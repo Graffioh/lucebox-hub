@@ -31,6 +31,7 @@
 #include <thread>
 #include <mutex>
 #include <functional>
+#include <limits>
 #include <vector>
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
@@ -50,6 +51,70 @@ static uint64_t ds4_elapsed_us(Ds4TimingClock::time_point start,
 static bool ds4_env_flag(const char * name) {
     const char * value = std::getenv(name);
     return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
+static bool ds4_numerics_debug_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = ds4_env_flag("DFLASH_DS4_NUMERICS_DEBUG") ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+// Debug-only finite check for host-visible activations. Returning false lets
+// the caller stop at the first corrupt stage instead of carrying NaNs through
+// every remaining layer and eventually reporting only all-NaN logits.
+static bool ds4_require_finite(
+        const char * stage,
+        int layer,
+        const float * values,
+        size_t count) {
+    if (!ds4_numerics_debug_enabled()) {
+        return true;
+    }
+
+    size_t finite_count = 0;
+    size_t nan_count = 0;
+    size_t inf_count = 0;
+    size_t first_bad = count;
+    float finite_min = std::numeric_limits<float>::infinity();
+    float finite_max = -std::numeric_limits<float>::infinity();
+    for (size_t i = 0; i < count; ++i) {
+        const float value = values[i];
+        if (std::isfinite(value)) {
+            ++finite_count;
+            finite_min = std::min(finite_min, value);
+            finite_max = std::max(finite_max, value);
+            continue;
+        }
+        if (first_bad == count) {
+            first_bad = i;
+        }
+        if (std::isnan(value)) {
+            ++nan_count;
+        } else {
+            ++inf_count;
+        }
+    }
+
+    if (first_bad == count) {
+        return true;
+    }
+
+    std::fprintf(stderr,
+                 "[deepseek4-numerics] non-finite stage=%s layer=%d "
+                 "count=%zu finite=%zu nan=%zu inf=%zu first_bad=%zu "
+                 "finite_min=%g finite_max=%g\n",
+                 stage,
+                 layer,
+                 count,
+                 finite_count,
+                 nan_count,
+                 inf_count,
+                 first_bad,
+                 finite_min,
+                 finite_max);
+    return false;
 }
 
 // Opt-in: reorders expert-FFN float accumulation, so output is not
@@ -4227,6 +4292,9 @@ bool deepseek4_step_layer_range(
         // Later shard: embed contains full HC state from previous shard
         memcpy(hc_state.data(), embed, sizeof(float) * (size_t)hc_dim * (size_t)n_tokens);
     }
+    if (!ds4_require_finite("shard-input", layer_begin, hc_state.data(), hc_state.size())) {
+        return false;
+    }
 
     // Lazy-load per-layer HC weights on CPU (static to avoid reloading)
     static std::vector<HcLayerWeightsCpu> hc_layer_weights_range;
@@ -4453,6 +4521,9 @@ bool deepseek4_step_layer_range(
             hc_pre_batch(cur, hc_post, hc_comb,
                          hc_state.data(), hc_lw.attn, L.hc_attn_fn,
                          n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+            if (!ds4_require_finite("attn-hc-pre", il, cur.data(), cur.size())) {
+                return false;
+            }
         }
         if (telemetry) telemetry->hc_pre_attn_us += ds4_elapsed_us(hc_pre_attn_t0, Ds4TimingClock::now());
 
@@ -4624,6 +4695,11 @@ bool deepseek4_step_layer_range(
                 const auto attn_read_t0 = Ds4TimingClock::now();
                 ggml_backend_tensor_get(attn_out, attn_out_host.data(), 0, sizeof(float) * attn_out_host.size());
                 if (telemetry) telemetry->attn_read_us += ds4_elapsed_us(attn_read_t0, Ds4TimingClock::now());
+                if (!ds4_require_finite("attn-output", il,
+                                        attn_out_host.data(), attn_out_host.size())) {
+                    if (ctx) ggml_free(ctx);
+                    return false;
+                }
             }
             if (ctx) ggml_free(ctx);
 
@@ -4640,6 +4716,10 @@ bool deepseek4_step_layer_range(
                               n_hc);
                 std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
                 if (telemetry) telemetry->hc_post_attn_us += ds4_elapsed_us(hc_post_attn_t0, Ds4TimingClock::now());
+                if (!ds4_require_finite("attn-hc-post", il,
+                                        hc_state.data(), hc_state.size())) {
+                    return false;
+                }
             }
         }
 
@@ -4714,6 +4794,10 @@ bool deepseek4_step_layer_range(
             hc_pre_batch(ffn_working, hc_post, hc_comb,
                          hc_state.data(), hc_lw.ffn, L.hc_ffn_fn,
                          n_tokens, n_embd, n_hc, w.n_hc_sinkhorn_iter, w.hc_eps);
+            if (!ds4_require_finite("ffn-hc-pre", il,
+                                    ffn_working.data(), ffn_working.size())) {
+                return false;
+            }
         }
         if (telemetry) telemetry->hc_pre_ffn_us += ds4_elapsed_us(hc_pre_ffn_t0, Ds4TimingClock::now());
 
@@ -4789,6 +4873,10 @@ bool deepseek4_step_layer_range(
                 const auto ffn_read_t0 = Ds4TimingClock::now();
                 ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
                 if (telemetry) telemetry->ffn_read_us += ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
+                if (!ds4_require_finite("ffn-output", il,
+                                        ffn_out_host.data(), ffn_out_host.size())) {
+                    return false;
+                }
             }
 
             // ── HC post (FFN) ───────────────────────────────────────
@@ -4804,12 +4892,20 @@ bool deepseek4_step_layer_range(
                               n_hc);
                 std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
                 if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
+                if (!ds4_require_finite("ffn-hc-post", il,
+                                        hc_state.data(), hc_state.size())) {
+                    return false;
+                }
             }
         }
     }
 
     if ((use_backend_decode_hc_graph || use_backend_decode_hc_direct) && hc_state_backend) {
         ggml_backend_tensor_get(hc_state_backend, hc_state.data(), 0, sizeof(float) * hc_state.size());
+        if (!ds4_require_finite("shard-output", layer_end - 1,
+                                hc_state.data(), hc_state.size())) {
+            return false;
+        }
     }
 
     // ── Output: HC pre → norm → lm_head (or return hidden state) ────────
@@ -4824,6 +4920,10 @@ bool deepseek4_step_layer_range(
                         n_embd,
                         n_hc,
                         w.hc_eps);
+        if (!ds4_require_finite("output-hc", w.n_layer,
+                                final_embd.data(), final_embd.size())) {
+            return false;
+        }
 
         if (reuse_decode_graphs) {
             if (!cached_decode_output_graph.valid() ||
@@ -4883,6 +4983,10 @@ bool deepseek4_step_layer_range(
             ggml_backend_tensor_get(logits, out_logits->data(), logits_offset,
                                     sizeof(float) * (size_t)w.n_vocab);
             ggml_free(ctx);
+        }
+        if (!ds4_require_finite("logits", w.n_layer,
+                                out_logits->data(), out_logits->size())) {
+            return false;
         }
         if (telemetry) telemetry->output_us += ds4_elapsed_us(output_t0, Ds4TimingClock::now());
     } else if (out_logits) {
