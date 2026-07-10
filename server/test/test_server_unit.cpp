@@ -26,6 +26,7 @@
 #include "placement/placement_config.h"
 #include "common/layer_split_backend.h"
 #include "common/layer_split_kvflash.h"
+#include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
 #include "common/kvflash_pager.h"
 #include "placement/draft_residency.h"
@@ -3144,6 +3145,47 @@ static void test_moe_hybrid_prefill_hot_sub_batch_limit() {
 // Sampler tests (model-independent, CPU-only)
 // ═══════════════════════════════════════════════════════════════════════
 
+static void test_layer_split_greedy_can_require_logits() {
+    SamplerCfg cfg;
+    std::mt19937_64 rng(42);
+    const std::vector<float> prefill_logits = {0.0f, 1.0f, 4.0f, 2.0f};
+    std::vector<int32_t> output;
+    std::vector<int32_t> emitted;
+    int forward_calls = 0;
+
+    LayerSplitForwardStep forward = [&](
+            const std::vector<int32_t> & input,
+            int,
+            int & next_tok,
+            std::vector<float> * logits_out) {
+        TEST_ASSERT(input.size() == 1);
+        TEST_ASSERT(logits_out != nullptr);
+        next_tok = input[0];  // Deliberately echo input: logits must win.
+        if (forward_calls++ == 0) {
+            *logits_out = {5.0f, 0.0f, 0.0f, 0.0f};
+        } else {
+            *logits_out = {0.0f, 6.0f, 0.0f, 0.0f};
+        }
+        return true;
+    };
+    DaemonIO io;
+    io.on_token = [&](int32_t token) {
+        emitted.push_back(token);
+        return true;
+    };
+
+    const bool ok = run_layer_split_ar_decode(
+        /*last_tok=*/3, /*committed=*/10, /*n_gen=*/3, /*vocab=*/4,
+        prefill_logits, cfg, rng, forward,
+        [](int) { return false; }, output, io,
+        /*forward_provides_argmax=*/false);
+
+    TEST_ASSERT(ok);
+    TEST_ASSERT(forward_calls == 2);
+    TEST_ASSERT(output == std::vector<int32_t>({2, 0, 1}));
+    TEST_ASSERT(emitted == output);
+}
+
 static void test_sampler_cfg_defaults() {
     SamplerCfg cfg;
     TEST_ASSERT(cfg.temp == 0.0f);
@@ -4577,6 +4619,7 @@ int main() {
     RUN_TEST(test_disk_identity_salt_zero_is_backcompat);
 
     std::fprintf(stderr, "\n── Sampler ──\n");
+    RUN_TEST(test_layer_split_greedy_can_require_logits);
     RUN_TEST(test_sampler_cfg_defaults);
     RUN_TEST(test_sampler_greedy_argmax);
     RUN_TEST(test_sampler_temperature_affects_distribution);

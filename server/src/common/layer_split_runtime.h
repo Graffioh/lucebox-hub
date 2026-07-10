@@ -90,6 +90,7 @@ bool run_layer_split_ar_decode(
     const LayerSplitForwardStep & forward_one,
     const std::function<bool(int)> & is_eos,
     std::vector<int32_t> & out_tokens,
-    const DaemonIO & io);
+    const DaemonIO & io,
+    bool forward_provides_argmax = true);
 
 }  // namespace dflash::common

@@ -13,10 +13,14 @@ bool run_layer_split_ar_decode(
         const LayerSplitForwardStep & forward_one,
         const std::function<bool(int)> & is_eos,
         std::vector<int32_t> & out_tokens,
-        const DaemonIO & io) {
+        const DaemonIO & io,
+        bool forward_provides_argmax) {
     if (n_gen <= 0) return true;
 
-    if (sampler.needs_logit_processing()) {
+    const bool require_logits =
+        sampler.needs_logit_processing() || !forward_provides_argmax;
+
+    if (require_logits) {
         if ((int)prefill_last_logits.size() != vocab) return false;
         last_tok = sample_logits(prefill_last_logits.data(), vocab, sampler,
                                  out_tokens, rng);
@@ -40,10 +44,10 @@ bool run_layer_split_ar_decode(
         int next_tok = -1;
         logits_buf.clear();
         if (!forward_one(one, committed, next_tok,
-                         sampler.needs_logit_processing() ? &logits_buf : nullptr)) {
+                         require_logits ? &logits_buf : nullptr)) {
             return false;
         }
-        if (sampler.needs_logit_processing()) {
+        if (require_logits) {
             if ((int)logits_buf.size() != vocab) return false;
             next_tok = sample_logits(logits_buf.data(), vocab, sampler,
                                      out_tokens, rng);
