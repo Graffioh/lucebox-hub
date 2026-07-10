@@ -1004,6 +1004,13 @@ if(DFLASH27B_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/scripts/entrypoint.sh")
     endif()
 
+    # CPU-only contract test for the fail-closed layer-split tree boundary.
+    add_executable(test_qwen35_split_tree_guard
+        test/test_qwen35_split_tree_guard.cpp)
+    target_include_directories(test_qwen35_split_tree_guard PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+    add_test(NAME qwen35_split_tree_guard COMMAND test_qwen35_split_tree_guard)
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         set(_server_unit_sources
             test/test_unit_main.cpp
