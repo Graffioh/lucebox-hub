@@ -1722,7 +1722,9 @@ static void test_deepseek4_render_empty_chat_gen_prompt() {
         /*enable_thinking=*/false,
         /*tools_json=*/"");
     const std::string expected =
-        "<｜begin▁of▁sentence｜><｜Assistant｜></think>";
+        "<｜begin▁of▁sentence｜>You are a helpful assistant. Answer the user's "
+        "question directly and carefully. Do not change numbers or facts from "
+        "the prompt.<｜Assistant｜></think>";
     TEST_ASSERT(out == expected);
 }
 

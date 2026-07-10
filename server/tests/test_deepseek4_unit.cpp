@@ -575,6 +575,25 @@ static void test_auto_split_computation() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_prefill_chunk_defaults_to_single_token() {
+    std::fprintf(stderr, "  test_prefill_chunk_defaults_to_single_token ...");
+
+    ScopedEnvVar env_guard("DFLASH_DS4_CHUNKED_PREFILL");
+    unsetenv("DFLASH_DS4_CHUNKED_PREFILL");
+
+    DeepSeek4LayerSplitAdapterConfig cfg;
+    cfg.device.gpu = 0;
+    cfg.device.max_ctx = 8192;
+    cfg.chunk = 64;
+    DeepSeek4LayerSplitAdapter adapter(cfg);
+    TEST_ASSERT(adapter.prefill_chunk_tokens() == 1);
+
+    setenv("DFLASH_DS4_CHUNKED_PREFILL", "1", 1);
+    TEST_ASSERT(adapter.prefill_chunk_tokens() == 64);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_layer_range_validation() {
     std::fprintf(stderr, "  test_layer_range_validation ...");
 
@@ -1556,6 +1575,7 @@ int main() {
     test_grouped_output_projection_shape();
     test_hash_routing_lookup();
     test_auto_split_computation();
+    test_prefill_chunk_defaults_to_single_token();
     test_layer_range_validation();
     test_hc_state_dimensions();
     test_loader_rejects_missing_required_metadata(backend);

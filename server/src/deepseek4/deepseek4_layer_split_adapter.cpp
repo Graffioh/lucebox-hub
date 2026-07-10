@@ -576,7 +576,7 @@ bool DeepSeek4LayerSplitAdapter::prefill(
         const std::vector<int32_t> & prompt,
         int base_pos,
         int & last_tok) {
-    const int chunk_size = cfg_.chunk > 0 ? cfg_.chunk : 512;
+    const int chunk_size = prefill_chunk_tokens();
     const int n_prompt = (int)prompt.size();
 
     for (int offset = 0; offset < n_prompt; offset += chunk_size) {
@@ -592,6 +592,17 @@ bool DeepSeek4LayerSplitAdapter::prefill(
         }
     }
     return true;
+}
+
+int DeepSeek4LayerSplitAdapter::prefill_chunk_tokens() const {
+    // DeepSeek4's learned compressor and HC state are updated autoregressively.
+    // Chunked prefill only matches the reference while all dependent state fits
+    // inside the raw SWA window, so keep the correctness path token-by-token.
+    // The chunked path remains available for short-prompt performance experiments.
+    if (env_flag_enabled("DFLASH_DS4_CHUNKED_PREFILL")) {
+        return cfg_.chunk > 0 ? cfg_.chunk : 512;
+    }
+    return 1;
 }
 
 bool DeepSeek4LayerSplitAdapter::decode_ar(
