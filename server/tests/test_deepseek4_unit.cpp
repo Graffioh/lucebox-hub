@@ -846,6 +846,7 @@ static void test_reset_request_state() {
     auto adapter = make_test_adapter();
     adapter.cur_pos_ = 9;
     adapter.last_tok_ = 77;
+    adapter.prefill_last_logits_ = {1.0f, 2.0f};
     adapter.hc_state_.assign(8, 5.0f);
     adapter.shards_.resize(2);
     for (auto & shard : adapter.shards_) {
@@ -860,6 +861,7 @@ static void test_reset_request_state() {
     adapter.reset_request_state();
     TEST_ASSERT(adapter.cur_pos_ == 0);
     TEST_ASSERT(adapter.last_tok_ == -1);
+    TEST_ASSERT(adapter.prefill_last_logits_.empty());
     for (float v : adapter.hc_state_) {
         TEST_ASSERT(v == 0.0f);
     }

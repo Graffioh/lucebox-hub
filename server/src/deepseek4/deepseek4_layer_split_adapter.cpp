@@ -411,11 +411,15 @@ void DeepSeek4LayerSplitAdapter::begin_request(const GenerateRequest & req) {
 void DeepSeek4LayerSplitAdapter::reset_request_state() {
     cur_pos_ = 0;
     last_tok_ = -1;
+    prefill_last_logits_.clear();
     const size_t hc_size = hc_state_.size();
     std::fill(hc_state_.begin(), hc_state_.end(), 0.0f);
 
     for (auto & shard : shards_) {
         shard.cache.cur_pos = 0;
+        if (shard.cache.buf) {
+            ggml_backend_buffer_clear(shard.cache.buf, 0);
+        }
         for (auto & lc : shard.cache.layers) {
             lc.n_comp = 0;
             lc.n_index_comp = 0;
