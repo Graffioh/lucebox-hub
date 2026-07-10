@@ -103,3 +103,54 @@ Each run writes:
 Prompt files are JSONL. Each line needs `id` and either `prompt` or `messages`.
 Optional `expect_contains` and `expect_regex` fields define lightweight accuracy
 checks.
+
+## Thinking-efficiency baseline
+
+`thinking_efficiency_benchmark.py` measures reasoning-token usage and surfaces
+possible doom loops without changing the server. It deliberately reports three
+different concepts separately:
+
+- **doom loop**: exact repeated n-grams or sentence-like spans in reasoning;
+- **overthinking**: reasoning exceeds a configurable token threshold;
+- **failure to finalize**: the request hits its output cap or has no visible answer.
+
+Start DeepSeek V4 Flash with the thinking-capable Lucebox endpoint, then run a
+small smoke sample before spending GPU time on the full temperature matrix:
+
+```bash
+python3 harness/benchmarks/thinking_efficiency_benchmark.py run \
+  --url http://127.0.0.1:8000/v1 \
+  --model deepseek-v4-flash \
+  --limit 3 \
+  --temperatures 0 \
+  --jsonl-out harness/results/thinking-smoke.jsonl
+```
+
+Run the full 18-prompt baseline at greedy, low, and medium temperature:
+
+```bash
+python3 harness/benchmarks/thinking_efficiency_benchmark.py run \
+  --url http://127.0.0.1:8000/v1 \
+  --model deepseek-v4-flash \
+  --temperatures 0,0.2,0.6 \
+  --jsonl-out harness/results/deepseek-v4-flash-baseline.jsonl
+```
+
+Each result is flushed immediately. If a rental or server process stops, rerun
+with `--resume` to skip completed `(prompt, temperature, repeat)` tuples.
+
+Create machine-readable and Markdown summaries:
+
+```bash
+python3 harness/benchmarks/thinking_efficiency_benchmark.py summarize \
+  --jsonl harness/results/deepseek-v4-flash-baseline.jsonl \
+  --json-out harness/results/deepseek-v4-flash-summary.json \
+  --md-out harness/results/deepseek-v4-flash-summary.md
+```
+
+The default request uses a combined 8192-token cap, a 7168-token thinking
+budget, and a 1024-token reply reserve. Lucebox's exact
+`finish_details.thinking_tokens` is preferred; word-based token estimates are
+only a compatibility fallback. The detector is a baseline triage heuristic,
+not a ground-truth label. Manually inspect the cases ranked in the generated
+report before making claims from the loop rate.
