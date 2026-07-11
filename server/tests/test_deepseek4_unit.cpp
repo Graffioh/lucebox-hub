@@ -1425,6 +1425,21 @@ static void test_backend_sampling_penalizes_prompt_history() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_local_shards_receive_hc_boundary_state() {
+    std::fprintf(stderr, "  test_local_shards_receive_hc_boundary_state ...");
+
+    const std::vector<float> embeddings = {1.0f, 2.0f, 3.0f, 4.0f};
+    const std::vector<float> hc_state = {5.0f, 6.0f, 7.0f, 8.0f};
+    TEST_ASSERT(DeepSeek4LayerSplitAdapter::local_shard_input(
+                    0, embeddings, hc_state) == embeddings.data());
+    TEST_ASSERT(DeepSeek4LayerSplitAdapter::local_shard_input(
+                    1, embeddings, hc_state) == hc_state.data());
+    TEST_ASSERT(DeepSeek4LayerSplitAdapter::local_shard_input(
+                    2, embeddings, hc_state) == hc_state.data());
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_loader_rejects_missing_required_metadata(ggml_backend_t backend) {
     std::fprintf(stderr, "  test_loader_rejects_missing_required_metadata ...");
 
@@ -2883,6 +2898,7 @@ int main() {
     test_layer_split_sampler_appends_generated_tokens();
     test_layer_split_restore_preserves_full_sampling_history();
     test_backend_sampling_penalizes_prompt_history();
+    test_local_shards_receive_hc_boundary_state();
     test_loader_rejects_missing_required_metadata(backend);
     test_loader_rejects_invalid_compress_ratio_type(backend);
     test_loader_rejects_zero_vocab_size(backend);
