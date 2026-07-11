@@ -1010,6 +1010,7 @@ if(DFLASH27B_TESTS)
     target_include_directories(test_qwen35_split_tree_guard PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
     add_test(NAME qwen35_split_tree_guard COMMAND test_qwen35_split_tree_guard)
+    list(APPEND _raw_unit_test_targets test_qwen35_split_tree_guard)
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         set(_server_unit_sources
