@@ -4,6 +4,10 @@
 
 namespace dflash::common {
 
+// CUDA and HIP select devices per host thread. Call this at worker/shard entry
+// before invoking the direct HC helpers.
+bool deepseek4_cuda_hc_set_device(int device);
+
 bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
                                const void *  fn_device,
                                int           n_embd,
@@ -46,5 +50,12 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                          void *        working_device,
                                          void *        post_device,
                                          void *        comb_device);
+
+bool deepseek4_cuda_hc_upload_f16(int          device,
+                                  const void * host_f16,
+                                  size_t       bytes,
+                                  void **      device_out);
+
+void deepseek4_cuda_hc_free(int device, void * device_ptr);
 
 } // namespace dflash::common

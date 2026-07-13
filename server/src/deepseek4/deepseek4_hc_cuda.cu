@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -20,6 +21,7 @@ constexpr int kMaxHc = 8;
 constexpr int kMaxMixDim = 2 * kMaxHc + kMaxHc * kMaxHc;
 
 struct HcCudaScratch {
+    int owner_device = -1;
     float * d_state = nullptr;
     float * d_sums = nullptr;
     float * d_mix = nullptr;
@@ -30,7 +32,12 @@ struct HcCudaScratch {
     float * d_comb = nullptr;
     size_t state_cap = 0;
 
+    explicit HcCudaScratch(int device = -1) : owner_device(device) {}
+
     ~HcCudaScratch() {
+        if (owner_device >= 0) {
+            (void) cudaSetDevice(owner_device);
+        }
         if (d_state) cudaFree(d_state);
         if (d_sums) cudaFree(d_sums);
         if (d_mix) cudaFree(d_mix);
@@ -62,8 +69,38 @@ struct HcCudaScratch {
     }
 };
 
-std::mutex g_mu;
-HcCudaScratch g_scratch;
+struct HcScratchSlot {
+    explicit HcScratchSlot(int device = -1) : scratch(device) {}
+
+    std::mutex mutex;
+    HcCudaScratch scratch;
+};
+
+void hc_log_cuda_error(const char * label, cudaError_t err);
+
+// CUDA and HIP allocations belong to the device that was current when they
+// were created. Keep one independently locked slot per logical device so local
+// shards cannot reuse another device's scratch pointers.
+std::mutex g_scratch_slots_mutex;
+std::vector<std::unique_ptr<HcScratchSlot>> g_scratch_slots;
+
+HcScratchSlot * current_scratch_slot() {
+    int device = -1;
+    const cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess || device < 0) {
+        hc_log_cuda_error("get current device", err);
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(g_scratch_slots_mutex);
+    if (g_scratch_slots.size() <= (size_t) device) {
+        g_scratch_slots.resize((size_t) device + 1);
+    }
+    if (!g_scratch_slots[(size_t) device]) {
+        g_scratch_slots[(size_t) device] = std::make_unique<HcScratchSlot>(device);
+    }
+    return g_scratch_slots[(size_t) device].get();
+}
 
 void hc_log_cuda_error(const char * label, cudaError_t err) {
     if (err != cudaSuccess) {
@@ -246,7 +283,8 @@ __global__ void hc_finish_kernel(const float * hc_state,
     }
 }
 
-bool hc_pre_device_locked(const void * hc_state_device,
+bool hc_pre_device_locked(HcCudaScratch & scratch,
+                          const void * hc_state_device,
                           const void * fn_device,
                           const void * scale_device,
                           const void * base_device,
@@ -267,8 +305,8 @@ bool hc_pre_device_locked(const void * hc_state_device,
         return false;
     };
 
-    if (hc_state_device != g_scratch.d_state) {
-        cudaError_t err = cudaMemcpy(g_scratch.d_state, hc_state_device,
+    if (hc_state_device != scratch.d_state) {
+        cudaError_t err = cudaMemcpy(scratch.d_state, hc_state_device,
                                      sizeof(float) * (size_t) hc_dim,
                                      cudaMemcpyDeviceToDevice);
         if (err != cudaSuccess) {
@@ -277,28 +315,28 @@ bool hc_pre_device_locked(const void * hc_state_device,
     }
 
     hc_mix_norm_kernel<<<mix_dim, kThreads>>>(
-        g_scratch.d_state,
+        scratch.d_state,
         static_cast<const __half *>(fn_device),
         hc_dim,
         mix_dim,
         eps,
-        g_scratch.d_mix);
+        scratch.d_mix);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         return fail("mix kernel", err);
     }
 
     hc_finish_kernel<<<1, kThreads>>>(
-        g_scratch.d_state,
-        g_scratch.d_mix,
+        scratch.d_state,
+        scratch.d_mix,
         static_cast<const float *>(scale_device),
         static_cast<const float *>(base_device),
         n_embd,
         n_hc,
         sinkhorn_iters,
-        g_scratch.d_working,
-        g_scratch.d_post,
-        g_scratch.d_comb);
+        scratch.d_working,
+        scratch.d_post,
+        scratch.d_comb);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         return fail("finish kernel", err);
@@ -310,24 +348,24 @@ bool hc_pre_device_locked(const void * hc_state_device,
     }
 #endif
 
-    if (working_device != g_scratch.d_working) {
-        err = cudaMemcpy(working_device, g_scratch.d_working,
+    if (working_device != scratch.d_working) {
+        err = cudaMemcpy(working_device, scratch.d_working,
                          sizeof(float) * (size_t) n_embd,
                          cudaMemcpyDeviceToDevice);
         if (err != cudaSuccess) {
             return fail("copy working d2d", err);
         }
     }
-    if (post_device != g_scratch.d_post) {
-        err = cudaMemcpy(post_device, g_scratch.d_post,
+    if (post_device != scratch.d_post) {
+        err = cudaMemcpy(post_device, scratch.d_post,
                          sizeof(float) * (size_t) n_hc,
                          cudaMemcpyDeviceToDevice);
         if (err != cudaSuccess) {
             return fail("copy post d2d", err);
         }
     }
-    if (comb_device != g_scratch.d_comb) {
-        err = cudaMemcpy(comb_device, g_scratch.d_comb,
+    if (comb_device != scratch.d_comb) {
+        err = cudaMemcpy(comb_device, scratch.d_comb,
                          sizeof(float) * (size_t) n_hc * (size_t) n_hc,
                          cudaMemcpyDeviceToDevice);
         if (err != cudaSuccess) {
@@ -344,6 +382,18 @@ bool hc_pre_device_locked(const void * hc_state_device,
 
 } // namespace
 
+bool deepseek4_cuda_hc_set_device(int device) {
+    if (device < 0) {
+        return false;
+    }
+    const cudaError_t err = cudaSetDevice(device);
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("set device", err);
+        return false;
+    }
+    return true;
+}
+
 bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
                                const void *  fn_device,
                                int           n_embd,
@@ -354,31 +404,34 @@ bool deepseek4_cuda_hc_pre_mix(const float * hc_state_host,
         return false;
     }
     const int hc_dim = n_embd * n_hc;
-    std::lock_guard<std::mutex> lock(g_mu);
-    if (!g_scratch.ensure((size_t)hc_dim, (size_t)n_embd, (size_t)n_hc)) {
+    HcScratchSlot * slot = current_scratch_slot();
+    if (!slot) return false;
+    std::lock_guard<std::mutex> lock(slot->mutex);
+    HcCudaScratch & scratch = slot->scratch;
+    if (!scratch.ensure((size_t)hc_dim, (size_t)n_embd, (size_t)n_hc)) {
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_state, hc_state_host, sizeof(float) * (size_t)hc_dim,
+    if (cudaMemcpy(scratch.d_state, hc_state_host, sizeof(float) * (size_t)hc_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
-    hc_sumsq_kernel<<<kSums, kThreads>>>(g_scratch.d_state, hc_dim, g_scratch.d_sums);
+    hc_sumsq_kernel<<<kSums, kThreads>>>(scratch.d_state, hc_dim, scratch.d_sums);
     if (cudaGetLastError() != cudaSuccess) return false;
     std::vector<float> sums(kSums);
-    if (cudaMemcpy(sums.data(), g_scratch.d_sums, sizeof(float) * sums.size(),
+    if (cudaMemcpy(sums.data(), scratch.d_sums, sizeof(float) * sums.size(),
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
     float ss = 0.0f;
     for (float v : sums) ss += v;
     const float inv_rms = 1.0f / std::sqrt(ss / (float)hc_dim + eps);
-    hc_mix_kernel<<<kMixDim, kThreads>>>(g_scratch.d_state,
+    hc_mix_kernel<<<kMixDim, kThreads>>>(scratch.d_state,
                                          static_cast<const __half *>(fn_device),
                                          hc_dim,
                                          inv_rms,
-                                         g_scratch.d_mix);
+                                         scratch.d_mix);
     if (cudaGetLastError() != cudaSuccess) return false;
-    if (cudaMemcpy(mix_host, g_scratch.d_mix, sizeof(float) * kMixDim,
+    if (cudaMemcpy(mix_host, scratch.d_mix, sizeof(float) * kMixDim,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
@@ -407,47 +460,51 @@ bool deepseek4_cuda_hc_pre(const float * hc_state_host,
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(g_mu);
-    if (!g_scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
+    HcScratchSlot * slot = current_scratch_slot();
+    if (!slot) return false;
+    std::lock_guard<std::mutex> lock(slot->mutex);
+    HcCudaScratch & scratch = slot->scratch;
+    if (!scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_state, hc_state_host, sizeof(float) * (size_t) hc_dim,
+    if (cudaMemcpy(scratch.d_state, hc_state_host, sizeof(float) * (size_t) hc_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
+    if (cudaMemcpy(scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
+    if (cudaMemcpy(scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         return false;
     }
     if (!hc_pre_device_locked(
-            g_scratch.d_state,
+            scratch,
+            scratch.d_state,
             fn_device,
-            g_scratch.d_scale,
-            g_scratch.d_base,
+            scratch.d_scale,
+            scratch.d_base,
             n_embd,
             n_hc,
             sinkhorn_iters,
             eps,
-            g_scratch.d_working,
-            g_scratch.d_post,
-            g_scratch.d_comb,
+            scratch.d_working,
+            scratch.d_post,
+            scratch.d_comb,
             false)) {
         return false;
     }
 
-    if (cudaMemcpy(working_host, g_scratch.d_working, sizeof(float) * (size_t) n_embd,
+    if (cudaMemcpy(working_host, scratch.d_working, sizeof(float) * (size_t) n_embd,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
-    if (cudaMemcpy(post_host, g_scratch.d_post, sizeof(float) * (size_t) n_hc,
+    if (cudaMemcpy(post_host, scratch.d_post, sizeof(float) * (size_t) n_hc,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
-    if (cudaMemcpy(comb_host, g_scratch.d_comb, sizeof(float) * (size_t) n_hc * (size_t) n_hc,
+    if (cudaMemcpy(comb_host, scratch.d_comb, sizeof(float) * (size_t) n_hc * (size_t) n_hc,
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
         return false;
     }
@@ -477,11 +534,15 @@ bool deepseek4_cuda_hc_pre_device(const void * hc_state_device,
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(g_mu);
-    if (!g_scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
+    HcScratchSlot * slot = current_scratch_slot();
+    if (!slot) return false;
+    std::lock_guard<std::mutex> lock(slot->mutex);
+    HcCudaScratch & scratch = slot->scratch;
+    if (!scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
         return false;
     }
-    return hc_pre_device_locked(hc_state_device,
+    return hc_pre_device_locked(scratch,
+                                hc_state_device,
                                 fn_device,
                                 scale_device,
                                 base_device,
@@ -517,30 +578,34 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(g_mu);
-    if (!g_scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
+    HcScratchSlot * slot = current_scratch_slot();
+    if (!slot) return false;
+    std::lock_guard<std::mutex> lock(slot->mutex);
+    HcCudaScratch & scratch = slot->scratch;
+    if (!scratch.ensure((size_t) hc_dim, (size_t) n_embd, (size_t) n_hc)) {
         std::fprintf(stderr, "[deepseek4-hc-direct] ensure failed\n");
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_state, hc_state_device, sizeof(float) * (size_t) hc_dim,
+    if (cudaMemcpy(scratch.d_state, hc_state_device, sizeof(float) * (size_t) hc_dim,
                    cudaMemcpyDeviceToDevice) != cudaSuccess) {
         hc_log_cuda_error("copy state d2d", cudaGetLastError());
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
+    if (cudaMemcpy(scratch.d_scale, scale_host, sizeof(float) * (size_t) mix_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         hc_log_cuda_error("copy scale", cudaGetLastError());
         return false;
     }
-    if (cudaMemcpy(g_scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
+    if (cudaMemcpy(scratch.d_base, base_host, sizeof(float) * (size_t) mix_dim,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
         hc_log_cuda_error("copy base", cudaGetLastError());
         return false;
     }
-    return hc_pre_device_locked(g_scratch.d_state,
+    return hc_pre_device_locked(scratch,
+                                scratch.d_state,
                                 fn_device,
-                                g_scratch.d_scale,
-                                g_scratch.d_base,
+                                scratch.d_scale,
+                                scratch.d_base,
                                 n_embd,
                                 n_hc,
                                 sinkhorn_iters,
@@ -549,6 +614,41 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                 post_device,
                                 comb_device,
                                 true);
+}
+
+bool deepseek4_cuda_hc_upload_f16(int          device,
+                                  const void * host_f16,
+                                  size_t       bytes,
+                                  void **      device_out) {
+    if (!host_f16 || bytes == 0 || !device_out) {
+        return false;
+    }
+    if (!deepseek4_cuda_hc_set_device(device)) {
+        return false;
+    }
+    void * ptr = nullptr;
+    cudaError_t err = cudaMalloc(&ptr, bytes);
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("hc f16 mirror malloc", err);
+        return false;
+    }
+    err = cudaMemcpy(ptr, host_f16, bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        hc_log_cuda_error("hc f16 mirror upload", err);
+        cudaFree(ptr);
+        return false;
+    }
+    *device_out = ptr;
+    return true;
+}
+
+void deepseek4_cuda_hc_free(int device, void * device_ptr) {
+    if (device_ptr) {
+        if (!deepseek4_cuda_hc_set_device(device)) {
+            return;
+        }
+        cudaFree(device_ptr);
+    }
 }
 
 } // namespace dflash::common

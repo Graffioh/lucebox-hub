@@ -54,6 +54,11 @@ static bool ds4_env_flag(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
+static bool ds4_rocmfpx_hc_gpu_enabled() {
+    static const bool enabled = ds4_env_flag("DFLASH_DS4_ROCMFPX_HC_GPU");
+    return enabled;
+}
+
 static int ds4_effective_expert_count(const DeepSeek4Weights & w) {
     const int requested = w.routed_expert_top_k;
     if (requested > 0 && requested < w.n_expert_used) {
@@ -3016,6 +3021,9 @@ struct HcWeightsCpu {
     std::vector<uint16_t> fn_data;   // [hc_dim * mix_dim] F16
     std::vector<float> scale_data;   // [3]
     std::vector<float> base_data;    // [2*n_hc + n_hc*n_hc]
+    void * fn_f16_device = nullptr;  // Persistent F16 mirror for quantized HC fn tensors.
+    size_t fn_f16_device_bytes = 0;
+    int fn_f16_device_id = -1;
     bool loaded = false;
 };
 
@@ -3723,7 +3731,19 @@ static bool load_hc_weights_cpu(HcWeightsCpu & dst, ggml_tensor * fn,
     return true;
 }
 
+static void release_hc_fn_device(HcWeightsCpu & w) {
+#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (w.fn_f16_device) {
+        deepseek4_cuda_hc_free(w.fn_f16_device_id, w.fn_f16_device);
+    }
+#endif
+    w.fn_f16_device = nullptr;
+    w.fn_f16_device_bytes = 0;
+    w.fn_f16_device_id = -1;
+}
+
 static void reset_hc_weights_cpu(HcWeightsCpu & w) {
+    release_hc_fn_device(w);
     w.fn_data.clear();
     w.scale_data.clear();
     w.base_data.clear();
@@ -3755,10 +3775,38 @@ struct DeepSeek4HybridRuntime {
 
 static thread_local DeepSeek4HybridRuntime ds4_hybrid_runtime;
 
-static const void * hc_fn_device_ptr(const HcWeightsCpu &, ggml_tensor * fn) {
+static bool ensure_hc_fn_device(HcWeightsCpu & w, ggml_tensor * fn, int device) {
+    if (!fn || !fn->data) return false;
+    if (fn->type == GGML_TYPE_F16) return true;
+    if (!ds4_rocmfpx_hc_gpu_enabled()) return false;
+    if (!w.loaded || w.fn_data.empty()) return false;
+
+#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    const size_t bytes = w.fn_data.size() * sizeof(uint16_t);
+    if (w.fn_f16_device && w.fn_f16_device_bytes == bytes &&
+        w.fn_f16_device_id == device) {
+        return true;
+    }
+    release_hc_fn_device(w);
+    if (!deepseek4_cuda_hc_upload_f16(device, w.fn_data.data(), bytes, &w.fn_f16_device)) {
+        w.fn_f16_device = nullptr;
+        w.fn_f16_device_bytes = 0;
+        w.fn_f16_device_id = -1;
+        return false;
+    }
+    w.fn_f16_device_bytes = bytes;
+    w.fn_f16_device_id = device;
+    return true;
+#else
+    return false;
+#endif
+}
+
+static const void * hc_fn_device_ptr(const HcWeightsCpu & w, ggml_tensor * fn) {
     if (!fn) return nullptr;
     if (fn->type == GGML_TYPE_F16) return fn->data;
-    return nullptr;
+    if (!ds4_rocmfpx_hc_gpu_enabled()) return nullptr;
+    return w.fn_f16_device;
 }
 
 static bool load_hash_routing_cpu(HashRoutingTableCpu & dst, ggml_tensor * table) {
@@ -4253,6 +4301,7 @@ static bool deepseek4_step_hybrid(
 
 bool deepseek4_step(
         ggml_backend_t backend,
+        int device,
         const DeepSeek4Weights & w,
         DeepSeek4Cache & cache,
         const float * embed,
@@ -4273,7 +4322,7 @@ bool deepseek4_step(
 
     std::vector<float> hc_state;
     return deepseek4_step_layer_range(
-        backend, w, cache, hc_state, embed, n_tokens, kv_start,
+        backend, device, w, cache, hc_state, embed, n_tokens, kv_start,
         0, w.n_layer, &out_logits, token_ids, telemetry,
         /*allow_decode_graph_reuse=*/verify_hooks == nullptr, verify_hooks);
 }
@@ -4360,6 +4409,7 @@ struct DeepSeek4LayerRangeRuntimeCache {
     const DeepSeek4Weights * owner_weights = nullptr;
     const ggml_context * owner_ctx = nullptr;
     ggml_backend_t backend = nullptr;
+    int device = -1;
     int n_layer = 0;
     int layer_begin = -1;
     int layer_end = -1;
@@ -4381,12 +4431,14 @@ struct DeepSeek4LayerRangeRuntimeCache {
 
     bool matches(const DeepSeek4Weights & w,
                  ggml_backend_t candidate_backend,
+                 int candidate_device,
                  int candidate_begin,
                  int candidate_end,
                  bool candidate_owns_output) const {
         return owner_weights == &w &&
                owner_ctx == w.ctx &&
                backend == candidate_backend &&
+               device == candidate_device &&
                n_layer == w.n_layer &&
                layer_begin == candidate_begin &&
                layer_end == candidate_end &&
@@ -4429,6 +4481,7 @@ struct DeepSeek4LayerRangeRuntimeCache {
         owner_weights = nullptr;
         owner_ctx = nullptr;
         backend = nullptr;
+        device = -1;
         n_layer = 0;
         layer_begin = -1;
         layer_end = -1;
@@ -5740,6 +5793,7 @@ static bool ds4_hc_output_weights_ready(const HcWeightsCpu & weights,
 static bool initialize_layer_range_runtime_cache(
         DeepSeek4LayerRangeRuntimeCache & runtime,
         ggml_backend_t backend,
+        int device,
         const DeepSeek4Weights & w,
         int layer_begin,
         int layer_end,
@@ -5779,6 +5833,10 @@ static bool initialize_layer_range_runtime_cache(
             runtime.reset();
             return false;
         }
+        if (ds4_backend_is_gpu(backend) && !ds4_env_flag("DFLASH_DS4_HC_CPU")) {
+            ensure_hc_fn_device(cached.attn, layer.hc_attn_fn, device);
+            ensure_hc_fn_device(cached.ffn, layer.hc_ffn_fn, device);
+        }
         if (il < w.n_hash_layer && layer.ffn_gate_tid2eid) {
             load_hash_routing_cpu(runtime.hash_routing_tables[(size_t)il],
                                   layer.ffn_gate_tid2eid);
@@ -5800,6 +5858,7 @@ static bool initialize_layer_range_runtime_cache(
     runtime.owner_weights = &w;
     runtime.owner_ctx = w.ctx;
     runtime.backend = backend;
+    runtime.device = device;
     runtime.n_layer = w.n_layer;
     runtime.layer_begin = layer_begin;
     runtime.layer_end = layer_end;
@@ -5809,6 +5868,7 @@ static bool initialize_layer_range_runtime_cache(
 
 bool deepseek4_step_layer_range(
         ggml_backend_t backend,
+        int device,
         const DeepSeek4Weights & w,
         DeepSeek4Cache & cache,
         std::vector<float> & hc_state,
@@ -5823,6 +5883,16 @@ bool deepseek4_step_layer_range(
         bool allow_decode_graph_reuse,
         Ds4VerifyHooks * verify_hooks) {
     const auto step_t0 = Ds4TimingClock::now();
+
+    if (!deepseek4_cuda_hc_set_device(device)) {
+        std::fprintf(stderr,
+                     "[deepseek4] failed to select HC device %d for layer range [%d,%d)\n",
+                     device, layer_begin, layer_end);
+        return false;
+    }
+
+    // NOTE: The old deepseek4_step() lacks HC implementation.
+    // Always use the HC-enabled layer_range path below.
 
     // ── Partial layer-range forward with HC ─────────────────────────────
     const int n_embd = w.n_embd;
@@ -5872,7 +5942,7 @@ bool deepseek4_step_layer_range(
                 chunk_hooks_ptr = &chunk_hooks;
             }
             if (!deepseek4_step_layer_range(
-                    backend, w, cache, chunk_hc,
+                    backend, device, w, cache, chunk_hc,
                     embed + (size_t) off * input_width,
                     chunk, kv_start + off, layer_begin, layer_end,
                     out_logits ? &chunk_out : nullptr,
@@ -5955,9 +6025,9 @@ bool deepseek4_step_layer_range(
         cache.layer_range_runtime = new DeepSeek4LayerRangeRuntimeCache();
     }
     DeepSeek4LayerRangeRuntimeCache & runtime = *cache.layer_range_runtime;
-    if (!runtime.matches(w, backend, layer_begin, layer_end, is_last_shard) &&
+    if (!runtime.matches(w, backend, device, layer_begin, layer_end, is_last_shard) &&
         !initialize_layer_range_runtime_cache(
-            runtime, backend, w, layer_begin, layer_end, is_last_shard)) {
+            runtime, backend, device, w, layer_begin, layer_end, is_last_shard)) {
         return false;
     }
 

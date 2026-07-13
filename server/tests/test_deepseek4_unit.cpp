@@ -28,6 +28,7 @@
 #include <limits>
 #include <numeric>
 #include <sys/stat.h>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 
@@ -2869,6 +2870,91 @@ static void test_hc_pre_kernel_gpu() {
     ggml_free(ctx);
     ggml_backend_free(backend);
 }
+
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+static void test_hc_scratch_per_device() {
+    std::fprintf(stderr, "  test_hc_scratch_per_device ...");
+    if (ggml_backend_cuda_get_device_count() < 2) {
+        std::fprintf(stderr, " skipped (requires two GPU devices)\n");
+        return;
+    }
+
+    constexpr int n_embd = 32;
+    constexpr int n_hc = 4;
+    constexpr int sinkhorn_iters = 6;
+    constexpr float hc_eps = 1.0e-6f;
+    constexpr int mix_dim = 2 * n_hc + n_hc * n_hc;
+    constexpr int hc_dim = n_embd * n_hc;
+
+    std::vector<float> hc_state((size_t) hc_dim);
+    std::iota(hc_state.begin(), hc_state.end(), -16.0f);
+    for (float & value : hc_state) value *= 0.01f;
+    std::vector<ggml_fp16_t> fn_f16((size_t) mix_dim * (size_t) hc_dim,
+                                     ggml_fp32_to_fp16(0.0f));
+    std::vector<float> scale((size_t) mix_dim, 0.0f);
+    scale[0] = 1.0f;
+    scale[1] = 1.0f;
+    scale[2] = 1.0f;
+    std::vector<float> base((size_t) mix_dim, 0.0f);
+
+    struct Result {
+        bool ok = false;
+        std::vector<float> working;
+        std::vector<float> post;
+        std::vector<float> comb;
+
+        Result(int embd, int hc)
+            : working((size_t) embd),
+              post((size_t) hc),
+              comb((size_t) hc * (size_t) hc) {}
+    };
+
+    auto run_on_worker = [&](int device, Result & result) {
+        std::thread worker([&, device]() {
+            void * fn_device = nullptr;
+            if (!deepseek4_cuda_hc_set_device(device) ||
+                !deepseek4_cuda_hc_upload_f16(
+                    device, fn_f16.data(), fn_f16.size() * sizeof(ggml_fp16_t), &fn_device)) {
+                return;
+            }
+            result.ok = deepseek4_cuda_hc_pre(
+                hc_state.data(), fn_device, scale.data(), base.data(),
+                n_embd, n_hc, sinkhorn_iters, hc_eps,
+                result.working.data(), result.post.data(), result.comb.data());
+            deepseek4_cuda_hc_free(device, fn_device);
+        });
+        worker.join();
+    };
+
+    Result first_device(n_embd, n_hc);
+    Result second_device(n_embd, n_hc);
+    Result first_device_again(n_embd, n_hc);
+    run_on_worker(0, first_device);
+    run_on_worker(1, second_device);
+    run_on_worker(0, first_device_again);
+
+    TEST_ASSERT_MSG(first_device.ok, "HC direct call failed on GPU device 0");
+    TEST_ASSERT_MSG(second_device.ok, "HC direct call failed on GPU device 1");
+    TEST_ASSERT_MSG(first_device_again.ok, "HC direct call failed after returning to GPU device 0");
+    if (first_device.ok && second_device.ok && first_device_again.ok) {
+        for (int i = 0; i < n_embd; ++i) {
+            TEST_ASSERT(nearly_equal(first_device.working[(size_t) i],
+                                     second_device.working[(size_t) i]));
+            TEST_ASSERT(nearly_equal(first_device.working[(size_t) i],
+                                     first_device_again.working[(size_t) i]));
+        }
+        for (int i = 0; i < n_hc; ++i) {
+            TEST_ASSERT(nearly_equal(first_device.post[(size_t) i],
+                                     second_device.post[(size_t) i]));
+        }
+        for (int i = 0; i < n_hc * n_hc; ++i) {
+            TEST_ASSERT(nearly_equal(first_device.comb[(size_t) i],
+                                     second_device.comb[(size_t) i]));
+        }
+    }
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+#endif
 #endif
 
 int main() {
@@ -2922,6 +3008,7 @@ int main() {
     test_ds4_flash_attention_inverse_rope_fallback_gpu();
     test_hc_post_strided_split_gpu();
     test_hc_pre_kernel_gpu();
+    test_hc_scratch_per_device();
 #endif
 
     ggml_backend_free(backend);
