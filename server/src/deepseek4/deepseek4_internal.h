@@ -268,7 +268,7 @@ struct DeepSeek4LayerCache {
 // Per-shard runtime state for deepseek4_step_layer_range (host-side HC weight
 // cache + cached decode graphs). Defined in deepseek4_graph.cpp; owned by the
 // DeepSeek4Cache below and released by free_deepseek4_cache().
-struct DeepSeek4LayerRangeRuntimeCache;
+struct DeepSeek4LayerRangeCache;
 
 struct DeepSeek4Cache {
     int cur_pos  = 0;
@@ -282,7 +282,7 @@ struct DeepSeek4Cache {
     ggml_tensor * hc_state    = nullptr;  // [n_hc * n_embd]
 
     // Lazily created on the first deepseek4_step_layer_range call.
-    DeepSeek4LayerRangeRuntimeCache * layer_range_runtime = nullptr;
+    DeepSeek4LayerRangeCache * layer_range_cache = nullptr;
 
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;

@@ -4403,8 +4403,8 @@ struct DeepSeek4FusedDecodeCache {
     }
 };
 
-struct DeepSeek4LayerRangeRuntimeCache {
-    ~DeepSeek4LayerRangeRuntimeCache() { reset(); }
+struct DeepSeek4LayerRangeCache {
+    ~DeepSeek4LayerRangeCache() { reset(); }
 
     const DeepSeek4Weights * owner_weights = nullptr;
     const ggml_context * owner_ctx = nullptr;
@@ -5790,8 +5790,8 @@ static bool ds4_hc_output_weights_ready(const HcWeightsCpu & weights,
            weights.base_data.size() >= (size_t)n_hc;
 }
 
-static bool initialize_layer_range_runtime_cache(
-        DeepSeek4LayerRangeRuntimeCache & runtime,
+static bool initialize_layer_range_cache(
+        DeepSeek4LayerRangeCache & runtime,
         ggml_backend_t backend,
         int device,
         const DeepSeek4Weights & w,
@@ -5986,9 +5986,9 @@ bool deepseek4_step_layer_range(
     //   separate buffer (IPC daemon). Detect the alias before any resize, which
     //   would invalidate embed.
     const size_t hc_state_elems = (size_t)hc_dim * (size_t)n_tokens;
-    const bool boundary_in_place = embed != nullptr && embed == hc_state.data();
+    const bool embed_points_to_hc_state = embed != nullptr && embed == hc_state.data();
     if (hc_state.size() != hc_state_elems) {
-        if (boundary_in_place) {
+        if (embed_points_to_hc_state) {
             std::fprintf(stderr,
                          "[deepseek4] HC boundary state size mismatch for layer range [%d,%d): "
                          "have %zu want %zu\n",
@@ -6012,41 +6012,40 @@ bool deepseek4_step_layer_range(
                          layer_begin, layer_end);
             return false;
         }
-        if (!boundary_in_place) {
+        if (!embed_points_to_hc_state) {
             memcpy(hc_state.data(), embed, sizeof(float) * hc_state_elems);
         }
     }
 
-    // Each partial model owns only its assigned layer range. Its HC and graph
-    // caches live on the shard's DeepSeek4Cache — created with the shard,
-    // freed with it — instead of one process-global cache being reset as
-    // local/remote contexts alternate.
-    if (!cache.layer_range_runtime) {
-        cache.layer_range_runtime = new DeepSeek4LayerRangeRuntimeCache();
+    // Keep HC and graph runtime state per DeepSeek4Cache. This isolates model
+    // and shard instances that may execute interleaved in the same process and
+    // ties the cached resources to the owning cache's lifetime.
+    if (!cache.layer_range_cache) {
+        cache.layer_range_cache = new DeepSeek4LayerRangeCache();
     }
-    DeepSeek4LayerRangeRuntimeCache & runtime = *cache.layer_range_runtime;
-    if (!runtime.matches(w, backend, device, layer_begin, layer_end, is_last_shard) &&
-        !initialize_layer_range_runtime_cache(
-            runtime, backend, device, w, layer_begin, layer_end, is_last_shard)) {
+    DeepSeek4LayerRangeCache & layer_range_cache = *cache.layer_range_cache;
+    if (!layer_range_cache.matches(w, backend, device, layer_begin, layer_end, is_last_shard) &&
+        !initialize_layer_range_cache(
+            layer_range_cache, backend, device, w, layer_begin, layer_end, is_last_shard)) {
         return false;
     }
 
-    auto & hc_layer_weights_range = runtime.hc_layer_weights;
-    auto & hc_output_weights_range = runtime.hc_output_weights;
-    auto & hash_routing_tables_range = runtime.hash_routing_tables;
-    auto & cached_attn_allocs = runtime.cached_attn_allocs;
-    auto & cached_decode_attn_hc_pre_graphs = runtime.cached_decode_attn_hc_pre_graphs;
-    auto & cached_decode_ffn_hc_pre_graphs = runtime.cached_decode_ffn_hc_pre_graphs;
-    auto & cached_decode_hc_post_graph = runtime.cached_decode_hc_post_graph;
-    auto & cached_decode_attn_graphs = runtime.cached_decode_attn_graphs;
-    auto & cached_decode_ffn_graphs = runtime.cached_decode_ffn_graphs;
-    auto & cached_decode_output_graph = runtime.cached_decode_output_graph;
-    auto & cached_dynamic_output_alloc = runtime.cached_dynamic_output_alloc;
-    auto & fused_decode_graph_cache = runtime.fused_decode_graph_cache;
-    auto & decode_shared_inputs = runtime.decode_shared_inputs;
+    auto & hc_layer_weights_range = layer_range_cache.hc_layer_weights;
+    auto & hc_output_weights_range = layer_range_cache.hc_output_weights;
+    auto & hash_routing_tables_range = layer_range_cache.hash_routing_tables;
+    auto & cached_attn_allocs = layer_range_cache.cached_attn_allocs;
+    auto & cached_decode_attn_hc_pre_graphs = layer_range_cache.cached_decode_attn_hc_pre_graphs;
+    auto & cached_decode_ffn_hc_pre_graphs = layer_range_cache.cached_decode_ffn_hc_pre_graphs;
+    auto & cached_decode_hc_post_graph = layer_range_cache.cached_decode_hc_post_graph;
+    auto & cached_decode_attn_graphs = layer_range_cache.cached_decode_attn_graphs;
+    auto & cached_decode_ffn_graphs = layer_range_cache.cached_decode_ffn_graphs;
+    auto & cached_decode_output_graph = layer_range_cache.cached_decode_output_graph;
+    auto & cached_dynamic_output_alloc = layer_range_cache.cached_dynamic_output_alloc;
+    auto & fused_decode_graph_cache = layer_range_cache.fused_decode_graph_cache;
+    auto & decode_shared_inputs = layer_range_cache.decode_shared_inputs;
 
     // Per-layer execution with CPU-side HC
-    DeepSeek4LayerRangeScratch & scratch = runtime.scratch;
+    DeepSeek4LayerRangeScratch & scratch = layer_range_cache.scratch;
     const int n_expert_used = ds4_effective_expert_count(w);
     scratch.ensure(w.ctx, n_tokens, n_embd, n_hc, n_expert_used);
 
@@ -6854,8 +6853,8 @@ bool create_deepseek4_cache(ggml_backend_t backend,
 }
 
 void free_deepseek4_cache(DeepSeek4Cache & c) {
-    delete c.layer_range_runtime;
-    c.layer_range_runtime = nullptr;
+    delete c.layer_range_cache;
+    c.layer_range_cache = nullptr;
     if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
     c.layers.clear();
