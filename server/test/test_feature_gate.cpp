@@ -226,7 +226,7 @@ static void test_feature_gate_tensor_parallel_requirements() {
 
     BackendArgs draft = valid;
     draft.draft_path = "/nonexistent/draft.gguf";
-    TEST_ASSERT(!gate_result(
+    TEST_ASSERT(gate_result(
         draft, "qwen35", PlacementBackend::Cuda).empty());
 }
 

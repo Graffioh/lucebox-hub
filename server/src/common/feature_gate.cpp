@@ -98,9 +98,6 @@ std::string check_feature_compatibility(
         if (features.pflash_enabled) {
             return "tensor parallelism does not yet support prefill compression";
         }
-        if (args.draft_path) {
-            return "tensor parallelism does not yet support a DFlash draft";
-        }
     }
 
     const bool mixed_target_split =
