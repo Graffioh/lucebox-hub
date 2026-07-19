@@ -34,6 +34,7 @@
 #include <mutex>
 #include <functional>
 #include <vector>
+#include <unistd.h>
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
@@ -146,6 +147,59 @@ static void add_ffn_telemetry(DeepSeek4StepTelemetry * dst,
 }
 
 } // namespace
+
+bool deepseek4_validation_state_enabled() {
+    return ds4_env_flag("DFLASH_DS4_VALIDATE_STATE");
+}
+
+DeepSeek4StateDigest deepseek4_state_digest(const float * data, size_t elements) {
+    DeepSeek4StateDigest digest;
+    digest.elements = elements;
+    digest.hash = 1469598103934665603ULL;
+    if (!data) {
+        digest.nonfinite = elements;
+        return digest;
+    }
+
+    for (size_t i = 0; i < elements; ++i) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, data + i, sizeof(bits));
+        digest.hash ^= bits;
+        digest.hash *= 1099511628211ULL;
+        const float value = data[i];
+        if (std::isfinite(value)) {
+            digest.sum_squares += (double)value * (double)value;
+        } else {
+            ++digest.nonfinite;
+        }
+    }
+    return digest;
+}
+
+void deepseek4_log_state_digest(
+        const char * role,
+        const char * phase,
+        size_t shard,
+        int device,
+        int layer_begin,
+        int layer_end,
+        int n_tokens,
+        const float * data,
+        size_t elements,
+        bool aliases_hc_state) {
+    if (!deepseek4_validation_state_enabled()) return;
+    const DeepSeek4StateDigest digest = deepseek4_state_digest(data, elements);
+    std::fprintf(
+        stderr,
+        "[deepseek4-state] pid=%ld role=%s phase=%s shard=%zu device=%d "
+        "layers=[%d,%d) tokens=%d elements=%zu nonfinite=%zu "
+        "hash=%016llx sumsq=%.9e alias_hc=%d\n",
+        (long)getpid(), role ? role : "unknown", phase ? phase : "unknown",
+        shard, device,
+        layer_begin, layer_end, n_tokens, digest.elements, digest.nonfinite,
+        (unsigned long long)digest.hash, digest.sum_squares,
+        aliases_hc_state ? 1 : 0);
+}
 
 int deepseek4_previous_raw_ring_spans(
         int kv_start,
@@ -4489,6 +4543,60 @@ struct DeepSeek4LayerRangeCache {
     }
 };
 
+bool deepseek4_validate_layer_range_cache_isolation_for_test() {
+    DeepSeek4Weights first_weights;
+    DeepSeek4Weights second_weights;
+    int first_context_token = 0;
+    int second_context_token = 0;
+    int first_backend_token = 0;
+    int second_backend_token = 0;
+    first_weights.ctx = reinterpret_cast<ggml_context *>(&first_context_token);
+    second_weights.ctx = reinterpret_cast<ggml_context *>(&second_context_token);
+    first_weights.n_layer = 43;
+    second_weights.n_layer = 43;
+    ggml_backend_t first_backend =
+        reinterpret_cast<ggml_backend_t>(&first_backend_token);
+    ggml_backend_t second_backend =
+        reinterpret_cast<ggml_backend_t>(&second_backend_token);
+
+    DeepSeek4Cache first_cache;
+    DeepSeek4Cache second_cache;
+    first_cache.layer_range_cache = new DeepSeek4LayerRangeCache();
+    second_cache.layer_range_cache = new DeepSeek4LayerRangeCache();
+    auto & first = *first_cache.layer_range_cache;
+    auto & second = *second_cache.layer_range_cache;
+
+    first.owner_weights = &first_weights;
+    first.owner_ctx = first_weights.ctx;
+    first.backend = first_backend;
+    first.device = 0;
+    first.n_layer = first_weights.n_layer;
+    first.layer_begin = 0;
+    first.layer_end = 24;
+    first.owns_output = false;
+
+    second.owner_weights = &second_weights;
+    second.owner_ctx = second_weights.ctx;
+    second.backend = second_backend;
+    second.device = 1;
+    second.n_layer = second_weights.n_layer;
+    second.layer_begin = 24;
+    second.layer_end = 43;
+    second.owns_output = true;
+
+    const bool ok =
+        first_cache.layer_range_cache != second_cache.layer_range_cache &&
+        first.matches(first_weights, first_backend, 0, 0, 24, false) &&
+        second.matches(second_weights, second_backend, 1, 24, 43, true) &&
+        !first.matches(first_weights, first_backend, 1, 0, 24, false) &&
+        !first.matches(first_weights, first_backend, 0, 24, 43, true) &&
+        !first.matches(second_weights, second_backend, 1, 24, 43, true);
+
+    free_deepseek4_cache(first_cache);
+    free_deepseek4_cache(second_cache);
+    return ok;
+}
+
 static ggml_tensor * ds4_fused_hc_base_f32(ggml_context * ctx, ggml_tensor * base) {
     if (!base) return nullptr;
     ggml_tensor * b = base;
@@ -5866,6 +5974,62 @@ static bool initialize_layer_range_cache(
     return true;
 }
 
+bool deepseek4_prepare_hc_boundary_state(
+        int layer_begin,
+        int layer_end,
+        int n_tokens,
+        int n_embd,
+        int n_hc,
+        const float * input,
+        std::vector<float> & hc_state) {
+    if (layer_begin < 0 || layer_end <= layer_begin || n_tokens <= 0 ||
+        n_embd <= 0 || n_hc <= 0) {
+        std::fprintf(stderr,
+                     "[deepseek4] invalid HC boundary parameters for layer range [%d,%d)\n",
+                     layer_begin, layer_end);
+        return false;
+    }
+
+    const size_t hc_dim = (size_t)n_embd * (size_t)n_hc;
+    const size_t expected_elements = hc_dim * (size_t)n_tokens;
+    const bool input_aliases_hc_state =
+        input != nullptr && input == hc_state.data();
+    if (hc_state.size() != expected_elements) {
+        if (input_aliases_hc_state) {
+            std::fprintf(stderr,
+                         "[deepseek4] HC boundary state size mismatch for layer range [%d,%d): "
+                         "have %zu want %zu\n",
+                         layer_begin, layer_end, hc_state.size(), expected_elements);
+            return false;
+        }
+        hc_state.resize(expected_elements);
+    }
+
+    if (!input) {
+        std::fprintf(stderr,
+                     "[deepseek4] missing %s for layer range [%d,%d)\n",
+                     layer_begin == 0 ? "token embeddings" : "HC boundary state",
+                     layer_begin, layer_end);
+        return false;
+    }
+
+    if (layer_begin == 0) {
+        for (int token = 0; token < n_tokens; ++token) {
+            for (int stream = 0; stream < n_hc; ++stream) {
+                std::memcpy(
+                    hc_state.data() + (size_t)token * hc_dim +
+                        (size_t)stream * (size_t)n_embd,
+                    input + (size_t)token * (size_t)n_embd,
+                    (size_t)n_embd * sizeof(float));
+            }
+        }
+    } else if (!input_aliases_hc_state) {
+        std::memcpy(hc_state.data(), input,
+                    expected_elements * sizeof(float));
+    }
+    return true;
+}
+
 bool deepseek4_step_layer_range(
         ggml_backend_t backend,
         int device,
@@ -5978,56 +6142,38 @@ bool deepseek4_step_layer_range(
         return true;
     }
 
-    // Initialize HC state.
-    // First shard (layer_begin=0): embed is token embeddings [n_embd × n_tokens],
-    //   replicate into n_hc streams.
-    // Later shards: embed is full HC state [hc_dim × n_tokens] from previous
-    //   shard — either hc_state's own buffer (local in-process handoff) or a
-    //   separate buffer (IPC daemon). Detect the alias before any resize, which
-    //   would invalidate embed.
-    const size_t hc_state_elems = (size_t)hc_dim * (size_t)n_tokens;
-    const bool embed_points_to_hc_state = embed != nullptr && embed == hc_state.data();
-    if (hc_state.size() != hc_state_elems) {
-        if (embed_points_to_hc_state) {
-            std::fprintf(stderr,
-                         "[deepseek4] HC boundary state size mismatch for layer range [%d,%d): "
-                         "have %zu want %zu\n",
-                         layer_begin, layer_end, hc_state.size(), hc_state_elems);
-            return false;
-        }
-        hc_state.resize(hc_state_elems);
-    }
-    if (layer_begin == 0) {
-        // First shard: replicate embedding into all HC streams
-        for (int t = 0; t < n_tokens; t++) {
-            for (int h = 0; h < n_hc; h++) {
-                memcpy(hc_state.data() + (size_t)t * hc_dim + (size_t)h * n_embd,
-                       embed + (size_t)t * n_embd, (size_t)n_embd * sizeof(float));
-            }
-        }
-    } else {
-        // Later shard: embed contains full HC state from previous shard
-        if (!embed) {
-            std::fprintf(stderr, "[deepseek4] missing HC boundary state for layer range [%d,%d)\n",
-                         layer_begin, layer_end);
-            return false;
-        }
-        if (!embed_points_to_hc_state) {
-            memcpy(hc_state.data(), embed, sizeof(float) * hc_state_elems);
-        }
+    // Initialize HC state. The first shard replicates token embeddings across
+    // all HC streams; later shards preserve or copy the full boundary state.
+    if (!deepseek4_prepare_hc_boundary_state(
+            layer_begin, layer_end, n_tokens, n_embd, n_hc, embed, hc_state)) {
+        return false;
     }
 
     // Keep HC and graph runtime state per DeepSeek4Cache. This isolates model
     // and shard instances that may execute interleaved in the same process and
     // ties the cached resources to the owning cache's lifetime.
-    if (!cache.layer_range_cache) {
+    const bool cache_created = cache.layer_range_cache == nullptr;
+    if (cache_created) {
         cache.layer_range_cache = new DeepSeek4LayerRangeCache();
     }
     DeepSeek4LayerRangeCache & layer_range_cache = *cache.layer_range_cache;
-    if (!layer_range_cache.matches(w, backend, device, layer_begin, layer_end, is_last_shard) &&
+    const bool cache_match = layer_range_cache.matches(
+        w, backend, device, layer_begin, layer_end, is_last_shard);
+    if (!cache_match &&
         !initialize_layer_range_cache(
             layer_range_cache, backend, device, w, layer_begin, layer_end, is_last_shard)) {
         return false;
+    }
+    if (deepseek4_validation_state_enabled()) {
+        std::fprintf(
+            stderr,
+            "[deepseek4-cache-state] pid=%ld event=%s cache_owner=%p runtime=%p "
+            "weights=%p context=%p backend=%p device=%d layers=[%d,%d) owns_output=%d\n",
+            (long)getpid(),
+            cache_created ? "create" : (cache_match ? "reuse" : "reinitialize"),
+            (void *)&cache, (void *)cache.layer_range_cache, (const void *)&w,
+            (const void *)w.ctx, (void *)backend, device, layer_begin, layer_end,
+            is_last_shard ? 1 : 0);
     }
 
     auto & hc_layer_weights_range = layer_range_cache.hc_layer_weights;

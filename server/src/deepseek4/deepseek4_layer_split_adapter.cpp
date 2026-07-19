@@ -475,6 +475,14 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
         std::vector<float> * shard_logits = is_last ? logits_out : nullptr;
         DeepSeek4StepTelemetry step_tel;
         const float * shard_input = local_shard_input(si, embed, hc_state_);
+        const size_t shard_input_elements = si == 0
+            ? (size_t)n_tokens * (size_t)n_embd
+            : (size_t)n_tokens * (size_t)n_embd * (size_t)shard.weights.n_hc;
+        deepseek4_log_state_digest(
+            "local", si == 0 ? "input-embedding" : "input-hc", si,
+            shard.gpu, shard.layer_begin, shard.layer_end, n_tokens,
+            shard_input, shard_input_elements,
+            shard_input == hc_state_.data());
 
         if (!deepseek4_step_layer_range(
                 shard.backend, shard.gpu, shard.weights, shard.cache,
@@ -484,6 +492,10 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
             std::fprintf(stderr, "[deepseek4-split] forward failed on shard %zu\n", si);
             return false;
         }
+        deepseek4_log_state_digest(
+            "local", "output-hc", si, shard.gpu,
+            shard.layer_begin, shard.layer_end, n_tokens,
+            hc_state_.data(), hc_state_.size(), true);
         if (timing) add_step_tel(tel_acc, step_tel);
     }
 
@@ -535,6 +547,11 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
         std::fprintf(stderr, "[deepseek4-split] local shard forward failed\n");
         return false;
     }
+    deepseek4_log_state_digest(
+        "ipc-parent", "send-hc", 0, local_shard.gpu,
+        local_shard.layer_begin, local_shard.layer_end, n_tokens,
+        hidden_out.data(), hidden_out.size(),
+        hidden_out.data() == hc_state_.data());
 
     // Send boundary activation (hidden state) to remote shard
     TargetShardForwardRequest req;

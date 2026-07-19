@@ -308,6 +308,16 @@ struct DeepSeek4BackendConfig {
     bool         fused_decode = false; // single-graph GPU decode
 };
 
+// Validation-only state summary used by the opt-in DS4 shard trace. The hash
+// is computed from the exact float bit patterns so a producer/consumer pair
+// can be compared across an IPC boundary without dumping model activations.
+struct DeepSeek4StateDigest {
+    size_t elements = 0;
+    size_t nonfinite = 0;
+    uint64_t hash = 0;
+    double sum_squares = 0.0;
+};
+
 // ─── Function declarations ──────────────────────────────────────────────
 
 bool load_deepseek4_gguf(const std::string & path,
@@ -332,6 +342,28 @@ bool create_deepseek4_cache(ggml_backend_t backend,
 
 void free_deepseek4_cache(DeepSeek4Cache & c);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
+bool deepseek4_validation_state_enabled();
+DeepSeek4StateDigest deepseek4_state_digest(const float * data, size_t elements);
+void deepseek4_log_state_digest(
+    const char * role,
+    const char * phase,
+    size_t shard,
+    int device,
+    int layer_begin,
+    int layer_end,
+    int n_tokens,
+    const float * data,
+    size_t elements,
+    bool aliases_hc_state);
+bool deepseek4_prepare_hc_boundary_state(
+    int layer_begin,
+    int layer_end,
+    int n_tokens,
+    int n_embd,
+    int n_hc,
+    const float * input,
+    std::vector<float> & hc_state);
+bool deepseek4_validate_layer_range_cache_isolation_for_test();
 int deepseek4_previous_raw_ring_spans(
     int kv_start,
     int n_swa,

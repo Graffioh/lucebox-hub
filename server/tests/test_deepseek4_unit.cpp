@@ -1441,6 +1441,82 @@ static void test_local_shards_receive_hc_boundary_state() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_hc_boundary_state_contents_and_aliasing() {
+    std::fprintf(stderr, "  test_hc_boundary_state_contents_and_aliasing ...");
+
+    constexpr int n_tokens = 2;
+    constexpr int n_embd = 3;
+    constexpr int n_hc = 2;
+    const std::vector<float> embeddings = {
+        1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f,
+    };
+    const std::vector<float> expected_replicated = {
+        1.0f, 2.0f, 3.0f, 1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f, 4.0f, 5.0f, 6.0f,
+    };
+
+    std::vector<float> first_shard_state;
+    TEST_ASSERT(deepseek4_prepare_hc_boundary_state(
+        0, 24, n_tokens, n_embd, n_hc,
+        embeddings.data(), first_shard_state));
+    TEST_ASSERT(first_shard_state == expected_replicated);
+
+    std::vector<float> incoming(expected_replicated.size());
+    std::iota(incoming.begin(), incoming.end(), 10.0f);
+    std::vector<float> copied_state;
+    TEST_ASSERT(deepseek4_prepare_hc_boundary_state(
+        24, 43, n_tokens, n_embd, n_hc,
+        incoming.data(), copied_state));
+    TEST_ASSERT(copied_state == incoming);
+
+    std::vector<float> aliased_state = incoming;
+    const float * aliased_input = aliased_state.data();
+    TEST_ASSERT(deepseek4_prepare_hc_boundary_state(
+        24, 43, n_tokens, n_embd, n_hc,
+        aliased_input, aliased_state));
+    TEST_ASSERT(aliased_state.data() == aliased_input);
+    TEST_ASSERT(aliased_state == incoming);
+
+    std::vector<float> wrong_sized_alias(3, 7.0f);
+    const float * wrong_sized_input = wrong_sized_alias.data();
+    TEST_ASSERT(!deepseek4_prepare_hc_boundary_state(
+        24, 43, n_tokens, n_embd, n_hc,
+        wrong_sized_input, wrong_sized_alias));
+    TEST_ASSERT(wrong_sized_alias.size() == 3);
+    TEST_ASSERT(wrong_sized_alias.data() == wrong_sized_input);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_hc_state_digest_contract() {
+    std::fprintf(stderr, "  test_hc_state_digest_contract ...");
+
+    const std::vector<float> state = {1.0f, -2.0f, 3.5f, 0.0f};
+    const DeepSeek4StateDigest first =
+        deepseek4_state_digest(state.data(), state.size());
+    const DeepSeek4StateDigest second =
+        deepseek4_state_digest(state.data(), state.size());
+    TEST_ASSERT(first.elements == state.size());
+    TEST_ASSERT(first.nonfinite == 0);
+    TEST_ASSERT(first.hash == second.hash);
+    TEST_ASSERT(nearly_equal((float)first.sum_squares, 17.25f));
+
+    std::vector<float> changed = state;
+    changed[2] += 1.0f;
+    const DeepSeek4StateDigest changed_digest =
+        deepseek4_state_digest(changed.data(), changed.size());
+    TEST_ASSERT(changed_digest.hash != first.hash);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_layer_range_cache_isolation() {
+    std::fprintf(stderr, "  test_layer_range_cache_isolation ...");
+    TEST_ASSERT(deepseek4_validate_layer_range_cache_isolation_for_test());
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_loader_rejects_missing_required_metadata(ggml_backend_t backend) {
     std::fprintf(stderr, "  test_loader_rejects_missing_required_metadata ...");
 
@@ -2964,6 +3040,28 @@ int main() {
         return 1;
     }
 
+    const char * validation_only =
+        std::getenv("DFLASH_DS4_VALIDATION_TESTS_ONLY");
+    if (validation_only && validation_only[0] &&
+        std::strcmp(validation_only, "0") != 0) {
+        test_layer_range_validation();
+        test_hc_state_dimensions();
+        test_local_shards_receive_hc_boundary_state();
+        test_hc_boundary_state_contents_and_aliasing();
+        test_hc_state_digest_contract();
+        test_layer_range_cache_isolation();
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+        test_hc_scratch_per_device();
+#endif
+        ggml_backend_free(backend);
+        if (g_failures != 0) {
+            std::fprintf(stderr, "FAILED: %d assertion(s)\n", g_failures);
+            return 1;
+        }
+        std::printf("OK\n");
+        return 0;
+    }
+
     test_compressor_pooling_correctness(backend);
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);
@@ -2985,6 +3083,9 @@ int main() {
     test_layer_split_restore_preserves_full_sampling_history();
     test_backend_sampling_penalizes_prompt_history();
     test_local_shards_receive_hc_boundary_state();
+    test_hc_boundary_state_contents_and_aliasing();
+    test_hc_state_digest_contract();
+    test_layer_range_cache_isolation();
     test_loader_rejects_missing_required_metadata(backend);
     test_loader_rejects_invalid_compress_ratio_type(backend);
     test_loader_rejects_zero_vocab_size(backend);

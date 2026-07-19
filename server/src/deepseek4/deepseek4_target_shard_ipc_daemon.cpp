@@ -232,6 +232,11 @@ int run_deepseek4_target_shard_ipc_daemon(
         for (size_t i = 0; i < shards.size(); ++i) {
             auto & shard = shards[i];
             const bool is_last = (i + 1 == shards.size());
+            deepseek4_log_state_digest(
+                "ipc-daemon", i == 0 ? "receive-hc" : "input-hc", i,
+                shard.gpu, shard.layer_begin, shard.layer_end, n_tokens,
+                shard_input, (size_t)hidden * (size_t)n_tokens,
+                shard_input == hc_state.data());
             DeepSeek4StepTelemetry tel;
             const auto forward_t0 = TargetShardClock::now();
             std::fprintf(stderr,
@@ -250,6 +255,10 @@ int run_deepseek4_target_shard_ipc_daemon(
                              i);
                 return false;
             }
+            deepseek4_log_state_digest(
+                "ipc-daemon", "output-hc", i, shard.gpu,
+                shard.layer_begin, shard.layer_end, n_tokens,
+                hc_state.data(), hc_state.size(), true);
             if (timing) {
                 const uint64_t wall_us =
                     target_shard_elapsed_us(forward_t0, TargetShardClock::now());

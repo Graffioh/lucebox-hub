@@ -6,10 +6,13 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <unistd.h>
 
 namespace dflash::common {
 namespace {
@@ -84,6 +87,11 @@ void hc_log_cuda_error(const char * label, cudaError_t err);
 std::mutex g_scratch_slots_mutex;
 std::vector<std::unique_ptr<HcScratchSlot>> g_scratch_slots;
 
+bool hc_validation_trace_enabled() {
+    const char * value = std::getenv("DFLASH_DS4_VALIDATE_STATE");
+    return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
 HcScratchSlot * current_scratch_slot() {
     int device = -1;
     const cudaError_t err = cudaGetDevice(&device);
@@ -96,10 +104,24 @@ HcScratchSlot * current_scratch_slot() {
     if (g_scratch_slots.size() <= (size_t) device) {
         g_scratch_slots.resize((size_t) device + 1);
     }
-    if (!g_scratch_slots[(size_t) device]) {
+    const bool created = !g_scratch_slots[(size_t) device];
+    if (created) {
         g_scratch_slots[(size_t) device] = std::make_unique<HcScratchSlot>(device);
     }
-    return g_scratch_slots[(size_t) device].get();
+    HcScratchSlot * slot = g_scratch_slots[(size_t) device].get();
+    static thread_local int last_reported_device = -1;
+    static thread_local HcScratchSlot * last_reported_slot = nullptr;
+    if (hc_validation_trace_enabled() &&
+        (created || device != last_reported_device || slot != last_reported_slot)) {
+        std::fprintf(stderr,
+                     "[deepseek4-scratch-state] pid=%ld event=%s device=%d "
+                     "slot=%p owner_device=%d\n",
+                     (long)getpid(), created ? "create" : "reuse", device, (void *)slot,
+                     slot->scratch.owner_device);
+        last_reported_device = device;
+        last_reported_slot = slot;
+    }
+    return slot;
 }
 
 void hc_log_cuda_error(const char * label, cudaError_t err) {
