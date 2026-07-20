@@ -142,7 +142,8 @@ bool deepseek4_dspark_draft_forward_async_reuse_context(
 // for the drafter backend before calling this function.
 bool deepseek4_dspark_draft_read_async_output(
                                           ggml_backend_t backend,
-                                          std::vector<float> & out_hidden);
+                                          std::vector<float> & out_hidden,
+                                          std::vector<float> * confidence_hidden = nullptr);
 void deepseek4_dspark_draft_wait(ggml_backend_t backend);
 
 // Batched target verify forward WITH feature capture (defined in
@@ -239,13 +240,5 @@ bool run_deepseek4_dspark_spec_decode(
         MoeHybridStorage * moe_hybrid = nullptr,
         MoeExpertComputeRuntime * expert_runtime = nullptr,
         MoeHybridRoutingStats * routing_stats = nullptr);
-
-int run_deepseek4_dspark_draft_ipc_daemon(const char * draft_path,
-                                           int ring_cap,
-                                           int draft_gpu,
-                                           int stream_fd,
-                                           int payload_fd,
-                                           int shared_payload_fd = -1,
-                                           size_t shared_payload_bytes = 0);
 
 }  // namespace dflash::common
