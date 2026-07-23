@@ -16,6 +16,7 @@
 #include "model_card.h"
 #include "common/backend_factory.h"
 #include "common/gguf_inspect.h"
+#include "common/paged_attention_config.h"
 #include "common/layer_split_utils.h"
 #include "common/spark_corpus.h"
 #include "common/moe_routing_collector.h"
@@ -23,6 +24,7 @@
 #include "common/peer_access.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
+#include "kvflash_pager.h"
 
 #include "gguf.h"
 
@@ -227,6 +229,8 @@ static void print_usage(const char * prog) {
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
+        "  --paged-attention   Use 16-token paged KV blocks for Qwen3.6-27B\n"
+        "                       autoregressive decode (experimental)\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
@@ -336,6 +340,8 @@ int main(int argc, char ** argv) {
     std::string cache_type_k;  // explicit --cache-type-k override
     std::string cache_type_v;  // explicit --cache-type-v override
     bool target_device_seen = false;
+    bool prefix_cache_slots_seen = false;
+    bool prefill_cache_slots_seen = false;
     bool target_devices_seen = false;
     bool fast_rollback_forced_off = false;
 
@@ -454,12 +460,16 @@ int main(int argc, char ** argv) {
             }
         } else if (std::strcmp(argv[i], "--fa-window") == 0 && i + 1 < argc) {
             bargs.fa_window = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--paged-attention") == 0) {
+            bargs.paged_attention = true;
         } else if (std::strcmp(argv[i], "--model-name") == 0 && i + 1 < argc) {
             sconfig.model_name = argv[++i];
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefix_cache_cap = std::atoi(argv[++i]);
+            prefix_cache_slots_seen = true;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefill_cache_cap = std::atoi(argv[++i]);
+            prefill_cache_slots_seen = true;
         } else if (std::strcmp(argv[i], "--fast-rollback") == 0) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree") == 0) {
@@ -671,6 +681,44 @@ int main(int argc, char ** argv) {
         }
     }
     if (fast_rollback_forced_off) bargs.fast_rollback = false;
+
+    if (bargs.paged_attention) {
+        const PlacementBackend compiled_backend = compiled_placement_backend();
+        const PagedAttentionOptions paged_options{
+            true,
+            nullptr,
+            compiled_backend == PlacementBackend::Cuda ||
+                compiled_backend == PlacementBackend::Hip,
+            bargs.device.is_layer_split(),
+            bargs.remote_target_shard.enabled(),
+            bargs.draft_path != nullptr,
+            bargs.remote_draft.enabled(),
+            bargs.ddtree_mode,
+            bargs.fa_window,
+            sconfig.pflash_mode != ServerConfig::PflashMode::OFF,
+            kvflash_pool_from_env(
+                bargs.device.max_ctx, KvFlashConfig{}) > 0,
+            bargs.device.max_ctx,
+        };
+        const std::string paged_error =
+            validate_paged_attention_options(paged_options);
+        if (!paged_error.empty()) {
+            std::fprintf(stderr, "[server] --paged-attention %s\n",
+                         paged_error.c_str());
+            return 2;
+        }
+        if ((prefix_cache_slots_seen && sconfig.prefix_cache_cap > 0) ||
+            (prefill_cache_slots_seen && sconfig.prefill_cache_cap > 0) ||
+            !sconfig.disk_cache_dir.empty()) {
+            std::fprintf(stderr,
+                "[server] paged attention disables prefix/prefill snapshots "
+                "until their format stores page tables\n");
+        }
+        sconfig.prefix_cache_cap = 0;
+        sconfig.prefill_cache_cap = 0;
+        sconfig.disk_cache_dir.clear();
+        sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
+    }
 
     if (!validate_server_placement(bargs, sconfig)) return 2;
 

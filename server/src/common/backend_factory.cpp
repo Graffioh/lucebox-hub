@@ -2,6 +2,7 @@
 
 #include "backend_factory.h"
 #include "gguf_inspect.h"
+#include "paged_attention_config.h"
 
 #include "qwen35_backend.h"
 #include "qwen35moe_backend.h"
@@ -19,6 +20,19 @@
 #include <algorithm>
 
 namespace dflash::common {
+
+namespace {
+
+constexpr bool has_compiled_accelerator_backend() {
+#if defined(DFLASH27B_BACKEND_CUDA) || defined(GGML_USE_CUDA) || \
+    defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    return true;
+#else
+    return false;
+#endif
+}
+
+}  // namespace
 
 std::string detect_arch(const char * model_path) {
     auto info = inspect_gguf_model_info(model_path);
@@ -52,6 +66,29 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         std::fprintf(stderr,
             "[backend_factory] --ds4-prefill is only valid for deepseek4 models "
             "(detected %s)\n", arch.c_str());
+        return nullptr;
+    }
+
+    const PagedAttentionOptions paged_options{
+        args.paged_attention,
+        arch.c_str(),
+        has_compiled_accelerator_backend(),
+        args.device.is_layer_split(),
+        args.remote_target_shard.enabled(),
+        args.draft_path != nullptr,
+        args.remote_draft.enabled(),
+        args.ddtree_mode,
+        args.fa_window,
+        false,
+        false,
+        args.device.max_ctx,
+    };
+    const std::string paged_error =
+        validate_paged_attention_options(paged_options);
+    if (!paged_error.empty()) {
+        std::fprintf(stderr,
+            "[backend_factory] --paged-attention %s\n",
+            paged_error.c_str());
         return nullptr;
     }
 
@@ -91,6 +128,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         cfg.remote_draft       = args.remote_draft;
         cfg.stream_fd          = args.stream_fd;
         cfg.fa_window          = args.fa_window;
+        cfg.paged_attention    = args.paged_attention;
         cfg.kq_stride_pad      = args.kq_stride_pad;
         cfg.draft_swa_window   = args.draft_swa_window;
         cfg.draft_ctx_max      = args.draft_ctx_max;
