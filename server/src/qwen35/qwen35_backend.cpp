@@ -534,10 +534,18 @@ bool Qwen35Backend::prepare_paged_decode_step(uint32_t logical_position) {
         return false;
     }
 
-    // Graph inputs are not persistent allocations: gallocr may reuse this
-    // tensor's buffer after its last attention consumer. Keep the stable table
-    // on the host, but upload every live entry before every compute.
-    if (paged_block_table_size_ == 0 || slot.block_offset == 0) {
+    // The block table is a persistent cache allocation (created next to the
+    // K/V pool), so device contents survive graph execution and rebuilds. A
+    // fresh sequence uploads the whole live table once — covering the prefill
+    // blocks — and afterwards each step uploads at most one new entry, when
+    // the sequence grows into a fresh block. Steps inside a block upload
+    // nothing here.
+    const bool new_block = slot.block_offset == 0;
+    if (paged_block_table_size_ == 0 ||
+        (new_block && logical_block != paged_block_table_size_)) {
+        // The second condition covers a non-append allocation, which the
+        // pool never produces today; re-uploading everything keeps the
+        // device table correct if that ever changes.
         PagedKvSequenceSnapshot sequence;
         const PagedKvStatus status =
             paged_kv_pool_->sequence(*paged_sequence_, sequence);
@@ -568,10 +576,17 @@ bool Qwen35Backend::prepare_paged_decode_step(uint32_t logical_position) {
                 (int32_t)sequence.block_table[i];
         }
         paged_block_table_size_ = sequence.block_table.size();
+        ggml_backend_tensor_set(
+            sg_.paged_block_table, paged_block_table_upload_.data(), 0,
+            paged_block_table_size_ * sizeof(paged_block_table_upload_[0]));
+    } else if (new_block) {
+        const int32_t entry = (int32_t)slot.physical_block;
+        paged_block_table_upload_[logical_block] = entry;
+        ggml_backend_tensor_set(
+            sg_.paged_block_table, &entry,
+            logical_block * sizeof(entry), sizeof(entry));
+        paged_block_table_size_ = logical_block + 1;
     }
-    ggml_backend_tensor_set(
-        sg_.paged_block_table, paged_block_table_upload_.data(), 0,
-        paged_block_table_size_ * sizeof(paged_block_table_upload_[0]));
 
     const int32_t kv_seq_len = (int32_t)logical_position + 1;
     ggml_backend_tensor_set(sg_.paged_kv_seq_lens, &kv_seq_len, 0,
@@ -1861,8 +1876,10 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         if (IS_EOS_TOK(first_tok, w_)) return true;
         // Preserve the existing AR position semantics: the first sampled
         // token advances cur_pos without a cache write. The page table must
-        // include that zero-initialized logical row so subsequent attention
-        // sees exactly the same context as the dense path.
+        // include that logical row so subsequent attention sees exactly the
+        // same context as the dense path. Prefill does not refresh this row,
+        // so after the first request it may contain residual K/V from the
+        // previous request.
         if (!append_paged_gap((uint32_t)committed)) return false;
         committed++;
         cache_.cur_pos = committed;

@@ -217,6 +217,22 @@ bool create_target_cache_partial(const TargetWeights & w,
                                        head_dim, w.n_head, n_full_attn);
         ggml_set_name(out.q_cap, "q_cap");
 
+        // Paged-attention metadata is persistent like the K/V pool itself so
+        // decode steps can update it append-only; a gallocr graph input would
+        // need every live entry re-uploaded before every compute because its
+        // buffer region may be recycled between attention consumers.
+        if (paged_attention) {
+            out.paged_block_table = ggml_new_tensor_2d(
+                out.base_ctx, GGML_TYPE_I32, paged_block_count(max_ctx), 1);
+            ggml_set_name(out.paged_block_table, "paged_block_table");
+            out.paged_kv_seq_lens =
+                ggml_new_tensor_1d(out.base_ctx, GGML_TYPE_I32, 1);
+            ggml_set_name(out.paged_kv_seq_lens, "paged_kv_seq_lens");
+        } else {
+            out.paged_block_table = nullptr;
+            out.paged_kv_seq_lens = nullptr;
+        }
+
         out.base_buf = ggml_backend_alloc_ctx_tensors(out.base_ctx, backend);
         if (!out.base_buf) {
             set_last_error("ggml_backend_alloc_ctx_tensors failed for base cache");
@@ -578,8 +594,7 @@ static ggml_tensor * build_full_attn_block(
     ggml_tensor * kv_write_rows = nullptr,
     ggml_tensor ** q_fa_out = nullptr,  // post-RoPE/post-rotation Q [head_dim, n_tokens, n_head]
     ggml_tensor * paged_block_table = nullptr,
-    ggml_tensor * paged_kv_seq_lens = nullptr,
-    int paged_block_size = 0
+    ggml_tensor * paged_kv_seq_lens = nullptr
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -721,10 +736,24 @@ static ggml_tensor * build_full_attn_block(
     const float kq_scale = 1.0f / std::sqrt((float)head_dim);
     ggml_tensor * attn = nullptr;
     if (paged_block_table) {
-        GGML_ASSERT(paged_kv_seq_lens && paged_block_size > 0);
+        GGML_ASSERT(paged_kv_seq_lens);
+        // The launch bound lands in op_params, and the ggml-cuda graph cache
+        // memcmps the whole ggml_tensor: a live kv_len here would differ on
+        // every decode step and force a re-capture per token. Pad it on the
+        // same 256-token stride the dense path uses for win_len_padded, so the
+        // paged node's properties are stable within each window. Exact
+        // per-sequence extents still come from kv_seq_lens on device; a larger
+        // bound only over-sizes the partition grid, and partitions past the
+        // real length exit with a zero-weight sentinel.
+        int paged_launch_len =
+            ((kv_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
+        // Never claim more than the physical pool (max_ctx may not be
+        // 256-aligned); ggml_paged_attn asserts max_kv_seq_len <= k->ne[1].
+        paged_launch_len = std::min(paged_launch_len, (int)cache_k->ne[1]);
         attn = ggml_paged_attn(ctx, Qfa, cache_k, cache_v,
                                paged_block_table, paged_kv_seq_lens,
-                               kq_scale, paged_block_size);
+                               kq_scale, PAGED_BLOCK_SIZE,
+                               paged_launch_len);
     } else {
         // fa_window > 0: attend only to the last fa_window positions (cuts FA
         // cost during spec-decode verify at long contexts). Paged attention
@@ -1250,8 +1279,7 @@ QwenGraphOutputs build_qwen35_graph(
                                         in.kv_write_rows,
                                         want_q_cap ? &q_fa : nullptr,
                                         in.paged_block_table,
-                                        in.paged_kv_seq_lens,
-                                        in.paged_block_size);
+                                        in.paged_kv_seq_lens);
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
                 // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx

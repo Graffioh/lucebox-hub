@@ -2465,6 +2465,8 @@ extern "C" {
     // k/v:          [D, pool_tokens, n_head_kv]
     // block_table:  [max_blocks, n_seq] I32
     // kv_seq_lens: [n_seq] I32 (valid cached K/V tokens per sequence)
+    // max_kv_seq_len: host-known maximum of kv_seq_lens, used to size the
+    //                 CUDA/HIP launch without reading block-table capacity
     // res:          [D, n_seq, n_head] F32
     //
     // A logical token t is read from physical row
@@ -2479,7 +2481,8 @@ extern "C" {
             struct ggml_tensor  * block_table,
             struct ggml_tensor  * kv_seq_lens,
             float                 scale,
-            int                   block_size);
+            int                   block_size,
+            int                   max_kv_seq_len);
 
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).

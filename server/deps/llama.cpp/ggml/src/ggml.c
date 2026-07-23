@@ -5618,7 +5618,8 @@ struct ggml_tensor * ggml_paged_attn(
         struct ggml_tensor  * block_table,
         struct ggml_tensor  * kv_seq_lens,
         float                 scale,
-        int                   block_size) {
+        int                   block_size,
+        int                   max_kv_seq_len) {
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q4_0 || v->type == GGML_TYPE_Q8_0);
@@ -5640,11 +5641,14 @@ struct ggml_tensor * ggml_paged_attn(
 
     GGML_ASSERT(block_size > 0);
     GGML_ASSERT(k->ne[1] % block_size == 0);
+    GGML_ASSERT(max_kv_seq_len > 0);
+    GGML_ASSERT(max_kv_seq_len <= k->ne[1]);
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, q->ne);
 
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, block_size);
+    ggml_set_op_params_i32(result, 2, max_kv_seq_len);
 
     result->op     = GGML_OP_PAGED_ATTN;
     result->src[0] = q;

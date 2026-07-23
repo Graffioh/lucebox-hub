@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 using namespace dflash::common;
@@ -63,6 +65,20 @@ static void test_block_boundaries() {
     }
 }
 
+static void test_nondefault_block_size() {
+    PagedKvPool pool(5, 3, 7);
+    CHECK(pool.block_size() == 7);
+    CHECK(pool.max_sequences() == 3);
+
+    const auto handle = acquire(pool, 77);
+    const auto append = pool.append(handle, 15);
+    CHECK(append.status == PagedKvStatus::Ok);
+    CHECK(equals(sequence(pool, handle).block_table, {0, 1, 2}));
+    CHECK(append.write_slots[6].block_offset == 6);
+    CHECK(append.write_slots[7].physical_block == 1);
+    CHECK(append.write_slots[14].physical_token_index == 14);
+}
+
 static void test_reserve_then_append() {
     PagedKvPool pool(4, 2);
     const auto handle = acquire(pool, 7);
@@ -82,6 +98,14 @@ static void test_reserve_then_append() {
 
     CHECK(pool.reserve(handle, 16) == PagedKvStatus::Ok);
     CHECK(equals(sequence(pool, handle).block_table, {0, 1}));
+
+    const auto before_zero = sequence(pool, handle);
+    const auto append_zero = pool.append(handle, 0);
+    CHECK(append_zero.status == PagedKvStatus::Ok);
+    CHECK(append_zero.write_slots.empty());
+    const auto after_zero = sequence(pool, handle);
+    CHECK(after_zero.kv_seq_len == before_zero.kv_seq_len);
+    CHECK(after_zero.block_table == before_zero.block_table);
 }
 
 static void test_compact_append() {
@@ -207,21 +231,34 @@ static void test_request_identity_and_stale_handles() {
     CHECK(after_reset.generation != replacement.generation);
     CHECK(pool.append(after_reset, 1));
     CHECK(sequence(pool, after_reset).block_table.front() == 0);
+
+    const PagedKvSequenceHandle out_of_range{
+        std::numeric_limits<uint32_t>::max(), 1};
+    CHECK(pool.append(out_of_range, 1).status ==
+          PagedKvStatus::StaleHandle);
+    CHECK(pool.reserve(out_of_range, 1) == PagedKvStatus::StaleHandle);
+    CHECK(pool.release(out_of_range) == PagedKvStatus::StaleHandle);
+    PagedKvSequenceSnapshot invalid_snapshot;
+    CHECK(pool.sequence(out_of_range, invalid_snapshot) ==
+          PagedKvStatus::StaleHandle);
 }
 
 static void test_metadata_snapshot() {
-    PagedKvPool pool(7, 4);
+    PagedKvPool pool(8, 4);
     const auto first = acquire(pool, 11);
     const auto second = acquire(pool, 22);
+    const auto third = acquire(pool, 33);
     CHECK(pool.append(first, 17));
     CHECK(pool.append(second, 1));
-    CHECK(pool.reserve(second, 33) == PagedKvStatus::Ok);
+    CHECK(pool.append(third, 17));
+    CHECK(pool.release(second) == PagedKvStatus::Ok);
+    CHECK(pool.reserve(third, 33) == PagedKvStatus::Ok);
 
     const auto metadata = pool.metadata_snapshot();
     CHECK(metadata.block_size == 16);
-    CHECK(metadata.physical_block_count == 7);
+    CHECK(metadata.physical_block_count == 8);
     CHECK(metadata.sequences.size() == 2);
-    CHECK(equals(metadata.block_table, {0, 1, 2, 3, 4}));
+    CHECK(equals(metadata.block_table, {0, 1, 3, 4, 2}));
 
     const auto & first_meta = metadata.sequences[0];
     CHECK(first_meta.request_id == 11);
@@ -231,13 +268,13 @@ static void test_metadata_snapshot() {
     CHECK(first_meta.block_table_offset == 0);
     CHECK(first_meta.block_count == 2);
 
-    const auto & second_meta = metadata.sequences[1];
-    CHECK(second_meta.request_id == 22);
-    CHECK(second_meta.generation == second.generation);
-    CHECK(second_meta.sequence_slot == second.slot);
-    CHECK(second_meta.kv_seq_len == 1);
-    CHECK(second_meta.block_table_offset == 2);
-    CHECK(second_meta.block_count == 3);
+    const auto & third_meta = metadata.sequences[1];
+    CHECK(third_meta.request_id == 33);
+    CHECK(third_meta.generation == third.generation);
+    CHECK(third_meta.sequence_slot == third.slot);
+    CHECK(third_meta.kv_seq_len == 17);
+    CHECK(third_meta.block_table_offset == 2);
+    CHECK(third_meta.block_count == 3);
 }
 
 static void test_duplicate_request_is_transactional() {
@@ -249,6 +286,40 @@ static void test_duplicate_request_is_transactional() {
     CHECK(pool.active_sequence_count() == 1);
     CHECK(pool.lookup(88, output) == PagedKvStatus::Ok);
     CHECK(output == first);
+}
+
+static bool constructor_rejects(uint32_t physical_blocks,
+                                uint32_t max_sequences,
+                                uint32_t block_size) {
+    try {
+        PagedKvPool pool(physical_blocks, max_sequences, block_size);
+    } catch (const std::invalid_argument &) {
+        return true;
+    }
+    return false;
+}
+
+static void test_invalid_arguments() {
+    CHECK(constructor_rejects(0, 1, 16));
+    CHECK(constructor_rejects(
+        0, std::numeric_limits<uint32_t>::max(), 16));
+    CHECK(constructor_rejects(1, 0, 16));
+    CHECK(constructor_rejects(1, 1, 0));
+    CHECK(constructor_rejects(
+        2, 1, std::numeric_limits<uint32_t>::max()));
+
+    PagedKvPool pool(
+        1, 1, std::numeric_limits<uint32_t>::max());
+    const auto handle = acquire(pool, 99);
+    CHECK(pool.append(handle, 1).status == PagedKvStatus::Ok);
+    const auto before = sequence(pool, handle);
+    const auto overflow =
+        pool.append(handle, std::numeric_limits<uint32_t>::max());
+    CHECK(overflow.status == PagedKvStatus::InvalidArgument);
+    CHECK(overflow.write_slots.empty());
+    const auto after = sequence(pool, handle);
+    CHECK(after.kv_seq_len == before.kv_seq_len);
+    CHECK(after.block_table == before.block_table);
 }
 
 static void test_paged_attention_compatibility() {
@@ -273,6 +344,7 @@ static void test_paged_attention_compatibility() {
 
 int main() {
     test_block_boundaries();
+    test_nondefault_block_size();
     test_reserve_then_append();
     test_compact_append();
     test_noncontiguous_reuse_and_isolation();
@@ -280,6 +352,7 @@ int main() {
     test_request_identity_and_stale_handles();
     test_metadata_snapshot();
     test_duplicate_request_is_transactional();
+    test_invalid_arguments();
     test_paged_attention_compatibility();
 
     if (failures != 0) {

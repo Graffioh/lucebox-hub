@@ -418,6 +418,14 @@ struct TargetCache {
     // kv_k_rotated) query per full-attention layer, written by the graph
     // when QwenGraphInputs::q_capture is set. F32 [head_dim, n_head, n_fa].
     ggml_tensor * q_cap = nullptr;
+
+    // Paged-attention metadata, resident next to the K/V pool (only when the
+    // cache was created with paged_attention). Living here instead of as
+    // gallocr-managed graph inputs lets decode steps update them append-only
+    // — one table entry per new 16-token block plus a 4-byte length per step
+    // — instead of re-uploading the whole live table before every compute.
+    ggml_tensor * paged_block_table = nullptr;   // I32 [max_blocks, 1]
+    ggml_tensor * paged_kv_seq_lens = nullptr;   // I32 [1]
 };
 
 // Snapshot the current SSM+conv state into TargetCache::*_snap tensors.
@@ -614,7 +622,6 @@ struct QwenGraphInputs {
     ggml_tensor * paged_block_table = nullptr; // [max_blocks,n_seqs] i32
     // [n_seqs] i32; valid cached K/V tokens per sequence.
     ggml_tensor * paged_kv_seq_lens = nullptr;
-    int paged_block_size = 0;
     // Capture the LAST token's post-RoPE/post-rotation Q per full-attention
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.

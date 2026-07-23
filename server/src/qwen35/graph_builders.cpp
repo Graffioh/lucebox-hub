@@ -326,15 +326,13 @@ bool build_target_step(
 
     if (paged_attention) {
         if (n_tokens != 1 || with_mask || fa_window != 0) return false;
-        const int max_blocks = paged_block_count(cache.max_ctx);
-        sg.paged_block_table = ggml_new_tensor_2d(
-            sg.ctx, GGML_TYPE_I32, max_blocks, 1);
-        ggml_set_name(sg.paged_block_table, "paged_block_table");
-        ggml_set_input(sg.paged_block_table);
-        sg.paged_kv_seq_lens =
-            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
-        ggml_set_name(sg.paged_kv_seq_lens, "paged_kv_seq_lens");
-        ggml_set_input(sg.paged_kv_seq_lens);
+        // The paging metadata lives in the persistent target cache (next to
+        // the K/V pool), not as gallocr graph inputs: contents survive graph
+        // execution and rebuilds, so the backend uploads only what changed
+        // between decode steps.
+        if (!cache.paged_block_table || !cache.paged_kv_seq_lens) return false;
+        sg.paged_block_table = cache.paged_block_table;
+        sg.paged_kv_seq_lens = cache.paged_kv_seq_lens;
     }
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
@@ -375,7 +373,6 @@ bool build_target_step(
     gi.kv_write_rows              = sg.kv_write_rows;
     gi.paged_block_table          = sg.paged_block_table;
     gi.paged_kv_seq_lens          = sg.paged_kv_seq_lens;
-    gi.paged_block_size           = paged_attention ? PAGED_BLOCK_SIZE : 0;
     gi.q_capture                  = capture_qk;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
