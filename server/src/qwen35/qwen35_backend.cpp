@@ -458,22 +458,6 @@ bool Qwen35Backend::begin_paged_sequence(uint32_t prompt_tokens) {
     return true;
 }
 
-bool Qwen35Backend::append_paged_gap(uint32_t logical_position) {
-    if (!cfg_.paged_attention) return true;
-    if (!paged_kv_pool_ || !paged_sequence_) return false;
-    PagedKvAppendSpan append =
-        paged_kv_pool_->append_compact(*paged_sequence_, /*token_count=*/1);
-    if (!append || append.token_count != 1 ||
-        append.last.logical_position != logical_position) {
-        std::fprintf(stderr,
-            "[paged-attention] logical gap allocation failed at %u (%s)\n",
-            logical_position, paged_kv_status_string(append.status));
-        set_last_error("paged attention logical gap allocation failed");
-        return false;
-    }
-    return true;
-}
-
 bool Qwen35Backend::prepare_paged_decode_step(uint32_t logical_position) {
     if (!cfg_.paged_attention) return true;
     if (!paged_kv_pool_ || !paged_sequence_ || !sg_.kv_write_rows ||
@@ -1130,7 +1114,12 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
             // positions past max_ctx) instead of finishing cleanly. The HTTP
             // admission gate normally guarantees prompt+n_gen <= max_ctx, but
             // daemon-command callers are not required to.
-            const int max_ar_n_gen = cfg_.device.max_ctx - committed;
+            //
+            // AR decode emits its first token from the prefill logits without
+            // writing a K/V row, so the last position it forwards is
+            // committed+n_gen-2: one token more than the remaining context
+            // still fits.
+            const int max_ar_n_gen = cfg_.device.max_ctx - committed + 1;
             if (max_ar_n_gen <= 0) {
                 // do_ar_decode would return true on a non-positive count and
                 // report an empty completion as success.
@@ -1758,15 +1747,20 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     //     normal sampling resumes (model writes visible answer).
     bool budget_close_started = false;
     int  close_inject_pos     = 0;
-    // Capture entry KV position so the budget check is in the
+    // Capture the entry emit count so the budget check is in the
     // "generated since entry" frame, not the absolute KV frame.
     // n_gen is the gen-only count (or the remaining-budget remap done by
-    // spec-decode tail-off); subtracting committed_now (absolute KV =
-    // prompt_len + tokens generated this call) directly would treat
-    // prompt-length tokens as if they were generated output, firing
-    // force-close prompt_len tokens early on prompted requests and
-    // potentially going negative after spec-decode tail-off.
-    const int committed_at_entry = committed;
+    // spec-decode tail-off); measuring against the absolute KV position
+    // (prompt_len + tokens generated this call) would treat prompt-length
+    // tokens as if they were generated output, firing force-close
+    // prompt_len tokens early on prompted requests and potentially going
+    // negative after spec-decode tail-off.
+    //
+    // Count emitted tokens rather than KV positions: the first AR token is
+    // sampled from the prefill logits and stays pending until the first loop
+    // iteration forwards it, so `committed` lags the emit count by one for
+    // the whole loop and is not a usable "tokens generated" proxy.
+    const size_t out_tokens_at_entry = out_tokens.size();
     auto maybe_force_close = [&](int32_t & tok, int committed_now) {
         if (budget_hook.close_token_ids.empty()) return;
 
@@ -1789,11 +1783,12 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         if (budget_close_started) return;
 
         // Check if budget has tightened to the force-close trigger.
-        // generated = tokens produced in THIS do_ar_decode call;
+        // generated = tokens already emitted by THIS do_ar_decode call
+        // (`tok` is the candidate for the next one, not yet pushed);
         // remaining = budget headroom, measured against n_gen (the
         // requested gen count or tail-off remap, never against the
         // absolute KV position which would mis-count the prompt).
-        const int generated = committed_now - committed_at_entry;
+        const int generated = (int)(out_tokens.size() - out_tokens_at_entry);
         int remaining = n_gen - generated;
         if (remaining <= budget_hook.hard_limit_remaining) {
             // Don't trigger if the model already sampled the first close
@@ -1830,7 +1825,6 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     if (n_gen <= 0) return true;
 
     auto t_dec0_ar = std::chrono::steady_clock::now();
-    const size_t out_tokens_at_entry = out_tokens.size();
     const int _min_floor = dflash_min_tokens_floor();
     static const int _repeat_guard = []{
         const int explicit_guard =
@@ -1874,15 +1868,9 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         io.emit(first_tok);
         if (kvflash_active()) kvflash_history_.push_back(first_tok);
         if (IS_EOS_TOK(first_tok, w_)) return true;
-        // Preserve the existing AR position semantics: the first sampled
-        // token advances cur_pos without a cache write. The page table must
-        // include that logical row so subsequent attention sees exactly the
-        // same context as the dense path. Prefill does not refresh this row,
-        // so after the first request it may contain residual K/V from the
-        // previous request.
-        if (!append_paged_gap((uint32_t)committed)) return false;
-        committed++;
-        cache_.cur_pos = committed;
+        // The first token is pending: the prefill logits produced it, but its
+        // K/V row has not been written yet. The first loop iteration below
+        // forwards it at `committed`; only that compute may advance the cache.
     }
 
     // AR decode loop for remaining tokens

@@ -81,12 +81,19 @@ PagedKvStatus PagedKvPool::acquire(PagedKvRequestId request_id,
     uint64_t generation = sequence.generation + 1;
     if (generation == 0) generation = 1;
 
+    // Insert before mutating anything: emplace() is the only step here that can
+    // throw (rehash allocation), and a slot marked active while its request is
+    // missing from the map would desync active_sequence_count() (map size) from
+    // metadata_snapshot() (which walks sequences_ by the active flag). Past this
+    // point every step is non-allocating, so the claim completes or the pool is
+    // untouched.
+    request_to_slot_.emplace(request_id, slot);
+
     // release_sequence(), reset(), and construction leave every free slot
     // empty; acquire only installs its new identity.
     sequence.request_id = request_id;
     sequence.generation = generation;
     sequence.active = true;
-    request_to_slot_.emplace(request_id, slot);
     take_lowest(free_sequence_slots_);
 
     out_handle = {slot, generation};

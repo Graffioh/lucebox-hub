@@ -331,7 +331,6 @@ private:
                       bool * degenerate_close_out = nullptr);
 
     bool begin_paged_sequence(uint32_t prompt_tokens);
-    bool append_paged_gap(uint32_t logical_position);
     bool prepare_paged_decode_step(uint32_t logical_position);
     void end_paged_sequence();
 
