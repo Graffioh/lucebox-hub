@@ -3602,6 +3602,12 @@ static void test_sampler_needs_logit_processing() {
     TEST_ASSERT(!cfg.needs_logit_processing());
 }
 
+static void test_server_config_cache_defaults() {
+    ServerConfig cfg;
+    TEST_ASSERT(cfg.prefix_cache_cap == 32);
+    TEST_ASSERT(cfg.prefill_cache_cap == 0);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // /props body shape tests (model-free)
 //
@@ -4778,6 +4784,7 @@ int main() {
     RUN_TEST(test_parse_sampler_token_no_samp);
     RUN_TEST(test_sampler_temp_zero_with_penalties_uses_argmax);
     RUN_TEST(test_sampler_needs_logit_processing);
+    RUN_TEST(test_server_config_cache_defaults);
 
     std::fprintf(stderr, "\n── /props body shape ──\n");
     RUN_TEST(test_props_model_card_wholesale_sidecar);

@@ -38,8 +38,10 @@ boundary. The cache key remains the longer safe chat boundary, while
 restored. This is conservative: the backend recomputes the small remainder and
 never restores past the stable prefix.
 
-Use `--prefix-cache-slots N` to size the in-memory cache. No tool-specific flag
-is required.
+No tool-specific flag is required. The native server default enables the
+in-memory prefix cache with 32 slots. Direct container launches inherit that
+default; set `DFLASH_PREFIX_CACHE_SLOTS=N` to override it or explicitly set it
+to `0` to disable prefix reuse.
 
 ## Reproducible benchmark
 

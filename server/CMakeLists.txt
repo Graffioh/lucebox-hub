@@ -1085,6 +1085,18 @@ if(DFLASH27B_TESTS)
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     enable_testing()
 
+    # The production CUDA and ROCm images share this entrypoint. Keep native
+    # server defaults intact unless an operator explicitly supplies an env
+    # override; otherwise container launches can silently disable features
+    # that are enabled by the C++ server itself.
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_entrypoint_cache_defaults.sh")
+        add_test(
+            NAME server_unit_entrypoint_cache_defaults
+            COMMAND bash
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/test_entrypoint_cache_defaults.sh"
+                "${CMAKE_CURRENT_SOURCE_DIR}/scripts/entrypoint.sh")
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         add_executable(test_server_unit test/test_server_unit.cpp)
         target_sources(test_server_unit PRIVATE
