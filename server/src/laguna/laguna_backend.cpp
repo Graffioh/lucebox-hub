@@ -15,6 +15,7 @@
 #include "common/dspark_head.h"
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
+#include "common/platform_env.h"
 #include "common/prof_env.h"
 #include "kv_quant.h"
 
@@ -177,7 +178,7 @@ bool LagunaBackend::init() {
         !std::getenv("DFLASH_LAGUNA_KV_HEAD_MAJOR") &&
         kvflash_tokens_ <= 0 &&
         !args_.ddtree_mode) {
-        setenv("DFLASH_LAGUNA_KV_HEAD_MAJOR", "1", 0);
+        set_environment_variable("DFLASH_LAGUNA_KV_HEAD_MAJOR", "1", false);
         std::fprintf(stderr,
                      "[laguna] auto-enabled head-major KV layout "
                      "(disable with DFLASH_LAGUNA_AUTO_HEAD_MAJOR=0)\n");
@@ -401,7 +402,7 @@ bool LagunaBackend::unpark(ParkTarget target) {
             !std::getenv("DFLASH_LAGUNA_KV_HEAD_MAJOR") &&
             kvflash_tokens_ <= 0 &&
             !args_.ddtree_mode) {
-            setenv("DFLASH_LAGUNA_KV_HEAD_MAJOR", "1", 0);
+            set_environment_variable("DFLASH_LAGUNA_KV_HEAD_MAJOR", "1", false);
             std::fprintf(stderr,
                          "[laguna] auto-enabled head-major KV layout "
                          "(disable with DFLASH_LAGUNA_AUTO_HEAD_MAJOR=0)\n");

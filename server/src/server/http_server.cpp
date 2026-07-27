@@ -39,6 +39,10 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
+#include <utility>
+
+using dflash::common::SocketHandle;
 
 #if defined(_WIN32)
 #include <io.h>
@@ -49,12 +53,11 @@ typedef long ssize_t;
 #define SHUT_RDWR      SD_BOTH
 #define socklen_t      int
 #define poll(fds,nfds,timeout)  WSAPoll(fds,nfds,timeout)
-#define SOCK_FD(fd)    ((SOCKET)(fd))
 // Replace fcntl(F_GETFL) / fcntl(F_SETFL, O_NONBLOCK) with ioctlsocket
-static inline int sock_get_flags(int fd) { (void)fd; return 0; /* stub */ }
-static inline void sock_set_nonblock(int fd) { u_long m = 1; ioctlsocket(SOCK_FD(fd), FIONBIO, &m); }
-static inline void sock_set_block(int fd) { u_long m = 0; ioctlsocket(SOCK_FD(fd), FIONBIO, &m); }
-static inline void socket_close(int fd) { closesocket(SOCK_FD(fd)); }
+static inline int sock_get_flags(SocketHandle fd) { (void)fd; return 0; /* stub */ }
+static inline void sock_set_nonblock(SocketHandle fd) { u_long m = 1; ioctlsocket(fd, FIONBIO, &m); }
+static inline void sock_set_block(SocketHandle fd) { u_long m = 0; ioctlsocket(fd, FIONBIO, &m); }
+static inline void socket_close(SocketHandle fd) { closesocket(fd); }
 #define SETSOCKOPT_CAST (const char *)
 static inline const char* sock_strerror() {
     static thread_local char buf[64];
@@ -62,17 +65,22 @@ static inline const char* sock_strerror() {
     snprintf(buf, sizeof(buf), "WSA error %d", WSAGetLastError());
     return buf;
 }
+static inline int  sock_errno()          { return WSAGetLastError(); }
+static inline bool sock_is_eintr (int e) { return e == WSAEINTR; }
+static inline bool sock_is_eagain(int e) { return e == WSAEWOULDBLOCK; }
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
-#define SOCK_FD(fd)    (fd)
-static inline int sock_get_flags(int fd) { return fcntl(fd, F_GETFL, 0); }
-static inline void sock_set_nonblock(int fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK); }
-static inline void sock_set_block(int fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f & ~O_NONBLOCK); }
-static inline void socket_close(int fd) { ::close(fd); }
+static inline int sock_get_flags(SocketHandle fd) { return fcntl(fd, F_GETFL, 0); }
+static inline void sock_set_nonblock(SocketHandle fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK); }
+static inline void sock_set_block(SocketHandle fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f & ~O_NONBLOCK); }
+static inline void socket_close(SocketHandle fd) { ::close(fd); }
 #define SETSOCKOPT_CAST  /* empty on POSIX */
 #include <unistd.h>
 static inline const char* sock_strerror() { return strerror(errno); }
+static inline int  sock_errno()          { return errno; }
+static inline bool sock_is_eintr (int e) { return e == EINTR; }
+static inline bool sock_is_eagain(int e) { return e == EAGAIN || e == EWOULDBLOCK; }
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -129,7 +137,7 @@ static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
 #ifdef DFLASH_HAS_CURL
 
 struct CurlWriteCtx {
-    int client_fd;
+    SocketHandle client_fd;
     bool streaming;
     bool first_chunk;
     bool chat_rewrite;   // rewrite completions → chat format
@@ -236,7 +244,7 @@ static json rewrite_completions_to_chat(const json & comp_resp) {
     return chat_resp;
 }
 
-static bool curl_forward(int client_fd, const std::string & url,
+static bool curl_forward(SocketHandle client_fd, const std::string & url,
                          const std::string & api_key, const json & body,
                          bool streaming, bool rewrite_to_chat,
                          const std::string & response_id,
@@ -376,6 +384,63 @@ static const char * api_format_name(ApiFormat format) {
 
 static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
+}
+
+int resolve_max_output_tokens(const json & body, int default_max_tokens) {
+    if (body.contains("max_tokens")) {
+        return body.at("max_tokens").get<int>();
+    }
+    if (body.contains("max_output_tokens")) {
+        return body.at("max_output_tokens").get<int>();
+    }
+    if (body.contains("max_completion_tokens")) {
+        return body.at("max_completion_tokens").get<int>();
+    }
+    return default_max_tokens;
+}
+
+// Sampler parameters. When the request omits a value, fall back to the
+// model card's sampling defaults (spec §3.3); when the card doesn't
+// supply one either, use the hard-coded default.
+SamplerCfg parse_request_sampler(const json & body,
+                                 const SamplingDefaults & defaults) {
+    SamplerCfg sampler;
+    sampler.temp = body.value(
+        "temperature", defaults.has_temperature ? defaults.temperature : 0.0f);
+    sampler.top_p = body.value(
+        "top_p", defaults.has_top_p ? defaults.top_p : 1.0f);
+    sampler.top_k = body.value(
+        "top_k", defaults.has_top_k ? defaults.top_k : 0);
+    if (body.contains("seed")) {
+        sampler.seed = body["seed"].get<uint64_t>();
+    }
+
+    // OpenAI-style additive penalties.
+    sampler.freq_pen = body.value("frequency_penalty", 0.0f);
+    sampler.pres_pen = body.value(
+        "presence_penalty",
+        defaults.has_presence_penalty ? defaults.presence_penalty : 0.0f);
+    // HuggingFace-style multiplicative repetition penalty (also used by
+    // vLLM, llama.cpp, etc.). Accepts both "repetition_penalty" and the
+    // shorter "rep_pen" for daemon compatibility.
+    sampler.rep_pen = body.value(
+        "repetition_penalty",
+        body.value("rep_pen",
+                   defaults.has_repetition_penalty
+                       ? defaults.repetition_penalty
+                       : 1.0f));
+    if (body.contains("rep_window")) {
+        sampler.rep_window = body["rep_window"].get<int>();
+    }
+    return sampler;
+}
+
+json require_messages_array(const json & body) {
+    if (!body.contains("messages") || !body["messages"].is_array() ||
+        body["messages"].empty()) {
+        throw std::invalid_argument("messages must be a non-empty array");
+    }
+    return body["messages"];
 }
 
 static bool env_flag_enabled(const char * name) {
@@ -944,7 +1009,7 @@ std::string HttpServer::resolve_status_html() {
 
 // Send data to an SSE client fd with a short (1s) timeout to avoid stalling
 // the inference worker. Returns false if the send fails or times out.
-static bool sse_try_send(int fd, const void * data, size_t len) {
+static bool sse_try_send(SocketHandle fd, const void * data, size_t len) {
     const char * p = static_cast<const char *>(data);
     size_t sent = 0;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -953,17 +1018,17 @@ static bool sse_try_send(int fd, const void * data, size_t len) {
             deadline - std::chrono::steady_clock::now()).count();
         if (remaining <= 0) return false;
 
-        struct pollfd pfd = {SOCK_FD(fd), POLLOUT, 0};
+        struct pollfd pfd = {fd, POLLOUT, 0};
         int ret;
         do {
             ret = poll(&pfd, 1, (int)(remaining < 50 ? remaining : 50));
-        } while (ret < 0 && errno == EINTR);
+        } while (ret < 0 && sock_is_eintr(sock_errno()));
         if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
         if (ret == 0) continue;
 
         ssize_t n = ::send(fd, p + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (sock_is_eintr(sock_errno()) || sock_is_eagain(sock_errno())) continue;
             return false;
         }
         sent += n;
@@ -975,13 +1040,13 @@ static bool sse_try_send(int fd, const void * data, size_t len) {
 void HttpServer::broadcast_status() {
     std::string event = status_.to_sse_event();
     std::lock_guard<std::mutex> lk(sse_mu_);
-    std::vector<int> dead;
-    for (int fd : sse_fds_) {
+    std::vector<SocketHandle> dead;
+    for (SocketHandle fd : sse_fds_) {
         if (!sse_try_send(fd, event.data(), event.size())) {
             dead.push_back(fd);
         }
     }
-    for (int fd : dead) {
+    for (SocketHandle fd : dead) {
         socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
@@ -998,13 +1063,13 @@ void HttpServer::broadcast_token(const std::string & text) {
     std::string event = "event: token\ndata: " +
         j.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
     std::lock_guard<std::mutex> lk(sse_mu_);
-    std::vector<int> dead;
-    for (int fd : sse_fds_) {
+    std::vector<SocketHandle> dead;
+    for (SocketHandle fd : sse_fds_) {
         if (!sse_try_send(fd, event.data(), event.size())) {
             dead.push_back(fd);
         }
     }
-    for (int fd : dead) {
+    for (SocketHandle fd : dead) {
         socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
@@ -1016,8 +1081,8 @@ void HttpServer::broadcast_token(const std::string & text) {
 void HttpServer::sse_heartbeat() {
     static const char ping[] = ":heartbeat\n\n";
     std::lock_guard<std::mutex> lk(sse_mu_);
-    std::vector<int> dead;
-    for (int fd : sse_fds_) {
+    std::vector<SocketHandle> dead;
+    for (SocketHandle fd : sse_fds_) {
         // Non-blocking send: if the socket buffer can't accept 12 bytes
         // immediately, the client is too far behind — treat as dead.
         ssize_t n = ::send(fd, ping, sizeof(ping) - 1, MSG_NOSIGNAL | MSG_DONTWAIT);
@@ -1025,7 +1090,7 @@ void HttpServer::sse_heartbeat() {
             dead.push_back(fd);
         }
     }
-    for (int fd : dead) {
+    for (SocketHandle fd : dead) {
         socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
@@ -1043,9 +1108,9 @@ void HttpServer::shutdown() {
     // Signal worker and accept loop to stop.
     stopping_.store(true);
     queue_cv_.notify_all();
-    if (listen_fd_ >= 0) {
+    if (socket_is_valid(listen_fd_)) {
         socket_close(listen_fd_);
-        listen_fd_ = -1;
+        listen_fd_ = kInvalidSocket;
     }
     if (worker_thread_.joinable()) {
         worker_thread_.join();
@@ -1054,7 +1119,7 @@ void HttpServer::shutdown() {
     // Close SSE client connections.
     {
         std::lock_guard<std::mutex> lk(sse_mu_);
-        for (int fd : sse_fds_) socket_close(fd);
+        for (SocketHandle fd : sse_fds_) socket_close(fd);
         sse_fds_.clear();
     }
 
@@ -1091,17 +1156,25 @@ int HttpServer::run() {
 #if !defined(_WIN32)
     // Ignore SIGPIPE so send() returns EPIPE instead of killing the process.
     signal(SIGPIPE, SIG_IGN);
+#else
+    // Initialise Winsock — required before any socket call on Windows.
+    WSADATA wsa_data;
+    const int wsa_error = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+    if (wsa_error != 0) {
+        std::fprintf(stderr, "[server] WSAStartup() failed: %d\n", wsa_error);
+        return 1;
+    }
 #endif
 
     // Create listen socket.
     listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) {
+    if (!socket_is_valid(listen_fd_)) {
         std::fprintf(stderr, "[server] socket() failed: %s\n", sock_strerror());
         return 1;
     }
 
     int yes = 1;
-    setsockopt(SOCK_FD(listen_fd_), SOL_SOCKET, SO_REUSEADDR, SETSOCKOPT_CAST &yes, sizeof(yes));
+    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, SETSOCKOPT_CAST &yes, sizeof(yes));
 
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
@@ -1109,7 +1182,7 @@ int HttpServer::run() {
     if (inet_pton(AF_INET, config_.host.c_str(), &sa.sin_addr) != 1) {
         std::fprintf(stderr, "[server] invalid host address: %s\n", config_.host.c_str());
         socket_close(listen_fd_);
-        listen_fd_ = -1;
+        listen_fd_ = kInvalidSocket;
         return 1;
     }
 
@@ -1117,14 +1190,14 @@ int HttpServer::run() {
         std::fprintf(stderr, "[server] bind(%s:%d) failed: %s\n",
                      config_.host.c_str(), config_.port, sock_strerror());
         socket_close(listen_fd_);
-        listen_fd_ = -1;
+        listen_fd_ = kInvalidSocket;
         return 1;
     }
 
     if (listen(listen_fd_, 128) < 0) {
         std::fprintf(stderr, "[server] listen() failed: %s\n", sock_strerror());
         socket_close(listen_fd_);
-        listen_fd_ = -1;
+        listen_fd_ = kInvalidSocket;
         return 1;
     }
 
@@ -1138,7 +1211,7 @@ int HttpServer::run() {
         if (false) {
             std::fprintf(stderr, "[server] fcntl(O_NONBLOCK) failed: %s\n", "n/a");
             socket_close(listen_fd_);
-            listen_fd_ = -1;
+            listen_fd_ = kInvalidSocket;
             return 1;
         }
     }
@@ -1151,11 +1224,11 @@ int HttpServer::run() {
 
     // Accept loop.
     while (!stopping_.load()) {
-        struct pollfd pfd{SOCK_FD(listen_fd_), POLLIN, 0};
+        struct pollfd pfd{listen_fd_, POLLIN, 0};
         int pr = poll(&pfd, 1, 200 /* ms */);
         if (pr <= 0) {
             // 0 = timeout (re-check stopping_); <0 with EINTR = signal. Both loop.
-            if (pr < 0 && errno != EINTR) {
+            if (pr < 0 && !sock_is_eintr(sock_errno())) {
                 std::fprintf(stderr, "[server] poll() error: %s\n", sock_strerror());
             }
             continue;
@@ -1163,17 +1236,18 @@ int HttpServer::run() {
 
         struct sockaddr_in client_sa{};
         socklen_t client_len = sizeof(client_sa);
-        int client_fd = accept(listen_fd_, (struct sockaddr *)&client_sa, &client_len);
-        if (client_fd < 0) {
+        SocketHandle client_fd = accept(
+            listen_fd_, (struct sockaddr *)&client_sa, &client_len);
+        if (!socket_is_valid(client_fd)) {
             if (stopping_.load()) break;
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (sock_is_eintr(sock_errno()) || sock_is_eagain(sock_errno())) continue;
             std::fprintf(stderr, "[server] accept() error: %s\n", sock_strerror());
             continue;
         }
 
         // Disable Nagle for low-latency SSE streaming.
         int flag = 1;
-        setsockopt(SOCK_FD(client_fd), IPPROTO_TCP, TCP_NODELAY, SETSOCKOPT_CAST &flag, sizeof(flag));
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, SETSOCKOPT_CAST &flag, sizeof(flag));
 
         // Spawn client thread (detached — client_main owns the fd).
         active_clients_.fetch_add(1);
@@ -1223,12 +1297,21 @@ int HttpServer::run() {
         slot_tokens_.clear();
     }
 
+#if defined(_WIN32)
+    // Intentionally NOT calling WSACleanup() here. Detached client threads
+    // may still be running after the 5-second shutdown grace period (e.g. a
+    // client mid-stream on a long SSE generation). Tearing down Winsock
+    // underneath them causes spurious socket errors. The OS reclaims all
+    // Winsock resources on process exit, so retaining it for the full process
+    // lifetime is safe and avoids the race.
+#endif
+
     return 0;
 }
 
 // ─── Client thread ──────────────────────────────────────────────────────
 
-void HttpServer::handle_client(int fd) {
+void HttpServer::handle_client(SocketHandle fd) {
     HttpRequest hr;
     if (!read_http_request(fd, hr)) {
         send_error(fd, 400, "bad HTTP request");
@@ -1385,1945 +1468,2030 @@ void HttpServer::handle_client(int fd) {
     socket_close(fd);
 }
 
-bool HttpServer::route_request(int fd, const HttpRequest & hr) {
+// ─── Request parsing ────────────────────────────────────────────────────
+
+// Fields shared by every endpoint: stream/model/max-tokens, sampler,
+// tools, prefix-cache overrides, stop sequences.
+bool HttpServer::parse_common_request_fields(
+        SocketHandle fd, const json & body, ParsedRequest & req) {
+    req.stream = body.value("stream", false);
+    req.model = body.value("model", config_.model_name);
+    req.disk_cache_policy = config_.disk_cache_policy;
+
+    // Accept the output-token names used by each supported API dialect.
+    // Default when the client omits all three: --default-max-tokens, so
+    // thinking-budget requests that omit max_tokens keep headroom for the
+    // visible reply after thinking.
+    req.max_output =
+        resolve_max_output_tokens(body, config_.default_max_tokens);
+    // Spec §4.4: clamp request max_tokens to --default-max-tokens.
+    if (req.max_output > config_.default_max_tokens) {
+        std::fprintf(stderr,
+            "[server] max_tokens=%d clamped to default_max_tokens=%d\n",
+            req.max_output, config_.default_max_tokens);
+        req.max_output = config_.default_max_tokens;
+    }
+
+    req.sampler = parse_request_sampler(body, config_.sampler_defaults);
+    if (body.contains("tools")) req.tools = body["tools"];
+    // Tool choice constraint for hint generation.
+    if (body.contains("tool_choice")) req.tool_choice = body["tool_choice"];
+
+    if (body.contains("prefix_cache") && body["prefix_cache"].is_object()) {
+        const auto & prefix_cache = body["prefix_cache"];
+        if (prefix_cache.contains("scope") && prefix_cache["scope"].is_string() &&
+            !apply_request_scope_override(
+                req.disk_cache_policy, prefix_cache["scope"].get<std::string>())) {
+            send_error(fd, 400,
+                "prefix_cache.scope must be off, full, auto, auto:<window>, or a positive token count");
+            return false;
+        }
+        if (prefix_cache.contains("window") &&
+            prefix_cache["window"].is_number_integer()) {
+            const int window = prefix_cache["window"].get<int>();
+            if (window <= 0 || window > 1000000) {
+                send_error(fd, 400,
+                           "prefix_cache.window must be a positive integer");
+                return false;
+            }
+            req.disk_cache_policy.auto_window = window;
+        }
+    }
+
+    // Stop sequences — OpenAI uses "stop" (string or array), Anthropic
+    // uses "stop_sequences" (array).
+    if (body.contains("stop")) {
+        const auto & stop = body["stop"];
+        if (stop.is_string()) {
+            std::string value = stop.get<std::string>();
+            if (!value.empty()) req.stop_sequences.push_back(std::move(value));
+        } else if (stop.is_array()) {
+            for (const auto & item : stop) {
+                if (!item.is_string()) continue;
+                std::string value = item.get<std::string>();
+                if (!value.empty()) req.stop_sequences.push_back(std::move(value));
+            }
+        }
+    }
+    if (body.contains("stop_sequences") && body["stop_sequences"].is_array()) {
+        for (const auto & item : body["stop_sequences"]) {
+            if (!item.is_string()) continue;
+            std::string value = item.get<std::string>();
+            if (!value.empty()) req.stop_sequences.push_back(std::move(value));
+        }
+    }
+    return true;
+}
+
+// Path dispatch: sets the API format, response id, and message
+// extraction for each supported dialect.
+bool HttpServer::parse_endpoint_request(
+        const std::string & path, const json & body, ParsedRequest & req,
+        bool & count_tokens_only) {
+    count_tokens_only = false;
+    if (path == "/v1/chat/completions") {
+        req.format = ApiFormat::OPENAI_CHAT;
+        req.response_id = generate_id("chatcmpl");
+        req.messages = require_messages_array(body);
+        // Strip volatile billing header from messages[0] (OpenAI system).
+        if (req.messages.is_array() && !req.messages.empty()) {
+            auto & first_message = req.messages[0];
+            if (first_message.is_object() &&
+                first_message.value("role", "") == "system" &&
+                first_message.contains("content") &&
+                first_message["content"].is_string()) {
+                first_message["content"] = normalize_system_for_cache(req.messages);
+            }
+        }
+        return true;
+    }
+    if (path == "/v1/messages/count_tokens") {
+        // Shares Anthropic's message parsing; the flag makes route_request
+        // short-circuit before enqueueing a generation job.
+        req.format = ApiFormat::ANTHROPIC;
+        req.response_id = generate_id("count");
+        req.messages = body.value("messages", json::array());
+        normalize_anthropic_system(body, req.messages);
+        count_tokens_only = true;
+        return true;
+    }
+    if (path == "/v1/messages") {
+        req.format = ApiFormat::ANTHROPIC;
+        req.response_id = generate_id("msg");
+        req.messages = require_messages_array(body);
+        normalize_anthropic_system(body, req.messages);
+        return true;
+    }
+    if (path == "/v1/responses") {
+        req.format = ApiFormat::RESPONSES;
+        req.response_id = generate_id("resp");
+        // Responses API uses "input" instead of "messages".
+        if (body.contains("input")) req.messages = body["input"];
+        if (body.contains("instructions")) {
+            // Strip billing header from codex instructions before hashing.
+            std::string instructions = normalize_system_for_cache(body["instructions"]);
+            json system_message = {{"role", "system"}, {"content", instructions}};
+            if (req.messages.is_array()) {
+                req.messages.insert(req.messages.begin(), system_message);
+            } else {
+                req.messages = json::array({
+                    system_message,
+                    {{"role", "user"},
+                     {"content", body.value("input", json())}},
+                });
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+void HttpServer::apply_request_reasoning(
+        const json & body, ParsedRequest & req) {
+    // Explicit thinking budgets override reasoning-effort tiers. Template
+    // kwargs can still override whether the rendered prompt enables thinking.
+    // Default: thinking OFF (Qwen3.6 thinking wrecks DFlash acceptance
+    // rates; clients opt in explicitly).
+    bool enable_thinking = false;
+    int request_budget_tokens = -1;
+    int request_reply_budget = -1;
+    int effort_phase1_cap = -1;
+    bool effort_set = false;
+
+    auto apply_reasoning_effort = [&](const std::string & effort) {
+        if (effort == "none") {
+            enable_thinking = false;
+            return;
+        }
+
+        // Five-tier vocabulary (spec §4.2). Unknown tier → high.
+        int tier_value = config_.effort_tiers.high;
+        if (effort == "minimal" || effort == "low") {
+            tier_value = config_.effort_tiers.low;
+        } else if (effort == "medium") {
+            tier_value = config_.effort_tiers.medium;
+        } else if (effort == "x-high") {
+            tier_value = config_.effort_tiers.x_high;
+        } else if (effort == "max") {
+            tier_value = config_.effort_tiers.max;
+        }
+
+        effort_phase1_cap = tier_value;
+        effort_set = true;
+        enable_thinking = true;
+        // Spec §4.2: reasoning effort activates the budget envelope.
+        req.thinking_opt_in = true;
+    };
+
+    if (body.contains("reasoning")) {
+        const auto & reasoning = body["reasoning"];
+        if (reasoning.contains("effort")) {
+            apply_reasoning_effort(reasoning.value("effort", "high"));
+        } else {
+            enable_thinking = true;
+        }
+    }
+    if (!effort_set && body.contains("reasoning_effort") &&
+        body["reasoning_effort"].is_string()) {
+        apply_reasoning_effort(body["reasoning_effort"].get<std::string>());
+    }
+    if (body.contains("thinking")) {
+        const auto & thinking = body["thinking"];
+        if (thinking.contains("type")) {
+            const bool enabled = thinking.value("type", "") == "enabled";
+            enable_thinking = enabled;
+            req.thinking_opt_in = enabled;
+        }
+        if (thinking.contains("budget_tokens") &&
+            thinking["budget_tokens"].is_number_integer()) {
+            request_budget_tokens = thinking["budget_tokens"].get<int>();
+        }
+        if (thinking.contains("reply_budget") &&
+            thinking["reply_budget"].is_number_integer()) {
+            request_reply_budget = thinking["reply_budget"].get<int>();
+        }
+    }
+    if (body.contains("chat_template_kwargs")) {
+        const auto & kwargs = body["chat_template_kwargs"];
+        if (kwargs.contains("enable_thinking")) {
+            enable_thinking = kwargs["enable_thinking"].get<bool>();
+        }
+    }
+    req.thinking_enabled = enable_thinking;
+
+    // Spec §4.3 combined precedence + §4.4 clamping: thinking.budget_tokens
+    // (if set) wins over reasoning.effort for the phase-1 cap; either is
+    // clamped to the server ceilings.
+    if (request_budget_tokens >= 0) {
+        req.per_req_phase1_cap =
+            (std::min)(request_budget_tokens, config_.think_max_tokens);
+        if (request_budget_tokens > config_.think_max_tokens) {
+            std::fprintf(stderr,
+                "[server] thinking.budget_tokens=%d clamped to "
+                "think_max_tokens=%d\n",
+                request_budget_tokens, config_.think_max_tokens);
+        }
+    } else if (effort_set) {
+        // Spec §4.4: effective cap is min(tier value, max_tokens -
+        // hard_limit_reply_budget). Tier values can legitimately exceed
+        // default_max_tokens; clients that want the full tier budget must
+        // pass an explicit max_tokens. Otherwise we narrow silently to fit.
+        const int max_output_phase1_room = (std::max)(
+            0, req.max_output - config_.hard_limit_reply_budget);
+        req.per_req_phase1_cap =
+            (std::min)(effort_phase1_cap, max_output_phase1_room);
+        if (effort_phase1_cap > max_output_phase1_room) {
+            std::fprintf(stderr,
+                "[server] reasoning.effort tier=%d narrowed to %d "
+                "(max_tokens=%d - hard_limit_reply_budget=%d); "
+                "pass a larger max_tokens to use the full tier budget\n",
+                effort_phase1_cap, req.per_req_phase1_cap,
+                req.max_output, config_.hard_limit_reply_budget);
+        }
+    }
+    if (request_reply_budget >= 0) {
+        req.per_req_reply_budget =
+            (std::min)(request_reply_budget, config_.hard_limit_reply_budget);
+        if (request_reply_budget > config_.hard_limit_reply_budget) {
+            std::fprintf(stderr,
+                "[server] thinking.reply_budget=%d clamped to "
+                "hard_limit_reply_budget=%d\n",
+                request_reply_budget, config_.hard_limit_reply_budget);
+        }
+    }
+    // (The effort tier doesn't influence reply_budget — spec §4.2: the
+    // reply reserve falls back to --hard-limit-reply-budget.)
+}
+
+// Render messages to prompt text and tokenize into req.prompt_tokens.
+bool HttpServer::render_and_tokenize_request(
+        SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
+        ParsedRequest & req) {
+    std::string tools_json;
+    if (req.tools.is_array() && !req.tools.empty()) {
+        tools_json = req.tools.dump();
+    }
+
+    std::string rendered;
+    if (!config_.chat_template_src.empty()) {
+        // Jinja path: --chat-template-file overrides the hardcoded
+        // QWEN3/LAGUNA renderer. Used for tool-using agents that need the
+        // Anthropic tool_use envelope (e.g. froggeric Qwen3.6 template).
+        //
+        // Special tokens like <|im_start|> / <|im_end|> are stored verbatim
+        // in the GGUF vocab — use raw_token() to skip the GPT-2 byte decode
+        // (otherwise <0xC4><0x91> nonsense appears).
+        const std::string & bos = tokenizer_.bos_id() >= 0
+            ? tokenizer_.raw_token(tokenizer_.bos_id())
+            : std::string();
+        const std::string & eos = tokenizer_.eos_id() >= 0
+            ? tokenizer_.raw_token(tokenizer_.eos_id())
+            : std::string();
+        try {
+            rendered = render_chat_template_jinja(
+                config_.chat_template_src, chat_messages, bos, eos,
+                /*add_generation_prompt=*/true,
+                req.thinking_enabled, tools_json);
+        } catch (const std::exception & e) {
+            send_error(fd, 500,
+                std::string("chat template (jinja) render failed: ") + e.what());
+            return false;
+        }
+    } else {
+        rendered = render_chat_template(
+            chat_messages, chat_format_, /*add_generation_prompt=*/true,
+            req.thinking_enabled, tools_json);
+    }
+
+    req.started_in_thinking = prompt_ends_in_open_think(rendered);
+    req.prompt_tokens = tokenizer_.encode(rendered);
+    return true;
+}
+
+// Context-length gate. Oversized prompts pass through when compression
+// (pflash) will run — the post-compress check is the real gate.
+bool HttpServer::validate_request_context(
+        SocketHandle fd, const ParsedRequest & req) {
+    const int prompt_tokens = (int) req.prompt_tokens.size();
+    const bool pflash_will_run =
+        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        drafter_tokenizer_ != nullptr &&
+        (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
+         prompt_tokens >= config_.pflash_threshold);
+    if (!should_reject_oversized(
+            prompt_tokens, req.max_output, config_.max_ctx, pflash_will_run)) {
+        return true;
+    }
+    send_error(fd, 400,
+               context_overflow_message(
+                   config_.max_ctx, prompt_tokens, req.max_output));
+    return false;
+}
+
+void HttpServer::log_parsed_request(const ParsedRequest & req) const {
+    std::fprintf(stderr,
+        "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
+        "max_tokens=%d max_ctx=%d thinking=%s started_in_thinking=%s stops=%zu model=%s\n",
+        req.response_id.c_str(), api_format_name(req.format),
+        req.stream ? "true" : "false",
+        json_array_size(req.messages), json_array_size(req.tools),
+        req.prompt_tokens.size(), req.max_output, config_.max_ctx,
+        req.thinking_enabled ? "true" : "false",
+        req.started_in_thinking ? "true" : "false",
+        req.stop_sequences.size(), req.model.c_str());
+}
+
+void HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req) {
+    // Set socket non-blocking for send() stall detection during streaming.
+    const int flags = sock_get_flags(fd);
+    if (flags >= 0) sock_set_nonblock(fd);
+
+    ServerJob job;
+    job.fd = fd;
+    job.req = std::move(req);
+    enqueue(&job);
+
+    std::unique_lock<std::mutex> lock(job.mu);
+    job.cv.wait(lock, [&]() { return job.done; });
+}
+
+bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
     if (hr.method != "POST") return false;
 
     std::fprintf(stderr, "[server] request path=%s body_bytes=%zu\n",
                  hr.path.c_str(), hr.body.size());
 
     ParsedRequest req;
-    std::string err;
-
+    bool count_tokens_only = false;
     try {
-        json body = json::parse(hr.body);
+        const json body = json::parse(hr.body);
         req.raw_body = body;
+        if (!parse_common_request_fields(fd, body, req)) return true;
+        if (!parse_endpoint_request(
+                hr.path, body, req, count_tokens_only)) return false;
 
-        // Common fields.
-        req.stream = body.value("stream", false);
-        req.model = body.value("model", config_.model_name);
-        req.disk_cache_policy = config_.disk_cache_policy;
-        // Default when client omits all three: use --default-max-tokens
-        // (16000, matches ds4_eval.c). Codex review flagged that
-        // --default-max-tokens was previously a dead flag because the
-        // parser read config_.max_tokens (legacy 4096) instead. The new
-        // default protects thinking-budget requests that omit max_tokens
-        // from being capped at 4096 — thinking alone can consume that,
-        // leaving no headroom for the visible reply.
-        req.max_output = body.value("max_tokens",
-                         body.value("max_output_tokens",
-                         body.value("max_completion_tokens", config_.default_max_tokens)));
-        // Spec §4.4: clamp request max_tokens to --default-max-tokens.
-        if (req.max_output > config_.default_max_tokens) {
-            std::fprintf(stderr,
-                "[server] max_tokens=%d clamped to default_max_tokens=%d\n",
-                req.max_output, config_.default_max_tokens);
-            req.max_output = config_.default_max_tokens;
-        }
-
-        // Sampler parameters. When the request omits a value, fall back to
-        // the model card's sampling defaults (spec §3.3); when the card
-        // doesn't supply one either, use the hard-coded default.
-        const auto & sd = config_.sampler_defaults;
-        req.sampler.temp = body.value("temperature",
-                                      sd.has_temperature ? sd.temperature : 0.0f);
-        req.sampler.top_p = body.value("top_p",
-                                       sd.has_top_p ? sd.top_p : 1.0f);
-        req.sampler.top_k = body.value("top_k",
-                                       sd.has_top_k ? sd.top_k : 0);
-        if (body.contains("seed")) {
-            req.sampler.seed = body["seed"].get<uint64_t>();
-        }
-
-        // OpenAI-style additive penalties.
-        req.sampler.freq_pen = body.value("frequency_penalty", 0.0f);
-        req.sampler.pres_pen = body.value("presence_penalty",
-                                          sd.has_presence_penalty ? sd.presence_penalty : 0.0f);
-
-        // HuggingFace-style multiplicative repetition penalty (also used by
-        // vLLM, llama.cpp, etc.). Accepts both "repetition_penalty" and
-        // the shorter "rep_pen" for daemon compatibility.
-        req.sampler.rep_pen = body.value("repetition_penalty",
-                              body.value("rep_pen",
-                                  sd.has_repetition_penalty ? sd.repetition_penalty : 1.0f));
-        if (body.contains("rep_window")) {
-            req.sampler.rep_window = body["rep_window"].get<int>();
-        }
-
-        // Tools.
-        if (body.contains("tools")) {
-            req.tools = body["tools"];
-        }
-        // Tool choice constraint for hint generation.
-        if (body.contains("tool_choice")) {
-            req.tool_choice = body["tool_choice"];
-        }
-
-        if (body.contains("prefix_cache") && body["prefix_cache"].is_object()) {
-            const auto & pc = body["prefix_cache"];
-            if (pc.contains("scope") && pc["scope"].is_string()) {
-                if (!apply_request_scope_override(req.disk_cache_policy,
-                                                  pc["scope"].get<std::string>())) {
-                    send_error(fd, 400,
-                        "prefix_cache.scope must be off, full, auto, auto:<window>, or a positive token count");
-                    return true;
-                }
-            }
-            if (pc.contains("window") && pc["window"].is_number_integer()) {
-                const int window = pc["window"].get<int>();
-                if (window <= 0 || window > 1000000) {
-                    send_error(fd, 400, "prefix_cache.window must be a positive integer");
-                    return true;
-                }
-                req.disk_cache_policy.auto_window = window;
-            }
-        }
-
-        // Stop sequences — OpenAI uses "stop" (string or array), Anthropic uses "stop_sequences" (array).
-        if (body.contains("stop")) {
-            auto & stop = body["stop"];
-            if (stop.is_string()) {
-                std::string s = stop.get<std::string>();
-                if (!s.empty()) req.stop_sequences.push_back(s);
-            } else if (stop.is_array()) {
-                for (const auto & item : stop) {
-                    if (item.is_string()) {
-                        std::string s = item.get<std::string>();
-                        if (!s.empty()) req.stop_sequences.push_back(s);
-                    }
-                }
-            }
-        }
-        if (body.contains("stop_sequences") && body["stop_sequences"].is_array()) {
-            for (const auto & item : body["stop_sequences"]) {
-                if (item.is_string()) {
-                    std::string s = item.get<std::string>();
-                    if (!s.empty()) req.stop_sequences.push_back(s);
-                }
-            }
-        }
-
-        // count_tokens shares Anthropic's message parsing; flag so we
-        // short-circuit before enqueueing the generation job.
-        bool count_tokens_only = false;
-
-        if (hr.path == "/v1/chat/completions") {
-            req.format = ApiFormat::OPENAI_CHAT;
-            req.response_id = generate_id("chatcmpl");
-            req.messages = body["messages"];
-            // Strip volatile billing header from messages[0] (OpenAI system).
-            if (req.messages.is_array() && !req.messages.empty()) {
-                auto & m0 = req.messages[0];
-                if (m0.is_object() && m0.value("role", "") == "system" &&
-                    m0.contains("content") && m0["content"].is_string()) {
-                    m0["content"] = dflash::common::normalize_system_for_cache(req.messages);
-                }
-            }
-        } else if (hr.path == "/v1/messages/count_tokens") {
-            req.format = ApiFormat::ANTHROPIC;
-            req.response_id = generate_id("count");
-            req.messages = body.value("messages", json::array());
-            normalize_anthropic_system(body, req.messages);
-            count_tokens_only = true;
-        } else if (hr.path == "/v1/messages") {
-            req.format = ApiFormat::ANTHROPIC;
-            req.response_id = generate_id("msg");
-            req.messages = body["messages"];
-            normalize_anthropic_system(body, req.messages);
-        } else if (hr.path == "/v1/responses") {
-            req.format = ApiFormat::RESPONSES;
-            req.response_id = generate_id("resp");
-            // Responses API uses "input" instead of "messages".
-            if (body.contains("input")) {
-                req.messages = body["input"];
-            }
-            if (body.contains("instructions")) {
-                // Strip billing header from codex instructions before hashing.
-                std::string inst = dflash::common::normalize_system_for_cache(body["instructions"]);
-                json sys_msg = {{"role", "system"}, {"content", inst}};
-                if (req.messages.is_array()) {
-                    req.messages.insert(req.messages.begin(), sys_msg);
-                } else {
-                    req.messages = json::array({sys_msg, {{"role", "user"}, {"content", body["input"]}}});
-                }
-            }
-        } else {
-            return false;
-        }
-
-        // Render messages to text and tokenize.
-        std::vector<ChatMessage> chat_msgs =
+        const std::vector<ChatMessage> chat_messages =
             normalize_chat_messages(req.messages, req.format, tool_memory_);
-
-        // Determine thinking mode BEFORE rendering so the template can inject
-        // the <think>\n\n</think>\n\n block when thinking is disabled.
-        // Default: thinking OFF (Qwen3.6 thinking wrecks
-        // DFlash acceptance rates; clients opt in explicitly).
-        bool enable_thinking = false;
-
-        // Track which fields the request explicitly set, so we can apply
-        // §4.3 combined precedence: thinking.budget_tokens beats
-        // reasoning.effort for the phase-1 cap, but the effort tier still
-        // selects defaults for any unspecified thinking.* field.
-        int  request_budget_tokens   = -1;  // from thinking.budget_tokens
-        int  request_reply_budget    = -1;  // from thinking.reply_budget
-        int  effort_phase1_cap       = -1;  // from reasoning.effort lookup
-        bool effort_set              = false;
-
-        auto apply_reasoning_effort = [&](const std::string & effort) {
-            if (effort == "none") {
-                enable_thinking = false;
-                return;
-            }
-
-            // Five-tier vocabulary (spec §4.2). Unknown → high.
-            int tier_value = config_.effort_tiers.high;
-            if      (effort == "minimal") tier_value = config_.effort_tiers.low;
-            else if (effort == "low")     tier_value = config_.effort_tiers.low;
-            else if (effort == "medium")  tier_value = config_.effort_tiers.medium;
-            else if (effort == "high")    tier_value = config_.effort_tiers.high;
-            else if (effort == "x-high")  tier_value = config_.effort_tiers.x_high;
-            else if (effort == "max")     tier_value = config_.effort_tiers.max;
-            // else: unknown tier → fall back to high (no error).
-
-            effort_phase1_cap = tier_value;
-            effort_set = true;
-            enable_thinking = true;
-            // Spec §4.2: reasoning effort activates the budget envelope.
-            req.thinking_opt_in = true;
-        };
-
-        // OpenAI Responses API: "reasoning" field. Spec §4.2.
-        if (body.contains("reasoning")) {
-            auto & r = body["reasoning"];
-            if (r.contains("effort")) {
-                apply_reasoning_effort(r.value("effort", "high"));
-            } else {
-                enable_thinking = true;
-            }
-        }
-        // OpenAI Chat Completions compatibility: some clients send a
-        // top-level reasoning_effort instead of Responses-style
-        // reasoning.effort. Treat it as the same tier selector unless the
-        // structured field already provided one.
-        if (!effort_set && body.contains("reasoning_effort") &&
-            body["reasoning_effort"].is_string()) {
-            apply_reasoning_effort(body["reasoning_effort"].get<std::string>());
-        }
-        // Anthropic-style: "thinking" field. Presence-as-opt-in: any
-        // request that sends this field has opted in to the thinking-budget
-        // envelope (and will see a `finish_details` block on the response).
-        if (body.contains("thinking")) {
-            auto & th = body["thinking"];
-            if (th.contains("type")) {
-                std::string type = th.value("type", "");
-                enable_thinking = (type == "enabled");
-                req.thinking_opt_in = (type == "enabled");
-            }
-            // Spec §4.1 fields. Clamp to server ceilings (§4.4).
-            if (th.contains("budget_tokens") && th["budget_tokens"].is_number_integer()) {
-                request_budget_tokens = th["budget_tokens"].get<int>();
-            }
-            if (th.contains("reply_budget") && th["reply_budget"].is_number_integer()) {
-                request_reply_budget = th["reply_budget"].get<int>();
-            }
-        }
-        // Direct: chat_template_kwargs.enable_thinking
-        if (body.contains("chat_template_kwargs")) {
-            auto & kwargs = body["chat_template_kwargs"];
-            if (kwargs.contains("enable_thinking")) {
-                enable_thinking = kwargs["enable_thinking"].get<bool>();
-            }
-        }
-
-        req.thinking_enabled = enable_thinking;
-
-        // Spec §4.3 combined precedence + §4.4 clamping.
-        // Phase-1 cap:
-        //   thinking.budget_tokens (if set) wins over reasoning.effort.
-        //   Either is clamped to think_max_tokens.
-        if (request_budget_tokens >= 0) {
-            int eff = (std::min)(request_budget_tokens, config_.think_max_tokens);
-            if (request_budget_tokens > config_.think_max_tokens) {
-                std::fprintf(stderr,
-                    "[server] thinking.budget_tokens=%d clamped to "
-                    "think_max_tokens=%d\n",
-                    request_budget_tokens, config_.think_max_tokens);
-            }
-            req.per_req_phase1_cap = eff;
-        } else if (effort_set) {
-            // Spec §4.4: when reasoning.effort is set, the effective phase-1
-            // cap is min(effort_tier_value, request.max_tokens -
-            // hard_limit_reply_budget). The effort tier value can legitimately
-            // exceed default_max_tokens (e.g. Qwen3.6 max=81408 with
-            // default=32768) — clients that want that full budget must pass
-            // an explicit max_tokens. Otherwise we narrow silently to fit.
-            const int max_output_phase1_room = (std::max)(0,
-                req.max_output - config_.hard_limit_reply_budget);
-            int eff = (std::min)(effort_phase1_cap, max_output_phase1_room);
-            if (effort_phase1_cap > max_output_phase1_room) {
-                // Info-level: this is normal when clients use a tier name but
-                // don't pass an explicit max_tokens. Not a warning.
-                std::fprintf(stderr,
-                    "[server] reasoning.effort tier=%d narrowed to %d "
-                    "(max_tokens=%d - hard_limit_reply_budget=%d); "
-                    "pass a larger max_tokens to use the full tier budget\n",
-                    effort_phase1_cap, eff,
-                    req.max_output, config_.hard_limit_reply_budget);
-            }
-            req.per_req_phase1_cap = eff;
-        }
-        // Reply budget:
-        if (request_reply_budget >= 0) {
-            int eff = (std::min)(request_reply_budget, config_.hard_limit_reply_budget);
-            if (request_reply_budget > config_.hard_limit_reply_budget) {
-                std::fprintf(stderr,
-                    "[server] thinking.reply_budget=%d clamped to "
-                    "hard_limit_reply_budget=%d\n",
-                    request_reply_budget, config_.hard_limit_reply_budget);
-            }
-            req.per_req_reply_budget = eff;
-        }
-        // (effort tier doesn't influence reply_budget — spec §4.2: "the reply
-        // reserve falls back to --hard-limit-reply-budget".)
-
-        // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio)
+        // Reasoning must be applied BEFORE rendering: the template injects
+        // the empty <think>\n\n</think>\n\n block when thinking is disabled.
+        apply_request_reasoning(body, req);
+        // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
         req.session_id = parse_session_id_from_body(body);
-
-        // Serialize tools JSON for template injection.
-        std::string tools_json;
-        if (req.tools.is_array() && !req.tools.empty()) {
-            tools_json = req.tools.dump();
-        }
-
-        std::string rendered;
-        if (!config_.chat_template_src.empty()) {
-            // Jinja path: caller supplied a chat template file via
-            // --chat-template-file. Override the hardcoded QWEN3/LAGUNA
-            // renderer. Used for tool-using agents that need the Anthropic
-            // tool_use envelope (e.g. froggeric Qwen3.6 template).
-            //
-            // Special tokens like <|im_start|> / <|im_end|> are stored
-            // verbatim in the GGUF vocab — use raw_token() to skip the
-            // GPT-2 byte decode (otherwise <0xC4><0x91> nonsense appears).
-            const std::string & bos_str = (tokenizer_.bos_id() >= 0)
-                ? tokenizer_.raw_token(tokenizer_.bos_id())
-                : std::string();
-            const std::string & eos_str = (tokenizer_.eos_id() >= 0)
-                ? tokenizer_.raw_token(tokenizer_.eos_id())
-                : std::string();
-            try {
-                rendered = render_chat_template_jinja(
-                    config_.chat_template_src,
-                    chat_msgs,
-                    bos_str,
-                    eos_str,
-                    /*add_generation_prompt=*/true,
-                    enable_thinking,
-                    tools_json);
-            } catch (const std::exception & e) {
-                send_error(fd, 500,
-                    std::string("chat template (jinja) render failed: ") + e.what());
-                return true;
-            }
-        } else {
-            rendered = render_chat_template(chat_msgs, chat_format_,
-                                            true, enable_thinking,
-                                            tools_json);
-        }
-        req.started_in_thinking = prompt_ends_in_open_think(rendered);
-        req.prompt_tokens = tokenizer_.encode(rendered);
+        if (!render_and_tokenize_request(fd, chat_messages, req)) return true;
 
         // count_tokens: short-circuit after tokenization. Skip generation
-        // entirely — Anthropic's contract is just `{"input_tokens": N}`.
+        // entirely — Anthropic's contract is just {"input_tokens": N}.
         if (count_tokens_only) {
-            json resp = {{"input_tokens", (int)req.prompt_tokens.size()}};
-            send_response(fd, 200, "application/json", resp.dump() + "\n");
+            const json response = {
+                {"input_tokens", (int) req.prompt_tokens.size()},
+            };
+            send_response(fd, 200, "application/json", response.dump() + "\n");
             return true;
         }
-
     } catch (const std::exception & e) {
         send_error(fd, 400, std::string("JSON parse error: ") + e.what());
-        return true;  // handled (with error)
+        return true;
     }
 
-    // Check context length; oversized + compression_enabled passes through — post-compress check is the real gate.
-    {
-        const int n_prompt = (int)req.prompt_tokens.size();
-        const bool pflash_will_run =
-            (config_.pflash_mode != ServerConfig::PflashMode::OFF) &&
-            (drafter_tokenizer_ != nullptr) &&
-            (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
-             n_prompt >= config_.pflash_threshold);
-        if (should_reject_oversized(n_prompt, req.max_output,
-                                    config_.max_ctx, pflash_will_run)) {
-            send_error(fd, 400,
-                       context_overflow_message(config_.max_ctx, n_prompt,
-                                                req.max_output));
-            return true;
-        }
-    }
-
-    std::fprintf(stderr,
-        "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
-        "max_tokens=%d max_ctx=%d thinking=%s started_in_thinking=%s stops=%zu model=%s\n",
-        req.response_id.c_str(),
-        api_format_name(req.format),
-        req.stream ? "true" : "false",
-        json_array_size(req.messages),
-        json_array_size(req.tools),
-        req.prompt_tokens.size(),
-        req.max_output,
-        config_.max_ctx,
-        req.thinking_enabled ? "true" : "false",
-        req.started_in_thinking ? "true" : "false",
-        req.stop_sequences.size(),
-        req.model.c_str());
-
-    // Set socket non-blocking for send() stall detection during streaming.
-    int flags = sock_get_flags(fd);
-    if (flags >= 0) sock_set_nonblock(fd);
-
-    // Enqueue job and wait for worker.
-    ServerJob job;
-    job.fd = fd;
-    job.req = std::move(req);
-
-    enqueue(&job);
-
-    // Wait for the worker to signal completion.
-    {
-        std::unique_lock<std::mutex> lk(job.mu);
-        job.cv.wait(lk, [&]() { return job.done; });
-    }
-
+    if (!validate_request_context(fd, req)) return true;
+    log_parsed_request(req);
+    enqueue_request_and_wait(fd, std::move(req));
     return true;
 }
 
 // ─── Worker thread ──────────────────────────────────────────────────────
+
+// Non-streaming response serialization is API-specific but independent of
+// prompt preparation and model execution.
+
+namespace {
+
+// Staging slot for disk-cache loads: the last ModelBackend slot, reserved
+// so it never collides with PrefixCache slots (inline uses 0..cap-1, full
+// uses cap..cap+full_cap-1 — safe as long as total cache slots stay below
+// kMaxSlots - 1).
+constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
+
+struct CompletionTokenCounts {
+    int total = 0;
+    int reasoning = 0;
+    int content = 0;
+};
+
+enum class TokenDelivery {
+    kSkip,      // EOS or internal control marker — never reaches the emitter
+    kThinkTag,  // thinking-boundary marker mapped to its <think> text form
+    kText,      // ordinary text (token_text may still be empty)
+};
+
+// Classifies one generated token for delivery to the SseEmitter, filling
+// `text` with the deliverable form for kThinkTag / kText. Shared by the
+// streaming on_token callback and the non-streaming replay: the two paths
+// MUST classify identically, or the reasoning/content split diverges
+// between streamed and non-streamed responses.
+TokenDelivery classify_generated_token(
+        Tokenizer & tokenizer, int32_t token, std::string & text) {
+    if (token == tokenizer.eos_id() || token == tokenizer.eos_chat_id()) {
+        return TokenDelivery::kSkip;
+    }
+
+    const std::string & raw = tokenizer.raw_token(token);
+
+    // Gemma4 thinking channel (<|channel> / <channel|>) and Qwen3.6
+    // thinking markers share one mapped dialect. The Qwen markers
+    // <think> (id 248068) and </think> (id 248069) are SINGLE special
+    // tokens in the added_tokens vocab: without this mapping they would
+    // hit the generic "<...>" strip below and be silently dropped, the
+    // emitter would never see the reasoning→content transition, and the
+    // whole answer would land in reasoning_content with empty content.
+    if (raw == "<|channel>" || raw == "<think>") {
+        text = "<think>";
+        return TokenDelivery::kThinkTag;
+    }
+    if (raw == "<channel|>" || raw == "</think>") {
+        text = "</think>\n";
+        return TokenDelivery::kThinkTag;
+    }
+
+    // Other special tokens are internal control markers. Byte-fallback
+    // tokens such as <0xAB> are text and must still reach the emitter.
+    if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') {
+        return TokenDelivery::kSkip;
+    }
+    if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>' &&
+        !(raw.size() == 6 && raw[1] == '0' && raw[2] == 'x')) {
+        return TokenDelivery::kSkip;
+    }
+
+    text = tokenizer.token_text(token);
+    return TokenDelivery::kText;
+}
+
+CompletionTokenCounts feed_non_streaming_tokens(
+        const std::vector<int32_t> & tokens, Tokenizer & tokenizer,
+        SseEmitter & emitter) {
+    for (int32_t token : tokens) {
+        std::string text;
+        const TokenDelivery delivery =
+            classify_generated_token(tokenizer, token, text);
+        if (delivery == TokenDelivery::kSkip) continue;
+
+        emitter.emit_token(text);
+        // Matching the streaming path, only ordinary text is checked
+        // against stop sequences — think-tag markers never count.
+        if (delivery == TokenDelivery::kText && emitter.stop_hit()) break;
+    }
+
+    CompletionTokenCounts counts;
+    counts.total = (int) tokens.size();
+    emitter.emit_finish(counts.total);
+
+    // Split reasoning vs content at the emitter's REASONING→CONTENT
+    // transition; see first_content_token_index() in sse_emitter.h.
+    // Skipped specials mean `emitted` can be below counts.total — the
+    // remainder is unattributed (e.g. TOOL_BUFFER).
+    const int first_content = emitter.first_content_token_index();
+    const int emitted = emitter.emit_token_count();
+    counts.reasoning = first_content < 0 ? emitted : first_content;
+    counts.content = first_content < 0 ? 0 : emitted - first_content;
+    return counts;
+}
+
+json build_openai_completion_response(
+        const ParsedRequest & req, const GenerateResult & result,
+        int generation_cap, const GenTimings & timings,
+        const CompletionTokenCounts & counts, const SseEmitter & emitter) {
+    json message = {
+        {"role", "assistant"},
+        {"content", emitter.accumulated_text()},
+    };
+    if (!emitter.reasoning_text().empty()) {
+        // Multi-dialect reasoning emission — same text, three keys. See
+        // docs/specs/thinking-budget.md "Response shape — multi-dialect
+        // aliasing".
+        //   reasoning_content : DeepSeek R1 / dflash primary
+        //   reasoning         : OpenRouter / Anthropic-gateway flat
+        //   reasoning_details : typed-block list; single block.
+        const std::string & reasoning = emitter.reasoning_text();
+        message["reasoning_content"] = reasoning;
+        message["reasoning"] = reasoning;
+        message["reasoning_details"] = json::array({
+            {{"type", "reasoning.text"}, {"text", reasoning}},
+        });
+    }
+    if (!emitter.tool_calls().empty()) {
+        json tool_calls = json::array();
+        for (const auto & tool_call : emitter.tool_calls()) {
+            tool_calls.push_back({
+                {"id", tool_call.id},
+                {"type", "function"},
+                {"function", {
+                    {"name", tool_call.name},
+                    {"arguments", tool_call.arguments},
+                }},
+            });
+        }
+        message["tool_calls"] = tool_calls;
+    }
+
+    // The emitter only knows "stop" / "tool_calls"; it cannot see that the
+    // daemon hit the n_gen cap. Derive "length" from the committed-token
+    // count — OpenAI-compatible clients (open-webui, Cline) gate retry
+    // logic on finish_reason == "length".
+    std::string finish_reason = emitter.finish_reason();
+    if (finish_reason == "stop" && counts.total >= generation_cap) {
+        finish_reason = "length";
+    }
+    // Degenerate decode (post-close repetition-loop watchdog) also reports
+    // "length": OpenAI/Anthropic/Gemini all collapse budget-class events
+    // into one closed enum, with richer signal in sidecar fields below.
+    if (result.degenerate_decode_close) finish_reason = "length";
+
+    json choice = {
+        {"index", 0},
+        {"message", message},
+        {"finish_reason", finish_reason},
+    };
+    if (req.thinking_opt_in) {
+        // finish_details mirrors ds4_eval.c's eval_think_close_info.
+        // close_kind is "natural" when the model closed its own thinking
+        // block, "hard" when the BudgetHook force-closed it at the budget
+        // boundary. See docs/specs/thinking-budget.md "v2 design".
+        choice["finish_details"] = {
+            {"close_kind", result.budget_forced_close ? "hard" : "natural"},
+            {"thinking_tokens", counts.reasoning},
+            {"content_tokens", counts.content},
+            {"total_tokens", counts.total},
+        };
+        // Honest signaling: the answer after an aborted repetition loop is
+        // unreliable; surface that without breaking the finish_reason enum.
+        if (result.degenerate_decode_close) {
+            choice["finish_details"]["degenerate_decode"] = true;
+        }
+    }
+
+    // usage.completion_tokens_details.reasoning_tokens — OpenAI o1/o3
+    // standard location; kept in sync with finish_details.thinking_tokens.
+    // usage.timings — per-request prefill/decode wall clock, additive to
+    // the OpenAI shape (ignored by clients that don't recognize it). See
+    // docs/specs/thinking-budget.md §6.3.
+    const int prompt_tokens = (int) req.prompt_tokens.size();
+    const json usage = {
+        {"prompt_tokens", prompt_tokens},
+        {"completion_tokens", counts.total},
+        {"total_tokens", prompt_tokens + counts.total},
+        {"completion_tokens_details", {
+            {"reasoning_tokens", counts.reasoning},
+        }},
+        {"timings", build_timings_json(timings, counts.total)},
+        {"accept_rate", result.accept_rate},
+    };
+    return {
+        {"id", req.response_id},
+        {"object", "chat.completion"},
+        {"created", std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count()},
+        {"model", req.model},
+        {"choices", json::array({choice})},
+        {"usage", usage},
+    };
+}
+
+json build_anthropic_response(
+        const ParsedRequest & req, const GenerateResult & result,
+        int generation_cap, const GenTimings & timings,
+        const CompletionTokenCounts & counts, const SseEmitter & emitter) {
+    json content = json::array();
+    if (!emitter.reasoning_text().empty()) {
+        content.push_back({
+            {"type", "thinking"},
+            {"thinking", emitter.reasoning_text()},
+        });
+    }
+    // Tool-only replies intentionally omit an empty text block; Anthropic
+    // clients expect the tool_use blocks to stand alone.
+    if (!emitter.accumulated_text().empty()) {
+        content.push_back({
+            {"type", "text"},
+            {"text", emitter.accumulated_text()},
+        });
+    }
+    for (const auto & tool_call : emitter.tool_calls()) {
+        // Anthropic expects `input` as an object; arguments arrive as a
+        // JSON-encoded string. Fall back to an empty object on bad JSON.
+        json input;
+        try {
+            input = tool_call.arguments.empty()
+                ? json::object()
+                : json::parse(tool_call.arguments);
+        } catch (const std::exception &) {
+            input = json::object();
+        }
+        content.push_back({
+            {"type", "tool_use"},
+            {"id", tool_call.id},
+            {"name", tool_call.name},
+            {"input", input},
+        });
+    }
+
+    // stop_reason is Anthropic's analog of finish_reason, with the same
+    // length-vs-EOS distinction — Cline / Anthropic SDK clients gate
+    // retry logic on stop_reason == "max_tokens".
+    std::string stop_reason;
+    if (emitter.finish_reason() == "tool_calls") {
+        stop_reason = "tool_use";
+    } else if (counts.total >= generation_cap) {
+        stop_reason = "max_tokens";
+    } else {
+        stop_reason = "end_turn";
+    }
+
+    const json usage = {
+        {"input_tokens", (int) req.prompt_tokens.size()},
+        {"output_tokens", counts.total},
+        {"timings", build_timings_json(timings, counts.total)},
+        {"accept_rate", result.accept_rate},
+    };
+    return {
+        {"id", req.response_id},
+        {"type", "message"},
+        {"role", "assistant"},
+        {"model", req.model},
+        {"content", content},
+        {"stop_reason", stop_reason},
+        {"usage", usage},
+    };
+}
+
+json build_responses_api_response(
+        const ParsedRequest & req, const GenerateResult & result,
+        const GenTimings & timings, const CompletionTokenCounts & counts,
+        const SseEmitter & emitter) {
+    json output = json::array();
+    if (!emitter.tool_calls().empty()) {
+        for (const auto & tool_call : emitter.tool_calls()) {
+            output.push_back({
+                {"type", "function_call"},
+                {"id", tool_call.id},
+                {"status", "completed"},
+                {"call_id", tool_call.id},
+                {"name", tool_call.name},
+                {"arguments", tool_call.arguments},
+            });
+        }
+    } else {
+        output.push_back({
+            {"type", "message"},
+            {"id", req.response_id + "_msg"},
+            {"status", "completed"},
+            {"role", "assistant"},
+            {"content", json::array({{
+                {"type", "output_text"},
+                {"text", emitter.accumulated_text()},
+                {"annotations", json::array()},
+            }})},
+        });
+    }
+
+    const int prompt_tokens = (int) req.prompt_tokens.size();
+    const json usage = {
+        {"input_tokens", prompt_tokens},
+        {"output_tokens", counts.total},
+        {"total_tokens", prompt_tokens + counts.total},
+        {"timings", build_timings_json(timings, counts.total)},
+        {"accept_rate", result.accept_rate},
+    };
+    return {
+        {"id", req.response_id},
+        {"object", "response"},
+        {"status", "completed"},
+        {"model", req.model},
+        {"output", output},
+        {"usage", usage},
+    };
+}
+
+json build_non_streaming_response(
+        const ParsedRequest & req, const GenerateResult & result,
+        int generation_cap, const GenTimings & timings, Tokenizer & tokenizer,
+        SseEmitter & emitter) {
+    const CompletionTokenCounts counts = feed_non_streaming_tokens(
+        result.tokens, tokenizer, emitter);
+    switch (req.format) {
+    case ApiFormat::OPENAI_CHAT:
+        return build_openai_completion_response(
+            req, result, generation_cap, timings, counts, emitter);
+    case ApiFormat::ANTHROPIC:
+        return build_anthropic_response(
+            req, result, generation_cap, timings, counts, emitter);
+    case ApiFormat::RESPONSES:
+        return build_responses_api_response(
+            req, result, timings, counts, emitter);
+    default:
+        return {{"text", emitter.accumulated_text()}};
+    }
+}
+
+// Prompt preparation applies exactly one compression policy: FlowKV for
+// continuations, a verbatim turn-one anchor, or whole-prompt PFlash.
+bool is_continuation_request(const json & messages) {
+    if (!messages.is_array()) return false;
+
+    for (const auto & message : messages) {
+        if (!message.is_object()) continue;
+        if (message.value("role", "") == "assistant") return true;
+
+        if (message.contains("tool_calls")) {
+            const auto & tool_calls = message["tool_calls"];
+            if (tool_calls.is_array() && !tool_calls.empty()) return true;
+        }
+        if (message.contains("content") && message["content"].is_array()) {
+            for (const auto & block : message["content"]) {
+                if (!block.is_object()) continue;
+                const std::string type = block.value("type", "");
+                if (type == "tool_result" || type == "tool_use") return true;
+            }
+        }
+
+        const std::string type = message.value("type", "");
+        if (type == "function_call" || type == "function_call_output") {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+void HttpServer::apply_flowkv_compression(
+        const ParsedRequest & req, PreparedPrompt & prepared) {
+    int hot_window = 2;
+    const char * hot_window_env = std::getenv("PFLASH_FREEZE_HOT_WINDOW");
+    if (hot_window_env && *hot_window_env) {
+        const int configured_window = std::atoi(hot_window_env);
+        if (configured_window > 0) hot_window = configured_window;
+    }
+
+    const int message_count = (int) req.messages.size();
+    if (message_count < 2 + hot_window) {
+        std::fprintf(stderr,
+            "[flowkv] too few turns (n_msgs=%d hot_window=%d) — skip\n",
+            message_count, hot_window);
+        return;
+    }
+
+    const int aged_begin = 1;
+    const int aged_end = message_count - hot_window;
+
+    // Small aged bands cost more to compress than they save during prefill.
+    int aged_token_estimate = 0;
+    for (int index = aged_begin; index < aged_end; ++index) {
+        const auto & message = req.messages[index];
+        if (!message.is_object()) continue;
+
+        std::string content;
+        if (message.contains("content")) {
+            const auto & value = message["content"];
+            if (value.is_string()) {
+                content = value.get<std::string>();
+            } else if (value.is_array()) {
+                for (const auto & part : value) {
+                    if (!part.is_object()) continue;
+                    const std::string type = part.value("type", "");
+                    if (type == "text" || type == "input_text" ||
+                        type == "output_text") {
+                        content += part.value("text", "");
+                    }
+                }
+            }
+        }
+        if (!content.empty()) {
+            aged_token_estimate +=
+                (int) drafter_tokenizer_->encode(content).size();
+        }
+    }
+
+    static constexpr int kFlowKvInertMinTokens = 512;
+    if (aged_token_estimate < kFlowKvInertMinTokens) {
+        std::fprintf(stderr,
+            "[flowkv] inert-guard: aged band %d toks < %d — skip\n",
+            aged_token_estimate, kFlowKvInertMinTokens);
+        return;
+    }
+
+    json modified_messages = req.messages;
+    bool any_compressed = false;
+    int cache_hits = 0;
+
+    for (int index = aged_begin; index < aged_end; ++index) {
+        auto & message = modified_messages[index];
+        if (!message.is_object()) continue;
+
+        std::string content;
+        if (message.contains("content")) {
+            const auto & value = message["content"];
+            if (value.is_string()) {
+                content = value.get<std::string>();
+            } else if (value.is_array()) {
+                for (const auto & part : value) {
+                    if (!part.is_object()) continue;
+                    const std::string type = part.value("type", "");
+                    if (type == "text" || type == "input_text" ||
+                        type == "output_text") {
+                        content += part.value("text", "");
+                    }
+                }
+            }
+        }
+        if (content.empty()) continue;
+
+        auto drafter_ids = drafter_tokenizer_->encode(content);
+        if ((int) drafter_ids.size() < config_.pflash_threshold) continue;
+
+        const PrefixHash cache_key = frozen_block_key(
+            drafter_ids.data(), 0, (int) drafter_ids.size());
+
+        std::string compressed_text;
+        auto cache_it = frozen_content_cache_.find(cache_key);
+        if (cache_it != frozen_content_cache_.end()) {
+            compressed_text = cache_it->second;
+            ++cache_hits;
+            std::fprintf(stderr,
+                "[flowkv] msg[%d] cache hit (%zu drafter toks)\n",
+                index, drafter_ids.size());
+        } else {
+            ModelBackend::CompressRequest compress_request;
+            compress_request.input_ids = std::move(drafter_ids);
+            compress_request.keep_ratio = pflash_keep_ratio(
+                config_, (int) compress_request.input_ids.size());
+            compress_request.drafter_path = config_.pflash_drafter_path;
+            compress_request.drafter_gpu = config_.pflash_drafter_gpu;
+            compress_request.skip_park = config_.pflash_skip_park;
+            compress_request.residency_action = resolve_draft_residency_action(
+                config_.draft_residency,
+                DraftResidencyContext{
+                    DraftResidencyUse::PFlashCompress,
+                    config_.lazy_draft,
+                    !config_.draft_path.empty(),
+                });
+
+            auto result = backend_.compress(compress_request);
+            if (!result.ok || result.compressed_ids.empty()) {
+                std::fprintf(stderr,
+                    "[flowkv] msg[%d] compress failed — kept verbatim\n",
+                    index);
+                continue;
+            }
+            compressed_text = drafter_tokenizer_->decode(result.compressed_ids);
+            std::fprintf(stderr,
+                "[flowkv] msg[%d] %zu → %zu drafter toks (keep=%.2f)\n",
+                index, compress_request.input_ids.size(),
+                result.compressed_ids.size(), compress_request.keep_ratio);
+
+            if (frozen_content_cache_.size() >= kFrozenCacheMax) {
+                std::fprintf(stderr,
+                    "[flowkv] cache full (%zu entries) — clearing\n",
+                    frozen_content_cache_.size());
+                frozen_content_cache_.clear();
+            }
+            frozen_content_cache_.emplace(cache_key, compressed_text);
+        }
+
+        message["content"] = compressed_text;
+        any_compressed = true;
+    }
+
+    if (!any_compressed) {
+        std::fprintf(stderr,
+            "[flowkv] no aged msgs above threshold — skip\n");
+        return;
+    }
+
+    std::string tools_json;
+    if (req.tools.is_array() && !req.tools.empty()) {
+        tools_json = req.tools.dump();
+    }
+    const std::vector<ChatMessage> chat_messages = normalize_chat_messages(
+        modified_messages, req.format, tool_memory_);
+
+    std::string rendered;
+    if (!config_.chat_template_src.empty()) {
+        const std::string & bos = tokenizer_.bos_id() >= 0
+            ? tokenizer_.raw_token(tokenizer_.bos_id())
+            : std::string();
+        const std::string & eos = tokenizer_.eos_id() >= 0
+            ? tokenizer_.raw_token(tokenizer_.eos_id())
+            : std::string();
+        try {
+            rendered = render_chat_template_jinja(
+                config_.chat_template_src, chat_messages, bos, eos,
+                /*add_generation_prompt=*/true,
+                req.thinking_enabled, tools_json);
+        } catch (const std::exception & error) {
+            std::fprintf(stderr,
+                "[flowkv] jinja re-render failed (%s) — skipping\n",
+                error.what());
+            return;
+        }
+    } else {
+        rendered = render_chat_template(
+            chat_messages, chat_format_, /*add_generation_prompt=*/true,
+            req.thinking_enabled, tools_json);
+    }
+
+    const int tokens_before = (int) prepared.tokens.size();
+    prepared.tokens = tokenizer_.encode(rendered);
+    prepared.compressed = true;
+    std::fprintf(stderr,
+        "[flowkv] %d → %d target toks "
+        "(%d aged msgs, %d cache hits, hot_window=%d)\n",
+        tokens_before, (int) prepared.tokens.size(),
+        aged_end - aged_begin, cache_hits, hot_window);
+}
+
+std::string HttpServer::apply_pflash_compression(
+        const ParsedRequest & req, PreparedPrompt & prepared) {
+    auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
+    if (full_slot >= 0) {
+        std::fprintf(stderr,
+            "[pflash] full-cache hit slot=%d — skipping compress\n",
+            full_slot);
+        prepared.compressed = true;
+        prepared.full_cache_hit_slot = full_slot;
+        prepared.full_cache_hit_len = full_len;
+        // The restore path only needs a prompt whose length matches snap_pos.
+        prepared.tokens.assign((size_t) full_len, 0);
+        prepared.full_cache_served_tokens = full_len;
+        return {};
+    }
+
+    const int prompt_tokens = (int) req.prompt_tokens.size();
+    const std::string prompt_text = tokenizer_.decode(req.prompt_tokens);
+    auto drafter_ids = drafter_tokenizer_->encode(prompt_text);
+    if (drafter_ids.empty()) {
+        return "PFlash drafter tokenizer produced an empty prompt";
+    }
+
+    ModelBackend::CompressRequest compress_request;
+    compress_request.input_ids = std::move(drafter_ids);
+    compress_request.keep_ratio = req.session_id.empty()
+        ? pflash_keep_ratio(config_, prompt_tokens)
+        : sessions_.get_keep_ratio(req.session_id);
+    compress_request.drafter_path = config_.pflash_drafter_path;
+    compress_request.drafter_gpu = config_.pflash_drafter_gpu;
+    compress_request.skip_park = config_.pflash_skip_park;
+    const auto residency = resolve_draft_residency_action(
+        config_.draft_residency,
+        DraftResidencyContext{
+            DraftResidencyUse::PFlashCompress,
+            config_.lazy_draft,
+            !config_.draft_path.empty(),
+        });
+    compress_request.residency_action = residency;
+
+    ModelBackend::CompressResult result;
+    if (config_.pflash_remote_drafter) {
+        if (!pflash_remote_.active() &&
+            !pflash_remote_.start(config_.pflash_remote.ipc_bin,
+                                  config_.pflash_drafter_path,
+                                  config_.pflash_drafter_gpu,
+                                  config_.pflash_remote.work_dir)) {
+            return "remote PFlash drafter start failed";
+        }
+        result.ok = pflash_remote_.compress(
+            compress_request.input_ids, compress_request.keep_ratio,
+            result.compressed_ids);
+        if (residency == DraftResidencyAction::ReleaseAfterUse) {
+            pflash_remote_.close();
+        }
+    } else {
+        result = backend_.compress(compress_request);
+    }
+
+    if (!result.ok || result.compressed_ids.empty()) {
+        return config_.pflash_remote_drafter
+            ? "remote PFlash drafter compression failed"
+            : "PFlash compression failed";
+    }
+
+    std::string compressed_text =
+        drafter_tokenizer_->decode(result.compressed_ids);
+
+    // Compression is allowed to be lossy, but the active user query must
+    // survive. Re-append short queries when fewer than 80% of their tokens do.
+    std::string last_user_text;
+    if (req.messages.is_array()) {
+        for (int index = (int) req.messages.size() - 1; index >= 0; --index) {
+            if (req.messages[index].value("role", "") != "user") continue;
+            const auto & content = req.messages[index]["content"];
+            if (content.is_string()) {
+                last_user_text = content.get<std::string>();
+            } else if (content.is_array()) {
+                for (const auto & part : content) {
+                    const std::string type = part.value("type", "");
+                    if (type == "text" || type == "input_text" ||
+                        type == "output_text") {
+                        last_user_text += part.value("text", "");
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if (!last_user_text.empty()) {
+        const auto query_ids = drafter_tokenizer_->encode(last_user_text);
+        int query_kept = 0;
+        if (!query_ids.empty()) {
+            int query_index = (int) query_ids.size() - 1;
+            for (int kept_index = (int) result.compressed_ids.size() - 1;
+                 kept_index >= 0 && query_index >= 0; --kept_index) {
+                if (result.compressed_ids[kept_index] == query_ids[query_index]) {
+                    ++query_kept;
+                    --query_index;
+                }
+            }
+        }
+        const float survival = (float) query_kept /
+            (std::max)(1, (int) query_ids.size());
+        std::fprintf(stderr,
+            "[pflash] query survival: %d/%d (%.0f%%)\n",
+            query_kept, (int) query_ids.size(), survival * 100.0f);
+        if (survival < 0.80f && (int) query_ids.size() < 1000) {
+            compressed_text += "\n" + last_user_text;
+            std::fprintf(stderr,
+                "[pflash] query below 80%% — re-appended full query (%d tokens)\n",
+                (int) query_ids.size());
+        } else if (survival < 0.80f) {
+            std::fprintf(stderr,
+                "[pflash] query below 80%% but too large to re-append (%d tokens)\n",
+                (int) query_ids.size());
+        }
+    }
+
+    prepared.tokens = tokenizer_.encode(compressed_text);
+    prepared.compressed = true;
+    std::fprintf(stderr,
+        "[pflash] %d -> %d -> %d tokens (%.1f%% kept)\n",
+        prompt_tokens, (int) result.compressed_ids.size(),
+        (int) prepared.tokens.size(),
+        100.0 * prepared.tokens.size() / prompt_tokens);
+    return {};
+}
+
+HttpServer::PreparedPrompt HttpServer::prepare_prompt(
+        const ParsedRequest & req) {
+    PreparedPrompt prepared;
+    prepared.tokens = req.prompt_tokens;
+
+    if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        drafter_tokenizer_ != nullptr) {
+        const int prompt_tokens = (int) req.prompt_tokens.size();
+        bool should_compress =
+            config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
+            (config_.pflash_mode == ServerConfig::PflashMode::AUTO &&
+             prompt_tokens >= config_.pflash_threshold);
+        const bool continuation = should_compress &&
+            is_continuation_request(req.messages);
+
+        if (should_compress && continuation &&
+            req.disk_cache_policy.compress && req.messages.is_array()) {
+            // FlowKV owns continuation compression; falling back to whole-
+            // prompt compression would destroy the reusable prefix anchor.
+            apply_flowkv_compression(req, prepared);
+            should_compress = false;
+        } else if (should_compress && continuation) {
+            should_compress = false;
+            std::fprintf(stderr,
+                "[pflash] skip-compress (continuation: prior assistant/tool history)\n");
+        }
+
+        if (should_compress && req.disk_cache_policy.compress) {
+            // Turn one stays verbatim so the next turn can reuse its KV prefix.
+            should_compress = false;
+            std::fprintf(stderr,
+                "[flowkv] turn-1 verbatim (system kept as cache anchor)\n");
+        }
+
+        if (should_compress) {
+            prepared.error = apply_pflash_compression(req, prepared);
+            if (!prepared.error.empty()) {
+                prepared.error_status = 500;
+                return prepared;
+            }
+        }
+    }
+
+    const int prompt_length = prepared.full_cache_served_tokens >= 0
+        ? prepared.full_cache_served_tokens
+        : (int) prepared.tokens.size();
+    if (effective_prompt_overflows(
+            (int) prepared.tokens.size(), prepared.full_cache_served_tokens,
+            req.max_output, config_.max_ctx)) {
+        prepared.error_status = 400;
+        prepared.error = context_overflow_message(
+            config_.max_ctx, prompt_length, req.max_output);
+    }
+    return prepared;
+}
+
+bool HttpServer::forward_upstream(
+        SocketHandle fd, const ParsedRequest & req,
+        const PreparedPrompt & prepared) {
+#ifdef DFLASH_HAS_CURL
+    if (config_.pflash_upstream_base.empty()) return false;
+
+    const std::string & upstream = config_.pflash_upstream_base;
+    const std::string & upstream_key = config_.pflash_upstream_key;
+    const std::string & upstream_model = config_.pflash_upstream_model.empty()
+        ? req.model : config_.pflash_upstream_model;
+
+    if (prepared.compressed) {
+        std::string compressed_text = tokenizer_.decode(prepared.tokens);
+        compressed_text += "\n<|im_start|>assistant\n";
+
+        json body;
+        body["model"] = upstream_model;
+        body["prompt"] = compressed_text;
+        body["stream"] = req.stream;
+        if (req.raw_body.contains("max_tokens")) {
+            body["max_tokens"] = req.raw_body["max_tokens"];
+        } else {
+            body["max_tokens"] = req.max_output;
+        }
+        for (const char * key : {
+                 "temperature", "top_p", "top_k", "min_p",
+                 "frequency_penalty", "presence_penalty", "stop", "seed"}) {
+            if (req.raw_body.contains(key)) body[key] = req.raw_body[key];
+        }
+
+        std::fprintf(stderr,
+            "[pflash-proxy] compressed forward → %s/completions  "
+            "prompt=%zu tokens  model=%s\n",
+            upstream.c_str(), prepared.tokens.size(), upstream_model.c_str());
+        curl_forward(fd, upstream + "/completions", upstream_key, body,
+                     req.stream, /*rewrite_to_chat=*/true,
+                     req.response_id, upstream_model);
+    } else {
+        json body = req.raw_body;
+        body["model"] = upstream_model;
+
+        std::fprintf(stderr,
+            "[pflash-proxy] passthrough → %s/chat/completions  model=%s\n",
+            upstream.c_str(), upstream_model.c_str());
+        curl_forward(fd, upstream + "/chat/completions", upstream_key, body,
+                     req.stream, /*rewrite_to_chat=*/false,
+                     req.response_id, upstream_model);
+    }
+    return true;
+#else
+    (void) fd;
+    (void) req;
+    (void) prepared;
+    return false;
+#endif
+}
+
+// Cache lookup and snapshot preparation form one lifecycle; confirmation is
+// deferred until generation proves that the snapshot contains useful output.
+HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
+        const ParsedRequest & req, PreparedPrompt & prepared,
+        GenerateRequest & generate_request) {
+    auto & effective_prompt = prepared.tokens;
+    GenerationCacheState cache;
+    cache.cache_slot = prepared.full_cache_hit_slot;
+    cache.prefix_len = prepared.full_cache_hit_len;
+    cache.using_restore = cache.cache_slot >= 0;
+    cache.disk_policy = req.disk_cache_policy;
+
+    // Exact raw-prompt snapshots take priority over inline turn boundaries.
+    if (!cache.using_restore) {
+        auto [full_slot, full_len] =
+            prefix_cache_.lookup_full(req.prompt_tokens);
+        if (full_slot >= 0) {
+            cache.cache_slot = full_slot;
+            cache.prefix_len = full_len;
+            cache.using_restore = true;
+            if (prepared.compressed) {
+                effective_prompt.assign((size_t) full_len, 0);
+                generate_request.prompt = effective_prompt;
+            }
+        }
+    }
+    if (!cache.using_restore) {
+        auto [inline_slot, inline_len] =
+            prefix_cache_.lookup(effective_prompt);
+        cache.cache_slot = inline_slot;
+        cache.prefix_len = inline_len;
+        cache.using_restore = cache.cache_slot >= 0;
+    }
+
+    // FlowKV may rewrite aged messages, so only its stable system prefix is
+    // safe for scoped disk reuse. Whole-prompt PFlash requires Full scope.
+    int system_end = 0;
+    if (prepared.compressed && req.disk_cache_policy.compress) {
+        const auto boundaries = find_all_boundaries(
+            effective_prompt, prefix_cache_.chat_markers());
+        system_end = boundaries.empty() ? 0 : boundaries[0];
+        if (system_end >= config_.disk_cache_min_tokens) {
+            cache.disk_policy.mode = DiskPrefixCacheMode::Fixed;
+            cache.disk_policy.fixed_tokens = system_end;
+            std::fprintf(stderr,
+                "[flowkv] disk-clamp: boundary clamped to system_end=%d\n",
+                system_end);
+        } else {
+            cache.disk_policy.mode = DiskPrefixCacheMode::Off;
+            std::fprintf(stderr,
+                "[flowkv] disk-clamp: system_end=%d < min=%d — disk off\n",
+                system_end, config_.disk_cache_min_tokens);
+        }
+    } else if (prepared.compressed &&
+               cache.disk_policy.mode != DiskPrefixCacheMode::Full) {
+        cache.disk_policy.mode = DiskPrefixCacheMode::Off;
+    }
+
+    std::vector<int> safe_boundaries;
+    if (cache.disk_policy.mode == DiskPrefixCacheMode::Auto) {
+        safe_boundaries = find_all_boundaries(
+            effective_prompt, prefix_cache_.chat_markers());
+    }
+
+    int selected_boundary = 0;
+    if (cache.disk_policy.mode == DiskPrefixCacheMode::Fixed) {
+        selected_boundary = disk_prefix_cache_fixed_boundary(
+            cache.disk_policy, (int) effective_prompt.size(),
+            config_.disk_cache_min_tokens);
+    } else if (cache.disk_policy.mode == DiskPrefixCacheMode::Auto) {
+        selected_boundary = disk_prefix_cache_auto_boundary(
+            effective_prompt, recent_disk_prompts_,
+            cache.disk_policy.auto_window, safe_boundaries,
+            config_.disk_cache_min_tokens);
+        std::fprintf(stderr,
+            "[disk-cache] auto scope: window=%d recent=%zu safe=%zu selected=%d\n",
+            cache.disk_policy.auto_window,
+            std::min(recent_disk_prompts_.size(),
+                     (size_t) cache.disk_policy.auto_window),
+            safe_boundaries.size(), selected_boundary);
+    }
+
+    std::vector<int> lookup_lengths;
+    if (cache.disk_policy.mode == DiskPrefixCacheMode::Full &&
+        !effective_prompt.empty()) {
+        lookup_lengths.push_back((int) effective_prompt.size());
+        if ((int) effective_prompt.size() >
+            config_.disk_cache_cold_max_tokens) {
+            const auto boundaries = find_all_boundaries(
+                effective_prompt, prefix_cache_.chat_markers());
+            int cold_boundary = 0;
+            for (int boundary : boundaries) {
+                if (boundary <= config_.disk_cache_cold_max_tokens &&
+                    boundary >= config_.disk_cache_min_tokens) {
+                    cold_boundary = boundary;
+                }
+            }
+            if (cold_boundary > 0 &&
+                cold_boundary != (int) effective_prompt.size()) {
+                lookup_lengths.push_back(cold_boundary);
+            }
+        }
+    } else if (selected_boundary > 0) {
+        lookup_lengths.push_back(selected_boundary);
+    } else if (cache.disk_policy.mode == DiskPrefixCacheMode::Auto) {
+        for (auto it = safe_boundaries.rbegin();
+             it != safe_boundaries.rend(); ++it) {
+            if (*it >= config_.disk_cache_min_tokens &&
+                *it <= (int) effective_prompt.size()) {
+                lookup_lengths.push_back(*it);
+            }
+        }
+    }
+
+    if (!cache.using_restore && !disk_cache_.disabled()) {
+        for (int lookup_length : lookup_lengths) {
+            std::vector<int32_t> prefix_tokens(
+                effective_prompt.begin(),
+                effective_prompt.begin() + lookup_length);
+            if (!disk_cache_.lookup(prefix_tokens, kDiskStagingSlot)) continue;
+
+            cache.cache_slot = kDiskStagingSlot;
+            cache.prefix_len = backend_.snapshot_cur_pos(kDiskStagingSlot);
+            if (cache.prefix_len <= 0 ||
+                cache.prefix_len > (int) effective_prompt.size()) {
+                std::fprintf(stderr,
+                    "[disk-cache] ignoring invalid hit pos=%d prompt=%zu\n",
+                    cache.prefix_len, effective_prompt.size());
+                backend_.snapshot_free(kDiskStagingSlot);
+                continue;
+            }
+            cache.using_restore = true;
+            cache.disk_hit = true;
+            std::fprintf(stderr,
+                "[disk-cache] hit policy=%s len=%d slot=%d pos=%d\n",
+                disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
+                lookup_length, kDiskStagingSlot, cache.prefix_len);
+            break;
+        }
+    }
+
+    // Scoped entries must prefill exactly to their hashed boundary before
+    // the staging snapshot can be used for the remaining prompt.
+    if (!cache.using_restore && !disk_cache_.disabled() &&
+        selected_boundary > 0) {
+        std::fprintf(stderr,
+            "[disk-cache] scoped prefix: policy=%s boundary=%d\n",
+            disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
+            selected_boundary);
+        GenerateRequest scoped_request;
+        scoped_request.prompt = std::vector<int32_t>(
+            effective_prompt.begin(),
+            effective_prompt.begin() + selected_boundary);
+        scoped_request.n_gen = 0;
+        scoped_request.snap_slot = kDiskStagingSlot;
+        scoped_request.snap_pos = selected_boundary;
+        DaemonIO scoped_io;
+        scoped_io.stream_fd = -1;
+        const auto scoped_result =
+            backend_.generate(scoped_request, scoped_io);
+        if (scoped_result.ok() &&
+            backend_.snapshot_used(kDiskStagingSlot)) {
+            disk_cache_.learn_layout(kDiskStagingSlot);
+            const bool saved =
+                disk_cache_.save(kDiskStagingSlot, scoped_request.prompt);
+            cache.cache_slot = kDiskStagingSlot;
+            cache.prefix_len = selected_boundary;
+            cache.using_restore = true;
+            cache.disk_hit = true;
+            std::fprintf(stderr,
+                "[disk-cache] scoped prefix %s, restoring from %d\n",
+                saved ? "saved" : "staged", selected_boundary);
+        } else {
+            backend_.snapshot_free(kDiskStagingSlot);
+        }
+    }
+
+    // Edited or summarized histories can be shorter than the stored KV.
+    // Such snapshots cannot be diff-prefilled safely.
+    if (cache.using_restore) {
+        const int snapshot_length =
+            backend_.snapshot_cur_pos(cache.cache_slot);
+        if (snapshot_length <= 0 ||
+            snapshot_length > (int) effective_prompt.size()) {
+            std::fprintf(stderr,
+                "[pc] slot=%d invalid snapshot pos=%d prompt=%zu — treating as miss\n",
+                cache.cache_slot, snapshot_length, effective_prompt.size());
+            if (cache.disk_hit) {
+                backend_.snapshot_free(kDiskStagingSlot);
+            } else {
+                // A memory-cache key whose backend snapshot disappeared
+                // must not remain discoverable on every later request.
+                // Inline and full caches use disjoint slot ranges, so
+                // invalidating both ownership tables is unambiguous.
+                backend_.snapshot_free(cache.cache_slot);
+                prefix_cache_.abort_inline_snap(cache.cache_slot);
+                prefix_cache_.abort_full_snap(cache.cache_slot);
+            }
+            cache.cache_slot = -1;
+            cache.prefix_len = 0;
+            cache.using_restore = false;
+            cache.disk_hit = false;
+        } else {
+            // PrefixCache keys use safe chat boundaries. Qwen may save at an
+            // earlier chunk-aligned position to keep prefill numerically
+            // identical, so backend state is the authoritative amount of
+            // work actually reused.
+            cache.prefix_len = snapshot_length;
+        }
+    }
+
+    if (!cache.using_restore && !disk_cache_.disabled() &&
+        cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
+        const auto boundaries = find_all_boundaries(
+            effective_prompt, prefix_cache_.chat_markers());
+        const int cold_boundary =
+            disk_cache_.cold_prefix_boundary(effective_prompt, boundaries);
+        if (cold_boundary > 0) {
+            std::fprintf(stderr,
+                "[disk-cache] cold prefix: prefilling to boundary=%d\n",
+                cold_boundary);
+            GenerateRequest cold_request;
+            cold_request.prompt = std::vector<int32_t>(
+                effective_prompt.begin(),
+                effective_prompt.begin() + cold_boundary);
+            cold_request.n_gen = 0;
+            cold_request.snap_slot = kDiskStagingSlot;
+            cold_request.snap_pos = cold_boundary;
+            DaemonIO cold_io;
+            cold_io.stream_fd = -1;
+            const auto cold_result = backend_.generate(cold_request, cold_io);
+            if (cold_result.ok() &&
+                backend_.snapshot_used(kDiskStagingSlot)) {
+                disk_cache_.learn_layout(kDiskStagingSlot);
+                const std::vector<int32_t> prefix_tokens(
+                    effective_prompt.begin(),
+                    effective_prompt.begin() + cold_boundary);
+                disk_cache_.save(kDiskStagingSlot, prefix_tokens);
+                cache.cache_slot = kDiskStagingSlot;
+                cache.prefix_len = cold_boundary;
+                cache.using_restore = true;
+                cache.disk_hit = true;
+                std::fprintf(stderr,
+                    "[disk-cache] cold prefix saved, restoring from %d\n",
+                    cold_boundary);
+            } else {
+                backend_.snapshot_free(kDiskStagingSlot);
+            }
+        }
+    }
+
+    // A generation can save only one snapshot during prefill. Tool-heavy
+    // requests prefer the reusable system/tool boundary; otherwise an
+    // enabled exact full-prompt cache retains its existing priority.
+    const bool prefer_inline_snap = !req.tools.empty();
+    auto prepare_inline = [&]() {
+        const auto prepared_snapshot = prefix_cache_.prepare_inline_snap(
+            effective_prompt,
+            cache.using_restore ? cache.prefix_len : 0);
+        cache.snap_slot = prepared_snapshot.first;
+        cache.snap_cut = prepared_snapshot.second;
+    };
+    auto prepare_full = [&]() {
+        cache.full_snap_slot =
+            prefix_cache_.prepare_full_snap(req.prompt_tokens);
+        if (cache.full_snap_slot >= 0) {
+            cache.full_snap_pos = (int) effective_prompt.size();
+            generate_request.snap_slot = cache.full_snap_slot;
+            generate_request.snap_pos = cache.full_snap_pos;
+            cache.full_snap_prepared = true;
+        }
+    };
+
+    if (prefer_inline_snap || cache.using_restore) {
+        prepare_inline();
+    }
+    if (!cache.using_restore && cache.snap_slot < 0) {
+        prepare_full();
+    }
+
+    // Full cache may be disabled or already contain this exact key. Fall
+    // back to an inline snapshot when no target has been selected yet.
+    if (!cache.full_snap_prepared && cache.snap_slot < 0) {
+        prepare_inline();
+    }
+
+    // Never destroy the snapshot needed by this request's restore. With a
+    // one-slot cache there may be no independent destination for a deeper
+    // checkpoint; preserving the current hit is better than invalidating
+    // it before restore starts.
+    if (cache.using_restore && cache.snap_slot == cache.cache_slot) {
+        prefix_cache_.cancel_inline_snap(cache.snap_slot);
+        cache.snap_slot = -1;
+        cache.snap_cut = 0;
+    }
+    cache.snap_prepared = cache.snap_slot >= 0;
+    if (cache.snap_prepared) {
+        backend_.snapshot_free(cache.snap_slot);
+        generate_request.snap_slot = cache.snap_slot;
+        generate_request.snap_pos = cache.snap_cut;
+    }
+    if (cache.full_snap_prepared) {
+        backend_.snapshot_free(cache.full_snap_slot);
+    }
+
+    std::fprintf(stderr,
+        "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
+        "effective_prompt=%zu pflash=%s disk_policy=%s disk_hit=%s "
+        "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d\n",
+        req.response_id.c_str(),
+        cache.using_restore ? "true" : "false",
+        cache.cache_slot, cache.prefix_len, effective_prompt.size(),
+        prepared.compressed ? "true" : "false",
+        disk_prefix_cache_policy_name(cache.disk_policy).c_str(),
+        cache.disk_hit ? "true" : "false",
+        cache.snap_slot, cache.snap_cut,
+        cache.full_snap_slot, cache.full_snap_pos);
+
+    status_.set_flags(
+        cache.using_restore, prepared.compressed,
+        !config_.draft_path.empty());
+    broadcast_status();
+    return cache;
+}
+
+void HttpServer::finalize_generation_cache(
+        const ParsedRequest & req, const PreparedPrompt & prepared,
+        const GenerationCacheState & cache, const GenerateResult & result,
+        int completion_tokens, bool visible_output_seen,
+        bool client_disconnected) {
+    const auto & effective_prompt = prepared.tokens;
+    const bool generation_produced_output = result.ok() &&
+        completion_tokens > 0 && visible_output_seen && !client_disconnected;
+
+    if (cache.full_snap_prepared) {
+        if (generation_produced_output &&
+            backend_.snapshot_used(cache.full_snap_slot)) {
+            const int saved_position =
+                backend_.snapshot_cur_pos(cache.full_snap_slot);
+            if (saved_position > 0 &&
+                saved_position <= cache.full_snap_pos) {
+                prefix_cache_.confirm_full_snap(
+                    cache.full_snap_slot, req.prompt_tokens, saved_position);
+            } else {
+                backend_.snapshot_free(cache.full_snap_slot);
+                prefix_cache_.abort_full_snap(cache.full_snap_slot);
+            }
+        } else {
+            backend_.snapshot_free(cache.full_snap_slot);
+            prefix_cache_.abort_full_snap(cache.full_snap_slot);
+        }
+    }
+
+    if (cache.snap_prepared) {
+        if (generation_produced_output &&
+            backend_.snapshot_used(cache.snap_slot)) {
+            const int saved_position =
+                backend_.snapshot_cur_pos(cache.snap_slot);
+            if (saved_position > 0 && saved_position <= cache.snap_cut) {
+                std::fprintf(stderr,
+                    "[pc] inline snapshot requested=%d saved=%d slot=%d\n",
+                    cache.snap_cut, saved_position, cache.snap_slot);
+                prefix_cache_.confirm_inline_snap(
+                    cache.snap_slot, cache.snap_cut, effective_prompt);
+                // Track for shutdown save. The key may be stricter than a
+                // Qwen chunk-aligned snapshot, which is safe: matching the
+                // longer token prefix necessarily matches saved KV rows.
+                slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
+                    effective_prompt.begin(),
+                    effective_prompt.begin() + cache.snap_cut);
+                if (!disk_cache_.disabled()) {
+                    disk_cache_.learn_layout(cache.snap_slot);
+                    if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
+                        disk_cache_.save(cache.snap_slot, effective_prompt);
+                    }
+                }
+            } else {
+                backend_.snapshot_free(cache.snap_slot);
+                prefix_cache_.abort_inline_snap(cache.snap_slot);
+            }
+        } else {
+            backend_.snapshot_free(cache.snap_slot);
+            prefix_cache_.abort_inline_snap(cache.snap_slot);
+        }
+    }
+
+    if (cache.disk_hit) backend_.snapshot_free(kDiskStagingSlot);
+
+    // Long conversations get a continued checkpoint after crossing the
+    // configured interval so a future turn can restore prompt plus output.
+    if (!disk_cache_.disabled() &&
+        cache.disk_policy.mode == DiskPrefixCacheMode::Full && result.ok() &&
+        generation_produced_output) {
+        const int final_position =
+            (int) effective_prompt.size() + (int) result.tokens.size();
+        if (final_position >= disk_cache_.continued_interval()) {
+            std::vector<int32_t> all_tokens(effective_prompt);
+            all_tokens.insert(
+                all_tokens.end(), result.tokens.begin(), result.tokens.end());
+            if (backend_.snapshot_save(kDiskStagingSlot)) {
+                disk_cache_.learn_layout(kDiskStagingSlot);
+                disk_cache_.maybe_store_continued(
+                    kDiskStagingSlot, all_tokens, final_position);
+                backend_.snapshot_free(kDiskStagingSlot);
+            }
+        }
+    }
+
+    if (disk_cache_.disabled()) return;
+
+    if (!prepared.compressed) {
+        recent_disk_prompts_.insert(
+            recent_disk_prompts_.begin(), effective_prompt);
+    } else if (req.disk_cache_policy.compress) {
+        // FlowKV history is rewritten; retain the verbatim prompt for future
+        // Auto-boundary comparisons.
+        recent_disk_prompts_.insert(
+            recent_disk_prompts_.begin(), req.prompt_tokens);
+    }
+    static constexpr size_t kMaxRecentDiskPrompts = 256;
+    if (recent_disk_prompts_.size() > kMaxRecentDiskPrompts) {
+        recent_disk_prompts_.resize(kMaxRecentDiskPrompts);
+    }
+}
+
+// Generation setup owns backing storage for every pointer placed in
+// GenerateRequest, keeping those pointers valid through the decode call.
+void HttpServer::prepare_generation_inputs(
+        const ParsedRequest & req, const PreparedPrompt & prepared,
+        GenerationInputs & inputs) {
+    const bool budget_active = req.thinking_opt_in;
+    const int thinking_ceiling = req.per_req_phase1_cap >= 0
+        ? req.per_req_phase1_cap
+        : config_.think_max_tokens;
+    const int reply_budget = req.per_req_reply_budget >= 0
+        ? req.per_req_reply_budget
+        : config_.hard_limit_reply_budget;
+    inputs.generation_cap = budget_active
+        ? (std::min)(thinking_ceiling + reply_budget, req.max_output)
+        : req.max_output;
+
+    inputs.request.prompt = prepared.tokens;
+    inputs.request.n_gen = inputs.generation_cap;
+    inputs.request.sampler = req.sampler;
+    inputs.request.do_sample = req.sampler.needs_logit_processing();
+    // Tokens are delivered through DaemonIO so all API formats share the
+    // same disconnect and streaming state machine.
+    inputs.request.stream = false;
+
+    // The budget hook injects the close sequence while KV state is live,
+    // leaving the remaining reserve for a visible answer.
+    if (budget_active && !config_.think_close_token_ids.empty() &&
+        config_.hard_limit_reply_budget > 0) {
+        inputs.request.budget_hook.close_token_ids =
+            config_.think_close_token_ids;
+        inputs.request.budget_hook.hard_limit_remaining = reply_budget;
+    }
+
+    if (!req.tools.empty() && !req.tool_choice.is_null()) {
+        ToolHintGenerator hint_generator(tokenizer_);
+        auto hint = hint_generator.build_hint(req.tools, req.tool_choice);
+        if (!hint.empty()) {
+            inputs.hint_tokens = std::move(hint.prefix_tokens);
+            inputs.request.hint_tokens = &inputs.hint_tokens;
+        }
+    }
+
+    if (req.tools.empty() || !env_flag_enabled("DFLASH_STALL_TOOL_PREFIX")) {
+        return;
+    }
+
+    inputs.stall_tool_prefix_tokens = tokenizer_.encode(
+        build_stall_tool_prefix(req.tools, req.tool_choice));
+    inputs.stall_action_suffix_tokens = tokenizer_.encode(":");
+
+    // The detector matches recent terminal tokens, not the full action
+    // prefix. Collect the final token for common colon spellings.
+    auto add_suffix_terminal = [&](const std::string & text) {
+        const auto ids = tokenizer_.encode(text);
+        if (ids.empty()) return;
+        const int32_t token = ids.back();
+        if (std::find(inputs.stall_action_suffix_tokens.begin(),
+                      inputs.stall_action_suffix_tokens.end(), token) ==
+            inputs.stall_action_suffix_tokens.end()) {
+            inputs.stall_action_suffix_tokens.push_back(token);
+        }
+    };
+    add_suffix_terminal("`:");
+    add_suffix_terminal("):");
+    add_suffix_terminal("\":");
+
+    inputs.stall_skip_tokens = tokenizer_.encode(" done");
+    inputs.request.stall_tool_prefix_tokens =
+        &inputs.stall_tool_prefix_tokens;
+    inputs.request.stall_action_suffix_tokens =
+        &inputs.stall_action_suffix_tokens;
+    inputs.request.stall_skip_tokens = &inputs.stall_skip_tokens;
+}
+
+void HttpServer::configure_generation_io(
+        SocketHandle fd, const ParsedRequest & req, SseEmitter & emitter,
+        GenerationOutputState & output, DaemonIO & io) {
+    io.stream_fd = -1;
+    io.observer = [this](const char *, const std::vector<int32_t> & tokens) {
+        std::vector<std::string> token_strings;
+        token_strings.reserve(tokens.size());
+        for (int32_t token : tokens) {
+            token_strings.push_back(tokenizer_.token_text(token));
+        }
+        status_.set_draft_tokens(token_strings);
+        broadcast_status();
+    };
+
+    io.on_token = [this, fd, &req, &emitter, &output](
+            int32_t token) -> bool {
+        if (output.client_disconnected) return false;
+        ++output.completion_tokens;
+
+        if (output.completion_tokens % 10 == 0) {
+            status_.update_completion_tokens(output.completion_tokens);
+            broadcast_status();
+        }
+
+        std::string text;
+        const TokenDelivery delivery =
+            classify_generated_token(tokenizer_, token, text);
+        if (delivery == TokenDelivery::kSkip) return true;
+
+        if (!text.empty()) {
+            output.visible_output_seen = true;
+            broadcast_token(text);
+        }
+        if (!req.stream || text.empty()) return true;
+
+        for (const auto & chunk : emitter.emit_token(text)) {
+            if (!send_all(fd, chunk.data(), chunk.size())) {
+                output.client_disconnected = true;
+                return false;
+            }
+        }
+        // Only ordinary text is checked against stop sequences — think-tag
+        // markers never terminate generation.
+        return delivery == TokenDelivery::kThinkTag || !emitter.stop_hit();
+    };
+}
 
 void HttpServer::worker_loop() {
     while (true) {
         ServerJob * job = dequeue();
         if (!job) break;  // stopping
 
-        int fd = job->fd;
-        const auto & req = job->req;
-        auto started_at = std::chrono::steady_clock::now();
-
-        // Track live status for /status page. RAII guard ensures idle on all paths.
-        std::string prompt_excerpt;
-        if (!req.prompt_tokens.empty()) {
-            // Decode first ~40 tokens as a prompt excerpt (cheap, bounded).
-            const int excerpt_len = (std::min)((int)req.prompt_tokens.size(), 40);
-            std::vector<int32_t> excerpt_toks(req.prompt_tokens.begin(),
-                                               req.prompt_tokens.begin() + excerpt_len);
-            prompt_excerpt = tokenizer_.decode(excerpt_toks);
-            if (prompt_excerpt.size() > 200) prompt_excerpt.resize(200);
-        }
-        {
-            ServerStatus::RequestInfo info;
-            info.model = req.model;
-            info.format = api_format_name(req.format);
-            info.session_id = req.session_id;
-            info.max_output = req.max_output;
-            info.temperature = req.sampler.temp;
-            info.top_p = req.sampler.top_p;
-            info.top_k = req.sampler.top_k;
-            info.thinking_enabled = req.thinking_enabled;
-            status_.set_running(prompt_excerpt, (int)req.prompt_tokens.size(), req.stream, info);
-        }
-        // Store messages JSON for request inspection (truncate to avoid huge payloads).
-        if (!req.messages.is_null()) {
-            std::string msg_str = req.messages.dump();
-            if (msg_str.size() > 4096) msg_str.resize(4096);
-            status_.set_messages(msg_str);
-        }
-        broadcast_status();
-        StatusGuard status_guard{status_};
-
-        auto finish_job = [&]() {
-            std::lock_guard<std::mutex> lk(job->mu);
-            job->done = true;
-            job->cv.notify_one();
-        };
-        auto fail_request = [&](int status, const std::string & message) {
-            std::fprintf(stderr, "[server] request failed: %s\n", message.c_str());
-            if (req.stream) {
-                json err = {{"error", {{"message", message}, {"type", "server_error"}}}};
-                const std::string chunk = "data: " + err.dump() + "\n\n";
-                send_all(fd, chunk.data(), chunk.size());
-                const char done[] = "data: [DONE]\n\n";
-                send_all(fd, done, sizeof(done) - 1);
-            } else {
-                send_error(fd, status, message);
-            }
-            finish_job();
-        };
-
-        std::fprintf(stderr,
-            "[server] chat START %s format=%s stream=%s prompt_tokens=%zu "
-            "max_tokens=%d tools=%zu\n",
-            req.response_id.c_str(),
-            api_format_name(req.format),
-            req.stream ? "true" : "false",
-            req.prompt_tokens.size(),
-            req.max_output,
-            json_array_size(req.tools));
-
-        // Send SSE headers (skip when proxying — curl_forward handles its own headers).
-        if (req.stream && config_.pflash_upstream_base.empty()) {
-            if (!send_sse_headers(fd)) {
-                finish_job();
-                continue;
-            }
-        }
-
-        // Create SSE emitter for streaming state machine.
-        SseEmitter emitter(req.format, req.response_id, req.model,
-                           (int)req.prompt_tokens.size(), req.tools,
-                           &tool_memory_,
-                           req.stop_sequences,
-                           req.started_in_thinking);
-
-        // Emit initial SSE events (skip when proxying).
-        if (req.stream && config_.pflash_upstream_base.empty()) {
-            bool start_ok = true;
-            for (const auto & chunk : emitter.emit_start()) {
-                if (!send_all(fd, chunk.data(), chunk.size())) {
-                    start_ok = false;
-                    break;
-                }
-            }
-            if (!start_ok) {
-                finish_job();
-                continue;
-            }
-        }
-
-        // ── PFlash / FlowKV unified gate: FlowKV > WS1 skip > whole-prompt pFlash ──
-        std::vector<int32_t> effective_prompt = req.prompt_tokens;
-        bool pflash_compressed = false;
-        // Compressed token count served from pFlash full-cache (-1 = not a full-cache hit).
-        int pflash_full_cache_served_tokens = -1;
-        int full_cache_hit_slot = -1;
-        int full_cache_hit_len = 0;
-
-        if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
-            drafter_tokenizer_ != nullptr)
-        {
-            const int n_prompt = (int)req.prompt_tokens.size();
-            bool should_compress = false;
-            if (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS) {
-                should_compress = true;
-            } else if (config_.pflash_mode == ServerConfig::PflashMode::AUTO) {
-                should_compress = (n_prompt >= config_.pflash_threshold);
-            }
-
-            // Detect whether this is a multi-turn continuation.
-            bool is_continuation = false;
-            if (should_compress && req.messages.is_array()) {
-                for (const auto & _m : req.messages) {
-                    if (!_m.is_object()) continue;
-                    const std::string _role = _m.value("role", "");
-                    if (_role == "assistant") { is_continuation = true; break; }
-                    if (_m.contains("tool_calls")) {
-                        const auto & _tc = _m["tool_calls"];
-                        if (_tc.is_array() && !_tc.empty()) { is_continuation = true; break; }
-                    }
-                    if (_m.contains("content") && _m["content"].is_array()) {
-                        for (const auto & _b : _m["content"]) {
-                            if (_b.is_object() &&
-                                (_b.value("type", "") == "tool_result" ||
-                                 _b.value("type", "") == "tool_use")) {
-                                is_continuation = true; break;
-                            }
-                        }
-                    }
-                    const std::string _itype = _m.value("type", "");
-                    if (_itype == "function_call" || _itype == "function_call_output") {
-                        is_continuation = true; break;
-                    }
-                    if (is_continuation) break;
-                }
-            }
-
-            // FlowKV: compress aged msgs[1..n-hot_window) once per session; system + hot tail verbatim.
-            if (should_compress && is_continuation && req.disk_cache_policy.compress &&
-                req.messages.is_array())
-            {
-                int hot_window = 2;
-                {
-                    const char * hwe = std::getenv("PFLASH_FREEZE_HOT_WINDOW");
-                    if (hwe && *hwe) {
-                        int v = std::atoi(hwe);
-                        if (v > 0) hot_window = v;
-                    }
-                }
-                const int n_msgs = (int)req.messages.size();
-                if (n_msgs >= 2 + hot_window) {
-                    const int aged_begin = 1;
-                    const int aged_end   = n_msgs - hot_window;  // exclusive
-
-                    // Inert-guard: skip if aged band < 512 drafter tokens.
-                    int aged_token_estimate = 0;
-                    for (int mi = aged_begin; mi < aged_end; ++mi) {
-                        const auto & msg = req.messages[mi];
-                        if (!msg.is_object()) continue;
-                        std::string mc;
-                        if (msg.contains("content")) {
-                            const auto & c = msg["content"];
-                            if (c.is_string()) mc = c.get<std::string>();
-                            else if (c.is_array()) {
-                                for (const auto & part : c) {
-                                    if (!part.is_object()) continue;
-                                    const std::string pt = part.value("type", "");
-                                    if (pt == "text" || pt == "input_text" ||
-                                        pt == "output_text")
-                                        mc += part.value("text", "");
-                                }
-                            }
-                        }
-                        if (!mc.empty())
-                            aged_token_estimate += (int)drafter_tokenizer_->encode(mc).size();
-                    }
-                    static constexpr int kFkvInertMinTokens = 512;
-                    if (aged_token_estimate < kFkvInertMinTokens) {
-                        std::fprintf(stderr,
-                            "[flowkv] inert-guard: aged band %d toks < %d — skip\n",
-                            aged_token_estimate, kFkvInertMinTokens);
-                        should_compress = false;
-                    } else {
-                        json modified_messages = req.messages;
-                        bool any_compressed = false;
-                        int n_cache_hits = 0;
-
-                        for (int mi = aged_begin; mi < aged_end; ++mi) {
-                            auto & msg = modified_messages[mi];
-                            if (!msg.is_object()) continue;
-
-                            std::string msg_content;
-                            if (msg.contains("content")) {
-                                const auto & c = msg["content"];
-                                if (c.is_string()) {
-                                    msg_content = c.get<std::string>();
-                                } else if (c.is_array()) {
-                                    for (const auto & part : c) {
-                                        if (!part.is_object()) continue;
-                                        const std::string ptype = part.value("type", "");
-                                        if (ptype == "text" || ptype == "input_text" ||
-                                            ptype == "output_text")
-                                            msg_content += part.value("text", "");
-                                    }
-                                }
-                            }
-                            if (msg_content.empty()) continue;
-
-                            auto msg_drafter_ids = drafter_tokenizer_->encode(msg_content);
-                            if ((int)msg_drafter_ids.size() < config_.pflash_threshold) continue;
-
-                            const PrefixHash msg_key = frozen_block_key(
-                                msg_drafter_ids.data(), 0, (int)msg_drafter_ids.size());
-
-                            std::string compressed_text;
-                            auto cache_it = frozen_content_cache_.find(msg_key);
-                            if (cache_it != frozen_content_cache_.end()) {
-                                compressed_text = cache_it->second;
-                                ++n_cache_hits;
-                                std::fprintf(stderr,
-                                    "[flowkv] msg[%d] cache hit (%zu drafter toks)\n",
-                                    mi, msg_drafter_ids.size());
-                            } else {
-                                ModelBackend::CompressRequest creq;
-                                creq.input_ids    = std::move(msg_drafter_ids);
-                                creq.keep_ratio   = pflash_keep_ratio(config_, (int)creq.input_ids.size());
-                                creq.drafter_path = config_.pflash_drafter_path;
-                                creq.drafter_gpu  = config_.pflash_drafter_gpu;
-                                creq.skip_park    = config_.pflash_skip_park;
-                                creq.residency_action = resolve_draft_residency_action(
-                                    config_.draft_residency,
-                                    DraftResidencyContext{
-                                        DraftResidencyUse::PFlashCompress,
-                                        config_.lazy_draft,
-                                        !config_.draft_path.empty(),
-                                    });
-
-                                auto cresult = backend_.compress(creq);
-                                if (!cresult.ok || cresult.compressed_ids.empty()) {
-                                    std::fprintf(stderr,
-                                        "[flowkv] msg[%d] compress failed — kept verbatim\n", mi);
-                                    continue;
-                                }
-                                compressed_text = drafter_tokenizer_->decode(cresult.compressed_ids);
-                                std::fprintf(stderr,
-                                    "[flowkv] msg[%d] %zu → %zu drafter toks (keep=%.2f)\n",
-                                    mi, creq.input_ids.size(),
-                                    cresult.compressed_ids.size(), creq.keep_ratio);
-
-                                if (frozen_content_cache_.size() >= kFrozenCacheMax) {
-                                    std::fprintf(stderr,
-                                        "[flowkv] cache full (%zu entries) — clearing\n",
-                                        frozen_content_cache_.size());
-                                    frozen_content_cache_.clear();
-                                }
-                                frozen_content_cache_.emplace(msg_key, compressed_text);
-                            }
-
-                            msg["content"] = compressed_text;
-                            any_compressed = true;
-                        }
-
-                        if (any_compressed) {
-                            const bool   fkv_enable_thinking = req.thinking_enabled;
-                            std::string  fkv_tools_json;
-                            if (req.tools.is_array() && !req.tools.empty()) {
-                                fkv_tools_json = req.tools.dump();
-                            }
-                            std::vector<ChatMessage> fkv_chat_msgs =
-                                normalize_chat_messages(modified_messages, req.format,
-                                                        tool_memory_);
-                            std::string fkv_rendered;
-                            bool fkv_render_ok = true;
-                            if (!config_.chat_template_src.empty()) {
-                                const std::string & bos_str = (tokenizer_.bos_id() >= 0)
-                                    ? tokenizer_.raw_token(tokenizer_.bos_id())
-                                    : std::string();
-                                const std::string & eos_str = (tokenizer_.eos_id() >= 0)
-                                    ? tokenizer_.raw_token(tokenizer_.eos_id())
-                                    : std::string();
-                                try {
-                                    fkv_rendered = render_chat_template_jinja(
-                                        config_.chat_template_src,
-                                        fkv_chat_msgs,
-                                        bos_str, eos_str,
-                                        /*add_generation_prompt=*/true,
-                                        fkv_enable_thinking,
-                                        fkv_tools_json);
-                                } catch (const std::exception & e) {
-                                    std::fprintf(stderr,
-                                        "[flowkv] jinja re-render failed (%s) — skipping\n",
-                                        e.what());
-                                    fkv_render_ok = false;
-                                }
-                            } else {
-                                fkv_rendered = render_chat_template(
-                                    fkv_chat_msgs, chat_format_,
-                                    true, fkv_enable_thinking, fkv_tools_json);
-                            }
-                            if (fkv_render_ok) {
-                                const int n_before = (int)effective_prompt.size();
-                                effective_prompt  = tokenizer_.encode(fkv_rendered);
-                                pflash_compressed = true;
-                                std::fprintf(stderr,
-                                    "[flowkv] %d → %d target toks "
-                                    "(%d aged msgs, %d cache hits, hot_window=%d)\n",
-                                    n_before, (int)effective_prompt.size(),
-                                    aged_end - aged_begin, n_cache_hits, hot_window);
-                            }
-                            should_compress = false;
-                        } else {
-                            should_compress = false;
-                            std::fprintf(stderr,
-                                "[flowkv] no aged msgs above threshold — skip\n");
-                        }
-                    }
-                } else {
-                    should_compress = false;
-                    std::fprintf(stderr,
-                        "[flowkv] too few turns (n_msgs=%d hot_window=%d) — skip\n",
-                        n_msgs, hot_window);
-                }
-            } else if (should_compress && is_continuation) {
-                // Continuation without FlowKV: skip compression to preserve prefix KV cache (~22x).
-                should_compress = false;
-                std::fprintf(stderr,
-                    "[pflash] skip-compress (continuation: prior assistant/tool history)\n");
-            }
-
-            // WS1: turn-1 verbatim anchor — compressing would cold-poison turn-2 cache key.
-            if (should_compress && !is_continuation && req.disk_cache_policy.compress) {
-                should_compress = false;
-                std::fprintf(stderr,
-                    "[flowkv] turn-1 verbatim (system kept as cache anchor)\n");
-            }
-
-            if (should_compress) {
-                // Check full-compress cache FIRST — if we've seen this exact
-                // raw prompt before, skip the expensive compress cycle entirely.
-                auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
-                if (full_slot >= 0) {
-                    std::fprintf(stderr, "[pflash] full-cache hit slot=%d — skipping compress\n", full_slot);
-                    pflash_compressed = true;
-                    full_cache_hit_slot = full_slot;
-                    full_cache_hit_len = full_len;
-                    // Restore-only path: the prompt bytes are irrelevant as
-                    // long as restore_and_generate sees prompt_len == snap_pos
-                    // and therefore does not prefill a suffix.
-                    effective_prompt.assign((size_t)full_len, 0);
-                    // Record the compressed size for the post-compress budget gate.
-                    pflash_full_cache_served_tokens = full_len;
-                } else {
-                    std::string compression_error;
-                    // 1. Decode prompt to text using target tokenizer
-                    std::string prompt_text = tokenizer_.decode(req.prompt_tokens);
-
-                    // 2. Re-encode with drafter tokenizer
-                    auto drafter_ids = drafter_tokenizer_->encode(prompt_text);
-
-                    if (drafter_ids.empty()) {
-                        compression_error = "PFlash drafter tokenizer produced an empty prompt";
-                    } else {
-                        // 3. Compress via typed API
-                        ModelBackend::CompressRequest creq;
-                        creq.input_ids = std::move(drafter_ids);
-                        // Bandit overrides curve when session_id is present.
-                        creq.keep_ratio = req.session_id.empty()
-                            ? pflash_keep_ratio(config_, n_prompt)
-                            : sessions_.get_keep_ratio(req.session_id);
-                        creq.drafter_path = config_.pflash_drafter_path;
-                        creq.drafter_gpu = config_.pflash_drafter_gpu;
-                        creq.skip_park = config_.pflash_skip_park;
-                        const auto pflash_residency =
-                            resolve_draft_residency_action(
-                                config_.draft_residency,
-                                DraftResidencyContext{
-                                    DraftResidencyUse::PFlashCompress,
-                                    config_.lazy_draft,
-                                    !config_.draft_path.empty(),
-                                });
-                        creq.residency_action = pflash_residency;
-
-                        ModelBackend::CompressResult cresult;
-                        if (config_.pflash_remote_drafter) {
-                            if (!pflash_remote_.active() &&
-                                !pflash_remote_.start(config_.pflash_remote.ipc_bin,
-                                                       config_.pflash_drafter_path,
-                                                       config_.pflash_drafter_gpu,
-                                                       config_.pflash_remote.work_dir)) {
-                                compression_error = "remote PFlash drafter start failed";
-                            } else {
-                                cresult.ok = pflash_remote_.compress(
-                                    creq.input_ids, creq.keep_ratio,
-                                    cresult.compressed_ids);
-                                if (pflash_residency == DraftResidencyAction::ReleaseAfterUse) {
-                                    pflash_remote_.close();
-                                }
-                            }
-                        } else {
-                            cresult = backend_.compress(creq);
-                        }
-
-                        // 4. Decode compressed IDs with drafter tokenizer
-                        if (cresult.ok && !cresult.compressed_ids.empty()) {
-                            std::string compressed_text =
-                                drafter_tokenizer_->decode(cresult.compressed_ids);
-
-                            // 5. Query survival check: verify the last user
-                            //    message survived compression. If < 80% of its
-                            //    tokens are present, re-append the full query.
-                            std::string last_user_text;
-                            if (req.messages.is_array()) {
-                                for (int mi = (int)req.messages.size() - 1; mi >= 0; --mi) {
-                                    if (req.messages[mi].value("role", "") == "user") {
-                                        auto & c = req.messages[mi]["content"];
-                                        if (c.is_string()) {
-                                            last_user_text = c.get<std::string>();
-                                        } else if (c.is_array()) {
-                                            for (const auto & part : c) {
-                                                std::string ptype = part.value("type", "");
-                                                if (ptype == "text" || ptype == "input_text" ||
-                                                    ptype == "output_text") {
-                                                    last_user_text += part.value("text", "");
-                                                }
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            if (!last_user_text.empty() && drafter_tokenizer_) {
-                                auto query_ids = drafter_tokenizer_->encode(last_user_text);
-                                int query_kept = 0;
-                                if (!query_ids.empty()) {
-                                    int qi = (int)query_ids.size() - 1;
-                                    for (int ki = (int)cresult.compressed_ids.size() - 1; ki >= 0 && qi >= 0; --ki) {
-                                        if (cresult.compressed_ids[ki] == query_ids[qi]) {
-                                            ++query_kept;
-                                            --qi;
-                                        }
-                                    }
-                                }
-                                float survival = (float)query_kept / (std::max)(1, (int)query_ids.size());
-                                std::fprintf(stderr, "[pflash] query survival: %d/%d (%.0f%%)\n",
-                                             query_kept, (int)query_ids.size(), survival * 100.0f);
-                                if (survival < 0.80f && (int)query_ids.size() < 1000) {
-                                    compressed_text += "\n" + last_user_text;
-                                    std::fprintf(stderr, "[pflash] query below 80%% — re-appended full query (%d tokens)\n",
-                                                 (int)query_ids.size());
-                                } else if (survival < 0.80f) {
-                                    std::fprintf(stderr, "[pflash] query below 80%% but too large to re-append (%d tokens)\n",
-                                                 (int)query_ids.size());
-                                }
-                            }
-
-                            // 6. Re-tokenize with target tokenizer
-                            effective_prompt = tokenizer_.encode(compressed_text);
-                            pflash_compressed = true;
-
-                            std::fprintf(stderr,
-                                "[pflash] %d -> %d -> %d tokens (%.1f%% kept)\n",
-                                n_prompt, (int)cresult.compressed_ids.size(),
-                                (int)effective_prompt.size(),
-                                100.0 * effective_prompt.size() / n_prompt);
-                        } else if (compression_error.empty()) {
-                            compression_error = config_.pflash_remote_drafter
-                                ? "remote PFlash drafter compression failed"
-                                : "PFlash compression failed";
-                        }
-                    }
-                    if (!pflash_compressed && !compression_error.empty()) {
-                        fail_request(500, compression_error);
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // Post-compress gate: reject if still oversized after FlowKV/pFlash.
-        // On a pFlash full-cache hit, use the cached compressed size (not the raw
-        // effective_prompt) — the KV was built from the compressed form.
-        if (effective_prompt_overflows((int)effective_prompt.size(),
-                                       pflash_full_cache_served_tokens,
-                                       req.max_output, config_.max_ctx)) {
-            const int prompt_len = pflash_full_cache_served_tokens >= 0
-                ? pflash_full_cache_served_tokens
-                : (int)effective_prompt.size();
-            fail_request(400, context_overflow_message(config_.max_ctx, prompt_len,
-                                                       req.max_output));
-            continue;
-        }
-
-        // ── Upstream proxy: forward to remote server if configured ────
-#ifdef DFLASH_HAS_CURL
-        if (!config_.pflash_upstream_base.empty()) {
-            const std::string & upstream = config_.pflash_upstream_base;
-            const std::string & upstream_key = config_.pflash_upstream_key;
-            const std::string & upstream_model = config_.pflash_upstream_model.empty()
-                ? req.model : config_.pflash_upstream_model;
-
-            if (pflash_compressed) {
-                std::string compressed_text = tokenizer_.decode(effective_prompt);
-                compressed_text += "\n<|im_start|>assistant\n";
-
-                json comp_body;
-                comp_body["model"] = upstream_model;
-                comp_body["prompt"] = compressed_text;
-                comp_body["stream"] = req.stream;
-                if (req.raw_body.contains("max_tokens"))
-                    comp_body["max_tokens"] = req.raw_body["max_tokens"];
-                else
-                    comp_body["max_tokens"] = req.max_output;
-                for (const char * key : {"temperature", "top_p", "top_k", "min_p",
-                                         "frequency_penalty", "presence_penalty",
-                                         "stop", "seed"}) {
-                    if (req.raw_body.contains(key)) comp_body[key] = req.raw_body[key];
-                }
-
-                std::fprintf(stderr,
-                    "[pflash-proxy] compressed forward → %s/completions  prompt=%zu tokens  model=%s\n",
-                    upstream.c_str(), effective_prompt.size(), upstream_model.c_str());
-
-                curl_forward(fd, upstream + "/completions",
-                             upstream_key, comp_body,
-                             req.stream, /*rewrite_to_chat=*/true,
-                             req.response_id, upstream_model);
-            } else {
-                json fwd_body = req.raw_body;
-                fwd_body["model"] = upstream_model;
-
-                std::fprintf(stderr,
-                    "[pflash-proxy] passthrough → %s/chat/completions  model=%s\n",
-                    upstream.c_str(), upstream_model.c_str());
-
-                curl_forward(fd, upstream + "/chat/completions",
-                             upstream_key, fwd_body,
-                             req.stream, /*rewrite_to_chat=*/false,
-                             req.response_id, upstream_model);
-            }
-            finish_job();
-            continue;
-        }
-#endif // DFLASH_HAS_CURL
-
-        // Build generate request.
-        //
-        // Thinking-budget v2 (Level 2): when caller opts in via
-        // `thinking:{type:enabled}`, cap n_gen at think_max + reply_budget
-        // so the BudgetHook fires at the boundary, mid-stream, with KV
-        // state intact. Applies uniformly to streaming and non-streaming
-        // requests — the BudgetHook lives inside do_ar_decode /
-        // do_spec_decode and injects close tokens at the budget edge
-        // regardless of how the server is delivering the result.
-        const bool budget_active = req.thinking_opt_in;
-        // Effective think cap: per-request value (already clamped to
-        // config_.think_max_tokens above) wins over the server-wide
-        // think_max_tokens. Then both must fit inside the combined
-        // max_output. Spec §4.4 + §5.3.
-        const int effective_think_ceiling = (req.per_req_phase1_cap >= 0)
-            ? req.per_req_phase1_cap
-            : config_.think_max_tokens;
-        // The effective per-request reply budget is the operator's choice
-        // (CLI / sidecar / per-request override). The AR loop force-closes
-        // when `n_gen - generated <= eff_reply`, which means n_gen must
-        // include BOTH the think budget AND the reply reserve. Without the
-        // `+ eff_reply` term, force-close fires immediately when
-        // `eff_reply == effective_think_ceiling` (e.g. think_max=4096,
-        // hard_limit=4096 → remaining starts at 4096, condition fires
-        // before the model emits a single thinking token). Spec §4.4.
-        const int eff_reply_for_n_gen = (req.per_req_reply_budget >= 0)
-            ? req.per_req_reply_budget
-            : config_.hard_limit_reply_budget;
-        const int n_gen_cap = budget_active
-            ? (std::min)(effective_think_ceiling + eff_reply_for_n_gen, req.max_output)
-            : req.max_output;
-
-        GenerateRequest gen_req;
-        gen_req.prompt = effective_prompt;
-        gen_req.n_gen = n_gen_cap;
-        gen_req.sampler = req.sampler;
-        gen_req.do_sample = req.sampler.needs_logit_processing();
-        gen_req.stream = false;  // we handle streaming via on_token callback
-
-        // Level 2 force-close: when thinking is opted in, the server is
-        // configured with a hard-limit reply budget, and we resolved the
-        // close-tag sequence at startup, wire the BudgetHook so the
-        // backend's AR decode injects `</think>` at the budget boundary.
-        // The model gets to write the visible answer in-stream rather than
-        // running unbounded.
-        //
-        // hard_limit_remaining is the per-request reply_budget when set
-        // (already clamped to config_.hard_limit_reply_budget above), else
-        // the server default. Spec §4.4 + §5.3.
-        if (budget_active && !config_.think_close_token_ids.empty() &&
-            config_.hard_limit_reply_budget > 0)
-        {
-            int eff_reply_budget = (req.per_req_reply_budget >= 0)
-                ? req.per_req_reply_budget
-                : config_.hard_limit_reply_budget;
-            gen_req.budget_hook.close_token_ids = config_.think_close_token_ids;
-            gen_req.budget_hook.hard_limit_remaining = eff_reply_budget;
-        }
-
-        // Tool call hint generation: pre-tokenize predictable structural tokens
-        // to accelerate spec decode when tool_choice constrains the output.
-        std::vector<int32_t> hint_tokens_storage;
-        if (!req.tools.empty() && !req.tool_choice.is_null()) {
-            ToolHintGenerator hint_gen(tokenizer_);
-            auto hint = hint_gen.build_hint(req.tools, req.tool_choice);
-            if (!hint.empty()) {
-                hint_tokens_storage = std::move(hint.prefix_tokens);
-                gen_req.hint_tokens = &hint_tokens_storage;
-            }
-        }
-        std::vector<int32_t> stall_tool_prefix_tokens_storage;
-        std::vector<int32_t> stall_action_suffix_tokens_storage;
-        std::vector<int32_t> stall_skip_tokens_storage;
-        if (!req.tools.empty() && env_flag_enabled("DFLASH_STALL_TOOL_PREFIX")) {
-            stall_tool_prefix_tokens_storage =
-                tokenizer_.encode(build_stall_tool_prefix(req.tools,
-                                                          req.tool_choice));
-            stall_action_suffix_tokens_storage = tokenizer_.encode(":");
-            // The stall detector only asks "did the model just end on an action
-            // suffix?" by matching individual recent tokens (tokens_have_recent_any),
-            // so we collect the trailing token of each colon variant rather than the
-            // full encoded sequence. The final ":" piece is what actually precedes the
-            // premature EOS regardless of how the preamble before it tokenizes, so a
-            // flat set of these terminal tokens is the right granularity here.
-            auto add_suffix_terminal = [&](const std::string & text) {
-                auto ids = tokenizer_.encode(text);
-                if (ids.empty()) return;
-                int32_t tok = ids.back();
-                if (std::find(stall_action_suffix_tokens_storage.begin(),
-                              stall_action_suffix_tokens_storage.end(), tok) ==
-                    stall_action_suffix_tokens_storage.end()) {
-                    stall_action_suffix_tokens_storage.push_back(tok);
-                }
-            };
-            add_suffix_terminal("`:");
-            add_suffix_terminal("):");
-            add_suffix_terminal("\":");
-            stall_skip_tokens_storage = tokenizer_.encode(" done");
-            gen_req.stall_tool_prefix_tokens = &stall_tool_prefix_tokens_storage;
-            gen_req.stall_action_suffix_tokens = &stall_action_suffix_tokens_storage;
-            gen_req.stall_skip_tokens = &stall_skip_tokens_storage;
-        }
-
-        // Full-prompt cache: exact raw-prompt hit skips most/all prefill.
-        int cache_slot = full_cache_hit_slot;
-        int prefix_len = full_cache_hit_len;
-        bool using_restore = (cache_slot >= 0);
-        if (!using_restore) {
-            auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
-            if (full_slot >= 0) {
-                cache_slot = full_slot;
-                prefix_len = full_len;
-                using_restore = true;
-                if (pflash_compressed) {
-                    effective_prompt.assign((size_t)full_len, 0);
-                    gen_req.prompt = effective_prompt;
-                }
-            }
-        }
-
-        // Inline prefix cache: check for cached turn-boundary KV state if no
-        // exact full-prompt cache was available.
-        if (!using_restore) {
-            auto [inline_slot, inline_len] = prefix_cache_.lookup(effective_prompt);
-            cache_slot = inline_slot;
-            prefix_len = inline_len;
-            using_restore = (cache_slot >= 0);
-        }
-
-        // Disk prefix cache: try disk if memory missed.
-        // Staging slot is the last ModelBackend slot, reserved for disk loads.
-        // PrefixCache inline uses 0..cap-1 and full uses cap..cap+full_cap-1,
-        // so slot 63 is safe as long as total cache slots < 63.
-        static constexpr int DISK_STAGING_SLOT = ModelBackend::kMaxSlots - 1;
-        bool disk_hit = false;
-        DiskPrefixCachePolicy disk_policy = req.disk_cache_policy;
-        // system_end: first chat-marker boundary; FlowKV clamps disk cache to verbatim system prefix.
-        int system_end = 0;
-        if (pflash_compressed && req.disk_cache_policy.compress) {
-            // FlowKV: cache only [0, system_end) — stable cross-session key, never compressed.
-            auto fkv_boundaries =
-                find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
-            system_end = fkv_boundaries.empty() ? 0 : fkv_boundaries[0];
-            if (system_end >= config_.disk_cache_min_tokens) {
-                disk_policy.mode = DiskPrefixCacheMode::Fixed;
-                disk_policy.fixed_tokens = system_end;
-                std::fprintf(stderr,
-                    "[flowkv] disk-clamp: boundary clamped to system_end=%d\n", system_end);
-            } else {
-                disk_policy.mode = DiskPrefixCacheMode::Off;
-                std::fprintf(stderr,
-                    "[flowkv] disk-clamp: system_end=%d < min=%d — disk off\n",
-                    system_end, config_.disk_cache_min_tokens);
-            }
-        } else if (pflash_compressed) {
-            // Standard PFlash (compress=false): effective_prompt is rewritten; only Full cache is safe.
-            if (disk_policy.mode != DiskPrefixCacheMode::Full) {
-                disk_policy.mode = DiskPrefixCacheMode::Off;
-            }
-        }
-        std::vector<int> safe_boundaries;
-        if (disk_policy.mode == DiskPrefixCacheMode::Auto) {
-            safe_boundaries =
-                find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
-        }
-        int selected_prefix_boundary = 0;
-        if (disk_policy.mode == DiskPrefixCacheMode::Fixed) {
-            selected_prefix_boundary =
-                disk_prefix_cache_fixed_boundary(
-                    disk_policy, (int)effective_prompt.size(),
-                    config_.disk_cache_min_tokens);
-        } else if (disk_policy.mode == DiskPrefixCacheMode::Auto) {
-            selected_prefix_boundary =
-                disk_prefix_cache_auto_boundary(
-                    effective_prompt, recent_disk_prompts_, disk_policy.auto_window,
-                    safe_boundaries, config_.disk_cache_min_tokens);
-            std::fprintf(stderr,
-                "[disk-cache] auto scope: window=%d recent=%zu safe=%zu selected=%d\n",
-                disk_policy.auto_window,
-                std::min(recent_disk_prompts_.size(), (size_t)disk_policy.auto_window),
-                safe_boundaries.size(), selected_prefix_boundary);
-        }
-        std::vector<int> disk_lookup_lengths;
-        if (disk_policy.mode == DiskPrefixCacheMode::Full &&
-            !effective_prompt.empty()) {
-            disk_lookup_lengths.push_back((int)effective_prompt.size());
-            if ((int)effective_prompt.size() > config_.disk_cache_cold_max_tokens) {
-                auto boundaries =
-                    find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
-                int cold_boundary = 0;
-                for (int b : boundaries) {
-                    if (b <= config_.disk_cache_cold_max_tokens &&
-                        b >= config_.disk_cache_min_tokens) {
-                        cold_boundary = b;
-                    }
-                }
-                if (cold_boundary > 0 &&
-                    cold_boundary != (int)effective_prompt.size()) {
-                    disk_lookup_lengths.push_back(cold_boundary);
-                }
-            }
-        } else if (selected_prefix_boundary > 0) {
-            disk_lookup_lengths.push_back(selected_prefix_boundary);
-        } else if (disk_policy.mode == DiskPrefixCacheMode::Auto) {
-            for (auto it = safe_boundaries.rbegin(); it != safe_boundaries.rend(); ++it) {
-                const int b = *it;
-                if (b >= config_.disk_cache_min_tokens &&
-                    b <= (int)effective_prompt.size()) {
-                    disk_lookup_lengths.push_back(b);
-                }
-            }
-        }
-        if (!using_restore && !disk_cache_.disabled()) {
-            for (int lookup_len : disk_lookup_lengths) {
-                std::vector<int32_t> prefix_tokens(
-                    effective_prompt.begin(), effective_prompt.begin() + lookup_len);
-                if (disk_cache_.lookup(prefix_tokens, DISK_STAGING_SLOT)) {
-                    cache_slot = DISK_STAGING_SLOT;
-                    prefix_len = backend_.snapshot_cur_pos(DISK_STAGING_SLOT);
-                    if (prefix_len <= 0 || prefix_len > (int)effective_prompt.size()) {
-                        std::fprintf(stderr,
-                            "[disk-cache] ignoring invalid hit pos=%d prompt=%zu\n",
-                            prefix_len, effective_prompt.size());
-                        backend_.snapshot_free(DISK_STAGING_SLOT);
-                        continue;
-                    }
-                    using_restore = true;
-                    disk_hit = true;
-                    std::fprintf(stderr,
-                        "[disk-cache] hit policy=%s len=%d slot=%d pos=%d\n",
-                        disk_prefix_cache_policy_name(disk_policy).c_str(), lookup_len,
-                        DISK_STAGING_SLOT, prefix_len);
-                    break;
-                }
-            }
-        }
-
-        // Scoped prefix save: auto/fixed modes prefill exactly to the
-        // selected token boundary and save that snapshot.
-        // This keeps the disk key and snapshot position aligned; unlike the
-        // legacy full-prompt key path, scoped entries must not point at a
-        // longer snapshot than their token hash covers.
-        if (!using_restore && !disk_cache_.disabled() &&
-            selected_prefix_boundary > 0) {
-            const int scoped_boundary = selected_prefix_boundary;
-            if (scoped_boundary > 0) {
-                std::fprintf(stderr,
-                    "[disk-cache] scoped prefix: policy=%s boundary=%d\n",
-                    disk_prefix_cache_policy_name(disk_policy).c_str(), scoped_boundary);
-                GenerateRequest scoped_req;
-                scoped_req.prompt = std::vector<int32_t>(
-                    effective_prompt.begin(), effective_prompt.begin() + scoped_boundary);
-                scoped_req.n_gen = 0;
-                scoped_req.snap_slot = DISK_STAGING_SLOT;
-                scoped_req.snap_pos = scoped_boundary;
-                DaemonIO scoped_io;
-                scoped_io.stream_fd = -1;
-                auto scoped_result = backend_.generate(scoped_req, scoped_io);
-                if (scoped_result.ok() && backend_.snapshot_used(DISK_STAGING_SLOT)) {
-                    disk_cache_.learn_layout(DISK_STAGING_SLOT);
-                    const bool saved =
-                        disk_cache_.save(DISK_STAGING_SLOT, scoped_req.prompt);
-                    cache_slot = DISK_STAGING_SLOT;
-                    prefix_len = scoped_boundary;
-                    using_restore = true;
-                    disk_hit = true;
-                    std::fprintf(stderr,
-                        "[disk-cache] scoped prefix %s, restoring from %d\n",
-                        saved ? "saved" : "staged", scoped_boundary);
-                } else {
-                    backend_.snapshot_free(DISK_STAGING_SLOT);
-                }
-            }
-        }
-
-        // A slot whose snapshot covers more KV than this prompt cannot be
-        // diff-prefilled (the client edited/summarized its history since the
-        // snapshot was saved). Treat as a cache miss; the backend-side
-        // fallback also guards this, but skipping restore here avoids a
-        // pointless snapshot copy-in.
-        if (using_restore) {
-            const int snap_len = backend_.snapshot_cur_pos(cache_slot);
-            if (snap_len > (int)effective_prompt.size()) {
-                std::fprintf(stderr,
-                    "[pc] slot=%d snapshot pos=%d > prompt=%zu — treating as miss\n",
-                    cache_slot, snap_len, effective_prompt.size());
-                cache_slot = -1;
-                prefix_len = 0;
-                using_restore = false;
-                disk_hit = false;
-            }
-        }
-
-        // Cold prefix save: for long prompts with no cache hit, prefill to a
-        // turn boundary and save a cold checkpoint before the full generation.
-        // This makes subsequent requests to similar (but not identical) prompts
-        // much faster by reusing the cold prefix.
-        if (!using_restore && !disk_cache_.disabled() &&
-            disk_policy.mode == DiskPrefixCacheMode::Full) {
-            auto boundaries = find_all_boundaries(effective_prompt, prefix_cache_.chat_markers());
-            int cold_boundary = disk_cache_.cold_prefix_boundary(effective_prompt, boundaries);
-            if (cold_boundary > 0) {
-                std::fprintf(stderr, "[disk-cache] cold prefix: prefilling to boundary=%d\n",
-                             cold_boundary);
-                // Phase 1: prefill to cold_boundary with snapshot save.
-                GenerateRequest cold_req;
-                cold_req.prompt = std::vector<int32_t>(effective_prompt.begin(),
-                                                       effective_prompt.begin() + cold_boundary);
-                cold_req.n_gen = 0;  // no decode, just prefill
-                cold_req.snap_slot = DISK_STAGING_SLOT;
-                cold_req.snap_pos = cold_boundary;  // save at end of prefix
-                DaemonIO cold_io;
-                cold_io.stream_fd = -1;
-                auto cold_result = backend_.generate(cold_req, cold_io);
-                if (cold_result.ok() && backend_.snapshot_used(DISK_STAGING_SLOT)) {
-                    disk_cache_.learn_layout(DISK_STAGING_SLOT);
-                    std::vector<int32_t> prefix_tokens(effective_prompt.begin(),
-                                                       effective_prompt.begin() + cold_boundary);
-                    disk_cache_.save(DISK_STAGING_SLOT, prefix_tokens);
-                    // Use this cold snapshot as restore point for full generation.
-                    cache_slot = DISK_STAGING_SLOT;
-                    prefix_len = cold_boundary;
-                    using_restore = true;
-                    disk_hit = true;  // ensure staging slot is freed after use
-                    std::fprintf(stderr, "[disk-cache] cold prefix saved, restoring from %d\n",
-                                 cold_boundary);
-                } else {
-                    backend_.snapshot_free(DISK_STAGING_SLOT);
-                }
-            }
-        }
-
-        // Prepare a full-prompt snapshot for exact prefill-cache hits.
-        int full_snap_slot = -1;
-        int full_snap_pos = 0;
-        bool full_snap_prepared = false;
-        if (!using_restore) {
-            full_snap_slot = prefix_cache_.prepare_full_snap(req.prompt_tokens);
-            if (full_snap_slot >= 0) {
-                full_snap_pos = (int)effective_prompt.size();
-                gen_req.snap_slot = full_snap_slot;
-                gen_req.snap_pos = full_snap_pos;
-                full_snap_prepared = true;
-            }
-        }
-
-        // Prepare inline snapshot for future cache hits. GenerateRequest only
-        // carries one snapshot target, so exact full-prompt cache takes
-        // priority when enabled.
-        int snap_slot = -1;
-        int snap_cut = 0;
-        if (!full_snap_prepared) {
-            auto prepared = prefix_cache_.prepare_inline_snap(effective_prompt);
-            snap_slot = prepared.first;
-            snap_cut = prepared.second;
-        }
-        bool snap_prepared = (snap_slot >= 0);
-        if (snap_prepared) {
-            gen_req.snap_slot = snap_slot;
-            gen_req.snap_pos = snap_cut;
-        }
-
-        std::fprintf(stderr,
-            "[server] chat CACHE %s restore=%s slot=%d prefix_len=%d "
-            "effective_prompt=%zu pflash=%s disk_policy=%s disk_hit=%s "
-            "snap_slot=%d snap_pos=%d full_snap_slot=%d full_snap_pos=%d\n",
-            req.response_id.c_str(),
-            using_restore ? "true" : "false",
-            cache_slot,
-            prefix_len,
-            effective_prompt.size(),
-            pflash_compressed ? "true" : "false",
-            disk_prefix_cache_policy_name(disk_policy).c_str(),
-            disk_hit ? "true" : "false",
-            snap_slot,
-            snap_cut,
-            full_snap_slot,
-            full_snap_pos);
-
-        // Update status page with cache/pflash/spec-decode flags.
-        status_.set_flags(using_restore, pflash_compressed, !config_.draft_path.empty());
-        broadcast_status();
-
-        // Set up DaemonIO with on_token callback for streaming + disconnect.
-        DaemonIO io;
-        io.stream_fd = -1;  // no pipe — we write SSE directly
-
-        // Inference observer: updates status page with draft tokens per step.
-        io.observer = [&](const char * phase, const std::vector<int32_t> & tokens) {
-            std::vector<std::string> token_strs;
-            token_strs.reserve(tokens.size());
-            for (int32_t t : tokens) {
-                token_strs.push_back(tokenizer_.token_text(t));
-            }
-            status_.set_draft_tokens(token_strs);
-            broadcast_status();
-        };
-
-        int completion_tokens = 0;
-        bool visible_output_seen = false;
-        bool client_disconnected = false;
-
-        io.on_token = [&](int32_t token) -> bool {
-            if (client_disconnected) return false;
-            completion_tokens++;
-
-            // Update status page every 10 tokens (low overhead).
-            if (completion_tokens % 10 == 0) {
-                status_.update_completion_tokens(completion_tokens);
-                broadcast_status();
-            }
-
-            // Skip EOS/EOT/special tokens — don't forward to SSE.
-            int32_t eos = tokenizer_.eos_id();
-            int32_t eot = tokenizer_.eos_chat_id();
-            if (token == eos || token == eot) return true;
-
-            const std::string & raw = tokenizer_.raw_token(token);
-
-            // Gemma4 thinking channel: map <|channel> → <think>, <channel|> → </think>\n
-            if (raw == "<|channel>") {
-                visible_output_seen = true;
-                broadcast_token("<think>");
-                if (req.stream) {
-                    auto chunks = emitter.emit_token("<think>");
-                    for (const auto & chunk : chunks)
-                        if (!send_all(fd, chunk.data(), chunk.size())) { client_disconnected = true; return false; }
-                }
-                return true;
-            }
-            if (raw == "<channel|>") {
-                visible_output_seen = true;
-                broadcast_token("</think>\n");
-                if (req.stream) {
-                    auto chunks = emitter.emit_token("</think>\n");
-                    for (const auto & chunk : chunks)
-                        if (!send_all(fd, chunk.data(), chunk.size())) { client_disconnected = true; return false; }
-                }
-                return true;
-            }
-
-            // Qwen3.6 thinking tokens: <think> (id 248068) and </think> (id 248069)
-            // are SINGLE special tokens in the added_tokens vocab. Without this
-            // mapping they hit the generic "skip <...>" filter below and get
-            // silently dropped — which means the emitter never sees the
-            // reasoning→content transition and stuffs everything into
-            // reasoning_content with empty visible content. Forward the text
-            // form into the emitter so parse_reasoning() can split correctly.
-            if (raw == "<think>" || raw == "</think>") {
-                visible_output_seen = true;
-                broadcast_token(raw == "</think>" ? "</think>\n" : "<think>");
-                if (req.stream) {
-                    auto chunks = emitter.emit_token(
-                        raw == "</think>" ? "</think>\n" : "<think>");
-                    for (const auto & chunk : chunks)
-                        if (!send_all(fd, chunk.data(), chunk.size())) { client_disconnected = true; return false; }
-                }
-                return true;
-            }
-
-            // Skip other special tokens (starting with <|, or any <...> except byte-fallback)
-            if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') return true;
-            if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') {
-                if (!(raw.size() == 6 && raw[1] == '0' && raw[2] == 'x'))
-                    return true;
-            }
-
-            std::string text = tokenizer_.token_text(token);
-
-            // Send token text to status page clients (browser accumulates).
-            if (!text.empty()) {
-                visible_output_seen = true;
-                broadcast_token(text);
-            }
-
-            if (req.stream && !text.empty()) {
-                auto chunks = emitter.emit_token(text);
-                for (const auto & chunk : chunks) {
-                    if (!send_all(fd, chunk.data(), chunk.size())) {
-                        client_disconnected = true;
-                        return false;
-                    }
-                }
-                // Stop generation if a stop sequence was hit.
-                if (emitter.stop_hit()) return false;
-            }
-            return true;
-        };
-
-        const auto dflash_residency =
-            resolve_draft_residency_action(
-                config_.draft_residency,
-                DraftResidencyContext{
-                    DraftResidencyUse::DFlashDecode,
-                    config_.lazy_draft,
-                    !config_.draft_path.empty(),
-                });
-
-        // Run generation (with or without restore).
-        // Request-scoped draft residency ensures decode draft is loaded only
-        // around the generation window, leaving room for PFlash/target state.
-        if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
-            !config_.draft_path.empty()) {
-            backend_.free_drafter();    // free pflash drafter (~1.4 GB) if loaded
-            backend_.unpark(ParkTarget::DraftModel);   // reload decode draft (~3.3 GB)
-        }
-
-        // Transition status to decode phase.
-        status_.set_decode();
-        broadcast_status();
-
-        GenerateResult result;
-        if (using_restore) {
-            result = backend_.restore_and_generate(cache_slot, gen_req, io);
-        } else {
-            result = backend_.generate(gen_req, io);
-        }
-
-        if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
-            !config_.draft_path.empty()) {
-            backend_.park(ParkTarget::DraftModel);
-        }
-
-        // Release oversized scratch buffers (gallocr, BSA cache) so VRAM
-        // doesn't grow monotonically across requests with different sizes.
-        backend_.release_scratch();
-
-        // Bandit: update when spec decode actually ran — including 0-accept case,
-        // which signals the current keep_ratio is too low.
-        if (!req.session_id.empty() && result.spec_decode_ran) {
-            float old_keep = sessions_.get_keep_ratio(req.session_id);
-            int   old_turn = sessions_.turn_count(req.session_id);
-            sessions_.update(req.session_id, result.accept_rate);
-            float new_keep = sessions_.get_keep_ratio(req.session_id);
-            float ema      = sessions_.get_ema(req.session_id);
-            std::fprintf(stderr,
-                "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f ema=%.3f accept=%.3f\n",
-                req.session_id.c_str(), old_turn + 1,
-                old_keep, new_keep, ema, result.accept_rate);
-        }
-
-
-        // Confirm or abort the full-prompt snapshot.
-        if (full_snap_prepared) {
-            if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
-                backend_.snapshot_used(full_snap_slot)) {
-                int saved_pos = backend_.snapshot_cur_pos(full_snap_slot);
-                if (saved_pos > 0) {
-                    prefix_cache_.confirm_full_snap(full_snap_slot, req.prompt_tokens,
-                                                    saved_pos);
-                } else {
-                    prefix_cache_.abort_full_snap(full_snap_slot);
-                }
-            } else {
-                prefix_cache_.abort_full_snap(full_snap_slot);
-            }
-        }
-
-        // Confirm or abort the inline snapshot.
-        if (snap_prepared) {
-            if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
-                backend_.snapshot_used(snap_slot)) {
-                prefix_cache_.confirm_inline_snap(snap_slot, snap_cut, effective_prompt);
-                // Track for shutdown save.
-                slot_tokens_[snap_slot] = std::vector<int32_t>(
-                    effective_prompt.begin(), effective_prompt.begin() + snap_cut);
-                // Save to disk cache if threshold met.
-                if (!disk_cache_.disabled()) {
-                    disk_cache_.learn_layout(snap_slot);
-                    if (disk_policy.mode == DiskPrefixCacheMode::Full) {
-                        disk_cache_.save(snap_slot, effective_prompt);
-                    }
-                }
-            } else {
-                prefix_cache_.abort_inline_snap(snap_slot);
-            }
-        }
-
-        // Free the disk staging slot after use.
-        if (disk_hit) {
-            backend_.snapshot_free(DISK_STAGING_SLOT);
-        }
-
-        // Continued checkpoint: save if total tokens crossed an interval boundary.
-        // This captures prompt + all generated tokens for long conversation reuse.
-        if (!disk_cache_.disabled() && disk_policy.mode == DiskPrefixCacheMode::Full &&
-            result.ok() && completion_tokens > 0 &&
-            visible_output_seen && !client_disconnected) {
-            int final_pos = (int)effective_prompt.size() + (int)result.tokens.size();
-            if (final_pos >= disk_cache_.continued_interval()) {
-                // Build all_tokens = effective_prompt + result.tokens
-                std::vector<int32_t> all_tokens(effective_prompt);
-                all_tokens.insert(all_tokens.end(), result.tokens.begin(), result.tokens.end());
-                // Save a snapshot of the live KV at end-of-generation.
-                if (backend_.snapshot_save(DISK_STAGING_SLOT)) {
-                    disk_cache_.learn_layout(DISK_STAGING_SLOT);
-                    disk_cache_.maybe_store_continued(DISK_STAGING_SLOT, all_tokens, final_pos);
-                    backend_.snapshot_free(DISK_STAGING_SLOT);
-                }
-            }
-        }
-
-        if (!disk_cache_.disabled()) {
-            if (!pflash_compressed) {
-                recent_disk_prompts_.insert(recent_disk_prompts_.begin(), effective_prompt);
-            } else if (req.disk_cache_policy.compress) {
-                // FlowKV: record verbatim prompt so Auto boundary lookups see stable content.
-                recent_disk_prompts_.insert(recent_disk_prompts_.begin(), req.prompt_tokens);
-            }
-            // pflash_compressed && !compress: skip (effective_prompt is rewritten).
-            static constexpr size_t kMaxRecentDiskPrompts = 256;
-            if (recent_disk_prompts_.size() > kMaxRecentDiskPrompts) {
-                recent_disk_prompts_.resize(kMaxRecentDiskPrompts);
-            }
-        }
-
-        // close_kind reflects the Level 2 BudgetHook outcome: "hard" when
-        // the backend's AR/spec decode injected the close-token sequence
-        // at the budget boundary, "natural" when the model self-closed
-        // (or the request never opted in). Emitted as part of
-        // finish_details for thinking-budget callers.
-        std::string close_kind =
-            (req.thinking_opt_in && result.budget_forced_close)
-                ? "hard"
-                : "natural";
-
-        // Finalize.
-        // Per-request wall-clock timings forwarded to the response's
-        // `usage.timings` (OpenAI Chat usage chunk, Anthropic
-        // message_delta usage, Responses response.completed usage).
-        // See docs/specs/thinking-budget.md §6.3.
-        GenTimings gen_timings{ result.prefill_s, result.decode_s };
-
-        // Record performance for /status page.
-        if (result.ok()) {
-            PerfRecord perf;
-            perf.prompt_tokens = (int)req.prompt_tokens.size();
-            perf.completion_tokens = completion_tokens;
-            // Use actual prefilled token count: on cache hit the backend only
-            // prefills the delta beyond the cached prefix, so dividing the full
-            // prompt size by delta time would be wrong.
-            const int prefill_tokens = using_restore
-                ? (std::max)(0, (int)effective_prompt.size() - prefix_len)
-                : (int)effective_prompt.size();
-            perf.prefill_tok_s = (result.prefill_s > 0.0)
-                ? (double)prefill_tokens / result.prefill_s : 0.0;
-            perf.decode_tok_s = (result.decode_s > 0.0)
-                ? (double)completion_tokens / result.decode_s : 0.0;
-            perf.accept_rate = result.accept_rate;
-            perf.cache_hit = using_restore;
-            perf.pflash = pflash_compressed;
-            perf.spec_decode = result.spec_decode_ran;
-            perf.timestamp = std::chrono::steady_clock::now();
-            status_.record_perf(perf);
-            status_.update_completion_tokens(completion_tokens);
-            broadcast_status();
-        }
-        if (req.stream && !client_disconnected) {
-            auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
-            for (const auto & chunk : final_chunks) {
-                if (!send_all(fd, chunk.data(), chunk.size())) {
-                    client_disconnected = true;
-                    break;
-                }
-            }
-        } else if (!req.stream && !client_disconnected) {
-            // Non-streaming: build complete response using emitter state.
-            // Feed all tokens through emitter (skip specials like streaming path).
-            auto feed_tokens = [&](const std::vector<int32_t> & toks) -> bool {
-                for (int32_t tok : toks) {
-                    const std::string & raw = tokenizer_.raw_token(tok);
-                    if (tok == tokenizer_.eos_id()) continue;
-                    if (tok == tokenizer_.eos_chat_id()) continue;
-                    // Gemma4 channel → think mapping
-                    if (raw == "<|channel>") { emitter.emit_token("<think>"); continue; }
-                    if (raw == "<channel|>") { emitter.emit_token("</think>\n"); continue; }
-                    // Qwen3.6 thinking tokens (id 248068 / 248069) — must
-                    // forward as text so the emitter transitions
-                    // reasoning→content. Without this the generic <...>
-                    // strip below drops them silently, leaving content
-                    // empty and the model's whole answer wedged in
-                    // reasoning_content. Mirrors the streaming-path fix
-                    // above.
-                    if (raw == "<think>") { emitter.emit_token("<think>"); continue; }
-                    if (raw == "</think>") { emitter.emit_token("</think>\n"); continue; }
-                    if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') continue;
-                    if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>') {
-                        if (!(raw.size() == 6 && raw[1] == '0' && raw[2] == 'x'))
-                            continue;
-                    }
-                    std::string text = tokenizer_.token_text(tok);
-                    emitter.emit_token(text);
-                    if (emitter.stop_hit()) return false;
-                }
-                return true;
-            };
-
-            feed_tokens(result.tokens);
-            const int total_completion_tokens = (int)result.tokens.size();
-            emitter.emit_finish(total_completion_tokens);
-
-            // Derive per-mode token counts from the emitter's REASONING
-            // → CONTENT transition. first_content_token_index() returns
-            // the emit_token index that first ran with mode == CONTENT;
-            // tokens before that index were emitted while the emitter
-            // was in REASONING (the `</think>`-carrying token itself
-            // lands in REASONING and the NEXT token is the first
-            // CONTENT). EOS/special tokens are skipped by feed_tokens
-            // above, so emit_token_count() may be smaller than
-            // result.tokens.size(); the remainder counts as
-            // unattributed (e.g., TOOL_BUFFER).
-            const int fci = emitter.first_content_token_index();
-            const int emitted = emitter.emit_token_count();
-            const int reasoning_tokens_emitted =
-                fci < 0 ? emitted : fci;
-            const int content_tokens_emitted =
-                fci < 0 ? 0 : emitted - fci;
-
-            json resp;
-            switch (req.format) {
-            case ApiFormat::OPENAI_CHAT: {
-                json msg = {{"role", "assistant"}, {"content", emitter.accumulated_text()}};
-                if (!emitter.reasoning_text().empty()) {
-                    // Multi-dialect reasoning emission — same text, three keys.
-                    // See docs/specs/thinking-budget.md "Response shape —
-                    // multi-dialect aliasing".
-                    //   reasoning_content : DeepSeek R1 / dflash primary
-                    //   reasoning         : OpenRouter / Anthropic-gateway flat
-                    //   reasoning_details : typed-block list; single block.
-                    const std::string & rt = emitter.reasoning_text();
-                    msg["reasoning_content"] = rt;
-                    msg["reasoning"]         = rt;
-                    msg["reasoning_details"] = json::array({
-                        {{"type", "reasoning.text"}, {"text", rt}}
-                    });
-                }
-                if (!emitter.tool_calls().empty()) {
-                    json tcs = json::array();
-                    for (const auto & tc : emitter.tool_calls()) {
-                        tcs.push_back({{"id", tc.id}, {"type", "function"},
-                                       {"function", {{"name", tc.name},
-                                                     {"arguments", tc.arguments}}}});
-                    }
-                    msg["tool_calls"] = tcs;
-                }
-                // finish_reason: emitter only knows about "stop" / "tool_calls"
-                // (EOS / tool-call detection). It can't see that the daemon
-                // hit the n_gen cap. Compute "length" here from the
-                // committed-token count vs the n_gen cap.
-                // OpenAI/Anthropic clients (open-webui, Cline) gate retry
-                // logic on finish_reason="length".
-                std::string effective_finish_reason = emitter.finish_reason();
-                if (effective_finish_reason == "stop") {
-                    bool at_cap = (int)result.tokens.size() >= n_gen_cap;
-                    if (at_cap) {
-                        effective_finish_reason = "length";
-                    }
-                }
-                if (result.degenerate_decode_close) {
-                    effective_finish_reason = "length";
-                }
-                json choice = {
-                    {"index", 0}, {"message", msg},
-                    {"finish_reason", effective_finish_reason}
-                };
-                // finish_details — mirrors ds4_eval.c's eval_think_close_info.
-                // Emitted when the caller opted in to the thinking-budget
-                // envelope via `thinking:{type:enabled}`. close_kind reflects
-                // whether the model self-closed the thinking block ("natural")
-                // or the BudgetHook force-closed it at the budget boundary
-                // ("hard"). See docs/specs/thinking-budget.md "v2 design".
-                if (req.thinking_opt_in) {
-                    // thinking_tokens / content_tokens come from the
-                    // emitter's REASONING→CONTENT transition tracking;
-                    // total_tokens is the raw committed-token count.
-                    choice["finish_details"] = {
-                        {"close_kind",      close_kind},
-                        {"thinking_tokens", reasoning_tokens_emitted},
-                        {"content_tokens",  content_tokens_emitted},
-                        {"total_tokens",    total_completion_tokens},
-                    };
-                    // Honest signaling: when the post-close watchdog
-                    // detected an n-gram repetition loop and aborted
-                    // generation, surface a sibling flag so callers know
-                    // the answer is unreliable. finish_reason stays
-                    // "length" (SDK-safe per the truncation-signaling
-                    // convention: OpenAI/Anthropic/Gemini all collapse
-                    // budget-class events to one closed enum and put
-                    // richer signal in sidecar fields).
-                    if (result.degenerate_decode_close) {
-                        choice["finish_details"]["degenerate_decode"] = true;
-                    }
-                }
-                // usage.completion_tokens_details.reasoning_tokens — OpenAI
-                // o1/o3 standard location, also OR's normalized shape. Mirrors
-                // finish_details.thinking_tokens; kept in sync.
-                // usage.timings — per-request prefill / decode wall clock
-                // (always emitted; additive to OpenAI shape, ignored by
-                // clients that don't recognize it). See spec §6.3.
-                json chat_usage = {
-                    {"prompt_tokens", (int)req.prompt_tokens.size()},
-                    {"completion_tokens", total_completion_tokens},
-                    {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens},
-                    {"completion_tokens_details", {
-                        // Match finish_details.thinking_tokens
-                        // (emitter-tracked split).
-                        {"reasoning_tokens", reasoning_tokens_emitted}
-                    }},
-                    {"timings", build_timings_json(gen_timings, total_completion_tokens)},
-                    {"accept_rate", result.accept_rate}
-                };
-                resp = {
-                    {"id", req.response_id},
-                    {"object", "chat.completion"},
-                    {"created", std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count()},
-                    {"model", req.model},
-                    {"choices", json::array({choice})},
-                    {"usage", chat_usage}
-                };
-                break;
-            }
-            case ApiFormat::ANTHROPIC: {
-                json content = json::array();
-                if (!emitter.reasoning_text().empty()) {
-                    content.push_back({{"type", "thinking"}, {"thinking", emitter.reasoning_text()}});
-                }
-                // Only emit a text block when there is actual text. When the
-                // model emitted ONLY a tool_call (Qwen3 XML), accumulated_text
-                // is empty — pushing an empty text block confuses Anthropic
-                // SDK clients (they expect tool_use blocks alone).
-                if (!emitter.accumulated_text().empty()) {
-                    content.push_back({{"type", "text"}, {"text", emitter.accumulated_text()}});
-                }
-                // Tool calls — the OPENAI_CHAT branch above does this; the
-                // ANTHROPIC branch was missing the tool_use serialisation,
-                // so stop_reason="tool_use" was returned with empty content.
-                // tc.arguments is a JSON-encoded string; parse to object for
-                // Anthropic's `input` field (Anthropic expects object, not
-                // string). Fall back to empty object on parse failure.
-                if (!emitter.tool_calls().empty()) {
-                    for (const auto & tc : emitter.tool_calls()) {
-                        json input_obj;
-                        try {
-                            input_obj = tc.arguments.empty()
-                                ? json::object()
-                                : json::parse(tc.arguments);
-                        } catch (const std::exception &) {
-                            input_obj = json::object();
-                        }
-                        content.push_back({
-                            {"type",  "tool_use"},
-                            {"id",    tc.id},
-                            {"name",  tc.name},
-                            {"input", input_obj}
-                        });
-                    }
-                }
-                // stop_reason: Anthropic's analog of finish_reason. Same
-                // length-vs-EOS distinction as OpenAI — Cline / Anthropic
-                // SDK gate retry on stop_reason=="max_tokens".
-                std::string anthropic_stop_reason;
-                {
-                    std::string er = emitter.finish_reason();
-                    bool at_cap = (int)result.tokens.size() >= n_gen_cap;
-                    if (er == "tool_calls") anthropic_stop_reason = "tool_use";
-                    else if (at_cap)        anthropic_stop_reason = "max_tokens";
-                    else                    anthropic_stop_reason = "end_turn";
-                }
-                json anth_usage = {
-                    {"input_tokens", (int)req.prompt_tokens.size()},
-                    {"output_tokens", total_completion_tokens},
-                    {"timings", build_timings_json(gen_timings, total_completion_tokens)},
-                    {"accept_rate", result.accept_rate}
-                };
-                resp = {
-                    {"id", req.response_id}, {"type", "message"},
-                    {"role", "assistant"}, {"model", req.model},
-                    {"content", content},
-                    {"stop_reason", anthropic_stop_reason},
-                    {"usage", anth_usage}
-                };
-                break;
-            }
-            case ApiFormat::RESPONSES: {
-                json output = json::array();
-                if (!emitter.tool_calls().empty()) {
-                    for (const auto & tc : emitter.tool_calls()) {
-                        output.push_back({
-                            {"type", "function_call"}, {"id", tc.id},
-                            {"status", "completed"}, {"call_id", tc.id},
-                            {"name", tc.name}, {"arguments", tc.arguments}
-                        });
-                    }
-                } else {
-                    output.push_back({
-                        {"type", "message"}, {"id", req.response_id + "_msg"},
-                        {"status", "completed"}, {"role", "assistant"},
-                        {"content", json::array({{
-                            {"type", "output_text"}, {"text", emitter.accumulated_text()},
-                            {"annotations", json::array()}
-                        }})}
-                    });
-                }
-                json resp_usage = {
-                    {"input_tokens", (int)req.prompt_tokens.size()},
-                    {"output_tokens", total_completion_tokens},
-                    {"total_tokens", (int)req.prompt_tokens.size() + total_completion_tokens},
-                    {"timings", build_timings_json(gen_timings, total_completion_tokens)},
-                    {"accept_rate", result.accept_rate}
-                };
-                resp = {
-                    {"id", req.response_id}, {"object", "response"},
-                    {"status", "completed"}, {"model", req.model},
-                    {"output", output},
-                    {"usage", resp_usage}
-                };
-                break;
-            }
-            default:
-                resp = {{"text", emitter.accumulated_text()}};
-            }
-            // Set socket back to blocking for the final send.
-            int flags = sock_get_flags(fd);
-            if (flags >= 0) sock_set_block(fd);
-            send_response(fd, 200, "application/json", resp.dump() + "\n");
-        }
-
-        if (client_disconnected) {
-            std::fprintf(stderr, "[server] client disconnected — generation aborted "
-                         "(prompt=%zu out=%d)\n",
-                         req.prompt_tokens.size(), completion_tokens);
-        }
-
-        const auto done_at = std::chrono::steady_clock::now();
-        const double elapsed_s =
-            std::chrono::duration<double>(done_at - started_at).count();
-        const int result_tokens = (int)result.tokens.size();
-        const int out_tokens = (std::max)(completion_tokens, result_tokens);
-        const double tok_s = elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0;
-        const double decode_tok_s =
-            result.decode_s > 0.0 ? out_tokens / result.decode_s : 0.0;
-        const std::string finish = client_disconnected
-            ? "client_disconnect"
-            : (result.ok() ? emitter.finish_reason() : "error");
-
-        std::fprintf(stderr,
-            "[server] chat DONE %s ok=%s in=%zu effective_in=%zu out=%d "
-            "%.1fs %.1f tok/s finish=%s restore=%s slot=%d prefix_len=%d "
-            "prefill=%.1fs decode=%.1fs(%.1ftok/s) error=%s detail=%s\n",
-            req.response_id.c_str(),
-            result.ok() ? "true" : "false",
-            req.prompt_tokens.size(),
-            effective_prompt.size(),
-            out_tokens,
-            elapsed_s,
-            tok_s,
-            finish.c_str(),
-            using_restore ? "true" : "false",
-            cache_slot,
-            prefix_len,
-            result.prefill_s,
-            result.decode_s,
-            decode_tok_s,
-            result.ok() ? "-" : result.error_code().data(),
-            result.error_detail().empty() ? "-" : result.error_detail().data());
-
-        // Signal client thread that we're done.
-        finish_job();
+        process_job(job);
     }
+}
+
+void HttpServer::process_job(ServerJob * job) {
+    SocketHandle fd = job->fd;
+    const auto & req = job->req;
+    auto started_at = std::chrono::steady_clock::now();
+
+    // Track live status for /status page. RAII guard ensures idle on all paths.
+    std::string prompt_excerpt;
+    if (!req.prompt_tokens.empty()) {
+        // Decode first ~40 tokens as a prompt excerpt (cheap, bounded).
+        const int excerpt_len = (std::min)((int)req.prompt_tokens.size(), 40);
+        std::vector<int32_t> excerpt_toks(req.prompt_tokens.begin(),
+                                           req.prompt_tokens.begin() + excerpt_len);
+        prompt_excerpt = tokenizer_.decode(excerpt_toks);
+        if (prompt_excerpt.size() > 200) prompt_excerpt.resize(200);
+    }
+    {
+        ServerStatus::RequestInfo info;
+        info.model = req.model;
+        info.format = api_format_name(req.format);
+        info.session_id = req.session_id;
+        info.max_output = req.max_output;
+        info.temperature = req.sampler.temp;
+        info.top_p = req.sampler.top_p;
+        info.top_k = req.sampler.top_k;
+        info.thinking_enabled = req.thinking_enabled;
+        status_.set_running(prompt_excerpt, (int)req.prompt_tokens.size(), req.stream, info);
+    }
+    // Store messages JSON for request inspection (truncate to avoid huge payloads).
+    if (!req.messages.is_null()) {
+        std::string msg_str = req.messages.dump();
+        if (msg_str.size() > 4096) msg_str.resize(4096);
+        status_.set_messages(msg_str);
+    }
+    broadcast_status();
+    StatusGuard status_guard{status_};
+
+    auto finish_job = [&]() {
+        std::lock_guard<std::mutex> lk(job->mu);
+        job->done = true;
+        job->cv.notify_one();
+    };
+    auto fail_request = [&](int status, const std::string & message) {
+        std::fprintf(stderr, "[server] request failed: %s\n", message.c_str());
+        if (req.stream) {
+            json err = {{"error", {{"message", message}, {"type", "server_error"}}}};
+            const std::string chunk = "data: " + err.dump() + "\n\n";
+            send_all(fd, chunk.data(), chunk.size());
+            const char done[] = "data: [DONE]\n\n";
+            send_all(fd, done, sizeof(done) - 1);
+        } else {
+            send_error(fd, status, message);
+        }
+        finish_job();
+    };
+
+    std::fprintf(stderr,
+        "[server] chat START %s format=%s stream=%s prompt_tokens=%zu "
+        "max_tokens=%d tools=%zu\n",
+        req.response_id.c_str(),
+        api_format_name(req.format),
+        req.stream ? "true" : "false",
+        req.prompt_tokens.size(),
+        req.max_output,
+        json_array_size(req.tools));
+
+    // Send SSE headers (skip when proxying — curl_forward handles its own headers).
+    if (req.stream && config_.pflash_upstream_base.empty()) {
+        if (!send_sse_headers(fd)) {
+            finish_job();
+            return;
+        }
+    }
+
+    // Create SSE emitter for streaming state machine.
+    SseEmitter emitter(req.format, req.response_id, req.model,
+                       (int)req.prompt_tokens.size(), req.tools,
+                       &tool_memory_,
+                       req.stop_sequences,
+                       req.started_in_thinking);
+
+    // Emit initial SSE events (skip when proxying).
+    if (req.stream && config_.pflash_upstream_base.empty()) {
+        bool start_ok = true;
+        for (const auto & chunk : emitter.emit_start()) {
+            if (!send_all(fd, chunk.data(), chunk.size())) {
+                start_ok = false;
+                break;
+            }
+        }
+        if (!start_ok) {
+            finish_job();
+            return;
+        }
+    }
+
+    PreparedPrompt prepared = prepare_prompt(req);
+    if (prepared.error_status != 0) {
+        fail_request(prepared.error_status, prepared.error);
+        return;
+    }
+    if (forward_upstream(fd, req, prepared)) {
+        finish_job();
+        return;
+    }
+
+    auto & effective_prompt = prepared.tokens;
+    const bool pflash_compressed = prepared.compressed;
+
+    GenerationInputs generation_inputs;
+    prepare_generation_inputs(req, prepared, generation_inputs);
+    GenerateRequest & gen_req = generation_inputs.request;
+    const int n_gen_cap = generation_inputs.generation_cap;
+
+    GenerationCacheState cache =
+        prepare_generation_cache(req, prepared, gen_req);
+    const bool using_restore = cache.using_restore;
+    const int cache_slot = cache.cache_slot;
+    const int prefix_len = cache.prefix_len;
+
+    DaemonIO io;
+    GenerationOutputState output;
+    configure_generation_io(fd, req, emitter, output, io);
+    int & completion_tokens = output.completion_tokens;
+    bool & visible_output_seen = output.visible_output_seen;
+    bool & client_disconnected = output.client_disconnected;
+
+    const auto dflash_residency =
+        resolve_draft_residency_action(
+            config_.draft_residency,
+            DraftResidencyContext{
+                DraftResidencyUse::DFlashDecode,
+                config_.lazy_draft,
+                !config_.draft_path.empty(),
+            });
+
+    // Run generation (with or without restore).
+    // Request-scoped draft residency ensures decode draft is loaded only
+    // around the generation window, leaving room for PFlash/target state.
+    if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
+        !config_.draft_path.empty()) {
+        backend_.free_drafter();    // free pflash drafter (~1.4 GB) if loaded
+        backend_.unpark(ParkTarget::DraftModel);   // reload decode draft (~3.3 GB)
+    }
+
+    // Transition status to decode phase.
+    status_.set_decode();
+    broadcast_status();
+
+    GenerateResult result;
+    if (using_restore) {
+        result = backend_.restore_and_generate(cache_slot, gen_req, io);
+    } else {
+        result = backend_.generate(gen_req, io);
+    }
+
+    if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
+        !config_.draft_path.empty()) {
+        backend_.park(ParkTarget::DraftModel);
+    }
+
+    // Release oversized scratch buffers (gallocr, BSA cache) so VRAM
+    // doesn't grow monotonically across requests with different sizes.
+    backend_.release_scratch();
+
+    // Bandit: update when spec decode actually ran — including 0-accept case,
+    // which signals the current keep_ratio is too low.
+    if (!req.session_id.empty() && result.spec_decode_ran) {
+        float old_keep = sessions_.get_keep_ratio(req.session_id);
+        int   old_turn = sessions_.turn_count(req.session_id);
+        sessions_.update(req.session_id, result.accept_rate);
+        float new_keep = sessions_.get_keep_ratio(req.session_id);
+        float ema      = sessions_.get_ema(req.session_id);
+        std::fprintf(stderr,
+            "[pflash-bandit] session=%s turn=%d keep=%.4f->%.4f ema=%.3f accept=%.3f\n",
+            req.session_id.c_str(), old_turn + 1,
+            old_keep, new_keep, ema, result.accept_rate);
+    }
+
+    finalize_generation_cache(
+        req, prepared, cache, result, completion_tokens,
+        visible_output_seen, client_disconnected);
+
+    // Finalize.
+    // Per-request wall-clock timings forwarded to the response's
+    // `usage.timings` (OpenAI Chat usage chunk, Anthropic
+    // message_delta usage, Responses response.completed usage).
+    // See docs/specs/thinking-budget.md §6.3.
+    const int effective_prompt_tokens = (int) effective_prompt.size();
+    const int cached_prefix_tokens = using_restore
+        ? (std::clamp)(prefix_len, 0, effective_prompt_tokens)
+        : 0;
+    GenTimings gen_timings{
+        result.prefill_s,
+        result.decode_s,
+        using_restore,
+        cached_prefix_tokens,
+        effective_prompt_tokens - cached_prefix_tokens,
+        effective_prompt_tokens,
+    };
+
+    // Record performance for /status page.
+    if (result.ok()) {
+        PerfRecord perf;
+        perf.prompt_tokens = (int)req.prompt_tokens.size();
+        perf.completion_tokens = completion_tokens;
+        // Use actual prefilled token count: on cache hit the backend only
+        // prefills the delta beyond the cached prefix, so dividing the full
+        // prompt size by delta time would be wrong.
+        const int prefill_tokens = using_restore
+            ? (std::max)(0, (int)effective_prompt.size() - prefix_len)
+            : (int)effective_prompt.size();
+        perf.prefill_tok_s = (result.prefill_s > 0.0)
+            ? (double)prefill_tokens / result.prefill_s : 0.0;
+        perf.decode_tok_s = (result.decode_s > 0.0)
+            ? (double)completion_tokens / result.decode_s : 0.0;
+        perf.accept_rate = result.accept_rate;
+        perf.cache_hit = using_restore;
+        perf.pflash = pflash_compressed;
+        perf.spec_decode = result.spec_decode_ran;
+        perf.timestamp = std::chrono::steady_clock::now();
+        status_.record_perf(perf);
+        status_.update_completion_tokens(completion_tokens);
+        broadcast_status();
+    }
+    if (req.stream && !client_disconnected) {
+        auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
+        for (const auto & chunk : final_chunks) {
+            if (!send_all(fd, chunk.data(), chunk.size())) {
+                client_disconnected = true;
+                break;
+            }
+        }
+    } else if (!req.stream && !client_disconnected) {
+        const json response = build_non_streaming_response(
+            req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
+        // Streaming uses non-blocking sends; restore blocking mode before
+        // writing a complete JSON response on this shared socket path.
+        const int flags = sock_get_flags(fd);
+        if (flags >= 0) sock_set_block(fd);
+        send_response(fd, 200, "application/json",
+                      response.dump() + "\n");
+    }
+
+    if (client_disconnected) {
+        std::fprintf(stderr, "[server] client disconnected — generation aborted "
+                     "(prompt=%zu out=%d)\n",
+                     req.prompt_tokens.size(), completion_tokens);
+    }
+
+    const auto done_at = std::chrono::steady_clock::now();
+    const double elapsed_s =
+        std::chrono::duration<double>(done_at - started_at).count();
+    const int result_tokens = (int)result.tokens.size();
+    const int out_tokens = (std::max)(completion_tokens, result_tokens);
+    const double tok_s = elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0;
+    const double decode_tok_s =
+        result.decode_s > 0.0 ? out_tokens / result.decode_s : 0.0;
+    const std::string finish = client_disconnected
+        ? "client_disconnect"
+        : (result.ok() ? emitter.finish_reason() : "error");
+
+    std::fprintf(stderr,
+        "[server] chat DONE %s ok=%s in=%zu effective_in=%zu out=%d "
+        "%.1fs %.1f tok/s finish=%s restore=%s slot=%d prefix_len=%d "
+        "prefill=%.1fs decode=%.1fs(%.1ftok/s) error=%s detail=%s\n",
+        req.response_id.c_str(),
+        result.ok() ? "true" : "false",
+        req.prompt_tokens.size(),
+        effective_prompt.size(),
+        out_tokens,
+        elapsed_s,
+        tok_s,
+        finish.c_str(),
+        using_restore ? "true" : "false",
+        cache_slot,
+        prefix_len,
+        result.prefill_s,
+        result.decode_s,
+        decode_tok_s,
+        result.ok() ? "-" : result.error_code().data(),
+        result.error_detail().empty() ? "-" : result.error_detail().data());
+
+    // Signal client thread that we're done.
+    finish_job();
 }
 
 // ─── Job queue ──────────────────────────────────────────────────────────
@@ -3365,7 +3533,12 @@ ServerJob * HttpServer::dequeue() {
 
 // ─── HTTP I/O ───────────────────────────────────────────────────────────
 
-bool HttpServer::read_http_request(int fd, HttpRequest & out) {
+bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
+#if defined(_WIN32)
+    // On Windows, accept() may return a socket that inherits the non-blocking
+    // mode of the listen socket. Force blocking mode for reliable recv().
+    sock_set_block(fd);
+#endif
     std::string buf;
     buf.reserve(8192);
     char tmp[4096];
@@ -3374,7 +3547,14 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     ssize_t hend = -1;
     while (hend < 0 && buf.size() < 65536) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && sock_is_eintr(sock_errno())) continue;
+#if defined(_WIN32)
+        if (n < 0 && sock_is_eagain(sock_errno())) {
+            struct pollfd pfd{fd, POLLIN, 0};
+            poll(&pfd, 1, 1000);
+            continue;
+        }
+#endif
         if (n <= 0) return false;
         buf.append(tmp, n);
 
@@ -3440,7 +3620,14 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     // Read body.
     while ((ssize_t)buf.size() < hend + content_length) {
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && sock_is_eintr(sock_errno())) continue;
+#if defined(_WIN32)
+        if (n < 0 && sock_is_eagain(sock_errno())) {
+            struct pollfd pfd{fd, POLLIN, 0};
+            poll(&pfd, 1, 1000);
+            continue;
+        }
+#endif
         if (n <= 0) return false;
         buf.append(tmp, n);
     }
@@ -3449,7 +3636,7 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     return true;
 }
 
-bool HttpServer::send_all(int fd, const void * data, size_t len) {
+bool HttpServer::send_all(SocketHandle fd, const void * data, size_t len) {
     const char * p = (const char *)data;
     size_t sent = 0;
     // Stall deadline resets on each successful write (ds4 pattern).
@@ -3459,19 +3646,19 @@ bool HttpServer::send_all(int fd, const void * data, size_t len) {
             deadline - std::chrono::steady_clock::now()).count();
         if (remaining <= 0) return false;  // stall timeout
 
-        struct pollfd pfd = {SOCK_FD(fd), POLLOUT, 0};
+        struct pollfd pfd = {fd, POLLOUT, 0};
         int timeout = remaining > 50 ? 50 : (int)remaining;
         int ret;
         do {
             ret = poll(&pfd, 1, timeout);
-        } while (ret < 0 && errno == EINTR);
+        } while (ret < 0 && sock_is_eintr(sock_errno()));
         if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
         if (ret == 0) continue;  // poll timeout, retry until deadline
 
         ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (sock_is_eintr(sock_errno())) continue;
+            if (sock_is_eagain(sock_errno())) continue;
             return false;  // EPIPE, ECONNRESET, etc.
         }
         sent += n;
@@ -3480,7 +3667,8 @@ bool HttpServer::send_all(int fd, const void * data, size_t len) {
     return true;
 }
 
-bool HttpServer::send_response(int fd, int status, const std::string & content_type,
+bool HttpServer::send_response(
+        SocketHandle fd, int status, const std::string & content_type,
                                const std::string & body) {
     const char * reason = "OK";
     switch (status) {
@@ -3508,12 +3696,13 @@ bool HttpServer::send_response(int fd, int status, const std::string & content_t
     return send_all(fd, header.data(), header.size());
 }
 
-bool HttpServer::send_error(int fd, int status, const std::string & message) {
+bool HttpServer::send_error(
+        SocketHandle fd, int status, const std::string & message) {
     json err = {{"error", {{"message", message}, {"type", "invalid_request_error"}}}};
     return send_response(fd, status, "application/json", err.dump() + "\n");
 }
 
-bool HttpServer::send_sse_headers(int fd) {
+bool HttpServer::send_sse_headers(SocketHandle fd) {
     std::string header = "HTTP/1.1 200 OK\r\n";
     if (config_.enable_cors) {
         header += "Access-Control-Allow-Origin: *\r\n";

@@ -293,6 +293,38 @@ bool run_case(ggml_backend_t backend,
     return ok;
 }
 
+bool rejects_unlaunchable_gqa(ggml_backend_t backend) {
+    ggml_init_params params{};
+    params.mem_size = 2 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    // Ratio 34 cannot fit the one-head-per-warp fallback in a CUDA block and
+    // is not divisible by either wider specialization (3 or 6 heads/warp).
+    // The support query must reject it before dispatch indexes the occupancy
+    // cache or attempts an oversized launch.
+    ggml_tensor * q =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 1, 34);
+    ggml_tensor * k =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F16, D, BLOCK_SIZE, 1);
+    ggml_tensor * v =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F16, D, BLOCK_SIZE, 1);
+    ggml_tensor * table =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
+    ggml_tensor * kv_seq_lens =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * output = ggml_paged_attn(
+        ctx, q, k, v, table, kv_seq_lens,
+        1.0f / std::sqrt(static_cast<float>(D)), BLOCK_SIZE, 1);
+
+    const bool rejected = !ggml_backend_supports_op(backend, output);
+    std::printf("paged attention unlaunchable GQA support %s\n",
+                rejected ? "PASS" : "FAIL");
+    ggml_free(ctx);
+    return rejected;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -328,7 +360,7 @@ int main(int argc, char ** argv) {
     const ggml_type types[] = {
         GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
     };
-    bool ok = true;
+    bool ok = rejects_unlaunchable_gqa(backend);
     for (ggml_type k_type : types) {
         for (ggml_type v_type : types) {
             ok = run_case(backend, test_case, k_type, v_type) && ok;

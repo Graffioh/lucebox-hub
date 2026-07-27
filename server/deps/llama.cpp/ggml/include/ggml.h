@@ -2492,6 +2492,26 @@ extern "C" {
              struct ggml_tensor * a,
                               int direction);
 
+    // GGML_OP_MOE_FUSED multiplexes a small family of GPU-only MoE helpers.
+    // Parameter zero normally contains n_embd; negative values identify the
+    // specialized sub-operation. Keep the values named so graph schedulers
+    // and backends do not depend on unexplained integer literals.
+    enum ggml_moe_fused_subop {
+        GGML_MOE_FUSED_COMBINE            = -1,
+        GGML_MOE_FUSED_OWNER              = -2,
+        GGML_MOE_FUSED_DEFERRED_PEER_COPY = -3,
+        GGML_MOE_FUSED_OWNER_SPLIT        = -4,
+        GGML_MOE_FUSED_ALIGN_IDS          = -5,
+    };
+
+    // Word offsets in ggml_tensor::op_params for the deferred peer-copy op.
+    // Both pointers start at naturally aligned 64-bit boundaries.
+    enum ggml_moe_fused_deferred_peer_param {
+        GGML_MOE_FUSED_DEFERRED_EVENT_WORD         = 2,
+        GGML_MOE_FUSED_DEFERRED_SOURCE_WORD        = 4,
+        GGML_MOE_FUSED_DEFERRED_EXTERNAL_WAIT_WORD = 7,
+    };
+
     GGML_API struct ggml_tensor * ggml_moe_fused(
             struct ggml_context * ctx,
             struct ggml_tensor  * input,
@@ -2512,6 +2532,51 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * experts,
             struct ggml_tensor  * expert_weights);
+
+    // Coarse DeepSeek-V4 routed-owner op. gate_up contains concatenated gate
+    // and up output rows; the backend performs fused gate/up MMVQ + clamped
+    // SwiGLU, down MMVQ, route weighting, and local reduction.
+    GGML_API struct ggml_tensor * ggml_ds4_moe_owner(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * gate_up_w,
+            struct ggml_tensor  * down_w,
+            struct ggml_tensor  * expert_ids,
+            struct ggml_tensor  * expert_weights,
+            int64_t               ff_dim,
+            float                 swiglu_clamp,
+            float                 down_scale);
+
+    // Coarse owner variant for checkpoints that store gate and up tensors
+    // separately. The backend fuses their MMVQ traversal and SwiGLU while
+    // preserving the checkpoint's three external value scales.
+    GGML_API struct ggml_tensor * ggml_ds4_moe_owner_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * gate_w,
+            struct ggml_tensor  * up_w,
+            struct ggml_tensor  * down_w,
+            struct ggml_tensor  * expert_ids,
+            struct ggml_tensor  * expert_weights,
+            int64_t               ff_dim,
+            float                 swiglu_clamp,
+            float                 gate_scale,
+            float                 up_scale,
+            float                 down_scale);
+
+    // Reorder a small [route, token] owner-local ID matrix so occurrences of
+    // the same expert across verification tokens share a kernel block. Each
+    // encoded ID retains its original route slot for exact output scatter.
+    GGML_API struct ggml_tensor * ggml_ds4_moe_align_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * expert_ids);
+
+    // Copy an F32 peer-GPU tensor only after a scheduler-provided device event
+    // has completed. The scheduler writes the native event handle into the op
+    // parameters and deliberately leaves src on its owner backend.
+    GGML_API struct ggml_tensor * ggml_ds4_deferred_peer_copy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * src);
 
     // Fused DeepSeek4 hyper-connection helpers. The first dimension is the
     // per-token payload; an optional second dimension batches independent
@@ -2536,6 +2601,17 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * residual_hc,
             struct ggml_tensor  * block_out,
+            struct ggml_tensor  * split,
+            int                   n_hc);
+
+    // Exact mode-1 variant for heterogeneous MoE verification. It computes
+    // block_out[d] = peer_block[d] + main_block[d] inside the HC-post kernel,
+    // eliminating the standalone reduction and tokenwise CONT copies.
+    GGML_API struct ggml_tensor * ggml_ds4_hc_post_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual_hc,
+            struct ggml_tensor  * main_block,
+            struct ggml_tensor  * peer_block,
             struct ggml_tensor  * split,
             int                   n_hc);
 

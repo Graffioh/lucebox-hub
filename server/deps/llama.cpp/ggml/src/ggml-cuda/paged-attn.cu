@@ -560,6 +560,16 @@ static bool paged_attn_type_supported(ggml_type type) {
            type == GGML_TYPE_Q8_0;
 }
 
+static bool paged_attn_gqa_supported(int64_t n_head, int64_t n_head_kv) {
+    if (n_head_kv <= 0 || n_head % n_head_kv != 0) {
+        return false;
+    }
+    const int64_t gqa_ratio = n_head / n_head_kv;
+    return (gqa_ratio % 6 == 0 && gqa_ratio / 6 <= WARP_SIZE) ||
+           (gqa_ratio % 3 == 0 && gqa_ratio / 3 <= WARP_SIZE) ||
+           gqa_ratio <= WARP_SIZE;
+}
+
 bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
     const ggml_tensor * q             = dst->src[0];
     const ggml_tensor * k             = dst->src[1];
@@ -595,7 +605,7 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
            k->ne[1] == v->ne[1] &&
            k->ne[2] > 0 &&
            k->ne[2] == v->ne[2] &&
-           q->ne[2] % k->ne[2] == 0 &&
+           paged_attn_gqa_supported(q->ne[2], k->ne[2]) &&
            q->ne[3] == 1 &&
            k->ne[3] == 1 &&
            v->ne[3] == 1 &&
@@ -654,6 +664,13 @@ static bool try_launch_paged_attn(
     // where occupancy no longer influences the topology.
     while (true) {
         const int warps_per_block = warps_per_group * kv_heads_per_block;
+        // occupancy is indexed by the CUDA block's warp count. Values above
+        // WARP_SIZE are both unlaunchable (>1024 threads) and outside the
+        // cache's [0, WARP_SIZE] range, so reject this specialization before
+        // touching the cache and let the caller try a narrower head batch.
+        if (warps_per_block > WARP_SIZE) {
+            return false;
+        }
         // 0 means "not queried yet"; UNLAUNCHABLE records a block size this
         // device rejects, so the fallback below is decided once rather than
         // on every decode step.

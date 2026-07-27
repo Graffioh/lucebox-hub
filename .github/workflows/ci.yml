@@ -172,12 +172,17 @@ jobs:
             -DDFLASH27B_ENABLE_BSA=OFF \
             -DDFLASH27B_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target test_flash_attn_sparse -j"$(nproc)"
+          cmake --build build \
+            --target test_flash_attn_sparse test_deepseek4_mmid_grouped_cuda \
+            -j"$(nproc)"
 
       - name: Run flash-attn sparse kernel test on the 3090
         # Self-contained kernel correctness test (no model weights), so it is
         # safe and fast in CI. This is the execution the hosted jobs cannot do.
         run: ./server/build/test_flash_attn_sparse
+
+      - name: Run grouped MMID dispatch and parity test on the 3090
+        run: ./server/build/test_deepseek4_mmid_grouped_cuda
 
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
       # disabled by default because it builds dflash_server and lazy-loads the
@@ -274,7 +279,7 @@ jobs:
             -o "$RUNNER_TEMP/hip_smoke" .github/ci/hip_smoke.cpp
           "$RUNNER_TEMP/hip_smoke"
 
-      - name: Build + test ROCmFP formats
+      - name: Build + test ROCm formats and inference core
         run: |
           cmake -S server -B "$RUNNER_TEMP/rocmfp-build" \
             -DDFLASH27B_GPU_BACKEND=hip \
@@ -285,7 +290,73 @@ jobs:
             -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
             --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail test_rocmfpx_mmq \
+              test_deepseek4_mmid_grouped_cuda test_recurrent_snapshot test_server_unit \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq'
+            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|recurrent_snapshot|ChainRollbackPolicy'
+
+  build-windows:
+    name: Build Windows (MSVC + CUDA, library + server targets)
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
+        with:
+          arch: x64
+
+      - name: Set up CUDA Toolkit 12.8
+        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
+        with:
+          cuda: '12.8.0'
+          method: network
+          # Windows installer component names differ from the Linux apt
+          # packages used by the hosted Ubuntu job above.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
+
+      - name: Configure (cmake)
+        working-directory: server
+        shell: cmd
+        run: |
+          cmake -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_CUDA_ARCHITECTURES="75" ^
+            -DDFLASH27B_ENABLE_BSA=OFF ^
+            -DDFLASH27B_FA_ALL_QUANTS=OFF ^
+            -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe"
+
+      - name: Build Windows targets
+        working-directory: server
+        shell: cmd
+        run: cmake --build build --target dflash_common dflash_server backend_ipc_daemon test_platform_compat -j 4
+
+      - name: Run Windows platform smoke test
+        working-directory: server
+        shell: cmd
+        run: ctest --test-dir build -R "^platform_compat$" --output-on-failure
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          $lib = Get-ChildItem server/build -Recurse -Filter "dflash_common.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $lib) {
+            Write-Error "dflash_common.lib not found in build output"
+            exit 1
+          }
+          Write-Host "Built: $($lib.FullName)"
+          Write-Host "Size: $([math]::Round($lib.Length / 1MB, 2)) MB"
+
+          foreach ($binaryName in @("dflash_server.exe", "backend_ipc_daemon.exe")) {
+            $binary = Get-ChildItem server/build -Recurse -Filter $binaryName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $binary) {
+              Write-Error "$binaryName not found in build output"
+              exit 1
+            }
+            Write-Host "Built: $($binary.FullName)"
+          }

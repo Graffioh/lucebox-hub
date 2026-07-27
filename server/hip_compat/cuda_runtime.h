@@ -29,6 +29,9 @@ using cudaDeviceProp        = hipDeviceProp_t;
 // Error codes
 #define cudaSuccess                 hipSuccess
 #define cudaErrorInvalidValue       hipErrorInvalidValue
+#define cudaErrorIllegalAddress     hipErrorIllegalAddress
+#define cudaErrorAssert             hipErrorAssert
+#define cudaErrorLaunchFailure      hipErrorLaunchFailure
 
 // Memory functions
 #define cudaMalloc                  hipMalloc
@@ -49,6 +52,7 @@ using cudaDeviceProp        = hipDeviceProp_t;
 #define cudaStreamSynchronize       hipStreamSynchronize
 #define cudaStreamDefault           hipStreamDefault
 #define cudaStreamNonBlocking       hipStreamNonBlocking
+#define cudaStreamPerThread         hipStreamPerThread
 
 // Device functions
 #define cudaGetDevice               hipGetDevice
@@ -73,6 +77,8 @@ using cudaDeviceProp        = hipDeviceProp_t;
 // Error checking
 #define cudaGetLastError            hipGetLastError
 #define cudaGetErrorString          hipGetErrorString
+#define cudaGetErrorName            hipGetErrorName
+#define cudaPeekAtLastError         hipPeekAtLastError
 
 // Launch bounds
 #define __launch_bounds__           __launch_bounds__

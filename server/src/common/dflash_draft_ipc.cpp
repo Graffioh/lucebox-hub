@@ -146,9 +146,13 @@ bool DFlashDraftIpcClient::send_feature_slice(
         capture_idx >= n_target_layers_ || start_pos < 0 || n_tokens <= 0) {
         return false;
     }
-    const size_t expected = (size_t)n_tokens * hidden_size_;
+    size_t expected = 0;
+    if (!checked_mul_size((size_t)n_tokens, (size_t)hidden_size_, expected)) {
+        return false;
+    }
     if (slice.size() != expected) return false;
-    const size_t bytes = slice.size() * sizeof(float);
+    size_t bytes = 0;
+    if (!checked_mul_size(slice.size(), sizeof(float), bytes)) return false;
     if (process_.resolved_payload_transport() == BackendIpcPayloadTransport::Shared) {
         uint64_t seq = 0;
         if (!process_.write_shared_payload(slice.data(), bytes, seq)) {
@@ -216,12 +220,24 @@ bool DFlashDraftIpcClient::propose(
     const int payload_fd = process_.payload_fd();
     if (!active_ || !cmd || stream_fd < 0 || committed < 0 ||
         ctx_len <= 0 || ctx_len > ring_cap_) {
+        std::fprintf(stderr,
+                     "draft-ipc propose rejected active=%d cmd=%p stream_fd=%d committed=%d ctx_len=%d ring_cap=%d\n",
+                     (int)active_, (void *)cmd, stream_fd, committed, ctx_len, ring_cap_);
         return false;
     }
-    const size_t noise_expected =
-        (size_t)hidden_size_ * block_size_;
-    if (noise_embed.size() != noise_expected) return false;
-    const size_t bytes = noise_embed.size() * sizeof(float);
+    size_t noise_expected = 0;
+    if (!checked_mul_size(
+            (size_t)hidden_size_, (size_t)block_size_, noise_expected)) {
+        return false;
+    }
+    if (noise_embed.size() != noise_expected) {
+        std::fprintf(stderr,
+                     "draft-ipc propose noise size mismatch got=%zu expected=%zu hidden=%d block=%d\n",
+                     noise_embed.size(), noise_expected, hidden_size_, block_size_);
+        return false;
+    }
+    size_t bytes = 0;
+    if (!checked_mul_size(noise_embed.size(), sizeof(float), bytes)) return false;
     if (process_.resolved_payload_transport() == BackendIpcPayloadTransport::Shared) {
         uint64_t seq = 0;
         if (!process_.write_shared_payload(noise_embed.data(), bytes, seq)) {

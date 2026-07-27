@@ -3,6 +3,7 @@
 #include "qwen35_layer_split_adapter.h"
 
 #include "common/backend_precision.h"
+#include "common/chain_rollback_policy.h"
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
@@ -90,7 +91,10 @@ bool Qwen35LayerSplitAdapter::init() {
                                          /*prefill_only=*/!cfg_.run_dflash,
                                          shard.layer_begin, shard.layer_end,
                                          /*allocate_target_feat=*/false,
-                                         kvflash_tokens_)) {
+                                         kvflash_tokens_,
+                                         /*f32_ssm_intermediates=*/
+                                             cfg_.run_dflash &&
+                                             split_chain_fast_rollback_enabled())) {
             std::fprintf(stderr, "[target-split] cache gpu=%d: %s\n",
                          shard.gpu, dflash27b_last_error());
             return false;
@@ -543,7 +547,8 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
             &prefill_last_logits_,
             (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
             remote_draft_.active() ? &remote_draft_ : nullptr,
-            kvflash_active() ? &kvflash_pager_ : nullptr);
+            kvflash_active() ? &kvflash_pager_ : nullptr,
+            /*capture_ssm_intermediates=*/false, /*capture_stats=*/nullptr);
         if (ok && kvflash_active()) {
             kvflash_sync_history(prompt, base_pos);
             kvflash_pager_.zero_free_blocks();
@@ -558,7 +563,8 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
         &prefill_last_logits_,
         cfg_.run_dflash ? &remote_draft_ : nullptr,
         activation_type_,
-        kvflash_active() ? &kvflash_pager_ : nullptr);
+        kvflash_active() ? &kvflash_pager_ : nullptr,
+        /*capture_ssm_intermediates=*/false, /*capture_stats=*/nullptr);
     if (ok && kvflash_active()) {
         kvflash_sync_history(prompt, base_pos);
         kvflash_pager_.zero_free_blocks();
@@ -1290,7 +1296,8 @@ bool Qwen35LayerSplitAdapter::decode_ar(
                     logits_out,
                     (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
                     remote_draft_.active() ? &remote_draft_ : nullptr,
-                    kvflash_active() ? &kvflash_pager_ : nullptr);
+                    kvflash_active() ? &kvflash_pager_ : nullptr,
+                    /*capture_ssm_intermediates=*/false, /*capture_stats=*/nullptr);
             }
             return run_qwen35_layer_split_forward(
                 shards_, shards_.front().weights, one, pos, 1, next_tok,
@@ -1300,7 +1307,8 @@ bool Qwen35LayerSplitAdapter::decode_ar(
                 logits_out,
                 cfg_.run_dflash ? &remote_draft_ : nullptr,
                 activation_type_,
-                kvflash_active() ? &kvflash_pager_ : nullptr);
+                kvflash_active() ? &kvflash_pager_ : nullptr,
+                /*capture_ssm_intermediates=*/false, /*capture_stats=*/nullptr);
         },
         [&](int tok) { return is_eos_tok(tok, w); },
         out_tokens, io);

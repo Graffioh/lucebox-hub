@@ -8,6 +8,7 @@
 #include "deepseek4_dspark.h"
 
 #include "common/gguf_bounds.h"
+#include "common/gguf_mmap.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -19,10 +20,6 @@
 #include <initializer_list>
 #include <string>
 #include <vector>
-
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace dflash::common {
 
@@ -249,24 +246,17 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     // forming an absolute file offset. The drafter contract intentionally has
     // no embedding/lm-head tensors; rejecting unknown tensors prevents a stray
     // full-model tensor from consuming the entire GPU allocation.
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        set_err("open failed: " + path);
+    GgufMmap mapped_file;
+    std::string mmap_err;
+    if (!mapped_file.open(path, mmap_err)) {
+        set_err(mmap_err);
         gguf_free(g);
         ggml_free(meta);
         out = DSparkDrafter{};
         return false;
     }
-    struct stat st{};
-    if (::fstat(fd, &st) != 0 || st.st_size < 0) {
-        set_err("fstat failed: " + path);
-        ::close(fd);
-        gguf_free(g);
-        ggml_free(meta);
-        out = DSparkDrafter{};
-        return false;
-    }
-    const size_t file_size = (size_t) st.st_size;
+    const size_t file_size = mapped_file.size();
+    const auto * file_bytes = static_cast<const uint8_t *>(mapped_file.data());
     const size_t data_off = gguf_get_data_offset(g);
     const int64_t n_tensors = gguf_get_n_tensors(g);
     bool ok = true;
@@ -294,7 +284,6 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
         }
     }
     if (!ok) {
-        ::close(fd);
         gguf_free(g);
         ggml_free(meta);
         out = DSparkDrafter{};
@@ -305,7 +294,6 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(meta, backend);
     if (!buf) {
         set_err("ggml_backend_alloc_ctx_tensors failed");
-        ::close(fd);
         gguf_free(g);
         ggml_free(meta);
         out = DSparkDrafter{};
@@ -313,7 +301,7 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     }
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // ── Stream tensor bytes from the file (pread per tensor) ────────────
+    // ── Stream tensor bytes from the read-only mapping ─────────────────
     std::vector<char> staging;
     for (int64_t ti = 0; ti < n_tensors && ok; ti++) {
         const char * tname = gguf_get_tensor_name(g, ti);
@@ -322,16 +310,9 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
         const size_t off  = data_off + tensor_off;  // preflight proved no overflow
         const size_t size = gguf_get_tensor_size(g, ti);
         staging.resize(size);
-        size_t done = 0;
-        while (done < size) {
-            const ssize_t r = ::pread(fd, staging.data() + done, size - done, (off_t)(off + done));
-            if (r <= 0) { set_err(std::string("pread failed for ") + tname); ok = false; break; }
-            done += (size_t)r;
-        }
-        if (!ok) break;
+        std::memcpy(staging.data(), file_bytes + off, size);
         ggml_backend_tensor_set(t, staging.data(), 0, size);
     }
-    ::close(fd);
     if (!ok) {
         ggml_backend_buffer_free(buf);
         gguf_free(g);
@@ -538,8 +519,74 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     return true;
 }
 
+bool clone_deepseek4_dspark_heads(DSparkDrafter & d,
+                                  ggml_backend_t backend) {
+    if (!backend || !d.markov_w1 || !d.markov_w2) {
+        set_err("cannot clone missing DSpark heads");
+        return false;
+    }
+    if (d.head_buf || d.head_ctx) {
+        set_err("DSpark heads are already cloned");
+        return false;
+    }
+
+    ggml_init_params ip{};
+    ip.mem_size = 1024 * 1024;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        set_err("DSpark head mirror ggml_init failed");
+        return false;
+    }
+
+    auto duplicate = [&](ggml_tensor * src) -> ggml_tensor * {
+        return src ? ggml_dup_tensor(ctx, src) : nullptr;
+    };
+    ggml_tensor * markov_w1 = duplicate(d.markov_w1);
+    ggml_tensor * markov_w2 = duplicate(d.markov_w2);
+    ggml_tensor * confidence_w = duplicate(d.confidence_w);
+    ggml_tensor * confidence_b = duplicate(d.confidence_b);
+    if (!markov_w1 || !markov_w2) {
+        ggml_free(ctx);
+        set_err("DSpark head mirror metadata allocation failed");
+        return false;
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        set_err("DSpark head mirror backend allocation failed");
+        return false;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<uint8_t> staging;
+    auto copy_tensor = [&](ggml_tensor * src, ggml_tensor * dst) {
+        if (!src || !dst) return;
+        const size_t bytes = ggml_nbytes(src);
+        staging.resize(bytes);
+        ggml_backend_tensor_get(src, staging.data(), 0, bytes);
+        ggml_backend_tensor_set(dst, staging.data(), 0, bytes);
+    };
+    copy_tensor(d.markov_w1, markov_w1);
+    copy_tensor(d.markov_w2, markov_w2);
+    copy_tensor(d.confidence_w, confidence_w);
+    copy_tensor(d.confidence_b, confidence_b);
+
+    d.head_ctx = ctx;
+    d.head_buf = buf;
+    d.markov_w1 = markov_w1;
+    d.markov_w2 = markov_w2;
+    d.confidence_w = confidence_w;
+    d.confidence_b = confidence_b;
+    return true;
+}
+
 void free_deepseek4_dspark_drafter(DSparkDrafter & d) {
     reset_deepseek4_dspark_runtime_cache();
+    if (d.head_buf) { ggml_backend_buffer_free(d.head_buf); d.head_buf = nullptr; }
+    if (d.head_ctx) { ggml_free(d.head_ctx); d.head_ctx = nullptr; }
     if (d.core.buf) { ggml_backend_buffer_free(d.core.buf); d.core.buf = nullptr; }
     if (d.core.ctx) { ggml_free(d.core.ctx); d.core.ctx = nullptr; }
     d = DSparkDrafter{};

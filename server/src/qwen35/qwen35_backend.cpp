@@ -179,31 +179,6 @@ bool Qwen35Backend::init() {
     split_gpus_ = !use_remote_draft &&
                   (cfg_.device.gpu != cfg_.draft_gpu);
 
-    const bool paged_kvflash =
-        cfg_.paged_attention &&
-        kvflash_pool_from_env(cfg_.device.max_ctx, KvFlashConfig{}) > 0;
-    const PagedAttentionOptions paged_options{
-        cfg_.paged_attention,
-        "qwen35",
-        true,
-        cfg_.device.is_layer_split(),
-        false,
-        cfg_.draft_path != nullptr,
-        use_remote_draft,
-        cfg_.ddtree_mode,
-        cfg_.fa_window,
-        false,
-        paged_kvflash,
-        cfg_.device.max_ctx,
-    };
-    const std::string paged_error =
-        validate_paged_attention_options(paged_options);
-    if (!paged_error.empty()) {
-        std::fprintf(stderr, "[paged-attention] %s\n", paged_error.c_str());
-        set_last_error("invalid paged-attention configuration: " + paged_error);
-        return false;
-    }
-
     target_backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
     if (!target_backend_) {
         std::fprintf(stderr, "target cuda init failed\n");
@@ -314,6 +289,18 @@ bool Qwen35Backend::init() {
     // Subclass gate (e.g. MoE all-hot): may zero kvflash_tokens_ before the KV
     // cache is sized, so create_target_cache allocates full max_ctx KV.
     if (!post_kvflash_init_gate()) return false;
+    // check_feature_compatibility() rejects this pairing, but only for callers
+    // that fill BackendFeatureConfig::kvflash_enabled — the gate cannot read
+    // DFLASH_KVFLASH itself, and create_backend(args) defaults the field to
+    // false. Only the server fills it today, so this is what stops any other
+    // caller from paging over a cache KVFlash is also evicting from.
+    if (cfg_.paged_attention && kvflash_active()) {
+        std::fprintf(stderr,
+            "[paged-attention] cannot be combined with KVFlash "
+            "(resident pool %d tokens)\n", kvflash_tokens_);
+        set_last_error("paged attention cannot be combined with KVFlash");
+        return false;
+    }
     // Paged mode sizes the KV cache to whole blocks; otherwise KVFlash
     // decides the allocation (0 = full max_ctx).
     const int ctx_alloc = cfg_.paged_attention

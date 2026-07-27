@@ -172,6 +172,15 @@ int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru
     return select_inline_evict_victim(ptrs);
 }
 
+int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
+                                    int restored_prefix_len) {
+    if (boundaries.empty()) return 0;
+    const int target = boundaries.size() >= 2
+        ? boundaries[boundaries.size() - 2]
+        : boundaries.back();
+    return target > restored_prefix_len ? target : 0;
+}
+
 // ─── PrefixCache ────────────────────────────────────────────────────────
 
 PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
@@ -234,6 +243,17 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
         auto key = hash_prefix(prompt_ids.data(), cut);
         int idx = find_entry(key);
         if (idx >= 0) {
+            const int committed = (int)entries_[idx].ids.size();
+            if (committed != cut) {
+                // Slot was refreshed in-place at a deeper boundary; a shallow
+                // hash→slot entry would restore the wrong cur_pos.
+                std::fprintf(stderr,
+                    "[pc] lookup stale slot=%d key_cut=%d committed=%d — evicting\n",
+                    entries_[idx].slot, cut, committed);
+                entries_.erase(entries_.begin() + idx);
+                entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+                continue;
+            }
             if (cut > best_len) {
                 best_slot = entries_[idx].slot;
                 best_len = cut;
@@ -251,16 +271,14 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
 }
 
 std::pair<int, int> PrefixCache::prepare_inline_snap(
-        const std::vector<int32_t> & prompt_ids) {
+        const std::vector<int32_t> & prompt_ids,
+        int restored_prefix_len) {
     if (disabled_) return {-1, 0};
 
     auto candidates = find_all_boundaries(prompt_ids, markers_);
-    if (candidates.empty()) return {-1, 0};
-
-    // Best cache point: second-to-last boundary (last completed assistant turn).
-    int target_cut = candidates.size() >= 2
-        ? candidates[candidates.size() - 2]
-        : candidates.back();
+    const int target_cut =
+        select_inline_snapshot_boundary(candidates, restored_prefix_len);
+    if (target_cut <= 0) return {-1, 0};
 
     auto key = hash_prefix(prompt_ids.data(), target_cut);
     if (find_entry(key) >= 0) return {-1, 0};  // already cached
@@ -329,16 +347,28 @@ void PrefixCache::confirm_inline_snap(int slot, int target_cut,
                  slot, target_cut);
 }
 
-void PrefixCache::abort_inline_snap(int /*slot*/) {
+void PrefixCache::abort_inline_snap(int slot) {
     if (disabled_) return;
-    if (has_pending_evict_) {
-        int idx = find_entry(pending_evict_key_);
-        if (idx >= 0) {
-            entries_.erase(entries_.begin() + idx);
+    // The HTTP layer clears the reserved backend slot before generation. Any
+    // metadata still pointing at it is therefore invalid, whether the slot was
+    // selected through the explicit eviction path or through a round-robin
+    // hole left by an earlier aborted reservation.
+    for (int i = (int)entries_.size() - 1; i >= 0; --i) {
+        if (entries_[(size_t)i].slot == slot) {
+            entries_.erase(entries_.begin() + i);
             entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
         }
-        has_pending_evict_ = false;
     }
+    has_pending_evict_ = false;
+}
+
+void PrefixCache::cancel_inline_snap(int slot) {
+    if (disabled_) return;
+    if (has_pending_evict_) {
+        const int idx = find_entry(pending_evict_key_);
+        if (idx >= 0 && entries_[idx].slot != slot) return;
+    }
+    has_pending_evict_ = false;
 }
 
 void PrefixCache::mark_all_cleared() {
@@ -457,8 +487,17 @@ void PrefixCache::confirm_full_snap(int slot,
                  slot, cur_ids_len);
 }
 
-void PrefixCache::abort_full_snap(int /*slot*/) {
+void PrefixCache::abort_full_snap(int slot) {
     if (full_disabled_) return;
+    // The reserved backend slot was cleared before generation. Purge every
+    // stale key that still names it, including round-robin reuse through a
+    // sparse pool where no LRU eviction key was recorded.
+    for (int i = (int)full_entries_.size() - 1; i >= 0; --i) {
+        if (full_entries_[(size_t)i].entry.slot == slot) {
+            full_entries_.erase(full_entries_.begin() + i);
+            full_entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
     full_has_pending_evict_ = false;
 }
 

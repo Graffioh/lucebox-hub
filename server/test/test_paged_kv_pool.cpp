@@ -1,5 +1,4 @@
 #include "../src/common/paged_kv_pool.h"
-#include "../src/common/paged_attention_config.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -322,26 +321,6 @@ static void test_invalid_arguments() {
     CHECK(after.block_table == before.block_table);
 }
 
-static void test_paged_attention_compatibility() {
-    PagedAttentionOptions options;
-    options.enabled = true;
-    options.architecture = "qwen35";
-    options.max_ctx = 131072;
-    CHECK(validate_paged_attention_options(options).empty());
-
-    options.pflash = true;
-    CHECK(!validate_paged_attention_options(options).empty());
-    options.pflash = false;
-    options.kvflash = true;
-    CHECK(!validate_paged_attention_options(options).empty());
-    options.kvflash = false;
-    options.fa_window = 4096;
-    CHECK(!validate_paged_attention_options(options).empty());
-    options.fa_window = 0;
-    options.max_ctx = 0;
-    CHECK(!validate_paged_attention_options(options).empty());
-}
-
 int main() {
     test_block_boundaries();
     test_nondefault_block_size();
@@ -353,7 +332,6 @@ int main() {
     test_metadata_snapshot();
     test_duplicate_request_is_transactional();
     test_invalid_arguments();
-    test_paged_attention_compatibility();
 
     if (failures != 0) {
         std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);

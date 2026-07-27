@@ -540,7 +540,8 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
             if (shared_payload && shared_payload != MAP_FAILED && shared_payload_data &&
                 seq != 0 && bytes == expected_bytes &&
                 backend_ipc_payload_in_bounds(0, bytes, shared_payload_capacity) &&
-                header->sequence == seq && header->bytes == (uint64_t)bytes) {
+                backend_ipc_shared_payload_header_matches(
+                    header, seq, static_cast<uint64_t>(bytes))) {
                 host_act.assign(bytes / sizeof(float), 0.0f);
                 std::memcpy(host_act.data(), shared_payload_data, bytes);
                 payload_ok = true;
@@ -550,8 +551,11 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                 if (!enable_dflash) {
                     stream_status(stream_fd, -1);
                 } else {
-                    for (auto & shard : shards) snapshot_ssm_state(shard.cache);
-                    stream_status(stream_fd, 0);
+                    bool ok = true;
+                    for (auto & shard : shards) {
+                        if (!snapshot_ssm_state(shard.cache, shard.backend)) ok = false;
+                    }
+                    stream_status(stream_fd, ok ? 0 : -1);
                 }
                 continue;
             }
@@ -559,8 +563,11 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                 if (!enable_dflash) {
                     stream_status(stream_fd, -1);
                 } else {
-                    for (auto & shard : shards) restore_ssm_state(shard.cache);
-                    stream_status(stream_fd, 0);
+                    bool ok = true;
+                    for (auto & shard : shards) {
+                        if (!restore_ssm_state(shard.cache, shard.backend)) ok = false;
+                    }
+                    stream_status(stream_fd, ok ? 0 : -1);
                 }
                 continue;
             }

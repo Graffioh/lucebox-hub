@@ -8,6 +8,7 @@
 #include "gemma4/gemma4_layer_split_adapter.h"
 #include "laguna/laguna_layer_split_adapter.h"
 #include "pflash_drafter_ipc.h"
+#include "common/platform_env.h"
 #include "qwen35_target_shard_ipc.h"
 
 #include <algorithm>
@@ -301,7 +302,7 @@ int main(int argc, char ** argv) {
     (void)target_max_tokens;
 
     if (ds4_fixed_slot_graphs) {
-        setenv("DFLASH_MOE_FIXED_SLOT_GRAPHS", "1", 1);
+        set_environment_variable("DFLASH_MOE_FIXED_SLOT_GRAPHS", "1", true);
     }
 
     switch (mode) {

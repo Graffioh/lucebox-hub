@@ -31,7 +31,6 @@
 #include <vector>
 #include <thread>
 #include <atomic>
-#include <unistd.h>
 #include <fcntl.h>
 
 extern "C" bool ggml_backend_cuda_buffer_is_managed(ggml_backend_buffer_t buffer);
@@ -51,9 +50,70 @@ namespace {
 struct DS4Mmap {
     void *  addr = nullptr;
     size_t  len  = 0;
+#if defined(_WIN32)
+    HANDLE  hFile = INVALID_HANDLE_VALUE;
+    HANDLE  hMap  = nullptr;
+#else
     int     fd   = -1;
+#endif
+
+    bool is_fd_open() const {
+#if defined(_WIN32)
+        return hFile != INVALID_HANDLE_VALUE;
+#else
+        return fd >= 0;
+#endif
+    }
+    void close_fd() {
+#if defined(_WIN32)
+        if (hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; }
+#else
+        if (fd >= 0) { ::close(fd); fd = -1; }
+#endif
+    }
 
     bool open_ro(const std::string & path, std::string & err) {
+#if defined(_WIN32)
+        // Convert UTF-8 path to UTF-16 for CreateFileW — CreateFileA uses the
+        // active ANSI code page and fails on non-ASCII paths (e.g. CJK chars).
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        if (wlen == 0) {
+            err = "MultiByteToWideChar: " + path + ": error " + std::to_string(GetLastError());
+            return false;
+        }
+        std::wstring wpath(wlen, L'\0');
+        if (MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen) == 0) {
+            err = "MultiByteToWideChar (fill): " + path + ": error " + std::to_string(GetLastError());
+            return false;
+        }
+
+        hFile = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            err = "CreateFileW: " + path + ": error " + std::to_string(GetLastError());
+            return false;
+        }
+        LARGE_INTEGER sz;
+        if (!GetFileSizeEx(hFile, &sz)) {
+            err = "GetFileSizeEx: error " + std::to_string(GetLastError());
+            CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
+            return false;
+        }
+        len = (size_t)sz.QuadPart;
+        hMap = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!hMap) {
+            err = "CreateFileMappingW: error " + std::to_string(GetLastError());
+            CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
+            return false;
+        }
+        addr = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        if (!addr) {
+            err = "MapViewOfFile: error " + std::to_string(GetLastError());
+            CloseHandle(hMap); hMap = nullptr;
+            CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE;
+            return false;
+        }
+#else
         fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) { err = "open: " + path + " " + strerror(errno); return false; }
         struct stat st;
@@ -61,11 +121,18 @@ struct DS4Mmap {
         len = (size_t)st.st_size;
         addr = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
         if (addr == MAP_FAILED) { err = "mmap"; addr = nullptr; ::close(fd); fd = -1; return false; }
+#endif
         return true;
     }
     void close_map() {
+#if defined(_WIN32)
+        if (addr) { UnmapViewOfFile(addr); addr = nullptr; }
+        if (hMap) { CloseHandle(hMap); hMap = nullptr; }
+        if (hFile != INVALID_HANDLE_VALUE) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; }
+#else
         if (addr) { ::munmap(addr, len); addr = nullptr; }
         if (fd >= 0) { ::close(fd); fd = -1; }
+#endif
     }
 };
 
@@ -198,6 +265,33 @@ static bool should_upload_ds4_tensor(const char * name,
     return !(plan.skip_expert_tensors && is_expert_tensor(name));
 }
 
+static int ds4_dense_tp_mask() {
+    const char * value = std::getenv("DFLASH_DS4_DENSE_TP_MASK");
+    if (!value || !value[0]) return 0;
+    return std::max(0, std::atoi(value));
+}
+
+static bool should_split_ds4_dense_tensor(const char * name, int mask) {
+    if (mask == 0 || !name) return false;
+    // Each selected tensor is consumed as src0 of a plain 2-D MUL_MAT. Expert
+    // tensors and the grouped output-A view are deliberately excluded: the
+    // CUDA/HIP split-buffer implementation cannot split 3-D weight views.
+    if ((mask & 1) && std::strcmp(name, "output.weight") == 0) return true;
+    if ((mask & 2) && std::strstr(name, ".attn_q_b.weight") &&
+        !std::strstr(name, ".indexer.attn_q_b.weight")) return true;
+    if ((mask & 4) && std::strstr(name, ".attn_output_b.weight")) return true;
+    if ((mask & 8) && (std::strstr(name, ".attn_q_a.weight") ||
+                       std::strstr(name, ".attn_kv.weight") ||
+                       std::strstr(name, ".indexer.attn_q_b.weight") ||
+                       std::strstr(name, ".attn_compressor_kv.weight") ||
+                       std::strstr(name, ".attn_compressor_gate.weight") ||
+                       std::strstr(name, ".indexer_compressor_kv.weight") ||
+                       std::strstr(name, ".indexer_compressor_gate.weight"))) {
+        return true;
+    }
+    return false;
+}
+
 struct DS4TensorAlloc {
     ggml_tensor * tensor = nullptr;
     size_t tensor_offset = 0;
@@ -205,6 +299,7 @@ struct DS4TensorAlloc {
     size_t file_size = 0;
     size_t buffer_offset = 0;
     bool upload_to_backend = true;
+    bool dense_split = false;
 };
 
 }  // namespace
@@ -417,10 +512,41 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     const size_t data_offset = gguf_get_data_offset(gctx);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    int dense_tp_mask = ds4_dense_tp_mask();
+    if (dense_tp_mask != 0) {
+        const char * fused_verify = std::getenv("DFLASH_DS4_FUSED_VERIFY");
+        if (fused_verify && fused_verify[0] &&
+            std::strcmp(fused_verify, "0") != 0) {
+            std::fprintf(stderr,
+                "[deepseek4-dense-tp] disabling mask=%d: split-buffer dense "
+                "weights are incompatible with fused verifier graph replay\n",
+                dense_tp_mask);
+            dense_tp_mask = 0;
+        }
+    }
+    ggml_backend_buffer_type_t split_buft = nullptr;
+    size_t split_alignment = 1;
+    if (dense_tp_mask != 0 && ggml_backend_is_cuda(backend) &&
+        ggml_backend_cuda_get_device_count() >= 2) {
+        float strix_fraction = 0.28f;
+        if (const char * value = std::getenv("DFLASH_DS4_DENSE_TP_STRIX_FRACTION")) {
+            const float parsed = std::strtof(value, nullptr);
+            if (parsed > 0.0f && parsed < 1.0f) strix_fraction = parsed;
+        }
+        float tensor_split[GGML_CUDA_MAX_DEVICES] = {};
+        tensor_split[0] = 1.0f - strix_fraction;
+        tensor_split[1] = strix_fraction;
+        split_buft = ggml_backend_cuda_split_buffer_type(0, tensor_split);
+        split_alignment = ggml_backend_buft_get_alignment(split_buft);
+        std::fprintf(stderr,
+                     "[deepseek4-dense-tp] mask=%d row split R9700=%.3f Strix=%.3f\n",
+                     dense_tp_mask, 1.0f - strix_fraction, strix_fraction);
+    }
 
     std::vector<DS4TensorAlloc> allocs;
     allocs.reserve(n_tensors);
     size_t total_buf_size = 0;
+    size_t split_total_buf_size = 0;
     size_t tok_embd_alloc_idx = SIZE_MAX;
 
     for (int ti = 0; ti < n_tensors; ti++) {
@@ -438,10 +564,20 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         a.tensor_offset = tensor_offset;
         a.file_size = gguf_get_tensor_size(gctx, ti);
         a.upload_to_backend = upload_to_backend;
+        a.dense_split = upload_to_backend && split_buft &&
+                        should_split_ds4_dense_tensor(tname, dense_tp_mask);
         if (upload_to_backend) {
-            total_buf_size = align_up_size(total_buf_size, alignment);
-            a.buffer_offset = total_buf_size;
-            total_buf_size += ggml_backend_buft_get_alloc_size(buft, t);
+            if (a.dense_split) {
+                split_total_buf_size = align_up_size(
+                    split_total_buf_size, split_alignment);
+                a.buffer_offset = split_total_buf_size;
+                split_total_buf_size +=
+                    ggml_backend_buft_get_alloc_size(split_buft, t);
+            } else {
+                total_buf_size = align_up_size(total_buf_size, alignment);
+                a.buffer_offset = total_buf_size;
+                total_buf_size += ggml_backend_buft_get_alloc_size(buft, t);
+            }
         }
         allocs.push_back(a);
         if (std::strcmp(tname, "token_embd.weight") == 0) {
@@ -451,6 +587,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
     // ── Allocate GPU buffer ─────────────────────────────────────────────
     ggml_backend_buffer_t buf = nullptr;
+    ggml_backend_buffer_t split_buf = nullptr;
     if (total_buf_size > 0) {
         buf = ggml_backend_alloc_buffer(backend, total_buf_size);
         if (!buf) {
@@ -461,14 +598,36 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         }
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
+    if (split_total_buf_size > 0) {
+        split_buf = ggml_backend_buft_alloc_buffer(
+            split_buft, split_total_buf_size);
+        if (!split_buf) {
+            set_last_error("failed to allocate dense TP split buffer (" +
+                           std::to_string(split_total_buf_size) + " bytes)");
+            if (buf) ggml_backend_buffer_free(buf);
+            gguf_free(gctx);
+            if (meta_ctx) ggml_free(meta_ctx);
+            return false;
+        }
+        ggml_backend_buffer_set_usage(
+            split_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
 
     // ── Assign tensors from meta_ctx to the backend buffer ──────────────
     // Use ggml_backend_tensor_alloc to properly set the buffer association.
     char * buf_base = buf ? (char *)ggml_backend_buffer_get_base(buf) : nullptr;
+    char * split_buf_base = split_buf
+        ? (char *)ggml_backend_buffer_get_base(split_buf) : nullptr;
     for (auto & a : allocs) {
-        if (!a.upload_to_backend || !buf) continue;
-        if (ggml_backend_tensor_alloc(buf, a.tensor, buf_base + a.buffer_offset) != GGML_STATUS_SUCCESS) {
+        if (!a.upload_to_backend) continue;
+        ggml_backend_buffer_t tensor_buf = a.dense_split ? split_buf : buf;
+        char * tensor_base = a.dense_split ? split_buf_base : buf_base;
+        if (!tensor_buf ||
+            ggml_backend_tensor_alloc(tensor_buf, a.tensor,
+                                      tensor_base + a.buffer_offset) !=
+                GGML_STATUS_SUCCESS) {
             set_last_error("ggml_backend_tensor_alloc failed");
+            if (split_buf) ggml_backend_buffer_free(split_buf);
             if (buf) ggml_backend_buffer_free(buf);
             gguf_free(gctx);
             ggml_free(meta_ctx);
@@ -481,6 +640,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     std::string mmap_err;
     if (!mmap.open_ro(path, mmap_err)) {
         set_last_error("mmap: " + mmap_err);
+        if (split_buf) ggml_backend_buffer_free(split_buf);
         if (buf) ggml_backend_buffer_free(buf);
         gguf_free(gctx);
         ggml_free(meta_ctx);
@@ -496,6 +656,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
                                              a.file_size,
                                              mmap.len));
             mmap.close_map();
+            if (split_buf) ggml_backend_buffer_free(split_buf);
             if (buf) ggml_backend_buffer_free(buf);
             gguf_free(gctx);
             ggml_free(meta_ctx);
@@ -504,7 +665,12 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         a.file_offset = data_offset + a.tensor_offset;
     }
 
+#if !defined(_WIN32)
     bool fast_managed = (buf != nullptr) && ggml_backend_cuda_buffer_is_managed(buf) && (getenv("DFLASH_NO_PREAD") == nullptr);
+#else
+    // pread/posix_fadvise not available on Windows; fall back to mmap path.
+    bool fast_managed = false;
+#endif
     if (fast_managed) {
         // Unified/managed buffer: read weights straight off disk into it in parallel at
         // disk bandwidth, instead of mmap page-faults (~5x slower). Drop the cached file
@@ -518,12 +684,16 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             size_t i;
             while ((i = next.fetch_add(1)) < allocs.size()) {
                 auto & a = allocs[i];
-                if (!a.upload_to_backend) continue;
+                if (!a.upload_to_backend || a.dense_split) continue;
                 char * dst = (char *) a.tensor->data;
                 size_t done = 0;
                 while (done < a.file_size) {
+#if !defined(_WIN32)
                     ssize_t r = pread(mmap.fd, dst + done, a.file_size - done,
-                                      (off_t) (a.file_offset + done));
+                              (off_t) (a.file_offset + done));
+#else
+                    int r = -1;  // not reached: fast_managed is false on Windows
+#endif
                     if (r <= 0) { read_ok = false; return; }
                     done += (size_t) r;
                 }
@@ -532,11 +702,21 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         std::vector<std::thread> pool;
         for (unsigned t = 0; t < nth; t++) pool.emplace_back(worker);
         for (auto & th : pool) th.join();
+#if !defined(_WIN32)
         posix_fadvise(mmap.fd, 0, (off_t) mmap.len, POSIX_FADV_DONTNEED);
+#endif
         ggml_backend_synchronize(backend);  // make CPU-written managed pages visible to GPU
+        // Split tensors have no single CPU-visible base address. Upload them
+        // through the split buffer, which distributes whole rows to each GPU.
+        for (auto & a : allocs) {
+            if (!a.upload_to_backend || !a.dense_split) continue;
+            const void * src_data = (const char *)mmap.addr + a.file_offset;
+            ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+        }
         if (!read_ok) {
             set_last_error("parallel weight read failed");
             mmap.close_map();
+            if (split_buf) ggml_backend_buffer_free(split_buf);
             if (buf) ggml_backend_buffer_free(buf);
             gguf_free(gctx);
             ggml_free(meta_ctx);
@@ -567,6 +747,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             emb_mmap.close_map();
         } else {
             set_last_error("embedder mmap: " + emb_err);
+            if (split_buf) ggml_backend_buffer_free(split_buf);
             if (buf) ggml_backend_buffer_free(buf);
             gguf_free(gctx);
             ggml_free(meta_ctx);
@@ -654,12 +835,13 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
     out.ctx = meta_ctx;
     out.buf = buf;
-
+    out.dense_split_buf = split_buf;
     gguf_free(gctx);
     // Note: meta_ctx is now owned by out.ctx — do NOT free it here.
 
-    std::fprintf(stderr, "[deepseek4] loaded %zu tensors, %.1f MB GPU buffer%s\n",
+    std::fprintf(stderr, "[deepseek4] loaded %zu tensors, %.1f MB GPU buffer, %.1f MB dense TP split%s\n",
                  allocs.size(), (double)total_buf_size / (1024.0 * 1024.0),
+                 (double)split_total_buf_size / (1024.0 * 1024.0),
                  plan.expert_metadata_only ? " [expert-metadata-only]" : "");
     return true;
 }
@@ -790,7 +972,8 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
         const MoeHybridPlacement & placement,
         const MoeHybridConfig * cfg_override,
         MoeHybridStorage & out,
-        std::string * err) {
+        std::string * err,
+        ggml_backend_t cold_gpu_backend) {
     ggml_context * expert_meta = nullptr;
     gguf_init_params gip{};
     gip.no_alloc = true;
@@ -809,10 +992,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
         if (err) *err = mmap_err;
         return false;
     }
-    if (mmap.fd >= 0) {
-        ::close(mmap.fd);
-        mmap.fd = -1;
-    }
+    mmap.close_fd();
 
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = static_cast<const uint8_t *>(mmap.addr);
@@ -859,7 +1039,7 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
     const bool ok = build_moe_hybrid_storage_from_file_with_mmap(
         cfg, backend, placement, layer_descs, layer_file_data,
-        mmap.addr, mmap.len, out, err);
+        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend);
 
     if (!ok) {
         mmap.close_map();
@@ -886,6 +1066,10 @@ bool build_deepseek4_moe_hybrid_storage_from_file(
 void free_deepseek4_weights(DeepSeek4Weights & w) {
     deepseek4_release_runtime_graphs(w);
     if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
+    if (w.dense_split_buf) {
+        ggml_backend_buffer_free(w.dense_split_buf);
+        w.dense_split_buf = nullptr;
+    }
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     w.layers.clear();
     w.embedder.tok_embd_owned.clear();

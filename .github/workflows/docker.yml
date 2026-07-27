@@ -28,6 +28,7 @@ on:
       - .dockerignore
       - .github/workflows/docker.yml
       - server/CMakeLists.txt
+      - server/cmake/**
       - server/src/**
       - server/test/**
       - server/include/**
@@ -51,6 +52,7 @@ on:
       - docker-bake.hcl
       - .dockerignore
       - .github/workflows/docker.yml
+      - server/cmake/**
   # Manual trigger for one-off rebuilds or pre-release smoke tests. The
   # `push` input controls whether the resulting images land in GHCR or only
   # populate the buildx cache.
