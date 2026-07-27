@@ -510,7 +510,8 @@ carries a `timings` object with per-request performance metrics:
     "decode_tokens_per_sec": 41.6,
     "cache_hit": true,
     "cached_prefix_tokens": 192,
-    "prefilled_tokens": 64
+    "prefilled_tokens": 64,
+    "effective_prompt_tokens": 256
   }
 }
 ```
@@ -532,6 +533,9 @@ carries a `timings` object with per-request performance metrics:
   excluding the restored prefix. For FlowKV/PFlash requests, these two token
   counts describe the rewritten prompt seen by the backend rather than the raw
   API prompt.
+- `effective_prompt_tokens` — total tokens in that backend prompt. This can
+  differ from `usage.prompt_tokens` when FlowKV/PFlash rewrites the raw API
+  prompt, and equals `cached_prefix_tokens + prefilled_tokens`.
 
 These fields are emitted on every response (OpenAI Chat Completions,
 Anthropic Messages, OpenAI Responses), regardless of whether the

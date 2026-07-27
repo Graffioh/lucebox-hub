@@ -3092,6 +3092,7 @@ void HttpServer::worker_loop() {
             using_restore,
             cached_prefix_tokens,
             effective_prompt_tokens - cached_prefix_tokens,
+            effective_prompt_tokens,
         };
 
         // Record performance for /status page.

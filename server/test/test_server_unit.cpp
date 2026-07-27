@@ -3874,11 +3874,12 @@ static void test_usage_timings_zero_decode_no_div_by_zero() {
 }
 
 static void test_usage_timings_reports_prefix_cache_work() {
-    GenTimings t{0.012, 0.25, true, 8192, 64};
+    GenTimings t{0.012, 0.25, true, 8192, 64, 8256};
     json j = build_timings_json(t, /*completion_tokens=*/10);
     TEST_ASSERT(j["cache_hit"].get<bool>());
     TEST_ASSERT(j["cached_prefix_tokens"].get<int>() == 8192);
     TEST_ASSERT(j["prefilled_tokens"].get<int>() == 64);
+    TEST_ASSERT(j["effective_prompt_tokens"].get<int>() == 8256);
 }
 
 static void test_usage_timings_omitted_when_null() {

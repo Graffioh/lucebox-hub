@@ -45,6 +45,7 @@ struct GenTimings {
     bool   cache_hit            = false;
     int    cached_prefix_tokens = 0;
     int    prefilled_tokens     = 0;
+    int    effective_prompt_tokens = 0;
 };
 
 // Build the `timings` sub-object emitted under `usage`.
@@ -56,6 +57,7 @@ struct GenTimings {
 //   cache_hit               = whether a prefix snapshot was restored
 //   cached_prefix_tokens    = effective-prompt tokens supplied by that snapshot
 //   prefilled_tokens        = effective-prompt tokens computed for this request
+//   effective_prompt_tokens = total prompt tokens seen by the backend
 nlohmann::json build_timings_json(const GenTimings & t, int completion_tokens);
 
 // Manages SSE streaming for a single request.

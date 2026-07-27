@@ -174,6 +174,7 @@ def extract_result(
         "cache_hit",
         "cached_prefix_tokens",
         "prefilled_tokens",
+        "effective_prompt_tokens",
     }
     missing = sorted(required.difference(timings))
     if missing and require_cache_telemetry:
@@ -210,6 +211,11 @@ def extract_result(
         "prefilled_tokens": (
             int(timings["prefilled_tokens"])
             if "prefilled_tokens" in timings
+            else None
+        ),
+        "effective_prompt_tokens": (
+            int(timings["effective_prompt_tokens"])
+            if "effective_prompt_tokens" in timings
             else None
         ),
         "wall_ms": round(wall_ms, 1),
@@ -281,15 +287,21 @@ def main() -> int:
 
     cold = rows[0]
     warm = rows[1:-1]
+    measured_prefill_ms = [row["prefill_ms"] for row in [cold, *warm]]
+    if any(value <= 0 for value in measured_prefill_ms):
+        raise RuntimeError(
+            "cold and warm prefill timings must all be positive; got "
+            f"{measured_prefill_ms}"
+        )
     median_warm_ms = statistics.median(row["prefill_ms"] for row in warm)
-    speedup = cold["prefill_ms"] / median_warm_ms if median_warm_ms > 0 else float("inf")
+    speedup = cold["prefill_ms"] / median_warm_ms
 
     checks = {"speedup_meets_threshold": speedup >= args.min_speedup}
     if not args.timing_only:
         checks = {
             "all_outputs_nonempty": all(row["output_text"] for row in rows),
             "outputs_are_stable": all(
-                row["output_text"] == cold["output_text"] for row in rows[1:]
+                row["output_text"] == cold["output_text"] for row in warm
             ),
             "cold_is_miss": not cold["cache_hit"],
             "all_warm_hit": all(row["cache_hit"] for row in warm),
@@ -302,7 +314,7 @@ def main() -> int:
             "changed_tools_is_miss": not mutation["cache_hit"],
             "token_accounting_is_exact": all(
                 row["cached_prefix_tokens"] + row["prefilled_tokens"]
-                == row["prompt_tokens"]
+                == row["effective_prompt_tokens"]
                 for row in rows
             ),
             **checks,
@@ -334,7 +346,8 @@ def main() -> int:
     }
 
     print(
-        "turn                     prompt  cached  prefilled  prefill_ms  cache_hit"
+        "turn                     raw_prompt  effective  cached  prefilled  "
+        "prefill_ms  cache_hit"
     )
     for row in rows:
         cached = (
@@ -347,14 +360,19 @@ def main() -> int:
             if row["prefilled_tokens"] is not None
             else "-"
         )
+        effective = (
+            str(row["effective_prompt_tokens"])
+            if row["effective_prompt_tokens"] is not None
+            else "-"
+        )
         cache_hit = (
             str(row["cache_hit"]).lower()
             if row["cache_hit"] is not None
             else "-"
         )
         print(
-            f"{row['turn']:<24} {row['prompt_tokens']:>6} "
-            f"{cached:>7} {prefilled:>10} "
+            f"{row['turn']:<24} {row['prompt_tokens']:>10} "
+            f"{effective:>10} {cached:>7} {prefilled:>10} "
             f"{row['prefill_ms']:>10.1f}  {cache_hit}"
         )
     print(
