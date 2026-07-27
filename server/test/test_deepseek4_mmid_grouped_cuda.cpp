@@ -27,6 +27,7 @@ static bool run_case(
         ggml_backend_t backend,
         ggml_type type,
         int width,
+        bool fused_ds4,
         bool write_output,
         std::ofstream & output) {
     constexpr int k_dim = 256;
@@ -41,13 +42,22 @@ static bool run_case(
     }
 
     ggml_tensor * weights = ggml_new_tensor_3d(ctx, type, k_dim, n_rows, n_experts);
+    ggml_tensor * gate_weights =
+        fused_ds4 ? ggml_new_tensor_3d(ctx, type, k_dim, n_rows, n_experts) : nullptr;
     ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_dim, 1, width);
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, width);
     ggml_set_input(weights);
+    if (gate_weights != nullptr) {
+        ggml_set_input(gate_weights);
+    }
     ggml_set_input(input);
     ggml_set_input(ids);
 
     ggml_tensor * result = ggml_mul_mat_id(ctx, weights, input, ids);
+    if (gate_weights != nullptr) {
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, input, ids);
+        result = ggml_swiglu_ds4_split(ctx, gate, result, 1.5f);
+    }
     ggml_set_output(result);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, result);
@@ -89,12 +99,17 @@ static bool run_case(
     }
 
     ggml_backend_tensor_set(weights, weights_q.data(), 0, weights_q.size());
+    if (gate_weights != nullptr) {
+        ggml_backend_tensor_set(gate_weights, weights_q.data(), 0, weights_q.size());
+    }
     ggml_backend_tensor_set(input, input_f.data(), 0, input_f.size() * sizeof(float));
     ggml_backend_tensor_set(ids, ids_h.data(), 0, ids_h.size() * sizeof(int32_t));
+    ggml_backend_synchronize(backend);
 
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
     std::vector<float> result_h(ggml_nelements(result));
     if (status == GGML_STATUS_SUCCESS) {
+        ggml_backend_synchronize(backend);
         ggml_backend_tensor_get(result, result_h.data(), 0, result_h.size() * sizeof(float));
         if (write_output) {
             output.write(reinterpret_cast<const char *>(result_h.data()),
@@ -102,8 +117,8 @@ static bool run_case(
         }
     }
 
-    std::printf("[mmid-grouped-test] type=%s width=%d pairs=%d status=%d bytes=%zu\n",
-                ggml_type_name(type), width, width * top_k, (int) status,
+    std::printf("[mmid-grouped-test] type=%s width=%d fused_ds4=%d pairs=%d status=%d bytes=%zu\n",
+                ggml_type_name(type), width, fused_ds4 ? 1 : 0, width * top_k, (int) status,
                 result_h.size() * sizeof(float));
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
@@ -111,6 +126,24 @@ static bool run_case(
 }
 
 static int run_child(const char * mode, const char * output_path) {
+    const bool grouped = std::strcmp(mode, "grouped") == 0;
+    if (!grouped && std::strcmp(mode, "legacy") != 0) {
+        return 2;
+    }
+#if defined(_WIN32)
+    if (!grouped) {
+        _putenv_s("GGML_CUDA_DISABLE_FUSION", "1");
+    } else {
+        _putenv_s("GGML_CUDA_DISABLE_FUSION", "");
+    }
+#else
+    if (!grouped) {
+        setenv("GGML_CUDA_DISABLE_FUSION", "1", 1);
+    } else {
+        unsetenv("GGML_CUDA_DISABLE_FUSION");
+    }
+#endif
+
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (backend == nullptr) {
         std::fprintf(stderr, "GPU backend unavailable\n");
@@ -122,14 +155,11 @@ static int run_child(const char * mode, const char * output_path) {
         GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K,
     };
     const int widths[] = {2, 4, 8, 9, 16};
-    const bool grouped = std::strcmp(mode, "grouped") == 0;
-    if (!grouped && std::strcmp(mode, "legacy") != 0) {
-        return 2;
-    }
     bool ok = output.good();
     for (ggml_type type : types) {
         for (int width : widths) {
-            ok = run_case(backend, type, width, true, output) && ok;
+            ok = run_case(backend, type, width, false, true, output) && ok;
+            ok = run_case(backend, type, width, true, true, output) && ok;
         }
     }
     output.close();
@@ -213,9 +243,10 @@ static bool compare_case_outputs(
         reference_power += (double) expected * expected;
     }
 
-    // The legacy MMQ path is an independent numerical oracle for cases that did
-    // not previously fit the architecture's MMVQ ceiling. Match the tolerance
-    // used by the ROCmFPX MMQ reference test for reduction-order differences.
+    // The unfused legacy graph is an independent numerical oracle for fused
+    // DS4 cases, and legacy MMQ is the oracle for cases that did not previously
+    // fit the architecture's MMVQ ceiling. Match the repository's MMQ tolerance
+    // for the resulting reduction-order and fused-operation differences.
     constexpr double max_nmse = 5e-4;
     const double nmse = squared_error / std::max(reference_power, 1e-30);
     return finite && nmse <= max_nmse;
@@ -328,24 +359,33 @@ int main(int argc, char ** argv) {
     bool grouped_dispatch = true;
     for (ggml_type type : types) {
         for (int width : widths) {
-            const size_t case_bytes = (size_t) 128 * 8 * width * sizeof(float);
             const bool legacy_mmvq = has_mmvq_record(legacy_log, type, width);
-            grouped_dispatch =
-                has_mmvq_record(grouped_log, type, width, "grouped") && grouped_dispatch;
-            if (output_parity) {
-                output_parity =
-                    compare_case_outputs(legacy, grouped, offset, case_bytes, legacy_mmvq);
+            for (bool fused_ds4 : {false, true}) {
+                const size_t case_bytes = (size_t) 128 * 8 * width * sizeof(float);
+                const bool require_exact = legacy_mmvq && !fused_ds4;
+                grouped_dispatch =
+                    has_mmvq_record(grouped_log, type, width, "grouped") && grouped_dispatch;
+                if (output_parity) {
+                    output_parity = compare_case_outputs(
+                        legacy, grouped, offset, case_bytes, require_exact);
+                    if (!output_parity) {
+                        std::fprintf(stderr,
+                                     "output mismatch type=%s width=%d fused_ds4=%d exact=%d\n",
+                                     ggml_type_name(type), width, fused_ds4 ? 1 : 0,
+                                     require_exact ? 1 : 0);
+                    }
+                }
+                compared_bytes += case_bytes;
+                ++compared_cases;
+                exact_cases += require_exact ? 1 : 0;
+                tolerant_cases += require_exact ? 0 : 1;
+                offset += case_bytes;
             }
-            compared_bytes += case_bytes;
-            ++compared_cases;
-            exact_cases += legacy_mmvq ? 1 : 0;
-            tolerant_cases += legacy_mmvq ? 0 : 1;
-            offset += case_bytes;
         }
     }
-    output_parity = output_parity && offset == legacy.size() && compared_cases == 25;
+    output_parity = output_parity && offset == legacy.size() && compared_cases == 50;
     const bool pass = legacy_status == 0 && grouped_status == 0 &&
-        output_parity && grouped_dispatch && legacy_grouped == 0 && grouped_grouped == 25;
+        output_parity && grouped_dispatch && legacy_grouped == 0 && grouped_grouped == 75;
     if (pass) {
         std::remove(legacy_path.c_str());
         std::remove(grouped_path.c_str());

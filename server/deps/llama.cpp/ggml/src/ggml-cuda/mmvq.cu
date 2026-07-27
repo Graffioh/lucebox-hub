@@ -256,7 +256,8 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 // weight traffic toward the union of routed experts. Bit-exact per
 // (row, token) vs mul_mat_vec_q_moe (same vec_dot sequence and reduction).
 // Model-agnostic: applies to any MoE with n_expert_used*n_tokens <= 256.
-//   DFLASH_MMID_GROUPED=1       opt-in
+//   DFLASH_MMID_GROUPED         1 = enable, 0 = disable
+//                               (CUDA default on; HIP default off)
 //   DFLASH_MMID_GROUPED_TYPES   bitmask, 1 = Q4_K (default), 2 = Q6_K,
 //                               4 = Q4_0/Q8_0/Q5_K. Q6_K stays on its tuned
 //                               MMQ route above 5 tokens unless enabled.
@@ -285,9 +286,9 @@ struct mmid_gate_extra {
 static bool mmid_grouped_env() {
     // Bit-exact and measured equal-or-faster on small MoE verify batches, so
     // enabled by default on CUDA; DFLASH_MMID_GROUPED=0 is the kill switch.
-    // HIP (RDNA3/RDNA4) is wired but unvalidated on-hardware, so it stays opt-in
-    // and default-off (DFLASH_MMID_GROUPED=1 to enable); flip the default once the
-    // gfx1151 bit-exact + perf run lands.
+    // HIP (RDNA3/RDNA4) correctness is validated on gfx1151, but performance is
+    // still unmeasured, so it stays opt-in and default-off
+    // (DFLASH_MMID_GROUPED=1 to enable).
     static const bool on = []() {
         const char * e = std::getenv("DFLASH_MMID_GROUPED");
         if (e != nullptr) {
@@ -329,6 +330,13 @@ static bool mmid_grouped_type_ok(ggml_type type) {
 static bool mmid_grouped_arch_ok(int cc) {
     return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) ||
         GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
+}
+
+bool ggml_cuda_mmvq_mmid_grouped_enabled(
+        ggml_type type, int cc, int64_t ncols_dst, int64_t routed_pairs) {
+    return ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_MOE_BATCH_SIZE &&
+        routed_pairs <= MMID_GROUPED_MAX_PAIRS &&
+        mmid_grouped_env() && mmid_grouped_type_ok(type) && mmid_grouped_arch_ok(cc);
 }
 
 // Host function: returns the max batch size for the current arch+type at runtime.
@@ -1132,6 +1140,8 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
     ggml_glu_op active_glu;
+    float glu_param0 = 0.0f;
+    float glu_param1 = 0.0f;
 
     if constexpr (has_fusion) {
         use_gate      = fusion.gate      != nullptr;
@@ -1141,6 +1151,8 @@ static __global__ void mul_mat_vec_q_moe_grouped(
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
+        glu_param0    = fusion.glu_param0;
+        glu_param1    = fusion.glu_param1;
     }
 
     float tmp[c_rows_per_block] = {0.0f};
@@ -1190,7 +1202,11 @@ static __global__ void mul_mat_vec_q_moe_grouped(
                         result *= ggml_cuda_op_gelu_single(gate_value);
                         break;
                     case GGML_GLU_OP_SWIGLU_OAI:
-                        result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                        result = ggml_cuda_op_swiglu_oai_single(
+                            gate_value, result, glu_param0, glu_param1);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_DS4:
+                        result = ggml_cuda_op_swiglu_ds4_single(gate_value, result, glu_param0);
                         break;
                     default:
                         result = result * gate_value;
@@ -1202,7 +1218,9 @@ static __global__ void mul_mat_vec_q_moe_grouped(
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, vgate, x_bias, gate_bias, active_glu, tmp_gate);
+        GGML_UNUSED_VARS(
+            use_gate, use_bias, use_gate_bias, vgate, x_bias, gate_bias,
+            active_glu, glu_param0, glu_param1, tmp_gate);
     }
 }
 
@@ -2017,9 +2035,8 @@ void ggml_cuda_mul_mat_vec_q(
     }();
 
     // [TAG_MMID_GROUPED] grouped-expert path for small MUL_MAT_ID batches.
-    if (ids && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_MOE_BATCH_SIZE &&
-        (int) (nchannels_dst*ncols_dst) <= MMID_GROUPED_MAX_PAIRS &&
-        mmid_grouped_env() && mmid_grouped_type_ok(src0->type) && mmid_grouped_arch_ok(cc)) {
+    if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
+            src0->type, cc, ncols_dst, nchannels_dst*ncols_dst)) {
         // Batches above MMID_GROUPED_MAX_PAIRS fall through to the legacy
         // per-expert kernel instead of aborting the request.
         const int np = (int) (nchannels_dst*ncols_dst);
