@@ -1387,6 +1387,56 @@ static void test_find_boundaries_empty() {
     TEST_ASSERT(bounds.empty());
 }
 
+static void test_tool_schema_is_part_of_stable_system_boundary() {
+    // Synthetic Qwen-shaped prompt:
+    //   <system> TOOL_SCHEMA </system> <user> question </user> <assistant>
+    // Marker IDs are intentionally simple; the invariant under test is that
+    // the first safe boundary ends after the system/tool block. Its position
+    // stays stable while its prefix hash changes with the tools, but not with
+    // a user-only suffix change.
+    ChatMarkers markers;
+    markers.family = "qwen";
+    markers.sys_role_prefix = {10, 11};
+    markers.end_msg_seqs = {{12}};
+    markers.next_role_starts = {{10}};
+
+    const std::vector<int32_t> prompt_a = {
+        10, 11, 100, 101, 102, 12, 10, 20, 200, 12, 10, 30,
+    };
+    const std::vector<int32_t> prompt_new_user = {
+        10, 11, 100, 101, 102, 12, 10, 20, 999, 12, 10, 30,
+    };
+    const std::vector<int32_t> prompt_new_tools = {
+        10, 11, 100, 101, 777, 12, 10, 20, 200, 12, 10, 30,
+    };
+
+    const auto bounds_a = find_all_boundaries(prompt_a, markers);
+    const auto bounds_user = find_all_boundaries(prompt_new_user, markers);
+    const auto bounds_tools = find_all_boundaries(prompt_new_tools, markers);
+    TEST_ASSERT(bounds_a.size() == 2);
+    TEST_ASSERT(bounds_user == bounds_a);
+    TEST_ASSERT(bounds_tools == bounds_a);
+
+    const int system_end = bounds_a.front();
+    TEST_ASSERT(system_end == 7);
+    TEST_ASSERT(hash_prefix(prompt_a.data(), system_end) ==
+                hash_prefix(prompt_new_user.data(), system_end));
+    TEST_ASSERT(hash_prefix(prompt_a.data(), system_end) !=
+                hash_prefix(prompt_new_tools.data(), system_end));
+}
+
+static void test_inline_snapshot_boundary_advances_past_restore() {
+    const std::vector<int> boundaries = {100, 240, 380, 520};
+    // Second-to-last is the boundary before the current user turn.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries) == 380);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 240) == 380);
+    // Do not reserve a snapshot when the restore already covers that point.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 500) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary({}, 0) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary({100}, 0) == 100);
+}
+
 // ── Prefix-aware eviction policy (model-free) ───────────────────────────
 
 static void test_evict_empty_is_zero() {
@@ -3823,6 +3873,14 @@ static void test_usage_timings_zero_decode_no_div_by_zero() {
     TEST_ASSERT(finish_str.find("nan") == std::string::npos);
 }
 
+static void test_usage_timings_reports_prefix_cache_work() {
+    GenTimings t{0.012, 0.25, true, 8192, 64};
+    json j = build_timings_json(t, /*completion_tokens=*/10);
+    TEST_ASSERT(j["cache_hit"].get<bool>());
+    TEST_ASSERT(j["cached_prefix_tokens"].get<int>() == 8192);
+    TEST_ASSERT(j["prefilled_tokens"].get<int>() == 64);
+}
+
 static void test_usage_timings_omitted_when_null() {
     // Backward compat: emit_finish(n) (no timings) emits the legacy
     // usage block — no `timings` key. Guards the SDK-facing default
@@ -4597,6 +4655,8 @@ int main() {
     RUN_TEST(test_hash_prefix_different_lengths);
     RUN_TEST(test_hash_prefix_empty);
     RUN_TEST(test_find_boundaries_empty);
+    RUN_TEST(test_tool_schema_is_part_of_stable_system_boundary);
+    RUN_TEST(test_inline_snapshot_boundary_advances_past_restore);
     RUN_TEST(test_evict_empty_is_zero);
     RUN_TEST(test_evict_single_is_zero);
     RUN_TEST(test_evict_chain_keeps_ancestors);
@@ -4729,6 +4789,7 @@ int main() {
     RUN_TEST(test_usage_timings_anthropic_streaming);
     RUN_TEST(test_usage_timings_responses_streaming);
     RUN_TEST(test_usage_timings_zero_decode_no_div_by_zero);
+    RUN_TEST(test_usage_timings_reports_prefix_cache_work);
     RUN_TEST(test_usage_timings_omitted_when_null);
 
     std::fprintf(stderr, "\n── ModelBackend empty-spec retry ──\n");

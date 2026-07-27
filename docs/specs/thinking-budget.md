@@ -507,7 +507,10 @@ carries a `timings` object with per-request performance metrics:
   "timings": {
     "prefill_ms": 234.5,
     "decode_ms": 2456.7,
-    "decode_tokens_per_sec": 41.6
+    "decode_tokens_per_sec": 41.6,
+    "cache_hit": true,
+    "cached_prefix_tokens": 192,
+    "prefilled_tokens": 64
   }
 }
 ```
@@ -521,6 +524,14 @@ carries a `timings` object with per-request performance metrics:
   The model's effective throughput on this request. Emitted as
   `0.0` when `decode_ms` is zero (prefill-only / count-tokens paths)
   rather than `null` / `NaN` so JSON parsers don't trip.
+- `cache_hit` — whether the server restored a prefix snapshot for this
+  request.
+- `cached_prefix_tokens` — tokens in the effective prompt supplied by the
+  restored snapshot. Zero on a cache miss.
+- `prefilled_tokens` — effective-prompt tokens computed on this request,
+  excluding the restored prefix. For FlowKV/PFlash requests, these two token
+  counts describe the rewritten prompt seen by the backend rather than the raw
+  API prompt.
 
 These fields are emitted on every response (OpenAI Chat Completions,
 Anthropic Messages, OpenAI Responses), regardless of whether the

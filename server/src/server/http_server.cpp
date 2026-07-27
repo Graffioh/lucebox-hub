@@ -2671,14 +2671,31 @@ void HttpServer::worker_loop() {
         // pointless snapshot copy-in.
         if (using_restore) {
             const int snap_len = backend_.snapshot_cur_pos(cache_slot);
-            if (snap_len > (int)effective_prompt.size()) {
+            if (snap_len <= 0 || snap_len > (int)effective_prompt.size()) {
                 std::fprintf(stderr,
-                    "[pc] slot=%d snapshot pos=%d > prompt=%zu — treating as miss\n",
+                    "[pc] slot=%d invalid snapshot pos=%d prompt=%zu — treating as miss\n",
                     cache_slot, snap_len, effective_prompt.size());
+                if (disk_hit) {
+                    backend_.snapshot_free(DISK_STAGING_SLOT);
+                } else {
+                    // A memory-cache key whose backend snapshot disappeared
+                    // must not remain discoverable on every later request.
+                    // Inline and full caches use disjoint slot ranges, so
+                    // invalidating both ownership tables is unambiguous.
+                    backend_.snapshot_free(cache_slot);
+                    prefix_cache_.abort_inline_snap(cache_slot);
+                    prefix_cache_.abort_full_snap(cache_slot);
+                }
                 cache_slot = -1;
                 prefix_len = 0;
                 using_restore = false;
                 disk_hit = false;
+            } else {
+                // PrefixCache keys use safe chat boundaries. Qwen may save at
+                // an earlier chunk-aligned position to keep prefill numerically
+                // identical, so backend state is the authoritative amount of
+                // work actually reused.
+                prefix_len = snap_len;
             }
         }
 
@@ -2721,11 +2738,23 @@ void HttpServer::worker_loop() {
             }
         }
 
-        // Prepare a full-prompt snapshot for exact prefill-cache hits.
+        // A generation can save only one snapshot during prefill. Tool-heavy
+        // requests prefer the reusable system/tool boundary; otherwise an
+        // enabled exact full-prompt cache retains its existing priority.
         int full_snap_slot = -1;
         int full_snap_pos = 0;
         bool full_snap_prepared = false;
-        if (!using_restore) {
+        int snap_slot = -1;
+        int snap_cut = 0;
+        const bool prefer_inline_snap = !req.tools.empty();
+
+        auto prepare_inline = [&]() {
+            auto prepared = prefix_cache_.prepare_inline_snap(
+                effective_prompt, using_restore ? prefix_len : 0);
+            snap_slot = prepared.first;
+            snap_cut = prepared.second;
+        };
+        auto prepare_full = [&]() {
             full_snap_slot = prefix_cache_.prepare_full_snap(req.prompt_tokens);
             if (full_snap_slot >= 0) {
                 full_snap_pos = (int)effective_prompt.size();
@@ -2733,22 +2762,38 @@ void HttpServer::worker_loop() {
                 gen_req.snap_pos = full_snap_pos;
                 full_snap_prepared = true;
             }
+        };
+
+        if (prefer_inline_snap || using_restore) {
+            prepare_inline();
+        }
+        if (!using_restore && snap_slot < 0) {
+            prepare_full();
         }
 
-        // Prepare inline snapshot for future cache hits. GenerateRequest only
-        // carries one snapshot target, so exact full-prompt cache takes
-        // priority when enabled.
-        int snap_slot = -1;
-        int snap_cut = 0;
-        if (!full_snap_prepared) {
-            auto prepared = prefix_cache_.prepare_inline_snap(effective_prompt);
-            snap_slot = prepared.first;
-            snap_cut = prepared.second;
+        // Full cache may be disabled or already contain this exact key. Fall
+        // back to an inline snapshot when no target has been selected yet.
+        if (!full_snap_prepared && snap_slot < 0) {
+            prepare_inline();
+        }
+
+        // Never destroy the snapshot needed by this request's restore. With a
+        // one-slot cache there may be no independent destination for a deeper
+        // checkpoint; preserving the current hit is better than invalidating
+        // it before restore starts.
+        if (using_restore && snap_slot == cache_slot) {
+            prefix_cache_.cancel_inline_snap(snap_slot);
+            snap_slot = -1;
+            snap_cut = 0;
         }
         bool snap_prepared = (snap_slot >= 0);
         if (snap_prepared) {
+            backend_.snapshot_free(snap_slot);
             gen_req.snap_slot = snap_slot;
             gen_req.snap_pos = snap_cut;
+        }
+        if (full_snap_prepared) {
+            backend_.snapshot_free(full_snap_slot);
         }
 
         std::fprintf(stderr,
@@ -2933,36 +2978,53 @@ void HttpServer::worker_loop() {
 
         // Confirm or abort the full-prompt snapshot.
         if (full_snap_prepared) {
-            if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
+            if (result.ok() && completion_tokens > 0 && visible_output_seen &&
+                !client_disconnected &&
                 backend_.snapshot_used(full_snap_slot)) {
                 int saved_pos = backend_.snapshot_cur_pos(full_snap_slot);
-                if (saved_pos > 0) {
+                if (saved_pos > 0 && saved_pos <= full_snap_pos) {
                     prefix_cache_.confirm_full_snap(full_snap_slot, req.prompt_tokens,
                                                     saved_pos);
                 } else {
+                    backend_.snapshot_free(full_snap_slot);
                     prefix_cache_.abort_full_snap(full_snap_slot);
                 }
             } else {
+                backend_.snapshot_free(full_snap_slot);
                 prefix_cache_.abort_full_snap(full_snap_slot);
             }
         }
 
         // Confirm or abort the inline snapshot.
         if (snap_prepared) {
-            if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
+            if (result.ok() && completion_tokens > 0 && visible_output_seen &&
+                !client_disconnected &&
                 backend_.snapshot_used(snap_slot)) {
-                prefix_cache_.confirm_inline_snap(snap_slot, snap_cut, effective_prompt);
-                // Track for shutdown save.
-                slot_tokens_[snap_slot] = std::vector<int32_t>(
-                    effective_prompt.begin(), effective_prompt.begin() + snap_cut);
-                // Save to disk cache if threshold met.
-                if (!disk_cache_.disabled()) {
-                    disk_cache_.learn_layout(snap_slot);
-                    if (disk_policy.mode == DiskPrefixCacheMode::Full) {
-                        disk_cache_.save(snap_slot, effective_prompt);
+                const int saved_pos = backend_.snapshot_cur_pos(snap_slot);
+                if (saved_pos > 0 && saved_pos <= snap_cut) {
+                    std::fprintf(stderr,
+                        "[pc] inline snapshot requested=%d saved=%d slot=%d\n",
+                        snap_cut, saved_pos, snap_slot);
+                    prefix_cache_.confirm_inline_snap(
+                        snap_slot, snap_cut, effective_prompt);
+                    // Track for shutdown save. The key may be stricter than a
+                    // Qwen chunk-aligned snapshot, which is safe: matching the
+                    // longer token prefix necessarily matches saved KV rows.
+                    slot_tokens_[snap_slot] = std::vector<int32_t>(
+                        effective_prompt.begin(), effective_prompt.begin() + snap_cut);
+                    // Save to disk cache if threshold met.
+                    if (!disk_cache_.disabled()) {
+                        disk_cache_.learn_layout(snap_slot);
+                        if (disk_policy.mode == DiskPrefixCacheMode::Full) {
+                            disk_cache_.save(snap_slot, effective_prompt);
+                        }
                     }
+                } else {
+                    backend_.snapshot_free(snap_slot);
+                    prefix_cache_.abort_inline_snap(snap_slot);
                 }
             } else {
+                backend_.snapshot_free(snap_slot);
                 prefix_cache_.abort_inline_snap(snap_slot);
             }
         }
@@ -3020,7 +3082,17 @@ void HttpServer::worker_loop() {
         // `usage.timings` (OpenAI Chat usage chunk, Anthropic
         // message_delta usage, Responses response.completed usage).
         // See docs/specs/thinking-budget.md §6.3.
-        GenTimings gen_timings{ result.prefill_s, result.decode_s };
+        const int effective_prompt_tokens = (int)effective_prompt.size();
+        const int cached_prefix_tokens = using_restore
+            ? (std::clamp)(prefix_len, 0, effective_prompt_tokens)
+            : 0;
+        GenTimings gen_timings{
+            result.prefill_s,
+            result.decode_s,
+            using_restore,
+            cached_prefix_tokens,
+            effective_prompt_tokens - cached_prefix_tokens,
+        };
 
         // Record performance for /status page.
         if (result.ok()) {

@@ -57,6 +57,12 @@ PrefixHash hash_prefix(const int32_t * ids, int count);
 int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru);
 int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru);
 
+// Pick the inline snapshot boundary for a request. We cache the boundary before
+// the current user turn (second-to-last marker) and only when it advances past
+// an already-restored prefix. Returns 0 when there is no useful new boundary.
+int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
+                                    int restored_prefix_len = 0);
+
 // ─── Prefix cache entry ─────────────────────────────────────────────────
 
 struct FullCacheEntry {
@@ -87,8 +93,12 @@ public:
     // Look up the longest cached prefix. Returns (slot, prefix_len) or (-1, 0).
     std::pair<int, int> lookup(const std::vector<int32_t> & prompt_ids);
 
-    // Prepare an inline snapshot. Returns (slot, target_cut) or (-1, 0).
-    std::pair<int, int> prepare_inline_snap(const std::vector<int32_t> & prompt_ids);
+    // Prepare an inline snapshot. `restored_prefix_len` prevents reserving a
+    // slot for a boundary already covered by the restored snapshot. Returns
+    // (slot, target_cut) or (-1, 0).
+    std::pair<int, int> prepare_inline_snap(
+        const std::vector<int32_t> & prompt_ids,
+        int restored_prefix_len = 0);
 
     // Confirm after daemon successfully saved the snapshot.
     void confirm_inline_snap(int slot, int target_cut,
@@ -96,6 +106,11 @@ public:
 
     // Abort if the snapshot failed.
     void abort_inline_snap(int slot);
+
+    // Cancel before the backend slot is touched (for example when the selected
+    // destination is also the snapshot being restored). Unlike abort, this
+    // preserves the existing entry and only drops the pending reservation.
+    void cancel_inline_snap(int slot);
 
     // Drop all entries (e.g., after OOM recovery).
     void mark_all_cleared();

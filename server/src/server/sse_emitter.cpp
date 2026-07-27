@@ -93,7 +93,10 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
     return json{
         {"prefill_ms",            prefill_ms},
         {"decode_ms",             decode_ms},
-        {"decode_tokens_per_sec", tps}
+        {"decode_tokens_per_sec", tps},
+        {"cache_hit",             t.cache_hit},
+        {"cached_prefix_tokens",  t.cached_prefix_tokens},
+        {"prefilled_tokens",      t.prefilled_tokens}
     };
 }
 
