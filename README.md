@@ -56,22 +56,27 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 
 | Model | Speedup |
 |-------|:-------:|
-| Qwen 3.5-0.8B (Megakernel) | **~2×** |
-| Qwen 3.6-27B + PFlash | **~5.6×** |
-| Qwen 3.6-27B + DDTree | **4.84×** |
-| Laguna-XS.2 33B + PFlash | **5.4×** @128K |
-| Qwen 3.6-27B HIP | **~2.6×** |
-| Gemma-4-26B-A4B | **1.31×** |
+| Qwen 3.5 0.8B (Megakernel) | **~2×** |
+| Qwen 3.6 27B + PFlash | **~5.6×** |
+| Qwen 3.6 27B + DDTree | **4.84×** |
+| Laguna XS 2.1 33B + PFlash | **8.2×** @256K |
+| Laguna XS 2.1 33B + DFlash | **1.7×** @256K |
+| Qwen 3.6 27B HIP | **~2.6×** |
+| Gemma 4 26B-A4B | **1.31×** |
+| Gemma 4 31B IT | **3.2×** |
+| [`DeepSeek V4 Flash ROCMFPX HIP`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-ROCMFPX) | **2×** |
 
 </td>
 <td valign="top">
 
 | Drafter | Phase |
 |---------|:-----:|
-| [`Qwen3.6-27B`](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) | decode |
-| [`gemma-4-26B-A4B`](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | decode |
-| [`gemma-4-31B`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | decode |
-| [`Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) | prefill |
+| [`Qwen3.6 27B`](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) | decode |
+| [`gemma 4 26B A4B`](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | decode |
+| [`gemma 4 31B`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | decode |
+| [`Laguna XS 2.1 33B`](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF) | decode |
+| [`Qwen3 0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) | prefill |
+| [`DeepSeek V4 Flash DSpark Drafter`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-DSpark-Drafter-GGUF) | decode |
 
 </td>
 </tr>
@@ -94,7 +99,7 @@ Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NV
 | <img src="assets/gpus/7900xtx.png" width="750" /> | RDNA3 `gfx1100` | Radeon RX 7900 XTX | ROCm 6+ | ✅ 50 tok/s HIP | [↗](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
 | — | RDNA4 `gfx1201` | Radeon AI PRO R9700 | ROCm 6.4+ | ✅ 55 tok/s HIP | [↗](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
 
-`server/` (DFlash) builds with CMake 3.18+ and `--recurse-submodules` for `Luce-Org/llama.cpp@luce-dflash` — no PyTorch needed. `optimizations/megakernel/` is the only component requiring PyTorch 2.0+ (CUDAExtension links against torch C++ libs). Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
+`server/` (DFlash) builds with CMake 3.18+ and vendors the required `ggml` sources directly; only `Block-Sparse-Attention` remains a git submodule. No PyTorch is needed for `server/`. `optimizations/megakernel/` is the only component requiring PyTorch 2.0+ (CUDAExtension links against torch C++ libs). Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
 
 ## Quick Start On Harnesses
 
@@ -274,7 +279,7 @@ Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temper
 
 **GPU draft top-K & verify-argmax (DFlash)**
 
-The draft-token top-K extraction and the per-step verify argmax used to run on the CPU, each requiring a full `vocab × n_tokens` logits copy from device to host (D2H) every speculation step. These two env flags move both onto the GPU, reading the logits in place on the device buffer and skipping the bulk D2H. Both are **on by default** and only take effect on **CUDA builds** (the kernel is CUDA-only — on HIP/ROCm builds the flags are no-ops and the CPU path always runs). Each path validates its result and **falls back to the legacy CPU computation automatically** on any failure (e.g. an out-of-range index), so disabling them is only needed for debugging or A/B comparison.
+The draft-token top-K extraction and the per-step verify argmax used to run on the CPU, each requiring a full `vocab × n_tokens` logits copy from device to host (D2H) every speculation step. These two env flags move both onto the GPU, reading the logits in place on the device buffer and skipping the bulk D2H. Both are **on by default in the server** (the `test_dflash` harness defaults `DFLASH_GPU_VERIFY_ARGMAX` to off, see the table below) and take effect on **both CUDA and HIP/ROCm builds**: the draft top-K uses a custom device kernel (`geometric_draft_topk_cuda.cu`, the same source compiled directly for HIP) and the verify argmax reads an in-graph `ggml_argmax` node, so neither depends on a CUDA-only path. Each path validates its result and **falls back to the legacy CPU computation automatically** on any failure (e.g. an out-of-range index), so disabling them is only needed for debugging or A/B comparison.
 
 | Env | Default | Effect |
 |---|---|---|
@@ -282,6 +287,39 @@ The draft-token top-K extraction and the per-step verify argmax used to run on t
 | `DFLASH_GPU_VERIFY_ARGMAX` | on (server) / `0` (test harness) | Per-step verify argmax. In the server it is on by default and a simple on/off; `=0` forces the legacy CPU path. In `test_dflash` it is a tri-state with these values: <br>• `0` — legacy CPU path: full `vocab × N` D2H + CPU argmax (default in the test harness). <br>• `1` — GPU fast-path: read the in-graph batched GPU argmax (N int32s), no bulk D2H. <br>• `2` — run **both** the CPU and GPU paths and report any per-step mismatches (validation mode; guards against the historical tree-verify `-1`/tie regression). |
 
 To reproduce the benchmark: baseline `DFLASH_GPU_DRAFT_TOPK=0 DFLASH_GPU_VERIFY_ARGMAX=0`, optimized `DFLASH_GPU_DRAFT_TOPK=1 DFLASH_GPU_VERIFY_ARGMAX=1`, both via `python server/scripts/bench_llm.py --bench HumanEval`.
+
+| Env | Default | Effect |
+|---|---|---|
+| `DFLASH_TOPK_SPLIT=N` | auto-tuned | Override the split-K factor (blocks per draft position) for the GPU top-K kernel; auto-tune aims for ~240 total blocks across the device. Useful to re-sweep on a GPU with a different SM count. |
+| `DFLASH_TOPK_PROFILE=1` | off | Print per-launch CUDA event timing (partial pass + combine pass) for the GPU top-K kernel to stderr. |
+
+**GPU sampler (DFlash)**
+
+The CPU `sample_logits` chain (repetition/frequency/presence penalty → softmax(temp) → top_p nucleus → multinomial draw) requires a full vocab-wide D2H logits copy every token. `geometric_sampler_cuda.cu` ports penalty application, the softmax reductions, and the draw onto the GPU, reading logits straight off the device tensor in the qwen35 decode loop (skipping that D2H). It's **on by default** at runtime on CUDA builds (opt out with `DFLASH_GPU_SAMPLE=0`).
+
+Coverage is config-dependent, chosen by measurement rather than what's merely *possible* on the GPU:
+- **Greedy and plain temperature/penalty sampling** (no `top_k`/`top_p` truncation) run entirely on the GPU — one kernel launch does penalties, softmax, and the multinomial draw, then a 4-byte D2H copy for the result.
+- **Pure `top_p` nucleus sampling** (no `top_k`) is GPU-*assisted*: the GPU computes penalties+softmax and hands back the normalized probability vector, and the CPU does the nucleus search (`std::nth_element`-based binary search — O(vocab), not the O(vocab log vocab) a full sort would cost) on that already-computed vector.
+- **`top_k` (with or without `top_p`)** always stays on the CPU. Its cost is already cheap — `partial_sort` scales with `k`, not vocab — so a GPU round trip (kernel launch + D2H copy) measured as a net *regression*, not just a non-win.
+
+Per-call sampler-only latency at the Qwen3 vocab (151,936), measured on an RTX 3090 (GPU column reflects `DFLASH_GPU_SAMPLE=1`, CPU column reflects `=0`):
+
+| Config | CPU | GPU | Speedup |
+|---|---|---|---|
+| greedy (temp=0) | 746 µs | 139 µs | ~5.4× |
+| temp=0.8 (no truncation) | 1092 µs | 235 µs | ~4.6× |
+| temp=0.8 + top_p=0.9 | 4915 µs | 3504 µs | ~1.4× (GPU-assisted) |
+| temp=0.8 + top_k=40 | 283 µs | 273 µs | ~1.0× (top_k stays CPU-only either way) |
+
+| Env / flag | Default | Effect |
+|---|---|---|
+| `DFLASH_GPU_SAMPLE=0` | on | Opt out of the GPU `sample_logits` path at runtime (on by default on CUDA builds). Falls back to the CPU chain per call when the config is unsupported or on any CUDA error. |
+| `DFLASH_GPU_SAMPLER` (CMake option) | `ON` | Build-time switch; compiles `src/common/geometric_sampler_cuda.cu` into `dflash_common`. Configure with `-DDFLASH_GPU_SAMPLER=OFF` to drop the kernel entirely. |
+| `--samp=temp,top_p,top_k,rep_pen,seed[,freq,pres]` **(for `test_dflash`)** | greedy | Exercise the sampler chain (and its GPU port, gated by `DFLASH_GPU_SAMPLE`) in the positional (non-daemon) harness instead of greedy decode. Same field order as the daemon's ` samp=` request-line tail. |
+| `DFLASH_SAMP=temp,top_p,top_k,rep_pen,seed[,freq,pres]` **(for `bench_llm.py`)** | off (greedy) | Forward the same sampler tail to every DFlash bench call instead of greedy decode. AR (`test_generate`) is greedy-only and ignores this. |
+| `DFLASH_N_SAMPLE=N` **(for `bench_llm.py`)** | `10` | Overrides how many prompts are drawn per benchmark dataset. |
+
+End-to-end repro: `DFLASH_SAMP=0.8,1.0,0,1.1,42 python server/scripts/bench_llm.py --bench HumanEval` (GPU sampler on by default) vs the same command with `DFLASH_GPU_SAMPLE=0` (CPU-only).
 
 **Prefill compression (PFlash)**
 

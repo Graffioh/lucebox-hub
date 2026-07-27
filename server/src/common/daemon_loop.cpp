@@ -139,6 +139,17 @@ static bool looks_like_path(const std::string & s) {
     return s.find('/') != std::string::npos;
 }
 
+static void emit_generate_error(const GenerateResult & result) {
+    std::fprintf(stderr, "[daemon] generation failed: code=%s",
+                 result.error_code().data());
+    if (!result.error_detail().empty()) {
+        std::fprintf(stderr, " detail=%s", result.error_detail().data());
+    }
+    std::fprintf(stderr, "\n");
+    std::printf("err %s\n", result.error_code().data());
+    std::fflush(stdout);
+}
+
 // Read a prompt file: raw int32 stream (file size implies token count).
 static std::vector<int32_t> read_uncounted_i32(const std::string & path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -217,14 +228,26 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
         if (starts_with(line, "park")) {
             std::string what;
             if (line.size() > 5) what = line.substr(5);
-            backend.park(what);
+            const auto target = parse_park_target(what);
+            if (!target) {
+                std::fprintf(stderr, "[daemon] invalid park target: %s\n",
+                             what.c_str());
+            } else {
+                backend.park(*target);
+            }
             io.emit(-1);
             continue;
         }
         if (starts_with(line, "unpark")) {
             std::string what;
             if (line.size() > 7) what = line.substr(7);
-            backend.unpark(what);
+            const auto target = parse_park_target(what);
+            if (!target) {
+                std::fprintf(stderr, "[daemon] invalid unpark target: %s\n",
+                             what.c_str());
+            } else {
+                backend.unpark(*target);
+            }
             io.emit(-1);
             continue;
         }
@@ -318,9 +341,8 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             req.stream    = false;
 
             auto result = backend.generate(req, io);
-            if (!result.ok) {
-                std::printf("err %s\n", result.error.c_str());
-                std::fflush(stdout);
+            if (!result.ok()) {
+                emit_generate_error(result);
                 continue;
             }
             if (!write_counted_i32(out_path, result.tokens)) {
@@ -375,9 +397,8 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             req.snap_slot = snap_slot;
 
             auto result = backend.restore_and_generate(slot, req, io);
-            if (!result.ok) {
-                std::printf("err %s\n", result.error.c_str());
-                std::fflush(stdout);
+            if (!result.ok()) {
+                emit_generate_error(result);
                 io.emit(-1);
                 continue;
             }
@@ -424,10 +445,9 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
             req.snap_slot = snap_slot;
 
             auto result = backend.generate(req, io);
-            if (!result.ok) {
+            if (!result.ok()) {
                 io.emit(-1);
-                std::printf("err %s\n", result.error.c_str());
-                std::fflush(stdout);
+                emit_generate_error(result);
                 continue;
             }
             std::printf("ok N=%d gen=%zu prefill_s=%.3f decode_s=%.3f decode_tok_s=%.1f stream_fd=%d\n",

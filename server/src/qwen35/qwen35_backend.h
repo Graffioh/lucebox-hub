@@ -19,6 +19,7 @@
 #include "step_graph.h"
 #include "ddtree.h"
 #include "dflash_feature_ring.h"
+#include "common/dflash_draft_kv.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
@@ -88,8 +89,8 @@ public:
     // ── ModelBackend interface ────────────────────────────────────────
     void print_ready_banner() const override;
 
-    bool park(const std::string & what) override;
-    bool unpark(const std::string & what) override;
+    bool park(ParkTarget target) override;
+    bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return target_parked_; }
 
     GenerateResult generate_impl(const GenerateRequest & req,
@@ -233,6 +234,9 @@ private:
 
     // ── Draft feature mirror (cross-GPU feature transfer) ────────────
     DraftFeatureMirror feature_mirror_;
+    // [TAG_DRAFT_KV] drafter context-KV ring cache (lazy-init; kill with
+    // DFLASH_DRAFT_KV=0). Shared module: common/dflash_draft_kv.h.
+    DraftKvState draft_kv_;
     DFlashDraftIpcClient remote_draft_;
 
     // ── Prefix cache (snapshots) ─────────────────────────────────────

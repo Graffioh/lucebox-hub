@@ -122,8 +122,8 @@ void Qwen3Backend::print_ready_banner() const {
 
 // ── Park / unpark ──────────────────────────────────────────────────────
 
-bool Qwen3Backend::park(const std::string & what) {
-    if (what == "target" || what == "all") {
+bool Qwen3Backend::park(ParkTarget target) {
+    if (target == ParkTarget::TargetModel || target == ParkTarget::All) {
         if (!parked_) {
             // Free weights buffer to reclaim VRAM (keep cache)
             if (w_.buf) {
@@ -139,8 +139,8 @@ bool Qwen3Backend::park(const std::string & what) {
     return false;
 }
 
-bool Qwen3Backend::unpark(const std::string & what) {
-    if (what == "target" || what == "all") {
+bool Qwen3Backend::unpark(ParkTarget target) {
+    if (target == ParkTarget::TargetModel || target == ParkTarget::All) {
         if (parked_) {
             // Reload weights
             Qwen3DrafterWeights w_new;
@@ -525,7 +525,7 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
     // Prefill
     const int committed = do_prefill(req.prompt, out_io);
     if (committed < 0) {
-        result.error = "prefill";
+        result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
 
@@ -567,7 +567,7 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
                 ggml_backend_get_default_buffer_type(backend_));
             if (!ggml_gallocr_alloc_graph(galloc, gf)) {
                 ggml_gallocr_free(galloc); ggml_free(ectx);
-                result.error = "embed alloc"; return result;
+                result.fail(GenerateErrorCode::BackendSpecific, "embed alloc"); return result;
             }
             ggml_backend_tensor_set(ids, &last_tok, 0, sizeof(int32_t));
             ggml_backend_graph_compute(backend_, gf);
@@ -578,7 +578,7 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
 
         // Re-step at committed-1 to get logits (KV already written, idempotent)
         if (!do_step(embed_buf.data(), 1, committed - 1, logits)) {
-            result.error = "first logits";
+            result.fail(GenerateErrorCode::BackendSpecific, "first logits");
             return result;
         }
 
@@ -598,13 +598,13 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
         out_io.emit(first);
         if (out_io.cancelled) {
             out_io.emit(-1);
-            result.ok = true;
+            result.succeed();
             return result;
         }
 
         if (first == 151643 || first == 151645) {
             out_io.emit(-1);
-            result.ok = true;
+            result.succeed();
             return result;
         }
 
@@ -630,7 +630,7 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
                     ggml_backend_get_default_buffer_type(backend_));
                 if (!ggml_gallocr_alloc_graph(galloc2, gf2)) {
                     ggml_gallocr_free(galloc2); ggml_free(ectx2);
-                    result.error = "embed2 alloc"; return result;
+                    result.fail(GenerateErrorCode::BackendSpecific, "embed2 alloc"); return result;
                 }
                 ggml_backend_tensor_set(ids2, &ft, 0, sizeof(int32_t));
                 ggml_backend_graph_compute(backend_, gf2);
@@ -639,21 +639,21 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
                 ggml_free(ectx2);
             }
             if (!do_step(embed_buf.data(), 1, cur_committed, last_logits_)) {
-                result.error = "decode logits";
+                result.fail(GenerateErrorCode::BackendSpecific, "decode logits");
                 return result;
             }
             cur_committed++;
             cache_.cur_pos = cur_committed;
 
             if (!do_decode(cur_committed, req.n_gen - 1, result.tokens, out_io)) {
-                result.error = "decode";
+                result.fail(GenerateErrorCode::DecodeFailed);
                 return result;
             }
         }
     }
 
     out_io.emit(-1);
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -665,7 +665,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !snapshots_[slot].ctx) {
-        result.error = "bad slot";
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
         return result;
     }
@@ -691,7 +691,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
                                         req.prompt.end());
         const int committed = do_prefill(remaining, out_io, prefix_len);
         if (committed < 0) {
-            result.error = "prefill after restore";
+            result.fail(GenerateErrorCode::BackendSpecific, "prefill after restore");
             return result;
         }
     }
@@ -734,7 +734,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
                 ggml_backend_get_default_buffer_type(backend_));
             if (!ggml_gallocr_alloc_graph(galloc, gf)) {
                 ggml_gallocr_free(galloc); ggml_free(ectx);
-                result.error = "embed alloc"; return result;
+                result.fail(GenerateErrorCode::BackendSpecific, "embed alloc"); return result;
             }
             ggml_backend_tensor_set(ids, &last_tok, 0, sizeof(int32_t));
             ggml_backend_graph_compute(backend_, gf);
@@ -745,7 +745,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
 
         // Re-step at last position to get logits
         if (!do_step(embed_buf.data(), 1, total_committed - 1, logits)) {
-            result.error = "first logits";
+            result.fail(GenerateErrorCode::BackendSpecific, "first logits");
             return result;
         }
 
@@ -765,13 +765,13 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
         out_io.emit(first);
         if (out_io.cancelled) {
             out_io.emit(-1);
-            result.ok = true;
+            result.succeed();
             return result;
         }
 
         if (first == 151643 || first == 151645) {
             out_io.emit(-1);
-            result.ok = true;
+            result.succeed();
             return result;
         }
 
@@ -796,7 +796,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
                     ggml_backend_get_default_buffer_type(backend_));
                 if (!ggml_gallocr_alloc_graph(galloc2, gf2)) {
                     ggml_gallocr_free(galloc2); ggml_free(ectx2);
-                    result.error = "embed2 alloc"; return result;
+                    result.fail(GenerateErrorCode::BackendSpecific, "embed2 alloc"); return result;
                 }
                 ggml_backend_tensor_set(ids2, &ft, 0, sizeof(int32_t));
                 ggml_backend_graph_compute(backend_, gf2);
@@ -805,21 +805,21 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
                 ggml_free(ectx2);
             }
             if (!do_step(embed_buf.data(), 1, cur_committed, last_logits_)) {
-                result.error = "decode logits";
+                result.fail(GenerateErrorCode::BackendSpecific, "decode logits");
                 return result;
             }
             cur_committed++;
             cache_.cur_pos = cur_committed;
 
             if (!do_decode(cur_committed, req.n_gen - 1, result.tokens, out_io)) {
-                result.error = "decode";
+                result.fail(GenerateErrorCode::DecodeFailed);
                 return result;
             }
         }
     }
 
     out_io.emit(-1);
-    result.ok = true;
+    result.succeed();
     return result;
 }
 
@@ -940,12 +940,12 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
     if (req.input_ids.empty()) return result;
 
     const bool was_parked = parked_;
-    if (!req.skip_park && !parked_) park("target");
+    if (!req.skip_park && !parked_) park(ParkTarget::TargetModel);
 
     if (!drafter_loaded_) {
         if (!load_drafter(req.drafter_path, 999, req.drafter_gpu, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] load failed: %s\n", dflash27b_last_error());
-            if (!req.skip_park && !was_parked) unpark("target");
+            if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
             return result;
         }
         drafter_loaded_ = true;
@@ -959,7 +959,7 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
         free_drafter();
     }
 
-    if (!req.skip_park && !was_parked) unpark("target");
+    if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
     return result;
 }
 
@@ -997,12 +997,12 @@ bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io
     }
 
     const bool was_parked = parked_;
-    if (!skip_park && !parked_) park("target");
+    if (!skip_park && !parked_) park(ParkTarget::TargetModel);
 
     if (!drafter_loaded_) {
         if (!load_drafter(drafter_path, 999, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] load failed: %s\n", dflash27b_last_error());
-            if (!skip_park && !was_parked) unpark("target");
+            if (!skip_park && !was_parked) unpark(ParkTarget::TargetModel);
             io.emit(-1);
             return false;
         }
@@ -1014,7 +1014,7 @@ bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io
     std::printf("[compress] %zu -> %zu tokens\n", src_ids.size(), compressed.size());
     std::fflush(stdout);
 
-    if (!skip_park && !was_parked) unpark("target");
+    if (!skip_park && !was_parked) unpark(ParkTarget::TargetModel);
 
     for (int32_t t : compressed) io.emit(t);
     io.emit(-1);

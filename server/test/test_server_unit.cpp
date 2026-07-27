@@ -335,6 +335,40 @@ static void test_parse_bare_function_xml() {
     }
 }
 
+static void test_parse_bare_tool_name_xml_with_function_close() {
+    std::string text =
+        "\n\n\nLet me find the correct line range for the tests array.\n\n\n"
+        "<bash>\n"
+        "<parameter=command>\n"
+        "grep -n \"f5.test\" /workspace/project/tests/bootstrap.cjs\n"
+        "</parameter>\n"
+        "</function>\n";
+    json tools = json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] ==
+                    "grep -n \"f5.test\" /workspace/project/tests/bootstrap.cjs");
+    }
+    TEST_ASSERT(result.cleaned_text.find("<bash>") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("</function>") == std::string::npos);
+    TEST_ASSERT(result.cleaned_text.find("Let me find the correct line range") !=
+                std::string::npos);
+}
+
 static void test_parse_json_tool_call() {
     std::string text =
         "{\"name\": \"search\", \"arguments\": {\"query\": \"hello world\"}}";
@@ -1528,6 +1562,66 @@ static void test_pflash_raw_body_preserved() {
     TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
 }
 
+static void test_parse_request_sampler_applies_defaults_and_overrides() {
+    SamplingDefaults defaults;
+    defaults.has_temperature = true;
+    defaults.temperature = 0.6f;
+    defaults.has_top_p = true;
+    defaults.top_p = 0.9f;
+    defaults.has_repetition_penalty = true;
+    defaults.repetition_penalty = 1.1f;
+
+    const SamplerCfg sampler = parse_request_sampler({
+        {"temperature", 0.2f},
+        {"top_k", 20},
+        {"seed", 42},
+        {"presence_penalty", 0.3f},
+    }, defaults);
+
+    TEST_ASSERT(std::fabs(sampler.temp - 0.2f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.top_p - 0.9f) < 0.001f);
+    TEST_ASSERT(sampler.top_k == 20);
+    TEST_ASSERT(sampler.seed == 42);
+    TEST_ASSERT(std::fabs(sampler.pres_pen - 0.3f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.rep_pen - 1.1f) < 0.001f);
+}
+
+static void test_require_messages_array_rejects_invalid() {
+    const json valid = {{"messages", json::array({
+        {{"role", "user"}, {"content", "hi"}},
+    })}};
+    TEST_ASSERT(require_messages_array(valid).size() == 1);
+
+    const json invalid_bodies[] = {
+        json::object(),                       // missing
+        {{"messages", nullptr}},              // null
+        {{"messages", "hi"}},                 // wrong type
+        {{"messages", json::array()}},        // empty
+    };
+    for (const auto & body : invalid_bodies) {
+        bool threw = false;
+        try {
+            require_messages_array(body);
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        TEST_ASSERT(threw);
+    }
+}
+
+static void test_max_output_alias_precedence_ignores_shadowed_invalid_value() {
+    const json body = {
+        {"max_tokens", 100},
+        {"max_output_tokens", 200},
+        {"max_completion_tokens", "invalid"},
+    };
+
+    TEST_ASSERT(resolve_max_output_tokens(body, 400) == 100);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_output_tokens", 200}}, 400) == 200);
+    TEST_ASSERT(resolve_max_output_tokens(json::object(), 400) == 400);
+}
+
 static void test_pflash_placement_same_backend_local() {
     DevicePlacement target;
     target.backend = compiled_placement_backend();
@@ -1698,6 +1792,32 @@ static const char MINI_JINJA_TEMPLATE[] =
     "{%- if add_generation_prompt -%}"
     "<|assistant|>"
     "{%- endif -%}";
+
+static void test_deepseek4_render_system_only_gen_prompt() {
+    std::vector<ChatMessage> msgs = {
+        {"system", "sys only", ""},
+    };
+    const std::string out = render_chat_template(
+        msgs, ChatFormat::DEEPSEEK4,
+        /*add_generation_prompt=*/true,
+        /*enable_thinking=*/false,
+        /*tools_json=*/"");
+    const std::string expected =
+        "<｜begin▁of▁sentence｜>sys only<｜Assistant｜></think>";
+    TEST_ASSERT(out == expected);
+}
+
+static void test_deepseek4_render_empty_chat_gen_prompt() {
+    std::vector<ChatMessage> msgs;
+    const std::string out = render_chat_template(
+        msgs, ChatFormat::DEEPSEEK4,
+        /*add_generation_prompt=*/true,
+        /*enable_thinking=*/false,
+        /*tools_json=*/"");
+    const std::string expected =
+        "<｜begin▁of▁sentence｜><｜Assistant｜></think>";
+    TEST_ASSERT(out == expected);
+}
 
 static void test_jinja_render_basic() {
     std::vector<ChatMessage> msgs = {
@@ -2078,8 +2198,10 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         return true;
     }
     bool decode_ar(int last_tok, int committed, int n_gen,
+                   const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override {
+        (void)history_prefix;
         TEST_ASSERT(committed == current_pos);
         for (int i = 0; i < n_gen; ++i) {
             int32_t tok = last_tok + i + 1;
@@ -2159,7 +2281,7 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     DaemonIO io;
     GenerateResult result = backend.generate(req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(raw->reset_called);
     TEST_ASSERT(raw->saved_slot == 2);
     TEST_ASSERT(raw->saved_pos == 3);
@@ -2180,7 +2302,7 @@ static void test_layer_split_backend_inline_snapshot_and_restore_delta() {
     restore_req.n_gen = 1;
     GenerateResult restored = backend.restore_and_generate(2, restore_req, io);
 
-    TEST_ASSERT(restored.ok);
+    TEST_ASSERT(restored.ok());
     TEST_ASSERT(raw->dflash_called);
     TEST_ASSERT(raw->restored_slot == 2);
     TEST_ASSERT(!raw->reset_called);
@@ -2204,8 +2326,9 @@ static void test_layer_split_backend_sampling_capability_gate() {
         DaemonIO io;
         GenerateResult result = backend.generate(req, io);
 
-        TEST_ASSERT(!result.ok);
-        TEST_ASSERT(result.error == "sampling_unsupported");
+        TEST_ASSERT(!result.ok());
+        TEST_ASSERT(result.error->code == GenerateErrorCode::SamplingUnsupported);
+        TEST_ASSERT(result.error_code() == "sampling_unsupported");
     }
 
     {
@@ -2221,7 +2344,7 @@ static void test_layer_split_backend_sampling_capability_gate() {
         DaemonIO io;
         GenerateResult result = backend.generate(req, io);
 
-        TEST_ASSERT(result.ok);
+        TEST_ASSERT(result.ok());
         TEST_ASSERT(result.tokens.size() == 1);
         TEST_ASSERT(result.tokens[0] == 12);
     }
@@ -2238,7 +2361,7 @@ static void test_layer_split_backend_chunks_prefill_by_adapter_limit() {
     DaemonIO io;
     GenerateResult result = backend.generate(req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(raw->prefill_bases.size() == 3);
     TEST_ASSERT(raw->prefill_sizes.size() == 3);
     TEST_ASSERT(raw->prefill_bases[0] == 0);
@@ -2312,8 +2435,8 @@ static void test_layer_split_backend_capability_proxy() {
 // Minimal mock backend for testing (no GPU needed).
 struct MockBackend : ModelBackend {
     void print_ready_banner() const override {}
-    bool park(const std::string &) override { return true; }
-    bool unpark(const std::string &) override { return true; }
+    bool park(ParkTarget) override { return true; }
+    bool unpark(ParkTarget) override { return true; }
     bool is_target_parked() const override { return false; }
     GenerateResult generate_impl(const GenerateRequest &, const DaemonIO &) override { return {}; }
     bool snapshot_save(int) override { return false; }
@@ -3729,7 +3852,7 @@ struct EmptySpecRetryBackend : MockBackend {
                             const DaemonIO &) override {
         generate_calls++;
         GenerateResult result;
-        result.ok = true;
+        result.succeed();
         if (req.force_ar_decode) {
             generate_saw_force_ar = true;
             result.tokens = {42};
@@ -3747,7 +3870,7 @@ struct EmptySpecRetryBackend : MockBackend {
                                         const DaemonIO &) override {
         restore_calls++;
         GenerateResult result;
-        result.ok = true;
+        result.succeed();
         if (req.force_ar_decode) {
             restore_saw_force_ar = true;
             result.tokens = {84};
@@ -3771,7 +3894,7 @@ static void test_model_backend_retries_empty_spec_generate_once_with_ar() {
 
     GenerateResult result = backend.generate(req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 42);
     TEST_ASSERT(result.spec_decode_ran);
@@ -3789,7 +3912,7 @@ static void test_model_backend_retries_empty_spec_restore_once_with_ar() {
     GenerateResult result =
         backend.restore_and_generate(7, req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 84);
     TEST_ASSERT(result.spec_decode_ran);
@@ -3807,7 +3930,7 @@ static void test_model_backend_retries_empty_visible_spec_generate_once_with_ar(
 
     GenerateResult result = backend.generate(req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 42);
     TEST_ASSERT(!result.empty_visible_output);
@@ -3826,7 +3949,7 @@ static void test_model_backend_retries_empty_visible_spec_restore_once_with_ar()
 
     GenerateResult result = backend.restore_and_generate(7, req, io);
 
-    TEST_ASSERT(result.ok);
+    TEST_ASSERT(result.ok());
     TEST_ASSERT(result.tokens.size() == 1);
     TEST_ASSERT(result.tokens[0] == 84);
     TEST_ASSERT(!result.empty_visible_output);
@@ -3861,7 +3984,7 @@ static void test_generate_result_accept_rate_in_usage_openai() {
     // Simulate the non-streaming OpenAI JSON response build.
     // Verify accept_rate flows from GenerateResult into usage block.
     GenerateResult result;
-    result.ok = true;
+    result.succeed();
     result.tokens = {1, 2, 3};
     result.accept_rate = 0.75f;
 
@@ -3883,7 +4006,7 @@ static void test_generate_result_accept_rate_in_usage_openai() {
 
 static void test_generate_result_accept_rate_in_usage_anthropic() {
     GenerateResult result;
-    result.ok = true;
+    result.succeed();
     result.tokens = {1, 2};
     result.accept_rate = 0.60f;
 
@@ -3904,9 +4027,28 @@ static void test_generate_result_accept_rate_in_usage_anthropic() {
 static void test_generate_result_accept_rate_zero_when_no_spec_decode() {
     // When spec decode doesn't run (no draft model), accept_rate stays 0.
     GenerateResult r;
-    r.ok = true;
+    r.succeed();
     // accept_rate not set → must be 0.0f
     TEST_ASSERT(r.accept_rate == 0.0f);
+}
+
+static void test_generate_result_error_state_is_consistent() {
+    GenerateResult result;
+    TEST_ASSERT(!result.ok());
+    TEST_ASSERT(result.error->code == GenerateErrorCode::Incomplete);
+    TEST_ASSERT(result.error_code() == "incomplete");
+
+    result.fail(GenerateErrorCode::BackendSpecific, "prefill graph allocation failed");
+    TEST_ASSERT(!result.ok());
+    TEST_ASSERT(result.error->code == GenerateErrorCode::BackendSpecific);
+    TEST_ASSERT(result.error_code() == "backend_specific");
+    TEST_ASSERT(result.error_detail() == "prefill graph allocation failed");
+
+    result.succeed();
+    TEST_ASSERT(result.ok());
+    TEST_ASSERT(!result.error.has_value());
+    TEST_ASSERT(result.error_code().empty());
+    TEST_ASSERT(result.error_detail().empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4377,6 +4519,7 @@ int main() {
     std::fprintf(stderr, "\n── Tool parser ──\n");
     RUN_TEST(test_parse_tool_call_xml);
     RUN_TEST(test_parse_bare_function_xml);
+    RUN_TEST(test_parse_bare_tool_name_xml_with_function_close);
     RUN_TEST(test_parse_json_tool_call);
     RUN_TEST(test_parse_single_tool_bare_json_args);
     RUN_TEST(test_parse_single_tool_bare_json_args_allows_empty_optional_object);
@@ -4460,6 +4603,11 @@ int main() {
     RUN_TEST(test_evict_unrelated_falls_back_to_lru);
     RUN_TEST(test_evict_branch_spares_shared_root);
 
+    std::fprintf(stderr, "\n── Request parsing ──\n");
+    RUN_TEST(test_parse_request_sampler_applies_defaults_and_overrides);
+    RUN_TEST(test_require_messages_array_rejects_invalid);
+    RUN_TEST(test_max_output_alias_precedence_ignores_shadowed_invalid_value);
+
     std::fprintf(stderr, "\n── PFlash config ──\n");
     RUN_TEST(test_pflash_config_defaults);
     RUN_TEST(test_pflash_config_modes);
@@ -4493,6 +4641,8 @@ int main() {
     RUN_TEST(test_moe_hybrid_prefill_hot_sub_batch_limit);
 
     std::fprintf(stderr, "\n── Jinja chat template ──\n");
+    RUN_TEST(test_deepseek4_render_system_only_gen_prompt);
+    RUN_TEST(test_deepseek4_render_empty_chat_gen_prompt);
     RUN_TEST(test_jinja_render_basic);
     RUN_TEST(test_jinja_render_no_gen_prompt);
     RUN_TEST(test_jinja_render_tools_injected);
@@ -4594,6 +4744,7 @@ int main() {
     RUN_TEST(test_generate_result_accept_rate_in_usage_openai);
     RUN_TEST(test_generate_result_accept_rate_in_usage_anthropic);
     RUN_TEST(test_generate_result_accept_rate_zero_when_no_spec_decode);
+    RUN_TEST(test_generate_result_error_state_is_consistent);
 
     std::fprintf(stderr, "\n── normalize_system_for_cache ──\n");
     RUN_TEST(test_normalize_strips_billing_header_anthropic_array);

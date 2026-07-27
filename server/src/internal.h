@@ -215,6 +215,7 @@ struct TargetLoadPlan {
     bool load_output = true;  // output_norm + lm_head
     bool skip_expert_tensors = false;  // skip ffn_*_exps from GPU (for hybrid MoE split load)
     bool metadata_only = false;        // parse tensor descriptors/scales without GPU allocation
+    bool expert_metadata_only = false; // keep only routed expert tensor metadata; upload nothing
 };
 
 // Load a Q4_K_M target model from a GGUF file on disk.
@@ -239,12 +240,14 @@ struct DraftLayer {
     ggml_tensor * wk;
     ggml_tensor * wv;
     ggml_tensor * wo;
+    ggml_tensor * attn_gate = nullptr;  // optional Laguna XS 2.1 attention gate
     ggml_tensor * q_norm;
     ggml_tensor * k_norm;
     ggml_tensor * w_gate;
     ggml_tensor * w_up;
     ggml_tensor * w_down;
     bool is_swa = false;  // true for SWA layers (Qwen3.6 pattern)
+    bool attn_gate_per_head = false;
 };
 
 struct DraftDominoWeights {
@@ -283,6 +286,8 @@ struct DraftWeights {
 
     ggml_tensor *          fc          = nullptr;   // [5*hidden, hidden]
     ggml_tensor *          hidden_norm = nullptr;   // [hidden]
+    std::vector<ggml_tensor *> aux_hidden_norms;    // optional [hidden] per captured target layer
+    bool context_kv_layer_norm = false;             // Laguna DFlash: per-layer input norm before context K/V
     std::vector<DraftLayer> layers;                 // size = n_layer
     ggml_tensor *          out_norm    = nullptr;   // [hidden]
 
@@ -649,7 +654,8 @@ ggml_tensor * build_qwen35_layer(
     int                   fa_window = 0,
     ggml_tensor *         q_tail_capture = nullptr,
     int                   q_tail_start = 0,
-    ggml_tensor *         kv_write_rows = nullptr);
+    ggml_tensor *         kv_write_rows = nullptr,
+    ggml_tensor *         parent_ids = nullptr);
 
 // Overload that also exposes the MoE router selection tensor (if MoE layer).
 ggml_tensor * build_qwen35_layer(
@@ -668,7 +674,8 @@ ggml_tensor * build_qwen35_layer(
     ggml_tensor *         q_tail_capture,
     int                   q_tail_start,
     ggml_tensor **        moe_selected_out,
-    ggml_tensor *         kv_write_rows = nullptr);
+    ggml_tensor *         kv_write_rows = nullptr,
+    ggml_tensor *         parent_ids = nullptr);
 
 QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     ggml_context *        ctx,

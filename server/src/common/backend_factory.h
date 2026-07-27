@@ -10,11 +10,10 @@
 
 #pragma once
 
+#include "backend_args.h"
+#include "gguf_inspect.h"
+#include "model_capabilities.h"
 #include "model_backend.h"
-#include "internal.h"
-#include "placement/placement_config.h"
-#include "placement/remote_draft_config.h"
-#include "placement/remote_target_shard_config.h"
 
 #include <memory>
 #include <string>
@@ -22,54 +21,71 @@
 
 namespace dflash::common {
 
-// ─── Backend creation arguments ─────────────────────────────────────────
-// A superset of all per-arch config fields. The factory reads only those
-// relevant to the detected arch; unused fields are silently ignored.
-struct BackendArgs {
-    // Required
-    const char *    model_path   = nullptr;   // target .gguf
+struct BackendPreparation;
 
-    // Optional: speculative decode draft model (qwen35 only)
-    const char *    draft_path   = nullptr;
+// Runtime facts resolved once from BackendArgs and shared by server admission
+// and backend construction. Fields are private so callers cannot substitute
+// an architecture that disagrees with model_path.
+class ResolvedBackendPlan {
+public:
+    const GgufModelInfo & model() const { return model_; }
+    const std::string & arch() const { return model_.arch; }
+    const std::string & model_path() const { return model_path_; }
+    PlacementBackend target_backend() const { return target_backend_; }
+    PlacementBackend compiled_backend() const { return compiled_backend_; }
+    const BackendFeatureConfig & features() const { return features_; }
 
-    // Device placement
-    DevicePlacement device;
-    DevicePlacement draft_device;
-    RemoteDraftConfig remote_draft;
-    RemoteTargetShardConfig remote_target_shard;
+private:
+    std::string          model_path_;
+    GgufModelInfo        model_;
+    BackendFeatureConfig features_;
+    PlacementBackend    target_backend_ = PlacementBackend::Auto;
+    PlacementBackend    compiled_backend_ = PlacementBackend::Auto;
 
-    // I/O — only used when running under daemon_loop (legacy). The new
-    // server passes -1 and uses on_token callbacks instead.
-    int             stream_fd    = -1;
-
-    // Chunked prefill
-    int             chunk        = 512;
-
-    // qwen35-specific speculative decode options
-    int             fa_window        = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
-    int             kq_stride_pad    = 32;
-    int             draft_swa_window = 0;
-    int             draft_ctx_max    = 4096;
-    bool            fast_rollback    = true;
-    bool            seq_verify       = false;
-    bool            ddtree_mode      = false;
-    int             ddtree_budget    = 22;
-    float           ddtree_temp      = 1.0f;
-    bool            ddtree_chain_seed = true;
-    int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
-    bool            use_feature_mirror = false;
+    friend BackendPreparation prepare_backend(
+        const BackendArgs & args,
+        const BackendFeatureConfig & features);
 };
+
+enum class BackendPreparationError {
+    None,
+    InvalidRequest,
+    ModelInspection,
+    FeatureCompatibility,
+};
+
+struct BackendPreparation {
+    ResolvedBackendPlan plan;
+    BackendPreparationError error = BackendPreparationError::None;
+    std::string message;
+
+    // Accepted-but-inert options for the resolved architecture and placement.
+    // Populated only when ok(); the caller decides how to surface them.
+    std::vector<std::string> warnings;
+
+    bool ok() const { return error == BackendPreparationError::None; }
+};
+
+// Resolve model metadata and compiled placement, then apply all cross-feature
+// compatibility policy. This is the server's fail-fast factory entry point:
+// server_main forwards the raw request and only handles the categorized result.
+BackendPreparation prepare_backend(
+    const BackendArgs & args,
+    const BackendFeatureConfig & features = {});
 
 // ─── Factory function ───────────────────────────────────────────────────
 // Inspects model_path GGUF metadata, constructs the correct backend, and
 // calls init(). Returns nullptr on failure (diagnostic printed to stderr).
 std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args);
 
+// Uses facts already resolved from the same BackendArgs. The factory verifies
+// that the plan belongs to args.model_path before dispatching.
+std::unique_ptr<ModelBackend> create_backend(
+    const BackendArgs & args,
+    const ResolvedBackendPlan & plan);
+
 // Returns the detected architecture string without creating a backend.
 // Useful for early dispatch (e.g. printing which backend will be used).
 std::string detect_arch(const char * model_path);
-
-bool arch_supports_remote_draft(const std::string & arch);
-bool arch_supports_pflash_compression(const std::string & arch);
 
 }  // namespace dflash::common

@@ -10,6 +10,11 @@ __global__ void rms_norm_mul_w_f32_kernel(
     float       * __restrict__ dst,
     int hidden, float eps)
 {
+    // HIP exposes the target-specific width through a device builtin. Unlike
+    // preprocessor spellings of the AMDGCN builtin, this works across ROCm
+    // releases and remains correct in multi-architecture builds.
+    const int wave = warpSize;
+
     const int tok = blockIdx.x;
     const float * row = src + (size_t)tok * hidden;
     float       * out = dst + (size_t)tok * hidden;
@@ -22,17 +27,22 @@ __global__ void rms_norm_mul_w_f32_kernel(
         sumsq += v * v;
     }
 
-    for (int off = 16; off > 0; off >>= 1)
+    #pragma unroll
+    for (int off = wave / 2; off > 0; off >>= 1)
         sumsq += __shfl_xor(sumsq, off);
 
-    if ((threadIdx.x & 31) == 0)
-        smem[threadIdx.x >> 5] = sumsq;
+    if ((threadIdx.x & (wave - 1)) == 0)
+        smem[threadIdx.x / wave] = sumsq;
     __syncthreads();
 
-    const int n_warps = blockDim.x >> 5;
-    if (threadIdx.x < 32) {
+    // Final reduce across per-wavefront partials in a single wavefront. Valid
+    // while n_warps <= wave, which holds for the fixed block=256 launch below
+    // (8 warps on wave32, 4 on wave64).
+    const int n_warps = blockDim.x / wave;
+    if (threadIdx.x < wave) {
         sumsq = (threadIdx.x < n_warps) ? smem[threadIdx.x] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1)
+        #pragma unroll
+        for (int off = wave / 2; off > 0; off >>= 1)
             sumsq += __shfl_xor(sumsq, off);
         if (threadIdx.x == 0)
             smem[0] = sumsq;
@@ -51,6 +61,9 @@ extern "C" void launch_rms_norm_mul_w_f32(
     hipStream_t stream)
 {
     const int block = 256;
+    // One float per wavefront partial. Host code can't see __AMDGCN_WAVEFRONT_SIZE,
+    // so size for the wave32 (max-warp) case: block/32 floats is a safe upper
+    // bound that also covers wave64 (block/64 partials).
     const size_t smem = (size_t)(block >> 5) * sizeof(float);
     rms_norm_mul_w_f32_kernel<<<n_tokens, block, smem, stream>>>(
         src, w, dst, hidden, eps);

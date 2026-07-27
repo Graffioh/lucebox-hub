@@ -8,6 +8,7 @@
 // 5. call:<ns>?<verb>{relaxed-JSON args}    (gemma plain-text emissions)
 // 6. Bare JSON objects with name+arguments fields
 // 7. Whole-response JSON args for exactly one declared tool
+// 8. <TOOL_NAME>...<parameter=K>V</parameter>...</function>  (bare tool tag)
 //
 // Pattern 5 runs *before* pattern 6 so that args like
 //   call:outer{"name": "inner", "arguments": {}}
@@ -28,6 +29,14 @@
 namespace dflash::common {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
+
+static std::string trim_ws(const std::string & v) {
+    const char * ws = " \t\r\n";
+    const size_t a = v.find_first_not_of(ws);
+    if (a == std::string::npos) return std::string();
+    const size_t b = v.find_last_not_of(ws);
+    return v.substr(a, b - a + 1);
+}
 
 static std::string generate_call_id() {
     static std::mutex rng_mu;
@@ -76,7 +85,19 @@ static json convert_param_value(const std::string & val, const std::string & key
     const auto & cfg = props[key];
     std::string ptype = "string";
     if (cfg.is_object() && cfg.contains("type")) {
-        ptype = cfg["type"].get<std::string>();
+        const auto & t = cfg["type"];
+        if (t.is_string()) {
+            ptype = t.get<std::string>();
+        } else if (t.is_array()) {
+            // JSON Schema allows "type": ["string","null"]; take the first
+            // non-null string entry instead of throwing.
+            for (const auto & e : t) {
+                if (e.is_string() && e.get<std::string>() != "null") {
+                    ptype = e.get<std::string>();
+                    break;
+                }
+            }
+        }
     }
 
     // string types
@@ -161,6 +182,11 @@ static const std::regex & re_bare_function_xml() {
 
 static const std::regex & re_function_signature() {
     static std::regex r(R"(<function=([A-Za-z_][\w.\-]*?)\(([\s\S]*?)\)</function>)");
+    return r;
+}
+
+static const std::regex & re_bare_tool_name_xml() {
+    static std::regex r(R"(<([A-Za-z_][\w.\-]*?)>([\s\S]*?)(?:</function>|</\1>))");
     return r;
 }
 
@@ -586,6 +612,107 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         removals.push_back({start, end});
     };
 
+    // Pattern 8 (Laguna): <tool_call>NAME\n<arg_key>K</arg_key>\n
+    // <arg_value>V</arg_value>...\n</tool_call>. Values are raw strings or
+    // JSON (the template emits non-strings via tojson); coerce via the
+    // declared tool schema like the other patterns. Checked before pattern 1
+    // so the shared <tool_call> wrapper is not half-consumed by the Qwen
+    // regexes.
+    {
+        size_t pos = 0;
+        while ((pos = text.find("<tool_call>", pos)) != std::string::npos) {
+            const size_t body_start = pos + 11;
+            const size_t close = text.find("</tool_call>", body_start);
+            if (close == std::string::npos) break;
+            const std::string body = text.substr(body_start, close - body_start);
+            const size_t first_key = body.find("<arg_key>");
+            // Only claim bodies in the Laguna shape: bare name then arg tags
+            // (or a bare name alone for zero-arg calls); leave <function=...>
+            // bodies to the Qwen patterns below.
+            // Laguna bodies are `NAME<arg_key>...` (values may contain JSON —
+            // the template serializes non-string args via tojson). Only leave
+            // <function=...> and pure-JSON bodies to the Qwen patterns.
+            if (body.find("<function") == std::string::npos &&
+                (first_key != std::string::npos ||
+                 body.find('{') == std::string::npos)) {
+                std::string name = trim_ws(
+                    first_key == std::string::npos ? body : body.substr(0, first_key));
+                if (!name.empty() && name.find('<') == std::string::npos) {
+                    const json props = find_tool_properties(tools, name);
+                    json args = json::object();
+                    size_t kpos = first_key;
+                    while (kpos != std::string::npos) {
+                        const size_t kend = body.find("</arg_key>", kpos);
+                        if (kend == std::string::npos) break;
+                        const std::string key =
+                            trim_ws(body.substr(kpos + 9, kend - (kpos + 9)));
+                        const size_t vpos = body.find("<arg_value>", kend);
+                        if (vpos == std::string::npos) break;
+                        const size_t vend = body.find("</arg_value>", vpos);
+                        if (vend == std::string::npos) break;
+                        const std::string val =
+                            trim_ws(body.substr(vpos + 11, vend - (vpos + 11)));
+                        if (!key.empty()) {
+                            args[key] = convert_param_value(val, key, props);
+                        }
+                        kpos = body.find("<arg_key>", vend);
+                    }
+                    add_call(name, args, pos, close + 12);
+                }
+            }
+            pos = close + 12;
+        }
+
+        // Stripped-wrapper variant: <tool_call>/</tool_call> are SPECIAL
+        // tokens in the laguna vocab and detokenization removes them, so the
+        // visible text is `NAME<arg_key>K</arg_key><arg_value>V</arg_value>…`.
+        // Anchor on <arg_key> and walk back over identifier chars for the
+        // name. No other family emits bare <arg_key>, so this cannot
+        // misfire cross-family.
+        size_t apos = 0;
+        while ((apos = text.find("<arg_key>", apos)) != std::string::npos) {
+            if (overlaps(removals, apos)) { apos += 9; continue; }
+            size_t name_end = apos;
+            size_t name_start = name_end;
+            auto is_ident = [](char c) {
+                // OpenAI-shape function names: [A-Za-z0-9_-] only. '.' must
+                // stay out or prose immediately before the name gets eaten
+                // ("...the weather tool.get_weather<arg_key>").
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '_' || c == '-';
+            };
+            while (name_start > 0 && is_ident(text[name_start - 1])) name_start--;
+            const std::string name = text.substr(name_start, name_end - name_start);
+            if (name.empty()) { apos += 9; continue; }
+            const json props = find_tool_properties(tools, name);
+            json args = json::object();
+            size_t kpos = apos;
+            size_t span_end = apos;
+            while (kpos != std::string::npos && kpos == span_end) {
+                const size_t kend = text.find("</arg_key>", kpos);
+                if (kend == std::string::npos) break;
+                const size_t vpos = text.find("<arg_value>", kend);
+                if (vpos == std::string::npos) break;
+                const size_t vend = text.find("</arg_value>", vpos);
+                if (vend == std::string::npos) break;
+                const std::string key = trim_ws(text.substr(kpos + 9, kend - (kpos + 9)));
+                const std::string val = trim_ws(text.substr(vpos + 11, vend - (vpos + 11)));
+                if (!key.empty()) args[key] = convert_param_value(val, key, props);
+                span_end = vend + 12;
+                // consume whitespace between pairs, then check for the next key
+                size_t nxt = span_end;
+                while (nxt < text.size() && (text[nxt] == '\n' || text[nxt] == ' ' ||
+                                             text[nxt] == '\t' || text[nxt] == '\r')) nxt++;
+                kpos = (text.compare(nxt, 9, "<arg_key>") == 0) ? nxt : std::string::npos;
+                if (kpos != std::string::npos) span_end = nxt;
+            }
+            if (!args.empty()) {
+                add_call(name, args, name_start, span_end);
+            }
+            apos = span_end > apos ? span_end : apos + 9;
+        }
+    }
+
     // Pattern 1: <tool_call>...<function=NAME>...params...</function>...</tool_call>
     {
         auto begin = std::sregex_iterator(text.begin(), text.end(), re_tool_call_complete());
@@ -632,6 +759,25 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             json args;
             if (!parse_function_sig_args((*it)[2].str(), args)) continue;
             add_call((*it)[1].str(), args, pos, pos + it->length());
+        }
+    }
+
+    // Pattern 3b: <TOOL_NAME>...params...</function>. Some agents/models
+    // emit the selected tool name as the XML tag itself, then close with the
+    // Qwen </function> tag. Only accept requested tools and real parameter
+    // tags so arbitrary XML-ish prose remains visible text.
+    if (tools.is_array() && !tools.empty()) {
+        auto begin = std::sregex_iterator(text.begin(), text.end(), re_bare_tool_name_xml());
+        auto end = std::sregex_iterator();
+        for (auto it = begin; it != end; ++it) {
+            size_t pos = it->position();
+            if (overlaps(removals, pos)) continue;
+            std::string fn_name = (*it)[1].str();
+            std::string params = (*it)[2].str();
+            if (!tool_allowed(tools, fn_name)) continue;
+            if (params.find("<parameter=") == std::string::npos) continue;
+            add_call(fn_name, parse_xml_params(params, fn_name, tools),
+                     pos, pos + it->length());
         }
     }
 
