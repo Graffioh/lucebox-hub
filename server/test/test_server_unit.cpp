@@ -1609,6 +1609,19 @@ static void test_require_messages_array_rejects_invalid() {
     }
 }
 
+static void test_max_output_alias_precedence_ignores_shadowed_invalid_value() {
+    const json body = {
+        {"max_tokens", 100},
+        {"max_output_tokens", 200},
+        {"max_completion_tokens", "invalid"},
+    };
+
+    TEST_ASSERT(resolve_max_output_tokens(body, 400) == 100);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_output_tokens", 200}}, 400) == 200);
+    TEST_ASSERT(resolve_max_output_tokens(json::object(), 400) == 400);
+}
+
 static void test_pflash_placement_same_backend_local() {
     DevicePlacement target;
     target.backend = compiled_placement_backend();
@@ -4593,6 +4606,7 @@ int main() {
     std::fprintf(stderr, "\n── Request parsing ──\n");
     RUN_TEST(test_parse_request_sampler_applies_defaults_and_overrides);
     RUN_TEST(test_require_messages_array_rejects_invalid);
+    RUN_TEST(test_max_output_alias_precedence_ignores_shadowed_invalid_value);
 
     std::fprintf(stderr, "\n── PFlash config ──\n");
     RUN_TEST(test_pflash_config_defaults);
