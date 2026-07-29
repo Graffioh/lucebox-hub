@@ -15,6 +15,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# MSVC: treat source files as UTF-8 (the codebase contains UTF-8 string
+# literals such as  tags). Without this, MSVC defaults to the system
+# code page and emits C4819 warnings or garbles multi-byte literals.
+# Use a generator expression so /utf-8 is NOT passed to nvcc (which would
+# misinterpret the leading slash as a file path).
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
+endif()
+
 # ── nlohmann/json (header-only, prefer system install, fallback to download) ──
 find_package(nlohmann_json CONFIG QUIET)
 if(NOT nlohmann_json_FOUND)
@@ -647,6 +656,19 @@ option(DFLASH27B_SERVER "Build dflash_server + backend_ipc_daemon" ON)
 if(DFLASH27B_TESTS)
     set(_raw_unit_test_targets)
     enable_testing()
+
+    # Header-only platform shims must remain independently buildable and
+    # runnable on hosted Windows workers without a GPU.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_platform_compat.cpp")
+        add_executable(test_platform_compat test/test_platform_compat.cpp)
+        target_include_directories(test_platform_compat PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(WIN32)
+            target_link_libraries(test_platform_compat PRIVATE ws2_32)
+        endif()
+        add_test(NAME platform_compat COMMAND test_platform_compat)
+    endif()
+
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip"
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_pool_shutdown.cpp")
         add_executable(test_cuda_pool_shutdown
@@ -1181,6 +1203,9 @@ if(DFLASH27B_TESTS)
     # 'make check' — build every registered unit-test target, including the
     # lightweight feature gate added on main, then run the complete CTest set.
     set(_check_deps ${_raw_unit_test_targets})
+    if(TARGET test_platform_compat)
+        list(APPEND _check_deps test_platform_compat)
+    endif()
     if(TARGET test_feature_gate)
         list(APPEND _check_deps test_feature_gate)
     endif()

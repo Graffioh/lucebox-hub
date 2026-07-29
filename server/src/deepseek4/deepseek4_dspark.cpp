@@ -8,6 +8,7 @@
 #include "deepseek4_dspark.h"
 
 #include "common/gguf_bounds.h"
+#include "common/gguf_mmap.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -19,10 +20,6 @@
 #include <initializer_list>
 #include <string>
 #include <vector>
-
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace dflash::common {
 
@@ -249,24 +246,17 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     // forming an absolute file offset. The drafter contract intentionally has
     // no embedding/lm-head tensors; rejecting unknown tensors prevents a stray
     // full-model tensor from consuming the entire GPU allocation.
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        set_err("open failed: " + path);
+    GgufMmap mapped_file;
+    std::string mmap_err;
+    if (!mapped_file.open(path, mmap_err)) {
+        set_err(mmap_err);
         gguf_free(g);
         ggml_free(meta);
         out = DSparkDrafter{};
         return false;
     }
-    struct stat st{};
-    if (::fstat(fd, &st) != 0 || st.st_size < 0) {
-        set_err("fstat failed: " + path);
-        ::close(fd);
-        gguf_free(g);
-        ggml_free(meta);
-        out = DSparkDrafter{};
-        return false;
-    }
-    const size_t file_size = (size_t) st.st_size;
+    const size_t file_size = mapped_file.size();
+    const auto * file_bytes = static_cast<const uint8_t *>(mapped_file.data());
     const size_t data_off = gguf_get_data_offset(g);
     const int64_t n_tensors = gguf_get_n_tensors(g);
     bool ok = true;
@@ -294,7 +284,6 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
         }
     }
     if (!ok) {
-        ::close(fd);
         gguf_free(g);
         ggml_free(meta);
         out = DSparkDrafter{};
@@ -305,7 +294,6 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(meta, backend);
     if (!buf) {
         set_err("ggml_backend_alloc_ctx_tensors failed");
-        ::close(fd);
         gguf_free(g);
         ggml_free(meta);
         out = DSparkDrafter{};
@@ -313,7 +301,7 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
     }
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // ── Stream tensor bytes from the file (pread per tensor) ────────────
+    // ── Stream tensor bytes from the read-only mapping ─────────────────
     std::vector<char> staging;
     for (int64_t ti = 0; ti < n_tensors && ok; ti++) {
         const char * tname = gguf_get_tensor_name(g, ti);
@@ -322,16 +310,9 @@ bool load_deepseek4_dspark_drafter(const std::string & path,
         const size_t off  = data_off + tensor_off;  // preflight proved no overflow
         const size_t size = gguf_get_tensor_size(g, ti);
         staging.resize(size);
-        size_t done = 0;
-        while (done < size) {
-            const ssize_t r = ::pread(fd, staging.data() + done, size - done, (off_t)(off + done));
-            if (r <= 0) { set_err(std::string("pread failed for ") + tname); ok = false; break; }
-            done += (size_t)r;
-        }
-        if (!ok) break;
+        std::memcpy(staging.data(), file_bytes + off, size);
         ggml_backend_tensor_set(t, staging.data(), 0, size);
     }
-    ::close(fd);
     if (!ok) {
         ggml_backend_buffer_free(buf);
         gguf_free(g);
