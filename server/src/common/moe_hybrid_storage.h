@@ -105,17 +105,46 @@ struct MoeHybridLayerStorage {
     std::vector<uint64_t> spare_lru;    // [cache_slots] last-use tick
     uint64_t lru_clock = 0;
 
-    // Bitmask: bit set = expert is in VRAM (hot). Supports up to 256 experts.
-    uint64_t expert_vram_mask[4] = {};
+    // Bitmask: bit set = expert is in VRAM (hot). Sized from the model's
+    // declared expert count so the common runtime does not impose an
+    // architecture-specific expert limit.
+    std::vector<uint64_t> expert_vram_mask;
+
+    void reset_expert_vram_mask(int n_expert) {
+        const size_t word_count = n_expert > 0 ? ((size_t)n_expert + 63) / 64 : 0;
+        expert_vram_mask.assign(word_count, 0);
+    }
+
+    bool is_expert_hot(int global_expert) const {
+        if (global_expert < 0) return false;
+        const size_t word = (size_t)global_expert >> 6;
+        return word < expert_vram_mask.size() &&
+               ((expert_vram_mask[word] >> (global_expert & 63)) & 1ULL) != 0;
+    }
+
+    void set_expert_hot(int global_expert) {
+        if (global_expert < 0) return;
+        const size_t word = (size_t)global_expert >> 6;
+        if (word < expert_vram_mask.size()) {
+            expert_vram_mask[word] |= 1ULL << (global_expert & 63);
+        }
+    }
+
+    void clear_expert_hot(int global_expert) {
+        if (global_expert < 0) return;
+        const size_t word = (size_t)global_expert >> 6;
+        if (word < expert_vram_mask.size()) {
+            expert_vram_mask[word] &= ~(1ULL << (global_expert & 63));
+        }
+    }
 
     // Fast check: are ALL routed experts in VRAM for this batch?
     // selected_ids has n_slots entries (n_tokens * n_expert_used).
     bool all_routed_are_hot(const int32_t * selected_ids, int n_slots) const {
         for (int i = 0; i < n_slots; ++i) {
             const int g = selected_ids[i];
-            if (g < 0 || g >= 256) continue;
-            if (!((expert_vram_mask[g >> 6] >> (g & 63)) & 1ULL))
-                return false;
+            if (g < 0) continue;
+            if (!is_expert_hot(g)) return false;
         }
         return true;
     }

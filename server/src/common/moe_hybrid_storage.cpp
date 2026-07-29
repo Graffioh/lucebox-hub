@@ -301,11 +301,10 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
             }
         }
 
-        // Populate VRAM bitmask from hot expert IDs
-        std::memset(dst.expert_vram_mask, 0, sizeof(dst.expert_vram_mask));
+        // Populate the model-sized VRAM bitmask from hot expert IDs.
+        dst.reset_expert_vram_mask(cfg.n_expert);
         for (int32_t eid : dst.hot_expert_ids) {
-            if (eid >= 0 && eid < 256)
-                dst.expert_vram_mask[eid >> 6] |= (1ULL << (eid & 63));
+            dst.set_expert_hot(eid);
         }
 
         dst.fused_gate_up = desc.has_fused_gate_up();
@@ -517,11 +516,10 @@ bool build_moe_hybrid_storage_from_file(
             }
         }
 
-        // Populate VRAM bitmask from hot expert IDs
-        std::memset(dst.expert_vram_mask, 0, sizeof(dst.expert_vram_mask));
+        // Populate the model-sized VRAM bitmask from hot expert IDs.
+        dst.reset_expert_vram_mask(cfg.n_expert);
         for (int32_t eid : dst.hot_expert_ids) {
-            if (eid >= 0 && eid < 256)
-                dst.expert_vram_mask[eid >> 6] |= (1ULL << (eid & 63));
+            dst.set_expert_hot(eid);
         }
 
         dst.fused_gate_up = desc.has_fused_gate_up();
@@ -687,7 +685,7 @@ int moe_hybrid_cache_swap_in(MoeHybridLayerStorage & st, int global_expert,
     if (slot < 0) return -1;
     const int evicted = st.spare_global[(size_t)slot];
     if (evicted >= 0) st.hot_local_by_global[(size_t)evicted] = -1;  // evicted -> served cold again
-    if (evicted >= 0 && evicted < 256) st.expert_vram_mask[evicted >> 6] &= ~(1ULL << (evicted & 63));
+    st.clear_expert_hot(evicted);
 
     const int hslot = st.hot_active + slot;  // hot-local index of the spare slot
     auto copy_slice = [&](ggml_tensor * cold_t, ggml_tensor * hot_t, size_t ebytes) {
@@ -706,7 +704,7 @@ int moe_hybrid_cache_swap_in(MoeHybridLayerStorage & st, int global_expert,
     }
 
     st.hot_local_by_global[(size_t)global_expert] = hslot;
-    if (global_expert < 256) st.expert_vram_mask[global_expert >> 6] |= 1ULL << (global_expert & 63);
+    st.set_expert_hot(global_expert);
     st.spare_global[(size_t)slot] = global_expert;
     st.spare_lru[(size_t)slot] = ++st.lru_clock;
     return hslot;

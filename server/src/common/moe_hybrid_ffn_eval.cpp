@@ -36,15 +36,26 @@ inline ggml_tensor * swiglu_maybe_clamped(ggml_context * ctx,
 
 using HybridClock = std::chrono::steady_clock;
 
+// Common execution policy uses model-neutral names. Keep the original DS4
+// variables as compatibility aliases so existing Lucebox profiles remain
+// reproducible while new model adapters do not inherit DS4 naming.
+static const char * moe_policy_env(const char * name, const char * legacy_name) {
+    const char * raw = std::getenv(name);
+    if (raw && *raw) return raw;
+    return legacy_name ? std::getenv(legacy_name) : nullptr;
+}
+
 static bool heterogeneous_prefill_eager_enabled(
         bool persistent_owner_alloc = false) {
-    const char * raw = std::getenv("DFLASH_DS4_HYBRID_PREFILL_EAGER");
+    const char * raw = moe_policy_env(
+        "DFLASH_MOE_HYBRID_PREFILL_EAGER", "DFLASH_DS4_HYBRID_PREFILL_EAGER");
     if (!raw || !*raw) return persistent_owner_alloc;
     return std::strcmp(raw, "0") != 0;
 }
 
 static bool heterogeneous_prefill_trace_enabled() {
-    const char * raw = std::getenv("DFLASH_DS4_PREFILL_TRACE");
+    const char * raw = moe_policy_env(
+        "DFLASH_MOE_PREFILL_TRACE", "DFLASH_DS4_PREFILL_TRACE");
     return raw && *raw && std::strcmp(raw, "0") != 0;
 }
 
@@ -73,10 +84,12 @@ static bool compact_materialized_experts_enabled() {
 // backend gained its grouped MUL_MAT_ID MMVQ kernel, but it multiplies graph
 // nodes, scheduler copies, and launches by the verify width.  Keep the old
 // lowering as the default while the grouped path is qualified on each ROCm
-// architecture; opt in with DFLASH_DS4_TP_GROUPED_MMVQ=1.
+// architecture; opt in with DFLASH_MOE_TP_GROUPED_MMVQ=1. The original DS4
+// variable remains a compatibility alias.
 static bool grouped_mmvq_moe_enabled() {
     static const bool enabled = [] {
-        const char * raw = std::getenv("DFLASH_DS4_TP_GROUPED_MMVQ");
+        const char * raw = moe_policy_env(
+            "DFLASH_MOE_TP_GROUPED_MMVQ", "DFLASH_DS4_TP_GROUPED_MMVQ");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -111,7 +124,8 @@ static bool fused_moe_combine_enabled() {
 // used by the heterogeneous path); other scale values retain the old graph.
 static bool fused_gate_up_mmvq_enabled() {
     static const bool enabled = [] {
-        const char * raw = std::getenv("DFLASH_DS4_TP_FUSED_GATE_UP");
+        const char * raw = moe_policy_env(
+            "DFLASH_MOE_TP_FUSED_GATE_UP", "DFLASH_DS4_TP_FUSED_GATE_UP");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -119,7 +133,8 @@ static bool fused_gate_up_mmvq_enabled() {
 
 static bool coarse_owner_op_enabled() {
     static const bool enabled = [] {
-        const char * raw = std::getenv("DFLASH_DS4_TP_COARSE_OWNER");
+        const char * raw = moe_policy_env(
+            "DFLASH_MOE_TP_COARSE_OWNER", "DFLASH_DS4_TP_COARSE_OWNER");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -127,7 +142,8 @@ static bool coarse_owner_op_enabled() {
 
 static bool coarse_owner_split_op_enabled() {
     static const bool enabled = [] {
-        const char * raw = std::getenv("DFLASH_DS4_TP_COARSE_OWNER_SPLIT");
+        const char * raw = moe_policy_env(
+            "DFLASH_MOE_TP_COARSE_OWNER_SPLIT", "DFLASH_DS4_TP_COARSE_OWNER_SPLIT");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -142,7 +158,7 @@ static bool align_shared_moe_ids_enabled() {
             std::strcmp(kernel, "0") != 0;
         if (requested && !dedicated_kernel) {
             std::fprintf(stderr,
-                "[ds4-tp] shared-ID alignment disabled because the dedicated "
+                "[moe-hybrid] shared-ID alignment disabled because the dedicated "
                 "MMVQ MoE kernel is disabled\n");
         }
         return requested && dedicated_kernel;
@@ -152,7 +168,8 @@ static bool align_shared_moe_ids_enabled() {
 
 static bool device_join_enabled() {
     static const bool enabled = [] {
-        const char * raw = std::getenv("DFLASH_DS4_TP_DEVICE_JOIN");
+        const char * raw = moe_policy_env(
+            "DFLASH_MOE_TP_DEVICE_JOIN", "DFLASH_DS4_TP_DEVICE_JOIN");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -160,7 +177,8 @@ static bool device_join_enabled() {
 
 static bool route_prefork_enabled() {
     static const bool enabled = [] {
-        const char * raw = std::getenv("DFLASH_DS4_TP_ROUTE_PREFORK");
+        const char * raw = moe_policy_env(
+            "DFLASH_MOE_TP_ROUTE_PREFORK", "DFLASH_DS4_TP_ROUTE_PREFORK");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -660,7 +678,7 @@ static bool build_batched_routed_graph(
         bool & logged = coarse_split_eligible ? logged_active : logged_ineligible;
         if (!logged) {
             std::fprintf(stderr,
-                "[ds4-tp] split-owner %s gate=%s up=%s down=%s gate_up=%s tokens=%d routes=%d\n",
+                "[moe-hybrid] split-owner %s gate=%s up=%s down=%s gate_up=%s tokens=%d routes=%d\n",
                 coarse_split_eligible ? "active" : "ineligible",
                 gate_tensor ? ggml_type_name(gate_tensor->type) : "none",
                 up_tensor ? ggml_type_name(up_tensor->type) : "none",

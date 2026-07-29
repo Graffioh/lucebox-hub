@@ -217,6 +217,10 @@ Untagged variables are operational tuning knobs.
 
 | Variable | Purpose |
 |---|---|
+| `DFLASH_MOE_HYBRID_PREFILL_EAGER` / `DFLASH_MOE_PREFILL_TRACE` | Model-neutral heterogeneous prefill policy and tracing. The legacy `DFLASH_DS4_*` spellings remain aliases. |
+| `DFLASH_MOE_TP_GROUPED_MMVQ` / `DFLASH_MOE_TP_FUSED_GATE_UP` | Model-neutral grouped and fused routed-FFN kernel qualification switches. The legacy `DFLASH_DS4_*` spellings remain aliases. |
+| `DFLASH_MOE_TP_COARSE_OWNER` / `DFLASH_MOE_TP_COARSE_OWNER_SPLIT` | Model-neutral owner-op lowering switches. The legacy `DFLASH_DS4_*` spellings remain aliases. |
+| `DFLASH_MOE_TP_DEVICE_JOIN` / `DFLASH_MOE_TP_ROUTE_PREFORK` | Model-neutral cross-owner scheduling switches. The legacy `DFLASH_DS4_*` spellings remain aliases. |
 | `DFLASH_MOE_EXPERT_COMPUTE_THREADS` / `DFLASH_COLD_THREADS` | CPU threads for expert compute. |
 | `DFLASH_MOE_EXPERT_COMPUTE_BATCH` / `DFLASH_MOE_EXPERT_COMPUTE_BATCH_MAX` | Expert compute batch sizing. |
 | `DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE` | Expert-compute IPC mode. |

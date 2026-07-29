@@ -1027,7 +1027,8 @@ if(DFLASH27B_TESTS)
             test/test_kvflash_qk.cpp
             test/test_qwen35moe_routing_stats.cpp
             test/test_qwen35moe_expert_placement.cpp
-            test/test_qwen35moe_swap_manager.cpp)
+            test/test_qwen35moe_swap_manager.cpp
+            test/test_moe_hybrid_storage.cpp)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
                 test/test_gpu_sampler_cuda.cpp
