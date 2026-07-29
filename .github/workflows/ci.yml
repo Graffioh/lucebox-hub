@@ -316,7 +316,9 @@ jobs:
         with:
           cuda: '12.8.0'
           method: network
-          sub-packages: '["nvcc", "cudart-dev", "thrust", "driver-dev"]'
+          # Windows installer component names differ from the Linux apt
+          # packages used by the hosted Ubuntu job above.
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust"]'
 
       - name: Configure (cmake)
         working-directory: server
