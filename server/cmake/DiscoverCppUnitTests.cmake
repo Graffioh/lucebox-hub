@@ -61,7 +61,7 @@ if(_discover_output)
         endif()
 
         file(APPEND "${CTEST_FILE}"
-            "add_test([==[${_ctest_name}]==] [==[${TEST_EXECUTABLE}]==] [==[${_test_keyword}]==])\n"
+            "add_test([==[${_ctest_name}]==] [==[${TEST_EXECUTABLE}]==] --exact [==[${_test_keyword}]==])\n"
             "set_tests_properties([==[${_ctest_name}]==] PROPERTIES WORKING_DIRECTORY [==[${TEST_WORKING_DIR}]==])\n")
         list(APPEND _discovered_ctest_names "${_ctest_name}")
     endforeach()

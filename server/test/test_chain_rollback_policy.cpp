@@ -1,4 +1,5 @@
 #include "CppUnitTestFramework.hpp"
+#include "scoped_env.h"
 #include "chain_rollback_policy.h"
 
 #include <cstdio>
@@ -20,6 +21,9 @@ static void clear_policy_env() {
 }
 
 TEST_CASE(ChainRollbackPolicyFixture, policy_defaults_and_env_parsing) {
+    const luce_test::ScopedEnvVar checkpoint("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", nullptr);
+    const luce_test::ScopedEnvVar threshold("DFLASH_FAST_ROLLBACK_THRESHOLD", nullptr);
+    const luce_test::ScopedEnvVar diagnostics("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG", nullptr);
     clear_policy_env();
     auto policy = resolve_chain_rollback_policy();
     CHECK(!policy.checkpoint_f32);
@@ -59,6 +63,9 @@ TEST_CASE(ChainRollbackPolicyFixture, policy_defaults_and_env_parsing) {
 }
 
 TEST_CASE(ChainRollbackPolicyFixture, diagnostics_accumulator_and_print_contract) {
+    const luce_test::ScopedEnvVar checkpoint("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", nullptr);
+    const luce_test::ScopedEnvVar threshold("DFLASH_FAST_ROLLBACK_THRESHOLD", nullptr);
+    const luce_test::ScopedEnvVar diagnostics("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG", nullptr);
     clear_policy_env();
     setenv("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG", "1", 1);
 

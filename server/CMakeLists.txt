@@ -318,6 +318,7 @@ add_library(dflash_common STATIC
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
     src/common/backend_factory.cpp
+    src/common/feature_gate.cpp
     src/placement/placement_config.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
@@ -648,7 +649,9 @@ if(DFLASH27B_TESTS)
     enable_testing()
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip"
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_pool_shutdown.cpp")
-        add_executable(test_cuda_pool_shutdown test/test_cuda_pool_shutdown.cpp)
+        add_executable(test_cuda_pool_shutdown
+            test/test_unit_main.cpp
+            test/test_cuda_pool_shutdown.cpp)
         set_source_files_properties(test/test_cuda_pool_shutdown.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_cuda_pool_shutdown PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
         target_include_directories(test_cuda_pool_shutdown PRIVATE
@@ -755,7 +758,9 @@ if(DFLASH27B_TESTS)
         # spellings (<cuda_runtime.h> + cudaMalloc/cudaMemcpy/...); the hip_compat
         # shim maps them onto HIP, exactly as the kernel TU does. Lets the draft
         # top-K port be validated on AMD (gfx1100 / gfx1151 / gfx12xx).
-        add_executable(test_draft_topk_cuda test/test_draft_topk_cuda.cpp)
+        add_executable(test_draft_topk_cuda
+            test/test_unit_main.cpp
+            test/test_draft_topk_cuda.cpp)
         set_source_files_properties(test/test_draft_topk_cuda.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_draft_topk_cuda PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
         target_include_directories(test_draft_topk_cuda PRIVATE
@@ -869,6 +874,20 @@ if(DFLASH27B_TESTS)
         target_include_directories(bench_laguna_spark PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         target_link_libraries(bench_laguna_spark PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
+    # This synthetic stream benchmark touches a multi-gigabyte sparse file and
+    # requires a real CUDA device. Keep it manually runnable instead of adding
+    # it to the hosted server-unit suite.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_stream.cpp"
+       AND DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        add_executable(test_moe_stream
+            test/test_unit_main.cpp
+            test/test_moe_stream.cpp)
+        target_include_directories(test_moe_stream PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(test_moe_stream PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} CUDA::cudart)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_laguna_daemon.cpp")
         add_executable(test_laguna_daemon test/test_laguna_daemon.cpp)
         target_include_directories(test_laguna_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
@@ -944,6 +963,18 @@ if(DFLASH27B_TESTS)
     endif()
 
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
+    # The production CUDA and ROCm images share this entrypoint. Keep native
+    # server defaults intact unless an operator explicitly supplies an env
+    # override; otherwise container launches can silently disable features
+    # that are enabled by the C++ server itself.
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_entrypoint_cache_defaults.sh")
+        add_test(
+            NAME server_unit_entrypoint_cache_defaults
+            COMMAND bash
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/test_entrypoint_cache_defaults.sh"
+                "${CMAKE_CURRENT_SOURCE_DIR}/scripts/entrypoint.sh")
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         set(_server_unit_sources
             test/test_unit_main.cpp
@@ -972,8 +1003,7 @@ if(DFLASH27B_TESTS)
             list(APPEND _server_unit_sources
                 test/test_gpu_sampler_cuda.cpp
                 test/test_cuda_pool_shutdown.cpp
-                test/test_draft_topk_cuda.cpp
-                test/test_moe_stream.cpp)
+                test/test_draft_topk_cuda.cpp)
         endif()
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
@@ -981,8 +1011,10 @@ if(DFLASH27B_TESTS)
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
             src/qwen3/anchor_scan.cpp)
-        set_source_files_properties(test/test_drafter_tail_capture_guard.cpp
-            PROPERTIES COMPILE_DEFINITIONS TAIL_GUARD_USE_NEW_FORMULA)
+        # Keep the GREEN formula target-local: the separate RED regression
+        # executable compiles the same source without this definition.
+        target_compile_definitions(test_server_unit PRIVATE
+            TAIL_GUARD_USE_NEW_FORMULA)
         target_include_directories(test_server_unit PRIVATE
             ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
@@ -1006,49 +1038,110 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_server_unit PRIVATE hip::host)
         endif()
-        set(_server_unit_ctest_generated
-            "${CMAKE_CURRENT_BINARY_DIR}/test_server_unit_discovered_tests.cmake")
-        set(_server_unit_ctest_include
-            "${CMAKE_CURRENT_BINARY_DIR}/test_server_unit_discovered_tests_include.cmake")
-        file(GENERATE OUTPUT "${_server_unit_ctest_include}"
-            CONTENT "include([==[${_server_unit_ctest_generated}]==] OPTIONAL)\n")
-        set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
-            "${_server_unit_ctest_include}")
-        add_custom_command(TARGET test_server_unit POST_BUILD
-            COMMAND ${CMAKE_COMMAND}
-                -DTEST_EXECUTABLE=$<TARGET_FILE:test_server_unit>
-                -DTEST_WORKING_DIR=${CMAKE_CURRENT_BINARY_DIR}
-                -DCTEST_FILE=${_server_unit_ctest_generated}
-                -DTEST_PREFIX=test_server_unit.
-                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/DiscoverCppUnitTests.cmake
-            VERBATIM
-            COMMENT "Discovering CppUnitTestFramework tests for test_server_unit")
-        unset(_server_unit_ctest_generated)
-        unset(_server_unit_ctest_include)
+        if(CMAKE_CROSSCOMPILING)
+            # Runtime discovery cannot execute a target binary on the build
+            # host. Register one aggregate test instead; CMake prepends the
+            # target's CROSSCOMPILING_EMULATOR when one is configured.
+            add_test(NAME server_unit COMMAND test_server_unit)
+        else()
+            set(_server_unit_ctest_generated
+                "${CMAKE_CURRENT_BINARY_DIR}/test_server_unit_discovered_tests.cmake")
+            set(_server_unit_ctest_include
+                "${CMAKE_CURRENT_BINARY_DIR}/test_server_unit_discovered_tests_include.cmake")
+            file(GENERATE OUTPUT "${_server_unit_ctest_include}"
+                CONTENT "include([==[${_server_unit_ctest_generated}]==] OPTIONAL)\n")
+            set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+                "${_server_unit_ctest_include}")
+            add_custom_command(TARGET test_server_unit POST_BUILD
+                COMMAND ${CMAKE_COMMAND}
+                    -DTEST_EXECUTABLE=$<TARGET_FILE:test_server_unit>
+                    -DTEST_WORKING_DIR=${CMAKE_CURRENT_BINARY_DIR}
+                    -DCTEST_FILE=${_server_unit_ctest_generated}
+                    -DTEST_PREFIX=test_server_unit.
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/DiscoverCppUnitTests.cmake
+                VERBATIM
+                COMMENT "Discovering CppUnitTestFramework tests for test_server_unit")
+            unset(_server_unit_ctest_generated)
+            unset(_server_unit_ctest_include)
+        endif()
         unset(_server_unit_sources)
         list(APPEND _raw_unit_test_targets test_server_unit)
+    endif()
+
+    # Feature/architecture gate tests. check_feature_compatibility(),
+    # collect_feature_warnings() and the capability table are pure functions,
+    # so this target deliberately compiles only feature_gate.cpp and
+    # placement_config.cpp — no dflash_common, no ggml, no GPU toolkit. That
+    # keeps a gate rule testable in seconds instead of behind a full backend
+    # build, which is the whole reason these tests do not live in
+    # test_server_unit.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_feature_gate.cpp")
+        add_executable(test_feature_gate test/test_feature_gate.cpp)
+        target_sources(test_feature_gate PRIVATE
+            src/common/feature_gate.cpp
+            src/placement/placement_config.cpp)
+        target_include_directories(test_feature_gate PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+        # compiled_placement_backend() is decided by these defines, so the
+        # gate must be tested with the same ones the server is built with.
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_feature_gate PRIVATE
+                DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_feature_gate PRIVATE
+                DFLASH27B_BACKEND_CUDA=1)
+        endif()
+        add_test(NAME feature_gate COMMAND test_feature_gate)
     endif()
 
     if(_raw_unit_test_targets)
         foreach(_unit_target IN LISTS _raw_unit_test_targets)
             if(NOT _unit_target STREQUAL "test_server_unit")
-                add_test(NAME "${_unit_target}" COMMAND ${_unit_target})
+                # Preserve the established CTest names used by CI filters and
+                # downstream scripts even though dependency tracking uses the
+                # executable target names.
+                set(_unit_ctest_name "${_unit_target}")
+                if(_unit_target STREQUAL "test_cuda_pool_shutdown")
+                    set(_unit_ctest_name cuda_pool_shutdown)
+                elseif(_unit_target STREQUAL "test_rocmfp4")
+                    set(_unit_ctest_name rocmfp4_reference)
+                elseif(_unit_target STREQUAL "test_rocmfpx")
+                    set(_unit_ctest_name rocmfpx_reference)
+                elseif(_unit_target STREQUAL "test_rms_norm_hip")
+                    set(_unit_ctest_name rms_norm_hip)
+                elseif(_unit_target STREQUAL "test_deepseek4_hc_cuda")
+                    set(_unit_ctest_name deepseek4_hc_cuda)
+                elseif(_unit_target STREQUAL "test_draft_topk_cuda")
+                    set(_unit_ctest_name draft_topk_cuda)
+                elseif(_unit_target STREQUAL "test_deepseek4_unit")
+                    set(_unit_ctest_name deepseek4_unit)
+                endif()
+                add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
             endif()
         endforeach()
+        unset(_unit_ctest_name)
     endif()
 
-    # 'make check' — build unit-test targets then run ctest.
-    if(_raw_unit_test_targets)
+    # 'make check' — build every registered unit-test target, including the
+    # lightweight feature gate added on main, then run the complete CTest set.
+    set(_check_deps ${_raw_unit_test_targets})
+    if(TARGET test_feature_gate)
+        list(APPEND _check_deps test_feature_gate)
+    endif()
+    if(_check_deps)
         add_custom_target(check
             COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-            DEPENDS ${_raw_unit_test_targets}
+            DEPENDS ${_check_deps}
             COMMENT "Building and running unit tests"
         )
     else()
         add_custom_target(check
+            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
             COMMENT "No unit-test binaries are enabled in this configuration"
         )
     endif()
+    unset(_check_deps)
     unset(_raw_unit_test_targets)
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")

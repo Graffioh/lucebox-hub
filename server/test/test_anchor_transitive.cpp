@@ -7,12 +7,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #define TEST_ASSERT(cond) do { \
-    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
-    if (_cpputf_exception) { \
-        throw *_cpputf_exception; \
+    if (!(cond)) { \
+        throw std::runtime_error(std::string(__FILE__) + ":" + \
+            std::to_string(__LINE__) + ": " + #cond); \
     } \
 } while (0)
 #undef REQUIRE

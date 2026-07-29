@@ -1,4 +1,5 @@
 #include "CppUnitTestFramework.hpp"
+#include "scoped_env.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
@@ -12,24 +13,13 @@ namespace {
 struct CudaPoolShutdownFixture {};
 }
 
-#define TEST_ASSERT(cond) do { \
-    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
-    if (_cpputf_exception) { \
-        throw *_cpputf_exception; \
-    } \
-} while (0)
-
 TEST_CASE(CudaPoolShutdownFixture, backend_pool_shutdown) {
-#if defined(_WIN32)
-    _putenv_s("LUCE_Q8_MEMO", "1");
-#else
-    setenv("LUCE_Q8_MEMO", "1", 1);
-#endif
+    const luce_test::ScopedEnvVar q8_memo("LUCE_Q8_MEMO", "1");
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
-        std::fprintf(stderr, "failed to initialize CUDA/HIP backend\n");
-        TEST_ASSERT(false);
+        std::fprintf(stderr, "skip: no CUDA/HIP backend available\n");
+        return;
     }
 
     ggml_init_params params{};
@@ -38,7 +28,7 @@ TEST_CASE(CudaPoolShutdownFixture, backend_pool_shutdown) {
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
         ggml_backend_free(backend);
-        TEST_ASSERT(false);
+        REQUIRE_TRUE(false);
     }
 
     constexpr int64_t k = 256;
@@ -56,7 +46,7 @@ TEST_CASE(CudaPoolShutdownFixture, backend_pool_shutdown) {
     if (!buffer) {
         ggml_free(ctx);
         ggml_backend_free(backend);
-        TEST_ASSERT(false);
+        REQUIRE_TRUE(false);
     }
 
     std::vector<uint8_t> weights_data(ggml_nbytes(weights), 0);
@@ -69,11 +59,11 @@ TEST_CASE(CudaPoolShutdownFixture, backend_pool_shutdown) {
     ggml_free(ctx);
     if (status != GGML_STATUS_SUCCESS) {
         ggml_backend_free(backend);
-        TEST_ASSERT(false);
+        REQUIRE_TRUE(false);
     }
 
     // LUCE_Q8_MEMO intentionally retains the pool allocation after compute.
     // Backend teardown must release that allocation before destroying its pool.
     ggml_backend_free(backend);
-    TEST_ASSERT(true);
+    REQUIRE_TRUE(true);
 }

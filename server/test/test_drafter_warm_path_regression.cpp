@@ -6,14 +6,16 @@
 
 #include <cassert>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 
 using dflash::common::ScoreRange;
 using dflash::common::compute_score_range;
 
 #define TEST_ASSERT(cond) do { \
-    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
-    if (_cpputf_exception) { \
-        throw *_cpputf_exception; \
+    if (!(cond)) { \
+        throw std::runtime_error(std::string(__FILE__) + ":" + \
+            std::to_string(__LINE__) + ": " + #cond); \
     } \
 } while (0)
 #undef assert

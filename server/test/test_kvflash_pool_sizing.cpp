@@ -7,6 +7,7 @@
 // These asserts pin the two behaviours so a future caller can't silently
 // reintroduce the divergence.
 #include "CppUnitTestFramework.hpp"
+#include "scoped_env.h"
 #include "../src/common/kvflash_pager.h"
 
 #include <cstdio>
@@ -19,8 +20,8 @@ struct KvflashPoolSizingFixture {};
 }
 
 TEST_CASE(KvflashPoolSizingFixture, kvflash_pool_sizing_suite) {
-    setenv("DFLASH_KVFLASH", "auto", 1);
-    unsetenv("DFLASH_KVFLASH_MAX_POOL");
+    const luce_test::ScopedEnvVar kvflash_mode("DFLASH_KVFLASH", "auto");
+    const luce_test::ScopedEnvVar max_pool("DFLASH_KVFLASH_MAX_POOL", nullptr);
     const int max_ctx = 131072;
 
     // No budget supplied -> fallback fraction of max_ctx (the buggy placement

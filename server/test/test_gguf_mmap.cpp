@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 
 #if defined(_WIN32)
@@ -30,9 +31,9 @@
 // Use a local shim because helper functions below are free functions rather than
 // fixture members, so the README's direct REQUIRE/CHECK macros are not in scope.
 #define TEST_ASSERT(cond) do { \
-    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
-    if (_cpputf_exception) { \
-        throw *_cpputf_exception; \
+    if (!(cond)) { \
+        throw std::runtime_error(std::string(__FILE__) + ":" + \
+            std::to_string(__LINE__) + ": " + #cond); \
     } \
 } while (0)
 #undef assert

@@ -15,7 +15,6 @@
 #include "chat_template.h"
 #include "model_card.h"
 #include "common/backend_factory.h"
-#include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
 #include "common/spark_corpus.h"
 #include "common/moe_routing_collector.h"
@@ -23,8 +22,6 @@
 #include "common/peer_access.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
-
-#include "gguf.h"
 
 #include <algorithm>
 #include <csignal>
@@ -68,127 +65,6 @@ static bool parse_double_list(const char * value, std::vector<double> & out) {
         if (!*p) return false;
     }
     return !out.empty();
-}
-
-static bool validate_server_placement(const BackendArgs & bargs,
-                                      const ServerConfig & sconfig) {
-    const PlacementBackend compiled = compiled_placement_backend();
-    if (!placement_backend_supported(bargs.device.backend)) {
-        std::fprintf(stderr,
-            "[server] --target-device=%s is unsupported in this binary "
-            "(compiled backend: %s)\n",
-            placement_device_name(bargs.device).c_str(),
-            placement_backend_name(compiled));
-        return false;
-    }
-    const bool pflash_enabled =
-        sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
-    const PFlashDrafterPlacement pflash_placement =
-        resolve_pflash_drafter_placement(
-            bargs.device, bargs.draft_device, bargs.remote_draft,
-            pflash_enabled);
-    const PlacementBackend target = pflash_placement.target_backend;
-    const PlacementBackend draft = pflash_placement.drafter_backend;
-    const bool draft_placement_used =
-        pflash_drafter_placement_used(pflash_enabled, bargs.draft_path != nullptr);
-    if (!bargs.remote_draft.enabled() && bargs.remote_draft.has_aux_options()) {
-        std::fprintf(stderr,
-            "[server] --draft-ipc-work-dir and --draft-ipc-ring-cap require "
-            "--draft-ipc-bin\n");
-        return false;
-    }
-    if (!bargs.remote_target_shard.enabled() &&
-        bargs.remote_target_shard.has_aux_options()) {
-        std::fprintf(stderr,
-            "[server] --target-shard-ipc-work-dir requires --target-shard-ipc-bin\n");
-        return false;
-    }
-    if (draft_placement_used && target != draft) {
-        if (!bargs.remote_draft.enabled()) {
-            std::fprintf(stderr,
-                "[server] mixed target/draft backends require --draft-ipc-bin "
-                "(target=%s draft=%s)\n",
-                placement_backend_name(target), placement_backend_name(draft));
-            return false;
-        }
-        if (!bargs.draft_path && !pflash_enabled) {
-            std::fprintf(stderr,
-                "[server] mixed target/draft backends require --draft <path> "
-                "or --prefill-compression with --prefill-drafter\n");
-            return false;
-        }
-    } else if (bargs.remote_draft.enabled()) {
-        std::fprintf(stderr,
-            "[server] --draft-ipc-bin is only needed for mixed target/draft "
-            "backends (target=%s draft=%s)\n",
-            placement_backend_name(target), placement_backend_name(draft));
-        return false;
-    } else if (draft_placement_used &&
-               !placement_backend_supported(bargs.draft_device.backend)) {
-        std::fprintf(stderr,
-            "[server] --draft-device=%s is unsupported in this binary "
-            "(compiled backend: %s)\n",
-            placement_device_name(bargs.draft_device).c_str(),
-            placement_backend_name(compiled));
-        return false;
-    }
-    if (!bargs.device.is_layer_split() && !bargs.device.layer_split_weights.empty()) {
-        std::fprintf(stderr,
-            "[server] --target-layer-split requires --target-devices\n");
-        return false;
-    }
-    if (bargs.device.is_layer_split()) {
-        const std::string placement_error =
-            validate_device_placement(bargs.device, /*device_count=*/-1);
-        if (!placement_error.empty()) {
-            std::fprintf(stderr, "[server] bad target layer split: %s\n",
-                         placement_error.c_str());
-            return false;
-        }
-    }
-    const bool mixed_target_split =
-        bargs.device.is_layer_split() && bargs.device.is_mixed_layer_split();
-    if (mixed_target_split) {
-        if (!bargs.remote_target_shard.enabled()) {
-            std::fprintf(stderr,
-                "[server] mixed-backend target layer split requires "
-                "--target-shard-ipc-bin\n");
-            return false;
-        }
-        size_t remote_begin = 0;
-        while (remote_begin < bargs.device.layer_split_gpus.size() &&
-               bargs.device.layer_split_backend(remote_begin) == compiled) {
-            ++remote_begin;
-        }
-        if (remote_begin == 0 || remote_begin >= bargs.device.layer_split_gpus.size()) {
-            std::fprintf(stderr,
-                "[server] mixed-backend target layer split currently supports "
-                "one local backend group followed by one remote backend group\n");
-            return false;
-        }
-        const PlacementBackend remote_backend =
-            bargs.device.layer_split_backend(remote_begin);
-        bool one_boundary = true;
-        for (size_t i = remote_begin; i < bargs.device.layer_split_gpus.size(); ++i) {
-            if (bargs.device.layer_split_backend(i) != remote_backend) {
-                one_boundary = false;
-                break;
-            }
-        }
-        if (!one_boundary) {
-            std::fprintf(stderr,
-                "[server] mixed-backend target layer split currently supports "
-                "only one backend boundary\n");
-            return false;
-        }
-    } else if (bargs.device.is_layer_split() && target != compiled) {
-        std::fprintf(stderr,
-            "[server] target layer split must use this binary's compiled "
-            "backend (target=%s compiled=%s)\n",
-            placement_backend_name(target), placement_backend_name(compiled));
-        return false;
-    }
-    return true;
 }
 
 static void print_usage(const char * prog) {
@@ -338,6 +214,7 @@ int main(int argc, char ** argv) {
     bool target_device_seen = false;
     bool target_devices_seen = false;
     bool fast_rollback_forced_off = false;
+    bool adaptive_experts_set = false;  // --adaptive-experts (MoE architectures only)
 
     // Track which thinking-budget tunables the operator set via CLI.
     // Those values win over the model card (spec §3.1: "Explicit CLI
@@ -480,6 +357,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             setenv("DFLASH_ADAPTIVE_K_TAU", tau, 0);  // explicit env still wins
+            adaptive_experts_set = true;
         } else if (std::strcmp(argv[i], "--verify-width") == 0 && i + 1 < argc) {
             bargs.verify_width = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-fast-rollback") == 0) {
@@ -672,22 +550,43 @@ int main(int argc, char ** argv) {
     }
     if (fast_rollback_forced_off) bargs.fast_rollback = false;
 
-    if (!validate_server_placement(bargs, sconfig)) return 2;
-
-    if (bargs.remote_draft.enabled() && bargs.draft_path) {
-        const std::string arch = detect_arch(bargs.model_path);
-        if (arch.empty()) {
-            std::fprintf(stderr,
-                "[server] failed to detect model architecture for remote draft validation\n");
-            return 1;
-        }
-        if (!arch_supports_remote_draft(arch)) {
-            std::fprintf(stderr,
-                "[server] model architecture '%s' does not support remote draft execution\n",
-                arch.c_str());
-            return 2;
+    // Resolve documented environment defaults before factory preparation so
+    // compatibility warnings describe the effective backend configuration.
+    // An explicit --draft-swa value continues to take precedence.
+    if (bargs.draft_swa_window == 0) {
+        if (const char * e = std::getenv("DFLASH27B_DRAFT_SWA")) {
+            bargs.draft_swa_window = std::atoi(e);
         }
     }
+
+    // Ask the factory to resolve model/placement facts and apply its feature
+    // admission policy before any setup work. server_main only maps the
+    // categorized result to the existing process exit convention.
+    BackendFeatureConfig backend_features;
+    backend_features.pflash_enabled =
+        sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
+    backend_features.pflash_drafter_configured =
+        !sconfig.pflash_drafter_path.empty();
+    backend_features.routing_stats_requested =
+        sconfig.freq_tracking || !sconfig.collect_routing_path.empty();
+    backend_features.adaptive_experts_requested = adaptive_experts_set;
+    const BackendPreparation backend_preparation =
+        prepare_backend(bargs, backend_features);
+    if (!backend_preparation.ok()) {
+        std::fprintf(stderr, "[server] %s\n",
+                     backend_preparation.message.c_str());
+        return backend_preparation.error ==
+                BackendPreparationError::FeatureCompatibility
+            ? 2
+            : 1;
+    }
+    // Options that parsed cleanly but do nothing on this model. Reported up
+    // front so they are visible before the backend's own startup chatter.
+    for (const std::string & warning : backend_preparation.warnings) {
+        std::fprintf(stderr, "[server] warning: %s\n", warning.c_str());
+    }
+    const ResolvedBackendPlan & backend_plan = backend_preparation.plan;
+    const std::string & arch = backend_plan.arch();
 
     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.
     // This prevents the HTTP server from accepting prompts larger than the
@@ -762,29 +661,11 @@ int main(int argc, char ** argv) {
     // Load pflash drafter tokenizer (if pflash enabled).
     Tokenizer drafter_tokenizer;
     if (pflash_enabled) {
-        if (sconfig.pflash_drafter_path.empty()) {
-            std::fprintf(stderr, "[server] --prefill-compression requires --prefill-drafter\n");
-            return 1;
-        }
         std::fprintf(stderr, "[server] loading pflash drafter tokenizer from %s\n",
                      sconfig.pflash_drafter_path.c_str());
         if (!drafter_tokenizer.load_from_gguf(sconfig.pflash_drafter_path.c_str())) {
             std::fprintf(stderr, "[server] drafter tokenizer load failed\n");
             return 1;
-        }
-        if (sconfig.pflash_remote_drafter) {
-            if (!bargs.remote_draft.enabled()) {
-                std::fprintf(stderr,
-                    "[server] mixed-backend PFlash requires --draft-ipc-bin\n");
-                return 2;
-            }
-            const std::string arch = detect_arch(bargs.model_path);
-            if (!arch_supports_pflash_compression(arch)) {
-                std::fprintf(stderr,
-                    "[server] model architecture '%s' does not support PFlash compression\n",
-                    arch.c_str());
-                return 2;
-            }
         }
         std::fprintf(stderr, "[server] pflash: mode=%s threshold=%d keep=%.3f drafter_gpu=%d skip_park=%d\n",
                      sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" : "always",
@@ -804,48 +685,17 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Honor DFLASH27B_DRAFT_SWA env (documented in server/README.md) when --draft-swa is absent.
-    if (bargs.draft_swa_window == 0) {
-        if (const char * e = std::getenv("DFLASH27B_DRAFT_SWA")) {
-            bargs.draft_swa_window = std::atoi(e);
-        }
-    }
-
     // Create backend.
     g_peer_access_opt_in = bargs.device.peer_access;
     std::fprintf(stderr, "[server] creating backend...\n");
-    const std::string arch = detect_arch(bargs.model_path);
-    if (bargs.ds4_prefill_mode_set && arch != "deepseek4") {
-        std::fprintf(stderr,
-            "[server] --ds4-prefill is only valid for deepseek4 models "
-            "(detected '%s')\n", arch.c_str());
-        return 2;
-    }
-    const PlacementBackend target_backend =
-        bargs.device.backend == PlacementBackend::Auto
-            ? compiled_placement_backend()
-            : bargs.device.backend;
-    const bool monolithic_ds4 =
-        arch == "deepseek4" &&
-        target_backend == PlacementBackend::Hip &&
-        !bargs.device.is_layer_split() &&
-        !bargs.remote_target_shard.enabled();
-    if ((bargs.ds4_fused_decode || bargs.ds4_expert_top_k != 0) &&
-        !monolithic_ds4) {
-        std::fprintf(stderr,
-                     "[server] --ds4-fused-decode and --ds4-expert-top-k "
-                     "currently require single-device HIP DeepSeek4\n");
-        return 2;
-    }
     if (spark_autotune) {
         // Self-tuning hot/cold MoE residency: enable the bounded expert cache
         // (auto-tunes the working set at serve time), auto-load a learned
         // placement profile next to the model if present, and keep persisting it
         // from live traffic. One command; improves across restarts. Both laguna
         // and qwen35moe.
-        const bool is_laguna  = (arch == "laguna");
-        const bool is_qwenmoe = (arch == "qwen35moe");
-        if (is_laguna || is_qwenmoe) {
+        const bool is_laguna = (arch == "laguna");
+        if (arch_has_expert_offload(arch)) {
             const std::string pfx = is_laguna ? "DFLASH_LAGUNA_" : "DFLASH_QWEN35MOE_";
             const std::string profile = std::string(bargs.model_path) + ".spark.csv";
             std::FILE * pf = std::fopen(profile.c_str(), "rb");
@@ -880,48 +730,32 @@ int main(int argc, char ** argv) {
                 arch.c_str());
         }
     }
-    auto backend = create_backend(bargs);
+    auto backend = create_backend(bargs, backend_plan);
     if (!backend) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
     }
+    // Cross-check the capability table against the backend that was actually
+    // built. arch_supports_remote_draft() admitted this launch from the arch
+    // string alone; if the two ever disagree the table is stale, and failing
+    // here beats routing draft work to a backend that cannot serve it.
     if (bargs.remote_draft.enabled() && bargs.draft_path &&
         !backend->supports_remote_draft()) {
         std::fprintf(stderr,
-            "[server] detected model backend does not support remote draft execution\n");
+            "[server] internal: architecture '%s' is listed as supporting "
+            "remote draft execution but the constructed backend does not\n",
+            arch.c_str());
         backend->shutdown();
         return 2;
     }
-
     // ── Thinking-budget v2: resolve model card and apply to ServerConfig ──
-    // Read general.name + general.architecture directly from the GGUF.
-    // This is best-effort; if the file can't be opened (corruption, removed
-    // after backend init) we fall through to hard-fallback defaults via
-    // resolve_model_card(...).
-    std::string general_name;
-    std::string general_arch = arch;  // fall back to detect_arch() result
-    {
-        gguf_init_params gip{};
-        gip.no_alloc = true;
-        gip.ctx = nullptr;
-        gguf_context * gctx = gguf_init_from_file(bargs.model_path, gip);
-        if (gctx) {
-            int64_t name_id = gguf_find_key(gctx, "general.name");
-            if (name_id >= 0) {
-                const char * v = gguf_get_val_str(gctx, name_id);
-                if (v) general_name = v;
-            }
-            int64_t arch_id = gguf_find_key(gctx, "general.architecture");
-            if (arch_id >= 0) {
-                const char * v = gguf_get_val_str(gctx, arch_id);
-                if (v) general_arch = v;
-            }
-            gguf_free(gctx);
-        }
-        std::fprintf(stderr,
-            "[server] gguf meta: general.name='%s' general.architecture='%s'\n",
-            general_name.c_str(), general_arch.c_str());
-    }
+    // Reuse the metadata captured during factory preparation instead of
+    // opening the GGUF header again.
+    const std::string & general_name = backend_plan.model().name;
+    const std::string & general_arch = backend_plan.arch();
+    std::fprintf(stderr,
+        "[server] gguf meta: general.name='%s' general.architecture='%s'\n",
+        general_name.c_str(), general_arch.c_str());
 
     ModelCard card = resolve_model_card(
         bargs.model_path ? bargs.model_path : "",

@@ -7,12 +7,15 @@
 // Expected: prints "[dflash] KV pair …" message and aborts.
 
 #include "CppUnitTestFramework.hpp"
+#include "scoped_env.h"
 #include "kv_quant.h"
 
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 #ifdef _WIN32
 #define setenv(name, value, overwrite) _putenv_s(name, value)
@@ -22,9 +25,9 @@
 // Use a local shim because helper functions below are free functions rather than
 // fixture members, so the README's direct REQUIRE/CHECK macros are not in scope.
 #define TEST_ASSERT(cond) do { \
-    auto _cpputf_exception = CppUnitTestFramework::Assert::IsTrue(static_cast<bool>(cond), #cond); \
-    if (_cpputf_exception) { \
-        throw *_cpputf_exception; \
+    if (!(cond)) { \
+        throw std::runtime_error(std::string(__FILE__) + ":" + \
+            std::to_string(__LINE__) + ": " + #cond); \
     } \
 } while (0)
 #undef assert
@@ -208,6 +211,11 @@ static void t5_kv_reservation() {
 // ─── main ────────────────────────────────────────────────────────────────────
 
 TEST_CASE(KvQuantFixture, kv_quant_suite) {
+    const luce_test::ScopedEnvVar kv_f16("DFLASH27B_KV_F16", nullptr);
+    const luce_test::ScopedEnvVar kv_q4("DFLASH27B_KV_Q4", nullptr);
+    const luce_test::ScopedEnvVar kv_tq3("DFLASH27B_KV_TQ3", nullptr);
+    const luce_test::ScopedEnvVar kv_k("DFLASH27B_KV_K", nullptr);
+    const luce_test::ScopedEnvVar kv_v("DFLASH27B_KV_V", nullptr);
     clear_kv_env();  // start clean regardless of calling environment
 
     t1_parse_kv_type();

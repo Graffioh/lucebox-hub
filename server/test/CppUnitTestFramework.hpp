@@ -1,15 +1,46 @@
+// CppUnitTestFramework
+// Source: https://github.com/drleq/CppUnitTestFramework
+// Copyright (c) 2018 Andrew Condie
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 #pragma once
 
 #include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <string_view>
+#include <type_traits>
+#include <typeinfo>
+#include <utility>
 #include <vector>
 
 namespace CppUnitTestFramework {
@@ -47,6 +78,7 @@ namespace CppUnitTestFramework {
         bool Verbose = false;
         bool DiscoveryMode = false;
         bool AdapterInfo = false;
+        bool ExactMatch = false;
         std::vector<std::string> Keywords;
 
         bool ParseCommandLine(int argc, const char* argv[]) {
@@ -65,6 +97,7 @@ namespace CppUnitTestFramework {
                     std::cout << "    -v, --verbose:         Show verbose output" << std::endl;
                     std::cout << "        --discover_tests:  Output test details" << std::endl;
                     std::cout << "        --adapter_info:    Output additional details for test adapters" << std::endl;
+                    std::cout << "        --exact:           Match complete test names instead of substrings" << std::endl;
                     return false;
                 }
 
@@ -80,6 +113,11 @@ namespace CppUnitTestFramework {
 
                 if (option_name == "-adapter_info") {
                     AdapterInfo = true;
+                    continue;
+                }
+
+                if (option_name == "-exact") {
+                    ExactMatch = true;
                     continue;
                 }
 
@@ -143,7 +181,7 @@ namespace CppUnitTestFramework {
         void SkipTest(const std::string_view& name) override {
             m_test_log.clear();
             m_test_log << "Skip: " << name.data() << std::endl;
-            
+
             if (m_run_options->Verbose) {
                 FlushLog();
             }
@@ -202,7 +240,7 @@ namespace CppUnitTestFramework {
         ) override {
             auto& log = Indent();
 
-            log << "@" << location.LineNumber << " ";
+            log << "@" << location.SourceFile << ":" << location.LineNumber << " ";
 
             switch (type) {
             case AssertType::Throw: log << "REQUIRE"; break;
@@ -210,7 +248,7 @@ namespace CppUnitTestFramework {
             }
 
             log << ": " << message.data() << std::endl;
-            
+
             if (m_run_options->Verbose) {
                 FlushLog();
             }
@@ -361,7 +399,8 @@ namespace CppUnitTestFramework {
             }
 
             for (auto& keyword : options->Keywords) {
-                if (test_name.find(keyword) != std::string_view::npos) {
+                if ((options->ExactMatch && test_name == keyword) ||
+                    (!options->ExactMatch && test_name.find(keyword) != std::string_view::npos)) {
                     return true;
                 }
 
@@ -406,7 +445,7 @@ namespace CppUnitTestFramework {
                 // Enum -> [<name>] <number>
                 std::ostringstream ss;
                 if constexpr (sizeof(std::underlying_type_t<T>) == sizeof(char)) {
-                    ss << "[" << typeid(T).name() << "] " << static_cast<int>(value);    
+                    ss << "[" << typeid(T).name() << "] " << static_cast<int>(value);
                 } else {
                     ss << "[" << typeid(T).name() << "] " << static_cast<std::underlying_type_t<T>>(value);
                 }
@@ -594,7 +633,7 @@ namespace CppUnitTestFramework {
             auto safe_div = [](double a, double b) -> double {
                 // Avoid overflow.
                 if ((b < 1.0) && (a > b*std::numeric_limits<double>::max())) {
-                    return std::numeric_limits<float>::max();
+                    return std::numeric_limits<double>::max();
                 }
 
                 // Avoid underflow.
