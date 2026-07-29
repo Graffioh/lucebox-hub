@@ -1,17 +1,17 @@
-# MoE Hybrid Expert Offload
+# MoE Heterogeneous Expert Runtime
 
-Model-agnostic Mixture-of-Experts (MoE) hybrid offload subsystem that splits experts between GPU ("hot") and CPU ("cold") to fit large MoE models (e.g. Qwen3.5-MoE, Laguna) on consumer GPUs with limited VRAM.
+Model-agnostic Mixture-of-Experts (MoE) runtime that assigns routed experts to two heterogeneous owners. An owner may be a discrete GPU, an integrated GPU using unified memory, or the CPU. Model code describes tensors and routing semantics; the common runtime owns placement, compact storage, concurrent execution, and result joining.
 
 ## Overview
 
-In a standard MoE forward pass, all experts reside on GPU. The hybrid mode instead:
+In a standard MoE forward pass, one device owns every expert. The hybrid mode instead:
 
 1. **Profiles** which experts are activated most frequently (routing statistics).
-2. **Places** the most-used experts on GPU (hot), the rest on CPU (cold).
-3. **Evaluates** hot experts on GPU and cold experts on CPU concurrently, then combines results.
+2. **Places** experts across a primary owner (hot) and a complementary owner (cold).
+3. **Evaluates** both owner subsets concurrently, then joins their partial outputs.
 4. **Swaps** experts between hot/cold at request boundaries based on shifting workload patterns.
 
-This allows running 27B+ MoE models on a single RTX 3090 (24 GB) that would otherwise require 40+ GB.
+The same mechanism supports GPU+CPU offload on a memory-constrained card and GPU+GPU expert parallelism on a heterogeneous Lucebox. The hardware profile chooses owners and placement; it is not part of the model adapter.
 
 ## File Layout
 
@@ -22,8 +22,10 @@ This allows running 27B+ MoE models on a single RTX 3090 (24 GB) that would othe
 | `moe_hybrid_routing_stats.{h,cpp}` | Per-layer expert activation counters and ranking |
 | `moe_hybrid_placement.{h,cpp}` | Hot/cold assignment: greedy budget allocation from stats |
 | `moe_hybrid_swap_manager.{h,cpp}` | Runtime expert promotion/demotion between requests |
-| `moe_hybrid_storage.{h,cpp}` | GPU/CPU buffer management for split expert tensors |
-| `moe_hybrid_ffn_eval.{h,cpp}` | FFN execution: hot on GPU, cold on CPU, result combination |
+| `moe_hybrid_storage.{h,cpp}` | Compact owner-local buffers for split expert tensors |
+| `moe_hybrid_ffn_eval.{h,cpp}` | Concurrent owner execution and partial-result joining |
+| `moe_expert_compute.{h,cpp}` | Backend-neutral selected-expert compute interface |
+| `moe_expert_compute_ipc.cpp` | Second-GPU process transport and architecture adapter registry |
 
 ## Key Types
 
@@ -63,8 +65,8 @@ Specifies which experts are hot per layer:
 
 Per-layer split buffer state:
 
-- `hot_ctx/hot_buf` — GPU-resident tensors for hot experts
-- `cold_ctx/cold_buf` — CPU-resident tensors for cold experts
+- `hot_ctx/hot_buf` — primary-owner tensors
+- `cold_ctx/cold_buf` — complementary-owner tensors (CPU or second GPU)
 - `hot_local_by_global[expert_id]` — maps global expert index → local hot index (-1 if cold)
 - `cold_local_by_global[expert_id]` — maps global expert index → local cold index (-1 if hot)
 - `CachedFfnGraph hot_graph/cold_graph` — pre-built ggml compute graphs (avoids per-token rebuild)
@@ -104,14 +106,18 @@ This adapts placement to workload drift without full re-profiling.
 
 ### `eval_moe_hybrid_ffn_single`
 
-Single-token decode path:
+Single-token GPU+CPU offload path:
 
 1. **Partition** selected expert IDs into hot (GPU-local) and cold (CPU-local) subsets using the local-by-global index maps.
 2. **GPU path**: Run hot routed experts + shared expert in a single fused ggml graph (`run_hot_and_shared_ffn_gpu`).
-3. **CPU path**: Run cold routed experts via `run_routed_subset` on CPU backend.
+3. **CPU path**: Run cold routed experts via `run_routed_subset` on the CPU backend.
 4. **Combine**: Sum hot+shared and cold results on host.
 
 Telemetry reports wall time and per-phase breakdown (partition, hot, cold, shared, combine).
+
+### `build_moe_hybrid_ffn_graph`
+
+Device-resident GPU+GPU path used by heterogeneous Lucebox profiles. It builds one routed branch per expert owner, pins every branch intermediate to its weight backend, launches the two owners independently, and inserts a peer-owned event only at the first consumer of the complementary partial. The caller can consume `main_output` and `peer_output` separately to fuse the final join into the next operation.
 
 ### `eval_moe_hybrid_ffn_gpu_resident`
 
@@ -120,7 +126,7 @@ Optimized single-token path that keeps activations on GPU:
 - Reads only router IDs to CPU for hot/cold partitioning.
 - Uses `GpuResidentState` with a pre-built `ResidualCombineGraph` (residual + hot + cold correction).
 - Uses `CachedFfnGraph` to avoid per-token graph rebuilds.
-- Cold expert output is uploaded back to GPU for the residual combine.
+- The complementary owner's partial output is joined on the primary GPU.
 
 ### `eval_moe_batched_prefill_ffn`
 
@@ -128,14 +134,14 @@ Batched prefill (all experts on GPU, no hybrid split). Used when all tokens can 
 
 ### `eval_moe_hybrid_ffn_batched`
 
-Batched hybrid prefill: splits the batch FFN into hot (GPU) and cold (CPU) subgraphs computed concurrently, then combines. Supports reusable allocators (`p_hot_alloc`, `p_cold_alloc`) for amortizing allocation cost across layers.
+Batched hybrid prefill: splits the batch FFN into primary and complementary owner subgraphs computed concurrently, then combines them. Reusable allocators (`p_hot_alloc`, `p_cold_alloc`) amortize allocation cost across layers.
 
 ## Cached FFN Graphs
 
 To avoid per-token ggml graph construction overhead, `CachedFfnGraph` pre-builds the computation graph for a fixed expert count:
 
 - `build_cached_hot_graph` — hot experts + shared expert, fused into one GPU graph
-- `build_cached_cold_graph` — cold experts on CPU
+- `build_cached_cold_graph` — complementary-owner experts
 
 At inference time, only input/ids/weights tensors are updated and `ggml_backend_graph_compute` is called on the pre-allocated graph.
 
@@ -143,23 +149,33 @@ At inference time, only input/ids/weights tensors are updated and `ggml_backend_
 
 Two loading paths:
 
-1. **From GPU tensors** (`build_moe_hybrid_storage`): Reads expert slices from already-loaded full stacked tensors on GPU. Copies hot slices to a compact GPU buffer, cold slices to CPU.
+1. **From backend tensors** (`build_moe_hybrid_storage`): Reads expert slices from already-loaded full stacks and compacts them into owner-local buffers.
 
-2. **From file** (`build_moe_hybrid_storage_from_file`): Reads expert slices directly from mmap'd GGUF file data, avoiding the need to load all experts to GPU first. Useful when VRAM is insufficient for the full model.
+2. **From file** (`build_moe_hybrid_storage_from_file`): Reads expert slices directly from mmap'd GGUF data into the selected owners, avoiding a temporary full expert stack on either GPU.
 
 Both paths produce the same `MoeHybridStorage` containing per-layer split buffers ready for evaluation.
 
-## Model Integration
+## Model Integration Contract
 
-The subsystem is model-agnostic. Model backends integrate via:
+Adding a compatible MoE architecture requires a thin adapter, not another scheduler:
 
-1. Include `moe_hybrid_types_impl.h` after their internal weight struct header.
-2. Call `make_moe_hybrid_config(weights)` and `make_moe_layer_desc(layer)` to convert model-specific types to the generic interface.
-3. Use the generic placement, storage, and eval APIs.
+1. Build `MoeHybridConfig` from model metadata: dimensions, layer and expert counts, top-k width, first MoE layer, activation clamp, and owner materialization policy.
+2. Build one `MoeLayerDesc` per layer. It maps the model's routed gate/up/down tensors, optional fused gate+up tensor, optional shared expert, and quantization scales.
+3. Expose router IDs and weights in the common fixed-width or ragged batch layout. Negative IDs are padding; non-negative IDs must be smaller than `n_expert`.
+4. Register the model's metadata-only GGUF loader in `load_remote_moe_runtime()` when second-GPU IPC is required.
+5. Let the model backend retain its own attention, KV-cache, and speculative-decoding state. It calls the common owner evaluator only at the routed-FFN boundary.
+
+Hardware policy remains outside this contract: placement budgets, which GPU is primary, peer-copy mode, verification width, and kernel qualification are Lucebox profile choices. A model adapter must not duplicate owner scheduling, storage, peer transport, or join logic.
+
+Common execution switches use the `DFLASH_MOE_*` namespace. The corresponding `DFLASH_DS4_*` names remain accepted as compatibility aliases for existing DeepSeek V4 profiles.
 
 Currently integrated with:
-- **qwen35moe** — all layers are MoE (`first_moe_layer = 0`), supports fused gate_up, shared expert gating, NVFP4 scales.
-- **laguna** — layer 0 is dense (`first_moe_layer = n_layer_dense_lead`), no fused gate_up, no shared-expert gate, no NVFP4.
+
+- **qwen35moe** — fused gate+up, shared-expert gating, and NVFP4 scales.
+- **laguna** — dense leading layers, separate gate/up tensors, and no shared-expert gate.
+- **deepseek4** — clamped SwiGLU and the two-GPU route-owner path used by the heterogeneous Lucebox profile.
+
+The common residency mask is sized from `n_expert`; there is no fixed 256-expert architecture limit. The current evaluator supports SwiGLU-family routed FFNs with fused or separate gate/up projections. A model using a different expert activation needs one additional activation policy implementation, but does not need changes to placement, storage, scheduling, or transport. Dense models do not use this subsystem.
 
 ## Quantization Support
 

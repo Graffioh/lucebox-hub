@@ -813,6 +813,20 @@ if(DFLASH27B_TESTS)
         endif()
         list(APPEND _raw_unit_test_targets test_deepseek4_unit)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ggml_rmsnorm_batch.cpp")
+        add_executable(test_ggml_rmsnorm_batch test/test_ggml_rmsnorm_batch.cpp)
+        target_include_directories(test_ggml_rmsnorm_batch PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_ggml_rmsnorm_batch PRIVATE ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_ggml_rmsnorm_batch PRIVATE GGML_USE_HIP)
+            target_link_libraries(test_ggml_rmsnorm_batch PRIVATE hip::host)
+        else()
+            target_compile_definitions(test_ggml_rmsnorm_batch PRIVATE GGML_USE_CUDA)
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_ggml_rmsnorm_batch PRIVATE CUDA::cudart)
+        endif()
+        add_test(NAME ggml_rmsnorm_batch COMMAND test_ggml_rmsnorm_batch)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
         target_include_directories(test_ds4_dspark_load PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -1013,7 +1027,8 @@ if(DFLASH27B_TESTS)
             test/test_kvflash_qk.cpp
             test/test_qwen35moe_routing_stats.cpp
             test/test_qwen35moe_expert_placement.cpp
-            test/test_qwen35moe_swap_manager.cpp)
+            test/test_qwen35moe_swap_manager.cpp
+            test/test_moe_hybrid_storage.cpp)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
                 test/test_gpu_sampler_cuda.cpp

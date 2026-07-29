@@ -252,6 +252,14 @@ static void ggml_cuda_mul_mat_q_impl(
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
     {
+        // The sorter compacts negative (masked) owner routes out of the expert
+        // ranges. Quantization still visits these fixed-capacity arrays, so
+        // make the unused tail point at token zero instead of stale pool data.
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0,
+                                   ne_get_rows * sizeof(int32_t), stream));
+        CUDA_CHECK(cudaMemsetAsync(ids_dst.get(), 0,
+                                   (ne_get_rows + mmq_x_pad) * sizeof(int32_t),
+                                   stream));
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
@@ -261,11 +269,15 @@ static void ggml_cuda_mul_mat_q_impl(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+    // The helper's fixed-capacity layout is part of MMQ's addressing contract.
+    // A future compact route count must be produced and owned by the graph
+    // builder; until then, quantize the complete initialized route array.
+    const int64_t n_routes_quantized = ne_get_rows;
+    const size_t nbytes_src1_q8_1 = n_routes_quantized*ne10_padded * sizeof(block_q8_1)/QK8_1 +
         get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
 
-    const int64_t ne11_flat = ne12*n_expert_used;
+    const int64_t ne11_flat = n_routes_quantized;
     const int64_t ne12_flat = 1;
     const int64_t ne13_flat = 1;
 
@@ -288,13 +300,15 @@ static void ggml_cuda_mul_mat_q_impl(
                                            ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
+    const int64_t ncols_max = ne12;
+
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
-        ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+        ne00, ne01, ne_get_rows, s01, n_routes_quantized, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12};
+        use_stream_k, ncols_max};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
     if (src0_pair) {
@@ -405,8 +419,13 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_Q2_0_ROCMFP2:
         case GGML_TYPE_Q3_0_ROCMFPX:
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            // ROCmFPX MMQ variants are implemented for gfx1151 only.
-            mmq_supported = GGML_CUDA_CC_IS_RDNA3_5(cc);
+            // ROCmFPX MMQ uses wave32 WMMA plus portable packed-int dot
+            // products. Both gfx1151 (RDNA 3.5) and gfx12xx (RDNA 4) provide
+            // that contract; the latter is required by the grouped DS4
+            // prefill projection because no BLAS path understands its
+            // strided [K/group, N, group] activation layout.
+            mmq_supported = GGML_CUDA_CC_IS_RDNA3_5(cc) ||
+                            GGML_CUDA_CC_IS_RDNA4(cc);
             break;
         default:
             mmq_supported = false;

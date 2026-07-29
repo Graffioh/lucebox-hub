@@ -12,6 +12,8 @@
 #include "deepseek4_hc_cuda.h"
 #include "internal.h"
 #include "../common/step_graph.h"
+#include "../common/cuda_graph_overrides.h"
+#include "../common/moe_expert_compute.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_stream.h"
@@ -20,6 +22,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cuda.h"
 
 #include <algorithm>
 #include <array>
@@ -33,6 +36,7 @@
 #include <thread>
 #include <mutex>
 #include <functional>
+#include <limits>
 #include <vector>
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
@@ -55,11 +59,22 @@ static bool ds4_env_flag(const char * name) {
 }
 
 static int ds4_effective_expert_count(const DeepSeek4Weights & w) {
-    const int requested = w.routed_expert_top_k;
-    if (requested > 0 && requested < w.n_expert_used) {
-        return requested;
+    int requested = w.routed_expert_top_k;
+    if (const char * value = std::getenv("DFLASH_DS4_TOPK")) {
+        const int env_requested = std::atoi(value);
+        if (env_requested > 0) requested = env_requested;
     }
-    return w.n_expert_used;
+    const int effective = requested > 0 && requested < w.n_expert_used
+        ? requested
+        : w.n_expert_used;
+    static std::atomic<bool> logged{false};
+    if (effective != w.n_expert_used && !logged.exchange(true)) {
+        std::fprintf(stderr,
+                     "[deepseek4] effective routed experts=%d "
+                     "(checkpoint=%d; hash and learned layers)\n",
+                     effective, w.n_expert_used);
+    }
+    return effective;
 }
 
 static size_t ds4_attn_step_meta_size(int n_tokens) {
@@ -138,6 +153,20 @@ static void add_ffn_telemetry(DeepSeek4StepTelemetry * dst,
     dst->ffn_cold_graph_hits += src.cold_graph_hits;
     dst->hot_selected += src.hot_selected;
     dst->cold_selected += src.cold_selected;
+}
+
+static void observe_active_routing(MoeHybridRoutingStats * stats,
+                                   int layer,
+                                   const int32_t * ids,
+                                   const float * weights,
+                                   int n_ids) {
+    if (!stats || !ids || !weights || n_ids <= 0) return;
+    int32_t active[16];
+    int n_active = 0;
+    for (int i = 0; i < n_ids && n_active < 16; ++i) {
+        if (weights[i] != 0.0f) active[n_active++] = ids[i];
+    }
+    if (n_active > 0) stats->observe(layer, active, n_active);
 }
 
 } // namespace
@@ -2192,6 +2221,78 @@ struct DeepSeek4CachedDecodeHcPostGraph {
     }
 };
 
+// Heterogeneous sparse prefill keeps the HC residual on the R9700.  The HC
+// pre graph is rebuilt for each layer (the projection weights change) while
+// retaining one gallocr arena; the HC post topology is layer-independent and
+// remains cached for the current batch width.  This avoids retaining 86 large
+// per-layer batch graphs and, more importantly, removes two full HC
+// device-to-host round trips per layer.
+struct DeepSeek4PrefillHcPreGraph {
+    const ggml_context * owner_ctx = nullptr;
+    ggml_backend_t backend = nullptr;
+    int n_tokens = 0;
+    int layer_idx = -1;
+    bool ffn = false;
+    StepGraph sg;
+    ggml_tensor * split = nullptr;
+
+    bool valid() const {
+        return owner_ctx && backend && n_tokens > 0 && layer_idx >= 0 &&
+               sg.ctx && sg.gf && sg.alloc && sg.inp_embed &&
+               sg.hidden_states && split;
+    }
+
+    void reset_graph() {
+        step_graph_free(sg);
+        owner_ctx = nullptr;
+        backend = nullptr;
+        n_tokens = 0;
+        layer_idx = -1;
+        ffn = false;
+        split = nullptr;
+    }
+
+    void free() {
+        step_graph_destroy(sg);
+        owner_ctx = nullptr;
+        backend = nullptr;
+        n_tokens = 0;
+        layer_idx = -1;
+        ffn = false;
+        split = nullptr;
+    }
+};
+
+struct DeepSeek4PrefillHcPostGraph {
+    const ggml_context * owner_ctx = nullptr;
+    ggml_backend_t backend = nullptr;
+    int n_tokens = 0;
+    StepGraph sg;
+    ggml_tensor * residual_hc = nullptr;
+    ggml_tensor * block_out = nullptr;
+    ggml_tensor * block_out_cold = nullptr;
+    ggml_tensor * split = nullptr;
+    bool owner_join = false;
+
+    bool valid() const {
+        return owner_ctx && backend && n_tokens > 0 && sg.ctx && sg.gf &&
+               sg.alloc && sg.hidden_states && residual_hc && block_out &&
+               split && (!owner_join || block_out_cold);
+    }
+
+    void free() {
+        step_graph_destroy(sg);
+        owner_ctx = nullptr;
+        backend = nullptr;
+        n_tokens = 0;
+        residual_hc = nullptr;
+        block_out = nullptr;
+        block_out_cold = nullptr;
+        split = nullptr;
+        owner_join = false;
+    }
+};
+
 // Per-step decode scalar inputs shared by all cached per-layer decode graphs.
 // Values depend only on (kv_start, ratio), so one tensor per slot serves every
 // layer with that ratio. i32 layout per ratio-slot: {rope_pos, neg_pos,
@@ -2720,13 +2821,14 @@ static bool build_cached_decode_hc_post_graph(
 struct Ds4MoeRouting {
     ggml_tensor * selected = nullptr;
     ggml_tensor * weights = nullptr;
+    std::vector<ggml_tensor *> nodes;
 };
 
 static MoeHybridConfig make_ds4_moe_hybrid_config(const DeepSeek4Weights & w) {
     MoeHybridConfig cfg;
     cfg.n_embd = w.n_embd;
     cfg.n_expert = w.n_expert;
-    cfg.n_expert_used = w.n_expert_used;
+    cfg.n_expert_used = ds4_effective_expert_count(w);
     cfg.n_ff_exp = w.n_ff_exp;
     cfg.n_ff_shexp = w.n_ff_exp;
     cfg.n_layer = w.n_layer;
@@ -2777,9 +2879,14 @@ static bool eval_ds4_hybrid(
         std::vector<float> & ffn_out_host,
         ggml_gallocr_t * hot_alloc,
         ggml_gallocr_t * cold_alloc,
-        DeepSeek4StepTelemetry * step_tel) {
+        MoeExpertCompute * expert_compute,
+        const MoeExpertLayer * expert_layer,
+        DeepSeek4StepTelemetry * step_tel,
+        ggml_tensor * ffn_normed_backend = nullptr,
+        const MoeHybridDeviceOutputs * device_outputs = nullptr) {
     const auto ffn_t0 = Ds4TimingClock::now();
-    if (!storage.down_cold && !storage.gate_up_cold) {
+    if (!storage.down_cold && !storage.gate_up_cold &&
+        !(expert_compute && expert_layer)) {
         if (!hybrid_owner || !stream_engine || !stream_engine->is_ready() ||
             !hybrid_owner->has_mmap() ||
             layer < 0 || layer >= (int) hybrid_owner->layer_regions.size()) {
@@ -2861,18 +2968,34 @@ static bool eval_ds4_hybrid(
     }
 
     MoeHybridFfnTelemetry ffn_tel;
+    std::string batched_err;
     bool ffn_ok = eval_moe_hybrid_ffn_batched(
         backend, cpu_backend, hybrid_cfg, desc, storage,
         ffn_normed_host, selected_host, weights_host,
-        n_tokens, ffn_out_host, nullptr, hot_alloc, cold_alloc,
-        nullptr, nullptr,
-        step_tel ? &ffn_tel : nullptr);
+        n_tokens, ffn_out_host, &batched_err, hot_alloc, cold_alloc,
+        expert_compute, expert_layer,
+        step_tel ? &ffn_tel : nullptr,
+        ffn_normed_backend, device_outputs);
     if (ffn_ok) {
         if (step_tel) {
             step_tel->ffn_eval_us += ds4_elapsed_us(ffn_t0, Ds4TimingClock::now());
             add_ffn_telemetry(step_tel, ffn_tel);
         }
         return true;
+    }
+
+    if (expert_compute && expert_layer) {
+        std::fprintf(stderr,
+                     "[deepseek4-moe-tp] remote expert evaluation failed at layer %d\n",
+                     layer);
+        return false;
+    }
+    if (ffn_normed_backend) {
+        std::fprintf(stderr,
+                     "[deepseek4] device-resident batched FFN failed at layer %d: "
+                     "%s; refusing an unsafe host fallback\n",
+                     layer, batched_err.empty() ? "unknown error" : batched_err.c_str());
+        return false;
     }
 
     ffn_out_host.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
@@ -2903,28 +3026,33 @@ static Ds4MoeRouting build_moe_routing(
         const DeepSeek4Layer & L,
         int n_tokens) {
     Ds4MoeRouting out;
-    ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, cur);
+    auto track = [&](ggml_tensor * tensor) {
+        if (tensor) out.nodes.push_back(tensor);
+        return tensor;
+    };
+    ggml_tensor * logits = track(ggml_mul_mat(ctx, L.ffn_gate_inp, cur));
 
     // DS4 routes with sqrt(softplus(logit)). Optional bias affects only the
     // top-k expert selection, while expert weights come from the unbiased
     // router probabilities and are normalized after selection.
-    ggml_tensor * probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+    ggml_tensor * softplus = track(ggml_softplus(ctx, logits));
+    ggml_tensor * probs = track(ggml_sqrt(ctx, softplus));
     ggml_tensor * selection = probs;
     if (L.ffn_exp_probs_b) {
-        selection = ggml_add(ctx, selection, L.ffn_exp_probs_b);
+        selection = track(ggml_add(ctx, selection, L.ffn_exp_probs_b));
     }
 
     const int k_used = ds4_effective_expert_count(w);
-    out.selected = ggml_top_k(ctx, selection, k_used);
+    out.selected = track(ggml_top_k(ctx, selection, k_used));
     ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, w.n_expert, n_tokens);
-    out.weights = ggml_get_rows(ctx, probs_3d, out.selected);
+    out.weights = track(ggml_get_rows(ctx, probs_3d, out.selected));
     out.weights = ggml_reshape_2d(ctx, out.weights, k_used, n_tokens);
 
-    ggml_tensor * w_sum = ggml_sum_rows(ctx, out.weights);
-    w_sum = ggml_clamp(ctx, w_sum, 6.103515625e-5f, INFINITY);
-    out.weights = ggml_div(ctx, out.weights, w_sum);
+    ggml_tensor * w_sum = track(ggml_sum_rows(ctx, out.weights));
+    w_sum = track(ggml_clamp(ctx, w_sum, 6.103515625e-5f, INFINITY));
+    out.weights = track(ggml_div(ctx, out.weights, w_sum));
     if (w.expert_weight_scale != 1.0f) {
-        out.weights = ggml_scale(ctx, out.weights, w.expert_weight_scale);
+        out.weights = track(ggml_scale(ctx, out.weights, w.expert_weight_scale));
     }
     return out;
 }
@@ -3782,7 +3910,8 @@ static bool deepseek4_step_hybrid(
         const int32_t * token_ids,
         MoeHybridStreamEngine * stream_engine,
         DeepSeek4StepTelemetry * telemetry,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats,
+        MoeExpertComputeRuntime * expert_runtime) {
     const auto step_t0 = Ds4TimingClock::now();
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
@@ -3998,9 +4127,9 @@ static bool deepseek4_step_hybrid(
                 return false;
             }
 
-            const int n_used = ds4_effective_expert_count(w);
-            std::vector<int32_t> selected_host((size_t)n_used * (size_t)n_tokens);
-            std::vector<float> weights_host((size_t)n_used * (size_t)n_tokens);
+            const int route_width = ds4_effective_expert_count(w);
+            std::vector<int32_t> selected_host((size_t)route_width * (size_t)n_tokens);
+            std::vector<float> weights_host((size_t)route_width * (size_t)n_tokens);
             const auto route_select_t0 = Ds4TimingClock::now();
             for (int ti = 0; ti < n_tokens; ++ti) {
                 const int32_t tok = token_ids[ti];
@@ -4013,39 +4142,45 @@ static bool deepseek4_step_hybrid(
                     return false;
                 }
                 float sum = 0.0f;
-                for (int ei = 0; ei < n_used; ++ei) {
+                for (int ei = 0; ei < route_width; ++ei) {
                     const int32_t expert = row[ei];
-                    selected_host[(size_t)ti * (size_t)n_used + (size_t)ei] = expert;
+                    selected_host[(size_t)ti * (size_t)route_width + (size_t)ei] = expert;
                     float prob = 0.0f;
                     if (expert >= 0 && expert < w.n_expert) {
                         prob = probs_host[(size_t)ti * (size_t)w.n_expert + (size_t)expert];
                     }
-                    weights_host[(size_t)ti * (size_t)n_used + (size_t)ei] = prob;
+                    weights_host[(size_t)ti * (size_t)route_width + (size_t)ei] = prob;
                     sum += prob;
                 }
                 sum = std::max(sum, 6.103515625e-5f);
-                for (int ei = 0; ei < n_used; ++ei) {
-                    float & weight = weights_host[(size_t)ti * (size_t)n_used + (size_t)ei];
+                for (int ei = 0; ei < route_width; ++ei) {
+                    float & weight = weights_host[(size_t)ti * (size_t)route_width + (size_t)ei];
                     weight = weight / sum * w.expert_weight_scale;
                 }
             }
             if (telemetry) telemetry->route_select_us += ds4_elapsed_us(route_select_t0, Ds4TimingClock::now());
             if (routing_stats) {
                 for (int ti = 0; ti < n_tokens; ++ti) {
-                    routing_stats->observe(il,
-                        selected_host.data() + (size_t)ti * (size_t)n_used,
-                        n_used);
+                    observe_active_routing(routing_stats, il,
+                        selected_host.data() + (size_t)ti * (size_t)route_width,
+                        weights_host.data() + (size_t)ti * (size_t)route_width,
+                        route_width);
                 }
             }
 
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
             auto & storage = moe_hybrid.layers[(size_t) il];
+            MoeExpertCompute * expert_compute =
+                expert_runtime ? expert_runtime->compute_ptr() : nullptr;
+            const MoeExpertLayer * expert_layer =
+                expert_runtime ? expert_runtime->layer_ptr((size_t)il) : nullptr;
             if (!eval_ds4_hybrid(
                     backend, cpu_backend, hybrid_cfg, desc, &moe_hybrid, storage, stream_engine,
-                    il, n_embd, n_used,
+                    il, n_embd, route_width,
                     ffn_normed_host.data(), selected_host.data(), weights_host.data(),
-                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc, telemetry)) {
+                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc,
+                    expert_compute, expert_layer, telemetry)) {
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
@@ -4092,9 +4227,9 @@ static bool deepseek4_step_hybrid(
 
             std::vector<float> ffn_normed_host((size_t)n_embd * (size_t)n_tokens);
             std::vector<float> probs_host((size_t)w.n_expert * (size_t)n_tokens);
-            const int n_used = ds4_effective_expert_count(w);
-            std::vector<int32_t> selected_host((size_t)n_used * (size_t)n_tokens);
-            std::vector<float> weights_host((size_t)n_used * (size_t)n_tokens);
+            const int route_width = ds4_effective_expert_count(w);
+            std::vector<int32_t> selected_host((size_t)route_width * (size_t)n_tokens);
+            std::vector<float> weights_host((size_t)route_width * (size_t)n_tokens);
             const auto route_read_t0 = Ds4TimingClock::now();
             ggml_backend_tensor_get(ffn_normed, ffn_normed_host.data(), 0, sizeof(float) * ffn_normed_host.size());
             ggml_backend_tensor_get(router_probs, probs_host.data(), 0, sizeof(float) * probs_host.size());
@@ -4111,18 +4246,18 @@ static bool deepseek4_step_hybrid(
             }
             for (int ti = 0; ti < n_tokens; ++ti) {
                 const float * probs = probs_host.data() + (size_t)ti * (size_t)w.n_expert;
-                std::vector<int32_t> top((size_t)n_used, -1);
+                std::vector<int32_t> top((size_t)route_width, -1);
                 for (int expert = 0; expert < w.n_expert; ++expert) {
                     const float score = probs[expert] +
                         (!bias_host.empty() ? bias_host[(size_t)expert] : 0.0f);
-                    for (int slot = 0; slot < n_used; ++slot) {
+                    for (int slot = 0; slot < route_width; ++slot) {
                         const int32_t cur_expert = top[(size_t)slot];
                         const float cur_score = cur_expert >= 0
                             ? probs[cur_expert] +
                                 (!bias_host.empty() ? bias_host[(size_t)cur_expert] : 0.0f)
                             : -INFINITY;
                         if (cur_expert < 0 || score > cur_score) {
-                            for (int m = n_used - 1; m > slot; --m) {
+                            for (int m = route_width - 1; m > slot; --m) {
                                 top[(size_t)m] = top[(size_t)m - 1];
                             }
                             top[(size_t)slot] = expert;
@@ -4131,36 +4266,43 @@ static bool deepseek4_step_hybrid(
                     }
                 }
                 float sum = 0.0f;
-                for (int slot = 0; slot < n_used; ++slot) {
+                for (int slot = 0; slot < route_width; ++slot) {
                     const int32_t expert = top[(size_t)slot];
-                    selected_host[(size_t)ti * (size_t)n_used + (size_t)slot] = expert;
+                    selected_host[(size_t)ti * (size_t)route_width + (size_t)slot] = expert;
                     const float weight = expert >= 0 ? probs[expert] : 0.0f;
-                    weights_host[(size_t)ti * (size_t)n_used + (size_t)slot] = weight;
+                    weights_host[(size_t)ti * (size_t)route_width + (size_t)slot] = weight;
                     sum += weight;
                 }
                 sum = std::max(sum, 6.103515625e-5f);
-                for (int slot = 0; slot < n_used; ++slot) {
-                    float & weight = weights_host[(size_t)ti * (size_t)n_used + (size_t)slot];
+                for (int slot = 0; slot < route_width; ++slot) {
+                    float & weight = weights_host[(size_t)ti * (size_t)route_width + (size_t)slot];
                     weight = weight / sum * w.expert_weight_scale;
                 }
             }
             if (telemetry) telemetry->route_select_us += ds4_elapsed_us(route_select_t0, Ds4TimingClock::now());
             if (routing_stats) {
                 for (int ti = 0; ti < n_tokens; ++ti) {
-                    routing_stats->observe(il,
-                        selected_host.data() + (size_t)ti * (size_t)n_used,
-                        n_used);
+                    observe_active_routing(routing_stats, il,
+                        selected_host.data() + (size_t)ti * (size_t)route_width,
+                        weights_host.data() + (size_t)ti * (size_t)route_width,
+                        route_width);
                 }
             }
 
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
+            hybrid_cfg.n_expert_used = route_width;
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
             auto & storage = moe_hybrid.layers[(size_t) il];
+            MoeExpertCompute * expert_compute =
+                expert_runtime ? expert_runtime->compute_ptr() : nullptr;
+            const MoeExpertLayer * expert_layer =
+                expert_runtime ? expert_runtime->layer_ptr((size_t)il) : nullptr;
             if (!eval_ds4_hybrid(
                     backend, cpu_backend, hybrid_cfg, desc, &moe_hybrid, storage, stream_engine,
-                    il, n_embd, n_used,
+                    il, n_embd, route_width,
                     ffn_normed_host.data(), selected_host.data(), weights_host.data(),
-                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc, telemetry)) {
+                    n_tokens, ffn_out_host, &hot_alloc, &cold_alloc,
+                    expert_compute, expert_layer, telemetry)) {
                 if (hot_alloc) ggml_gallocr_free(hot_alloc);
                 if (cold_alloc) ggml_gallocr_free(cold_alloc);
                 return false;
@@ -4265,7 +4407,8 @@ bool deepseek4_step(
         MoeHybridStreamEngine * stream_engine,
         DeepSeek4StepTelemetry * telemetry,
         MoeHybridRoutingStats * routing_stats,
-        Ds4VerifyHooks * verify_hooks) {
+        Ds4VerifyHooks * verify_hooks,
+        MoeExpertComputeRuntime * expert_runtime) {
     if (w.moe_hybrid && moe_hybrid != nullptr) {
         if (!deepseek4_cuda_hc_set_device(device)) {
             std::fprintf(stderr,
@@ -4275,14 +4418,16 @@ bool deepseek4_step(
         }
         return deepseek4_step_hybrid(backend, w, cache, *moe_hybrid,
                                      embed, n_tokens, kv_start, out_logits,
-                                     token_ids, stream_engine, telemetry, routing_stats);
+                                     token_ids, stream_engine, telemetry, routing_stats,
+                                     expert_runtime);
     }
 
     std::vector<float> hc_state;
     return deepseek4_step_layer_range(
         backend, device, w, cache, hc_state, embed, n_tokens, kv_start,
         0, w.n_layer, &out_logits, token_ids, telemetry,
-        /*allow_decode_graph_reuse=*/verify_hooks == nullptr, verify_hooks);
+        /*allow_decode_graph_reuse=*/verify_hooks == nullptr, verify_hooks,
+        /*moe_hybrid=*/nullptr, expert_runtime, routing_stats);
 }
 
 // ─── Fused single-graph decode (n_tokens == 1) ──────────────────────────
@@ -4299,7 +4444,21 @@ bool deepseek4_step(
 // while a variant recurs, which is what the ggml-cuda/HIP graph cache keys
 // on, enabling graph replay for the bulk of decode steps.
 
+static bool ds4_fused_decode_enabled() {
+    static const bool enabled =
+        ds4_env_flag("DFLASH_DS4_FUSED_DECODE");
+    return enabled;
+}
+
 struct DeepSeek4FusedDecodeGraph {
+    struct AuthoritativeRouteOutput {
+        int layer = -1;
+        int lane_start = 0;
+        int n_tokens = 0;
+        int width = 0;
+        ggml_tensor * selected = nullptr;
+        ggml_tensor * weights = nullptr;
+    };
     std::vector<int64_t> shape_key;
     uint64_t last_use = 0;
     StepGraph sg;
@@ -4308,7 +4467,10 @@ struct DeepSeek4FusedDecodeGraph {
     ggml_tensor * i64_bundle = nullptr;
     ggml_tensor * mask_bundle = nullptr;   // additive score mask (0 / -1e30), may be null
     std::vector<ggml_tensor *> hash_ids;
+    std::vector<MoeHybridGraphInputs> hybrid_inputs;
+    std::vector<AuthoritativeRouteOutput> authoritative_routes;
     ggml_tensor * logits = nullptr;
+    ggml_backend_sched_t sched = nullptr;
 
     void reset_nodes() {
         inp_embed = nullptr;
@@ -4317,6 +4479,8 @@ struct DeepSeek4FusedDecodeGraph {
         mask_bundle = nullptr;
         logits = nullptr;
         hash_ids.clear();
+        hybrid_inputs.clear();
+        authoritative_routes.clear();
         shape_key.clear();
         last_use = 0;
     }
@@ -4326,6 +4490,10 @@ struct DeepSeek4FusedDecodeGraph {
     }
 
     void destroy() {
+        if (sched) {
+            ggml_backend_sched_free(sched);
+            sched = nullptr;
+        }
         step_graph_destroy(sg);
         reset_nodes();
     }
@@ -4361,6 +4529,46 @@ struct DeepSeek4FusedDecodeCache {
     }
 };
 
+// Fused verification graphs retain allocators, schedulers, peer events, and
+// model tensor pointers.  Keep them under DeepSeek4Cache ownership so park,
+// reload, and shutdown destroy them before either GPU backend is released.
+struct Ds4FusedVerifyCache {
+    static constexpr size_t kSlotCount = 12;
+
+    const ggml_context * owner_ctx = nullptr;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_t peer_backend = nullptr;
+    bool disabled = false;
+    uint64_t counter = 0;
+    std::array<DeepSeek4FusedDecodeGraph, kSlotCount> slots;
+
+    struct Extra {
+        ggml_tensor * pos_q = nullptr;    // i32 [q]
+        ggml_tensor * neg_q = nullptr;    // i32 [q]
+        ggml_tensor * rawrows = nullptr;  // i64 [1,q]
+        ggml_tensor * ape4 = nullptr;     // i32 [q]
+        ggml_tensor * ape128 = nullptr;   // i32 [q]
+        ggml_tensor * st4 = nullptr;      // i64 [1,q]
+        ggml_tensor * st128 = nullptr;    // i64 [1,q]
+        ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap*q], order [ci][t]
+        ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
+        int q = 0;
+
+        void reset() { *this = Extra{}; }
+    };
+    std::array<Extra, kSlotCount> extra;
+
+    void destroy() {
+        for (auto & slot : slots) slot.destroy();
+        for (auto & value : extra) value.reset();
+        owner_ctx = nullptr;
+        backend = nullptr;
+        peer_backend = nullptr;
+        disabled = false;
+        counter = 0;
+    }
+};
+
 struct DeepSeek4LayerRangeCache {
     ~DeepSeek4LayerRangeCache() { reset(); }
 
@@ -4375,14 +4583,23 @@ struct DeepSeek4LayerRangeCache {
     HcWeightsCpu hc_output_weights;
     std::vector<HashRoutingTableCpu> hash_routing_tables;
     std::vector<DeepSeek4CachedLayerAlloc> cached_attn_allocs;
+    // Heterogeneous sparse prefill executes layers serially.  Its large
+    // attention graphs therefore share one scratch arena instead of retaining
+    // n_layer copies (a 2K-token graph is roughly 550 MiB on the R9700).
+    DeepSeek4CachedLayerAlloc shared_prefill_attn_alloc;
     std::vector<DeepSeek4CachedDecodeHcPreGraph> cached_decode_attn_hc_pre_graphs;
     std::vector<DeepSeek4CachedDecodeHcPreGraph> cached_decode_ffn_hc_pre_graphs;
     DeepSeek4CachedDecodeHcPostGraph cached_decode_hc_post_graph;
+    DeepSeek4PrefillHcPreGraph prefill_hc_pre_graph;
+    DeepSeek4PrefillHcPostGraph prefill_hc_post_graph;
+    DeepSeek4PrefillHcPostGraph prefill_moe_hc_post_graph;
     std::vector<std::vector<DeepSeek4CachedDecodeAttnGraph>> cached_decode_attn_graphs;
     std::vector<DeepSeek4CachedDecodeFfnGraph> cached_decode_ffn_graphs;
     DeepSeek4CachedDecodeOutputGraph cached_decode_output_graph;
     DeepSeek4CachedLayerAlloc cached_dynamic_output_alloc;
     DeepSeek4FusedDecodeCache fused_decode_graph_cache;
+    Ds4FusedVerifyCache fused_verify_graph_cache;
+    Ds4FusedVerifyCache fused_capture_graph_cache;
     Ds4DecodeSharedInputs decode_shared_inputs;
     DeepSeek4LayerRangeScratch scratch;
 
@@ -4406,6 +4623,7 @@ struct DeepSeek4LayerRangeCache {
             alloc.free();
         }
         cached_attn_allocs.clear();
+        shared_prefill_attn_alloc.free();
         for (auto & graph : cached_decode_attn_hc_pre_graphs) {
             graph.free();
         }
@@ -4415,6 +4633,9 @@ struct DeepSeek4LayerRangeCache {
         }
         cached_decode_ffn_hc_pre_graphs.clear();
         cached_decode_hc_post_graph.free();
+        prefill_hc_pre_graph.free();
+        prefill_hc_post_graph.free();
+        prefill_moe_hc_post_graph.free();
         for (auto & per_layer : cached_decode_attn_graphs) {
             for (auto & graph : per_layer) {
                 graph.free();
@@ -4428,6 +4649,8 @@ struct DeepSeek4LayerRangeCache {
         cached_decode_output_graph.free();
         cached_dynamic_output_alloc.free();
         fused_decode_graph_cache.destroy();
+        fused_verify_graph_cache.destroy();
+        fused_capture_graph_cache.destroy();
         decode_shared_inputs.free();
         reset_hc_layer_weights_cpu(hc_layer_weights);
         reset_hc_weights_cpu(hc_output_weights);
@@ -4486,6 +4709,7 @@ static ggml_tensor * ds4_build_hash_routed_ffn(
     ggml_tensor * probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
 
     const int n_used = (int) hash_ids->ne[0];
+    GGML_ASSERT(n_used > 0 && n_used <= w.n_expert_used);
     const int n_ff_exp = w.n_ff_exp;
     ggml_tensor * cur_3d = ggml_reshape_3d(
         ctx, ffn_normed, w.n_embd, 1, n_tokens);
@@ -4581,6 +4805,141 @@ static bool ds4_fused_ensure_fn_mirrors(
     }
     const auto & o = hc_out_weights.fn_data;
     ggml_backend_tensor_set(fc.fn_out_f16, o.data(), 0, o.size() * sizeof(uint16_t));
+    return true;
+}
+
+static bool build_prefill_hc_pre_graph(
+        DeepSeek4PrefillHcPreGraph & out,
+        ggml_backend_t backend,
+        const DeepSeek4Weights & w,
+        ggml_tensor * fn_f16,
+        ggml_tensor * base,
+        const float * scale_data,
+        int layer_idx,
+        bool ffn,
+        int n_tokens) {
+    if (!backend || !fn_f16 || !base || !scale_data || n_tokens <= 0) {
+        return false;
+    }
+    if ((out.owner_ctx && out.owner_ctx != w.ctx) ||
+        (out.backend && out.backend != backend)) {
+        out.free();
+    } else {
+        // Keep the largest scratch buffer while replacing layer-specific graph
+        // metadata and tensor handles.
+        out.reset_graph();
+    }
+
+    ggml_init_params params{};
+    params.mem_size = 8 * 1024 * 1024;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    out.sg.ctx = ggml_init(params);
+    if (!out.sg.ctx) return false;
+
+    const int64_t hc_dim = (int64_t)w.n_embd * w.n_hc;
+    const int64_t mix_dim = 2 * (int64_t)w.n_hc +
+                            (int64_t)w.n_hc * w.n_hc;
+    out.sg.inp_embed = ggml_new_tensor_2d(
+        out.sg.ctx, GGML_TYPE_F32, hc_dim, n_tokens);
+    ggml_set_input(out.sg.inp_embed);
+
+    ggml_tensor * normed = ggml_rms_norm(
+        out.sg.ctx, out.sg.inp_embed, w.hc_eps);
+    ggml_tensor * mix = ggml_mul_mat(out.sg.ctx, fn_f16, normed);
+    mix = ggml_reshape_2d(out.sg.ctx, mix, mix_dim, n_tokens);
+    ggml_tensor * base_f32 = ds4_fused_hc_base_f32(out.sg.ctx, base);
+    ggml_tensor * pre = ggml_ds4_hc_pre(
+        out.sg.ctx, mix, base_f32, out.sg.inp_embed, w.n_hc,
+        w.n_hc_sinkhorn_iter, scale_data[0], scale_data[1], scale_data[2]);
+    // The HC op packs working+split in one row.  Materialize both views on
+    // device so subsequent graph-to-graph copies have identical contiguous
+    // layouts; ggml_backend_tensor_copy deliberately rejects strided copies.
+    out.sg.hidden_states = ggml_cont(out.sg.ctx, ggml_view_2d(
+        out.sg.ctx, pre, w.n_embd, n_tokens, pre->nb[1], 0));
+    out.split = ggml_cont(out.sg.ctx, ggml_view_2d(
+        out.sg.ctx, pre, mix_dim, n_tokens, pre->nb[1],
+        (size_t)w.n_embd * sizeof(float)));
+
+    out.sg.gf = ggml_new_graph_custom(out.sg.ctx, 4096, false);
+    ggml_set_output(out.sg.hidden_states);
+    ggml_set_output(out.split);
+    ggml_build_forward_expand(out.sg.gf, out.sg.hidden_states);
+    ggml_build_forward_expand(out.sg.gf, out.split);
+    if (!out.sg.alloc) {
+        out.sg.alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!out.sg.alloc || !ggml_gallocr_alloc_graph(out.sg.alloc, out.sg.gf)) {
+        out.free();
+        return false;
+    }
+
+    out.owner_ctx = w.ctx;
+    out.backend = backend;
+    out.n_tokens = n_tokens;
+    out.layer_idx = layer_idx;
+    out.ffn = ffn;
+    return true;
+}
+
+static bool build_prefill_hc_post_graph(
+        DeepSeek4PrefillHcPostGraph & out,
+        ggml_backend_t backend,
+        const DeepSeek4Weights & w,
+        int n_tokens,
+        bool owner_join = false) {
+    if (out.valid() && out.owner_ctx == w.ctx && out.backend == backend &&
+        out.n_tokens == n_tokens && out.owner_join == owner_join) {
+        return true;
+    }
+    out.free();
+    if (!backend || n_tokens <= 0) return false;
+
+    ggml_init_params params{};
+    params.mem_size = 4 * 1024 * 1024;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    out.sg.ctx = ggml_init(params);
+    if (!out.sg.ctx) return false;
+
+    const int64_t hc_dim = (int64_t)w.n_embd * w.n_hc;
+    const int64_t mix_dim = 2 * (int64_t)w.n_hc +
+                            (int64_t)w.n_hc * w.n_hc;
+    out.residual_hc = ggml_new_tensor_2d(
+        out.sg.ctx, GGML_TYPE_F32, hc_dim, n_tokens);
+    out.block_out = ggml_new_tensor_2d(
+        out.sg.ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
+    if (owner_join) {
+        out.block_out_cold = ggml_new_tensor_2d(
+            out.sg.ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
+    }
+    out.split = ggml_new_tensor_2d(
+        out.sg.ctx, GGML_TYPE_F32, mix_dim, n_tokens);
+    ggml_set_input(out.residual_hc);
+    ggml_set_input(out.block_out);
+    if (out.block_out_cold) ggml_set_input(out.block_out_cold);
+    ggml_set_input(out.split);
+
+    ggml_tensor * hc_block_out = out.block_out_cold
+        ? ggml_add(out.sg.ctx, out.block_out, out.block_out_cold)
+        : out.block_out;
+    out.sg.hidden_states = ggml_ds4_hc_post(
+        out.sg.ctx, out.residual_hc, hc_block_out, out.split, w.n_hc);
+    out.sg.gf = ggml_new_graph_custom(out.sg.ctx, 1024, false);
+    ggml_set_output(out.sg.hidden_states);
+    ggml_build_forward_expand(out.sg.gf, out.sg.hidden_states);
+    out.sg.alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    if (!out.sg.alloc || !ggml_gallocr_alloc_graph(out.sg.alloc, out.sg.gf)) {
+        out.free();
+        return false;
+    }
+
+    out.owner_ctx = w.ctx;
+    out.backend = backend;
+    out.n_tokens = n_tokens;
+    out.owner_join = owner_join;
     return true;
 }
 
@@ -4968,6 +5327,283 @@ static int ds4_try_fused_decode_step(
                             sizeof(float) * (size_t) w.n_vocab);
     if (telemetry) telemetry->full_graph_read_us += ds4_elapsed_us(read_t0, Ds4TimingClock::now());
     return 1;
+}
+
+static bool eval_ds4_layer_range_hybrid_ffn(
+        ggml_backend_t backend,
+        const DeepSeek4Weights & w,
+        const DeepSeek4Layer & L,
+        int layer,
+        int n_tokens,
+        const float * ffn_working_host,
+        const ggml_tensor * ffn_in_backend,
+        const int32_t * token_ids,
+        const HashRoutingTableCpu & hash_table,
+        MoeHybridStorage & hybrid,
+        MoeExpertComputeRuntime * expert_runtime,
+        MoeHybridRoutingStats * routing_stats,
+        std::vector<float> & out,
+        DeepSeek4StepTelemetry * telemetry,
+        const MoeHybridDeviceOutputs * device_outputs = nullptr) {
+    const bool trace_prefill = ds4_env_flag("DFLASH_DS4_PREFILL_TRACE");
+    if (trace_prefill) {
+        std::fprintf(stderr,
+                     "[deepseek4-prefill-trace] layer=%d ffn route begin tokens=%d\n",
+                     layer, n_tokens);
+    }
+    const int n_embd = w.n_embd;
+    const bool hash_routed =
+        layer < w.n_hash_layer && L.ffn_gate_tid2eid &&
+        token_ids && hash_table.loaded;
+    const int route_width = ds4_effective_expert_count(w);
+    MoeExpertCompute * expert_compute =
+        expert_runtime ? expert_runtime->compute_ptr() : nullptr;
+    const MoeExpertLayer * expert_layer =
+        expert_runtime ? expert_runtime->layer_ptr((size_t)layer) : nullptr;
+    const MoeHybridLayerStorage & layer_storage =
+        hybrid.layers[(size_t)layer];
+    ggml_tensor * hot_stack_ref = layer_storage.gate_up_hot
+        ? layer_storage.gate_up_hot : layer_storage.gate_hot;
+    ggml_tensor * cold_stack_ref = layer_storage.gate_up_cold
+        ? layer_storage.gate_up_cold : layer_storage.gate_cold;
+    const char * device_input_env =
+        std::getenv("DFLASH_MOE_PREFILL_DEVICE_INPUT");
+    const bool device_input_enabled =
+        !device_input_env || !*device_input_env ||
+        std::strcmp(device_input_env, "0") != 0;
+    const bool device_ffn_input =
+        device_input_enabled &&
+        !expert_compute && n_tokens >= 512 &&
+        layer_storage.cold_backend_kind == MoeHybridColdBackend::Gpu &&
+        layer_storage.cold_backend && layer_storage.cold_backend != backend &&
+        hot_stack_ref && hot_stack_ref->ne[2] > 0 &&
+        cold_stack_ref && cold_stack_ref->ne[2] > 0;
+    const char * persistent_owner_env =
+        std::getenv("DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC");
+    const bool persistent_owner_requested =
+        !persistent_owner_env || !*persistent_owner_env ||
+        std::strcmp(persistent_owner_env, "0") != 0;
+    const bool persistent_owner_alloc =
+        n_tokens >= 512 && device_ffn_input && persistent_owner_requested;
+    if (persistent_owner_alloc) {
+        static bool logged_persistent_owner_alloc = false;
+        if (!logged_persistent_owner_alloc) {
+            std::fprintf(stderr,
+                         "[deepseek4] persistent heterogeneous prefill "
+                         "routing and owner arenas active\n");
+            logged_persistent_owner_alloc = true;
+        }
+    }
+
+    const auto route_build_t0 = Ds4TimingClock::now();
+    ggml_init_params params{};
+    params.mem_size = 16 * 1024 * 1024;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_input(inp);
+    ggml_tensor * normed = build_rms_norm(ctx, inp, L.ffn_norm, w.rms_eps);
+    ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, normed);
+    ggml_tensor * probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, normed);
+    ggml_build_forward_expand(gf, probs);
+    ggml_gallocr_t alloc = nullptr;
+    if (persistent_owner_alloc) {
+        if (!hybrid.prefill_route_alloc) {
+            hybrid.prefill_route_alloc = ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(backend));
+        }
+        alloc = hybrid.prefill_route_alloc;
+    } else {
+        alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
+        if (persistent_owner_alloc) {
+            if (hybrid.prefill_route_alloc) {
+                ggml_gallocr_free(hybrid.prefill_route_alloc);
+                hybrid.prefill_route_alloc = nullptr;
+            }
+        } else if (alloc) {
+            ggml_gallocr_free(alloc);
+        }
+        ggml_free(ctx);
+        return false;
+    }
+    struct RouteGraphLifetime {
+        ggml_gallocr_t alloc = nullptr;
+        ggml_context * ctx = nullptr;
+        bool owns_alloc = true;
+        void reset() {
+            if (owns_alloc && alloc) {
+                ggml_gallocr_free(alloc);
+            }
+            alloc = nullptr;
+            if (ctx) {
+                ggml_free(ctx);
+                ctx = nullptr;
+            }
+        }
+        ~RouteGraphLifetime() { reset(); }
+    } route_graph{alloc, ctx, !persistent_owner_alloc};
+    if (telemetry) {
+        telemetry->route_build_us +=
+            ds4_elapsed_us(route_build_t0, Ds4TimingClock::now());
+    }
+
+    if (ffn_in_backend) {
+        ggml_backend_tensor_copy(
+            const_cast<ggml_tensor *>(ffn_in_backend), inp);
+    } else {
+        ggml_backend_tensor_set(inp, ffn_working_host, 0,
+                                sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+    }
+    const auto route_compute_t0 = Ds4TimingClock::now();
+    const bool route_ok =
+        ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    if (trace_prefill) {
+        std::fprintf(stderr,
+                     "[deepseek4-prefill-trace] layer=%d ffn route compute=%s\n",
+                     layer, route_ok ? "ok" : "failed");
+    }
+    if (telemetry) {
+        telemetry->route_compute_us +=
+            ds4_elapsed_us(route_compute_t0, Ds4TimingClock::now());
+    }
+
+    std::vector<float> normed_host;
+    if (!device_ffn_input) {
+        normed_host.resize((size_t)n_embd * (size_t)n_tokens);
+    }
+    std::vector<float> probs_host((size_t)w.n_expert * (size_t)n_tokens);
+    if (route_ok) {
+        const auto route_read_t0 = Ds4TimingClock::now();
+        if (!device_ffn_input) {
+            ggml_backend_tensor_get(normed, normed_host.data(), 0,
+                                    sizeof(float) * normed_host.size());
+        }
+        ggml_backend_tensor_get(probs, probs_host.data(), 0,
+                                sizeof(float) * probs_host.size());
+        if (telemetry) {
+            telemetry->route_read_us +=
+                ds4_elapsed_us(route_read_t0, Ds4TimingClock::now());
+        }
+    }
+    if (!device_ffn_input) {
+        route_graph.reset();
+    } else {
+        static bool logged_device_input = false;
+        if (!logged_device_input) {
+            std::fprintf(stderr,
+                         "[deepseek4] device-resident heterogeneous prefill "
+                         "input active; skipping normalized activation readback\n");
+            logged_device_input = true;
+        }
+    }
+    if (!route_ok) return false;
+
+    std::vector<int32_t> selected((size_t)route_width * (size_t)n_tokens);
+    std::vector<float> weights((size_t)route_width * (size_t)n_tokens);
+    std::vector<float> bias;
+    if (!hash_routed && L.ffn_exp_probs_b) {
+        bias.resize((size_t)w.n_expert);
+        ggml_backend_tensor_get(L.ffn_exp_probs_b, bias.data(), 0,
+                                sizeof(float) * bias.size());
+    }
+
+    const auto route_select_t0 = Ds4TimingClock::now();
+    for (int t = 0; t < n_tokens; ++t) {
+        const float * token_probs =
+            probs_host.data() + (size_t)t * (size_t)w.n_expert;
+        int32_t * token_ids_out =
+            selected.data() + (size_t)t * (size_t)route_width;
+        float * token_weights =
+            weights.data() + (size_t)t * (size_t)route_width;
+
+        if (hash_routed) {
+            const int32_t tok = token_ids[t];
+            if (tok < 0 || tok >= w.n_vocab) return false;
+            const int32_t * row =
+                hash_table.ids.data() +
+                (size_t)tok * (size_t)w.n_expert_used;
+            std::memcpy(token_ids_out, row,
+                        sizeof(int32_t) * (size_t)route_width);
+        } else {
+            std::fill(token_ids_out, token_ids_out + route_width, -1);
+            for (int expert = 0; expert < w.n_expert; ++expert) {
+                const float score = token_probs[expert] +
+                    (!bias.empty() ? bias[(size_t)expert] : 0.0f);
+                for (int slot = 0; slot < route_width; ++slot) {
+                    const int32_t current = token_ids_out[slot];
+                    const float current_score = current >= 0
+                        ? token_probs[current] +
+                            (!bias.empty() ? bias[(size_t)current] : 0.0f)
+                        : -INFINITY;
+                    if (current < 0 || score > current_score) {
+                        for (int move = route_width - 1; move > slot; --move) {
+                            token_ids_out[move] = token_ids_out[move - 1];
+                        }
+                        token_ids_out[slot] = expert;
+                        break;
+                    }
+                }
+            }
+        }
+
+        float sum = 0.0f;
+        for (int slot = 0; slot < route_width; ++slot) {
+            const int32_t expert = token_ids_out[slot];
+            token_weights[slot] =
+                expert >= 0 && expert < w.n_expert ? token_probs[expert] : 0.0f;
+            sum += token_weights[slot];
+        }
+        sum = std::max(sum, 6.103515625e-5f);
+        for (int slot = 0; slot < route_width; ++slot) {
+            token_weights[slot] =
+                token_weights[slot] / sum * w.expert_weight_scale;
+        }
+        observe_active_routing(routing_stats, layer,
+                               token_ids_out, token_weights, route_width);
+    }
+    if (telemetry) {
+        telemetry->route_select_us +=
+            ds4_elapsed_us(route_select_t0, Ds4TimingClock::now());
+    }
+
+    MoeHybridConfig cfg = make_ds4_moe_hybrid_config(w);
+    cfg.n_expert_used = route_width;
+    MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
+    ggml_gallocr_t * hot_alloc = persistent_owner_alloc
+        ? &hybrid.prefill_hot_alloc : nullptr;
+    ggml_gallocr_t * cold_alloc = persistent_owner_alloc
+        ? &hybrid.prefill_cold_alloc : nullptr;
+    if (trace_prefill) {
+        std::fprintf(stderr,
+                     "[deepseek4-prefill-trace] layer=%d expert owners begin\n",
+                     layer);
+    }
+    const auto owners_t0 = Ds4TimingClock::now();
+    const bool ok = eval_ds4_hybrid(
+        backend, hybrid.cpu_backend, cfg, desc, &hybrid,
+        hybrid.layers[(size_t)layer], nullptr,
+        layer, n_embd, route_width,
+        device_ffn_input ? nullptr : normed_host.data(),
+        selected.data(), weights.data(),
+        n_tokens, out, hot_alloc, cold_alloc,
+        expert_compute, expert_layer, telemetry,
+        device_ffn_input ? normed : nullptr,
+        device_ffn_input ? device_outputs : nullptr);
+    if (trace_prefill) {
+        std::fprintf(stderr,
+                     "[deepseek4-prefill-trace] layer=%d expert owners=%s "
+                     "wall_ms=%.3f\n",
+                     layer, ok ? "ok" : "failed",
+                     ds4_elapsed_us(owners_t0, Ds4TimingClock::now()) / 1000.0);
+    }
+    return ok;
 }
 
 // Exact-order prefill control: retain the layer-major HC/FFN schedule, but run
@@ -5418,7 +6054,7 @@ static int ds4_try_layer_major_prefill(
                 return fail("cached scratch allocation failed", il);
             }
             if (telemetry) {
-                telemetry->full_graph_alloc_us += ds4_elapsed_us(
+                telemetry->full_graph_build_us += ds4_elapsed_us(
                     alloc_t0, Ds4TimingClock::now());
             }
             for (const auto & b : layer.i32_inputs) {
@@ -5815,7 +6451,6 @@ static bool initialize_layer_range_cache(
     runtime.owns_output = owns_output;
     return true;
 }
-
 bool deepseek4_step_layer_range(
         ggml_backend_t backend,
         int device,
@@ -5831,7 +6466,10 @@ bool deepseek4_step_layer_range(
         const int32_t * token_ids,
         DeepSeek4StepTelemetry * telemetry,
         bool allow_decode_graph_reuse,
-        Ds4VerifyHooks * verify_hooks) {
+        Ds4VerifyHooks * verify_hooks,
+        MoeHybridStorage * moe_hybrid,
+        MoeExpertComputeRuntime * expert_runtime,
+        MoeHybridRoutingStats * routing_stats) {
     const auto step_t0 = Ds4TimingClock::now();
 
     if (!deepseek4_cuda_hc_set_device(device)) {
@@ -5847,13 +6485,39 @@ bool deepseek4_step_layer_range(
     const int hc_dim = n_hc * n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
 
+    const bool fused_hybrid_ready =
+        moe_hybrid && !expert_runtime &&
+        moe_hybrid->materialized_cold_experts &&
+        moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
+        moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
+    const bool fused_verify_candidate =
+        (!moe_hybrid || fused_hybrid_ready) &&
+        n_tokens >= 2 && n_tokens <= 4 && verify_hooks &&
+        layer_begin == 0 && is_last_shard && out_logits &&
+        ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
+    const bool heterogeneous_sparse_prefill =
+        moe_hybrid && cache.prefill_mode == PrefillAttentionMode::Sparse &&
+        n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
+        layer_begin == 0 && is_last_shard && out_logits &&
+        ds4_backend_is_gpu(backend);
+    // These graphs are rebuilt around an owner join on every layer, so tensor
+    // metadata addresses can be recycled for different topologies.  Until
+    // the full heterogeneous layer is captured as one stable scheduler graph,
+    // eager execution prevents a prefill graph entry from being replayed by
+    // the following decode/request.  The override is thread-local and scoped
+    // to this forward call; decode graph replay is restored on every return.
+    ScopedCudaGraphOverrides heterogeneous_prefill_eager_scope(
+        heterogeneous_sparse_prefill &&
+        ds4_env_flag("DFLASH_DS4_HYBRID_PREFILL_EAGER"));
+
     // A dynamic batch may be supplied by callers other than the DSpark
     // verifier. Split it whenever it spans a learned-compressor boundary:
     // each sub-forward then writes at most one window and, if present, its
     // boundary is the final token. This preserves the same pool/rotate order
     // as sequential execution while retaining safe batched prefixes.
     const int first_chunk = deepseek4_safe_compressor_batch_tokens(w, kv_start, n_tokens);
-    if (first_chunk > 0 && first_chunk < n_tokens) {
+    if (first_chunk > 0 && first_chunk < n_tokens &&
+        !fused_verify_candidate && !heterogeneous_sparse_prefill) {
         const int input_width = layer_begin == 0 ? n_embd : hc_dim;
         std::vector<float> hc_all;
         std::vector<float> shard_out_all;
@@ -5894,7 +6558,8 @@ bool deepseek4_step_layer_range(
                     chunk, kv_start + off, layer_begin, layer_end,
                     out_logits ? &chunk_out : nullptr,
                     token_ids ? token_ids + off : nullptr,
-                    telemetry, allow_decode_graph_reuse, chunk_hooks_ptr)) {
+                    telemetry, allow_decode_graph_reuse, chunk_hooks_ptr,
+                    moe_hybrid, expert_runtime, routing_stats)) {
                 return false;
             }
             hc_all.insert(hc_all.end(), chunk_hc.begin(), chunk_hc.end());
@@ -5984,6 +6649,10 @@ bool deepseek4_step_layer_range(
     auto & cached_decode_attn_hc_pre_graphs = layer_range_cache.cached_decode_attn_hc_pre_graphs;
     auto & cached_decode_ffn_hc_pre_graphs = layer_range_cache.cached_decode_ffn_hc_pre_graphs;
     auto & cached_decode_hc_post_graph = layer_range_cache.cached_decode_hc_post_graph;
+    auto & shared_prefill_attn_alloc = layer_range_cache.shared_prefill_attn_alloc;
+    auto & prefill_hc_pre_graph = layer_range_cache.prefill_hc_pre_graph;
+    auto & prefill_hc_post_graph = layer_range_cache.prefill_hc_post_graph;
+    auto & prefill_moe_hc_post_graph = layer_range_cache.prefill_moe_hc_post_graph;
     auto & cached_decode_attn_graphs = layer_range_cache.cached_decode_attn_graphs;
     auto & cached_decode_ffn_graphs = layer_range_cache.cached_decode_ffn_graphs;
     auto & cached_decode_output_graph = layer_range_cache.cached_decode_output_graph;
@@ -5995,6 +6664,14 @@ bool deepseek4_step_layer_range(
     DeepSeek4LayerRangeScratch & scratch = layer_range_cache.scratch;
     const int n_expert_used = ds4_effective_expert_count(w);
     scratch.ensure(w.ctx, n_tokens, n_embd, n_hc, n_expert_used);
+    const bool trace_prefill =
+        heterogeneous_sparse_prefill &&
+        ds4_env_flag("DFLASH_DS4_PREFILL_TRACE");
+    if (trace_prefill) {
+        std::fprintf(stderr,
+                     "[deepseek4-prefill-trace] step begin pos=%d tokens=%d\n",
+                     kv_start, n_tokens);
+    }
 
     // Large full-model prefill batches use the device-resident layer-major
     // pipeline. DSpark verification remains on its exact q=2..4 path below.
@@ -6016,14 +6693,45 @@ bool deepseek4_step_layer_range(
         }
     }
 
-    if (n_tokens >= 2 && n_tokens <= 4 && verify_hooks && layer_begin == 0 && is_last_shard &&
-        out_logits && ds4_backend_is_gpu(backend) && w.fused_decode &&
-        ds4_fused_verify_enabled()) {
+    // The batched verifier graph is also the only whole-model graph that can
+    // currently own tensors on both GPU backends.  Reuse it for q=1 hybrid
+    // decode so native AR does not fall back to 43 host-synchronized FFN
+    // calls.  DSpark prefill also needs this q=1 path: feature-capture hooks
+    // must not silently force it back to the numerically different per-layer
+    // implementation, otherwise the first speculative seed can diverge from
+    // native AR before the drafter has run at all.
+    const bool fused_hybrid_decode =
+        fused_hybrid_ready && n_tokens == 1 && allow_decode_graph_reuse &&
+        ds4_env_flag("DFLASH_DS4_FUSED_HYBRID_DECODE");
+    std::vector<int> fused_hybrid_decode_capture_ids;
+    Ds4VerifyHooks fused_hybrid_decode_hooks;
+    if (fused_hybrid_decode && !verify_hooks) {
+        fused_hybrid_decode_hooks.capture_layer_ids =
+            &fused_hybrid_decode_capture_ids;
+    }
+    Ds4VerifyHooks * fused_graph_hooks =
+        (fused_hybrid_decode && !verify_hooks)
+            ? &fused_hybrid_decode_hooks : verify_hooks;
+    if ((!moe_hybrid || fused_hybrid_ready) &&
+        ((n_tokens >= 2 && n_tokens <= 4 && verify_hooks) ||
+         fused_hybrid_decode) &&
+        layer_begin == 0 && is_last_shard &&
+        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {
+        const bool q1_feature_capture =
+            n_tokens == 1 && verify_hooks && verify_hooks->capture_out;
+        // q=1 target-feature capture walks many prompt-position shapes. Keep
+        // it separate from q>=2 verification so prefill cannot evict the
+        // expensive warm q=3/q=4 verifier working set.
+        Ds4FusedVerifyCache & graph_cache = q1_feature_capture
+            ? layer_range_cache.fused_capture_graph_cache
+            : layer_range_cache.fused_verify_graph_cache;
         const int vrc = ds4_try_fused_verify_step(
-            fused_verify_graph_cache, fused_decode_graph_cache, backend, w, cache,
+            graph_cache, q1_feature_capture, fused_decode_graph_cache,
+            backend, w, cache,
             hc_layer_weights_range, hc_output_weights_range, hash_routing_tables_range,
             scratch.hash_expert_ids, embed, n_tokens, kv_start, *out_logits, token_ids,
-            verify_hooks, telemetry);
+            fused_graph_hooks, telemetry, fused_hybrid_ready ? moe_hybrid : nullptr,
+            routing_stats);
         if (vrc < 0) return false;
         if (vrc > 0) {
             const int np = kv_start + n_tokens;
@@ -6037,10 +6745,22 @@ bool deepseek4_step_layer_range(
             if (telemetry) telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
             return true;
         }
+        // The generic dynamic graph cannot safely span a learned-compressor
+        // boundary. A fused candidate deliberately bypassed the splitter
+        // above because the fused graph models that boundary explicitly. If
+        // graph construction was unavailable, fail closed instead of running
+        // an unsafe dynamic batch or silently degrading into q=3 + q=1.
+        if (first_chunk > 0 && first_chunk < n_tokens) {
+            std::fprintf(stderr,
+                         "[ds4-fused-verify] boundary-spanning graph unavailable\n");
+            return false;
+        }
     }
     std::vector<float> fused_debug_logits;
-    if (n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
-        out_logits && ds4_backend_is_gpu(backend) && w.fused_decode) {
+    if (!moe_hybrid && n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
+        !(verify_hooks && verify_hooks->capture_layer_ids &&
+          verify_hooks->capture_out) &&
+        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_decode_enabled()) {
         const int rc = ds4_try_fused_decode_step(
             fused_decode_graph_cache, backend, w, cache, hc_layer_weights_range,
             hc_output_weights_range, hash_routing_tables_range, scratch.hash_expert_ids,
@@ -6095,8 +6815,28 @@ bool deepseek4_step_layer_range(
     const bool use_backend_decode_hc_direct = use_backend_decode_hc && ds4_backend_is_hip(backend);
     const bool use_backend_decode_hc_graph =
         use_backend_decode_hc && !use_backend_decode_hc_direct;
+    const bool use_backend_prefill_hc =
+        heterogeneous_sparse_prefill &&
+        ds4_env_flag("DFLASH_DS4_HYBRID_PREFILL_GPU_HC");
     ggml_tensor * hc_state_backend = nullptr;
-    if (use_backend_decode_hc_graph || use_backend_decode_hc_direct) {
+    if (use_backend_prefill_hc) {
+        if (!ds4_fused_ensure_fn_mirrors(
+                fused_decode_graph_cache, backend, w,
+                hc_layer_weights_range, hc_output_weights_range) ||
+            !build_prefill_hc_post_graph(
+                prefill_hc_post_graph, backend, w, n_tokens) ||
+            (moe_hybrid && !build_prefill_hc_post_graph(
+                prefill_moe_hc_post_graph, backend, w, n_tokens,
+                /*owner_join=*/true))) {
+            std::fprintf(stderr,
+                         "[deepseek4-prefill] batched GPU HC initialization failed\n");
+            return false;
+        }
+        ggml_backend_tensor_set(prefill_hc_post_graph.residual_hc,
+                                hc_state.data(), 0,
+                                sizeof(float) * hc_state.size());
+        hc_state_backend = prefill_hc_post_graph.residual_hc;
+    } else if (use_backend_decode_hc_graph || use_backend_decode_hc_direct) {
         if (!cached_decode_hc_post_graph.valid() ||
             cached_decode_hc_post_graph.owner_ctx != w.ctx ||
             cached_decode_hc_post_graph.backend != backend) {
@@ -6120,10 +6860,46 @@ bool deepseek4_step_layer_range(
         const ggml_tensor * attn_comb_backend = nullptr;
         const ggml_tensor * ffn_post_backend = nullptr;
         const ggml_tensor * ffn_comb_backend = nullptr;
+        const ggml_tensor * attn_split_backend = nullptr;
+        const ggml_tensor * ffn_split_backend = nullptr;
+        if (trace_prefill) {
+            std::fprintf(stderr,
+                         "[deepseek4-prefill-trace] layer=%d attention begin\n",
+                         il);
+        }
 
         // ── HC pre (attention) ──────────────────────────────────────
         const auto hc_pre_attn_t0 = Ds4TimingClock::now();
-        if (use_backend_decode_hc_direct) {
+        if (use_backend_prefill_hc) {
+            const auto hc_pre_attn_build_t0 = Ds4TimingClock::now();
+            if (!build_prefill_hc_pre_graph(
+                    prefill_hc_pre_graph, backend, w,
+                    fused_decode_graph_cache.fn_attn_f16[(size_t)il],
+                    L.hc_attn_base, hc_lw.attn.scale_data.data(),
+                    il, /*ffn=*/false, n_tokens)) {
+                std::fprintf(stderr,
+                             "[deepseek4-prefill] batched HC-pre build failed "
+                             "layer %d attn\n", il);
+                return false;
+            }
+            if (telemetry) telemetry->hc_pre_build_us += ds4_elapsed_us(
+                hc_pre_attn_build_t0, Ds4TimingClock::now());
+            ggml_backend_tensor_copy(hc_state_backend,
+                                     prefill_hc_pre_graph.sg.inp_embed);
+            const auto hc_pre_attn_compute_t0 = Ds4TimingClock::now();
+            if (ggml_backend_graph_compute(
+                    backend, prefill_hc_pre_graph.sg.gf) !=
+                GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr,
+                             "[deepseek4-prefill] batched HC-pre compute failed "
+                             "layer %d attn\n", il);
+                return false;
+            }
+            if (telemetry) telemetry->hc_pre_compute_us += ds4_elapsed_us(
+                hc_pre_attn_compute_t0, Ds4TimingClock::now());
+            attn_in_backend = prefill_hc_pre_graph.sg.hidden_states;
+            attn_split_backend = prefill_hc_pre_graph.split;
+        } else if (use_backend_decode_hc_direct) {
             auto & cached = cached_decode_attn_hc_pre_graphs[(size_t)il];
             if (!cached.valid() ||
                 cached.owner_ctx != w.ctx ||
@@ -6205,7 +6981,8 @@ bool deepseek4_step_layer_range(
             DeepSeek4CachedDecodeAttnGraph * cached_attn = nullptr;
 
             const bool exact_tokenwise_prefill =
-                !reuse_decode_attn && n_tokens > 1;
+                !reuse_decode_attn && n_tokens > 1 &&
+                cache.prefill_mode == PrefillAttentionMode::Exact;
             if (exact_tokenwise_prefill) {
                 const DeepSeek4AttentionImpl attention_impl =
                     cache.prefill_mode == PrefillAttentionMode::Sparse
@@ -6331,7 +7108,9 @@ bool deepseek4_step_layer_range(
                 ggml_set_output(attn_out);
                 ggml_build_forward_expand(gf, attn_out);
 
-                auto & attn_alloc = cached_attn_allocs[(size_t)il];
+                auto & attn_alloc = heterogeneous_sparse_prefill
+                    ? shared_prefill_attn_alloc
+                    : cached_attn_allocs[(size_t)il];
                 if (!attn_alloc.valid() || attn_alloc.owner_ctx != w.ctx || attn_alloc.backend != backend) {
                     attn_alloc.free();
                     attn_alloc.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -6367,7 +7146,42 @@ bool deepseek4_step_layer_range(
                 return false;
             }
             if (telemetry) telemetry->attn_compute_us += ds4_elapsed_us(attn_compute_t0, Ds4TimingClock::now());
-            if (use_backend_decode_hc_graph || use_backend_decode_hc_direct) {
+            if (trace_prefill) {
+                std::fprintf(stderr,
+                             "[deepseek4-prefill-trace] layer=%d attention compute=ok\n",
+                             il);
+            }
+            if (use_backend_prefill_hc) {
+                if (!attn_split_backend) {
+                    std::fprintf(stderr,
+                                 "[deepseek4-prefill] missing HC split layer %d attn\n",
+                                 il);
+                    if (ctx) ggml_free(ctx);
+                    return false;
+                }
+                if (hc_state_backend != prefill_hc_post_graph.residual_hc) {
+                    ggml_backend_tensor_copy(
+                        hc_state_backend, prefill_hc_post_graph.residual_hc);
+                }
+                ggml_backend_tensor_copy(
+                    attn_out, prefill_hc_post_graph.block_out);
+                ggml_backend_tensor_copy(
+                    const_cast<ggml_tensor *>(attn_split_backend),
+                    prefill_hc_post_graph.split);
+                const auto hc_post_attn_t0 = Ds4TimingClock::now();
+                if (ggml_backend_graph_compute(
+                        backend, prefill_hc_post_graph.sg.gf) !=
+                    GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr,
+                                 "[deepseek4-prefill] batched HC-post compute "
+                                 "failed layer %d attn\n", il);
+                    if (ctx) ggml_free(ctx);
+                    return false;
+                }
+                hc_state_backend = prefill_hc_post_graph.sg.hidden_states;
+                if (telemetry) telemetry->hc_post_attn_us += ds4_elapsed_us(
+                    hc_post_attn_t0, Ds4TimingClock::now());
+            } else if (use_backend_decode_hc_graph || use_backend_decode_hc_direct) {
                 if (hc_state_backend != cached_decode_hc_post_graph.residual_hc) {
                     ggml_backend_tensor_copy(hc_state_backend, cached_decode_hc_post_graph.residual_hc);
                 }
@@ -6391,7 +7205,8 @@ bool deepseek4_step_layer_range(
             }
 
             // ── HC post (attention) ─────────────────────────────────
-            if (!(use_backend_decode_hc_graph || use_backend_decode_hc_direct)) {
+            if (!use_backend_prefill_hc &&
+                !(use_backend_decode_hc_graph || use_backend_decode_hc_direct)) {
                 const auto hc_post_attn_t0 = Ds4TimingClock::now();
                 hc_post_batch(next_hc,
                               attn_out_host.data(),
@@ -6408,7 +7223,41 @@ bool deepseek4_step_layer_range(
 
         // ── HC pre (FFN) ────────────────────────────────────────────
         const auto hc_pre_ffn_t0 = Ds4TimingClock::now();
-        if (use_backend_decode_hc_direct) {
+        if (trace_prefill) {
+            std::fprintf(stderr,
+                         "[deepseek4-prefill-trace] layer=%d ffn begin\n",
+                         il);
+        }
+        if (use_backend_prefill_hc) {
+            const auto hc_pre_ffn_build_t0 = Ds4TimingClock::now();
+            if (!build_prefill_hc_pre_graph(
+                    prefill_hc_pre_graph, backend, w,
+                    fused_decode_graph_cache.fn_ffn_f16[(size_t)il],
+                    L.hc_ffn_base, hc_lw.ffn.scale_data.data(),
+                    il, /*ffn=*/true, n_tokens)) {
+                std::fprintf(stderr,
+                             "[deepseek4-prefill] batched HC-pre build failed "
+                             "layer %d ffn\n", il);
+                return false;
+            }
+            if (telemetry) telemetry->hc_pre_build_us += ds4_elapsed_us(
+                hc_pre_ffn_build_t0, Ds4TimingClock::now());
+            ggml_backend_tensor_copy(hc_state_backend,
+                                     prefill_hc_pre_graph.sg.inp_embed);
+            const auto hc_pre_ffn_compute_t0 = Ds4TimingClock::now();
+            if (ggml_backend_graph_compute(
+                    backend, prefill_hc_pre_graph.sg.gf) !=
+                GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr,
+                             "[deepseek4-prefill] batched HC-pre compute failed "
+                             "layer %d ffn\n", il);
+                return false;
+            }
+            if (telemetry) telemetry->hc_pre_compute_us += ds4_elapsed_us(
+                hc_pre_ffn_compute_t0, Ds4TimingClock::now());
+            ffn_in_backend = prefill_hc_pre_graph.sg.hidden_states;
+            ffn_split_backend = prefill_hc_pre_graph.split;
+        } else if (use_backend_decode_hc_direct) {
             auto & cached = cached_decode_ffn_hc_pre_graphs[(size_t)il];
             if (!cached.valid() ||
                 cached.owner_ctx != w.ctx ||
@@ -6487,82 +7336,177 @@ bool deepseek4_step_layer_range(
             hash_routed =
                 il < w.n_hash_layer && L.ffn_gate_tid2eid && token_ids &&
                 hash_routing_tables_range[(size_t)il].loaded;
-            if (hash_routed) {
-                const int n_used = n_expert_used;
-                hash_expert_ids_host.resize((size_t)n_used * (size_t)n_tokens);
-                for (int ti = 0; ti < n_tokens; ti++) {
-                    const int32_t tok = token_ids[ti];
-                    const int32_t * row = hash_routing_row(
-                        hash_routing_tables_range[(size_t)il], tok, w.n_expert_used);
-                    if (!row) {
+            ggml_tensor * ffn_out = nullptr;
+            bool ffn_device_join = false;
+            MoeHybridDeviceOutputs owner_outputs;
+            if (moe_hybrid) {
+                const MoeHybridLayerStorage & layer_storage =
+                    moe_hybrid->layers[(size_t)il];
+                ggml_tensor * cold_stack = layer_storage.gate_up_cold
+                    ? layer_storage.gate_up_cold
+                    : layer_storage.gate_cold;
+                const bool local_expert_runtime =
+                    !expert_runtime || !expert_runtime->compute_ptr();
+                ffn_device_join =
+                    use_backend_prefill_hc && ffn_in_backend &&
+                    local_expert_runtime &&
+                    prefill_moe_hc_post_graph.valid() &&
+                    cold_stack && cold_stack->ne[2] == w.n_expert;
+                if (ffn_device_join) {
+                    static bool logged_device_join = false;
+                    if (!logged_device_join) {
                         std::fprintf(stderr,
-                                     "[deepseek4] token id %d outside hash table for layer %d\n",
-                                     tok, il);
-                        return false;
+                                     "[deepseek4-prefill] device-resident "
+                                     "hot+cold owner join active\n");
+                        logged_device_join = true;
                     }
-                    memcpy(hash_expert_ids_host.data() + (size_t)ti * n_used,
-                           row, (size_t)n_used * sizeof(int32_t));
+                    owner_outputs.backend = backend;
+                    owner_outputs.hot = prefill_moe_hc_post_graph.block_out;
+                    owner_outputs.cold =
+                        prefill_moe_hc_post_graph.block_out_cold;
                 }
-            }
-
-            auto & cached = cached_decode_ffn_graphs[(size_t)il];
-            if (!cached.valid() ||
-                cached.owner_ctx != w.ctx ||
-                cached.backend != backend ||
-                cached.layer_idx != il ||
-                cached.n_tokens != n_tokens ||
-                cached.n_expert_used != n_expert_used ||
-                cached.hash_routed != hash_routed) {
-                const auto ffn_build_t0 = Ds4TimingClock::now();
-                if (!build_cached_decode_ffn_graph(cached, backend, w, L, il, n_tokens, hash_routed)) {
-                    std::fprintf(stderr, "[deepseek4] cached ffn graph alloc failed layer %d\n", il);
+                if (!eval_ds4_layer_range_hybrid_ffn(
+                        backend, w, L, il, n_tokens,
+                        ffn_working.data(), ffn_in_backend,
+                        token_ids, hash_routing_tables_range[(size_t)il],
+                        *moe_hybrid, expert_runtime, routing_stats,
+                        ffn_out_host, telemetry,
+                        ffn_device_join ? &owner_outputs : nullptr)) {
+                    std::fprintf(stderr,
+                                 "[deepseek4-moe-tp] layer-range FFN failed layer %d\n",
+                                 il);
                     return false;
                 }
-                if (telemetry) telemetry->ffn_build_us += ds4_elapsed_us(ffn_build_t0, Ds4TimingClock::now());
-            }
-
-            ggml_tensor * ffn_out = cached.sg.hidden_states;
-            if (ffn_in_backend) {
-                ggml_backend_tensor_copy(ffn_in_backend, cached.sg.inp_embed);
             } else {
-                ggml_backend_tensor_set(cached.sg.inp_embed, ffn_working.data(), 0,
-                                        sizeof(float) * ffn_working.size());
-            }
-            if (cached.hash_ids) {
-                ggml_backend_tensor_set(cached.hash_ids, hash_expert_ids_host.data(), 0,
-                                        sizeof(int32_t) * hash_expert_ids_host.size());
-            }
-
-            const auto ffn_compute_t0 = Ds4TimingClock::now();
-            auto status = ggml_backend_graph_compute(backend, cached.sg.gf);
-            if (telemetry) telemetry->ffn_compute_us += ds4_elapsed_us(ffn_compute_t0, Ds4TimingClock::now());
-            if (status != GGML_STATUS_SUCCESS) {
-                std::fprintf(stderr, "[deepseek4] cached ffn compute failed layer %d\n", il);
-                return false;
-            }
-
-            if (use_backend_decode_hc_graph || use_backend_decode_hc_direct) {
-                if (hc_state_backend != cached_decode_hc_post_graph.residual_hc) {
-                    ggml_backend_tensor_copy(hc_state_backend, cached_decode_hc_post_graph.residual_hc);
+                if (hash_routed) {
+                    const int n_used = n_expert_used;
+                    hash_expert_ids_host.resize((size_t)n_used * (size_t)n_tokens);
+                    for (int ti = 0; ti < n_tokens; ti++) {
+                        const int32_t tok = token_ids[ti];
+                        const int32_t * row = hash_routing_row(
+                            hash_routing_tables_range[(size_t)il], tok,
+                            w.n_expert_used);
+                        if (!row) {
+                            std::fprintf(stderr,
+                                         "[deepseek4] token id %d outside hash table for layer %d\n",
+                                         tok, il);
+                            return false;
+                        }
+                        memcpy(hash_expert_ids_host.data() + (size_t)ti * n_used,
+                               row, (size_t)n_used * sizeof(int32_t));
+                    }
                 }
-                ggml_backend_tensor_copy(ffn_out, cached_decode_hc_post_graph.block_out);
-                ggml_backend_tensor_copy(ffn_post_backend, cached_decode_hc_post_graph.post);
-                ggml_backend_tensor_copy(ffn_comb_backend, cached_decode_hc_post_graph.comb);
+
+                auto & cached = cached_decode_ffn_graphs[(size_t)il];
+                if (!cached.valid() ||
+                    cached.owner_ctx != w.ctx ||
+                    cached.backend != backend ||
+                    cached.layer_idx != il ||
+                    cached.n_tokens != n_tokens ||
+                    cached.n_expert_used != n_expert_used ||
+                    cached.hash_routed != hash_routed) {
+                    const auto ffn_build_t0 = Ds4TimingClock::now();
+                    if (!build_cached_decode_ffn_graph(cached, backend, w, L, il, n_tokens, hash_routed)) {
+                        std::fprintf(stderr, "[deepseek4] cached ffn graph alloc failed layer %d\n", il);
+                        return false;
+                    }
+                    if (telemetry) telemetry->ffn_build_us += ds4_elapsed_us(ffn_build_t0, Ds4TimingClock::now());
+                }
+
+                ffn_out = cached.sg.hidden_states;
+                if (ffn_in_backend) {
+                    ggml_backend_tensor_copy(ffn_in_backend, cached.sg.inp_embed);
+                } else {
+                    ggml_backend_tensor_set(cached.sg.inp_embed, ffn_working.data(), 0,
+                                            sizeof(float) * ffn_working.size());
+                }
+                if (cached.hash_ids) {
+                    ggml_backend_tensor_set(cached.hash_ids, hash_expert_ids_host.data(), 0,
+                                            sizeof(int32_t) * hash_expert_ids_host.size());
+                }
+
+                const auto ffn_compute_t0 = Ds4TimingClock::now();
+                auto status = ggml_backend_graph_compute(backend, cached.sg.gf);
+                if (telemetry) telemetry->ffn_compute_us += ds4_elapsed_us(ffn_compute_t0, Ds4TimingClock::now());
+                if (status != GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr, "[deepseek4] cached ffn compute failed layer %d\n", il);
+                    return false;
+                }
+                if (!(use_backend_decode_hc_graph || use_backend_decode_hc_direct)) {
+                    const auto ffn_read_t0 = Ds4TimingClock::now();
+                    ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0,
+                                            sizeof(float) * ffn_out_host.size());
+                    if (telemetry) telemetry->ffn_read_us +=
+                        ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
+                }
+            }
+
+            if (use_backend_prefill_hc) {
+                if (!ffn_split_backend) {
+                    std::fprintf(stderr,
+                                 "[deepseek4-prefill] missing HC split layer %d ffn\n",
+                                 il);
+                    return false;
+                }
+                DeepSeek4PrefillHcPostGraph & hc_post_graph =
+                    ffn_device_join
+                        ? prefill_moe_hc_post_graph
+                        : prefill_hc_post_graph;
+                if (hc_state_backend != hc_post_graph.residual_hc) {
+                    ggml_backend_tensor_copy(
+                        hc_state_backend, hc_post_graph.residual_hc);
+                }
+                if (!ffn_device_join) {
+                    ggml_backend_tensor_set(
+                        hc_post_graph.block_out,
+                        ffn_out_host.data(), 0,
+                        sizeof(float) * ffn_out_host.size());
+                }
+                ggml_backend_tensor_copy(
+                    const_cast<ggml_tensor *>(ffn_split_backend),
+                    hc_post_graph.split);
+                const auto hc_post_ffn_t0 = Ds4TimingClock::now();
+                if (ggml_backend_graph_compute(
+                        backend, hc_post_graph.sg.gf) !=
+                    GGML_STATUS_SUCCESS) {
+                    std::fprintf(stderr,
+                                 "[deepseek4-prefill] batched HC-post compute "
+                                 "failed layer %d ffn\n", il);
+                    return false;
+                }
+                hc_state_backend = hc_post_graph.sg.hidden_states;
+                if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(
+                    hc_post_ffn_t0, Ds4TimingClock::now());
+            } else if (use_backend_decode_hc_graph || use_backend_decode_hc_direct) {
+                if (hc_state_backend != cached_decode_hc_post_graph.residual_hc) {
+                    ggml_backend_tensor_copy(hc_state_backend,
+                                             cached_decode_hc_post_graph.residual_hc);
+                }
+                if (moe_hybrid) {
+                    ggml_backend_tensor_set(cached_decode_hc_post_graph.block_out,
+                                            ffn_out_host.data(), 0,
+                                            sizeof(float) * ffn_out_host.size());
+                } else {
+                    ggml_backend_tensor_copy(ffn_out,
+                                             cached_decode_hc_post_graph.block_out);
+                }
+                ggml_backend_tensor_copy(ffn_post_backend,
+                                         cached_decode_hc_post_graph.post);
+                ggml_backend_tensor_copy(ffn_comb_backend,
+                                         cached_decode_hc_post_graph.comb);
                 const auto hc_post_ffn_t0 = Ds4TimingClock::now();
                 if (ggml_backend_graph_compute(backend, cached_decode_hc_post_graph.sg.gf) != GGML_STATUS_SUCCESS) {
                     std::fprintf(stderr, "[deepseek4] cached hc-post compute failed layer %d ffn\n", il);
                     return false;
                 }
                 hc_state_backend = cached_decode_hc_post_graph.sg.hidden_states;
-                if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
-            } else {
-                const auto ffn_read_t0 = Ds4TimingClock::now();
-                ggml_backend_tensor_get(ffn_out, ffn_out_host.data(), 0, sizeof(float) * ffn_out_host.size());
-                if (telemetry) telemetry->ffn_read_us += ds4_elapsed_us(ffn_read_t0, Ds4TimingClock::now());
+                if (telemetry) telemetry->hc_post_ffn_us +=
+                    ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
             }
 
             // ── HC post (FFN) ───────────────────────────────────────
-            if (!(use_backend_decode_hc_graph || use_backend_decode_hc_direct)) {
+            if (!use_backend_prefill_hc &&
+                !(use_backend_decode_hc_graph || use_backend_decode_hc_direct)) {
                 const auto hc_post_ffn_t0 = Ds4TimingClock::now();
                 hc_post_batch(next_hc,
                               ffn_out_host.data(),
@@ -6597,7 +7541,8 @@ bool deepseek4_step_layer_range(
         }
     }
 
-    if ((use_backend_decode_hc_graph || use_backend_decode_hc_direct) && hc_state_backend) {
+    if ((use_backend_prefill_hc || use_backend_decode_hc_graph ||
+         use_backend_decode_hc_direct) && hc_state_backend) {
         ggml_backend_tensor_get(hc_state_backend, hc_state.data(), 0, sizeof(float) * hc_state.size());
     }
 
@@ -7044,13 +7989,14 @@ static ggml_tensor * build_dspark_attention(
         ggml_context * ctx,
         ggml_tensor * cur,      // [n_embd, block]  (post attn_norm)
         ggml_tensor * main_x,   // [n_embd, ctx_len] (post main_norm, shared)
+        ggml_tensor * cached_ctx_kv, // optional [head_dim, ctx_len], already normed+RoPE
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
         int ctx_len,
         ggml_tensor * pos_block,   // I32[block]    absolute positions committed..committed+block-1
         ggml_tensor * neg_block,   // I32[block]    -(block positions)
-        ggml_tensor * pos_ctx) {   // I32[ctx_len]  absolute positions committed-ctx_len..committed-1
-    const int n_embd    = w.n_embd;
+        ggml_tensor * pos_ctx,     // I32[ctx_len]  absolute positions committed-ctx_len..committed-1
+        ggml_tensor * attn_mask) { // F32[ctx_len+block], 0 or -inf
     const int head_dim  = w.head_dim;
     const int n_head    = w.n_head;
     const int n_rot     = w.n_rot;
@@ -7082,10 +8028,13 @@ static ggml_tensor * build_dspark_attention(
     ggml_tensor * kv_attn = kv_b;
     int n_attn = block;
     if (ctx_len > 0) {
-        ggml_tensor * kv_c = build_rms_norm(ctx, ggml_mul_mat(ctx, L.attn_kv, main_x), L.attn_kv_a_norm, eps);
-        kv_c = build_tail_rope_2d(ctx, kv_c, pos_ctx, n_rot, head_dim, ctx_len,
-                                  rope_freq, rope_scale, rope_ext, rope_attn,
-                                  w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_orig);
+        ggml_tensor * kv_c = cached_ctx_kv;
+        if (!kv_c) {
+            kv_c = build_rms_norm(ctx, ggml_mul_mat(ctx, L.attn_kv, main_x), L.attn_kv_a_norm, eps);
+            kv_c = build_tail_rope_2d(ctx, kv_c, pos_ctx, n_rot, head_dim, ctx_len,
+                                      rope_freq, rope_scale, rope_ext, rope_attn,
+                                      w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_orig);
+        }
         kv_attn = ggml_concat(ctx, kv_c, kv_b, 1);               // [head_dim, ctx_len+block]
         n_attn = ctx_len + block;
     }
@@ -7094,6 +8043,12 @@ static ggml_tensor * build_dspark_attention(
     ggml_tensor * q_flat = ggml_reshape_2d(ctx, q, head_dim, n_head * block);
     ggml_tensor * scores = ggml_mul_mat(ctx, kv_attn, q_flat);    // [n_attn, n_head*block]
     scores = ggml_scale(ctx, scores, 1.0f / sqrtf((float) head_dim));
+    if (attn_mask) {
+        // Runtime mask keeps a fixed n_swa-wide graph mathematically
+        // equivalent to the shorter valid prompt window. Padded context
+        // columns receive -inf; block columns remain visible.
+        scores = ggml_add(ctx, scores, ggml_repeat(ctx, attn_mask, scores));
+    }
     ggml_tensor * probs = nullptr;
     if (L.attn_sinks) {
         ggml_tensor * sink = ggml_reshape_2d(ctx, L.attn_sinks, 1, n_head);
@@ -7141,22 +8096,217 @@ static void ds4_read_f32(ggml_tensor * t, float * dst, int k) {
 // drafter instance) and re-set only the inputs per call.
 namespace {
 
-struct DsparkDraftCache {
-    int ctx_len = -1;
-    int block   = -1;
+// Cache DSpark context KV projections across speculative steps. Only newly
+// committed target-feature columns are projected on the draft GPU; the final
+// normed+RoPE KV window is small enough (<1 MiB at n_swa=128) to retain in a
+// host-side ring and upload as one compact draft-graph input.
+struct DsparkContextKvProjector {
+    int n_cols = -1;
     const void * drafter = nullptr;
     ggml_backend_t backend = nullptr;
     std::vector<uint8_t> arena;
     ggml_context * ctx = nullptr;
     ggml_gallocr_t alloc = nullptr;
     ggml_cgraph * gf = nullptr;
+    ggml_tensor * inp_features = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * out = nullptr;
+
+    int end_pos = -1;
+    int valid = 0;
+    std::vector<float> host_kv;
+    std::vector<float> projected;
+};
+
+thread_local DsparkContextKvProjector g_dspark_ctx_kv;
+
+static bool dspark_project_context_columns(
+        ggml_backend_t backend,
+        const DSparkDrafter & d,
+        const float * features,
+        int n_cols,
+        int first_pos,
+        std::vector<float> & out) {
+    if (!backend || !features || n_cols <= 0) return false;
+    const DeepSeek4Weights & w = d.core;
+    const int n_embd = w.n_embd;
+    const int fc_in = d.n_target_layers * n_embd;
+    const int head_dim = w.head_dim;
+    DsparkContextKvProjector & P = g_dspark_ctx_kv;
+
+    if (!P.ctx || P.n_cols != n_cols || P.drafter != (const void *) &d ||
+        P.backend != backend) {
+        if (P.alloc && P.backend != backend) {
+            ggml_gallocr_free(P.alloc);
+            P.alloc = nullptr;
+        }
+        if (P.ctx) {
+            ggml_free(P.ctx);
+            P.ctx = nullptr;
+        }
+        P.gf = nullptr;
+        P.inp_features = nullptr;
+        P.positions = nullptr;
+        P.out = nullptr;
+        if (P.arena.empty()) P.arena.resize(32u * 1024 * 1024);
+        ggml_init_params ip{};
+        ip.mem_size = P.arena.size();
+        ip.mem_buffer = P.arena.data();
+        ip.no_alloc = true;
+        P.ctx = ggml_init(ip);
+        if (!P.ctx) return false;
+        P.gf = ggml_new_graph_custom(P.ctx, 4096, false);
+        P.inp_features = ggml_new_tensor_2d(
+            P.ctx, GGML_TYPE_F32, fc_in, n_cols);
+        ggml_set_input(P.inp_features);
+        P.positions = ggml_new_tensor_1d(
+            P.ctx, GGML_TYPE_I32, n_cols);
+        ggml_set_input(P.positions);
+
+        ggml_tensor * feature_norm =
+            ggml_rms_norm(P.ctx, P.inp_features, w.rms_eps);
+        ggml_tensor * main_x = build_rms_norm(
+            P.ctx, ggml_mul_mat(P.ctx, d.main_proj, feature_norm),
+            d.main_norm, w.rms_eps);
+        ggml_tensor * stacked = nullptr;
+        for (int il = 0; il < w.n_layer; ++il) {
+            const DeepSeek4Layer & L = w.layers[(size_t) il];
+            ggml_tensor * kv = build_rms_norm(
+                P.ctx, ggml_mul_mat(P.ctx, L.attn_kv, main_x),
+                L.attn_kv_a_norm, w.rms_eps);
+            kv = build_tail_rope_2d(
+                P.ctx, kv, P.positions, w.n_rot, head_dim, n_cols,
+                w.rope_freq_base, 1.0f, 0.0f, 1.0f,
+                w.rope_yarn_beta_fast, w.rope_yarn_beta_slow,
+                (int) w.rope_orig_ctx);
+            kv = ggml_reshape_3d(P.ctx, kv, head_dim, n_cols, 1);
+            stacked = stacked ? ggml_concat(P.ctx, stacked, kv, 2) : kv;
+        }
+        P.out = ggml_cont(P.ctx, stacked);
+        ggml_set_output(P.out);
+        ggml_build_forward_expand(P.gf, P.out);
+        if (!P.alloc) {
+            P.alloc = ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(backend));
+        }
+        if (!P.alloc || !ggml_gallocr_alloc_graph(P.alloc, P.gf)) {
+            ggml_free(P.ctx);
+            P.ctx = nullptr;
+            P.gf = nullptr;
+            return false;
+        }
+        P.n_cols = n_cols;
+        P.drafter = (const void *) &d;
+        P.backend = backend;
+    }
+
+    ggml_backend_tensor_set(
+        P.inp_features, features, 0,
+        sizeof(float) * (size_t) fc_in * n_cols);
+    std::vector<int32_t> pos((size_t) n_cols);
+    for (int i = 0; i < n_cols; ++i) pos[(size_t) i] = first_pos + i;
+    ggml_backend_tensor_set(
+        P.positions, pos.data(), 0, sizeof(int32_t) * pos.size());
+    if (ggml_backend_graph_compute(backend, P.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    out.resize((size_t) head_dim * n_cols * w.n_layer);
+    ggml_backend_tensor_get(
+        P.out, out.data(), 0, sizeof(float) * out.size());
+    return true;
+}
+
+static bool dspark_update_context_kv_cache(
+        ggml_backend_t backend,
+        const DSparkDrafter & d,
+        const float * ctx_features,
+        int ctx_len,
+        int committed,
+        const std::vector<float> ** out_host_kv) {
+    const DeepSeek4Weights & w = d.core;
+    const int n_swa = w.n_swa;
+    const int head_dim = w.head_dim;
+    const int fc_in = d.n_target_layers * w.n_embd;
+    DsparkContextKvProjector & P = g_dspark_ctx_kv;
+    if (ctx_len <= 0) {
+        P.end_pos = committed;
+        P.valid = 0;
+        P.host_kv.assign((size_t) w.n_layer * n_swa * head_dim, 0.0f);
+        *out_host_kv = &P.host_kv;
+        return true;
+    }
+    if (!ctx_features || ctx_len > n_swa) return false;
+
+    int n_new = committed - P.end_pos;
+    const bool rebuild =
+        P.drafter != (const void *) &d || P.backend != backend ||
+        P.end_pos < 0 ||
+        n_new <= 0 || n_new > ctx_len ||
+        std::min(n_swa, P.valid + n_new) != ctx_len ||
+        P.host_kv.size() != (size_t) w.n_layer * n_swa * head_dim;
+    if (rebuild) {
+        P.host_kv.assign((size_t) w.n_layer * n_swa * head_dim, 0.0f);
+        P.valid = 0;
+        n_new = ctx_len;
+    }
+
+    const int first_new_pos = committed - n_new;
+    const float * new_features =
+        ctx_features + (size_t) (ctx_len - n_new) * fc_in;
+    if (!dspark_project_context_columns(
+            backend, d, new_features, n_new, first_new_pos, P.projected)) {
+        return false;
+    }
+
+    const int keep = std::max(0, std::min(P.valid, n_swa - n_new));
+    const int drop = P.valid - keep;
+    for (int il = 0; il < w.n_layer; ++il) {
+        float * layer_cache = P.host_kv.data() +
+            (size_t) il * n_swa * head_dim;
+        if (keep > 0 && drop > 0) {
+            std::memmove(
+                layer_cache,
+                layer_cache + (size_t) drop * head_dim,
+                sizeof(float) * (size_t) keep * head_dim);
+        }
+        const float * layer_new = P.projected.data() +
+            (size_t) il * n_new * head_dim;
+        std::memcpy(
+            layer_cache + (size_t) keep * head_dim,
+            layer_new,
+            sizeof(float) * (size_t) n_new * head_dim);
+    }
+    P.valid = keep + n_new;
+    P.end_pos = committed;
+    P.drafter = (const void *) &d;
+    if (P.valid != ctx_len) return false;
+    *out_host_kv = &P.host_kv;
+    return true;
+}
+
+struct DsparkDraftCache {
+    int ctx_len = -1;       // allocated graph context width
+    int valid_ctx_len = -1; // valid columns in the last uploaded context
+    int block   = -1;
+    const void * drafter = nullptr;
+    ggml_backend_t backend = nullptr;
+    bool fixed_context = false;
+    bool context_kv_cache = false;
+    std::vector<uint8_t> arena;
+    ggml_context * ctx = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    ggml_cgraph * gf = nullptr;
     ggml_tensor * inp_noise = nullptr;
     ggml_tensor * inp_ctx = nullptr;
+    ggml_tensor * inp_ctx_kv = nullptr;
     ggml_tensor * pos_block = nullptr;
     ggml_tensor * neg_block = nullptr;
     ggml_tensor * pos_ctx = nullptr;
+    ggml_tensor * attn_mask = nullptr;
     ggml_tensor * out = nullptr;
     ggml_tensor * confidence_out = nullptr;
+    std::vector<float> padded_ctx;
+    std::vector<float> host_attn_mask;
     std::vector<std::pair<std::string, ggml_tensor *>> dbg_taps;
     // HC scales are immutable weights: read from the backend once.
     std::vector<std::array<float, 3>> s_attn, s_ffn;
@@ -7178,16 +8328,29 @@ void reset_deepseek4_dspark_runtime_cache() {
         cache.ctx = nullptr;
     }
     cache = DsparkDraftCache{};
+
+    DsparkContextKvProjector & projector = g_dspark_ctx_kv;
+    if (projector.alloc) {
+        ggml_gallocr_free(projector.alloc);
+        projector.alloc = nullptr;
+    }
+    if (projector.ctx) {
+        ggml_free(projector.ctx);
+        projector.ctx = nullptr;
+    }
+    projector = DsparkContextKvProjector{};
 }
 
-bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
+static bool deepseek4_dspark_draft_forward_impl(
+                                    ggml_backend_t backend,
                                     const DSparkDrafter & d,
                                     const float * noise_embed,
                                     const float * ctx_features,
                                     int ctx_len,
                                     int committed,
-                                    std::vector<float> & out_hidden,
-                                    std::vector<float> * confidence_hidden) {
+                                    std::vector<float> * out_hidden,
+                                    std::vector<float> * confidence_hidden,
+                                    bool upload_context) {
     const DeepSeek4Weights & w = d.core;
     const int n_embd  = w.n_embd;
     const int n_hc    = w.n_hc;
@@ -7196,9 +8359,37 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
     const int mix_dim = 2 * n_hc + n_hc * n_hc;
     const float hc_eps = w.hc_eps;
     if (ctx_len < 0) ctx_len = 0;
+    const int valid_ctx_len = ctx_len;
+    const bool context_kv_cache =
+        ds4_env_flag("DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE");
+    const bool fixed_context = context_kv_cache ||
+        ds4_env_flag("DFLASH_DS4_DRAFT_FIXED_CONTEXT");
+    const int graph_ctx_len = fixed_context
+        ? std::max(valid_ctx_len, w.n_swa)
+        : valid_ctx_len;
+
+    const std::vector<float> * cached_host_kv = nullptr;
+    if (context_kv_cache && upload_context &&
+        !dspark_update_context_kv_cache(
+            backend, d, ctx_features, valid_ctx_len, committed,
+            &cached_host_kv)) {
+        return false;
+    }
 
     DsparkDraftCache & C = g_dspark_draft_cache;
     const bool DS4_DBG = std::getenv("DFLASH_DS4_DSPARK_DEBUG") != nullptr;
+
+    // Context reuse is deliberately strict: never submit a graph with an
+    // uninitialized or differently-shaped context tensor.  The normal warm
+    // forward must have populated this exact cache first.
+    if (!upload_context &&
+        (!C.ctx || C.ctx_len != graph_ctx_len ||
+         C.valid_ctx_len != valid_ctx_len || C.block != block ||
+         C.fixed_context != fixed_context ||
+         C.context_kv_cache != context_kv_cache ||
+         C.drafter != (const void *) &d || C.backend != backend)) {
+        return false;
+    }
 
     if (C.drafter != (const void *) &d || C.backend != backend) {
         // HC scales (host) per layer + output — immutable, read once per drafter.
@@ -7213,7 +8404,9 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
         C.s_out = so[0];
     }
 
-    if (!C.ctx || C.ctx_len != ctx_len || C.block != block ||
+    if (!C.ctx || C.ctx_len != graph_ctx_len || C.block != block ||
+        C.fixed_context != fixed_context ||
+        C.context_kv_cache != context_kv_cache ||
         C.drafter != (const void *) &d || C.backend != backend) {
         // ── (Re)build the graph ─────────────────────────────────────────
         if (C.backend != backend && C.alloc) {
@@ -7243,18 +8436,35 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
         // Inputs.
         C.inp_noise = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, block);
         ggml_set_input(C.inp_noise);
-        C.inp_ctx = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, fc_in, ctx_len > 0 ? ctx_len : 1);
-        ggml_set_input(C.inp_ctx);
+        C.inp_ctx = nullptr;
+        C.inp_ctx_kv = nullptr;
+        if (context_kv_cache) {
+            C.inp_ctx_kv = ggml_new_tensor_3d(
+                ctx, GGML_TYPE_F32, w.head_dim,
+                graph_ctx_len > 0 ? graph_ctx_len : 1, w.n_layer);
+            ggml_set_input(C.inp_ctx_kv);
+        } else {
+            C.inp_ctx = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, fc_in,
+                                           graph_ctx_len > 0 ? graph_ctx_len : 1);
+            ggml_set_input(C.inp_ctx);
+        }
         C.pos_block = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, block);
         ggml_set_input(C.pos_block);
         C.neg_block = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, block);
         ggml_set_input(C.neg_block);
-        C.pos_ctx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ctx_len > 0 ? ctx_len : 1);
-        ggml_set_input(C.pos_ctx);
+        C.pos_ctx = nullptr;
+        if (!context_kv_cache) {
+            C.pos_ctx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,
+                                           graph_ctx_len > 0 ? graph_ctx_len : 1);
+            ggml_set_input(C.pos_ctx);
+        }
+        C.attn_mask = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_F32, graph_ctx_len + block);
+        ggml_set_input(C.attn_mask);
 
         // main_x = main_norm(main_proj(ctx_features)).  Shared across layers.
         ggml_tensor * main_x = nullptr;
-        if (ctx_len > 0) {
+        if (graph_ctx_len > 0 && !context_kv_cache) {
             // Captured target features have large magnitude (rms ~1e3 — HC streams
             // accumulate over 40+ layers). main_proj is rocmfp4-quantized and its
             // activation quantization overflows on inputs that big -> NaN. Since
@@ -7299,8 +8509,19 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
             ggml_tensor * attn_in = work_cols[0];
             for (int p = 1; p < block; p++) attn_in = ggml_concat(ctx, attn_in, work_cols[p], 1);
             ggml_tensor * attn_normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
-            ggml_tensor * attn_out = build_dspark_attention(ctx, attn_normed, main_x, w, L,
-                                                            ctx_len, C.pos_block, C.neg_block, C.pos_ctx);
+            ggml_tensor * layer_ctx_kv = nullptr;
+            if (context_kv_cache && graph_ctx_len > 0) {
+                layer_ctx_kv = ggml_view_2d(
+                    ctx, C.inp_ctx_kv, w.head_dim, graph_ctx_len,
+                    C.inp_ctx_kv->nb[1],
+                    (size_t) il * C.inp_ctx_kv->nb[2]);
+            }
+            ggml_tensor * attn_out = build_dspark_attention(
+                                                            ctx, attn_normed, main_x,
+                                                            layer_ctx_kv, w, L,
+                                                            graph_ctx_len, C.pos_block,
+                                                            C.neg_block, C.pos_ctx,
+                                                            C.attn_mask);
             dbg_tap(std::string("attn_L") + std::to_string(il), attn_out);
             // ── HC post (attention), per block position ─────────────────
             ggml_tensor * hc_next = nullptr;
@@ -7376,33 +8597,118 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
             ggml_free(C.ctx); C.ctx = nullptr; C.gf = nullptr;
             return false;
         }
-        C.ctx_len = ctx_len;
+        if (ds4_env_flag("DFLASH_DS4_DRAFT_GRAPH_STATS")) {
+            std::fprintf(stderr,
+                "[ds4-draft-graph] ctx=%d valid=%d nodes=%d scratch=%.2f MiB\n",
+                graph_ctx_len, valid_ctx_len, ggml_graph_n_nodes(gf),
+                (double) ggml_gallocr_get_buffer_size(C.alloc, 0) /
+                    (1024.0 * 1024.0));
+        }
+        C.ctx_len = graph_ctx_len;
+        C.valid_ctx_len = -1;
         C.block   = block;
+        C.fixed_context = fixed_context;
+        C.context_kv_cache = context_kv_cache;
         C.drafter = (const void *) &d;
         C.backend = backend;
     }
 
     // ── Set inputs + compute (cached graph) ─────────────────────────────
     ggml_backend_tensor_set(C.inp_noise, noise_embed, 0, sizeof(float) * (size_t) n_embd * block);
-    if (ctx_len > 0) {
-        ggml_backend_tensor_set(C.inp_ctx, ctx_features, 0, sizeof(float) * (size_t) fc_in * ctx_len);
-        std::vector<int32_t> pc(ctx_len);
-        for (int i = 0; i < ctx_len; i++) pc[i] = committed - ctx_len + i;
-        ggml_backend_tensor_set(C.pos_ctx, pc.data(), 0, sizeof(int32_t) * ctx_len);
+    if (upload_context) {
+        if (graph_ctx_len > 0) {
+            if (context_kv_cache) {
+                if (!cached_host_kv) return false;
+                const int head_dim = w.head_dim;
+                const int source_stride = w.n_swa * head_dim;
+                const float * upload = cached_host_kv->data();
+                if (valid_ctx_len < graph_ctx_len || graph_ctx_len != w.n_swa) {
+                    C.padded_ctx.assign(
+                        (size_t) w.n_layer * graph_ctx_len * head_dim, 0.0f);
+                    for (int il = 0; il < w.n_layer; ++il) {
+                        std::memcpy(
+                            C.padded_ctx.data() +
+                                ((size_t) il * graph_ctx_len +
+                                 (graph_ctx_len - valid_ctx_len)) * head_dim,
+                            cached_host_kv->data() +
+                                (size_t) il * source_stride,
+                            sizeof(float) * (size_t) valid_ctx_len * head_dim);
+                    }
+                    upload = C.padded_ctx.data();
+                }
+                ggml_backend_tensor_set(
+                    C.inp_ctx_kv, upload, 0,
+                    sizeof(float) * (size_t) w.n_layer *
+                        graph_ctx_len * head_dim);
+            } else {
+                const float * upload = ctx_features;
+                if (valid_ctx_len < graph_ctx_len) {
+                    C.padded_ctx.assign((size_t) fc_in * graph_ctx_len, 0.0f);
+                    if (valid_ctx_len > 0 && ctx_features) {
+                        std::memcpy(
+                            C.padded_ctx.data() +
+                                (size_t)(graph_ctx_len - valid_ctx_len) * fc_in,
+                            ctx_features,
+                            sizeof(float) * (size_t) fc_in * valid_ctx_len);
+                    }
+                    upload = C.padded_ctx.data();
+                }
+                if (!upload) return false;
+                ggml_backend_tensor_set(
+                    C.inp_ctx, upload, 0,
+                    sizeof(float) * (size_t) fc_in * graph_ctx_len);
+                std::vector<int32_t> pc(graph_ctx_len);
+                for (int i = 0; i < graph_ctx_len; i++) {
+                    pc[i] = committed - graph_ctx_len + i;
+                }
+                ggml_backend_tensor_set(
+                    C.pos_ctx, pc.data(), 0,
+                    sizeof(int32_t) * graph_ctx_len);
+            }
+        }
+        C.host_attn_mask.assign((size_t) graph_ctx_len + block, 0.0f);
+        const int n_pad = graph_ctx_len - valid_ctx_len;
+        for (int i = 0; i < n_pad; ++i) {
+            C.host_attn_mask[(size_t)i] =
+                -std::numeric_limits<float>::infinity();
+        }
+        ggml_backend_tensor_set(
+            C.attn_mask, C.host_attn_mask.data(), 0,
+            sizeof(float) * C.host_attn_mask.size());
+        C.valid_ctx_len = valid_ctx_len;
     }
     std::vector<int32_t> pb(block), nb(block);
     for (int i = 0; i < block; i++) { pb[i] = committed + i; nb[i] = -(committed + i); }
     ggml_backend_tensor_set(C.pos_block, pb.data(), 0, sizeof(int32_t) * block);
     ggml_backend_tensor_set(C.neg_block, nb.data(), 0, sizeof(int32_t) * block);
 
-    const ggml_status st = ggml_backend_graph_compute(backend, C.gf);
+    // This cache owns a single immutable graph: topology, tensor addresses,
+    // and shapes remain fixed until the cache is explicitly rebuilt above.
+    // ggml's conservative property scan sees backend-populated tensor metadata
+    // change and repeatedly drops otherwise valid HIP-graph replay.  Once the
+    // backend has captured the warm graph, bypass that scan for this call only.
+    // The backend still performs its normal warmup/capture before the bypass
+    // can take effect.  Keep this opt-in until exact output and replay stats
+    // have both been qualified on the deployment GPUs.
+    const bool force_graph_replay =
+        ds4_env_flag("DFLASH_DS4_DRAFT_FORCE_GRAPH_REPLAY");
+    ScopedCudaGraphOverrides graph_replay_scope(
+        /*disable_graphs=*/false,
+        /*mmvq_max_ncols=*/0,
+        /*skip_property_check=*/force_graph_replay);
+    const ggml_status st = out_hidden
+        ? ggml_backend_graph_compute(backend, C.gf)
+        : ggml_backend_graph_compute_async(backend, C.gf);
     if (st != GGML_STATUS_SUCCESS) {
         // Invalidate: a failed compute leaves no reusable state guarantees.
         ggml_free(C.ctx); C.ctx = nullptr; C.gf = nullptr; C.ctx_len = -1;
         return false;
     }
-    out_hidden.resize((size_t) n_embd * block);
-    ggml_backend_tensor_get(C.out, out_hidden.data(), 0, sizeof(float) * out_hidden.size());
+    if (!out_hidden) return true;
+
+    out_hidden->resize((size_t) n_embd * block);
+    ggml_backend_tensor_get(
+        C.out, out_hidden->data(), 0, sizeof(float) * out_hidden->size());
     if (confidence_hidden) {
         confidence_hidden->resize((size_t) n_embd * block);
         ggml_backend_tensor_get(C.confidence_out, confidence_hidden->data(), 0,
@@ -7425,6 +8731,70 @@ bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
     }
 
     return true;
+}
+
+bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
+                                    const DSparkDrafter & d,
+                                    const float * noise_embed,
+                                    const float * ctx_features,
+                                    int ctx_len,
+                                    int committed,
+                                    std::vector<float> & out_hidden,
+                                    std::vector<float> * confidence_hidden) {
+    return deepseek4_dspark_draft_forward_impl(
+        backend, d, noise_embed, ctx_features, ctx_len, committed,
+        &out_hidden, confidence_hidden, true);
+}
+
+bool deepseek4_dspark_draft_forward_async(ggml_backend_t backend,
+                                          const DSparkDrafter & d,
+                                          const float * noise_embed,
+                                          const float * ctx_features,
+                                          int ctx_len,
+                                          int committed) {
+    return deepseek4_dspark_draft_forward_impl(
+        backend, d, noise_embed, ctx_features, ctx_len, committed,
+        nullptr, nullptr, true);
+}
+
+bool deepseek4_dspark_draft_forward_async_reuse_context(
+                                          ggml_backend_t backend,
+                                          const DSparkDrafter & d,
+                                          const float * noise_embed,
+                                          int ctx_len,
+                                          int committed) {
+    return deepseek4_dspark_draft_forward_impl(
+        backend, d, noise_embed, nullptr, ctx_len, committed,
+        nullptr, nullptr, false);
+}
+
+bool deepseek4_dspark_draft_read_async_output(
+                                          ggml_backend_t backend,
+                                          std::vector<float> & out_hidden,
+                                          std::vector<float> * confidence_hidden) {
+    DsparkDraftCache & C = g_dspark_draft_cache;
+    if (!backend || backend != C.backend || !C.ctx || !C.out ||
+        (confidence_hidden && !C.confidence_out) ||
+        C.block <= 0 || !C.drafter) {
+        return false;
+    }
+    const DSparkDrafter * d =
+        static_cast<const DSparkDrafter *>(C.drafter);
+    const size_t count = (size_t) d->core.n_embd * (size_t) C.block;
+    out_hidden.resize(count);
+    ggml_backend_tensor_get(
+        C.out, out_hidden.data(), 0, sizeof(float) * count);
+    if (confidence_hidden) {
+        confidence_hidden->resize(count);
+        ggml_backend_tensor_get(
+            C.confidence_out, confidence_hidden->data(), 0,
+            sizeof(float) * count);
+    }
+    return true;
+}
+
+void deepseek4_dspark_draft_wait(ggml_backend_t backend) {
+    ggml_backend_synchronize(backend);
 }
 
 }  // namespace dflash::common

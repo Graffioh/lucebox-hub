@@ -322,10 +322,15 @@ void ggml_cuda_op_ds4_indexer_score(
     GGML_ASSERT(dst->ne[0] == n_comp && dst->ne[1] == n_tokens);
 
     cudaStream_t stream = ctx.stream();
-    const int warp_size =
-        ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int device = ggml_cuda_get_device();
+    const auto & device_info = ggml_cuda_info().devices[device];
+    const int warp_size = device_info.warp_size;
+    const bool wmma_capable =
+        warp_size == 32 &&
+        (!GGML_CUDA_CC_IS_NVIDIA(device_info.cc) ||
+         device_info.cc >= GGML_CUDA_CC_VOLTA);
 #if DS4_INDEXER_WMMA_AVAILABLE
-    if (warp_size == 32) {
+    if (wmma_capable) {
         const dim3 grid((unsigned) ((n_comp + 127) / 128),
                         (unsigned) ((n_tokens + 15) / 16), 1);
         ds4_indexer_score_wmma_kernel<<<grid, 256, 0, stream>>>(
@@ -337,6 +342,7 @@ void ggml_cuda_op_ds4_indexer_score(
     } else
 #endif
     {
+        (void) wmma_capable;
         const dim3 grid((unsigned) n_comp, (unsigned) n_tokens, 1);
         ds4_indexer_score_scalar_kernel<<<grid, 256, 0, stream>>>(
             static_cast<float *>(dst->data),

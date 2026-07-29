@@ -11,3 +11,17 @@ This directory contains the ggml-only subset used by Lucebox Hub.
 - Vendored paths: `LICENSE`, `common/jinja`, `common/log.h`, `common/unicode.*`, `ggml`, `gguf-py`
 
 Open ggml feature PRs are intentionally not included until they are merged, except for explicitly listed hub test PRs.
+
+## Hub-local heterogeneous execution patches
+
+PR `Luce-Org/lucebox#505` carries a temporary, reviewable patch set on top of
+the snapshot above for AMD heterogeneous MoE execution:
+
+- scheduler support for late cross-backend joins and deferred peer copies;
+- ROCmFP quantized MMVQ/MMID kernels and grouped expert execution;
+- fused MoE owner/combine operations and DeepSeek V4 HC/indexer kernels; and
+- thread-local CUDA/HIP graph policy overrides used by fixed-topology graphs.
+
+These changes are limited to `ggml/`. Keep their public declarations in
+`ggml/include`, avoid DeepSeek-specific policy in generic kernels, and update
+this provenance when the patch set is moved to `lucebox-ggml`.

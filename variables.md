@@ -207,6 +207,9 @@ Untagged variables are operational tuning knobs.
 |---|---|
 | `DFLASH_DS4_TIMING` | 🐛 **debug** DS4 timing instrumentation. |
 | `DFLASH_DS4_CUDA_LAYERS` | Number of DS4 layers on CUDA. |
+| `DFLASH_DS4_SPEC` / `DFLASH_DS4_DRAFT` / `DFLASH_DS4_DRAFT_GPU` | Enable the local DSpark drafter, select its GGUF, and choose its HIP device. |
+| `DFLASH_DS4_MOE_TP` / `DFLASH_DS4_MOE_TP_INPROC` / `DFLASH_DS4_MOE_TP_GPU` | Burn-in controls for in-process route-owner expert parallelism and the cold-owner HIP device. |
+| `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer expert routing profile for hot placement. |
 | `DFLASH_MOE_COLD_BACKEND` | Cold-expert compute backend. |
 | `DFLASH_NO_PREAD` | Disable pread-based weight loading. |
 
@@ -214,6 +217,10 @@ Untagged variables are operational tuning knobs.
 
 | Variable | Purpose |
 |---|---|
+| `DFLASH_MOE_HYBRID_PREFILL_EAGER` / `DFLASH_MOE_PREFILL_TRACE` | Model-neutral heterogeneous prefill policy and tracing. The legacy `DFLASH_DS4_*` spellings remain aliases. |
+| `DFLASH_MOE_TP_GROUPED_MMVQ` / `DFLASH_MOE_TP_FUSED_GATE_UP` | Model-neutral grouped and fused routed-FFN kernel qualification switches. The legacy `DFLASH_DS4_*` spellings remain aliases. |
+| `DFLASH_MOE_TP_COARSE_OWNER` / `DFLASH_MOE_TP_COARSE_OWNER_SPLIT` | Model-neutral owner-op lowering switches. The legacy `DFLASH_DS4_*` spellings remain aliases. |
+| `DFLASH_MOE_TP_DEVICE_JOIN` / `DFLASH_MOE_TP_ROUTE_PREFORK` | Model-neutral cross-owner scheduling switches. The legacy `DFLASH_DS4_*` spellings remain aliases. |
 | `DFLASH_MOE_EXPERT_COMPUTE_THREADS` / `DFLASH_COLD_THREADS` | CPU threads for expert compute. |
 | `DFLASH_MOE_EXPERT_COMPUTE_BATCH` / `DFLASH_MOE_EXPERT_COMPUTE_BATCH_MAX` | Expert compute batch sizing. |
 | `DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE` | Expert-compute IPC mode. |
@@ -225,6 +232,7 @@ Untagged variables are operational tuning knobs.
 | `DFLASH_MOE_EXPERT_COMPUTE_IPC_BIN` / `DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU` / `DFLASH_MOE_EXPERT_COMPUTE_IPC_WORK_DIR` / `DFLASH_MOE_EXPERT_COMPUTE_IPC_REQUIRED` | IPC daemon binary / GPU / work dir / required flag. |
 | `DFLASH_MOE_FIXED_SLOT_GRAPHS` / `DFLASH_MOE_FIXED_SLOT_MAX` | Fixed-slot MoE graph controls. |
 | `DFLASH_MOE_PREFILL_HOT_SUB_BATCH` | Hot-expert prefill sub-batch. |
+| `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Kill switch for persistent long-prefill route and owner arenas. |
 | `DFLASH_NO_MOE_ROUTER_FUSE` / `DFLASH_NO_MOE_SWIGLU_FUSE` | Disable router / SwiGLU fusion. |
 | `DFLASH_EXPERT_BUDGET_MB` / `DFLASH_EXPERT_BUDGET_PCT` | Expert VRAM budget (absolute / percent). |
 | `DFLASH_DROP_COLD` | Drop cold experts. |
@@ -243,6 +251,8 @@ Untagged variables are operational tuning knobs.
 |---|---|
 | `DFLASH_MMID_GROUPED` | Grouped `MUL_MAT_ID` kernel for small verify batches. |
 | `DFLASH_MMID_GROUPED_TYPES` | Types eligible for the grouped MMID kernel. |
+| `DFLASH_MMID_GROUPED_DEVICE` | Optional device restriction for the grouped MMID kernel. |
+| `GGML_CUDA_BATCH_PEER_COPIES` | Batch ordered CUDA/HIP peer copies behind one dependency per source/destination pair. |
 | `DFLASH_MMQ_FULL_BATCH_MIN` / `DFLASH_MMQ_SUB_BATCH` | MMQ batch thresholds. |
 | `DFLASH_CUDA_MMVQ_TOKENWISE` / `DFLASH_CUDA_MMVQ_MOE_TOKENWISE` / `DFLASH_CUDA_MMVQ_MOE_KERNEL` | MMVQ token-wise / MoE kernel selection. |
 | `DFLASH_GDN_FORCE_GROUPED_COLS` / `DFLASH_GDN_NO_GROUPED_COLS` | Gated-delta-net grouped-column control. |
