@@ -35,12 +35,17 @@ enum class StreamMode { REASONING, CONTENT, TOOL_BUFFER };
 // response shape (OpenAI Chat Completions, Anthropic Messages, OpenAI
 // Responses). See docs/specs/thinking-budget.md §6.3.
 //
-// `prefill_s` and `decode_s` come straight from GenerateResult; the bench
-// & client side compute `decode_tokens_per_sec = completion_tokens /
-// decode_s` (server emits it pre-computed to avoid drift).
+// `prefill_s` and `decode_s` come straight from GenerateResult. Cache fields
+// describe the effective prompt seen by the backend, after any FlowKV/PFlash
+// rewrite, so benchmarks can distinguish a real prefix restore from a merely
+// fast cold prefill.
 struct GenTimings {
-    double prefill_s = 0.0;
-    double decode_s  = 0.0;
+    double prefill_s            = 0.0;
+    double decode_s             = 0.0;
+    bool   cache_hit            = false;
+    int    cached_prefix_tokens = 0;
+    int    prefilled_tokens     = 0;
+    int    effective_prompt_tokens = 0;
 };
 
 // Build the `timings` sub-object emitted under `usage`.
@@ -49,6 +54,10 @@ struct GenTimings {
 //   decode_tokens_per_sec   = completion_tokens / decode_s (0.0 when
 //                              decode_s == 0 to avoid div-by-zero on
 //                              prefill-only / count_tokens responses)
+//   cache_hit               = whether a prefix snapshot was restored
+//   cached_prefix_tokens    = effective-prompt tokens supplied by that snapshot
+//   prefilled_tokens        = effective-prompt tokens computed for this request
+//   effective_prompt_tokens = total prompt tokens seen by the backend
 nlohmann::json build_timings_json(const GenTimings & t, int completion_tokens);
 
 // Manages SSE streaming for a single request.
@@ -177,7 +186,9 @@ private:
     // Responses API IDs
     std::string  msg_item_id_;
 
-    static constexpr size_t BASE_HOLDBACK = 12;  // max(len("<tool_call>"), len("</think>"), len("<think>"))
+    // Longest tool/reasoning opener minus one, retained so an opener split
+    // across streamed tokens is still recognized on the next token.
+    static constexpr size_t BASE_HOLDBACK = 15;  // len("<parameter name=") - 1
 };
 
 }  // namespace dflash::common

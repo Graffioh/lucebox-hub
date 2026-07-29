@@ -1,6 +1,7 @@
 // Backend factory implementation.
 
 #include "backend_factory.h"
+#include "feature_gate.h"
 #include "gguf_inspect.h"
 
 #include "qwen35_backend.h"
@@ -17,41 +18,209 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <type_traits>
 
 namespace dflash::common {
+
+namespace {
+
+// ─── Capability table ↔ dispatch cross-check ────────────────────────────
+// Every option an architecture can receive arrives through a named field on
+// its backend config struct. Detecting whether that field exists lets the
+// compiler verify model_capabilities.h against the structs this file feeds:
+// a row claiming support an architecture has nowhere to store, or a config
+// carrying a field the table calls unsupported, fails the build here.
+//
+// This is the strongest check the language allows. It cannot see whether the
+// dispatch below actually *assigns* a field it has — that is what the unit
+// tests and the table's dispatch-matching row order are for.
+
+#define DFLASH_ARCH_FIELD_TRAIT(trait_name, field_name)                  \
+    template <class T, class = void>                                     \
+    struct trait_name : std::false_type {};                              \
+    template <class T>                                                   \
+    struct trait_name<T, std::void_t<decltype(T::field_name)>>           \
+        : std::true_type {}
+
+DFLASH_ARCH_FIELD_TRAIT(has_draft_path,        draft_path);
+DFLASH_ARCH_FIELD_TRAIT(has_fa_window,         fa_window);
+DFLASH_ARCH_FIELD_TRAIT(has_verify_width,      verify_width);
+DFLASH_ARCH_FIELD_TRAIT(has_draft_swa,         draft_swa_window);
+DFLASH_ARCH_FIELD_TRAIT(has_ddtree_mode,       ddtree_mode);
+DFLASH_ARCH_FIELD_TRAIT(has_max_verify_tokens, max_verify_tokens);
+
+#undef DFLASH_ARCH_FIELD_TRAIT
+
+// DDTree reaches qwen35's layer-split path as a max_verify_tokens budget
+// rather than a ddtree_mode flag, so either field counts as a carrier.
+template <class T>
+struct has_ddtree : std::bool_constant<has_ddtree_mode<T>::value ||
+                                       has_max_verify_tokens<T>::value> {};
+
+// Architectures with no layer-split adapter. Pairing one of these with the
+// split half of a check requires the row to be Monolithic or Never, which
+// table_split_coherent() already guarantees.
+struct NoLayerSplitConfig {};
+
+constexpr bool monolithic_carries(FeatureSupport support) {
+    return support != FeatureSupport::Never;
+}
+constexpr bool layer_split_carries(FeatureSupport support) {
+    return support == FeatureSupport::Both;
+}
+
+#define DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, trait, field)        \
+    static_assert(                                                            \
+        trait<Mono>::value ==                                                 \
+            monolithic_carries(arch_capabilities(arch_name).field),           \
+        arch_name ": monolithic config and capability table disagree on "     \
+        #field);                                                              \
+    static_assert(                                                            \
+        trait<Split>::value ==                                                \
+            layer_split_carries(arch_capabilities(arch_name).field),          \
+        arch_name ": layer-split config and capability table disagree on "    \
+        #field)
+
+#define DFLASH_CHECK_ARCH(arch_name, Mono, Split)                             \
+    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_draft_path,   decode_draft); \
+    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_ddtree,       ddtree);       \
+    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_verify_width, verify_width); \
+    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_fa_window,    fa_window);    \
+    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_draft_swa,    draft_swa)
+
+DFLASH_CHECK_ARCH("qwen35",    Qwen35Config,          Qwen35LayerSplitAdapterConfig);
+DFLASH_CHECK_ARCH("qwen35moe", Qwen35Config,          NoLayerSplitConfig);
+DFLASH_CHECK_ARCH("laguna",    LagunaBackendArgs,     LagunaLayerSplitAdapterConfig);
+DFLASH_CHECK_ARCH("qwen3",     Qwen3BackendConfig,    NoLayerSplitConfig);
+DFLASH_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfig);
+DFLASH_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
+
+#undef DFLASH_CHECK_ARCH
+#undef DFLASH_CHECK_ARCH_OPTION
+
+PlacementBackend resolve_target_backend(
+    const BackendArgs & args,
+    PlacementBackend compiled_backend) {
+    return args.device.backend == PlacementBackend::Auto
+        ? compiled_backend
+        : args.device.backend;
+}
+
+}  // namespace
 
 std::string detect_arch(const char * model_path) {
     auto info = inspect_gguf_model_info(model_path);
     return info.arch;
 }
 
-bool arch_supports_remote_draft(const std::string & arch) {
-    return arch == "qwen35";
-}
+BackendPreparation prepare_backend(
+    const BackendArgs & args,
+    const BackendFeatureConfig & features) {
+    BackendPreparation preparation;
+    if (!args.model_path) {
+        preparation.error = BackendPreparationError::InvalidRequest;
+        preparation.message = "model_path is null";
+        return preparation;
+    }
 
-bool arch_supports_pflash_compression(const std::string & arch) {
-    return arch == "qwen35" || arch == "qwen3";
+    preparation.plan.model_path_ = args.model_path;
+    preparation.plan.features_ = features;
+    preparation.plan.compiled_backend_ = compiled_placement_backend();
+    preparation.plan.target_backend_ = resolve_target_backend(
+        args, preparation.plan.compiled_backend_);
+    preparation.plan.model_ = inspect_gguf_model_info(args.model_path);
+
+    if (preparation.plan.arch().empty()) {
+        preparation.error = BackendPreparationError::ModelInspection;
+        preparation.message =
+            "failed to detect architecture from " +
+            preparation.plan.model_path();
+        return preparation;
+    }
+
+    // A model this binary cannot construct is a property of the model, not of
+    // the requested feature set — same category (and same exit status) as an
+    // unreadable GGUF. Checking it here means the arch-dependent rules below
+    // only ever run against an architecture the capability table describes.
+    if (!arch_is_supported(preparation.plan.arch())) {
+        preparation.error = BackendPreparationError::ModelInspection;
+        preparation.message =
+            "unsupported model architecture '" + preparation.plan.arch() +
+            "' in " + preparation.plan.model_path();
+        return preparation;
+    }
+
+    preparation.message = check_feature_compatibility(
+        args,
+        preparation.plan.features(),
+        preparation.plan.arch(),
+        preparation.plan.target_backend(),
+        preparation.plan.compiled_backend());
+    if (!preparation.message.empty()) {
+        preparation.error = BackendPreparationError::FeatureCompatibility;
+        return preparation;
+    }
+
+    preparation.warnings = collect_feature_warnings(
+        args, preparation.plan.features(), preparation.plan.arch());
+    return preparation;
 }
 
 std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
+    const BackendPreparation preparation = prepare_backend(args);
+    if (!preparation.ok()) {
+        std::fprintf(stderr, "[backend_factory] %s\n",
+                     preparation.message.c_str());
+        return nullptr;
+    }
+    for (const std::string & warning : preparation.warnings) {
+        std::fprintf(stderr, "[backend_factory] warning: %s\n",
+                     warning.c_str());
+    }
+    return create_backend(args, preparation.plan);
+}
+
+std::unique_ptr<ModelBackend> create_backend(
+    const BackendArgs & args,
+    const ResolvedBackendPlan & plan) {
     if (!args.model_path) {
         std::fprintf(stderr, "[backend_factory] model_path is null\n");
         return nullptr;
     }
+    if (plan.model_path() != args.model_path) {
+        std::fprintf(stderr,
+            "[backend_factory] resolved plan does not match model_path %s\n",
+            args.model_path);
+        return nullptr;
+    }
+    if (plan.compiled_backend() != compiled_placement_backend() ||
+        plan.target_backend() !=
+            resolve_target_backend(args, plan.compiled_backend())) {
+        std::fprintf(stderr,
+            "[backend_factory] resolved plan does not match target placement\n");
+        return nullptr;
+    }
 
-    const std::string arch = detect_arch(args.model_path);
+    const std::string & arch = plan.arch();
     if (arch.empty()) {
-        std::fprintf(stderr, "[backend_factory] failed to detect architecture from %s\n",
-                     args.model_path);
+        std::fprintf(stderr,
+            "[backend_factory] failed to detect architecture from %s\n",
+            args.model_path);
         return nullptr;
     }
 
     std::fprintf(stderr, "[backend_factory] detected arch=%s\n", arch.c_str());
 
-    if (args.ds4_prefill_mode_set && arch != "deepseek4") {
-        std::fprintf(stderr,
-            "[backend_factory] --ds4-prefill is only valid for deepseek4 models "
-            "(detected %s)\n", arch.c_str());
+    // Recheck at the construction boundary in case raw arguments changed
+    // after preparation. No entry point can dispatch an incoherent request.
+    const std::string incompatible = check_feature_compatibility(
+        args,
+        plan.features(),
+        arch,
+        plan.target_backend(),
+        plan.compiled_backend());
+    if (!incompatible.empty()) {
+        std::fprintf(stderr, "[backend_factory] %s\n", incompatible.c_str());
         return nullptr;
     }
 
@@ -213,6 +382,10 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         gcfg.device        = args.device;
         gcfg.stream_fd     = args.stream_fd;
         gcfg.chunk         = args.chunk;
+        // Gemma4Backend reads this into its cache (gemma4_backend.cpp) exactly
+        // as the layer-split adapter does; leaving it unset silently dropped
+        // --fa-window on single-device gemma4.
+        gcfg.fa_window     = args.fa_window;
 
         auto backend = std::make_unique<Gemma4Backend>(gcfg);
         if (!backend->init()) {
@@ -222,27 +395,13 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         return backend;
 
     } else if (arch == "deepseek4") {
-        const PlacementBackend target_backend =
-            args.device.backend == PlacementBackend::Auto
-                ? compiled_placement_backend()
-                : args.device.backend;
-        if (prefill_attention_mode_is_approximate(args.ds4_prefill_mode) &&
-            (target_backend != PlacementBackend::Hip ||
-             args.device.is_layer_split() ||
-             args.remote_target_shard.enabled())) {
-            std::fprintf(stderr,
-                "[backend_factory] DS4 %s prefill requires a single local HIP "
-                "target; use --ds4-prefill exact for split, remote, or CUDA "
-                "placement\n",
-                prefill_attention_mode_name(args.ds4_prefill_mode));
-            return nullptr;
-        }
+        // Approximate prefill and the fused decode options are gated against
+        // non-monolithic-HIP placement in check_feature_compatibility().
 
-        // HIP single-device launches cannot rely on the CUDA/Halo auto-split
-        // path; use the single-backend loader, which can fall back to hybrid
-        // expert placement when a full monolithic load does not fit.
-        if (target_backend == PlacementBackend::Hip &&
-            !args.device.is_layer_split() &&
+        // A single local device uses the monolithic backend. Reserve the
+        // layer-split adapter for explicit multi-device placement or remote
+        // target shards.
+        if (!args.device.is_layer_split() &&
             !args.remote_target_shard.enabled()) {
             DeepSeek4BackendConfig cfg;
             cfg.model_path = args.model_path;
@@ -262,8 +421,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
             return backend;
         }
 
-        // CUDA builds keep the layer-split backend so they can auto-split
-        // across CUDA and remote HIP target shards.
+        // Explicit local splits and CUDA/HIP remote splits use the adapter.
         DeepSeek4LayerSplitAdapterConfig cfg;
         cfg.target_path        = args.model_path;
         cfg.device             = args.device;
