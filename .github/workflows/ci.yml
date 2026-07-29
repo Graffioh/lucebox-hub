@@ -331,12 +331,17 @@ jobs:
             -DDFLASH27B_FA_ALL_QUANTS=OFF ^
             -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe"
 
-      - name: Build dflash_common
+      - name: Build Windows targets
         working-directory: server
         shell: cmd
-        run: cmake --build build --target dflash_common -j 4
+        run: cmake --build build --target dflash_common dflash_server backend_ipc_daemon test_platform_compat -j 4
 
-      - name: Verify library output
+      - name: Run Windows platform smoke test
+        working-directory: server
+        shell: cmd
+        run: ctest --test-dir build -R "^platform_compat$" --output-on-failure
+
+      - name: Verify build outputs
         shell: pwsh
         run: |
           $lib = Get-ChildItem server/build -Recurse -Filter "dflash_common.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -346,3 +351,12 @@ jobs:
           }
           Write-Host "Built: $($lib.FullName)"
           Write-Host "Size: $([math]::Round($lib.Length / 1MB, 2)) MB"
+
+          foreach ($binaryName in @("dflash_server.exe", "backend_ipc_daemon.exe")) {
+            $binary = Get-ChildItem server/build -Recurse -Filter $binaryName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $binary) {
+              Write-Error "$binaryName not found in build output"
+              exit 1
+            }
+            Write-Host "Built: $($binary.FullName)"
+          }

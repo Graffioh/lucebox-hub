@@ -51,12 +51,11 @@ typedef long ssize_t;
 #define SHUT_RDWR      SD_BOTH
 #define socklen_t      int
 #define poll(fds,nfds,timeout)  WSAPoll(fds,nfds,timeout)
-#define SOCK_FD(fd)    ((SOCKET)(fd))
 // Replace fcntl(F_GETFL) / fcntl(F_SETFL, O_NONBLOCK) with ioctlsocket
-static inline int sock_get_flags(int fd) { (void)fd; return 0; /* stub */ }
-static inline void sock_set_nonblock(int fd) { u_long m = 1; ioctlsocket(SOCK_FD(fd), FIONBIO, &m); }
-static inline void sock_set_block(int fd) { u_long m = 0; ioctlsocket(SOCK_FD(fd), FIONBIO, &m); }
-static inline void socket_close(int fd) { closesocket(SOCK_FD(fd)); }
+static inline int sock_get_flags(SocketHandle fd) { (void)fd; return 0; /* stub */ }
+static inline void sock_set_nonblock(SocketHandle fd) { u_long m = 1; ioctlsocket(fd, FIONBIO, &m); }
+static inline void sock_set_block(SocketHandle fd) { u_long m = 0; ioctlsocket(fd, FIONBIO, &m); }
+static inline void socket_close(SocketHandle fd) { closesocket(fd); }
 #define SETSOCKOPT_CAST (const char *)
 static inline const char* sock_strerror() {
     static thread_local char buf[64];
@@ -70,11 +69,10 @@ static inline bool sock_is_eagain(int e) { return e == WSAEWOULDBLOCK; }
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
-#define SOCK_FD(fd)    (fd)
-static inline int sock_get_flags(int fd) { return fcntl(fd, F_GETFL, 0); }
-static inline void sock_set_nonblock(int fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK); }
-static inline void sock_set_block(int fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f & ~O_NONBLOCK); }
-static inline void socket_close(int fd) { ::close(fd); }
+static inline int sock_get_flags(SocketHandle fd) { return fcntl(fd, F_GETFL, 0); }
+static inline void sock_set_nonblock(SocketHandle fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f | O_NONBLOCK); }
+static inline void sock_set_block(SocketHandle fd) { int f = fcntl(fd, F_GETFL, 0); if (f >= 0) fcntl(fd, F_SETFL, f & ~O_NONBLOCK); }
+static inline void socket_close(SocketHandle fd) { ::close(fd); }
 #define SETSOCKOPT_CAST  /* empty on POSIX */
 #include <unistd.h>
 static inline const char* sock_strerror() { return strerror(errno); }
@@ -137,7 +135,7 @@ static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
 #ifdef DFLASH_HAS_CURL
 
 struct CurlWriteCtx {
-    int client_fd;
+    SocketHandle client_fd;
     bool streaming;
     bool first_chunk;
     bool chat_rewrite;   // rewrite completions → chat format
@@ -244,7 +242,7 @@ static json rewrite_completions_to_chat(const json & comp_resp) {
     return chat_resp;
 }
 
-static bool curl_forward(int client_fd, const std::string & url,
+static bool curl_forward(SocketHandle client_fd, const std::string & url,
                          const std::string & api_key, const json & body,
                          bool streaming, bool rewrite_to_chat,
                          const std::string & response_id,
@@ -1009,7 +1007,7 @@ std::string HttpServer::resolve_status_html() {
 
 // Send data to an SSE client fd with a short (1s) timeout to avoid stalling
 // the inference worker. Returns false if the send fails or times out.
-static bool sse_try_send(int fd, const void * data, size_t len) {
+static bool sse_try_send(SocketHandle fd, const void * data, size_t len) {
     const char * p = static_cast<const char *>(data);
     size_t sent = 0;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -1018,7 +1016,7 @@ static bool sse_try_send(int fd, const void * data, size_t len) {
             deadline - std::chrono::steady_clock::now()).count();
         if (remaining <= 0) return false;
 
-        struct pollfd pfd = {SOCK_FD(fd), POLLOUT, 0};
+        struct pollfd pfd = {fd, POLLOUT, 0};
         int ret;
         do {
             ret = poll(&pfd, 1, (int)(remaining < 50 ? remaining : 50));
@@ -1040,13 +1038,13 @@ static bool sse_try_send(int fd, const void * data, size_t len) {
 void HttpServer::broadcast_status() {
     std::string event = status_.to_sse_event();
     std::lock_guard<std::mutex> lk(sse_mu_);
-    std::vector<int> dead;
-    for (int fd : sse_fds_) {
+    std::vector<SocketHandle> dead;
+    for (SocketHandle fd : sse_fds_) {
         if (!sse_try_send(fd, event.data(), event.size())) {
             dead.push_back(fd);
         }
     }
-    for (int fd : dead) {
+    for (SocketHandle fd : dead) {
         socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
@@ -1063,13 +1061,13 @@ void HttpServer::broadcast_token(const std::string & text) {
     std::string event = "event: token\ndata: " +
         j.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
     std::lock_guard<std::mutex> lk(sse_mu_);
-    std::vector<int> dead;
-    for (int fd : sse_fds_) {
+    std::vector<SocketHandle> dead;
+    for (SocketHandle fd : sse_fds_) {
         if (!sse_try_send(fd, event.data(), event.size())) {
             dead.push_back(fd);
         }
     }
-    for (int fd : dead) {
+    for (SocketHandle fd : dead) {
         socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
@@ -1081,8 +1079,8 @@ void HttpServer::broadcast_token(const std::string & text) {
 void HttpServer::sse_heartbeat() {
     static const char ping[] = ":heartbeat\n\n";
     std::lock_guard<std::mutex> lk(sse_mu_);
-    std::vector<int> dead;
-    for (int fd : sse_fds_) {
+    std::vector<SocketHandle> dead;
+    for (SocketHandle fd : sse_fds_) {
         // Non-blocking send: if the socket buffer can't accept 12 bytes
         // immediately, the client is too far behind — treat as dead.
         ssize_t n = ::send(fd, ping, sizeof(ping) - 1, MSG_NOSIGNAL | MSG_DONTWAIT);
@@ -1090,7 +1088,7 @@ void HttpServer::sse_heartbeat() {
             dead.push_back(fd);
         }
     }
-    for (int fd : dead) {
+    for (SocketHandle fd : dead) {
         socket_close(fd);
         sse_fds_.erase(std::remove(sse_fds_.begin(), sse_fds_.end(), fd),
                        sse_fds_.end());
@@ -1108,9 +1106,9 @@ void HttpServer::shutdown() {
     // Signal worker and accept loop to stop.
     stopping_.store(true);
     queue_cv_.notify_all();
-    if (listen_fd_ >= 0) {
+    if (socket_is_valid(listen_fd_)) {
         socket_close(listen_fd_);
-        listen_fd_ = -1;
+        listen_fd_ = kInvalidSocket;
     }
     if (worker_thread_.joinable()) {
         worker_thread_.join();
@@ -1119,7 +1117,7 @@ void HttpServer::shutdown() {
     // Close SSE client connections.
     {
         std::lock_guard<std::mutex> lk(sse_mu_);
-        for (int fd : sse_fds_) socket_close(fd);
+        for (SocketHandle fd : sse_fds_) socket_close(fd);
         sse_fds_.clear();
     }
 
@@ -1159,21 +1157,22 @@ int HttpServer::run() {
 #else
     // Initialise Winsock — required before any socket call on Windows.
     WSADATA wsa_data;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
-        std::fprintf(stderr, "[server] WSAStartup() failed: %d\n", WSAGetLastError());
+    const int wsa_error = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+    if (wsa_error != 0) {
+        std::fprintf(stderr, "[server] WSAStartup() failed: %d\n", wsa_error);
         return 1;
     }
 #endif
 
     // Create listen socket.
     listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) {
+    if (!socket_is_valid(listen_fd_)) {
         std::fprintf(stderr, "[server] socket() failed: %s\n", sock_strerror());
         return 1;
     }
 
     int yes = 1;
-    setsockopt(SOCK_FD(listen_fd_), SOL_SOCKET, SO_REUSEADDR, SETSOCKOPT_CAST &yes, sizeof(yes));
+    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, SETSOCKOPT_CAST &yes, sizeof(yes));
 
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
@@ -1181,7 +1180,7 @@ int HttpServer::run() {
     if (inet_pton(AF_INET, config_.host.c_str(), &sa.sin_addr) != 1) {
         std::fprintf(stderr, "[server] invalid host address: %s\n", config_.host.c_str());
         socket_close(listen_fd_);
-        listen_fd_ = -1;
+        listen_fd_ = kInvalidSocket;
         return 1;
     }
 
@@ -1189,14 +1188,14 @@ int HttpServer::run() {
         std::fprintf(stderr, "[server] bind(%s:%d) failed: %s\n",
                      config_.host.c_str(), config_.port, sock_strerror());
         socket_close(listen_fd_);
-        listen_fd_ = -1;
+        listen_fd_ = kInvalidSocket;
         return 1;
     }
 
     if (listen(listen_fd_, 128) < 0) {
         std::fprintf(stderr, "[server] listen() failed: %s\n", sock_strerror());
         socket_close(listen_fd_);
-        listen_fd_ = -1;
+        listen_fd_ = kInvalidSocket;
         return 1;
     }
 
@@ -1210,7 +1209,7 @@ int HttpServer::run() {
         if (false) {
             std::fprintf(stderr, "[server] fcntl(O_NONBLOCK) failed: %s\n", "n/a");
             socket_close(listen_fd_);
-            listen_fd_ = -1;
+            listen_fd_ = kInvalidSocket;
             return 1;
         }
     }
@@ -1223,7 +1222,7 @@ int HttpServer::run() {
 
     // Accept loop.
     while (!stopping_.load()) {
-        struct pollfd pfd{SOCK_FD(listen_fd_), POLLIN, 0};
+        struct pollfd pfd{listen_fd_, POLLIN, 0};
         int pr = poll(&pfd, 1, 200 /* ms */);
         if (pr <= 0) {
             // 0 = timeout (re-check stopping_); <0 with EINTR = signal. Both loop.
@@ -1235,8 +1234,9 @@ int HttpServer::run() {
 
         struct sockaddr_in client_sa{};
         socklen_t client_len = sizeof(client_sa);
-        int client_fd = accept(listen_fd_, (struct sockaddr *)&client_sa, &client_len);
-        if (client_fd < 0) {
+        SocketHandle client_fd = accept(
+            listen_fd_, (struct sockaddr *)&client_sa, &client_len);
+        if (!socket_is_valid(client_fd)) {
             if (stopping_.load()) break;
             if (sock_is_eintr(sock_errno()) || sock_is_eagain(sock_errno())) continue;
             std::fprintf(stderr, "[server] accept() error: %s\n", sock_strerror());
@@ -1245,7 +1245,7 @@ int HttpServer::run() {
 
         // Disable Nagle for low-latency SSE streaming.
         int flag = 1;
-        setsockopt(SOCK_FD(client_fd), IPPROTO_TCP, TCP_NODELAY, SETSOCKOPT_CAST &flag, sizeof(flag));
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, SETSOCKOPT_CAST &flag, sizeof(flag));
 
         // Spawn client thread (detached — client_main owns the fd).
         active_clients_.fetch_add(1);
@@ -1309,7 +1309,7 @@ int HttpServer::run() {
 
 // ─── Client thread ──────────────────────────────────────────────────────
 
-void HttpServer::handle_client(int fd) {
+void HttpServer::handle_client(SocketHandle fd) {
     HttpRequest hr;
     if (!read_http_request(fd, hr)) {
         send_error(fd, 400, "bad HTTP request");
@@ -1471,7 +1471,7 @@ void HttpServer::handle_client(int fd) {
 // Fields shared by every endpoint: stream/model/max-tokens, sampler,
 // tools, prefix-cache overrides, stop sequences.
 bool HttpServer::parse_common_request_fields(
-        int fd, const json & body, ParsedRequest & req) {
+        SocketHandle fd, const json & body, ParsedRequest & req) {
     req.stream = body.value("stream", false);
     req.model = body.value("model", config_.model_name);
     req.disk_cache_policy = config_.disk_cache_policy;
@@ -1723,7 +1723,7 @@ void HttpServer::apply_request_reasoning(
 
 // Render messages to prompt text and tokenize into req.prompt_tokens.
 bool HttpServer::render_and_tokenize_request(
-        int fd, const std::vector<ChatMessage> & chat_messages,
+        SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
         ParsedRequest & req) {
     std::string tools_json;
     if (req.tools.is_array() && !req.tools.empty()) {
@@ -1768,7 +1768,8 @@ bool HttpServer::render_and_tokenize_request(
 
 // Context-length gate. Oversized prompts pass through when compression
 // (pflash) will run — the post-compress check is the real gate.
-bool HttpServer::validate_request_context(int fd, const ParsedRequest & req) {
+bool HttpServer::validate_request_context(
+        SocketHandle fd, const ParsedRequest & req) {
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const bool pflash_will_run =
         config_.pflash_mode != ServerConfig::PflashMode::OFF &&
@@ -1798,7 +1799,7 @@ void HttpServer::log_parsed_request(const ParsedRequest & req) const {
         req.stop_sequences.size(), req.model.c_str());
 }
 
-void HttpServer::enqueue_request_and_wait(int fd, ParsedRequest req) {
+void HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req) {
     // Set socket non-blocking for send() stall detection during streaming.
     const int flags = sock_get_flags(fd);
     if (flags >= 0) sock_set_nonblock(fd);
@@ -1812,7 +1813,7 @@ void HttpServer::enqueue_request_and_wait(int fd, ParsedRequest req) {
     job.cv.wait(lock, [&]() { return job.done; });
 }
 
-bool HttpServer::route_request(int fd, const HttpRequest & hr) {
+bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
     if (hr.method != "POST") return false;
 
     std::fprintf(stderr, "[server] request path=%s body_bytes=%zu\n",
@@ -2594,7 +2595,7 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
 }
 
 bool HttpServer::forward_upstream(
-        int fd, const ParsedRequest & req,
+        SocketHandle fd, const ParsedRequest & req,
         const PreparedPrompt & prepared) {
 #ifdef DFLASH_HAS_CURL
     if (config_.pflash_upstream_base.empty()) return false;
@@ -3150,7 +3151,7 @@ void HttpServer::prepare_generation_inputs(
 }
 
 void HttpServer::configure_generation_io(
-        int fd, const ParsedRequest & req, SseEmitter & emitter,
+        SocketHandle fd, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io) {
     io.stream_fd = -1;
     io.observer = [this](const char *, const std::vector<int32_t> & tokens) {
@@ -3206,7 +3207,7 @@ void HttpServer::worker_loop() {
 }
 
 void HttpServer::process_job(ServerJob * job) {
-    int fd = job->fd;
+    SocketHandle fd = job->fd;
     const auto & req = job->req;
     auto started_at = std::chrono::steady_clock::now();
 
@@ -3530,7 +3531,7 @@ ServerJob * HttpServer::dequeue() {
 
 // ─── HTTP I/O ───────────────────────────────────────────────────────────
 
-bool HttpServer::read_http_request(int fd, HttpRequest & out) {
+bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
 #if defined(_WIN32)
     // On Windows, accept() may return a socket that inherits the non-blocking
     // mode of the listen socket. Force blocking mode for reliable recv().
@@ -3547,7 +3548,7 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
         if (n < 0 && sock_is_eintr(sock_errno())) continue;
 #if defined(_WIN32)
         if (n < 0 && sock_is_eagain(sock_errno())) {
-            struct pollfd pfd{SOCK_FD(fd), POLLIN, 0};
+            struct pollfd pfd{fd, POLLIN, 0};
             poll(&pfd, 1, 1000);
             continue;
         }
@@ -3620,7 +3621,7 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
         if (n < 0 && sock_is_eintr(sock_errno())) continue;
 #if defined(_WIN32)
         if (n < 0 && sock_is_eagain(sock_errno())) {
-            struct pollfd pfd{SOCK_FD(fd), POLLIN, 0};
+            struct pollfd pfd{fd, POLLIN, 0};
             poll(&pfd, 1, 1000);
             continue;
         }
@@ -3633,7 +3634,7 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
     return true;
 }
 
-bool HttpServer::send_all(int fd, const void * data, size_t len) {
+bool HttpServer::send_all(SocketHandle fd, const void * data, size_t len) {
     const char * p = (const char *)data;
     size_t sent = 0;
     // Stall deadline resets on each successful write (ds4 pattern).
@@ -3643,7 +3644,7 @@ bool HttpServer::send_all(int fd, const void * data, size_t len) {
             deadline - std::chrono::steady_clock::now()).count();
         if (remaining <= 0) return false;  // stall timeout
 
-        struct pollfd pfd = {SOCK_FD(fd), POLLOUT, 0};
+        struct pollfd pfd = {fd, POLLOUT, 0};
         int timeout = remaining > 50 ? 50 : (int)remaining;
         int ret;
         do {
@@ -3664,7 +3665,8 @@ bool HttpServer::send_all(int fd, const void * data, size_t len) {
     return true;
 }
 
-bool HttpServer::send_response(int fd, int status, const std::string & content_type,
+bool HttpServer::send_response(
+        SocketHandle fd, int status, const std::string & content_type,
                                const std::string & body) {
     const char * reason = "OK";
     switch (status) {
@@ -3692,12 +3694,13 @@ bool HttpServer::send_response(int fd, int status, const std::string & content_t
     return send_all(fd, header.data(), header.size());
 }
 
-bool HttpServer::send_error(int fd, int status, const std::string & message) {
+bool HttpServer::send_error(
+        SocketHandle fd, int status, const std::string & message) {
     json err = {{"error", {{"message", message}, {"type", "invalid_request_error"}}}};
     return send_response(fd, status, "application/json", err.dump() + "\n");
 }
 
-bool HttpServer::send_sse_headers(int fd) {
+bool HttpServer::send_sse_headers(SocketHandle fd) {
     std::string header = "HTTP/1.1 200 OK\r\n";
     if (config_.enable_cors) {
         header += "Access-Control-Allow-Origin: *\r\n";

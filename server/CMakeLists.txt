@@ -656,6 +656,19 @@ option(DFLASH27B_SERVER "Build dflash_server + backend_ipc_daemon" ON)
 if(DFLASH27B_TESTS)
     set(_raw_unit_test_targets)
     enable_testing()
+
+    # Header-only platform shims must remain independently buildable and
+    # runnable on hosted Windows workers without a GPU.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_platform_compat.cpp")
+        add_executable(test_platform_compat test/test_platform_compat.cpp)
+        target_include_directories(test_platform_compat PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(WIN32)
+            target_link_libraries(test_platform_compat PRIVATE ws2_32)
+        endif()
+        add_test(NAME platform_compat COMMAND test_platform_compat)
+    endif()
+
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip"
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_pool_shutdown.cpp")
         add_executable(test_cuda_pool_shutdown

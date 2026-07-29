@@ -19,6 +19,7 @@
 #include "common/spark_corpus.h"
 #include "common/moe_routing_collector.h"
 #include "common/moe_hybrid_routing_stats.h"
+#include "common/platform_env.h"
 #include "common/peer_access.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
@@ -32,11 +33,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#ifdef _WIN32
-#define setenv(name, value, overwrite) _putenv_s(name, value)
-#define unsetenv(name) _putenv_s(name, "")
-#endif
 
 using namespace dflash::common;
 
@@ -356,7 +352,7 @@ int main(int argc, char ** argv) {
                     "--adaptive-experts: tau must be a float in (0,1], got \"%s\"\n", tau);
                 return 1;
             }
-            setenv("DFLASH_ADAPTIVE_K_TAU", tau, 0);  // explicit env still wins
+            set_environment_variable("DFLASH_ADAPTIVE_K_TAU", tau, false);  // explicit env still wins
             adaptive_experts_set = true;
         } else if (std::strcmp(argv[i], "--verify-width") == 0 && i + 1 < argc) {
             bargs.verify_width = std::atoi(argv[++i]);
@@ -374,7 +370,7 @@ int main(int argc, char ** argv) {
                                      "'auto', got '%s'\n", argv[i]);
                 return 1;
             }
-            ::setenv("DFLASH_KVFLASH", argv[i], 1);
+            set_environment_variable("DFLASH_KVFLASH", argv[i], true);
         } else if (std::strcmp(argv[i], "--kvflash-policy") == 0 && i + 1 < argc) {
             ++i;
             if (std::strcmp(argv[i], "drafter") != 0 && std::strcmp(argv[i], "lru") != 0 &&
@@ -383,14 +379,14 @@ int main(int argc, char ** argv) {
                              argv[i]);
                 return 1;
             }
-            ::setenv("DFLASH_KVFLASH_POLICY", argv[i], 1);
+            set_environment_variable("DFLASH_KVFLASH_POLICY", argv[i], true);
         } else if (std::strcmp(argv[i], "--kvflash-tau") == 0 && i + 1 < argc) {
             if (std::atoi(argv[++i]) <= 0) {
                 std::fprintf(stderr, "--kvflash-tau expects a positive interval, got '%s'\n",
                              argv[i]);
                 return 1;
             }
-            ::setenv("DFLASH_KVFLASH_TAU", argv[i], 1);
+            set_environment_variable("DFLASH_KVFLASH_TAU", argv[i], true);
         } else if (std::strcmp(argv[i], "--spark") == 0) {
             spark_autotune = true;
         } else if (std::strcmp(argv[i], "--spark-slots") == 0 && i + 1 < argc) {
@@ -444,7 +440,7 @@ int main(int argc, char ** argv) {
             sconfig.pflash_drafter_path = argv[++i];
             // kvflash reads this to lazy-attach the drafter as its
             // residency scorer even when prefill compression is off.
-            ::setenv("DFLASH_KVFLASH_DRAFTER", argv[i], 1);
+            set_environment_variable("DFLASH_KVFLASH_DRAFTER", argv[i], true);
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
             sconfig.pflash_skip_park = true;
         } else if (std::strcmp(argv[i], "--prefill-upstream-base") == 0 && i + 1 < argc) {
@@ -608,13 +604,13 @@ int main(int argc, char ** argv) {
     // allocate their routing_stats_ so we can print freq analysis at shutdown.
     if (sconfig.freq_tracking || !sconfig.collect_routing_path.empty()) {
         // Enable routing stats on all MoE backends. An explicit CLI flag must
-        // guarantee stats are allocated, but setenv(overwrite=0) would leave a
+        // guarantee stats are allocated, but overwrite=false would leave a
         // pre-existing EMPTY env var in place — and the backends treat an empty
         // path as "disabled", so --freq/--collect-routing would silently no-op.
         // Force the value when unset or empty; preserve a non-empty user path.
         auto ensure_stats_env = [](const char * name, const char * val) {
             const char * cur = std::getenv(name);
-            if (!cur || cur[0] == '\0') setenv(name, val, 1);
+            if (!cur || cur[0] == '\0') set_environment_variable(name, val, true);
         };
         ensure_stats_env("DFLASH_QWEN35MOE_RUNTIME_STATS_OUT", "/dev/null");
         ensure_stats_env("DFLASH_LAGUNA_NEXT_PLACEMENT_OUT", "/dev/null");
@@ -622,10 +618,10 @@ int main(int argc, char ** argv) {
 
     // Explicit --cache-type-k/v override via env vars.
     if (!cache_type_k.empty()) {
-        setenv("DFLASH27B_KV_K", cache_type_k.c_str(), 1);
+        set_environment_variable("DFLASH27B_KV_K", cache_type_k.c_str(), true);
     }
     if (!cache_type_v.empty()) {
-        setenv("DFLASH27B_KV_V", cache_type_v.c_str(), 1);
+        set_environment_variable("DFLASH27B_KV_V", cache_type_v.c_str(), true);
     }
 
     // TQ3_0 KV auto-selection was removed (2026-07): tq3_0 saved ~40% VRAM on
@@ -636,9 +632,9 @@ int main(int argc, char ** argv) {
     // PFlash performance defaults: BSA kernel + sparse alpha + full attention window.
     bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
     if (pflash_enabled) {
-        setenv("DFLASH_FP_USE_BSA", "1", 0);
-        setenv("DFLASH_FP_ALPHA", "0.85", 0);
-        setenv("DFLASH27B_FA_WINDOW", "0", 0);
+        set_environment_variable("DFLASH_FP_USE_BSA", "1", false);
+        set_environment_variable("DFLASH_FP_ALPHA", "0.85", false);
+        set_environment_variable("DFLASH27B_FA_WINDOW", "0", false);
     }
 
     if (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped &&
@@ -701,23 +697,30 @@ int main(int argc, char ** argv) {
             std::FILE * pf = std::fopen(profile.c_str(), "rb");
             const bool have_profile = (pf != nullptr);
             if (pf) std::fclose(pf);
-            ::setenv("DFLASH_SPARK", "1", 1);   // backend auto-sizes the cache ring from the VRAM target
+            // The backend auto-sizes the cache ring from the VRAM target.
+            set_environment_variable("DFLASH_SPARK", "1", true);
             if (spark_vram_gib > 0.0)
-                ::setenv("DFLASH_SPARK_VRAM_MB",
-                         std::to_string((long long)(spark_vram_gib * 1024.0)).c_str(), 1);
+                set_environment_variable(
+                    "DFLASH_SPARK_VRAM_MB",
+                    std::to_string((long long)(spark_vram_gib * 1024.0)).c_str(), true);
             if (spark_slots >= 0)               // explicit --spark-slots overrides auto-sizing
-                ::setenv((pfx + "CACHE_SLOTS").c_str(), std::to_string(spark_slots).c_str(), 1);
+                set_environment_variable(
+                    (pfx + "CACHE_SLOTS").c_str(),
+                    std::to_string(spark_slots).c_str(), true);
             if (is_laguna) {
-                ::setenv("DFLASH_LAGUNA_EXPERT_CACHE", "1", 1);
-                ::setenv("DFLASH_LAGUNA_GPU_REMAP", "1", 1);
+                set_environment_variable("DFLASH_LAGUNA_EXPERT_CACHE", "1", true);
+                set_environment_variable("DFLASH_LAGUNA_GPU_REMAP", "1", true);
             }
-            if (have_profile) ::setenv((pfx + "HOTNESS").c_str(), profile.c_str(), 1);
+            if (have_profile) {
+                set_environment_variable(
+                    (pfx + "HOTNESS").c_str(), profile.c_str(), true);
+            }
             // Persist the learned routing profile after each request. laguna saves
             // via NEXT_PLACEMENT_OUT; qwen35moe via RUNTIME_STATS_OUT (that var is
             // what allocates its routing-stats accumulator).
             const char * save_var = is_laguna ? "DFLASH_LAGUNA_NEXT_PLACEMENT_OUT"
                                               : "DFLASH_QWEN35MOE_RUNTIME_STATS_OUT";
-            ::setenv(save_var, profile.c_str(), 1);
+            set_environment_variable(save_var, profile.c_str(), true);
             if (spark_vram_gib > 0.0)
                 std::fprintf(stderr, "[spark] autotune ON (%s): vram target %.1f GiB, profile=%s (%s)\n",
                     arch.c_str(), spark_vram_gib, profile.c_str(), have_profile ? "loaded" : "new");
