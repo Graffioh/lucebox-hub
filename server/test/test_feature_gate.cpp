@@ -369,6 +369,80 @@ static void test_feature_gate_paged_attention_requires_plain_ar_decode() {
     }
 }
 
+static void test_feature_gate_parallel_and_kv_pool_rules() {
+    // A valid paged qwen35 monolithic launch is the baseline every rule
+    // below perturbs.
+    BackendArgs paged;
+    paged.model_path = "/nonexistent/model.gguf";
+    paged.paged_attention = true;
+
+    // --max-concurrency is validated even without any other flag: zero decode
+    // slots is meaningless on every backend.
+    BackendArgs plain;
+    plain.model_path = "/nonexistent/model.gguf";
+    plain.max_concurrency = 0;
+    TEST_ASSERT(!gate_result(plain, "qwen35", PlacementBackend::Cuda).empty());
+    plain.max_concurrency = 1;
+    TEST_ASSERT(gate_result(plain, "qwen35", PlacementBackend::Cuda).empty());
+
+    // More than one slot exists only in the paged qwen35 backend.
+    BackendArgs dense;
+    dense.model_path = "/nonexistent/model.gguf";
+    dense.max_concurrency = 2;
+    TEST_ASSERT(!gate_result(dense, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs parallel = paged;
+    parallel.max_concurrency = 2;
+    TEST_ASSERT(gate_result(
+        parallel, "qwen35", PlacementBackend::Cuda).empty());
+
+    // 64 slots is the top of the supported range.
+    parallel.max_concurrency = 64;
+    TEST_ASSERT(gate_result(
+        parallel, "qwen35", PlacementBackend::Cuda).empty());
+    parallel.max_concurrency = 65;
+    TEST_ASSERT(!gate_result(
+        parallel, "qwen35", PlacementBackend::Cuda).empty());
+
+    // --kv-pool-tokens sizes the shared pool, so it needs slots to share.
+    BackendArgs pool = paged;
+    pool.kv_pool_tokens = 4096;
+    TEST_ASSERT(!gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+    pool.max_concurrency = 2;
+    TEST_ASSERT(gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+
+    // The pool must hold at least one block, and stay addressable with int
+    // after rounding up to whole blocks.
+    pool.kv_pool_tokens = PAGED_BLOCK_SIZE - 1;
+    TEST_ASSERT(!gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+    pool.kv_pool_tokens = PAGED_BLOCK_SIZE;
+    TEST_ASSERT(gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+    const long long max_pool_tokens =
+        ((long long)INT_MAX - PAGED_BLOCK_SIZE) /
+        PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
+    pool.kv_pool_tokens = max_pool_tokens + 1;
+    TEST_ASSERT(!gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+    pool.kv_pool_tokens = max_pool_tokens;
+    TEST_ASSERT(gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+
+    // Defaulting the pool to max_concurrency full contexts must fail loudly
+    // when that product leaves INT32 token space...
+    BackendArgs overflow = paged;
+    overflow.max_concurrency = 2;
+    overflow.device.max_ctx = 1 << 30;  // capacity 2^30; x2 + 16 > INT_MAX
+    TEST_ASSERT(!gate_result(
+        overflow, "qwen35", PlacementBackend::Cuda).empty());
+    // ...but an explicit pool size replaces the default and is accepted.
+    overflow.kv_pool_tokens = 1 << 20;
+    TEST_ASSERT(gate_result(
+        overflow, "qwen35", PlacementBackend::Cuda).empty());
+    // One block-aligned context lower, the doubled default fits.
+    overflow.kv_pool_tokens = 0;
+    overflow.device.max_ctx = (1 << 30) - PAGED_BLOCK_SIZE;
+    TEST_ASSERT(gate_result(
+        overflow, "qwen35", PlacementBackend::Cuda).empty());
+}
+
 // ── Inert-flag warnings ─────────────────────────────────────────────────
 // Warnings must never gate admission, so each case also asserts the same
 // configuration passes check_feature_compatibility().
@@ -518,6 +592,7 @@ int main() {
     RUN_TEST(test_feature_gate_layer_split_requires_supported_arch);
     RUN_TEST(test_feature_gate_paged_attention_requires_qwen35_monolithic);
     RUN_TEST(test_feature_gate_paged_attention_requires_plain_ar_decode);
+    RUN_TEST(test_feature_gate_parallel_and_kv_pool_rules);
     RUN_TEST(test_feature_warnings_silent_when_supported);
     RUN_TEST(test_feature_warnings_report_inert_draft);
     RUN_TEST(test_feature_warnings_report_inert_decode_tunables);

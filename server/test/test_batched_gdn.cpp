@@ -1,0 +1,336 @@
+// Batched-decode correctness foundation: proves the n_seqs batch axis of
+// ggml_gated_delta_net and ggml_ssm_conv is exactly equivalent to running
+// each sequence independently. The concurrent serving path (--max-concurrency N)
+// relies on this: it stacks N single-token decodes on the n_seqs axis of
+// both ops with per-slot state slabs, so any cross-sequence leakage or
+// stride bug here would silently corrupt every parallel stream.
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cuda.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdio>
+#include <random>
+#include <vector>
+
+namespace {
+
+// qwen35-like shapes scaled down. S_V doubles as head_k_dim: the fused GDN
+// kernel reads q/k rows with the S_v extent, and 32 is a supported kernel
+// specialization (16/32/64/128).
+constexpr int S_V = 32;
+constexpr int N_HEAD = 4;
+constexpr int N_SEQS = 4;
+constexpr int D_CONV = 4;
+// CUDA ssm_conv launches 128-thread blocks and asserts channels % 128 == 0.
+constexpr int CONV_CHANNELS = 128;
+constexpr int N_STEPS = 3;
+constexpr float MAX_ABS_ERROR = 1.0e-5f;
+
+// Single-token decode: n_tokens == 1, so each sequence's slice of every
+// contiguous [.., n_tokens, n_seqs] host buffer is one contiguous chunk.
+constexpr size_t GDN_QKV_PER_SEQ = static_cast<size_t>(S_V) * N_HEAD;
+constexpr size_t GDN_GATE_PER_SEQ = N_HEAD;
+constexpr size_t GDN_STATE_PER_SEQ = static_cast<size_t>(S_V) * S_V * N_HEAD;
+constexpr size_t CONV_IN_PER_SEQ =
+    static_cast<size_t>(D_CONV) * CONV_CHANNELS;  // (d_conv-1) history + 1 token
+constexpr size_t CONV_HIST_PER_SEQ =
+    static_cast<size_t>(D_CONV - 1) * CONV_CHANNELS;
+constexpr size_t CONV_OUT_PER_SEQ = CONV_CHANNELS;
+constexpr size_t CONV_WEIGHT_ELEMS = static_cast<size_t>(D_CONV) * CONV_CHANNELS;
+
+void fill_uniform(std::mt19937 & rng, float lo, float hi,
+                  std::vector<float> & values) {
+    std::uniform_real_distribution<float> dist(lo, hi);
+    for (float & value : values) value = dist(rng);
+}
+
+// One fused GDN decode step over n_seqs sequences (n_tokens == 1 each).
+// Reads the packed result: attn [S_V*N_HEAD per seq] followed by the final
+// state [S_V*S_V*N_HEAD per seq] — the same regions the backend slices.
+bool run_gdn(ggml_backend_t backend, int n_seqs,
+             const float * q, const float * k, const float * v,
+             const float * g, const float * beta, const float * state,
+             float * attn_out, float * state_out) {
+    ggml_init_params params{};
+    params.mem_size = 4 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * q_t =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, n_seqs);
+    ggml_tensor * k_t =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, n_seqs);
+    ggml_tensor * v_t =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, n_seqs);
+    ggml_tensor * g_t =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, N_HEAD, 1, n_seqs);
+    ggml_tensor * beta_t =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, N_HEAD, 1, n_seqs);
+    ggml_tensor * state_t =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_V, S_V, N_HEAD, n_seqs);
+    for (ggml_tensor * input : {q_t, k_t, v_t, g_t, beta_t, state_t}) {
+        ggml_set_input(input);
+    }
+
+    ggml_tensor * result =
+        ggml_gated_delta_net(ctx, q_t, k_t, v_t, g_t, beta_t, state_t);
+    // Decode path compacts the result to [attn | final_state], exactly like
+    // build_delta_net_block with skip_gdn_intermediate.
+    ggml_gated_delta_net_set_skip_intermediate(result, true);
+    ggml_set_output(result);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+
+    ggml_gallocr_t allocator =
+        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    bool ok = ggml_gallocr_alloc_graph(allocator, graph);
+    if (ok) {
+        const size_t qkv_bytes = GDN_QKV_PER_SEQ * n_seqs * sizeof(float);
+        const size_t gate_bytes = GDN_GATE_PER_SEQ * n_seqs * sizeof(float);
+        const size_t state_bytes = GDN_STATE_PER_SEQ * n_seqs * sizeof(float);
+        ggml_backend_tensor_set(q_t, q, 0, qkv_bytes);
+        ggml_backend_tensor_set(k_t, k, 0, qkv_bytes);
+        ggml_backend_tensor_set(v_t, v, 0, qkv_bytes);
+        ggml_backend_tensor_set(g_t, g, 0, gate_bytes);
+        ggml_backend_tensor_set(beta_t, beta, 0, gate_bytes);
+        ggml_backend_tensor_set(state_t, state, 0, state_bytes);
+        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        if (ok) {
+            const size_t attn_bytes = GDN_QKV_PER_SEQ * n_seqs * sizeof(float);
+            ggml_backend_tensor_get(result, attn_out, 0, attn_bytes);
+            ggml_backend_tensor_get(result, state_out, attn_bytes, state_bytes);
+        }
+    }
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    return ok;
+}
+
+// One ssm_conv step: sx [d_conv-1 + 1, channels, n_seqs] against shared
+// [d_conv, channels] weights, producing [channels, 1, n_seqs].
+bool run_conv(ggml_backend_t backend, int n_seqs,
+              const float * sx, const float * weights, float * out) {
+    ggml_init_params params{};
+    params.mem_size = 4 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * sx_t =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D_CONV, CONV_CHANNELS, n_seqs);
+    ggml_tensor * w_t =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_CONV, CONV_CHANNELS);
+    for (ggml_tensor * input : {sx_t, w_t}) {
+        ggml_set_input(input);
+    }
+
+    ggml_tensor * result = ggml_ssm_conv(ctx, sx_t, w_t);
+    ggml_set_output(result);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+
+    ggml_gallocr_t allocator =
+        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    bool ok = ggml_gallocr_alloc_graph(allocator, graph);
+    if (ok) {
+        ggml_backend_tensor_set(sx_t, sx, 0,
+                                CONV_IN_PER_SEQ * n_seqs * sizeof(float));
+        ggml_backend_tensor_set(w_t, weights, 0,
+                                CONV_WEIGHT_ELEMS * sizeof(float));
+        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        if (ok) {
+            ggml_backend_tensor_get(result, out, 0,
+                                    CONV_OUT_PER_SEQ * n_seqs * sizeof(float));
+        }
+    }
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool check(const char * name, const float * batched, const float * reference,
+           size_t count) {
+    float max_abs_diff = 0.0f;
+    bool finite = true;
+    for (size_t i = 0; i < count; ++i) {
+        if (!std::isfinite(batched[i]) || !std::isfinite(reference[i])) {
+            finite = false;
+            break;
+        }
+        max_abs_diff =
+            std::max(max_abs_diff, std::fabs(batched[i] - reference[i]));
+    }
+    const bool ok = finite && max_abs_diff < MAX_ABS_ERROR;
+    std::printf("batched gdn %-24s max_abs=%.6g %s\n", name,
+                finite ? max_abs_diff : INFINITY, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// Fresh random single-token inputs for all N_SEQS sequences. Ranges follow
+// what the model block feeds the fused op: q/k are L2-normalized (order-one
+// entries), beta is a sigmoid in (0,1), and g = -A.exp()*softplus(alpha) is
+// negative so exp(g) <= 1 keeps the recurrence contractive.
+struct GdnStep {
+    std::vector<float> q, k, v, g, beta;
+
+    explicit GdnStep(std::mt19937 & rng)
+        : q(GDN_QKV_PER_SEQ * N_SEQS), k(GDN_QKV_PER_SEQ * N_SEQS),
+          v(GDN_QKV_PER_SEQ * N_SEQS), g(GDN_GATE_PER_SEQ * N_SEQS),
+          beta(GDN_GATE_PER_SEQ * N_SEQS) {
+        fill_uniform(rng, -1.0f, 1.0f, q);
+        fill_uniform(rng, -1.0f, 1.0f, k);
+        fill_uniform(rng, -1.0f, 1.0f, v);
+        fill_uniform(rng, -1.0f, 0.0f, g);
+        fill_uniform(rng, 0.05f, 0.95f, beta);
+    }
+};
+
+// Runs one decode step batched (n_seqs = N_SEQS) and per-sequence
+// (N_SEQS calls with n_seqs = 1) from the SAME carried states, compares
+// attn and final state, then advances both state copies for the next step.
+bool step_and_compare(ggml_backend_t backend, const char * label,
+                      const GdnStep & step,
+                      std::vector<float> & state_batched,
+                      std::vector<float> & state_reference) {
+    std::vector<float> attn_batched(GDN_QKV_PER_SEQ * N_SEQS);
+    std::vector<float> attn_reference(GDN_QKV_PER_SEQ * N_SEQS);
+    std::vector<float> next_batched(GDN_STATE_PER_SEQ * N_SEQS);
+    std::vector<float> next_reference(GDN_STATE_PER_SEQ * N_SEQS);
+
+    bool ok = run_gdn(backend, N_SEQS, step.q.data(), step.k.data(),
+                      step.v.data(), step.g.data(), step.beta.data(),
+                      state_batched.data(), attn_batched.data(),
+                      next_batched.data());
+    for (int seq = 0; ok && seq < N_SEQS; ++seq) {
+        ok = run_gdn(backend, 1,
+                     step.q.data() + seq * GDN_QKV_PER_SEQ,
+                     step.k.data() + seq * GDN_QKV_PER_SEQ,
+                     step.v.data() + seq * GDN_QKV_PER_SEQ,
+                     step.g.data() + seq * GDN_GATE_PER_SEQ,
+                     step.beta.data() + seq * GDN_GATE_PER_SEQ,
+                     state_reference.data() + seq * GDN_STATE_PER_SEQ,
+                     attn_reference.data() + seq * GDN_QKV_PER_SEQ,
+                     next_reference.data() + seq * GDN_STATE_PER_SEQ);
+    }
+    if (!ok) {
+        std::fprintf(stderr, "batched gdn %s: compute failed\n", label);
+        return false;
+    }
+
+    char name[64];
+    std::snprintf(name, sizeof(name), "%s attn", label);
+    ok = check(name, attn_batched.data(), attn_reference.data(),
+               attn_batched.size());
+    std::snprintf(name, sizeof(name), "%s state", label);
+    ok = check(name, next_batched.data(), next_reference.data(),
+               next_batched.size()) && ok;
+
+    // Carry each side's own output so a state-propagation bug compounds
+    // across steps instead of being masked by a shared copy.
+    state_batched = std::move(next_batched);
+    state_reference = std::move(next_reference);
+    return ok;
+}
+
+bool test_gdn_sequential(ggml_backend_t backend, std::mt19937 & rng) {
+    std::vector<float> state(GDN_STATE_PER_SEQ * N_SEQS);
+    fill_uniform(rng, -0.5f, 0.5f, state);
+    std::vector<float> state_batched = state;
+    std::vector<float> state_reference = state;
+
+    bool ok = true;
+    for (int step_idx = 0; step_idx < N_STEPS; ++step_idx) {
+        char label[32];
+        std::snprintf(label, sizeof(label), "step%d", step_idx);
+        const GdnStep step(rng);
+        ok = step_and_compare(backend, label, step, state_batched,
+                              state_reference) && ok;
+    }
+    return ok;
+}
+
+bool test_conv(ggml_backend_t backend, std::mt19937 & rng) {
+    std::vector<float> weights(CONV_WEIGHT_ELEMS);
+    fill_uniform(rng, -0.5f, 0.5f, weights);
+
+    // Per-sequence conv history, carried on the host exactly like the
+    // backend's conv_state slots: each step prepends the (d_conv-1)-row
+    // history to the new token, convolves, then shifts the token in.
+    std::vector<float> history(CONV_HIST_PER_SEQ * N_SEQS);
+    fill_uniform(rng, -1.0f, 1.0f, history);
+
+    bool ok = true;
+    for (int step_idx = 0; step_idx < N_STEPS; ++step_idx) {
+        std::vector<float> token(static_cast<size_t>(CONV_CHANNELS) * N_SEQS);
+        fill_uniform(rng, -1.0f, 1.0f, token);
+
+        // sx rows per channel: [h0, h1, h2, new_token]
+        std::vector<float> sx(CONV_IN_PER_SEQ * N_SEQS);
+        for (int seq = 0; seq < N_SEQS; ++seq) {
+            for (int channel = 0; channel < CONV_CHANNELS; ++channel) {
+                float * row = sx.data() + seq * CONV_IN_PER_SEQ +
+                              static_cast<size_t>(channel) * D_CONV;
+                const float * hist = history.data() + seq * CONV_HIST_PER_SEQ +
+                                     static_cast<size_t>(channel) * (D_CONV - 1);
+                for (int j = 0; j < D_CONV - 1; ++j) row[j] = hist[j];
+                row[D_CONV - 1] = token[seq * CONV_CHANNELS + channel];
+            }
+        }
+
+        std::vector<float> out_batched(CONV_OUT_PER_SEQ * N_SEQS);
+        std::vector<float> out_reference(CONV_OUT_PER_SEQ * N_SEQS);
+        bool computed =
+            run_conv(backend, N_SEQS, sx.data(), weights.data(),
+                     out_batched.data());
+        for (int seq = 0; computed && seq < N_SEQS; ++seq) {
+            computed = run_conv(backend, 1, sx.data() + seq * CONV_IN_PER_SEQ,
+                                weights.data(),
+                                out_reference.data() + seq * CONV_OUT_PER_SEQ);
+        }
+        if (!computed) {
+            std::fprintf(stderr, "batched gdn conv step%d: compute failed\n",
+                         step_idx);
+            return false;
+        }
+
+        char name[32];
+        std::snprintf(name, sizeof(name), "conv step%d", step_idx);
+        ok = check(name, out_batched.data(), out_reference.data(),
+                   out_batched.size()) && ok;
+
+        // Shift the new token into the history window.
+        for (int seq = 0; seq < N_SEQS; ++seq) {
+            for (int channel = 0; channel < CONV_CHANNELS; ++channel) {
+                float * hist = history.data() + seq * CONV_HIST_PER_SEQ +
+                               static_cast<size_t>(channel) * (D_CONV - 1);
+                for (int j = 0; j < D_CONV - 2; ++j) hist[j] = hist[j + 1];
+                hist[D_CONV - 2] = token[seq * CONV_CHANNELS + channel];
+            }
+        }
+    }
+    return ok;
+}
+
+}  // namespace
+
+int main() {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, "GPU backend unavailable\n");
+        return 1;
+    }
+
+    std::mt19937 rng(20260728);
+    bool ok = test_gdn_sequential(backend, rng);
+    ok = test_conv(backend, rng) && ok;
+
+    ggml_backend_free(backend);
+    return ok ? 0 : 1;
+}
