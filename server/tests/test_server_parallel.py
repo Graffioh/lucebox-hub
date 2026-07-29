@@ -3,8 +3,8 @@
 
 Exercises the qwen35 paged-attention slot engine: true decode overlap across
 streams, per-request state isolation, sequential-vs-concurrent consistency,
-SSE interleaving, over-subscription (queueing beyond slot count), and
-concurrent non-streaming completions.
+SSE interleaving, over-subscription (queueing beyond slot count), concurrent
+non-streaming completions, and non-pausing admission.
 
 Usage:
     # Start server first with concurrent serving enabled:
@@ -394,6 +394,85 @@ class ParallelTestSuite:
                         f"reasoning={r['reasoning'][:200]!r}")
         print(f"    → {count} requests completed in {elapsed:.1f}s")
 
+    def test_parallel_prefill_no_pause(self):
+        """A long admission must not pause a stream that is already decoding."""
+        n = self.parallel
+        print("\n[PAR-7] Prefill/decode fusion — decode continues during "
+              "a long prefill")
+        if n == 1:
+            self._skip("prefill no-pause",
+                       "--max-concurrency 1: fusion not applicable, skipping")
+            return
+
+        # Stream A starts alone and reaches steady decode before B arrives.
+        a_prompt, _ = make_long_prompts(1)[0]
+        timeline: list = []
+        timeline_lock = threading.Lock()
+        a_res: list = [None]
+        a_thread = threading.Thread(
+            target=self._stream_worker, args=(0, a_prompt, 320, a_res),
+            kwargs={"timeline": timeline, "timeline_lock": timeline_lock},
+            daemon=True)
+        a_thread.start()
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            ra = a_res[0]
+            if ra is not None and (ra["n_chunks"] >= 3 or ra["error"]):
+                break
+            time.sleep(0.05)
+        ra = a_res[0]
+        if ra is None or ra["error"] or ra["n_chunks"] < 3:
+            self._check("stream A reaches steady decode", False,
+                        "no chunks" if ra is None else
+                        (ra["error"] or f"only {ra['n_chunks']} chunks"))
+            return
+        self._check("stream A reaches steady decode", True)
+
+        # Stream B has several 512-token prefill chunks. Answer 167 cannot
+        # collide with the filler item indices (0..139).
+        filler = "\n".join(
+            f"item {i}: the quick brown fox jumps over the lazy dog"
+            for i in range(140))
+        b_prompt = (f"Here is a list:\n{filler}\n"
+                    "Ignore the list entirely. What is 83+84? "
+                    "Answer with just the number.")
+        b_res: list = [None]
+        b_started = time.monotonic()
+        b_thread = threading.Thread(
+            target=self._stream_worker, args=(0, b_prompt, 512, b_res),
+            daemon=True)
+        b_thread.start()
+        b_thread.join(timeout=900)
+        a_thread.join(timeout=900)
+
+        rb = b_res[0]
+        if rb is None or not rb["ok"] or rb["first_chunk_t"] is None:
+            self._check("stream B completes", False,
+                        "no result" if rb is None else str(rb["error"]))
+            return
+        self._check("stream B completes", True)
+        self._check("stream B answers 167",
+                    contains_number(self._combined(rb), "167"),
+                    f"content={rb['content']!r}")
+
+        # Blocking admission leaves the prefill-dominated first 70% of B's
+        # TTFT window empty. Fused steps keep producing A outputs there.
+        window = rb["first_chunk_t"] - b_started
+        early_end = b_started + 0.7 * window
+        with timeline_lock:
+            a_early = [t for t, idx in timeline
+                       if idx == 0 and b_started <= t <= early_end]
+        ra = a_res[0]
+        if ra["finish_t"] is not None and ra["finish_t"] < early_end:
+            self._skip("A kept emitting during B's prefill",
+                       "stream A finished before B's window closed")
+            return
+        self._check("stream A kept emitting during B's prefill window",
+                    len(a_early) >= 2,
+                    f"A emitted {len(a_early)} chunks in the first "
+                    f"{0.7 * window:.2f}s of B's {window:.2f}s "
+                    "admission window")
+
     # ── Run all ──────────────────────────────────────────────────────────
 
     def run_all(self):
@@ -406,6 +485,7 @@ class ParallelTestSuite:
         self.test_parallel_isolation()
         self.test_parallel_nonstream()
         self.test_parallel_more_than_slots()
+        self.test_parallel_prefill_no_pause()
 
         print("\n" + "=" * 60)
         total = self.passed + self.failed + self.skipped
