@@ -88,9 +88,18 @@ bool build_hybrid_full_layer_step(
 //   `paged_prefill` — chunk prefill of one slot: masked stride-1 reads and
 //     legacy writes go to cache.staging_k/v while kv_write_rows dual-writes
 //     the pool blocks. Pass paged_attention=false with it (prefill reads
-//     never touch the block table).
+//     never touch the block table) — unless fusing, see n_prefill_tokens.
 //   `paged_max_kv_len` — batched decode: max kv_seq_len over live slots
 //     (kernel launch bound).
+//   `n_prefill_tokens` — fused prefill+decode step: the leading
+//     n_prefill_tokens rows are one slot's prefill chunk (staging reads at
+//     kv_start, masked; kv_write_rows covers the WHOLE batch) and the
+//     remaining n_seqs rows are the batched decode. Requires
+//     paged_attention && paged_prefill && n_seqs == cache.n_seq_slots &&
+//     n_tokens == n_prefill_tokens + n_seqs.
+//   `prefill_commit` — final prefill chunk: append staging→slot recurrent
+//     state copies at the end of the graph (see QwenGraphInputs).
+//   `logits_tail_rows` — logits/argmax only for the last n rows (0 = all).
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -112,6 +121,9 @@ bool build_target_step(
     int seq_slot = 0,
     bool paged_prefill = false,
     int paged_max_kv_len = 0,
+    int n_prefill_tokens = 0,
+    bool prefill_commit = false,
+    int logits_tail_rows = 0,
     bool compact_slots = false,
     int graph_key_slot = 0);
 

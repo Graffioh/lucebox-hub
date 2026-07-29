@@ -19,9 +19,21 @@ int SeqSlotManager::active_count() const {
     return n;
 }
 
+int SeqSlotManager::decoding_count() const {
+    int n = 0;
+    for (const SeqSlot & s : slots_) {
+        n += (s.active && !s.prefilling) ? 1 : 0;
+    }
+    return n;
+}
+
 bool SeqSlotManager::is_active(int slot) const {
     return slot >= 0 && slot < (int)slots_.size() &&
            slots_[(size_t)slot].active;
+}
+
+bool SeqSlotManager::is_prefilling(int slot) const {
+    return is_active(slot) && slots_[(size_t)slot].prefilling;
 }
 
 SeqSlotManager::AdmitOutcome SeqSlotManager::admit(
@@ -31,6 +43,19 @@ SeqSlotManager::AdmitOutcome SeqSlotManager::admit(
     if (prompt_len < 1)          { r.error = "empty prompt"; return r; }
     if (n_gen < 1)               { r.error = "n_gen must be >= 1"; return r; }
     if (prompt_len > max_ctx_)   { r.error = "prompt exceeds max_ctx"; return r; }
+
+    // A prompt larger than the whole pool can NEVER be admitted; waiting
+    // for other sequences to drain would stall the queue forever and then
+    // fail anyway. Hard-fail it up front instead of reporting busy.
+    const uint64_t pool_capacity =
+        (uint64_t)pool_.physical_block_count() * pool_.block_size();
+    if ((uint64_t)prompt_len > pool_capacity) {
+        r.error = "prompt needs " + std::to_string(prompt_len) +
+                  " KV tokens but the pool holds " +
+                  std::to_string(pool_capacity) +
+                  "; raise --kv-pool-tokens or shorten the prompt";
+        return r;
+    }
 
     int slot = -1;
     for (int i = 0; i < (int)slots_.size(); i++) {
@@ -42,23 +67,13 @@ SeqSlotManager::AdmitOutcome SeqSlotManager::admit(
         return r;
     }
 
-    // Same clamp as generate_impl: the first generated token comes from the
-    // prefill logits without a K/V row, so ar_n_gen tokens need only
-    // prompt + ar_n_gen - 1 cache rows.
-    const int max_ar_n_gen = max_ctx_ - prompt_len + 1;
-    const int ar_n_gen = std::min(n_gen, max_ar_n_gen);
-    const uint32_t reserve_tokens = (uint32_t)(prompt_len + ar_n_gen - 1);
-
-    // A request larger than the whole pool can NEVER be admitted; waiting
-    // for other sequences to drain would stall the queue forever and then
-    // fail anyway. Hard-fail it up front instead of reporting busy.
-    const uint64_t pool_capacity =
-        (uint64_t)pool_.physical_block_count() * pool_.block_size();
-    if ((uint64_t)reserve_tokens > pool_capacity) {
-        r.error = "request needs " + std::to_string(reserve_tokens) +
-                  " KV tokens but the pool holds " +
-                  std::to_string(pool_capacity) +
-                  "; raise --kv-pool-tokens or lower max_tokens";
+    // A prompt that fits the whole pool but not the blocks currently free can
+    // be admitted later. Gate on the exact prompt, never the speculative
+    // output cap.
+    const uint32_t need = (uint32_t)paged_block_count(prompt_len);
+    if (need > pool_.free_block_count()) {
+        r.busy = pool_.active_sequence_count() > 0;
+        r.error = "not enough free KV blocks for the prompt";
         return r;
     }
 
@@ -69,47 +84,10 @@ SeqSlotManager::AdmitOutcome SeqSlotManager::admit(
         r.error = paged_kv_status_string(status);
         return r;
     }
-    // Reserve the whole worst case up front: admission is all-or-nothing and
-    // decode-time appends can never hit BlocksExhausted. It also fixes the
-    // sequence's entire block table NOW, so one table_column upload covers
-    // every block the sequence will ever touch.
-    status = pool_.reserve(handle, reserve_tokens);
-    if (status != PagedKvStatus::Ok) {
-        pool_.release(handle);
-        // Waiting only helps if someone else holds blocks to free.
-        r.busy = (status == PagedKvStatus::BlocksExhausted) &&
-                 pool_.active_sequence_count() > 0;
-        r.error = paged_kv_status_string(status);
-        return r;
-    }
-    PagedKvAppendResult app = pool_.append(handle, (uint32_t)prompt_len);
-    if (!app) {
-        pool_.release(handle);
-        r.error = paged_kv_status_string(app.status);
-        return r;
-    }
-
-    PagedKvSequenceSnapshot snap;
-    status = pool_.sequence(handle, snap);
-    if (status != PagedKvStatus::Ok ||
-        snap.block_table.size() > (size_t)paged_block_count(max_ctx_)) {
-        pool_.release(handle);
-        r.error = "block table snapshot failed";
-        return r;
-    }
-
-    r.prompt_rows.resize((size_t)prompt_len);
-    for (int i = 0; i < prompt_len; i++) {
-        r.prompt_rows[(size_t)i] =
-            (int64_t)app.write_slots[(size_t)i].physical_token_index;
-    }
-    r.table_column.resize(snap.block_table.size());
-    for (size_t i = 0; i < snap.block_table.size(); i++) {
-        r.table_column[i] = (int32_t)snap.block_table[i];
-    }
 
     SeqSlot & s = slots_[(size_t)slot];
     s.active = true;
+    s.prefilling = true;
     s.request_id = request_id;
     s.handle = handle;
     s.cur_pos = 0;
@@ -126,11 +104,56 @@ SeqSlotManager::AdmitOutcome SeqSlotManager::admit(
 
     r.ok = true;
     r.slot = slot;
+    r.n_gen_cap = std::min(n_gen, max_ctx_ - prompt_len + 1);
     return r;
+}
+
+SeqSlotManager::PrefillChunk SeqSlotManager::append_prefill(
+        int slot, int n_tokens) {
+    PrefillChunk out;
+    if (!is_prefilling(slot) || n_tokens < 1) return out;
+
+    SeqSlot & s = slots_[(size_t)slot];
+    PagedKvSequenceSnapshot before;
+    if (pool_.sequence(s.handle, before) != PagedKvStatus::Ok ||
+        before.kv_seq_len > (uint32_t)max_ctx_ ||
+        (uint32_t)n_tokens > (uint32_t)max_ctx_ - before.kv_seq_len) {
+        return out;
+    }
+
+    PagedKvAppendResult app = pool_.append(s.handle, (uint32_t)n_tokens);
+    if (!app) {
+        out.busy = app.status == PagedKvStatus::BlocksExhausted;
+        return out;
+    }
+
+    PagedKvSequenceSnapshot after;
+    if (pool_.sequence(s.handle, after) != PagedKvStatus::Ok ||
+        after.block_table.size() < before.block_table.size() ||
+        after.block_table.size() > (size_t)paged_block_count(max_ctx_)) {
+        return out;
+    }
+
+    out.rows.reserve(app.write_slots.size());
+    for (const PagedKvWriteSlot & write : app.write_slots) {
+        out.rows.push_back((int64_t)write.physical_token_index);
+    }
+    if (after.block_table.size() > before.block_table.size()) {
+        out.first_new_block = (int)before.block_table.size();
+        out.new_blocks.reserve(after.block_table.size() -
+                               before.block_table.size());
+        for (size_t i = before.block_table.size();
+             i < after.block_table.size(); i++) {
+            out.new_blocks.push_back((int32_t)after.block_table[i]);
+        }
+    }
+    out.ok = true;
+    return out;
 }
 
 void SeqSlotManager::commit_prefill(int slot, int committed) {
     if (!is_active(slot)) return;
+    slots_[(size_t)slot].prefilling = false;
     slots_[(size_t)slot].cur_pos = committed;
     lens_host_[(size_t)slot] = committed;
 }
@@ -138,7 +161,7 @@ void SeqSlotManager::commit_prefill(int slot, int committed) {
 SeqSlotManager::StepAppend SeqSlotManager::append_token(int slot,
                                                         int32_t fed_token) {
     StepAppend out;
-    if (!is_active(slot)) return out;
+    if (!is_active(slot) || slots_[(size_t)slot].prefilling) return out;
     SeqSlot & s = slots_[(size_t)slot];
     if (s.cur_pos >= max_ctx_) {
         // No context left; the scheduler should have stopped this slot.
@@ -147,8 +170,7 @@ SeqSlotManager::StepAppend SeqSlotManager::append_token(int slot,
     PagedKvAppendSpan app = pool_.append_compact(s.handle, 1);
     if (!app || app.token_count != 1 ||
         app.last.logical_position != (uint32_t)s.cur_pos) {
-        std::fprintf(stderr, "[parallel] slot %d append failed: %s\n",
-                     slot, paged_kv_status_string(app.status));
+        out.busy = app.status == PagedKvStatus::BlocksExhausted;
         return out;
     }
     s.sample_history.push_back(fed_token);
@@ -156,6 +178,10 @@ SeqSlotManager::StepAppend SeqSlotManager::append_token(int slot,
     out.ok = true;
     out.physical_row = (int64_t)app.last.physical_token_index;
     out.position = s.cur_pos;
+    if ((uint32_t)s.cur_pos % pool_.block_size() == 0) {
+        out.new_block = (int32_t)app.last.physical_block;
+        out.new_block_index = s.cur_pos / (int)pool_.block_size();
+    }
     return out;
 }
 

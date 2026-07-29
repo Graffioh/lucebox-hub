@@ -400,6 +400,19 @@ struct TargetCache {
     std::vector<ggml_tensor *> staging_k;    // size = n_full_attn_layers or empty
     std::vector<ggml_tensor *> staging_v;
 
+    // Prefill staging for the DeltaNet recurrent state (only when
+    // n_seq_slots > 1): a single-sequence conv/ssm slab per delta layer.
+    // The prefilling sequence carries its chunk-to-chunk state HERE instead
+    // of its slot's slab, because every fused/batched decode step writes all
+    // n_seq_slots slabs back (the prefilling slot's dummy row included) and
+    // would corrupt mid-prefill state. The final prefill chunk's graph
+    // copies these into the admitted slot's slabs (ordered after the decode
+    // write-back, so the dummy garbage loses).
+    //   staging_ssm_state:  [S_v, S_v, H_v, 1] f32
+    //   staging_conv_state: [(kernel-1), conv_channels, 1] f32
+    std::vector<ggml_tensor *> staging_ssm_state;   // size = n_delta or empty
+    std::vector<ggml_tensor *> staging_conv_state;
+
     // Snapshot buffers for speculative decoding rollback. Sized identically
     // to ssm_state/conv_state above. Populated by snapshot_ssm_state() and
     // restored by restore_ssm_state().
@@ -610,15 +623,10 @@ void reset_target_cache(TargetCache & c);
 // stale delta-net state corrupting subsequent prefills.
 void reset_recurrent_state(TargetCache & c);
 
-// Zero one sequence slot's recurrent state (SSM + conv slabs) in place.
-// Device-side memset of the slot's slices; other slots are untouched. The
-// concurrent scheduler calls this at admission instead of the whole-buffer
-// reset_recurrent_state, whose clear would destroy every other live sequence.
-void reset_slot_recurrent_state(TargetCache & c, int slot);
-
-// Zero the prefill staging K/V tensors (multi-slot caches only; no-op
-// otherwise). Called before each admission's prefill so the staging region
-// behaves exactly like the freshly reset cache the dense prefill path expects.
+// Zero the prefill staging tensors — K/V and the staging conv/ssm state
+// slabs (multi-slot caches only; no-op otherwise). Called at each admission
+// so the staging region behaves exactly like the freshly reset cache the
+// dense prefill path expects.
 void reset_prefill_staging(TargetCache & c);
 
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
@@ -690,10 +698,28 @@ struct QwenGraphInputs {
     //   paged_max_kv_len — batched decode: max kv_seq_len over live slots,
     //     used (256-padded) as the kernel launch bound instead of
     //     kv_start + n_tokens, which is meaningless across slots.
+    //   n_prefill_tokens — fused prefill+decode: the first n_prefill_tokens
+    //     rows of the token axis are one sequence's prefill chunk (staging
+    //     reads, masked, kv_start offset) and the remaining n_seqs rows are
+    //     the fixed-width batched decode (one token per slot, paged reads).
+    //     Projections, FFN, norms, and the LM head run once over the whole
+    //     batch; only the attention and DeltaNet cores split. Requires
+    //     paged_prefill && n_seqs == n_seq_slots && n_tokens ==
+    //     n_prefill_tokens + n_seqs. 0 = not fused.
+    //   prefill_commit — final prefill chunk: append per-delta-layer copies
+    //     of the staging conv/ssm state into slot seq_slot's slabs at the
+    //     END of the graph (after the batched decode state write-back).
+    //   logits_tail_rows — compute logits only for the LAST n rows of the
+    //     token axis (0 = all rows, subject to last_token_logits_only).
+    //     Fused steps use n_seqs (+1 on the committing chunk, whose extra
+    //     leading row is the prompt's last token — the first-token sample).
     int  n_seqs = 1;
     int  seq_slot = 0;
     bool paged_prefill = false;
     int  paged_max_kv_len = 0;
+    int  n_prefill_tokens = 0;
+    bool prefill_commit = false;
+    int  logits_tail_rows = 0;
     // Capture the LAST token's post-RoPE/post-rotation Q per full-attention
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.

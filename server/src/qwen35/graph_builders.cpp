@@ -285,9 +285,22 @@ bool build_target_step(
     int seq_slot,
     bool paged_prefill,
     int paged_max_kv_len,
+    int n_prefill_tokens,
+    bool prefill_commit,
+    int logits_tail_rows,
     bool compact_slots,
     int graph_key_slot) {
     step_graph_free(sg);
+
+    // Fused prefill+decode: prefill rows lead, decode rows trail.
+    const bool fused = n_prefill_tokens > 0;
+    if (fused && (!paged_attention || !paged_prefill ||
+                  n_tokens != n_prefill_tokens + n_seqs ||
+                  (compact_slots
+                       ? (n_seqs < 1 || n_seqs > cache.n_seq_slots)
+                       : n_seqs != cache.n_seq_slots))) {
+        return false;
+    }
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
     // addresses, keeping the ggml-cuda CUDA-graph cache key (nodes[0]) and
@@ -304,9 +317,8 @@ bool build_target_step(
     if (!sg.ctx) return false;
 
     // ggml-cuda keys its graph cache by nodes[0]. Salting the metadata
-    // allocation shifts node addresses deterministically so each decode
-    // width bucket keeps an independent captured graph while sharing this
-    // single 512 MiB metadata arena.
+    // allocation shifts node addresses deterministically so each compact
+    // decode-width bucket keeps an independent captured graph.
     if (graph_key_slot < 0 || graph_key_slot > 16) return false;
     for (int i = 0; i < graph_key_slot; ++i) {
         (void)ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
@@ -337,21 +349,27 @@ bool build_target_step(
                 if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
             }
         }
-        const int max_win_len = phys_ctx + n_tokens;
+        // Fused steps: the mask feeds only the prefill segment's flash
+        // attention, so its query axis is the chunk, not the whole batch.
+        const int q_rows = fused ? n_prefill_tokens : n_tokens;
+        const int max_win_len = phys_ctx + q_rows;
         const int kv_pad = align_up(max_win_len, kq_stride_pad);
-        const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+        const int q_pad  = align_up(q_rows, KQ_MASK_PAD);
         sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
         ggml_set_name(sg.attn_mask, "attn_mask");
         ggml_set_input(sg.attn_mask);
     }
 
-    if (paged_attention) {
+    if (paged_attention && !fused) {
         // Classic paged decode is single-token; batched decode carries one
         // token per sequence slot (token axis == sequence axis).
         const bool batched = n_seqs > 1;
         if (compact_slots) {
             if (n_tokens != n_seqs || n_seqs < 1 ||
-                n_seqs > 64 || paged_prefill) return false;
+                n_seqs > cache.n_seq_slots || n_seqs > 64 ||
+                paged_prefill) {
+                return false;
+            }
         } else if (batched
                 ? (n_tokens != n_seqs || n_seqs != cache.n_seq_slots)
                 : (n_tokens != 1)) {
@@ -369,16 +387,31 @@ bool build_target_step(
         }
         sg.paged_block_table = cache.paged_block_table;
         sg.paged_kv_seq_lens = cache.paged_kv_seq_lens;
-        if (compact_slots) {
-            sg.active_slot_ids =
-                ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
-            sg.state_slot_ids =
-                ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
-            ggml_set_name(sg.active_slot_ids, "active_slot_ids");
-            ggml_set_name(sg.state_slot_ids, "state_slot_ids");
-            ggml_set_input(sg.active_slot_ids);
-            ggml_set_input(sg.state_slot_ids);
+    }
+    if (paged_attention && fused) {
+        // Fused shape was validated above; the block table spans the decode
+        // segment (one query column per slot).
+        if (fa_window != 0) return false;
+        if (!cache.paged_block_table || !cache.paged_kv_seq_lens) return false;
+        if ((int)cache.paged_block_table->ne[1] != cache.n_seq_slots ||
+            (int)cache.paged_kv_seq_lens->ne[0] != cache.n_seq_slots) {
+            return false;
         }
+        if (cache.staging_k.empty() || cache.staging_conv_state.empty()) {
+            return false;
+        }
+        sg.paged_block_table = cache.paged_block_table;
+        sg.paged_kv_seq_lens = cache.paged_kv_seq_lens;
+    }
+    if (paged_attention && compact_slots) {
+        sg.active_slot_ids =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
+        sg.state_slot_ids =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(sg.active_slot_ids, "active_slot_ids");
+        ggml_set_name(sg.state_slot_ids, "state_slot_ids");
+        ggml_set_input(sg.active_slot_ids);
+        ggml_set_input(sg.state_slot_ids);
     }
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
@@ -426,6 +459,9 @@ bool build_target_step(
     gi.seq_slot                   = seq_slot;
     gi.paged_prefill              = paged_prefill;
     gi.paged_max_kv_len           = paged_max_kv_len;
+    gi.n_prefill_tokens           = n_prefill_tokens;
+    gi.prefill_commit             = prefill_commit;
+    gi.logits_tail_rows           = logits_tail_rows;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

@@ -5,11 +5,12 @@
 // A backend qualifies when it can keep several independent sequences in a
 // paged KV cache and execute a batched decode step. Any additional
 // per-sequence model state is owned by the concrete engine, not by this
-// interface. The scheduler admits one request per slot (blocking prefill),
-// then advances every live slot one token per step(), feeding each sampled
-// token back as the next step's input — which is what lets the scheduler
-// override a token (thinking-budget force-close) before it is committed to
-// the cache.
+// interface. admit() claims a slot and queues its prompt without compute.
+// Each step() then advances that prefill by one chunk alongside the live
+// decode batch. Once prefilling completes, the scheduler advances the slot
+// one token per step(), feeding each sampled token back as the next step's
+// input — which is what lets it override a token (thinking-budget
+// force-close) before it is committed to the cache.
 //
 // The split of duties is deliberate and is the reason this interface exists
 // apart from ModelBackend:
@@ -66,23 +67,21 @@ public:
 
     struct AdmitResult {
         bool ok = false;
-        // Full: no free slot or not enough free KV blocks — retrying after a
-        // retire can succeed. Distinct from a hard error (ok=false,
-        // busy=false), which never can.
+        // Full: no free slot, not enough free KV blocks, or another
+        // admission's prefill is still in flight. Retrying after a retire or
+        // prefill completion can succeed. Distinct from a hard error
+        // (ok=false, busy=false), which never can.
         bool busy = false;
         int  slot = -1;
-        // First generated token, sampled from the prefill logits. It is
-        // PENDING: its KV row is written by the first step() that feeds it
-        // back (mirrors the AR loop's first-token handoff).
-        int32_t first_token = -1;
-        double  prefill_s = 0.0;
+        // Requested output cap clamped to the admitted sequence's context.
+        int  n_gen_cap = 0;
         std::string error;
     };
 
-    // Admit one request into a free slot: allocate its KV blocks (reserving
-    // room for prompt + n_gen), run the full chunked prefill, and sample the
-    // pending first token with the request's sampler. Blocking; decode of the
-    // other slots pauses for the duration.
+    // Admit one request into a free slot and queue its prompt for chunked
+    // prefill. No K/V blocks or compute are consumed here — subsequent step()
+    // calls allocate and advance one prefill chunk alongside the decode batch.
+    // At most one admission may prefill at a time.
     //
     // `sampler` is the only source of truth for how the slot samples:
     // sampler.needs_logit_processing() selects CPU sampling over GPU argmax
@@ -103,16 +102,26 @@ public:
         int     slot   = -1;
         int32_t token  = -1;  // newly sampled token (pending until next step)
         bool    failed = false;
+        // Present when failed=true so the scheduler can report an honest
+        // per-request error instead of silently truncating generation.
+        std::string error;
+        // This step completed the slot's admission prefill. `token` is the
+        // request's first sampled token, still pending like every decode
+        // output. `prefill_s` spans admission through prefill completion.
+        bool    prefill_done = false;
+        double  prefill_s = 0.0;
     };
 
-    // One batched decode iteration: commit each input token to its slot's KV,
-    // run one forward over all slots, sample one new token per live slot.
-    // Every live slot must appear in `inputs`. The engine owns the mapping
-    // from slots to batch rows and must not silently advance an active slot
-    // with a dummy input. Returns false on a whole-batch failure (outputs may
-    // be partial).
+    // One scheduler iteration: commit each input token and advance every
+    // decoding slot, while also advancing the pending admission's prefill by
+    // one chunk when present. Every decoding slot must appear in `inputs`;
+    // the prefilling slot must not. A completed prefill contributes one extra
+    // output with prefill_done=true. Returns false on a whole-batch failure
+    // (outputs may be partial).
     virtual bool step(const std::vector<StepInput> & inputs,
                       std::vector<StepOutput> & outputs) = 0;
+
+    virtual bool prefill_pending() const = 0;
 
     // Release a slot's KV blocks and mark it free. Safe on failed slots.
     virtual void retire(int slot) = 0;

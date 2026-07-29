@@ -24,7 +24,9 @@
 #include "common/seq_engine.h"
 #include "common/seq_slot_manager.h"
 
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace dflash::common {
@@ -50,17 +52,25 @@ public:
     bool step(const std::vector<StepInput> & inputs,
               std::vector<StepOutput> & outputs) override;
 
+    bool prefill_pending() const override {
+        return pending_prefill_.has_value();
+    }
+
     void retire(int slot) override;
 
     bool token_is_eos(int32_t token) const override;
 
 private:
-    // Chunked prefill of one slot through the staging tensors, dual-writing
-    // the pool blocks. Returns committed tokens or -1. `phys_rows` maps the
-    // prompt's logical positions to pool rows (from the slot's block table).
-    int prefill_slot(int slot, const std::vector<int32_t> & tokens,
-                     const std::vector<int64_t> & phys_rows,
-                     int32_t * first_token_out);
+    struct PendingPrefill {
+        int slot = -1;
+        std::vector<int32_t> prompt;
+        int progress = 0;
+        std::chrono::steady_clock::time_point admitted_at{};
+    };
+
+    std::optional<PendingPrefill> pending_prefill_;
+
+    int32_t sample_prefill_first_token(int slot);
 
     Qwen35Backend & b_;
     SeqSlotManager  slots_;
