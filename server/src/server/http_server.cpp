@@ -370,18 +370,6 @@ static std::string generate_id(const char * prefix) {
     return buf;
 }
 
-// Logging helpers shared by route_request() / worker_loop(). Kept static
-// (file-scope) so they don't leak into the public ABI; the chat lifecycle
-// logs that use them are part of #270's request-tracing instrumentation.
-static const char * api_format_name(ApiFormat format) {
-    switch (format) {
-    case ApiFormat::OPENAI_CHAT: return "chat";
-    case ApiFormat::ANTHROPIC:   return "anthropic";
-    case ApiFormat::RESPONSES:   return "responses";
-    default:                     return "unknown";
-    }
-}
-
 static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
 }
@@ -1219,8 +1207,16 @@ int HttpServer::run() {
     std::fprintf(stderr, "[server] listening on http://%s:%d\n",
                  config_.host.c_str(), config_.port);
 
-    // Start worker thread.
-    worker_thread_ = std::thread([this]() { worker_loop(); });
+    // A backend-provided sequence engine replaces the one-request worker
+    // with the concurrent scheduler. Upstream forwarding stays on the
+    // classic path even when the local backend exposes an engine.
+    if (SeqEngine * engine = backend_.seq_engine();
+        engine && config_.pflash_upstream_base.empty()) {
+        worker_thread_ =
+            std::thread([this, engine]() { scheduler_loop(*engine); });
+    } else {
+        worker_thread_ = std::thread([this]() { worker_loop(); });
+    }
 
     // Accept loop.
     while (!stopping_.load()) {
@@ -1803,8 +1799,7 @@ void HttpServer::log_parsed_request(const ParsedRequest & req) const {
 
 void HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req) {
     // Set socket non-blocking for send() stall detection during streaming.
-    const int flags = sock_get_flags(fd);
-    if (flags >= 0) sock_set_nonblock(fd);
+    sock_set_nonblock(fd);
 
     ServerJob job;
     job.fd = fd;
@@ -3199,6 +3194,99 @@ void HttpServer::configure_generation_io(
     };
 }
 
+bool HttpServer::deliver_generation_token(
+        const ParsedRequest & req, SocketHandle fd, SseEmitter & emitter,
+        int32_t token, int & completion_tokens, bool & visible_output_seen,
+        bool & client_disconnected, ClientSendBuffer * send_buffer) {
+    if (client_disconnected) return false;
+    ++completion_tokens;
+
+    auto put = [&](const std::string & chunk) {
+        if (send_buffer) {
+            send_buffer->append(chunk);
+            return true;
+        }
+        if (!send_all(fd, chunk.data(), chunk.size())) {
+            client_disconnected = true;
+            return false;
+        }
+        return true;
+    };
+
+    const bool publish_request_status = send_buffer == nullptr;
+    if (publish_request_status && completion_tokens % 10 == 0) {
+        status_.update_completion_tokens(completion_tokens);
+        broadcast_status();
+    }
+
+    std::string text;
+    const TokenDelivery delivery =
+        classify_generated_token(tokenizer_, token, text);
+    if (delivery == TokenDelivery::kSkip) return true;
+
+    if (!text.empty()) {
+        visible_output_seen = true;
+        if (publish_request_status) broadcast_token(text);
+    }
+    if (text.empty()) return true;
+
+    const auto chunks = emitter.emit_token(text);
+    if (req.stream) {
+        for (const auto & chunk : chunks) {
+            if (!put(chunk)) return false;
+        }
+    }
+    return delivery == TokenDelivery::kThinkTag || !emitter.stop_hit();
+}
+
+void HttpServer::send_nonstream_response(
+        const ParsedRequest & req, SocketHandle fd, SseEmitter & emitter,
+        const std::vector<int32_t> & gen_tokens, int n_gen_cap,
+        bool budget_forced_close, bool degenerate_decode_close,
+        float accept_rate, const GenTimings & gen_timings,
+        ClientSendBuffer * send_buffer) {
+    CompletionTokenCounts counts;
+    counts.total = (int) gen_tokens.size();
+    emitter.emit_finish(counts.total);
+    const int first_content = emitter.first_content_token_index();
+    const int emitted = emitter.emit_token_count();
+    counts.reasoning = first_content < 0 ? emitted : first_content;
+    counts.content = first_content < 0 ? 0 : emitted - first_content;
+
+    GenerateResult result;
+    result.tokens = gen_tokens;
+    result.budget_forced_close = budget_forced_close;
+    result.degenerate_decode_close = degenerate_decode_close;
+    result.accept_rate = accept_rate;
+
+    json response;
+    switch (req.format) {
+    case ApiFormat::OPENAI_CHAT:
+        response = build_openai_completion_response(
+            req, result, n_gen_cap, gen_timings, counts, emitter);
+        break;
+    case ApiFormat::ANTHROPIC:
+        response = build_anthropic_response(
+            req, result, n_gen_cap, gen_timings, counts, emitter);
+        break;
+    case ApiFormat::RESPONSES:
+        response = build_responses_api_response(
+            req, result, gen_timings, counts, emitter);
+        break;
+    default:
+        response = {{"text", emitter.accumulated_text()}};
+        break;
+    }
+
+    const std::string body = response.dump() + "\n";
+    if (send_buffer) {
+        send_buffer->append(
+            format_http_response(200, "application/json", body));
+    } else {
+        send_response(fd, 200, "application/json", body);
+    }
+}
+
 void HttpServer::worker_loop() {
     while (true) {
         ServerJob * job = dequeue();
@@ -3445,8 +3533,7 @@ void HttpServer::process_job(ServerJob * job) {
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
         // Streaming uses non-blocking sends; restore blocking mode before
         // writing a complete JSON response on this shared socket path.
-        const int flags = sock_get_flags(fd);
-        if (flags >= 0) sock_set_block(fd);
+        sock_set_block(fd);
         send_response(fd, 200, "application/json",
                       response.dump() + "\n");
     }
@@ -3529,6 +3616,16 @@ ServerJob * HttpServer::dequeue() {
     if (!queue_head_) queue_tail_ = nullptr;
     j->next = nullptr;
     return j;
+}
+
+ServerJob * HttpServer::try_dequeue() {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    if (!queue_head_) return nullptr;
+    ServerJob * job = queue_head_;
+    queue_head_ = job->next;
+    if (!queue_head_) queue_tail_ = nullptr;
+    job->next = nullptr;
+    return job;
 }
 
 // ─── HTTP I/O ───────────────────────────────────────────────────────────
@@ -3667,9 +3764,9 @@ bool HttpServer::send_all(SocketHandle fd, const void * data, size_t len) {
     return true;
 }
 
-bool HttpServer::send_response(
-        SocketHandle fd, int status, const std::string & content_type,
-                               const std::string & body) {
+std::string HttpServer::format_http_response(
+        int status, const std::string & content_type,
+        const std::string & body) {
     const char * reason = "OK";
     switch (status) {
         case 200: reason = "OK"; break;
@@ -3693,7 +3790,15 @@ bool HttpServer::send_response(
     header += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     header += "Connection: close\r\n\r\n";
     header += body;
-    return send_all(fd, header.data(), header.size());
+    return header;
+}
+
+bool HttpServer::send_response(
+        SocketHandle fd, int status, const std::string & content_type,
+        const std::string & body) {
+    const std::string payload =
+        format_http_response(status, content_type, body);
+    return send_all(fd, payload.data(), payload.size());
 }
 
 bool HttpServer::send_error(

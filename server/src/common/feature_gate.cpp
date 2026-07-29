@@ -179,6 +179,54 @@ std::string check_feature_compatibility(
         }
     }
 
+    // ── --max-concurrency × paged attention
+    // Concurrent decode slots are currently implemented only by the paged
+    // qwen35 backend. The common scheduler does not require a particular
+    // model-state representation; each backend owns whatever per-slot state
+    // its graph needs alongside one block-table column per sequence.
+    // Everything the paged cluster above rejects is transitively rejected,
+    // so the rules here are only about the flag pair itself.
+    if (args.max_concurrency < 1) {
+        return "--max-concurrency must be at least 1";
+    }
+    if (args.max_concurrency > 1) {
+        if (!args.paged_attention) {
+            return "--max-concurrency requires --paged-attention";
+        }
+        // The paged pool addresses tokens with uint32; 64 slots is far above
+        // any batch the decode kernel has been sized for and keeps the
+        // fixed-width decode batch bounded.
+        if (args.max_concurrency > 64) {
+            return "--max-concurrency must be at most 64";
+        }
+        // The default pool allocates one full logical context per slot, so an
+        // accidental huge product should fail loudly.
+        if ((long long)args.max_concurrency *
+                (long long)paged_token_capacity(args.device.max_ctx) +
+                PAGED_BLOCK_SIZE > (long long)INT_MAX &&
+            args.kv_pool_tokens <= 0) {
+            return "--max-concurrency x --max-ctx exceeds the pool's INT32 token "
+                   "space; pass --kv-pool-tokens";
+        }
+    }
+    if (args.kv_pool_tokens != 0) {
+        if (args.max_concurrency <= 1) {
+            return "--kv-pool-tokens requires --max-concurrency greater than 1";
+        }
+        // The cache appends one scratch block after the physical pool, and
+        // the requested pool itself is rounded up to a whole block. Cap the
+        // request at the largest aligned pool that leaves room for scratch.
+        const long long max_pool_tokens =
+            ((long long)INT_MAX - PAGED_BLOCK_SIZE) /
+            PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
+        if (args.kv_pool_tokens < PAGED_BLOCK_SIZE ||
+            args.kv_pool_tokens > max_pool_tokens) {
+            return "--kv-pool-tokens must be in [" +
+                   std::to_string(PAGED_BLOCK_SIZE) + ", " +
+                   std::to_string(max_pool_tokens) + "]";
+        }
+    }
+
     // ── --ds4-prefill × architecture
     if (args.ds4_prefill_mode_set && arch != "deepseek4") {
         return "--ds4-prefill is only valid for deepseek4 models (detected '" +

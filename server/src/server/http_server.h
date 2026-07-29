@@ -12,6 +12,7 @@
 #pragma once
 
 #include "socket_handle.h"
+#include "client_send_buffer.h"
 #include "common/model_backend.h"
 #include "tokenizer.h"
 #include "chat_template.h"
@@ -26,6 +27,7 @@
 #include "model_card.h"
 #include "adaptive_keep_ratio.h"
 #include "server_status.h"
+#include "sse_emitter.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -356,6 +358,31 @@ private:
         SocketHandle fd, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io);
 
+    // Worker thread, concurrent mode (the backend exposes a SeqEngine):
+    // iteration-level scheduler. Admission is blocking between decode
+    // iterations; active slots advance together in one batched step.
+    void scheduler_loop(SeqEngine & engine);
+
+    // Non-blocking dequeue used for admission polling between decode steps.
+    ServerJob * try_dequeue();
+
+    // Token delivery and response construction shared with the concurrent
+    // scheduler. A send buffer keeps slow clients off the shared decode loop.
+    bool deliver_generation_token(
+        const ParsedRequest & req, SocketHandle fd, SseEmitter & emitter,
+        int32_t token, int & completion_tokens, bool & visible_output_seen,
+        bool & client_disconnected,
+        ClientSendBuffer * send_buffer = nullptr);
+    void send_nonstream_response(
+        const ParsedRequest & req, SocketHandle fd, SseEmitter & emitter,
+        const std::vector<int32_t> & gen_tokens, int n_gen_cap,
+        bool budget_forced_close, bool degenerate_decode_close,
+        float accept_rate, const GenTimings & gen_timings,
+        ClientSendBuffer * send_buffer = nullptr);
+    std::string format_http_response(
+        int status, const std::string & content_type,
+        const std::string & body);
+
     // Parse HTTP request from socket.
     struct HttpRequest {
         std::string method;
@@ -478,6 +505,12 @@ struct ServerJob {
     std::mutex    mu;
     std::condition_variable cv;
     ServerJob *   next = nullptr;
+
+    // Concurrent-scheduler state that survives a pool-full admission retry.
+    // The classic worker leaves these fields untouched.
+    bool          announced = false;
+    bool          sse_started = false;
+    std::unique_ptr<SseEmitter> emitter;
 };
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────

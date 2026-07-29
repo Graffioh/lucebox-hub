@@ -1100,6 +1100,7 @@ if(DFLASH27B_TESTS)
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
+            src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
             src/qwen3/anchor_scan.cpp)
@@ -1339,6 +1340,7 @@ if(DFLASH27B_SERVER)
         add_executable(dflash_server
             src/server/server_main.cpp
             src/server/http_server.cpp
+            src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
         )

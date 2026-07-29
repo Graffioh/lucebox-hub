@@ -106,6 +106,11 @@ static void print_usage(const char * prog) {
         "                       from attention at long contexts. Use 0 for tools.\n"
         "  --paged-attention   Use 16-token paged KV blocks for Qwen3.6-27B\n"
         "                       autoregressive decode (experimental)\n"
+        "  --max-concurrency <N>  Maximum concurrent decode sequences\n"
+        "                         (requires --paged-attention; default: 1)\n"
+        "  --kv-pool-tokens <N> Total paged K/V pool shared by all\n"
+        "                       --max-concurrency slots, in tokens\n"
+        "                       (default: N x max-ctx)\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
@@ -349,6 +354,10 @@ int main(int argc, char ** argv) {
             bargs.fa_window = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--paged-attention") == 0) {
             bargs.paged_attention = true;
+        } else if (std::strcmp(argv[i], "--max-concurrency") == 0 && i + 1 < argc) {
+            bargs.max_concurrency = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-pool-tokens") == 0 && i + 1 < argc) {
+            bargs.kv_pool_tokens = std::atoll(argv[++i]);
         } else if (std::strcmp(argv[i], "--model-name") == 0 && i + 1 < argc) {
             sconfig.model_name = argv[++i];
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
@@ -611,11 +620,11 @@ int main(int argc, char ** argv) {
     backend_features.routing_stats_requested =
         sconfig.freq_tracking || !sconfig.collect_routing_path.empty();
     backend_features.adaptive_experts_requested = adaptive_experts_set;
-    // The gate rejects --paged-attention alongside KVFlash, and KVFlash is
-    // requested through the environment, so resolve it here where the pool
-    // sizing code is linked.
+    // Fixed pools are known incompatibilities before model setup. Automatic
+    // sizing needs the backend's real VRAM budget; if it produces a live pool,
+    // the backend rejects the pairing after sizing.
     backend_features.kvflash_enabled =
-        kvflash_pool_from_env(bargs.device.max_ctx, KvFlashConfig{}) > 0;
+        kvflash_fixed_pool_requested(std::getenv("DFLASH_KVFLASH"));
     const BackendPreparation backend_preparation =
         prepare_backend(bargs, backend_features);
     if (!backend_preparation.ok()) {
