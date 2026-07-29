@@ -2466,6 +2466,26 @@ extern "C" {
              struct ggml_tensor * a,
                               int direction);
 
+    // GGML_OP_MOE_FUSED multiplexes a small family of GPU-only MoE helpers.
+    // Parameter zero normally contains n_embd; negative values identify the
+    // specialized sub-operation. Keep the values named so graph schedulers
+    // and backends do not depend on unexplained integer literals.
+    enum ggml_moe_fused_subop {
+        GGML_MOE_FUSED_COMBINE            = -1,
+        GGML_MOE_FUSED_OWNER              = -2,
+        GGML_MOE_FUSED_DEFERRED_PEER_COPY = -3,
+        GGML_MOE_FUSED_OWNER_SPLIT        = -4,
+        GGML_MOE_FUSED_ALIGN_IDS          = -5,
+    };
+
+    // Word offsets in ggml_tensor::op_params for the deferred peer-copy op.
+    // Both pointers start at naturally aligned 64-bit boundaries.
+    enum ggml_moe_fused_deferred_peer_param {
+        GGML_MOE_FUSED_DEFERRED_EVENT_WORD         = 2,
+        GGML_MOE_FUSED_DEFERRED_SOURCE_WORD        = 4,
+        GGML_MOE_FUSED_DEFERRED_EXTERNAL_WAIT_WORD = 7,
+    };
+
     GGML_API struct ggml_tensor * ggml_moe_fused(
             struct ggml_context * ctx,
             struct ggml_tensor  * input,
@@ -2485,15 +2505,6 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_laguna_moe_combine(
             struct ggml_context * ctx,
             struct ggml_tensor  * experts,
-            struct ggml_tensor  * expert_weights);
-
-    // Reduce packed owner-local expert rows directly back to token order.
-    // inverse_routes maps [route, token] to a row in packed_experts; routes
-    // with zero weight are ignored before the row is read.
-    GGML_API struct ggml_tensor * ggml_laguna_moe_packed_combine(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * packed_experts,
-            struct ggml_tensor  * inverse_routes,
             struct ggml_tensor  * expert_weights);
 
     // Coarse DeepSeek-V4 routed-owner op. gate_up contains concatenated gate

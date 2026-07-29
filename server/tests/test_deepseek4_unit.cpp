@@ -4,6 +4,7 @@
 #include "ggml-cpu.h"
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
 #include "ggml-cuda.h"
+#include "common/cuda_graph_overrides.h"
 #include "deepseek4/deepseek4_hc_cuda.h"
 #endif
 
@@ -1869,7 +1870,6 @@ static void test_reset_deepseek4_cache(ggml_backend_t backend) {
     DeepSeek4Cache cache;
     TEST_ASSERT(create_deepseek4_cache(backend, weights, 32, cache));
     if (cache.buf) {
-        TEST_ASSERT(cache.sequence_id == 0);
         ggml_backend_buffer_clear(cache.buf, 0x7f);
         cache.cur_pos = 17;
         cache.layers[0].n_comp = 4;
@@ -1879,7 +1879,6 @@ static void test_reset_deepseek4_cache(ggml_backend_t backend) {
 
         reset_deepseek4_cache(cache);
 
-        TEST_ASSERT(cache.sequence_id == 1);
         TEST_ASSERT(cache.cur_pos == 0);
         for (const auto & layer : cache.layers) {
             TEST_ASSERT(layer.n_comp == 0);
@@ -1890,7 +1889,7 @@ static void test_reset_deepseek4_cache(ggml_backend_t backend) {
         }
 
         reset_deepseek4_cache(cache);
-        TEST_ASSERT(cache.sequence_id == 2);
+        TEST_ASSERT(cache.cur_pos == 0);
     }
     free_deepseek4_cache(cache);
 
@@ -3078,6 +3077,50 @@ static void test_hc_set_device_contract() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_cuda_graph_overrides_restore_nested_state() {
+    std::fprintf(stderr, "  test_cuda_graph_overrides_restore_nested_state ...");
+
+    const bool initial_disabled =
+        ggml_backend_cuda_set_graphs_disabled_override(false);
+    const int initial_mmvq =
+        ggml_backend_cuda_set_mmvq_max_ncols_override(0);
+    const bool initial_skip =
+        ggml_backend_cuda_set_skip_props_check(false);
+
+    {
+        ScopedCudaGraphOverrides outer(
+            /*disable_graphs=*/true,
+            /*mmvq_max_ncols=*/4,
+            /*skip_property_check=*/true);
+        TEST_ASSERT(ggml_backend_cuda_set_graphs_disabled_override(true));
+        TEST_ASSERT(ggml_backend_cuda_set_mmvq_max_ncols_override(4) == 4);
+        TEST_ASSERT(ggml_backend_cuda_set_skip_props_check(true));
+
+        {
+            ScopedCudaGraphOverrides inner(
+                /*disable_graphs=*/true,
+                /*mmvq_max_ncols=*/2,
+                /*skip_property_check=*/true);
+            TEST_ASSERT(ggml_backend_cuda_set_graphs_disabled_override(true));
+            TEST_ASSERT(ggml_backend_cuda_set_mmvq_max_ncols_override(2) == 2);
+            TEST_ASSERT(ggml_backend_cuda_set_skip_props_check(true));
+        }
+
+        TEST_ASSERT(ggml_backend_cuda_set_graphs_disabled_override(true));
+        TEST_ASSERT(ggml_backend_cuda_set_mmvq_max_ncols_override(4) == 4);
+        TEST_ASSERT(ggml_backend_cuda_set_skip_props_check(true));
+    }
+
+    TEST_ASSERT(!ggml_backend_cuda_set_graphs_disabled_override(false));
+    TEST_ASSERT(ggml_backend_cuda_set_mmvq_max_ncols_override(0) == 0);
+    TEST_ASSERT(!ggml_backend_cuda_set_skip_props_check(false));
+
+    ggml_backend_cuda_set_graphs_disabled_override(initial_disabled);
+    ggml_backend_cuda_set_mmvq_max_ncols_override(initial_mmvq);
+    ggml_backend_cuda_set_skip_props_check(initial_skip);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_hc_scratch_shape_capacity() {
     std::fprintf(stderr, "  test_hc_scratch_shape_capacity ...");
     if (!deepseek4_cuda_hc_set_device(0)) {
@@ -3224,6 +3267,7 @@ int main() {
     test_layer_range_rejects_stale_hc_boundary();
     test_hc_scratch_per_device();
     test_hc_set_device_contract();
+    test_cuda_graph_overrides_restore_nested_state();
     test_hc_scratch_shape_capacity();
 #endif
 

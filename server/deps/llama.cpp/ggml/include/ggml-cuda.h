@@ -34,23 +34,11 @@ GGML_BACKEND_API bool ggml_backend_cuda_set_low_priority_stream(
 // calling thread once a stable graph has already been captured.  Callers must
 // bracket only immutable-topology graphs whose tensor addresses and shapes do
 // not change; input contents may still be updated in place.
-GGML_BACKEND_API void ggml_backend_cuda_set_skip_props_check(bool skip);
+GGML_BACKEND_API bool ggml_backend_cuda_set_skip_props_check(bool skip);
 
-// Capture a scheduler-wide device program around multiple ordinary backend
-// graph submissions.  The handle is opaque and belongs to `backend`; callers
-// must free it before freeing that backend.  These hooks are intentionally
-// opt-in so normal per-split CUDA/HIP graph behavior is unchanged.
-typedef void * ggml_backend_cuda_whole_graph_t;
-GGML_BACKEND_API bool ggml_backend_cuda_whole_graph_capture_prepare(
-    ggml_backend_t backend0, ggml_backend_t backend1);
-GGML_BACKEND_API bool ggml_backend_cuda_whole_graph_capture_begin(
-    ggml_backend_t backend);
-GGML_BACKEND_API ggml_backend_cuda_whole_graph_t
-ggml_backend_cuda_whole_graph_capture_end(ggml_backend_t backend);
-GGML_BACKEND_API bool ggml_backend_cuda_whole_graph_launch(
-    ggml_backend_t backend, ggml_backend_cuda_whole_graph_t graph);
-GGML_BACKEND_API void ggml_backend_cuda_whole_graph_free(
-    ggml_backend_t backend, ggml_backend_cuda_whole_graph_t graph);
+// Disable CUDA/HIP graph capture and replay on the calling thread. Returns the
+// previous value so scoped callers can restore nested overrides correctly.
+GGML_BACKEND_API bool ggml_backend_cuda_set_graphs_disabled_override(bool disabled);
 
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
@@ -72,7 +60,7 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 // thread. Pass zero to restore LUCE_MMVQ_MAX_NCOLS. This is intentionally
 // thread-local so one graph builder can select a safe topology without
 // changing concurrent requests or other CUDA/HIP backends.
-GGML_BACKEND_API void ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols);
+GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);

@@ -127,8 +127,6 @@ struct MoeHybridGraphInputs {
     ggml_tensor * hot_valid_lut = nullptr;
     ggml_tensor * cold_local_lut = nullptr;
     ggml_tensor * cold_valid_lut = nullptr;
-    ggml_tensor * shard_local_lut = nullptr;
-    ggml_tensor * shard_valid_lut = nullptr;
     ggml_tensor * output = nullptr;
     // Exact owner-local partials exposed for consumers that can fold the
     // hot+cold reduction into their own kernel.  peer_output is the stable
@@ -141,9 +139,7 @@ struct MoeHybridGraphInputs {
     // backend avoids gate/up -> activation -> down ping-pong copies.
     std::vector<ggml_tensor *> hot_remap_nodes;
     std::vector<ggml_tensor *> cold_remap_nodes;
-    std::vector<ggml_tensor *> shard_remap_nodes;
     std::vector<ggml_tensor *> hot_nodes;
-    std::vector<ggml_tensor *> shard_nodes;
     std::vector<ggml_tensor *> cold_nodes;
     // Main-backend nodes that first consume a completed cold branch. Hash
     // layers can append two joins because six routes are lowered as 4 + 2.

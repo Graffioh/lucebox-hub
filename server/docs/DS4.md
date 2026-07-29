@@ -188,7 +188,7 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_DS4_MOE_TP_GPU` | HIP device that owns the cold expert stack. |
 | `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
-| `DFLASH_DS4_TP_BATCH_PEER_COPIES` | Batch same-split peer copies behind one dependency. |
+| `GGML_CUDA_BATCH_PEER_COPIES` | Batch ordered peer copies behind one dependency. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Long-prefill arena kill switch; set `0` to restore per-layer owner allocation. |
 
 `DFLASH_DS4_TIMING` enables the existing timing banners:

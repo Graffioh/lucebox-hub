@@ -758,17 +758,6 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     out.ctx = meta_ctx;
     out.buf = buf;
     out.dense_split_buf = split_buf;
-    // Pointer equality is insufficient to identify a reload: allocators may
-    // reuse the same ggml_context address after park/unpark. Cached graphs use
-    // this generation to reject tensors from the prior model lifetime.
-    static std::atomic<uint64_t> next_runtime_generation{1};
-    out.runtime_generation =
-        next_runtime_generation.fetch_add(1, std::memory_order_relaxed);
-    if (out.runtime_generation == 0) {
-        out.runtime_generation =
-            next_runtime_generation.fetch_add(1, std::memory_order_relaxed);
-    }
-
     gguf_free(gctx);
     // Note: meta_ctx is now owned by out.ctx — do NOT free it here.
 
@@ -1011,7 +1000,6 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
     w.embedder.tok_embd_owned.clear();
     w.embedder.tok_embd_bytes = nullptr;
     w.moe_hybrid = false;
-    w.runtime_generation = 0;
 }
 
 }  // namespace dflash::common

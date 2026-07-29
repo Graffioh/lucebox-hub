@@ -323,9 +323,6 @@ extern "C" {
 
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
-    GGML_API int                  ggml_backend_sched_get_n_splits_for_backend(
-                                            ggml_backend_sched_t sched,
-                                            ggml_backend_t backend);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
@@ -342,13 +339,6 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
-
-    // The caller has synchronized all backends and is recording this compute
-    // into an outer device graph.  Buffer-reuse waits may be omitted, while
-    // any copy requiring a synchronous fallback becomes an explicit error.
-    GGML_API void                 ggml_backend_sched_set_whole_graph_capture(
-                                            ggml_backend_sched_t sched,
-                                            bool enabled);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
@@ -370,12 +360,25 @@ extern "C" {
                                             ggml_backend_sched_t sched,
                                             const struct ggml_tensor * node);
 
-    // Mark a GGML_OP_MOE_FUSED mode -3 node as a deferred peer copy. The
+    // Mark a GGML_MOE_FUSED_DEFERRED_PEER_COPY node as a deferred peer copy. The
     // scheduler keeps src[0] on its owner backend, records a dedicated event
     // after the producing split, and injects the native handle into the op.
     GGML_API void                 ggml_backend_sched_add_deferred_peer_copy_node(
                                             ggml_backend_sched_t sched,
                                             struct ggml_tensor * node);
+
+    // Configure generic execution policy for registered deferred peer copies.
+    // A split queues the event wait before the consumer split; without it the
+    // deferred-copy op waits at its exact position in the consumer graph.
+    GGML_API void                 ggml_backend_sched_set_deferred_peer_copy_split(
+                                            ggml_backend_sched_t sched,
+                                            bool enabled);
+
+    // Inputs in one split share a destination backend and copy generation, so
+    // they may reuse one generation wait before their ordered copies.
+    GGML_API void                 ggml_backend_sched_set_batch_split_copies(
+                                            ggml_backend_sched_t sched,
+                                            bool enabled);
 
     //
     // Meta backend

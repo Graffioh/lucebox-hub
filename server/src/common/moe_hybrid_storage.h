@@ -81,15 +81,6 @@ struct MoeHybridLayerStorage {
     ggml_tensor * down_hot = nullptr;
     ggml_tensor * gate_up_hot = nullptr;
 
-    // Optional prompt-independent tensor-parallel shard for every cold
-    // expert.  The main GPU owns the leading `expert_shard_channels` FFN
-    // channels while the cold GPU owns the exact complementary channels in
-    // gate_cold/up_cold/down_cold.  Full hot experts remain unsharded.
-    ggml_tensor * gate_shard_hot = nullptr;
-    ggml_tensor * up_shard_hot = nullptr;
-    ggml_tensor * down_shard_hot = nullptr;
-    int expert_shard_channels = 0;
-
     ggml_context * cold_ctx = nullptr;
     ggml_backend_buffer_t cold_buf = nullptr;
     ggml_tensor * gate_cold = nullptr;
@@ -229,15 +220,6 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
 // hot-local index, or -1 on failure. No-op (returns existing) if already hot.
 int moe_hybrid_cache_swap_in(MoeHybridLayerStorage & st, int global_expert,
                              ggml_backend_t gpu_backend);
-
-// Replace the fixed hot stacks in-place from the persistent expert GGUF mmap.
-// Tensor shapes and addresses remain unchanged, so cached graphs stay valid;
-// only the global->local LUTs need refreshing before their next execution.
-bool moe_hybrid_reassign_hot_experts_from_mmap(
-    MoeHybridStorage & storage,
-    ggml_backend_t hot_backend,
-    const std::vector<std::vector<int32_t>> & hot_ids_by_layer,
-    std::string * err = nullptr);
 
 // Build hybrid storage by loading expert data directly from file (mmap).
 bool build_moe_hybrid_storage_from_file(

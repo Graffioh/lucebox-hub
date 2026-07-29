@@ -233,7 +233,6 @@ struct DeepSeek4Weights {
 
     // Runtime serving policy. These values are set by the backend after the
     // GGUF is loaded; they are not model metadata.
-    uint64_t runtime_generation  = 0;  // unique successful-load identity
     int  routed_expert_top_k = 0;  // 0 = model default (n_expert_used)
     bool fused_decode        = false;
 };
@@ -276,9 +275,6 @@ struct DeepSeek4LayerRangeCache;
 
 struct DeepSeek4Cache {
     int cur_pos  = 0;
-    // Monotonic request generation. Whole-step HIP graphs may retain kernel
-    // state safely within one sequence, but must not survive a cache clear.
-    uint64_t sequence_id = 0;
     int max_ctx  = 0;
     int n_layer  = 0;
 
@@ -339,9 +335,6 @@ bool create_deepseek4_cache(ggml_backend_t backend,
 
 void free_deepseek4_cache(DeepSeek4Cache & c);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
-// Release cached fused decode/verify schedulers before their model/backend
-// owners are destroyed (park, shutdown, or failed reload).
-void reset_deepseek4_graph_runtime_caches();
 int deepseek4_previous_raw_ring_spans(
     int kv_start,
     int n_swa,

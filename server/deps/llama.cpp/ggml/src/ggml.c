@@ -8167,40 +8167,10 @@ struct ggml_tensor * ggml_laguna_moe_combine(
     result->src[0] = experts;
     result->src[1] = expert_weights;
 
-    ggml_set_op_params_i32(result, 0, -1);
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_COMBINE);
     ggml_set_op_params_i32(result, 1, (int32_t) experts->ne[0]);
     ggml_set_op_params_i32(result, 2, (int32_t) experts->ne[1]);
     ggml_set_op_params_i32(result, 3, (int32_t) experts->ne[2]);
-
-    return result;
-}
-
-struct ggml_tensor * ggml_laguna_moe_packed_combine(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * packed_experts,
-        struct ggml_tensor  * inverse_routes,
-        struct ggml_tensor  * expert_weights) {
-    GGML_ASSERT(packed_experts->type == GGML_TYPE_F32);
-    GGML_ASSERT(inverse_routes->type == GGML_TYPE_I32);
-    GGML_ASSERT(expert_weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(inverse_routes->ne[0] == expert_weights->ne[0]);
-    GGML_ASSERT(inverse_routes->ne[1] == expert_weights->ne[1]);
-
-    const int64_t ne[4] = {
-        packed_experts->ne[0], inverse_routes->ne[1], 1, 1 };
-    struct ggml_tensor * result =
-        ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
-
-    result->op = GGML_OP_MOE_FUSED;
-    result->src[0] = packed_experts;
-    result->src[1] = inverse_routes;
-    result->src[2] = expert_weights;
-
-    ggml_set_op_params_i32(result, 0, -6);
-    ggml_set_op_params_i32(result, 1, (int32_t) packed_experts->ne[0]);
-    ggml_set_op_params_i32(result, 2, (int32_t) packed_experts->ne[1]);
-    ggml_set_op_params_i32(result, 3, (int32_t) inverse_routes->ne[0]);
-    ggml_set_op_params_i32(result, 4, (int32_t) inverse_routes->ne[1]);
 
     return result;
 }
@@ -8237,7 +8207,7 @@ struct ggml_tensor * ggml_ds4_moe_owner(
     result->src[3] = expert_ids;
     result->src[4] = expert_weights;
 
-    ggml_set_op_params_i32(result, 0, -2);
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_OWNER);
     ggml_set_op_params_i32(result, 1, (int32_t) ff_dim);
     ggml_set_op_params_f32(result, 2, swiglu_clamp);
     ggml_set_op_params_f32(result, 3, down_scale);
@@ -8283,7 +8253,7 @@ struct ggml_tensor * ggml_ds4_moe_owner_split(
     result->src[4] = expert_ids;
     result->src[5] = expert_weights;
 
-    ggml_set_op_params_i32(result, 0, -4);
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_OWNER_SPLIT);
     ggml_set_op_params_i32(result, 1, (int32_t) ff_dim);
     ggml_set_op_params_f32(result, 2, swiglu_clamp);
     ggml_set_op_params_f32(result, 3, gate_scale);
@@ -8303,7 +8273,7 @@ struct ggml_tensor * ggml_ds4_moe_align_ids(
     struct ggml_tensor * result = ggml_dup_tensor(ctx, expert_ids);
     result->op = GGML_OP_MOE_FUSED;
     result->src[0] = expert_ids;
-    ggml_set_op_params_i32(result, 0, -5);
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_ALIGN_IDS);
     return result;
 }
 
@@ -8319,7 +8289,7 @@ struct ggml_tensor * ggml_ds4_deferred_peer_copy(
 
     // op_params[2..3] is populated by the backend scheduler with the native
     // event handle after backend assignment and before graph allocation.
-    ggml_set_op_params_i32(result, 0, -3);
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_DEFERRED_PEER_COPY);
 
     return result;
 }

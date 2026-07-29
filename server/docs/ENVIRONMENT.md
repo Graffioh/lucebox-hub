@@ -28,7 +28,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_MMID_GROUPED_DEVICE` | -1 | Optional zero-based device restriction; unset/-1 applies to every eligible device. |
 | `DFLASH_DS4_MOE_TP` / `DFLASH_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. |
 | `DFLASH_DS4_MOE_TP_GPU` | auto | HIP device for the cold DeepSeek4 expert owner. |
-| `DFLASH_DS4_TP_BATCH_PEER_COPIES` | unset | BURN-IN: publish same-split HIP peer copies with one cross-device dependency. |
+| `GGML_CUDA_BATCH_PEER_COPIES` | unset | BURN-IN: publish ordered HIP peer copies with one cross-device dependency per source/destination pair. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `DFLASH_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
 | `DFLASH_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |

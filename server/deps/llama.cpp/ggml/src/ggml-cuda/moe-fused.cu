@@ -309,56 +309,6 @@ static __global__ void laguna_moe_combine_kernel(
         (size_t)t * output_nb1) = sum;
 }
 
-static __global__ void laguna_moe_packed_combine_kernel(
-    const char * __restrict__ packed,
-    const char * __restrict__ inverse,
-    const char * __restrict__ weights,
-    char * __restrict__ output,
-    const int n_embd,
-    const int n_pairs,
-    const int n_used,
-    const int n_tokens,
-    const size_t packed_nb0,
-    const size_t packed_nb1,
-    const size_t inverse_nb0,
-    const size_t inverse_nb1,
-    const size_t weights_nb0,
-    const size_t weights_nb1,
-    const size_t output_nb0,
-    const size_t output_nb1) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = n_embd * n_tokens;
-    if (idx >= total) return;
-
-    const int h = idx % n_embd;
-    const int t = idx / n_embd;
-    float sum = 0.0f;
-    for (int e = 0; e < n_used; ++e) {
-        const float w = *(const float *)(weights +
-            (size_t)e * weights_nb0 +
-            (size_t)t * weights_nb1);
-        if (w == 0.0f) {
-            if (e == 0) sum = 0.0f;
-            continue;
-        }
-        const int32_t row = *(const int32_t *)(inverse +
-            (size_t)e * inverse_nb0 +
-            (size_t)t * inverse_nb1);
-        if (row < 0 || row >= n_pairs) {
-            if (e == 0) sum = 0.0f;
-            continue;
-        }
-        const float v = *(const float *)(packed +
-            (size_t)h * packed_nb0 +
-            (size_t)row * packed_nb1);
-        const float prod = __fmul_rn(v, w);
-        sum = (e == 0) ? prod : __fadd_rn(sum, prod);
-    }
-    *(float *)(output +
-        (size_t)h * output_nb0 +
-        (size_t)t * output_nb1) = sum;
-}
-
 static __global__ void ds4_peer_copy_f32_kernel(
         const float * __restrict__ src,
         float * __restrict__ dst,
@@ -657,39 +607,7 @@ static void ggml_cuda_op_ds4_moe_owner_split(
 
 void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 0);
-    if (mode == -6) {
-        const ggml_tensor * packed = dst->src[0];
-        const ggml_tensor * inverse = dst->src[1];
-        const ggml_tensor * weights = dst->src[2];
-        GGML_ASSERT(packed && packed->type == GGML_TYPE_F32);
-        GGML_ASSERT(inverse && inverse->type == GGML_TYPE_I32);
-        GGML_ASSERT(weights && weights->type == GGML_TYPE_F32);
-        GGML_ASSERT(dst->type == GGML_TYPE_F32);
-
-        const int n_embd = (int) packed->ne[0];
-        const int n_pairs = (int) packed->ne[1];
-        const int n_used = (int) inverse->ne[0];
-        const int n_tokens = (int) inverse->ne[1];
-        GGML_ASSERT(weights->ne[0] == n_used &&
-                    weights->ne[1] == n_tokens);
-        GGML_ASSERT(dst->ne[0] == n_embd && dst->ne[1] == n_tokens);
-
-        const int total = n_embd * n_tokens;
-        const int block = 256;
-        const int grid = (total + block - 1) / block;
-        laguna_moe_packed_combine_kernel<<<grid, block, 0, ctx.stream()>>>(
-            (const char *) packed->data,
-            (const char *) inverse->data,
-            (const char *) weights->data,
-            (char *) dst->data,
-            n_embd, n_pairs, n_used, n_tokens,
-            packed->nb[0], packed->nb[1],
-            inverse->nb[0], inverse->nb[1],
-            weights->nb[0], weights->nb[1],
-            dst->nb[0], dst->nb[1]);
-        return;
-    }
-    if (mode == -5) {
+    if (mode == GGML_MOE_FUSED_ALIGN_IDS) {
         const ggml_tensor * ids = dst->src[0];
         GGML_ASSERT(ids && ids->type == GGML_TYPE_I32);
         GGML_ASSERT(dst->type == GGML_TYPE_I32);
@@ -703,41 +621,23 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (int) (dst->nb[1] / sizeof(int32_t)));
         return;
     }
-    if (mode == -3) {
+    if (mode == GGML_MOE_FUSED_DEFERRED_PEER_COPY) {
         GGML_ASSERT(ggml_is_contiguous(dst));
 
         void * event_context = nullptr;
-        memcpy(&event_context, &dst->op_params[2], sizeof(event_context));
+        memcpy(&event_context,
+               &dst->op_params[GGML_MOE_FUSED_DEFERRED_EVENT_WORD],
+               sizeof(event_context));
         GGML_ASSERT(event_context);
 
-        const int transfer_mode = ggml_get_op_params_i32(dst, 6);
-        if (transfer_mode == 3) {
-            // Whole-step heterogeneous graph path: the Strix producer wrote
-            // this activation into coherent mapped staging before publishing
-            // the scheduler event.  The scheduler's late event wait precedes
-            // this node, so only a local R9700 destination write is needed.
-            void * staging_data = nullptr;
-            memcpy(&staging_data, &dst->op_params[8], sizeof(staging_data));
-            GGML_ASSERT(staging_data);
-            const int64_t n = ggml_nelements(dst);
-            const int block = 256;
-            const int grid = (int) ((n + block - 1) / block);
-            ds4_peer_copy_f32_kernel<<<grid, block, 0, ctx.stream()>>>(
-                (const float *) staging_data, (float *) dst->data, n);
-            return;
-        }
-
-        if (transfer_mode != 0) {
-            // Diagnostic path: the scheduler prefilled dst with a synchronous
-            // peer copy. Leave the graph node as a dependency-only no-op.
-            return;
-        }
-
         void * source_data = nullptr;
-        memcpy(&source_data, &dst->op_params[4], sizeof(source_data));
+        memcpy(&source_data,
+               &dst->op_params[GGML_MOE_FUSED_DEFERRED_SOURCE_WORD],
+               sizeof(source_data));
         GGML_ASSERT(source_data);
 
-        if (ggml_get_op_params_i32(dst, 7) == 0) {
+        if (ggml_get_op_params_i32(
+                dst, GGML_MOE_FUSED_DEFERRED_EXTERNAL_WAIT_WORD) == 0) {
             // Same-split control: capture the wait at its exact position in
             // the main GPU graph. On the current ROCm runtime this preserves
             // correctness but realizes almost no cross-device overlap.
@@ -757,15 +657,15 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (const float *) source_data, (float *) dst->data, n);
         return;
     }
-    if (mode == -2) {
+    if (mode == GGML_MOE_FUSED_OWNER) {
         ggml_cuda_op_ds4_moe_owner(ctx, dst);
         return;
     }
-    if (mode == -4) {
+    if (mode == GGML_MOE_FUSED_OWNER_SPLIT) {
         ggml_cuda_op_ds4_moe_owner_split(ctx, dst);
         return;
     }
-    if (mode == -1) {
+    if (mode == GGML_MOE_FUSED_COMBINE) {
         const ggml_tensor * experts = dst->src[0];  // [n_embd, n_used, n_tokens]
         const ggml_tensor * weights = dst->src[1];  // [n_used, n_tokens]
         const int n_embd   = (int) experts->ne[0];

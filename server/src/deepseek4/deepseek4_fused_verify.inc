@@ -21,48 +21,6 @@ static bool ds4_fused_verify_enabled() {
     return enabled == 1;
 }
 
-// Zero-output-change audit for Luce Spark's proposed layer-ahead cache.  A
-// positive value asks the graph to predict routes that many layers ahead.
-// The widest candidate list is retained once; post-compute accounting reports
-// recall at the authoritative route width and at wider prefixes.
-static int ds4_tp_route_predict_audit_lookahead() {
-    static const int value = [] {
-        const char * raw = std::getenv("DFLASH_DS4_TP_PREDICT_AUDIT");
-        return raw ? std::max(0, std::min(4, std::atoi(raw))) : 0;
-    }();
-    return value;
-}
-
-static int ds4_tp_route_predict_audit_width() {
-    static const int value = [] {
-        const char * raw = std::getenv("DFLASH_DS4_TP_PREDICT_WIDTH");
-        return raw ? std::max(1, std::min(32, std::atoi(raw))) : 12;
-    }();
-    return value;
-}
-
-// Opt-in heterogeneous q4 pipeline.  The ordinary verifier batches all four
-// tokens through attention and then places a hot+cold expert join at every
-// transformer layer.  On R9700 + Strix this exposes the tail of the slower
-// owner once per transformer layer.  The wavefront keeps two q2 lanes in
-// flight instead:
-// lane B's attention/FFN prefix is appended before lane A's deferred join,
-// then lane A advances to the next layer before lane B joins.  Both lanes
-// remain exact causal target work; this is not drafting or prediction.
-static bool ds4_tp_q2_wavefront_requested() {
-    static const bool enabled =
-        ds4_env_flag("DFLASH_DS4_TP_Q2_WAVEFRONT");
-    return enabled;
-}
-
-static bool ds4_tp_q2_wavefront_active(
-        int q, int, const MoeHybridStorage * hybrid) {
-    // build_compressor_step already supports one boundary at any index inside
-    // a causal batch.  Exactly one q2 lane owns that boundary; its span-A
-    // write, pool/rotation, and optional span-B write preserve q4 semantics.
-    return ds4_tp_q2_wavefront_requested() && hybrid && q == 4;
-}
-
 static bool ds4_fused_verify_trace_node(
         ggml_tensor * tensor, bool ask, void *) {
     static const bool trace_all =
@@ -128,50 +86,6 @@ static bool ds4_fused_verify_trace_node(
     return true;
 }
 
-struct Ds4FusedVerifyCache {
-    const ggml_context * owner_ctx = nullptr;
-    ggml_backend_t backend = nullptr;
-    ggml_backend_t peer_backend = nullptr;
-    bool disabled = false;
-    uint64_t counter = 0;
-    std::array<DeepSeek4FusedDecodeGraph, 12> slots;
-    // verify-specific inputs/outputs per slot (parallel arrays, same index)
-    struct Extra {
-        ggml_tensor * pos_q = nullptr;    // i32 [q]
-        ggml_tensor * neg_q = nullptr;    // i32 [q]
-        ggml_tensor * rawrows = nullptr;  // i64 [1,q]
-        ggml_tensor * ape4 = nullptr;     // i32 [q]
-        ggml_tensor * ape128 = nullptr;   // i32 [q]
-        ggml_tensor * st4 = nullptr;      // i64 [1,q]
-        ggml_tensor * st128 = nullptr;    // i64 [1,q]
-        ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap*q], order [ci][t]
-        ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy verify output
-        int q = 0;
-        void reset() { *this = Extra{}; }
-    };
-    std::array<Extra, 12> extra;
-    void destroy() {
-        for (auto & s : slots) s.destroy();
-        for (auto & e : extra) e.reset();
-        owner_ctx = nullptr;
-        backend = nullptr;
-        peer_backend = nullptr;
-        disabled = false;
-        counter = 0;
-    }
-};
-
-static Ds4FusedVerifyCache fused_verify_graph_cache;
-// q=1 target-feature capture walks many prompt-position shapes.  Keep those
-// graphs out of the q>=2 speculative verifier LRU or every fresh prefill
-// evicts the expensive warm q=3 verifier working set.
-static Ds4FusedVerifyCache fused_capture_graph_cache;
-
-void reset_deepseek4_graph_runtime_caches() {
-    fused_verify_graph_cache.destroy();
-    fused_capture_graph_cache.destroy();
-}
-
 // Cached verifier graphs retain their input tensors, while a request-adaptive
 // placement changes only the global->local expert maps.  Refresh those small
 // LUT inputs without rebuilding or reallocating the graph.  Mask any hot/cold
@@ -179,13 +93,12 @@ void reset_deepseek4_graph_runtime_caches() {
 static void ds4_fused_verify_refresh_hybrid_luts(
         const DeepSeek4Weights & w,
         MoeHybridStorage * hybrid,
-        DeepSeek4FusedDecodeGraph & fg,
-        bool q2_wavefront) {
+        DeepSeek4FusedDecodeGraph & fg) {
     if (!hybrid) return;
     const int32_t invalid_route =
         ds4_env_flag("DFLASH_DS4_TP_MASKED_ROUTES") ? -1 : 0;
     for (size_t hi = 0; hi < fg.hybrid_inputs.size(); ++hi) {
-        const int il = q2_wavefront ? (int) (hi / 2u) : (int) hi;
+        const int il = (int) hi;
         const MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
         const MoeHybridGraphInputs & inputs = fg.hybrid_inputs[hi];
         std::vector<int32_t> hot_lut((size_t) w.n_expert, invalid_route);
@@ -212,18 +125,8 @@ static void ds4_fused_verify_refresh_hybrid_luts(
                    sizeof(int32_t) * cold_lut.size());
         ds4_fv_set(inputs.cold_valid_lut, cold_valid.data(),
                    sizeof(float) * cold_valid.size());
-        ds4_fv_set(inputs.shard_local_lut, cold_lut.data(),
-                   sizeof(int32_t) * cold_lut.size());
-        ds4_fv_set(inputs.shard_valid_lut, cold_valid.data(),
-                   sizeof(float) * cold_valid.size());
     }
 }
-
-struct Ds4AuthoritativeRouteSnapshot {
-    const DeepSeek4FusedDecodeGraph::AuthoritativeRouteOutput * route = nullptr;
-    std::vector<int32_t> ids;
-    std::vector<float> weights;
-};
 
 template <typename T>
 static bool ds4_fused_read_route_matrix(
@@ -257,44 +160,41 @@ static void ds4_fused_consume_route_diagnostics(
         DeepSeek4FusedDecodeGraph & fg,
         const MoeHybridStorage * hybrid,
         MoeHybridRoutingStats * routing_stats) {
-    const bool predict_audit =
-        ds4_tp_route_predict_audit_lookahead() > 0;
     const bool cache_audit =
         ds4_env_flag("DFLASH_DS4_TP_CACHE_AUDIT");
-    if (!routing_stats && !predict_audit && !cache_audit) return;
+    if (!routing_stats && !cache_audit) return;
 
-    std::vector<Ds4AuthoritativeRouteSnapshot> snapshots;
-    snapshots.reserve(fg.authoritative_routes.size());
     uint64_t cache_hot = 0;
     uint64_t cache_total = 0;
     for (const auto & route : fg.authoritative_routes) {
-        Ds4AuthoritativeRouteSnapshot snapshot;
-        snapshot.route = &route;
+        std::vector<int32_t> ids;
+        std::vector<float> weights;
         if (!ds4_fused_read_route_matrix(
                 route.selected, GGML_TYPE_I32, route.width,
-                route.n_tokens, snapshot.ids) ||
+                route.n_tokens, ids) ||
             !ds4_fused_read_route_matrix(
                 route.weights, GGML_TYPE_F32, route.width,
-                route.n_tokens, snapshot.weights)) {
+                route.n_tokens, weights)) {
             std::fprintf(stderr,
                 "[ds4-route-audit] failed to read layer=%d lane=%d\n",
                 route.layer, route.lane_start);
             continue;
         }
         for (int token = 0; token < route.n_tokens; ++token) {
-            const int32_t * ids = snapshot.ids.data() +
+            const int32_t * token_ids = ids.data() +
                 (size_t) token * route.width;
-            const float * weights = snapshot.weights.data() +
+            const float * token_weights = weights.data() +
                 (size_t) token * route.width;
             observe_active_routing(
-                routing_stats, route.layer, ids, weights, route.width);
+                routing_stats, route.layer, token_ids, token_weights,
+                route.width);
             if (cache_audit && hybrid && route.layer >= 0 &&
                 route.layer < (int) hybrid->layers.size()) {
                 const MoeHybridLayerStorage & layer =
                     hybrid->layers[(size_t) route.layer];
                 for (int i = 0; i < route.width; ++i) {
-                    const int32_t id = ids[i];
-                    if (weights[i] == 0.0f || id < 0 ||
+                    const int32_t id = token_ids[i];
+                    if (token_weights[i] == 0.0f || id < 0 ||
                         id >= (int32_t) layer.hot_local_by_global.size()) {
                         continue;
                     }
@@ -305,7 +205,6 @@ static void ds4_fused_consume_route_diagnostics(
                 }
             }
         }
-        snapshots.push_back(std::move(snapshot));
     }
 
     if (cache_audit && cache_total > 0) {
@@ -314,71 +213,6 @@ static void ds4_fused_consume_route_diagnostics(
             (unsigned long long) cache_hot,
             (unsigned long long) cache_total,
             (double) cache_hot / (double) cache_total);
-    }
-    if (!predict_audit) return;
-
-    uint64_t active_total = 0;
-    uint64_t base_hits = 0;
-    uint64_t wide_hits = 0;
-    uint64_t comparisons = 0;
-    int base_width = 0;
-    int wide_width = 0;
-    for (const auto & prediction : fg.route_predictions) {
-        const Ds4AuthoritativeRouteSnapshot * target = nullptr;
-        for (const auto & snapshot : snapshots) {
-            if (snapshot.route->layer == prediction.target_layer &&
-                snapshot.route->lane_start == prediction.lane_start &&
-                snapshot.route->n_tokens == prediction.n_tokens) {
-                target = &snapshot;
-                break;
-            }
-        }
-        if (!target) continue;
-        std::vector<int32_t> predicted;
-        if (!ds4_fused_read_route_matrix(
-                prediction.selected, GGML_TYPE_I32, prediction.width,
-                prediction.n_tokens, predicted)) {
-            std::fprintf(stderr,
-                "[ds4-route-predict-audit] failed to read source=%d target=%d\n",
-                prediction.source_layer, prediction.target_layer);
-            continue;
-        }
-        const int primary = std::min(
-            target->route->width, prediction.width);
-        base_width = std::max(base_width, primary);
-        wide_width = std::max(wide_width, prediction.width);
-        ++comparisons;
-        for (int token = 0; token < prediction.n_tokens; ++token) {
-            const int32_t * actual = target->ids.data() +
-                (size_t) token * target->route->width;
-            const float * weights = target->weights.data() +
-                (size_t) token * target->route->width;
-            const int32_t * candidate = predicted.data() +
-                (size_t) token * prediction.width;
-            for (int i = 0; i < target->route->width; ++i) {
-                if (weights[i] == 0.0f || actual[i] < 0) continue;
-                ++active_total;
-                bool in_base = false;
-                bool in_wide = false;
-                for (int j = 0; j < prediction.width; ++j) {
-                    if (candidate[j] != actual[i]) continue;
-                    in_wide = true;
-                    if (j < primary) in_base = true;
-                    break;
-                }
-                base_hits += in_base ? 1u : 0u;
-                wide_hits += in_wide ? 1u : 0u;
-            }
-        }
-    }
-    if (active_total > 0) {
-        std::fprintf(stderr,
-            "[ds4-route-predict-audit] comparisons=%llu active=%llu "
-            "recall@%d=%.3f recall@%d=%.3f\n",
-            (unsigned long long) comparisons,
-            (unsigned long long) active_total,
-            base_width, (double) base_hits / (double) active_total,
-            wide_width, (double) wide_hits / (double) active_total);
     }
 }
 
@@ -395,7 +229,7 @@ static size_t ds4_fused_verify_hybrid_slot_limit() {
         const long requested = raw ? std::strtol(raw, nullptr, 10) : 2;
         return (size_t) std::max<long>(
             1, std::min<long>(requested,
-                              (long) fused_verify_graph_cache.slots.size()));
+                              (long) Ds4FusedVerifyCache::kSlotCount));
     }();
     return limit;
 }
@@ -406,145 +240,9 @@ static size_t ds4_fused_capture_hybrid_slot_limit() {
         const long requested = raw ? std::strtol(raw, nullptr, 10) : 4;
         return (size_t) std::max<long>(
             1, std::min<long>(requested,
-                              (long) fused_capture_graph_cache.slots.size()));
+                              (long) Ds4FusedVerifyCache::kSlotCount));
     }();
     return limit;
-}
-
-static bool ds4_tp_whole_step_graphs_enabled() {
-    static const bool enabled =
-        ds4_env_flag("DFLASH_DS4_TP_WHOLE_STEP_GRAPHS");
-    return enabled;
-}
-
-// Replace the host's per-split launch sequence with one executable graph per
-// GPU after two ordinary warmups.  All kernels, copies, and reduction order
-// remain unchanged; only their submission boundary moves to the device.  The
-// capture is rejected if the scheduler assigned any split to a non-CUDA
-// backend because such work could not be replayed by the two device graphs.
-static ggml_status ds4_fused_verify_compute_whole_step(
-        DeepSeek4FusedDecodeGraph & fg, int q) {
-    if (!fg.sched || q != 4 || !ds4_tp_whole_step_graphs_enabled()) {
-        return fg.sched
-            ? ggml_backend_sched_graph_compute(fg.sched, fg.sg.gf)
-            : GGML_STATUS_FAILED;
-    }
-
-    std::array<ggml_backend_t, 2> gpu_backends{};
-    int gpu_count = 0;
-    int gpu_splits = 0;
-    const int n_backends = ggml_backend_sched_get_n_backends(fg.sched);
-    for (int i = 0; i < n_backends; ++i) {
-        ggml_backend_t candidate =
-            ggml_backend_sched_get_backend(fg.sched, i);
-        const int splits = ggml_backend_sched_get_n_splits_for_backend(
-            fg.sched, candidate);
-        if (ggml_backend_is_cuda(candidate)) {
-            if (gpu_count < (int) gpu_backends.size()) {
-                gpu_backends[(size_t) gpu_count++] = candidate;
-            }
-            gpu_splits += splits;
-        } else if (splits != 0) {
-            static bool logged_cpu_split = false;
-            if (!logged_cpu_split) {
-                std::fprintf(stderr,
-                    "[ds4-whole-graph] disabled: non-GPU backend has %d splits\n",
-                    splits);
-                logged_cpu_split = true;
-            }
-            return ggml_backend_sched_graph_compute(fg.sched, fg.sg.gf);
-        }
-    }
-    if (gpu_count != 2 ||
-        gpu_splits != ggml_backend_sched_get_n_splits(fg.sched)) {
-        return ggml_backend_sched_graph_compute(fg.sched, fg.sg.gf);
-    }
-
-    if (fg.whole_step_graph_count == 2) {
-        // Waits are captured compute kernels on this ROCm pair, not hardware
-        // semaphore packets. Enqueue the R9700 publisher first so MES never
-        // starts with an unsignaled Strix spin queue. R9700 dense work leaves
-        // ample time to enqueue Strix before the first reverse dependency.
-        for (int i = 0; i < 2; ++i) {
-            if (!ggml_backend_cuda_whole_graph_launch(
-                    fg.whole_step_backends[(size_t) i],
-                    fg.whole_step_graphs[(size_t) i])) {
-                return GGML_STATUS_FAILED;
-            }
-        }
-        ggml_backend_sched_synchronize(fg.sched);
-        return GGML_STATUS_SUCCESS;
-    }
-
-    if (fg.whole_step_warmups++ < 2) {
-        return ggml_backend_sched_graph_compute(fg.sched, fg.sg.gf);
-    }
-
-    // Both streams must be capturing before the scheduler emits the first
-    // cross-device event. Begin with the cold owner to match replay order.
-    if (!ggml_backend_cuda_whole_graph_capture_prepare(
-            gpu_backends[0], gpu_backends[1])) {
-        std::fprintf(stderr,
-            "[ds4-whole-graph] doorbell preparation failed; using scheduler\n");
-        return ggml_backend_sched_graph_compute(fg.sched, fg.sg.gf);
-    }
-    std::fprintf(stderr, "[ds4-whole-graph] capture begin peer\n");
-    const bool began_peer =
-        ggml_backend_cuda_whole_graph_capture_begin(gpu_backends[1]);
-    std::fprintf(stderr, "[ds4-whole-graph] capture begin main peer=%d\n",
-                 (int) began_peer);
-    const bool began_main = began_peer &&
-        ggml_backend_cuda_whole_graph_capture_begin(gpu_backends[0]);
-    if (!began_main) {
-        if (began_peer) {
-            auto abandoned =
-                ggml_backend_cuda_whole_graph_capture_end(gpu_backends[1]);
-            ggml_backend_cuda_whole_graph_free(
-                gpu_backends[1], abandoned);
-        }
-        return ggml_backend_sched_graph_compute(fg.sched, fg.sg.gf);
-    }
-
-    ggml_backend_sched_set_whole_graph_capture(fg.sched, true);
-    std::fprintf(stderr, "[ds4-whole-graph] scheduler capture submit\n");
-    const ggml_status captured_status =
-        ggml_backend_sched_graph_compute_async(fg.sched, fg.sg.gf);
-    std::fprintf(stderr, "[ds4-whole-graph] scheduler capture status=%d\n",
-                 (int) captured_status);
-    ggml_backend_sched_set_whole_graph_capture(fg.sched, false);
-    std::fprintf(stderr, "[ds4-whole-graph] capture end peer\n");
-    auto peer_graph =
-        ggml_backend_cuda_whole_graph_capture_end(gpu_backends[1]);
-    std::fprintf(stderr, "[ds4-whole-graph] capture end main peer_graph=%p\n",
-                 peer_graph);
-    auto main_graph =
-        ggml_backend_cuda_whole_graph_capture_end(gpu_backends[0]);
-    if (captured_status != GGML_STATUS_SUCCESS ||
-        !main_graph || !peer_graph) {
-        ggml_backend_cuda_whole_graph_free(gpu_backends[0], main_graph);
-        ggml_backend_cuda_whole_graph_free(gpu_backends[1], peer_graph);
-        std::fprintf(stderr,
-            "[ds4-whole-graph] capture failed status=%d main=%p peer=%p\n",
-            (int) captured_status, main_graph, peer_graph);
-        return captured_status == GGML_STATUS_SUCCESS
-            ? GGML_STATUS_FAILED : captured_status;
-    }
-
-    fg.whole_step_backends = gpu_backends;
-    fg.whole_step_graphs = {main_graph, peer_graph};
-    fg.whole_step_graph_count = 2;
-    std::fprintf(stderr,
-        "[ds4-whole-graph] active q=4 splits=%d\n",
-        ggml_backend_sched_get_n_splits(fg.sched));
-    for (int i = 0; i < 2; ++i) {
-        if (!ggml_backend_cuda_whole_graph_launch(
-                fg.whole_step_backends[(size_t) i],
-                fg.whole_step_graphs[(size_t) i])) {
-            return GGML_STATUS_FAILED;
-        }
-    }
-    ggml_backend_sched_synchronize(fg.sched);
-    return GGML_STATUS_SUCCESS;
 }
 
 static ggml_tensor * ds4_fused_weights_for_selected(
@@ -586,7 +284,6 @@ static bool ds4_build_fused_verify_graph(
         const std::vector<int> & capture_ids,
         MoeHybridStorage * hybrid,
         std::vector<int64_t> && shape_key) {
-    fg.clear_whole_step_graphs();
     if (fg.sched) {
         ggml_backend_sched_free(fg.sched);
         fg.sched = nullptr;
@@ -594,18 +291,14 @@ static bool ds4_build_fused_verify_graph(
     step_graph_free(fg.sg);
     fg.reset_nodes();
     ex.reset();
-    const bool q2_wavefront =
-        ds4_tp_q2_wavefront_active(q, kv_start, hybrid);
     fg.hash_ids.assign((size_t) w.n_layer, nullptr);
     if (hybrid) {
-        fg.hybrid_inputs.assign(
-            (size_t) w.n_layer * (q2_wavefront ? 2u : 1u), {});
+        fg.hybrid_inputs.assign((size_t) w.n_layer, {});
     }
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
 
-    const size_t arena_size =
-        (q2_wavefront ? 512u : 256u) * 1024 * 1024;
+    const size_t arena_size = 256u * 1024 * 1024;
     if (fg.sg.meta_arena.size() < arena_size) fg.sg.meta_arena.resize(arena_size);
     ggml_init_params params{};
     params.mem_size = fg.sg.meta_arena.size();
@@ -614,7 +307,7 @@ static bool ds4_build_fused_verify_graph(
     fg.sg.ctx = ggml_init(params);
     if (!fg.sg.ctx) return false;
     ggml_context * ctx = fg.sg.ctx;
-    const size_t graph_capacity = q2_wavefront ? 131072u : 65536u;
+    constexpr size_t graph_capacity = 65536u;
     fg.sg.gf = ggml_new_graph_custom(ctx, graph_capacity, false);
     ggml_cgraph * gf = fg.sg.gf;
 
@@ -642,25 +335,17 @@ static bool ds4_build_fused_verify_graph(
     int64_t mask_total = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
-        const int n_lanes = q2_wavefront ? 2 : 1;
-        for (int lane = 0; lane < n_lanes; ++lane) {
-            const int lane_q = q2_wavefront ? 2 : q;
-            const int lane_start = q2_wavefront ? 2 * lane : 0;
-            const int lane_token_pos = kv_start + lane_start + lane_q - 1;
-            int padded = 0;
-            if (ratio > 0 && cache.layers[(size_t) il].comp_kv) {
-                const int n_comp = ds4_comp_rows_used(
-                    cache.layers[(size_t) il].comp_kv,
-                    cache.layers[(size_t) il].n_comp, ratio,
-                    lane_token_pos);
-                padded = ds4_padded_comp_rows(
-                    n_comp,
-                    (int) cache.layers[(size_t) il].comp_kv->ne[1]);
-            }
-            const int preserved_rows = lane_q > 1 ? lane_q : 0;
-            mask_total +=
-                (int64_t) (w.n_swa + padded + preserved_rows) * lane_q;
+        int padded = 0;
+        if (ratio > 0 && cache.layers[(size_t) il].comp_kv) {
+            const int n_comp = ds4_comp_rows_used(
+                cache.layers[(size_t) il].comp_kv,
+                cache.layers[(size_t) il].n_comp, ratio,
+                kv_start + q - 1);
+            padded = ds4_padded_comp_rows(
+                n_comp, (int) cache.layers[(size_t) il].comp_kv->ne[1]);
         }
+        const int preserved_rows = q > 1 ? q : 0;
+        mask_total += (int64_t) (w.n_swa + padded + preserved_rows) * q;
     }
     fg.mask_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, mask_total);
     ggml_set_input(fg.mask_bundle);
@@ -683,22 +368,11 @@ static bool ds4_build_fused_verify_graph(
         const HcLayerWeightsCpu & hlw = hc_weights[(size_t) il];
         const int ratio = (int) w.compress_ratios[il];
 
-        // In wavefront mode the two lane builds deliberately stay inside the
-        // same layer loop.  The hybrid builder expands each lane's cold and
-        // hot prefixes but leaves its deferred-copy join unexpanded.  Building
-        // lane B therefore appends useful main-GPU work before lane A's join;
-        // at the next outer iteration lane A's dependency pulls that join in
-        // before layer il+1.  This produces the diagonal A/B pipeline without
-        // changing transformer dependencies.
-        const int n_lanes = q2_wavefront ? 2 : 1;
-        for (int lane = 0; lane < n_lanes; ++lane) {
-        const int lane_q = q2_wavefront ? 2 : q;
-        const int lane_start = q2_wavefront ? 2 * lane : 0;
+        const int lane_q = q;
+        const int lane_start = 0;
         const int lane_kv_start = kv_start + lane_start;
         const int lane_token_pos = lane_kv_start + lane_q - 1;
-        const size_t hybrid_idx = q2_wavefront
-            ? (size_t) il * 2 + (size_t) lane
-            : (size_t) il;
+        const size_t hybrid_idx = (size_t) il;
 
         // ── HC pre (attention), per token ──
         std::vector<ggml_tensor *> hc_flat(lane_q), split_attn(lane_q);
@@ -717,39 +391,21 @@ static bool ds4_build_fused_verify_graph(
 
         // ── Batched attention ──
         DeepSeek4AttentionGraphInputs ain{};
-        const size_t i32_lane_off =
-            (size_t) lane_start * sizeof(int32_t);
-        const size_t i64_lane_off =
-            (size_t) lane_start * sizeof(int64_t);
-        ain.rope_pos = q2_wavefront
-            ? ggml_view_1d(ctx, ex.pos_q, lane_q, i32_lane_off)
-            : ex.pos_q;
-        ain.neg_pos = q2_wavefront
-            ? ggml_view_1d(ctx, ex.neg_q, lane_q, i32_lane_off)
-            : ex.neg_q;
-        ain.raw_kv_rows = q2_wavefront
-            ? ggml_view_1d(ctx, ex.rawrows, lane_q, i64_lane_off)
-            : ex.rawrows;
+        ain.rope_pos = ex.pos_q;
+        ain.neg_pos = ex.neg_q;
+        ain.raw_kv_rows = ex.rawrows;
         if (ratio > 0) {
             ggml_tensor * ape_all = (ratio == 4) ? ex.ape4 : ex.ape128;
             ggml_tensor * state_all = (ratio == 4) ? ex.st4 : ex.st128;
-            ain.attn_ape_row = q2_wavefront
-                ? ggml_view_1d(ctx, ape_all, lane_q, i32_lane_off)
-                : ape_all;
-            ain.attn_state_rows = q2_wavefront
-                ? ggml_view_1d(ctx, state_all, lane_q, i64_lane_off)
-                : state_all;
+            ain.attn_ape_row = ape_all;
+            ain.attn_state_rows = state_all;
             ain.attn_comp_pos = ggml_view_1d(ctx, fg.i32_bundle, 1, ((size_t) il * 2 + 1) * sizeof(int32_t));
             ain.attn_comp_rows = ggml_view_2d(ctx, fg.i64_bundle, 1, 1, sizeof(int64_t),
                                               (size_t) il * sizeof(int64_t));
         }
         if (ratio == 4) {
-            ain.index_ape_row = q2_wavefront
-                ? ggml_view_1d(ctx, ex.ape4, lane_q, i32_lane_off)
-                : ex.ape4;
-            ain.index_state_rows = q2_wavefront
-                ? ggml_view_1d(ctx, ex.st4, lane_q, i64_lane_off)
-                : ex.st4;
+            ain.index_ape_row = ex.ape4;
+            ain.index_state_rows = ex.st4;
             ain.index_comp_pos = ggml_view_1d(ctx, fg.i32_bundle, 1, ((size_t) il * 2 + 1) * sizeof(int32_t));
             ain.index_comp_rows = ggml_view_2d(ctx, fg.i64_bundle, 1, 1, sizeof(int64_t),
                                                (size_t) il * sizeof(int64_t));
@@ -813,8 +469,7 @@ static bool ds4_build_fused_verify_graph(
         std::vector<ggml_tensor *> router_nodes;
         if (hash_routed) {
             const int route_width = ds4_effective_expert_count(w);
-            // Keep one q-wide input for host filling and give each wavefront
-            // lane a zero-copy two-column view.
+            // Keep one q-wide input for host filling.
             ggml_tensor * hids_all = fg.hash_ids[(size_t) il];
             if (!hids_all) {
                 hids_all = ggml_new_tensor_2d(
@@ -822,12 +477,7 @@ static bool ds4_build_fused_verify_graph(
                 ggml_set_input(hids_all);
                 fg.hash_ids[(size_t) il] = hids_all;
             }
-            selected = q2_wavefront
-                ? ggml_view_2d(
-                    ctx, hids_all, route_width, lane_q,
-                    hids_all->nb[1],
-                    (size_t) lane_start * hids_all->nb[1])
-                : hids_all;
+            selected = hids_all;
             if (hybrid) {
                 router_weights = ds4_fused_weights_for_selected(
                     ctx, ffn_normed, w, L, selected, lane_q);
@@ -866,40 +516,6 @@ static bool ds4_build_fused_verify_graph(
             fg.authoritative_routes.push_back(route);
         }
 
-        // Diagnostic branch only: predict future score-routed expert IDs from
-        // the current normalized FFN input.  The authoritative routing above
-        // remains the sole input to the model FFN, so this cannot affect
-        // logits.  q2 wavefront is excluded to keep the audit's source/target
-        // correspondence unambiguous.
-        const int predict_ahead = ds4_tp_route_predict_audit_lookahead();
-        if (hybrid && q > 1 && predict_ahead > 0 && !q2_wavefront) {
-            for (int ahead = 1; ahead <= predict_ahead; ++ahead) {
-                const int target_layer = il + ahead;
-                if (target_layer >= w.n_layer ||
-                    target_layer < w.n_hash_layer) {
-                    continue;
-                }
-                const DeepSeek4Layer & future =
-                    w.layers[(size_t) target_layer];
-                if (!future.ffn_gate_inp) continue;
-                Ds4MoeRoutePrediction prediction =
-                    build_moe_route_prediction(
-                        ctx, ffn_normed, w, future,
-                        ds4_tp_route_predict_audit_width());
-                if (!prediction.selected) return false;
-                ggml_set_output(prediction.selected);
-                ggml_build_forward_expand(gf, prediction.selected);
-                DeepSeek4FusedDecodeGraph::RoutePredictionOutput saved;
-                saved.source_layer = il;
-                saved.target_layer = target_layer;
-                saved.lane_start = lane_start;
-                saved.n_tokens = lane_q;
-                saved.width = (int) prediction.selected->ne[0];
-                saved.selected = prediction.selected;
-                saved.nodes = std::move(prediction.nodes);
-                fg.route_predictions.push_back(std::move(saved));
-            }
-        }
         if (hybrid) {
             const bool allow_fused_combine =
                 ggml_backend_is_cuda(backend) &&
@@ -1052,7 +668,6 @@ static bool ds4_build_fused_verify_graph(
                     ggml_reshape_1d(ctx, ggml_cont(ctx, mean), n_embd);
             }
         }
-        } // lane
     }
 
     // ── Output: per-token HC merge → batched out_norm + lm_head ──
@@ -1151,12 +766,20 @@ static bool ds4_build_fused_verify_graph(
             ds4_env_flag("DFLASH_DS4_TP_LATE_JOIN_SPLIT");
         const bool targeted_join_split =
             ds4_env_flag("DFLASH_DS4_TP_TARGETED_JOIN_SPLIT");
+        const bool device_join_split =
+            ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN_SPLIT");
+        const bool batch_split_copies =
+            ds4_env_flag("GGML_CUDA_BATCH_PEER_COPIES");
         const bool gpu_i32_repeat =
             ds4_env_flag("LUCE_CUDA_I32_REPEAT");
         const bool report_split_count =
             ds4_env_flag("DFLASH_DS4_TP_SPLIT_COUNT");
         ggml_backend_sched_set_late_cross_input_split(
             fg.sched, late_join_split);
+        ggml_backend_sched_set_deferred_peer_copy_split(
+            fg.sched, device_join_split);
+        ggml_backend_sched_set_batch_split_copies(
+            fg.sched, batch_split_copies);
         if (ds4_env_flag("DFLASH_DS4_TP_SCHED_TRACE")) {
             ggml_backend_sched_set_eval_callback(
                 fg.sched, ds4_fused_verify_trace_node, nullptr);
@@ -1197,8 +820,6 @@ static bool ds4_build_fused_verify_graph(
             }
             pin_main(inputs.hot_local_lut);
             pin_main(inputs.hot_valid_lut);
-            pin_main(inputs.shard_local_lut);
-            pin_main(inputs.shard_valid_lut);
             // q1 has no repeat.  The opt-in exact I32 GPU repeat lets q>1 keep
             // both the LUT and its repeated output on the cold owner as well.
             if (q == 1 || gpu_i32_repeat) {
@@ -1213,17 +834,11 @@ static bool ds4_build_fused_verify_graph(
             for (ggml_tensor * node : inputs.cold_remap_nodes) {
                 pin_peer(node);
             }
-            for (ggml_tensor * node : inputs.shard_remap_nodes) {
-                pin_main(node);
-            }
             for (ggml_tensor * node : inputs.hot_nodes) {
                 pin_main(node);
             }
             for (ggml_tensor * node : inputs.cold_nodes) {
                 pin_peer(node);
-            }
-            for (ggml_tensor * node : inputs.shard_nodes) {
-                pin_main(node);
             }
             for (ggml_tensor * node : inputs.join_nodes) {
                 pin_main(node);
@@ -1241,18 +856,12 @@ static bool ds4_build_fused_verify_graph(
             pin_main(inputs.peer_output);
             pin_main(inputs.output);
         }
-        for (const auto & prediction : fg.route_predictions) {
-            for (ggml_tensor * node : prediction.nodes) pin_main(node);
-            pin_main(prediction.selected);
-        }
         for (const auto & route : fg.authoritative_routes) {
             pin_main(route.selected);
             pin_main(route.weights);
         }
         if (ds4_env_flag("DFLASH_DS4_TP_ROUTE_STATS") ||
             ds4_env_flag("DFLASH_DS4_ROUTING_STATS_OUT") ||
-            ds4_env_flag("DFLASH_DS4_TP_DYNAMIC_HOTSET") ||
-            (q > 1 && ds4_tp_route_predict_audit_lookahead() > 0) ||
             ds4_env_flag("DFLASH_DS4_TP_CACHE_AUDIT")) {
             // Preserve the unsplit authoritative route and weight matrices.
             // Reading the pre-fork list is insufficient in the legacy 4+2
@@ -1282,8 +891,7 @@ static bool ds4_build_fused_verify_graph(
                          ggml_backend_sched_get_n_splits(fg.sched), q);
         }
 
-        ds4_fused_verify_refresh_hybrid_luts(
-            w, hybrid, fg, q2_wavefront);
+        ds4_fused_verify_refresh_hybrid_luts(w, hybrid, fg);
     } else {
         if (!fg.sg.alloc) {
             fg.sg.alloc = ggml_gallocr_new(
@@ -1300,6 +908,7 @@ static bool ds4_build_fused_verify_graph(
 
 static int ds4_try_fused_verify_step(
         Ds4FusedVerifyCache & vc,
+        bool capture_cache,
         DeepSeek4FusedDecodeCache & mc,
         ggml_backend_t backend,
         const DeepSeek4Weights & w,
@@ -1351,15 +960,12 @@ static int ds4_try_fused_verify_step(
 
     const int q = n_tokens;
     const int token_pos = kv_start + q - 1;
-    const bool q2_wavefront =
-        ds4_tp_q2_wavefront_active(q, kv_start, hybrid);
     std::vector<int64_t> key;
-    key.reserve((size_t) w.n_layer + hooks->capture_layer_ids->size() + 6);
+    key.reserve((size_t) w.n_layer + hooks->capture_layer_ids->size() + 5);
     key.push_back(w.n_swa);
     key.push_back(q);
     key.push_back(token_ids ? 1 : 0);
     key.push_back(hybrid ? 1 : 0);
-    key.push_back(q2_wavefront ? 1 : 0);
     key.push_back((int64_t) hooks->capture_layer_ids->size());
     for (int layer : *hooks->capture_layer_ids) key.push_back(layer);
     for (int il = 0; il < w.n_layer; ++il) {
@@ -1376,26 +982,11 @@ static int ds4_try_fused_verify_step(
                 if (((kv_start + t + 1) % ratio) == 0) { b_idx = t; break; }
             }
         }
-        if (q2_wavefront) {
-            int padded_a = 0;
-            if (ratio > 0 && lc.comp_kv) {
-                const int n_comp_a = ds4_comp_rows_used(
-                    lc.comp_kv, lc.n_comp, ratio, kv_start + 1);
-                padded_a = ds4_padded_comp_rows(
-                    n_comp_a, (int) lc.comp_kv->ne[1]);
-            }
-            key.push_back(
-                ((int64_t) padded_a << 32) |
-                ((int64_t) padded << 8) |
-                (int64_t) (b_idx + 1));
-        } else {
-            key.push_back(
-                ((int64_t) padded << 4) | (int64_t) (b_idx + 1));
-        }
+        key.push_back(
+            ((int64_t) padded << 4) | (int64_t) (b_idx + 1));
     }
 
     vc.counter++;
-    const bool capture_cache = &vc == &fused_capture_graph_cache;
     const size_t slot_limit = hybrid
         ? (capture_cache ? ds4_fused_capture_hybrid_slot_limit()
                          : ds4_fused_verify_hybrid_slot_limit())
@@ -1448,23 +1039,6 @@ static int ds4_try_fused_verify_step(
     }
     fg->last_use = vc.counter;
 
-    // A fresh request clears KV/HC/compressor storage in place. Kernel
-    // addresses remain stable, but a whole-step executable also retains its
-    // captured cross-device dependency state. Never carry that executable
-    // across the cache-clear boundary; recapture after the normal two q4
-    // warmups and continue replaying for the rest of this request.
-    if (q == 4 && ds4_tp_whole_step_graphs_enabled() &&
-        fg->whole_step_sequence_id != cache.sequence_id) {
-        if (fg->whole_step_graph_count != 0) {
-            std::fprintf(stderr,
-                "[ds4-whole-graph] request boundary old=%llu new=%llu; recapturing\n",
-                (unsigned long long) fg->whole_step_sequence_id,
-                (unsigned long long) cache.sequence_id);
-        }
-        fg->clear_whole_step_graphs();
-        fg->whole_step_sequence_id = cache.sequence_id;
-    }
-
     // ── Fill inputs ──
     const auto set_t0 = Ds4TimingClock::now();
     ds4_fv_set(fg->inp_embed, embed, sizeof(float) * (size_t) w.n_embd * q);
@@ -1509,16 +1083,10 @@ static int ds4_try_fused_verify_step(
         for (int il = 0; il < w.n_layer; ++il) {
             const int ratio = (int) w.compress_ratios[il];
             DeepSeek4LayerCache & lc = cache.layers[(size_t) il];
-            const int n_lanes = q2_wavefront ? 2 : 1;
-            for (int lane = 0; lane < n_lanes; ++lane) {
-            const int lane_q = q2_wavefront ? 2 : q;
-            const int lane_start = q2_wavefront ? 2 * lane : 0;
+            const int lane_q = q;
+            const int lane_start = 0;
             const int lane_kv_start = kv_start + lane_start;
             const int lane_token_pos = lane_kv_start + lane_q - 1;
-            // At lane A's attention only its two writes have happened.  At
-            // lane B, e covers all four writes.  This makes the physical-ring
-            // mask and the preserved overwritten-row suffix equivalent to the
-            // original q4 causal graph.
             const int e = lane_kv_start + lane_q;
             int padded = 0;
             if (ratio > 0 && lc.comp_kv) {
@@ -1554,7 +1122,6 @@ static int ds4_try_fused_verify_step(
                 }
             }
             off += n_attn * lane_q;
-            } // lane
         }
         GGML_ASSERT(off == maskv.size());
         ds4_fv_set(fg->mask_bundle, maskv.data(), sizeof(float) * maskv.size());
@@ -1588,14 +1155,6 @@ static int ds4_try_fused_verify_step(
         telemetry->full_graph_set_us += ds4_elapsed_us(set_t0, Ds4TimingClock::now());
     }
 
-    // A graph can be reused across requests after the fixed hot tensor stacks
-    // have been repopulated.  The weights keep stable addresses; only these
-    // tiny map inputs must follow the new request-adaptive placement.
-    if (hybrid && ds4_env_flag("DFLASH_DS4_TP_DYNAMIC_HOTSET")) {
-        ds4_fused_verify_refresh_hybrid_luts(
-            w, hybrid, *fg, ds4_tp_q2_wavefront_active(q, kv_start, hybrid));
-    }
-
     // ── Compute + read back ──
     const auto compute_t0 = Ds4TimingClock::now();
 
@@ -1607,12 +1166,6 @@ static int ds4_try_fused_verify_step(
     // the process ceiling (LUCE_MMVQ_MAX_NCOLS=4 in the optimized launch).
     const bool capture_eager = capture_cache &&
         ds4_env_flag("DFLASH_DS4_TP_CAPTURE_EAGER");
-    if (capture_cache) {
-        ggml_backend_cuda_set_mmvq_max_ncols_override(3);
-    }
-    if (capture_eager) {
-        ggml_backend_cuda_set_graphs_disabled_override(true);
-    }
     // q>=2 verifier graph slots own fixed tensor storage. Position, mask,
     // routing-map, and embedding values are refreshed through stable input
     // buffers above; the graph topology and all allocation addresses remain
@@ -1622,21 +1175,13 @@ static int ds4_try_fused_verify_step(
     // independent opt-in while retaining normal warmup/capture semantics.
     const bool force_verify_graph_replay = q > 1 &&
         ds4_env_flag("DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY");
-    if (force_verify_graph_replay) {
-        ggml_backend_cuda_set_skip_props_check(true);
-    }
+    ScopedCudaGraphOverrides graph_override_scope(
+        /*disable_graphs=*/capture_eager,
+        /*mmvq_max_ncols=*/capture_cache ? 3 : 0,
+        /*skip_property_check=*/force_verify_graph_replay);
     const enum ggml_status compute_status = fg->sched
-        ? ds4_fused_verify_compute_whole_step(*fg, q)
+        ? ggml_backend_sched_graph_compute(fg->sched, fg->sg.gf)
         : ggml_backend_graph_compute(backend, fg->sg.gf);
-    if (force_verify_graph_replay) {
-        ggml_backend_cuda_set_skip_props_check(false);
-    }
-    if (capture_eager) {
-        ggml_backend_cuda_set_graphs_disabled_override(false);
-    }
-    if (capture_cache) {
-        ggml_backend_cuda_set_mmvq_max_ncols_override(0);
-    }
     if (compute_status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[ds4-fused-verify] compute failed\n");
         return -1;

@@ -350,178 +350,6 @@ static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
 // The cost model intentionally uses measured bandwidth rather than advertised
 // peak bandwidth.  It is only an allocation objective; actual placement still
 // uses authoritative router statistics and evaluates every selected expert.
-static bool fill_time_balanced_profiled_hot_placement(
-        const DeepSeek4Weights & w,
-        int active_routes,
-        int hot_per_layer,
-        const char * profile_path,
-        MoeHybridPlacement & out,
-        std::string * err) {
-    MoeHybridRoutingStats stats;
-    if (!MoeHybridRoutingStats::load_csv(profile_path, stats, err)) {
-        return false;
-    }
-    if (stats.n_layer != w.n_layer || stats.n_expert != w.n_expert) {
-        if (err) *err = "routing profile shape does not match DeepSeek V4 target";
-        return false;
-    }
-
-    const int total_hot_budget = hot_per_layer * w.n_layer;
-    if (total_hot_budget <= 0 || active_routes <= 0 ||
-        active_routes > w.n_expert_used) {
-        if (err) *err = "time-balanced placement requires a positive hot budget";
-        return false;
-    }
-
-    const auto env_double = [](const char * name, double fallback) {
-        const char * raw = std::getenv(name);
-        if (!raw || !*raw) return fallback;
-        const double value = std::atof(raw);
-        return value > 0.0 ? value : fallback;
-    };
-    const auto env_int = [](const char * name, int fallback) {
-        const char * raw = std::getenv(name);
-        if (!raw || !*raw) return fallback;
-        return std::atoi(raw);
-    };
-
-    // Sustained read probes on lucebox5, in GB/s.  Only their ratio affects
-    // the optimizer, but retaining physical units makes the model auditable.
-    const double main_bw = env_double(
-        "DFLASH_DS4_TP_MAIN_OWNER_GBPS", 519.91);
-    const double cold_bw = env_double(
-        "DFLASH_DS4_TP_COLD_OWNER_GBPS", 242.36);
-    const double shared_equiv = env_double(
-        "DFLASH_DS4_TP_SHARED_EXPERT_EQUIV", 1.0);
-    const int min_hot = std::clamp(env_int(
-        "DFLASH_DS4_TP_MIN_HOT_PER_LAYER", 4), 0, w.n_expert);
-    const int max_hot = std::clamp(env_int(
-        "DFLASH_DS4_TP_MAX_HOT_PER_LAYER", 64), min_hot, w.n_expert);
-
-    if ((int64_t) min_hot * w.n_layer > total_hot_budget ||
-        (int64_t) max_hot * w.n_layer < total_hot_budget) {
-        if (err) *err = "time-balanced placement bounds cannot satisfy hot budget";
-        return false;
-    }
-
-    std::vector<std::vector<int>> ranked((size_t) w.n_layer);
-    std::vector<std::vector<double>> coverage(
-        (size_t) w.n_layer,
-        std::vector<double>((size_t) max_hot + 1, 0.0));
-    for (int il = 0; il < w.n_layer; ++il) {
-        ranked[(size_t) il] = stats.ranked_experts(il);
-        const uint64_t total = stats.layer_totals[(size_t) il];
-        if (total == 0) {
-            if (err) *err = "routing profile contains an empty layer";
-            return false;
-        }
-        uint64_t cumulative = 0;
-        for (int k = 1; k <= max_hot; ++k) {
-            cumulative += stats.count(il, ranked[(size_t) il][(size_t) k - 1]);
-            coverage[(size_t) il][(size_t) k] =
-                (double) cumulative / (double) total;
-        }
-    }
-
-    const auto layer_cost = [&](int il, int hot_count) {
-        const double hot_fraction = coverage[(size_t) il][(size_t) hot_count];
-        const double hot_routes = (double) active_routes * hot_fraction;
-        const double cold_routes =
-            (double) active_routes * (1.0 - hot_fraction);
-        const double main_time = (shared_equiv + hot_routes) / main_bw;
-        const double cold_time = cold_routes / cold_bw;
-        return std::max(main_time, cold_time);
-    };
-
-    const double inf = std::numeric_limits<double>::infinity();
-    std::vector<double> dp((size_t) total_hot_budget + 1, inf);
-    std::vector<double> next((size_t) total_hot_budget + 1, inf);
-    std::vector<std::vector<int16_t>> choice(
-        (size_t) w.n_layer,
-        std::vector<int16_t>((size_t) total_hot_budget + 1, -1));
-    dp[0] = 0.0;
-
-    for (int il = 0; il < w.n_layer; ++il) {
-        std::fill(next.begin(), next.end(), inf);
-        const int layers_left = w.n_layer - il - 1;
-        for (int used = 0; used <= total_hot_budget; ++used) {
-            if (!std::isfinite(dp[(size_t) used])) continue;
-            for (int k = min_hot; k <= max_hot; ++k) {
-                const int new_used = used + k;
-                if (new_used > total_hot_budget) break;
-                const int remaining = total_hot_budget - new_used;
-                if (remaining < layers_left * min_hot ||
-                    remaining > layers_left * max_hot) {
-                    continue;
-                }
-                const double candidate = dp[(size_t) used] + layer_cost(il, k);
-                if (candidate < next[(size_t) new_used]) {
-                    next[(size_t) new_used] = candidate;
-                    choice[(size_t) il][(size_t) new_used] = (int16_t) k;
-                }
-            }
-        }
-        dp.swap(next);
-    }
-
-    if (!std::isfinite(dp[(size_t) total_hot_budget])) {
-        if (err) *err = "time-balanced placement optimizer found no feasible assignment";
-        return false;
-    }
-
-    std::vector<int> hot_counts((size_t) w.n_layer, 0);
-    int used = total_hot_budget;
-    for (int il = w.n_layer - 1; il >= 0; --il) {
-        const int k = choice[(size_t) il][(size_t) used];
-        if (k < min_hot || k > max_hot) {
-            if (err) *err = "time-balanced placement backtracking failed";
-            return false;
-        }
-        hot_counts[(size_t) il] = k;
-        used -= k;
-    }
-
-    double uniform_cost = 0.0;
-    double balanced_cost = 0.0;
-    for (int il = 0; il < w.n_layer; ++il) {
-        uniform_cost += layer_cost(il, hot_per_layer);
-        balanced_cost += layer_cost(il, hot_counts[(size_t) il]);
-    }
-
-    out = {};
-    out.n_layer = w.n_layer;
-    out.n_expert = w.n_expert;
-    out.n_expert_used = w.n_expert_used;
-    out.hot_counts = hot_counts;
-    out.hot_expert_ids.resize((size_t) w.n_layer);
-    out.total_hot = total_hot_budget;
-    for (int il = 0; il < w.n_layer; ++il) {
-        const int k = hot_counts[(size_t) il];
-        auto & ids = out.hot_expert_ids[(size_t) il];
-        ids.reserve((size_t) k);
-        for (int rank = 0; rank < k; ++rank) {
-            ids.push_back((int32_t) ranked[(size_t) il][(size_t) rank]);
-        }
-    }
-
-    const auto [min_it, max_it] = std::minmax_element(
-        hot_counts.begin(), hot_counts.end());
-    std::fprintf(stderr,
-        "[deepseek4] time-balanced placement: slots=%d layer_range=%d..%d "
-        "routes=%d main/cold=%.2f/%.2f GB/s "
-        "predicted_owner_reduction=%.2f%% counts=",
-        total_hot_budget, *min_it, *max_it, active_routes, main_bw, cold_bw,
-        uniform_cost > 0.0
-            ? 100.0 * (1.0 - balanced_cost / uniform_cost)
-            : 0.0);
-    for (int il = 0; il < w.n_layer; ++il) {
-        std::fprintf(stderr, "%s%d", il == 0 ? "[" : ",",
-                     hot_counts[(size_t) il]);
-    }
-    std::fprintf(stderr, "]\n");
-    return true;
-}
-
 static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
                                            int gpu,
                                            int max_ctx,
@@ -866,17 +694,6 @@ bool DeepSeek4Backend::init() {
         std::fprintf(stderr,
                      "[deepseek4-moe-tp] in-memory routing stats enabled\n");
     }
-    if (env_flag_enabled("DFLASH_DS4_TP_DYNAMIC_HOTSET") && !routing_stats_) {
-        routing_stats_ = std::make_shared<MoeHybridRoutingStats>();
-        if (!routing_stats_->init(w_.n_layer, w_.n_expert, w_.n_expert_used)) {
-            std::fprintf(stderr,
-                         "[deepseek4] failed to initialize dynamic-hotset routing stats\n");
-            return false;
-        }
-        std::fprintf(stderr,
-                     "[deepseek4-moe-tp] request-adaptive hotset enabled\n");
-    }
-
     const int active_experts =
         w_.routed_expert_top_k > 0 ? w_.routed_expert_top_k : w_.n_expert_used;
     std::fprintf(stderr,
@@ -968,67 +785,20 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     }
 
     const bool all_cold = env_flag_enabled("DFLASH_DS4_MOE_TP_ALL_COLD");
-    int active_routes = cfg_.expert_top_k;
-    if (const char * raw = std::getenv("DFLASH_DS4_TOPK")) {
-        const int env_routes = std::atoi(raw);
-        if (env_routes > 0) active_routes = env_routes;
-    }
-    if (active_routes <= 0 || active_routes > w.n_expert_used) {
-        active_routes = w.n_expert_used;
-    }
     int hot_per_layer = all_cold ? 0 : budget.max_hot_per_layer;
-    int shard_channels = 0;
-    if (!all_cold && ds4_inprocess_moe_tp_enabled()) {
-        if (const char * raw = std::getenv("DFLASH_DS4_TP_COLD_SHARD_CHANNELS")) {
-            shard_channels = std::max(0, std::atoi(raw));
-        }
-    }
-    if (shard_channels > 0) {
-        if (shard_channels >= w.n_ff_exp || w.n_ff_exp <= 0) {
-            if (err) *err = "invalid DFLASH_DS4_TP_COLD_SHARD_CHANNELS";
-            return false;
-        }
-        // Every non-hot expert keeps a prefix shard on the main GPU.  Reserve
-        // that prompt-independent footprint first, then spend the remainder
-        // upgrading selected experts from a shard to their full tensors.
-        const uint64_t shard_base =
-            budget.mem.total_expert_bytes * (uint64_t) shard_channels /
-            (uint64_t) w.n_ff_exp;
-        const uint64_t upgrade_round =
-            budget.mem.bytes_per_uniform_round *
-            (uint64_t) (w.n_ff_exp - shard_channels) /
-            (uint64_t) w.n_ff_exp;
-        if (budget.expert_budget <= shard_base || upgrade_round == 0) {
-            if (err) *err = "expert budget cannot fit the universal cold-expert shard";
-            return false;
-        }
-        hot_per_layer = std::min(
-            w.n_expert,
-            (int) ((budget.expert_budget - shard_base) / upgrade_round));
-        std::fprintf(stderr,
-            "[deepseek4-tp] cold channel shard=%d/%d reserve=%.2f GiB full_hot/layer=%d\n",
-            shard_channels, w.n_ff_exp, gib(shard_base), hot_per_layer);
-    }
     if (all_cold) {
         std::fprintf(stderr,
                      "[deepseek4-moe-tp] all routed experts assigned to the cold backend\n");
     }
     if (const char * profile_path = std::getenv("DFLASH_DS4_HOTNESS_CSV")) {
         if (*profile_path) {
-            const bool time_balanced =
-                env_flag_enabled("DFLASH_DS4_TP_TIME_BALANCED_PLACEMENT");
-            const bool placed = time_balanced
-                ? fill_time_balanced_profiled_hot_placement(
-                    w, active_routes, hot_per_layer, profile_path, out, err)
-                : fill_profiled_hot_placement(
-                    w, hot_per_layer, profile_path, out, err);
-            if (!placed) {
+            if (!fill_profiled_hot_placement(
+                    w, hot_per_layer, profile_path, out, err)) {
                 return false;
             }
             std::fprintf(stderr,
-                         "[deepseek4] hybrid placement profile=%s mode=%s\n",
-                         profile_path,
-                         time_balanced ? "time-balanced" : "uniform");
+                         "[deepseek4] hybrid placement profile=%s\n",
+                         profile_path);
         } else {
             fill_prefix_hot_placement(w, hot_per_layer, out);
         }
@@ -1546,35 +1316,6 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
         sampler_rng_.seed(sampler_.seed);
     }
 
-    const bool dynamic_hotset =
-        env_flag_enabled("DFLASH_DS4_TP_DYNAMIC_HOTSET");
-    if (dynamic_hotset) {
-        if (!moe_hybrid_ || !expert_backend_ || !routing_stats_) {
-            result.fail(GenerateErrorCode::BackendSpecific,
-                        "dynamic hotset requires in-process heterogeneous MoE TP");
-            return result;
-        }
-        // A previous request may have installed its own placement.  Restore
-        // the calibrated general placement before observing this prompt, then
-        // collect a request-local route histogram from q1 prefill only.
-        std::string err;
-        if (!moe_hybrid_reassign_hot_experts_from_mmap(
-                *moe_hybrid_, backend_, moe_placement_.hot_expert_ids, &err)) {
-            std::fprintf(stderr,
-                         "[deepseek4-moe-tp] dynamic-hotset restore failed: %s\n",
-                         err.c_str());
-            result.fail(GenerateErrorCode::BackendSpecific,
-                        "dynamic hotset restore");
-            return result;
-        }
-        if (!routing_stats_->init(w_.n_layer, w_.n_expert,
-                                  w_.n_expert_used)) {
-            result.fail(GenerateErrorCode::BackendSpecific,
-                        "dynamic hotset stats reset");
-            return result;
-        }
-    }
-
     // Prefill
     int committed = do_prefill(req.prompt, out_io);
     if (committed < 0) {
@@ -1587,46 +1328,6 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
         result.succeed();
         maybe_save_routing_stats();
         return result;
-    }
-
-    if (dynamic_hotset) {
-        const auto adapt_t0 = Clock::now();
-        std::vector<std::vector<int32_t>> request_hot(
-            (size_t) w_.n_layer);
-        uint64_t covered = 0;
-        uint64_t total = 0;
-        for (int il = 0; il < w_.n_layer; ++il) {
-            const int slots = moe_hybrid_->layers[(size_t) il].hot_active;
-            std::vector<int> ranked = routing_stats_->hot_experts(il, slots);
-            if ((int) ranked.size() != slots) {
-                result.fail(GenerateErrorCode::BackendSpecific,
-                            "dynamic hotset empty prefill routes");
-                return result;
-            }
-            auto & ids = request_hot[(size_t) il];
-            ids.assign(ranked.begin(), ranked.end());
-            total += routing_stats_->layer_totals[(size_t) il];
-            for (int expert : ranked) {
-                covered += routing_stats_->count(il, expert);
-            }
-        }
-        std::string err;
-        if (!moe_hybrid_reassign_hot_experts_from_mmap(
-                *moe_hybrid_, backend_, request_hot, &err)) {
-            std::fprintf(stderr,
-                         "[deepseek4-moe-tp] dynamic-hotset install failed: %s\n",
-                         err.c_str());
-            result.fail(GenerateErrorCode::BackendSpecific,
-                        "dynamic hotset install");
-            return result;
-        }
-        const double adapt_s = elapsed_s(adapt_t0);
-        result.prefill_s += adapt_s;
-        std::fprintf(stderr,
-                     "[deepseek4-moe-tp] dynamic-hotset prompt_routes=%" PRIu64
-                     " coverage=%.3f install=%.3fs\n",
-                     total, total ? (double) covered / (double) total : 0.0,
-                     adapt_s);
     }
 
     if (req.n_gen <= 0) {

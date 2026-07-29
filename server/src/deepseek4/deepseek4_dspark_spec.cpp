@@ -656,8 +656,6 @@ bool run_deepseek4_dspark_spec_decode(
         spec_env_flag("DFLASH_DS4_DRAFT_OVERLAP_PROBE");
     const bool draft_overlap_reuse_context =
         spec_env_flag("DFLASH_DS4_DRAFT_OVERLAP_REUSE_CONTEXT");
-    const bool draft_ahead =
-        spec_env_flag("DFLASH_DS4_DRAFT_AHEAD");
     ggml_backend_t drafter_backend =
         drafter.core.backend ? drafter.core.backend : backend;
     const bool draft_overlap_probe_active =
@@ -667,14 +665,6 @@ bool run_deepseek4_dspark_spec_decode(
         std::fprintf(stderr,
             "[ds4-spec] draft overlap probe requested without an independent "
             "in-process backend; probe disabled\n");
-    }
-    const bool draft_ahead_active =
-        draft_ahead && drafter_backend != backend;
-    bool draft_ahead_enabled = draft_ahead_active;
-    if (draft_ahead && !draft_ahead_active) {
-        std::fprintf(stderr,
-            "[ds4-spec] draft-ahead requested without an independent "
-            "in-process backend; draft-ahead disabled\n");
     }
     // Laguna-style adaptive verify width: EWMA of accepted candidates, width =
     // ewma + 2 (avg_commit << block means the wide tail is usually wasted).
@@ -780,15 +770,6 @@ bool run_deepseek4_dspark_spec_decode(
     std::vector<float> padded_confidence_hidden((size_t) n_embd * (block + 1), 0.0f);
     std::vector<int32_t> draft_tok, tgt_am;
     std::vector<float> draft_confidence;
-    std::vector<float> cached_ahead_hidden;
-    std::vector<float> cached_ahead_confidence_hidden;
-    std::vector<float> ahead_noise_embed((size_t) n_embd * block);
-    bool cached_ahead_ready = false;
-    int cached_ahead_pos = -1;
-    int cached_ahead_seed = -1;
-    long ahead_launches = 0;
-    long ahead_seed_hits = 0;
-    long ahead_reuses = 0;
 
     // Cumulative phase timings (ms).
     double tm_draft = 0, tm_head = 0, tm_save = 0, tm_verify = 0, tm_apply = 0, tm_feat = 0;
@@ -801,48 +782,29 @@ bool run_deepseek4_dspark_spec_decode(
         // Noise block = [seed] + [MASK]*(block-1).
         SpecClock::time_point t0 = SpecClock::now();
         if (q_cap >= 2) {
-            const bool use_ahead =
-                cached_ahead_ready && cached_ahead_pos == pos &&
-                cached_ahead_seed == lt &&
-                cached_ahead_hidden.size() == (size_t) n_embd * block &&
-                (!use_confidence_width ||
-                 cached_ahead_confidence_hidden.size() ==
-                     (size_t) n_embd * block);
-            if (use_ahead) {
-                local_hidden.swap(cached_ahead_hidden);
-                if (use_confidence_width) {
-                    confidence_hidden.swap(cached_ahead_confidence_hidden);
-                }
-                cached_ahead_ready = false;
-                ++ahead_reuses;
-            } else {
-                cached_ahead_ready = false;
-                cached_ahead_hidden.clear();
-                cached_ahead_confidence_hidden.clear();
-                noise_ids[0] = lt;
-                for (int i = 1; i < block; i++) {
-                    noise_ids[i] = drafter.mask_token_id;
-                }
-                if (!target.embed_tokens(
-                        noise_ids.data(), block, noise_embed.data())) {
-                    std::fprintf(stderr,
-                        "[ds4-spec] draft embedding lookup failed\n");
-                    ok = false;
-                    break;
-                }
+            noise_ids[0] = lt;
+            for (int i = 1; i < block; i++) {
+                noise_ids[i] = drafter.mask_token_id;
+            }
+            if (!target.embed_tokens(
+                    noise_ids.data(), block, noise_embed.data())) {
+                std::fprintf(stderr,
+                    "[ds4-spec] draft embedding lookup failed\n");
+                ok = false;
+                break;
+            }
 
-                // Drafter forward -> block normed hidden states.
-                const bool draft_ok = deepseek4_dspark_draft_forward(
-                    drafter_backend,
-                    drafter, noise_embed.data(),
-                    ctx_len > 0 ? feat_win.data() : nullptr,
-                    ctx_len, pos, local_hidden,
-                    use_confidence_width ? &confidence_hidden : nullptr);
-                if (!draft_ok) {
-                    std::fprintf(stderr, "[ds4-spec] drafter forward failed\n");
-                    ok = false;
-                    break;
-                }
+            // Drafter forward -> block normed hidden states.
+            const bool draft_ok = deepseek4_dspark_draft_forward(
+                drafter_backend,
+                drafter, noise_embed.data(),
+                ctx_len > 0 ? feat_win.data() : nullptr,
+                ctx_len, pos, local_hidden,
+                use_confidence_width ? &confidence_hidden : nullptr);
+            if (!draft_ok) {
+                std::fprintf(stderr, "[ds4-spec] drafter forward failed\n");
+                ok = false;
+                break;
             }
         }
         tm_draft += spec_ms_since(t0);
@@ -882,12 +844,6 @@ bool run_deepseek4_dspark_spec_decode(
             const int w_cap = (int) ewma_accept + 2;
             if (w_cap < q_step_cap) q_step_cap = w_cap;
         }
-        // Draft-ahead needs one unverified token beyond the verifier width.
-        // It predicts only the next seed; the target remains authoritative.
-        const int head_step_cap = draft_ahead_enabled && q_step_cap >= 2
-            ? std::min(q_step_cap + 1, block + 1)
-            : q_step_cap;
-        int predicted_ahead_seed = -1;
         if (q_step_cap >= 2) {
             std::memcpy(padded_hidden.data() + n_embd, local_hidden.data(),
                         sizeof(float) * (size_t) n_embd * block);
@@ -898,19 +854,19 @@ bool run_deepseek4_dspark_spec_decode(
             }
             ds_ok = dspark_markov_correct_greedy_chain_fused(
                             dw, backend, target.lm_head_tensor(), padded_hidden.data(),
-                            head_step_cap, lt, draft_tok,
+                            q_step_cap, lt, draft_tok,
                             use_confidence_width ? &draft_confidence : nullptr,
                             use_confidence_width
                                 ? padded_confidence_hidden.data() : nullptr);
             if (!ds_ok) {
                 ds_ok = dspark_markov_correct_greedy_chain(dw, backend, target,
-                            padded_hidden.data(), head_step_cap, lt, 0.0f, draft_tok);
+                            padded_hidden.data(), q_step_cap, lt, 0.0f, draft_tok);
             }
             if (!ds_ok || (int) draft_tok.size() < 2) {
                 // Fallback: plain projection of the block hiddens.
                 std::vector<int32_t> pj;
                 if (!target.project_hidden_to_tokens(
-                        local_hidden.data(), head_step_cap - 1, pj)) {
+                        local_hidden.data(), q_step_cap - 1, pj)) {
                     std::fprintf(stderr,
                         "[ds4-spec] draft projection fallback failed\n");
                     ok = false;
@@ -918,13 +874,9 @@ bool run_deepseek4_dspark_spec_decode(
                 }
                 draft_tok.clear();
                 draft_tok.push_back(lt);
-                for (int i = 0; i < head_step_cap - 1; i++) {
+                for (int i = 0; i < q_step_cap - 1; i++) {
                     draft_tok.push_back(pj[(size_t) i]);
                 }
-            }
-            if ((int) draft_tok.size() > q_step_cap) {
-                predicted_ahead_seed = draft_tok[(size_t) q_step_cap];
-                draft_tok.resize((size_t) q_step_cap);
             }
         } else {
             draft_tok.push_back(lt);   // q=1: seed only, no speculation
@@ -959,47 +911,9 @@ bool run_deepseek4_dspark_spec_decode(
                          q > 2 ? draft_tok[2] : -1, q > 3 ? draft_tok[3] : -1);
         }
 
-        // Predict the next seed with one extra Markov step, then run its
-        // drafter forward on the independent low-priority R9700 stream while
-        // the target verifies this step. The feature window is deliberately
-        // one verifier step stale. A miss is discarded; every proposal still
-        // passes through the exact target verifier.
-        bool ahead_inflight = false;
-        bool ahead_output_ready = false;
-        int inflight_ahead_seed = -1;
-        int inflight_ahead_pos = -1;
-        std::vector<float> completed_ahead_hidden;
-        std::vector<float> completed_ahead_confidence_hidden;
-        if (draft_ahead_enabled && q == q_step_cap && q >= 2 &&
-            predicted_ahead_seed >= 0) {
-            const SpecClock::time_point probe_t0 = SpecClock::now();
-            noise_ids[0] = predicted_ahead_seed;
-            for (int i = 1; i < block; ++i) {
-                noise_ids[i] = drafter.mask_token_id;
-            }
-            if (target.embed_tokens(
-                    noise_ids.data(), block, ahead_noise_embed.data())) {
-                inflight_ahead_seed = predicted_ahead_seed;
-                inflight_ahead_pos = pos + q;
-                ahead_inflight = deepseek4_dspark_draft_forward_async(
-                    drafter_backend, drafter, ahead_noise_embed.data(),
-                    ctx_len > 0 ? feat_win.data() : nullptr,
-                    ctx_len, inflight_ahead_pos);
-            }
-            tm_probe_submit += spec_ms_since(probe_t0);
-            if (ahead_inflight) {
-                ++ahead_launches;
-            } else {
-                draft_ahead_enabled = false;
-                std::fprintf(stderr,
-                    "[ds4-spec] draft-ahead launch failed; disabling\n");
-            }
-        }
-
-        // Feasibility-only control: duplicate the current draft and discard
-        // it. Never run this at the same time as real draft-ahead.
+        // Feasibility-only control: duplicate the current draft and discard it.
         bool probe_inflight = false;
-        if (!draft_ahead_enabled && draft_overlap_probe_enabled && q_cap >= 2) {
+        if (draft_overlap_probe_enabled && q_cap >= 2) {
             const SpecClock::time_point probe_t0 = SpecClock::now();
             probe_inflight = draft_overlap_reuse_context
                 ? deepseek4_dspark_draft_forward_async_reuse_context(
@@ -1041,21 +955,9 @@ bool run_deepseek4_dspark_spec_decode(
         const bool verify_ok =
             target.verify_batch(draft_tok, pos, verify_last, &tgt_am);
         tm_verify += spec_ms_since(t0);
-        if (ahead_inflight || probe_inflight) {
+        if (probe_inflight) {
             const SpecClock::time_point probe_t0 = SpecClock::now();
             deepseek4_dspark_draft_wait(drafter_backend);
-            if (ahead_inflight) {
-                ahead_output_ready =
-                    deepseek4_dspark_draft_read_async_output(
-                        drafter_backend, completed_ahead_hidden,
-                        use_confidence_width
-                            ? &completed_ahead_confidence_hidden : nullptr);
-                if (!ahead_output_ready) {
-                    draft_ahead_enabled = false;
-                    std::fprintf(stderr,
-                        "[ds4-spec] draft-ahead output read failed; disabling\n");
-                }
-            }
             tm_probe_wait += spec_ms_since(probe_t0);
         }
         if (!verify_ok) {
@@ -1084,36 +986,6 @@ bool run_deepseek4_dspark_spec_decode(
         const int matched = accept - 1;                       // accepted candidates
         const int bonus = tgt_am[accept - 1];                 // target's token at the accept point
         const int commit_pos = pos + accept;                  // seed + accepted candidates in KV
-
-        if (ahead_output_ready) {
-            const bool seed_hit =
-                accept == q && inflight_ahead_pos == commit_pos &&
-                inflight_ahead_seed == bonus;
-            if (seed_hit) {
-                ++ahead_seed_hits;
-                cached_ahead_hidden = std::move(completed_ahead_hidden);
-                if (use_confidence_width) {
-                    cached_ahead_confidence_hidden =
-                        std::move(completed_ahead_confidence_hidden);
-                } else {
-                    cached_ahead_confidence_hidden.clear();
-                }
-                cached_ahead_pos = commit_pos;
-                cached_ahead_seed = bonus;
-                cached_ahead_ready = true;
-            } else {
-                cached_ahead_ready = false;
-                cached_ahead_hidden.clear();
-                cached_ahead_confidence_hidden.clear();
-            }
-            if (timing && steps < 8) {
-                std::fprintf(stderr,
-                    "[ds4-draft-ahead] step=%ld predicted_seed=%d bonus=%d "
-                    "full_accept=%d hit=%d\n",
-                    steps, inflight_ahead_seed, bonus,
-                    accept == q ? 1 : 0, seed_hit ? 1 : 0);
-            }
-        }
 
         if (timing && steps < 8 && q >= 2) {
             // Alignment probe: draft candidate i should match tgt_am[i-1]. A
@@ -1212,15 +1084,6 @@ bool run_deepseek4_dspark_spec_decode(
                  steps ? (double) accept_sum / steps : 0.0,
                  steps ? (double) offered_sum / steps : 0.0, q_cap,
                  (int) full_snap);
-    if (draft_ahead) {
-        std::fprintf(stderr,
-            "[ds4-draft-ahead] launches=%ld seed_hits=%ld reused=%ld "
-            "seed_hit_rate=%.3f reuse_rate=%.3f\n",
-            ahead_launches, ahead_seed_hits, ahead_reuses,
-            ahead_launches > 0
-                ? (double) ahead_seed_hits / (double) ahead_launches : 0.0,
-            steps > 0 ? (double) ahead_reuses / (double) steps : 0.0);
-    }
     if (steps > 0) {
         std::fprintf(stderr,
             "[ds4-spec-t] TOTAL %.1f ms, %ld steps (%.1f ms/step), %d tok (%.1f tok/s) | "

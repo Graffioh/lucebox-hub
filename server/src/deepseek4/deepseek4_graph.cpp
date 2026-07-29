@@ -12,6 +12,7 @@
 #include "deepseek4_hc_cuda.h"
 #include "internal.h"
 #include "../common/step_graph.h"
+#include "../common/cuda_graph_overrides.h"
 #include "../common/moe_expert_compute.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_routing_stats.h"
@@ -22,8 +23,6 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
-
-extern "C" void ggml_backend_cuda_set_graphs_disabled_override(bool disabled);
 
 #include <algorithm>
 #include <array>
@@ -58,22 +57,6 @@ static bool ds4_env_flag(const char * name) {
     const char * value = std::getenv(name);
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
-
-class Ds4CudaGraphDisableScope {
-public:
-    explicit Ds4CudaGraphDisableScope(bool active) : active_(active) {
-        if (active_) ggml_backend_cuda_set_graphs_disabled_override(true);
-    }
-    ~Ds4CudaGraphDisableScope() {
-        if (active_) ggml_backend_cuda_set_graphs_disabled_override(false);
-    }
-
-    Ds4CudaGraphDisableScope(const Ds4CudaGraphDisableScope &) = delete;
-    Ds4CudaGraphDisableScope & operator=(const Ds4CudaGraphDisableScope &) = delete;
-
-private:
-    bool active_;
-};
 
 static int ds4_effective_expert_count(const DeepSeek4Weights & w) {
     int requested = w.routed_expert_top_k;
@@ -2841,41 +2824,6 @@ struct Ds4MoeRouting {
     std::vector<ggml_tensor *> nodes;
 };
 
-// Diagnostic-only route look-ahead.  The prediction is deliberately kept
-// separate from Ds4MoeRouting: it never supplies weights to the authoritative
-// FFN and therefore cannot change model output.  It applies a future layer's
-// real gate to an earlier layer's normalized FFN input, matching the
-// cross-layer-gate prefetch construction used by Fate.
-struct Ds4MoeRoutePrediction {
-    ggml_tensor * selected = nullptr;
-    std::vector<ggml_tensor *> nodes;
-};
-
-static Ds4MoeRoutePrediction build_moe_route_prediction(
-        ggml_context * ctx,
-        ggml_tensor * earlier_cur,
-        const DeepSeek4Weights & w,
-        const DeepSeek4Layer & future_layer,
-        int prediction_width) {
-    Ds4MoeRoutePrediction out;
-    auto track = [&](ggml_tensor * tensor) {
-        if (tensor) out.nodes.push_back(tensor);
-        return tensor;
-    };
-    ggml_tensor * logits = track(
-        ggml_mul_mat(ctx, future_layer.ffn_gate_inp, earlier_cur));
-    ggml_tensor * selection = track(
-        ggml_sqrt(ctx, track(ggml_softplus(ctx, logits))));
-    if (future_layer.ffn_exp_probs_b) {
-        selection = track(
-            ggml_add(ctx, selection, future_layer.ffn_exp_probs_b));
-    }
-    const int width = std::max(
-        1, std::min(prediction_width, w.n_expert));
-    out.selected = track(ggml_top_k(ctx, selection, width));
-    return out;
-}
-
 static MoeHybridConfig make_ds4_moe_hybrid_config(const DeepSeek4Weights & w) {
     MoeHybridConfig cfg;
     cfg.n_embd = w.n_embd;
@@ -4511,15 +4459,6 @@ struct DeepSeek4FusedDecodeGraph {
         ggml_tensor * selected = nullptr;
         ggml_tensor * weights = nullptr;
     };
-    struct RoutePredictionOutput {
-        int source_layer = -1;
-        int target_layer = -1;
-        int lane_start = 0;
-        int n_tokens = 0;
-        int width = 0;
-        ggml_tensor * selected = nullptr;
-        std::vector<ggml_tensor *> nodes;
-    };
     std::vector<int64_t> shape_key;
     uint64_t last_use = 0;
     StepGraph sg;
@@ -4530,26 +4469,8 @@ struct DeepSeek4FusedDecodeGraph {
     std::vector<ggml_tensor *> hash_ids;
     std::vector<MoeHybridGraphInputs> hybrid_inputs;
     std::vector<AuthoritativeRouteOutput> authoritative_routes;
-    std::vector<RoutePredictionOutput> route_predictions;
     ggml_tensor * logits = nullptr;
     ggml_backend_sched_t sched = nullptr;
-    uint32_t whole_step_warmups = 0;
-    uint64_t whole_step_sequence_id = 0;
-    int whole_step_graph_count = 0;
-    std::array<ggml_backend_t, 2> whole_step_backends{};
-    std::array<ggml_backend_cuda_whole_graph_t, 2> whole_step_graphs{};
-
-    void clear_whole_step_graphs() {
-        for (int i = 0; i < whole_step_graph_count; ++i) {
-            ggml_backend_cuda_whole_graph_free(
-                whole_step_backends[(size_t) i],
-                whole_step_graphs[(size_t) i]);
-        }
-        whole_step_graphs = {};
-        whole_step_backends = {};
-        whole_step_graph_count = 0;
-        whole_step_warmups = 0;
-    }
 
     void reset_nodes() {
         inp_embed = nullptr;
@@ -4560,8 +4481,6 @@ struct DeepSeek4FusedDecodeGraph {
         hash_ids.clear();
         hybrid_inputs.clear();
         authoritative_routes.clear();
-        route_predictions.clear();
-        whole_step_sequence_id = 0;
         shape_key.clear();
         last_use = 0;
     }
@@ -4571,7 +4490,6 @@ struct DeepSeek4FusedDecodeGraph {
     }
 
     void destroy() {
-        clear_whole_step_graphs();
         if (sched) {
             ggml_backend_sched_free(sched);
             sched = nullptr;
@@ -4611,6 +4529,46 @@ struct DeepSeek4FusedDecodeCache {
     }
 };
 
+// Fused verification graphs retain allocators, schedulers, peer events, and
+// model tensor pointers.  Keep them under DeepSeek4Cache ownership so park,
+// reload, and shutdown destroy them before either GPU backend is released.
+struct Ds4FusedVerifyCache {
+    static constexpr size_t kSlotCount = 12;
+
+    const ggml_context * owner_ctx = nullptr;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_t peer_backend = nullptr;
+    bool disabled = false;
+    uint64_t counter = 0;
+    std::array<DeepSeek4FusedDecodeGraph, kSlotCount> slots;
+
+    struct Extra {
+        ggml_tensor * pos_q = nullptr;    // i32 [q]
+        ggml_tensor * neg_q = nullptr;    // i32 [q]
+        ggml_tensor * rawrows = nullptr;  // i64 [1,q]
+        ggml_tensor * ape4 = nullptr;     // i32 [q]
+        ggml_tensor * ape128 = nullptr;   // i32 [q]
+        ggml_tensor * st4 = nullptr;      // i64 [1,q]
+        ggml_tensor * st128 = nullptr;    // i64 [1,q]
+        ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap*q], order [ci][t]
+        ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
+        int q = 0;
+
+        void reset() { *this = Extra{}; }
+    };
+    std::array<Extra, kSlotCount> extra;
+
+    void destroy() {
+        for (auto & slot : slots) slot.destroy();
+        for (auto & value : extra) value.reset();
+        owner_ctx = nullptr;
+        backend = nullptr;
+        peer_backend = nullptr;
+        disabled = false;
+        counter = 0;
+    }
+};
+
 struct DeepSeek4LayerRangeCache {
     ~DeepSeek4LayerRangeCache() { reset(); }
 
@@ -4640,6 +4598,8 @@ struct DeepSeek4LayerRangeCache {
     DeepSeek4CachedDecodeOutputGraph cached_decode_output_graph;
     DeepSeek4CachedLayerAlloc cached_dynamic_output_alloc;
     DeepSeek4FusedDecodeCache fused_decode_graph_cache;
+    Ds4FusedVerifyCache fused_verify_graph_cache;
+    Ds4FusedVerifyCache fused_capture_graph_cache;
     Ds4DecodeSharedInputs decode_shared_inputs;
     DeepSeek4LayerRangeScratch scratch;
 
@@ -4689,6 +4649,8 @@ struct DeepSeek4LayerRangeCache {
         cached_decode_output_graph.free();
         cached_dynamic_output_alloc.free();
         fused_decode_graph_cache.destroy();
+        fused_verify_graph_cache.destroy();
+        fused_capture_graph_cache.destroy();
         decode_shared_inputs.free();
         reset_hc_layer_weights_cpu(hc_layer_weights);
         reset_hc_weights_cpu(hc_output_weights);
@@ -6544,7 +6506,7 @@ bool deepseek4_step_layer_range(
     // eager execution prevents a prefill graph entry from being replayed by
     // the following decode/request.  The override is thread-local and scoped
     // to this forward call; decode graph replay is restored on every return.
-    Ds4CudaGraphDisableScope heterogeneous_prefill_eager_scope(
+    ScopedCudaGraphOverrides heterogeneous_prefill_eager_scope(
         heterogeneous_sparse_prefill &&
         ds4_env_flag("DFLASH_DS4_HYBRID_PREFILL_EAGER"));
 
@@ -6757,10 +6719,15 @@ bool deepseek4_step_layer_range(
         out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {
         const bool q1_feature_capture =
             n_tokens == 1 && verify_hooks && verify_hooks->capture_out;
+        // q=1 target-feature capture walks many prompt-position shapes. Keep
+        // it separate from q>=2 verification so prefill cannot evict the
+        // expensive warm q=3/q=4 verifier working set.
         Ds4FusedVerifyCache & graph_cache = q1_feature_capture
-            ? fused_capture_graph_cache : fused_verify_graph_cache;
+            ? layer_range_cache.fused_capture_graph_cache
+            : layer_range_cache.fused_verify_graph_cache;
         const int vrc = ds4_try_fused_verify_step(
-            graph_cache, fused_decode_graph_cache, backend, w, cache,
+            graph_cache, q1_feature_capture, fused_decode_graph_cache,
+            backend, w, cache,
             hc_layer_weights_range, hc_output_weights_range, hash_routing_tables_range,
             scratch.hash_expert_ids, embed, n_tokens, kv_start, *out_logits, token_ids,
             fused_graph_hooks, telemetry, fused_hybrid_ready ? moe_hybrid : nullptr,
@@ -7787,13 +7754,6 @@ void free_deepseek4_cache(DeepSeek4Cache & c) {
 }
 
 void reset_deepseek4_cache(DeepSeek4Cache & c) {
-    // Graph executables may retain cross-device dependency state even though
-    // their tensor addresses are stable. Give every fresh request a distinct
-    // generation so those executables cannot be replayed across a cache clear.
-    ++c.sequence_id;
-    if (c.sequence_id == 0) {
-        ++c.sequence_id;
-    }
     c.cur_pos = 0;
     for (DeepSeek4LayerCache & lc : c.layers) {
         lc.n_comp = 0;
@@ -8732,11 +8692,13 @@ static bool deepseek4_dspark_draft_forward_impl(
     // have both been qualified on the deployment GPUs.
     const bool force_graph_replay =
         ds4_env_flag("DFLASH_DS4_DRAFT_FORCE_GRAPH_REPLAY");
-    if (force_graph_replay) ggml_backend_cuda_set_skip_props_check(true);
+    ScopedCudaGraphOverrides graph_replay_scope(
+        /*disable_graphs=*/false,
+        /*mmvq_max_ncols=*/0,
+        /*skip_property_check=*/force_graph_replay);
     const ggml_status st = out_hidden
         ? ggml_backend_graph_compute(backend, C.gf)
         : ggml_backend_graph_compute_async(backend, C.gf);
-    if (force_graph_replay) ggml_backend_cuda_set_skip_props_check(false);
     if (st != GGML_STATUS_SUCCESS) {
         // Invalidate: a failed compute leaves no reusable state guarantees.
         ggml_free(C.ctx); C.ctx = nullptr; C.gf = nullptr; C.ctx_len = -1;
