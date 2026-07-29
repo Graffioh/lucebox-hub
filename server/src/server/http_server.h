@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "socket_handle.h"
 #include "common/model_backend.h"
 #include "tokenizer.h"
 #include "chat_template.h"
@@ -283,7 +284,7 @@ public:
 
 private:
     // Client thread: read HTTP request, parse, enqueue job, wait.
-    void handle_client(int fd);
+    void handle_client(SocketHandle fd);
 
     // Worker thread: process jobs sequentially. process_job owns the
     // lifecycle of one dequeued request, including signaling completion.
@@ -307,7 +308,7 @@ private:
                                   PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,
                                          PreparedPrompt & prepared);
-    bool forward_upstream(int fd, const ParsedRequest & req,
+    bool forward_upstream(SocketHandle fd, const ParsedRequest & req,
                           const PreparedPrompt & prepared);
 
     struct GenerationCacheState {
@@ -352,7 +353,7 @@ private:
         const ParsedRequest & req, const PreparedPrompt & prepared,
         GenerationInputs & inputs);
     void configure_generation_io(
-        int fd, const ParsedRequest & req, SseEmitter & emitter,
+        SocketHandle fd, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io);
 
     // Parse HTTP request from socket.
@@ -362,34 +363,34 @@ private:
         std::string query;  // raw query string (after '?')
         std::string body;
     };
-    bool read_http_request(int fd, HttpRequest & out);
+    bool read_http_request(SocketHandle fd, HttpRequest & out);
 
     // Route request to appropriate parser.
-    bool route_request(int fd, const HttpRequest & hr);
+    bool route_request(SocketHandle fd, const HttpRequest & hr);
     // parse_common_request_fields, render_and_tokenize_request, and
     // validate_request_context return false after sending an error
     // response. parse_endpoint_request returns false only when the path
     // is unsupported (the caller sends the 404).
-    bool parse_common_request_fields(int fd, const json & body,
+    bool parse_common_request_fields(SocketHandle fd, const json & body,
                                      ParsedRequest & req);
     bool parse_endpoint_request(const std::string & path, const json & body,
                                 ParsedRequest & req, bool & count_tokens_only);
     void apply_request_reasoning(const json & body, ParsedRequest & req);
     bool render_and_tokenize_request(
-        int fd, const std::vector<ChatMessage> & chat_messages,
+        SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
         ParsedRequest & req);
-    bool validate_request_context(int fd, const ParsedRequest & req);
+    bool validate_request_context(SocketHandle fd, const ParsedRequest & req);
     void log_parsed_request(const ParsedRequest & req) const;
-    void enqueue_request_and_wait(int fd, ParsedRequest req);
+    void enqueue_request_and_wait(SocketHandle fd, ParsedRequest req);
 
     // Send HTTP response helpers.
-    bool send_response(int fd, int status, const std::string & content_type,
+    bool send_response(SocketHandle fd, int status, const std::string & content_type,
                        const std::string & body);
-    bool send_error(int fd, int status, const std::string & message);
-    bool send_sse_headers(int fd);
+    bool send_error(SocketHandle fd, int status, const std::string & message);
+    bool send_sse_headers(SocketHandle fd);
 
     // Send raw bytes with stall detection.
-    bool send_all(int fd, const void * data, size_t len);
+    bool send_all(SocketHandle fd, const void * data, size_t len);
 
     // Job queue.
     void enqueue(ServerJob * job);
@@ -414,7 +415,7 @@ private:
 
     // SSE client connections for /status/events push.
     std::mutex             sse_mu_;
-    std::vector<int>       sse_fds_;
+    std::vector<SocketHandle> sse_fds_;
 
     // Broadcast current status to all SSE clients. Removes dead fds.
     void broadcast_status();
@@ -466,12 +467,12 @@ private:
     std::condition_variable         clients_cv_;
 
     // Listen socket.
-    int listen_fd_ = -1;
+    SocketHandle listen_fd_ = kInvalidSocket;
 };
 
 // ─── Job (stack-owned by client thread) ─────────────────────────────────
 struct ServerJob {
-    int           fd = -1;
+    SocketHandle  fd = kInvalidSocket;
     ParsedRequest req;
     bool          done = false;
     std::mutex    mu;
