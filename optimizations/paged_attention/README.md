@@ -27,9 +27,8 @@
 - **Resident metadata.** The block table and sequence length live in the
   persistent target cache next to the pool, so a decode step uploads 4 bytes per
   newly filled block instead of the whole table every token.
-- **Prefill is unchanged.** The prompt runs through the existing exact chunked
-  path against a freshly reset pool, so its layout is identity-mapped. Paging
-  begins at autoregressive decode.
+- **Prefill remains exact.** Prompt chunks attend a contiguous staging copy of
+  their K/V while dual-writing rows into the sequence's physical blocks.
 
 Not to be confused with [KVFlash](../kvflash/README.md): that one bounds how much
 context stays resident and evicts cold chunks. Paging keeps every token.
@@ -76,13 +75,25 @@ slab of every layer's state tensor (~150 MB/slot) plus one block-table column �
 and decode runs one batched step per token across all live slots (the token
 axis of the graph becomes the sequence axis; GDN, `ssm_conv`, and the paged
 kernel all iterate sequences independently, bitwise-identically to running
-them alone — see `ctest -R batched_gdn`). Admission reserves a request's whole
-`prompt + max_tokens` block budget up front, so a decoding sequence can never
-run out of pool mid-stream; requests that don't fit wait in the queue. Prefill
-of a new request runs between decode iterations through a contiguous staging
-copy of its K/V (the exact dense chunked path), dual-writing the same rows
-into its scattered pool blocks. `--kv-pool-tokens` sizes the shared pool below
-`N x max_ctx` when admission by blocks — not worst case — is wanted.
+them alone — see `ctest -R batched_gdn`). Admission claims a slot but allocates
+no K/V. Each prefill chunk allocates only the rows it is about to write, and
+decode adds one block at each 16-token boundary. A prompt that fits the whole
+pool but not the blocks currently free waits in the queue; a prefilling request
+that temporarily runs out of blocks keeps its completed chunks and pauses.
+Decode exhaustion fails that request explicitly rather than truncating it.
+At the default pool size (`N x max_ctx`) those exhaustion paths are unreachable;
+`--kv-pool-tokens` can explicitly select a smaller shared pool.
+
+**Non-pausing admission.** `SeqEngine::admit()` claims a slot and queues its
+prompt without allocating K/V or running the full prefill. Each scheduler
+iteration then allocates one prompt chunk and calls `SeqEngine::step()` with
+that chunk and every live decode slot in the same forward pass. Prompt rows use
+the exact dense attention path against staging K/V while decode rows read the
+paged pool; the committing chunk copies the prompt's recurrent state into its
+slot and returns the first sampled token. This keeps existing streams advancing
+through an admission instead of stopping for the whole prefill. One staging set
+means only one prompt can be prefilling at a time, so cold-burst admissions are
+still serialized.
 
 ## Numbers
 
@@ -114,12 +125,16 @@ kernel in step 4 is what fixes that.
 
 ### End-to-end concurrent serving (`--max-concurrency`)
 
+The following measurements are the blocking-admission PR1 baseline. They
+predate both non-pausing admission and the benchmark's unique expansion of
+reused base prompts, so they are retained for historical comparison rather
+than presented as current PR2 results.
+
 Whole-model HTTP serving, Qwen3.6-27B Q4_K_M, Q8_0 K/V, greedy, ~300-token
 prompts, 256 generated tokens per request, 2 requests per stream
 (`harness/benchmarks/concurrent_benchmark.py`, 2026-07-28). Aggregate is the
 sum of generated tokens over the level's wall clock; per-stream is decode-only
-tok/s of one stream; TTFT includes queueing and the serialized prefills of a
-cold burst — the worst case for time-to-first-token.
+tok/s of one stream; TTFT includes queueing and serialized cold-burst prefills.
 
 RTX 3090 (CUDA, `--max-ctx 4096`):
 
@@ -150,12 +165,13 @@ unrelated 100 GB tenant during the run):
    through `set_rows` while attending a contiguous staging copy — exact, any
    block layout. A paged-aware prefill *read* path (no staging copy) remains
    open.
-4. **Partly done.** Block-budget admission with up-front reservation and
-   client-disconnect cancellation are in; still open: prefill/decode
-   interleaving (a prefill today pauses decode for its duration), decode
-   batches sized to live slots (today the batch is fixed at `--max-concurrency`
-   width; idle slots decode a dummy row), oversubscription with preemption,
-   and the stream-K decode kernel for ragged batches.
+4. **Partly done.** On-demand block allocation, client-disconnect cancellation,
+   and non-pausing prefill/decode fusion are in. The physical pool still
+   defaults to `max-concurrency x max-ctx`; memory-derived sizing and
+   recompute preemption remain follow-up work. Also open: decode batches sized
+   to live slots (today the batch is fixed at `--max-concurrency` width; idle
+   slots decode a dummy row), more than one in-flight prefill, and the stream-K
+   decode kernel for ragged batches.
 5. **Variable-length batched prefill.**
 6. **Prefix caching / CoW.** Shared prefix blocks with reference counting and
    copy-on-write.
