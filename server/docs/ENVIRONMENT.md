@@ -24,6 +24,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
 | `DFLASH_ADAPTIVE_K_DENSE` | per-model default | CSV of MoE layers kept dense under adaptive-K (DFlash capture layers). Warned-inert on families that do not thread layer indices yet. |
 | `DFLASH_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. |
+| `DFLASH_MMID_GROUPED_TYPES` | 7 | Grouped-kernel type mask; bit 3 (`8`) opts ROCmFP2/ROCmFP3 into the path. |
+| `DFLASH_MMID_GROUPED_DEVICE` | -1 | Optional zero-based device restriction; unset/-1 applies to every eligible device. |
+| `DFLASH_DS4_MOE_TP` / `DFLASH_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. |
+| `DFLASH_DS4_MOE_TP_GPU` | auto | HIP device for the cold DeepSeek4 expert owner. |
+| `DFLASH_DS4_TP_BATCH_PEER_COPIES` | unset | BURN-IN: publish same-split HIP peer copies with one cross-device dependency. |
+| `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `DFLASH_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
 | `DFLASH_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
 
@@ -57,7 +63,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DRAFT_KV` - laguna_backend.cpp, qwen35_backend.cpp
 - `DFLASH_DRAFT_PERSIST` - laguna_backend.cpp
 - `DFLASH_DROP_COLD` - qwen35moe_backend.cpp, qwen35moe_pipelined_decode.cpp
-- `DFLASH_DS4_TIMING` - deepseek4_target_shard_ipc_daemon.cpp
+- `DFLASH_DS4_DRAFT_GPU` - deepseek4_backend.cpp
+- `DFLASH_DS4_HOTNESS_CSV` - deepseek4_backend.cpp
+- `DFLASH_DS4_MOE_TP` - deepseek4_backend.cpp
+- `DFLASH_DS4_MOE_TP_GPU` - deepseek4_backend.cpp
+- `DFLASH_DS4_MOE_TP_INPROC` - deepseek4_backend.cpp
+- `DFLASH_DS4_TIMING` - deepseek4_backend.cpp, deepseek4_target_shard_ipc_daemon.cpp
 - `DFLASH_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
 - `DFLASH_EXPERT_BUDGET_PCT` - laguna_backend.cpp
 - `DFLASH_FEATURE_DTYPE` - dflash_feature_ring.cpp
@@ -131,6 +142,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_MOE_FIXED_SLOT_GRAPHS` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FIXED_SLOT_MAX` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_PREFILL_HOT_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` - deepseek4_graph.cpp
 - `DFLASH_NO_MASK` - laguna_backend.cpp
 - `DFLASH_NO_MOE_ROUTER_FUSE` - qwen35moe_ffn.cpp
 - `DFLASH_NO_MOE_SWIGLU_FUSE` - qwen35moe_ffn.cpp
