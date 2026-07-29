@@ -40,6 +40,15 @@ context stays resident and evicts cold chunks. Paging keeps every token.
 ./server/build/dflash_server model.gguf --paged-attention --max-ctx 131072
 ```
 
+Concurrent serving — N requests decoded together, one batched paged step
+per token, per-request SSE streams:
+
+```bash
+./server/build/dflash_server model.gguf --paged-attention --max-ctx 4096 \
+    --max-concurrency 8         # 8 decode slots
+    # --kv-pool-tokens 16384    # optional: shared pool smaller than 8 full contexts
+```
+
 ## Compatibility
 
 | | |
@@ -48,7 +57,7 @@ context stays resident and evicts cold chunks. Paging keeps every token.
 | Placement | one local CUDA or HIP device |
 | Attention | full only (`--fa-window 0`) |
 | K/V types | F16, Q4_0, Q8_0 |
-| Decode | autoregressive, one live sequence |
+| Decode | autoregressive; up to 64 concurrent sequences with `--max-concurrency` |
 | Block size | 16 tokens, fixed |
 
 **Rejected at startup** (exit 2, with the reason): `--draft`, `--ddtree`,
@@ -60,10 +69,20 @@ placement they are allowed on is one row in `model_capabilities.h`.
 **Disabled, not rejected:** prefix, prefill, and disk snapshots. Their format
 assumes contiguous K/V rows, so `--paged-attention` zeroes the caps and says so.
 
-**Why one sequence.** Qwen3.6 is hybrid: 48 of its 64 layers hold recurrent Gated
-DeltaNet state rather than an attention cache, and that state is backend-global
-today. Two live requests would mix it even with perfectly isolated K/V blocks.
-Making it sequence-indexed is step 2 below.
+**Concurrent serving (`--max-concurrency N`).** Qwen3.6 is hybrid: 48 of its 64 layers
+hold recurrent Gated DeltaNet state rather than an attention cache. With
+`--max-concurrency N` that state is sequence-indexed — each slot owns a contiguous
+slab of every layer's state tensor (~150 MB/slot) plus one block-table column —
+and decode runs one batched step per token across all live slots (the token
+axis of the graph becomes the sequence axis; GDN, `ssm_conv`, and the paged
+kernel all iterate sequences independently, bitwise-identically to running
+them alone — see `ctest -R batched_gdn`). Admission reserves a request's whole
+`prompt + max_tokens` block budget up front, so a decoding sequence can never
+run out of pool mid-stream; requests that don't fit wait in the queue. Prefill
+of a new request runs between decode iterations through a contiguous staging
+copy of its K/V (the exact dense chunked path), dual-writing the same rows
+into its scattered pool blocks. `--kv-pool-tokens` sizes the shared pool below
+`N x max_ctx` when admission by blocks — not worst case — is wanted.
 
 ## Numbers
 
@@ -93,17 +112,50 @@ small ragged batches are still behind (`4K + 7x256` measures 0.48x), because
 short sequences carry dead partitions sized by the longest sequence; the stream-K
 kernel in step 4 is what fixes that.
 
+### End-to-end concurrent serving (`--max-concurrency`)
+
+Whole-model HTTP serving, Qwen3.6-27B Q4_K_M, Q8_0 K/V, greedy, ~300-token
+prompts, 256 generated tokens per request, 2 requests per stream
+(`harness/benchmarks/concurrent_benchmark.py`, 2026-07-28). Aggregate is the
+sum of generated tokens over the level's wall clock; per-stream is decode-only
+tok/s of one stream; TTFT includes queueing and the serialized prefills of a
+cold burst — the worst case for time-to-first-token.
+
+RTX 3090 (CUDA, `--max-ctx 4096`):
+
+| Streams | Aggregate tok/s | Per-stream tok/s | TTFT p95 | vs 1 stream |
+|---:|---:|---:|---:|---:|
+| 1 | 21.0 | 21.8 | 0.45 s | 1.00x |
+| 4 | 60.1 | 16.4 | 1.49 s | 2.86x |
+| 8 | 88.2 | 12.6 | 2.90 s | 4.20x |
+| 16 | 110.3 | 8.2 | 5.78 s | 5.25x |
+
+Radeon 8060S (HIP gfx1151, `--max-ctx 2048`, host RAM constrained by an
+unrelated 100 GB tenant during the run):
+
+| Streams | Aggregate tok/s | Per-stream tok/s | TTFT p95 | vs 1 stream |
+|---:|---:|---:|---:|---:|
+| 1 | 11.0 | 11.5 | 1.06 s | 1.00x |
+| 4 | 26.5 | 7.2 | 3.29 s | 2.42x |
+| 8 | 42.7 | 6.1 | 6.25 s | 3.89x |
+| 16 | 56.4 | 4.2 | 11.51 s | 5.15x |
+
 ## Roadmap
 
 1. **Done.** Decode-only `ggml_paged_attn`, block manager, CUDA/HIP integration,
    benchmarks.
-2. **Scheduler groundwork.** Sequence-indexed DeltaNet/conv state, iteration-level
-   scheduling, dynamic decode batches.
-3. **Paged-aware chunk prefill.** Arbitrary block-table writes, multi-token
-   queries over preceding paged K/V, causal attention within the chunk.
-4. **Continuous admission and interleaving.** Token budgets, decode
-   prioritization, admission control, cancellation, prefill/decode interleaving,
-   plus the stream-K decode kernel for ragged batches.
+2. **Done.** Scheduler groundwork: sequence-indexed DeltaNet/conv state,
+   iteration-level scheduling, batched decode (`--max-concurrency`).
+3. **Done** (via staging): chunk prefill writes arbitrary block-table rows
+   through `set_rows` while attending a contiguous staging copy — exact, any
+   block layout. A paged-aware prefill *read* path (no staging copy) remains
+   open.
+4. **Partly done.** Block-budget admission with up-front reservation and
+   client-disconnect cancellation are in; still open: prefill/decode
+   interleaving (a prefill today pauses decode for its duration), decode
+   batches sized to live slots (today the batch is fixed at `--max-concurrency`
+   width; idle slots decode a dummy row), oversubscription with preemption,
+   and the stream-K decode kernel for ragged batches.
 5. **Variable-length batched prefill.**
 6. **Prefix caching / CoW.** Shared prefix blocks with reference counting and
    copy-on-write.

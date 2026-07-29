@@ -640,6 +640,14 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
         finish_job(deferred);
     }
+    // Jobs that never reached admission are still parked in their client
+    // threads too. Drain the raw queue before returning so run() does not hit
+    // its client-shutdown timeout and the destructor never has to wake threads
+    // after the server/backend teardown has already started.
+    while (ServerJob * queued = try_dequeue()) {
+        send_error(queued->fd, 503, "server shutting down");
+        finish_job(queued);
+    }
 }
 
 
