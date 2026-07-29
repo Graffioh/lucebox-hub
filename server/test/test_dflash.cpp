@@ -23,6 +23,7 @@
 #include "draft_graph.h"
 #include "qwen3_drafter.h"
 #include "gpu_runtime_compat.h"
+#include "chain_rollback_policy.h"
 #include "laguna_daemon.h"  // arch dispatch - laguna targets are served by
                             // dflash::common::run_laguna_daemon() instead of the
                             // qwen35 + DFlash + DDTree pipeline below.
@@ -369,7 +370,11 @@ static int run_target_layer_split_harness(
                                          shard.backend, shard.cache,
                                          /*prefill_only=*/!run_dflash,
                                          shard.layer_begin, shard.layer_end,
-                                         allocate_target_feat)) {
+                                         allocate_target_feat,
+                                         /*ctx_alloc=*/0,
+                                         /*f32_ssm_intermediates=*/
+                                             run_dflash &&
+                                             split_chain_fast_rollback_enabled())) {
             std::fprintf(stderr, "target-split cache gpu=%d: %s\n",
                          shard.gpu, dflash27b_last_error());
             free_qwen35_layer_split_shards(shards);

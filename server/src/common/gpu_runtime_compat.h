@@ -14,11 +14,16 @@
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
+#define cudaErrorIllegalAddress hipErrorIllegalAddress
+#define cudaErrorAssert hipErrorAssert
+#define cudaErrorLaunchFailure hipErrorLaunchFailure
 #define cudaError_t hipError_t
 #define cudaFree hipFree
 #define cudaGetDeviceCount hipGetDeviceCount
 #define cudaGetErrorString hipGetErrorString
+#define cudaGetErrorName hipGetErrorName
 #define cudaGetLastError hipGetLastError
+#define cudaPeekAtLastError hipPeekAtLastError
 #define cudaMalloc hipMalloc
 #define cudaMemcpy2D hipMemcpy2D
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
@@ -33,6 +38,7 @@
 #define cudaSetDevice hipSetDevice
 #define cudaStreamSynchronize hipStreamSynchronize
 #define cudaStream_t hipStream_t
+#define cudaStreamPerThread hipStreamPerThread
 #define cudaSuccess hipSuccess
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceReset hipDeviceReset

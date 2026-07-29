@@ -39,7 +39,9 @@ bool qwen35_split_ssm_rollback_storage_present(
            delta_idx < (int)shard.cache.ssm_intermediate.size() &&
            delta_idx < (int)shard.cache.conv_input_cache.size() &&
            shard.cache.ssm_intermediate[(size_t)delta_idx] &&
-           shard.cache.conv_input_cache[(size_t)delta_idx];
+           shard.cache.conv_input_cache[(size_t)delta_idx] &&
+           shard.cache.ssm_intermediate[(size_t)delta_idx]->type == GGML_TYPE_F32 &&
+           shard.cache.conv_input_cache[(size_t)delta_idx]->type == GGML_TYPE_F32;
 }
 
 bool fill_qwen35_kvflash_inputs(

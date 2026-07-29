@@ -7,6 +7,7 @@
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "common/kvflash_pager.h"
+#include "common/chain_rollback_policy.h"
 #include "common/gpu_runtime_compat.h"
 
 #include <algorithm>
@@ -26,6 +27,45 @@ static bool split_rollback_context_fatal(cudaError_t err) {
     return err == cudaErrorIllegalAddress ||
            err == cudaErrorAssert ||
            err == cudaErrorLaunchFailure;
+}
+
+static bool split_fast_rollback_storage_ready(
+        const std::vector<Qwen35LayerSplitShard> & shards) {
+    bool found_owned_delta_layer = false;
+    for (const auto & shard : shards) {
+        const auto & cache = shard.cache;
+        const auto & w = shard.weights;
+        int dn_idx = 0;
+        for (int il = 0; il < w.n_layer; ++il) {
+            const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
+            if (is_attn) continue;
+            const bool owns_layer = il >= shard.layer_begin && il < shard.layer_end;
+            if (!owns_layer) {
+                ++dn_idx;
+                continue;
+            }
+            found_owned_delta_layer = true;
+            if (dn_idx >= (int)cache.ssm_state.size() ||
+                dn_idx >= (int)cache.conv_state.size() ||
+                dn_idx >= (int)cache.ssm_intermediate.size() ||
+                dn_idx >= (int)cache.conv_input_cache.size()) {
+                return false;
+            }
+            const ggml_tensor * ssm_state = cache.ssm_state[(size_t)dn_idx];
+            const ggml_tensor * conv_state = cache.conv_state[(size_t)dn_idx];
+            const ggml_tensor * ssm_inter = cache.ssm_intermediate[(size_t)dn_idx];
+            const ggml_tensor * conv_input = cache.conv_input_cache[(size_t)dn_idx];
+            if (!ssm_state || !conv_state || !ssm_inter || !conv_input ||
+                ssm_state->type != GGML_TYPE_F32 ||
+                conv_state->type != GGML_TYPE_F32 ||
+                ssm_inter->type != GGML_TYPE_F32 ||
+                conv_input->type != GGML_TYPE_F32) {
+                return false;
+            }
+            ++dn_idx;
+        }
+    }
+    return found_owned_delta_layer;
 }
 
 }  // namespace
@@ -74,6 +114,10 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
     Qwen35SplitCaptureStats capture_stats;
     const bool capture_selftest = std::getenv("DFLASH_SPLIT_CAPTURE_SELFTEST") != nullptr;
     const bool capture_diag = std::getenv("DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr;
+    const bool local_only = !(remote_target_shard_ && remote_target_shard_->active());
+    const bool storage_ready = split_fast_rollback_storage_ready(shards_);
+    const bool capture_enabled = capture_ssm_intermediates &&
+        split_chain_fast_rollback_enabled() && local_only && storage_ready;
     capture_stats.reset(shards_.size());
     if (capture_ssm_intermediates) capture_stats.requested++;
 
@@ -83,7 +127,7 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
             shards_, *remote_target_shard_, shards_.front().weights, tokens,
             base_pos, (int)tokens.size(), last_tok, kq_stride_pad_, fa_window_,
             all_argmax, /*logits_out=*/nullptr, feature_ring_, remote_draft_,
-            kvflash_, capture_ssm_intermediates, &capture_stats);
+            kvflash_, capture_enabled, &capture_stats);
     } else {
         ok = run_qwen35_layer_split_forward(
             shards_, shards_.front().weights, tokens, base_pos, (int)tokens.size(),
@@ -91,7 +135,7 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
             feature_ring_,
             all_argmax, /*logits_out=*/nullptr, remote_draft_,
             /*activation_type=*/GGML_TYPE_F32, kvflash_,
-            capture_ssm_intermediates, &capture_stats);
+            capture_enabled, &capture_stats);
     }
 
     if (capture_selftest || capture_diag) {
@@ -121,7 +165,7 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
     bool capture_gate_ok = false;
     bool feature_gate_ok = true;
     bool shard_gate_ok = !capture_stats.layers_owned_per_shard.empty();
-    if (capture_ssm_intermediates) {
+    if (capture_enabled) {
         capture_gate_ok = ok && capture_stats.enabled > 0 &&
             capture_stats.missing_owner_count == 0;
         for (size_t i = 0; i < capture_stats.layers_owned_per_shard.size(); ++i) {
@@ -146,7 +190,10 @@ bool Qwen35LayerSplitDFlashTarget::verify_batch(
     }
     if (capture_selftest && capture_ssm_intermediates) {
         if (!split_capture_validated_) {
-            std::fprintf(stderr, "[target-split][capture] self-test failed closed\n");
+            std::fprintf(stderr,
+                "[target-split][capture] self-test failed closed env_enabled=%d local_only=%d storage_ready=%d\n",
+                split_chain_fast_rollback_enabled() ? 1 : 0,
+                local_only ? 1 : 0, storage_ready ? 1 : 0);
             return false;
         }
     }
@@ -177,15 +224,17 @@ bool Qwen35LayerSplitDFlashTarget::restore_kv() {
 }
 
 bool Qwen35LayerSplitDFlashTarget::supports_fast_rollback() const {
-    const char * e = std::getenv("DFLASH_SPLIT_FAST_ROLLBACK");
-    const bool env_enabled = e != nullptr && std::strcmp(e, "0") != 0;
+    const bool env_enabled = split_chain_fast_rollback_enabled();
     const bool local_only = !(remote_target_shard_ && remote_target_shard_->active());
-    const bool supported = env_enabled && local_only && split_capture_validated_;
+    const bool storage_ready = split_fast_rollback_storage_ready(shards_);
+    const bool supported = env_enabled && local_only && storage_ready &&
+        split_capture_validated_;
     if (std::getenv("DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG") != nullptr) {
         std::fprintf(stderr,
-            "[target-split][chain-rollback] split_chain_fast_rollback_supported=%d env_enabled=%d capture_validated=%d local_only=%d split_tree_verify_supported=0 split_rollback_to_tree_supported=0\n",
+            "[target-split][chain-rollback] split_chain_fast_rollback_supported=%d env_enabled=%d capture_validated=%d local_only=%d storage_ready=%d split_tree_verify_supported=0 split_rollback_to_tree_supported=0\n",
             supported ? 1 : 0, env_enabled ? 1 : 0,
-            split_capture_validated_ ? 1 : 0, local_only ? 1 : 0);
+            split_capture_validated_ ? 1 : 0, local_only ? 1 : 0,
+            storage_ready ? 1 : 0);
     }
     return supported;
 }

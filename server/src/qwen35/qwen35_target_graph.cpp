@@ -93,7 +93,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  int layer_begin,
                                  int layer_end,
                                  bool allocate_target_feat,
-                                 int ctx_alloc) {
+                                 int ctx_alloc,
+                                 bool f32_ssm_intermediates) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
     if (layer_begin > layer_end) {
@@ -238,7 +239,9 @@ bool create_target_cache_partial(const TargetWeights & w,
                 // I0 domain: ne[3] is the root-inclusive flat verify-token
                 // domain. Tree capture writes t=0 synthetic root through the
                 // final/padded flat slot directly into slot t.
-                ggml_tensor * Si = ggml_new_tensor_4d(out.rollback_ctx, GGML_TYPE_F32,
+                const ggml_type ssm_intermediate_type = f32_ssm_intermediates
+                    ? GGML_TYPE_F32 : GGML_TYPE_Q8_0;
+                ggml_tensor * Si = ggml_new_tensor_4d(out.rollback_ctx, ssm_intermediate_type,
                                                        head_v_dim, head_v_dim,
                                                        w.ssm_dt_rank, max_verify_tokens);
                 // I0 domain: ne[0] is [K_conv-1 prefix rows |
@@ -273,9 +276,13 @@ bool create_target_cache_partial(const TargetWeights & w,
             const size_t f32_total = f32_bytes_per_slot_per_layer * (size_t)max_verify_tokens * (size_t)owned_delta_layers;
             const size_t q8_total = q8_bytes_per_slot_per_layer * (size_t)max_verify_tokens * (size_t)owned_delta_layers;
             std::fprintf(stderr,
-                "[target-split][chain-rollback] split_ssm_intermediate_dtype=F32 split_ssm_intermediate_persist_dtype_dst=F32 split_ssm_intermediate_persist_quantized=0 layer_begin=%d layer_end=%d owned_delta_layers=%d max_verify_tokens=%d split_ssm_intermediate_f32_bytes=%zu split_ssm_intermediate_incremental_bytes_over_q8=%zu\n",
+                "[target-split][chain-rollback] split_ssm_intermediate_dtype=%s split_ssm_intermediate_persist_dtype_dst=%s split_ssm_intermediate_persist_quantized=%d layer_begin=%d layer_end=%d owned_delta_layers=%d max_verify_tokens=%d split_ssm_intermediate_f32_bytes=%zu split_ssm_intermediate_incremental_bytes_over_q8=%zu\n",
+                f32_ssm_intermediates ? "F32" : "Q8_0",
+                f32_ssm_intermediates ? "F32" : "Q8_0",
+                f32_ssm_intermediates ? 0 : 1,
                 layer_begin, layer_end, owned_delta_layers, max_verify_tokens, f32_total,
-                f32_total > q8_total ? f32_total - q8_total : 0);
+                f32_ssm_intermediates && f32_total > q8_total
+                    ? f32_total - q8_total : 0);
         }
         if (!out.rollback_buf) {
             set_last_error("ggml_backend_alloc_ctx_tensors failed for rollback cache");

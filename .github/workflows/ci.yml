@@ -279,7 +279,7 @@ jobs:
             -o "$RUNNER_TEMP/hip_smoke" .github/ci/hip_smoke.cpp
           "$RUNNER_TEMP/hip_smoke"
 
-      - name: Build + test ROCmFP formats
+      - name: Build + test ROCm formats and inference core
         run: |
           cmake -S server -B "$RUNNER_TEMP/rocmfp-build" \
             -DDFLASH27B_GPU_BACKEND=hip \
@@ -290,8 +290,8 @@ jobs:
             -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
             --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail test_rocmfpx_mmq \
-              test_deepseek4_mmid_grouped_cuda \
+              test_deepseek4_mmid_grouped_cuda test_recurrent_snapshot test_server_unit \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda'
+            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|recurrent_snapshot|ChainRollbackPolicy'

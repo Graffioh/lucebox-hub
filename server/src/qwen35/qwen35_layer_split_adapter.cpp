@@ -3,6 +3,7 @@
 #include "qwen35_layer_split_adapter.h"
 
 #include "common/backend_precision.h"
+#include "common/chain_rollback_policy.h"
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
@@ -90,7 +91,10 @@ bool Qwen35LayerSplitAdapter::init() {
                                          /*prefill_only=*/!cfg_.run_dflash,
                                          shard.layer_begin, shard.layer_end,
                                          /*allocate_target_feat=*/false,
-                                         kvflash_tokens_)) {
+                                         kvflash_tokens_,
+                                         /*f32_ssm_intermediates=*/
+                                             cfg_.run_dflash &&
+                                             split_chain_fast_rollback_enabled())) {
             std::fprintf(stderr, "[target-split] cache gpu=%d: %s\n",
                          shard.gpu, dflash27b_last_error());
             return false;
