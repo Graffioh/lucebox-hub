@@ -1,3 +1,5 @@
+#include "CppUnitTestFramework.hpp"
+#include "scoped_env.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
@@ -7,17 +9,17 @@
 #include <cstdlib>
 #include <vector>
 
-int main() {
-#if defined(_WIN32)
-    _putenv_s("LUCE_Q8_MEMO", "1");
-#else
-    setenv("LUCE_Q8_MEMO", "1", 1);
-#endif
+namespace {
+struct CudaPoolShutdownFixture {};
+}
+
+TEST_CASE(CudaPoolShutdownFixture, backend_pool_shutdown) {
+    const luce_test::ScopedEnvVar q8_memo("LUCE_Q8_MEMO", "1");
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
-        std::fprintf(stderr, "failed to initialize CUDA/HIP backend\n");
-        return 1;
+        std::fprintf(stderr, "skip: no CUDA/HIP backend available\n");
+        return;
     }
 
     ggml_init_params params{};
@@ -26,7 +28,7 @@ int main() {
     ggml_context * ctx = ggml_init(params);
     if (!ctx) {
         ggml_backend_free(backend);
-        return 1;
+        REQUIRE_TRUE(false);
     }
 
     constexpr int64_t k = 256;
@@ -44,7 +46,7 @@ int main() {
     if (!buffer) {
         ggml_free(ctx);
         ggml_backend_free(backend);
-        return 1;
+        REQUIRE_TRUE(false);
     }
 
     std::vector<uint8_t> weights_data(ggml_nbytes(weights), 0);
@@ -57,11 +59,11 @@ int main() {
     ggml_free(ctx);
     if (status != GGML_STATUS_SUCCESS) {
         ggml_backend_free(backend);
-        return 1;
+        REQUIRE_TRUE(false);
     }
 
     // LUCE_Q8_MEMO intentionally retains the pool allocation after compute.
     // Backend teardown must release that allocation before destroying its pool.
     ggml_backend_free(backend);
-    return 0;
+    REQUIRE_TRUE(true);
 }

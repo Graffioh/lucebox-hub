@@ -148,7 +148,7 @@ Untagged variables are operational tuning knobs.
 | `DFLASH_PREFILL_THRESHOLD` | Prefill length threshold. |
 | `DFLASH_PREFILL_DRAFTER` | Drafter participation during prefill. |
 | `DFLASH_PREFILL_KEEP` | Keep prefill cache across requests. |
-| `DFLASH_PREFILL_CACHE_SLOTS` / `DFLASH_PREFIX_CACHE_SLOTS` | Prefill/prefix cache slot count. |
+| `DFLASH_PREFILL_CACHE_SLOTS` / `DFLASH_PREFIX_CACHE_SLOTS` | Optional prefill/prefix cache slot override. When unset, the container preserves the native server defaults (prefix: 32; exact prefill: 0). Set either value to `0` for an explicit opt-out. |
 | `DFLASH_PREFILL_CACHE_TEST_LOG` / `DFLASH_PREFILL_CACHE_TEST_PORT` | 🧪 **test/bench** Prefill-cache test harness. |
 | `DFLASH27B_LAYER_PREFILL` / `DFLASH27B_PREFILL_UBATCH` | Layer-split prefill / prefill micro-batch. |
 | `DFLASH27B_CHUNKED` / `DFLASH27B_CHUNKED_CHUNK` / `DFLASH27B_CHUNKED_Q_BATCH` / `DFLASH27B_CHUNKED_THRESHOLD` | Chunked prefill controls. |
