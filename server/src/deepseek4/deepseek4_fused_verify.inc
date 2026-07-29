@@ -86,10 +86,10 @@ static bool ds4_fused_verify_trace_node(
     return true;
 }
 
-// Cached verifier graphs retain their input tensors, while a request-adaptive
-// placement changes only the global->local expert maps.  Refresh those small
-// LUT inputs without rebuilding or reallocating the graph.  Mask any hot/cold
-// duplication defensively so every selected route is evaluated exactly once.
+// Populate a cached verifier graph's LUT inputs from its fixed expert
+// placement after allocation. Mask any hot/cold duplication defensively so
+// every selected route is evaluated exactly once. Mutable LRU placement is
+// rejected before this graph path is entered.
 static void ds4_fused_verify_refresh_hybrid_luts(
         const DeepSeek4Weights & w,
         MoeHybridStorage * hybrid,
@@ -938,6 +938,21 @@ static int ds4_try_fused_verify_step(
             !L.hc_attn_fn || !L.hc_ffn_fn || !L.hc_attn_base || !L.hc_ffn_base) {
             vc.disabled = true;
             return 0;
+        }
+    }
+    // A fused graph snapshots the global-to-local expert LUTs when it is built.
+    // DeepSeek currently uses fixed placement, but the common storage type also
+    // supports mutable LRU slots for other models. Fail closed if that feature
+    // is ever enabled here until cache-generation invalidation is implemented.
+    if (hybrid) {
+        for (const MoeHybridLayerStorage & layer : hybrid->layers) {
+            if (layer.cache_slots > 0) {
+                std::fprintf(stderr,
+                    "[ds4-fused-verify] mutable expert cache unsupported; "
+                    "using dynamic verifier\n");
+                vc.disabled = true;
+                return 0;
+            }
         }
     }
     ggml_backend_t peer_backend = hybrid ? hybrid->cold_backend : nullptr;
