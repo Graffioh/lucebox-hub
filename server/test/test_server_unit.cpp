@@ -147,6 +147,55 @@ static json shell_tools() {
     });
 }
 
+static json bash_tools() {
+    json tools = shell_tools();
+    tools[0]["name"] = "bash";
+    return tools;
+}
+
+static json read_tools() {
+    return json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}},
+                     {"offset", {{"type", "integer"}}},
+                     {"limit", {{"type", "integer"}}}
+                 }},
+                 {"required", json::array({"path"})}
+             }}
+         }}}
+    });
+}
+
+static json read_and_bash_tools() {
+    json tools = read_tools();
+    tools.push_back(bash_tools()[0]);
+    return tools;
+}
+
+static json edit_tools() {
+    return json::array({
+        {{"type", "function"},
+         {"function", {
+             {"name", "edit"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"edits", {
+                         {"type", "array"},
+                         {"items", {{"type", "object"}}}
+                     }}
+                 }},
+                 {"required", json::array({"edits"})}
+             }}
+         }}}
+    });
+}
+
 static json optional_shell_tools() {
     json tools = shell_tools();
     tools[0]["input_schema"].erase("required");
@@ -367,6 +416,210 @@ static void test_parse_bare_tool_name_xml_with_function_close() {
     TEST_ASSERT(result.cleaned_text.find("</function>") == std::string::npos);
     TEST_ASSERT(result.cleaned_text.find("Let me find the correct line range") !=
                 std::string::npos);
+}
+
+static void test_parse_repeated_bare_edit_calls_with_trailing_close() {
+    const std::string text =
+        "Applying both updates.\n\n"
+        "<edit>\n"
+        "<parameter=edits>\n"
+        "[{\"path\":\"/workspace/first.conf\",\"oldText\":\"auto\","
+        "\"newText\":\"enabled\"}]\n"
+        "</parameter>\n"
+        "</function>\n\n"
+        "<edit>\n"
+        "<parameter=edits>\n"
+        "[{\"path\":\"/workspace/second.conf\",\"oldText\":\"auto\","
+        "\"newText\":\"enabled\"}]\n"
+        "</parameter>\n"
+        "</function>\n\n"
+        "</edit>";
+
+    auto result = parse_tool_calls(text, edit_tools());
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "edit");
+        TEST_ASSERT(result.tool_calls[1].name == "edit");
+        const auto first = json::parse(result.tool_calls[0].arguments);
+        const auto second = json::parse(result.tool_calls[1].arguments);
+        TEST_ASSERT(first["edits"][0]["path"] == "/workspace/first.conf");
+        TEST_ASSERT(second["edits"][0]["path"] == "/workspace/second.conf");
+    }
+    TEST_ASSERT(result.cleaned_text == "Applying both updates.");
+}
+
+static void test_tool_syntax_scanner_declared_name_guards() {
+    size_t pos = std::string::npos;
+    TEST_ASSERT(find_tool_syntax_start("prefix<edit>", edit_tools(), pos));
+    TEST_ASSERT(pos == 6);
+
+    pos = std::string::npos;
+    TEST_ASSERT(!find_tool_syntax_start("prefix<unknown_tool>", edit_tools(), pos));
+
+    json invalid = edit_tools();
+    invalid[0]["function"]["name"] = std::string(65, 'x');
+    TEST_ASSERT(tool_syntax_holdback(invalid) == 15);
+    pos = std::string::npos;
+    TEST_ASSERT(!find_tool_syntax_start("<" + std::string(65, 'x') + ">",
+                                        invalid, pos));
+}
+
+static void test_parse_undeclared_file_tag_stays_content() {
+    const std::string text =
+        "Now I understand how to add a custom model. I need to edit "
+        "~/.pi/agent/models.json to add a vLLM provider with the "
+        "laguna-s-2.1 model. Let me check if the file exists first.\n\n"
+        "<file>\n"
+        "<parameter=path>\n"
+        "~/.pi/agent/models.json\n"
+        "</parameter>\n"
+        "</function>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.empty());
+    TEST_ASSERT(result.cleaned_text == text);
+}
+
+static void test_parse_attribute_style_tool_xml() {
+    std::string text =
+        "The branch already exists. Let me check the current state:\n\n"
+        "<parameter name=\"bash\"><parameter name=\"command\">"
+        "cd /workspace/project && "
+        "git status -sb && git branch\n --show-current</parameter>\n"
+        "</function>\n";
+    auto result = parse_tool_calls(text, bash_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] ==
+                    "cd /workspace/project && "
+                    "git status -sb && git branch\n --show-current");
+    }
+    TEST_ASSERT(result.cleaned_text ==
+                "The branch already exists. Let me check the current state:");
+
+    const std::string wrapped =
+        "Checking now.\n\n<tool_call>\n"
+        "<parameter name=\"bash\"><parameter name=\"command\">"
+        "git status</parameter>\n</function>\n</tool_call>";
+    auto wrapped_result = parse_tool_calls(wrapped, bash_tools());
+    TEST_ASSERT(wrapped_result.tool_calls.size() == 1);
+    TEST_ASSERT(wrapped_result.cleaned_text == "Checking now.");
+}
+
+static void test_parse_mixed_tool_variants_preserve_source_order() {
+    const std::string text =
+        "<function read>\n"
+        "<parameter=path>/tmp/first.md</parameter>\n"
+        "</function>\n"
+        "<parameter name=\"bash\"><parameter name=\"command\">"
+        "cat /tmp/first.md</parameter></function>";
+    auto result = parse_tool_calls(text, read_and_bash_tools());
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        TEST_ASSERT(result.tool_calls[1].name == "bash");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+static void test_parse_attribute_style_tool_xml_rejects_malformed_body() {
+    const std::string malformed =
+        "<parameter name=\"bash\"><parameter name=\"command\">git status\n"
+        "</function>";
+    auto malformed_result = parse_tool_calls(malformed, bash_tools());
+    TEST_ASSERT(malformed_result.tool_calls.empty());
+    TEST_ASSERT(malformed_result.cleaned_text == malformed);
+
+    const std::string unknown =
+        "<parameter name=\"not_a_tool\"><parameter name=\"command\">"
+        "git status</parameter></function>";
+    auto unknown_result = parse_tool_calls(unknown, bash_tools());
+    TEST_ASSERT(unknown_result.tool_calls.empty());
+    TEST_ASSERT(unknown_result.cleaned_text == unknown);
+}
+
+static void test_parse_funcname_tool_xml() {
+    const std::string text =
+        "<tool_call>\n"
+        "<funcname>read\n"
+        "<parameter=limit>\n50\n</parameter>\n"
+        "<parameter=offset>\n1\n</parameter>\n"
+        "<parameter=path>\n"
+        "/tmp/tool-input.md\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>\n";
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["limit"] == 50);
+        TEST_ASSERT(args["offset"] == 1);
+        TEST_ASSERT(args["path"] == "/tmp/tool-input.md");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+static void test_parse_funcname_tool_xml_rejects_malformed_or_unknown() {
+    const std::string malformed =
+        "<funcname>read\n"
+        "<parameter=path>/tmp/task.md\n"
+        "</function>";
+    auto malformed_result = parse_tool_calls(malformed, read_tools());
+    TEST_ASSERT(malformed_result.tool_calls.empty());
+    TEST_ASSERT(malformed_result.cleaned_text == malformed);
+
+    const std::string unknown =
+        "<funcname>write\n"
+        "<parameter=path>/tmp/task.md</parameter>\n"
+        "</function>";
+    auto unknown_result = parse_tool_calls(unknown, read_tools());
+    TEST_ASSERT(unknown_result.tool_calls.empty());
+    TEST_ASSERT(unknown_result.cleaned_text == unknown);
+}
+
+static void test_parse_space_function_tool_xml() {
+    const std::string text =
+        "Let me read the file and compute its SHA-256 hash.\n\n"
+        "<function read>\n"
+        "<parameter=path>\n"
+        "/tmp/tool-input.md\n"
+        "</parameter>\n"
+        "</function>\n\n"
+        "<function bash>\n"
+        "<parameter=command>\n"
+        "sha256sum /tmp/tool-input.md\n"
+        "</parameter>\n"
+        "</function>";
+    auto result = parse_tool_calls(text, read_and_bash_tools());
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        TEST_ASSERT(json::parse(result.tool_calls[0].arguments)["path"] ==
+                    "/tmp/tool-input.md");
+        TEST_ASSERT(result.tool_calls[1].name == "bash");
+        TEST_ASSERT(json::parse(result.tool_calls[1].arguments)["command"] ==
+                    "sha256sum /tmp/tool-input.md");
+    }
+    TEST_ASSERT(result.cleaned_text ==
+                "Let me read the file and compute its SHA-256 hash.");
+}
+
+static void test_parse_space_function_tool_xml_rejects_malformed_or_unknown() {
+    const std::string malformed =
+        "<function read>\n<parameter=path>/tmp/task.md\n</function>";
+    auto malformed_result = parse_tool_calls(malformed, read_tools());
+    TEST_ASSERT(malformed_result.tool_calls.empty());
+    TEST_ASSERT(malformed_result.cleaned_text == malformed);
+
+    const std::string unknown =
+        "<function write>\n<parameter=path>/tmp/task.md</parameter>\n</function>";
+    auto unknown_result = parse_tool_calls(unknown, read_tools());
+    TEST_ASSERT(unknown_result.tool_calls.empty());
+    TEST_ASSERT(unknown_result.cleaned_text == unknown);
 }
 
 static void test_parse_json_tool_call() {
@@ -1048,6 +1301,106 @@ static void test_emitter_bare_function_tool_buffer_detection() {
     TEST_ASSERT(em.accumulated_text().find("<function=terminal>") == std::string::npos);
 }
 
+static void test_emitter_attribute_style_tool_buffer_detection() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, bash_tools());
+    em.emit_start();
+    em.emit_token("The branch already exists. Let me check the current state:\n\n"
+                  "<param");
+    em.emit_token("eter name=\"bash\"><parameter name=\"command\">"
+                  "git status -sb && git branch\n");
+    em.emit_token(" --show-current</parameter>\n</function>");
+    auto finish = em.emit_finish(20);
+    const std::string wire = concat(finish);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "bash");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["command"] ==
+                    "git status -sb && git branch\n --show-current");
+    }
+    TEST_ASSERT(em.accumulated_text() ==
+                "The branch already exists. Let me check the current state:\n\n");
+    TEST_ASSERT(em.accumulated_text().find("<parameter") == std::string::npos);
+    TEST_ASSERT(wire.find("\"finish_reason\":\"tool_calls\"") !=
+                std::string::npos);
+}
+
+static void test_emitter_funcname_tool_buffer_detection() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools());
+    em.emit_start();
+    em.emit_token("\n\n<func");
+    em.emit_token("name>read\n<parameter=limit>\n50\n</parameter>\n"
+                  "<parameter=offset>\n1\n</parameter>\n");
+    em.emit_token("<parameter=path>\n"
+                  "/tmp/tool-input.md\n"
+                  "</parameter>\n</function>\n");
+    auto finish = em.emit_finish(88);
+    const std::string wire = concat(finish);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "read");
+        auto args = json::parse(em.tool_calls()[0].arguments);
+        TEST_ASSERT(args["limit"] == 50);
+        TEST_ASSERT(args["offset"] == 1);
+        TEST_ASSERT(args["path"] == "/tmp/tool-input.md");
+    }
+    TEST_ASSERT(em.accumulated_text().find("<funcname>") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text() == "\n\n");
+    TEST_ASSERT(wire.find("\"finish_reason\":\"tool_calls\"") !=
+                std::string::npos);
+}
+
+static void test_emitter_space_function_tool_buffer_detection() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools());
+    em.emit_start();
+    em.emit_token("Let me read it.\n\n<funct");
+    em.emit_token("ion read>\n<parameter=path>\n");
+    em.emit_token("/tmp/tool-input.md\n"
+                  "</parameter>\n</function>");
+    const std::string wire = concat(em.emit_finish(42));
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    if (!em.tool_calls().empty()) {
+        TEST_ASSERT(em.tool_calls()[0].name == "read");
+        TEST_ASSERT(json::parse(em.tool_calls()[0].arguments)["path"] ==
+                    "/tmp/tool-input.md");
+    }
+    TEST_ASSERT(em.accumulated_text() == "Let me read it.\n\n");
+    TEST_ASSERT(em.accumulated_text().find("<function read>") ==
+                std::string::npos);
+    TEST_ASSERT(wire.find("\"finish_reason\":\"tool_calls\"") !=
+                std::string::npos);
+}
+
+static void test_emitter_repeated_bare_edit_calls() {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, edit_tools());
+    em.emit_start();
+    em.emit_token("Applying both updates.\n\n<ed");
+    em.emit_token("it>\n<parameter=edits>\n"
+                  "[{\"path\":\"/workspace/first.conf\","
+                  "\"oldText\":\"auto\",\"newText\":\"enabled\"}]\n"
+                  "</parameter>\n</function>\n\n<edit>\n");
+    em.emit_token("<parameter=edits>\n"
+                  "[{\"path\":\"/workspace/second.conf\","
+                  "\"oldText\":\"auto\",\"newText\":\"enabled\"}]\n"
+                  "</parameter>\n</function>\n\n</edit>");
+    const std::string wire = concat(em.emit_finish(96));
+
+    TEST_ASSERT(em.tool_calls().size() == 2);
+    if (em.tool_calls().size() == 2) {
+        const auto first = json::parse(em.tool_calls()[0].arguments);
+        const auto second = json::parse(em.tool_calls()[1].arguments);
+        TEST_ASSERT(first["edits"][0]["path"] == "/workspace/first.conf");
+        TEST_ASSERT(second["edits"][0]["path"] == "/workspace/second.conf");
+    }
+    TEST_ASSERT(em.accumulated_text() == "Applying both updates.\n\n");
+    TEST_ASSERT(em.accumulated_text().find("<edit>") == std::string::npos);
+    TEST_ASSERT(wire.find("\"finish_reason\":\"tool_calls\"") !=
+                std::string::npos);
+}
+
 static void test_emitter_does_not_leak_malformed_tool_xml() {
     auto em = make_emitter(ApiFormat::OPENAI_CHAT, weather_tools());
     em.emit_start();
@@ -1096,6 +1449,24 @@ static void test_emitter_no_tools_keeps_tool_like_text() {
 
     TEST_ASSERT(em.tool_calls().empty());
     TEST_ASSERT(em.accumulated_text().find("<function=terminal>") != std::string::npos);
+}
+
+static void test_emitter_undeclared_file_tag_stays_content() {
+    const std::string text =
+        "Let me check if the file exists first.\n\n"
+        "<file>\n"
+        "<parameter=path>\n"
+        "~/.pi/agent/models.json\n"
+        "</parameter>\n"
+        "</function>";
+
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools());
+    em.emit_start();
+    em.emit_token(text);
+    em.emit_finish(20);
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text() == text);
 }
 
 static void test_emitter_anthropic_structure() {
@@ -1387,6 +1758,56 @@ static void test_find_boundaries_empty() {
     TEST_ASSERT(bounds.empty());
 }
 
+static void test_tool_schema_is_part_of_stable_system_boundary() {
+    // Synthetic Qwen-shaped prompt:
+    //   <system> TOOL_SCHEMA </system> <user> question </user> <assistant>
+    // Marker IDs are intentionally simple; the invariant under test is that
+    // the first safe boundary ends after the system/tool block. Its position
+    // stays stable while its prefix hash changes with the tools, but not with
+    // a user-only suffix change.
+    ChatMarkers markers;
+    markers.family = "qwen";
+    markers.sys_role_prefix = {10, 11};
+    markers.end_msg_seqs = {{12}};
+    markers.next_role_starts = {{10}};
+
+    const std::vector<int32_t> prompt_a = {
+        10, 11, 100, 101, 102, 12, 10, 20, 200, 12, 10, 30,
+    };
+    const std::vector<int32_t> prompt_new_user = {
+        10, 11, 100, 101, 102, 12, 10, 20, 999, 12, 10, 30,
+    };
+    const std::vector<int32_t> prompt_new_tools = {
+        10, 11, 100, 101, 777, 12, 10, 20, 200, 12, 10, 30,
+    };
+
+    const auto bounds_a = find_all_boundaries(prompt_a, markers);
+    const auto bounds_user = find_all_boundaries(prompt_new_user, markers);
+    const auto bounds_tools = find_all_boundaries(prompt_new_tools, markers);
+    TEST_ASSERT(bounds_a.size() == 2);
+    TEST_ASSERT(bounds_user == bounds_a);
+    TEST_ASSERT(bounds_tools == bounds_a);
+
+    const int system_end = bounds_a.front();
+    TEST_ASSERT(system_end == 7);
+    TEST_ASSERT(hash_prefix(prompt_a.data(), system_end) ==
+                hash_prefix(prompt_new_user.data(), system_end));
+    TEST_ASSERT(hash_prefix(prompt_a.data(), system_end) !=
+                hash_prefix(prompt_new_tools.data(), system_end));
+}
+
+static void test_inline_snapshot_boundary_advances_past_restore() {
+    const std::vector<int> boundaries = {100, 240, 380, 520};
+    // Second-to-last is the boundary before the current user turn.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries) == 380);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 240) == 380);
+    // Do not reserve a snapshot when the restore already covers that point.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 500) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary({}, 0) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary({100}, 0) == 100);
+}
+
 // ── Prefix-aware eviction policy (model-free) ───────────────────────────
 
 static void test_evict_empty_is_zero() {
@@ -1560,6 +1981,66 @@ static void test_pflash_raw_body_preserved() {
     TEST_ASSERT(req.raw_body.contains("model"));
     TEST_ASSERT(req.raw_body.contains("temperature"));
     TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
+}
+
+static void test_parse_request_sampler_applies_defaults_and_overrides() {
+    SamplingDefaults defaults;
+    defaults.has_temperature = true;
+    defaults.temperature = 0.6f;
+    defaults.has_top_p = true;
+    defaults.top_p = 0.9f;
+    defaults.has_repetition_penalty = true;
+    defaults.repetition_penalty = 1.1f;
+
+    const SamplerCfg sampler = parse_request_sampler({
+        {"temperature", 0.2f},
+        {"top_k", 20},
+        {"seed", 42},
+        {"presence_penalty", 0.3f},
+    }, defaults);
+
+    TEST_ASSERT(std::fabs(sampler.temp - 0.2f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.top_p - 0.9f) < 0.001f);
+    TEST_ASSERT(sampler.top_k == 20);
+    TEST_ASSERT(sampler.seed == 42);
+    TEST_ASSERT(std::fabs(sampler.pres_pen - 0.3f) < 0.001f);
+    TEST_ASSERT(std::fabs(sampler.rep_pen - 1.1f) < 0.001f);
+}
+
+static void test_require_messages_array_rejects_invalid() {
+    const json valid = {{"messages", json::array({
+        {{"role", "user"}, {"content", "hi"}},
+    })}};
+    TEST_ASSERT(require_messages_array(valid).size() == 1);
+
+    const json invalid_bodies[] = {
+        json::object(),                       // missing
+        {{"messages", nullptr}},              // null
+        {{"messages", "hi"}},                 // wrong type
+        {{"messages", json::array()}},        // empty
+    };
+    for (const auto & body : invalid_bodies) {
+        bool threw = false;
+        try {
+            require_messages_array(body);
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        TEST_ASSERT(threw);
+    }
+}
+
+static void test_max_output_alias_precedence_ignores_shadowed_invalid_value() {
+    const json body = {
+        {"max_tokens", 100},
+        {"max_output_tokens", 200},
+        {"max_completion_tokens", "invalid"},
+    };
+
+    TEST_ASSERT(resolve_max_output_tokens(body, 400) == 100);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_output_tokens", 200}}, 400) == 200);
+    TEST_ASSERT(resolve_max_output_tokens(json::object(), 400) == 400);
 }
 
 static void test_pflash_placement_same_backend_local() {
@@ -3492,6 +3973,12 @@ static void test_sampler_needs_logit_processing() {
     TEST_ASSERT(!cfg.needs_logit_processing());
 }
 
+static void test_server_config_cache_defaults() {
+    ServerConfig cfg;
+    TEST_ASSERT(cfg.prefix_cache_cap == 32);
+    TEST_ASSERT(cfg.prefill_cache_cap == 0);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // /props body shape tests (model-free)
 //
@@ -3761,6 +4248,15 @@ static void test_usage_timings_zero_decode_no_div_by_zero() {
     // No NaN / Inf serialization leak.
     TEST_ASSERT(finish_str.find("inf") == std::string::npos);
     TEST_ASSERT(finish_str.find("nan") == std::string::npos);
+}
+
+static void test_usage_timings_reports_prefix_cache_work() {
+    GenTimings t{0.012, 0.25, true, 8192, 64, 8256};
+    json j = build_timings_json(t, /*completion_tokens=*/10);
+    TEST_ASSERT(j["cache_hit"].get<bool>());
+    TEST_ASSERT(j["cached_prefix_tokens"].get<int>() == 8192);
+    TEST_ASSERT(j["prefilled_tokens"].get<int>() == 64);
+    TEST_ASSERT(j["effective_prompt_tokens"].get<int>() == 8256);
 }
 
 static void test_usage_timings_omitted_when_null() {
@@ -4460,6 +4956,16 @@ int main() {
     RUN_TEST(test_parse_tool_call_xml);
     RUN_TEST(test_parse_bare_function_xml);
     RUN_TEST(test_parse_bare_tool_name_xml_with_function_close);
+    RUN_TEST(test_parse_repeated_bare_edit_calls_with_trailing_close);
+    RUN_TEST(test_tool_syntax_scanner_declared_name_guards);
+    RUN_TEST(test_parse_undeclared_file_tag_stays_content);
+    RUN_TEST(test_parse_attribute_style_tool_xml);
+    RUN_TEST(test_parse_mixed_tool_variants_preserve_source_order);
+    RUN_TEST(test_parse_attribute_style_tool_xml_rejects_malformed_body);
+    RUN_TEST(test_parse_funcname_tool_xml);
+    RUN_TEST(test_parse_funcname_tool_xml_rejects_malformed_or_unknown);
+    RUN_TEST(test_parse_space_function_tool_xml);
+    RUN_TEST(test_parse_space_function_tool_xml_rejects_malformed_or_unknown);
     RUN_TEST(test_parse_json_tool_call);
     RUN_TEST(test_parse_single_tool_bare_json_args);
     RUN_TEST(test_parse_single_tool_bare_json_args_allows_empty_optional_object);
@@ -4509,9 +5015,14 @@ int main() {
     RUN_TEST(test_emitter_single_tool_bare_json_args);
     RUN_TEST(test_emitter_bare_json_args_do_not_trigger_after_content);
     RUN_TEST(test_emitter_bare_function_tool_buffer_detection);
+    RUN_TEST(test_emitter_attribute_style_tool_buffer_detection);
+    RUN_TEST(test_emitter_funcname_tool_buffer_detection);
+    RUN_TEST(test_emitter_space_function_tool_buffer_detection);
+    RUN_TEST(test_emitter_repeated_bare_edit_calls);
     RUN_TEST(test_emitter_does_not_leak_malformed_tool_xml);
     RUN_TEST(test_emitter_parses_tool_call_missing_outer_close);
     RUN_TEST(test_emitter_no_tools_keeps_tool_like_text);
+    RUN_TEST(test_emitter_undeclared_file_tag_stays_content);
     RUN_TEST(test_emitter_anthropic_structure);
     RUN_TEST(test_emitter_responses_structure);
     RUN_TEST(test_emitter_responses_bare_function_tool_call);
@@ -4537,11 +5048,18 @@ int main() {
     RUN_TEST(test_hash_prefix_different_lengths);
     RUN_TEST(test_hash_prefix_empty);
     RUN_TEST(test_find_boundaries_empty);
+    RUN_TEST(test_tool_schema_is_part_of_stable_system_boundary);
+    RUN_TEST(test_inline_snapshot_boundary_advances_past_restore);
     RUN_TEST(test_evict_empty_is_zero);
     RUN_TEST(test_evict_single_is_zero);
     RUN_TEST(test_evict_chain_keeps_ancestors);
     RUN_TEST(test_evict_unrelated_falls_back_to_lru);
     RUN_TEST(test_evict_branch_spares_shared_root);
+
+    std::fprintf(stderr, "\n── Request parsing ──\n");
+    RUN_TEST(test_parse_request_sampler_applies_defaults_and_overrides);
+    RUN_TEST(test_require_messages_array_rejects_invalid);
+    RUN_TEST(test_max_output_alias_precedence_ignores_shadowed_invalid_value);
 
     std::fprintf(stderr, "\n── PFlash config ──\n");
     RUN_TEST(test_pflash_config_defaults);
@@ -4652,6 +5170,7 @@ int main() {
     RUN_TEST(test_parse_sampler_token_no_samp);
     RUN_TEST(test_sampler_temp_zero_with_penalties_uses_argmax);
     RUN_TEST(test_sampler_needs_logit_processing);
+    RUN_TEST(test_server_config_cache_defaults);
 
     std::fprintf(stderr, "\n── /props body shape ──\n");
     RUN_TEST(test_props_model_card_wholesale_sidecar);
@@ -4664,6 +5183,7 @@ int main() {
     RUN_TEST(test_usage_timings_anthropic_streaming);
     RUN_TEST(test_usage_timings_responses_streaming);
     RUN_TEST(test_usage_timings_zero_decode_no_div_by_zero);
+    RUN_TEST(test_usage_timings_reports_prefix_cache_work);
     RUN_TEST(test_usage_timings_omitted_when_null);
 
     std::fprintf(stderr, "\n── ModelBackend empty-spec retry ──\n");

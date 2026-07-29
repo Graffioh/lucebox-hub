@@ -318,6 +318,7 @@ add_library(dflash_common STATIC
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
     src/common/backend_factory.cpp
+    src/common/feature_gate.cpp
     src/placement/placement_config.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
@@ -1084,6 +1085,18 @@ if(DFLASH27B_TESTS)
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     enable_testing()
 
+    # The production CUDA and ROCm images share this entrypoint. Keep native
+    # server defaults intact unless an operator explicitly supplies an env
+    # override; otherwise container launches can silently disable features
+    # that are enabled by the C++ server itself.
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_entrypoint_cache_defaults.sh")
+        add_test(
+            NAME server_unit_entrypoint_cache_defaults
+            COMMAND bash
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/test_entrypoint_cache_defaults.sh"
+                "${CMAKE_CURRENT_SOURCE_DIR}/scripts/entrypoint.sh")
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         add_executable(test_server_unit test/test_server_unit.cpp)
         target_sources(test_server_unit PRIVATE
@@ -1114,23 +1127,57 @@ if(DFLASH27B_TESTS)
         add_test(NAME server_unit COMMAND test_server_unit)
     endif()
 
-    # 'make check' — builds test targets then runs ctest
-    if(TARGET test_server_unit)
-        set(_check_deps test_server_unit)
-        if(TARGET test_deepseek4_unit)
-            list(APPEND _check_deps test_deepseek4_unit)
+    # Feature/architecture gate tests. check_feature_compatibility(),
+    # collect_feature_warnings() and the capability table are pure functions,
+    # so this target deliberately compiles only feature_gate.cpp and
+    # placement_config.cpp — no dflash_common, no ggml, no GPU toolkit. That
+    # keeps a gate rule testable in seconds instead of behind a full backend
+    # build, which is the whole reason these tests do not live in
+    # test_server_unit.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_feature_gate.cpp")
+        add_executable(test_feature_gate test/test_feature_gate.cpp)
+        target_sources(test_feature_gate PRIVATE
+            src/common/feature_gate.cpp
+            src/placement/placement_config.cpp)
+        target_include_directories(test_feature_gate PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+        # compiled_placement_backend() is decided by these defines, so the
+        # gate must be tested with the same ones the server is built with.
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_feature_gate PRIVATE
+                DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_feature_gate PRIVATE
+                DFLASH27B_BACKEND_CUDA=1)
         endif()
-        add_custom_target(check
-            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-            DEPENDS ${_check_deps}
-            COMMENT "Building and running unit tests"
-        )
-    else()
-        add_custom_target(check
-            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-            COMMENT "Building and running unit tests (server unit tests skipped — CURL not found)"
-        )
+        add_test(NAME feature_gate COMMAND test_feature_gate)
     endif()
+
+    # 'make check' — builds test targets then runs ctest.
+    # Collect deps per target rather than gating the whole list on
+    # test_server_unit: test_feature_gate has no CURL dependency, so it must
+    # still build when the server unit tests are skipped.
+    set(_check_deps "")
+    if(TARGET test_server_unit)
+        list(APPEND _check_deps test_server_unit)
+    endif()
+    if(TARGET test_feature_gate)
+        list(APPEND _check_deps test_feature_gate)
+    endif()
+    if(TARGET test_deepseek4_unit)
+        list(APPEND _check_deps test_deepseek4_unit)
+    endif()
+    if(TARGET test_server_unit)
+        set(_check_comment "Building and running unit tests")
+    else()
+        set(_check_comment "Building and running unit tests (server unit tests skipped — CURL not found)")
+    endif()
+    add_custom_target(check
+        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+        DEPENDS ${_check_deps}
+        COMMENT "${_check_comment}"
+    )
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     # internal.h includes <cuda_runtime.h> when GGML_USE_CUDA is set; link

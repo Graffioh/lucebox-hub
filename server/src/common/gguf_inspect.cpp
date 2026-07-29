@@ -29,6 +29,12 @@ GgufModelInfo inspect_gguf_model_info(const char * path) {
         if (v) info.arch = v;
     }
 
+    int64_t name_id = gguf_find_key(gctx, "general.name");
+    if (name_id >= 0) {
+        const char * v = gguf_get_val_str(gctx, name_id);
+        if (v) info.name = v;
+    }
+
     // Read layer count: <arch>.block_count
     if (!info.arch.empty()) {
         std::string key = info.arch + ".block_count";
