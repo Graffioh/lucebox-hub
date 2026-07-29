@@ -297,7 +297,7 @@ jobs:
             -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda'
 
   build-windows:
-    name: Build Windows (cmake + MSVC + CUDA, dflash_common)
+    name: Build Windows (MSVC + CUDA, library + server targets)
     runs-on: windows-2022
     timeout-minutes: 45
     steps:

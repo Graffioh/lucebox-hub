@@ -1168,6 +1168,9 @@ if(DFLASH27B_TESTS)
     # 'make check' — build every registered unit-test target, including the
     # lightweight feature gate added on main, then run the complete CTest set.
     set(_check_deps ${_raw_unit_test_targets})
+    if(TARGET test_platform_compat)
+        list(APPEND _check_deps test_platform_compat)
+    endif()
     if(TARGET test_feature_gate)
         list(APPEND _check_deps test_feature_gate)
     endif()
