@@ -385,8 +385,9 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 // weight traffic toward the union of routed experts. Bit-exact per
 // (row, token) vs mul_mat_vec_q_moe (same vec_dot sequence and reduction).
 // Model-agnostic: applies to any MoE with n_expert_used*n_tokens <= 256.
-//   DFLASH_MMID_GROUPED=1       opt-in
-//   DFLASH_MMID_GROUPED_TYPES   bitmask, 1 = Q4_K (default), 2 = Q6_K,
+//   DFLASH_MMID_GROUPED         1 = enable, 0 = disable
+//                               (CUDA default on; HIP default off)
+//   DFLASH_MMID_GROUPED_TYPES   bitmask, 1 = Q4_K, 2 = Q6_K,
 //                               4 = Q4_0/Q8_0/Q5_K, 8 = ROCmFP2/ROCmFP3.
 //   DFLASH_MMID_GROUPED_DEVICE  optional zero-based device index; unset/-1
 //                               applies the path to every eligible device.
@@ -418,7 +419,9 @@ struct mmid_gate_extra {
 static bool mmid_grouped_env() {
     // Bit-exact and measured equal-or-faster on small MoE verify batches, so
     // enabled by default on CUDA; DFLASH_MMID_GROUPED=0 is the kill switch.
-    // HIP is unvalidated and stays opt-in (DFLASH_MMID_GROUPED=1).
+    // HIP (RDNA3/RDNA4) stays opt-in and default-off. Generic quantized types
+    // have correctness coverage on gfx1151; ROCmFP2/ROCmFP3 are separately
+    // enabled by the type mask after platform-specific qualification.
     static const bool on = []() {
         const char * e = std::getenv("DFLASH_MMID_GROUPED");
         if (e != nullptr) {
@@ -475,11 +478,28 @@ static bool mmid_grouped_device_ok() {
     return selected < 0 || selected == ggml_cuda_get_device();
 }
 
+static bool mmid_grouped_arch_ok(int cc) {
+    return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) ||
+        GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
+}
+
+bool ggml_cuda_mmvq_mmid_grouped_enabled(
+        ggml_type type, int cc, int64_t ncols_dst, int64_t routed_pairs) {
+    return ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_MOE_BATCH_SIZE &&
+        routed_pairs <= MMID_GROUPED_MAX_PAIRS &&
+        mmid_grouped_env() && mmid_grouped_type_ok(type) &&
+        mmid_grouped_arch_ok(cc) && mmid_grouped_device_ok();
+}
+
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // [TAG_MMID_GROUPED] the grouped kernel handles any supported type up to the
     // MoE batch ceiling; this also keeps CUDA graphs on for these batches.
-    if (mmid_grouped_env() && mmid_grouped_type_ok(type) && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
+    // RDNA3/RDNA4 (wave32) share the non-grouped kernel's wave-width warp_reduce.
+    // IS_RDNA3/IS_RDNA4 are pure cc-range checks, safe above the IS_AMD guard below.
+    // The HIP path remains opt-in until on-hardware parity and performance validation.
+    if (mmid_grouped_env() && mmid_grouped_type_ok(type) &&
+        mmid_grouped_arch_ok(cc) && mmid_grouped_device_ok()) {
         return MMVQ_MAX_MOE_BATCH_SIZE;
     }
     // Dedicated multi-token MoE kernel: extend the MUL_MAT_ID ceiling to 16
@@ -2675,15 +2695,15 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
     static const bool mmid_telemetry = []() {
         const char * value = std::getenv("DFLASH_MMID_TELEMETRY");
         return value != nullptr && std::strcmp(value, "0") != 0;
     }();
 
     // [TAG_MMID_GROUPED] grouped-expert path for small MUL_MAT_ID batches.
-    if (ids && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_MOE_BATCH_SIZE &&
-        (int) (nchannels_dst*ncols_dst) <= MMID_GROUPED_MAX_PAIRS &&
-        mmid_grouped_env() && mmid_grouped_type_ok(src0->type) && mmid_grouped_device_ok()) {
+    if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
+            src0->type, cc, ncols_dst, nchannels_dst*ncols_dst)) {
         // Batches above MMID_GROUPED_MAX_PAIRS fall through to the legacy
         // per-expert kernel instead of aborting the request.
         const int np = (int) (nchannels_dst*ncols_dst);
@@ -2762,7 +2782,9 @@ void ggml_cuda_mul_mat_vec_q(
                 ncols_dst > MMVQ_MAX_MOE_BATCH_SIZE ? "width_gt_16" :
                 (int) (nchannels_dst*ncols_dst) > MMID_GROUPED_MAX_PAIRS ? "pairs_gt_256" :
                 !mmid_grouped_env() ? "flag_off" :
-                !mmid_grouped_type_ok(src0->type) ? "unsupported_type" : "dispatch_rejected";
+                !mmid_grouped_type_ok(src0->type) ? "unsupported_type" :
+                !mmid_grouped_arch_ok(cc) ? "unsupported_arch" :
+                !mmid_grouped_device_ok() ? "device_filtered" : "dispatch_rejected";
             std::fprintf(stderr,
                 "[dflash-mmid] event=mmvq type=%s width=%lld pairs=%lld variant=%s reason=%s\n",
                 ggml_type_name(src0->type), (long long) ncols_dst,

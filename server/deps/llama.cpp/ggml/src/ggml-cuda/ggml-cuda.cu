@@ -2499,6 +2499,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (is_mul_mat_id && ggml_cuda_mmvq_mmid_grouped_enabled(
+            src0->type, cc, dst->ne[2], dst->ne[1]*dst->ne[2])) {
+        return false;
+    }
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
@@ -2534,6 +2538,12 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     const ggml_tensor * src0 = up->src[0];
     const ggml_tensor * src1 = up->src[1];
     const ggml_tensor * ids  = up->src[2];
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (ids && ggml_cuda_mmvq_mmid_grouped_enabled(
+            src0->type, cc, up->ne[2], up->ne[1]*up->ne[2])) {
+        return false;
+    }
 
     // Vector fusion writes the final GLU tensor directly and indexes routing
     // ids from the matmul layout. A reshape that changes token/expert axes is
@@ -2579,7 +2589,6 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
             }
         }
 
-        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const int64_t ncols = ids ? src1->ne[2] : src1->ne[1];
         if (ggml_cuda_should_use_mmq(src0->type, cc, ncols, src0->ne[2])) {
             ggml_cuda_mul_mat_q_pair(

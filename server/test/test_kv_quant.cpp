@@ -1,22 +1,41 @@
 // Unit tests for dflash::kv_quant (parse_kv_type, resolve_kv_types,
-// is_supported_kv_pair). Plain int main(), no frameworks.
+// is_supported_kv_pair).
 //
 // T8 (unsupported pair aborts) is not tested in-process because std::abort()
 // terminates the test runner. Manual verification:
 //   DFLASH27B_KV_K=tq3_0 DFLASH27B_KV_V=q5_0 ./dflash/build/test_kv_quant
 // Expected: prints "[dflash] KV pair …" message and aborts.
 
+#include "CppUnitTestFramework.hpp"
+#include "scoped_env.h"
 #include "kv_quant.h"
 
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 #ifdef _WIN32
 #define setenv(name, value, overwrite) _putenv_s(name, value)
 #define unsetenv(name) _putenv_s(name, "")
 #endif
+
+// Use a local shim because helper functions below are free functions rather than
+// fixture members, so the README's direct REQUIRE/CHECK macros are not in scope.
+#define TEST_ASSERT(cond) do { \
+    if (!(cond)) { \
+        throw std::runtime_error(std::string(__FILE__) + ":" + \
+            std::to_string(__LINE__) + ": " + #cond); \
+    } \
+} while (0)
+#undef assert
+#define assert(cond) TEST_ASSERT(cond)
+
+namespace {
+struct KvQuantFixture {};
+}
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -59,10 +78,10 @@ static void t1_parse_kv_type() {
 static void t2_resolve_kv_types() {
     ggml_type k, v;
 
-    // 2a: no env → default Q8_0/Q8_0
+    // 2a: no env → default Q4_0/Q4_0
     clear_kv_env();
     dflash::resolve_kv_types(k, v);
-    assert(k == GGML_TYPE_Q8_0 && v == GGML_TYPE_Q8_0);
+    assert(k == GGML_TYPE_Q4_0 && v == GGML_TYPE_Q4_0);
 
     // 2b: F16 shorthand
     clear_kv_env();
@@ -191,7 +210,12 @@ static void t5_kv_reservation() {
 
 // ─── main ────────────────────────────────────────────────────────────────────
 
-int main() {
+TEST_CASE(KvQuantFixture, kv_quant_suite) {
+    const luce_test::ScopedEnvVar kv_f16("DFLASH27B_KV_F16", nullptr);
+    const luce_test::ScopedEnvVar kv_q4("DFLASH27B_KV_Q4", nullptr);
+    const luce_test::ScopedEnvVar kv_tq3("DFLASH27B_KV_TQ3", nullptr);
+    const luce_test::ScopedEnvVar kv_k("DFLASH27B_KV_K", nullptr);
+    const luce_test::ScopedEnvVar kv_v("DFLASH27B_KV_V", nullptr);
     clear_kv_env();  // start clean regardless of calling environment
 
     t1_parse_kv_type();
@@ -201,5 +225,4 @@ int main() {
     t5_kv_reservation();
 
     std::puts("ALL TESTS PASS");
-    return 0;
 }
