@@ -3,16 +3,6 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
-// Private contract with the heterogeneous owner builder. The hint is attached
-// only to synchronous, large-batch prefill ID tensors and bounds the widest
-// expert bucket after negative owner routes have been compacted away.
-struct mmid_owner_grid_hint {
-    uint32_t magic;
-    int32_t  max_expert_rows;
-    int32_t  live_routes;
-};
-static constexpr uint32_t MMID_OWNER_GRID_HINT_MAGIC = 0x4D4F4752u; // "MOGR"
-
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q4_0:
@@ -279,22 +269,10 @@ static void ggml_cuda_mul_mat_q_impl(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const mmid_owner_grid_hint * grid_hint =
-        (const mmid_owner_grid_hint *) ids->extra;
-    const bool valid_grid_hint =
-        grid_hint && grid_hint->magic == MMID_OWNER_GRID_HINT_MAGIC &&
-        grid_hint->max_expert_rows > 0 &&
-        grid_hint->max_expert_rows <= ne12 &&
-        grid_hint->live_routes > 0 &&
-        grid_hint->live_routes <= ne_get_rows;
-    // The ID helper compacts negative owner routes to the tail of ids_src1.
-    // Quantizing that zero-filled tail repeats the same token activation for
-    // work that no expert will consume. Preserve the expert-sorted prefix
-    // expected by MMQ, but size and launch activation quantization for only
-    // the live cold routes. Unlike a separate owner-row gather this adds no
-    // full-precision activation traffic.
-    const int64_t n_routes_quantized =
-        valid_grid_hint ? grid_hint->live_routes : ne_get_rows;
+    // The helper's fixed-capacity layout is part of MMQ's addressing contract.
+    // A future compact route count must be produced and owned by the graph
+    // builder; until then, quantize the complete initialized route array.
+    const int64_t n_routes_quantized = ne_get_rows;
     const size_t nbytes_src1_q8_1 = n_routes_quantized*ne10_padded * sizeof(block_q8_1)/QK8_1 +
         get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
@@ -322,10 +300,7 @@ static void ggml_cuda_mul_mat_q_impl(
                                            ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
-    int64_t ncols_max = ne12;
-    if (valid_grid_hint) {
-        ncols_max = grid_hint->max_expert_rows;
-    }
+    const int64_t ncols_max = ne12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {

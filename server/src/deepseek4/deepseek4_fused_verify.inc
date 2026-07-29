@@ -170,10 +170,6 @@ static Ds4FusedVerifyCache fused_capture_graph_cache;
 void reset_deepseek4_graph_runtime_caches() {
     fused_verify_graph_cache.destroy();
     fused_capture_graph_cache.destroy();
-    if (g_deepseek4_fused_decode_runtime_cache) {
-        g_deepseek4_fused_decode_runtime_cache->destroy();
-        g_deepseek4_fused_decode_runtime_cache = nullptr;
-    }
 }
 
 // Cached verifier graphs retain their input tensors, while a request-adaptive
@@ -842,7 +838,8 @@ static bool ds4_build_fused_verify_graph(
                     ggml_tensor * hcol = ggml_view_2d(
                         ctx, selected, route_width, 1,
                         selected->nb[1], (size_t) t * selected->nb[1]);
-                    ggml_tensor * fo = ds4_build_hash_routed_ffn(ctx, w, L, ggml_cont(ctx, fcol), hcol);
+                    ggml_tensor * fo = ds4_build_hash_routed_ffn(
+                        ctx, w, L, ggml_cont(ctx, fcol), hcol, 1);
                     if (!fo) { ffn_out = nullptr; break; }
                     ffn_out = ffn_out ? ggml_concat(ctx, ffn_out, fo, 1) : fo;
                 }

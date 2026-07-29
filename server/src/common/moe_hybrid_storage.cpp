@@ -247,6 +247,18 @@ static bool read_input_channel_slices_from_mem(
 } // namespace
 
 MoeHybridStorage::~MoeHybridStorage() {
+    if (prefill_route_alloc) {
+        ggml_gallocr_free(prefill_route_alloc);
+        prefill_route_alloc = nullptr;
+    }
+    if (prefill_hot_alloc) {
+        ggml_gallocr_free(prefill_hot_alloc);
+        prefill_hot_alloc = nullptr;
+    }
+    if (prefill_cold_alloc) {
+        ggml_gallocr_free(prefill_cold_alloc);
+        prefill_cold_alloc = nullptr;
+    }
     for (auto & layer : layers) {
         layer.hot_graph.free();
         layer.cold_graph.free();

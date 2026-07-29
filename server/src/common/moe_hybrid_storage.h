@@ -178,6 +178,15 @@ struct MoeHybridStorage {
     MoeHybridPlacement placement;
     std::vector<MoeHybridLayerStorage> layers;
 
+    // Long heterogeneous prefill uses one routing graph and one owner graph
+    // per layer, but never executes two graphs of the same class concurrently.
+    // Reusing these arenas avoids repeated HIP allocation/page-mapping churn
+    // while keeping memory bounded by the largest graph rather than n_layer
+    // graphs.
+    ggml_gallocr_t prefill_route_alloc = nullptr;
+    ggml_gallocr_t prefill_hot_alloc = nullptr;
+    ggml_gallocr_t prefill_cold_alloc = nullptr;
+
     // Persistent mmap for streaming prefill (nullptr if not available).
     // When set, the streaming engine can DMA cold experts directly from here.
     const void * mmap_data = nullptr;

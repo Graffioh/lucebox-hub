@@ -891,9 +891,11 @@ bool DeepSeek4Backend::init() {
         const char * dp = std::getenv("DFLASH_DS4_DRAFT");
         if (dp && *dp) {
             spec_draft_path_ = dp;
-            const bool loaded = load_spec_drafter();
-            if (!loaded && env_flag_enabled("DFLASH_DS4_DRAFT_IPC_REQUIRED")) {
-                return false;
+            if (!load_spec_drafter()) {
+                std::fprintf(stderr,
+                             "[deepseek4] DSpark drafter load failed; "
+                             "continuing with autoregressive decode\n");
+            }
         } else {
             std::fprintf(stderr, "[deepseek4] DFLASH_DS4_SPEC set but DFLASH_DS4_DRAFT gguf missing\n");
         }
@@ -1286,7 +1288,14 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     // kernels. Smaller tail chunks use the same scheduler or its reference
     // fallback.
     const int layer_major_cap = DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
-    const int chunk = !prefill_attention_mode_is_approximate(cfg_.prefill_mode)
+    // Only sparse prefill has a qualified batched mixed-owner HC path. Dense
+    // hybrid execution remains tokenwise; batching it would skip per-token HC
+    // post-mixing and corrupt the hidden state.
+    const bool hybrid_batch_supported =
+        !moe_hybrid_ || cfg_.prefill_mode == PrefillAttentionMode::Sparse;
+    const int chunk =
+        !prefill_attention_mode_is_approximate(cfg_.prefill_mode) ||
+        !hybrid_batch_supported
         ? 1
         : std::max(1, std::min(requested_chunk,
                                layer_major_cap));
@@ -1661,7 +1670,6 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
                         out_io.emit(tok);
                         return !out_io.cancelled;
                     },
-                    spec_remote_drafter_.get(),
                     (expert_runtime_.compute || expert_backend_)
                         ? moe_hybrid_.get() : nullptr,
                     expert_runtime_.compute ? &expert_runtime_ : nullptr,

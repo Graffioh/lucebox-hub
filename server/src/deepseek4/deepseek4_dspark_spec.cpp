@@ -637,7 +637,6 @@ bool run_deepseek4_dspark_spec_decode(
         std::vector<int32_t> & out_tokens,
         float * accept_rate_out,
         const std::function<bool(int32_t)> & on_token,
-        DFlashDraftIpcClient * remote_draft,
         MoeHybridStorage * moe_hybrid,
         MoeExpertComputeRuntime * expert_runtime,
         MoeHybridRoutingStats * routing_stats) {
@@ -662,7 +661,7 @@ bool run_deepseek4_dspark_spec_decode(
     ggml_backend_t drafter_backend =
         drafter.core.backend ? drafter.core.backend : backend;
     const bool draft_overlap_probe_active =
-        draft_overlap_probe && !remote_draft && drafter_backend != backend;
+        draft_overlap_probe && drafter_backend != backend;
     bool draft_overlap_probe_enabled = draft_overlap_probe_active;
     if (draft_overlap_probe && !draft_overlap_probe_active) {
         std::fprintf(stderr,
@@ -670,7 +669,7 @@ bool run_deepseek4_dspark_spec_decode(
             "in-process backend; probe disabled\n");
     }
     const bool draft_ahead_active =
-        draft_ahead && !remote_draft && drafter_backend != backend;
+        draft_ahead && drafter_backend != backend;
     bool draft_ahead_enabled = draft_ahead_active;
     if (draft_ahead && !draft_ahead_active) {
         std::fprintf(stderr,
@@ -833,15 +832,12 @@ bool run_deepseek4_dspark_spec_decode(
                 }
 
                 // Drafter forward -> block normed hidden states.
-                const bool draft_ok = remote_draft && remote_draft->active()
-                    ? remote_draft->propose(
-                        pos, ctx_len, noise_embed, local_hidden)
-                    : deepseek4_dspark_draft_forward(
-                        drafter_backend,
-                        drafter, noise_embed.data(),
-                        ctx_len > 0 ? feat_win.data() : nullptr,
-                        ctx_len, pos, local_hidden,
-                        use_confidence_width ? &confidence_hidden : nullptr);
+                const bool draft_ok = deepseek4_dspark_draft_forward(
+                    drafter_backend,
+                    drafter, noise_embed.data(),
+                    ctx_len > 0 ? feat_win.data() : nullptr,
+                    ctx_len, pos, local_hidden,
+                    use_confidence_width ? &confidence_hidden : nullptr);
                 if (!draft_ok) {
                     std::fprintf(stderr, "[ds4-spec] drafter forward failed\n");
                     ok = false;

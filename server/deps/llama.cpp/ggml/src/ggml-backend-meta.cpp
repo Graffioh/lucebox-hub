@@ -862,10 +862,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
                 split_state = handle_mul_mat(src_ss);
             } break;
             case GGML_OP_MUL_MAT_GROUPED_SRC: {
-                // The logical activation rows are assembled from a private
-                // grouped physical layout. Keep the operation local; only the
-                // CPU and CUDA/HIP backends implement that layout contract.
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                // Grouped physical activations retain MUL_MAT's logical split
+                // semantics. This lets owner-local expert weights split on
+                // axis 1 while the grouped activation is mirrored.
+                split_state = handle_mul_mat(src_ss);
             } break;
             case GGML_OP_OUT_PROD: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);

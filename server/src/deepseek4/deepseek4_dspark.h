@@ -236,7 +236,6 @@ bool run_deepseek4_dspark_spec_decode(
         std::vector<int32_t> & out_tokens,
         float * accept_rate_out,
         const std::function<bool(int32_t)> & on_token = {},
-        DFlashDraftIpcClient * remote_draft = nullptr,
         MoeHybridStorage * moe_hybrid = nullptr,
         MoeExpertComputeRuntime * expert_runtime = nullptr,
         MoeHybridRoutingStats * routing_stats = nullptr);

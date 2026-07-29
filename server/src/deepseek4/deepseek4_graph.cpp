@@ -5416,6 +5416,22 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         layer_storage.cold_backend && layer_storage.cold_backend != backend &&
         hot_stack_ref && hot_stack_ref->ne[2] > 0 &&
         cold_stack_ref && cold_stack_ref->ne[2] > 0;
+    const char * persistent_owner_env =
+        std::getenv("DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC");
+    const bool persistent_owner_requested =
+        !persistent_owner_env || !*persistent_owner_env ||
+        std::strcmp(persistent_owner_env, "0") != 0;
+    const bool persistent_owner_alloc =
+        n_tokens >= 512 && device_ffn_input && persistent_owner_requested;
+    if (persistent_owner_alloc) {
+        static bool logged_persistent_owner_alloc = false;
+        if (!logged_persistent_owner_alloc) {
+            std::fprintf(stderr,
+                         "[deepseek4] persistent heterogeneous prefill "
+                         "routing and owner arenas active\n");
+            logged_persistent_owner_alloc = true;
+        }
+    }
 
     const auto route_build_t0 = Ds4TimingClock::now();
     ggml_init_params params{};
@@ -5432,28 +5448,45 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, normed);
     ggml_build_forward_expand(gf, probs);
-    ggml_gallocr_t alloc =
-        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_t alloc = nullptr;
+    if (persistent_owner_alloc) {
+        if (!hybrid.prefill_route_alloc) {
+            hybrid.prefill_route_alloc = ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(backend));
+        }
+        alloc = hybrid.prefill_route_alloc;
+    } else {
+        alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+    }
     if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
-        if (alloc) ggml_gallocr_free(alloc);
+        if (persistent_owner_alloc) {
+            if (hybrid.prefill_route_alloc) {
+                ggml_gallocr_free(hybrid.prefill_route_alloc);
+                hybrid.prefill_route_alloc = nullptr;
+            }
+        } else if (alloc) {
+            ggml_gallocr_free(alloc);
+        }
         ggml_free(ctx);
         return false;
     }
     struct RouteGraphLifetime {
         ggml_gallocr_t alloc = nullptr;
         ggml_context * ctx = nullptr;
+        bool owns_alloc = true;
         void reset() {
-            if (alloc) {
+            if (owns_alloc && alloc) {
                 ggml_gallocr_free(alloc);
-                alloc = nullptr;
             }
+            alloc = nullptr;
             if (ctx) {
                 ggml_free(ctx);
                 ctx = nullptr;
             }
         }
         ~RouteGraphLifetime() { reset(); }
-    } route_graph{alloc, ctx};
+    } route_graph{alloc, ctx, !persistent_owner_alloc};
     if (telemetry) {
         telemetry->route_build_us +=
             ds4_elapsed_us(route_build_t0, Ds4TimingClock::now());
@@ -5581,25 +5614,32 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     MoeHybridConfig cfg = make_ds4_moe_hybrid_config(w);
     cfg.n_expert_used = route_width;
     MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
+    ggml_gallocr_t * hot_alloc = persistent_owner_alloc
+        ? &hybrid.prefill_hot_alloc : nullptr;
+    ggml_gallocr_t * cold_alloc = persistent_owner_alloc
+        ? &hybrid.prefill_cold_alloc : nullptr;
     if (trace_prefill) {
         std::fprintf(stderr,
                      "[deepseek4-prefill-trace] layer=%d expert owners begin\n",
                      layer);
     }
+    const auto owners_t0 = Ds4TimingClock::now();
     const bool ok = eval_ds4_hybrid(
         backend, hybrid.cpu_backend, cfg, desc, &hybrid,
         hybrid.layers[(size_t)layer], nullptr,
         layer, n_embd, route_width,
         device_ffn_input ? nullptr : normed_host.data(),
         selected.data(), weights.data(),
-        n_tokens, out, nullptr, nullptr,
+        n_tokens, out, hot_alloc, cold_alloc,
         expert_compute, expert_layer, telemetry,
         device_ffn_input ? normed : nullptr,
         device_ffn_input ? device_outputs : nullptr);
     if (trace_prefill) {
         std::fprintf(stderr,
-                     "[deepseek4-prefill-trace] layer=%d expert owners=%s\n",
-                     layer, ok ? "ok" : "failed");
+                     "[deepseek4-prefill-trace] layer=%d expert owners=%s "
+                     "wall_ms=%.3f\n",
+                     layer, ok ? "ok" : "failed",
+                     ds4_elapsed_us(owners_t0, Ds4TimingClock::now()) / 1000.0);
     }
     return ok;
 }
@@ -6052,7 +6092,7 @@ static int ds4_try_layer_major_prefill(
                 return fail("cached scratch allocation failed", il);
             }
             if (telemetry) {
-                telemetry->full_graph_alloc_us += ds4_elapsed_us(
+                telemetry->full_graph_build_us += ds4_elapsed_us(
                     alloc_t0, Ds4TimingClock::now());
             }
             for (const auto & b : layer.i32_inputs) {
@@ -6449,170 +6489,6 @@ static bool initialize_layer_range_cache(
     runtime.owns_output = owns_output;
     return true;
 }
-static bool eval_ds4_layer_range_hybrid_ffn_obsolete(
-        ggml_backend_t backend,
-        const DeepSeek4Weights & w,
-        const DeepSeek4Layer & L,
-        int layer,
-        int n_tokens,
-        const float * ffn_working_host,
-        const ggml_tensor * ffn_in_backend,
-        const int32_t * token_ids,
-        const HashRoutingTableCpu & hash_table,
-        MoeHybridStorage & hybrid,
-        MoeExpertComputeRuntime * expert_runtime,
-        MoeHybridRoutingStats * routing_stats,
-        std::vector<float> & out,
-        DeepSeek4StepTelemetry * telemetry) {
-    const int n_embd = w.n_embd;
-    const bool hash_routed =
-        layer < w.n_hash_layer && L.ffn_gate_tid2eid &&
-        token_ids && hash_table.loaded;
-    const int route_width = ds4_effective_expert_count(w);
-
-    const auto route_build_t0 = Ds4TimingClock::now();
-    ggml_init_params params{};
-    params.mem_size = 16 * 1024 * 1024;
-    params.mem_buffer = nullptr;
-    params.no_alloc = true;
-    ggml_context * ctx = ggml_init(params);
-    if (!ctx) return false;
-    ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-    ggml_set_input(inp);
-    ggml_tensor * normed = build_rms_norm(ctx, inp, L.ffn_norm, w.rms_eps);
-    ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, normed);
-    ggml_tensor * probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, normed);
-    ggml_build_forward_expand(gf, probs);
-    ggml_gallocr_t alloc =
-        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
-        if (alloc) ggml_gallocr_free(alloc);
-        ggml_free(ctx);
-        return false;
-    }
-    if (telemetry) {
-        telemetry->route_build_us +=
-            ds4_elapsed_us(route_build_t0, Ds4TimingClock::now());
-    }
-
-    if (ffn_in_backend) {
-        ggml_backend_tensor_copy(
-            const_cast<ggml_tensor *>(ffn_in_backend), inp);
-    } else {
-        ggml_backend_tensor_set(inp, ffn_working_host, 0,
-                                sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
-    }
-    const auto route_compute_t0 = Ds4TimingClock::now();
-    const bool route_ok =
-        ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
-    if (telemetry) {
-        telemetry->route_compute_us +=
-            ds4_elapsed_us(route_compute_t0, Ds4TimingClock::now());
-    }
-
-    std::vector<float> normed_host((size_t)n_embd * (size_t)n_tokens);
-    std::vector<float> probs_host((size_t)w.n_expert * (size_t)n_tokens);
-    if (route_ok) {
-        const auto route_read_t0 = Ds4TimingClock::now();
-        ggml_backend_tensor_get(normed, normed_host.data(), 0,
-                                sizeof(float) * normed_host.size());
-        ggml_backend_tensor_get(probs, probs_host.data(), 0,
-                                sizeof(float) * probs_host.size());
-        if (telemetry) {
-            telemetry->route_read_us +=
-                ds4_elapsed_us(route_read_t0, Ds4TimingClock::now());
-        }
-    }
-    ggml_gallocr_free(alloc);
-    ggml_free(ctx);
-    if (!route_ok) return false;
-
-    std::vector<int32_t> selected((size_t)route_width * (size_t)n_tokens);
-    std::vector<float> weights((size_t)route_width * (size_t)n_tokens);
-    std::vector<float> bias;
-    if (!hash_routed && L.ffn_exp_probs_b) {
-        bias.resize((size_t)w.n_expert);
-        ggml_backend_tensor_get(L.ffn_exp_probs_b, bias.data(), 0,
-                                sizeof(float) * bias.size());
-    }
-
-    const auto route_select_t0 = Ds4TimingClock::now();
-    for (int t = 0; t < n_tokens; ++t) {
-        const float * token_probs =
-            probs_host.data() + (size_t)t * (size_t)w.n_expert;
-        int32_t * token_ids_out =
-            selected.data() + (size_t)t * (size_t)route_width;
-        float * token_weights =
-            weights.data() + (size_t)t * (size_t)route_width;
-
-        if (hash_routed) {
-            const int32_t tok = token_ids[t];
-            if (tok < 0 || tok >= w.n_vocab) return false;
-            const int32_t * row =
-                hash_table.ids.data() +
-                (size_t)tok * (size_t)w.n_expert_used;
-            std::memcpy(token_ids_out, row,
-                        sizeof(int32_t) * (size_t)route_width);
-        } else {
-            std::fill(token_ids_out, token_ids_out + route_width, -1);
-            for (int expert = 0; expert < w.n_expert; ++expert) {
-                const float score = token_probs[expert] +
-                    (!bias.empty() ? bias[(size_t)expert] : 0.0f);
-                for (int slot = 0; slot < route_width; ++slot) {
-                    const int32_t current = token_ids_out[slot];
-                    const float current_score = current >= 0
-                        ? token_probs[current] +
-                            (!bias.empty() ? bias[(size_t)current] : 0.0f)
-                        : -INFINITY;
-                    if (current < 0 || score > current_score) {
-                        for (int move = route_width - 1; move > slot; --move) {
-                            token_ids_out[move] = token_ids_out[move - 1];
-                        }
-                        token_ids_out[slot] = expert;
-                        break;
-                    }
-                }
-            }
-        }
-
-        float sum = 0.0f;
-        for (int slot = 0; slot < route_width; ++slot) {
-            const int32_t expert = token_ids_out[slot];
-            token_weights[slot] =
-                expert >= 0 && expert < w.n_expert ? token_probs[expert] : 0.0f;
-            sum += token_weights[slot];
-        }
-        sum = std::max(sum, 6.103515625e-5f);
-        for (int slot = 0; slot < route_width; ++slot) {
-            token_weights[slot] =
-                token_weights[slot] / sum * w.expert_weight_scale;
-        }
-        observe_active_routing(routing_stats, layer,
-                               token_ids_out, token_weights, route_width);
-    }
-    if (telemetry) {
-        telemetry->route_select_us +=
-            ds4_elapsed_us(route_select_t0, Ds4TimingClock::now());
-    }
-
-    MoeHybridConfig cfg = make_ds4_moe_hybrid_config(w);
-    cfg.n_expert_used = route_width;
-    MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
-    MoeExpertCompute * expert_compute =
-        expert_runtime ? expert_runtime->compute_ptr() : nullptr;
-    const MoeExpertLayer * expert_layer =
-        expert_runtime ? expert_runtime->layer_ptr((size_t)layer) : nullptr;
-    return eval_ds4_hybrid(
-        backend, hybrid.cpu_backend, cfg, desc, &hybrid,
-        hybrid.layers[(size_t)layer], nullptr,
-        layer, n_embd, route_width,
-        normed_host.data(), selected.data(), weights.data(),
-        n_tokens, out, nullptr, nullptr,
-        expert_compute, expert_layer, telemetry);
-}
-
 bool deepseek4_step_layer_range(
         ggml_backend_t backend,
         int device,
