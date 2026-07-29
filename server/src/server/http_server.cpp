@@ -42,6 +42,8 @@
 #include <stdexcept>
 #include <utility>
 
+using dflash::common::SocketHandle;
+
 #if defined(_WIN32)
 #include <io.h>
 #include <sys/stat.h>
