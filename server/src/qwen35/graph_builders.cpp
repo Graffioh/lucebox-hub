@@ -280,7 +280,11 @@ bool build_target_step(
     bool capture_moe_router,
     bool kvflash_mask,
     bool capture_qk,
-    bool paged_attention) {
+    bool paged_attention,
+    int n_seqs,
+    int seq_slot,
+    bool paged_prefill,
+    int paged_max_kv_len) {
     step_graph_free(sg);
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
@@ -313,8 +317,14 @@ bool build_target_step(
         // kvflash mode: the physical span is the (smaller) pool capacity of
         // the attention tensors, so size the mask from those instead.
         int phys_ctx = cache.max_ctx;
-        for (auto * t : cache.attn_k) {
-            if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
+        if (paged_prefill && !cache.staging_k.empty() && cache.staging_k[0]) {
+            // Paged prefill reads the staging tensors, not the (larger,
+            // pool-sized) cache K/V — size the mask from those.
+            phys_ctx = std::min(phys_ctx, (int)cache.staging_k[0]->ne[1]);
+        } else {
+            for (auto * t : cache.attn_k) {
+                if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
+            }
         }
         const int max_win_len = phys_ctx + n_tokens;
         const int kv_pad = align_up(max_win_len, kq_stride_pad);
@@ -325,12 +335,18 @@ bool build_target_step(
     }
 
     if (paged_attention) {
-        if (n_tokens != 1 || with_mask || fa_window != 0) return false;
+        // Classic paged decode is single-token; batched decode carries one
+        // token per sequence slot (token axis == sequence axis).
+        const bool batched = n_seqs > 1;
+        if (batched ? (n_tokens != n_seqs || n_seqs != cache.n_seq_slots)
+                    : (n_tokens != 1)) return false;
+        if (with_mask || fa_window != 0) return false;
         // The paging metadata lives in the persistent target cache (next to
         // the K/V pool), not as gallocr graph inputs: contents survive graph
         // execution and rebuilds, so the backend uploads only what changed
         // between decode steps.
         if (!cache.paged_block_table || !cache.paged_kv_seq_lens) return false;
+        if ((int)cache.paged_block_table->ne[1] != n_tokens) return false;
         sg.paged_block_table = cache.paged_block_table;
         sg.paged_kv_seq_lens = cache.paged_kv_seq_lens;
     }
@@ -347,7 +363,7 @@ bool build_target_step(
     // physical slots, so the slot-mapped write stays active for masked,
     // multi-token, and feature-capturing forwards (decode AND spec verify).
     const bool use_kv_write_rows =
-        paged_attention ||
+        paged_attention || paged_prefill ||
         (!g_no_kvpad && !capture_delta_intermediate &&
          (kvflash_mask
               ? (fa_window == 0)
@@ -374,6 +390,10 @@ bool build_target_step(
     gi.paged_block_table          = sg.paged_block_table;
     gi.paged_kv_seq_lens          = sg.paged_kv_seq_lens;
     gi.q_capture                  = capture_qk;
+    gi.n_seqs                     = n_seqs;
+    gi.seq_slot                   = seq_slot;
+    gi.paged_prefill              = paged_prefill;
+    gi.paged_max_kv_len           = paged_max_kv_len;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

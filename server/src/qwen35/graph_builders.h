@@ -79,6 +79,18 @@ bool build_hybrid_full_layer_step(
 // even though a mask is requested (the mask carries pool-slot validity and
 // must be re-uploaded by the caller before every compute). Used by both
 // single-token decode and multi-token spec verify; requires fa_window == 0.
+//
+// Concurrent-slot serving (multi-slot paged caches):
+//   `n_seqs` > 1 — batched decode over every slot: n_tokens must equal both
+//     n_seqs and cache.n_seq_slots; the token axis is the sequence axis.
+//   `seq_slot` — single-sequence forwards (prefill chunks) pick which slot's
+//     recurrent-state slab the DeltaNet blocks read and write.
+//   `paged_prefill` — chunk prefill of one slot: masked stride-1 reads and
+//     legacy writes go to cache.staging_k/v while kv_write_rows dual-writes
+//     the pool blocks. Pass paged_attention=false with it (prefill reads
+//     never touch the block table).
+//   `paged_max_kv_len` — batched decode: max kv_seq_len over live slots
+//     (kernel launch bound).
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -95,7 +107,11 @@ bool build_target_step(
     bool capture_moe_router = false,
     bool kvflash_mask = false,
     bool capture_qk = false,
-    bool paged_attention = false);
+    bool paged_attention = false,
+    int n_seqs = 1,
+    int seq_slot = 0,
+    bool paged_prefill = false,
+    int paged_max_kv_len = 0);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(
