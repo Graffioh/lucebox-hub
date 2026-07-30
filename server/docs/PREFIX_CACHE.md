@@ -49,6 +49,13 @@ Caches KV state at **turn boundaries** within a conversation. The boundary
 detector uses `ChatMarkers` to find end-of-message + start-of-next-role
 token sequences.
 
+For tool-using chat templates, tool definitions are rendered in the system
+prefix. The first safe boundary therefore includes the complete tool schema:
+the first request pays that prefill once, and later requests with the same
+tools restore it through the normal native cache. See
+[`TOOL_PREFIX_CACHE.md`](TOOL_PREFIX_CACHE.md) for the correctness contract and
+benchmark.
+
 - **lookup()**: Finds the longest cached prefix matching the current prompt.
 - **prepare_inline_snap()**: Selects a slot and cut-point for snapshotting
   after the current prefill completes.
@@ -68,6 +75,13 @@ The two flags are intentionally separate:
 
 - `--prefix-cache-slots` controls turn-boundary prefix snapshots.
 - `--prefill-cache-slots` controls exact full-prompt snapshots.
+
+The backend can save one snapshot during a generation. For requests carrying
+tools, the reusable inline system/tool boundary takes priority over an exact
+full-prompt snapshot; for ordinary requests, the exact cache keeps priority.
+If the preferred cache has no useful boundary or available slot, the server
+falls back to the other tier. A restore only reserves a new inline snapshot
+when the selected boundary advances beyond the restored prefix.
 
 The disk prefix cache is a separate persistence/overflow layer for token-keyed
 snapshots. Today it is integrated with the inline/effective-prompt path; exact

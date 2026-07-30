@@ -1,4 +1,5 @@
 #include "qwen35_backend.h"
+#include "common/chain_rollback_policy.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -347,12 +348,12 @@ void Qwen35Backend::print_ready_banner() const {
 
 // ── Park / unpark ───────────────────────────────────────────────────────
 
-bool Qwen35Backend::park(const std::string & what) {
-    bool want_draft  = (what.empty() || what == "all" || what == "draft");
-    bool want_target = (what.empty() || what == "all" || what == "target");
+bool Qwen35Backend::park(ParkTarget target) {
+    const bool want_draft_model = park_target_includes_draft_model(target);
+    const bool want_target_model = park_target_includes_target_model(target);
     const bool use_remote_draft = cfg_.remote_draft.enabled();
 
-    if (want_draft && !draft_parked_) {
+    if (want_draft_model && !draft_parked_) {
         if (use_remote_draft) {
             remote_draft_.close();
         } else {
@@ -362,7 +363,7 @@ bool Qwen35Backend::park(const std::string & what) {
         draft_parked_ = true;
         std::printf("[park] draft released\n"); std::fflush(stdout);
     }
-    if (want_target && !target_parked_) {
+    if (want_target_model && !target_parked_) {
         step_graph_destroy(proj_sg_);
         free_target_weights(w_);
         target_parked_ = true;
@@ -371,12 +372,12 @@ bool Qwen35Backend::park(const std::string & what) {
     return true;
 }
 
-bool Qwen35Backend::unpark(const std::string & what) {
-    bool want_target = (what.empty() || what == "all" || what == "target");
-    bool want_draft  = (what.empty() || what == "all" || what == "draft");
+bool Qwen35Backend::unpark(ParkTarget target) {
+    const bool want_target_model = park_target_includes_target_model(target);
+    const bool want_draft_model = park_target_includes_draft_model(target);
     const bool use_remote_draft = cfg_.remote_draft.enabled();
 
-    if (want_target && target_parked_) {
+    if (want_target_model && target_parked_) {
         if (!load_target_model(target_backend_, w_)) {
             std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
             return false;
@@ -385,7 +386,7 @@ bool Qwen35Backend::unpark(const std::string & what) {
         target_parked_ = false;
         std::printf("[unpark] target restored\n"); std::fflush(stdout);
     }
-    if (want_draft && draft_parked_ && cfg_.draft_path) {
+    if (want_draft_model && draft_parked_ && cfg_.draft_path) {
         if (use_remote_draft) {
             const int cap = cfg_.remote_draft.ring_cap > 0
                 ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
@@ -565,8 +566,8 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
     const bool was_draft_parked  = draft_parked_;
     if (!req.skip_park) {
         step_graph_destroy(sg_);
-        if (!target_parked_) park("target");
-        if (!draft_parked_)  park("draft");
+        if (!target_parked_) park(ParkTarget::TargetModel);
+        if (!draft_parked_)  park(ParkTarget::DraftModel);
     }
 
     // Synchronize all backends to flush any outstanding async CUDA work
@@ -589,8 +590,8 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
                          dflash27b_last_error());
             if (!req.skip_park) {
-                if (!was_target_parked) unpark("target");
-                if (!was_draft_parked)  unpark("draft");
+                if (!was_target_parked) unpark(ParkTarget::TargetModel);
+                if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
             }
             return result;
         }
@@ -619,8 +620,8 @@ ModelBackend::CompressResult Qwen35Backend::compress(const CompressRequest & req
 
     // Restore park state
     if (!req.skip_park) {
-        if (!was_target_parked) unpark("target");
-        if (!was_draft_parked)  unpark("draft");
+        if (!was_target_parked) unpark(ParkTarget::TargetModel);
+        if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
     }
 
     return result;
@@ -1927,12 +1928,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
+    const ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
+    RollbackDiag rollback_diag;
 
     auto log_target_forward_stats = [&]() {
         std::fprintf(stderr, "[spec-decode] target_forwards=%d forwards_per_token=%.6f forwards_per_step=%.3f\n",
                      target_forwards,
                      n_generated > 0 ? (double)target_forwards / n_generated : 0.0,
                      n_draft_steps > 0 ? (double)target_forwards / n_draft_steps : 0.0);
+        rollback_diag.print(rollback_policy, stderr);
     };
 
     // kvflash: an in-pool prompt prefills contiguously without registering
@@ -2488,11 +2492,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // 6. Fix state: adaptive fast-rollback vs legacy replay.
         //    Fast-rollback (implicit bonus, skip replay) is profitable when
         //    accept_n is large enough that skipping the replay saves more compute
-        //    than the cost of deferring the bonus to the next step. Breakeven
-        //    is around accept_n ≈ 5. Below that, legacy replay is cheaper.
-        constexpr int kFastRollbackThreshold = 5;
+        //    than the cost of deferring the bonus to the next step. The default
+        //    threshold is 5; exact F32 checkpoints may opt in to a lower value.
+        rollback_diag.record_accept(accept_n);
         const bool use_fast_rollback =
-            target->supports_fast_rollback() && (accept_n >= kFastRollbackThreshold);
+            target->supports_fast_rollback() &&
+            (accept_n >= rollback_policy.fast_rollback_threshold);
 
         int replay_last_tok = -1;
         bool fast_rolled_back = false;
@@ -2508,15 +2513,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             if (target->rollback_to(committed, commit_n)) {
                 replay_last_tok = target_tok[commit_n - 1];
                 fast_rolled_back = true;
+                rollback_diag.record_fast_rollback(accept_n);
             } else {
                 // Rollback failed (CUDA error / unsupported state type). The
                 // pre-verify snapshot is still valid, so degrade to the legacy
                 // restore+replay path below instead of aborting the request.
                 std::fprintf(stderr, "spec-decode: rollback_to failed; "
                                      "falling back to restore+replay\n");
+                rollback_diag.record_failed_fallback();
             }
         }
         if (!fast_rolled_back) {
+            rollback_diag.record_legacy_replay();
             // Legacy replay: restore SSM snapshot, replay accepted + bonus tokens.
             // (When falling back from fast-rollback, bonus_tok is -1 and commit_n
             //  is the budget-clamped accepted count.)

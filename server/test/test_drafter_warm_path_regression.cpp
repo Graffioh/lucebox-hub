@@ -1,13 +1,29 @@
 // Regression test: K_norope_v/Q_norope_v sized to n_score_layers, not n_layer.
 // Old code allocated 28 entries (~5.6 GB wasted at 128K); fix uses score_range.count().
 
+#include "CppUnitTestFramework.hpp"
 #include "score_range.h"
 
 #include <cassert>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 
 using dflash::common::ScoreRange;
 using dflash::common::compute_score_range;
+
+#define TEST_ASSERT(cond) do { \
+    if (!(cond)) { \
+        throw std::runtime_error(std::string(__FILE__) + ":" + \
+            std::to_string(__LINE__) + ": " + #cond); \
+    } \
+} while (0)
+#undef assert
+#define assert(cond) TEST_ASSERT(cond)
+
+namespace {
+struct DrafterWarmPathRegressionFixture {};
+}
 
 // Helper: compute n_score_layers as the fixed allocator does.
 static int score_layer_count(int n_layer, int score_layers_env, int early_exit_env) {
@@ -142,7 +158,7 @@ static void t7_alloc_loop_upper_bound() {
     }
 }
 
-int main() {
+TEST_CASE(DrafterWarmPathRegressionFixture, warm_path_regression_suite) {
     t1_baseline_full_alloc();
     t2_l7_trimmed_alloc();
     t3_early_exit_with_score_layers();
@@ -151,5 +167,4 @@ int main() {
     t6_start_pre_matches_loop_start();
     t7_alloc_loop_upper_bound();
     printf("\nAll warm-path regression tests passed.\n");
-    return 0;
 }

@@ -53,6 +53,7 @@ public:
     bool prefill(const std::vector<int32_t> & prompt,
                  int base_pos, int & last_tok) override;
     bool decode_ar(int last_tok, int committed, int n_gen,
+                   const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io) override;
     bool supports_cpu_sampling() const override { return true; }
@@ -83,6 +84,10 @@ private:
     int compute_auto_split_layers() const;
     static int estimate_cuda_layers_from_free_bytes(size_t free_bytes);
     static size_t hc_state_elements(const DeepSeek4Weights & weights);
+    static const float * local_shard_input(
+        size_t shard_index,
+        const std::vector<float> & token_embeddings,
+        const std::vector<float> & hc_state);
 
     DeepSeek4LayerSplitAdapterConfig cfg_;
     std::vector<DeepSeek4LayerSplitShard> shards_;

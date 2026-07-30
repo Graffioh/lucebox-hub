@@ -7,12 +7,14 @@
 #pragma once
 
 #include "common/model_backend.h"
+#include "common/moe_expert_compute.h"
 #include "common/sampler.h"
 #include "../common/moe_hybrid_placement.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
+#include "deepseek4_dspark.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -37,8 +39,8 @@ public:
     // ModelBackend interface
     void print_ready_banner() const override;
 
-    bool park(const std::string & what) override;
-    bool unpark(const std::string & what) override;
+    bool park(ParkTarget target) override;
+    bool unpark(ParkTarget target) override;
     bool is_target_parked() const override { return parked_; }
 
     GenerateResult generate_impl(const GenerateRequest & req,
@@ -59,10 +61,15 @@ public:
 
     void shutdown() override;
 
+    const MoeHybridRoutingStats * get_routing_stats() const override {
+        return routing_stats_.get();
+    }
+
 private:
     DeepSeek4BackendConfig cfg_;
     ggml_backend_t         backend_      = nullptr;
     ggml_backend_t         snap_backend_ = nullptr;
+    ggml_backend_t         expert_backend_ = nullptr;
     DeepSeek4Weights       w_;
     DeepSeek4Cache         cache_;
     bool                   parked_       = false;
@@ -76,18 +83,34 @@ private:
     DeepSeek4Snapshot      snapshots_[PREFIX_SLOTS];
     std::vector<float>     last_logits_;
 
+    // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
+    bool                           spec_enabled_ = false;
+    bool                           spec_drafter_parked_ = false;
+    std::string                    spec_draft_path_;
+    ggml_backend_t                 spec_backend_ = nullptr;
+    std::unique_ptr<DSparkDrafter> spec_drafter_;
+    std::vector<float>             spec_feat_window_;
+
+    bool load_spec_drafter();
+    void release_spec_drafter(bool mark_parked);
+
     // Prefill prompt tokens in chunks, return absolute committed position.
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
                    int kv_offset = 0);
 
     // Autoregressive decode loop.
     bool do_decode(int committed, int n_gen,
+                   const std::vector<int32_t> & history_prefix,
                    std::vector<int32_t> & out_tokens,
                    const DaemonIO & io,
                    const BudgetHook & budget_hook = {},
                    bool * forced_close_out = nullptr);
 
+    bool load_model();
     bool init_hybrid_model();
+    bool requires_monolithic_model() const;
+    bool validate_prefill_mode() const;
+    bool init_moe_tensor_parallel();
     bool compute_uniform_hybrid_placement(const DeepSeek4Weights & w,
                                           int max_ctx,
                                           MoeHybridPlacement & out,
@@ -97,9 +120,7 @@ private:
     std::shared_ptr<MoeHybridStorage> moe_hybrid_;
     MoeHybridPlacement                moe_placement_;
     MoeHybridStreamEngine             stream_engine_;
-    // Expert IPC removed — layer split replaces expert split.
-    // Kept for compilation compatibility; init_hybrid_model() is no longer called
-    // from the layer-split path.
+    MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;
 };

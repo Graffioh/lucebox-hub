@@ -15,16 +15,15 @@
 #include "chat_template.h"
 #include "model_card.h"
 #include "common/backend_factory.h"
-#include "common/gguf_inspect.h"
+#include "common/chain_rollback_policy.h"
 #include "common/layer_split_utils.h"
 #include "common/spark_corpus.h"
 #include "common/moe_routing_collector.h"
 #include "common/moe_hybrid_routing_stats.h"
+#include "common/platform_env.h"
 #include "common/peer_access.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
-
-#include "gguf.h"
 
 #include <algorithm>
 #include <csignal>
@@ -35,11 +34,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#ifdef _WIN32
-#define setenv(name, value, overwrite) _putenv_s(name, value)
-#define unsetenv(name) _putenv_s(name, "")
-#endif
 
 using namespace dflash::common;
 
@@ -70,127 +64,6 @@ static bool parse_double_list(const char * value, std::vector<double> & out) {
     return !out.empty();
 }
 
-static bool validate_server_placement(const BackendArgs & bargs,
-                                      const ServerConfig & sconfig) {
-    const PlacementBackend compiled = compiled_placement_backend();
-    if (!placement_backend_supported(bargs.device.backend)) {
-        std::fprintf(stderr,
-            "[server] --target-device=%s is unsupported in this binary "
-            "(compiled backend: %s)\n",
-            placement_device_name(bargs.device).c_str(),
-            placement_backend_name(compiled));
-        return false;
-    }
-    const bool pflash_enabled =
-        sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
-    const PFlashDrafterPlacement pflash_placement =
-        resolve_pflash_drafter_placement(
-            bargs.device, bargs.draft_device, bargs.remote_draft,
-            pflash_enabled);
-    const PlacementBackend target = pflash_placement.target_backend;
-    const PlacementBackend draft = pflash_placement.drafter_backend;
-    const bool draft_placement_used =
-        pflash_drafter_placement_used(pflash_enabled, bargs.draft_path != nullptr);
-    if (!bargs.remote_draft.enabled() && bargs.remote_draft.has_aux_options()) {
-        std::fprintf(stderr,
-            "[server] --draft-ipc-work-dir and --draft-ipc-ring-cap require "
-            "--draft-ipc-bin\n");
-        return false;
-    }
-    if (!bargs.remote_target_shard.enabled() &&
-        bargs.remote_target_shard.has_aux_options()) {
-        std::fprintf(stderr,
-            "[server] --target-shard-ipc-work-dir requires --target-shard-ipc-bin\n");
-        return false;
-    }
-    if (draft_placement_used && target != draft) {
-        if (!bargs.remote_draft.enabled()) {
-            std::fprintf(stderr,
-                "[server] mixed target/draft backends require --draft-ipc-bin "
-                "(target=%s draft=%s)\n",
-                placement_backend_name(target), placement_backend_name(draft));
-            return false;
-        }
-        if (!bargs.draft_path && !pflash_enabled) {
-            std::fprintf(stderr,
-                "[server] mixed target/draft backends require --draft <path> "
-                "or --prefill-compression with --prefill-drafter\n");
-            return false;
-        }
-    } else if (bargs.remote_draft.enabled()) {
-        std::fprintf(stderr,
-            "[server] --draft-ipc-bin is only needed for mixed target/draft "
-            "backends (target=%s draft=%s)\n",
-            placement_backend_name(target), placement_backend_name(draft));
-        return false;
-    } else if (draft_placement_used &&
-               !placement_backend_supported(bargs.draft_device.backend)) {
-        std::fprintf(stderr,
-            "[server] --draft-device=%s is unsupported in this binary "
-            "(compiled backend: %s)\n",
-            placement_device_name(bargs.draft_device).c_str(),
-            placement_backend_name(compiled));
-        return false;
-    }
-    if (!bargs.device.is_layer_split() && !bargs.device.layer_split_weights.empty()) {
-        std::fprintf(stderr,
-            "[server] --target-layer-split requires --target-devices\n");
-        return false;
-    }
-    if (bargs.device.is_layer_split()) {
-        const std::string placement_error =
-            validate_device_placement(bargs.device, /*device_count=*/-1);
-        if (!placement_error.empty()) {
-            std::fprintf(stderr, "[server] bad target layer split: %s\n",
-                         placement_error.c_str());
-            return false;
-        }
-    }
-    const bool mixed_target_split =
-        bargs.device.is_layer_split() && bargs.device.is_mixed_layer_split();
-    if (mixed_target_split) {
-        if (!bargs.remote_target_shard.enabled()) {
-            std::fprintf(stderr,
-                "[server] mixed-backend target layer split requires "
-                "--target-shard-ipc-bin\n");
-            return false;
-        }
-        size_t remote_begin = 0;
-        while (remote_begin < bargs.device.layer_split_gpus.size() &&
-               bargs.device.layer_split_backend(remote_begin) == compiled) {
-            ++remote_begin;
-        }
-        if (remote_begin == 0 || remote_begin >= bargs.device.layer_split_gpus.size()) {
-            std::fprintf(stderr,
-                "[server] mixed-backend target layer split currently supports "
-                "one local backend group followed by one remote backend group\n");
-            return false;
-        }
-        const PlacementBackend remote_backend =
-            bargs.device.layer_split_backend(remote_begin);
-        bool one_boundary = true;
-        for (size_t i = remote_begin; i < bargs.device.layer_split_gpus.size(); ++i) {
-            if (bargs.device.layer_split_backend(i) != remote_backend) {
-                one_boundary = false;
-                break;
-            }
-        }
-        if (!one_boundary) {
-            std::fprintf(stderr,
-                "[server] mixed-backend target layer split currently supports "
-                "only one backend boundary\n");
-            return false;
-        }
-    } else if (bargs.device.is_layer_split() && target != compiled) {
-        std::fprintf(stderr,
-            "[server] target layer split must use this binary's compiled "
-            "backend (target=%s compiled=%s)\n",
-            placement_backend_name(target), placement_backend_name(compiled));
-        return false;
-    }
-    return true;
-}
-
 static void print_usage(const char * prog) {
     std::fprintf(stderr,
         "Usage: %s <model.gguf> [options]\n"
@@ -215,8 +88,18 @@ static void print_usage(const char * prog) {
         "  --target-shard-ipc-work-dir <path>  Remote target shard IPC scratch directory\n"
         "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
+        "  --target-split-fast-rollback   Opt in to exact F32 checkpoints for local\n"
+        "                                 qwen35 layer splits (extra VRAM; env:\n"
+        "                                 DFLASH_SPLIT_FAST_ROLLBACK=1)\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
+        "  --ds4-fused-decode   Enable DeepSeek4 single-graph GPU decode\n"
+        "  --ds4-expert-top-k <N>\n"
+        "                       Keep and renormalize the highest-ranked N routed experts\n"
+        "                       (0=model default; single-device DeepSeek4 only)\n"
+        "  --ds4-prefill <mode> DeepSeek4 prefill: exact, dense, or sparse\n"
+        "                       (default: exact; dense/sparse are experimental\n"
+        "                       and may change generated tokens)\n"
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
@@ -261,6 +144,9 @@ static void print_usage(const char * prog) {
 #else
         "                         Default: per model family (laguna q8_0, else q4_0)\n"
 #endif
+        "  --kvflash <tokens|auto>       Enable bounded KV residency\n"
+        "  --kvflash-policy <policy>     drafter, lru, or qk (default: drafter)\n"
+        "  --kvflash-tau <N>             Drafter-policy reselect interval (default: 64)\n"
         "\n"
         "PFlash (speculative prefill compression):\n"
         "  --prefill-compression off|auto|always  (default: off)\n"
@@ -296,7 +182,7 @@ static void print_usage(const char * prog) {
         "                              prefix; auto:N uses the last N requests.\n"
         "                              A plain N caches the first N prompt tokens.\n"
         "  --disk-prefix-cache-compress Enable FlowKV aged-history compression composed\n"
-        "                              with the disk cache. Requires --pflash-drafter.\n"
+        "                              with the disk cache. Requires --prefill-drafter.\n"
         "                              compress=false default is byte-identical to base.\n"
         "\n"
         "Chat template (optional, e.g. froggeric Qwen3.6 template for tool-using\n"
@@ -305,6 +191,11 @@ static void print_usage(const char * prog) {
         "                               Overrides the hardcoded Qwen3/Laguna\n"
         "                               renderer. Empty or missing falls back\n"
         "                               to the hardcoded template.\n"
+        "\n"
+        "MoE expert placement:\n"
+        "  --spark                      Enable self-tuning hot/cold expert placement\n"
+        "  --spark-slots <N>            Explicit expert-cache slots per layer\n"
+        "  --spark-vram <GiB>           Total VRAM target (default: whole card)\n"
         "\n"
         "Expert routing analysis:\n"
         "  --freq                       Enable expert frequency tracking + print analysis at shutdown\n"
@@ -331,6 +222,8 @@ int main(int argc, char ** argv) {
     bool target_device_seen = false;
     bool target_devices_seen = false;
     bool fast_rollback_forced_off = false;
+    bool target_split_fast_rollback_cli = false;
+    bool adaptive_experts_set = false;  // --adaptive-experts (MoE architectures only)
 
     // Track which thinking-budget tunables the operator set via CLI.
     // Those values win over the model card (spec §3.1: "Explicit CLI
@@ -419,10 +312,34 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "[server] bad --target-layer-split value\n");
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--target-split-fast-rollback") == 0) {
+            target_split_fast_rollback_cli = true;
         } else if (std::strcmp(argv[i], "--peer-access") == 0) {
             bargs.device.peer_access = true;
         } else if (std::strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
             bargs.chunk = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--ds4-fused-decode") == 0) {
+            bargs.ds4_fused_decode = true;
+        } else if (std::strcmp(argv[i], "--ds4-expert-top-k") == 0 && i + 1 < argc) {
+            bargs.ds4_expert_top_k = std::atoi(argv[++i]);
+            if (bargs.ds4_expert_top_k < 0) {
+                std::fprintf(stderr, "[server] --ds4-expert-top-k must be non-negative\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--ds4-prefill") == 0 && i + 1 < argc) {
+            const char * mode = argv[++i];
+            bargs.ds4_prefill_mode_set = true;
+            if (std::strcmp(mode, "exact") == 0) {
+                bargs.ds4_prefill_mode = PrefillAttentionMode::Exact;
+            } else if (std::strcmp(mode, "dense") == 0) {
+                bargs.ds4_prefill_mode = PrefillAttentionMode::Dense;
+            } else if (std::strcmp(mode, "sparse") == 0) {
+                bargs.ds4_prefill_mode = PrefillAttentionMode::Sparse;
+            } else {
+                std::fprintf(stderr,
+                    "[server] --ds4-prefill expects exact, dense, or sparse\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--fa-window") == 0 && i + 1 < argc) {
             bargs.fa_window = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--model-name") == 0 && i + 1 < argc) {
@@ -450,7 +367,8 @@ int main(int argc, char ** argv) {
                     "--adaptive-experts: tau must be a float in (0,1], got \"%s\"\n", tau);
                 return 1;
             }
-            setenv("DFLASH_ADAPTIVE_K_TAU", tau, 0);  // explicit env still wins
+            set_environment_variable("DFLASH_ADAPTIVE_K_TAU", tau, false);  // explicit env still wins
+            adaptive_experts_set = true;
         } else if (std::strcmp(argv[i], "--verify-width") == 0 && i + 1 < argc) {
             bargs.verify_width = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-fast-rollback") == 0) {
@@ -467,7 +385,7 @@ int main(int argc, char ** argv) {
                                      "'auto', got '%s'\n", argv[i]);
                 return 1;
             }
-            ::setenv("DFLASH_KVFLASH", argv[i], 1);
+            set_environment_variable("DFLASH_KVFLASH", argv[i], true);
         } else if (std::strcmp(argv[i], "--kvflash-policy") == 0 && i + 1 < argc) {
             ++i;
             if (std::strcmp(argv[i], "drafter") != 0 && std::strcmp(argv[i], "lru") != 0 &&
@@ -476,14 +394,14 @@ int main(int argc, char ** argv) {
                              argv[i]);
                 return 1;
             }
-            ::setenv("DFLASH_KVFLASH_POLICY", argv[i], 1);
+            set_environment_variable("DFLASH_KVFLASH_POLICY", argv[i], true);
         } else if (std::strcmp(argv[i], "--kvflash-tau") == 0 && i + 1 < argc) {
             if (std::atoi(argv[++i]) <= 0) {
                 std::fprintf(stderr, "--kvflash-tau expects a positive interval, got '%s'\n",
                              argv[i]);
                 return 1;
             }
-            ::setenv("DFLASH_KVFLASH_TAU", argv[i], 1);
+            set_environment_variable("DFLASH_KVFLASH_TAU", argv[i], true);
         } else if (std::strcmp(argv[i], "--spark") == 0) {
             spark_autotune = true;
         } else if (std::strcmp(argv[i], "--spark-slots") == 0 && i + 1 < argc) {
@@ -537,7 +455,7 @@ int main(int argc, char ** argv) {
             sconfig.pflash_drafter_path = argv[++i];
             // kvflash reads this to lazy-attach the drafter as its
             // residency scorer even when prefill compression is off.
-            ::setenv("DFLASH_KVFLASH_DRAFTER", argv[i], 1);
+            set_environment_variable("DFLASH_KVFLASH_DRAFTER", argv[i], true);
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
             sconfig.pflash_skip_park = true;
         } else if (std::strcmp(argv[i], "--prefill-upstream-base") == 0 && i + 1 < argc) {
@@ -641,23 +559,71 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
-    if (fast_rollback_forced_off) bargs.fast_rollback = false;
-
-    if (!validate_server_placement(bargs, sconfig)) return 2;
-
-    if (bargs.remote_draft.enabled() && bargs.draft_path) {
-        const std::string arch = detect_arch(bargs.model_path);
-        if (arch.empty()) {
+    if (fast_rollback_forced_off) {
+        bargs.fast_rollback = false;
+        target_split_fast_rollback_cli = false;
+        // This is the global rollback kill switch, including an externally
+        // supplied layer-split opt-in.
+        unset_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK");
+    } else if (target_split_fast_rollback_cli) {
+        if (!bargs.device.is_layer_split()) {
             std::fprintf(stderr,
-                "[server] failed to detect model architecture for remote draft validation\n");
-            return 1;
-        }
-        if (!arch_supports_remote_draft(arch)) {
-            std::fprintf(stderr,
-                "[server] model architecture '%s' does not support remote draft execution\n",
-                arch.c_str());
+                "[server] --target-split-fast-rollback requires "
+                "--target-devices with at least two local devices\n");
             return 2;
         }
+        if (bargs.device.is_mixed_layer_split() ||
+            bargs.remote_target_shard.enabled()) {
+            std::fprintf(stderr,
+                "[server] --target-split-fast-rollback supports only local "
+                "same-backend target splits\n");
+            return 2;
+        }
+        set_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK", "1", true);
+    }
+
+    // Resolve documented environment defaults before factory preparation so
+    // compatibility warnings describe the effective backend configuration.
+    // An explicit --draft-swa value continues to take precedence.
+    if (bargs.draft_swa_window == 0) {
+        if (const char * e = std::getenv("DFLASH27B_DRAFT_SWA")) {
+            bargs.draft_swa_window = std::atoi(e);
+        }
+    }
+
+    // Ask the factory to resolve model/placement facts and apply its feature
+    // admission policy before any setup work. server_main only maps the
+    // categorized result to the existing process exit convention.
+    BackendFeatureConfig backend_features;
+    backend_features.pflash_enabled =
+        sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
+    backend_features.pflash_drafter_configured =
+        !sconfig.pflash_drafter_path.empty();
+    backend_features.routing_stats_requested =
+        sconfig.freq_tracking || !sconfig.collect_routing_path.empty();
+    backend_features.adaptive_experts_requested = adaptive_experts_set;
+    const BackendPreparation backend_preparation =
+        prepare_backend(bargs, backend_features);
+    if (!backend_preparation.ok()) {
+        std::fprintf(stderr, "[server] %s\n",
+                     backend_preparation.message.c_str());
+        return backend_preparation.error ==
+                BackendPreparationError::FeatureCompatibility
+            ? 2
+            : 1;
+    }
+    // Options that parsed cleanly but do nothing on this model. Reported up
+    // front so they are visible before the backend's own startup chatter.
+    for (const std::string & warning : backend_preparation.warnings) {
+        std::fprintf(stderr, "[server] warning: %s\n", warning.c_str());
+    }
+    const ResolvedBackendPlan & backend_plan = backend_preparation.plan;
+    const std::string & arch = backend_plan.arch();
+    if (target_split_fast_rollback_cli && arch != "qwen35") {
+        std::fprintf(stderr,
+            "[server] --target-split-fast-rollback is only supported for "
+            "qwen35 targets (detected '%s')\n", arch.c_str());
+        return 2;
     }
 
     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.
@@ -680,13 +646,13 @@ int main(int argc, char ** argv) {
     // allocate their routing_stats_ so we can print freq analysis at shutdown.
     if (sconfig.freq_tracking || !sconfig.collect_routing_path.empty()) {
         // Enable routing stats on all MoE backends. An explicit CLI flag must
-        // guarantee stats are allocated, but setenv(overwrite=0) would leave a
+        // guarantee stats are allocated, but overwrite=false would leave a
         // pre-existing EMPTY env var in place — and the backends treat an empty
         // path as "disabled", so --freq/--collect-routing would silently no-op.
         // Force the value when unset or empty; preserve a non-empty user path.
         auto ensure_stats_env = [](const char * name, const char * val) {
             const char * cur = std::getenv(name);
-            if (!cur || cur[0] == '\0') setenv(name, val, 1);
+            if (!cur || cur[0] == '\0') set_environment_variable(name, val, true);
         };
         ensure_stats_env("DFLASH_QWEN35MOE_RUNTIME_STATS_OUT", "/dev/null");
         ensure_stats_env("DFLASH_LAGUNA_NEXT_PLACEMENT_OUT", "/dev/null");
@@ -694,10 +660,10 @@ int main(int argc, char ** argv) {
 
     // Explicit --cache-type-k/v override via env vars.
     if (!cache_type_k.empty()) {
-        setenv("DFLASH27B_KV_K", cache_type_k.c_str(), 1);
+        set_environment_variable("DFLASH27B_KV_K", cache_type_k.c_str(), true);
     }
     if (!cache_type_v.empty()) {
-        setenv("DFLASH27B_KV_V", cache_type_v.c_str(), 1);
+        set_environment_variable("DFLASH27B_KV_V", cache_type_v.c_str(), true);
     }
 
     // TQ3_0 KV auto-selection was removed (2026-07): tq3_0 saved ~40% VRAM on
@@ -708,9 +674,9 @@ int main(int argc, char ** argv) {
     // PFlash performance defaults: BSA kernel + sparse alpha + full attention window.
     bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
     if (pflash_enabled) {
-        setenv("DFLASH_FP_USE_BSA", "1", 0);
-        setenv("DFLASH_FP_ALPHA", "0.85", 0);
-        setenv("DFLASH27B_FA_WINDOW", "0", 0);
+        set_environment_variable("DFLASH_FP_USE_BSA", "1", false);
+        set_environment_variable("DFLASH_FP_ALPHA", "0.85", false);
+        set_environment_variable("DFLASH27B_FA_WINDOW", "0", false);
     }
 
     if (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped &&
@@ -733,29 +699,11 @@ int main(int argc, char ** argv) {
     // Load pflash drafter tokenizer (if pflash enabled).
     Tokenizer drafter_tokenizer;
     if (pflash_enabled) {
-        if (sconfig.pflash_drafter_path.empty()) {
-            std::fprintf(stderr, "[server] --prefill-compression requires --prefill-drafter\n");
-            return 1;
-        }
         std::fprintf(stderr, "[server] loading pflash drafter tokenizer from %s\n",
                      sconfig.pflash_drafter_path.c_str());
         if (!drafter_tokenizer.load_from_gguf(sconfig.pflash_drafter_path.c_str())) {
             std::fprintf(stderr, "[server] drafter tokenizer load failed\n");
             return 1;
-        }
-        if (sconfig.pflash_remote_drafter) {
-            if (!bargs.remote_draft.enabled()) {
-                std::fprintf(stderr,
-                    "[server] mixed-backend PFlash requires --draft-ipc-bin\n");
-                return 2;
-            }
-            const std::string arch = detect_arch(bargs.model_path);
-            if (!arch_supports_pflash_compression(arch)) {
-                std::fprintf(stderr,
-                    "[server] model architecture '%s' does not support PFlash compression\n",
-                    arch.c_str());
-                return 2;
-            }
         }
         std::fprintf(stderr, "[server] pflash: mode=%s threshold=%d keep=%.3f drafter_gpu=%d skip_park=%d\n",
                      sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" : "always",
@@ -775,48 +723,46 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Honor DFLASH27B_DRAFT_SWA env (documented in server/README.md) when --draft-swa is absent.
-    if (bargs.draft_swa_window == 0) {
-        if (const char * e = std::getenv("DFLASH27B_DRAFT_SWA")) {
-            bargs.draft_swa_window = std::atoi(e);
-        }
-    }
-
     // Create backend.
     g_peer_access_opt_in = bargs.device.peer_access;
     std::fprintf(stderr, "[server] creating backend...\n");
-    const std::string arch = detect_arch(bargs.model_path);
     if (spark_autotune) {
         // Self-tuning hot/cold MoE residency: enable the bounded expert cache
         // (auto-tunes the working set at serve time), auto-load a learned
         // placement profile next to the model if present, and keep persisting it
         // from live traffic. One command; improves across restarts. Both laguna
         // and qwen35moe.
-        const bool is_laguna  = (arch == "laguna");
-        const bool is_qwenmoe = (arch == "qwen35moe");
-        if (is_laguna || is_qwenmoe) {
+        const bool is_laguna = (arch == "laguna");
+        if (arch_has_expert_offload(arch)) {
             const std::string pfx = is_laguna ? "DFLASH_LAGUNA_" : "DFLASH_QWEN35MOE_";
             const std::string profile = std::string(bargs.model_path) + ".spark.csv";
             std::FILE * pf = std::fopen(profile.c_str(), "rb");
             const bool have_profile = (pf != nullptr);
             if (pf) std::fclose(pf);
-            ::setenv("DFLASH_SPARK", "1", 1);   // backend auto-sizes the cache ring from the VRAM target
+            // The backend auto-sizes the cache ring from the VRAM target.
+            set_environment_variable("DFLASH_SPARK", "1", true);
             if (spark_vram_gib > 0.0)
-                ::setenv("DFLASH_SPARK_VRAM_MB",
-                         std::to_string((long long)(spark_vram_gib * 1024.0)).c_str(), 1);
+                set_environment_variable(
+                    "DFLASH_SPARK_VRAM_MB",
+                    std::to_string((long long)(spark_vram_gib * 1024.0)).c_str(), true);
             if (spark_slots >= 0)               // explicit --spark-slots overrides auto-sizing
-                ::setenv((pfx + "CACHE_SLOTS").c_str(), std::to_string(spark_slots).c_str(), 1);
+                set_environment_variable(
+                    (pfx + "CACHE_SLOTS").c_str(),
+                    std::to_string(spark_slots).c_str(), true);
             if (is_laguna) {
-                ::setenv("DFLASH_LAGUNA_EXPERT_CACHE", "1", 1);
-                ::setenv("DFLASH_LAGUNA_GPU_REMAP", "1", 1);
+                set_environment_variable("DFLASH_LAGUNA_EXPERT_CACHE", "1", true);
+                set_environment_variable("DFLASH_LAGUNA_GPU_REMAP", "1", true);
             }
-            if (have_profile) ::setenv((pfx + "HOTNESS").c_str(), profile.c_str(), 1);
+            if (have_profile) {
+                set_environment_variable(
+                    (pfx + "HOTNESS").c_str(), profile.c_str(), true);
+            }
             // Persist the learned routing profile after each request. laguna saves
             // via NEXT_PLACEMENT_OUT; qwen35moe via RUNTIME_STATS_OUT (that var is
             // what allocates its routing-stats accumulator).
             const char * save_var = is_laguna ? "DFLASH_LAGUNA_NEXT_PLACEMENT_OUT"
                                               : "DFLASH_QWEN35MOE_RUNTIME_STATS_OUT";
-            ::setenv(save_var, profile.c_str(), 1);
+            set_environment_variable(save_var, profile.c_str(), true);
             if (spark_vram_gib > 0.0)
                 std::fprintf(stderr, "[spark] autotune ON (%s): vram target %.1f GiB, profile=%s (%s)\n",
                     arch.c_str(), spark_vram_gib, profile.c_str(), have_profile ? "loaded" : "new");
@@ -829,48 +775,32 @@ int main(int argc, char ** argv) {
                 arch.c_str());
         }
     }
-    auto backend = create_backend(bargs);
+    auto backend = create_backend(bargs, backend_plan);
     if (!backend) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
     }
+    // Cross-check the capability table against the backend that was actually
+    // built. arch_supports_remote_draft() admitted this launch from the arch
+    // string alone; if the two ever disagree the table is stale, and failing
+    // here beats routing draft work to a backend that cannot serve it.
     if (bargs.remote_draft.enabled() && bargs.draft_path &&
         !backend->supports_remote_draft()) {
         std::fprintf(stderr,
-            "[server] detected model backend does not support remote draft execution\n");
+            "[server] internal: architecture '%s' is listed as supporting "
+            "remote draft execution but the constructed backend does not\n",
+            arch.c_str());
         backend->shutdown();
         return 2;
     }
-
     // ── Thinking-budget v2: resolve model card and apply to ServerConfig ──
-    // Read general.name + general.architecture directly from the GGUF.
-    // This is best-effort; if the file can't be opened (corruption, removed
-    // after backend init) we fall through to hard-fallback defaults via
-    // resolve_model_card(...).
-    std::string general_name;
-    std::string general_arch = arch;  // fall back to detect_arch() result
-    {
-        gguf_init_params gip{};
-        gip.no_alloc = true;
-        gip.ctx = nullptr;
-        gguf_context * gctx = gguf_init_from_file(bargs.model_path, gip);
-        if (gctx) {
-            int64_t name_id = gguf_find_key(gctx, "general.name");
-            if (name_id >= 0) {
-                const char * v = gguf_get_val_str(gctx, name_id);
-                if (v) general_name = v;
-            }
-            int64_t arch_id = gguf_find_key(gctx, "general.architecture");
-            if (arch_id >= 0) {
-                const char * v = gguf_get_val_str(gctx, arch_id);
-                if (v) general_arch = v;
-            }
-            gguf_free(gctx);
-        }
-        std::fprintf(stderr,
-            "[server] gguf meta: general.name='%s' general.architecture='%s'\n",
-            general_name.c_str(), general_arch.c_str());
-    }
+    // Reuse the metadata captured during factory preparation instead of
+    // opening the GGUF header again.
+    const std::string & general_name = backend_plan.model().name;
+    const std::string & general_arch = backend_plan.arch();
+    std::fprintf(stderr,
+        "[server] gguf meta: general.name='%s' general.architecture='%s'\n",
+        general_name.c_str(), general_arch.c_str());
 
     ModelCard card = resolve_model_card(
         bargs.model_path ? bargs.model_path : "",
@@ -1072,6 +1002,18 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  peer_access     = %s\n",
                  bargs.device.peer_access ? "ON" : "off");
     std::fprintf(stderr, "[server] │  chunk           = %d\n", bargs.chunk);
+    if (arch == "deepseek4") {
+        std::fprintf(stderr, "[server] │  ds4_fused      = %s\n",
+                     bargs.ds4_fused_decode ? "ON" : "off");
+        if (bargs.ds4_expert_top_k > 0) {
+            std::fprintf(stderr, "[server] │  ds4_expert_topk= %d\n",
+                         bargs.ds4_expert_top_k);
+        } else {
+            std::fprintf(stderr, "[server] │  ds4_expert_topk= model default\n");
+        }
+        std::fprintf(stderr, "[server] │  ds4_prefill     = %s\n",
+                     prefill_attention_mode_name(bargs.ds4_prefill_mode));
+    }
     std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
     if (bargs.fa_window > 0) {
         std::fprintf(stderr, "[server] │  ⚠  fa_window > 0 drops system prompt / "
@@ -1080,6 +1022,10 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
+    if (bargs.device.is_layer_split()) {
+        std::fprintf(stderr, "[server] │  split_rollback  = %s\n",
+                     split_chain_fast_rollback_enabled() ? "ON" : "off");
+    }
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
     std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
@@ -1209,7 +1155,7 @@ int main(int argc, char ** argv) {
 
     // Lazy-draft: park decode draft at startup to free VRAM (~3.3 GB).
     if (sconfig.lazy_draft && bargs.draft_path) {
-        backend->park("draft");
+        backend->park(ParkTarget::DraftModel);
     }
 
     // Set up routing data collector (--collect-routing)

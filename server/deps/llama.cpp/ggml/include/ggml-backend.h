@@ -348,6 +348,38 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // End a backend split before a late node introduces a new cross-backend
+    // input, so independent earlier nodes can be enqueued before the copy/event
+    // wait. Must be configured before allocating the graph.
+    GGML_API void                 ggml_backend_sched_set_late_cross_input_split(ggml_backend_sched_t sched, bool enabled);
+
+    // Apply the same split rule only at an explicitly marked node. This keeps
+    // unrelated cross-backend consumers in their established scheduler
+    // segments. Nodes must be registered before allocating the graph.
+    GGML_API void                 ggml_backend_sched_add_late_cross_input_split_node(
+                                            ggml_backend_sched_t sched,
+                                            const struct ggml_tensor * node);
+
+    // Mark a GGML_MOE_FUSED_DEFERRED_PEER_COPY node as a deferred peer copy. The
+    // scheduler keeps src[0] on its owner backend, records a dedicated event
+    // after the producing split, and injects the native handle into the op.
+    GGML_API void                 ggml_backend_sched_add_deferred_peer_copy_node(
+                                            ggml_backend_sched_t sched,
+                                            struct ggml_tensor * node);
+
+    // Configure generic execution policy for registered deferred peer copies.
+    // A split queues the event wait before the consumer split; without it the
+    // deferred-copy op waits at its exact position in the consumer graph.
+    GGML_API void                 ggml_backend_sched_set_deferred_peer_copy_split(
+                                            ggml_backend_sched_t sched,
+                                            bool enabled);
+
+    // Inputs in one split share a destination backend and copy generation, so
+    // they may reuse one generation wait before their ordered copies.
+    GGML_API void                 ggml_backend_sched_set_batch_split_copies(
+                                            ggml_backend_sched_t sched,
+                                            bool enabled);
+
     //
     // Meta backend
     //

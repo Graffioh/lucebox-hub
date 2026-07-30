@@ -1,6 +1,9 @@
 # DeepSeek V4 Flash — DFlash Integration
 
-This document describes the current DeepSeek V4 Flash implementation in DFlash. Today DeepSeek4 runs through the layer-split path: a local CUDA prefix shard plus either a local follow-on shard or a remote Halo/HIP target shard.
+This document describes the current DeepSeek V4 Flash implementation in
+DFlash. DeepSeek4 supports a monolithic HIP backend, a layer-split backend,
+and an in-process heterogeneous expert-parallel backend for a discrete GPU
+paired with Strix Halo.
 
 ## Model Architecture
 
@@ -23,10 +26,12 @@ DeepSeek V4 Flash is a 43-layer MoE model with:
 
 | Area | Files |
 |------|-------|
-| Backend selection / init | `src/common/backend_factory.cpp`, `src/deepseek4/deepseek4_layer_split_adapter.{h,cpp}` |
+| Backend selection / init | `src/common/backend_factory.cpp`, `src/deepseek4/deepseek4_backend.{h,cpp}`, `src/deepseek4/deepseek4_layer_split_adapter.{h,cpp}` |
 | Per-shard forward graph | `src/deepseek4/deepseek4_graph.cpp` |
 | Model weights and metadata | `src/deepseek4/deepseek4_internal.h`, `src/deepseek4/deepseek4_loader.cpp` |
 | HC pre/post CUDA kernel | `src/deepseek4/deepseek4_hc_cuda.cu`, `.h` |
+| DSpark runtime | `src/deepseek4/deepseek4_dspark*.{h,cpp}` |
+| Heterogeneous expert storage/evaluation | `src/common/moe_hybrid_{storage,ffn_eval}.*` |
 | Remote target-shard daemon | `src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp` |
 | Shared target-shard IPC infrastructure | `src/common/target_shard_ipc.*`, `src/placement/remote_target_shard_config.h` |
 | Backend IPC CLI entry | `src/ipc/backend_ipc_main.cpp` |
@@ -41,9 +46,83 @@ DeepSeek V4 Flash is a 43-layer MoE model with:
 4. **Shard boundary handoff** — Non-final shards return the updated **full HC state tensor** (`n_tokens × n_hc × n_embd`) to the next shard.
 5. **Tail shard completion** — The last shard resumes at its `layer_begin`, runs the remaining layers, then performs the final HC merge, RMSNorm, and `lm_head` projection to produce logits.
 
-The production DeepSeek4 path does **not** use the retired per-expert worker split. The MoE computation stays inside the shard that owns each layer.
+The layer-split path keeps MoE computation inside the shard that owns each
+layer. The heterogeneous path is different: it partitions every layer's routed
+experts between two local HIP backends and joins their results in process. It
+does not use the retired per-expert IPC worker.
 
 ## Execution Modes
+
+### Monolithic HIP
+
+Single-device HIP launches use `DeepSeek4Backend`. Two explicit serving
+options are available:
+
+- `--ds4-fused-decode` enables the cached single-graph decode path. It keeps
+  HC, attention, MoE, and the output projection on the GPU and avoids
+  per-layer host round trips. On HIP this option requests a monolithic model
+  load because the fused graph must reference every expert tensor directly.
+  If that allocation fails, the backend logs the fallback and continues with
+  hybrid expert placement and layered decode.
+- `--ds4-expert-top-k N` keeps the highest-ranked `N` routed experts and
+  renormalizes their weights. `0` uses the model default. Reducing this value is an
+  approximate inference policy and must be quality-validated for the target
+  workload.
+
+For the validated single-device Strix Halo profile:
+
+```bash
+./server/build-hip/dflash_server /opt/models/DeepSeek-V4-Flash.gguf \
+  --target-device hip:0 \
+  --ds4-fused-decode \
+  --ds4-expert-top-k 4
+```
+
+### In-process heterogeneous expert parallel
+
+The Lucebox path keeps dense target work, selected hot experts, and the local
+DSpark drafter on the discrete GPU. Strix Halo owns the remaining routed
+experts. Both owners are submitted for each MoE layer before an on-device join;
+the target KV cache and sampler remain on the main GPU. This is route-level
+expert parallelism, not layer pipelining or a second server process.
+
+Build one HIP binary for both architectures. For the qualified R9700 + Strix
+Halo machine:
+
+```bash
+cmake -S server -B server/build-hip-dual \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES='gfx1151;gfx1201' \
+  -DGGML_HIP_GRAPHS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build server/build-hip-dual -j
+```
+
+The feature is still a burn-in profile and is disabled by default. The minimum
+placement controls are:
+
+```bash
+export DFLASH_DS4_MOE_TP=1
+export DFLASH_DS4_MOE_TP_INPROC=1
+export DFLASH_DS4_MOE_TP_GPU=1       # Strix Halo
+export DFLASH_EXPERT_BUDGET_MB=11700 # hot experts on the R9700
+export DFLASH_DS4_DRAFT_GPU=0        # local drafter on the R9700
+export LUCE_MMVQ_MAX_NCOLS=4
+
+./server/build-hip-dual/dflash_server /path/to/deepseek4-target.gguf \
+  --target-device hip:0 \
+  --peer-access \
+  --ds4-expert-top-k 4 \
+  --ds4-prefill sparse
+```
+
+Top-4 routing and sparse prefill are explicit approximations. Omit them when
+the model-default top-6 route or exact prefill is required. The 2026-07-29
+qualification used a fixed q=4 local drafter, two discarded warm-ups, R9700
+`auto`, and Strix Halo `high`. A 1,956-token prompt measured 51.1 tok/s median
+decode and 415.52 tok/s median sparse prefill. Those numbers require the full
+qualified manifest, including the burn-in kernel switches; they are not a
+claim for the minimal activation example above.
 
 ### Local single-shard
 
@@ -102,13 +181,108 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 |----------|---------|
 | `DFLASH_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
 | `DFLASH_DS4_TIMING` | Enable DS4 timing logs for the layer-split parent and target-shard daemon. Useful for profiling prefill/decode breakdowns; leave unset for normal runs. |
+| `DFLASH_DS4_SPEC` / `DFLASH_DS4_DRAFT` | Enable DSpark and select its GGUF. |
+| `DFLASH_DS4_DRAFT_GPU` | HIP device for the in-process drafter. |
+| `DFLASH_DS4_MOE_TP` | Enable routed-expert partitioning. |
+| `DFLASH_DS4_MOE_TP_INPROC` | Use two local HIP backends instead of an expert IPC worker. |
+| `DFLASH_DS4_MOE_TP_GPU` | HIP device that owns the cold expert stack. |
+| `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
+| `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
+| `GGML_CUDA_BATCH_PEER_COPIES` | Batch ordered peer copies behind one dependency. |
+| `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Long-prefill arena kill switch; set `0` to restore per-layer owner allocation. |
 
 `DFLASH_DS4_TIMING` enables the existing timing banners:
 
 - parent / local shard: `[deepseek4-split-timing]`
 - remote Halo shard: `[deepseek4-target-timing]`
 
-DeepSeek4 no longer uses the old expert-split environment variables or expert-worker tuning knobs. Those retired knobs were removed from the codebase rather than left behind as unsupported debug switches.
+The old per-expert IPC worker is retired. The `DFLASH_DS4_MOE_TP*` variables
+above configure the in-process route-owner implementation.
+
+## DSpark Speculative Decode
+
+DeepSeek4 uses the shared DFlash DSpark head implementation together with a
+DeepSeek4-specific three-layer drafter and fused target verification. The draft
+GGUF carries its auxiliary projections under the existing `dflash.dspark.*`
+tensor contract. DeepSeek4/MTP checkpoints store compatible heads under the
+`mtp.2.*` namespace, which the converter maps as follows.
+
+Supported DeepSeek4/MTP input tensors:
+
+| DeepSeek4/MTP tensor | GGUF tensor |
+|----------------------|-------------|
+| `mtp.2.markov_head.markov_w1.weight` | `dflash.dspark.markov.w1` |
+| `mtp.2.markov_head.markov_w2.weight` | `dflash.dspark.markov.w2` |
+| `mtp.2.confidence_head.proj.weight` | `dflash.dspark.confidence.weight` |
+| `mtp.2.confidence_head.proj.bias` | `dflash.dspark.confidence.bias` |
+
+If the MTP confidence projection is bias-less, the converter writes a zero
+bias so the GGUF loader still sees the pair it expects. The Markov head alone
+is enough for DSpark greedy-chain correction; confidence gating remains
+optional.
+
+Example conversion with the DS4 MTP shard that contains the DSpark heads:
+
+```bash
+python server/scripts/convert_dflash_to_gguf.py \
+  /path/to/dflash-draft/model.safetensors \
+  /path/to/dflash-draft.gguf \
+  --aux-heads /path/to/hf-ds4-flash-dspark/model-00048-of-00048.safetensors
+```
+
+Run the converted drafter against a DeepSeek4 target with:
+
+```bash
+export DFLASH_DS4_SPEC=1
+export DFLASH_DS4_FUSED_VERIFY=1
+export DFLASH_DS4_DRAFT=/path/to/dflash-draft.gguf
+export DFLASH_DS4_SPEC_Q=4
+
+./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
+  --target-device hip:0 \
+  --ds4-fused-decode \
+  --ds4-expert-top-k 4
+```
+
+`DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
+whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
+logits can select a different token than the normal causal verifier even at
+temperature 0. Leave it unset when comparing against the normal verifier, or
+set `DFLASH_DS4_SEQ_VERIFY=1` for the slower token-at-a-time verification
+diagnostic. Neither fused verification nor the separate
+`--ds4-expert-top-k 4` approximation should be presented as byte-identical AR.
+
+DSpark can verify against in-process heterogeneous expert placement. The
+drafter remains local to its selected HIP backend; a failed draft load is
+reported and falls back to normal autoregressive decode. The target cache and
+sampler stay on the main backend while routed target experts execute on their
+configured owners. `--ds4-expert-top-k 4` remains a separate approximate
+policy; omit it to retain the model's default six routed experts.
+
+On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
+the variable is unset. This keeps the four-row verifier on MMVQ. On a 128 GiB
+Strix Halo Radeon 8060S using ROCm 7.2.4, the rebased candidate measured 32.12
+tok/s weighted at fixed q=4 and 31.94 tok/s with confidence-adaptive width,
+versus 25.31 tok/s autoregressive. All three configurations scored 10/10 on the
+same five GSM and five Math prompts. The run used `--ds4-expert-top-k 4`, the
+platform `performance` profile, and the GPU `high` performance level; fixed
+q=4 with the model-default six routed experts measured 28.26 tok/s. Enabling
+DSpark alone therefore does not guarantee 30 tok/s. Set
+`LUCE_MMVQ_MAX_NCOLS` explicitly to override the platform default. AR, NVIDIA,
+and other HIP architectures retain the shared dispatch default.
+
+Adaptive width is automatic. When the draft artifact has a compatible
+confidence projection, the runtime selects q=2, q=3, or q=4 from the cumulative
+confidence of the proposed prefix. It adds the projection to the same fused
+Markov graph and reads its scores in the existing token-id synchronization; no
+additional host round trip is introduced. Artifacts without a compatible
+confidence head transparently retain the existing acceptance-EWMA policy.
+
+On the gfx1151 validation host, confidence-adaptive width retained 10/10
+GSM+Math accuracy and measured 31.94 tok/s weighted, within 0.6% of fixed q=4
+at 32.12 tok/s. These numbers are workload-specific; the confidence policy is
+enabled only when DSpark is explicitly enabled and the draft artifact contains
+a compatible confidence head.
 
 ## Example: CUDA + Halo Layer Split
 
@@ -148,6 +322,6 @@ Explicit mixed-backend split using the generic target-shard flags:
 
 | Target | Backend | Purpose |
 |--------|---------|---------|
-| `dflash_server` | CUDA | Production server / CUDA parent |
+| `dflash_server` | CUDA or HIP | Production server |
 | `backend_ipc_daemon` | HIP | Remote Halo target shard for mixed-backend layer split |
 | `test_deepseek4_unit` | CUDA | Unit tests (no model files needed) |

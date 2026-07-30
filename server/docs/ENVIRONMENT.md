@@ -24,7 +24,21 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |
 | `DFLASH_ADAPTIVE_K_DENSE` | per-model default | CSV of MoE layers kept dense under adaptive-K (DFlash capture layers). Warned-inert on families that do not thread layer indices yet. |
 | `DFLASH_MMID_GROUPED` | unset | Grouped MUL_MAT_ID kernel for small verify batches; candidate for CLI promotion. |
+| `DFLASH_MMID_GROUPED_TYPES` | 7 | Grouped-kernel type mask; bit 3 (`8`) opts ROCmFP2/ROCmFP3 into the path. |
+| `DFLASH_MMID_GROUPED_DEVICE` | -1 | Optional zero-based device restriction; unset/-1 applies to every eligible device. |
+| `DFLASH_DS4_MOE_TP` / `DFLASH_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. |
+| `DFLASH_DS4_MOE_TP_GPU` | auto | HIP device for the cold DeepSeek4 expert owner. |
+| `GGML_CUDA_BATCH_PEER_COPIES` | unset | BURN-IN: publish ordered HIP peer copies with one cross-device dependency per source/destination pair. |
+| `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
+| `DFLASH_MOE_TP_*` / `DFLASH_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `DFLASH_DS4_*` names remain compatibility aliases. |
+| `DFLASH_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
 | `DFLASH_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
+| `DFLASH_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
+| `DFLASH_PREFILL_CACHE_SLOTS` | 0 | Container-entrypoint equivalent of `--prefill-cache-slots`; not read directly by the native binary. |
+| `DFLASH_SPLIT_FAST_ROLLBACK` | unset | OPT-IN: exact F32 checkpoints and replay-free rollback for local qwen35 target layer splits. Prefer `--target-split-fast-rollback`; adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
+| `DFLASH_STALL_TOOL_PREFIX` | unset | OPT-IN: recover a stalled tool call by injecting the prepared tool prefix when generation stops after an action suffix. |
+| `DFLASH_DS4_SPEC` / `DFLASH_DS4_DRAFT` / `DFLASH_DS4_DRAFT_GPU` | unset | OPT-IN: enable DeepSeek4 DSpark, select its draft GGUF, and optionally select the local drafter GPU. See `DS4.md`. |
+| `DFLASH_DS4_CUDA_LAYERS` | auto | Override the DeepSeek4 heterogeneous layer-split heuristic. See `DS4.md`. |
 
 ## Full inventory (generated)
 
@@ -45,6 +59,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_ADAPTIVE_WIDTH_MIN` - adaptive_verify_width.h
 - `DFLASH_ADAPTIVE_WIDTH_THETA` - adaptive_verify_width.h
 - `DFLASH_COLD_THREADS` - moe_expert_compute_cpu.cpp
+- `DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_CUDA_MMVQ_MOE_KERNEL` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_DISABLE_DRAFT_ATTN` - draft_graph.cpp
 - `DFLASH_DISABLE_DRAFT_ATTN_GATE` - draft_graph.cpp
 - `DFLASH_DISABLE_DRAFT_AUX_NORMS` - draft_graph.cpp
@@ -56,9 +72,29 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DRAFT_KV` - laguna_backend.cpp, qwen35_backend.cpp
 - `DFLASH_DRAFT_PERSIST` - laguna_backend.cpp
 - `DFLASH_DROP_COLD` - qwen35moe_backend.cpp, qwen35moe_pipelined_decode.cpp
-- `DFLASH_DS4_TIMING` - deepseek4_target_shard_ipc_daemon.cpp
+- `DFLASH_DS4_ADAPTIVE_WIDTH` - deepseek4_dspark_spec.cpp
+- `DFLASH_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp
+- `DFLASH_DS4_DENSE_TP_MASK` - deepseek4_loader.cpp
+- `DFLASH_DS4_DENSE_TP_STRIX_FRACTION` - deepseek4_loader.cpp
+- `DFLASH_DS4_DRAFT` - deepseek4_backend.cpp
+- `DFLASH_DS4_DRAFT_GPU` - deepseek4_backend.cpp
+- `DFLASH_DS4_DSPARK_DEBUG` - deepseek4_graph.cpp
+- `DFLASH_DS4_FUSED_VERIFY` - deepseek4_dspark_spec.cpp, deepseek4_loader.cpp
+- `DFLASH_DS4_HOTNESS_CSV` - deepseek4_backend.cpp
+- `DFLASH_DS4_MOE_TP` - deepseek4_backend.cpp
+- `DFLASH_DS4_MOE_TP_GPU` - deepseek4_backend.cpp
+- `DFLASH_DS4_MOE_TP_INPROC` - deepseek4_backend.cpp
+- `DFLASH_DS4_ROUTING_STATS_OUT` - deepseek4_backend.cpp
+- `DFLASH_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
+- `DFLASH_DS4_SPEC` - deepseek4_backend.cpp
+- `DFLASH_DS4_SPEC_Q` - deepseek4_dspark_spec.cpp
+- `DFLASH_DS4_TIMING` - deepseek4_backend.cpp, deepseek4_target_shard_ipc_daemon.cpp
+- `DFLASH_DS4_TP_CAPTURE_CACHE_SLOTS` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TOPK` - deepseek4_graph.cpp
 - `DFLASH_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
 - `DFLASH_EXPERT_BUDGET_PCT` - laguna_backend.cpp
+- `DFLASH_FAST_ROLLBACK_THRESHOLD` - chain_rollback_policy.h
 - `DFLASH_FEATURE_DTYPE` - dflash_feature_ring.cpp
 - `DFLASH_FP_ALPHA` - http_server.cpp, qwen3_graph.cpp, server_main.cpp
 - `DFLASH_FP_CHUNK_S` - qwen3_graph.cpp
@@ -115,25 +151,39 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_LAGUNA_VERIFY_WIDTH` - laguna_backend.cpp
 - `DFLASH_LAGUNA_VERIFY_WIDTH_MAX` - laguna_backend.cpp
 - `DFLASH_MAX_CONTEXT` - laguna_backend.cpp, qwen35moe_backend.cpp
+- `DFLASH_MMID_TELEMETRY` - ggml-cuda.cu, mmvq.cu
 - `DFLASH_MMQ_FULL_BATCH_MIN` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MMQ_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MODEL_CARDS_DIR` - model_card.cpp
 - `DFLASH_MOE_COLD_BACKEND` - deepseek4_loader.cpp
+- `DFLASH_MOE_COMPACT_MATERIALIZED` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_DUPLICATE_HOT_ON_COLD` - moe_hybrid_storage.cpp
+- `DFLASH_MOE_EXPERT_COMPUTE_DAEMON_TOKEN_LOOP` - moe_expert_compute_ipc.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY` - moe_expert_compute_ipc.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_IPC_DTYPE` - moe_expert_compute_ipc.cpp
+- `DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU` - deepseek4_backend.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_IPC_PROFILE` - moe_expert_compute_ipc.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_IPC_SHARED_BYTES` - moe_expert_compute_ipc.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_IPC_TRANSPORT` - moe_expert_compute_ipc.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_THREADS` - moe_expert_compute_cpu.cpp
+- `DFLASH_MOE_EXPERT_MAJOR_GPU_REDUCE` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_EXPERT_MAJOR_PREFILL` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FIXED_SLOT_GRAPHS` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FIXED_SLOT_MAX` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_FULL_COLD_PARALLEL` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_FUSED_COMBINE` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_PREFILL_DEVICE_INPUT` - deepseek4_graph.cpp
 - `DFLASH_MOE_PREFILL_HOT_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_PREFILL_MASKED_COLD` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` - deepseek4_graph.cpp
 - `DFLASH_NO_MASK` - laguna_backend.cpp
 - `DFLASH_NO_MOE_ROUTER_FUSE` - qwen35moe_ffn.cpp
 - `DFLASH_NO_MOE_SWIGLU_FUSE` - qwen35moe_ffn.cpp
 - `DFLASH_NO_PREAD` - deepseek4_loader.cpp
 - `DFLASH_PROF` - prof_env.h
+- `DFLASH_PREFILL_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefill-cache-slots`)
+- `DFLASH_PREFIX_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefix-cache-slots`)
 - `DFLASH_QWEN35MOE_CACHE_SLOTS` - qwen35moe_backend.cpp
 - `DFLASH_QWEN35MOE_HOTNESS` - qwen35moe_backend.cpp
 - `DFLASH_QWEN35MOE_NEXT_PLACEMENT_OUT` - qwen35moe_backend.cpp
@@ -146,8 +196,14 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_QWEN35_NO_KVPAD` - graph_builders.cpp
 - `DFLASH_SAMPLED_VERIFY` - laguna_backend.cpp, qwen35_backend.cpp
 - `DFLASH_SHARE_DIR` - http_server.cpp
+- `DFLASH_SINGLE_CHAIN_CHECKPOINT_F32` - chain_rollback_policy.h
+- `DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG` - chain_rollback_policy.h
 - `DFLASH_SPARK` - laguna_backend.cpp, qwen35moe_backend.cpp
 - `DFLASH_SPARK_VRAM_MB` - laguna_backend.cpp, qwen35moe_backend.cpp
+- `DFLASH_SPLIT_CAPTURE_SELFTEST` - qwen35_layer_split_dflash_target.cpp
+- `DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG` - qwen35_layer_split_dflash_target.cpp, qwen35_target_graph.cpp
+- `DFLASH_SPLIT_FAST_ROLLBACK` - chain_rollback_policy.h
+- `DFLASH_STALL_TOOL_PREFIX` - http_server.cpp
 - `DFLASH_SV_DEBUG` - qwen35_backend.cpp
 - `DFLASH_TARGET_SHARD_IPC_SHARED_BYTES` - target_shard_ipc.cpp
 - `DFLASH_TARGET_SHARD_IPC_TRANSPORT` - target_shard_ipc.cpp
@@ -156,6 +212,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
 - `HOME` - spark_corpus.cpp
+- `LUCE_CUDA_I32_REPEAT` - moe_hybrid_ffn_eval.cpp
+- `LUCE_MMVQ_MAX_NCOLS` - deepseek4_backend.cpp
 - `LUCE_QK_FUSE_LAYERS` - laguna_target_graph.cpp
 - `LUCE_QK_FUSE_MODE` - laguna_target_graph.cpp
 - `PFLASH_DRAFTER_EARLY_EXIT_N` - qwen3_graph.cpp

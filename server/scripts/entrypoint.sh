@@ -264,10 +264,7 @@ if [ "$GPU_VRAM_GB" -gt 0 ]; then
         else
             : "${DFLASH_MAX_CTX:=98304}"
         fi
-    elif [ "$GPU_VRAM_GB" -lt 48 ]; then
-        : "${DFLASH_MAX_CTX:=131072}"
     else
-        : "${DFLASH_PREFIX_CACHE_SLOTS:=0}"
         : "${DFLASH_MAX_CTX:=131072}"
     fi
 fi
@@ -279,8 +276,6 @@ fi
 : "${DFLASH_BUDGET:=22}"
 : "${DFLASH_MAX_CTX:=16384}"
 : "${DFLASH_LAZY:=0}"
-: "${DFLASH_PREFIX_CACHE_SLOTS:=0}"
-: "${DFLASH_PREFILL_CACHE_SLOTS:=0}"
 : "${DFLASH_CACHE_TYPE_K:=}"
 : "${DFLASH_CACHE_TYPE_V:=}"
 : "${DFLASH_VERBOSE:=0}"
@@ -493,8 +488,14 @@ CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
      --host "$DFLASH_HOST"
      --port "$DFLASH_PORT"
      --max-ctx "$DFLASH_MAX_CTX"
-     --prefix-cache-slots "$DFLASH_PREFIX_CACHE_SLOTS"
      --think-max-tokens "$DFLASH_THINK_MAX")
+
+# Keep cache defaults owned by dflash_server. In particular, omitting
+# DFLASH_PREFIX_CACHE_SLOTS preserves the native nonzero default instead of
+# silently disabling multi-turn prefix reuse in the container. Explicit
+# values, including 0 as an operator opt-out, are forwarded unchanged.
+[ -n "${DFLASH_PREFIX_CACHE_SLOTS:-}" ] && CMD+=(--prefix-cache-slots "$DFLASH_PREFIX_CACHE_SLOTS")
+[ -n "${DFLASH_PREFILL_CACHE_SLOTS:-}" ] && CMD+=(--prefill-cache-slots "$DFLASH_PREFILL_CACHE_SLOTS")
 
 [ -n "$DRAFT_ARG" ]                && CMD+=(--draft "$DRAFT_ARG")
 [ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$DFLASH_BUDGET")

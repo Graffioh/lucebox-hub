@@ -1,8 +1,8 @@
 // Common MoE hybrid mode types and descriptors.
 //
-// Model-agnostic abstractions used by both qwen35moe and laguna backends
-// to implement the hybrid expert offload strategy (hot experts on GPU,
-// cold experts on CPU, concurrent evaluation).
+// Model-agnostic abstractions used by MoE backends to implement heterogeneous
+// expert execution. The hot and cold owners may be two GPUs or a GPU and CPU;
+// model integrations only describe architecture and tensor layout.
 
 #pragma once
 
