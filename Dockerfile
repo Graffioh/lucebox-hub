@@ -55,7 +55,7 @@ WORKDIR /src
 
 # COPY ordering is structured to keep the CUDA build cached across
 # Python-only edits. The cmake build only depends on dflash/{CMakeLists,
-# include, src, test, hip_compat, deps}. Everything else (Python scripts,
+# cmake, include, src, test, hip_compat, deps}. Everything else (Python scripts,
 # workspace pyproject manifests, lockfile, READMEs) is copied later so
 # editing server.py / bench_*.py / lucebox sources doesn't invalidate the
 # ~25-minute CUDA template-instantiation layer below.
@@ -65,6 +65,7 @@ WORKDIR /src
 # uses server/; submodule binding names still write `dflash/deps/...`
 # inside .gitmodules (arbitrary identifiers; only paths matter).
 COPY server/CMakeLists.txt /src/server/CMakeLists.txt
+COPY server/cmake /src/server/cmake
 COPY server/include /src/server/include
 COPY server/src /src/server/src
 COPY server/test /src/server/test

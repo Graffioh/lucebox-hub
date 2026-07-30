@@ -806,6 +806,18 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_draft_topk_cuda PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_draft_topk_cuda)
     endif()
+    # Focused CUDA-vs-CPU oracle for the IQ4_XS MMQ stream-k scheduler. These
+    # shapes cover the no-fixup, partial-row, fixup, two-wave, and deeper-K
+    # transitions validated for the llama.cpp #22298 backport on sm_86.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmq_streamk_iq4_xs.cpp")
+        add_executable(test_mmq_streamk_iq4_xs test/test_mmq_streamk_iq4_xs.cpp)
+        target_link_libraries(test_mmq_streamk_iq4_xs PRIVATE
+            ggml
+            ggml-cpu
+            ggml-cuda
+            ggml-base)
+        list(APPEND _raw_unit_test_targets test_mmq_streamk_iq4_xs)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
         # RED phase binary: same source WITHOUT the fix flag — documents the bug.
         add_executable(test_drafter_tail_capture_guard_red
