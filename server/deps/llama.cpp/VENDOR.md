@@ -12,7 +12,7 @@ This directory contains the ggml-only subset used by Lucebox Hub.
 - Reconstruction: `luce-dflash@6fbe72d67069136bbd370be703e1d4f441b5e942` plus cherry-picked PRs `#35`, `#37`, upstream `llama.cpp #22298`, and the target-only GGML delta from `Luce-Org/lucebox-ggml#39`
 - Vendored paths: `LICENSE`, `common/jinja`, `common/log.h`, `common/unicode.*`, `ggml`, `gguf-py`
 
-Open ggml feature PRs are intentionally not included until they are merged, except for explicitly listed hub test PRs.
+Open ggml feature PRs are not included unless they are explicitly listed above as a vendored source.
 
 ## Hub-local heterogeneous execution patches
 
