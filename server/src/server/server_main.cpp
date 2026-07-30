@@ -86,7 +86,8 @@ static void print_usage(const char * prog) {
         "                                 Env: DFLASH27B_DRAFT_SWA)\n"
         "  --target-shard-ipc-bin <path>  Remote target shard IPC daemon for mixed target split\n"
         "  --target-shard-ipc-work-dir <path>  Remote target shard IPC scratch directory\n"
-        "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"
+        "  --target-devices <list>        Target devices, e.g. cuda:0,cuda:1\n"
+        "  --target-split-mode <mode>     Multi-GPU mode: layer (default) or tensor\n"
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --target-split-fast-rollback   Opt in to exact F32 checkpoints for local\n"
         "                                 qwen35 layer splits (extra VRAM; env:\n"
@@ -305,6 +306,12 @@ int main(int argc, char ** argv) {
             target_devices_seen = true;
             if (!parse_placement_device_list(argv[++i], bargs.device)) {
                 std::fprintf(stderr, "[server] bad --target-devices value (expected backend:gpu[,backend:gpu...])\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--target-split-mode") == 0 && i + 1 < argc) {
+            if (!parse_target_split_mode(argv[++i], bargs.device.split_mode)) {
+                std::fprintf(stderr,
+                    "[server] bad --target-split-mode value (expected layer or tensor)\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--target-layer-split") == 0 && i + 1 < argc) {
@@ -968,8 +975,10 @@ int main(int argc, char ** argv) {
                  sconfig.effort_tiers.max, src_of(cli_set.effort_max));
     std::fprintf(stderr, "[server] │  target_device   = %s\n",
                  placement_device_name(bargs.device).c_str());
-    if (bargs.device.is_layer_split()) {
-        std::fprintf(stderr, "[server] │  target_shards   =");
+    std::fprintf(stderr, "[server] │  target_split    = %s\n",
+                 target_split_mode_name(bargs.device.split_mode));
+    if (bargs.device.is_multi_device()) {
+        std::fprintf(stderr, "[server] │  target_devices  =");
         for (size_t i = 0; i < bargs.device.layer_split_gpus.size(); ++i) {
             std::fprintf(stderr, " %s:%d",
                          placement_backend_name(bargs.device.layer_split_backend(i)),

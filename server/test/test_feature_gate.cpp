@@ -176,6 +176,60 @@ static void test_feature_gate_validates_target_split_topology() {
         two_boundaries, "qwen35", PlacementBackend::Cuda).empty());
 }
 
+static void test_feature_gate_tensor_parallel_requirements() {
+    BackendArgs valid;
+    valid.model_path = "/nonexistent/model.gguf";
+    TEST_ASSERT(parse_placement_device_list(
+        "cuda:0,cuda:1", valid.device));
+    valid.device.split_mode = TargetSplitMode::Tensor;
+    TEST_ASSERT(gate_result(
+        valid, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs missing_devices;
+    missing_devices.model_path = "/nonexistent/model.gguf";
+    missing_devices.device.split_mode = TargetSplitMode::Tensor;
+    TEST_ASSERT(!gate_result(
+        missing_devices, "qwen35", PlacementBackend::Cuda).empty());
+
+    TEST_ASSERT(!gate_result(
+        valid, "laguna", PlacementBackend::Cuda).empty());
+
+    BackendArgs hip;
+    hip.model_path = "/nonexistent/model.gguf";
+    TEST_ASSERT(parse_placement_device_list("hip:0,hip:1", hip.device));
+    hip.device.split_mode = TargetSplitMode::Tensor;
+    TEST_ASSERT(!gate_result(
+        hip, "qwen35", PlacementBackend::Hip).empty());
+
+    BackendArgs mixed = valid;
+    TEST_ASSERT(parse_placement_device_list(
+        "cuda:0,hip:0", mixed.device));
+    mixed.device.split_mode = TargetSplitMode::Tensor;
+    TEST_ASSERT(!gate_result(
+        mixed, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs weighted = valid;
+    weighted.device.layer_split_weights = {1.0, 1.0};
+    TEST_ASSERT(!gate_result(
+        weighted, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs remote = valid;
+    remote.remote_target_shard.ipc_bin = "/usr/bin/target-shard";
+    TEST_ASSERT(!gate_result(
+        remote, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendFeatureConfig pflash;
+    pflash.pflash_enabled = true;
+    pflash.pflash_drafter_configured = true;
+    TEST_ASSERT(!gate_result(
+        valid, "qwen35", PlacementBackend::Cuda, pflash).empty());
+
+    BackendArgs draft = valid;
+    draft.draft_path = "/nonexistent/draft.gguf";
+    TEST_ASSERT(!gate_result(
+        draft, "qwen35", PlacementBackend::Cuda).empty());
+}
+
 static void test_feature_gate_ds4_prefill_requires_deepseek4() {
     BackendArgs args = gate_args_hip_deepseek4();
     args.ds4_prefill_mode_set = true;
@@ -414,6 +468,7 @@ int main() {
     RUN_TEST(test_feature_gate_mixed_draft_placement_requires_ipc);
     RUN_TEST(test_feature_gate_pflash_requires_drafter_and_supported_arch);
     RUN_TEST(test_feature_gate_validates_target_split_topology);
+    RUN_TEST(test_feature_gate_tensor_parallel_requirements);
     RUN_TEST(test_feature_gate_ds4_prefill_requires_deepseek4);
     RUN_TEST(test_feature_gate_approximate_ds4_prefill_requires_local_hip);
     RUN_TEST(test_feature_gate_ds4_decode_options_require_monolithic_hip);

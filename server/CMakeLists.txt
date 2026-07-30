@@ -317,6 +317,7 @@ add_library(dflash_common STATIC
     src/qwen35/qwen35_target_shard_ipc_daemon.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
+    src/qwen35/qwen35_tensor_parallel.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
     src/qwen35/qwen35_dflash_target.cpp
     src/qwen35/qwen35_layer_split_dflash_target.cpp
@@ -683,6 +684,16 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_cuda_pool_shutdown)
     endif()
 
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_comm_api.cpp")
+        add_executable(test_cuda_comm_api test/test_cuda_comm_api.cpp)
+        target_include_directories(test_cuda_comm_api PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_cuda_comm_api PRIVATE
+            ggml-cuda ggml ggml-base)
+        add_test(NAME cuda_comm_api COMMAND test_cuda_comm_api)
+    endif()
+
     add_executable(test_rocmfp4 deps/llama.cpp/ggml/rocmfp4/test_rocmfp4.c)
     target_link_libraries(test_rocmfp4 PRIVATE ggml-base)
     if(UNIX)
@@ -725,6 +736,10 @@ if(DFLASH27B_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_rocmfpx_mmq)
     endif()
+    add_executable(test_qwen35_tensor_parallel test/test_qwen35_tensor_parallel.cpp)
+    target_include_directories(test_qwen35_tensor_parallel PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+    target_link_libraries(test_qwen35_tensor_parallel PRIVATE dflash_common)
+    add_test(NAME qwen35_tensor_parallel COMMAND test_qwen35_tensor_parallel)
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)

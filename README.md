@@ -380,7 +380,8 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `--draft-device <dev>` | same as target | Draft backend; mixed backend needs `--draft-ipc-bin` |
 | `--target-gpu N` | `0` | Target GPU index |
 | `--draft-gpu N` | same as target | Draft GPU index; offload draft to a second GPU |
-| `--target-devices <list>` / `--target-layer-split` | single GPU | Layer-split target across GPUs |
+| `--target-devices <list>` / `--target-layer-split` | single GPU | Select target GPUs and optional layer-split weights |
+| `--target-split-mode {layer,tensor}` | `layer` | Multi-GPU strategy; tensor mode currently supports dense Qwen3.5/3.6 on local CUDA GPUs |
 | `--target-split-fast-rollback` | off | Qwen35 local layer-split only: enable exact F32 per-token checkpoints and skip accepted-token replay. Adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
 | `DFLASH_SPLIT_FAST_ROLLBACK=1` | off | Environment equivalent of `--target-split-fast-rollback`. |
 | `--draft-ipc-bin <path>` | — | Out-of-process draft binary (mixed CUDA/HIP) |
@@ -390,6 +391,22 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `DFLASH_TARGET_GPU=N` | `0` | Env var equivalent of `--target-gpu` |
 | `DFLASH_DRAFT_GPU=N` | same as target | Env var equivalent of `--draft-gpu` |
 | `DFLASH_MODEL_NAME=<name>` | `dflash` | Env var equivalent of `--model-name`; sets the `/v1/models` id and selects the matching `share/model_cards/<name>.json` |
+
+Tensor parallelism uses NCCL collectives between the selected devices and does
+not include other visible GPUs in its communicator. For example, this runs the
+Qwen3.6 target on GPU 1 and GPU 2 while leaving GPU 0 available:
+
+```bash
+dflash_server model.gguf \
+  --target-devices cuda:1,cuda:2 \
+  --target-split-mode tensor
+```
+
+Tensor mode requires at least two homogeneous local CUDA devices. It currently
+rejects weighted layer placement, target-shard IPC, and prefill compression.
+The token embedding stays on the host and the LM head is mirrored because the
+server performs argmax inside the target graph; transformer attention, FFN,
+DeltaNet weights, and runtime state are split across the selected GPUs.
 
 **MoE expert offload (Spark)**
 

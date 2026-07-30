@@ -62,16 +62,44 @@ std::string check_feature_compatibility(
                std::string(placement_backend_name(target_backend)) +
                " draft=" + placement_backend_name(draft_backend) + ")";
     }
-    // ── target layer split structure and remote backend topology
+    // ── target split structure and remote backend topology
+    const bool tensor_mode =
+        args.device.split_mode == TargetSplitMode::Tensor;
     if (!args.device.is_layer_split() &&
         !args.device.layer_split_weights.empty()) {
-        return "--target-layer-split requires --target-devices";
+        return tensor_mode
+            ? "--target-layer-split is incompatible with tensor parallelism"
+            : "--target-layer-split requires --target-devices";
     }
-    if (args.device.is_layer_split()) {
+    if (args.device.is_multi_device() || tensor_mode) {
         const std::string placement_error =
             validate_device_placement(args.device, /*device_count=*/-1);
         if (!placement_error.empty()) {
-            return "bad target layer split: " + placement_error;
+            return "bad target placement: " + placement_error;
+        }
+    }
+
+    // The target-only implementation is deliberately narrow: every rank must
+    // be a local CUDA device and target-replacing features are unsupported.
+    if (tensor_mode) {
+        if (arch != "qwen35") {
+            return "tensor parallelism is currently supported only for dense qwen35";
+        }
+        if (target_backend != PlacementBackend::Cuda ||
+            compiled_backend != PlacementBackend::Cuda) {
+            return "tensor parallelism currently requires local CUDA devices";
+        }
+        if (args.device.is_mixed_layer_split()) {
+            return "tensor parallelism requires homogeneous local devices";
+        }
+        if (args.remote_target_shard.enabled()) {
+            return "tensor parallelism is incompatible with --target-shard-ipc-bin";
+        }
+        if (features.pflash_enabled) {
+            return "tensor parallelism does not yet support prefill compression";
+        }
+        if (args.draft_path) {
+            return "tensor parallelism does not yet support a DFlash draft";
         }
     }
 
