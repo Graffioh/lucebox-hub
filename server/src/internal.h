@@ -392,7 +392,9 @@ struct TargetCache {
     // persistent cache memory (not tracked by the per-call gallocr), matching
     // SGLang's mamba_caches.intermediate_ssm / intermediate_conv_window pattern.
     //
-    //   ssm_intermediate: [S_v, S_v, H_v, max_q_len] f32, one per delta layer.
+    //   ssm_intermediate: [S_v, S_v, H_v, max_q_len], checkpoint dtype
+    //     (Q8_0 for direct caches, F16 for migrated single-target caches, or
+    //     F32 for opt-in exact rollback), one per delta layer.
     //     Element t on axis 3 holds the DeltaNet recurrent state after
     //     processing verify token t. Spec decode commits t = commit_n - 1.
     //   conv_input_cache: [(kernel-1) + max_q_len, conv_channels] f32, one per
@@ -420,9 +422,9 @@ struct TargetCache {
 };
 
 // Snapshot the current SSM+conv state into TargetCache::*_snap tensors.
-void snapshot_ssm_state(TargetCache & c);
+bool snapshot_ssm_state(TargetCache & c, ggml_backend_t backend);
 // Restore the SSM+conv state from the snapshot.
-void restore_ssm_state(TargetCache & c);
+bool restore_ssm_state(TargetCache & c, ggml_backend_t backend);
 // Allocate rollback snapshot tensors mirroring live ssm/conv state (MoE path).
 bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend);
 
@@ -536,6 +538,9 @@ bool create_target_cache(const TargetWeights & w,
                          bool prefill_only = false,
                          int ctx_alloc = 0);
 
+// `f32_ssm_intermediates` enables exact per-token checkpoints for the opt-in
+// layer-split fast rollback path. The default preserves the established Q8_0
+// allocation and avoids its ~1.65 GiB incremental memory cost.
 bool create_target_cache_partial(const TargetWeights & w,
                                  int max_ctx,
                                  int max_verify_tokens,
@@ -545,7 +550,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  int layer_begin,
                                  int layer_end,
                                  bool allocate_target_feat,
-                                 int ctx_alloc = 0);
+                                 int ctx_alloc = 0,
+                                 bool f32_ssm_intermediates = false);
 
 void free_target_cache(TargetCache & c);
 

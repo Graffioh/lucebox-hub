@@ -18,6 +18,13 @@ inline bool env_flag_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
+// Layer-split fast rollback needs exact F32 per-token checkpoints. Keep the
+// feature, its capture work, and its additional memory behind one shared
+// opt-in so allocation and runtime dispatch cannot drift apart.
+inline bool split_chain_fast_rollback_enabled() {
+    return env_flag_enabled("DFLASH_SPLIT_FAST_ROLLBACK");
+}
+
 inline ChainRollbackPolicy resolve_chain_rollback_policy() {
     ChainRollbackPolicy policy;
     policy.checkpoint_f32 = env_flag_enabled("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32");

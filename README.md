@@ -346,6 +346,8 @@ When compression is on, the request path picks one of three modes automatically,
 | `DFLASH27B_KV_TQ3=1` | (default) | Preset TQ3_0 K+V (3.5 bpv, fits 256K @ 24 GB) |
 | `DFLASH27B_KV_Q4=1` | off | Q4_0 K+V (4.5 bpv, legacy, ~128K ceiling) |
 | `--prefix-cache-slots N` | — | Live prefix-cache slot count |
+| `DFLASH_PREFIX_CACHE_SLOTS=N` | `32` | Container-entrypoint equivalent of `--prefix-cache-slots`; the native binary itself uses the CLI flag. |
+| `DFLASH_PREFILL_CACHE_SLOTS=N` | `0` | Container-entrypoint equivalent of `--prefill-cache-slots`; the native binary itself uses the CLI flag. |
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
 | `--kv-cache-budget N` | — | On-disk cache size cap |
 
@@ -379,6 +381,8 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `--target-gpu N` | `0` | Target GPU index |
 | `--draft-gpu N` | same as target | Draft GPU index; offload draft to a second GPU |
 | `--target-devices <list>` / `--target-layer-split` | single GPU | Layer-split target across GPUs |
+| `--target-split-fast-rollback` | off | Qwen35 local layer-split only: enable exact F32 per-token checkpoints and skip accepted-token replay. Adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
+| `DFLASH_SPLIT_FAST_ROLLBACK=1` | off | Environment equivalent of `--target-split-fast-rollback`. |
 | `--draft-ipc-bin <path>` | — | Out-of-process draft binary (mixed CUDA/HIP) |
 | `--peer-access` | off | Enable P2P between target GPUs |
 | `--chunk N` | backend default | Prefill ubatch size |
@@ -394,6 +398,7 @@ For MoE targets (`laguna`, `qwen35`/`qwen36`) whose experts don't fit in VRAM. `
 | Flag / env | Default | Effect |
 |---|---|---|
 | `--spark` | off | One-flag autotune: enable the bounded expert cache, size it from the VRAM target, auto-load and keep persisting a placement profile (`<model>.gguf.spark.csv`). |
+| `--spark-slots <N>` | auto | Explicit expert-cache slots per layer; overrides Spark auto-sizing. |
 | `--spark-vram <GiB>` | whole card | Total VRAM Spark may use; it sizes the hot tier + cache + KV under this cap. |
 | `DFLASH_SPARK=1` | off | Env equivalent of `--spark`. |
 | `DFLASH_SPARK_VRAM_MB=N` | — | Env equivalent of `--spark-vram` (in MB). |

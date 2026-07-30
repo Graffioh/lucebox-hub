@@ -1,6 +1,9 @@
 #include "CppUnitTestFramework.hpp"
 #include "scoped_env.h"
 #include "chain_rollback_policy.h"
+#include "internal.h"
+
+#include "ggml-cpu.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +12,7 @@
 
 using dflash::common::resolve_chain_rollback_policy;
 using dflash::common::RollbackDiag;
+using dflash::common::split_chain_fast_rollback_enabled;
 
 namespace {
 struct ChainRollbackPolicyFixture {};
@@ -60,6 +64,71 @@ TEST_CASE(ChainRollbackPolicyFixture, policy_defaults_and_env_parsing) {
     setenv("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG", "1", 1);
     CHECK(resolve_chain_rollback_policy().diagnostics);
     clear_policy_env();
+}
+
+TEST_CASE(ChainRollbackPolicyFixture, split_fast_rollback_is_explicitly_opt_in) {
+    const luce_test::ScopedEnvVar split_fast("DFLASH_SPLIT_FAST_ROLLBACK", nullptr);
+    unsetenv("DFLASH_SPLIT_FAST_ROLLBACK");
+    CHECK(!split_chain_fast_rollback_enabled());
+
+    setenv("DFLASH_SPLIT_FAST_ROLLBACK", "1", 1);
+    CHECK(split_chain_fast_rollback_enabled());
+    setenv("DFLASH_SPLIT_FAST_ROLLBACK", "true", 1);
+    CHECK(split_chain_fast_rollback_enabled());
+    setenv("DFLASH_SPLIT_FAST_ROLLBACK", "0", 1);
+    CHECK(!split_chain_fast_rollback_enabled());
+    setenv("DFLASH_SPLIT_FAST_ROLLBACK", "", 1);
+    CHECK(!split_chain_fast_rollback_enabled());
+    unsetenv("DFLASH_SPLIT_FAST_ROLLBACK");
+}
+
+TEST_CASE(ChainRollbackPolicyFixture, split_checkpoint_dtype_is_gated_at_allocation) {
+    const luce_test::ScopedEnvVar kv_f16("DFLASH27B_KV_F16", nullptr);
+    const luce_test::ScopedEnvVar kv_q4("DFLASH27B_KV_Q4", nullptr);
+    const luce_test::ScopedEnvVar kv_tq3("DFLASH27B_KV_TQ3", nullptr);
+    const luce_test::ScopedEnvVar kv_k("DFLASH27B_KV_K", nullptr);
+    const luce_test::ScopedEnvVar kv_v("DFLASH27B_KV_V", nullptr);
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    CHECK(backend != nullptr);
+    if (!backend) return;
+
+    dflash::common::TargetWeights weights;
+    weights.n_layer = 2;
+    weights.full_attention_interval = 2;
+    weights.n_embd_head_k = 32;
+    weights.n_embd_head_v = 32;
+    weights.n_head = 1;
+    weights.n_head_kv = 1;
+    weights.n_embd = 32;
+    weights.n_capture_layers = 0;
+    weights.ssm_d_inner = 32;
+    weights.ssm_d_state = 1;
+    weights.ssm_dt_rank = 1;
+    weights.ssm_n_group = 1;
+    weights.ssm_d_conv = 2;
+
+    auto check_type = [&](bool f32_checkpoints, ggml_type expected) {
+        dflash::common::TargetCache cache;
+        const bool ok = dflash::common::create_target_cache_partial(
+            weights, /*max_ctx=*/1, /*max_verify_tokens=*/2, backend, cache,
+            /*prefill_only=*/false, /*layer_begin=*/0, /*layer_end=*/2,
+            /*allocate_target_feat=*/false, /*ctx_alloc=*/0,
+            /*f32_ssm_intermediates=*/f32_checkpoints);
+        CHECK(ok);
+        if (ok) {
+            CHECK(cache.ssm_intermediate.size() == 1);
+            CHECK(cache.ssm_intermediate[0] != nullptr);
+            if (cache.ssm_intermediate[0]) {
+                CHECK(cache.ssm_intermediate[0]->type == expected);
+            }
+        }
+        dflash::common::free_target_cache(cache);
+    };
+
+    check_type(false, GGML_TYPE_Q8_0);
+    check_type(true, GGML_TYPE_F32);
+    ggml_backend_free(backend);
 }
 
 TEST_CASE(ChainRollbackPolicyFixture, diagnostics_accumulator_and_print_contract) {

@@ -6,6 +6,7 @@
 #include "layer_split_forward.h" // free_qwen35_layer_split_shards
 #include "dflash_feature_ring.h"
 #include "common/io_utils.h"
+#include "common/chain_rollback_policy.h"
 #include "common/sampler.h"
 #include "common/layer_split_utils.h"
 #include "common/gguf_inspect.h"
@@ -55,7 +56,11 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
                                          shard.backend, shard.cache,
                                          /*prefill_only=*/!cfg.run_dflash,
                                          shard.layer_begin, shard.layer_end,
-                                         /*allocate_target_feat=*/false)) {
+                                         /*allocate_target_feat=*/false,
+                                         /*ctx_alloc=*/0,
+                                         /*f32_ssm_intermediates=*/
+                                             cfg.run_dflash &&
+                                             split_chain_fast_rollback_enabled())) {
             std::fprintf(stderr, "target-split load/cache gpu=%d: %s\n",
                          shard.gpu, dflash27b_last_error());
             free_qwen35_layer_split_shards(shards);
