@@ -15,6 +15,7 @@
 #include "chat_template.h"
 #include "model_card.h"
 #include "common/backend_factory.h"
+#include "common/chain_rollback_policy.h"
 #include "common/layer_split_utils.h"
 #include "common/spark_corpus.h"
 #include "common/moe_routing_collector.h"
@@ -87,6 +88,9 @@ static void print_usage(const char * prog) {
         "  --target-shard-ipc-work-dir <path>  Remote target shard IPC scratch directory\n"
         "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
+        "  --target-split-fast-rollback   Opt in to exact F32 checkpoints for local\n"
+        "                                 qwen35 layer splits (extra VRAM; env:\n"
+        "                                 DFLASH_SPLIT_FAST_ROLLBACK=1)\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
         "  --ds4-fused-decode   Enable DeepSeek4 single-graph GPU decode\n"
@@ -140,6 +144,9 @@ static void print_usage(const char * prog) {
 #else
         "                         Default: per model family (laguna q8_0, else q4_0)\n"
 #endif
+        "  --kvflash <tokens|auto>       Enable bounded KV residency\n"
+        "  --kvflash-policy <policy>     drafter, lru, or qk (default: drafter)\n"
+        "  --kvflash-tau <N>             Drafter-policy reselect interval (default: 64)\n"
         "\n"
         "PFlash (speculative prefill compression):\n"
         "  --prefill-compression off|auto|always  (default: off)\n"
@@ -175,7 +182,7 @@ static void print_usage(const char * prog) {
         "                              prefix; auto:N uses the last N requests.\n"
         "                              A plain N caches the first N prompt tokens.\n"
         "  --disk-prefix-cache-compress Enable FlowKV aged-history compression composed\n"
-        "                              with the disk cache. Requires --pflash-drafter.\n"
+        "                              with the disk cache. Requires --prefill-drafter.\n"
         "                              compress=false default is byte-identical to base.\n"
         "\n"
         "Chat template (optional, e.g. froggeric Qwen3.6 template for tool-using\n"
@@ -184,6 +191,11 @@ static void print_usage(const char * prog) {
         "                               Overrides the hardcoded Qwen3/Laguna\n"
         "                               renderer. Empty or missing falls back\n"
         "                               to the hardcoded template.\n"
+        "\n"
+        "MoE expert placement:\n"
+        "  --spark                      Enable self-tuning hot/cold expert placement\n"
+        "  --spark-slots <N>            Explicit expert-cache slots per layer\n"
+        "  --spark-vram <GiB>           Total VRAM target (default: whole card)\n"
         "\n"
         "Expert routing analysis:\n"
         "  --freq                       Enable expert frequency tracking + print analysis at shutdown\n"
@@ -210,6 +222,7 @@ int main(int argc, char ** argv) {
     bool target_device_seen = false;
     bool target_devices_seen = false;
     bool fast_rollback_forced_off = false;
+    bool target_split_fast_rollback_cli = false;
     bool adaptive_experts_set = false;  // --adaptive-experts (MoE architectures only)
 
     // Track which thinking-budget tunables the operator set via CLI.
@@ -299,6 +312,8 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "[server] bad --target-layer-split value\n");
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--target-split-fast-rollback") == 0) {
+            target_split_fast_rollback_cli = true;
         } else if (std::strcmp(argv[i], "--peer-access") == 0) {
             bargs.device.peer_access = true;
         } else if (std::strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) {
@@ -544,7 +559,28 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
-    if (fast_rollback_forced_off) bargs.fast_rollback = false;
+    if (fast_rollback_forced_off) {
+        bargs.fast_rollback = false;
+        target_split_fast_rollback_cli = false;
+        // This is the global rollback kill switch, including an externally
+        // supplied layer-split opt-in.
+        unset_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK");
+    } else if (target_split_fast_rollback_cli) {
+        if (!bargs.device.is_layer_split()) {
+            std::fprintf(stderr,
+                "[server] --target-split-fast-rollback requires "
+                "--target-devices with at least two local devices\n");
+            return 2;
+        }
+        if (bargs.device.is_mixed_layer_split() ||
+            bargs.remote_target_shard.enabled()) {
+            std::fprintf(stderr,
+                "[server] --target-split-fast-rollback supports only local "
+                "same-backend target splits\n");
+            return 2;
+        }
+        set_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK", "1", true);
+    }
 
     // Resolve documented environment defaults before factory preparation so
     // compatibility warnings describe the effective backend configuration.
@@ -583,6 +619,12 @@ int main(int argc, char ** argv) {
     }
     const ResolvedBackendPlan & backend_plan = backend_preparation.plan;
     const std::string & arch = backend_plan.arch();
+    if (target_split_fast_rollback_cli && arch != "qwen35") {
+        std::fprintf(stderr,
+            "[server] --target-split-fast-rollback is only supported for "
+            "qwen35 targets (detected '%s')\n", arch.c_str());
+        return 2;
+    }
 
     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.
     // This prevents the HTTP server from accepting prompts larger than the
@@ -980,6 +1022,10 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
+    if (bargs.device.is_layer_split()) {
+        std::fprintf(stderr, "[server] │  split_rollback  = %s\n",
+                     split_chain_fast_rollback_enabled() ? "ON" : "off");
+    }
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
     std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
