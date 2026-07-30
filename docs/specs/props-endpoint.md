@@ -449,6 +449,8 @@ Future fields: `accept_rate`, `lookahead_depth`, `draft_model_id`
   "kv_cache_v":      "q4_0",
   "lazy_draft":      false,
   "target_sharding": false,
+  "max_concurrency": 8,
+  "kv_pool_tokens":  16384,
   "chunk":           512,
   "target_device":   "auto:0",
   "draft_device":    "auto:0"
@@ -471,6 +473,9 @@ configuration drift between runs is possible.
 - `lazy_draft` — whether the decode draft is parked when idle.
 - `target_sharding` — true when the target model is layer-split
   across multiple GPUs.
+- `max_concurrency` — configured concurrent decode-slot capacity.
+- `kv_pool_tokens` — total paged K/V pool capacity in tokens, or
+  `null` when the backend uses its default capacity.
 - `chunk` — prefill chunk size in tokens. Determines how prompt
   tokens are batched into the target model during prefill.
 - `target_device` — resolved target-model device placement string

@@ -9,6 +9,7 @@
 // matching wire formats.
 
 #include "http_server.h"
+#include "common/gpu_runtime_compat.h"
 
 #include <algorithm>
 #include <chrono>
@@ -66,7 +67,20 @@ enum class AdmissionDisposition {
 
 }  // namespace
 
-void HttpServer::scheduler_loop(SeqEngine & engine) {
+void HttpServer::scheduler_loop(SeqEngine & engine,
+                                ModelBackend * backend,
+                                size_t replica_index,
+                                int gpu) {
+    if (replica_index != SIZE_MAX && gpu >= 0) {
+        const cudaError_t err = cudaSetDevice(gpu);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr,
+                "[parallel] cannot select replica device %d: %s\n",
+                gpu, cudaGetErrorString(err));
+            request_stop();
+            return;
+        }
+    }
     const int n_slots = engine.slot_count();
     std::vector<SchedSlot> slots((size_t)n_slots);
     uint64_t next_request_id = 1;
@@ -97,9 +111,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         const int n = live_count();
         if (n == published_live_count) return;
         published_live_count = n;
-        if (n > 0) status_.set_concurrent_requests(n);
-        else status_.set_idle();
-        broadcast_status();
+        publish_replica_live(replica_index, n);
     };
 
     auto finish_job = [](ServerJob * job) {
@@ -291,7 +303,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             idx, s.prefill_s, decode_s,
             decode_s > 0.0 ? out_tokens / decode_s : 0.0);
 
+        const bool aborted = s.client_disconnected;
+        const bool failed = s.failed || !backend_ok;
         engine.retire(idx);
+        release_replica_assignment(replica_index, failed, aborted);
         // A retirement may have released the blocks the head job needs.
         deferred_retry_at = {};
 
@@ -364,6 +379,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                                         false, false, t);
             }
             finish_job(job);
+            release_replica_assignment(replica_index, false, false);
             return AdmissionDisposition::Retired;
         }
 
@@ -401,6 +417,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
             if (!ok) {
                 finish_job(job);
+                release_replica_assignment(replica_index, false, true);
                 return AdmissionDisposition::Retired;
             }
         } else if (req.stream) {
@@ -410,6 +427,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             probe.append(": admission retry\n\n");
             if (!probe.flush(job->fd) || !probe.empty()) {
                 finish_job(job);
+                release_replica_assignment(replica_index, false, true);
                 return AdmissionDisposition::Retired;
             }
         }
@@ -433,6 +451,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 send_error(job->fd, 500, "admission failed: " + ar.error);
             }
             finish_job(job);
+            release_replica_assignment(replica_index, true, false);
             return AdmissionDisposition::Retired;
         }
         next_request_id++;
@@ -495,12 +514,16 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     // Fully idle: no stream is waiting on us, so give the
                     // scratch memory back and park in a blocking dequeue.
                     publish_live_count();
-                    backend_.release_scratch();
-                    job = dequeue();
+                    if (backend) backend->release_scratch();
+                    job = replica_index == SIZE_MAX
+                        ? dequeue()
+                        : dequeue_replica(replica_index);
                 } else {
                     // Live slots (or drains) still need decode steps — only
                     // peek at the queue so we return to the loop immediately.
-                    job = try_dequeue();
+                    job = replica_index == SIZE_MAX
+                        ? try_dequeue()
+                        : try_dequeue_replica(replica_index);
                 }
             }
             if (!job) break;  // queue empty: go decode what is already live
@@ -626,6 +649,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             send_error(deferred->fd, 503, "server shutting down");
         }
         finish_job(deferred);
+        release_replica_assignment(replica_index, true, false);
     }
     // Jobs that never reached admission are still parked in their client
     // threads too. Drain the raw queue before returning so run() does not hit

@@ -639,6 +639,10 @@ json build_props_body(const ServerConfig & config,
             {"lazy_draft",      config.lazy_draft},
             {"draft_residency", draft_residency_policy_name(config.draft_residency)},
             {"target_sharding", config.target_sharding},
+            {"max_concurrency", config.max_concurrency},
+            {"kv_pool_tokens",  config.kv_pool_tokens > 0
+                                    ? json(config.kv_pool_tokens)
+                                    : json(nullptr)},
             // Prefill chunk size (bargs.chunk). Surfaced so snapshot
             // tooling captures the full config — bench consumers
             // (dflash/scripts/bench_http_capability.py) read
@@ -916,7 +920,8 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
 
 HttpServer::HttpServer(ModelBackend & backend,
                        Tokenizer & tokenizer,
-                       const ServerConfig & config)
+                       const ServerConfig & config,
+                       const std::vector<LocalReplica> & replicas)
     : backend_(backend)
     , tokenizer_(tokenizer)
     , config_(config)
@@ -928,6 +933,13 @@ HttpServer::HttpServer(ModelBackend & backend,
                    config.disk_cache_continued_interval,
                    config.disk_cache_cold_max_tokens}, backend)
 {
+    for (const LocalReplica & replica : replicas) {
+        auto worker = std::make_unique<ReplicaWorker>();
+        worker->backend = replica.backend;
+        worker->device = replica.device;
+        worker->gpu = replica.gpu;
+        replica_workers_.push_back(std::move(worker));
+    }
     #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
@@ -1103,6 +1115,10 @@ void HttpServer::shutdown() {
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
+    for (std::thread & thread : replica_threads_) {
+        if (thread.joinable()) thread.join();
+    }
+    replica_threads_.clear();
 
     // Close SSE client connections.
     {
@@ -1122,7 +1138,20 @@ void HttpServer::shutdown() {
             j->done = true;
             j->cv.notify_one();
         }
+        for (auto & worker : replica_workers_) {
+            while (!worker->queue.empty()) {
+                ServerJob * j = worker->queue.front();
+                worker->queue.pop_front();
+                std::lock_guard<std::mutex> jlk(j->mu);
+                j->done = true;
+                j->cv.notify_one();
+            }
+            worker->assigned = 0;
+            worker->active = 0;
+        }
         queue_tail_ = nullptr;
+        queue_depth_ = 0;
+        status_.set_queued_requests(0);
     }
 
     // Shutdown save: persist all tracked snapshot slots to disk.
@@ -1207,13 +1236,45 @@ int HttpServer::run() {
     std::fprintf(stderr, "[server] listening on http://%s:%d\n",
                  config_.host.c_str(), config_.port);
 
-    // A backend-provided sequence engine replaces the one-request worker
-    // with the concurrent scheduler. Upstream forwarding stays on the
-    // classic path even when the local backend exposes an engine.
-    if (SeqEngine * engine = backend_.seq_engine();
-        engine && config_.pflash_upstream_base.empty()) {
-        worker_thread_ =
-            std::thread([this, engine]() { scheduler_loop(*engine); });
+    // Start worker thread. When the backend hands out a concurrent-serving
+    // engine the worker runs the iteration-level scheduler over its slots
+    // instead of the one-job-at-a-time loop.
+    // Upstream forwarding, including optional PFlash compression, lives in
+    // the classic request path. Keep using that path when an upstream is
+    // configured even if the local backend also exposes a SeqEngine.
+    if (replica_workers_.size() > 1 &&
+        config_.pflash_upstream_base.empty()) {
+        bool ready = true;
+        for (auto & worker : replica_workers_) {
+            worker->engine = worker->backend
+                ? worker->backend->seq_engine()
+                : nullptr;
+            if (!worker->engine) {
+                std::fprintf(stderr,
+                    "[server] replica %s does not expose a concurrent SeqEngine\n",
+                    worker->device.c_str());
+                ready = false;
+                break;
+            }
+            worker->capacity = worker->engine->slot_count();
+        }
+        if (!ready) return 2;
+        {
+            std::lock_guard<std::mutex> lk(queue_mu_);
+            publish_replica_status_locked();
+        }
+        replica_threads_.reserve(replica_workers_.size());
+        for (size_t i = 0; i < replica_workers_.size(); ++i) {
+            ReplicaWorker * worker = replica_workers_[i].get();
+            replica_threads_.emplace_back([this, worker, i]() {
+                scheduler_loop(*worker->engine, worker->backend, i, worker->gpu);
+            });
+        }
+    } else if (SeqEngine * engine = backend_.seq_engine();
+               engine && config_.pflash_upstream_base.empty()) {
+        worker_thread_ = std::thread([this, engine]() {
+            scheduler_loop(*engine, &backend_, SIZE_MAX, -1);
+        });
     } else {
         worker_thread_ = std::thread([this]() { worker_loop(); });
     }
@@ -1279,6 +1340,10 @@ int HttpServer::run() {
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
+    for (std::thread & thread : replica_threads_) {
+        if (thread.joinable()) thread.join();
+    }
+    replica_threads_.clear();
 
     // Persist disk cache (worker joined — no race on slot_tokens_).
     if (!disk_cache_.disabled() && !slot_tokens_.empty()) {
@@ -3557,6 +3622,68 @@ void HttpServer::process_job(ServerJob * job) {
 
 // ─── Job queue ──────────────────────────────────────────────────────────
 
+int choose_primary_first_replica(const std::vector<int> & assigned,
+                                 const std::vector<int> & capacities) {
+    if (assigned.size() != capacities.size()) return -1;
+    for (size_t i = 0; i < assigned.size(); ++i) {
+        if (capacities[i] > 0 && assigned[i] < capacities[i]) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+void HttpServer::publish_replica_status_locked() {
+    json replicas = json::array();
+    int total_active = 0;
+    for (size_t i = 0; i < replica_workers_.size(); ++i) {
+        const ReplicaWorker & worker = *replica_workers_[i];
+        total_active += worker.active;
+        replicas.push_back({
+            {"priority", i},
+            {"device", worker.device},
+            {"capacity", worker.capacity},
+            {"assigned_requests", worker.assigned},
+            {"active_requests", worker.active},
+            {"available_slots", std::max(0, worker.capacity - worker.assigned)},
+            {"routed_total", worker.routed_total},
+            {"completed_total", worker.completed_total},
+            {"failed_total", worker.failed_total},
+            {"aborted_total", worker.aborted_total},
+        });
+    }
+    status_.set_concurrent_requests(total_active);
+    status_.set_replicas(std::move(replicas));
+}
+
+void HttpServer::dispatch_replicas_locked() {
+    if (replica_workers_.size() < 2) return;
+    while (queue_head_) {
+        std::vector<int> assigned;
+        std::vector<int> capacities;
+        assigned.reserve(replica_workers_.size());
+        capacities.reserve(replica_workers_.size());
+        for (const auto & worker : replica_workers_) {
+            assigned.push_back(worker->assigned);
+            capacities.push_back(worker->capacity);
+        }
+        const int selected = choose_primary_first_replica(assigned, capacities);
+        if (selected < 0) break;
+
+        ServerJob * job = queue_head_;
+        queue_head_ = job->next;
+        if (!queue_head_) queue_tail_ = nullptr;
+        job->next = nullptr;
+
+        ReplicaWorker & worker = *replica_workers_[static_cast<size_t>(selected)];
+        worker.queue.push_back(job);
+        worker.assigned++;
+        worker.routed_total++;
+    }
+    publish_replica_status_locked();
+    queue_cv_.notify_all();
+}
+
 void HttpServer::enqueue(ServerJob * job) {
     std::lock_guard<std::mutex> lk(queue_mu_);
     if (stopping_.load()) {
@@ -3570,7 +3697,13 @@ void HttpServer::enqueue(ServerJob * job) {
     if (queue_tail_) queue_tail_->next = job;
     else queue_head_ = job;
     queue_tail_ = job;
-    queue_cv_.notify_one();
+    ++queue_depth_;
+    status_.set_queued_requests(queue_depth_);
+    if (replica_workers_.size() > 1) {
+        dispatch_replicas_locked();
+    } else {
+        queue_cv_.notify_one();
+    }
 }
 
 ServerJob * HttpServer::dequeue() {
@@ -3588,6 +3721,8 @@ ServerJob * HttpServer::dequeue() {
     ServerJob * j = queue_head_;
     queue_head_ = j->next;
     if (!queue_head_) queue_tail_ = nullptr;
+    queue_depth_ = std::max(0, queue_depth_ - 1);
+    status_.set_queued_requests(queue_depth_);
     j->next = nullptr;
     return j;
 }
@@ -3598,8 +3733,72 @@ ServerJob * HttpServer::try_dequeue() {
     ServerJob * job = queue_head_;
     queue_head_ = job->next;
     if (!queue_head_) queue_tail_ = nullptr;
+    queue_depth_ = std::max(0, queue_depth_ - 1);
+    status_.set_queued_requests(queue_depth_);
     job->next = nullptr;
     return job;
+}
+
+ServerJob * HttpServer::dequeue_replica(size_t replica_index) {
+    std::unique_lock<std::mutex> lk(queue_mu_);
+    if (replica_index >= replica_workers_.size()) return nullptr;
+    ReplicaWorker & worker = *replica_workers_[replica_index];
+    while (worker.queue.empty() && !stopping_.load()) {
+        queue_cv_.wait(lk);
+    }
+    if (worker.queue.empty()) return nullptr;
+    ServerJob * job = worker.queue.front();
+    worker.queue.pop_front();
+    queue_depth_ = std::max(0, queue_depth_ - 1);
+    status_.set_queued_requests(queue_depth_);
+    publish_replica_status_locked();
+    return job;
+}
+
+ServerJob * HttpServer::try_dequeue_replica(size_t replica_index) {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    if (replica_index >= replica_workers_.size()) return nullptr;
+    ReplicaWorker & worker = *replica_workers_[replica_index];
+    if (worker.queue.empty()) return nullptr;
+    ServerJob * job = worker.queue.front();
+    worker.queue.pop_front();
+    queue_depth_ = std::max(0, queue_depth_ - 1);
+    status_.set_queued_requests(queue_depth_);
+    publish_replica_status_locked();
+    return job;
+}
+
+void HttpServer::release_replica_assignment(size_t replica_index,
+                                            bool failed,
+                                            bool aborted) {
+    if (replica_index == SIZE_MAX) return;
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    if (replica_index >= replica_workers_.size()) return;
+    ReplicaWorker & worker = *replica_workers_[replica_index];
+    worker.assigned = std::max(0, worker.assigned - 1);
+    if (aborted) {
+        worker.aborted_total++;
+    } else if (failed) {
+        worker.failed_total++;
+    } else {
+        worker.completed_total++;
+    }
+    dispatch_replicas_locked();
+}
+
+void HttpServer::publish_replica_live(size_t replica_index, int active) {
+    if (replica_index == SIZE_MAX) {
+        status_.set_concurrent_requests(active);
+        broadcast_status();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(queue_mu_);
+        if (replica_index >= replica_workers_.size()) return;
+        replica_workers_[replica_index]->active = active;
+        publish_replica_status_locked();
+    }
+    broadcast_status();
 }
 
 // ─── HTTP I/O ───────────────────────────────────────────────────────────

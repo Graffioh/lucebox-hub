@@ -1854,12 +1854,21 @@ TEST_CASE(ServerUnitFixture, test_concurrent_status_is_aggregate_only) {
     status.set_running("classic prompt", 12, true, info);
     json snapshot = status.to_json();
     TEST_ASSERT(snapshot["active_requests"] == 0);
+    TEST_ASSERT(snapshot["queued_requests"] == 0);
     TEST_ASSERT(snapshot["current"]["model"] == "classic-model");
 
+    status.set_queued_requests(3);
+    status.set_replicas(json::array({
+        {{"device", "hip:0"}, {"active_requests", 2}},
+        {{"device", "hip:1"}, {"active_requests", 0}},
+    }));
     status.set_concurrent_requests(2);
     snapshot = status.to_json();
     TEST_ASSERT(snapshot["phase"] == "decode");
     TEST_ASSERT(snapshot["active_requests"] == 2);
+    TEST_ASSERT(snapshot["queued_requests"] == 3);
+    TEST_ASSERT(snapshot["replicas"].size() == 2);
+    TEST_ASSERT(snapshot["replicas"][0]["device"] == "hip:0");
     TEST_ASSERT(snapshot["current"].is_null());
 
     status.set_idle();
@@ -1867,6 +1876,15 @@ TEST_CASE(ServerUnitFixture, test_concurrent_status_is_aggregate_only) {
     TEST_ASSERT(snapshot["phase"] == "idle");
     TEST_ASSERT(snapshot["active_requests"] == 0);
     TEST_ASSERT(snapshot["current"].is_null());
+}
+
+TEST_CASE(ServerUnitFixture, test_primary_first_replica_selection) {
+    TEST_ASSERT(choose_primary_first_replica({0, 0}, {4, 2}) == 0);
+    TEST_ASSERT(choose_primary_first_replica({3, 0}, {4, 2}) == 0);
+    TEST_ASSERT(choose_primary_first_replica({4, 0}, {4, 2}) == 1);
+    TEST_ASSERT(choose_primary_first_replica({4, 2}, {4, 2}) == -1);
+    TEST_ASSERT(choose_primary_first_replica({0}, {4, 2}) == -1);
+    TEST_ASSERT(choose_primary_first_replica({0, 0}, {0, 2}) == 1);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
@@ -4161,6 +4179,8 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     cfg.lazy_draft      = false;
     cfg.draft_residency = DraftResidencyPolicy::Persistent;
     cfg.target_sharding = false;
+    cfg.max_concurrency = 8;
+    cfg.kv_pool_tokens  = 16384;
     cfg.chunk           = 512;
     cfg.target_device   = "auto:0";
     cfg.draft_device    = "auto:0";
@@ -4179,6 +4199,8 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(rt["lazy_draft"].get<bool>()             == false);
     TEST_ASSERT(rt["draft_residency"].get<std::string>() == "persistent");
     TEST_ASSERT(rt["target_sharding"].get<bool>()        == false);
+    TEST_ASSERT(rt["max_concurrency"].get<int>()         == 8);
+    TEST_ASSERT(rt["kv_pool_tokens"].get<long long>()    == 16384);
     TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
     TEST_ASSERT(rt["target_device"].get<std::string>()   == "auto:0");
     TEST_ASSERT(rt["draft_device"].get<std::string>()    == "auto:0");
@@ -4186,8 +4208,10 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
 
     // draft_device is null when no draft model is loaded.
     cfg.draft_device.clear();
+    cfg.kv_pool_tokens = 0;
     body = build_props_body(cfg, pc, tm);
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
+    TEST_ASSERT(body["runtime"]["kv_pool_tokens"].is_null());
 }
 
 // ═══════════════════════════════════════════════════════════════════════

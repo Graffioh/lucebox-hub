@@ -755,6 +755,8 @@ components:
         - kv_cache_v
         - lazy_draft
         - target_sharding
+        - max_concurrency
+        - kv_pool_tokens
         - chunk
         - target_device
         - draft_device
@@ -787,6 +789,20 @@ components:
           type: boolean
           description: True when the target model is sharded across multiple GPUs.
           example: false
+        max_concurrency:
+          type: integer
+          minimum: 1
+          description: Configured concurrent decode-slot capacity.
+          example: 8
+        kv_pool_tokens:
+          type:
+            - integer
+            - "null"
+          minimum: 16
+          description: |
+            Total paged K/V pool capacity in tokens, or null when
+            the backend uses its default capacity.
+          example: 16384
         chunk:
           type: integer
           minimum: 0

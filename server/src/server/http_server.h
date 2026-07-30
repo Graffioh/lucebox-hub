@@ -34,6 +34,7 @@
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -137,6 +138,8 @@ struct ServerConfig {
     int         ddtree_budget       = 0;
     bool        speculative_enabled = false;
     bool        target_sharding     = false;
+    int         max_concurrency     = 1;
+    long long   kv_pool_tokens      = 0;
     // Prefill chunk size (bargs.chunk). Exposed at /props.runtime.chunk so
     // bench/snapshot tooling can capture the full server config — needed
     // because pre-c35a8a4 snapshots had no /props capture and post-hoc
@@ -252,12 +255,24 @@ json build_props_body(const ServerConfig & config,
                       const PrefixCache & prefix_cache,
                       const ToolMemory & tool_memory);
 
+// Return the first replica with unassigned capacity, or -1 when all are full.
+// Vector order is routing priority.
+int choose_primary_first_replica(const std::vector<int> & assigned,
+                                 const std::vector<int> & capacities);
+
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {
 public:
+    struct LocalReplica {
+        ModelBackend * backend = nullptr;
+        std::string device;
+        int gpu = 0;
+    };
+
     HttpServer(ModelBackend & backend,
                Tokenizer & tokenizer,
-               const ServerConfig & config);
+               const ServerConfig & config,
+               const std::vector<LocalReplica> & replicas = {});
     ~HttpServer();
 
     HttpServer(const HttpServer &) = delete;
@@ -359,13 +374,24 @@ private:
         GenerationOutputState & output, DaemonIO & io);
 
     // Worker thread, concurrent mode (the backend exposes a SeqEngine):
-    // iteration-level scheduler. Admission is claim-only; this baseline
-    // drains its pending prefill between decode iterations, then advances
-    // active slots together in one batched step.
-    void scheduler_loop(SeqEngine & engine);
+    // iteration-level scheduler. Admission is claim-only; prefill chunks
+    // advance alongside live decode, and replica_index selects the routed
+    // queue when heterogeneous serving is enabled.
+    void scheduler_loop(SeqEngine & engine,
+                        ModelBackend * backend,
+                        size_t replica_index,
+                        int gpu);
 
     // Non-blocking dequeue used for admission polling between decode steps.
     ServerJob * try_dequeue();
+    ServerJob * dequeue_replica(size_t replica_index);
+    ServerJob * try_dequeue_replica(size_t replica_index);
+    void release_replica_assignment(size_t replica_index,
+                                    bool failed,
+                                    bool aborted);
+    void publish_replica_live(size_t replica_index, int active);
+    void dispatch_replicas_locked();
+    void publish_replica_status_locked();
 
     // Concurrent-scheduler token delivery and shared response construction.
     // A send buffer keeps slow clients off the shared decode loop.
@@ -426,6 +452,21 @@ private:
 
     // Members.
     ModelBackend &   backend_;
+    struct ReplicaWorker {
+        ModelBackend * backend = nullptr;
+        SeqEngine * engine = nullptr;
+        std::string device;
+        int gpu = 0;
+        int capacity = 0;
+        int assigned = 0;
+        int active = 0;
+        uint64_t routed_total = 0;
+        uint64_t completed_total = 0;
+        uint64_t failed_total = 0;
+        uint64_t aborted_total = 0;
+        std::deque<ServerJob *> queue;
+    };
+    std::vector<std::unique_ptr<ReplicaWorker>> replica_workers_;
     Tokenizer &      tokenizer_;
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
     ServerConfig     config_;
@@ -483,10 +524,12 @@ private:
 
     // Worker thread.
     std::thread                     worker_thread_;
+    std::vector<std::thread>        replica_threads_;
     std::mutex                      queue_mu_;
     std::condition_variable         queue_cv_;
     ServerJob *                     queue_head_ = nullptr;
     ServerJob *                     queue_tail_ = nullptr;
+    int                             queue_depth_ = 0;
     std::atomic<bool>               stopping_{false};
 
     // Active client thread tracking.

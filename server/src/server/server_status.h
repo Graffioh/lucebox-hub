@@ -11,6 +11,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dflash::common {
@@ -129,6 +130,16 @@ public:
         draft_tokens_.clear();
     }
 
+    void set_queued_requests(int n) {
+        std::lock_guard<std::mutex> lk(mu_);
+        queued_requests_ = n;
+    }
+
+    void set_replicas(json replicas) {
+        std::lock_guard<std::mutex> lk(mu_);
+        replicas_ = std::move(replicas);
+    }
+
     void record_perf(const PerfRecord & rec) {
         std::lock_guard<std::mutex> lk(mu_);
         if ((int)perf_history_.size() >= kMaxHistory) {
@@ -153,6 +164,8 @@ public:
         bool cache_hit = false, pflash = false, spec_decode = false;
         std::string messages_json;
         int active_requests = 0;
+        int queued_requests = 0;
+        json replicas = json::array();
 
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -170,6 +183,8 @@ public:
             spec_decode = spec_decode_;
             messages_json = messages_json_;
             active_requests = active_requests_;
+            queued_requests = queued_requests_;
+            replicas = replicas_;
             if (phase != InferencePhase::IDLE) {
                 elapsed_s = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - started_at_).count();
@@ -180,6 +195,8 @@ public:
         j["phase"] = phase_name(phase);
         j["total_requests"] = total_requests;
         j["active_requests"] = active_requests;
+        j["queued_requests"] = queued_requests;
+        j["replicas"] = std::move(replicas);
 
         if (phase != InferencePhase::IDLE && active_requests == 0) {
             j["current"] = {
@@ -246,6 +263,8 @@ private:
     bool spec_decode_ = false;
     std::string messages_json_;
     int active_requests_ = 0;
+    int queued_requests_ = 0;
+    json replicas_ = json::array();
 
     // History.
     std::vector<PerfRecord> perf_history_;

@@ -170,6 +170,30 @@ Run it directly:
   --model-name luce-dflash
 ```
 
+### Heterogeneous routing
+
+A HIP build can keep two independent Qwen3.6 replicas inside one
+`dflash_server`. The first device is the fast primary; the second receives a
+request only after every primary slot has been assigned:
+
+```bash
+cmake -S server -B server/build-hip-dual \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES='gfx1201;gfx1151'
+cmake --build server/build-hip-dual --target dflash_server -j
+
+server/build-hip-dual/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+  --target-device hip:0 --overflow-device hip:1 \
+  --paged-attention --max-ctx 4096 \
+  --max-concurrency 8 --overflow-max-concurrency 4
+```
+
+This is one process, one HTTP endpoint, and one FIFO input queue. Each device
+owns a complete model replica and its own paged KV pool, so both devices must
+have enough memory for the model. Device order is intentional: put R9700
+first and Strix Halo second. R9700 + Strix works in a dual-architecture HIP
+build (`gfx1201;gfx1151`).
+
 ### Compression proxy mode
 
 `dflash_server` can run as a **PFlash compression proxy** in front of any

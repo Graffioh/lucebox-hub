@@ -78,6 +78,11 @@ static void print_usage(const char * prog) {
         "                       --default-max-tokens; loses to --default-max-tokens\n"
         "                       when both are passed)\n"
         "  --target-device <backend:gpu>  Target device (default: auto:0)\n"
+        "  --overflow-device <backend:gpu>  Second Qwen replica. Requests\n"
+        "                       use --target-device first and overflow here only\n"
+        "                       when every primary slot is assigned\n"
+        "  --overflow-max-concurrency <N>  Overflow replica slots (default:\n"
+        "                       same as --max-concurrency)\n"
         "  --draft-device <backend:gpu>   Draft device (default: auto:0)\n"
         "  --draft-ipc-bin <path>         Remote backend IPC daemon for mixed backends\n"
         "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
@@ -230,6 +235,9 @@ int main(int argc, char ** argv) {
     std::string cache_type_v;  // explicit --cache-type-v override
     bool target_device_seen = false;
     bool target_devices_seen = false;
+    DevicePlacement overflow_device;
+    bool overflow_device_seen = false;
+    int overflow_max_concurrency = -1;
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
     bool adaptive_experts_set = false;  // --adaptive-experts (MoE architectures only)
@@ -285,6 +293,16 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "[server] bad --target-device value (expected backend:gpu)\n");
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--overflow-device") == 0 && i + 1 < argc) {
+            if (!parse_placement_device(argv[++i], overflow_device)) {
+                std::fprintf(stderr,
+                    "[server] bad --overflow-device value (expected backend:gpu)\n");
+                return 2;
+            }
+            overflow_device_seen = true;
+        } else if (std::strcmp(argv[i], "--overflow-max-concurrency") == 0 &&
+                   i + 1 < argc) {
+            overflow_max_concurrency = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--draft-swa") == 0 && i + 1 < argc) {
             bargs.draft_swa_window = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--draft-device") == 0 && i + 1 < argc) {
@@ -652,6 +670,58 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
+    BackendArgs overflow_args;
+    BackendPreparation overflow_preparation;
+    if (overflow_max_concurrency >= 0 && !overflow_device_seen) {
+        std::fprintf(stderr,
+            "[server] --overflow-max-concurrency requires --overflow-device\n");
+        return 2;
+    }
+    if (overflow_device_seen) {
+        overflow_device.max_ctx = bargs.device.max_ctx;
+        overflow_args = bargs;
+        overflow_args.device = overflow_device;
+        overflow_args.max_concurrency = overflow_max_concurrency >= 0
+            ? overflow_max_concurrency
+            : bargs.max_concurrency;
+
+        if (arch != "qwen35") {
+            std::fprintf(stderr,
+                "[server] --overflow-device currently requires a dense "
+                "Qwen3.5/Qwen3.6 model\n");
+            return 2;
+        }
+        if (!bargs.paged_attention || bargs.max_concurrency <= 1 ||
+            overflow_args.max_concurrency <= 1) {
+            std::fprintf(stderr,
+                "[server] heterogeneous routing requires --paged-attention "
+                "and at least 2 slots on each replica\n");
+            return 2;
+        }
+        if (bargs.device.is_layer_split() || target_devices_seen) {
+            std::fprintf(stderr,
+                "[server] --overflow-device cannot be combined with "
+                "--target-devices\n");
+            return 2;
+        }
+
+        if (bargs.device.primary_gpu() == overflow_device.primary_gpu()) {
+            std::fprintf(stderr,
+                "[server] local overflow requires two distinct devices\n");
+            return 2;
+        }
+        overflow_preparation =
+            prepare_backend(overflow_args, backend_features);
+        if (!overflow_preparation.ok()) {
+            std::fprintf(stderr, "[server] overflow replica: %s\n",
+                         overflow_preparation.message.c_str());
+            return overflow_preparation.error ==
+                    BackendPreparationError::FeatureCompatibility
+                ? 2
+                : 1;
+        }
+    }
+
     // Paged decode owns its K/V through a block table that the snapshot format
     // cannot describe yet, so the caches it would restore into are turned off.
     // This rewrites ServerConfig rather than rejecting the launch, which is why
@@ -833,6 +903,21 @@ int main(int argc, char ** argv) {
         backend->shutdown();
         return 2;
     }
+    std::unique_ptr<ModelBackend> overflow_backend;
+    if (overflow_device_seen) {
+        std::fprintf(stderr,
+            "[server] creating overflow backend on %s...\n",
+            placement_device_name(overflow_args.device).c_str());
+        overflow_backend = create_backend(
+            overflow_args, overflow_preparation.plan);
+        if (!overflow_backend) {
+            std::fprintf(stderr,
+                "[server] overflow backend creation failed\n");
+            backend->shutdown();
+            return 1;
+        }
+    }
+    const bool overflow_enabled = overflow_backend != nullptr;
     // ── Thinking-budget v2: resolve model card and apply to ServerConfig ──
     // Reuse the metadata captured during factory preparation instead of
     // opening the GGUF header again.
@@ -1010,6 +1095,14 @@ int main(int argc, char ** argv) {
                  placement_device_name(bargs.device).c_str());
     std::fprintf(stderr, "[server] │  target_split    = %s\n",
                  target_split_mode_name(bargs.device.split_mode));
+    if (overflow_enabled) {
+        std::fprintf(stderr,
+            "[server] │  overflow_device = %s (in-process, primary-first)\n",
+            placement_device_name(overflow_args.device).c_str());
+        std::fprintf(stderr,
+            "[server] │  replica slots   = %d primary + %d overflow\n",
+            bargs.max_concurrency, overflow_args.max_concurrency);
+    }
     if (bargs.device.is_multi_device()) {
         std::fprintf(stderr, "[server] │  target_devices  =");
         for (size_t i = 0; i < bargs.device.layer_split_gpus.size(); ++i) {
@@ -1115,6 +1208,11 @@ int main(int argc, char ** argv) {
     sconfig.ddtree_budget = bargs.ddtree_budget;
     sconfig.speculative_enabled = bargs.ddtree_mode;
     sconfig.target_sharding     = bargs.device.is_layer_split();
+    sconfig.max_concurrency     = bargs.max_concurrency +
+        (overflow_enabled ? overflow_args.max_concurrency : 0);
+    sconfig.kv_pool_tokens      = bargs.kv_pool_tokens > 0
+        ? bargs.kv_pool_tokens * (overflow_enabled ? 2 : 1)
+        : 0;
     // KV type: report the operator's choice if set, else the family default
     // the backend resolves (the tq3_0 auto policy was removed; laguna uses
     // q8_0, base default q4_0). Matches the printed table above.
@@ -1186,7 +1284,20 @@ int main(int argc, char ** argv) {
         }
     }
 
-    HttpServer server(*backend, tokenizer, sconfig);
+    std::vector<HttpServer::LocalReplica> local_replicas;
+    if (overflow_enabled) {
+        local_replicas.push_back({
+            backend.get(),
+            placement_device_name(bargs.device),
+            bargs.device.primary_gpu(),
+        });
+        local_replicas.push_back({
+            overflow_backend.get(),
+            placement_device_name(overflow_args.device),
+            overflow_args.device.primary_gpu(),
+        });
+    }
+    HttpServer server(*backend, tokenizer, sconfig, local_replicas);
     server.set_chat_format(chat_format_for_arch(arch));
     g_server = &server;
     std::signal(SIGTERM, signal_handler);
@@ -1235,6 +1346,9 @@ int main(int argc, char ** argv) {
     }
 
     // Cleanup.
+    if (overflow_backend) {
+        overflow_backend->shutdown();
+    }
     backend->shutdown();
     return ret;
 }
