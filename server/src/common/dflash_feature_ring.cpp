@@ -343,6 +343,7 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
     if (n_tokens > mirror.cap) return false;
 
     const int fc_in = mirror.n_target_layers * mirror.hidden_size;
+    if (fc_in <= 0) return false;
     const size_t src_stride = src_target_feat->nb[1];
     const size_t dst_stride = mirror.target_feat->nb[1];
     const bool meta_source = src_target_feat->buffer &&
@@ -350,6 +351,12 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
             ggml_backend_buffer_get_type(src_target_feat->buffer));
 
     if (meta_source) {
+        // Bound host scratch for long prefix restores. Qwen3.6-27B has
+        // fc_in=25,600, so gathering all 4,096 rows at once used roughly
+        // 200 MiB of BF16 plus 400 MiB of F32 temporary storage. A 16 MiB
+        // F32 chunk keeps the combined BF16+F32 high-water mark near 24 MiB
+        // while retaining batched 2D transfers.
+        constexpr size_t kMaxF32ChunkBytes = 16 * 1024 * 1024;
         const size_t src_row_bytes =
             ggml_row_size(src_target_feat->type, fc_in);
         const size_t dst_row_bytes =
@@ -357,17 +364,24 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
         if (src_target_feat->type != GGML_TYPE_BF16) {
             return false;
         }
+        const size_t f32_row_bytes = (size_t) fc_in * sizeof(float);
+        const int max_chunk_rows = (int) std::max<size_t>(
+            1, kMaxF32ChunkBytes / f32_row_bytes);
+
+        std::vector<ggml_bf16_t> bf16;
+        std::vector<float> host;
+        std::vector<uint8_t> converted;
 
         int done = 0;
         while (done < n_tokens) {
             const int src_slot = (start_pos + done) % src_cap;
             const int dst_slot = (start_pos + done) % mirror.cap;
             const int run = std::min(
-                n_tokens - done,
+                std::min(n_tokens - done, max_chunk_rows),
                 std::min(src_cap - src_slot, mirror.cap - dst_slot));
             const size_t run_elements = (size_t) run * (size_t) fc_in;
 
-            std::vector<ggml_bf16_t> bf16(run_elements);
+            bf16.resize(run_elements);
 
             // One logical read lets the meta backend gather every row with
             // batched rank-local 2D transfers instead of synchronizing once
@@ -379,8 +393,6 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
                 src_stride, src_row_bytes);
 
             const void * upload_data = bf16.data();
-            std::vector<float> host;
-            std::vector<uint8_t> converted;
             if (mirror.storage_type != GGML_TYPE_BF16) {
                 host.resize(run_elements);
                 for (int row = 0; row < run; ++row) {
@@ -410,7 +422,7 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
             }
 
             // The destination run is contiguous, so upload all converted rows
-            // with one transfer. Runs split only at either ring's wrap point.
+            // with one transfer. Runs split at ring wraps or the scratch cap.
             ggml_backend_tensor_set_2d(
                 mirror.target_feat, upload_data,
                 (size_t) dst_slot * dst_stride,

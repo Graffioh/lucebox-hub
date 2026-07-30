@@ -898,11 +898,17 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         if (n > 0) {
             const int start = cache_.cur_pos - n;
             if (remote_draft_.active()) {
-                sync_remote_draft_features(start, n);
+                if (!sync_remote_draft_features(start, n)) {
+                    result.fail(GenerateErrorCode::BackendSpecific,
+                                "prefix remote feature sync");
+                    return result;
+                }
             } else if (feature_mirror_.target_feat && cache_.target_feat) {
-                draft_feature_mirror_sync_range(cache_.target_feat,
-                                                cache_.target_feat_cap,
-                                                feature_mirror_, start, n);
+                if (!sync_local_draft_features(start, n)) {
+                    result.fail(GenerateErrorCode::BackendSpecific,
+                                "prefix feature mirror sync");
+                    return result;
+                }
             }
         }
     }
@@ -1246,8 +1252,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (remote_draft_.active() && !draft_parked_) {
             if (!sync_remote_draft_features(kv_pos, n_tokens)) return -1;
         } else if (feature_mirror_.target_feat && !draft_parked_) {
-            draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                            feature_mirror_, kv_pos, n_tokens);
+            if (!sync_local_draft_features(kv_pos, n_tokens)) return -1;
         }
 
         start += n_tokens;
@@ -1794,6 +1799,22 @@ bool Qwen35Backend::sync_remote_draft_features(int start_pos, int n_tokens) {
     return true;
 }
 
+bool Qwen35Backend::sync_local_draft_features(int start_pos, int n_tokens) {
+    if (n_tokens <= 0 || draft_parked_ || !feature_mirror_.target_feat ||
+        !cache_.target_feat) {
+        return true;
+    }
+    if (draft_feature_mirror_sync_range(
+            cache_.target_feat, cache_.target_feat_cap,
+            feature_mirror_, start_pos, n_tokens)) {
+        return true;
+    }
+    std::fprintf(stderr,
+        "spec-decode: local feature sync failed start=%d n=%d\n",
+        start_pos, n_tokens);
+    return false;
+}
+
 // ── DFlash speculative decode loop ─────────────────────────────────────
 
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
@@ -2286,8 +2307,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
                     if (feature_mirror_.target_feat && !draft_parked_) {
                         const auto profile_feature_start = profile_start();
-                        draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                                        feature_mirror_, committed, accepted_emitted);
+                        if (!sync_local_draft_features(committed, accepted_emitted)) {
+                            step_graph_destroy(draft_sg);
+                            return false;
+                        }
                         profile_add(profile_feature_s, profile_feature_start);
                     }
 
@@ -2345,8 +2368,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
                 last_tok = replay_last_tok;
                 if (feature_mirror_.target_feat && !draft_parked_) {
-                    draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                                    feature_mirror_, committed, total_emitted);
+                    if (!sync_local_draft_features(committed, total_emitted)) {
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
                 }
 
                 committed   += total_emitted;
@@ -2414,8 +2439,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
             // Sampled path commits the bonus in-step, so sync accepted+bonus.
             if (feature_mirror_.target_feat && !draft_parked_) {
-                draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                                feature_mirror_, committed, total_emitted);
+                if (!sync_local_draft_features(committed, total_emitted)) {
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
             }
 
             committed   += total_emitted;
@@ -2614,8 +2641,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
         } else if (feature_mirror_.target_feat && cache_.target_feat) {
-            draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
-                                            feature_mirror_, committed, commit_n);
+            if (!sync_local_draft_features(committed, commit_n)) {
+                step_graph_destroy(draft_sg);
+                return false;
+            }
         }
 
         // 8. Emit committed tokens (stop at EOS)
