@@ -74,6 +74,7 @@ WORKDIR /src
 # COPY ordering mirrors the CUDA Dockerfile: C++ build inputs first so the
 # (slow) HIP build layer stays cached across Python-only edits.
 COPY server/CMakeLists.txt /src/server/CMakeLists.txt
+COPY server/cmake /src/server/cmake
 COPY server/include /src/server/include
 COPY server/src /src/server/src
 COPY server/test /src/server/test
