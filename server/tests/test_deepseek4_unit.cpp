@@ -2497,6 +2497,138 @@ static void test_ds4_flash_attention_keep_cap_gpu() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_ds4_flash_attention_parallel_index_scan_gpu() {
+    std::fprintf(stderr,
+                 "  test_ds4_flash_attention_parallel_index_scan_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only contract)\n");
+    return;
+#endif
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    constexpr int head_dim = 512;
+    constexpr int n_heads = 4;
+    constexpr int n_tokens = 2;
+    constexpr int raw_rows = 256;
+    constexpr int raw_window = 128;
+    constexpr int n_comp_rows = 1024;
+    constexpr int n_kv = raw_rows + n_comp_rows;
+    constexpr int selected_rows = 512;
+
+    ggml_context * ctx = make_test_context(4u << 20);
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        ggml_backend_free(backend);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * q = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, n_tokens, n_heads);
+    ggml_tensor * kv = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, head_dim, n_kv, 1);
+    ggml_tensor * mask = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F16, n_kv, n_tokens);
+    ggml_tensor * output = ggml_flash_attn_ext(
+        ctx, q, kv, kv, mask, 1.0f / std::sqrt((float) head_dim),
+        0.0f, 0.0f);
+    // Negative keep_rows marks an exact externally indexed mask. This shape
+    // enters the compact four-head HIP path and exceeds the parallel threshold.
+    ggml_flash_attn_ext_set_ds4_sparse(
+        output, raw_rows, raw_window, -selected_rows, 1);
+    ggml_set_output(output);
+    TEST_ASSERT_MSG(ggml_backend_supports_op(backend, output),
+                    "GPU rejected exact indexed DS4 attention");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 64, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
+    TEST_ASSERT_MSG(allocated, "indexed attention graph allocation failed");
+    if (allocated) {
+        std::vector<float> q_data((size_t) head_dim * n_tokens * n_heads);
+        std::vector<float> kv_data((size_t) head_dim * n_kv);
+        std::vector<ggml_fp16_t> mask_data(
+            (size_t) n_kv * n_tokens, ggml_fp32_to_fp16(-1.0e30f));
+        for (size_t i = 0; i < q_data.size(); ++i) {
+            q_data[i] = ((int) (i % 31) - 15) * 0.001f;
+        }
+        for (size_t i = 0; i < kv_data.size(); ++i) {
+            kv_data[i] = ((int) (i % 37) - 18) * 0.001f;
+        }
+        for (int token = 0; token < n_tokens; ++token) {
+            ggml_fp16_t * token_mask =
+                mask_data.data() + (size_t) token * n_kv;
+            for (int row = raw_rows - raw_window; row < raw_rows; ++row) {
+                token_mask[row] = ggml_fp32_to_fp16(0.0f);
+            }
+            for (int row = token; row < n_comp_rows; row += 2) {
+                token_mask[raw_rows + row] = ggml_fp32_to_fp16(0.0f);
+            }
+        }
+        ggml_backend_tensor_set(q, q_data.data(), 0,
+                                q_data.size() * sizeof(float));
+        ggml_backend_tensor_set(kv, kv_data.data(), 0,
+                                kv_data.size() * sizeof(float));
+        ggml_backend_tensor_set(mask, mask_data.data(), 0,
+                                mask_data.size() * sizeof(ggml_fp16_t));
+
+        const char * previous_serial =
+            std::getenv("GGML_DS4_FA_SERIAL_INDEX_SCAN");
+        const std::string previous_value = previous_serial
+            ? previous_serial : "";
+        std::vector<float> serial((size_t) ggml_nelements(output));
+        std::vector<float> parallel(serial.size());
+        {
+            setenv("GGML_DS4_FA_SERIAL_INDEX_SCAN", "1", 1);
+            ScopedCudaGraphOverrides eager(
+                /*disable_graphs=*/true,
+                /*mmvq_max_ncols=*/0,
+                /*skip_property_check=*/false);
+            TEST_ASSERT_MSG(
+                ggml_backend_graph_compute(backend, graph) ==
+                    GGML_STATUS_SUCCESS,
+                "serial indexed attention failed");
+            ggml_backend_tensor_get(output, serial.data(), 0,
+                                    serial.size() * sizeof(float));
+        }
+        {
+            unsetenv("GGML_DS4_FA_SERIAL_INDEX_SCAN");
+            ScopedCudaGraphOverrides eager(
+                /*disable_graphs=*/true,
+                /*mmvq_max_ncols=*/0,
+                /*skip_property_check=*/false);
+            TEST_ASSERT_MSG(
+                ggml_backend_graph_compute(backend, graph) ==
+                    GGML_STATUS_SUCCESS,
+                "parallel indexed attention failed");
+            ggml_backend_tensor_get(output, parallel.data(), 0,
+                                    parallel.size() * sizeof(float));
+        }
+        if (previous_serial) {
+            setenv("GGML_DS4_FA_SERIAL_INDEX_SCAN",
+                   previous_value.c_str(), 1);
+        } else {
+            unsetenv("GGML_DS4_FA_SERIAL_INDEX_SCAN");
+        }
+        for (size_t i = 0; i < serial.size(); ++i) {
+            TEST_ASSERT_MSG(
+                nearly_equal(serial[i], parallel[i], 1.0e-6f, 1.0e-6f),
+                "parallel index scan changed attention output");
+        }
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_ds4_flash_attention_inverse_rope_fallback_gpu() {
     std::fprintf(stderr,
                  "  test_ds4_flash_attention_inverse_rope_fallback_gpu ...");
@@ -3285,6 +3417,84 @@ static void test_cuda_graph_overrides_restore_nested_state() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_cuda_graph_rebuild_generation_guard() {
+    std::fprintf(stderr, "  test_cuda_graph_rebuild_generation_guard ...");
+    if (ggml_backend_cuda_get_device_count() <= 0) {
+        std::fprintf(stderr, " skipped (no GPU device)\n");
+        return;
+    }
+    ggml_backend_t gpu = ggml_backend_cuda_init(0);
+    if (!gpu) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+
+    std::vector<uint8_t> arena(1024 * 1024);
+    const void * first_graph_key = nullptr;
+    auto run_generation = [&](bool square, float expected,
+                              bool retire_after) -> bool {
+        ggml_init_params params{};
+        params.mem_size = arena.size();
+        params.mem_buffer = arena.data();
+        params.no_alloc = true;
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) return false;
+
+        ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_input(input);
+        ggml_tensor * output = square
+            ? ggml_sqr(ctx, input)
+            : ggml_neg(ctx, input);
+        ggml_set_output(output);
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16, false);
+        ggml_build_forward_expand(graph, output);
+
+        // Both generations intentionally reuse the exact metadata address,
+        // which reproduces the verifier LRU slot's pointer-key collision.
+        if (!first_graph_key) {
+            first_graph_key = graph->nodes[0];
+        } else {
+            TEST_ASSERT(graph->nodes[0] == first_graph_key);
+        }
+
+        ggml_backend_t backends[] = {gpu};
+        ggml_backend_sched_t sched = ggml_backend_sched_new(
+            backends, nullptr, 1, 64, false, true);
+        bool ok = sched && ggml_backend_sched_alloc_graph(sched, graph);
+        const float value = 3.0f;
+        if (ok) {
+            ggml_backend_tensor_set(input, &value, 0, sizeof(value));
+            for (int warm = 0; warm < 3 && ok; ++warm) {
+                ScopedCudaGraphOverrides force_replay(
+                    /*disable_graphs=*/false,
+                    /*mmvq_max_ncols=*/0,
+                    /*skip_property_check=*/true);
+                ok = ggml_backend_sched_graph_compute(sched, graph) ==
+                    GGML_STATUS_SUCCESS;
+            }
+        }
+        float actual = 0.0f;
+        if (ok) {
+            ggml_backend_tensor_get(output, &actual, 0, sizeof(actual));
+            ok = nearly_equal(actual, expected, 1.0e-6f, 1.0e-6f);
+        }
+        if (retire_after) {
+            ggml_backend_cuda_graph_invalidate_range(
+                gpu, arena.data(), arena.size());
+        }
+        if (sched) ggml_backend_sched_free(sched);
+        ggml_free(ctx);
+        return ok;
+    };
+
+    TEST_ASSERT_MSG(run_generation(true, 9.0f, false),
+                    "first graph generation failed");
+    TEST_ASSERT_MSG(run_generation(false, -3.0f, true),
+                    "rebuilt graph replayed stale executable");
+    ggml_backend_free(gpu);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_hc_scratch_shape_capacity() {
     std::fprintf(stderr, "  test_hc_scratch_shape_capacity ...");
     if (!deepseek4_cuda_hc_set_device(0)) {
@@ -3427,6 +3637,7 @@ int main() {
     test_output_graph_reuse_microbench(backend);
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
     test_ds4_flash_attention_keep_cap_gpu();
+    test_ds4_flash_attention_parallel_index_scan_gpu();
     test_ds4_flash_attention_inverse_rope_fallback_gpu();
     test_hc_post_strided_split_gpu();
     test_hc_pre_kernel_gpu();
@@ -3434,6 +3645,7 @@ int main() {
     test_hc_scratch_per_device();
     test_hc_set_device_contract();
     test_cuda_graph_overrides_restore_nested_state();
+    test_cuda_graph_rebuild_generation_guard();
     test_hc_scratch_shape_capacity();
 #endif
 

@@ -1126,7 +1126,7 @@ static int ds4_try_fused_verify_step(
         // buffers and HIP graph replay state still refers to those addresses.
         // Reinitializing the ggml context over the same metadata arena while
         // that state is live can replay kernels against stale allocations.
-        fg->destroy();
+        fg->destroy(vc.backend, vc.peer_backend);
         ex->reset();
 
         const auto build_t0 = Ds4TimingClock::now();
@@ -1135,7 +1135,7 @@ static int ds4_try_fused_verify_step(
                                           kv_start, q, token_ids != nullptr,
                                           *hooks->capture_layer_ids, hybrid,
                                           std::move(key))) {
-            fg->destroy();
+            fg->destroy(vc.backend, vc.peer_backend);
             ex->reset();
             vc.disabled = true;
             return 0;
@@ -1183,7 +1183,12 @@ static int ds4_try_fused_verify_step(
 
     // causal mask values
     {
-        std::vector<float> maskv((size_t) ggml_nelements(fg->mask_bundle), 0.0f);
+        const size_t mask_count = (size_t) ggml_nelements(fg->mask_bundle);
+        std::vector<float> & maskv = ex->mask_values;
+        if (maskv.size() != mask_count) {
+            maskv.resize(mask_count);
+        }
+        std::fill(maskv.begin(), maskv.end(), 0.0f);
         size_t off = 0;
         for (int il = 0; il < w.n_layer; ++il) {
             const int ratio = (int) w.compress_ratios[il];
@@ -1277,7 +1282,9 @@ static int ds4_try_fused_verify_step(
     // immutable until the slot is destroyed. The generic CUDA/HIP property
     // scan can nevertheless observe backend-mutated metadata and reset replay
     // at request boundaries. Mirror the qualified draft fast path behind an
-    // independent opt-in while retaining normal warmup/capture semantics.
+    // independent opt-in while retaining normal warmup/capture semantics. The
+    // backend additionally checks the scheduler graph uid, so a rebuilt slot
+    // can never bypass validation using the previous generation's executable.
     const bool force_verify_graph_replay = q > 1 &&
         ds4_env_flag("DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY");
     ScopedCudaGraphOverrides graph_override_scope(

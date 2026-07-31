@@ -4523,7 +4523,29 @@ struct DeepSeek4FusedDecodeGraph {
         return sg.ctx && sg.gf && logits;
     }
 
-    void destroy() {
+    void invalidate_native_graphs(ggml_backend_t main_backend,
+                                  ggml_backend_t peer_backend = nullptr) const {
+        if (sg.meta_arena.empty()) {
+            return;
+        }
+        auto invalidate = [&](ggml_backend_t candidate) {
+            if (candidate && ggml_backend_is_cuda(candidate)) {
+                ggml_backend_cuda_graph_invalidate_range(
+                    candidate, sg.meta_arena.data(), sg.meta_arena.size());
+            }
+        };
+        invalidate(main_backend);
+        if (peer_backend != main_backend) {
+            invalidate(peer_backend);
+        }
+    }
+
+    void destroy(ggml_backend_t main_backend,
+                 ggml_backend_t peer_backend = nullptr) {
+        // Native graph executables outlive ggml graph metadata in the backend
+        // cache. Retire them before either the scheduler or metadata arena is
+        // released, otherwise a rebuilt slot can inherit the same pointer key.
+        invalidate_native_graphs(main_backend, peer_backend);
         if (sched) {
             ggml_backend_sched_free(sched);
             sched = nullptr;
@@ -4550,7 +4572,7 @@ struct DeepSeek4FusedDecodeCache {
     ggml_tensor * fn_out_f16 = nullptr;
 
     void destroy() {
-        for (auto & s : slots) s.destroy();
+        for (auto & s : slots) s.destroy(backend);
         if (fn_buf) { ggml_backend_buffer_free(fn_buf); fn_buf = nullptr; }
         if (fn_ctx) { ggml_free(fn_ctx); fn_ctx = nullptr; }
         fn_attn_f16.clear();
@@ -4586,6 +4608,9 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * st128 = nullptr;    // i64 [1,q]
         ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap*q], order [ci][t]
         ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
+        // Reused host staging for the context-sized additive attention mask.
+        // Keeping it per slot removes one allocation from every verify step.
+        std::vector<float> mask_values;
         int q = 0;
 
         void reset() { *this = Extra{}; }
@@ -4593,7 +4618,7 @@ struct Ds4FusedVerifyCache {
     std::array<Extra, kSlotCount> extra;
 
     void destroy() {
-        for (auto & slot : slots) slot.destroy();
+        for (auto & slot : slots) slot.destroy(backend, peer_backend);
         for (auto & value : extra) value.reset();
         owner_ctx = nullptr;
         backend = nullptr;
@@ -5250,6 +5275,11 @@ static int ds4_try_fused_decode_step(
                 if (s.last_use < fg->last_use) fg = &s;
             }
         }
+        // The backend's native graph cache is keyed by tensor metadata
+        // addresses. Retire the previous generation before rebuilding this
+        // slot over the same persistent arena; keep the gallocr itself so its
+        // device scratch can still be reused.
+        fg->invalidate_native_graphs(backend);
         const auto build_t0 = Ds4TimingClock::now();
         if (!ds4_build_fused_decode_graph(fc, *fg, backend, w, cache,
                                           hc_weights, hc_out_weights, hash_tables,
