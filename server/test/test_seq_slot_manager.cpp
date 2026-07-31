@@ -298,6 +298,69 @@ int main() {
         CHECK(mgr.slot(0).rng() != first);
     }
 
+    // Admission watermark is asymmetric: the oldest request may use the full
+    // pool, while later admissions retain headroom for a running chunk.
+    {
+        PagedKvPool pool(/*physical_block_count=*/8,
+                         /*max_sequences=*/3);
+        SeqSlotManager mgr(pool, /*max_ctx=*/128,
+                           /*admission_watermark_blocks=*/2);
+        auto oldest = mgr.admit(1, 16, 16, greedy_sampler());
+        CHECK(oldest.ok);
+        CHECK(mgr.append_prefill(oldest.slot, 16).ok);
+        auto too_tight = mgr.admit(2, 96, 1, greedy_sampler());
+        CHECK(!too_tight.ok && too_tight.busy);  // 6 needed + 2 held > 7
+        auto fits = mgr.admit(2, 80, 1, greedy_sampler());
+        CHECK(fits.ok);                           // 5 needed + 2 held == 7
+    }
+
+    // Decode allocation is preflighted as one transaction. With both slots
+    // at a block boundary and no free blocks, no slot mutates before pressure
+    // is reported.
+    {
+        PagedKvPool pool(/*physical_block_count=*/2,
+                         /*max_sequences=*/2);
+        SeqSlotManager mgr(pool, /*max_ctx=*/64);
+        auto a = mgr.admit(1, 16, 16, greedy_sampler());
+        CHECK(a.ok && mgr.append_prefill(a.slot, 16).ok);
+        mgr.commit_prefill(a.slot, 16);
+        auto b = mgr.admit(2, 16, 16, greedy_sampler());
+        CHECK(b.ok && mgr.append_prefill(b.slot, 16).ok);
+        mgr.commit_prefill(b.slot, 16);
+        CHECK(pool.free_block_count() == 0);
+        CHECK(mgr.decode_pressure_slot({a.slot, b.slot}) == a.slot);
+        CHECK(mgr.slot(a.slot).sample_history.empty());
+        CHECK(mgr.lens_host()[(size_t)a.slot] == 16);
+
+        mgr.retire(b.slot);
+        CHECK(mgr.decode_pressure_slot({a.slot}) == -1);
+        CHECK(mgr.append_token(a.slot, 77).ok);
+    }
+
+    // Recompute admission restores penalty history and the exact RNG position
+    // after the old engine slot has released its blocks.
+    {
+        PagedKvPool pool(4, 1);
+        SeqSlotManager mgr(pool, 64);
+        SamplerCfg cfg = greedy_sampler();
+        cfg.temp = 0.7f;
+        cfg.seed = 4242;
+        auto a = mgr.admit(1, 16, 16, cfg);
+        CHECK(a.ok && mgr.append_prefill(a.slot, 16).ok);
+        mgr.commit_prefill(a.slot, 16);
+        CHECK(mgr.append_token(a.slot, 91).ok);
+        std::vector<int32_t> history;
+        std::mt19937_64 rng;
+        CHECK(mgr.capture_sampling_state(a.slot, history, rng));
+        CHECK(history == std::vector<int32_t>{91});
+        mgr.retire(a.slot);
+
+        auto resumed = mgr.admit(2, 17, 15, cfg, &history, &rng);
+        CHECK(resumed.ok);
+        CHECK(mgr.slot(resumed.slot).sample_history == history);
+        CHECK(mgr.slot(resumed.slot).rng == rng);
+    }
+
     // A greedy sampler never draws, so its seed is irrelevant and admission
     // must not depend on one being present.
     {

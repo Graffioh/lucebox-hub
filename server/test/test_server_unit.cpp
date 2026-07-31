@@ -1867,6 +1867,12 @@ TEST_CASE(ServerUnitFixture, test_concurrent_status_is_aggregate_only) {
     TEST_ASSERT(snapshot["phase"] == "idle");
     TEST_ASSERT(snapshot["active_requests"] == 0);
     TEST_ASSERT(snapshot["current"].is_null());
+
+    PerfRecord perf;
+    perf.preemptions = 2;
+    status.record_perf(perf);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["perf_history"][0]["preemptions"] == 2);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
