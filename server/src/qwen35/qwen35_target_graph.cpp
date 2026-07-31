@@ -88,6 +88,9 @@ bool create_target_cache(const TargetWeights & w,
                                        paged_attention, n_seq_slots);
 }
 
+// concurrent_fixed_cache_bytes() in qwen35_backend.cpp mirrors this
+// function's non-pool allocations to size the auto KV pool — keep the two
+// in sync when adding or resizing cache tensors here.
 bool create_target_cache_partial(const TargetWeights & w,
                                  int max_ctx,
                                  int max_verify_tokens,

@@ -218,7 +218,8 @@ bool Qwen35SeqEngine::step(
             slots_.append_token(in.slot, in.token);
         if (!app.ok) {
             out.error = app.busy
-                ? "paged KV pool exhausted during decode"
+                ? "paged KV pool exhausted during decode; raise "
+                  "--kv-pool-tokens or lower --max-ctx/--max-concurrency"
                 : "decode K/V append failed";
             outputs.push_back(out);
             output_rows.push_back(compact_row);

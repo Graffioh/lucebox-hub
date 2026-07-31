@@ -3,6 +3,7 @@
 #define GENERATE_UNIT_TEST_MAIN
 #include "CppUnitTestFramework.hpp"
 #include "../src/common/paged_kv_pool.h"
+#include "../src/common/paged_attention_config.h"
 
 #include <initializer_list>
 #include <limits>
@@ -272,4 +273,36 @@ TEST_CASE(PagedKvPoolFixture, invalid_arguments) {
         CHECK(overflow.status == PagedKvStatus::InvalidArgument);
         CHECK(overflow.write_slots.empty());
     }));
+}
+
+TEST_CASE(PagedKvPoolFixture, auto_pool_sizing) {
+    PagedKvAutoBudget budget;
+    budget.free_bytes = 10'000;
+    budget.fixed_cache_bytes = 1'000;
+    budget.reserve_bytes = 1'000;
+    budget.bytes_per_token = 10;
+    // Memory could hold 800 tokens, but four 128-token logical contexts cap
+    // the useful physical pool at 512.
+    CHECK(paged_kv_auto_pool_tokens(128, 4, budget) == 512);
+
+    budget.free_bytes = 5'000;
+    // 300 raw tokens round down to 288 (18 whole blocks).
+    CHECK(paged_kv_auto_pool_tokens(128, 4, budget) == 288);
+    budget.free_bytes = 1'999;
+    CHECK(paged_kv_auto_pool_tokens(128, 4, budget) == 0);
+    budget.free_bytes = 5'000;
+    budget.bytes_per_token = 0;
+    CHECK(paged_kv_auto_pool_tokens(128, 4, budget) == 0);
+
+    // A representative 24 GiB-card post-weight budget can keep one 32K
+    // context plus oversubscription headroom without allocating 16 x 32K.
+    budget.free_bytes = 10LL * 1024 * 1024 * 1024;
+    budget.fixed_cache_bytes = 4LL * 1024 * 1024 * 1024;
+    budget.reserve_bytes = 1536LL * 1024 * 1024;
+    budget.bytes_per_token = 64 * 1024;
+    const int64_t headline =
+        paged_kv_auto_pool_tokens(32768, 16, budget);
+    CHECK(headline == 73728);
+    CHECK(headline >= 32768);
+    CHECK(headline < 16LL * 32768);
 }
