@@ -3472,6 +3472,12 @@ static void test_cuda_graph_rebuild_generation_guard() {
         ggml_backend_t backends[] = {gpu, cpu};
         ggml_backend_sched_t sched = ggml_backend_sched_new(
             backends, nullptr, 2, 64, false, true);
+        if (sched) {
+            // Match the fused verifier: inputs and outputs are explicitly
+            // pinned to the main GPU before the scheduler allocates splits.
+            ggml_backend_sched_set_tensor_backend(sched, input, gpu);
+            ggml_backend_sched_set_tensor_backend(sched, output, gpu);
+        }
         bool ok = sched && ggml_backend_sched_alloc_graph(sched, graph);
         const float value = 3.0f;
         if (ok) {
@@ -3489,6 +3495,11 @@ static void test_cuda_graph_rebuild_generation_guard() {
         if (ok) {
             ggml_backend_tensor_get(output, &actual, 0, sizeof(actual));
             ok = nearly_equal(actual, expected, 1.0e-6f, 1.0e-6f);
+            if (!ok) {
+                std::fprintf(stderr,
+                             " graph output=%g expected=%g;", actual,
+                             expected);
+            }
         }
         if (retire_after) {
             ggml_backend_cuda_graph_invalidate_range(
