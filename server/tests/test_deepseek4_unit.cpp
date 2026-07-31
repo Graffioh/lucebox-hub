@@ -3481,8 +3481,11 @@ static void test_cuda_graph_rebuild_generation_guard() {
         bool ok = sched && ggml_backend_sched_alloc_graph(sched, graph);
         const float value = 3.0f;
         if (ok) {
-            ggml_backend_tensor_set(input, &value, 0, sizeof(value));
             for (int warm = 0; warm < 3 && ok; ++warm) {
+                // The scheduler allocator may legally reuse the input buffer
+                // for this unary output. Production uploads fresh inputs on
+                // every replay, so mirror that contract for each warmup.
+                ggml_backend_tensor_set(input, &value, 0, sizeof(value));
                 ScopedCudaGraphOverrides force_replay(
                     /*disable_graphs=*/false,
                     /*mmvq_max_ncols=*/0,
