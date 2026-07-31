@@ -86,7 +86,9 @@ because `main` cannot expose the restored-token counts.
 ## See also
 
 When volatile text (for example a session clock) sits *inside* the first system
-message, the first chat boundary cannot exclude it. **DiffPin** diffs the head,
-floats that volatility after the stable block, and pins the contiguous prefix.
-See [PIN_FRIENDLY_PROMPT.md](./PIN_FRIENDLY_PROMPT.md). Enable/disable with
-`DFLASH_PPP` (on by default).
+message, the first chat boundary cannot exclude it. **DiffPin** can diff the
+head, float that volatility after the stable block, and pin the contiguous
+prefix. See [PIN_FRIENDLY_PROMPT.md](./PIN_FRIENDLY_PROMPT.md). `DFLASH_PPP`
+(on by default) enables LCP pin-end annotation + sticky protect;
+`DFLASH_PPP_REARRANGE=1` opts into the token-level float rewrite (off by
+default — unconstrained peels can scramble tool JSON).

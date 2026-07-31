@@ -2708,31 +2708,44 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     const bool prefer_tools_boundary = prefer_inline_snap;
     int forced_cut = req.pin_end_token;
 
-    // PPP runs *before* lookup: rewrite the tools/system head into
-    // [shared prefix][shared suffix][volatile][end markers] so cache keys
-    // match across session-clock drift.
+    // PPP runs *before* lookup. Default (rearrange=0): annotate a sticky
+    // pin_end only — never mutate tokens. Token-level DiffPin rewrite
+    // (prefix|suffix|middle float) is opt-in via DFLASH_PPP_REARRANGE=1;
+    // unconstrained middle peels can scramble tool-schema JSON and yield
+    // empty post-tool completions.
     if (config_.ppp_enabled && prefer_tools_boundary) {
         const auto boundaries = find_all_boundaries(
             effective_prompt, prefix_cache_.chat_markers());
-        auto rewrite = PinFriendlyPrompt::diff_make_pin_friendly(
-            effective_prompt, boundaries, recent_tool_prefixes_,
-            prefix_cache_.chat_markers(),
-            config_.ppp_lcp_window, config_.ppp_min_pin_tokens,
-            config_.ppp_max_ephemeral_tokens);
-        if (rewrite.rewritten) {
-            effective_prompt = std::move(rewrite.tokens);
-            generate_request.prompt = effective_prompt;
-            std::fprintf(stderr,
-                "[ppp] diff-rewrite prefix=%d suffix=%d middle=%d "
-                "pin_end=%d prompt=%zu\n",
-                rewrite.prefix_len, rewrite.suffix_len, rewrite.middle_len,
-                rewrite.pin_end, effective_prompt.size());
-        }
-        if (forced_cut <= 0) forced_cut = rewrite.pin_end;
-        if (forced_cut > 0 && !rewrite.rewritten) {
-            std::fprintf(stderr,
-                "[ppp] pin_end=%d (no rewrite; prompt=%zu)\n",
-                forced_cut, effective_prompt.size());
+        if (config_.ppp_rearrange) {
+            auto rewrite = PinFriendlyPrompt::diff_make_pin_friendly(
+                effective_prompt, boundaries, recent_tool_prefixes_,
+                prefix_cache_.chat_markers(),
+                config_.ppp_lcp_window, config_.ppp_min_pin_tokens,
+                config_.ppp_max_ephemeral_tokens);
+            if (rewrite.rewritten) {
+                effective_prompt = std::move(rewrite.tokens);
+                generate_request.prompt = effective_prompt;
+                std::fprintf(stderr,
+                    "[ppp] diff-rewrite prefix=%d suffix=%d middle=%d "
+                    "pin_end=%d prompt=%zu\n",
+                    rewrite.prefix_len, rewrite.suffix_len, rewrite.middle_len,
+                    rewrite.pin_end, effective_prompt.size());
+            }
+            if (forced_cut <= 0) forced_cut = rewrite.pin_end;
+            if (forced_cut > 0 && !rewrite.rewritten) {
+                std::fprintf(stderr,
+                    "[ppp] pin_end=%d (no rewrite; prompt=%zu)\n",
+                    forced_cut, effective_prompt.size());
+            }
+        } else if (forced_cut <= 0) {
+            forced_cut = PinFriendlyPrompt::annotate_pin_end(
+                effective_prompt, boundaries, recent_tool_prefixes_,
+                config_.ppp_lcp_window, config_.ppp_min_pin_tokens);
+            if (forced_cut > 0) {
+                std::fprintf(stderr,
+                    "[ppp] pin_end=%d (pin-only; prompt=%zu)\n",
+                    forced_cut, effective_prompt.size());
+            }
         }
         const auto remember_bounds = find_all_boundaries(
             effective_prompt, prefix_cache_.chat_markers());
