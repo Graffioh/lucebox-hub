@@ -3451,10 +3451,11 @@ static void test_cuda_graph_rebuild_generation_guard() {
 
         // Both generations intentionally reuse the exact metadata address,
         // which reproduces the verifier LRU slot's pointer-key collision.
+        ggml_tensor * graph_key = ggml_graph_node(graph, 0);
         if (!first_graph_key) {
-            first_graph_key = graph->nodes[0];
+            first_graph_key = graph_key;
         } else {
-            TEST_ASSERT(graph->nodes[0] == first_graph_key);
+            TEST_ASSERT(graph_key == first_graph_key);
         }
 
         ggml_backend_t backends[] = {gpu};
