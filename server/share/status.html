@@ -72,6 +72,10 @@ h1 { color: #58a6ff; margin-bottom: 16px; font-size: 1.5em; }
       <span class="stat-value" id="total-req">0</span>
       <span class="stat-label">total requests</span>
     </span>
+    <span class="stat">
+      <span class="stat-value" id="total-preemptions">0</span>
+      <span class="stat-label">recent preemptions</span>
+    </span>
   </div>
   <div id="current-info" style="display:none; margin-top:12px;">
     <div>
@@ -287,6 +291,10 @@ function update(data) {
 
   // Charts
   const hist = data.perf_history || [];
+  const preemptions = hist.reduce(function(sum, h) {
+    return sum + (h.preemptions || 0);
+  }, 0);
+  document.getElementById('total-preemptions').textContent = preemptions;
   const prefillData = hist.map(function(h) { return h.prefill_tok_s; });
   const decodeData = hist.map(function(h) { return h.decode_tok_s; });
   const acceptData = hist.map(function(h) { return h.accept_rate * 100; });

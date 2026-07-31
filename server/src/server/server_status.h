@@ -24,6 +24,7 @@ struct PerfRecord {
     float  accept_rate      = 0.0f;
     int    prompt_tokens    = 0;
     int    completion_tokens = 0;
+    int    preemptions      = 0;
     bool   cache_hit        = false;
     bool   pflash           = false;
     bool   spec_decode      = false;
@@ -214,6 +215,7 @@ public:
                 {"accept_rate", r.accept_rate},
                 {"prompt_tokens", r.prompt_tokens},
                 {"completion_tokens", r.completion_tokens},
+                {"preemptions", r.preemptions},
                 {"cache_hit", r.cache_hit},
                 {"pflash", r.pflash},
                 {"spec_decode", r.spec_decode},

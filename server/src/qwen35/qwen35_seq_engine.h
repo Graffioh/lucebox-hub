@@ -39,15 +39,15 @@ public:
     // first row of the block appended past the pool's index space, used as
     // the K/V write destination of graph-bucket padding rows.
     Qwen35SeqEngine(Qwen35Backend & backend, PagedKvPool & pool,
-                    int max_ctx, int64_t scratch_row)
-        : b_(backend), slots_(pool, max_ctx), scratch_row_(scratch_row) {}
+                    int max_ctx, int64_t scratch_row);
 
     int slot_count() const override { return slots_.slot_count(); }
 
     AdmitResult admit(uint64_t request_id,
                       const std::vector<int32_t> & prompt,
                       const SamplerCfg & sampler,
-                      int n_gen) override;
+                      int n_gen,
+                      const ResumeState * resume = nullptr) override;
 
     bool step(const std::vector<StepInput> & inputs,
               std::vector<StepOutput> & outputs) override;
@@ -55,6 +55,8 @@ public:
     bool prefill_pending() const override {
         return pending_prefill_.has_value();
     }
+
+    bool capture_resume_state(int slot, ResumeState & out) const override;
 
     void retire(int slot) override;
 

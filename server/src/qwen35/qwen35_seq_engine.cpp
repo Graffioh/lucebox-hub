@@ -9,6 +9,7 @@
 #include "qwen35_backend.h"
 #include "graph_builders.h"
 #include "attn_masks.h"
+#include "common/paged_attention_config.h"
 #include "common/sampler.h"
 #include "internal.h"
 
@@ -38,7 +39,26 @@ int decode_bucket_graph_key(int width) {
     return key;
 }
 
-} // namespace
+int concurrent_prefill_ubatch() {
+    static const int value = [] {
+        if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
+            const int v = std::atoi(s);
+            if (v >= 1) return v;
+        }
+        return 512;
+    }();
+    return value;
+}
+
+}  // namespace
+
+Qwen35SeqEngine::Qwen35SeqEngine(
+        Qwen35Backend & backend, PagedKvPool & pool,
+        int max_ctx, int64_t scratch_row)
+    : b_(backend),
+      slots_(pool, max_ctx, paged_kv_admission_watermark_blocks(
+          pool.physical_block_count(), concurrent_prefill_ubatch())),
+      scratch_row_(scratch_row) {}
 
 bool Qwen35SeqEngine::token_is_eos(int32_t token) const {
     return b_.token_is_eos(token);
@@ -48,7 +68,8 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
         uint64_t request_id,
         const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler,
-        int n_gen) {
+        int n_gen,
+        const ResumeState * resume) {
     AdmitResult r;
     if (pending_prefill_) {
         r.busy = true;
@@ -57,7 +78,9 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
     }
 
     SeqSlotManager::AdmitOutcome ao =
-        slots_.admit(request_id, (int)prompt.size(), n_gen, sampler);
+        slots_.admit(request_id, (int)prompt.size(), n_gen, sampler,
+                     resume ? &resume->sample_history : nullptr,
+                     resume ? &resume->rng : nullptr);
     if (!ao.ok) {
         r.busy = ao.busy;
         r.error = std::move(ao.error);
@@ -82,6 +105,12 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
     return r;
 }
 
+bool Qwen35SeqEngine::capture_resume_state(
+        int slot, ResumeState & out) const {
+    return slots_.capture_sampling_state(
+        slot, out.sample_history, out.rng);
+}
+
 int32_t Qwen35SeqEngine::sample_prefill_first_token(int slot) {
     // The committing graph leaves the prompt's final logits at tail row 0.
     const int vocab = b_.w_.n_vocab;
@@ -97,7 +126,8 @@ int32_t Qwen35SeqEngine::sample_prefill_first_token(int slot) {
         ggml_backend_tensor_get(b_.sg_.argmax_tokens, &first, 0,
                                 sizeof(int32_t));
     }
-    first = b_.apply_min_tokens_floor(first, /*generated=*/0,
+    first = b_.apply_min_tokens_floor(
+        first, (int)seq.sample_history.size(),
                                       /*logits_row_offset=*/0);
     return first;
 }
@@ -118,6 +148,21 @@ bool Qwen35SeqEngine::step(
     }
     PendingPrefill * pp = pending_prefill_ ? &*pending_prefill_ : nullptr;
     if (inputs.empty() && !pp) return true;
+
+    // Preflight every boundary allocation before mutating any slot. Without
+    // this transaction boundary, early inputs could append successfully and a
+    // later input could discover exhaustion before the graph executes.
+    std::vector<int> decode_slots;
+    decode_slots.reserve(inputs.size());
+    for (const StepInput & in : inputs) decode_slots.push_back(in.slot);
+    const int pressure_slot = slots_.decode_pressure_slot(decode_slots);
+    if (pressure_slot >= 0) {
+        StepOutput out;
+        out.slot = pressure_slot;
+        out.pool_exhausted = true;
+        outputs.push_back(std::move(out));
+        return true;
+    }
 
     const TargetWeights & w = b_.w_;
     StepGraph & sg = b_.sg_;
@@ -209,13 +254,7 @@ bool Qwen35SeqEngine::step(
         }
     }
 
-    static const int prefill_ubatch = [] {
-        if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
-            const int v = std::atoi(s);
-            if (v >= 1) return v;
-        }
-        return 512;
-    }();
+    const int prefill_ubatch = concurrent_prefill_ubatch();
     int chunk = 0;
     bool commit = false;
     int kv_pos = 0;

@@ -257,6 +257,11 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
         }
         if (ended) break;   // the scheduler would retire that slot here
     }
+    if (!live.empty()) {
+        SeqEngine::ResumeState resume;
+        require(engine.capture_resume_state(live.front(), resume),
+                "capture_resume_state() must snapshot a live slot");
+    }
 
     // ── 5. A short batch is refused, not silently advanced ───────────────
     // One forward covers every row, so an omitted live slot would have its

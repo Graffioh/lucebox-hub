@@ -67,8 +67,10 @@ public:
     AdmitResult admit(uint64_t request_id,
                       const std::vector<int32_t> & prompt,
                       const SamplerCfg &,
-                      int n_gen) override {
+                      int n_gen,
+                      const ResumeState * resume = nullptr) override {
         (void)request_id;
+        (void)resume;
         AdmitResult r;
         if (prompt.empty() || n_gen < 1) {
             r.error = "invalid request";   // hard error: retrying cannot help
@@ -157,6 +159,14 @@ public:
         active_[(size_t)slot] = false;
         prefilling_[(size_t)slot] = false;
         fed_[(size_t)slot].clear();
+    }
+
+    bool capture_resume_state(int slot, ResumeState & out) const override {
+        if (slot < 0 || slot >= slot_count() || !active_[(size_t)slot]) {
+            return false;
+        }
+        out.sample_history = fed_[(size_t)slot];
+        return true;
     }
 
 private:

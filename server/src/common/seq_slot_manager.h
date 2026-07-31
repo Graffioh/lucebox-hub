@@ -48,8 +48,10 @@ struct SeqSlot {
 class SeqSlotManager {
 public:
     // `max_ctx` is the per-sequence logical bound; slot count comes from the
-    // pool's max_sequences. The pool must outlive the manager.
-    SeqSlotManager(PagedKvPool & pool, int max_ctx);
+    // pool's max_sequences. The admission watermark is held only while other
+    // sequences are active. The pool must outlive the manager.
+    SeqSlotManager(PagedKvPool & pool, int max_ctx,
+                   uint32_t admission_watermark_blocks = 0);
 
     struct AdmitOutcome {
         bool ok = false;
@@ -73,7 +75,9 @@ public:
     // actually draws, else nondeterministically; the sampler config alone
     // decides.
     AdmitOutcome admit(uint64_t request_id, int prompt_len, int n_gen,
-                       const SamplerCfg & sampler);
+                       const SamplerCfg & sampler,
+                       const std::vector<int32_t> * resume_history = nullptr,
+                       const std::mt19937_64 * resume_rng = nullptr);
 
     struct PrefillChunk {
         bool ok = false;
@@ -109,6 +113,14 @@ public:
     // step — while cur_pos waits for commit_step().
     StepAppend append_token(int slot, int32_t fed_token);
 
+    // Transactional decode-batch preflight. Returns the first slot whose new
+    // block would exceed the currently free pool, or -1 when every append can
+    // be performed. No sequence or free-list state is mutated.
+    int decode_pressure_slot(const std::vector<int> & decode_slots) const;
+
+    bool capture_sampling_state(int slot, std::vector<int32_t> & history,
+                                std::mt19937_64 & rng) const;
+
     // The batched step's compute succeeded: cur_pos++.
     void commit_step(int slot);
 
@@ -131,6 +143,7 @@ public:
 private:
     PagedKvPool & pool_;
     int max_ctx_ = 0;
+    uint32_t admission_watermark_blocks_ = 0;
     std::vector<SeqSlot> slots_;
     std::vector<int32_t> lens_host_;
 };

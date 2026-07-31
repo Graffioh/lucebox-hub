@@ -7,8 +7,11 @@
 
 namespace dflash::common {
 
-SeqSlotManager::SeqSlotManager(PagedKvPool & pool, int max_ctx)
-    : pool_(pool), max_ctx_(max_ctx) {
+SeqSlotManager::SeqSlotManager(PagedKvPool & pool, int max_ctx,
+                               uint32_t admission_watermark_blocks)
+    : pool_(pool),
+      max_ctx_(max_ctx),
+      admission_watermark_blocks_(admission_watermark_blocks) {
     slots_.assign(pool.max_sequences(), SeqSlot{});
     lens_host_.assign(pool.max_sequences(), 0);
 }
@@ -38,7 +41,9 @@ bool SeqSlotManager::is_prefilling(int slot) const {
 
 SeqSlotManager::AdmitOutcome SeqSlotManager::admit(
         uint64_t request_id, int prompt_len, int n_gen,
-        const SamplerCfg & sampler) {
+        const SamplerCfg & sampler,
+        const std::vector<int32_t> * resume_history,
+        const std::mt19937_64 * resume_rng) {
     AdmitOutcome r;
     if (prompt_len < 1)          { r.error = "empty prompt"; return r; }
     if (n_gen < 1)               { r.error = "n_gen must be >= 1"; return r; }
@@ -71,9 +76,14 @@ SeqSlotManager::AdmitOutcome SeqSlotManager::admit(
     // be admitted later. Gate on the exact prompt, never the speculative
     // output cap.
     const uint32_t need = (uint32_t)paged_block_count(prompt_len);
-    if (need > pool_.free_block_count()) {
+    const uint32_t free = pool_.free_block_count();
+    const uint32_t watermark =
+        pool_.active_sequence_count() > 0
+            ? admission_watermark_blocks_ : 0;
+    if (need > free || watermark > free - need) {
         r.busy = pool_.active_sequence_count() > 0;
-        r.error = "not enough free KV blocks for the prompt";
+        r.error = "not enough free KV blocks for the prompt and admission "
+                  "watermark";
         return r;
     }
 
@@ -92,13 +102,18 @@ SeqSlotManager::AdmitOutcome SeqSlotManager::admit(
     s.handle = handle;
     s.cur_pos = 0;
     s.sampler = sampler;
-    s.sample_history.clear();
-    // Same predicate the engine uses to pick CPU sampling over GPU argmax:
-    // a seed only means anything when the sampler actually draws.
-    if (sampler.needs_logit_processing() && sampler.seed != 0) {
-        s.rng.seed(sampler.seed);
+    if (resume_history && resume_rng) {
+        s.sample_history = *resume_history;
+        s.rng = *resume_rng;
     } else {
-        s.rng.seed(std::random_device{}());
+        s.sample_history.clear();
+        // Same predicate the engine uses to pick CPU sampling over GPU argmax:
+        // a seed only means anything when the sampler actually draws.
+        if (sampler.needs_logit_processing() && sampler.seed != 0) {
+            s.rng.seed(sampler.seed);
+        } else {
+            s.rng.seed(std::random_device{}());
+        }
     }
     lens_host_[(size_t)slot] = 0;
 
@@ -183,6 +198,32 @@ SeqSlotManager::StepAppend SeqSlotManager::append_token(int slot,
         out.new_block_index = s.cur_pos / (int)pool_.block_size();
     }
     return out;
+}
+
+int SeqSlotManager::decode_pressure_slot(
+        const std::vector<int> & decode_slots) const {
+    uint32_t free = pool_.free_block_count();
+    for (const int slot : decode_slots) {
+        if (!is_active(slot) || is_prefilling(slot)) continue;
+        const SeqSlot & s = slots_[(size_t)slot];
+        if (s.cur_pos >= max_ctx_ ||
+            (uint32_t)s.cur_pos % pool_.block_size() != 0) {
+            continue;
+        }
+        if (free == 0) return slot;
+        --free;
+    }
+    return -1;
+}
+
+bool SeqSlotManager::capture_sampling_state(
+        int slot, std::vector<int32_t> & history,
+        std::mt19937_64 & rng) const {
+    if (!is_active(slot)) return false;
+    const SeqSlot & s = slots_[(size_t)slot];
+    history = s.sample_history;
+    rng = s.rng;
+    return true;
 }
 
 void SeqSlotManager::commit_step(int slot) {

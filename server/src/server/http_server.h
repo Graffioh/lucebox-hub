@@ -31,6 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -511,6 +512,30 @@ struct ServerJob {
     bool          announced = false;
     bool          sse_started = false;
     std::unique_ptr<SseEmitter> emitter;
+
+    // Recompute-preemption state. A client thread owns this job for the whole
+    // request, so moving the scheduler half here keeps protocol, sampler, and
+    // generation state intact while its engine slot is retired and re-admitted.
+    bool          resume_pending = false;
+    std::vector<int32_t> resume_prompt_tokens;
+    int           resume_remaining_n_gen = 0;
+    SeqEngine::ResumeState resume_sampling;
+    uint64_t      admission_order = 0;
+    int           preemptions = 0;
+    std::chrono::steady_clock::time_point concurrent_started_at{};
+    double        concurrent_prefill_s = 0.0;
+    double        concurrent_decode_s = 0.0;
+    int           concurrent_n_gen_cap = 0;
+    int           concurrent_completion_tokens = 0;
+    bool          concurrent_visible_output_seen = false;
+    std::vector<int32_t> concurrent_gen_tokens;
+    int32_t       concurrent_pending_tok = -1;
+    ClientSendBuffer concurrent_send_buffer;
+    BudgetHook    concurrent_hook;
+    bool          concurrent_hook_started = false;
+    int           concurrent_hook_pos = 0;
+    bool          concurrent_budget_forced_close = false;
+    bool          concurrent_degenerate_close = false;
 };
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────
