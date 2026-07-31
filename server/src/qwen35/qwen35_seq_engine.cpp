@@ -10,6 +10,7 @@
 #include "graph_builders.h"
 #include "attn_masks.h"
 #include "prefill_staging.h"
+#include "common/paged_attention_config.h"
 #include "common/sampler.h"
 #include "internal.h"
 
@@ -29,7 +30,36 @@ int decode_bucket_width(int live_count) {
     return width;
 }
 
+// One prefill chunk in tokens; also the admission watermark's target. The
+// env override must reach both, or admission would hold headroom for a
+// chunk size the prefill never uses.
+int prefill_chunk_tokens() {
+    static const int tokens = qwen35_prefill_ubatch(512);
+    return tokens;
+}
+
+uint32_t admission_watermark_blocks(const PagedKvPool & pool) {
+    const uint32_t blocks = paged_kv_admission_watermark_blocks(
+        pool.physical_block_count(), prefill_chunk_tokens());
+    if ((int64_t)blocks * (int64_t)pool.block_size() <
+        (int64_t)prefill_chunk_tokens()) {
+        std::fprintf(stderr,
+            "[parallel] admission watermark %u of %u blocks cannot hold a "
+            "%d-token prefill chunk; co-admitted requests will lean on "
+            "recompute preemption under this pool\n",
+            blocks, pool.physical_block_count(), prefill_chunk_tokens());
+    }
+    return blocks;
+}
+
 } // namespace
+
+Qwen35SeqEngine::Qwen35SeqEngine(
+        Qwen35Backend & backend, PagedKvPool & pool,
+        int max_ctx, int64_t scratch_row)
+    : b_(backend),
+      slots_(pool, max_ctx, admission_watermark_blocks(pool)),
+      scratch_row_(scratch_row) {}
 
 bool Qwen35SeqEngine::token_is_eos(int32_t token) const {
     return b_.token_is_eos(token);
@@ -38,7 +68,8 @@ bool Qwen35SeqEngine::token_is_eos(int32_t token) const {
 SeqEngine::AdmitResult Qwen35SeqEngine::admit(
         uint64_t request_id,
         const std::vector<int32_t> & prompt,
-        const SamplerCfg & sampler) {
+        const SamplerCfg & sampler,
+        const ResumeState * resume) {
     if (pending_prefill_) {
         AdmitResult r;
         r.busy = true;
@@ -47,7 +78,9 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
     }
 
     AdmitResult r =
-        slots_.admit(request_id, (int)prompt.size(), sampler);
+        slots_.admit(request_id, (int)prompt.size(), sampler,
+                     resume ? &resume->sample_history : nullptr,
+                     resume ? &resume->rng : nullptr);
     if (!r.ok) return r;
     const int slot = r.slot;
 
@@ -62,6 +95,11 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
     pending_prefill_ = std::move(pp);
 
     return r;
+}
+
+bool Qwen35SeqEngine::capture_resume_state(
+        int slot, ResumeState & out) const {
+    return slots_.capture_rng(slot, out.rng);
 }
 
 int32_t Qwen35SeqEngine::sample_graph_row(
@@ -132,10 +170,9 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
     if (!pending_prefill_) return stage;
 
     PendingPrefill & pending = *pending_prefill_;
-    static const int prefill_ubatch = qwen35_prefill_ubatch(512);
     stage.kv_pos = pending.progress;
     stage.chunk = std::min(
-        prefill_ubatch, (int)pending.prompt.size() - stage.kv_pos);
+        prefill_chunk_tokens(), (int)pending.prompt.size() - stage.kv_pos);
     stage.commit = stage.kv_pos + stage.chunk >= (int)pending.prompt.size();
 
     SeqSlotManager::PrefillChunk chunk =
@@ -183,6 +220,21 @@ bool Qwen35SeqEngine::step(
         return false;
     }
     if (inputs.empty() && !pending_prefill_) return true;
+
+    // Preflight every boundary allocation before mutating any slot. Without
+    // this transaction boundary, early inputs could append successfully and a
+    // later input could discover exhaustion before the graph executes.
+    std::vector<int> decode_slots;
+    decode_slots.reserve(inputs.size());
+    for (const StepInput & in : inputs) decode_slots.push_back(in.slot);
+    const int pressure_slot = slots_.decode_pressure_slot(decode_slots);
+    if (pressure_slot >= 0) {
+        StepOutput out;
+        out.slot = pressure_slot;
+        out.pool_exhausted = true;
+        outputs.push_back(std::move(out));
+        return true;
+    }
 
     const TargetWeights & w = b_.w_;
     StepGraph & sg = b_.sg_;

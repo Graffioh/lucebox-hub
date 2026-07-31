@@ -48,16 +48,22 @@ struct SeqSlot {
 class SeqSlotManager {
 public:
     // `max_ctx` is the per-sequence logical bound; slot count comes from the
-    // pool's max_sequences. The pool must outlive the manager.
-    SeqSlotManager(PagedKvPool & pool, int max_ctx);
+    // pool's max_sequences. The admission watermark is held only while other
+    // sequences are active. The pool must outlive the manager.
+    SeqSlotManager(PagedKvPool & pool, int max_ctx,
+                   uint32_t admission_watermark_blocks = 0);
 
     // Claim a free slot without allocating K/V blocks. Admission gates only
     // on the known prompt size: prompts larger than the whole pool hard-fail,
     // while prompts that fit the pool but not its current free blocks report
     // busy. Seeds the slot RNG from sampler.seed only when the sampler actually
-    // draws, else nondeterministically; the sampler config alone decides.
+    // draws, else nondeterministically; the sampler config alone decides. A
+    // resume_history/resume_rng pair (recompute re-admission) overrides both
+    // the empty history and the seeding.
     SeqAdmissionResult admit(uint64_t request_id, int prompt_len,
-                             const SamplerCfg & sampler);
+                             const SamplerCfg & sampler,
+                             const std::vector<int32_t> * resume_history = nullptr,
+                             const std::mt19937_64 * resume_rng = nullptr);
 
     struct PrefillChunk {
         bool ok = false;
@@ -91,6 +97,16 @@ public:
     // entry, and log it to sample_history. cur_pos waits for commit_step().
     StepAppend append_token(int slot, int32_t fed_token);
 
+    // Transactional decode-batch preflight. Returns the first slot whose new
+    // block would exceed the currently free pool, or -1 when every append can
+    // be performed. No sequence or free-list state is mutated.
+    int decode_pressure_slot(const std::vector<int> & decode_slots) const;
+
+    // The RNG position is the one piece of sampling state a recompute
+    // cannot rebuild from tokens; the penalty history is the scheduler's
+    // to supply (it alone knows the still-pending sampled token).
+    bool capture_rng(int slot, std::mt19937_64 & rng) const;
+
     // The batched step's compute succeeded: cur_pos++.
     void commit_step(int slot);
 
@@ -109,6 +125,7 @@ public:
 private:
     PagedKvPool & pool_;
     int max_ctx_ = 0;
+    uint32_t admission_watermark_blocks_ = 0;
     std::vector<SeqSlot> slots_;
 };
 

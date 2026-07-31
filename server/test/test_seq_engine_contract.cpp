@@ -57,8 +57,10 @@ public:
 
     AdmitResult admit(uint64_t request_id,
                       const std::vector<int32_t> & prompt,
-                      const SamplerCfg &) override {
+                      const SamplerCfg &,
+                      const ResumeState * resume = nullptr) override {
         (void)request_id;
+        (void)resume;
         AdmitResult r;
         if (prompt.empty() || prompt.size() > (size_t)max_context()) {
             r.error = "invalid request";   // hard error: retrying cannot help
@@ -141,6 +143,13 @@ public:
         }
         active_[(size_t)slot] = false;
         fed_[(size_t)slot].clear();
+    }
+
+    bool capture_resume_state(int slot, ResumeState & out) const override {
+        // RNG-only contract: sample_history stays the caller's. The fake
+        // draws nothing, so validating the slot is the whole capture.
+        (void)out;
+        return slot >= 0 && slot < slot_count() && active_[(size_t)slot];
     }
 
 private:

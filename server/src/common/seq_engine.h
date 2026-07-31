@@ -49,6 +49,7 @@
 #pragma once
 
 #include <cstdint>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,16 @@ public:
 
     using AdmitResult = SeqAdmissionResult;
 
+    // Sampling state that must survive recompute preemption. Model K/V and
+    // recurrent state are rebuilt from the expanded prompt; the RNG position
+    // cannot be reconstructed from that prompt alone. sample_history is the
+    // scheduler's to fill: penalties must cover every emitted token, and only
+    // the scheduler knows the sampled token still pending in its step loop.
+    struct ResumeState {
+        std::vector<int32_t> sample_history;
+        std::mt19937_64 rng{0x9E3779B97F4A7C15ull};
+    };
+
     // Admit one request into a free slot and queue its prompt for chunked
     // prefill. No K/V blocks or compute are consumed here — subsequent step()
     // calls allocate and advance one prefill chunk alongside the decode batch.
@@ -84,7 +95,8 @@ public:
     // request sampling nondeterministically, with no error anywhere).
     virtual AdmitResult admit(uint64_t request_id,
                               const std::vector<int32_t> & prompt,
-                              const SamplerCfg & sampler) = 0;
+                              const SamplerCfg & sampler,
+                              const ResumeState * resume = nullptr) = 0;
 
     struct StepInput {
         int     slot  = -1;
@@ -94,6 +106,9 @@ public:
         int     slot   = -1;
         int32_t token  = -1;  // newly sampled token (pending until next step)
         bool    failed = false;
+        // No input was committed: the scheduler must free a victim and retry
+        // this exact batch. This is a pressure signal, not a request failure.
+        bool    pool_exhausted = false;
         // Present when failed=true so the scheduler can report an honest
         // per-request error instead of silently truncating generation.
         std::string error;
@@ -107,12 +122,17 @@ public:
     // decoding slot, while also advancing the pending admission's prefill by
     // one chunk when present. Every decoding slot must appear in `inputs`;
     // the prefilling slot must not. A completed prefill contributes one extra
-    // output with prefill_done=true. Returns false on a whole-batch failure
-    // (outputs may be partial).
+    // output with prefill_done=true. On batch allocation pressure, no input is
+    // mutated and one pool_exhausted output identifies the blocked decode
+    // slot. Returns false on a whole-batch failure (outputs may be partial).
     virtual bool step(const std::vector<StepInput> & inputs,
                       std::vector<StepOutput> & outputs) = 0;
 
     virtual bool prefill_pending() const = 0;
+
+    // Copy the host-only RNG position before recompute preemption. Leaves
+    // out.sample_history untouched — see ResumeState.
+    virtual bool capture_resume_state(int slot, ResumeState & out) const = 0;
 
     // Release a slot's KV blocks and mark it free. Safe on failed slots.
     virtual void retire(int slot) = 0;

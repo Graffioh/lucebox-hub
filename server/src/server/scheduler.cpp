@@ -14,6 +14,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <limits>
 #include <thread>
 
 namespace dflash::common {
@@ -33,6 +35,7 @@ struct SchedSlot {
     std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
     double prefill_s = 0.0;
+    double decode_accumulated_s = 0.0;
     int n_gen_cap = 0;
     int completion_tokens = 0;
     bool client_disconnected = false;
@@ -52,6 +55,8 @@ struct SchedSlot {
     int  hook_pos = 0;
     bool budget_forced_close = false;
     bool degenerate_close = false;
+    uint64_t admission_order = 0;
+    int preemptions = 0;
 };
 
 // Outcome of one admission attempt. The three cases differ in who owns the
@@ -74,6 +79,20 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // of the line so FIFO order survives the deferral.
     ServerJob * deferred = nullptr;
     std::chrono::steady_clock::time_point deferred_retry_at{};
+    // Preempted requests resume ahead of never-started queue entries, oldest
+    // admission first. A one-iteration admission skip lets the blocked decode
+    // consume blocks released by its victim before that victim re-enters.
+    std::deque<ServerJob *> preempted;
+    auto park_preempted = [&preempted](ServerJob * job) {
+        auto pos = preempted.begin();
+        while (pos != preempted.end() &&
+               (*pos)->admission_order < job->admission_order) {
+            ++pos;
+        }
+        preempted.insert(pos, job);
+    };
+    bool skip_admission_once = false;
+    uint64_t next_admission_order = 1;
 
     // Degenerate-run guard shared with do_ar_decode: explicit env override,
     // else 32 when the min-tokens floor is active, else off.
@@ -90,6 +109,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         int n = 0;
         for (const SchedSlot & s : slots) n += s.job ? 1 : 0;
         return n;
+    };
+
+    auto immune_request_live = [&]() {
+        for (const SchedSlot & s : slots) {
+            if (s.job && s.preemptions >= 2) return true;
+        }
+        return false;
     };
 
     int published_live_count = -1;
@@ -224,8 +250,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         SchedSlot & s = slots[(size_t)idx];
         if (!s.job) return;
         const ParsedRequest & req = s.job->req;
-        const double decode_s = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - s.decode_started_at).count();
+        const double decode_s = s.decode_accumulated_s +
+            (s.prefilling ? 0.0 : std::chrono::duration<double>(
+                std::chrono::steady_clock::now() -
+                s.decode_started_at).count());
         const int prompt_tokens = (int)req.prompt_tokens.size();
         GenTimings gen_timings{
             s.prefill_s,
@@ -244,6 +272,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 ? (double)req.prompt_tokens.size() / s.prefill_s : 0.0;
             perf.decode_tok_s = decode_s > 0.0
                 ? (double)s.completion_tokens / decode_s : 0.0;
+            perf.preemptions = s.preemptions;
             status_.record_perf(perf);
         }
 
@@ -281,7 +310,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         const int out_tokens = (int)s.gen_tokens.size();
         std::fprintf(stderr,
             "[server] chat DONE %s ok=%s in=%zu out=%d %.1fs %.1f tok/s "
-            "finish=%s slot=%d prefill=%.1fs decode=%.1fs(%.1ftok/s) parallel\n",
+            "finish=%s slot=%d prefill=%.1fs decode=%.1fs(%.1ftok/s) "
+            "preemptions=%d parallel\n",
             req.response_id.c_str(),
             (!s.failed && backend_ok) ? "true" : "false",
             req.prompt_tokens.size(), out_tokens, elapsed_s,
@@ -289,7 +319,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             s.client_disconnected ? "client_disconnect"
                                   : s.emitter->finish_reason().c_str(),
             idx, s.prefill_s, decode_s,
-            decode_s > 0.0 ? out_tokens / decode_s : 0.0);
+            decode_s > 0.0 ? out_tokens / decode_s : 0.0,
+            s.preemptions);
 
         engine.retire(idx);
         // A retirement may have released the blocks the head job needs.
@@ -319,6 +350,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     auto admit_job = [&](ServerJob * job) -> AdmissionDisposition {
         const ParsedRequest & req = job->req;
         const auto started_at = std::chrono::steady_clock::now();
+        const bool resuming = job->suspended.has_value();
+        const std::vector<int32_t> & admission_prompt =
+            resuming ? job->suspended->prompt_tokens : req.prompt_tokens;
 
         // Same thinking-budget n_gen math as the classic worker loop.
         const bool budget_active = req.thinking_opt_in;
@@ -328,10 +362,15 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         const int eff_reply_for_n_gen = (req.per_req_reply_budget >= 0)
             ? req.per_req_reply_budget
             : config_.hard_limit_reply_budget;
-        const int n_gen_cap = budget_active
+        const int initial_n_gen_cap = budget_active
             ? (std::min)(effective_think_ceiling + eff_reply_for_n_gen,
                          req.max_output)
             : req.max_output;
+        // A live victim always has gen < cap (advance_slot finishes a slot
+        // the moment it reaches its cap), so a resumed job's remaining cap
+        // is >= 1 and never takes the degenerate empty-completion path.
+        const int n_gen_cap = resuming
+            ? job->suspended->remaining_n_gen : initial_n_gen_cap;
 
         if (n_gen_cap < 1) {
             // Degenerate ask: reply with an empty completion, no slot needed.
@@ -403,6 +442,18 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 finish_job(job);
                 return AdmissionDisposition::Retired;
             }
+        } else if (req.stream && resuming) {
+            // Probe a resumed stream through its suspended buffer: bytes
+            // queued before preemption must stay ahead of anything new (a
+            // direct write could land inside a partially flushed event),
+            // and a partial flush of a real backlog only means a slow
+            // reader — the stall clock owns that — not a dead one.
+            ClientSendBuffer & buf = job->suspended->send_buffer;
+            if (buf.empty()) buf.append(": admission retry\n\n");
+            if (!buf.flush(job->fd)) {
+                finish_job(job);
+                return AdmissionDisposition::Retired;
+            }
         } else if (req.stream) {
             // A busy admission can sit deferred after its SSE preamble was
             // committed. Probe it again before paying for a long prefill.
@@ -416,8 +467,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
         // Admission only claims the slot and queues the prompt. Prefill
         // advances one chunk per engine step alongside live decode.
-        auto ar = engine.admit(next_request_id, req.prompt_tokens,
-                               req.sampler);
+        auto ar = engine.admit(next_request_id, admission_prompt,
+                               req.sampler,
+                               resuming ? &job->suspended->sampling : nullptr);
         if (!ar.ok && ar.busy) return AdmissionDisposition::Deferred;
         if (!ar.ok) {
             std::fprintf(stderr, "[server] admit failed: %s\n",
@@ -436,26 +488,135 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             return AdmissionDisposition::Retired;
         }
         next_request_id++;
+        const int admitted_n_gen_cap = std::min(
+            n_gen_cap,
+            engine.max_context() - (int)admission_prompt.size() + 1);
 
         SchedSlot & s = slots[(size_t)ar.slot];
         s = SchedSlot{};
         s.job = job;
         s.fd = job->fd;
         s.prefilling = true;
-        s.started_at = started_at;
-        s.decode_started_at = started_at;  // sane on prefill failure
-        s.n_gen_cap = std::min(
-            n_gen_cap,
-            engine.max_context() - (int)req.prompt_tokens.size() + 1);
         s.emitter = std::move(job->emitter);
-        s.send_buffer.mark_progress(std::chrono::steady_clock::now());
-        if (budget_active && !config_.think_close_token_ids.empty() &&
-            config_.hard_limit_reply_budget > 0) {
-            s.hook.close_token_ids = config_.think_close_token_ids;
-            s.hook.hard_limit_remaining = eff_reply_for_n_gen;
+        if (resuming) {
+            SuspendedRun run = std::move(*job->suspended);
+            job->suspended.reset();
+            s.started_at = run.started_at;
+            s.decode_started_at = started_at;
+            s.prefill_s = run.prefill_s;
+            s.decode_accumulated_s = run.decode_s;
+            s.n_gen_cap = std::min(
+                run.n_gen_cap,
+                (int)run.gen_tokens.size() + admitted_n_gen_cap);
+            s.completion_tokens = run.completion_tokens;
+            s.gen_tokens = std::move(run.gen_tokens);
+            s.send_buffer = std::move(run.send_buffer);
+            // Time parked in the preempted queue is the scheduler's fault,
+            // not the reader's: restart the stall clock.
+            s.send_buffer.mark_progress(std::chrono::steady_clock::now());
+            s.hook = std::move(run.hook);
+            s.hook_started = run.hook_started;
+            s.hook_pos = run.hook_pos;
+            s.budget_forced_close = run.budget_forced_close;
+            s.degenerate_close = run.degenerate_close;
+            s.admission_order = job->admission_order;
+            s.preemptions = job->preemptions;
+        } else {
+            s.started_at = started_at;
+            // Kept sane for failure paths before the first token exists.
+            s.decode_started_at = started_at;
+            s.n_gen_cap = admitted_n_gen_cap;
+            s.admission_order = next_admission_order++;
+            job->admission_order = s.admission_order;
+            s.send_buffer.mark_progress(std::chrono::steady_clock::now());
+            if (budget_active && !config_.think_close_token_ids.empty() &&
+                config_.hard_limit_reply_budget > 0) {
+                s.hook.close_token_ids = config_.think_close_token_ids;
+                s.hook.hard_limit_remaining = eff_reply_for_n_gen;
+            }
         }
         publish_live_count();
         return AdmissionDisposition::Admitted;
+    };
+
+    auto preempt_for_pressure = [&](int blocked_slot) {
+        uint64_t oldest_order = std::numeric_limits<uint64_t>::max();
+        for (const SchedSlot & s : slots) {
+            if (s.job) oldest_order = std::min(oldest_order,
+                                               s.admission_order);
+        }
+
+        auto newest_candidate = [&](bool prefilling) {
+            int victim = -1;
+            uint64_t newest = 0;
+            for (int i = 0; i < n_slots; i++) {
+                const SchedSlot & s = slots[(size_t)i];
+                if (!s.job || s.prefilling != prefilling ||
+                    s.admission_order == oldest_order ||
+                    s.preemptions >= 2) {
+                    continue;
+                }
+                if (victim < 0 || s.admission_order > newest) {
+                    victim = i;
+                    newest = s.admission_order;
+                }
+            }
+            return victim;
+        };
+
+        // Discard the cheapest work first: newest in-flight prefill, then the
+        // newest decoder. The oldest live request is never a victim.
+        int victim = newest_candidate(true);
+        if (victim < 0) victim = newest_candidate(false);
+        if (victim < 0) return false;
+
+        SchedSlot & s = slots[(size_t)victim];
+        ServerJob * job = s.job;
+        SuspendedRun run;
+        if (!engine.capture_resume_state(victim, run.sampling)) return false;
+        // The latest sampled token is pending in the scheduler and has not
+        // reached append_token yet. Re-prefill will consume it as prompt, so
+        // penalties must treat every emitted/generated token as fed.
+        run.sampling.sample_history = s.gen_tokens;
+
+        run.prompt_tokens = job->req.prompt_tokens;
+        run.prompt_tokens.insert(run.prompt_tokens.end(),
+                                 s.gen_tokens.begin(), s.gen_tokens.end());
+        run.remaining_n_gen = s.n_gen_cap - (int)s.gen_tokens.size();
+        run.started_at = s.started_at;
+        run.prefill_s = s.prefill_s;
+        run.decode_s = s.decode_accumulated_s;
+        if (!s.prefilling) {
+            run.decode_s += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() -
+                s.decode_started_at).count();
+        }
+        run.n_gen_cap = s.n_gen_cap;
+        run.completion_tokens = s.completion_tokens;
+        run.gen_tokens = std::move(s.gen_tokens);
+        run.send_buffer = std::move(s.send_buffer);
+        run.hook = std::move(s.hook);
+        run.hook_started = s.hook_started;
+        run.hook_pos = s.hook_pos;
+        run.budget_forced_close = s.budget_forced_close;
+        run.degenerate_close = s.degenerate_close;
+        job->suspended = std::move(run);
+        job->emitter = std::move(s.emitter);
+        job->preemptions = s.preemptions + 1;
+
+        std::fprintf(stderr,
+            "[parallel] KV pressure at slot %d: preempting slot %d "
+            "(%s, attempt %d) for recompute\n",
+            blocked_slot, victim,
+            s.prefilling ? "prefill" : "decode",
+            job->preemptions);
+        engine.retire(victim);
+        s = SchedSlot{};
+        park_preempted(job);
+        skip_admission_once = true;
+        deferred_retry_at = {};
+        publish_live_count();
+        return true;
     };
 
     // Scheduler loop. Every iteration walks the same five phases:
@@ -478,18 +639,35 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // Blocking dequeue only when idle; between decode steps only a poll.
         // The engine has one prefill staging set, so only one admission may
         // be prefilling at a time.
-        while (live_count() < n_slots && !stopping_.load() &&
-               !engine.prefill_pending()) {
+        const bool allow_admission = !skip_admission_once;
+        skip_admission_once = false;
+        while (allow_admission && live_count() < n_slots &&
+               !stopping_.load() && !engine.prefill_pending() &&
+               !immune_request_live()) {
             // A deferred job owns the front of the line, so nothing else may
             // be admitted while its retry backoff is still running.
-            if (deferred &&
+            if ((deferred || !preempted.empty()) &&
                 std::chrono::steady_clock::now() < deferred_retry_at) {
+                break;
+            }
+            // After two preemptions a request resumes alone. Let current work
+            // drain rather than creating another discard/recompute cycle.
+            if (!preempted.empty() && preempted.front()->preemptions >= 2 &&
+                live_count() > 0) {
                 break;
             }
             // Retry the deferred job first; it was already queued ahead of
             // everything still in the queue.
-            ServerJob * job = deferred;
-            deferred = nullptr;
+            bool from_preempted = false;
+            ServerJob * job = nullptr;
+            if (!preempted.empty()) {
+                job = preempted.front();
+                preempted.pop_front();
+                from_preempted = true;
+            } else {
+                job = deferred;
+                deferred = nullptr;
+            }
             if (!job) {
                 if (live_count() == 0 && drains.empty()) {
                     // Fully idle: no stream is waiting on us, so give the
@@ -506,7 +684,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             if (!job) break;  // queue empty: go decode what is already live
             const AdmissionDisposition outcome = admit_job(job);
             if (outcome == AdmissionDisposition::Deferred) {
-                deferred = job;
+                if (from_preempted) {
+                    park_preempted(job);
+                } else {
+                    deferred = job;
+                }
                 deferred_retry_at = std::chrono::steady_clock::now() +
                                     std::chrono::seconds(1);
                 break;  // wait for a retire to free blocks
@@ -549,10 +731,15 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
             continue;
         }
+        int pressure_slot = -1;
         for (const auto & out : outputs) {
             if (out.slot < 0 || out.slot >= n_slots) continue;
             SchedSlot & s = slots[(size_t)out.slot];
             if (!s.job) continue;
+            if (out.pool_exhausted) {
+                pressure_slot = out.slot;
+                continue;
+            }
             if (out.failed) {
                 s.failed = true;
                 s.error = out.error;
@@ -561,13 +748,26 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
             if (out.prefill_done) {
                 s.prefilling = false;
-                s.decode_started_at = std::chrono::steady_clock::now();
-                s.prefill_s = std::chrono::duration<double>(
-                    s.decode_started_at - s.started_at).count();
+                // Accumulates across recompute re-admissions: prefill_s
+                // carries the prior runs, decode_started_at marks this
+                // admission.
+                const auto now = std::chrono::steady_clock::now();
+                s.prefill_s += std::chrono::duration<double>(
+                    now - s.decode_started_at).count();
+                s.decode_started_at = now;
                 advance_slot(s, out.token);
                 continue;
             }
             advance_slot(s, out.token);
+        }
+        if (pressure_slot >= 0 &&
+            !preempt_for_pressure(pressure_slot)) {
+            SchedSlot & blocked = slots[(size_t)pressure_slot];
+            blocked.failed = true;
+            blocked.error =
+                "paged KV pool cannot advance the oldest sequence; "
+                "raise --kv-pool-tokens or lower --max-ctx";
+            blocked.finished = true;
         }
         // Phase 4 — Non-blocking flush of every live slot's chunks. Progress
         // resets the stall clock; a reader that makes no progress for 30 s
@@ -611,21 +811,30 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     service_drains();
     for (DrainJob & d : drains) finish_job(d.job);
     drains.clear();
-    if (deferred) {
+    auto fail_parked = [&](ServerJob * job) {
+        if (!job) return;
+        if (job->suspended && !job->suspended->send_buffer.empty()) {
+            job->suspended->send_buffer.flush(job->fd);
+        }
         // admit_job() sends the SSE headers and opening event before asking
         // the engine for a slot, so a pool-full deferred stream is already
         // live on the wire. Close that protocol cleanly on shutdown instead
         // of waking the client thread and letting it truncate the response.
-        const ParsedRequest & req = deferred->req;
-        if (req.stream && deferred->sse_started) {
+        const ParsedRequest & req = job->req;
+        if (req.stream && job->sse_started) {
             for (const std::string & chunk :
                  sse_error_close_chunks("server shutting down")) {
-                send_all(deferred->fd, chunk.data(), chunk.size());
+                send_all(job->fd, chunk.data(), chunk.size());
             }
         } else {
-            send_error(deferred->fd, 503, "server shutting down");
+            send_error(job->fd, 503, "server shutting down");
         }
-        finish_job(deferred);
+        finish_job(job);
+    };
+    fail_parked(deferred);
+    while (!preempted.empty()) {
+        fail_parked(preempted.front());
+        preempted.pop_front();
     }
     // Jobs that never reached admission are still parked in their client
     // threads too. Drain the raw queue before returning so run() does not hit

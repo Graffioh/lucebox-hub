@@ -32,11 +32,13 @@
 
 #include <atomic>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #if !defined(_WIN32)
@@ -499,6 +501,29 @@ private:
 };
 
 // ─── Job (stack-owned by client thread) ─────────────────────────────────
+// One slot's scheduler state, parked across a recompute preemption. Suspend
+// and resume each move this struct whole, so state cannot be dropped by
+// forgetting one of a pile of mirrored fields. The sampled-but-unfed token
+// needs no field of its own — it rides at the tail of prompt_tokens and
+// re-enters the engine as prompt.
+struct SuspendedRun {
+    std::vector<int32_t> prompt_tokens;   // original prompt + emitted tokens
+    int    remaining_n_gen = 0;
+    SeqEngine::ResumeState sampling;
+    std::chrono::steady_clock::time_point started_at{};
+    double prefill_s = 0.0;
+    double decode_s = 0.0;                // accumulated pre-preemption decode
+    int    n_gen_cap = 0;
+    int    completion_tokens = 0;
+    std::vector<int32_t> gen_tokens;
+    ClientSendBuffer send_buffer;
+    BudgetHook hook;
+    bool   hook_started = false;
+    int    hook_pos = 0;
+    bool   budget_forced_close = false;
+    bool   degenerate_close = false;
+};
+
 struct ServerJob {
     SocketHandle  fd = kInvalidSocket;
     ParsedRequest req;
@@ -512,6 +537,14 @@ struct ServerJob {
     bool          announced = false;
     bool          sse_started = false;
     std::unique_ptr<SseEmitter> emitter;
+
+    // Recompute-preemption state. A client thread owns this job for the
+    // whole request, so parking the scheduler half here keeps protocol,
+    // sampler, and generation state intact while the engine slot is retired
+    // and later re-admitted.
+    uint64_t      admission_order = 0;
+    int           preemptions = 0;
+    std::optional<SuspendedRun> suspended;
 };
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────
