@@ -82,3 +82,11 @@ For an A/B against an unmodified `main` server, use the same command with
 `--timing-only`. That mode accepts the older three-field `usage.timings` shape
 and reports prefill speedup, but deliberately does not claim cache correctness
 because `main` cannot expose the restored-token counts.
+
+## See also
+
+When volatile text (for example a session clock) sits *inside* the first system
+message, the first chat boundary cannot exclude it. **DiffPin** diffs the head,
+floats that volatility after the stable block, and pins the contiguous prefix.
+See [PIN_FRIENDLY_PROMPT.md](./PIN_FRIENDLY_PROMPT.md). Enable/disable with
+`DFLASH_PPP` (on by default).

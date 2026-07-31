@@ -254,6 +254,7 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
 
     auto boundaries = find_all_boundaries(prompt_ids, markers_);
     int best_slot = -1, best_len = 0;
+    int best_idx = -1;
 
     for (int cut : boundaries) {
         auto key = hash_prefix(prompt_ids.data(), cut);
@@ -273,12 +274,27 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
             if (cut > best_len) {
                 best_slot = entries_[idx].slot;
                 best_len = cut;
+                best_idx = idx;
             }
-            move_to_end(idx);
         }
     }
 
-    if (best_slot >= 0) {
+    // Match committed entry prefixes directly. Required for PPP mid-message
+    // pin_end cuts that are not chat-template boundaries.
+    for (int i = 0; i < (int)entries_.size(); ++i) {
+        const auto & e = entries_[(size_t)i];
+        const int len = (int)e.ids.size();
+        if (len <= best_len || len > (int)prompt_ids.size()) continue;
+        if (!std::equal(e.ids.begin(), e.ids.end(), prompt_ids.begin())) {
+            continue;
+        }
+        best_slot = e.slot;
+        best_len = len;
+        best_idx = i;
+    }
+
+    if (best_idx >= 0) {
+        move_to_end(best_idx);
         lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
         std::fprintf(stderr, "[pc] lookup hit slot=%d prefix_len=%d (of %zu total)\n",
                      best_slot, best_len, prompt_ids.size());
@@ -289,22 +305,32 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
 std::pair<int, int> PrefixCache::prepare_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len,
-        bool prefer_tools_boundary) {
+        bool prefer_tools_boundary,
+        int forced_cut) {
     if (disabled_) return {-1, 0};
 
     auto candidates = find_all_boundaries(prompt_ids, markers_);
-    const int target_cut =
-        select_inline_snapshot_boundary(
+    int target_cut = 0;
+    bool forced = false;
+    if (forced_cut > restored_prefix_len &&
+        forced_cut <= (int)prompt_ids.size()) {
+        target_cut = forced_cut;
+        forced = true;
+    } else {
+        target_cut = select_inline_snapshot_boundary(
             candidates, restored_prefix_len, prefer_tools_boundary);
+    }
     if (target_cut <= 0) return {-1, 0};
 
     auto key = hash_prefix(prompt_ids.data(), target_cut);
     if (find_entry(key) >= 0) return {-1, 0};  // already cached
 
-    // Protect the tools head pin (first boundary) for tool-heavy requests so
-    // multi-chat deepen snaps cannot thrash the ~18k system+tools KV away.
-    pending_protect_ = prefer_tools_boundary && !candidates.empty() &&
-                       target_cut == candidates.front();
+    // Protect the tools head pin for tool-heavy requests so multi-chat deepen
+    // snaps cannot thrash the ~18k system+tools KV away. PPP forced cuts are
+    // the stable tools/identity span and stay protected as well.
+    pending_protect_ = prefer_tools_boundary &&
+                       (forced ||
+                        (!candidates.empty() && target_cut == candidates.front()));
 
     int slot;
     if ((int)entries_.size() >= cap_) {

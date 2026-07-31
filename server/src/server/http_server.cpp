@@ -21,6 +21,7 @@
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
 #include "tool_hint.h"
+#include "pin_friendly_prompt.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
 
@@ -953,6 +954,36 @@ HttpServer::HttpServer(ModelBackend & backend,
     }
     disk_cache_.init();
     status_html_path_ = resolve_status_html();
+
+    // PPP env overrides (operator-facing; no CLI flags required).
+    auto env_truthy = [](const char * v) -> bool {
+        if (!v || !*v) return false;
+        return !(v[0] == '0' && v[1] == '\0') &&
+               !(v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
+    };
+    if (const char * e = std::getenv("DFLASH_PPP")) {
+        config_.ppp_enabled = env_truthy(e);
+    }
+    if (const char * e = std::getenv("DFLASH_PPP_REARRANGE")) {
+        config_.ppp_rearrange = env_truthy(e);
+    }
+    if (const char * e = std::getenv("DFLASH_PPP_LCP_WINDOW")) {
+        const int n = std::atoi(e);
+        if (n > 0) config_.ppp_lcp_window = n;
+    }
+    if (const char * e = std::getenv("DFLASH_PPP_MIN_PIN_TOKENS")) {
+        const int n = std::atoi(e);
+        if (n > 0) config_.ppp_min_pin_tokens = n;
+    }
+    if (const char * e = std::getenv("DFLASH_PPP_MAX_EPHEMERAL")) {
+        const int n = std::atoi(e);
+        if (n > 0) config_.ppp_max_ephemeral_tokens = n;
+    }
+    std::fprintf(stderr,
+        "[ppp] enabled=%d rearrange=%d lcp_window=%d min_pin=%d max_ephemeral=%d\n",
+        (int)config_.ppp_enabled, (int)config_.ppp_rearrange,
+        config_.ppp_lcp_window, config_.ppp_min_pin_tokens,
+        config_.ppp_max_ephemeral_tokens);
 }
 
 // Resolve path to share/status.html at startup.
@@ -1837,7 +1868,20 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         apply_request_reasoning(body, req);
         // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
         req.session_id = parse_session_id_from_body(body);
-        if (!render_and_tokenize_request(fd, chat_messages, req)) return true;
+
+        // PPP rearrange (optional): peel ephemeral system banners into a
+        // following system message so the first chat boundary is stable.
+        std::vector<ChatMessage> render_messages = chat_messages;
+        if (config_.ppp_enabled && config_.ppp_rearrange && !req.tools.empty()) {
+            auto layout = PinFriendlyPrompt::rearrange(chat_messages, true);
+            if (layout.rearranged) {
+                render_messages = std::move(layout.messages);
+                std::fprintf(stderr,
+                    "[ppp] rearranged: peeled ephemeral system tail\n");
+            }
+        }
+
+        if (!render_and_tokenize_request(fd, render_messages, req)) return true;
 
         // count_tokens: short-circuit after tokenization. Skip generation
         // entirely — Anthropic's contract is just {"input_tokens": N}.
@@ -2659,6 +2703,47 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request) {
     auto & effective_prompt = prepared.tokens;
+    // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
+    const bool prefer_inline_snap = !req.tools.empty();
+    const bool prefer_tools_boundary = prefer_inline_snap;
+    int forced_cut = req.pin_end_token;
+
+    // PPP runs *before* lookup: rewrite the tools/system head into
+    // [shared prefix][shared suffix][volatile][end markers] so cache keys
+    // match across session-clock drift.
+    if (config_.ppp_enabled && prefer_tools_boundary) {
+        const auto boundaries = find_all_boundaries(
+            effective_prompt, prefix_cache_.chat_markers());
+        auto rewrite = PinFriendlyPrompt::diff_make_pin_friendly(
+            effective_prompt, boundaries, recent_tool_prefixes_,
+            prefix_cache_.chat_markers(),
+            config_.ppp_lcp_window, config_.ppp_min_pin_tokens,
+            config_.ppp_max_ephemeral_tokens);
+        if (rewrite.rewritten) {
+            effective_prompt = std::move(rewrite.tokens);
+            generate_request.prompt = effective_prompt;
+            std::fprintf(stderr,
+                "[ppp] diff-rewrite prefix=%d suffix=%d middle=%d "
+                "pin_end=%d prompt=%zu\n",
+                rewrite.prefix_len, rewrite.suffix_len, rewrite.middle_len,
+                rewrite.pin_end, effective_prompt.size());
+        }
+        if (forced_cut <= 0) forced_cut = rewrite.pin_end;
+        if (forced_cut > 0 && !rewrite.rewritten) {
+            std::fprintf(stderr,
+                "[ppp] pin_end=%d (no rewrite; prompt=%zu)\n",
+                forced_cut, effective_prompt.size());
+        }
+        const auto remember_bounds = find_all_boundaries(
+            effective_prompt, prefix_cache_.chat_markers());
+        const int remember_n = !remember_bounds.empty()
+            ? remember_bounds.front()
+            : (int)effective_prompt.size();
+        PinFriendlyPrompt::remember_tool_prefix(
+            recent_tool_prefixes_, effective_prompt, remember_n,
+            config_.ppp_lcp_window);
+    }
+
     GenerationCacheState cache;
     cache.cache_slot = prepared.full_cache_hit_slot;
     cache.prefix_len = prepared.full_cache_hit_len;
@@ -2907,15 +2992,12 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     // A generation can save only one snapshot during prefill. Tool-heavy
     // requests prefer the reusable system/tool boundary; otherwise an
     // enabled exact full-prompt cache retains its existing priority.
-    const bool prefer_inline_snap = !req.tools.empty();
-    // When tools are present, pin the system+tools head first (sticky under
-    // eviction). After that head is restored, deepen to the turn boundary.
-    const bool prefer_tools_boundary = prefer_inline_snap;
     auto prepare_inline = [&]() {
         const auto prepared_snapshot = prefix_cache_.prepare_inline_snap(
             effective_prompt,
             cache.using_restore ? cache.prefix_len : 0,
-            prefer_tools_boundary);
+            prefer_tools_boundary,
+            forced_cut);
         cache.snap_slot = prepared_snapshot.first;
         cache.snap_cut = prepared_snapshot.second;
     };

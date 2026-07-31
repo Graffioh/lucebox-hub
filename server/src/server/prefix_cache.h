@@ -107,11 +107,14 @@ public:
     // Prepare an inline snapshot. `restored_prefix_len` prevents reserving a
     // slot for a boundary already covered by the restored snapshot.
     // `prefer_tools_boundary` selects the system/tools head first (see
-    // select_inline_snapshot_boundary). Returns (slot, target_cut) or (-1, 0).
+    // select_inline_snapshot_boundary). When `forced_cut` > restored, that
+    // cut is used instead (PPP pin_end, including mid-message LCP cuts).
+    // Returns (slot, target_cut) or (-1, 0).
     std::pair<int, int> prepare_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len = 0,
-        bool prefer_tools_boundary = false);
+        bool prefer_tools_boundary = false,
+        int forced_cut = 0);
 
     // Confirm after daemon successfully saved the snapshot.
     // `protect` marks the entry non-evictable by unprotected traffic (tool pin).
