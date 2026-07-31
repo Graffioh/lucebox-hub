@@ -63,7 +63,8 @@ struct ServerConfig {
 
     // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
     // See docs/PIN_FRIENDLY_PROMPT.md. Env: DFLASH_PPP=0|1,
-    // DFLASH_PPP_REARRANGE=0|1, DFLASH_PPP_LCP_WINDOW=N.
+    // DFLASH_PPP_REARRANGE=0|1, DFLASH_PPP_LCP_WINDOW=N,
+    // DFLASH_PPP_MIN_PIN_TOKENS=N, DFLASH_PPP_MAX_EPHEMERAL=N.
     bool        ppp_enabled = true;
     bool        ppp_rearrange = false;
     int         ppp_lcp_window = 8;
@@ -331,6 +332,9 @@ private:
         int full_snap_slot = -1;
         int full_snap_pos = 0;
         bool full_snap_prepared = false;
+        // When DiffPin rewrote tokens, full-cache keys must use
+        // prepared.tokens (effective), not req.prompt_tokens.
+        bool full_snap_key_effective = false;
         int snap_slot = -1;
         int snap_cut = 0;
         bool snap_prepared = false;

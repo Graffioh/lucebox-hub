@@ -1,6 +1,6 @@
 // Pin-Friendly Prompt Processor (PPP)
 //
-// Diffes the tools/system head against recent traffic, isolates the volatile
+// Diffs the tools/system head against recent traffic, isolates the volatile
 // span, and rewrites tokens to:
 //   [shared prefix][shared suffix][volatile middle][end markers]
 // so PrefixCache can pin the contiguous stable blob. See docs/PIN_FRIENDLY_PROMPT.md.
@@ -16,14 +16,6 @@
 #include <vector>
 
 namespace dflash::common {
-
-struct PinFriendlyPromptConfig {
-    bool enabled = true;
-    bool rearrange = false;     // optional text-level peel (legacy / explicit)
-    int  lcp_window = 8;        // recent tool-bearing prefixes to compare
-    int  min_pin_tokens = 512;
-    int  max_ephemeral_tokens = 256;  // only relocate small volatile hunks
-};
 
 struct PinFriendlyLayout {
     std::vector<ChatMessage> messages;
@@ -79,10 +71,17 @@ public:
         int window,
         int min_pin_tokens);
 
+    // Exclusive end of the first tools/system message (through end-of-message
+    // marker). Chat boundaries from find_all_boundaries() sit *after* the next
+    // role-start and must not be used as the DiffPin rewrite head.
+    static int tools_system_head_end(const std::vector<int32_t> & tokens,
+                                     const ChatMarkers & markers);
+
     // Diff the tools/system head against recent prefixes and rewrite:
     //   [tokentokentoken] with a mid clock → [tokentoken][token][time][im_end]
-    // pin_end covers the contiguous stable blob. No-op when history is empty,
-    // the volatile hunk is too large, or nothing moves.
+    // pin_end covers the contiguous stable blob. No-op when boundaries are
+    // empty (custom templates), history is empty, the volatile hunk is too
+    // large, or nothing moves.
     static PinFriendlyRewrite diff_make_pin_friendly(
         const std::vector<int32_t> & tokens,
         const std::vector<int> & boundaries,

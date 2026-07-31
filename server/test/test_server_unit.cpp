@@ -1876,7 +1876,9 @@ TEST_CASE(ServerUnitFixture, test_ppp_diff_rewrite_moves_volatile_after_stable) 
     markers.end_msg_seqs = {{50}};
 
     std::vector<std::vector<int32_t>> ring = {day1};
-    const std::vector<int> boundaries = {8};  // head through im_end
+    // Chat boundaries sit after the next role-start; DiffPin must still cut
+    // the rewrite head at the first im_end (index 8), not at boundaries.front().
+    const std::vector<int> boundaries = {10};
     auto rw = PinFriendlyPrompt::diff_make_pin_friendly(
         day2, boundaries, ring, markers,
         /*window=*/4, /*min_pin=*/4, /*max_ephemeral=*/16);
@@ -1893,6 +1895,51 @@ TEST_CASE(ServerUnitFixture, test_ppp_diff_rewrite_moves_volatile_after_stable) 
     TEST_ASSERT(rw.tokens[6] == 222);
     TEST_ASSERT(rw.tokens[7] == 50);
     TEST_ASSERT(rw.tokens[8] == 9);
+}
+
+TEST_CASE(ServerUnitFixture, test_ppp_diff_rewrite_noop_without_boundaries) {
+    std::vector<int32_t> day1 = {7, 7, 7, 7, 111, 8, 8, 50};
+    std::vector<int32_t> day2 = {7, 7, 7, 7, 222, 8, 8, 50, 9, 9};
+    ChatMarkers markers;
+    markers.end_msg_seqs = {{50}};
+    std::vector<std::vector<int32_t>> ring = {day1};
+    auto rw = PinFriendlyPrompt::diff_make_pin_friendly(
+        day2, /*boundaries=*/{}, ring, markers,
+        /*window=*/4, /*min_pin=*/4, /*max_ephemeral=*/16);
+    TEST_ASSERT(!rw.rewritten);
+    TEST_ASSERT(rw.tokens == day2);
+}
+
+TEST_CASE(ServerUnitFixture, test_ppp_diff_rewrite_stops_before_next_role) {
+    // Realistic boundary: after user role-start (token 90), past im_end (50).
+    // Volatile middle must not float into the user turn.
+    std::vector<int32_t> day1 = {7, 7, 7, 7, 111, 8, 8, 50};
+    std::vector<int32_t> day2 = {7, 7, 7, 7, 222, 8, 8, 50, 90, 91, 92};
+    ChatMarkers markers;
+    markers.end_msg_seqs = {{50}};
+    std::vector<std::vector<int32_t>> ring = {day1};
+    const std::vector<int> boundaries = {11};  // after user role start
+    auto rw = PinFriendlyPrompt::diff_make_pin_friendly(
+        day2, boundaries, ring, markers,
+        /*window=*/4, /*min_pin=*/4, /*max_ephemeral=*/16);
+    TEST_ASSERT(rw.rewritten);
+    TEST_ASSERT(rw.tokens.size() == day2.size());
+    // Head rewritten; user role tokens untouched at the end.
+    TEST_ASSERT(rw.tokens[rw.tokens.size() - 3] == 90);
+    TEST_ASSERT(rw.tokens[rw.tokens.size() - 2] == 91);
+    TEST_ASSERT(rw.tokens[rw.tokens.size() - 1] == 92);
+    TEST_ASSERT(rw.tokens[6] == 222);
+    TEST_ASSERT(rw.tokens[7] == 50);
+}
+
+TEST_CASE(ServerUnitFixture, test_ppp_tools_system_head_end) {
+    ChatMarkers markers;
+    markers.end_msg_seqs = {{50}, {51, 52}};
+    std::vector<int32_t> ids = {1, 2, 50, 90, 91};
+    TEST_ASSERT(PinFriendlyPrompt::tools_system_head_end(ids, markers) == 3);
+    ids = {1, 2, 51, 52, 90};
+    TEST_ASSERT(PinFriendlyPrompt::tools_system_head_end(ids, markers) == 4);
+    TEST_ASSERT(PinFriendlyPrompt::tools_system_head_end({1, 2, 3}, markers) == 0);
 }
 
 TEST_CASE(ServerUnitFixture, test_ppp_split_and_rearrange_ephemeral_tail) {

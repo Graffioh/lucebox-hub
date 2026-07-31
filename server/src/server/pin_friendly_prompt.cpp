@@ -108,6 +108,34 @@ int PinFriendlyPrompt::trailing_end_marker_len(
     return best;
 }
 
+int PinFriendlyPrompt::tools_system_head_end(
+        const std::vector<int32_t> & tokens,
+        const ChatMarkers & markers) {
+    if (tokens.empty() || markers.end_msg_seqs.empty()) return 0;
+    int best = -1;
+    int best_len = 0;
+    for (const auto & seq : markers.end_msg_seqs) {
+        if (seq.empty() || (int)seq.size() > (int)tokens.size()) continue;
+        for (int i = 0; i + (int)seq.size() <= (int)tokens.size(); ++i) {
+            bool match = true;
+            for (int k = 0; k < (int)seq.size(); ++k) {
+                if (tokens[(size_t)(i + k)] != seq[(size_t)k]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (!match) continue;
+            if (best < 0 || i < best) {
+                best = i;
+                best_len = (int)seq.size();
+            }
+            break;  // first occurrence of this seq; keep scanning other seqs
+        }
+    }
+    if (best < 0) return 0;
+    return best + best_len;
+}
+
 PinFriendlyRewrite PinFriendlyPrompt::diff_make_pin_friendly(
         const std::vector<int32_t> & tokens,
         const std::vector<int> & boundaries,
@@ -121,12 +149,14 @@ PinFriendlyRewrite PinFriendlyPrompt::diff_make_pin_friendly(
     if (tokens.empty() || recent_tool_prefixes.empty() || window <= 0) {
         return out;
     }
+    // Custom / unstructured templates: do not rewrite the whole prompt.
+    if (boundaries.empty()) return out;
 
-    // Only rewrite the tools/system head; leave transcript untouched.
-    const int head_end = boundaries.empty()
-        ? (int)tokens.size()
-        : boundaries.front();
-    if (head_end < min_pin_tokens) return out;
+    // Only rewrite through the first end-of-message marker. find_all_boundaries
+    // returns cuts *after* the next role-start; using those would let the
+    // volatile middle float past user/assistant markers.
+    const int head_end = tools_system_head_end(tokens, markers);
+    if (head_end <= 0 || head_end < min_pin_tokens) return out;
 
     std::vector<int32_t> head(tokens.begin(), tokens.begin() + head_end);
     const std::vector<int32_t> rest(tokens.begin() + head_end, tokens.end());

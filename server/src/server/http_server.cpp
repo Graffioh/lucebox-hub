@@ -1876,6 +1876,18 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
             auto layout = PinFriendlyPrompt::rearrange(chat_messages, true);
             if (layout.rearranged) {
                 render_messages = std::move(layout.messages);
+                // Keep FlowKV / response formatting aligned with the served
+                // layout (FlowKV re-renders from req.messages).
+                if (req.messages.is_array() && !req.messages.empty() &&
+                    req.messages[0].value("role", "") == "system" &&
+                    render_messages.size() >= 2) {
+                    req.messages[0]["content"] = render_messages[0].content;
+                    json meta = {
+                        {"role", "system"},
+                        {"content", render_messages[1].content},
+                    };
+                    req.messages.insert(req.messages.begin() + 1, std::move(meta));
+                }
                 std::fprintf(stderr,
                     "[ppp] rearranged: peeled ephemeral system tail\n");
             }
@@ -2713,6 +2725,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     // (prefix|suffix|middle float) is opt-in via DFLASH_PPP_REARRANGE=1;
     // unconstrained middle peels can scramble tool-schema JSON and yield
     // empty post-tool completions.
+    bool ppp_rewrote = false;
     if (config_.ppp_enabled && prefer_tools_boundary) {
         const auto boundaries = find_all_boundaries(
             effective_prompt, prefix_cache_.chat_markers());
@@ -2725,6 +2738,11 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
             if (rewrite.rewritten) {
                 effective_prompt = std::move(rewrite.tokens);
                 generate_request.prompt = effective_prompt;
+                ppp_rewrote = true;
+                // Full-cache hits/keys from unrearranged tokens are stale.
+                prepared.full_cache_hit_slot = -1;
+                prepared.full_cache_hit_len = 0;
+                prepared.full_cache_served_tokens = -1;
                 std::fprintf(stderr,
                     "[ppp] diff-rewrite prefix=%d suffix=%d middle=%d "
                     "pin_end=%d prompt=%zu\n",
@@ -2762,11 +2780,14 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     cache.prefix_len = prepared.full_cache_hit_len;
     cache.using_restore = cache.cache_slot >= 0;
     cache.disk_policy = req.disk_cache_policy;
+    cache.full_snap_key_effective = ppp_rewrote;
 
-    // Exact raw-prompt snapshots take priority over inline turn boundaries.
+    // Exact full-prompt snapshots. After a DiffPin rewrite, key by the
+    // tokens we actually serve (effective_prompt), not the client wire form.
     if (!cache.using_restore) {
-        auto [full_slot, full_len] =
-            prefix_cache_.lookup_full(req.prompt_tokens);
+        const auto & full_key =
+            ppp_rewrote ? effective_prompt : req.prompt_tokens;
+        auto [full_slot, full_len] = prefix_cache_.lookup_full(full_key);
         if (full_slot >= 0) {
             cache.cache_slot = full_slot;
             cache.prefix_len = full_len;
@@ -3015,8 +3036,9 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         cache.snap_cut = prepared_snapshot.second;
     };
     auto prepare_full = [&]() {
-        cache.full_snap_slot =
-            prefix_cache_.prepare_full_snap(req.prompt_tokens);
+        const auto & full_key = cache.full_snap_key_effective
+            ? effective_prompt : req.prompt_tokens;
+        cache.full_snap_slot = prefix_cache_.prepare_full_snap(full_key);
         if (cache.full_snap_slot >= 0) {
             cache.full_snap_pos = (int) effective_prompt.size();
             generate_request.snap_slot = cache.full_snap_slot;
@@ -3093,8 +3115,10 @@ void HttpServer::finalize_generation_cache(
                 backend_.snapshot_cur_pos(cache.full_snap_slot);
             if (saved_position > 0 &&
                 saved_position <= cache.full_snap_pos) {
+                const auto & full_key = cache.full_snap_key_effective
+                    ? effective_prompt : req.prompt_tokens;
                 prefix_cache_.confirm_full_snap(
-                    cache.full_snap_slot, req.prompt_tokens, saved_position);
+                    cache.full_snap_slot, full_key, saved_position);
             } else {
                 backend_.snapshot_free(cache.full_snap_slot);
                 prefix_cache_.abort_full_snap(cache.full_snap_slot);

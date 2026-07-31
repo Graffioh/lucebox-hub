@@ -155,6 +155,8 @@ flowchart TD
 
 End-of-message markers (the “this turn is over” tokens) stay at the end of the head so the chat shape still reads as a coherent system turn.
 
+The rewrite head stops at the **first end-of-message marker**, not at the PrefixCache chat boundary. Those boundaries sit *after* the next role-start; cutting there would let a floated middle cross into the user turn. With no chat boundaries (custom templates), DiffPin does not rewrite.
+
 ---
 
 ## What you should feel in production
