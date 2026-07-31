@@ -110,7 +110,7 @@ static void print_usage(const char * prog) {
         "                         (requires --paged-attention; default: 1)\n"
         "  --kv-pool-tokens <N> Total paged K/V pool shared by all\n"
         "                       --max-concurrency slots, in tokens\n"
-        "                       (default: N x max-ctx)\n"
+        "                       (default: sized from available device memory)\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"

@@ -134,6 +134,42 @@ static FILE * open_dflash_floor_log() {
     return out;
 #endif
 }
+
+// Persistent concurrent-cache bytes that do not scale with the physical
+// paged pool. The estimate mirrors create_target_cache_partial(): one
+// max-context staging K/V, recurrent state for N slots plus one staging slot,
+// target features, paged metadata, Q capture, and the dead-row scratch block.
+static int64_t concurrent_fixed_cache_bytes(
+        const TargetWeights & w, int max_ctx, int n_slots,
+        int64_t kv_bytes_per_token) {
+    const int64_t n_full_attn =
+        w.n_layer / w.full_attention_interval;
+    const int64_t n_delta = w.n_layer - n_full_attn;
+    const int64_t head_v_dim = w.ssm_d_inner / w.ssm_dt_rank;
+    const int64_t conv_ch =
+        w.ssm_d_inner + 2LL * w.ssm_n_group * w.ssm_d_state;
+    const int64_t state_per_layer =
+        (head_v_dim * head_v_dim * w.ssm_dt_rank +
+         (int64_t)(w.ssm_d_conv - 1) * conv_ch) *
+        (int64_t)sizeof(float);
+    const int64_t recurrent =
+        state_per_layer * n_delta * (n_slots + 1LL);
+    const int64_t staging_kv =
+        kv_bytes_per_token * paged_token_capacity(max_ctx);
+    const int64_t target_feat =
+        (int64_t)w.n_capture_layers * w.n_embd *
+        std::min(max_ctx, 4096) * (int64_t)sizeof(uint16_t);
+    const int64_t q_capture =
+        (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
+        (int64_t)sizeof(float);
+    const int64_t paged_metadata =
+        ((int64_t)paged_block_count(max_ctx) * n_slots + n_slots) *
+        (int64_t)sizeof(int32_t);
+    const int64_t scratch =
+        kv_bytes_per_token * PAGED_BLOCK_SIZE;
+    return recurrent + staging_kv + target_feat + q_capture +
+           paged_metadata + scratch;
+}
 }  // namespace
 
 #define IS_EOS_TOK(tok, w)                                         \
@@ -309,16 +345,47 @@ bool Qwen35Backend::init() {
         set_last_error("--max-concurrency requires --paged-attention");
         return false;
     }
-    // Concurrent slots share one physical pool. Default capacity is one full
-    // context per slot (no oversubscription); --kv-pool-tokens overrides it.
+    // Concurrent slots share one physical pool. An explicit
+    // --kv-pool-tokens is rounded up to a whole block; otherwise capacity is
+    // derived from device-free memory after subtracting fixed concurrent cache
+    // state and a runtime graph reserve. This decouples max-concurrency from
+    // startup K/V allocation while retaining at least one full logical context.
     // One extra scratch block is appended to the K/V tensors (outside the
     // pool's index space) as the write target of dead decode-batch rows.
     int64_t pool_tokens = 0;
     if (n_slots > 1) {
-        pool_tokens = cfg_.kv_pool_tokens > 0
-            ? (int64_t)paged_token_capacity(
-                  (int)std::min<int64_t>(cfg_.kv_pool_tokens, INT32_MAX - PAGED_BLOCK_SIZE))
-            : (int64_t)n_slots * paged_token_capacity(cfg_.device.max_ctx);
+        if (cfg_.kv_pool_tokens > 0) {
+            pool_tokens = (int64_t)paged_token_capacity(
+                (int)std::min<int64_t>(
+                    cfg_.kv_pool_tokens, INT32_MAX - PAGED_BLOCK_SIZE));
+        } else {
+            PagedKvAutoBudget budget;
+            budget.free_bytes = (int64_t)gpu_free;
+            budget.bytes_per_token = kvf_budget.bytes_per_token;
+            budget.reserve_bytes = kvf_budget.reserve_bytes;
+            budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
+                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token);
+            pool_tokens = paged_kv_auto_pool_tokens(
+                cfg_.device.max_ctx, n_slots, budget);
+            const int64_t one_context =
+                paged_token_capacity(cfg_.device.max_ctx);
+            std::fprintf(stderr,
+                "[parallel] auto KV pool: %lld tokens "
+                "(free %.2f GiB - fixed %.2f GiB - reserve %.2f GiB, "
+                "%.2f KiB/token; logical cap %lld)\n",
+                (long long)pool_tokens,
+                budget.free_bytes / 1073741824.0,
+                budget.fixed_cache_bytes / 1073741824.0,
+                budget.reserve_bytes / 1073741824.0,
+                budget.bytes_per_token / 1024.0,
+                (long long)n_slots * one_context);
+            if (pool_tokens < one_context) {
+                set_last_error(
+                    "not enough device memory for one max_ctx paged sequence; "
+                    "lower --max-ctx or set --kv-pool-tokens explicitly");
+                return false;
+            }
+        }
         if (pool_tokens + PAGED_BLOCK_SIZE > INT32_MAX) {
             set_last_error("paged KV pool exceeds INT32_MAX tokens");
             return false;
@@ -376,9 +443,12 @@ bool Qwen35Backend::init() {
                         (long long)pool_tokens, cfg_.device.max_ctx);
         }
         std::printf("[paged-attention] %u physical blocks x %u tokens "
-                    "(%d logical tokens)\n",
+                    "(%llu pool tokens, per-sequence max_ctx %d)\n",
                     paged_kv_pool_->physical_block_count(),
-                    paged_kv_pool_->block_size(), cfg_.device.max_ctx);
+                    paged_kv_pool_->block_size(),
+                    (unsigned long long)paged_kv_pool_->physical_block_count() *
+                        paged_kv_pool_->block_size(),
+                    cfg_.device.max_ctx);
         std::fflush(stdout);
     }
     if (kvflash_active()) {

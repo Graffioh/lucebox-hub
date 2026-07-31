@@ -199,15 +199,9 @@ std::string check_feature_compatibility(
         if (args.max_concurrency > 64) {
             return "--max-concurrency must be at most 64";
         }
-        // The default pool allocates one full logical context per slot, so an
-        // accidental huge product should fail loudly.
-        if ((long long)args.max_concurrency *
-                (long long)paged_token_capacity(args.device.max_ctx) +
-                PAGED_BLOCK_SIZE > (long long)INT_MAX &&
-            args.kv_pool_tokens <= 0) {
-            return "--max-concurrency x --max-ctx exceeds the pool's INT32 token "
-                   "space; pass --kv-pool-tokens";
-        }
+        // Physical capacity is memory-derived and capped independently of the
+        // logical slot count, so max-concurrency no longer multiplies max_ctx
+        // in the pool's tensor address space.
     }
     if (args.kv_pool_tokens != 0) {
         if (args.max_concurrency <= 1) {
