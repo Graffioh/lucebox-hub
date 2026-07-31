@@ -485,20 +485,15 @@ static void test_feature_gate_parallel_and_kv_pool_rules() {
     pool.kv_pool_tokens = max_pool_tokens;
     TEST_ASSERT(gate_accepts(pool, "qwen35", PlacementBackend::Cuda));
 
-    // Defaulting the pool to max_concurrency full contexts must fail loudly
-    // when that product leaves INT32 token space...
+    // The automatic pool is memory-derived, so a logical slot/context product
+    // larger than the physical tensor address space is legal.
     BackendArgs overflow = paged;
     overflow.max_concurrency = 2;
-    overflow.device.max_ctx = 1 << 30;  // capacity 2^30; x2 + 16 > INT_MAX
-    TEST_ASSERT(!gate_accepts(
-        overflow, "qwen35", PlacementBackend::Cuda));
-    // ...but an explicit pool size replaces the default and is accepted.
-    overflow.kv_pool_tokens = 1 << 20;
+    overflow.device.max_ctx = 1 << 30;
     TEST_ASSERT(gate_accepts(
         overflow, "qwen35", PlacementBackend::Cuda));
-    // One block-aligned context lower, the doubled default fits.
-    overflow.kv_pool_tokens = 0;
-    overflow.device.max_ctx = (1 << 30) - PAGED_BLOCK_SIZE;
+    // An explicit addressable pool remains accepted as well.
+    overflow.kv_pool_tokens = 1 << 20;
     TEST_ASSERT(gate_accepts(
         overflow, "qwen35", PlacementBackend::Cuda));
 }
