@@ -60,7 +60,7 @@ void fill_uniform(std::mt19937 & rng, float lo, float hi,
 bool run_gdn(ggml_backend_t backend, int n_seqs,
              const float * q, const float * k, const float * v,
              const float * g, const float * beta, const float * state,
-             float * attn_out, float * state_out) {
+             float * attn_out, float * state_out, bool inplace) {
     ggml_init_params params{};
     params.mem_size = 4 * 1024 * 1024;
     params.no_alloc = true;
@@ -83,11 +83,25 @@ bool run_gdn(ggml_backend_t backend, int n_seqs,
         ggml_set_input(input);
     }
 
-    ggml_tensor * result =
-        ggml_gated_delta_net(ctx, q_t, k_t, v_t, g_t, beta_t, state_t);
+    ggml_tensor * result = inplace
+        ? ggml_gated_delta_net_inplace(
+              ctx, q_t, k_t, v_t, g_t, beta_t, state_t)
+        : ggml_gated_delta_net(
+              ctx, q_t, k_t, v_t, g_t, beta_t, state_t);
     // Decode path compacts the result to [attn | final_state], exactly like
     // build_delta_net_block with skip_gdn_intermediate.
     ggml_gated_delta_net_set_skip_intermediate(result, true);
+    const size_t expected_result_elems =
+        (GDN_QKV_PER_SEQ + (inplace ? 0 : GDN_STATE_PER_SEQ)) * n_seqs;
+    if (ggml_nelements(result) != expected_result_elems) {
+        std::fprintf(stderr,
+                     "batched gdn: %s result has %zu elements, expected %zu\n",
+                     inplace ? "in-place" : "packed",
+                     static_cast<size_t>(ggml_nelements(result)),
+                     expected_result_elems);
+        ggml_free(ctx);
+        return false;
+    }
     ggml_set_output(result);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
@@ -110,7 +124,8 @@ bool run_gdn(ggml_backend_t backend, int n_seqs,
         if (ok) {
             const size_t attn_bytes = GDN_QKV_PER_SEQ * n_seqs * sizeof(float);
             ggml_backend_tensor_get(result, attn_out, 0, attn_bytes);
-            ggml_backend_tensor_get(result, state_out, attn_bytes, state_bytes);
+            ggml_backend_tensor_get(inplace ? state_t : result, state_out,
+                                    inplace ? 0 : attn_bytes, state_bytes);
         }
     }
     ggml_gallocr_free(allocator);
@@ -339,7 +354,8 @@ struct GdnStep {
 bool step_and_compare(ggml_backend_t backend, const char * label,
                       const GdnStep & step,
                       std::vector<float> & state_batched,
-                      std::vector<float> & state_reference) {
+                      std::vector<float> & state_reference,
+                      bool inplace_batched) {
     std::vector<float> attn_batched(GDN_QKV_PER_SEQ * N_SEQS);
     std::vector<float> attn_reference(GDN_QKV_PER_SEQ * N_SEQS);
     std::vector<float> next_batched(GDN_STATE_PER_SEQ * N_SEQS);
@@ -348,7 +364,7 @@ bool step_and_compare(ggml_backend_t backend, const char * label,
     bool ok = run_gdn(backend, N_SEQS, step.q.data(), step.k.data(),
                       step.v.data(), step.g.data(), step.beta.data(),
                       state_batched.data(), attn_batched.data(),
-                      next_batched.data());
+                      next_batched.data(), inplace_batched);
     for (int seq = 0; ok && seq < N_SEQS; ++seq) {
         ok = run_gdn(backend, 1,
                      step.q.data() + seq * GDN_QKV_PER_SEQ,
@@ -358,7 +374,8 @@ bool step_and_compare(ggml_backend_t backend, const char * label,
                      step.beta.data() + seq * GDN_GATE_PER_SEQ,
                      state_reference.data() + seq * GDN_STATE_PER_SEQ,
                      attn_reference.data() + seq * GDN_QKV_PER_SEQ,
-                     next_reference.data() + seq * GDN_STATE_PER_SEQ);
+                     next_reference.data() + seq * GDN_STATE_PER_SEQ,
+                     /*inplace=*/false);
     }
     if (!ok) {
         std::fprintf(stderr, "batched gdn %s: compute failed\n", label);
@@ -380,7 +397,8 @@ bool step_and_compare(ggml_backend_t backend, const char * label,
     return ok;
 }
 
-bool test_gdn_sequential(ggml_backend_t backend, std::mt19937 & rng) {
+bool test_gdn_sequential(ggml_backend_t backend, std::mt19937 & rng,
+                         bool inplace_batched) {
     std::vector<float> state(GDN_STATE_PER_SEQ * N_SEQS);
     fill_uniform(rng, -0.5f, 0.5f, state);
     std::vector<float> state_batched = state;
@@ -389,10 +407,11 @@ bool test_gdn_sequential(ggml_backend_t backend, std::mt19937 & rng) {
     bool ok = true;
     for (int step_idx = 0; step_idx < N_STEPS; ++step_idx) {
         char label[32];
-        std::snprintf(label, sizeof(label), "step%d", step_idx);
+        std::snprintf(label, sizeof(label), "%s step%d",
+                      inplace_batched ? "inplace" : "packed", step_idx);
         const GdnStep step(rng);
         ok = step_and_compare(backend, label, step, state_batched,
-                              state_reference) && ok;
+                              state_reference, inplace_batched) && ok;
     }
     return ok;
 }
@@ -429,7 +448,8 @@ bool test_gdn_active_slots(ggml_backend_t backend, std::mt19937 & rng) {
             step.g.data() + row * GDN_GATE_PER_SEQ,
             step.beta.data() + row * GDN_GATE_PER_SEQ,
             initial_state.data() + slot * GDN_STATE_PER_SEQ,
-            attn_reference.data(), state_reference.data()) && ok;
+            attn_reference.data(), state_reference.data(),
+            /*inplace=*/false) && ok;
 
         char label[48];
         std::snprintf(label, sizeof(label), "active row%d slot%d attn", row, slot);
@@ -524,7 +544,8 @@ int main(int argc, char ** argv) {
     }
 
     std::mt19937 rng(20260728);
-    bool ok = test_gdn_sequential(backend, rng);
+    bool ok = test_gdn_sequential(backend, rng, /*inplace_batched=*/false);
+    ok = test_gdn_sequential(backend, rng, /*inplace_batched=*/true) && ok;
     ok = test_gdn_active_slots(backend, rng) && ok;
     ok = test_conv(backend, rng) && ok;
     ok = test_masked_set_rows(backend) && ok;

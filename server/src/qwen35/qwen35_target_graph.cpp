@@ -1094,7 +1094,8 @@ static ggml_tensor * build_delta_net_block(
     ggml_tensor * prefill_conv_state = nullptr,
     ggml_tensor * prefill_ssm_state = nullptr,
     ggml_tensor * active_slot_ids = nullptr,
-    ggml_tensor * state_slot_ids = nullptr
+    ggml_tensor * state_slot_ids = nullptr,
+    bool allow_inplace_state = false
 ) {
     const int head_k_dim   = w.ssm_d_state;
     const int num_k_heads  = w.ssm_n_group;
@@ -1164,6 +1165,15 @@ static ggml_tensor * build_delta_net_block(
     const int seg_tokens   = seg.T * seg.S;
     const bool seg_active = active_slot_ids &&
         ((!fused && si == 0) || (fused && si == 1));
+    // Plain one-token decode has no in-graph consumer of the updated state:
+    // the next graph evaluation is the first read. Write the final state
+    // directly into its persistent slab and avoid materializing/copying a
+    // second S_v x S_v x H_v state. The active-aware path also updates each
+    // mapped physical slab directly; only its negative bucket-padding rows
+    // use the result tensor's retained scratch state region.
+    const bool inplace_state = seg_active ||
+        (allow_inplace_state && can_skip_gdn_intermediate &&
+         !fused && n_seq_tokens == 1);
 
     ggml_tensor * qkv_mixed = ggml_reshape_3d(ctx,
         seg_cols(qkv_2d, seg.off, seg_tokens),
@@ -1362,7 +1372,9 @@ static ggml_tensor * build_delta_net_block(
         // cache buffer — same mechanism as _tree_persist, but without tree
         // parent_ids. Avoids the legacy result-region cpy (and the OOB it
         // could cause if the result tensor has no embedded intermediate region).
-        result = ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        result = inplace_state
+            ? ggml_gated_delta_net_inplace(ctx, q_c, k_c, v_c, g_tensor, beta, s)
+            : ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
         if (persist_inter) {
             result->src[7] = persist_inter;
         }
@@ -1381,7 +1393,7 @@ static ggml_tensor * build_delta_net_block(
         S_v * H_v * r_elt,
         S_v * H_v * n_seq_tokens * r_elt,
         0);
-    if (!seg_active) {
+    if (!inplace_state) {
         ggml_tensor * new_state = ggml_view_4d(ctx, result,
             S_v, S_v, H_v, seg_seqs,
             S_v * r_elt,
@@ -1389,8 +1401,8 @@ static ggml_tensor * build_delta_net_block(
             S_v * S_v * H_v * r_elt,
             S_v * H_v * n_seq_tokens * seg_seqs * r_elt);
 
-        // Persist new_state back to cache. Compact decode writes physical
-        // slabs in-place inside the active-aware GDN kernel.
+        // Persist new_state back to cache. Both compact active decode and the
+        // plain in-place AR path write state from the GDN kernel directly.
         ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, seg.ssm_st));
     }
 
@@ -1698,7 +1710,10 @@ QwenGraphOutputs build_qwen35_graph(
                                         in.n_prefill_tokens,
                                         pf_conv, pf_ssm,
                                         in.active_slot_ids,
-                                        in.state_slot_ids);
+                                        in.state_slot_ids,
+                                        /*allow_inplace_state=*/
+                                            !in.paged_prefill &&
+                                            in.n_prefill_tokens == 0);
             dn_idx++;
         }
 
