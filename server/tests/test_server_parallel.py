@@ -73,9 +73,11 @@ def contains_number(text: str, number: str) -> bool:
 
 
 class ParallelTestSuite:
-    def __init__(self, base_url: str, parallel: int):
+    def __init__(self, base_url: str, parallel: int,
+                 expect_preemption: bool = False):
         self.base = base_url.rstrip("/")
         self.parallel = parallel
+        self.expect_preemption = expect_preemption
         self.passed = 0
         self.failed = 0
         self.skipped = 0
@@ -477,7 +479,61 @@ class ParallelTestSuite:
                     f"{0.7 * window:.2f}s of B's {window:.2f}s "
                     "admission window")
 
+    def test_recompute_preemption(self):
+        """A deliberately undersized pool must recompute without changing the
+        bytes observed by either greedy client."""
+        print("\n[PAR-8] KV pressure — recompute preserves greedy output")
+        if not self.expect_preemption:
+            self._skip("recompute preemption",
+                       "start with a pressure-sized --kv-pool-tokens and pass "
+                       "--expect-preemption")
+            return
+        if self.parallel < 2:
+            self._skip("recompute preemption",
+                       "requires --max-concurrency >= 2")
+            return
+
+        prompts = [
+            ("Count from 100 to 240, separated by commas, no other text.", "100"),
+            ("Count from 500 to 640, separated by commas, no other text.", "500"),
+        ]
+        baselines = []
+        for i, (prompt, _) in enumerate(prompts):
+            solo = [None]
+            self._stream_worker(0, prompt, 128, solo)
+            if solo[0] is None or not solo[0]["ok"]:
+                self._check(f"pressure baseline {i+1} completes", False,
+                            "no result" if solo[0] is None
+                            else str(solo[0]["error"]))
+                return
+            baselines.append(self._combined(solo[0]))
+        self._check("two unpreempted greedy baselines complete", True)
+
+        results = self._launch_streams(prompts, max_tokens=128)
+        if not self._all_completed(results, "pressure"):
+            return
+        for i, r in enumerate(results):
+            self._check(
+                f"preempted stream {i+1} is byte-identical to baseline",
+                self._combined(r) == baselines[i],
+                f"baseline_len={len(baselines[i])} "
+                f"resumed_len={len(self._combined(r))}")
+
+        status = self._req("GET", "/status/json")
+        recent = status.get("perf_history") or []
+        preemptions = sum(int(r.get("preemptions") or 0) for r in recent)
+        self._check("status reports at least one recompute preemption",
+                    preemptions > 0,
+                    f"recent preemptions={preemptions}")
+
     # ── Run all ──────────────────────────────────────────────────────────
+
+    def _report(self):
+        print("\n" + "=" * 60)
+        total = self.passed + self.failed + self.skipped
+        print(f"Results: {self.passed}/{total} passed, {self.failed} failed"
+              + (f", {self.skipped} skipped" if self.skipped else ""))
+        return 0 if self.failed == 0 else 1
 
     def run_all(self):
         print("=" * 60)
@@ -490,12 +546,17 @@ class ParallelTestSuite:
         self.test_parallel_nonstream()
         self.test_parallel_more_than_slots()
         self.test_parallel_prefill_no_pause()
+        self.test_recompute_preemption()
 
-        print("\n" + "=" * 60)
-        total = self.passed + self.failed + self.skipped
-        print(f"Results: {self.passed}/{total} passed, {self.failed} failed"
-              + (f", {self.skipped} skipped" if self.skipped else ""))
-        return 0 if self.failed == 0 else 1
+        return self._report()
+
+    def run_preemption_only(self):
+        print("=" * 60)
+        print("Paged KV Pressure Test")
+        print(f"Target: {self.base} (parallel={self.parallel})")
+        print("=" * 60)
+        self.test_recompute_preemption()
+        return self._report()
 
 
 # ─── Main ────────────────────────────────────────────────────────────────
@@ -509,7 +570,17 @@ def main():
                         help="Server base URL")
     parser.add_argument("--max-concurrency", type=int, default=3,
                         help="N: --max-concurrency value used to start the server")
+    parser.add_argument("--expect-preemption", action="store_true",
+                        help="Run PAR-8 against a deliberately undersized pool")
+    parser.add_argument("--preemption-only", action="store_true",
+                        help="Run only the deliberately undersized-pool case "
+                             "(implies --expect-preemption)")
     args = parser.parse_args()
+
+    # Alone, --preemption-only would select exactly one test and then skip
+    # it — an exit-0 no-op that reads as a pass.
+    if args.preemption_only:
+        args.expect_preemption = True
 
     if not (1 <= args.max_concurrency <= 64):
         print("ERROR: --max-concurrency must be in [1, 64], "
@@ -531,8 +602,10 @@ def main():
               f"--paged-attention --max-concurrency {args.max_concurrency}")
         sys.exit(2)
 
-    suite = ParallelTestSuite(base, args.max_concurrency)
-    sys.exit(suite.run_all())
+    suite = ParallelTestSuite(base, args.max_concurrency,
+                              expect_preemption=args.expect_preemption)
+    sys.exit(suite.run_preemption_only() if args.preemption_only
+             else suite.run_all())
 
 
 if __name__ == "__main__":
