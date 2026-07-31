@@ -2908,10 +2908,14 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     // requests prefer the reusable system/tool boundary; otherwise an
     // enabled exact full-prompt cache retains its existing priority.
     const bool prefer_inline_snap = !req.tools.empty();
+    // When tools are present, pin the system+tools head first (sticky under
+    // eviction). After that head is restored, deepen to the turn boundary.
+    const bool prefer_tools_boundary = prefer_inline_snap;
     auto prepare_inline = [&]() {
         const auto prepared_snapshot = prefix_cache_.prepare_inline_snap(
             effective_prompt,
-            cache.using_restore ? cache.prefix_len : 0);
+            cache.using_restore ? cache.prefix_len : 0,
+            prefer_tools_boundary);
         cache.snap_slot = prepared_snapshot.first;
         cache.snap_cut = prepared_snapshot.second;
     };

@@ -10,8 +10,14 @@ For Qwen chat templates, the first request is effectively:
 
 ```text
 [system + tool schemas] [user request] [assistant start]
-                       ^ native snapshot boundary
+                       ^ protected tools-boundary snapshot
 ```
+
+Turn 1 pays the tool-schema prefill once and commits a **protected** native
+inline snapshot at the system/tools head (first chat boundary). Later turns
+restore that head and prefill only the new conversation suffix. Progressive
+deeper conversation boundaries remain unprotected LRU leaves so multi-chat
+traffic cannot thrash the shared tools pin away.
 
 The snapshot is a normal, backend-owned prefix snapshot. This is important for
 hybrid architectures such as Qwen3.5/3.6: it contains attention KV, recurrent
@@ -21,9 +27,12 @@ a valid restore.
 
 ## Runtime behavior
 
-- Turn 1 pays the tool-schema prefill once and commits a native inline snapshot.
-- Turn 2 restores the snapshot keyed by the system/tool boundary.
+- Turn 1 (tools present, tools head miss): pay the tool-schema prefill once and
+  commit a protected inline snapshot at the first chat boundary.
+- Turn 2 restores the tools-head snapshot and can deepen to a later turn
+  boundary after the head is already restored.
 - Later turns can restore progressively deeper conversation boundaries.
+- Protected tools pins are skipped by eviction while unprotected leaves exist.
 - The cache key is the exact token prefix. Changing a tool name, description,
   parameter, system prompt, or template produces a miss; incompatible KV state
   is never reused.

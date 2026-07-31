@@ -1799,6 +1799,17 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_boundary_advances_past_restore
     TEST_ASSERT(select_inline_snapshot_boundary({100}, 0) == 100);
 }
 
+TEST_CASE(ServerUnitFixture, test_inline_snapshot_prefers_tools_boundary_until_restored) {
+    const std::vector<int> boundaries = {100, 240, 380, 520};
+    // Cold tool-heavy: pin system+tools head (first marker), not deepen cut.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 0, true) == 100);
+    // After tools head is restored, deepen to second-to-last.
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 100, true) == 380);
+    TEST_ASSERT(select_inline_snapshot_boundary(boundaries, 380, true) == 0);
+    TEST_ASSERT(select_inline_snapshot_boundary({100}, 0, true) == 100);
+    TEST_ASSERT(select_inline_snapshot_boundary({100}, 100, true) == 0);
+}
+
 // ── Prefix-aware eviction policy (model-free) ───────────────────────────
 
 TEST_CASE(ServerUnitFixture, test_evict_empty_is_zero) {
@@ -1831,6 +1842,19 @@ TEST_CASE(ServerUnitFixture, test_evict_branch_spares_shared_root) {
     int v = select_inline_evict_victim(ids);
     TEST_ASSERT(v == 1);
     TEST_ASSERT(v != 0);  // the shared root must be spared
+}
+
+TEST_CASE(ServerUnitFixture, test_evict_skips_protected_leaf) {
+    // Two unrelated leaves; oldest is protected → evict next unprotected leaf.
+    std::vector<std::vector<int32_t>> ids = {{1, 1}, {2, 2}, {3, 3}};
+    std::vector<bool> protect = {true, false, false};
+    TEST_ASSERT(select_inline_evict_victim(ids, &protect) == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_evict_all_protected_falls_back) {
+    std::vector<std::vector<int32_t>> ids = {{1, 1}, {2, 2}};
+    std::vector<bool> protect = {true, true};
+    TEST_ASSERT(select_inline_evict_victim(ids, &protect) == 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
