@@ -3430,6 +3430,13 @@ static void test_cuda_graph_rebuild_generation_guard() {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
         return;
     }
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    TEST_ASSERT_MSG(cpu != nullptr, "CPU fallback backend init failed");
+    if (!cpu) {
+        ggml_backend_free(gpu);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
 
     std::vector<uint8_t> arena(1024 * 1024);
     const void * first_graph_key = nullptr;
@@ -3460,9 +3467,11 @@ static void test_cuda_graph_rebuild_generation_guard() {
             TEST_ASSERT(graph_key == first_graph_key);
         }
 
-        ggml_backend_t backends[] = {gpu};
+        // The generic scheduler contract requires a CPU fallback as its final
+        // backend even when every operation in this graph stays on the GPU.
+        ggml_backend_t backends[] = {gpu, cpu};
         ggml_backend_sched_t sched = ggml_backend_sched_new(
-            backends, nullptr, 1, 64, false, true);
+            backends, nullptr, 2, 64, false, true);
         bool ok = sched && ggml_backend_sched_alloc_graph(sched, graph);
         const float value = 3.0f;
         if (ok) {
@@ -3494,6 +3503,7 @@ static void test_cuda_graph_rebuild_generation_guard() {
                     "first graph generation failed");
     TEST_ASSERT_MSG(run_generation(false, -3.0f, true),
                     "rebuilt graph replayed stale executable");
+    ggml_backend_free(cpu);
     ggml_backend_free(gpu);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
