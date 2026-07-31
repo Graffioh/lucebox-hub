@@ -2515,7 +2515,9 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
     constexpr int n_tokens = 2;
     constexpr int raw_rows = 256;
     constexpr int raw_window = 128;
-    constexpr int n_comp_rows = 1024;
+    // Keep the ordinary four-head shared-memory footprint above 24 KiB so
+    // this shape is forced through the compact indexed path under test.
+    constexpr int n_comp_rows = 1280;
     constexpr int n_kv = raw_rows + n_comp_rows;
     constexpr int selected_rows = 512;
 
