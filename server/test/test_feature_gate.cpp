@@ -290,6 +290,19 @@ static void test_feature_gate_ds4_decode_options_require_monolithic_hip() {
         topk, "qwen35", PlacementBackend::Hip));
     TEST_ASSERT(gate_accepts(
         topk, "deepseek4", PlacementBackend::Hip));
+
+    // Top-k is a model policy in the monolithic backend and is independent of
+    // the GPU vendor. Unlike fused decode, mixed CUDA-primary expert
+    // placement can therefore use it.
+    BackendArgs cuda_topk = topk;
+    cuda_topk.device.backend = PlacementBackend::Cuda;
+    TEST_ASSERT(gate_accepts(
+        cuda_topk, "deepseek4", PlacementBackend::Cuda));
+
+    BackendArgs split_topk = topk;
+    TEST_ASSERT(parse_placement_device_list("hip:0,hip:1", split_topk.device));
+    TEST_ASSERT(!gate_accepts(
+        split_topk, "deepseek4", PlacementBackend::Hip));
 }
 
 static void test_feature_gate_remote_draft_requires_supported_arch() {

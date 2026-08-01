@@ -264,12 +264,17 @@ std::string check_feature_compatibility(
                arch + "')";
     }
 
-    // Approximate prefill and the fused decode options are implemented only
-    // in the monolithic HIP DeepSeek4 backend; the layer-split adapter and
-    // the CUDA path have no equivalent.
+    // Approximate prefill and fused decode are implemented only in the
+    // monolithic HIP DeepSeek4 backend. Expert top-k is model policy handled
+    // by either monolithic backend, but the layer-split adapter does not yet
+    // propagate it.
     const bool monolithic_ds4 =
         arch == "deepseek4" &&
         target_backend == PlacementBackend::Hip &&
+        !args.device.is_layer_split() &&
+        !args.remote_target_shard.enabled();
+    const bool local_ds4 =
+        arch == "deepseek4" &&
         !args.device.is_layer_split() &&
         !args.remote_target_shard.enabled();
 
@@ -283,11 +288,16 @@ std::string check_feature_compatibility(
                "--ds4-prefill exact for split, remote, or CUDA placement";
     }
 
-    // ── --ds4-fused-decode / --ds4-expert-top-k × placement
-    if ((args.ds4_fused_decode || args.ds4_expert_top_k != 0) &&
-        !monolithic_ds4) {
-        return "--ds4-fused-decode and --ds4-expert-top-k currently require "
-               "single-device HIP DeepSeek4";
+    // ── --ds4-fused-decode × placement
+    if (args.ds4_fused_decode && !monolithic_ds4) {
+        return "--ds4-fused-decode currently requires single-device HIP "
+               "DeepSeek4";
+    }
+
+    // ── --ds4-expert-top-k × architecture/adapter
+    if (args.ds4_expert_top_k != 0 && !local_ds4) {
+        return "--ds4-expert-top-k currently requires a single local "
+               "DeepSeek4 backend";
     }
 
     return {};

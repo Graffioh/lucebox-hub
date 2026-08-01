@@ -27,7 +27,11 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_MMID_GROUPED_TYPES` | 7 | Grouped-kernel type mask; bit 3 (`8`) opts ROCmFP2/ROCmFP3 into the path. |
 | `DFLASH_MMID_GROUPED_DEVICE` | -1 | Optional zero-based device restriction; unset/-1 applies to every eligible device. |
 | `DFLASH_DS4_MOE_TP` / `DFLASH_DS4_MOE_TP_INPROC` | unset | BURN-IN: enable DeepSeek4 route-owner expert parallelism in one process. |
-| `DFLASH_DS4_MOE_TP_GPU` | auto | HIP device for the cold DeepSeek4 expert owner. |
+| `DFLASH_DS4_MOE_TP_BACKEND` / `DFLASH_MOE_TP_BACKEND` | peer runtime in a mixed build; compiled runtime otherwise | Select the in-process cold expert owner backend. |
+| `DFLASH_DS4_MOE_TP_GPU` | peer backend device 0 in a mixed build; other local device otherwise | Device index within the cold DeepSeek4 expert backend. |
+| `DFLASH_DS4_MOE_TP_CONCENTRATE_COLD` | unset | BURN-IN: use complete peer-owned expert layers to reduce cross-runtime joins; falls back when the placement would exceed the target budget. |
+| `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | compiled backend / target device | Select the in-process DSpark backend and device. |
+| `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | executable directory | Explicit peer module path for a mixed CUDA+HIP build. |
 | `GGML_CUDA_BATCH_PEER_COPIES` | unset | BURN-IN: publish ordered HIP peer copies with one cross-device dependency per source/destination pair. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `DFLASH_MOE_TP_*` / `DFLASH_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `DFLASH_DS4_*` names remain compatibility aliases. |
@@ -37,7 +41,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_PREFILL_CACHE_SLOTS` | 0 | Container-entrypoint equivalent of `--prefill-cache-slots`; not read directly by the native binary. |
 | `DFLASH_SPLIT_FAST_ROLLBACK` | unset | OPT-IN: exact F32 checkpoints and replay-free rollback for local qwen35 target layer splits. Prefer `--target-split-fast-rollback`; adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
 | `DFLASH_STALL_TOOL_PREFIX` | unset | OPT-IN: recover a stalled tool call by injecting the prepared tool prefix when generation stops after an action suffix. |
-| `DFLASH_DS4_SPEC` / `DFLASH_DS4_DRAFT` / `DFLASH_DS4_DRAFT_GPU` | unset | OPT-IN: enable DeepSeek4 DSpark, select its draft GGUF, and optionally select the local drafter GPU. See `DS4.md`. |
+| `DFLASH_DS4_SPEC` / `DFLASH_DS4_DRAFT` / `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | unset | OPT-IN: enable DeepSeek4 DSpark, select its draft GGUF, and optionally select the local drafter backend/device. See `DS4.md`. |
 | `DFLASH_DS4_CUDA_LAYERS` | auto | Override the DeepSeek4 heterogeneous layer-split heuristic. See `DS4.md`. |
 
 ## Full inventory (generated)
@@ -59,6 +63,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_ADAPTIVE_WIDTH_MIN` - adaptive_verify_width.h
 - `DFLASH_ADAPTIVE_WIDTH_THETA` - adaptive_verify_width.h
 - `DFLASH_COLD_THREADS` - moe_expert_compute_cpu.cpp
+- `DFLASH_CUDA_BACKEND_PATH` - dynamic_backend.cpp
 - `DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_CUDA_MMVQ_MOE_KERNEL` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_DISABLE_DRAFT_ATTN` - draft_graph.cpp
@@ -77,16 +82,20 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_DENSE_TP_MASK` - deepseek4_loader.cpp
 - `DFLASH_DS4_DENSE_TP_STRIX_FRACTION` - deepseek4_loader.cpp
 - `DFLASH_DS4_DRAFT` - deepseek4_backend.cpp
+- `DFLASH_DS4_DRAFT_BACKEND` - deepseek4_backend.cpp
 - `DFLASH_DS4_DRAFT_GPU` - deepseek4_backend.cpp
 - `DFLASH_DS4_DSPARK_DEBUG` - deepseek4_graph.cpp
 - `DFLASH_DS4_FUSED_VERIFY` - deepseek4_dspark_spec.cpp, deepseek4_loader.cpp
 - `DFLASH_DS4_HOTNESS_CSV` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP` - deepseek4_backend.cpp
+- `DFLASH_DS4_MOE_TP_BACKEND` - deepseek4_backend.cpp
+- `DFLASH_DS4_MOE_TP_CONCENTRATE_COLD` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_GPU` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_INPROC` - deepseek4_backend.cpp
 - `DFLASH_DS4_ROUTING_STATS_OUT` - deepseek4_backend.cpp
 - `DFLASH_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
 - `DFLASH_DS4_SPEC` - deepseek4_backend.cpp
+- `DFLASH_DS4_SPEC_REFERENCE_EXACT` - deepseek4_dspark_spec.cpp
 - `DFLASH_DS4_SPEC_Q` - deepseek4_dspark_spec.cpp
 - `DFLASH_DS4_TIMING` - deepseek4_backend.cpp, deepseek4_target_shard_ipc_daemon.cpp
 - `DFLASH_DS4_TP_CAPTURE_CACHE_SLOTS` - deepseek4_fused_verify.inc
@@ -112,6 +121,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_GPU_DRAFT_TOPK` - qwen35_dflash_target.cpp
 - `DFLASH_GPU_SAMPLE` - geometric_sampler_cuda.cu
 - `DFLASH_GPU_VERIFY_ARGMAX` - qwen35_dflash_target.cpp
+- `DFLASH_HIP_BACKEND_PATH` - dynamic_backend.cpp
 - `DFLASH_IGNORE_EOS` - laguna_backend.cpp
 - `DFLASH_KVFLASH` - gemma4_backend.cpp, gemma4_layer_split_adapter.cpp, kvflash_pager.h, laguna_backend.cpp, laguna_layer_split_adapter.cpp, qwen35_backend.cpp, qwen35_layer_split_adapter.cpp
 - `DFLASH_KVFLASH_DRAFTER` - kvflash_pager.h
@@ -177,6 +187,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_MOE_PREFILL_HOT_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_PREFILL_MASKED_COLD` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` - deepseek4_graph.cpp
+- `DFLASH_MOE_TP_BACKEND` - deepseek4_backend.cpp
 - `DFLASH_NO_MASK` - laguna_backend.cpp
 - `DFLASH_NO_MOE_ROUTER_FUSE` - qwen35moe_ffn.cpp
 - `DFLASH_NO_MOE_SWIGLU_FUSE` - qwen35moe_ffn.cpp

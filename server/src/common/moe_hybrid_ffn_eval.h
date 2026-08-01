@@ -149,6 +149,16 @@ struct MoeHybridGraphInputs {
     std::vector<ggml_tensor *> deferred_peer_copy_nodes;
 };
 
+enum class MoeHybridJoinMode {
+    // Reduce each owner's routes locally, then add the two partial sums. This
+    // minimizes transfer size and is the fast path for one GPU runtime.
+    OwnerPartialSums,
+    // Preserve the model's route order across owners and perform one final
+    // reduction on the main backend. Cross-runtime execution uses this mode
+    // to avoid changing floating-point association at the owner boundary.
+    CanonicalRouteOrder,
+};
+
 // Append a device-resident hot+cold+shared MoE FFN to an existing graph.
 // `global_ids` and `router_weights` are [n_expert_used, n_tokens]. Weight
 // tensors in `storage` determine scheduler placement on the two GPU backends.
@@ -169,7 +179,9 @@ bool build_moe_hybrid_ffn_graph(
     int                            n_tokens,
     MoeHybridGraphInputs &         out,
     bool                           include_shared = true,
-    bool                           allow_fused_combine = false);
+    bool                           allow_fused_combine = false,
+    MoeHybridJoinMode              join_mode =
+                                       MoeHybridJoinMode::OwnerPartialSums);
 
 int moe_hybrid_expert_compute_batch_limit();
 int moe_hybrid_expert_compute_ipc_batch_limit(int n_tokens);
