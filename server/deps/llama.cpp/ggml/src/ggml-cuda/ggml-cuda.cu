@@ -5178,7 +5178,14 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
+#if defined(GGML_USE_HIP)
+    // CUDA and HIP may coexist in one process as separate backend modules.
+    // A distinct GUID prevents either implementation from casting the other
+    // vendor's backend context and attempting an invalid peer copy.
+    static ggml_guid guid = { 0x87, 0x4b, 0x09, 0xd6, 0x72, 0x3f, 0x4e, 0x91, 0xa4, 0x66, 0x2d, 0x6e, 0x0a, 0x7f, 0x31, 0xbc };
+#else
     static ggml_guid guid = { 0x2c, 0xdd, 0xe8, 0x1c, 0x65, 0xb3, 0x65, 0x73, 0x6a, 0x12, 0x88, 0x61, 0x1c, 0xc9, 0xdc, 0x25 };
+#endif
     return &guid;
 }
 

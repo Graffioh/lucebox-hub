@@ -297,6 +297,10 @@ static bool ds4_build_fused_verify_graph(
     }
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
+    const BackendPairCapabilities pair_capabilities = hybrid
+        ? backend_pair_capabilities(backend, hybrid->cold_backend)
+        : BackendPairCapabilities{true, true};
+    const bool same_gpu_runtime = pair_capabilities.same_runtime;
 
     const size_t arena_size = 256u * 1024 * 1024;
     if (fg.sg.meta_arena.size() < arena_size) fg.sg.meta_arena.resize(arena_size);
@@ -517,9 +521,14 @@ static bool ds4_build_fused_verify_graph(
         }
 
         if (hybrid) {
-            const bool allow_fused_combine =
-                ggml_backend_is_cuda(backend) &&
-                ggml_backend_is_cuda(hybrid->cold_backend);
+            const bool allow_fused_combine = same_gpu_runtime;
+            const bool allow_direct_device_join =
+                pair_capabilities.native_gpu_handoff &&
+                (ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
+                 ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN"));
+            const MoeHybridJoinMode join_mode = same_gpu_runtime
+                ? MoeHybridJoinMode::OwnerPartialSums
+                : MoeHybridJoinMode::CanonicalRouteOrder;
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             hybrid_cfg.n_expert_used = (int) selected->ne[0];
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
@@ -540,6 +549,7 @@ static bool ds4_build_fused_verify_graph(
             // six routes in one owner graph: the legacy 4 + padded-2 split
             // computes two duplicate expert paths whose weights are zero.
             const bool native_route_width =
+                !same_gpu_runtime ||
                 ds4_env_flag("DFLASH_DS4_TP_NATIVE_ROUTE_WIDTH");
             if (lane_q > 1 && hybrid_cfg.n_expert_used > 4 && has_hot_routed &&
                 !native_route_width) {
@@ -584,36 +594,34 @@ static bool ds4_build_fused_verify_graph(
                 }
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
-                        (ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
-                         ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN")) ? gf : nullptr,
+                        allow_direct_device_join ? gf : nullptr,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
                         first_ids, first_weights, lane_q, inputs, true,
-                        allow_fused_combine)) {
+                        allow_fused_combine, join_mode)) {
                     return false;
                 }
                 ffn_out = inputs.output;
 
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
-                        (ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
-                         ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN")) ? gf : nullptr,
+                        allow_direct_device_join ? gf : nullptr,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
                         padded_ids, padded_weights, lane_q, inputs, false,
-                        allow_fused_combine)) {
+                        allow_fused_combine, join_mode)) {
                     return false;
                 }
                 ffn_out = ggml_add(ctx, ffn_out, inputs.output);
             } else {
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
-                        (ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
-                         ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN")) ? gf : nullptr,
+                        allow_direct_device_join ? gf : nullptr,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il],
                         ffn_normed, selected, router_weights,
-                        lane_q, inputs, true, allow_fused_combine)) {
+                        lane_q, inputs, true, allow_fused_combine,
+                        join_mode)) {
                     return false;
                 }
                 ffn_out = inputs.output;
@@ -752,6 +760,17 @@ static bool ds4_build_fused_verify_graph(
             std::fprintf(stderr,
                          "[ds4-fused-verify] scheduler CPU fallback unavailable\n");
             return false;
+        }
+        if (!same_gpu_runtime &&
+            (ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
+             ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN"))) {
+            static bool warned_cross_vendor_join = false;
+            if (!warned_cross_vendor_join) {
+                std::fprintf(stderr,
+                    "[ds4-fused-verify] direct peer join disabled across GPU "
+                    "vendors; using scheduler host staging\n");
+                warned_cross_vendor_join = true;
+            }
         }
         ggml_backend_t backends[3] = {
             backend, peer, hybrid->cpu_backend};

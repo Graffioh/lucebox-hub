@@ -124,6 +124,51 @@ decode and 415.52 tok/s median sparse prefill. Those numbers require the full
 qualified manifest, including the burn-in kernel switches; they are not a
 claim for the minimal activation example above.
 
+#### CUDA 3090 + Strix Halo in one process
+
+The mixed-vendor build links the selected target runtime normally and loads
+the other vendor as an isolated backend module. CUDA and HIP device indices
+have separate namespaces, so `cuda:0` and `hip:0` are a valid pair.
+Cross-vendor activations are staged in host memory inside the process; native
+peer access is intentionally not attempted.
+
+```bash
+cmake -S server -B server/build-cuda-hip \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_ENABLE_MIXED_CUDA_HIP=ON \
+  -DDFLASH27B_CUDA_ARCHITECTURES=86 \
+  -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build server/build-cuda-hip -j
+ctest --test-dir server/build-cuda-hip -R mixed_cuda_hip --output-on-failure
+```
+
+```bash
+export DFLASH_DS4_MOE_TP=1
+export DFLASH_DS4_MOE_TP_INPROC=1
+export DFLASH_DS4_MOE_TP_BACKEND=cuda
+export DFLASH_DS4_MOE_TP_GPU=0       # cuda:0 (RTX 3090)
+export DFLASH_DS4_MOE_TP_CONCENTRATE_COLD=1
+# Tune from startup memory logs; 85000 produced four complete CUDA layers on
+# the qualified 128 GiB Strix Halo + 24 GiB RTX 3090 machine.
+export DFLASH_EXPERT_BUDGET_MB=85000
+export DFLASH_DS4_DRAFT=/path/to/dspark-draft.gguf
+export DFLASH_DS4_DRAFT_BACKEND=cuda
+export DFLASH_DS4_DRAFT_GPU=0
+
+./server/build-cuda-hip/dflash_server /path/to/deepseek4-target.gguf \
+  --target-device hip:0 \
+  --ds4-expert-top-k 4 \
+  --ds4-prefill sparse
+```
+
+The peer module is normally found beside the executable. Set
+`DFLASH_CUDA_BACKEND_PATH` or `DFLASH_HIP_BACKEND_PATH` only when packaging it
+elsewhere. Sparse/approximate DeepSeek4 prefill remains restricted to a HIP
+target; CUDA-primary ROCmFP2 execution is not yet qualified. The mixed path is
+burn-in functionality and remains slower than the qualified single-Strix
+path on the tested machine.
+
 ### Local single-shard
 
 If the adapter decides all 43 layers fit on one CUDA GPU, it loads a single shard locally and no IPC daemon is involved.
@@ -182,10 +227,13 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
 | `DFLASH_DS4_TIMING` | Enable DS4 timing logs for the layer-split parent and target-shard daemon. Useful for profiling prefill/decode breakdowns; leave unset for normal runs. |
 | `DFLASH_DS4_SPEC` / `DFLASH_DS4_DRAFT` | Enable DSpark and select its GGUF. |
-| `DFLASH_DS4_DRAFT_GPU` | HIP device for the in-process drafter. |
+| `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | Backend and device for the in-process drafter. |
 | `DFLASH_DS4_MOE_TP` | Enable routed-expert partitioning. |
-| `DFLASH_DS4_MOE_TP_INPROC` | Use two local HIP backends instead of an expert IPC worker. |
-| `DFLASH_DS4_MOE_TP_GPU` | HIP device that owns the cold expert stack. |
+| `DFLASH_DS4_MOE_TP_INPROC` | Use two local GPU backends instead of an expert IPC worker. |
+| `DFLASH_DS4_MOE_TP_BACKEND` | Cold expert backend (`cuda` or `hip`); mixed builds default to the peer runtime. |
+| `DFLASH_DS4_MOE_TP_GPU` | Device index within the cold expert backend. |
+| `DFLASH_DS4_MOE_TP_CONCENTRATE_COLD` | Cross-vendor burn-in mode: place complete cold expert layers on the peer to reduce joins. |
+| `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | Optional explicit peer backend module path. |
 | `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
 | `GGML_CUDA_BATCH_PEER_COPIES` | Batch ordered peer copies behind one dependency. |
@@ -249,11 +297,13 @@ whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
 logits can select a different token than the normal causal verifier even at
 temperature 0. Leave it unset when comparing against the normal verifier, or
 set `DFLASH_DS4_SEQ_VERIFY=1` for the slower token-at-a-time verification
-diagnostic. Neither fused verification nor the separate
+diagnostic. `DFLASH_DS4_SPEC_REFERENCE_EXACT=1` combines sequential target
+verification with full rollback snapshots for byte-identity checks. Neither
+fused verification nor the separate
 `--ds4-expert-top-k 4` approximation should be presented as byte-identical AR.
 
 DSpark can verify against in-process heterogeneous expert placement. The
-drafter remains local to its selected HIP backend; a failed draft load is
+drafter remains local to its selected GPU backend; a failed draft load is
 reported and falls back to normal autoregressive decode. The target cache and
 sampler stay on the main backend while routed target experts execute on their
 configured owners. `--ds4-expert-top-k 4` remains a separate approximate

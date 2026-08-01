@@ -3,7 +3,6 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cuda.h"
 
 #include <algorithm>
 #include <chrono>
@@ -69,6 +68,15 @@ static bool prefill_masked_cold_routes_enabled() {
 
 static uint64_t elapsed_us(HybridClock::time_point start, HybridClock::time_point end) {
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+static bool backend_is_gpu(ggml_backend_t backend) {
+    if (!backend) return false;
+    ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    if (!device) return false;
+    const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+           type == GGML_BACKEND_DEVICE_TYPE_IGPU;
 }
 
 static bool compact_materialized_experts_enabled() {
@@ -631,7 +639,8 @@ static bool build_batched_routed_graph(
     bool tokenwise = false,
     std::vector<ggml_tensor *> * backend_nodes = nullptr,
     bool allow_fused_combine = false,
-    bool force_fused_combine = false)
+    bool force_fused_combine = false,
+    bool defer_route_reduction = false)
 {
     const auto track = [&](ggml_tensor * t) -> ggml_tensor * {
         if (backend_nodes && t) backend_nodes->push_back(t);
@@ -653,7 +662,8 @@ static bool build_batched_routed_graph(
                     inp_col, sel_col, wts_col,
                     n_embd, n_ff_exp, n_used, 1, swiglu_clamp,
                     &routed_col, false, backend_nodes,
-                    allow_fused_combine, force_fused_combine)) {
+                    allow_fused_combine, force_fused_combine,
+                    defer_route_reduction)) {
                 return false;
             }
             joined = joined ? track(ggml_concat(ctx, joined, routed_col, 1))
@@ -666,7 +676,8 @@ static bool build_batched_routed_graph(
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx, inp, n_embd, 1, n_tokens);
     ggml_tensor * gu = nullptr;
     const bool coarse_split_requested =
-        coarse_owner_op_enabled() && coarse_owner_split_op_enabled();
+        !defer_route_reduction && coarse_owner_op_enabled() &&
+        coarse_owner_split_op_enabled();
     const bool coarse_split_eligible =
         gate_tensor && up_tensor &&
         gate_tensor->type == GGML_TYPE_Q2_0_ROCMFP2 &&
@@ -694,7 +705,7 @@ static bool build_batched_routed_graph(
             n_ff_exp, swiglu_clamp,
             gate_scale, up_scale, down_scale));
         return *out_routed != nullptr;
-    } else if (coarse_owner_op_enabled() &&
+    } else if (!defer_route_reduction && coarse_owner_op_enabled() &&
         gate_up_tensor &&
         gate_up_scale == 1.0f &&
         gate_up_tensor->type == GGML_TYPE_Q2_0_ROCMFP2 &&
@@ -748,7 +759,7 @@ static bool build_batched_routed_graph(
         ggml_mul_mat_id(ctx, down_tensor, gu, sel), down_scale));
 
     // Weight and sum over experts: [n_embd, n_used, n_tokens] * [1, n_used, n_tokens]
-    if (allow_fused_combine &&
+    if (!defer_route_reduction && allow_fused_combine &&
         (force_fused_combine || fused_moe_combine_enabled())) {
         *out_routed = track(ggml_laguna_moe_combine(ctx, experts, wts));
         return *out_routed != nullptr;
@@ -756,6 +767,11 @@ static bool build_batched_routed_graph(
 
     ggml_tensor * w_view = ggml_reshape_3d(ctx, wts, 1, n_used, n_tokens);
     experts = track(ggml_mul(ctx, experts, w_view));
+
+    if (defer_route_reduction) {
+        *out_routed = experts;
+        return true;
+    }
 
     // repeat_back uses this tensor for shape only, but the scheduler still
     // treats it as a leaf. Keep it on the branch backend; otherwise every MoE
@@ -779,7 +795,8 @@ bool build_moe_hybrid_ffn_graph(
     int                            n_tokens,
     MoeHybridGraphInputs &         out,
     bool                           include_shared,
-    bool                           allow_fused_combine) {
+    bool                           allow_fused_combine,
+    MoeHybridJoinMode              join_mode) {
 
     out.output = nullptr;
     out.main_output = nullptr;
@@ -791,6 +808,8 @@ bool build_moe_hybrid_ffn_graph(
     }
 
     const int n_used = cfg.n_expert_used;
+    const bool canonical_route_join =
+        join_mode == MoeHybridJoinMode::CanonicalRouteOrder;
     // Both owner remaps consume the same normalized top-k route weights.
     // Expose the canonical tensor so the heterogeneous scheduler can keep it
     // on the main GPU. Otherwise expanding the cold branch first lets backend
@@ -849,9 +868,17 @@ bool build_moe_hybrid_ffn_graph(
         return (int)local_by_global.size() == cfg.n_expert;
     };
 
+    const bool has_hot_routed =
+        (storage.gate_up_hot || (storage.gate_hot && storage.up_hot)) &&
+        storage.down_hot;
+    const bool has_cold_routed =
+        (storage.gate_up_cold || (storage.gate_cold && storage.up_cold)) &&
+        storage.down_cold;
+
     ggml_tensor * hot_ids = nullptr;
     ggml_tensor * hot_weights = nullptr;
-    if (!build_remap(storage.hot_local_by_global,
+    if (has_hot_routed &&
+        !build_remap(storage.hot_local_by_global,
                      &out.hot_local_lut, &out.hot_valid_lut,
                      &hot_ids, &hot_weights, &out.hot_remap_nodes)) {
         return false;
@@ -859,7 +886,8 @@ bool build_moe_hybrid_ffn_graph(
 
     ggml_tensor * cold_ids = nullptr;
     ggml_tensor * cold_weights = nullptr;
-    if (!build_remap(storage.cold_local_by_global,
+    if (has_cold_routed &&
+        !build_remap(storage.cold_local_by_global,
                      &out.cold_local_lut, &out.cold_valid_lut,
                      &cold_ids, &cold_weights, &out.cold_remap_nodes)) {
         return false;
@@ -871,18 +899,21 @@ bool build_moe_hybrid_ffn_graph(
     // route slot is decoded by the dedicated MoE kernel, which scatters every
     // result back before the unchanged weighted reduction.
     if (n_tokens > 1 && align_shared_moe_ids_enabled()) {
-        hot_ids = ggml_ds4_moe_align_ids(ctx, hot_ids);
-        cold_ids = ggml_ds4_moe_align_ids(ctx, cold_ids);
-        out.hot_remap_nodes.push_back(hot_ids);
-        out.cold_remap_nodes.push_back(cold_ids);
+        if (hot_ids) {
+            hot_ids = ggml_ds4_moe_align_ids(ctx, hot_ids);
+            out.hot_remap_nodes.push_back(hot_ids);
+        }
+        if (cold_ids) {
+            cold_ids = ggml_ds4_moe_align_ids(ctx, cold_ids);
+            out.cold_remap_nodes.push_back(cold_ids);
+        }
     }
 
     ggml_tensor * hot = nullptr;
-    if ((storage.gate_up_hot || (storage.gate_hot && storage.up_hot)) &&
-        storage.down_hot) {
+    if (has_hot_routed) {
         const ggml_tensor * hot_gate = storage.gate_up_hot
             ? storage.gate_up_hot : storage.gate_hot;
-        const bool tokenwise =
+        const bool tokenwise = !canonical_route_join &&
             hot_gate->type == GGML_TYPE_Q2_0_ROCMFP2 &&
             !(n_tokens > 1 && grouped_mmvq_moe_enabled());
         if (!build_batched_routed_graph(
@@ -894,17 +925,18 @@ bool build_moe_hybrid_ffn_graph(
                 inp, hot_ids, hot_weights,
                 cfg.n_embd, cfg.n_ff_exp, n_used, n_tokens,
                 cfg.swiglu_clamp, &hot, tokenwise,
-                &out.hot_nodes, allow_fused_combine)) {
+                &out.hot_nodes, allow_fused_combine,
+                /*force_fused_combine=*/false,
+                canonical_route_join)) {
             return false;
         }
     }
 
     ggml_tensor * cold = nullptr;
-    if ((storage.gate_up_cold || (storage.gate_cold && storage.up_cold)) &&
-        storage.down_cold) {
+    if (has_cold_routed) {
         const ggml_tensor * cold_gate = storage.gate_up_cold
             ? storage.gate_up_cold : storage.gate_cold;
-        const bool tokenwise =
+        const bool tokenwise = !canonical_route_join &&
             cold_gate->type == GGML_TYPE_Q2_0_ROCMFP2 &&
             !(n_tokens > 1 && grouped_mmvq_moe_enabled());
         if (!build_batched_routed_graph(
@@ -917,12 +949,36 @@ bool build_moe_hybrid_ffn_graph(
                 cfg.n_embd, cfg.n_ff_exp,
                 n_used, n_tokens,
                 cfg.swiglu_clamp, &cold, tokenwise,
-                &out.cold_nodes, allow_fused_combine)) {
+                &out.cold_nodes, allow_fused_combine,
+                /*force_fused_combine=*/false,
+                canonical_route_join)) {
             return false;
         }
     }
 
     ggml_tensor * main_branch = hot;
+    if (canonical_route_join) {
+        ggml_tensor * routes = nullptr;
+        if (hot && cold) {
+            routes = ggml_add(ctx, hot, cold);
+            out.join_nodes.push_back(routes);
+        } else {
+            routes = hot ? hot : cold;
+        }
+        if (!routes) return false;
+
+        ggml_tensor * sum_shape = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, cfg.n_embd, 1, n_tokens);
+        ggml_tensor * route_sum = ggml_repeat_back(ctx, routes, sum_shape);
+        main_branch = ggml_reshape_2d(
+            ctx, route_sum, cfg.n_embd, n_tokens);
+        out.join_nodes.push_back(sum_shape);
+        out.join_nodes.push_back(route_sum);
+        out.join_nodes.push_back(main_branch);
+        // The cold contribution is now consumed by the canonical route join;
+        // do not add the old owner-level partial a second time below.
+        cold = nullptr;
+    }
     ggml_tensor * shared = include_shared
         ? build_shared_expert_subgraph(ctx, desc, inp, cfg.swiglu_clamp)
         : nullptr;
@@ -1238,7 +1294,7 @@ bool build_cached_hot_batched_graph(
             desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
             out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens,
             cfg.swiglu_clamp, &routed, false, nullptr,
-            ggml_backend_is_cuda(gpu_backend));
+            backend_is_gpu(gpu_backend));
     }
 
     // Shared expert (always on GPU)
@@ -1300,7 +1356,7 @@ static bool build_cached_cold_batched_graph(
         desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
         out.inp, out.sel, out.wts, n_embd, n_ff_exp, n_used, n_tokens,
         cfg.swiglu_clamp, &routed, false, nullptr,
-        ggml_backend_is_cuda(cpu_backend));
+        backend_is_gpu(cpu_backend));
     if (!routed) { out.free(); return false; }
     out.output = routed;
 
@@ -2050,7 +2106,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
                 desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                 inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens,
                 cfg.swiglu_clamp, &routed, false, nullptr,
-                ggml_backend_is_cuda(gpu_backend));
+                backend_is_gpu(gpu_backend));
         }
 
         // Shared expert (always on GPU)
@@ -2163,7 +2219,7 @@ static bool eval_moe_hybrid_ffn_batched_core(
             desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
             inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens,
             cfg.swiglu_clamp, &cold_routed, false, nullptr,
-            ggml_backend_is_cuda(cold_backend),
+            backend_is_gpu(cold_backend),
             /*force_fused_combine=*/mask_skipped_cold);
 
         ggml_cgraph * cold_gf = ggml_new_graph_custom(cold_ctx, 4096, false);
@@ -2871,7 +2927,7 @@ bool eval_moe_hot_only_batched(
         desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
         inp, sel, wts, n_embd, n_ff_exp, n_used, n_tokens,
         cfg.swiglu_clamp, &routed, false, nullptr,
-        ggml_backend_is_cuda(gpu_backend));
+        backend_is_gpu(gpu_backend));
 
     // Shared expert (always on GPU)
     ggml_tensor * combined = routed;
