@@ -323,7 +323,7 @@ bool forward_qwen3_drafter_model(
             return false;
         }
         for (int il = 0; il < w.n_layer; ++il) {
-            const size_t li = nope_tail ? 0u : (size_t)il;
+            const size_t li = buffer_plan.layer_cache_index(il);
             const bool need_layer_buffers = !nope_tail || il == 0;
             if (need_layer_buffers &&
                 (!make_pers(w.backend, half_type, 3, d_kv, K_curr_v[li]) ||
@@ -418,7 +418,7 @@ bool forward_qwen3_drafter_model(
 
     for (int il = 0; il < fwd_layer_limit; ++il) {
         const auto & L = w.layers[il];
-        const size_t layer_cache_idx = nope_tail ? 0u : (size_t)il;
+        const size_t layer_cache_idx = buffer_plan.layer_cache_index(il);
         const bool debug_first_layer = (il == 0 && std::getenv("DFLASH_FP_DEBUG_LAYER0") != nullptr);
 
         // ── Graph A (chunked): norm + Q/K/V proj + RoPE + copy to persistent K_curr/V_curr/Q_buf ──
@@ -783,7 +783,7 @@ bool forward_qwen3_drafter_model(
     auto t_score_start = std::chrono::steady_clock::now();
 
     for (int il = score_layer_start; il < score_layer_end; ++il) {
-        const size_t layer_cache_idx = nope_tail ? 0u : (size_t)il;
+        const size_t layer_cache_idx = buffer_plan.layer_cache_index(il);
         ggml_init_params ip{};
         ip.mem_size = ggml_tensor_overhead() * 32 + ggml_graph_overhead() + 16 * 1024;
         ip.no_alloc = true;
