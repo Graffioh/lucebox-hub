@@ -31,12 +31,14 @@ namespace dflash::common {
 // server/scheduler.cpp): KV stays here, sockets stay there.
 struct SeqSlot {
     bool active = false;
-    // Admitted but not fully prefilled. Its device length remains zero and
-    // it is excluded from the decode batch until commit_prefill().
+    // Admitted but not fully prefilled. It is excluded from the decode batch
+    // until commit_prefill(); its length mirror advances chunk by chunk so
+    // paged causal prefill can read the rows already written.
     bool prefilling = false;
     uint64_t request_id = 0;
     PagedKvSequenceHandle handle;
     int cur_pos = 0;                 // committed KV tokens
+    uint32_t reserved_prompt_blocks = 0; // promised, not yet allocated
     SamplerCfg sampler;              // sole authority on how this slot samples
     std::mt19937_64 rng{0x9E3779B97F4A7C15ull};
     // Penalty history (sample_logits' `history`), recorded as FED rather than

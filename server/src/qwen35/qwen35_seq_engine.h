@@ -52,9 +52,7 @@ public:
     bool step(const std::vector<StepInput> & inputs,
               std::vector<StepOutput> & outputs) override;
 
-    bool prefill_pending() const override {
-        return pending_prefill_.has_value();
-    }
+    bool prefill_pending() const override;
 
     bool capture_resume_state(int slot, ResumeState & out) const override;
 
@@ -70,9 +68,10 @@ private:
         std::chrono::steady_clock::time_point admitted_at{};
     };
 
-    std::optional<PendingPrefill> pending_prefill_;
+    std::vector<std::optional<PendingPrefill>> pending_prefills_;
+    int prefill_cursor_ = 0;
 
-    int32_t sample_prefill_first_token(int slot);
+    int32_t sample_prefill_first_token(int slot, int logits_row);
 
     Qwen35Backend & b_;
     SeqSlotManager  slots_;

@@ -5621,7 +5621,22 @@ struct ggml_tensor * ggml_flash_attn_sparse(
 
 // ggml_paged_attn
 
-static struct ggml_tensor * ggml_paged_attn_impl(
+struct ggml_tensor * ggml_paged_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len) {
+    return ggml_paged_attn_ext(ctx, q, k, v, block_table, kv_seq_lens,
+                               NULL, NULL, scale, block_size,
+                               max_kv_seq_len);
+}
+
+struct ggml_tensor * ggml_paged_attn_active(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -5632,12 +5647,32 @@ static struct ggml_tensor * ggml_paged_attn_impl(
         float                 scale,
         int                   block_size,
         int                   max_kv_seq_len) {
+    GGML_ASSERT(active_slot_ids != NULL);
+    return ggml_paged_attn_ext(ctx, q, k, v, block_table, kv_seq_lens,
+                               active_slot_ids, NULL, scale, block_size,
+                               max_kv_seq_len);
+}
+
+struct ggml_tensor * ggml_paged_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * query_seq_ids,
+        struct ggml_tensor  * query_positions,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len) {
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q4_0 || v->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(block_table->type == GGML_TYPE_I32);
     GGML_ASSERT(kv_seq_lens->type == GGML_TYPE_I32);
-    GGML_ASSERT(active_slot_ids == NULL || active_slot_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(query_positions == NULL || query_seq_ids != NULL);
+    GGML_ASSERT(query_seq_ids == NULL || query_seq_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(query_positions == NULL || query_positions->type == GGML_TYPE_I32);
 
     GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
     GGML_ASSERT(k->ne[1] == v->ne[1]);
@@ -5647,12 +5682,17 @@ static struct ggml_tensor * ggml_paged_attn_impl(
     GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1);
 
     GGML_ASSERT(block_table->ne[0] > 0);
+    GGML_ASSERT(block_table->ne[1] > 0);
     GGML_ASSERT(block_table->ne[2] == 1 && block_table->ne[3] == 1);
-    GGML_ASSERT(block_table->ne[1] == kv_seq_lens->ne[0]);
+    GGML_ASSERT(kv_seq_lens->ne[0] == block_table->ne[1]);
     GGML_ASSERT(kv_seq_lens->ne[1] == 1 && kv_seq_lens->ne[2] == 1 && kv_seq_lens->ne[3] == 1);
-    if (active_slot_ids) {
-        GGML_ASSERT(active_slot_ids->ne[0] == q->ne[1]);
-        GGML_ASSERT(active_slot_ids->ne[1] == 1 && active_slot_ids->ne[2] == 1 && active_slot_ids->ne[3] == 1);
+    if (query_seq_ids) {
+        GGML_ASSERT(query_seq_ids->ne[0] == q->ne[1]);
+        GGML_ASSERT(query_seq_ids->ne[1] == 1 && query_seq_ids->ne[2] == 1 && query_seq_ids->ne[3] == 1);
+        if (query_positions) {
+            GGML_ASSERT(query_positions->ne[0] == q->ne[1]);
+            GGML_ASSERT(query_positions->ne[1] == 1 && query_positions->ne[2] == 1 && query_positions->ne[3] == 1);
+        }
     } else {
         GGML_ASSERT(block_table->ne[1] == q->ne[1]);
     }
@@ -5674,40 +5714,10 @@ static struct ggml_tensor * ggml_paged_attn_impl(
     result->src[2] = v;
     result->src[3] = block_table;
     result->src[4] = kv_seq_lens;
-    result->src[5] = active_slot_ids;
+    result->src[5] = query_seq_ids;
+    result->src[6] = query_positions;
 
     return result;
-}
-
-struct ggml_tensor * ggml_paged_attn(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * k,
-        struct ggml_tensor  * v,
-        struct ggml_tensor  * block_table,
-        struct ggml_tensor  * kv_seq_lens,
-        float                 scale,
-        int                   block_size,
-        int                   max_kv_seq_len) {
-    return ggml_paged_attn_impl(ctx, q, k, v, block_table, kv_seq_lens,
-                                NULL, scale, block_size, max_kv_seq_len);
-}
-
-struct ggml_tensor * ggml_paged_attn_active(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * k,
-        struct ggml_tensor  * v,
-        struct ggml_tensor  * block_table,
-        struct ggml_tensor  * kv_seq_lens,
-        struct ggml_tensor  * active_slot_ids,
-        float                 scale,
-        int                   block_size,
-        int                   max_kv_seq_len) {
-    GGML_ASSERT(active_slot_ids != NULL);
-    return ggml_paged_attn_impl(ctx, q, k, v, block_table, kv_seq_lens,
-                                active_slot_ids, scale, block_size,
-                                max_kv_seq_len);
 }
 
 // ggml_flash_attn_back
@@ -6630,10 +6640,8 @@ void ggml_gated_delta_net_set_skip_intermediate(
     // Compact only the plain chain path. Tree/persistent variants need
     // intermediate states for branch reloads or explicit capture storage.
     const bool can_compact = tensor->src[6] == NULL && tensor->src[7] == NULL;
-    // A plain in-place GDN writes final state directly into src[5], so its
-    // packed result does not need the otherwise mandatory final-state region.
-    // Active-slot buckets retain that region as scratch for negative padding
-    // rows, which deliberately have no physical recurrent-state slab.
+    // Active-slot buckets retain the final-state region as scratch for
+    // negative padding rows, which have no physical state slab.
     const bool inplace_state = ggml_get_op_params_i32(tensor, 1) != 0;
     const bool active_slots = tensor->src[8] != NULL;
     tensor->ne[1] = n_tokens*n_seqs +

@@ -618,8 +618,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     //                 queue). Its prefill advances inside later steps.
     //   2. Idle     — nothing live: service drains and loop back, where the
     //                 admission phase parks in the blocking dequeue.
-    //   3. Step     — advance one pending prefill chunk alongside every
-    //                 decoding slot in one engine pass.
+    //   3. Step     — advance pending prefill chunks alongside every decoding
+    //                 slot in one engine pass.
     //   4. Flush    — non-blocking write of the buffered chunks; readers that
     //                 stall or overflow their buffer are dropped.
     //   5. Reap     — service drains, then retire whatever finished this
@@ -630,12 +630,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     while (true) {
         // Phase 1 — Admission: deferred job first (FIFO), then the queue.
         // Blocking dequeue only when idle; between decode steps only a poll.
-        // The engine has one prefill staging set, so only one admission may
-        // be prefilling at a time.
+        // Each admitted prompt owns a slot and advances under the engine's
+        // shared prefill token budget.
         const bool allow_admission = !skip_admission_once;
         skip_admission_once = false;
         while (allow_admission && live_count() < n_slots &&
-               !stopping_.load() && !engine.prefill_pending() &&
+               !stopping_.load() &&
                !immune_request_live()) {
             // A deferred job owns the front of the line, so nothing else may
             // be admitted while its retry backoff is still running.
@@ -703,8 +703,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             continue;                 // dequeue() blocks in admission
         }
 
-        // Phase 3 — One iteration over every decoding slot plus one prefill
-        // chunk, fused into the same engine pass.
+        // Phase 3 — One iteration over every decoding slot plus the selected
+        // ragged prefill chunks, fused into the same engine pass.
         std::vector<SeqEngine::StepInput> inputs;
         inputs.reserve((size_t)n_slots);
         for (int i = 0; i < n_slots; i++) {

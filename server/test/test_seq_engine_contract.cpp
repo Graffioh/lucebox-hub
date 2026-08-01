@@ -39,6 +39,7 @@ static int g_checks = 0;
 // false) is the conforming engine.
 struct Faults {
     bool hard_error_when_full       = false; // busy condition reports false
+    bool serial_prefill_only        = false; // rejects a free slot while another prefills
     bool reuse_live_slot            = false; // hands slot 0 to every request
     bool drop_one_output            = false; // answers n-1 decode inputs
     bool pause_decode_during_prefill = false; // omits live decode outputs
@@ -56,13 +57,17 @@ public:
         : faults_(faults),
           active_((size_t)slots, false),
           prefilling_((size_t)slots, false),
+          prefill_steps_left_((size_t)slots, 0),
           fed_((size_t)slots) {}
 
     int slot_count() const override { return (int)active_.size(); }
 
     bool token_is_eos(int32_t token) const override { return token == kEos; }
 
-    bool prefill_pending() const override { return pending_slot_ >= 0; }
+    bool prefill_pending() const override {
+        for (bool p : prefilling_) if (p) return true;
+        return false;
+    }
 
     AdmitResult admit(uint64_t request_id,
                       const std::vector<int32_t> & prompt,
@@ -76,9 +81,9 @@ public:
             r.error = "invalid request";   // hard error: retrying cannot help
             return r;
         }
-        if (pending_slot_ >= 0) {
+        if (faults_.serial_prefill_only && prefill_pending()) {
             r.busy = !faults_.hard_error_when_full;
-            r.error = "one prefill is already pending";
+            r.error = "another prefill is already pending";
             return r;
         }
         int slot = -1;
@@ -97,8 +102,7 @@ public:
         active_[(size_t)slot] = true;
         prefilling_[(size_t)slot] = true;
         fed_[(size_t)slot].clear();
-        pending_slot_ = slot;
-        prefill_steps_left_ = 2;
+        prefill_steps_left_[(size_t)slot] = 2;
         r.ok = true;
         r.slot = slot;
         r.n_gen_cap = n_gen;
@@ -112,10 +116,10 @@ public:
             (int)inputs.size() != decoding_count()) {
             return false;   // never advance state for a slot we were not given
         }
-        if (inputs.empty() && pending_slot_ < 0) return true;
+        if (inputs.empty() && !prefill_pending()) return true;
         size_t emit = inputs.size();
         if (faults_.drop_one_output && emit > 0) emit--;
-        if (faults_.pause_decode_during_prefill && pending_slot_ >= 0) {
+        if (faults_.pause_decode_during_prefill && prefill_pending()) {
             emit = 0;
         }
         for (size_t i = 0; i < emit; i++) {
@@ -135,9 +139,9 @@ public:
             outputs.push_back(out);
         }
 
-        if (pending_slot_ >= 0 && --prefill_steps_left_ == 0) {
-            const int slot = pending_slot_;
-            pending_slot_ = -1;
+        for (int slot = 0; slot < slot_count(); ++slot) {
+            if (!prefilling_[(size_t)slot] ||
+                --prefill_steps_left_[(size_t)slot] != 0) continue;
             prefilling_[(size_t)slot] = false;
             StepOutput out;
             out.slot = slot;
@@ -152,10 +156,7 @@ public:
     void retire(int slot) override {
         if (slot < 0 || slot >= slot_count()) return;
         if (faults_.retire_leaks) return;
-        if (pending_slot_ == slot) {
-            pending_slot_ = -1;
-            prefill_steps_left_ = 0;
-        }
+        prefill_steps_left_[(size_t)slot] = 0;
         active_[(size_t)slot] = false;
         prefilling_[(size_t)slot] = false;
         fed_[(size_t)slot].clear();
@@ -184,9 +185,8 @@ private:
     Faults                            faults_;
     std::vector<bool>                 active_;
     std::vector<bool>                 prefilling_;
+    std::vector<int>                  prefill_steps_left_;
     std::vector<std::vector<int32_t>> fed_;
-    int                               pending_slot_ = -1;
-    int                               prefill_steps_left_ = 0;
 };
 
 static void print_violations(const char * label,
@@ -224,6 +224,8 @@ int main() {
     const Case cases[] = {
         {"hard-error-when-full", &Faults::hard_error_when_full,
          "must report busy=true"},
+        {"serial-prefill-only", &Faults::serial_prefill_only,
+         "concurrent prefill"},
         {"reuse-live-slot", &Faults::reuse_live_slot,
          "reused a slot that is live"},
         {"drop-one-output", &Faults::drop_one_output,

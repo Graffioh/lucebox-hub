@@ -68,10 +68,9 @@ public:
 
     struct AdmitResult {
         bool ok = false;
-        // Full: no free slot, not enough free KV blocks, or another
-        // admission's prefill is still in flight. Retrying after a retire or
-        // prefill completion can succeed. Distinct from a hard error
-        // (ok=false, busy=false), which never can.
+        // Full: no free slot or not enough unreserved KV blocks. Retrying
+        // after a retire or prefill completion can succeed. Distinct from a
+        // hard error (ok=false, busy=false), which never can.
         bool busy = false;
         int  slot = -1;
         // Requested output cap clamped to the admitted sequence's context.
@@ -89,8 +88,9 @@ public:
 
     // Admit one request into a free slot and queue its prompt for chunked
     // prefill. No K/V blocks or compute are consumed here — subsequent step()
-    // calls allocate and advance one prefill chunk alongside the decode batch.
-    // At most one admission may prefill at a time.
+    // calls allocate and advance prompt chunks alongside the decode batch.
+    // Independent free slots may prefill concurrently under one shared token
+    // budget; admission must not serialize on another prompt's prefill.
     //
     // `sampler` is the only source of truth for how the slot samples:
     // sampler.needs_logit_processing() selects CPU sampling over GPU argmax
@@ -126,12 +126,12 @@ public:
     };
 
     // One scheduler iteration: commit each input token and advance every
-    // decoding slot, while also advancing the pending admission's prefill by
-    // one chunk when present. Every decoding slot must appear in `inputs`;
-    // the prefilling slot must not. A completed prefill contributes one extra
-    // output with prefill_done=true. On batch allocation pressure, no input is
-    // mutated and one pool_exhausted output identifies the blocked decode
-    // slot. Returns false on a whole-batch failure (outputs may be partial).
+    // decoding slot, while also advancing pending prompt chunks when present.
+    // Every decoding slot must appear in `inputs`; prefilling slots must not.
+    // Each prefill completed in this step contributes one extra output with
+    // prefill_done=true. On batch allocation pressure, no input is mutated and
+    // one pool_exhausted output identifies the blocked decode slot. Returns
+    // false on a whole-batch failure (outputs may be partial).
     virtual bool step(const std::vector<StepInput> & inputs,
                       std::vector<StepOutput> & outputs) = 0;
 

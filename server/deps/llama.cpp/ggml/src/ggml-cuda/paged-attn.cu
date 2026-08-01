@@ -159,7 +159,8 @@ static __global__ void paged_attn_decode(
         const float2  * __restrict__ q_ds_glob,
         const char    * __restrict__ block_table,
         const char    * __restrict__ kv_seq_lens,
-        const char    * __restrict__ active_slot_ids,
+        const char    * __restrict__ query_seq_ids,
+        const char    * __restrict__ query_positions,
         char          * __restrict__ dst,
         half          * __restrict__ partial_acc,
         float2        * __restrict__ partial_meta,
@@ -168,9 +169,10 @@ static __global__ void paged_attn_decode(
         int64_t v_nb1,   int64_t v_nb2,
         int64_t bt_nb0,  int64_t bt_nb1,
         int64_t ksl_nb0,
-        int64_t asi_nb0,
+        int64_t qsi_nb0, int64_t qpos_nb0,
         int64_t dst_nb1, int64_t dst_nb2,
-        int32_t n_seq,
+        int32_t n_query,
+        int32_t n_table_seq,
         int32_t n_head,
         int32_t n_head_kv,
         int32_t pool_tokens,
@@ -196,17 +198,27 @@ static __global__ void paged_attn_decode(
         warp / warps_per_group;
     const int head0 =
         kv_head * gqa_ratio + (warp % warps_per_group) * n_batch_heads;
-    const int seq       = blockIdx.y;
+    const int query     = blockIdx.y;
     const int partition = blockIdx.z;
     const int lane      = threadIdx.x;
 
-    const int32_t physical_seq = active_slot_ids
-        ? *(const int32_t *) (active_slot_ids + (int64_t) seq * asi_nb0)
-        : seq;
-    const int32_t kv_seq_len_raw = physical_seq < 0
-        ? 0
-        : *(const int32_t *) (kv_seq_lens +
-                              (int64_t) physical_seq * ksl_nb0);
+    int32_t seq = query;
+    int32_t query_pos = -1;
+    if (query_seq_ids) {
+        seq = *(const int32_t *)
+            (query_seq_ids + (int64_t) query * qsi_nb0);
+        query_pos = *(const int32_t *)
+            (query_positions + (int64_t) query * qpos_nb0);
+    }
+    const bool valid_query = seq >= 0 && seq < n_table_seq &&
+                             (!query_positions || query_pos >= 0);
+    if (!valid_query) seq = 0; // safe metadata column; kv_seq_len is forced 0
+    int32_t kv_seq_len_raw = valid_query
+        ? *(const int32_t *) (kv_seq_lens + (int64_t) seq * ksl_nb0)
+        : 0;
+    if (query_positions && kv_seq_len_raw > query_pos + 1) {
+        kv_seq_len_raw = query_pos + 1;
+    }
     const int64_t table_capacity =
         (int64_t) max_blocks * block_size;
     const int32_t kv_seq_len = kv_seq_len_raw <= 0
@@ -233,7 +245,7 @@ static __global__ void paged_attn_decode(
     if (partition >= active_partitions) {
 #pragma unroll
         for (int h = 0; h < n_batch_heads; ++h) {
-            const int64_t output_row = (int64_t) (head0 + h) * n_seq + seq;
+            const int64_t output_row = (int64_t) (head0 + h) * n_query + query;
             if constexpr (write_partials) {
                 if (lane == 0) {
                     partial_meta[output_row * n_partitions + partition] =
@@ -241,7 +253,7 @@ static __global__ void paged_attn_decode(
                 }
             } else {
                 float * o_row =
-                    (float *) (dst + (int64_t) seq * dst_nb1 +
+                    (float *) (dst + (int64_t) query * dst_nb1 +
                                      (int64_t) (head0 + h) * dst_nb2);
 #pragma unroll
                 for (int i = lane; i < D; i += nthreads) {
@@ -279,7 +291,7 @@ static __global__ void paged_attn_decode(
         // are tiny and shared by every partition, so they stay L2-resident.
 #pragma unroll
         for (int h = 0; h < n_batch_heads; ++h) {
-            const int64_t row = (int64_t) (head0 + h) * n_seq + seq;
+            const int64_t row = (int64_t) (head0 + h) * n_query + query;
             const int    * yq32 = q_i32_glob + row * (D / (int) sizeof(int));
             const float2 * yds  = q_ds_glob  + row * (D / QK8_1);
 #pragma unroll
@@ -299,7 +311,7 @@ static __global__ void paged_attn_decode(
 #pragma unroll
         for (int h = 0; h < n_batch_heads; ++h) {
             const float2 * q_f2 = (const float2 *)
-                (q + (int64_t) seq * q_nb1 + (int64_t) (head0 + h) * q_nb2);
+                (q + (int64_t) query * q_nb1 + (int64_t) (head0 + h) * q_nb2);
 #pragma unroll
             for (int i0 = 0; i0 < D / 2; i0 += nthreads * cpy_ne) {
                 const int i = i0 + lane * cpy_ne;
@@ -356,7 +368,7 @@ static __global__ void paged_attn_decode(
             const int32_t physical_block =
                 *(const int32_t *) (block_table +
                     (int64_t) logical_block * bt_nb0 +
-                    (int64_t) physical_seq * bt_nb1);
+                    (int64_t) seq * bt_nb1);
             if (physical_block >= 0 && physical_block < n_physical_blocks) {
                 phys_mine =
                     physical_block * block_size + my_token % block_size;
@@ -453,7 +465,7 @@ static __global__ void paged_attn_decode(
 
 #pragma unroll
     for (int h = 0; h < n_batch_heads; ++h) {
-        const int64_t output_row = (int64_t) (head0 + h) * n_seq + seq;
+        const int64_t output_row = (int64_t) (head0 + h) * n_query + query;
         const float inv_sum = qk_sum[h] > 0.0f ? 1.0f / qk_sum[h] : 0.0f;
         if constexpr (write_partials) {
             // Partials are stored normalized by the partition's qk_sum: it
@@ -479,7 +491,7 @@ static __global__ void paged_attn_decode(
             }
         } else {
             float * o_row =
-                (float *) (dst + (int64_t) seq * dst_nb1 +
+                (float *) (dst + (int64_t) query * dst_nb1 +
                                  (int64_t) (head0 + h) * dst_nb2);
 #pragma unroll
             for (int segment = 0;
@@ -583,11 +595,17 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
     const ggml_tensor * v             = dst->src[2];
     const ggml_tensor * block_table   = dst->src[3];
     const ggml_tensor * kv_seq_lens   = dst->src[4];
-    const ggml_tensor * active_slot_ids = dst->src[5];
+    const ggml_tensor * query_seq_ids = dst->src[5];
+    const ggml_tensor * query_positions = dst->src[6];
 
     if (!q || !k || !v || !block_table || !kv_seq_lens) {
         return false;
     }
+    if (!query_seq_ids && query_positions) {
+        return false;
+    }
+    const bool mapped = query_seq_ids != nullptr;
+    const bool ragged = query_positions != nullptr;
 
     const int32_t block_size = ggml_get_op_params_i32(dst, 1);
     const int32_t max_kv_seq_len = ggml_get_op_params_i32(dst, 2);
@@ -597,13 +615,15 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
            paged_attn_type_supported(v->type) &&
            block_table->type == GGML_TYPE_I32 &&
            kv_seq_lens->type == GGML_TYPE_I32 &&
-           (!active_slot_ids || active_slot_ids->type == GGML_TYPE_I32) &&
+           (!mapped || query_seq_ids->type == GGML_TYPE_I32) &&
+           (!ragged || query_positions->type == GGML_TYPE_I32) &&
            q->nb[0] == sizeof(float) &&
            k->nb[0] == ggml_type_size(k->type) &&
            v->nb[0] == ggml_type_size(v->type) &&
            block_table->nb[0] == sizeof(int32_t) &&
            kv_seq_lens->nb[0] == sizeof(int32_t) &&
-           (!active_slot_ids || active_slot_ids->nb[0] == sizeof(int32_t)) &&
+           (!mapped || query_seq_ids->nb[0] == sizeof(int32_t)) &&
+           (!ragged || query_positions->nb[0] == sizeof(int32_t)) &&
            dst->nb[0] == sizeof(float) &&
            dst->ne[0] == q->ne[0] &&
            dst->ne[1] == q->ne[1] &&
@@ -620,18 +640,20 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
            k->ne[3] == 1 &&
            v->ne[3] == 1 &&
            block_table->ne[0] > 0 &&
-           block_table->ne[1] == kv_seq_lens->ne[0] &&
+           block_table->ne[1] > 0 &&
            block_table->ne[2] == 1 &&
            block_table->ne[3] == 1 &&
+           kv_seq_lens->ne[0] == block_table->ne[1] &&
            kv_seq_lens->ne[1] == 1 &&
            kv_seq_lens->ne[2] == 1 &&
            kv_seq_lens->ne[3] == 1 &&
-           (active_slot_ids
-                ? (active_slot_ids->ne[0] == q->ne[1] &&
-                   active_slot_ids->ne[1] == 1 &&
-                   active_slot_ids->ne[2] == 1 &&
-                   active_slot_ids->ne[3] == 1)
-                : block_table->ne[1] == q->ne[1]) &&
+           (mapped || block_table->ne[1] == q->ne[1]) &&
+           (!mapped ||
+            (query_seq_ids->ne[0] == q->ne[1] &&
+             query_seq_ids->ne[1] == 1 && query_seq_ids->ne[2] == 1 && query_seq_ids->ne[3] == 1)) &&
+           (!ragged ||
+            (query_positions->ne[0] == q->ne[1] &&
+             query_positions->ne[1] == 1 && query_positions->ne[2] == 1 && query_positions->ne[3] == 1)) &&
            block_size > 0 &&
            max_kv_seq_len > 0 &&
            max_kv_seq_len <= k->ne[1] &&
@@ -655,7 +677,8 @@ static bool try_launch_paged_attn(
     const ggml_tensor * v            = dst->src[2];
     const ggml_tensor * block_table  = dst->src[3];
     const ggml_tensor * kv_seq_lens = dst->src[4];
-    const ggml_tensor * active_slot_ids = dst->src[5];
+    const ggml_tensor * query_seq_ids = dst->src[5];
+    const ggml_tensor * query_positions = dst->src[6];
 
     const int32_t n_head    = (int32_t) q->ne[2];
     const int32_t n_head_kv = (int32_t) k->ne[2];
@@ -832,7 +855,8 @@ static bool try_launch_paged_attn(
             q_ds_glob,
             (const char *) block_table->data,
             (const char *) kv_seq_lens->data,
-            active_slot_ids ? (const char *) active_slot_ids->data : nullptr,
+            query_seq_ids ? (const char *) query_seq_ids->data : nullptr,
+            query_positions ? (const char *) query_positions->data : nullptr,
             (char *) dst->data,
             nullptr,
             nullptr,
@@ -841,9 +865,11 @@ static bool try_launch_paged_attn(
             v->nb[1], v->nb[2],
             block_table->nb[0], block_table->nb[1],
             kv_seq_lens->nb[0],
-            active_slot_ids ? active_slot_ids->nb[0] : 0,
+            query_seq_ids ? query_seq_ids->nb[0] : 0,
+            query_positions ? query_positions->nb[0] : 0,
             dst->nb[1], dst->nb[2],
             (int32_t) q->ne[1],
+            (int32_t) block_table->ne[1],
             n_head,
             n_head_kv,
             (int32_t) k->ne[1],
@@ -874,7 +900,8 @@ static bool try_launch_paged_attn(
         q_ds_glob,
         (const char *) block_table->data,
         (const char *) kv_seq_lens->data,
-        active_slot_ids ? (const char *) active_slot_ids->data : nullptr,
+        query_seq_ids ? (const char *) query_seq_ids->data : nullptr,
+        query_positions ? (const char *) query_positions->data : nullptr,
         (char *) dst->data,
         partial_acc,
         partial_meta,
@@ -883,9 +910,11 @@ static bool try_launch_paged_attn(
         v->nb[1], v->nb[2],
         block_table->nb[0], block_table->nb[1],
         kv_seq_lens->nb[0],
-        active_slot_ids ? active_slot_ids->nb[0] : 0,
+        query_seq_ids ? query_seq_ids->nb[0] : 0,
+        query_positions ? query_positions->nb[0] : 0,
         dst->nb[1], dst->nb[2],
         (int32_t) q->ne[1],
+        (int32_t) block_table->ne[1],
         n_head,
         n_head_kv,
         (int32_t) k->ne[1],

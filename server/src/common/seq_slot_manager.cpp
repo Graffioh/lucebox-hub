@@ -77,10 +77,15 @@ SeqSlotManager::AdmitOutcome SeqSlotManager::admit(
     // output cap.
     const uint32_t need = (uint32_t)paged_block_count(prompt_len);
     const uint32_t free = pool_.free_block_count();
+    uint32_t reserved = 0;
+    for (const SeqSlot & live : slots_) {
+        reserved += live.reserved_prompt_blocks;
+    }
+    const uint32_t available = reserved < free ? free - reserved : 0;
     const uint32_t watermark =
         pool_.active_sequence_count() > 0
             ? admission_watermark_blocks_ : 0;
-    if (need > free || watermark > free - need) {
+    if (need > available || watermark > available - need) {
         r.busy = pool_.active_sequence_count() > 0;
         r.error = "not enough free KV blocks for the prompt and admission "
                   "watermark";
@@ -101,6 +106,7 @@ SeqSlotManager::AdmitOutcome SeqSlotManager::admit(
     s.request_id = request_id;
     s.handle = handle;
     s.cur_pos = 0;
+    s.reserved_prompt_blocks = need;
     s.sampler = sampler;
     if (resume_history && resume_rng) {
         s.sample_history = *resume_history;
@@ -161,7 +167,11 @@ SeqSlotManager::PrefillChunk SeqSlotManager::append_prefill(
              i < after.block_table.size(); i++) {
             out.new_blocks.push_back((int32_t)after.block_table[i]);
         }
+        const uint32_t allocated = (uint32_t)out.new_blocks.size();
+        s.reserved_prompt_blocks = allocated < s.reserved_prompt_blocks
+            ? s.reserved_prompt_blocks - allocated : 0;
     }
+    lens_host_[(size_t)slot] = (int32_t)after.kv_seq_len;
     out.ok = true;
     return out;
 }
@@ -170,6 +180,7 @@ void SeqSlotManager::commit_prefill(int slot, int committed) {
     if (!is_active(slot)) return;
     slots_[(size_t)slot].prefilling = false;
     slots_[(size_t)slot].cur_pos = committed;
+    slots_[(size_t)slot].reserved_prompt_blocks = 0;
     lens_host_[(size_t)slot] = committed;
 }
 
@@ -203,6 +214,11 @@ SeqSlotManager::StepAppend SeqSlotManager::append_token(int slot,
 int SeqSlotManager::decode_pressure_slot(
         const std::vector<int> & decode_slots) const {
     uint32_t free = pool_.free_block_count();
+    uint32_t reserved = 0;
+    for (const SeqSlot & live : slots_) {
+        reserved += live.reserved_prompt_blocks;
+    }
+    free = reserved < free ? free - reserved : 0;
     for (const int slot : decode_slots) {
         if (!is_active(slot) || is_prefilling(slot)) continue;
         const SeqSlot & s = slots_[(size_t)slot];

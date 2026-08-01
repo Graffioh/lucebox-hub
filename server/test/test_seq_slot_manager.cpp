@@ -61,12 +61,14 @@ int main() {
         CHECK(p0.ok && !p0.busy);
         CHECK(p0.rows.size() == 10 && p0.rows.front() == 0 &&
               p0.rows.back() == 9);
+        CHECK(mgr.lens_host()[0] == 10);
         CHECK(p0.first_new_block == 0 && p0.new_blocks.size() == 1 &&
               p0.new_blocks[0] == 0);
         auto p1 = mgr.append_prefill(a.slot, 10);
         CHECK(p1.ok && !p1.busy);
         CHECK(p1.rows.size() == 10 && p1.rows.front() == 10 &&
               p1.rows.back() == 19);
+        CHECK(mgr.lens_host()[0] == 20);
         CHECK(p1.first_new_block == 1 && p1.new_blocks.size() == 1 &&
               p1.new_blocks[0] == 1);
         mgr.commit_prefill(0, 20);
@@ -157,6 +159,29 @@ int main() {
         mgr.retire(big.slot);
         auto now_fits = mgr.admit(3, 32, 1, greedy_sampler());
         CHECK(now_fits.ok);
+    }
+
+    // Admissions reserve prompt capacity without allocating physical blocks.
+    // Multiple pending prompts therefore cannot over-promise the same free
+    // pages and deadlock once every live slot is still prefilling.
+    {
+        PagedKvPool pool(/*physical_block_count=*/4,
+                         /*max_sequences=*/3);
+        SeqSlotManager mgr(pool, /*max_ctx=*/64);
+        auto a = mgr.admit(1, 32, 1, greedy_sampler());
+        auto b = mgr.admit(2, 32, 1, greedy_sampler());
+        CHECK(a.ok && b.ok);
+        CHECK(pool.free_block_count() == 4); // promises are metadata only
+        auto blocked = mgr.admit(3, 16, 1, greedy_sampler());
+        CHECK(!blocked.ok && blocked.busy);
+
+        CHECK(mgr.append_prefill(a.slot, 16).ok);
+        CHECK(mgr.append_prefill(a.slot, 16).ok);
+        CHECK(pool.free_block_count() == 2);
+        blocked = mgr.admit(3, 16, 1, greedy_sampler());
+        CHECK(!blocked.ok && blocked.busy); // B still owns both free pages
+        mgr.retire(b.slot);
+        CHECK(mgr.admit(3, 16, 1, greedy_sampler()).ok);
     }
 
     // Never-fits: a prompt beyond the WHOLE pool is a hard error, not

@@ -2492,9 +2492,8 @@ extern "C" {
             int                   block_size,
             int                   max_kv_seq_len);
 
-    // Compact-batch variant. active_slot_ids maps each query row to the
-    // physical block-table column and sequence-length entry. A negative id is
-    // a padding row and produces a zero attention output.
+    // Compact-batch decode variant. active_slot_ids maps each query row to
+    // its physical block-table column. Negative ids are padding rows.
     GGML_API struct ggml_tensor * ggml_paged_attn_active(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2503,6 +2502,23 @@ extern "C" {
             struct ggml_tensor  * block_table,
             struct ggml_tensor  * kv_seq_lens,
             struct ggml_tensor  * active_slot_ids,
+            float                 scale,
+            int                   block_size,
+            int                   max_kv_seq_len);
+
+    // Ragged-query paged attention. query_seq_ids and query_positions are
+    // I32 [n_query]: each query selects a block-table column and attends
+    // causally through its inclusive logical position. The output keeps q's
+    // [head_dim, n_query, n_head] layout.
+    GGML_API struct ggml_tensor * ggml_paged_attn_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * block_table,
+            struct ggml_tensor  * kv_seq_lens,
+            struct ggml_tensor  * query_seq_ids,
+            struct ggml_tensor  * query_positions,
             float                 scale,
             int                   block_size,
             int                   max_kv_seq_len);

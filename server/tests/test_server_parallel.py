@@ -522,6 +522,48 @@ class ParallelTestSuite:
                     preemptions > 0,
                     f"recent preemptions={preemptions}")
 
+    def test_parallel_ragged_prefill(self):
+        """Equal long prompts should share prefill steps instead of waiting
+        for each previous prompt to finish its full prefill."""
+        print("\n[PAR-9] Ragged prefill — long prompts advance together")
+        if self.parallel < 3:
+            self._skip("ragged multi-prompt prefill",
+                       "requires --max-concurrency >= 3")
+            return
+
+        prompts = []
+        for i, answer in enumerate((701, 703, 705)):
+            filler = "\n".join(
+                f"request {i} item {j}: the quick brown fox jumps over the lazy dog"
+                for j in range(140))
+            a = answer // 2
+            prompts.append((
+                f"Reference text:\n{filler}\nIgnore it. What is {a}+{answer-a}? "
+                "Answer with just the number.",
+                str(answer)))
+
+        started = time.monotonic()
+        results = self._launch_streams(prompts, max_tokens=64)
+        if not self._all_completed(results, "ragged prefill"):
+            return
+        for i, result in enumerate(results):
+            self._check(
+                f"ragged prompt {i+1} answers {prompts[i][1]}",
+                contains_number(self._combined(result), prompts[i][1]),
+                f"content={result['content']!r}")
+
+        ttfts = [r["first_chunk_t"] - started for r in results
+                 if r["first_chunk_t"] is not None]
+        if len(ttfts) != len(results) or min(ttfts) <= 0:
+            self._check("all ragged prompts produce a first token", False,
+                        f"ttfts={ttfts}")
+            return
+        ratio = max(ttfts) / min(ttfts)
+        self._check(
+            "long-prompt TTFTs form one shared prefill wave",
+            ratio < 1.75,
+            f"TTFTs={[round(v, 2) for v in ttfts]} ratio={ratio:.2f}")
+
     # ── Run all ──────────────────────────────────────────────────────────
 
     def _report(self):
@@ -543,6 +585,7 @@ class ParallelTestSuite:
         self.test_parallel_more_than_slots()
         self.test_parallel_prefill_no_pause()
         self.test_recompute_preemption()
+        self.test_parallel_ragged_prefill()
 
         return self._report()
 
