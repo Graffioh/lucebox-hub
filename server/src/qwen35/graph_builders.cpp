@@ -284,7 +284,9 @@ bool build_target_step(
     int n_seqs,
     int seq_slot,
     bool paged_prefill,
-    int paged_max_kv_len) {
+    int paged_max_kv_len,
+    bool compact_slots,
+    int graph_key_slot) {
     step_graph_free(sg);
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
@@ -300,6 +302,15 @@ bool build_target_step(
     ip.no_alloc   = true;
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
+
+    // ggml-cuda keys its graph cache by nodes[0]. Salting the metadata
+    // allocation shifts node addresses deterministically so each decode
+    // width bucket keeps an independent captured graph while sharing this
+    // single 512 MiB metadata arena.
+    if (graph_key_slot < 0 || graph_key_slot > 16) return false;
+    for (int i = 0; i < graph_key_slot; ++i) {
+        (void)ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
+    }
 
     const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
@@ -338,17 +349,36 @@ bool build_target_step(
         // Classic paged decode is single-token; batched decode carries one
         // token per sequence slot (token axis == sequence axis).
         const bool batched = n_seqs > 1;
-        if (batched ? (n_tokens != n_seqs || n_seqs != cache.n_seq_slots)
-                    : (n_tokens != 1)) return false;
+        if (compact_slots) {
+            if (n_tokens != n_seqs || n_seqs < 1 ||
+                n_seqs > 64 || paged_prefill) return false;
+        } else if (batched
+                ? (n_tokens != n_seqs || n_seqs != cache.n_seq_slots)
+                : (n_tokens != 1)) {
+            return false;
+        }
         if (with_mask || fa_window != 0) return false;
         // The paging metadata lives in the persistent target cache (next to
         // the K/V pool), not as gallocr graph inputs: contents survive graph
         // execution and rebuilds, so the backend uploads only what changed
         // between decode steps.
         if (!cache.paged_block_table || !cache.paged_kv_seq_lens) return false;
-        if ((int)cache.paged_block_table->ne[1] != n_tokens) return false;
+        if ((int)cache.paged_block_table->ne[1] != cache.n_seq_slots ||
+            (int)cache.paged_kv_seq_lens->ne[0] != cache.n_seq_slots) {
+            return false;
+        }
         sg.paged_block_table = cache.paged_block_table;
         sg.paged_kv_seq_lens = cache.paged_kv_seq_lens;
+        if (compact_slots) {
+            sg.active_slot_ids =
+                ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
+            sg.state_slot_ids =
+                ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(sg.active_slot_ids, "active_slot_ids");
+            ggml_set_name(sg.state_slot_ids, "state_slot_ids");
+            ggml_set_input(sg.active_slot_ids);
+            ggml_set_input(sg.state_slot_ids);
+        }
     }
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
@@ -389,6 +419,8 @@ bool build_target_step(
     gi.kv_write_rows              = sg.kv_write_rows;
     gi.paged_block_table          = sg.paged_block_table;
     gi.paged_kv_seq_lens          = sg.paged_kv_seq_lens;
+    gi.active_slot_ids            = sg.active_slot_ids;
+    gi.state_slot_ids             = sg.state_slot_ids;
     gi.q_capture                  = capture_qk;
     gi.n_seqs                     = n_seqs;
     gi.seq_slot                   = seq_slot;

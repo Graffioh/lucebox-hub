@@ -21,6 +21,25 @@
 
 namespace dflash::common {
 
+namespace {
+
+int decode_bucket_width(int live_count) {
+    int width = 1;
+    while (width < live_count) width <<= 1;
+    return width;
+}
+
+int decode_bucket_graph_key(int width) {
+    int key = 1; // zero is reserved for non-bucketed prefill/verify graphs
+    while (width > 1) {
+        width >>= 1;
+        ++key;
+    }
+    return key;
+}
+
+} // namespace
+
 bool Qwen35SeqEngine::token_is_eos(int32_t token) const {
     return b_.token_is_eos(token);
 }
@@ -226,22 +245,26 @@ bool Qwen35SeqEngine::step(const std::vector<StepInput> & inputs,
         return false;
     }
 
-    // Stage the fixed-width batch. Dead slots decode a dummy token at
-    // position 0 with kv_seq_len 0 (attention exits empty) and their K/V
-    // write aimed at the scratch block past the pool.
-    std::vector<int32_t> tokens((size_t)n_slots, 0);
-    std::vector<int32_t> pos_buf((size_t)4 * n_slots, 0);
-    std::vector<int64_t> rows((size_t)n_slots * n_head_kv, scratch_row_);
-
     outputs.reserve(inputs.size());
+    std::vector<int> output_rows;
+    output_rows.reserve(inputs.size());
+    std::vector<int32_t> live_tokens;
+    std::vector<int32_t> live_positions;
+    std::vector<int64_t> live_physical_rows;
+    std::vector<int32_t> live_slot_ids;
+    live_tokens.reserve(inputs.size());
+    live_positions.reserve(inputs.size());
+    live_physical_rows.reserve(inputs.size());
+    live_slot_ids.reserve(inputs.size());
     int max_kv_len = 1;
-    bool any_live = false;
     for (const StepInput & in : inputs) {
         StepOutput out;
         out.slot = in.slot;
         out.failed = true;
+        int compact_row = -1;
         if (in.slot < 0 || in.slot >= n_slots) {
             outputs.push_back(out);
+            output_rows.push_back(compact_row);
             continue;
         }
         // Cache-row allocation, the context guard, the kv-length mirror,
@@ -250,25 +273,47 @@ bool Qwen35SeqEngine::step(const std::vector<StepInput> & inputs,
             slots_.append_token(in.slot, in.token);
         if (!app.ok) {
             outputs.push_back(out);
+            output_rows.push_back(compact_row);
             continue;
         }
-        tokens[(size_t)in.slot] = in.token;
-        for (int h = 0; h < n_head_kv; h++) {
-            rows[(size_t)h * n_slots + in.slot] = app.physical_row;
-        }
-        pos_buf[4 * in.slot + 0] = app.position;
-        pos_buf[4 * in.slot + 1] = app.position;
-        pos_buf[4 * in.slot + 2] = app.position;
-        pos_buf[4 * in.slot + 3] = 0;
+        compact_row = (int)live_tokens.size();
+        live_tokens.push_back(in.token);
+        live_positions.push_back(app.position);
+        live_physical_rows.push_back(app.physical_row);
+        live_slot_ids.push_back(in.slot);
         max_kv_len = std::max(max_kv_len, app.position + 1);
-        any_live = true;
         out.failed = false;
         outputs.push_back(out);
+        output_rows.push_back(compact_row);
     }
-    if (!any_live) return true;
+    const int live_count = (int)live_tokens.size();
+    if (live_count == 0) return true;
+    const int bucket = decode_bucket_width(live_count);
+
+    // Pack live sequences first and pad only to the next graph bucket. Paged
+    // attention and GDN consume active_slot_ids to reach the persistent
+    // physical metadata/state; -1 padding rows are computation-only.
+    std::vector<int32_t> tokens((size_t)bucket, 0);
+    std::vector<int32_t> pos_buf((size_t)4 * bucket, 0);
+    std::vector<int64_t> rows((size_t)bucket * n_head_kv, scratch_row_);
+    std::vector<int32_t> active_slot_ids((size_t)bucket, -1);
+    std::vector<int32_t> state_slot_ids((size_t)bucket, 0);
+    for (int row = 0; row < live_count; ++row) {
+        tokens[(size_t)row] = live_tokens[(size_t)row];
+        const int pos = live_positions[(size_t)row];
+        pos_buf[(size_t)4 * row + 0] = pos;
+        pos_buf[(size_t)4 * row + 1] = pos;
+        pos_buf[(size_t)4 * row + 2] = pos;
+        active_slot_ids[(size_t)row] = live_slot_ids[(size_t)row];
+        state_slot_ids[(size_t)row] = live_slot_ids[(size_t)row];
+        for (int h = 0; h < n_head_kv; ++h) {
+            rows[(size_t)h * bucket + row] =
+                live_physical_rows[(size_t)row];
+        }
+    }
 
     if (!build_target_step(sg, w, b_.cache_, b_.target_backend_,
-                           /*kv_start=*/0, /*n_tokens=*/n_slots,
+                           /*kv_start=*/0, /*n_tokens=*/bucket,
                            /*with_mask=*/false, /*capture=*/false,
                            /*capture_delta_intermediate=*/false,
                            /*fa_window=*/0,
@@ -278,25 +323,31 @@ bool Qwen35SeqEngine::step(const std::vector<StepInput> & inputs,
                            /*kvflash_mask=*/false,
                            /*capture_qk=*/false,
                            /*paged_attention=*/true,
-                           /*n_seqs=*/n_slots,
+                           /*n_seqs=*/bucket,
                            /*seq_slot=*/0,
                            /*paged_prefill=*/false,
-                           /*paged_max_kv_len=*/max_kv_len)) {
+                           /*paged_max_kv_len=*/max_kv_len,
+                           /*compact_slots=*/true,
+                           /*graph_key_slot=*/decode_bucket_graph_key(bucket))) {
         for (StepOutput & o : outputs) o.failed = true;
         return false;
     }
 
-    std::vector<float> embed_buf((size_t)hidden * n_slots);
-    if (!w.embedder.embed(tokens.data(), n_slots, embed_buf.data())) {
+    std::vector<float> embed_buf((size_t)hidden * bucket);
+    if (!w.embedder.embed(tokens.data(), bucket, embed_buf.data())) {
         for (StepOutput & o : outputs) o.failed = true;
         return false;
     }
     ggml_backend_tensor_set(sg.inp_embed, embed_buf.data(), 0,
-                            sizeof(float) * (size_t)hidden * n_slots);
+                            sizeof(float) * (size_t)hidden * bucket);
     ggml_backend_tensor_set(sg.positions, pos_buf.data(), 0,
                             sizeof(int32_t) * pos_buf.size());
     ggml_backend_tensor_set(sg.kv_write_rows, rows.data(), 0,
                             sizeof(int64_t) * rows.size());
+    ggml_backend_tensor_set(sg.active_slot_ids, active_slot_ids.data(), 0,
+                            sizeof(int32_t) * active_slot_ids.size());
+    ggml_backend_tensor_set(sg.state_slot_ids, state_slot_ids.data(), 0,
+                            sizeof(int32_t) * state_slot_ids.size());
     ggml_backend_tensor_set(b_.cache_.paged_kv_seq_lens,
                             slots_.lens_host().data(), 0,
                             sizeof(int32_t) * slots_.lens_host().size());
@@ -307,27 +358,33 @@ bool Qwen35SeqEngine::step(const std::vector<StepInput> & inputs,
         return false;
     }
 
-    std::vector<int32_t> argmax((size_t)n_slots, -1);
+    std::vector<int32_t> argmax((size_t)bucket, -1);
     ggml_backend_tensor_get(sg.argmax_tokens, argmax.data(), 0,
-                            sizeof(int32_t) * (size_t)n_slots);
+                            sizeof(int32_t) * (size_t)bucket);
     std::vector<float> logits_buf;
-    for (StepOutput & out : outputs) {
+    for (size_t oi = 0; oi < outputs.size(); ++oi) {
+        StepOutput & out = outputs[oi];
         if (out.failed) continue;
+        const int row = output_rows[oi];
+        if (row < 0 || row >= live_count) {
+            out.failed = true;
+            continue;
+        }
         SeqSlot & s = slots_.slot(out.slot);
         slots_.commit_step(out.slot);
         int32_t next;
         if (s.sampler.needs_logit_processing()) {
             if (logits_buf.empty()) logits_buf.resize((size_t)vocab);
             ggml_backend_tensor_get(sg.logits, logits_buf.data(),
-                                    (size_t)out.slot * (size_t)vocab * sizeof(float),
+                                    (size_t)row * (size_t)vocab * sizeof(float),
                                     sizeof(float) * (size_t)vocab);
             next = sample_logits(logits_buf.data(), vocab, s.sampler,
                                  s.sample_history, s.rng);
         } else {
-            next = argmax[(size_t)out.slot];
+            next = argmax[(size_t)row];
         }
         next = b_.apply_min_tokens_floor(next, (int)s.sample_history.size(),
-                                         (size_t)out.slot * (size_t)vocab *
+                                         (size_t)row * (size_t)vocab *
                                              sizeof(float));
         out.token = next;
     }

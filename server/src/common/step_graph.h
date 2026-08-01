@@ -56,6 +56,11 @@ struct StepGraph {
     // Both are null on the dense attention path.
     ggml_tensor *   paged_block_table = nullptr;
     ggml_tensor *   paged_kv_seq_lens = nullptr;
+    // Compact decode row -> physical sequence slot. Padding rows carry -1.
+    // state_slot_ids has the same shape but maps padding to a safe readable
+    // slot for graph-level conv-state gathers.
+    ggml_tensor *   active_slot_ids = nullptr;
+    ggml_tensor *   state_slot_ids = nullptr;
 
     // Output
     ggml_tensor *   logits = nullptr;
@@ -88,6 +93,8 @@ inline void step_graph_free(StepGraph & sg) {
     sg.kv_write_rows = nullptr;
     sg.paged_block_table = nullptr;
     sg.paged_kv_seq_lens = nullptr;
+    sg.active_slot_ids = nullptr;
+    sg.state_slot_ids = nullptr;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;
     sg.argmax_tokens = nullptr;

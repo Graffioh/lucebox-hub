@@ -111,7 +111,9 @@ bool build_target_step(
     int n_seqs = 1,
     int seq_slot = 0,
     bool paged_prefill = false,
-    int paged_max_kv_len = 0);
+    int paged_max_kv_len = 0,
+    bool compact_slots = false,
+    int graph_key_slot = 0);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

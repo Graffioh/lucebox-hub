@@ -7,12 +7,15 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-cuda.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -41,6 +44,9 @@ constexpr size_t CONV_HIST_PER_SEQ =
     static_cast<size_t>(D_CONV - 1) * CONV_CHANNELS;
 constexpr size_t CONV_OUT_PER_SEQ = CONV_CHANNELS;
 constexpr size_t CONV_WEIGHT_ELEMS = static_cast<size_t>(D_CONV) * CONV_CHANNELS;
+
+bool check(const char * name, const float * batched, const float * reference,
+           size_t count);
 
 void fill_uniform(std::mt19937 & rng, float lo, float hi,
                   std::vector<float> & values) {
@@ -112,6 +118,76 @@ bool run_gdn(ggml_backend_t backend, int n_seqs,
     return ok;
 }
 
+// One bucketed decode step. Inputs are compact, while state remains allocated
+// for every physical server slot. Negative active ids are bucket padding and
+// must not read or update a persistent state slab.
+bool run_gdn_active(ggml_backend_t backend, int batch_size, int physical_slots,
+                    const float * q, const float * k, const float * v,
+                    const float * g, const float * beta, const float * state,
+                    const int32_t * active_slot_ids,
+                    float * attn_out, float * state_out) {
+    ggml_init_params params{};
+    params.mem_size = 4 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * q_t =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, batch_size);
+    ggml_tensor * k_t =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, batch_size);
+    ggml_tensor * v_t =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_V, N_HEAD, 1, batch_size);
+    ggml_tensor * g_t =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, N_HEAD, 1, batch_size);
+    ggml_tensor * beta_t =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, N_HEAD, 1, batch_size);
+    ggml_tensor * state_t = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, S_V, S_V, N_HEAD, physical_slots);
+    ggml_tensor * active_t =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch_size);
+    for (ggml_tensor * input :
+         {q_t, k_t, v_t, g_t, beta_t, state_t, active_t}) {
+        ggml_set_input(input);
+    }
+
+    ggml_tensor * result = ggml_gated_delta_net_active_inplace(
+        ctx, q_t, k_t, v_t, g_t, beta_t, state_t, active_t);
+    ggml_gated_delta_net_set_skip_intermediate(result, true);
+    ggml_set_output(result);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+
+    ggml_gallocr_t allocator =
+        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    bool ok = ggml_gallocr_alloc_graph(allocator, graph);
+    if (ok) {
+        const size_t qkv_bytes = GDN_QKV_PER_SEQ * batch_size * sizeof(float);
+        const size_t gate_bytes = GDN_GATE_PER_SEQ * batch_size * sizeof(float);
+        const size_t state_bytes =
+            GDN_STATE_PER_SEQ * physical_slots * sizeof(float);
+        ggml_backend_tensor_set(q_t, q, 0, qkv_bytes);
+        ggml_backend_tensor_set(k_t, k, 0, qkv_bytes);
+        ggml_backend_tensor_set(v_t, v, 0, qkv_bytes);
+        ggml_backend_tensor_set(g_t, g, 0, gate_bytes);
+        ggml_backend_tensor_set(beta_t, beta, 0, gate_bytes);
+        ggml_backend_tensor_set(state_t, state, 0, state_bytes);
+        ggml_backend_tensor_set(active_t, active_slot_ids, 0,
+                                batch_size * sizeof(active_slot_ids[0]));
+        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        if (ok) {
+            ggml_backend_tensor_get(
+                result, attn_out, 0,
+                GDN_QKV_PER_SEQ * batch_size * sizeof(float));
+            ggml_backend_tensor_get(state_t, state_out, 0, state_bytes);
+        }
+    }
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    return ok;
+}
+
 // One ssm_conv step: sx [d_conv-1 + 1, channels, n_seqs] against shared
 // [d_conv, channels] weights, producing [channels, 1, n_seqs].
 bool run_conv(ggml_backend_t backend, int n_seqs,
@@ -150,6 +226,71 @@ bool run_conv(ggml_backend_t backend, int n_seqs,
                                     CONV_OUT_PER_SEQ * n_seqs * sizeof(float));
         }
     }
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool test_masked_set_rows(ggml_backend_t backend) {
+    constexpr int ROW_WIDTH = 4;
+    constexpr int DEST_ROWS = 4;
+    constexpr int SOURCE_ROWS = 3;
+
+    ggml_init_params params{};
+    params.mem_size = 2 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    ggml_tensor * destination = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, ROW_WIDTH, DEST_ROWS);
+    ggml_tensor * source = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, ROW_WIDTH, SOURCE_ROWS);
+    ggml_tensor * row_ids = ggml_new_tensor_1d(
+        ctx, GGML_TYPE_I32, SOURCE_ROWS);
+    for (ggml_tensor * input : {destination, source, row_ids}) {
+        ggml_set_input(input);
+    }
+    ggml_tensor * result =
+        ggml_set_rows_masked(ctx, destination, source, row_ids);
+    ggml_set_output(result);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+
+    ggml_gallocr_t allocator =
+        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    bool ok = ggml_gallocr_alloc_graph(allocator, graph);
+    std::vector<float> destination_data(ROW_WIDTH * DEST_ROWS);
+    std::vector<float> source_data(ROW_WIDTH * SOURCE_ROWS);
+    for (size_t i = 0; i < destination_data.size(); ++i) {
+        destination_data[i] = 100.0f + static_cast<float>(i);
+    }
+    for (size_t i = 0; i < source_data.size(); ++i) {
+        source_data[i] = 200.0f + static_cast<float>(i);
+    }
+    const std::vector<int32_t> ids{2, -1, 0};
+    if (ok) {
+        ggml_backend_tensor_set(destination, destination_data.data(), 0,
+                                destination_data.size() * sizeof(float));
+        ggml_backend_tensor_set(source, source_data.data(), 0,
+                                source_data.size() * sizeof(float));
+        ggml_backend_tensor_set(row_ids, ids.data(), 0,
+                                ids.size() * sizeof(ids[0]));
+        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+    }
+    if (ok) {
+        std::vector<float> actual(destination_data.size());
+        std::vector<float> expected = destination_data;
+        ggml_backend_tensor_get(result, actual.data(), 0,
+                                actual.size() * sizeof(float));
+        std::copy_n(source_data.data(), ROW_WIDTH,
+                    expected.data() + 2 * ROW_WIDTH);
+        std::copy_n(source_data.data() + 2 * ROW_WIDTH, ROW_WIDTH,
+                    expected.data());
+        ok = check("masked state scatter", actual.data(), expected.data(),
+                   actual.size());
+    }
+
     ggml_gallocr_free(allocator);
     ggml_free(ctx);
     return ok;
@@ -256,6 +397,54 @@ bool test_gdn_sequential(ggml_backend_t backend, std::mt19937 & rng) {
     return ok;
 }
 
+bool test_gdn_active_slots(ggml_backend_t backend, std::mt19937 & rng) {
+    const std::vector<int32_t> active_slot_ids{3, 1, -1, 0};
+    const GdnStep step(rng);
+    std::vector<float> initial_state(GDN_STATE_PER_SEQ * N_SEQS);
+    fill_uniform(rng, -0.5f, 0.5f, initial_state);
+
+    std::vector<float> attn_active(GDN_QKV_PER_SEQ * N_SEQS);
+    std::vector<float> state_active(initial_state.size());
+    bool ok = run_gdn_active(
+        backend, N_SEQS, N_SEQS, step.q.data(), step.k.data(), step.v.data(),
+        step.g.data(), step.beta.data(), initial_state.data(),
+        active_slot_ids.data(), attn_active.data(), state_active.data());
+    if (!ok) {
+        std::fprintf(stderr, "batched gdn active slots: compute failed\n");
+        return false;
+    }
+
+    std::vector<float> expected_state = initial_state;
+    for (int row = 0; row < N_SEQS; ++row) {
+        const int slot = active_slot_ids[row];
+        if (slot < 0) continue;
+
+        std::vector<float> attn_reference(GDN_QKV_PER_SEQ);
+        std::vector<float> state_reference(GDN_STATE_PER_SEQ);
+        ok = run_gdn(
+            backend, 1,
+            step.q.data() + row * GDN_QKV_PER_SEQ,
+            step.k.data() + row * GDN_QKV_PER_SEQ,
+            step.v.data() + row * GDN_QKV_PER_SEQ,
+            step.g.data() + row * GDN_GATE_PER_SEQ,
+            step.beta.data() + row * GDN_GATE_PER_SEQ,
+            initial_state.data() + slot * GDN_STATE_PER_SEQ,
+            attn_reference.data(), state_reference.data()) && ok;
+
+        char label[48];
+        std::snprintf(label, sizeof(label), "active row%d slot%d attn", row, slot);
+        ok = check(label,
+                   attn_active.data() + row * GDN_QKV_PER_SEQ,
+                   attn_reference.data(), GDN_QKV_PER_SEQ) && ok;
+        std::copy(state_reference.begin(), state_reference.end(),
+                  expected_state.begin() + slot * GDN_STATE_PER_SEQ);
+    }
+
+    ok = check("active physical state", state_active.data(),
+               expected_state.data(), state_active.size()) && ok;
+    return ok;
+}
+
 bool test_conv(ggml_backend_t backend, std::mt19937 & rng) {
     std::vector<float> weights(CONV_WEIGHT_ELEMS);
     fill_uniform(rng, -0.5f, 0.5f, weights);
@@ -320,16 +509,25 @@ bool test_conv(ggml_backend_t backend, std::mt19937 & rng) {
 
 }  // namespace
 
-int main() {
-    ggml_backend_t backend = ggml_backend_cuda_init(0);
+int main(int argc, char ** argv) {
+    const bool cpu = argc == 2 && std::strcmp(argv[1], "--cpu") == 0;
+    if (argc > 2 || (argc == 2 && !cpu)) {
+        std::fprintf(stderr, "usage: %s [--cpu]\n", argv[0]);
+        return 2;
+    }
+    ggml_backend_t backend = cpu
+        ? ggml_backend_cpu_init()
+        : ggml_backend_cuda_init(0);
     if (!backend) {
-        std::fprintf(stderr, "GPU backend unavailable\n");
+        std::fprintf(stderr, "%s backend unavailable\n", cpu ? "CPU" : "GPU");
         return 1;
     }
 
     std::mt19937 rng(20260728);
     bool ok = test_gdn_sequential(backend, rng);
+    ok = test_gdn_active_slots(backend, rng) && ok;
     ok = test_conv(backend, rng) && ok;
+    ok = test_masked_set_rows(backend) && ok;
 
     ggml_backend_free(backend);
     return ok ? 0 : 1;

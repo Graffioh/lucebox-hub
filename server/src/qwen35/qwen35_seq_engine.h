@@ -35,7 +35,7 @@ class Qwen35SeqEngine final : public SeqEngine {
 public:
     // `pool` and `backend` must outlive the engine. `scratch_row` is the
     // first row of the block appended past the pool's index space, used as
-    // the K/V write destination of dead slots in a decode batch.
+    // the K/V write destination of graph-bucket padding rows.
     Qwen35SeqEngine(Qwen35Backend & backend, PagedKvPool & pool,
                     int max_ctx, int64_t scratch_row)
         : b_(backend), slots_(pool, max_ctx), scratch_row_(scratch_row) {}
@@ -64,7 +64,7 @@ private:
 
     Qwen35Backend & b_;
     SeqSlotManager  slots_;
-    int64_t         scratch_row_ = 0;   // dead-slot KV write destination
+    int64_t         scratch_row_ = 0;   // bucket-padding KV write destination
 };
 
 }  // namespace dflash::common

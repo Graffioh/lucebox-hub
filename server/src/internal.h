@@ -669,6 +669,12 @@ struct QwenGraphInputs {
     ggml_tensor * paged_block_table = nullptr; // [max_blocks,n_seqs] i32
     // [n_seqs] i32; valid cached K/V tokens per sequence.
     ggml_tensor * paged_kv_seq_lens = nullptr;
+    // [n_seqs] i32 mapping compact decode rows to physical cache/state slots.
+    // A value of -1 denotes a graph-bucket padding row.
+    ggml_tensor * active_slot_ids = nullptr;
+    // [n_seqs] i32 gather-safe variant: padding maps to slot zero. Used only
+    // for reading the much smaller conv-state slabs; writes use active ids.
+    ggml_tensor * state_slot_ids = nullptr;
     // Concurrent-slot serving (paged only):
     //   n_seqs > 1  — batched decode: the token axis is the SEQUENCE axis
     //     (n_tokens == n_seqs, one token per slot). DeltaNet runs with

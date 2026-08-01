@@ -1360,6 +1360,7 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
         add_test(NAME batched_gdn COMMAND test_batched_gdn)
+        add_test(NAME batched_gdn_cpu COMMAND test_batched_gdn --cpu)
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")

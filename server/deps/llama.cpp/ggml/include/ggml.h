@@ -1736,6 +1736,14 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // As ggml_set_rows, but negative row ids are ignored. Intended for
+    // fixed-shape graph buckets whose padding rows must not update state.
+    GGML_API struct ggml_tensor * ggml_set_rows_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -2484,6 +2492,21 @@ extern "C" {
             int                   block_size,
             int                   max_kv_seq_len);
 
+    // Compact-batch variant. active_slot_ids maps each query row to the
+    // physical block-table column and sequence-length entry. A negative id is
+    // a padding row and produces a zero attention output.
+    GGML_API struct ggml_tensor * ggml_paged_attn_active(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * block_table,
+            struct ggml_tensor  * kv_seq_lens,
+            struct ggml_tensor  * active_slot_ids,
+            float                 scale,
+            int                   block_size,
+            int                   max_kv_seq_len);
+
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).
     // Used for KV cache rotation in TurboQuant quantization types (TQ3_0).
@@ -2811,6 +2834,19 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
+
+    // Compact-batch in-place recurrence. active_slot_ids maps the compact
+    // sequence axis to physical state slabs; negative ids use zero state and
+    // do not write back.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_active_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * active_slot_ids);
 
     GGML_API void ggml_gated_delta_net_set_skip_intermediate(
             struct ggml_tensor * tensor,
