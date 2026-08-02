@@ -6,17 +6,21 @@ generation_benchmark.py answers "how fast is one request". This file answers
 4/8/16 chat completions streaming at once" — the load shape served by
 `--max-concurrency N` with the paged-attention slot engine.
 
-For each concurrency level N it releases N threads from a barrier, each of
+For each client-load level N it releases N threads from a barrier, each of
 which POSTs a streaming /v1/chat/completions request and times every SSE
 content chunk. Levels run back to back against the same server process with a
 cool-down in between, results accumulate into one JSON report, and a compact
 markdown table prints at the end. Stdlib only; point it at a running server.
 
+Terminology: `--clients` controls only the offered benchmark load. Server
+capacity is configured independently when dflash_server starts with
+`--max-concurrency`; this benchmark neither repeats nor changes that value,
+and may intentionally offer more clients to measure queueing.
+
 Example:
     python3 harness/benchmarks/concurrent_benchmark.py \
         --base-url http://127.0.0.1:18080/v1 --model luce-dflash \
-        --concurrency 1 --concurrency 4 --concurrency 8 --concurrency 16 \
-        --server-max-concurrency 16 \
+        --clients 1 --clients 4 --clients 8 --clients 16 \
         --label paged-parallel --out /tmp/concurrent.json
 
 Metric definitions:
@@ -456,7 +460,7 @@ def run_level(n: int, args: argparse.Namespace, prompts: list[str]) -> dict[str,
     ttfts = [r["ttft_s"] for r in ok if r["ttft_s"] is not None]
     tok_s = [r["decode_tok_s"] for r in ok if r["decode_tok_s"] is not None]
     return {
-        "concurrency": n,
+        "clients": n,
         "requests_per_stream": args.requests_per_stream,
         "requests": n * args.requests_per_stream,
         "requests_ok": len(ok),
@@ -490,16 +494,15 @@ def markdown_lines(report: dict[str, Any]) -> list[str]:
         title,
         "",
         f"Server: `{report['base_url']}` model `{report['model']}` "
-        f"max_tokens={report['max_tokens']} temperature={report['temperature']} "
-        f"server_max_concurrency={report['server_max_concurrency'] or 'unrecorded'}",
+        f"max_tokens={report['max_tokens']} temperature={report['temperature']}",
         "",
-        "| Concurrency | Ok/Req | Agg tok/s | Stream tok/s mean | Stream tok/s median "
+        "| Clients | Ok/Req | Agg tok/s | Stream tok/s mean | Stream tok/s median "
         "| TTFT mean s | TTFT median s | TTFT p95 s | Wall s | Tokens |",
         "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for level in report["levels"]:
         lines.append(
-            f"| {level['concurrency']} "
+            f"| {level['clients']} "
             f"| {level['requests_ok']}/{level['requests']} "
             f"| {fmt(level['aggregate_tok_s'])} "
             f"| {fmt(level['stream_tok_s_mean'])} "
@@ -521,14 +524,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Base URL ending in /v1 (default %(default)s)")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--model", default="luce-dflash")
-    parser.add_argument("--concurrency", type=int, action="append", metavar="N",
-                        help="Concurrency level; repeat for several levels "
-                             "(default: 1 4 8 16).")
-    parser.add_argument(
-        "--server-max-concurrency", type=int, default=0, metavar="N",
-        help="Record the fixed --max-concurrency used to start the server and "
-             "reject load levels above it (recommended: 16). The benchmark "
-             "does not restart or reconfigure the server.")
+    parser.add_argument("--clients", dest="client_levels", type=int,
+                        action="append", metavar="N",
+                        help="Simultaneous clients; repeat for several load "
+                             "levels (default: 1 4 8 16).")
     parser.add_argument("--requests-per-stream", type=int, default=1,
                         help="Sequential requests each stream issues (default 1)")
     parser.add_argument("--max-tokens", type=int, default=256)
@@ -546,19 +545,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
-    levels_arg = args.concurrency or [1, 4, 8, 16]
+    levels_arg = args.client_levels or [1, 4, 8, 16]
     for n in levels_arg:
         if n < 1:
-            raise ValueError(f"--concurrency must be >= 1, got {n}")
+            raise ValueError(f"--clients must be >= 1, got {n}")
     if args.requests_per_stream < 1:
         raise ValueError("--requests-per-stream must be >= 1")
-    if args.server_max_concurrency < 0:
-        raise ValueError("--server-max-concurrency must be >= 0")
-    if (args.server_max_concurrency and
-            max(levels_arg) > args.server_max_concurrency):
-        raise ValueError(
-            f"load level {max(levels_arg)} exceeds recorded server "
-            f"--max-concurrency {args.server_max_concurrency}")
     prompts = load_prompts(Path(args.prompt_file) if args.prompt_file else None)
 
     levels: list[dict[str, Any]] = []
@@ -583,7 +575,6 @@ def run(args: argparse.Namespace) -> int:
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "requests_per_stream": args.requests_per_stream,
-        "server_max_concurrency": args.server_max_concurrency,
         "timeout_s": args.timeout,
         "prompt_source": args.prompt_file or f"builtin ({len(BUILTIN_PROMPTS)} prompts)",
         "levels": levels,

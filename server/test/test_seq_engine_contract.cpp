@@ -32,6 +32,7 @@ struct Faults {
     bool hard_error_when_full       = false; // busy condition reports false
     bool reuse_live_slot            = false; // hands slot 0 to every request
     bool drop_one_output            = false; // answers n-1 decode inputs
+    bool pause_decode_during_prefill = false; // omits live decode outputs
     bool accept_partial_batch       = false; // steps a batch missing a slot
     bool retire_leaks               = false; // retire() never frees the slot
     bool keeps_stale_outputs        = false; // appends to `outputs` as-is
@@ -93,26 +94,16 @@ public:
     bool step(const std::vector<StepInput> & inputs,
               std::vector<StepOutput> & outputs) override {
         if (!faults_.keeps_stale_outputs) outputs.clear();
-        if (pending_slot_ >= 0) {
-            if (!inputs.empty()) return false;
-            if (--prefill_steps_left_ == 0) {
-                const int slot = pending_slot_;
-                pending_slot_ = -1;
-                StepOutput out;
-                out.slot = slot;
-                out.token = kFirstToken + slot;
-                out.prefill_done = true;
-                outputs.push_back(out);
-            }
-            return true;
-        }
         if (!faults_.accept_partial_batch &&
             (int)inputs.size() != decoding_count()) {
             return false;   // never advance state for a slot we were not given
         }
-        if (inputs.empty()) return true;
+        if (inputs.empty() && pending_slot_ < 0) return true;
         size_t emit = inputs.size();
         if (faults_.drop_one_output && emit > 0) emit--;
+        if (faults_.pause_decode_during_prefill && pending_slot_ >= 0) {
+            emit = 0;
+        }
         for (size_t i = 0; i < emit; i++) {
             const StepInput & in = inputs[i];
             StepOutput out;
@@ -126,6 +117,16 @@ public:
             fed_[(size_t)in.slot].push_back(in.token);
             out.token  = kFirstToken + in.slot +
                          (int32_t)fed_[(size_t)in.slot].size();
+            outputs.push_back(out);
+        }
+
+        if (pending_slot_ >= 0 && --prefill_steps_left_ == 0) {
+            const int slot = pending_slot_;
+            pending_slot_ = -1;
+            StepOutput out;
+            out.slot = slot;
+            out.token = kFirstToken + slot;
+            out.prefill_done = true;
             outputs.push_back(out);
         }
         return true;
@@ -198,6 +199,8 @@ int main() {
          "reused a slot that is live"},
         {"drop-one-output", &Faults::drop_one_output,
          "one output per input"},
+        {"pause-decode-during-prefill", &Faults::pause_decode_during_prefill,
+         "prefill step left a decoding slot without an output"},
         {"accept-partial-batch", &Faults::accept_partial_batch,
          "omits a live slot"},
         {"retire-leaks", &Faults::retire_leaks,

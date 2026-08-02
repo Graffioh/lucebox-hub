@@ -278,7 +278,7 @@ struct BatchStepper {
         gi.n_tokens    = NB;
         gi.kv_start    = pool - NB;      // span = whole pool
         gi.kv_write_rows = kv_write_rows;
-        gi.last_token_logits_only = true;
+        gi.logits_tail_rows = 1;
         QwenGraphOutputs go = build_qwen35_graph(ctx, gf, *w, *cache, gi);
         if (!go.logits) return false;
         logits = go.logits;

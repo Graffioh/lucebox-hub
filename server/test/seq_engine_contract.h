@@ -77,17 +77,22 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
         return true;
     };
 
-    // Advance the one pending prefill to completion. PR #1 deliberately sends
-    // no decode inputs while doing this; the claim-only contract is final even
-    // though the baseline scheduling policy remains blocking.
+    // Advance the one pending prefill to completion. Every decoding slot must
+    // still produce exactly one output on every intervening step: this is the
+    // non-pausing-admission guarantee, expressed without model internals.
     auto complete_prefill = [&](int prefill_slot) {
         for (int iteration = 0; iteration < 1024; iteration++) {
+            std::vector<SeqEngine::StepInput> inputs;
+            for (size_t i = 0; i < live.size(); i++) {
+                inputs.push_back({live[i], pending[i]});
+            }
             std::vector<SeqEngine::StepOutput> outputs;
-            if (!engine.step({}, outputs)) {
+            if (!engine.step(inputs, outputs)) {
                 require(false, "step() must advance a pending prefill");
                 return false;
             }
 
+            std::vector<bool> answered((size_t)n_slots, false);
             bool completed = false;
             int32_t first_token = -1;
             for (const SeqEngine::StepOutput & o : outputs) {
@@ -105,8 +110,22 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
                     continue;
                 }
 
-                require(false,
-                        "blocking prefill step returned a decode output");
+                bool known = false;
+                for (size_t i = 0; i < live.size(); i++) {
+                    if (live[i] != o.slot) continue;
+                    require(!answered[(size_t)o.slot],
+                            "step() returned two decode outputs for one slot");
+                    answered[(size_t)o.slot] = true;
+                    pending[i] = o.token;
+                    known = true;
+                    break;
+                }
+                require(known,
+                        "step() returned a non-prefill output for a non-decoding slot");
+            }
+            for (const int slot : live) {
+                require(answered[(size_t)slot],
+                        "prefill step left a decoding slot without an output");
             }
 
             if (completed) {
@@ -145,7 +164,7 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
         return violations;
     }
 
-    // ── 2. Fill the remaining slots one claim-only admission at a time ───
+    // ── 2. Fill the remaining slots one asynchronous admission at a time ─
     bool filled_all = true;
     for (int i = 1; i < n_slots; i++) {
         const SeqEngine::AdmitResult r = engine.admit(
