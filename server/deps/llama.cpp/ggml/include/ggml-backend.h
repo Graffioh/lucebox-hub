@@ -377,8 +377,9 @@ extern "C" {
                                             ggml_backend_sched_t sched,
                                             bool enabled);
 
-    // Inputs in one split share a destination backend and copy generation, so
-    // they may reuse one generation wait before their ordered copies.
+    // Inputs in one split share a destination and copy generation. Batch
+    // unlike-runtime fallbacks through per-backend host arenas, synchronize
+    // each producer once, then enqueue the consumer transfers together.
     GGML_API void                 ggml_backend_sched_set_batch_split_copies(
                                             ggml_backend_sched_t sched,
                                             bool enabled);

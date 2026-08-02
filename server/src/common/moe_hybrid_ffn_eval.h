@@ -162,6 +162,24 @@ enum class MoeHybridJoinMode {
     CanonicalRouteOrder,
 };
 
+// Process-wide graph policy parsed once from the model-neutral environment
+// variables. Legacy DS4 spellings remain accepted by the implementation, but
+// graph builders and scheduler setup consume this typed view instead of
+// independently re-reading configuration in hot paths.
+struct MoeHybridGraphPolicy {
+    bool grouped_mmvq = false;
+    bool fused_combine = false;
+    bool fused_gate_up = false;
+    bool coarse_owner = false;
+    bool coarse_owner_split = false;
+    bool align_shared_ids = false;
+    bool device_join = false;
+    bool route_prefork = false;
+    bool targeted_join_split = false;
+};
+
+const MoeHybridGraphPolicy & moe_hybrid_graph_policy();
+
 // Append a device-resident hot+cold+shared MoE FFN to an existing graph.
 // `global_ids` and `router_weights` are [n_expert_used, n_tokens]. Weight
 // tensors in `storage` determine scheduler placement on the two GPU backends.

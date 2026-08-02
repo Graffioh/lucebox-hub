@@ -3417,7 +3417,12 @@ static thread_local ggml_cuda_pending_peer_copy_batch
 
 static bool ggml_cuda_batch_peer_copies_enabled() {
     static const bool enabled = [] {
-        const char * value = getenv("GGML_CUDA_BATCH_PEER_COPIES");
+        const char * value = getenv("GGML_BATCH_PEER_COPIES");
+        if (!value || !*value) {
+            // Compatibility with profiles created before the policy became
+            // runtime-neutral.
+            value = getenv("GGML_CUDA_BATCH_PEER_COPIES");
+        }
         return value && *value && strcmp(value, "0") != 0;
     }();
     return enabled;

@@ -171,6 +171,188 @@ bool run_cross_graph(ggml_backend_t first,
     return ok;
 }
 
+struct SchedulerGraphCase {
+    ggml_context * ctx = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * first = nullptr;
+    ggml_tensor * second = nullptr;
+    ggml_tensor * output = nullptr;
+    ggml_cgraph * graph = nullptr;
+    int64_t elements = 0;
+};
+
+SchedulerGraphCase make_resize_graph(int64_t elements) {
+    SchedulerGraphCase result;
+    result.elements = elements;
+    ggml_init_params params{};
+    params.mem_size = 4 * 1024 * 1024;
+    params.no_alloc = true;
+    result.ctx = ggml_init(params);
+    if (!result.ctx) return result;
+
+    result.input = ggml_new_tensor_1d(
+        result.ctx, GGML_TYPE_F32, elements);
+    ggml_set_input(result.input);
+    result.first = ggml_scale(result.ctx, result.input, 2.0f);
+    result.second = ggml_scale(result.ctx, result.first, 3.0f);
+    result.output = ggml_scale(result.ctx, result.second, 4.0f);
+    ggml_set_output(result.output);
+    result.graph = ggml_new_graph(result.ctx);
+    ggml_build_forward_expand(result.graph, result.output);
+    return result;
+}
+
+bool pin_resize_graph(ggml_backend_sched_t sched,
+                      const SchedulerGraphCase & graph,
+                      ggml_backend_t first,
+                      ggml_backend_t second) {
+    if (!sched || !graph.ctx || !graph.input || !graph.first ||
+        !graph.second || !graph.output || !graph.graph) {
+        return false;
+    }
+    ggml_backend_sched_set_tensor_backend(sched, graph.input, first);
+    ggml_backend_sched_set_tensor_backend(sched, graph.first, first);
+    ggml_backend_sched_set_tensor_backend(sched, graph.second, second);
+    ggml_backend_sched_set_tensor_backend(sched, graph.output, first);
+    return ggml_backend_sched_alloc_graph(sched, graph.graph);
+}
+
+bool set_and_check_resize_graph(ggml_backend_sched_t sched,
+                                const SchedulerGraphCase & graph,
+                                float bias,
+                                bool async) {
+    std::vector<float> input((size_t) graph.elements);
+    std::vector<float> output((size_t) graph.elements, 0.0f);
+    for (int64_t i = 0; i < graph.elements; ++i) {
+        input[(size_t) i] = ((float) i + bias) / 256.0f;
+    }
+    ggml_backend_tensor_set(
+        graph.input, input.data(), 0, ggml_nbytes(graph.input));
+    const enum ggml_status status = async
+        ? ggml_backend_sched_graph_compute_async(sched, graph.graph)
+        : ggml_backend_sched_graph_compute(sched, graph.graph);
+    if (status != GGML_STATUS_SUCCESS) return false;
+    if (async) return true;
+
+    ggml_backend_tensor_get(
+        graph.output, output.data(), 0, ggml_nbytes(graph.output));
+    for (int64_t i = 0; i < graph.elements; ++i) {
+        if (std::fabs(output[(size_t) i] - 24.0f * input[(size_t) i]) >=
+            1.0e-4f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool run_async_reset_resize_and_free(ggml_backend_t first,
+                                     ggml_backend_t second,
+                                     const char * label) {
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    SchedulerGraphCase small = make_resize_graph(1024);
+    SchedulerGraphCase large = make_resize_graph(32768);
+    ggml_backend_t backends[] = { first, second, cpu };
+    ggml_backend_sched_t sched = cpu
+        ? ggml_backend_sched_new(backends, nullptr, 3, 64, false, true)
+        : nullptr;
+    bool ok = sched && small.ctx && large.ctx;
+    if (ok) {
+        ggml_backend_sched_set_batch_split_copies(sched, true);
+        ok = pin_resize_graph(sched, small, first, second) &&
+             set_and_check_resize_graph(
+                 sched, small, 7.0f, /*async=*/true);
+    }
+    if (ok) {
+        // Reset while the small graph is still in flight, then grow both the
+        // graph allocation and staging arena. Allocation must quiesce old host
+        // pages before replacing them.
+        ggml_backend_sched_reset(sched);
+        ok = pin_resize_graph(sched, large, first, second) &&
+             set_and_check_resize_graph(
+                 sched, large, 11.0f, /*async=*/false);
+    }
+    if (ok) {
+        // Leave one final submission in flight. Scheduler teardown owns the
+        // wait required before freeing graph buffers and staging pages.
+        ok = set_and_check_resize_graph(
+            sched, large, 19.0f, /*async=*/true);
+    }
+    if (sched) ggml_backend_sched_free(sched);
+    if (cpu) ggml_backend_free(cpu);
+    if (large.ctx) ggml_free(large.ctx);
+    if (small.ctx) ggml_free(small.ctx);
+    std::printf("mixed-backend %s async-reset-resize-free: %s\n",
+                label, ok ? "ok" : "FAILED");
+    return ok;
+}
+
+bool run_multi_source_graph(ggml_backend_t first,
+                            ggml_backend_t second,
+                            const char * label) {
+    constexpr int64_t n = 8192;
+    ggml_init_params params{};
+    params.mem_size = 4 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    if (!ctx || !cpu) {
+        if (cpu) ggml_backend_free(cpu);
+        if (ctx) ggml_free(ctx);
+        return false;
+    }
+
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+    ggml_set_input(input);
+    ggml_tensor * first_head = ggml_scale(ctx, input, 2.0f);
+    ggml_tensor * cpu_head = ggml_scale(ctx, input, 5.0f);
+    ggml_tensor * second_head = ggml_scale(ctx, input, 3.0f);
+    ggml_tensor * second_join = ggml_add(ctx, first_head, cpu_head);
+    ggml_tensor * output = ggml_add(ctx, second_join, second_head);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_t backends[] = { first, second, cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends, nullptr, 3, 64, false, true);
+    bool ok = sched != nullptr;
+    if (ok) {
+        ggml_backend_sched_set_tensor_backend(sched, input, first);
+        ggml_backend_sched_set_tensor_backend(sched, first_head, first);
+        ggml_backend_sched_set_tensor_backend(sched, cpu_head, cpu);
+        ggml_backend_sched_set_tensor_backend(sched, second_head, second);
+        ggml_backend_sched_set_tensor_backend(sched, second_join, second);
+        ggml_backend_sched_set_tensor_backend(sched, output, first);
+        ggml_backend_sched_set_batch_split_copies(sched, true);
+        ok = ggml_backend_sched_alloc_graph(sched, graph);
+    }
+
+    std::vector<float> host((size_t) n);
+    std::vector<float> result((size_t) n, 0.0f);
+    for (int iteration = 0; ok && iteration < 3; ++iteration) {
+        for (int64_t i = 0; i < n; ++i) {
+            host[(size_t) i] = ((float) i + 13.0f * iteration) / 128.0f;
+        }
+        ggml_backend_tensor_set(input, host.data(), 0, ggml_nbytes(input));
+        ok = ggml_backend_sched_graph_compute(sched, graph) ==
+             GGML_STATUS_SUCCESS;
+        if (ok) {
+            ggml_backend_tensor_get(
+                output, result.data(), 0, ggml_nbytes(output));
+        }
+        for (int64_t i = 0; ok && i < n; ++i) {
+            ok = std::fabs(result[(size_t) i] - 10.0f * host[(size_t) i]) <
+                 1.0e-4f;
+        }
+    }
+    std::printf("mixed-backend %s multi-source graph: %s\n",
+                label, ok ? "ok" : "FAILED");
+    if (sched) ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -199,6 +381,12 @@ int main() {
     ok = run_cross_graph(cuda, hip, "CUDA->HIP->CUDA", true) && ok;
     ok = run_cross_graph(hip, cuda, "HIP->CUDA->HIP", false) && ok;
     ok = run_cross_graph(hip, cuda, "HIP->CUDA->HIP", true) && ok;
+    ok = run_multi_source_graph(cuda, hip, "CUDA+CPU->HIP") && ok;
+    ok = run_multi_source_graph(hip, cuda, "HIP+CPU->CUDA") && ok;
+    ok = run_async_reset_resize_and_free(
+        cuda, hip, "CUDA->HIP->CUDA") && ok;
+    ok = run_async_reset_resize_and_free(
+        hip, cuda, "HIP->CUDA->HIP") && ok;
 
     ggml_backend_free(hip);
     ggml_backend_free(cuda);

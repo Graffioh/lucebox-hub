@@ -46,15 +46,4 @@ inline PlacementBackend compiled_placement_backend() {
 #endif
 }
 
-inline bool placement_backend_supported(PlacementBackend backend) {
-#if defined(DFLASH27B_BACKEND_MIXED)
-    return backend == PlacementBackend::Auto ||
-           backend == PlacementBackend::Cuda ||
-           backend == PlacementBackend::Hip;
-#else
-    return backend == PlacementBackend::Auto ||
-           backend == compiled_placement_backend();
-#endif
-}
-
 }  // namespace dflash::common
