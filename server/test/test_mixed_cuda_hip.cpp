@@ -104,7 +104,8 @@ bool run_cross_copy(ggml_backend_t src_backend,
 
 bool run_cross_graph(ggml_backend_t first,
                      ggml_backend_t second,
-                     const char * label) {
+                     const char * label,
+                     bool batch_split_copies) {
     constexpr int64_t n = 4096;
     ggml_init_params params{};
     params.mem_size = 4 * 1024 * 1024;
@@ -120,7 +121,8 @@ bool run_cross_graph(ggml_backend_t first,
     ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
     ggml_set_input(input);
     ggml_tensor * first_head = ggml_scale(ctx, input, 2.0f);
-    ggml_tensor * second_middle = ggml_scale(ctx, first_head, 3.0f);
+    ggml_tensor * first_sibling = ggml_scale(ctx, input, 3.0f);
+    ggml_tensor * second_middle = ggml_add(ctx, first_head, first_sibling);
     ggml_tensor * first_tail = ggml_scale(ctx, second_middle, 4.0f);
     ggml_set_output(first_tail);
     ggml_cgraph * graph = ggml_new_graph(ctx);
@@ -133,28 +135,34 @@ bool run_cross_graph(ggml_backend_t first,
     if (ok) {
         ggml_backend_sched_set_tensor_backend(sched, input, first);
         ggml_backend_sched_set_tensor_backend(sched, first_head, first);
+        ggml_backend_sched_set_tensor_backend(sched, first_sibling, first);
         ggml_backend_sched_set_tensor_backend(sched, second_middle, second);
         ggml_backend_sched_set_tensor_backend(sched, first_tail, first);
+        ggml_backend_sched_set_batch_split_copies(
+            sched, batch_split_copies);
         ok = ggml_backend_sched_alloc_graph(sched, graph);
     }
 
     std::vector<float> host((size_t)n);
     std::vector<float> result((size_t)n, 0.0f);
-    for (int64_t i = 0; i < n; ++i) host[(size_t)i] = (float)i / 128.0f;
-    if (ok) {
+    for (int iteration = 0; ok && iteration < 3; ++iteration) {
+        for (int64_t i = 0; i < n; ++i) {
+            host[(size_t)i] = ((float)i + 17.0f * iteration) / 128.0f;
+        }
         ggml_backend_tensor_set(input, host.data(), 0, ggml_nbytes(input));
         ok = ggml_backend_sched_graph_compute(sched, graph) ==
              GGML_STATUS_SUCCESS;
+        if (ok) {
+            ggml_backend_tensor_get(
+                first_tail, result.data(), 0, ggml_nbytes(first_tail));
+        }
+        for (int64_t i = 0; ok && i < n; ++i) {
+            ok = std::fabs(result[(size_t)i] - 20.0f * host[(size_t)i]) <
+                 1.0e-4f;
+        }
     }
-    if (ok) {
-        ggml_backend_tensor_get(
-            first_tail, result.data(), 0, ggml_nbytes(first_tail));
-    }
-    for (int64_t i = 0; ok && i < n; ++i) {
-        ok = std::fabs(result[(size_t)i] - 24.0f * host[(size_t)i]) <
-             1.0e-4f;
-    }
-    std::printf("mixed-backend %s graph: %s\n", label,
+    std::printf("mixed-backend %s graph batch=%d: %s\n", label,
+                batch_split_copies ? 1 : 0,
                 ok ? "ok" : "FAILED");
 
     if (sched) ggml_backend_sched_free(sched);
@@ -187,8 +195,10 @@ int main() {
     ok = run_scale(hip, "HIP") && ok;
     ok = run_cross_copy(cuda, hip, "CUDA->HIP") && ok;
     ok = run_cross_copy(hip, cuda, "HIP->CUDA") && ok;
-    ok = run_cross_graph(cuda, hip, "CUDA->HIP->CUDA") && ok;
-    ok = run_cross_graph(hip, cuda, "HIP->CUDA->HIP") && ok;
+    ok = run_cross_graph(cuda, hip, "CUDA->HIP->CUDA", false) && ok;
+    ok = run_cross_graph(cuda, hip, "CUDA->HIP->CUDA", true) && ok;
+    ok = run_cross_graph(hip, cuda, "HIP->CUDA->HIP", false) && ok;
+    ok = run_cross_graph(hip, cuda, "HIP->CUDA->HIP", true) && ok;
 
     ggml_backend_free(hip);
     ggml_backend_free(cuda);

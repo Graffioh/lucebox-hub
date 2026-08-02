@@ -30,9 +30,16 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_MOE_TP_BACKEND` / `DFLASH_MOE_TP_BACKEND` | peer runtime in a mixed build; compiled runtime otherwise | Select the in-process cold expert owner backend. |
 | `DFLASH_DS4_MOE_TP_GPU` | peer backend device 0 in a mixed build; other local device otherwise | Device index within the cold DeepSeek4 expert backend. |
 | `DFLASH_DS4_MOE_TP_CONCENTRATE_COLD` | unset | BURN-IN: use complete peer-owned expert layers to reduce cross-runtime joins; falls back when the placement would exceed the target budget. |
+| `DFLASH_DS4_MOE_TP_PEER_HOT` | unset | BURN-IN: with `DFLASH_DS4_HOTNESS_CSV`, reserve the profile's hottest experts for the in-process peer instead of the primary GPU. |
+| `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` | unset | BURN-IN: reduce each mixed-vendor owner's routed outputs locally before the exact final owner add. |
+| `DFLASH_DS4_TP_SCHEDULE_BRANCHES` | unset | BURN-IN: expose independent mixed-vendor expert branches to the common multi-backend scheduler. |
+| `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` / `DFLASH_MOE_TP_TARGETED_JOIN_SPLIT` | unset | BURN-IN: start a main-GPU split only at each peer-result join, avoiding an extra peer fence per MoE layer. |
+| `DFLASH_DS4_COMP_PAD_STRIDE` | 16 | BURN-IN: compressed-KV padding bucket (`16`, `32`, `64`, or `128`); wider exact-masked buckets reduce verifier graph recapture churn. |
+| `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` | unset | DEBUG: restore the materialized output projection when diagnosing grouped-view copies across unlike runtimes. |
 | `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | compiled backend / target device | Select the in-process DSpark backend and device. |
 | `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | executable directory | Explicit peer module path for a mixed CUDA+HIP build. |
-| `GGML_CUDA_BATCH_PEER_COPIES` | unset | BURN-IN: publish ordered HIP peer copies with one cross-device dependency per source/destination pair. |
+| `GGML_CUDA_BATCH_PEER_COPIES` | unset | BURN-IN: batch unlike-runtime copies through per-backend pinned host arenas and wait once per source per split. |
+| `GGML_SCHED_PROFILE` / `GGML_SCHED_PROFILE_MIN_SPLITS` | unset / 1 | DEBUG: report scheduler splits, copy volume, submission time, and source/destination synchronization time. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `DFLASH_MOE_TP_*` / `DFLASH_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `DFLASH_DS4_*` names remain compatibility aliases. |
 | `DFLASH_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
@@ -78,9 +85,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DRAFT_PERSIST` - laguna_backend.cpp
 - `DFLASH_DROP_COLD` - qwen35moe_backend.cpp, qwen35moe_pipelined_decode.cpp
 - `DFLASH_DS4_ADAPTIVE_WIDTH` - deepseek4_dspark_spec.cpp
+- `DFLASH_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
+- `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp
 - `DFLASH_DS4_DENSE_TP_MASK` - deepseek4_loader.cpp
 - `DFLASH_DS4_DENSE_TP_STRIX_FRACTION` - deepseek4_loader.cpp
+- `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` - deepseek4_graph.cpp
 - `DFLASH_DS4_DRAFT` - deepseek4_backend.cpp
 - `DFLASH_DS4_DRAFT_BACKEND` - deepseek4_backend.cpp
 - `DFLASH_DS4_DRAFT_GPU` - deepseek4_backend.cpp
@@ -92,6 +102,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_MOE_TP_CONCENTRATE_COLD` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_GPU` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_INPROC` - deepseek4_backend.cpp
+- `DFLASH_DS4_MOE_TP_PEER_HOT` - deepseek4_backend.cpp
 - `DFLASH_DS4_ROUTING_STATS_OUT` - deepseek4_backend.cpp
 - `DFLASH_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
 - `DFLASH_DS4_SPEC` - deepseek4_backend.cpp
@@ -100,6 +111,8 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_TIMING` - deepseek4_backend.cpp, deepseek4_target_shard_ipc_daemon.cpp
 - `DFLASH_DS4_TP_CAPTURE_CACHE_SLOTS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_SCHEDULE_BRANCHES` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` - deepseek4_fused_verify.inc, moe_hybrid_ffn_eval.cpp
 - `DFLASH_DS4_TOPK` - deepseek4_graph.cpp
 - `DFLASH_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
 - `DFLASH_EXPERT_BUDGET_PCT` - laguna_backend.cpp
@@ -135,6 +148,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_LAGUNA_DSPARK_CONFIDENCE_THRESHOLD` - laguna_backend.cpp
 - `DFLASH_LAGUNA_DSPARK_TREE` - laguna_backend.cpp
 - `DFLASH_LAGUNA_EXPERT_CACHE` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_TP_TARGETED_JOIN_SPLIT` - moe_hybrid_ffn_eval.cpp, deepseek4_fused_verify.inc
 - `DFLASH_LAGUNA_FUSED_DOMINO` - laguna_backend.cpp
 - `DFLASH_LAGUNA_FUSED_DSPARK` - laguna_backend.cpp
 - `DFLASH_LAGUNA_FUSED_QK` - laguna_target_loader.cpp
@@ -223,7 +237,6 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
 - `HOME` - spark_corpus.cpp
-- `LUCE_CUDA_I32_REPEAT` - moe_hybrid_ffn_eval.cpp
 - `LUCE_MMVQ_MAX_NCOLS` - deepseek4_backend.cpp
 - `LUCE_QK_FUSE_LAYERS` - laguna_target_graph.cpp
 - `LUCE_QK_FUSE_MODE` - laguna_target_graph.cpp

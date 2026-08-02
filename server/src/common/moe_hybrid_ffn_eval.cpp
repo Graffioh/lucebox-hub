@@ -103,14 +103,6 @@ static bool grouped_mmvq_moe_enabled() {
     return enabled;
 }
 
-static bool gpu_i32_repeat_enabled() {
-    static const bool enabled = [] {
-        const char * raw = std::getenv("LUCE_CUDA_I32_REPEAT");
-        return raw && *raw && std::strcmp(raw, "0") != 0;
-    }();
-    return enabled;
-}
-
 // The regular DeepSeek graph already uses ggml_laguna_moe_combine for the
 // route-weighted expert reduction.  Keep the heterogeneous graph A/B-able
 // while replacing its MUL + shape-only REPEAT_BACK sequence with the same
@@ -187,6 +179,16 @@ static bool route_prefork_enabled() {
     static const bool enabled = [] {
         const char * raw = moe_policy_env(
             "DFLASH_MOE_TP_ROUTE_PREFORK", "DFLASH_DS4_TP_ROUTE_PREFORK");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool targeted_join_split_enabled() {
+    static const bool enabled = [] {
+        const char * raw = moe_policy_env(
+            "DFLASH_MOE_TP_TARGETED_JOIN_SPLIT",
+            "DFLASH_DS4_TP_TARGETED_JOIN_SPLIT");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -827,8 +829,8 @@ bool build_moe_hybrid_ffn_graph(
             return tensor;
         };
         if (!*local_lut) {
-            *local_lut = ggml_new_tensor_2d(
-                ctx, GGML_TYPE_I32, 1, cfg.n_expert);
+            *local_lut = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_I32, 1, cfg.n_expert, n_tokens, 1);
             ggml_set_input(*local_lut);
             // These inputs are consumed late in a whole-model graph. Preserve
             // their allocation from graph start; otherwise gallocr may reuse
@@ -836,31 +838,23 @@ bool build_moe_hybrid_ffn_graph(
             ggml_set_output(*local_lut);
         }
         if (!*valid_lut) {
-            *valid_lut = ggml_new_tensor_2d(
-                ctx, GGML_TYPE_F32, 1, cfg.n_expert);
+            *valid_lut = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_F32, 1, cfg.n_expert, n_tokens, 1);
             ggml_set_input(*valid_lut);
             ggml_set_output(*valid_lut);
         }
 
-        // q1 can address the 2-D LUT directly.  Historically q>1 left its tiny
-        // I32 repeat unpinned for CPU fallback.  With the exact GPU I32 repeat
-        // enabled, track it with the rest of the owner-local remap nodes.
+        // The placement LUT is immutable for the lifetime of a cached graph.
+        // Store its q replicated rows directly as an input instead of running
+        // an owner-local REPEAT kernel in every layer and verifier step. The
+        // repeated kernels otherwise create two extra CUDA/HIP scheduler
+        // transitions per layer before any expert work can begin.
         ggml_tensor * local_lut_batched = *local_lut;
-        if (n_tokens > 1) {
-            ggml_tensor * repeated = ggml_repeat_4d(
-                ctx, *local_lut, 1, cfg.n_expert, n_tokens, 1);
-            local_lut_batched =
-                gpu_i32_repeat_enabled() ? track(repeated) : repeated;
-        }
         ggml_tensor * mapped = track(ggml_get_rows(
             ctx, local_lut_batched, global_ids));
         mapped = track(ggml_reshape_2d(ctx, mapped, n_used, n_tokens));
         *local_ids = track(ggml_cont(ctx, mapped));
         ggml_tensor * valid_lut_batched = *valid_lut;
-        if (n_tokens > 1) {
-            valid_lut_batched = track(ggml_repeat_4d(
-                ctx, *valid_lut, 1, cfg.n_expert, n_tokens, 1));
-        }
         ggml_tensor * valid = track(ggml_get_rows(
             ctx, valid_lut_batched, global_ids));
         valid = track(ggml_reshape_2d(ctx, valid, n_used, n_tokens));
@@ -995,7 +989,7 @@ bool build_moe_hybrid_ffn_graph(
     // The scheduler can enqueue cold first and hot/shared second; the fence
     // separates the final join so its event wait is inserted after hot/shared.
     ggml_tensor * combined = nullptr;
-    if (schedule_graph && cold && device_join_enabled()) {
+    if (schedule_graph && cold && route_prefork_enabled()) {
         // Materialize both route IDs and normalized route weights before the
         // cold split is expanded.  Cross-device copies are not guaranteed to
         // remain asynchronous on this heterogeneous ROCm pair.  If the tiny
@@ -1006,12 +1000,12 @@ bool build_moe_hybrid_ffn_graph(
         // q4 verification calls this builder twice (4 routes + padded 2), so
         // retain every derived route tensor rather than only the canonical
         // six-wide routing output.
-        if (route_prefork_enabled()) {
-            out.route_prefork_nodes.push_back(global_ids);
-            out.route_prefork_nodes.push_back(router_weights);
-            ggml_build_forward_expand(schedule_graph, global_ids);
-            ggml_build_forward_expand(schedule_graph, router_weights);
-        }
+        out.route_prefork_nodes.push_back(global_ids);
+        out.route_prefork_nodes.push_back(router_weights);
+        ggml_build_forward_expand(schedule_graph, global_ids);
+        ggml_build_forward_expand(schedule_graph, router_weights);
+    }
+    if (schedule_graph && cold && device_join_enabled()) {
         // Enforce fork order without adding another backend graph:
         //   cold owner -> hot/shared -> in-graph event wait/copy -> add.
         // The deferred copy remains in the same main-backend split as the
@@ -1036,6 +1030,18 @@ bool build_moe_hybrid_ffn_graph(
         out.peer_output = cold_ready;
         combined = main_branch ? ggml_add(ctx, cold_ready, main_branch)
                                : cold_ready;
+    } else if (schedule_graph && cold && targeted_join_split_enabled()) {
+        // The scheduler marks this add as the first node of a fresh main-GPU
+        // split. Cold and main work can therefore be submitted back-to-back;
+        // the host-staged peer result is gathered only when the join split is
+        // reached. This is the cross-runtime equivalent of the explicit
+        // device-event join above, without an extra peer CONT fence and its
+        // fourth backend transition in every MoE layer.
+        ggml_build_forward_expand(schedule_graph, cold);
+        combined = main_branch ? ggml_add(ctx, cold, main_branch) : cold;
+        if (main_branch) {
+            out.join_nodes.push_back(combined);
+        }
     } else if (schedule_graph && cold) {
         ggml_build_forward_expand(schedule_graph, cold);
         ggml_tensor * cold_fence = ggml_cont(ctx, cold);
