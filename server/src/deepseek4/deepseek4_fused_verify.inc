@@ -13,6 +13,27 @@
 static void ds4_fv_set(ggml_tensor * t, const void * data, size_t nbytes) {
     if (t && t->buffer) ggml_backend_tensor_set(t, data, 0, nbytes);
 }
+
+static bool ds4_moe_policy_flag(const char * generic_name,
+                                const char * legacy_name) {
+    const char * raw = std::getenv(generic_name);
+    if (!raw || !*raw) raw = std::getenv(legacy_name);
+    return raw && *raw && std::strcmp(raw, "0") != 0;
+}
+
+template <typename T>
+static void ds4_fv_set_repeated_rows(
+        ggml_tensor * tensor,
+        const std::vector<T> & row) {
+    if (!tensor || row.empty()) return;
+    const size_t elements = (size_t) ggml_nelements(tensor);
+    GGML_ASSERT(elements % row.size() == 0);
+    std::vector<T> repeated(elements);
+    for (size_t offset = 0; offset < elements; offset += row.size()) {
+        std::copy(row.begin(), row.end(), repeated.begin() + offset);
+    }
+    ds4_fv_set(tensor, repeated.data(), repeated.size() * sizeof(T));
+}
 static bool ds4_fused_verify_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
@@ -117,14 +138,10 @@ static void ds4_fused_verify_refresh_hybrid_luts(
                 cold_valid[(size_t) ie] = 1.0f;
             }
         }
-        ds4_fv_set(inputs.hot_local_lut, hot_lut.data(),
-                   sizeof(int32_t) * hot_lut.size());
-        ds4_fv_set(inputs.hot_valid_lut, hot_valid.data(),
-                   sizeof(float) * hot_valid.size());
-        ds4_fv_set(inputs.cold_local_lut, cold_lut.data(),
-                   sizeof(int32_t) * cold_lut.size());
-        ds4_fv_set(inputs.cold_valid_lut, cold_valid.data(),
-                   sizeof(float) * cold_valid.size());
+        ds4_fv_set_repeated_rows(inputs.hot_local_lut, hot_lut);
+        ds4_fv_set_repeated_rows(inputs.hot_valid_lut, hot_valid);
+        ds4_fv_set_repeated_rows(inputs.cold_local_lut, cold_lut);
+        ds4_fv_set_repeated_rows(inputs.cold_valid_lut, cold_valid);
     }
 }
 
@@ -521,14 +538,33 @@ static bool ds4_build_fused_verify_graph(
         }
 
         if (hybrid) {
-            const bool allow_fused_combine = same_gpu_runtime;
+            const bool cross_vendor_owner_sums =
+                !same_gpu_runtime &&
+                ds4_env_flag("DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS");
+            const bool allow_fused_combine =
+                same_gpu_runtime || cross_vendor_owner_sums;
             const bool allow_direct_device_join =
                 pair_capabilities.native_gpu_handoff &&
                 (ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
                  ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN"));
-            const MoeHybridJoinMode join_mode = same_gpu_runtime
-                ? MoeHybridJoinMode::OwnerPartialSums
-                : MoeHybridJoinMode::CanonicalRouteOrder;
+            const bool schedule_host_staged_branches =
+                !same_gpu_runtime &&
+                ds4_env_flag("DFLASH_DS4_TP_SCHEDULE_BRANCHES");
+            ggml_cgraph * hybrid_schedule_graph =
+                (allow_direct_device_join || schedule_host_staged_branches)
+                    ? gf : nullptr;
+            // Cross-vendor staging normally preserves canonical route order
+            // so it matches the single-owner reduction as closely as
+            // possible.  For performance qualification, allow each owner to
+            // reduce its routed experts locally and stage one [n_embd, q]
+            // partial instead of the full [n_embd, n_used, q] route tensor.
+            // This is the same join shape used by the qualified same-runtime
+            // heterogeneous path, but remains opt-in until exact-output and
+            // mixed-vendor burn-in have passed.
+            const MoeHybridJoinMode join_mode =
+                same_gpu_runtime || cross_vendor_owner_sums
+                    ? MoeHybridJoinMode::OwnerPartialSums
+                    : MoeHybridJoinMode::CanonicalRouteOrder;
             MoeHybridConfig hybrid_cfg = make_ds4_moe_hybrid_config(w);
             hybrid_cfg.n_expert_used = (int) selected->ne[0];
             MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
@@ -594,7 +630,7 @@ static bool ds4_build_fused_verify_graph(
                 }
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
-                        allow_direct_device_join ? gf : nullptr,
+                        hybrid_schedule_graph,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
                         first_ids, first_weights, lane_q, inputs, true,
@@ -605,7 +641,7 @@ static bool ds4_build_fused_verify_graph(
 
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
-                        allow_direct_device_join ? gf : nullptr,
+                        hybrid_schedule_graph,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
                         padded_ids, padded_weights, lane_q, inputs, false,
@@ -616,7 +652,7 @@ static bool ds4_build_fused_verify_graph(
             } else {
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
-                        allow_direct_device_join ? gf : nullptr,
+                        hybrid_schedule_graph,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il],
                         ffn_normed, selected, router_weights,
@@ -784,13 +820,13 @@ static bool ds4_build_fused_verify_graph(
         const bool late_join_split =
             ds4_env_flag("DFLASH_DS4_TP_LATE_JOIN_SPLIT");
         const bool targeted_join_split =
-            ds4_env_flag("DFLASH_DS4_TP_TARGETED_JOIN_SPLIT");
+            ds4_moe_policy_flag(
+                "DFLASH_MOE_TP_TARGETED_JOIN_SPLIT",
+                "DFLASH_DS4_TP_TARGETED_JOIN_SPLIT");
         const bool device_join_split =
             ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN_SPLIT");
         const bool batch_split_copies =
             ds4_env_flag("GGML_CUDA_BATCH_PEER_COPIES");
-        const bool gpu_i32_repeat =
-            ds4_env_flag("LUCE_CUDA_I32_REPEAT");
         const bool report_split_count =
             ds4_env_flag("DFLASH_DS4_TP_SPLIT_COUNT");
         ggml_backend_sched_set_late_cross_input_split(
@@ -832,20 +868,18 @@ static bool ds4_build_fused_verify_graph(
                 }
                 pin_main(inputs.router_weights);
             }
-            if (ds4_env_flag("DFLASH_DS4_TP_ROUTE_PREFORK")) {
+            if (ds4_moe_policy_flag(
+                    "DFLASH_MOE_TP_ROUTE_PREFORK",
+                    "DFLASH_DS4_TP_ROUTE_PREFORK")) {
                 for (ggml_tensor * node : inputs.route_prefork_nodes) {
                     pin_main(node);
                 }
             }
             pin_main(inputs.hot_local_lut);
             pin_main(inputs.hot_valid_lut);
-            // q1 has no repeat.  The opt-in exact I32 GPU repeat lets q>1 keep
-            // both the LUT and its repeated output on the cold owner as well.
-            if (q == 1 || gpu_i32_repeat) {
-                pin_peer(inputs.cold_local_lut);
-            } else {
-                pin_main(inputs.cold_local_lut);
-            }
+            // The LUT is already q-batched and consumed only by the cold
+            // remap, so keep it with that owner for every verifier width.
+            pin_peer(inputs.cold_local_lut);
             pin_peer(inputs.cold_valid_lut);
             for (ggml_tensor * node : inputs.hot_remap_nodes) {
                 pin_main(node);

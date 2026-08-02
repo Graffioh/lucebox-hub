@@ -123,6 +123,9 @@ struct MoeHybridGraphInputs {
     // main->peer copy in the middle of cold execution, which synchronizes the
     // peer stream before the hot branch can be submitted.
     std::vector<ggml_tensor *> route_prefork_nodes;
+    // [1, n_expert, q, 1] immutable per-owner lookup rows. Keeping the q
+    // replicas in the input avoids per-step GPU REPEAT kernels and the split
+    // boundaries they introduce in a heterogeneous graph.
     ggml_tensor * hot_local_lut = nullptr;
     ggml_tensor * hot_valid_lut = nullptr;
     ggml_tensor * cold_local_lut = nullptr;
@@ -162,11 +165,12 @@ enum class MoeHybridJoinMode {
 // Append a device-resident hot+cold+shared MoE FFN to an existing graph.
 // `global_ids` and `router_weights` are [n_expert_used, n_tokens]. Weight
 // tensors in `storage` determine scheduler placement on the two GPU backends.
-// When `schedule_graph` is non-null, the cold branch is expanded immediately
-// and a peer-owned fence is inserted before the final main-backend join. This
-// forces three scheduler splits (cold, hot/shared, join), preventing the join's
-// cold-result copy from blocking hot/shared launch. Consumers may use
-// main_output + peer_output to fuse the exact final add into their next op.
+// When `schedule_graph` is non-null, the cold branch is expanded immediately.
+// The default path inserts a peer-owned fence before the final main-backend
+// join; targeted-join scheduling can instead mark the join itself as a fresh
+// split. Both forms submit cold and hot/shared independently before gathering
+// the peer result. Consumers may use main_output + peer_output to fuse the
+// exact final add into their next op.
 bool build_moe_hybrid_ffn_graph(
     ggml_context *                 ctx,
     ggml_cgraph *                  schedule_graph,

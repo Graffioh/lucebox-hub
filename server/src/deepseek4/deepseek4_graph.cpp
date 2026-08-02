@@ -1376,10 +1376,33 @@ static int ds4_comp_rows_used(const ggml_tensor * comp_cache, int n_cached, int 
 // rows in [n_comp, padded) are masked to -1e30 in the score matrix, which
 // underflows to exactly 0 in softmax, so a padded read is bit-identical to an
 // unpadded read of the first n_comp rows.
-static constexpr int DS4_COMP_PAD_STRIDE = 16;
+static int ds4_comp_pad_stride() {
+    static const int stride = [] {
+        constexpr int default_stride = 16;
+        const char * raw = std::getenv("DFLASH_DS4_COMP_PAD_STRIDE");
+        if (!raw || !*raw) return default_stride;
+        const int requested = std::atoi(raw);
+        switch (requested) {
+            case 16:
+            case 32:
+            case 64:
+            case 128:
+                return requested;
+            default:
+                std::fprintf(stderr,
+                    "[deepseek4] invalid DFLASH_DS4_COMP_PAD_STRIDE=%s; "
+                    "using %d\n",
+                    raw, default_stride);
+                return default_stride;
+        }
+    }();
+    return stride;
+}
+
 static int ds4_padded_comp_rows(int n_comp, int cap) {
     if (n_comp <= 0) return 0;
-    const int padded = ((n_comp + DS4_COMP_PAD_STRIDE - 1) / DS4_COMP_PAD_STRIDE) * DS4_COMP_PAD_STRIDE;
+    const int stride = ds4_comp_pad_stride();
+    const int padded = ((n_comp + stride - 1) / stride) * stride;
     return padded < cap ? padded : cap;
 }
 
@@ -2154,13 +2177,19 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);
     // attn_low: [n_lora_o, n_tokens, n_out_group]
     ggml_tensor * out = nullptr;
-    if (n_tokens > 1) {
+    const bool grouped_output_projection =
+        n_tokens > 1 &&
+        !ds4_env_flag("DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
+    if (grouped_output_projection) {
         // Batched ROCmFPX MMQ consumes src1's channel stride directly. This
         // avoids materializing both permutations (~256 MiB/layer at 2K).
         out = ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);
     } else {
-        // Preserve the established single-token graph and its numerical
-        // behavior. Decode is intentionally outside the prefill fast path.
+        // Preserve the established single-token graph and provide an exact
+        // fallback for heterogeneous runtimes that cannot retain grouped-view
+        // metadata across a scheduler copy. At verifier widths (q <= 4), this
+        // materializes at most 128 KiB per layer rather than the long-prefill
+        // volume avoided by the grouped path.
         attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));
         attn_low = ggml_reshape_2d(
             ctx, attn_low, n_lora_o * n_out_group, n_tokens);

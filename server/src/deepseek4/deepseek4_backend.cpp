@@ -383,6 +383,7 @@ static int fill_concentrated_cold_placement(const DeepSeek4Weights & w,
 static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
                                         int hot_per_layer,
                                         const char * profile_path,
+                                        bool hottest_on_peer,
                                         MoeHybridPlacement & out,
                                         std::string * err) {
     MoeHybridRoutingStats stats;
@@ -404,9 +405,41 @@ static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
     out.hot_expert_ids.resize((size_t)w.n_layer);
     out.total_hot = hot_per_layer * w.n_layer;
     for (int il = 0; il < w.n_layer; ++il) {
-        std::vector<int> ranked = stats.hot_experts(il, hot_per_layer);
         auto & ids = out.hot_expert_ids[(size_t)il];
-        ids.assign(ranked.begin(), ranked.end());
+        if (!hottest_on_peer) {
+            std::vector<int> ranked = stats.hot_experts(il, hot_per_layer);
+            ids.assign(ranked.begin(), ranked.end());
+            continue;
+        }
+
+        // `hot` is the primary-backend side of MoeHybridPlacement.  On a
+        // memory-rich iGPU paired with a smaller, faster dGPU, filling that
+        // primary side with the most frequently routed experts starves the
+        // dGPU of useful work. Reserve the peer-sized complement for the
+        // hottest experts and keep every other expert on the primary. This
+        // changes ownership only; route order and reduction semantics stay
+        // unchanged.
+        const int peer_count = w.n_expert - hot_per_layer;
+        const std::vector<int> ranked_peer =
+            stats.hot_experts(il, peer_count);
+        std::vector<uint8_t> on_peer((size_t)w.n_expert, 0);
+        for (int expert : ranked_peer) {
+            if (expert >= 0 && expert < w.n_expert) {
+                on_peer[(size_t)expert] = 1;
+            }
+        }
+        ids.reserve((size_t)hot_per_layer);
+        for (int expert = 0; expert < w.n_expert; ++expert) {
+            if (!on_peer[(size_t)expert]) {
+                ids.push_back((int32_t)expert);
+            }
+        }
+        if ((int)ids.size() != hot_per_layer) {
+            if (err) {
+                *err = "routing profile did not yield a complete expert ranking";
+            }
+            return false;
+        }
     }
     return true;
 }
@@ -421,12 +454,17 @@ static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
 // peak bandwidth.  It is only an allocation objective; actual placement still
 // uses authoritative router statistics and evaluates every selected expert.
 static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
-                                           int gpu,
+                                           ggml_backend_t backend,
                                            int max_ctx,
                                            Ds4HybridBudgetInfo & out,
                                            std::string * err) {
     out = {};
-    ggml_backend_cuda_get_device_memory(gpu, &out.gpu_free, &out.gpu_total);
+    if (!backend || !ggml_backend_get_device(backend)) {
+        if (err) *err = "target backend has no device";
+        return false;
+    }
+    ggml_backend_dev_memory(
+        ggml_backend_get_device(backend), &out.gpu_free, &out.gpu_total);
     if (out.gpu_total == 0) {
         if (err) *err = "could not query GPU memory";
         return false;
@@ -871,7 +909,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
                                                        MoeHybridPlacement & out,
                                                        std::string * err) const {
     Ds4HybridBudgetInfo budget;
-    if (!compute_ds4_hybrid_budget_info(w, cfg_.device.gpu, max_ctx, budget, err)) {
+    if (!compute_ds4_hybrid_budget_info(w, backend_, max_ctx, budget, err)) {
         return false;
     }
 
@@ -898,13 +936,18 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
         fill_prefix_hot_placement(w, hot_per_layer, out);
     } else if (const char * profile_path = std::getenv("DFLASH_DS4_HOTNESS_CSV")) {
         if (*profile_path) {
+            const bool hottest_on_peer =
+                ds4_inprocess_moe_tp_enabled() &&
+                env_flag_enabled("DFLASH_DS4_MOE_TP_PEER_HOT");
             if (!fill_profiled_hot_placement(
-                    w, hot_per_layer, profile_path, out, err)) {
+                    w, hot_per_layer, profile_path, hottest_on_peer,
+                    out, err)) {
                 return false;
             }
             std::fprintf(stderr,
-                         "[deepseek4] hybrid placement profile=%s\n",
-                         profile_path);
+                         "[deepseek4] hybrid placement profile=%s%s\n",
+                         profile_path,
+                         hottest_on_peer ? " hottest-owner=peer" : "");
         } else {
             fill_prefix_hot_placement(w, hot_per_layer, out);
         }
