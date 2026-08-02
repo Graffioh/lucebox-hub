@@ -294,6 +294,7 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_kv.cpp
     src/common/dflash_spec_decode.cpp
     src/common/paged_kv_pool.cpp
+    src/common/seq_slot_manager.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -319,6 +320,7 @@ add_library(dflash_common STATIC
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
     src/qwen35/qwen35_tensor_parallel.cpp
+    src/qwen35/qwen35_seq_engine.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
     src/qwen35/qwen35_dflash_target.cpp
     src/qwen35/qwen35_layer_split_dflash_target.cpp

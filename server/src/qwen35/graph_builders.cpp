@@ -280,7 +280,12 @@ bool build_target_step(
     bool capture_moe_router,
     bool kvflash_mask,
     bool capture_qk,
-    bool paged_attention) {
+    bool paged_attention,
+    int n_seqs,
+    int seq_slot,
+    bool paged_prefill,
+    int paged_max_kv_len,
+    bool compact_slots) {
     step_graph_free(sg);
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
@@ -296,6 +301,21 @@ bool build_target_step(
     ip.no_alloc   = true;
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
+
+    // ggml-cuda keys its graph cache by nodes[0]. Salting the metadata
+    // allocation shifts node addresses deterministically so each decode
+    // width bucket keeps an independent captured graph while sharing this
+    // single 512 MiB metadata arena.
+    int graph_key_slot = 0;
+    if (compact_slots) {
+        graph_key_slot = 1;
+        for (int width = n_seqs; width > 1; width >>= 1) {
+            ++graph_key_slot;
+        }
+    }
+    for (int i = 0; i < graph_key_slot; ++i) {
+        (void)ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
+    }
 
     const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
@@ -313,8 +333,14 @@ bool build_target_step(
         // kvflash mode: the physical span is the (smaller) pool capacity of
         // the attention tensors, so size the mask from those instead.
         int phys_ctx = cache.max_ctx;
-        for (auto * t : cache.attn_k) {
-            if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
+        if (paged_prefill && !cache.staging_k.empty() && cache.staging_k[0]) {
+            // Paged prefill reads the staging tensors, not the (larger,
+            // pool-sized) cache K/V — size the mask from those.
+            phys_ctx = std::min(phys_ctx, (int)cache.staging_k[0]->ne[1]);
+        } else {
+            for (auto * t : cache.attn_k) {
+                if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
+            }
         }
         const int max_win_len = phys_ctx + n_tokens;
         const int kv_pad = align_up(max_win_len, kq_stride_pad);
@@ -324,9 +350,40 @@ bool build_target_step(
         ggml_set_input(sg.attn_mask);
     }
 
+    ggml_tensor * paged_block_table = nullptr;
+    ggml_tensor * paged_kv_seq_lens = nullptr;
     if (paged_attention) {
-        if (n_tokens != 1 || with_mask || fa_window != 0) return false;
+        // Classic paged decode is one physical sequence and one token.
+        // Concurrent decode is always compact and carries an explicit
+        // row-to-slot mapping, even when its graph bucket width is one.
+        if (compact_slots) {
+            if (n_tokens != n_seqs || n_seqs < 1 ||
+                n_seqs > 64 || paged_prefill) return false;
+        } else if (n_tokens != 1 || n_seqs != 1 || paged_prefill) {
+            return false;
+        }
+        if (with_mask || fa_window != 0) return false;
+        // The paging metadata lives in the persistent target cache (next to
+        // the K/V pool), not as gallocr graph inputs: contents survive graph
+        // execution and rebuilds, so the backend uploads only what changed
+        // between decode steps.
         if (!cache.paged_block_table || !cache.paged_kv_seq_lens) return false;
+        if ((int)cache.paged_block_table->ne[1] != cache.n_seq_slots ||
+            (int)cache.paged_kv_seq_lens->ne[0] != cache.n_seq_slots) {
+            return false;
+        }
+        paged_block_table = cache.paged_block_table;
+        paged_kv_seq_lens = cache.paged_kv_seq_lens;
+        if (compact_slots) {
+            sg.active_slot_ids =
+                ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
+            sg.state_slot_ids =
+                ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
+            ggml_set_name(sg.active_slot_ids, "active_slot_ids");
+            ggml_set_name(sg.state_slot_ids, "state_slot_ids");
+            ggml_set_input(sg.active_slot_ids);
+            ggml_set_input(sg.state_slot_ids);
+        }
     }
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
@@ -341,7 +398,7 @@ bool build_target_step(
     // physical slots, so the slot-mapped write stays active for masked,
     // multi-token, and feature-capturing forwards (decode AND spec verify).
     const bool use_kv_write_rows =
-        paged_attention ||
+        paged_attention || paged_prefill ||
         (!g_no_kvpad && !capture_delta_intermediate &&
          (kvflash_mask
               ? (fa_window == 0)
@@ -365,8 +422,15 @@ bool build_target_step(
     gi.fa_window                  = fa_window;
     gi.last_token_logits_only     = last_token_logits_only;
     gi.kv_write_rows              = sg.kv_write_rows;
-    gi.paged_attention            = paged_attention;
+    gi.paged_block_table          = paged_block_table;
+    gi.paged_kv_seq_lens          = paged_kv_seq_lens;
+    gi.active_slot_ids            = sg.active_slot_ids;
+    gi.state_slot_ids             = sg.state_slot_ids;
     gi.q_capture                  = capture_qk;
+    gi.n_seqs                     = n_seqs;
+    gi.seq_slot                   = seq_slot;
+    gi.paged_prefill              = paged_prefill;
+    gi.paged_max_kv_len           = paged_max_kv_len;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

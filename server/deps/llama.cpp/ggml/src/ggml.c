@@ -4058,6 +4058,16 @@ struct ggml_tensor * ggml_set_rows(
     return result;
 }
 
+struct ggml_tensor * ggml_set_rows_masked(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c) {
+    struct ggml_tensor * result = ggml_set_rows(ctx, a, b, c);
+    ggml_set_op_params_i32(result, 0, 1);
+    return result;
+}
+
 // ggml_diag
 
 struct ggml_tensor * ggml_diag(
@@ -5620,13 +5630,14 @@ struct ggml_tensor * ggml_flash_attn_sparse(
 
 // ggml_paged_attn
 
-struct ggml_tensor * ggml_paged_attn(
+struct ggml_tensor * ggml_paged_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
         struct ggml_tensor  * block_table,
         struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * active_slot_ids,
         float                 scale,
         int                   block_size,
         int                   max_kv_seq_len) {
@@ -5635,6 +5646,7 @@ struct ggml_tensor * ggml_paged_attn(
     GGML_ASSERT(v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q4_0 || v->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(block_table->type == GGML_TYPE_I32);
     GGML_ASSERT(kv_seq_lens->type == GGML_TYPE_I32);
+    GGML_ASSERT(active_slot_ids == NULL || active_slot_ids->type == GGML_TYPE_I32);
 
     GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
     GGML_ASSERT(k->ne[1] == v->ne[1]);
@@ -5644,10 +5656,15 @@ struct ggml_tensor * ggml_paged_attn(
     GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1);
 
     GGML_ASSERT(block_table->ne[0] > 0);
-    GGML_ASSERT(block_table->ne[1] == q->ne[1]);
     GGML_ASSERT(block_table->ne[2] == 1 && block_table->ne[3] == 1);
-    GGML_ASSERT(kv_seq_lens->ne[0] == q->ne[1]);
+    GGML_ASSERT(block_table->ne[1] == kv_seq_lens->ne[0]);
     GGML_ASSERT(kv_seq_lens->ne[1] == 1 && kv_seq_lens->ne[2] == 1 && kv_seq_lens->ne[3] == 1);
+    if (active_slot_ids) {
+        GGML_ASSERT(active_slot_ids->ne[0] == q->ne[1]);
+        GGML_ASSERT(active_slot_ids->ne[1] == 1 && active_slot_ids->ne[2] == 1 && active_slot_ids->ne[3] == 1);
+    } else {
+        GGML_ASSERT(block_table->ne[1] == q->ne[1]);
+    }
 
     GGML_ASSERT(block_size > 0);
     GGML_ASSERT(k->ne[1] % block_size == 0);
@@ -5666,6 +5683,7 @@ struct ggml_tensor * ggml_paged_attn(
     result->src[2] = v;
     result->src[3] = block_table;
     result->src[4] = kv_seq_lens;
+    result->src[5] = active_slot_ids;
 
     return result;
 }
@@ -6467,14 +6485,15 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
-struct ggml_tensor * ggml_gated_delta_net(
+static struct ggml_tensor * ggml_gated_delta_net_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
-        struct ggml_tensor  * state) {
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * active_slot_ids) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6488,6 +6507,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
     GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(active_slot_ids == NULL || active_slot_ids->type == GGML_TYPE_I32);
 
     const int64_t S_v      = v->ne[0];
     const int64_t H        = v->ne[1];
@@ -6498,7 +6518,13 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
     GGML_ASSERT(beta->ne[0] == 1);
 
-    GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H);
+    if (active_slot_ids) {
+        GGML_ASSERT(active_slot_ids->ne[0] == n_seqs);
+        GGML_ASSERT(active_slot_ids->ne[1] == 1 && active_slot_ids->ne[2] == 1 && active_slot_ids->ne[3] == 1);
+    } else {
+        GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
+    }
 
     // Pack output, final new_state, and per-step intermediate states into one tensor.
     // Layout (in units of `S_v * H`-wide rows):
@@ -6520,8 +6546,20 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+    result->src[8] = active_slot_ids;
 
     return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state) {
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, NULL);
 }
 
 struct ggml_tensor * ggml_gated_delta_net_inplace(
@@ -6533,6 +6571,22 @@ struct ggml_tensor * ggml_gated_delta_net_inplace(
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state) {
     struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
+    ggml_set_op_params_i32(result, 1, 1);
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_active_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * active_slot_ids) {
+    GGML_ASSERT(active_slot_ids != NULL);
+    struct ggml_tensor * result = ggml_gated_delta_net_impl(
+        ctx, q, k, v, g, beta, state, active_slot_ids);
     ggml_set_op_params_i32(result, 1, 1);
     return result;
 }
