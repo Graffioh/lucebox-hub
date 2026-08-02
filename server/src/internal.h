@@ -401,6 +401,18 @@ struct TargetCache {
     std::vector<ggml_tensor *> staging_k;    // size = n_full_attn_layers or empty
     std::vector<ggml_tensor *> staging_v;
 
+    // Prefill staging for the DeltaNet recurrent state (only when
+    // n_seq_slots > 1): a single-sequence conv/ssm slab per delta layer.
+    // The prefilling sequence carries its chunk-to-chunk state HERE instead
+    // of its slot's slab: slots are reused without a device-side state
+    // reset, so the slab may still hold the previous occupant's state,
+    // while the staging slabs start zeroed. The final prefill chunk's
+    // graph copies them into the admitted slot's slabs (prefill_commit).
+    //   staging_ssm_state:  [S_v, S_v, H_v, 1] f32
+    //   staging_conv_state: [(kernel-1), conv_channels, 1] f32
+    std::vector<ggml_tensor *> staging_ssm_state;   // size = n_delta or empty
+    std::vector<ggml_tensor *> staging_conv_state;
+
     // Snapshot buffers for speculative decoding rollback. Sized identically
     // to ssm_state/conv_state above. Populated by snapshot_ssm_state() and
     // restored by restore_ssm_state().
@@ -611,15 +623,10 @@ void reset_target_cache(TargetCache & c);
 // stale delta-net state corrupting subsequent prefills.
 void reset_recurrent_state(TargetCache & c);
 
-// Zero one sequence slot's recurrent state (SSM + conv slabs) in place.
-// Device-side memset of the slot's slices; other slots are untouched. The
-// concurrent scheduler calls this at admission instead of the whole-buffer
-// reset_recurrent_state, whose clear would destroy every other live sequence.
-void reset_slot_recurrent_state(TargetCache & c, int slot);
-
-// Zero the prefill staging K/V tensors (multi-slot caches only; no-op
-// otherwise). Called before each admission's prefill so the staging region
-// behaves exactly like the freshly reset cache the dense prefill path expects.
+// Zero the prefill staging tensors — K/V and the staging conv/ssm state
+// slabs (multi-slot caches only; no-op otherwise). Called at each admission
+// so the staging region behaves exactly like the freshly reset cache the
+// dense prefill path expects.
 void reset_prefill_staging(TargetCache & c);
 
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
@@ -662,7 +669,7 @@ struct QwenGraphInputs {
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
     bool          capture_moe_router = false; // if true, expose selected expert ids for MoE layers
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
-    bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
+    int           logits_tail_rows = 0; // compute logits only for last n rows; 0 = all
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
     // [n_tokens,n_head_kv] i64 physical destination rows for the
     // ggml_set_rows KV write; step-invariant except under paged prefill,
@@ -683,8 +690,9 @@ struct QwenGraphInputs {
     //     n_seq_tokens=1 over the full state slabs, and the paged attention
     //     output is permuted from [D,n_seq,Hq] to the dense [D,Hq,n_tokens]
     //     layout before the reshape.
-    //   seq_slot — single-sequence forwards (prefill) against a multi-slot
-    //     cache: DeltaNet state views index this slot's slab.
+    //   seq_slot — the slot whose conv/ssm slabs the prefill_commit copy
+    //     targets (and the slab a plain single-sequence forward against a
+    //     multi-slot cache would select).
     //   paged_prefill — chunked prefill of one slot: K/V reads and the legacy
     //     cpy writes go to cache.staging_k/v (contiguous, masked, stride-1 —
     //     numerically identical to the dense path), while kv_write_rows
@@ -692,10 +700,25 @@ struct QwenGraphInputs {
     //   paged_max_kv_len — batched decode: max kv_seq_len over live slots,
     //     used (256-padded) as the kernel launch bound instead of
     //     kv_start + n_tokens, which is meaningless across slots.
+    //   n_prefill_tokens — fused prefill+decode: the first n_prefill_tokens
+    //     rows of the token axis are one sequence's prefill chunk (staging
+    //     reads, masked, kv_start offset) and the remaining n_seqs rows are
+    //     the compact batched decode (one token per live row, paged reads).
+    //     Projections, FFN, norms, and the LM head run once over the whole
+    //     batch; only the attention and DeltaNet cores split. Requires
+    //     paged_prefill && compact_slots && n_tokens ==
+    //     n_prefill_tokens + n_seqs. 0 = not fused.
+    //   prefill_commit — final prefill chunk: append per-delta-layer copies
+    //     of the staging conv/ssm state into slot seq_slot's slabs at the
+    //     END of the graph (after the batched decode state write-back).
+    // Fused steps set logits_tail_rows to n_seqs (+1 on the committing
+    // chunk, whose extra leading row is the prompt's last token).
     int  n_seqs = 1;
     int  seq_slot = 0;
     bool paged_prefill = false;
     int  paged_max_kv_len = 0;
+    int  n_prefill_tokens = 0;
+    bool prefill_commit = false;
     // Capture the LAST token's post-RoPE/post-rotation Q per full-attention
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.

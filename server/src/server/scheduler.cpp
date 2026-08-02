@@ -1,13 +1,12 @@
 // Concurrent scheduler for --max-concurrency serving: the worker thread's
 // iteration-level loop over a backend's SeqEngine decode slots.
 //
-// Split from http_server.cpp: this TU owns admission (one blocking prefill
-// between decode iterations, FIFO across pool-full deferrals), the batched
-// per-token stepping of every live slot, per-slot streaming through
-// ClientSendBuffer (never blocking on a client socket), and retirement. The
-// classic one-job-at-a-time worker_loop stays in http_server.cpp. SSE
-// emission, error-close chunks, and HTTP response formatting are shared
-// with it so both paths emit matching wire formats.
+// Split from http_server.cpp: this TU owns non-blocking admission (one
+// prefill chunk per engine step, fused with the live decode batch), FIFO
+// pool-full deferrals, per-slot streaming through ClientSendBuffer, and
+// retirement. SSE emission, error-close chunks, and HTTP response
+// formatting are shared with the classic worker so both paths emit
+// matching wire formats.
 
 #include "http_server.h"
 
@@ -30,6 +29,7 @@ struct SchedSlot {
     ServerJob * job = nullptr;
     SocketHandle fd = kInvalidSocket;
     std::unique_ptr<SseEmitter> emitter;
+    bool prefilling = false;
     std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
     double prefill_s = 0.0;
@@ -414,9 +414,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
         }
 
-        // Admission only claims the slot. This baseline immediately drains
-        // its pending prompt through pure-prefill step() calls, so decode of
-        // the other slots still pauses without baking compute into admit().
+        // Admission only claims the slot and queues the prompt. Prefill
+        // advances one chunk per engine step alongside live decode.
         auto ar = engine.admit(next_request_id, req.prompt_tokens,
                                req.sampler);
         if (!ar.ok && ar.busy) return AdmissionDisposition::Deferred;
@@ -442,6 +441,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s = SchedSlot{};
         s.job = job;
         s.fd = job->fd;
+        s.prefilling = true;
         s.started_at = started_at;
         s.decode_started_at = started_at;  // sane on prefill failure
         s.n_gen_cap = std::min(
@@ -454,63 +454,21 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             s.hook.close_token_ids = config_.think_close_token_ids;
             s.hook.hard_limit_remaining = eff_reply_for_n_gen;
         }
-        SeqEngine::StepOutput prefill_out;
-        bool prefill_done = false;
-        while (engine.prefill_pending()) {
-            std::vector<SeqEngine::StepOutput> outputs;
-            if (!engine.step({}, outputs)) {
-                s.failed = true;
-                s.error = "prefill step failed";
-                s.finished = true;
-                break;
-            }
-            for (const auto & out : outputs) {
-                if (out.slot == ar.slot && out.prefill_done) {
-                    prefill_out = out;
-                    prefill_done = true;
-                    break;
-                }
-            }
-            if (prefill_done) break;
-        }
-        if (!prefill_done && !s.finished) {
-            s.failed = true;
-            s.error = "prefill ended without a completion token";
-            s.finished = true;
-        } else if (prefill_out.failed) {
-            s.failed = true;
-            s.error = prefill_out.error;
-            s.finished = true;
-        } else if (prefill_done) {
-            s.decode_started_at = std::chrono::steady_clock::now();
-            s.prefill_s = std::chrono::duration<double>(
-                s.decode_started_at - s.started_at).count();
-            // First pending token from the prefill logits — same emit-then-
-            // forward handoff as the classic AR loop's first token.
-            advance_slot(s, prefill_out.token);
-        }
-        if (!s.client_disconnected && !s.send_buffer.flush(s.fd)) {
-            s.client_disconnected = true;
-            s.finished = true;
-        }
         publish_live_count();
         return AdmissionDisposition::Admitted;
     };
 
-    // Scheduler loop. Every iteration walks the same six phases:
+    // Scheduler loop. Every iteration walks the same five phases:
     //
     //   1. Admit    — seat at most one new job (deferred first, then the
-    //                 queue). Its prefill is blocking, so capping it at one
-    //                 bounds the stall the live streams see.
-    //   2. Retire   — drop slots that finished during admission, before they
-    //                 ever reach a decode step (EOS first token, cap 1).
-    //   3. Idle     — nothing live: service drains and loop back, where the
+    //                 queue). Its prefill advances inside later steps.
+    //   2. Idle     — nothing live: service drains and loop back, where the
     //                 admission phase parks in the blocking dequeue.
-    //   4. Decode   — one batched engine step over every live slot; each
-    //                 output token is appended to that slot's stream.
-    //   5. Flush    — non-blocking write of the buffered chunks; readers that
+    //   3. Step     — advance one pending prefill chunk alongside every
+    //                 decoding slot in one engine pass.
+    //   4. Flush    — non-blocking write of the buffered chunks; readers that
     //                 stall or overflow their buffer are dropped.
-    //   6. Reap     — service drains, then retire whatever finished this
+    //   5. Reap     — service drains, then retire whatever finished this
     //                 iteration so its blocks are free for the next admit.
     //
     // Exits on stopping_ (checked after admission), leaving the teardown
@@ -518,7 +476,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     while (true) {
         // Phase 1 — Admission: deferred job first (FIFO), then the queue.
         // Blocking dequeue only when idle; between decode steps only a poll.
-        while (live_count() < n_slots && !stopping_.load()) {
+        // The engine has one prefill staging set, so only one admission may
+        // be prefilling at a time.
+        while (live_count() < n_slots && !stopping_.load() &&
+               !engine.prefill_pending()) {
             // A deferred job owns the front of the line, so nothing else may
             // be admitted while its retry backoff is still running.
             if (deferred &&
@@ -551,21 +512,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 break;  // wait for a retire to free blocks
             }
             if (outcome == AdmissionDisposition::Admitted) {
-                // At most one blocking prefill between decode iterations so
-                // live streams stall for a single admission, not n_slots-1.
-                break;
+                break;  // its prefill now advances through step()
             }
         }
         if (stopping_.load()) break;
 
-        // Phase 2 — Retire slots that finished during admission
-        // (EOS-on-first-token, immediate stop-sequence, cap 1).
-        for (int i = 0; i < n_slots; i++) {
-            if (slots[(size_t)i].job && slots[(size_t)i].finished) {
-                retire_slot(i, true);
-            }
-        }
-        // Phase 3 — Idle: no slot to decode, so only the drains need service.
+        // Phase 2 — Idle: no slot to step, so only the drains need service.
         if (live_count() == 0) {
             service_drains();
             if (deferred) continue;   // freed everything; admit it now
@@ -576,11 +528,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             continue;                 // dequeue() blocks in admission
         }
 
-        // Phase 4 — One batched decode iteration over every live slot.
+        // Phase 3 — One iteration over every decoding slot plus one prefill
+        // chunk, fused into the same engine pass.
         std::vector<SeqEngine::StepInput> inputs;
         inputs.reserve((size_t)n_slots);
         for (int i = 0; i < n_slots; i++) {
-            if (slots[(size_t)i].job) {
+            if (slots[(size_t)i].job && !slots[(size_t)i].prefilling) {
                 inputs.push_back({i, slots[(size_t)i].pending_tok});
             }
         }
@@ -606,9 +559,17 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 s.finished = true;
                 continue;
             }
+            if (out.prefill_done) {
+                s.prefilling = false;
+                s.decode_started_at = std::chrono::steady_clock::now();
+                s.prefill_s = std::chrono::duration<double>(
+                    s.decode_started_at - s.started_at).count();
+                advance_slot(s, out.token);
+                continue;
+            }
             advance_slot(s, out.token);
         }
-        // Phase 5 — Non-blocking flush of every live slot's chunks. Progress
+        // Phase 4 — Non-blocking flush of every live slot's chunks. Progress
         // resets the stall clock; a reader that makes no progress for 30 s
         // or lets the buffer hit the cap is dropped (its slot retires).
         {
@@ -630,7 +591,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 }
             }
         }
-        // Phase 6 — Reap: finish the drains, then hand back the blocks of
+        // Phase 5 — Reap: finish the drains, then hand back the blocks of
         // every slot that ended this iteration so the next admit can use them.
         service_drains();
         for (int i = 0; i < n_slots; i++) {

@@ -275,7 +275,7 @@ bool build_target_step(
     bool capture,
     bool capture_delta_intermediate,
     int fa_window,
-    bool last_token_logits_only,
+    int logits_tail_rows,
     int kq_stride_pad,
     bool capture_moe_router,
     bool kvflash_mask,
@@ -285,8 +285,23 @@ bool build_target_step(
     int seq_slot,
     bool paged_prefill,
     int paged_max_kv_len,
+    int n_prefill_tokens,
+    bool prefill_commit,
     bool compact_slots) {
     step_graph_free(sg);
+
+    // Compact n_seqs is a power-of-two graph bucket width, not the physical
+    // slot count. active_slot_ids maps live rows to cache columns and uses -1
+    // for padding, so a valid bucket may be wider than cache.n_seq_slots.
+    const bool invalid_compact_width = n_seqs < 1 || n_seqs > 64;
+
+    // Fused prefill+decode: prefill rows lead, decode rows trail.
+    const bool fused = n_prefill_tokens > 0;
+    if (fused && (!paged_attention || !paged_prefill ||
+                  n_tokens != n_prefill_tokens + n_seqs ||
+                  !compact_slots || invalid_compact_width)) {
+        return false;
+    }
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
     // addresses, keeping the ggml-cuda CUDA-graph cache key (nodes[0]) and
@@ -342,9 +357,12 @@ bool build_target_step(
                 if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
             }
         }
-        const int max_win_len = phys_ctx + n_tokens;
+        // Fused steps: the mask feeds only the prefill segment's flash
+        // attention, so its query axis is the chunk, not the whole batch.
+        const int q_rows = fused ? n_prefill_tokens : n_tokens;
+        const int max_win_len = phys_ctx + q_rows;
         const int kv_pad = align_up(max_win_len, kq_stride_pad);
-        const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+        const int q_pad  = align_up(q_rows, KQ_MASK_PAD);
         sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
         ggml_set_name(sg.attn_mask, "attn_mask");
         ggml_set_input(sg.attn_mask);
@@ -353,16 +371,23 @@ bool build_target_step(
     ggml_tensor * paged_block_table = nullptr;
     ggml_tensor * paged_kv_seq_lens = nullptr;
     if (paged_attention) {
-        // Classic paged decode is one physical sequence and one token.
-        // Concurrent decode is always compact and carries an explicit
-        // row-to-slot mapping, even when its graph bucket width is one.
-        if (compact_slots) {
-            if (n_tokens != n_seqs || n_seqs < 1 ||
-                n_seqs > 64 || paged_prefill) return false;
-        } else if (n_tokens != 1 || n_seqs != 1 || paged_prefill) {
-            return false;
+        if (fused) {
+            // Fused shape was validated above; it additionally needs the
+            // staging slabs read by its leading prefill segment.
+            if (cache.staging_k.empty() || cache.staging_conv_state.empty()) {
+                return false;
+            }
+        } else {
+            // Classic paged decode is one physical sequence and one token.
+            // Concurrent decode always carries an explicit row-to-slot map.
+            if (compact_slots) {
+                if (n_tokens != n_seqs || invalid_compact_width) return false;
+            } else if (n_tokens != 1 || n_seqs != 1) {
+                return false;
+            }
+            if (paged_prefill || with_mask) return false;
         }
-        if (with_mask || fa_window != 0) return false;
+        if (fa_window != 0) return false;
         // The paging metadata lives in the persistent target cache (next to
         // the K/V pool), not as gallocr graph inputs: contents survive graph
         // execution and rebuilds, so the backend uploads only what changed
@@ -374,16 +399,16 @@ bool build_target_step(
         }
         paged_block_table = cache.paged_block_table;
         paged_kv_seq_lens = cache.paged_kv_seq_lens;
-        if (compact_slots) {
-            sg.active_slot_ids =
-                ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
-            sg.state_slot_ids =
-                ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
-            ggml_set_name(sg.active_slot_ids, "active_slot_ids");
-            ggml_set_name(sg.state_slot_ids, "state_slot_ids");
-            ggml_set_input(sg.active_slot_ids);
-            ggml_set_input(sg.state_slot_ids);
-        }
+    }
+    if (paged_attention && compact_slots) {
+        sg.active_slot_ids =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
+        sg.state_slot_ids =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(sg.active_slot_ids, "active_slot_ids");
+        ggml_set_name(sg.state_slot_ids, "state_slot_ids");
+        ggml_set_input(sg.active_slot_ids);
+        ggml_set_input(sg.state_slot_ids);
     }
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
@@ -420,7 +445,7 @@ bool build_target_step(
     gi.capture_delta_intermediate = capture_delta_intermediate;
     gi.capture_moe_router         = capture_moe_router;
     gi.fa_window                  = fa_window;
-    gi.last_token_logits_only     = last_token_logits_only;
+    gi.logits_tail_rows           = logits_tail_rows;
     gi.kv_write_rows              = sg.kv_write_rows;
     gi.paged_block_table          = paged_block_table;
     gi.paged_kv_seq_lens          = paged_kv_seq_lens;
@@ -431,6 +456,8 @@ bool build_target_step(
     gi.seq_slot                   = seq_slot;
     gi.paged_prefill              = paged_prefill;
     gi.paged_max_kv_len           = paged_max_kv_len;
+    gi.n_prefill_tokens           = n_prefill_tokens;
+    gi.prefill_commit             = prefill_commit;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

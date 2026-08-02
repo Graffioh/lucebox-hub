@@ -6608,7 +6608,14 @@ void ggml_gated_delta_net_set_skip_intermediate(
     // Compact only the plain chain path. Tree/persistent variants need
     // intermediate states for branch reloads or explicit capture storage.
     const bool can_compact = tensor->src[6] == NULL && tensor->src[7] == NULL;
-    tensor->ne[1] = n_tokens*n_seqs + S_v*n_seqs;
+    // A plain in-place GDN writes final state directly into src[5], so its
+    // packed result does not need the otherwise mandatory final-state region.
+    // Active-slot buckets retain that region as scratch for negative padding
+    // rows, which deliberately have no physical recurrent-state slab.
+    const bool inplace_state = ggml_get_op_params_i32(tensor, 1) != 0;
+    const bool active_slots = tensor->src[8] != NULL;
+    tensor->ne[1] = n_tokens*n_seqs +
+                    (inplace_state && !active_slots ? 0 : S_v*n_seqs);
     if (!skip_intermediate || !can_compact) {
         tensor->ne[1] += S_v*n_tokens*n_seqs;
     }

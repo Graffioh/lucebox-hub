@@ -83,17 +83,29 @@ bool build_hybrid_full_layer_step(
 // Concurrent-slot serving (multi-slot paged caches):
 //   `n_seqs` — compact decode graph-bucket width; the token axis is the
 //     sequence axis and n_tokens must equal n_seqs.
-//   `seq_slot` — single-sequence forwards (prefill chunks) pick which slot's
-//     recurrent-state slab the DeltaNet blocks read and write.
+//   `compact_slots` — explicit compact-row to physical-slot mapping. Required
+//     for concurrent and fused decode, including width-one buckets. n_seqs is
+//     in [1, 64] and may be wider than cache.n_seq_slots; active_slot_ids uses
+//     -1 for padding rows. Without it, paged attention is classic one-token,
+//     one-sequence decode only.
+//   `seq_slot` — the slot whose recurrent-state slabs the end-of-prefill
+//     commit copy (prefill_commit) targets; prefill chunks themselves run
+//     on the staging slabs.
 //   `paged_prefill` — chunk prefill of one slot: masked stride-1 reads and
 //     legacy writes go to cache.staging_k/v while kv_write_rows dual-writes
 //     the pool blocks. Pass paged_attention=false with it (prefill reads
-//     never touch the block table).
-//   `compact_slots` — explicit compact-row to physical-slot mapping. Required
-//     for concurrent decode, including a one-row bucket. The non-compact
-//     paged path is reserved for classic single-token decode.
+//     never touch the block table) — unless fusing, see n_prefill_tokens.
 //   `paged_max_kv_len` — batched decode: max kv_seq_len over live slots
 //     (kernel launch bound).
+//   `n_prefill_tokens` — fused prefill+decode step: the leading
+//     n_prefill_tokens rows are one slot's prefill chunk (staging reads at
+//     kv_start, masked; kv_write_rows covers the WHOLE batch) and the
+//     remaining n_seqs rows are the batched decode. Requires
+//     paged_attention && paged_prefill and
+//     n_tokens == n_prefill_tokens + n_seqs and compact_slots=true.
+//   `prefill_commit` — final prefill chunk: append staging→slot recurrent
+//     state copies at the end of the graph (see QwenGraphInputs).
+//   `logits_tail_rows` — logits/argmax only for the last n rows (0 = all).
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -105,7 +117,7 @@ bool build_target_step(
     bool capture,
     bool capture_delta_intermediate = false,
     int fa_window = 0,
-    bool last_token_logits_only = false,
+    int logits_tail_rows = 0,
     int kq_stride_pad = KQ_MASK_PAD,
     bool capture_moe_router = false,
     bool kvflash_mask = false,
@@ -115,6 +127,8 @@ bool build_target_step(
     int seq_slot = 0,
     bool paged_prefill = false,
     int paged_max_kv_len = 0,
+    int n_prefill_tokens = 0,
+    bool prefill_commit = false,
     bool compact_slots = false);
 
 // Full target forward: DDTree tree-verify mode.

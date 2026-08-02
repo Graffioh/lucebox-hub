@@ -66,11 +66,23 @@ private:
         int progress = 0;
     };
 
+    struct PrefillStage {
+        bool ready = false;
+        int kv_pos = 0;
+        int chunk = 0;
+        bool commit = false;
+        std::vector<int64_t> rows;
+        std::vector<float> embeddings;
+    };
+
     std::optional<PendingPrefill> pending_prefill_;
 
-    bool step_prefill(std::vector<StepOutput> & outputs);
     bool upload_block_table_delta(int slot, int first_block,
                                   const int32_t * blocks, size_t count);
+    void fail_pending_prefill(std::vector<StepOutput> & outputs,
+                              const char * log_message,
+                              const char * client_message);
+    PrefillStage stage_prefill_chunk(std::vector<StepOutput> & outputs);
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
                              std::vector<float> * logits_scratch = nullptr);

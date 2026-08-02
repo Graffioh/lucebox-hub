@@ -6,12 +6,11 @@
 // paged KV cache and execute a batched decode step. Any additional
 // per-sequence model state is owned by the concrete engine, not by this
 // interface. admit() claims a slot and queues its prompt without compute.
-// This baseline drains that prefill through chunk-sized step() calls before
-// resuming live decode; a follow-up may fuse the same pending work with the
-// decode batch without changing the admission contract. Once prefilling
-// completes, the scheduler advances the slot one token per step(), feeding
-// each sampled token back as the next step's input — which is what lets it
-// override a token before it is committed to the cache.
+// Each step() then advances that prefill by one chunk alongside the live
+// decode batch. Once prefilling completes, the scheduler advances the slot
+// one token per step(), feeding each sampled token back as the next step's
+// input — which is what lets it override a token (thinking-budget
+// force-close) before it is committed to the cache.
 //
 // The split of duties is deliberate and is the reason this interface exists
 // apart from ModelBackend:
@@ -33,7 +32,7 @@
 //
 // The model-independent half already exists in common/ and is meant to be
 // reused as-is: PagedKvPool (block allocator) and SeqSlotManager (slot
-// lifecycle, admission checks, per-slot sampler/RNG/penalty history, the
+// lifecycle, admission arithmetic, per-slot sampler/RNG/penalty history, the
 // kv-length mirror) are GPU-free and unit-tested. A new engine supplies only
 // the device half — its prefill, its batched forward, its metadata uploads.
 //
@@ -74,8 +73,8 @@ public:
 
     // Admit one request into a free slot and queue its prompt for chunked
     // prefill. No K/V blocks or compute are consumed here — subsequent step()
-    // calls allocate and advance one prefill chunk at a time. At most one
-    // admission may prefill at once.
+    // calls allocate and advance one prefill chunk alongside the decode batch.
+    // At most one admission may prefill at a time.
     //
     // `sampler` is the only source of truth for how the slot samples:
     // sampler.needs_logit_processing() selects CPU sampling over GPU argmax
@@ -104,11 +103,12 @@ public:
         bool    prefill_done = false;
     };
 
-    // Advance one unit of engine work. While admission prefill is pending,
-    // inputs must be empty and one prompt chunk advances; completion produces
-    // one output with prefill_done=true. Otherwise every decoding slot must
-    // appear and one compact batched decode runs. Returns false on a
-    // whole-engine failure (outputs may be partial).
+    // One scheduler iteration: commit each input token and advance every
+    // decoding slot, while also advancing the pending admission's prefill by
+    // one chunk when present. Every decoding slot must appear in `inputs`;
+    // the prefilling slot must not. A completed prefill contributes one extra
+    // output with prefill_done=true. Returns false on a whole-batch failure
+    // (outputs may be partial).
     virtual bool step(const std::vector<StepInput> & inputs,
                       std::vector<StepOutput> & outputs) = 0;
 

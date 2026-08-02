@@ -130,9 +130,13 @@ bool create_target_cache_partial(const TargetWeights & w,
     out.attn_v.assign(n_full_attn, nullptr);
     out.staging_k.clear();
     out.staging_v.clear();
+    out.staging_ssm_state.clear();
+    out.staging_conv_state.clear();
     if (n_seq_slots > 1) {
         out.staging_k.assign(n_full_attn, nullptr);
         out.staging_v.assign(n_full_attn, nullptr);
+        out.staging_ssm_state.assign(n_delta, nullptr);
+        out.staging_conv_state.assign(n_delta, nullptr);
     }
     out.ssm_state.assign(n_delta, nullptr);
     out.conv_state.assign(n_delta, nullptr);
@@ -180,7 +184,7 @@ bool create_target_cache_partial(const TargetWeights & w,
     // ── Base context: KV cache + SSM/conv state + target_feat ────────
     {
         const int base_tensors = 2 * n_full_attn + 2 * n_delta + 2
-                               + (multi_slot ? 2 * n_full_attn : 0);
+                               + (multi_slot ? 2 * n_full_attn + 2 * n_delta : 0);
         ggml_init_params ip{};
         ip.mem_size   = (size_t)(base_tensors + 16) * ggml_tensor_overhead();
         ip.mem_buffer = nullptr;
@@ -239,6 +243,22 @@ bool create_target_cache_partial(const TargetWeights & w,
                 std::snprintf(name, sizeof(name), "conv_state_%d", il); ggml_set_name(C, name);
                 out.ssm_state[dn_idx]  = S;
                 out.conv_state[dn_idx] = C;
+                if (multi_slot) {
+                    // Prefill staging state: the in-flight sequence's conv/ssm
+                    // slab, isolated from the batched decode write-back that
+                    // touches every slot slab each step (see internal.h).
+                    ggml_tensor * SS = ggml_new_tensor_4d(out.base_ctx, GGML_TYPE_F32,
+                                                          head_v_dim, head_v_dim,
+                                                          w.ssm_dt_rank, 1);
+                    ggml_tensor * SC = ggml_new_tensor_3d(out.base_ctx, GGML_TYPE_F32,
+                                                          w.ssm_d_conv - 1, conv_ch, 1);
+                    std::snprintf(name, sizeof(name), "staging_ssm_state_%d", il);
+                    ggml_set_name(SS, name);
+                    std::snprintf(name, sizeof(name), "staging_conv_state_%d", il);
+                    ggml_set_name(SC, name);
+                    out.staging_ssm_state[dn_idx]  = SS;
+                    out.staging_conv_state[dn_idx] = SC;
+                }
                 dn_idx++;
             }
         }
@@ -400,6 +420,8 @@ void free_target_cache(TargetCache & c) {
     c.attn_v.clear();
     c.staging_k.clear();
     c.staging_v.clear();
+    c.staging_ssm_state.clear();
+    c.staging_conv_state.clear();
     c.ssm_state.clear();
     c.conv_state.clear();
     c.ssm_state_snap.clear();
@@ -460,28 +482,17 @@ void reset_recurrent_state(TargetCache & c) {
     zero_tensors(c.conv_state);
 }
 
-void reset_slot_recurrent_state(TargetCache & c, int slot) {
-    if (slot < 0 || slot >= c.n_seq_slots) return;
-    // Slot s is the contiguous slab at index s of each state tensor's
-    // trailing axis; a device-side memset of that byte range clears it
-    // without touching any other live sequence.
-    for (ggml_tensor * t : c.ssm_state) {
-        if (!t) continue;
-        const size_t slab = t->nb[3];
-        ggml_backend_tensor_memset(t, 0, (size_t)slot * slab, slab);
-    }
-    for (ggml_tensor * t : c.conv_state) {
-        if (!t) continue;
-        const size_t slab = t->nb[2];
-        ggml_backend_tensor_memset(t, 0, (size_t)slot * slab, slab);
-    }
-}
-
 void reset_prefill_staging(TargetCache & c) {
     for (ggml_tensor * t : c.staging_k) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
     for (ggml_tensor * t : c.staging_v) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
+    for (ggml_tensor * t : c.staging_ssm_state) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
+    for (ggml_tensor * t : c.staging_conv_state) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
 }
@@ -757,7 +768,12 @@ static ggml_tensor * build_full_attn_block(
     int paged_max_kv_len = 0,
     // Compact decode row -> physical block-table column. Negative ids are
     // graph-bucket padding rows.
-    ggml_tensor * active_slot_ids = nullptr
+    ggml_tensor * active_slot_ids = nullptr,
+    // Fused prefill+decode: the first n_fused_prefill tokens are one slot's
+    // prefill chunk (staging reads at kv_start, masked) and the remaining
+    // n_tokens - n_fused_prefill are the batched paged decode. Projections
+    // and the output path stay whole-batch; only the attention core splits.
+    int n_fused_prefill = 0
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -846,6 +862,9 @@ static ggml_tensor * build_full_attn_block(
     }
 
     const bool paged_prefill = staging_k != nullptr && staging_v != nullptr;
+    const bool fused = n_fused_prefill > 0;
+    GGML_ASSERT(!fused || (paged_prefill && paged_block_table &&
+                           n_fused_prefill < n_tokens));
     if (kv_write_rows) {
         // Step-invariant: the destination tensor stays fixed while the input
         // indices carry contiguous, KVFlash, or paged physical rows.
@@ -859,19 +878,32 @@ static ggml_tensor * build_full_attn_block(
         // Legacy: kv_start as literal view offset (not step-invariant;
         // prefill/verify/non-graph). Paged prefill points this at the
         // contiguous staging tensors — the pool rows went through set_rows
-        // above — so chunk reads below see the dense layout.
+        // above — so chunk reads below see the dense layout. Fused mode
+        // stages only the prefill segment (the leading n_fused_prefill
+        // tokens); the decode rows live in the pool alone.
+        const int n_staged = fused ? n_fused_prefill : n_tokens;
+        ggml_tensor * stage_k_src = Kcur_T;
+        ggml_tensor * stage_v_src = Vcur_T;
+        if (fused) {
+            stage_k_src = ggml_view_3d(ctx, Kcur_T,
+                head_dim, n_staged, n_head_kv,
+                Kcur_T->nb[1], Kcur_T->nb[2], 0);
+            stage_v_src = ggml_view_3d(ctx, Vcur_T,
+                head_dim, n_staged, n_head_kv,
+                Vcur_T->nb[1], Vcur_T->nb[2], 0);
+        }
         ggml_tensor * legacy_k = paged_prefill ? staging_k : cache_k;
         ggml_tensor * legacy_v = paged_prefill ? staging_v : cache_v;
         ggml_tensor * k_slot = ggml_view_3d(ctx, legacy_k,
-            head_dim, n_tokens, n_head_kv,
+            head_dim, n_staged, n_head_kv,
             legacy_k->nb[1], legacy_k->nb[2],
             /*offset*/ legacy_k->nb[1] * kv_start);
         ggml_tensor * v_slot = ggml_view_3d(ctx, legacy_v,
-            head_dim, n_tokens, n_head_kv,
+            head_dim, n_staged, n_head_kv,
             legacy_v->nb[1], legacy_v->nb[2],
             legacy_v->nb[1] * kv_start);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, stage_k_src, k_slot));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, stage_v_src, v_slot));
     }
 
     // ── Flash attention over the valid slice
@@ -889,32 +921,80 @@ static ggml_tensor * build_full_attn_block(
     const bool  step_invariant = (kv_write_rows != nullptr) && !paged_prefill;
     const int fattn_stride  = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0 ||
                                step_invariant) ? 256 : 1;
-    // Round a KV span up to the FA stride; `clamp` bounds it to the physical
-    // cache rows (max_ctx may not be 256-aligned).
-    const auto padded_kv_len = [&](int len, bool clamp) {
-        const int padded = ((len + fattn_stride - 1) / fattn_stride) * fattn_stride;
-        return clamp ? std::min(padded, (int)cache_k->ne[1]) : padded;
+    // Round a KV span up to the FA stride.
+    const auto padded_kv_len = [&](int len) {
+        return ((len + fattn_stride - 1) / fattn_stride) * fattn_stride;
     };
 
-    ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);
+    ggml_tensor * Qperm = ggml_permute(ctx, Q, 0, 2, 1, 3);
     // When K is rotated (TQ3_0 or explicit FWHT), Q needs forward rotation too.
     const bool q_rotate   = (kv_k_type == GGML_TYPE_TQ3_0) || kv_k_rotated;
     const bool out_rotate = (kv_v_type == GGML_TYPE_TQ3_0);
+    // A token-axis slice of Qperm, rotated/cont'd for the attention ops.
     // turbo_wht handles strided input, so when rotating we skip the separate
-    // ggml_cont — the rotation kernel makes the output contiguous.
-    if (q_rotate) {
-        Qfa = ggml_turbo_wht(ctx, Qfa, 0);
-    } else {
-        Qfa = ggml_cont(ctx, Qfa);
-    }
-    // Post-rotation Q matches the basis of the K rows in the cache, so a
-    // cosine between this Q and pooled cache keys equals the unrotated
-    // cosine (orthogonal transform).
-    if (q_fa_out) *q_fa_out = Qfa;
+    // ggml_cont — the rotation kernel makes the output contiguous. Fused mode
+    // conts each segment on its own: a slice of one whole-batch cont would
+    // stay strided on the token axis.
+    auto q_segment = [&](int off, int len) {
+        ggml_tensor * q = (off == 0 && len == n_tokens)
+            ? Qperm
+            : ggml_view_3d(ctx, Qperm, head_dim, len, n_head,
+                           Qperm->nb[1], Qperm->nb[2],
+                           (size_t)off * Qperm->nb[1]);
+        return q_rotate ? ggml_turbo_wht(ctx, q, 0) : ggml_cont(ctx, q);
+    };
 
     const float kq_scale = 1.0f / std::sqrt((float)head_dim);
+    auto paged_decode = [&](ggml_tensor * q, int launch_kv_len,
+                            bool dense_token_layout) {
+        const int padded = ((std::max(1, launch_kv_len) + 255) / 256) * 256;
+        const int launch_len = std::min(padded, (int)cache_k->ne[1]);
+        ggml_tensor * out = ggml_paged_attn_ext(
+            ctx, q, cache_k, cache_v, paged_block_table,
+            paged_kv_seq_lens, active_slot_ids, kq_scale,
+            PAGED_BLOCK_SIZE, launch_len);
+        if (dense_token_layout) {
+            out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
+        }
+        return out;
+    };
+
     ggml_tensor * attn = nullptr;
-    if (paged_block_table) {
+    if (fused) {
+        // ── Fused prefill+decode: two attention cores over disjoint token
+        // segments, each in its already-proven configuration. The prefill
+        // rows read this sequence's contiguous staging copy (masked,
+        // stride-1 — identical numerics to the pure prefill chunk); the
+        // decode rows read the pool through the block table (mask-less,
+        // per-slot lens). The prefilling slot's lens entry is 0 until
+        // commit, so the decode side never sees the partial sequence.
+        const int n_decode = n_tokens - n_fused_prefill;
+        ggml_tensor * Qfa_p = q_segment(0, n_fused_prefill);
+        const int p_win = std::min(kv_start + n_fused_prefill,
+                                   (int)staging_k->ne[1]);
+        ggml_tensor * Kfa = ggml_view_3d(ctx, staging_k,
+            head_dim, p_win, n_head_kv,
+            staging_k->nb[1], staging_k->nb[2], 0);
+        ggml_tensor * Vfa = ggml_view_3d(ctx, staging_v,
+            head_dim, p_win, n_head_kv,
+            staging_v->nb[1], staging_v->nb[2], 0);
+        ggml_tensor * attn_p = ggml_flash_attn_ext(ctx, Qfa_p, Kfa, Vfa,
+                                                   attn_mask, kq_scale,
+                                                   0.0f, 0.0f);
+
+        ggml_tensor * Qfa_d = q_segment(n_fused_prefill, n_decode);
+        const int launch_kv_len = paged_max_kv_len > 0 ? paged_max_kv_len : 1;
+        GGML_ASSERT(active_slot_ids);
+        // Join paged [D,n_seq,Hq] to dense [D,Hq,tokens].
+        ggml_tensor * attn_d = paged_decode(
+            Qfa_d, launch_kv_len, /*dense_token_layout=*/true);
+        attn = ggml_concat(ctx, attn_p, attn_d, 2);
+    } else if (paged_block_table) {
+        ggml_tensor * Qfa = q_segment(0, n_tokens);
+        // Post-rotation Q matches the basis of the K rows in the cache, so a
+        // cosine between this Q and pooled cache keys equals the unrotated
+        // cosine (orthogonal transform).
+        if (q_fa_out) *q_fa_out = Qfa;
         GGML_ASSERT(paged_kv_seq_lens);
         // The launch bound lands in op_params, and the ggml-cuda graph cache
         // memcmps the whole ggml_tensor: a live kv_len here would differ on
@@ -928,20 +1008,10 @@ static ggml_tensor * build_full_attn_block(
         // the launch bound must cover the longest live slot instead. Clamped
         // because ggml_paged_attn asserts max_kv_seq_len <= k->ne[1].
         const int launch_kv_len = paged_max_kv_len > 0 ? paged_max_kv_len : kv_len;
-        const int paged_launch_len = padded_kv_len(launch_kv_len, /*clamp=*/true);
-        attn = ggml_paged_attn_ext(
-            ctx, Qfa, cache_k, cache_v, paged_block_table,
-            paged_kv_seq_lens, active_slot_ids, kq_scale,
-            PAGED_BLOCK_SIZE, paged_launch_len);
-        if (active_slot_ids) {
-            // Paged output is [D, n_seq, Hq]; the dense layout the reshape
-            // below expects is [D, Hq, n_tokens]. One query per sequence in
-            // batched decode makes n_seq the token axis — permute it back.
-            if (n_tokens > 1) {
-                attn = ggml_cont(
-                    ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
-            }
-        } else {
+        attn = paged_decode(
+            Qfa, launch_kv_len,
+            /*dense_token_layout=*/active_slot_ids && n_tokens > 1);
+        if (!active_slot_ids) {
             // The only non-mapped paged caller is classic single-token AR.
             GGML_ASSERT(n_tokens == 1);
         }
@@ -959,7 +1029,7 @@ static ggml_tensor * build_full_attn_block(
         // pool would attend foreign K/V.
         ggml_tensor * read_k = paged_prefill ? staging_k : cache_k;
         ggml_tensor * read_v = paged_prefill ? staging_v : cache_v;
-        int win_len_padded = padded_kv_len(win_len, /*clamp=*/false);
+        int win_len_padded = padded_kv_len(win_len);
         if (step_invariant || paged_prefill) {
             // Never view past the read tensor (its rows may not be 256-aligned).
             win_len_padded = std::min(win_len_padded, (int)read_k->ne[1]);
@@ -973,6 +1043,8 @@ static ggml_tensor * build_full_attn_block(
             head_dim, win_len_padded, n_head_kv,
             read_v->nb[1], read_v->nb[2], read_v->nb[1] * win_start);
 
+        ggml_tensor * Qfa = q_segment(0, n_tokens);
+        if (q_fa_out) *q_fa_out = Qfa;
         // A single query needs no causal mask. Multi-token callers supply one.
         attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
                                    kq_scale, 0.0f, 0.0f);
@@ -1022,65 +1094,132 @@ static ggml_tensor * build_delta_net_block(
     // Supported shapes are one sequence with any number of timesteps
     // (prefill/verify), or compact decode with one timestep per mapped row.
     int n_seqs = 1,
+    // Fused prefill+decode: the first n_fused_prefill tokens are ONE
+    // sequence's prefill chunk running against the staging state slabs;
+    // the remaining n_seqs tokens are the batched one-token-per-slot decode
+    // against the full state tensors. The projections and the output
+    // projection stay whole-batch (each weight read once); only the
+    // conv/recurrence core splits into two already-proven configurations.
+    int n_fused_prefill = 0,
+    ggml_tensor * prefill_conv_state = nullptr,
+    ggml_tensor * prefill_ssm_state = nullptr,
     ggml_tensor * active_slot_ids = nullptr,
-    ggml_tensor * state_slot_ids = nullptr
+    ggml_tensor * state_slot_ids = nullptr,
+    bool allow_inplace_state = false
 ) {
     const int head_k_dim   = w.ssm_d_state;
     const int num_k_heads  = w.ssm_n_group;
     const int num_v_heads  = w.ssm_dt_rank;
     const int head_v_dim   = w.ssm_d_inner / w.ssm_dt_rank;
     const int conv_channels = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
+    const bool fused = n_fused_prefill > 0;
     GGML_ASSERT(n_seqs >= 1);
+    GGML_ASSERT(!fused || (prefill_conv_state && prefill_ssm_state &&
+                           active_slot_ids &&
+                           n_fused_prefill + n_seqs == n_tokens));
     GGML_ASSERT((active_slot_ids == nullptr) == (state_slot_ids == nullptr));
-    if (active_slot_ids) {
-        GGML_ASSERT(!cap && !parent_ids && n_tokens == n_seqs);
-    } else {
-        GGML_ASSERT(n_seqs == 1);
+    GGML_ASSERT(!active_slot_ids ||
+                (!cap && !parent_ids && n_fused_prefill + n_seqs == n_tokens));
+    if (!fused) {
+        if (active_slot_ids) {
+            GGML_ASSERT(n_tokens == n_seqs);
+        } else {
+            GGML_ASSERT(n_seqs == 1);
+        }
     }
-    // There is deliberately no general [timesteps x sequences] mode here:
-    // callers are either one multi-token sequence, or compact decode with
-    // exactly one token per mapped sequence.
-    const int n_seq_tokens = active_slot_ids ? 1 : n_tokens;
     const bool can_skip_gdn_intermediate = skip_gdn_intermediate && !parent_ids && !cap;
 
-    // ── qkv_mixed = wqkv @ cur         [10240, n_tokens]
-    ggml_tensor * qkv_mixed = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv, cur), L.wqkv_s);
-    qkv_mixed = ggml_reshape_3d(ctx, qkv_mixed, conv_channels, n_seq_tokens, n_seqs);
+    // ── Whole-batch projections ─────────────────────────────────────
+    // qkv_mixed = wqkv @ cur           [10240, n_tokens]
+    ggml_tensor * qkv_2d = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv, cur), L.wqkv_s);
 
-    // ── z = wqkv_gate @ cur            [inner, n_tokens]
+    // z = wqkv_gate @ cur              [inner, n_tokens]
     ggml_tensor * z = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv_gate, cur), L.wqkv_gate_s);
 
-    // ── beta = ssm_beta @ cur          [dt_rank, n_tokens]
-    ggml_tensor * beta = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_beta, cur), L.ssm_beta_s);
-    beta = ggml_reshape_4d(ctx, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
-    beta = ggml_sigmoid(ctx, beta);
+    // beta = sigmoid(ssm_beta @ cur)   [dt_rank, n_tokens]
+    ggml_tensor * beta_2d = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_beta, cur), L.ssm_beta_s);
+    beta_2d = ggml_sigmoid(ctx, beta_2d);
 
-    // ── alpha = ssm_alpha @ cur        [dt_rank, n_tokens]
-    //    alpha = alpha + ssm_dt_bias          (per-head bias)
-    //    alpha = softplus(alpha)
-    //    g     = alpha * ssm_a                (-A_log.exp() * softplus)
+    // alpha = ssm_alpha @ cur          [dt_rank, n_tokens]
+    // g     = softplus(alpha + ssm_dt_bias) * ssm_a   (-A_log.exp() * softplus)
     ggml_tensor * alpha = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_alpha, cur), L.ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx, alpha, num_v_heads, n_seq_tokens, n_seqs);
     alpha = ggml_add(ctx, alpha, L.ssm_dt_bias);
     alpha = ggml_softplus(ctx, alpha);
-    ggml_tensor * g_tensor = ggml_mul(ctx, alpha, L.ssm_a);
-    g_tensor = ggml_reshape_4d(ctx, g_tensor, 1, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * g_2d = ggml_mul(ctx, alpha, L.ssm_a);
+
+    // ── Token-axis segments: one for the classic modes, two when fused ──
+    struct DeltaSeg {
+        int off;                  // first token of the segment
+        int T;                    // timesteps per sequence
+        int S;                    // sequences
+        ggml_tensor * conv_st;
+        ggml_tensor * ssm_st;
+    };
+    DeltaSeg segs[2];
+    int n_segs = 0;
+    if (fused) {
+        segs[n_segs++] = {0, n_fused_prefill, 1,
+                          prefill_conv_state, prefill_ssm_state};
+        segs[n_segs++] = {n_fused_prefill, 1, n_seqs, conv_state, ssm_state};
+    } else {
+        // No general [timesteps x sequences] mode: this is either one
+        // multi-token sequence or one compact token per mapped sequence.
+        const int timesteps = active_slot_ids ? 1 : n_tokens;
+        segs[n_segs++] = {0, timesteps, n_seqs, conv_state, ssm_state};
+    }
+
+    // Column slice of a [C, n_tokens] projection; the tensor itself when the
+    // segment spans the whole batch, so single-segment graphs keep today's
+    // topology exactly.
+    auto seg_cols = [&](ggml_tensor * t, int off, int n) -> ggml_tensor * {
+        if (off == 0 && n == (int)t->ne[1]) return t;
+        return ggml_view_2d(ctx, t, t->ne[0], n, t->nb[1],
+                            (size_t)off * t->nb[1]);
+    };
+
+    ggml_tensor * flat[2] = {nullptr, nullptr};
+    for (int si = 0; si < n_segs; si++) {
+    const DeltaSeg & seg = segs[si];
+    const int n_seq_tokens = seg.T;
+    const int seg_seqs     = seg.S;
+    const int seg_tokens   = seg.T * seg.S;
+    const bool seg_active = active_slot_ids &&
+        ((!fused && si == 0) || (fused && si == 1));
+    // Plain one-token decode has no in-graph consumer of the updated state:
+    // the next graph evaluation is the first read. Write the final state
+    // directly into its persistent slab and avoid materializing/copying a
+    // second S_v x S_v x H_v state. The active-aware path also updates each
+    // mapped physical slab directly; only its negative bucket-padding rows
+    // use the result tensor's retained scratch state region.
+    const bool inplace_state = seg_active ||
+        (allow_inplace_state && can_skip_gdn_intermediate &&
+         !fused && n_seq_tokens == 1);
+
+    ggml_tensor * qkv_mixed = ggml_reshape_3d(ctx,
+        seg_cols(qkv_2d, seg.off, seg_tokens),
+        conv_channels, n_seq_tokens, seg_seqs);
+    ggml_tensor * beta = ggml_reshape_4d(ctx,
+        seg_cols(beta_2d, seg.off, seg_tokens),
+        1, num_v_heads, n_seq_tokens, seg_seqs);
+    ggml_tensor * g_tensor = ggml_reshape_4d(ctx,
+        seg_cols(g_2d, seg.off, seg_tokens),
+        1, num_v_heads, n_seq_tokens, seg_seqs);
 
     // ── Fetch conv state [kernel-1, conv_channels] and prepend to qkv_mixed
     //    along the token axis to form the convolution input.
     ggml_tensor * conv_states_r = nullptr;
-    if (active_slot_ids) {
+    if (seg_active) {
         const int64_t slab =
             (int64_t)(w.ssm_d_conv - 1) * conv_channels;
         ggml_tensor * all_conv = ggml_reshape_2d(
-            ctx, conv_state, slab, conv_state->ne[2]);
+            ctx, seg.conv_st, slab, seg.conv_st->ne[2]);
         ggml_tensor * gathered =
             ggml_get_rows(ctx, all_conv, state_slot_ids);
         conv_states_r = ggml_reshape_3d(
-            ctx, gathered, w.ssm_d_conv - 1, conv_channels, n_seqs);
+            ctx, gathered, w.ssm_d_conv - 1, conv_channels, seg_seqs);
     } else {
-        conv_states_r = ggml_reshape_3d(ctx, conv_state,
-            w.ssm_d_conv - 1, conv_channels, n_seqs);
+        conv_states_r = ggml_reshape_3d(ctx, seg.conv_st,
+            w.ssm_d_conv - 1, conv_channels, seg_seqs);
     }
 
     // qkv_mixed currently is [conv_channels, n_tokens, n_seqs]; we need
@@ -1115,23 +1254,23 @@ static ggml_tensor * build_delta_net_block(
         ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, dst));
     }
 
-    // ── Save the last (kernel-1) steps back to conv_state
+    // ── Save the last (kernel-1) steps back to the conv state
     ggml_tensor * last_conv = ggml_view_3d(ctx, conv_input,
-        w.ssm_d_conv - 1, conv_channels, n_seqs,
+        w.ssm_d_conv - 1, conv_channels, seg_seqs,
         conv_input->nb[1], conv_input->nb[2],
         (conv_input->ne[0] - (w.ssm_d_conv - 1)) * ggml_element_size(conv_input));
-    if (active_slot_ids) {
+    if (seg_active) {
         const int64_t slab =
             (int64_t)(w.ssm_d_conv - 1) * conv_channels;
         ggml_tensor * compact_last = ggml_reshape_2d(
-            ctx, ggml_cont(ctx, last_conv), slab, n_seqs);
+            ctx, ggml_cont(ctx, last_conv), slab, seg_seqs);
         ggml_tensor * all_conv = ggml_reshape_2d(
-            ctx, conv_state, slab, conv_state->ne[2]);
+            ctx, seg.conv_st, slab, seg.conv_st->ne[2]);
         ggml_build_forward_expand(
             gf, ggml_set_rows_masked(
                     ctx, all_conv, compact_last, active_slot_ids));
     } else {
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, last_conv, conv_state));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, last_conv, seg.conv_st));
     }
 
     // ── 1D conv + silu
@@ -1153,19 +1292,19 @@ static ggml_tensor * build_delta_net_block(
     const size_t row_size = conv_channels * elt;
 
     ggml_tensor * q_c = ggml_view_4d(ctx, conv_out,
-        head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+        head_k_dim, num_k_heads, n_seq_tokens, seg_seqs,
         head_k_dim * elt,
         row_size,
         row_size * n_seq_tokens,
         q_offset * elt);
     ggml_tensor * k_c = ggml_view_4d(ctx, conv_out,
-        head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+        head_k_dim, num_k_heads, n_seq_tokens, seg_seqs,
         head_k_dim * elt,
         row_size,
         row_size * n_seq_tokens,
         k_offset * elt);
     ggml_tensor * v_c = ggml_view_4d(ctx, conv_out,
-        head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+        head_v_dim, num_v_heads, n_seq_tokens, seg_seqs,
         head_v_dim * elt,
         row_size,
         row_size * n_seq_tokens,
@@ -1178,15 +1317,15 @@ static ggml_tensor * build_delta_net_block(
     // Repeat Q and K from num_k_heads to num_v_heads so they match V's layout
     // (only needed if not using the fused op's broadcast support).
     if (num_k_heads != num_v_heads) {
-        q_c = ggml_repeat_4d(ctx, q_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-        k_c = ggml_repeat_4d(ctx, k_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+        q_c = ggml_repeat_4d(ctx, q_c, head_k_dim, num_v_heads, n_seq_tokens, seg_seqs);
+        k_c = ggml_repeat_4d(ctx, k_c, head_k_dim, num_v_heads, n_seq_tokens, seg_seqs);
     }
 
     // ── SSM state (recurrent): reshape to [S_v, S_v, H_v, n_seqs]
-    ggml_tensor * s = active_slot_ids
-        ? ssm_state
-        : ggml_reshape_4d(ctx, ssm_state,
-            head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    ggml_tensor * s = seg_active
+        ? seg.ssm_st
+        : ggml_reshape_4d(ctx, seg.ssm_st,
+            head_v_dim, head_v_dim, num_v_heads, seg_seqs);
 
     // ── Fused Gated DeltaNet op — returns packed (output | new_state [| intermediates]).
     //    In tree mode, the kernel uses parent_ids to reload state at DFS
@@ -1229,17 +1368,17 @@ static ggml_tensor * build_delta_net_block(
     }
 
     ggml_tensor * output = nullptr;
-    ggml_tensor * new_state = nullptr;
 
     if (use_chunked) {
         auto r = build_delta_net_chunked(ctx, q_c, k_c, v_c, g_tensor, beta, s);
-        output    = r.output;
-        new_state = r.new_state;
-        goto after_delta_net;
-    }
-
+        output = r.output;
+        // The chunked path writes into the same state slot via its 4D view
+        // `s` (a live view over the state tensor), using the same cpy
+        // pattern the sequential path uses for `new_state`.
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, r.new_state, s));
+    } else {
     ggml_tensor * result;
-    if (active_slot_ids) {
+    if (seg_active) {
         result = ggml_gated_delta_net_active_inplace(
             ctx, q_c, k_c, v_c, g_tensor, beta, s, active_slot_ids);
     } else if (parent_ids) {
@@ -1253,7 +1392,9 @@ static ggml_tensor * build_delta_net_block(
         // cache buffer — same mechanism as _tree_persist, but without tree
         // parent_ids. Avoids the legacy result-region cpy (and the OOB it
         // could cause if the result tensor has no embedded intermediate region).
-        result = ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        result = inplace_state
+            ? ggml_gated_delta_net_inplace(ctx, q_c, k_c, v_c, g_tensor, beta, s)
+            : ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
         if (persist_inter) {
             result->src[7] = persist_inter;
         }
@@ -1263,27 +1404,26 @@ static ggml_tensor * build_delta_net_block(
     }
 
     // Slice output and new_state out of the packed result
-    {
     const int64_t S_v = head_v_dim;
     const int64_t H_v = num_v_heads;
     const size_t r_elt = ggml_element_size(result);
     output = ggml_view_4d(ctx, result,
-        S_v, H_v, n_seq_tokens, n_seqs,
+        S_v, H_v, n_seq_tokens, seg_seqs,
         S_v * r_elt,
         S_v * H_v * r_elt,
         S_v * H_v * n_seq_tokens * r_elt,
         0);
-    if (!active_slot_ids) {
-        new_state = ggml_view_4d(ctx, result,
-            S_v, S_v, H_v, n_seqs,
+    if (!inplace_state) {
+        ggml_tensor * new_state = ggml_view_4d(ctx, result,
+            S_v, S_v, H_v, seg_seqs,
             S_v * r_elt,
             S_v * S_v * r_elt,
             S_v * S_v * H_v * r_elt,
-            S_v * H_v * n_seq_tokens * n_seqs * r_elt);
+            S_v * H_v * n_seq_tokens * seg_seqs * r_elt);
 
-        // Persist new_state back to cache. Compact decode writes physical
-        // slabs in-place inside the active-aware GDN kernel.
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, ssm_state));
+        // Persist new_state back to cache. Both compact active decode and the
+        // plain in-place AR path write state from the GDN kernel directly.
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, seg.ssm_st));
     }
 
     // Expose per-step intermediate states for spec-decode rollback. The patched
@@ -1311,35 +1451,27 @@ static ggml_tensor * build_delta_net_block(
             "(got type %d); use F16 intermediates (the default) or the tree-verify path.",
             (int)cap->ssm_intermediate_states->type);
     }
-    } // end of block started at `{` before `const int64_t S_v = head_v_dim;`
-
-after_delta_net:
-    // Chunked path writes directly into the same ssm_state slot via its 4D
-    // view `s` (which is a live view over ssm_state), using the same cpy
-    // pattern the sequential path uses for `new_state`. Sequential path's
-    // cpy was already emitted above; guard this second cpy on use_chunked
-    // so we don't double-write.
-    if (use_chunked) {
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, s));
     }
 
     // ── Gated output norm: rms_norm(output) * silu(z_4d)
-    ggml_tensor * z_4d = ggml_reshape_4d(ctx, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * z_4d = ggml_reshape_4d(ctx,
+        seg_cols(z, seg.off, seg_tokens),
+        head_v_dim, num_v_heads, n_seq_tokens, seg_seqs);
     ggml_tensor * output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
     output_n = ggml_mul(ctx, output_n, L.ssm_norm);
     ggml_tensor * z_silu  = ggml_silu(ctx, z_4d);
     output_n = ggml_mul(ctx, output_n, z_silu);
 
-    // Flatten the sequence axis into the token axis before the projection.
-    // Keeping this 3D makes quantized backends dispatch one MMVQ per sequence,
-    // rereading the large output weight for every slot. The 2D shape selects
-    // one whole-batch MMQ/GEMM while preserving the same contiguous layout.
-    ggml_tensor * flat = ggml_reshape_2d(ctx, output_n,
-        head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
+    // Reshape to [d_inner, seg_tokens]
+    flat[si] = ggml_reshape_2d(ctx, output_n,
+        head_v_dim * num_v_heads, seg_tokens);
+    }  // segment loop
 
-    // Output projection
-    ggml_tensor * out = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_out, flat), L.ssm_out_s);
-    out = ggml_reshape_2d(ctx, out, w.n_embd, n_seq_tokens * n_seqs);
+    // ── Output projection over the whole batch (one weight read)
+    ggml_tensor * flat_all = (n_segs == 1)
+        ? flat[0] : ggml_concat(ctx, flat[0], flat[1], 1);
+    ggml_tensor * out = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_out, flat_all), L.ssm_out_s);
+    out = ggml_reshape_2d(ctx, out, w.n_embd, n_tokens);
     return out;
 }
 
@@ -1528,7 +1660,8 @@ QwenGraphOutputs build_qwen35_graph(
                                         use_staging ? cache.staging_k[fa_idx] : nullptr,
                                         use_staging ? cache.staging_v[fa_idx] : nullptr,
                                         in.paged_max_kv_len,
-                                        in.active_slot_ids);
+                                        in.active_slot_ids,
+                                        in.n_prefill_tokens);
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
                 // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx
@@ -1559,10 +1692,28 @@ QwenGraphOutputs build_qwen35_graph(
             }
             ggml_tensor * conv_st = cache.conv_state[dn_idx];
             ggml_tensor * ssm_st  = cache.ssm_state[dn_idx];
-            if (cache.n_seq_slots > 1 && in.n_seqs == 1 &&
-                !in.active_slot_ids) {
-                // Single-sequence forward (prefill) against a multi-slot
-                // cache: this slot's contiguous slab of the state tensors.
+            ggml_tensor * pf_conv = nullptr;
+            ggml_tensor * pf_ssm  = nullptr;
+            if (in.n_prefill_tokens > 0) {
+                // Fused prefill+decode: the decode segment runs on the full
+                // state tensors; the prefill segment carries its state in
+                // the staging slabs (committed to the slot on prefill_commit).
+                pf_conv = cache.staging_conv_state[dn_idx];
+                pf_ssm  = cache.staging_ssm_state[dn_idx];
+            } else if (cache.n_seq_slots > 1 && in.n_seqs == 1 &&
+                       in.paged_prefill) {
+                // Pure prefill chunk against a multi-slot cache: run on the
+                // staging slabs, NOT the slot's own — slots are reused
+                // without a device-side state reset, so the slab may still
+                // hold a previous occupant's state, while staging is zeroed
+                // at admission. The final chunk (prefill_commit) copies
+                // staging into the slot's slabs.
+                conv_st = cache.staging_conv_state[dn_idx];
+                ssm_st  = cache.staging_ssm_state[dn_idx];
+            } else if (cache.n_seq_slots > 1 && in.n_seqs == 1 &&
+                       !in.active_slot_ids) {
+                // Single-sequence forward against a multi-slot cache: this
+                // slot's contiguous slab of the state tensors.
                 conv_st = ggml_view_3d(ctx, conv_st,
                     conv_st->ne[0], conv_st->ne[1], 1,
                     conv_st->nb[1], conv_st->nb[2],
@@ -1577,8 +1728,13 @@ QwenGraphOutputs build_qwen35_graph(
                                         n_tokens, cap_ptr, in.parent_ids,
                                         /*skip_gdn_intermediate=*/true,
                                         in.n_seqs,
+                                        in.n_prefill_tokens,
+                                        pf_conv, pf_ssm,
                                         in.active_slot_ids,
-                                        in.state_slot_ids);
+                                        in.state_slot_ids,
+                                        /*allow_inplace_state=*/
+                                            !in.paged_prefill &&
+                                            in.n_prefill_tokens == 0);
             dn_idx++;
         }
 
@@ -1649,17 +1805,44 @@ QwenGraphOutputs build_qwen35_graph(
         inpL = cur;
     }
 
+    // Prefill commit: copy the staging conv/ssm slabs into the admitted
+    // slot's slabs. Emitted AFTER every layer, so these nodes execute after
+    // the batched decode state write-back — the decode dummy-row garbage in
+    // the slot's slabs loses to the committed prefill state.
+    if (in.prefill_commit && cache.n_seq_slots > 1) {
+        for (size_t dn = 0; dn < cache.conv_state.size(); dn++) {
+            ggml_tensor * c_src = cache.staging_conv_state[dn];
+            ggml_tensor * s_src = cache.staging_ssm_state[dn];
+            ggml_tensor * c_full = cache.conv_state[dn];
+            ggml_tensor * s_full = cache.ssm_state[dn];
+            if (!c_src || !s_src || !c_full || !s_full) continue;
+            ggml_tensor * c_dst = ggml_view_3d(ctx, c_full,
+                c_full->ne[0], c_full->ne[1], 1,
+                c_full->nb[1], c_full->nb[2],
+                (size_t)in.seq_slot * c_full->nb[2]);
+            ggml_tensor * s_dst = ggml_view_4d(ctx, s_full,
+                s_full->ne[0], s_full->ne[1], s_full->ne[2], 1,
+                s_full->nb[1], s_full->nb[2], s_full->nb[3],
+                (size_t)in.seq_slot * s_full->nb[3]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, c_src, c_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, s_src, s_dst));
+        }
+    }
+
     // 2. Final norm
     ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
 
-    // 3. LM head — optionally only for the last token (prefill optimization:
-    //    reduces logits from [vocab, n_tokens] to [vocab, 1], saving ~233MB
-    //    scratch at ubatch=384 and eliminating a large matmul).
+    // 3. LM head — optionally only for a tail of the token axis (prefill
+    //    computes just the last row; fused steps compute the decode rows
+    //    plus, on the committing chunk, the prompt's last row. Saves the
+    //    [vocab, n_tokens] matmul and ~233MB scratch at ubatch=384).
     ggml_tensor * logits = nullptr;
     if (w.output) {
-        if (in.last_token_logits_only && n_tokens > 1) {
-            out = ggml_view_2d(ctx, out, hidden, 1, out->nb[1],
-                               (size_t)(n_tokens - 1) * out->nb[1]);
+        if (in.logits_tail_rows > 0 && in.logits_tail_rows < n_tokens) {
+            out = ggml_view_2d(ctx, out, hidden, in.logits_tail_rows,
+                               out->nb[1],
+                               (size_t)(n_tokens - in.logits_tail_rows) *
+                                   out->nb[1]);
         }
         logits = ggml_mul_mat(ctx, w.output, out);
         ggml_set_name(logits, "logits");
