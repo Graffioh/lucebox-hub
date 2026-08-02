@@ -90,41 +90,61 @@ static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
 #endif
 }
 
-static bool ds4_inprocess_moe_tp_enabled() {
-    return env_flag_enabled("DFLASH_DS4_MOE_TP_INPROC");
-}
+struct Ds4MoeTpConfig {
+    bool requested = false;
+    bool in_process = false;
+    bool backend_valid = true;
+    PlacementBackend secondary_backend = PlacementBackend::Auto;
+    int secondary_gpu = 0;
+    bool all_on_secondary = false;
+    bool concentrate_secondary = false;
+    bool profile_hot_on_secondary = false;
+};
 
-static bool ds4_moe_tp_backend(PlacementBackend & out) {
+static Ds4MoeTpConfig ds4_moe_tp_config(int local_gpu) {
+    Ds4MoeTpConfig result;
+    result.requested = env_flag_enabled("DFLASH_DS4_MOE_TP");
+    result.in_process = result.requested &&
+        env_flag_enabled("DFLASH_DS4_MOE_TP_INPROC");
+    result.all_on_secondary = result.requested &&
+        env_flag_enabled("DFLASH_DS4_MOE_TP_ALL_COLD");
+    result.concentrate_secondary = result.requested &&
+        env_flag_enabled("DFLASH_DS4_MOE_TP_CONCENTRATE_COLD");
+    result.profile_hot_on_secondary = result.in_process &&
+        env_flag_enabled("DFLASH_DS4_MOE_TP_PEER_HOT");
+
     const char * raw = std::getenv("DFLASH_DS4_MOE_TP_BACKEND");
     if (!raw || !*raw) raw = std::getenv("DFLASH_MOE_TP_BACKEND");
     if (!raw || !*raw) {
 #if defined(DFLASH27B_BACKEND_MIXED)
-        out = compiled_placement_backend() == PlacementBackend::Cuda
+        result.secondary_backend =
+            compiled_placement_backend() == PlacementBackend::Cuda
             ? PlacementBackend::Hip : PlacementBackend::Cuda;
 #else
-        out = compiled_placement_backend();
+        result.secondary_backend = compiled_placement_backend();
 #endif
-        return true;
+    } else {
+        result.backend_valid = parse_placement_backend(
+            raw, result.secondary_backend) &&
+            result.secondary_backend != PlacementBackend::Auto;
     }
-    return parse_placement_backend(raw, out) && out != PlacementBackend::Auto;
-}
 
-static int ds4_moe_tp_gpu(int local_gpu) {
-    const char * raw = std::getenv("DFLASH_DS4_MOE_TP_GPU");
-    if (!raw || !*raw) {
-        raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU");
+    const char * gpu_raw = std::getenv("DFLASH_DS4_MOE_TP_GPU");
+    if (!gpu_raw || !*gpu_raw) {
+        gpu_raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU");
     }
-    if (raw && *raw) return std::max(0, std::atoi(raw));
-
-    PlacementBackend expert_backend = PlacementBackend::Auto;
-    if (ds4_moe_tp_backend(expert_backend) &&
-        expert_backend != compiled_placement_backend()) {
+    if (gpu_raw && *gpu_raw) {
+        result.secondary_gpu = std::max(0, std::atoi(gpu_raw));
+    } else if (result.backend_valid &&
+               result.secondary_backend != compiled_placement_backend()) {
         // CUDA and HIP have independent device namespaces. The first device
         // in the peer runtime is therefore backend:0 even when the target is
         // also device zero in its own runtime.
-        return 0;
+        result.secondary_gpu = 0;
+    } else {
+        result.secondary_gpu = local_gpu == 0 ? 1 : 0;
     }
-    return local_gpu == 0 ? 1 : 0;
+    return result;
 }
 
 static bool ds4_draft_backend(PlacementBackend & out) {
@@ -383,7 +403,7 @@ static int fill_concentrated_cold_placement(const DeepSeek4Weights & w,
 static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
                                         int hot_per_layer,
                                         const char * profile_path,
-                                        bool hottest_on_peer,
+                                        bool profile_hot_on_secondary,
                                         MoeHybridPlacement & out,
                                         std::string * err) {
     MoeHybridRoutingStats stats;
@@ -406,7 +426,7 @@ static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
     out.total_hot = hot_per_layer * w.n_layer;
     for (int il = 0; il < w.n_layer; ++il) {
         auto & ids = out.hot_expert_ids[(size_t)il];
-        if (!hottest_on_peer) {
+        if (!profile_hot_on_secondary) {
             std::vector<int> ranked = stats.hot_experts(il, hot_per_layer);
             ids.assign(ranked.begin(), ranked.end());
             continue;
@@ -448,7 +468,7 @@ static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
 // but distribute those slots across layers to minimize the predicted owner
 // critical path.  Uniform expert counts are a poor fit for heterogeneous EP:
 // routing skew varies substantially by layer, while every layer joins on the
-// slower of its R9700 hot/shared and Strix cold branches.
+// slower of its primary/shared and secondary expert branches.
 //
 // The cost model intentionally uses measured bandwidth rather than advertised
 // peak bandwidth.  It is only an allocation objective; actual placement still
@@ -580,7 +600,7 @@ bool DeepSeek4Backend::load_model() {
 
     // Fused decode and layer-major prefill normally require monolithic expert
     // residency. Heterogeneous TP is the exception: its fused graph owns the
-    // routed experts across two HIP backends, so forcing a full load would
+    // routed experts across two local GPU backends, so forcing a full load would
     // disable the requested split before the TP runtime can initialize.
     const bool force_full = env_flag_enabled("DFLASH_DS4_FORCE_FULL_LOAD");
     const bool heterogeneous_tp = env_flag_enabled("DFLASH_DS4_MOE_TP");
@@ -849,7 +869,8 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
         return false;
     }
 
-    if (ds4_inprocess_moe_tp_enabled()) {
+    const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
+    if (tp.in_process) {
         if (!expert_backend_ || !moe_hybrid_->materialized_cold_experts ||
             moe_hybrid_->cold_backend != expert_backend_) {
             std::fprintf(stderr,
@@ -857,17 +878,16 @@ bool DeepSeek4Backend::init_moe_tensor_parallel() {
             return false;
         }
         expert_runtime_.reset();
-        PlacementBackend expert_kind = PlacementBackend::Auto;
-        (void) ds4_moe_tp_backend(expert_kind);
         const PlacementBackend local_kind =
             cfg_.device.backend == PlacementBackend::Auto
                 ? compiled_placement_backend() : cfg_.device.backend;
         std::fprintf(stderr,
                      "[deepseek4-moe-tp] enabled mode=in-process local=%s:%d "
-                     "expert=%s:%d local_experts=%d remote_experts=%d\n",
+                     "secondary=%s:%d primary_experts=%d "
+                     "secondary_experts=%d\n",
                      placement_backend_name(local_kind), cfg_.device.gpu,
-                     placement_backend_name(expert_kind),
-                     ds4_moe_tp_gpu(cfg_.device.gpu),
+                     placement_backend_name(tp.secondary_backend),
+                     tp.secondary_gpu,
                      moe_placement_.total_hot,
                      w_.n_layer * w_.n_expert - moe_placement_.total_hot);
         return true;
@@ -913,14 +933,14 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
         return false;
     }
 
-    const bool all_cold = env_flag_enabled("DFLASH_DS4_MOE_TP_ALL_COLD");
-    int hot_per_layer = all_cold ? 0 : budget.max_hot_per_layer;
-    if (all_cold) {
+    const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
+    int hot_per_layer = tp.all_on_secondary ? 0 : budget.max_hot_per_layer;
+    if (tp.all_on_secondary) {
         std::fprintf(stderr,
-                     "[deepseek4-moe-tp] all routed experts assigned to the cold backend\n");
+                     "[deepseek4-moe-tp] all routed experts assigned to the "
+                     "secondary backend\n");
     }
-    const bool concentrate_requested =
-        env_flag_enabled("DFLASH_DS4_MOE_TP_CONCENTRATE_COLD");
+    const bool concentrate_requested = tp.concentrate_secondary;
     bool concentrated = false;
     int retained_local = 0;
     const int requested_cold =
@@ -931,23 +951,24 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
         concentrated = true;
     } else if (concentrate_requested) {
         std::fprintf(stderr,
-                     "[deepseek4] concentrated cold placement needs at least "
+                     "[deepseek4] concentrated secondary placement needs at least "
                      "one complete layer; using uniform placement\n");
         fill_prefix_hot_placement(w, hot_per_layer, out);
     } else if (const char * profile_path = std::getenv("DFLASH_DS4_HOTNESS_CSV")) {
         if (*profile_path) {
-            const bool hottest_on_peer =
-                ds4_inprocess_moe_tp_enabled() &&
-                env_flag_enabled("DFLASH_DS4_MOE_TP_PEER_HOT");
+            const bool profile_hot_on_secondary =
+                tp.in_process && tp.profile_hot_on_secondary;
             if (!fill_profiled_hot_placement(
-                    w, hot_per_layer, profile_path, hottest_on_peer,
+                    w, hot_per_layer, profile_path,
+                    profile_hot_on_secondary,
                     out, err)) {
                 return false;
             }
             std::fprintf(stderr,
                          "[deepseek4] hybrid placement profile=%s%s\n",
                          profile_path,
-                         hottest_on_peer ? " hottest-owner=peer" : "");
+                         profile_hot_on_secondary
+                             ? " profile-hot-owner=secondary" : "");
         } else {
             fill_prefix_hot_placement(w, hot_per_layer, out);
         }
@@ -961,8 +982,8 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     }
     if (concentrated && placed_mem.hot_bytes > budget.expert_budget) {
         std::fprintf(stderr,
-                     "[deepseek4] concentrated cold placement exceeds the "
-                     "target expert budget; using uniform placement\n");
+                     "[deepseek4] concentrated secondary placement exceeds the "
+                     "primary expert budget; using uniform placement\n");
         fill_prefix_hot_placement(w, hot_per_layer, out);
         if (!compute_ds4_expert_memory_info(w, &out, placed_mem, err)) {
             return false;
@@ -974,9 +995,9 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
             w.n_expert > 0
                 ? (w.n_layer * w.n_expert - out.total_hot) / w.n_expert : 0;
         std::fprintf(stderr,
-                     "[deepseek4] concentrated cold placement: "
-                     "cross-owner layers=%d total_hot=%d total_cold=%d "
-                     "retained_local=%d\n",
+                     "[deepseek4] concentrated secondary placement: "
+                     "cross-owner layers=%d primary_experts=%d "
+                     "secondary_experts=%d retained_primary=%d\n",
                      cold_layers, out.total_hot,
                      w.n_layer * w.n_expert - out.total_hot,
                      retained_local);
@@ -1024,12 +1045,12 @@ bool DeepSeek4Backend::init_hybrid_model() {
 
     auto hybrid = std::make_shared<MoeHybridStorage>();
     MoeHybridConfig hybrid_cfg = make_ds4_parent_worker_cfg(w_);
-    const bool inprocess_tp =
-        env_flag_enabled("DFLASH_DS4_MOE_TP") && ds4_inprocess_moe_tp_enabled();
+    const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
+    const bool inprocess_tp = tp.requested && tp.in_process;
     if (inprocess_tp) {
-        const int expert_gpu = ds4_moe_tp_gpu(cfg_.device.gpu);
-        PlacementBackend expert_kind = PlacementBackend::Auto;
-        if (!ds4_moe_tp_backend(expert_kind)) {
+        const int expert_gpu = tp.secondary_gpu;
+        const PlacementBackend expert_kind = tp.secondary_backend;
+        if (!tp.backend_valid) {
             std::fprintf(stderr,
                          "[deepseek4-moe-tp] invalid DFLASH_DS4_MOE_TP_BACKEND; "
                          "expected cuda or hip\n");
@@ -1040,7 +1061,8 @@ bool DeepSeek4Backend::init_hybrid_model() {
                 ? compiled_placement_backend() : cfg_.device.backend;
         if (expert_kind == local_kind && expert_gpu == cfg_.device.gpu) {
             std::fprintf(stderr,
-                         "[deepseek4-moe-tp] in-process expert device must differ from local device\n");
+                         "[deepseek4-moe-tp] in-process secondary device must "
+                         "differ from the primary device\n");
             return false;
         }
         if (expert_kind == local_kind && g_peer_access_opt_in) {
@@ -1061,7 +1083,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
         if (!expert_backend_) {
             std::fprintf(stderr,
                          "[deepseek4-moe-tp] failed to initialize in-process "
-                         "expert %s:%d: %s\n",
+                         "secondary backend %s:%d: %s\n",
                          placement_backend_name(expert_kind), expert_gpu,
                          err.c_str());
             return false;

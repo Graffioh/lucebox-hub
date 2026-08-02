@@ -59,13 +59,12 @@ static ggml_backend_reg_t load_peer_registry(PlacementBackend backend,
     if (const char * explicit_path = std::getenv(path_variable)) {
         if (*explicit_path) candidates.emplace_back(explicit_path);
     }
-    const std::string exe_dir = executable_directory();
-    if (!exe_dir.empty()) {
-        candidates.emplace_back(fs::path(exe_dir) / module_name);
+    if (candidates.empty()) {
+        const std::string exe_dir = executable_directory();
+        if (!exe_dir.empty()) {
+            candidates.emplace_back(fs::path(exe_dir) / module_name);
+        }
     }
-    std::error_code cwd_error;
-    const fs::path cwd = fs::current_path(cwd_error);
-    if (!cwd_error) candidates.emplace_back(cwd / module_name);
 
     std::string attempted;
     for (const fs::path & candidate : candidates) {
@@ -93,7 +92,7 @@ static ggml_backend_reg_t load_peer_registry(PlacementBackend backend,
         if (!attempted.empty()) *error += " (tried " + attempted + ")";
         *error += "; set ";
         *error += path_variable;
-        *error += " to ";
+        *error += " to the full path of ";
         *error += module_name;
     }
     return nullptr;

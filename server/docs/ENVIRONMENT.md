@@ -30,15 +30,15 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_MOE_TP_BACKEND` / `DFLASH_MOE_TP_BACKEND` | peer runtime in a mixed build; compiled runtime otherwise | Select the in-process cold expert owner backend. |
 | `DFLASH_DS4_MOE_TP_GPU` | peer backend device 0 in a mixed build; other local device otherwise | Device index within the cold DeepSeek4 expert backend. |
 | `DFLASH_DS4_MOE_TP_CONCENTRATE_COLD` | unset | BURN-IN: use complete peer-owned expert layers to reduce cross-runtime joins; falls back when the placement would exceed the target budget. |
-| `DFLASH_DS4_MOE_TP_PEER_HOT` | unset | BURN-IN: with `DFLASH_DS4_HOTNESS_CSV`, reserve the profile's hottest experts for the in-process peer instead of the primary GPU. |
-| `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` | unset | BURN-IN: reduce each mixed-vendor owner's routed outputs locally before the exact final owner add. |
+| `DFLASH_DS4_MOE_TP_PEER_HOT` | unset | BURN-IN: with `DFLASH_DS4_HOTNESS_CSV`, reserve the profile's hottest experts for the secondary owner. |
+| `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` | unset | BURN-IN: reduce each mixed-vendor owner's routed outputs locally before the final owner add. This changes floating-point association and is not the byte-identity mode. |
 | `DFLASH_DS4_TP_SCHEDULE_BRANCHES` | unset | BURN-IN: expose independent mixed-vendor expert branches to the common multi-backend scheduler. |
 | `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` / `DFLASH_MOE_TP_TARGETED_JOIN_SPLIT` | unset | BURN-IN: start a main-GPU split only at each peer-result join, avoiding an extra peer fence per MoE layer. |
 | `DFLASH_DS4_COMP_PAD_STRIDE` | 16 | BURN-IN: compressed-KV padding bucket (`16`, `32`, `64`, or `128`); wider exact-masked buckets reduce verifier graph recapture churn. |
 | `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` | unset | DEBUG: restore the materialized output projection when diagnosing grouped-view copies across unlike runtimes. |
 | `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | compiled backend / target device | Select the in-process DSpark backend and device. |
-| `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | executable directory | Explicit peer module path for a mixed CUDA+HIP build. |
-| `GGML_CUDA_BATCH_PEER_COPIES` | unset | BURN-IN: batch unlike-runtime copies through per-backend pinned host arenas and wait once per source per split. |
+| `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | auto-discovered beside the executable | Explicit peer module file path for a mixed CUDA+HIP build. |
+| `GGML_BATCH_PEER_COPIES` | unset | BURN-IN: batch peer-runtime copies and unlike-runtime host staging with one source wait per split. `GGML_CUDA_BATCH_PEER_COPIES` remains a compatibility alias. |
 | `GGML_SCHED_PROFILE` / `GGML_SCHED_PROFILE_MIN_SPLITS` | unset / 1 | DEBUG: report scheduler splits, copy volume, submission time, and source/destination synchronization time. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `DFLASH_MOE_TP_*` / `DFLASH_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `DFLASH_DS4_*` names remain compatibility aliases. |

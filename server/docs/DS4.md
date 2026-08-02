@@ -149,8 +149,11 @@ export DFLASH_DS4_MOE_TP_INPROC=1
 export DFLASH_DS4_MOE_TP_BACKEND=cuda
 export DFLASH_DS4_MOE_TP_GPU=0       # cuda:0 (RTX 3090)
 export DFLASH_DS4_MOE_TP_CONCENTRATE_COLD=1
-# Tune from startup memory logs; 85000 produced four complete CUDA layers on
-# the qualified 128 GiB Strix Halo + 24 GiB RTX 3090 machine.
+export DFLASH_DS4_TP_SCHEDULE_BRANCHES=1
+export DFLASH_DS4_TP_TARGETED_JOIN_SPLIT=1
+export GGML_BATCH_PEER_COPIES=1
+# Start conservatively and tune from the startup placement and memory logs;
+# the usable budget depends on the model, placement policy, and free VRAM.
 export DFLASH_EXPERT_BUDGET_MB=85000
 export DFLASH_DS4_DRAFT=/path/to/dspark-draft.gguf
 export DFLASH_DS4_DRAFT_BACKEND=cuda
@@ -166,8 +169,10 @@ The peer module is normally found beside the executable. Set
 `DFLASH_CUDA_BACKEND_PATH` or `DFLASH_HIP_BACKEND_PATH` only when packaging it
 elsewhere. Sparse/approximate DeepSeek4 prefill remains restricted to a HIP
 target; CUDA-primary ROCmFP2 execution is not yet qualified. The mixed path is
-burn-in functionality and remains slower than the qualified single-Strix
-path on the tested machine.
+burn-in functionality. On the qualified 3090 + Strix machine, the tuned top-4
+performance profile held 48.1 tok/s median on the deterministic 128-token
+workload. The all-6-expert reference-exact mode is a correctness profile, not
+a throughput profile.
 
 ### Local single-shard
 
@@ -233,8 +238,8 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_DS4_MOE_TP_BACKEND` | Cold expert backend (`cuda` or `hip`); mixed builds default to the peer runtime. |
 | `DFLASH_DS4_MOE_TP_GPU` | Device index within the cold expert backend. |
 | `DFLASH_DS4_MOE_TP_CONCENTRATE_COLD` | Cross-vendor burn-in mode: place complete cold expert layers on the peer to reduce joins. |
-| `DFLASH_DS4_MOE_TP_PEER_HOT` | With a routing profile, place its hottest experts on the faster peer GPU. |
-| `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` | Reduce each owner's routed outputs locally before the final cross-vendor add. |
+| `DFLASH_DS4_MOE_TP_PEER_HOT` | With a routing profile, place its hottest experts on the secondary owner. |
+| `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` | Reduce each owner's routed outputs locally before the final cross-vendor add. This changes floating-point association and is not the byte-identity mode. |
 | `DFLASH_DS4_TP_SCHEDULE_BRANCHES` | Submit the two owner branches independently through the mixed scheduler. |
 | `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` | Gather the peer result at the join without an extra peer fence per layer. |
 | `DFLASH_DS4_COMP_PAD_STRIDE` | Exact compressed-KV padding bucket; wider buckets trade small masked work for fewer verifier graph captures. |
@@ -242,7 +247,7 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | Optional explicit peer backend module path. |
 | `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
-| `GGML_CUDA_BATCH_PEER_COPIES` | Batch unlike-runtime copies through pinned host staging with one source wait per split. |
+| `GGML_BATCH_PEER_COPIES` | Batch peer-runtime copies and unlike-runtime pinned-host staging with one source wait per split. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Long-prefill arena kill switch; set `0` to restore per-layer owner allocation. |
 
 `DFLASH_DS4_TIMING` enables the existing timing banners:
