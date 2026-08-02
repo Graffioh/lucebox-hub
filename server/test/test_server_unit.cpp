@@ -1847,6 +1847,28 @@ TEST_CASE(ServerUnitFixture, test_pflash_config_defaults) {
     TEST_ASSERT(cfg.draft_residency == DraftResidencyPolicy::Auto);
 }
 
+TEST_CASE(ServerUnitFixture, test_concurrent_status_is_aggregate_only) {
+    ServerStatus status;
+    ServerStatus::RequestInfo info;
+    info.model = "classic-model";
+    status.set_running("classic prompt", 12, true, info);
+    json snapshot = status.to_json();
+    TEST_ASSERT(snapshot["active_requests"] == 0);
+    TEST_ASSERT(snapshot["current"]["model"] == "classic-model");
+
+    status.set_concurrent_requests(2);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "decode");
+    TEST_ASSERT(snapshot["active_requests"] == 2);
+    TEST_ASSERT(snapshot["current"].is_null());
+
+    status.set_idle();
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "idle");
+    TEST_ASSERT(snapshot["active_requests"] == 0);
+    TEST_ASSERT(snapshot["current"].is_null());
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
     ServerConfig cfg;
     cfg.pflash_mode = ServerConfig::PflashMode::AUTO;

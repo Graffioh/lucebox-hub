@@ -12,6 +12,7 @@
 #pragma once
 
 #include "socket_handle.h"
+#include "client_send_buffer.h"
 #include "common/model_backend.h"
 #include "tokenizer.h"
 #include "chat_template.h"
@@ -26,9 +27,11 @@
 #include "model_card.h"
 #include "adaptive_keep_ratio.h"
 #include "server_status.h"
+#include "sse_emitter.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -48,7 +51,6 @@ using json = nlohmann::json;
 
 // ─── Forward declarations ───────────────────────────────────────────────
 struct ServerJob;
-class SseEmitter;
 
 // ─── Server configuration ───────────────────────────────────────────────
 struct ServerConfig {
@@ -356,6 +358,32 @@ private:
         SocketHandle fd, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io);
 
+    // Worker thread, concurrent mode (the backend exposes a SeqEngine):
+    // iteration-level scheduler. Admission is claim-only; this baseline
+    // drains its pending prefill between decode iterations, then advances
+    // active slots together in one batched step.
+    void scheduler_loop(SeqEngine & engine);
+
+    // Non-blocking dequeue used for admission polling between decode steps.
+    ServerJob * try_dequeue();
+
+    // Concurrent-scheduler token delivery and shared response construction.
+    // A send buffer keeps slow clients off the shared decode loop.
+    bool deliver_generation_token(
+        const ParsedRequest & req, SseEmitter & emitter, int32_t token,
+        int & completion_tokens, ClientSendBuffer & send_buffer);
+    void send_nonstream_response(
+        const ParsedRequest & req, SocketHandle fd, SseEmitter & emitter,
+        const std::vector<int32_t> & gen_tokens, int n_gen_cap,
+        bool budget_forced_close, bool degenerate_decode_close,
+        const GenTimings & gen_timings,
+        ClientSendBuffer * send_buffer = nullptr);
+    std::string format_http_response(
+        int status, const std::string & content_type,
+        const std::string & body);
+    static std::array<std::string, 2> sse_error_close_chunks(
+        const std::string & message);
+
     // Parse HTTP request from socket.
     struct HttpRequest {
         std::string method;
@@ -478,6 +506,12 @@ struct ServerJob {
     std::mutex    mu;
     std::condition_variable cv;
     ServerJob *   next = nullptr;
+
+    // Concurrent-scheduler state that survives a pool-full admission retry.
+    // The classic worker leaves these fields untouched.
+    bool          announced = false;
+    bool          sse_started = false;
+    std::unique_ptr<SseEmitter> emitter;
 };
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────
