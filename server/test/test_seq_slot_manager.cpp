@@ -281,6 +281,29 @@ int main() {
         CHECK(mgr.slot(0).rng() != first);
     }
 
+    // Admissions reserve prompt capacity without allocating physical
+    // blocks, and each reservation drains as its chunks land. Concurrent
+    // pending prompts therefore cannot be promised the same free pages and
+    // deadlock mid-prefill.
+    {
+        PagedKvPool pool(/*physical_block_count=*/4,
+                         /*max_sequences=*/3, /*block_size=*/16);
+        SeqSlotManager mgr(pool, /*max_ctx=*/64);
+        auto a = mgr.admit(1, 32, greedy_sampler());   // reserves 2 blocks
+        auto b = mgr.admit(2, 32, greedy_sampler());   // reserves 2 blocks
+        CHECK(a.ok && b.ok);
+        CHECK(pool.free_block_count() == 4);   // promises are metadata only
+        auto blocked = mgr.admit(3, 16, greedy_sampler());
+        CHECK(!blocked.ok && blocked.busy);    // 1 needed + 4 reserved > 4
+        CHECK(mgr.append_prefill(a.slot, 16).ok);
+        CHECK(mgr.append_prefill(a.slot, 16).ok);
+        CHECK(pool.free_block_count() == 2);   // A's promise became pages
+        blocked = mgr.admit(3, 16, greedy_sampler());
+        CHECK(!blocked.ok && blocked.busy);    // B still owns both free pages
+        mgr.retire(b.slot);
+        CHECK(mgr.admit(3, 16, greedy_sampler()).ok);
+    }
+
     // A greedy sampler never draws, so its seed is irrelevant and admission
     // must not depend on one being present.
     {

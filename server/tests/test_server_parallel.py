@@ -477,6 +477,48 @@ class ParallelTestSuite:
                     f"{0.7 * window:.2f}s of B's {window:.2f}s "
                     "admission window")
 
+    def test_parallel_ragged_prefill(self):
+        """Simultaneous long prompts must prefill as one shared wave, not a
+        serial queue: with a shared per-step chunk budget their TTFTs land
+        together instead of stacking end to end."""
+        print("\n[PAR-9] Ragged prefill — long prompts share one "
+              "prefill wave")
+        if self.parallel < 3:
+            self._skip("ragged prefill", "requires --max-concurrency >= 3")
+            return
+
+        # Three equal-length multi-chunk prompts with distinct questions.
+        # Answers cannot collide with the filler item indices (0..139).
+        filler = "\n".join(
+            f"item {i}: the quick brown fox jumps over the lazy dog"
+            for i in range(140))
+        sums = [(350, 351), (351, 352), (352, 353)]
+        prompts = [
+            (f"Here is a list:\n{filler}\n"
+             f"Ignore the list entirely. What is {a}+{b}? "
+             "Answer with just the number.", str(a + b))
+            for a, b in sums]
+
+        start = time.monotonic()
+        results = self._launch_streams(prompts, max_tokens=64)
+        if not self._all_completed(results, "ragged"):
+            return
+        for i, (r, (_, answer)) in enumerate(zip(results, prompts)):
+            self._check(f"request {i+1} answers {answer}",
+                        contains_number(self._combined(r), answer),
+                        f"content={r['content']!r}")
+        ttfts = [r["first_chunk_t"] - start for r in results]
+        if min(ttfts) <= 0:
+            self._check("ragged TTFTs measurable", False, f"ttfts={ttfts}")
+            return
+        # Serialized prefill stacks three equal prompts at ~1:2:3; a shared
+        # wave lands them together. 1.75 splits the two regimes with margin.
+        ratio = max(ttfts) / min(ttfts)
+        self._check("long-prompt TTFTs form one shared prefill wave",
+                    ratio < 1.75,
+                    f"TTFTs={[round(v, 2) for v in ttfts]} "
+                    f"ratio={ratio:.2f}")
+
     # ── Run all ──────────────────────────────────────────────────────────
 
     def run_all(self):
@@ -490,6 +532,7 @@ class ParallelTestSuite:
         self.test_parallel_nonstream()
         self.test_parallel_more_than_slots()
         self.test_parallel_prefill_no_pause()
+        self.test_parallel_ragged_prefill()
 
         print("\n" + "=" * 60)
         total = self.passed + self.failed + self.skipped

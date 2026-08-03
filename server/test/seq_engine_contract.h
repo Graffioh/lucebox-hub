@@ -77,11 +77,20 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
         return true;
     };
 
-    // Advance the one pending prefill to completion. Every decoding slot must
-    // still produce exactly one output on every intervening step: this is the
-    // non-pausing-admission guarantee, expressed without model internals.
-    auto complete_prefill = [&](int prefill_slot) {
-        for (int iteration = 0; iteration < 1024; iteration++) {
+    // Advance every pending prefill to completion — several may be in
+    // flight at once under the engine's shared chunk budget. Every decoding
+    // slot must still produce exactly one output on every intervening step
+    // (the non-pausing-admission guarantee), and a slot that completes
+    // mid-loop joins the decode batch on the very next step.
+    auto complete_prefills = [&](std::vector<int> awaiting_slots) {
+        std::vector<bool> awaiting((size_t)n_slots, false);
+        int remaining = 0;
+        for (const int slot : awaiting_slots) {
+            awaiting[(size_t)slot] = true;
+            remaining++;
+        }
+        for (int iteration = 0; iteration < 1024 && remaining > 0;
+             iteration++) {
             std::vector<SeqEngine::StepInput> inputs;
             for (size_t i = 0; i < live.size(); i++) {
                 inputs.push_back({live[i], pending[i]});
@@ -93,20 +102,22 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
             }
 
             std::vector<bool> answered((size_t)n_slots, false);
-            bool completed = false;
-            int32_t first_token = -1;
+            std::vector<SeqEngine::StepOutput> completed_now;
             for (const SeqEngine::StepOutput & o : outputs) {
                 if (!validate_output(o)) continue;
                 require(!o.failed,
                         "a contract-check prefill step must not fail a slot");
                 if (o.failed) continue;
                 if (o.prefill_done) {
-                    require(o.slot == prefill_slot,
-                            "prefill_done reported the wrong slot");
-                    require(!completed,
-                            "step() reported prefill completion twice");
-                    completed = true;
-                    first_token = o.token;
+                    require(o.slot >= 0 && o.slot < n_slots &&
+                                awaiting[(size_t)o.slot],
+                            "prefill_done reported an unexpected slot");
+                    if (o.slot >= 0 && o.slot < n_slots &&
+                        awaiting[(size_t)o.slot]) {
+                        awaiting[(size_t)o.slot] = false;
+                        remaining--;
+                        completed_now.push_back(o);
+                    }
                     continue;
                 }
 
@@ -127,19 +138,22 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
                 require(answered[(size_t)slot],
                         "prefill step left a decoding slot without an output");
             }
+            // A completed slot decodes from the next step on.
+            for (const SeqEngine::StepOutput & o : completed_now) {
+                live.push_back(o.slot);
+                pending.push_back(o.token);
+            }
 
-            if (completed) {
+            if (remaining == 0) {
                 require(!engine.prefill_pending(),
-                        "prefill_pending() stayed true after completion");
-                live.push_back(prefill_slot);
-                pending.push_back(first_token);
+                        "prefill_pending() stayed true after all completions");
                 return true;
             }
             require(engine.prefill_pending(),
-                    "prefill_pending() cleared before prefill_done");
+                    "prefill_pending() cleared before every prefill_done");
         }
-        require(false, "pending prefill did not complete");
-        return false;
+        require(remaining == 0, "pending prefill did not complete");
+        return remaining == 0;
     };
 
     // ── 1. Admission is non-computing and completes through step() ───────
@@ -154,19 +168,38 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
     require(engine.prefill_pending(),
             "successful admit() must leave a prefill pending");
 
-    // A single staging set permits only one admission prefill at a time.
+    // Independent free slots admit while another prompt is still
+    // prefilling: both prefills then advance under one shared chunk budget.
+    // A single-slot engine is simply full and reports busy.
     const SeqEngine::AdmitResult while_pending =
-        engine.admit(9000, prompt, greedy);
-    require(!while_pending.ok && while_pending.busy,
-            "admit() while a prefill is pending must report busy=true");
-    if (!complete_prefill(first.slot)) {
-        engine.retire(first.slot);
+        engine.admit(9000, prompt, seeded);
+    std::vector<int> initial_wave{first.slot};
+    if (n_slots > 1) {
+        require(while_pending.ok,
+                "a free slot must support concurrent prefill admission");
+        if (while_pending.ok) {
+            require(while_pending.slot >= 0 &&
+                        while_pending.slot < n_slots &&
+                        while_pending.slot != first.slot,
+                    "concurrent prefill admission returned an invalid slot");
+            if (while_pending.slot >= 0 && while_pending.slot < n_slots &&
+                while_pending.slot != first.slot) {
+                taken[(size_t)while_pending.slot] = true;
+                initial_wave.push_back(while_pending.slot);
+            }
+        }
+    } else {
+        require(!while_pending.ok && while_pending.busy,
+                "a full single-slot engine must report busy=true");
+    }
+    if (!complete_prefills(initial_wave)) {
+        for (const int slot : initial_wave) engine.retire(slot);
         return violations;
     }
 
     // ── 2. Fill the remaining slots one asynchronous admission at a time ─
     bool filled_all = true;
-    for (int i = 1; i < n_slots; i++) {
+    for (int i = (int)live.size(); i < n_slots; i++) {
         const SeqEngine::AdmitResult r = engine.admit(
             (uint64_t)(i + 1), prompt, (i % 2) ? seeded : greedy);
         if (!r.ok) {
@@ -190,7 +223,7 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
         taken[(size_t)r.slot] = true;
         require(engine.prefill_pending(),
                 "successful admit() must leave a prefill pending");
-        if (!complete_prefill(r.slot)) {
+        if (!complete_prefills({r.slot})) {
             filled_all = false;
             break;
         }

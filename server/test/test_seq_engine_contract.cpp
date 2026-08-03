@@ -36,6 +36,7 @@ struct Faults {
     bool accept_partial_batch       = false; // steps a batch missing a slot
     bool retire_leaks               = false; // retire() never frees the slot
     bool keeps_stale_outputs        = false; // appends to `outputs` as-is
+    bool serial_prefill_only        = false; // rejects a free slot mid-prefill
 };
 
 // ── A conforming SeqEngine with no model behind it ──────────────────────
@@ -46,14 +47,21 @@ public:
     explicit FakeSeqEngine(int slots, Faults faults = Faults())
         : faults_(faults),
           active_((size_t)slots, false),
-          fed_((size_t)slots) {}
+          fed_((size_t)slots),
+          prefilling_((size_t)slots, false),
+          prefill_steps_left_((size_t)slots, 0) {}
 
     int slot_count() const override { return (int)active_.size(); }
     int max_context() const override { return 128; }
 
     bool token_is_eos(int32_t token) const override { return token == kEos; }
 
-    bool prefill_pending() const override { return pending_slot_ >= 0; }
+    bool prefill_pending() const override {
+        for (bool p : prefilling_) {
+            if (p) return true;
+        }
+        return false;
+    }
 
     AdmitResult admit(uint64_t request_id,
                       const std::vector<int32_t> & prompt,
@@ -64,8 +72,8 @@ public:
             r.error = "invalid request";   // hard error: retrying cannot help
             return r;
         }
-        if (pending_slot_ >= 0) {
-            r.busy = !faults_.hard_error_when_full;
+        if (faults_.serial_prefill_only && prefill_pending()) {
+            r.busy = true;
             r.error = "one prefill is already pending";
             return r;
         }
@@ -84,8 +92,8 @@ public:
         }
         active_[(size_t)slot] = true;
         fed_[(size_t)slot].clear();
-        pending_slot_ = slot;
-        prefill_steps_left_ = 2;
+        prefilling_[(size_t)slot] = true;
+        prefill_steps_left_[(size_t)slot] = 2;
         r.ok = true;
         r.slot = slot;
         return r;
@@ -98,10 +106,10 @@ public:
             (int)inputs.size() != decoding_count()) {
             return false;   // never advance state for a slot we were not given
         }
-        if (inputs.empty() && pending_slot_ < 0) return true;
+        if (inputs.empty() && !prefill_pending()) return true;
         size_t emit = inputs.size();
         if (faults_.drop_one_output && emit > 0) emit--;
-        if (faults_.pause_decode_during_prefill && pending_slot_ >= 0) {
+        if (faults_.pause_decode_during_prefill && prefill_pending()) {
             emit = 0;
         }
         for (size_t i = 0; i < emit; i++) {
@@ -120,12 +128,15 @@ public:
             outputs.push_back(out);
         }
 
-        if (pending_slot_ >= 0 && --prefill_steps_left_ == 0) {
-            const int slot = pending_slot_;
-            pending_slot_ = -1;
+        // Every pending prompt advances each step (the shared-budget model);
+        // several may complete in the same step.
+        for (size_t slot = 0; slot < prefilling_.size(); slot++) {
+            if (!prefilling_[slot]) continue;
+            if (--prefill_steps_left_[slot] > 0) continue;
+            prefilling_[slot] = false;
             StepOutput out;
-            out.slot = slot;
-            out.token = kFirstToken + slot;
+            out.slot = (int)slot;
+            out.token = kFirstToken + (int)slot;
             out.prefill_done = true;
             outputs.push_back(out);
         }
@@ -135,10 +146,8 @@ public:
     void retire(int slot) override {
         if (slot < 0 || slot >= slot_count()) return;
         if (faults_.retire_leaks) return;
-        if (pending_slot_ == slot) {
-            pending_slot_ = -1;
-            prefill_steps_left_ = 0;
-        }
+        prefilling_[(size_t)slot] = false;
+        prefill_steps_left_[(size_t)slot] = 0;
         active_[(size_t)slot] = false;
         fed_[(size_t)slot].clear();
     }
@@ -149,15 +158,17 @@ private:
 
     int decoding_count() const {
         int n = 0;
-        for (bool active : active_) n += active ? 1 : 0;
-        return n - (pending_slot_ >= 0 ? 1 : 0);
+        for (size_t i = 0; i < active_.size(); i++) {
+            n += (active_[i] && !prefilling_[i]) ? 1 : 0;
+        }
+        return n;
     }
 
     Faults                            faults_;
     std::vector<bool>                 active_;
     std::vector<std::vector<int32_t>> fed_;
-    int                               pending_slot_ = -1;
-    int                               prefill_steps_left_ = 0;
+    std::vector<bool>                 prefilling_;
+    std::vector<int>                  prefill_steps_left_;
 };
 
 static void print_violations(const char * label,
@@ -207,6 +218,8 @@ int main() {
          "after a retire() freed a slot"},
         {"keeps-stale-outputs", &Faults::keeps_stale_outputs,
          "must clear `outputs`"},
+        {"serial-prefill-only", &Faults::serial_prefill_only,
+         "concurrent prefill"},
     };
     for (const Case & c : cases) {
         Faults faults;
