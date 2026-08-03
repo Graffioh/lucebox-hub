@@ -283,10 +283,8 @@ bool build_target_step(
     bool paged_attention,
     int n_seqs,
     int seq_slot,
-    bool paged_prefill,
     int paged_max_kv_len,
     int n_prefill_tokens,
-    bool prefill_commit,
     bool compact_slots) {
     step_graph_free(sg);
 
@@ -295,11 +293,20 @@ bool build_target_step(
     // for padding, so a valid bucket may be wider than cache.n_seq_slots.
     const bool invalid_compact_width = n_seqs < 1 || n_seqs > 64;
 
-    // Fused prefill+decode: prefill rows lead, decode rows trail.
-    const bool fused = n_prefill_tokens > 0;
-    if (fused && (!paged_attention || !paged_prefill ||
+    // Concurrent prefill rows read the pool through the ragged paged path
+    // (per-row seq ids and causal positions, no mask). Fused steps put the
+    // chunk rows first and the compact decode rows after; a prefill-only
+    // step has no decode rows.
+    const bool fused = n_prefill_tokens > 0 && n_tokens > n_prefill_tokens;
+    const bool prefill_only =
+        n_prefill_tokens > 0 && n_tokens == n_prefill_tokens;
+    if (fused && (!paged_attention ||
                   n_tokens != n_prefill_tokens + n_seqs ||
                   !compact_slots || invalid_compact_width)) {
+        return false;
+    }
+    if (prefill_only &&
+        (!paged_attention || compact_slots || n_seqs != 1 || with_mask)) {
         return false;
     }
 
@@ -348,21 +355,12 @@ bool build_target_step(
         // kvflash mode: the physical span is the (smaller) pool capacity of
         // the attention tensors, so size the mask from those instead.
         int phys_ctx = cache.max_ctx;
-        if (paged_prefill && !cache.staging_k.empty() && cache.staging_k[0]) {
-            // Paged prefill reads the staging tensors, not the (larger,
-            // pool-sized) cache K/V — size the mask from those.
-            phys_ctx = std::min(phys_ctx, (int)cache.staging_k[0]->ne[1]);
-        } else {
-            for (auto * t : cache.attn_k) {
-                if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
-            }
+        for (auto * t : cache.attn_k) {
+            if (t) { phys_ctx = std::min(phys_ctx, (int)t->ne[1]); break; }
         }
-        // Fused steps: the mask feeds only the prefill segment's flash
-        // attention, so its query axis is the chunk, not the whole batch.
-        const int q_rows = fused ? n_prefill_tokens : n_tokens;
-        const int max_win_len = phys_ctx + q_rows;
+        const int max_win_len = phys_ctx + n_tokens;
         const int kv_pad = align_up(max_win_len, kq_stride_pad);
-        const int q_pad  = align_up(q_rows, KQ_MASK_PAD);
+        const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
         sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
         ggml_set_name(sg.attn_mask, "attn_mask");
         ggml_set_input(sg.attn_mask);
@@ -371,13 +369,7 @@ bool build_target_step(
     ggml_tensor * paged_block_table = nullptr;
     ggml_tensor * paged_kv_seq_lens = nullptr;
     if (paged_attention) {
-        if (fused) {
-            // Fused shape was validated above; it additionally needs the
-            // staging slabs read by its leading prefill segment.
-            if (cache.staging_k.empty() || cache.staging_conv_state.empty()) {
-                return false;
-            }
-        } else {
+        if (n_prefill_tokens == 0) {
             // Classic paged decode is one physical sequence and one token.
             // Concurrent decode always carries an explicit row-to-slot map.
             if (compact_slots) {
@@ -385,7 +377,11 @@ bool build_target_step(
             } else if (n_tokens != 1 || n_seqs != 1) {
                 return false;
             }
-            if (paged_prefill || with_mask) return false;
+            if (with_mask) return false;
+        } else if (with_mask) {
+            // Causality for prefill rows comes from the kernel's per-row
+            // position clamp, never from a mask.
+            return false;
         }
         if (fa_window != 0) return false;
         // The paging metadata lives in the persistent target cache (next to
@@ -410,6 +406,19 @@ bool build_target_step(
         ggml_set_input(sg.active_slot_ids);
         ggml_set_input(sg.state_slot_ids);
     }
+    if (paged_attention && n_prefill_tokens > 0) {
+        // Ragged read metadata: every row of the batch (chunk rows and
+        // decode rows alike) names its block-table column and its inclusive
+        // logical position.
+        sg.paged_query_seq_ids =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+        sg.paged_query_positions =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_name(sg.paged_query_seq_ids, "paged_query_seq_ids");
+        ggml_set_name(sg.paged_query_positions, "paged_query_positions");
+        ggml_set_input(sg.paged_query_seq_ids);
+        ggml_set_input(sg.paged_query_positions);
+    }
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
@@ -423,7 +432,7 @@ bool build_target_step(
     // physical slots, so the slot-mapped write stays active for masked,
     // multi-token, and feature-capturing forwards (decode AND spec verify).
     const bool use_kv_write_rows =
-        paged_attention || paged_prefill ||
+        paged_attention ||
         (!g_no_kvpad && !capture_delta_intermediate &&
          (kvflash_mask
               ? (fa_window == 0)
@@ -454,10 +463,10 @@ bool build_target_step(
     gi.q_capture                  = capture_qk;
     gi.n_seqs                     = n_seqs;
     gi.seq_slot                   = seq_slot;
-    gi.paged_prefill              = paged_prefill;
     gi.paged_max_kv_len           = paged_max_kv_len;
     gi.n_prefill_tokens           = n_prefill_tokens;
-    gi.prefill_commit             = prefill_commit;
+    gi.paged_query_seq_ids        = sg.paged_query_seq_ids;
+    gi.paged_query_positions      = sg.paged_query_positions;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

@@ -88,23 +88,19 @@ bool build_hybrid_full_layer_step(
 //     in [1, 64] and may be wider than cache.n_seq_slots; active_slot_ids uses
 //     -1 for padding rows. Without it, paged attention is classic one-token,
 //     one-sequence decode only.
-//   `seq_slot` — the slot whose recurrent-state slabs the end-of-prefill
-//     commit copy (prefill_commit) targets; prefill chunks themselves run
-//     on the staging slabs.
-//   `paged_prefill` — chunk prefill of one slot: masked stride-1 reads and
-//     legacy writes go to cache.staging_k/v while kv_write_rows dual-writes
-//     the pool blocks. Pass paged_attention=false with it (prefill reads
-//     never touch the block table) — unless fusing, see n_prefill_tokens.
+//   `seq_slot` — the prefilling slot: its own recurrent-state slab carries
+//     the prompt's chunk-to-chunk state (reset at admission), and its
+//     block-table column resolves the chunk's paged K/V reads.
 //   `paged_max_kv_len` — batched decode: max kv_seq_len over live slots
-//     (kernel launch bound).
-//   `n_prefill_tokens` — fused prefill+decode step: the leading
-//     n_prefill_tokens rows are one slot's prefill chunk (staging reads at
-//     kv_start, masked; kv_write_rows covers the WHOLE batch) and the
-//     remaining n_seqs rows are the batched decode. Requires
-//     paged_attention && paged_prefill and
-//     n_tokens == n_prefill_tokens + n_seqs and compact_slots=true.
-//   `prefill_commit` — final prefill chunk: append staging→slot recurrent
-//     state copies at the end of the graph (see QwenGraphInputs).
+//     INCLUDING the prefilling slot's rows written this step (kernel launch
+//     bound).
+//   `n_prefill_tokens` — concurrent prefill: the leading n_prefill_tokens
+//     rows are one slot's prompt chunk, reading the pool through the ragged
+//     paged path (per-row seq ids and inclusive causal positions — no mask;
+//     kv_write_rows covers the WHOLE batch). Fused steps append n_seqs
+//     compact decode rows (n_tokens == n_prefill_tokens + n_seqs, requires
+//     compact_slots); a prefill-only step has n_tokens == n_prefill_tokens,
+//     n_seqs == 1 and no compact map. Requires paged_attention.
 //   `logits_tail_rows` — logits/argmax only for the last n rows (0 = all).
 bool build_target_step(
     StepGraph & sg,
@@ -125,10 +121,8 @@ bool build_target_step(
     bool paged_attention = false,
     int n_seqs = 1,
     int seq_slot = 0,
-    bool paged_prefill = false,
     int paged_max_kv_len = 0,
     int n_prefill_tokens = 0,
-    bool prefill_commit = false,
     bool compact_slots = false);
 
 // Full target forward: DDTree tree-verify mode.

@@ -8,7 +8,6 @@
 
 #include "qwen35_backend.h"
 #include "graph_builders.h"
-#include "attn_masks.h"
 #include "prefill_staging.h"
 #include "common/sampler.h"
 #include "internal.h"
@@ -51,10 +50,11 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
     if (!r.ok) return r;
     const int slot = r.slot;
 
-    // The staging K/V and recurrent slabs carry this sequence across its
-    // incremental prefill chunks. The slot's device length remains zero
-    // until the final chunk commits.
-    reset_prefill_staging(b_.cache_);
+    // The prompt's chunked prefill advances its recurrent state in this
+    // slot's own slab, so clear whatever the previous occupant left there.
+    // K/V needs no reset: chunk rows are written into freshly allocated pool
+    // blocks and read back causally through the block table.
+    reset_recurrent_slot(b_.cache_, slot);
 
     PendingPrefill pp;
     pp.slot = slot;
@@ -175,7 +175,7 @@ bool Qwen35SeqEngine::step(
     const int n_slots = slots_.slot_count();
 
     // Every decoding slot must appear. The prefilling slot is deliberately
-    // absent: its state advances through the staging segment.
+    // absent: its rows advance through the leading prefill segment.
     if ((int)inputs.size() != slots_.decoding_count()) {
         std::fprintf(stderr,
             "[parallel] step got %zu inputs for %d decoding slots\n",
@@ -257,10 +257,11 @@ bool Qwen35SeqEngine::step(
         (size_t)decode_bucket * n_head_kv, scratch_row_);
     std::vector<int32_t> active_slot_ids((size_t)decode_bucket, -1);
     std::vector<int32_t> state_slot_ids((size_t)decode_bucket, 0);
-    // Device kv lengths, rebuilt per step from the live rows. The kernel
-    // reads this only through active_slot_ids, so entries for idle,
-    // prefilling, or retired slots are never consumed and stay 0. The fed
-    // token's row is written and attended in this same step: position + 1.
+    // Device kv lengths, rebuilt per step from the live rows plus the
+    // prefilling slot's chunk (set after staging below). The kernel reads
+    // an entry only through a row's seq id, so idle and retired slots stay
+    // 0. The fed token's row is written and attended in this same step:
+    // position + 1.
     std::vector<int32_t> seq_lens((size_t)n_slots, 0);
     for (int row = 0; row < live_count; ++row) {
         dec_tokens[(size_t)row] = live_tokens[(size_t)row];
@@ -282,6 +283,14 @@ bool Qwen35SeqEngine::step(
     const int chunk = prefill.chunk;
     const bool commit = prefill.commit;
     const int kv_pos = prefill.kv_pos;
+    if (with_prefill) {
+        // The chunk's rows are written and causally read in this same step,
+        // so the launch bound and the prefilling slot's device length must
+        // cover them. Decode rows never see the partial sequence: their
+        // extents clamp to their own positions.
+        max_kv_len = std::max(max_kv_len, kv_pos + chunk);
+        seq_lens[(size_t)pending_prefill_->slot] = kv_pos + chunk;
+    }
 
     // A prefill graph build failure fails only the admission and falls back
     // to the established decode graph for existing streams.
@@ -293,13 +302,11 @@ bool Qwen35SeqEngine::step(
 
     bool built = false;
     if (with_prefill && with_decode) {
-        const bool with_mask =
-            (b_.cfg_.kq_stride_pad > KQ_MASK_PAD) || (chunk > 1);
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
             /*kv_start=*/kv_pos,
             /*n_tokens=*/chunk + decode_bucket,
-            with_mask, /*capture=*/false,
+            /*with_mask=*/false, /*capture=*/false,
             /*capture_delta_intermediate=*/false,
             /*fa_window=*/0,
             /*logits_tail_rows=*/decode_bucket + (commit ? 1 : 0),
@@ -310,19 +317,17 @@ bool Qwen35SeqEngine::step(
             /*paged_attention=*/true,
             /*n_seqs=*/decode_bucket,
             /*seq_slot=*/pending_prefill_->slot,
-            /*paged_prefill=*/true,
             /*paged_max_kv_len=*/max_kv_len,
             /*n_prefill_tokens=*/chunk,
-            /*prefill_commit=*/commit,
             /*compact_slots=*/true);
-        if (!built || !sg.kv_write_rows) fail_pending_build();
+        if (!built || !sg.kv_write_rows || !sg.paged_query_seq_ids) {
+            fail_pending_build();
+        }
     } else if (with_prefill) {
-        const bool with_mask =
-            (b_.cfg_.kq_stride_pad > KQ_MASK_PAD) || (chunk > 1);
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
             /*kv_start=*/kv_pos, /*n_tokens=*/chunk,
-            with_mask, /*capture=*/false,
+            /*with_mask=*/false, /*capture=*/false,
             /*capture_delta_intermediate=*/false,
             /*fa_window=*/0,
             /*logits_tail_rows=*/1,
@@ -330,14 +335,12 @@ bool Qwen35SeqEngine::step(
             /*capture_moe_router=*/false,
             /*kvflash_mask=*/false,
             /*capture_qk=*/false,
-            /*paged_attention=*/false,
+            /*paged_attention=*/true,
             /*n_seqs=*/1,
             /*seq_slot=*/pending_prefill_->slot,
-            /*paged_prefill=*/true,
-            /*paged_max_kv_len=*/0,
-            /*n_prefill_tokens=*/0,
-            /*prefill_commit=*/commit);
-        if (!built || !sg.kv_write_rows) {
+            /*paged_max_kv_len=*/max_kv_len,
+            /*n_prefill_tokens=*/chunk);
+        if (!built || !sg.kv_write_rows || !sg.paged_query_seq_ids) {
             fail_pending_build();
             return true;
         }
@@ -357,10 +360,8 @@ bool Qwen35SeqEngine::step(
             /*paged_attention=*/true,
             /*n_seqs=*/decode_bucket,
             /*seq_slot=*/0,
-            /*paged_prefill=*/false,
             /*paged_max_kv_len=*/max_kv_len,
             /*n_prefill_tokens=*/0,
-            /*prefill_commit=*/false,
             /*compact_slots=*/true);
         if (!built || !sg.kv_write_rows) {
             std::fprintf(stderr, "[parallel] decode build failed\n");
@@ -412,8 +413,28 @@ bool Qwen35SeqEngine::step(
     ggml_backend_tensor_set(sg.kv_write_rows, rows.data(), 0,
                             sizeof(int64_t) * rows.size());
     if (n_prefill > 0) {
-        upload_qwen35_causal_mask(
-            sg.attn_mask, kv_pos, n_prefill, b_.cfg_.kq_stride_pad);
+        // Ragged read metadata: chunk rows carry the prefilling slot and
+        // their own inclusive positions; decode rows carry their slot and
+        // appended position; bucket padding stays -1.
+        std::vector<int32_t> query_slots((size_t)n_total, -1);
+        std::vector<int32_t> query_positions((size_t)n_total, -1);
+        const int pf_slot = pending_prefill_->slot;
+        for (int i = 0; i < n_prefill; ++i) {
+            query_slots[(size_t)i] = pf_slot;
+            query_positions[(size_t)i] = kv_pos + i;
+        }
+        for (int row = 0; row < live_count; ++row) {
+            query_slots[(size_t)(n_prefill + row)] =
+                live_slot_ids[(size_t)row];
+            query_positions[(size_t)(n_prefill + row)] =
+                live_positions[(size_t)row];
+        }
+        ggml_backend_tensor_set(
+            sg.paged_query_seq_ids, query_slots.data(), 0,
+            sizeof(int32_t) * query_slots.size());
+        ggml_backend_tensor_set(
+            sg.paged_query_positions, query_positions.data(), 0,
+            sizeof(int32_t) * query_positions.size());
     }
     if (n_decode > 0) {
         ggml_backend_tensor_set(
@@ -422,10 +443,10 @@ bool Qwen35SeqEngine::step(
         ggml_backend_tensor_set(
             sg.state_slot_ids, state_slot_ids.data(), 0,
             sizeof(int32_t) * state_slot_ids.size());
-        ggml_backend_tensor_set(
-            b_.cache_.paged_kv_seq_lens, seq_lens.data(), 0,
-            sizeof(int32_t) * seq_lens.size());
     }
+    ggml_backend_tensor_set(
+        b_.cache_.paged_kv_seq_lens, seq_lens.data(), 0,
+        sizeof(int32_t) * seq_lens.size());
 
     const auto st =
         ggml_backend_graph_compute(b_.target_backend_, sg.gf);

@@ -138,9 +138,10 @@ static FILE * open_dflash_floor_log() {
 }
 
 // Persistent concurrent-cache bytes that do not scale with the physical
-// paged pool. The estimate mirrors create_target_cache_partial(): one
-// max-context staging K/V, recurrent state for N slots plus one staging slot,
-// target features, paged metadata, Q capture, and the dead-row scratch block.
+// paged pool. The estimate mirrors create_target_cache_partial(): recurrent
+// state for N slots, target features, paged metadata, Q capture, and the
+// dead-row scratch block. Prefill reads the pool directly, so there is no
+// staging K/V or staging recurrent slab to reserve.
 static int64_t concurrent_fixed_cache_bytes(
         const TargetWeights & w, int max_ctx, int n_slots,
         int64_t kv_bytes_per_token) {
@@ -155,9 +156,7 @@ static int64_t concurrent_fixed_cache_bytes(
          (int64_t)(w.ssm_d_conv - 1) * conv_ch) *
         (int64_t)sizeof(float);
     const int64_t recurrent =
-        state_per_layer * n_delta * (n_slots + 1LL);
-    const int64_t staging_kv =
-        kv_bytes_per_token * paged_token_capacity(max_ctx);
+        state_per_layer * n_delta * (int64_t)n_slots;
     const int64_t target_feat =
         (int64_t)w.n_capture_layers * w.n_embd *
         std::min(max_ctx, 4096) * (int64_t)sizeof(uint16_t);
@@ -169,7 +168,7 @@ static int64_t concurrent_fixed_cache_bytes(
         (int64_t)sizeof(int32_t);
     const int64_t scratch =
         kv_bytes_per_token * PAGED_BLOCK_SIZE;
-    return recurrent + staging_kv + target_feat + q_capture +
+    return recurrent + target_feat + q_capture +
            paged_metadata + scratch;
 }
 }  // namespace
