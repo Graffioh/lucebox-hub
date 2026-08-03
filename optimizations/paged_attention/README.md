@@ -40,12 +40,14 @@ context stays resident and evicts cold chunks. Paging keeps every token.
 ```
 
 Concurrent serving — N requests decoded together, one batched paged step
-per token, per-request SSE streams:
+per token, per-request SSE streams. The shared physical pool is sized from
+available device memory; `--kv-pool-tokens` is an explicit override (rounded
+up to a 16-token block) for testing or intentionally tighter oversubscription:
 
 ```bash
 ./server/build/dflash_server model.gguf --paged-attention --max-ctx 4096 \
-    --max-concurrency 8         # 8 decode slots
-    # --kv-pool-tokens 16384    # optional: shared pool smaller than 8 full contexts
+    --max-concurrency 8
+    # --kv-pool-tokens 16384
 ```
 
 ## Compatibility
@@ -81,8 +83,17 @@ decode adds one block at each 16-token boundary. A prompt that fits the whole
 pool but not the blocks currently free waits in the queue; a prefilling request
 that temporarily runs out of blocks keeps its completed chunks and pauses.
 Decode exhaustion fails that request explicitly rather than truncating it.
-At the default pool size (`N x max_ctx`) those exhaustion paths are unreachable;
-`--kv-pool-tokens` can explicitly select a smaller shared pool.
+
+The default pool is sized from device memory: automatic sizing subtracts the
+fixed concurrent cache and a runtime graph reserve from device-free memory,
+converts the remainder at the selected K/V type's bytes per token, rounds
+down to 16-token blocks, and caps the result at the logical
+`N x max_ctx` maximum. It requires room for at least one complete `max_ctx`
+sequence; lower `--max-ctx` or set `--kv-pool-tokens` explicitly when that is
+not possible. `--max-concurrency` therefore controls logical slots without
+reserving `N x max_ctx` physical K/V at startup, and the exhaustion paths
+above stay unreachable unless memory pressure actually forces
+oversubscription — configurations that previously failed to start at all.
 
 **Non-pausing admission.** `SeqEngine::admit()` claims a slot and queues its
 prompt without allocating K/V or running the full prefill. Each scheduler
@@ -165,11 +176,12 @@ unrelated 100 GB tenant during the run):
    through `set_rows` while attending a contiguous staging copy — exact, any
    block layout. A paged-aware prefill *read* path (no staging copy) remains
    open.
-4. **Partly done.** On-demand block allocation, client-disconnect cancellation,
-   and non-pausing prefill/decode fusion are in. The physical pool still
-   defaults to `max-concurrency x max-ctx`; memory-derived sizing and
-   recompute preemption remain follow-up work. Also open: more than one
-   in-flight prefill, and the stream-K decode kernel for ragged batches.
+4. **Partly done.** On-demand block allocation, memory-derived physical-pool
+   sizing, client-disconnect cancellation, and non-pausing prefill/decode
+   fusion are in. Recompute preemption under pool pressure (retire and replay
+   a victim instead of failing it) remains follow-up work. Also open: more
+   than one in-flight prefill, and the stream-K decode kernel for ragged
+   batches.
 5. **Variable-length batched prefill.**
 6. **Prefix caching / CoW.** Shared prefix blocks with reference counting and
    copy-on-write.
