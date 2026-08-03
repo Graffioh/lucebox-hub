@@ -190,14 +190,20 @@ option(DFLASH27B_HIP_SM80_EQUIV
 # (defaulting to gfx1151 / Strix Halo) and pass it through to the HIP
 # toolchain and ggml backend.
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-    # Pascal (60/61/62), Volta (70), Turing (75) and Ampere (86) always;
+    # Pascal (60–62) lacks tensor-core WMMA support and is excluded by default.
+    # Volta/Turing (70/75) support F16 WMMA (m16n8k16); Ampere (86)+ supports
+    # BF16 WMMA (m16n16k16). Add Pascal via -DDFLASH27B_USER_CUDA_ARCHITECTURES
+    # if needed (scalar fallback kernels compile for sm_60–69).
     # Blackwell consumer (120) and Thor
     # (110 on CUDA 13+) added when nvcc supports them. DGX Spark /
     # GB10 is compute capability 12.1 (121), added at CUDA 12.9+.
     if(DFLASH27B_USER_CUDA_ARCHITECTURES)
         set(_dflash_archs "${DFLASH27B_USER_CUDA_ARCHITECTURES}")
     else()
-        set(_dflash_archs "60;61;62;70;75;86")
+        # WMMA (warp matrix multiply) requires sm_70+. Pascal (60–62) lacks
+        # tensor cores and is excluded from the default arch list. Volta/Turing
+        # (70/75) support F16 WMMA; Ampere (86)+ supports BF16 WMMA.
+        set(_dflash_archs "70;75;86")
         if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
             list(APPEND _dflash_archs "120")
         endif()
