@@ -36,7 +36,7 @@ static const Ds4MixedMoePolicy & ds4_mixed_moe_policy() {
             ds4_env_flag("DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS");
         result.direct_device_join =
             ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
-            ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN");
+            moe_hybrid_graph_policy().device_join;
         result.schedule_branches =
             ds4_env_flag("DFLASH_DS4_TP_SCHEDULE_BRANCHES");
         result.native_route_width =

@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -168,6 +169,122 @@ bool run_cross_graph(ggml_backend_t first,
     if (sched) ggml_backend_sched_free(sched);
     ggml_backend_free(cpu);
     ggml_free(ctx);
+    return ok;
+}
+
+bool run_noncontiguous_cross_graph(ggml_backend_t first,
+                                   ggml_backend_t second,
+                                   const char * label,
+                                   bool transpose) {
+    constexpr int64_t columns = 13;
+    constexpr int64_t rows = 7;
+    constexpr int64_t padded_columns = 19;
+    const int64_t input_columns = transpose ? columns : padded_columns;
+
+    ggml_init_params params{};
+    params.mem_size = 4 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    if (!ctx || !cpu) {
+        if (cpu) ggml_backend_free(cpu);
+        if (ctx) ggml_free(ctx);
+        return false;
+    }
+
+    ggml_tensor * input = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, input_columns, rows);
+    ggml_set_input(input);
+    ggml_tensor * scaled = ggml_scale(ctx, input, 2.0f);
+    ggml_tensor * logical = transpose
+        ? ggml_transpose(ctx, scaled)
+        : ggml_view_2d(ctx, scaled, columns, rows, scaled->nb[1], 0);
+    ggml_tensor * packed = ggml_cont(ctx, logical);
+    ggml_tensor * output = ggml_scale(ctx, packed, 3.0f);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_t backends[] = { first, second, cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends, nullptr, 3, 128, false, true);
+    bool ok = sched != nullptr;
+    if (ok) {
+        ggml_backend_sched_set_tensor_backend(sched, input, first);
+        ggml_backend_sched_set_tensor_backend(sched, scaled, first);
+        ggml_backend_sched_set_tensor_backend(sched, logical, first);
+        ggml_backend_sched_set_tensor_backend(sched, packed, second);
+        ggml_backend_sched_set_tensor_backend(sched, output, second);
+        ggml_backend_sched_set_batch_split_copies(sched, true);
+        ok = ggml_backend_sched_alloc_graph(sched, graph);
+    }
+
+    const size_t input_size = (size_t) input_columns * (size_t) rows;
+    const size_t output_size = (size_t) columns * (size_t) rows;
+    std::vector<float> host(input_size);
+    std::vector<float> result(output_size, 0.0f);
+    for (int iteration = 0; ok && iteration < 2; ++iteration) {
+        for (size_t i = 0; i < host.size(); ++i) {
+            host[i] = ((float) i + 11.0f * iteration) / 32.0f;
+        }
+        ggml_backend_tensor_set(input, host.data(), 0, ggml_nbytes(input));
+        ok = ggml_backend_sched_graph_compute(sched, graph) ==
+             GGML_STATUS_SUCCESS;
+        if (ok) {
+            ggml_backend_tensor_get(
+                output, result.data(), 0, ggml_nbytes(output));
+        }
+        if (transpose) {
+            for (int64_t original_column = 0;
+                 ok && original_column < columns; ++original_column) {
+                for (int64_t original_row = 0;
+                     ok && original_row < rows; ++original_row) {
+                    const size_t output_index =
+                        (size_t) original_column * (size_t) rows +
+                        (size_t) original_row;
+                    const size_t input_index =
+                        (size_t) original_row * (size_t) columns +
+                        (size_t) original_column;
+                    ok = std::fabs(
+                        result[output_index] - 6.0f * host[input_index]) <
+                        1.0e-5f;
+                }
+            }
+        } else {
+            for (int64_t row = 0; ok && row < rows; ++row) {
+                for (int64_t column = 0; ok && column < columns; ++column) {
+                    const size_t output_index =
+                        (size_t) row * (size_t) columns + (size_t) column;
+                    const size_t input_index =
+                        (size_t) row * (size_t) padded_columns +
+                        (size_t) column;
+                    ok = std::fabs(
+                        result[output_index] - 6.0f * host[input_index]) <
+                        1.0e-5f;
+                }
+            }
+        }
+    }
+
+    std::printf("mixed-backend %s %s graph: %s\n", label,
+                transpose ? "permuted" : "strided",
+                ok ? "ok" : "FAILED");
+    if (sched) ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool reject_invalid_compiled_device() {
+    std::string error;
+    ggml_backend_t backend = init_placement_backend(
+        dflash::common::compiled_placement_backend(),
+        std::numeric_limits<int>::max(), &error);
+    const bool ok = backend == nullptr &&
+        error.find("is out of range (found ") != std::string::npos;
+    if (backend) ggml_backend_free(backend);
+    std::printf("mixed-backend compiled device bounds: %s\n",
+                ok ? "ok" : "FAILED");
     return ok;
 }
 
@@ -357,6 +474,7 @@ bool run_multi_source_graph(ggml_backend_t first,
 
 int main() {
     std::string error;
+    bool ok = reject_invalid_compiled_device();
     ggml_backend_t cuda = init_placement_backend(PlacementBackend::Cuda, 0, &error);
     if (!cuda) {
         std::fprintf(stderr, "CUDA initialization failed: %s\n", error.c_str());
@@ -370,9 +488,9 @@ int main() {
     }
 
     const auto pair = backend_pair_capabilities(cuda, hip);
-    bool ok = placement_backend_of(cuda) == PlacementBackend::Cuda &&
-              placement_backend_of(hip) == PlacementBackend::Hip &&
-              !pair.same_runtime && !pair.native_gpu_handoff;
+    ok = placement_backend_of(cuda) == PlacementBackend::Cuda &&
+         placement_backend_of(hip) == PlacementBackend::Hip &&
+         !pair.same_runtime && !pair.native_gpu_handoff && ok;
     ok = run_scale(cuda, "CUDA") && ok;
     ok = run_scale(hip, "HIP") && ok;
     ok = run_cross_copy(cuda, hip, "CUDA->HIP") && ok;
@@ -381,6 +499,14 @@ int main() {
     ok = run_cross_graph(cuda, hip, "CUDA->HIP->CUDA", true) && ok;
     ok = run_cross_graph(hip, cuda, "HIP->CUDA->HIP", false) && ok;
     ok = run_cross_graph(hip, cuda, "HIP->CUDA->HIP", true) && ok;
+    ok = run_noncontiguous_cross_graph(
+        cuda, hip, "CUDA->HIP", false) && ok;
+    ok = run_noncontiguous_cross_graph(
+        cuda, hip, "CUDA->HIP", true) && ok;
+    ok = run_noncontiguous_cross_graph(
+        hip, cuda, "HIP->CUDA", false) && ok;
+    ok = run_noncontiguous_cross_graph(
+        hip, cuda, "HIP->CUDA", true) && ok;
     ok = run_multi_source_graph(cuda, hip, "CUDA+CPU->HIP") && ok;
     ok = run_multi_source_graph(hip, cuda, "HIP+CPU->CUDA") && ok;
     ok = run_async_reset_resize_and_free(

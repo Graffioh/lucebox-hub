@@ -111,6 +111,16 @@ ggml_backend_t init_placement_backend(PlacementBackend backend,
     }
 
     if (backend == compiled_placement_backend()) {
+        const int count = ggml_backend_cuda_get_device_count();
+        if (device >= count) {
+            if (error) {
+                *error = std::string(placement_backend_name(backend)) +
+                         " device " + std::to_string(device) +
+                         " is out of range (found " +
+                         std::to_string(count) + ")";
+            }
+            return nullptr;
+        }
         ggml_backend_t result = ggml_backend_cuda_init(device);
         if (!result && error) {
             *error = "failed to initialize ";

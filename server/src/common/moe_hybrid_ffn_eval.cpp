@@ -603,7 +603,12 @@ static bool build_batched_routed_graph(
                     defer_route_reduction)) {
                 return false;
             }
-            joined = joined ? track(ggml_concat(ctx, joined, routed_col, 1))
+            // Reduced owner outputs concatenate by token columns. Canonical
+            // joins retain the per-route dimension until both owners have
+            // been combined, so append those token slices along dimension 2.
+            const int concat_dim = defer_route_reduction ? 2 : 1;
+            joined = joined ? track(ggml_concat(
+                                  ctx, joined, routed_col, concat_dim))
                             : routed_col;
         }
         *out_routed = joined;
@@ -834,7 +839,7 @@ static bool build_moe_owner_branch(
     const MoeHybridGraphPolicy & policy = moe_hybrid_graph_policy();
     const ggml_tensor * dispatch_weights = owner.gate_up
         ? owner.gate_up : owner.gate;
-    const bool tokenwise = !canonical_route_join &&
+    const bool tokenwise =
         dispatch_weights->type == GGML_TYPE_Q2_0_ROCMFP2 &&
         !(n_tokens > 1 && policy.grouped_mmvq);
     return build_batched_routed_graph(
