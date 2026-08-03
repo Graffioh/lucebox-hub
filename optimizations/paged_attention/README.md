@@ -27,8 +27,10 @@
 - **Resident metadata.** The block table and sequence length live in the
   persistent target cache next to the pool, so a decode step uploads 4 bytes per
   newly filled block instead of the whole table every token.
-- **Prefill remains exact.** Prompt chunks attend a contiguous staging copy of
-  their K/V while dual-writing rows into the sequence's physical blocks.
+- **Prefill reads the pool.** Prompt chunks write their rows into the
+  sequence's physical blocks and attend them directly through the block
+  table; the kernel clamps each query row's KV extent to its inclusive
+  position, so causality needs no mask and no staging copy.
 
 Not to be confused with [KVFlash](../kvflash/README.md): that one bounds how much
 context stays resident and evicts cold chunks. Paging keeps every token.
@@ -98,13 +100,14 @@ oversubscription — configurations that previously failed to start at all.
 **Non-pausing admission.** `SeqEngine::admit()` claims a slot and queues its
 prompt without allocating K/V or running the full prefill. Each scheduler
 iteration then allocates one prompt chunk and calls `SeqEngine::step()` with
-that chunk and every live decode slot in the same forward pass. Prompt rows use
-the exact dense attention path against staging K/V while decode rows read the
-paged pool; the committing chunk copies the prompt's recurrent state into its
-slot and returns the first sampled token. This keeps existing streams advancing
-through an admission instead of stopping for the whole prefill. One staging set
-means only one prompt can be prefilling at a time, so cold-burst admissions are
-still serialized.
+that chunk and every live decode slot in the same forward pass: one ragged
+paged attention call covers every row, with per-row causal extents. The
+prompt's recurrent state advances in its own slot's slab (zeroed at
+admission), so completion needs no state copy. This keeps existing streams
+advancing through an admission instead of stopping for the whole prefill.
+The engine still runs one prompt's prefill at a time, so cold-burst
+admissions are serialized; lifting that limit is the ragged multi-prompt
+follow-up.
 
 ## Numbers
 
@@ -172,10 +175,9 @@ unrelated 100 GB tenant during the run):
    benchmarks.
 2. **Done.** Scheduler groundwork: sequence-indexed DeltaNet/conv state,
    iteration-level scheduling, batched decode (`--max-concurrency`).
-3. **Done** (via staging): chunk prefill writes arbitrary block-table rows
-   through `set_rows` while attending a contiguous staging copy — exact, any
-   block layout. A paged-aware prefill *read* path (no staging copy) remains
-   open.
+3. **Done.** Chunk prefill writes arbitrary block-table rows through
+   `set_rows` and attends them directly through the block table with per-row
+   causal extents — no staging copy, no mask, any block layout.
 4. **Partly done.** On-demand block allocation, memory-derived physical-pool
    sizing, client-disconnect cancellation, and non-pausing prefill/decode
    fusion are in. Recompute preemption under pool pressure (retire and replay
