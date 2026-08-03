@@ -39,7 +39,9 @@ public:
     // the K/V write destination of graph-bucket padding rows.
     Qwen35SeqEngine(Qwen35Backend & backend, PagedKvPool & pool,
                     int max_ctx, int64_t scratch_row)
-        : b_(backend), slots_(pool, max_ctx), scratch_row_(scratch_row) {}
+        : pending_prefills_((size_t)pool.max_sequences()),
+          b_(backend), slots_(pool, max_ctx),
+          scratch_row_(scratch_row) {}
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
@@ -51,9 +53,7 @@ public:
     bool step(const std::vector<StepInput> & inputs,
               std::vector<StepOutput> & outputs) override;
 
-    bool prefill_pending() const override {
-        return pending_prefill_.has_value();
-    }
+    bool prefill_pending() const override;
 
     void retire(int slot) override;
 
@@ -61,28 +61,35 @@ public:
 
 private:
     struct PendingPrefill {
-        int slot = -1;
         std::vector<int32_t> prompt;
         int progress = 0;
     };
 
-    struct PrefillStage {
-        bool ready = false;
+    // One prompt's share of this step's prefill budget, pool rows already
+    // allocated. Selected prompts appear in scan order and their chunks
+    // occupy the leading token axis in the same order.
+    struct SelectedPrefill {
+        int slot = -1;
         int kv_pos = 0;
         int chunk = 0;
         bool commit = false;
         std::vector<int64_t> rows;
-        std::vector<float> embeddings;
     };
 
-    std::optional<PendingPrefill> pending_prefill_;
+    // Indexed by slot. Independent prompts prefill concurrently under one
+    // shared per-step token budget (select_prefill_chunks).
+    std::vector<std::optional<PendingPrefill>> pending_prefills_;
+    // Budget-scan rotation: the starting slot advances one per step so a
+    // prompt behind others in slot order cannot be perpetually last.
+    int prefill_cursor_ = 0;
 
     bool upload_block_table_delta(int slot, int first_block,
                                   const int32_t * blocks, size_t count);
-    void fail_pending_prefill(std::vector<StepOutput> & outputs,
+    void fail_pending_prefill(int slot, std::vector<StepOutput> & outputs,
                               const char * log_message,
                               const char * client_message);
-    PrefillStage stage_prefill_chunk(std::vector<StepOutput> & outputs);
+    std::vector<SelectedPrefill> select_prefill_chunks(
+        std::vector<StepOutput> & outputs);
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
                              std::vector<float> * logits_scratch = nullptr);

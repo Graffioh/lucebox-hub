@@ -37,6 +37,12 @@ struct SeqSlot {
     bool prefilling = false;
     PagedKvSequenceHandle handle;
     int cur_pos = 0;                 // appended KV tokens
+    // Prompt blocks promised at admission but not yet allocated. Concurrent
+    // prefills each draw down their own reservation as chunks land, and
+    // admission subtracts every live reservation from the free count — so
+    // several pending prompts cannot be promised the same free pages and
+    // deadlock mid-prefill.
+    uint32_t reserved_prompt_blocks = 0;
     SamplerCfg sampler;              // sole authority on how this slot samples
     std::mt19937_64 rng{0x9E3779B97F4A7C15ull};
     // Penalty history (sample_logits' `history`), recorded as FED rather than
@@ -51,11 +57,13 @@ public:
     // pool's max_sequences. The pool must outlive the manager.
     SeqSlotManager(PagedKvPool & pool, int max_ctx);
 
-    // Claim a free slot without allocating K/V blocks. Admission gates only
-    // on the known prompt size: prompts larger than the whole pool hard-fail,
-    // while prompts that fit the pool but not its current free blocks report
-    // busy. Seeds the slot RNG from sampler.seed only when the sampler actually
-    // draws, else nondeterministically; the sampler config alone decides.
+    // Claim a free slot without allocating K/V blocks, reserving the
+    // prompt's block count against future admissions. Admission gates only
+    // on the known prompt size minus live reservations: prompts larger than
+    // the whole pool hard-fail, while prompts that fit the pool but not its
+    // current unreserved free blocks report busy. Seeds the slot RNG from
+    // sampler.seed only when the sampler actually draws, else
+    // nondeterministically; the sampler config alone decides.
     SeqAdmissionResult admit(uint64_t request_id, int prompt_len,
                              const SamplerCfg & sampler);
 

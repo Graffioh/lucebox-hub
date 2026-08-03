@@ -635,6 +635,17 @@ struct DeltaNetCapture {
     ggml_tensor * conv_input              = nullptr;
 };
 
+// One contiguous prompt chunk on the flattened token axis of a concurrent
+// step. Several may be present, one per prefilling slot; segments are dense,
+// in order, and precede the decode rows. Full attention needs no per-segment
+// dispatch (the ragged read is row-driven); DeltaNet runs one independent
+// S=1 recurrence per segment on that slot's own state slab.
+struct QwenPrefillSegment {
+    int token_offset = 0;
+    int n_tokens = 0;
+    int seq_slot = 0;
+};
+
 struct QwenGraphInputs {
     ggml_tensor * inp_embed;      // [hidden, n_tokens, 1] f32 — pre-embedded by the caller
     ggml_tensor * positions;      // [4 * n_tokens] i32 (M-RoPE needs 4 per token)
@@ -667,6 +678,16 @@ struct QwenGraphInputs {
     // each row's KV extent to position+1, which IS the causal mask. -1 on
     // padding rows.
     ggml_tensor * paged_query_positions = nullptr;
+    // Optional [n_rows] i32 gather of final-norm rows before the LM head:
+    // multi-prompt steps sample scattered rows (each committing segment's
+    // last row plus the decode rows), which a tail view cannot express.
+    // Non-null overrides logits_tail_rows.
+    ggml_tensor * logits_row_indices = nullptr;
+    // Prefill segments on the leading token axis (see QwenPrefillSegment).
+    // n_prefill_tokens is their total row count. seq_slot is ignored when
+    // segments are present.
+    const QwenPrefillSegment * prefill_segments = nullptr;
+    int n_prefill_segments = 0;
     // Concurrent-slot serving (paged only):
     //   n_seqs > 1  — batched decode: the token axis is the SEQUENCE axis
     //     (n_tokens == n_seqs, one token per slot). DeltaNet runs with

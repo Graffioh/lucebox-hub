@@ -60,11 +60,18 @@ SeqAdmissionResult SeqSlotManager::admit(
 
     // A prompt that fits the whole pool but not the blocks currently free can
     // be admitted later. Gate on the exact prompt, never the speculative
-    // output cap.
+    // output cap — but subtract every live reservation: concurrent prefills
+    // must not be promised the same free pages.
     const uint32_t need = (uint32_t)paged_block_count(prompt_len);
-    if (need > pool_.free_block_count()) {
+    const uint32_t free = pool_.free_block_count();
+    uint32_t reserved = 0;
+    for (const SeqSlot & live : slots_) {
+        reserved += live.reserved_prompt_blocks;
+    }
+    const uint32_t available = reserved < free ? free - reserved : 0;
+    if (need > available) {
         r.busy = pool_.active_sequence_count() > 0;
-        r.error = "not enough free KV blocks for the prompt";
+        r.error = "not enough unreserved KV blocks for the prompt";
         return r;
     }
 
@@ -81,6 +88,7 @@ SeqAdmissionResult SeqSlotManager::admit(
     s.prefilling = true;
     s.handle = handle;
     s.cur_pos = 0;
+    s.reserved_prompt_blocks = need;
     s.sampler = sampler;
     s.sample_history.clear();
     // Same predicate the engine uses to pick CPU sampling over GPU argmax:
@@ -123,6 +131,11 @@ SeqSlotManager::PrefillChunk SeqSlotManager::append_prefill(
             out.new_blocks.push_back((int32_t)write.physical_block);
         }
     }
+    // Newly allocated blocks convert this slot's admission promise into
+    // real pages; the reservation drains to zero by the final chunk.
+    const uint32_t allocated = (uint32_t)out.new_blocks.size();
+    s.reserved_prompt_blocks -= (std::min)(s.reserved_prompt_blocks,
+                                           allocated);
     s.cur_pos += n_tokens;
     out.ok = true;
     return out;
@@ -132,6 +145,7 @@ void SeqSlotManager::commit_prefill(int slot, int committed) {
     if (!is_active(slot)) return;
     slots_[(size_t)slot].prefilling = false;
     slots_[(size_t)slot].cur_pos = committed;
+    slots_[(size_t)slot].reserved_prompt_blocks = 0;
 }
 
 SeqSlotManager::StepAppend SeqSlotManager::append_token(int slot,

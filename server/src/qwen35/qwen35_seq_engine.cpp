@@ -38,13 +38,6 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
         uint64_t request_id,
         const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler) {
-    if (pending_prefill_) {
-        AdmitResult r;
-        r.busy = true;
-        r.error = "another admission is still prefilling";
-        return r;
-    }
-
     AdmitResult r =
         slots_.admit(request_id, (int)prompt.size(), sampler);
     if (!r.ok) return r;
@@ -57,11 +50,17 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
     reset_recurrent_slot(b_.cache_, slot);
 
     PendingPrefill pp;
-    pp.slot = slot;
     pp.prompt = prompt;
-    pending_prefill_ = std::move(pp);
+    pending_prefills_[(size_t)slot] = std::move(pp);
 
     return r;
+}
+
+bool Qwen35SeqEngine::prefill_pending() const {
+    for (const auto & p : pending_prefills_) {
+        if (p) return true;
+    }
+    return false;
 }
 
 int32_t Qwen35SeqEngine::sample_graph_row(
@@ -112,60 +111,87 @@ bool Qwen35SeqEngine::upload_block_table_delta(
 }
 
 void Qwen35SeqEngine::fail_pending_prefill(
-        std::vector<StepOutput> & outputs, const char * log_message,
-        const char * client_message) {
-    if (!pending_prefill_) return;
+        int slot, std::vector<StepOutput> & outputs,
+        const char * log_message, const char * client_message) {
+    if (slot < 0 || slot >= (int)pending_prefills_.size() ||
+        !pending_prefills_[(size_t)slot]) {
+        return;
+    }
     std::fprintf(stderr, "[parallel] %s — failing slot %d\n",
-                 log_message, pending_prefill_->slot);
+                 log_message, slot);
     StepOutput out;
-    out.slot = pending_prefill_->slot;
+    out.slot = slot;
     out.failed = true;
     out.error = client_message;
     out.prefill_done = true;
     outputs.push_back(std::move(out));
-    pending_prefill_.reset();
+    pending_prefills_[(size_t)slot].reset();
 }
 
-Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
-        std::vector<StepOutput> & outputs) {
-    PrefillStage stage;
-    if (!pending_prefill_) return stage;
+std::vector<Qwen35SeqEngine::SelectedPrefill>
+Qwen35SeqEngine::select_prefill_chunks(std::vector<StepOutput> & outputs) {
+    std::vector<SelectedPrefill> selected;
+    const int n_slots = slots_.slot_count();
+    int n_pending = 0;
+    for (const auto & p : pending_prefills_) n_pending += p ? 1 : 0;
+    if (n_pending == 0) return selected;
 
-    PendingPrefill & pending = *pending_prefill_;
+    // Divide one global token budget across the pending prompts: an equal
+    // share recomputed against the residual budget, so a short prompt's
+    // leftover flows to the prompts scanned after it, and at least one
+    // token per prompt so progress never stalls. The starting slot rotates
+    // each step, keeping the split fair when the shares are uneven.
     static const int prefill_ubatch = qwen35_prefill_ubatch(512);
-    stage.kv_pos = pending.progress;
-    stage.chunk = std::min(
-        prefill_ubatch, (int)pending.prompt.size() - stage.kv_pos);
-    stage.commit = stage.kv_pos + stage.chunk >= (int)pending.prompt.size();
+    int budget = prefill_ubatch;
+    int left = n_pending;
+    const int start = prefill_cursor_ % std::max(1, n_slots);
+    for (int scan = 0; scan < n_slots && budget > 0 && left > 0; ++scan) {
+        const int slot = (start + scan) % n_slots;
+        auto & pending = pending_prefills_[(size_t)slot];
+        if (!pending) continue;
+        const int remaining = (int)pending->prompt.size() - pending->progress;
+        const int share = std::max(1, budget / left);
+        const int chunk = std::min(share, remaining);
+        --left;
+        if (chunk <= 0) {
+            fail_pending_prefill(slot, outputs, "invalid prefill progress",
+                                 "prefill state corrupted");
+            continue;
+        }
 
-    SeqSlotManager::PrefillChunk chunk =
-        slots_.append_prefill(pending.slot, stage.chunk);
-    if (chunk.busy) return PrefillStage{};
-    if (!chunk.ok || chunk.rows.size() != (size_t)stage.chunk) {
-        fail_pending_prefill(outputs, "prefill K/V allocation failed",
-                             "prefill K/V allocation failed");
-        return PrefillStage{};
-    }
-    if (!upload_block_table_delta(
-            pending.slot, chunk.first_new_block, chunk.new_blocks.data(),
-            chunk.new_blocks.size())) {
-        fail_pending_prefill(
-            outputs, "prefill block-table delta exceeds device capacity",
-            "prefill block-table update failed");
-        return PrefillStage{};
-    }
+        SeqSlotManager::PrefillChunk pc = slots_.append_prefill(slot, chunk);
+        if (pc.busy) {
+            // Pool temporarily out of blocks: keep the partial progress and
+            // the budget share; retried next step.
+            continue;
+        }
+        if (!pc.ok || pc.rows.size() != (size_t)chunk) {
+            fail_pending_prefill(slot, outputs,
+                                 "prefill K/V allocation failed",
+                                 "prefill K/V allocation failed");
+            continue;
+        }
+        if (!upload_block_table_delta(
+                slot, pc.first_new_block, pc.new_blocks.data(),
+                pc.new_blocks.size())) {
+            fail_pending_prefill(
+                slot, outputs,
+                "prefill block-table delta exceeds device capacity",
+                "prefill block-table update failed");
+            continue;
+        }
 
-    stage.rows = std::move(chunk.rows);
-    stage.embeddings.resize((size_t)b_.w_.n_embd * stage.chunk);
-    if (!b_.w_.embedder.embed(
-            pending.prompt.data() + stage.kv_pos, stage.chunk,
-            stage.embeddings.data())) {
-        fail_pending_prefill(outputs, "prefill embed failed",
-                             "prefill embedding failed");
-        return PrefillStage{};
+        SelectedPrefill sel;
+        sel.slot = slot;
+        sel.kv_pos = pending->progress;
+        sel.chunk = chunk;
+        sel.commit = pending->progress + chunk >= (int)pending->prompt.size();
+        sel.rows = std::move(pc.rows);
+        selected.push_back(std::move(sel));
+        budget -= chunk;
     }
-    stage.ready = true;
-    return stage;
+    prefill_cursor_ = (start + 1) % std::max(1, n_slots);
+    return selected;
 }
 
 bool Qwen35SeqEngine::step(
@@ -182,7 +208,7 @@ bool Qwen35SeqEngine::step(
             inputs.size(), slots_.decoding_count());
         return false;
     }
-    if (inputs.empty() && !pending_prefill_) return true;
+    if (inputs.empty() && !prefill_pending()) return true;
 
     const TargetWeights & w = b_.w_;
     StepGraph & sg = b_.sg_;
@@ -246,7 +272,7 @@ bool Qwen35SeqEngine::step(
     }
     const int live_count = (int)live_tokens.size();
     const bool with_decode = live_count > 0;
-    if (!with_decode && !pending_prefill_) return true;
+    if (!with_decode && !prefill_pending()) return true;
     const int decode_bucket = with_decode ? decode_bucket_width(live_count) : 0;
 
     // Pack live sequences first and pad only to the next graph bucket. Paged
@@ -278,69 +304,93 @@ bool Qwen35SeqEngine::step(
         }
     }
 
-    PrefillStage prefill = stage_prefill_chunk(outputs);
-    bool with_prefill = prefill.ready;
-    const int chunk = prefill.chunk;
-    const bool commit = prefill.commit;
-    const int kv_pos = prefill.kv_pos;
-    if (with_prefill) {
-        // The chunk's rows are written and causally read in this same step,
-        // so the launch bound and the prefilling slot's device length must
-        // cover them. Decode rows never see the partial sequence: their
-        // extents clamp to their own positions.
-        max_kv_len = std::max(max_kv_len, kv_pos + chunk);
-        seq_lens[(size_t)pending_prefill_->slot] = kv_pos + chunk;
+    std::vector<SelectedPrefill> selected = select_prefill_chunks(outputs);
+    bool with_prefill = !selected.empty();
+    int n_prefill = 0;
+    int n_commits = 0;
+    std::vector<QwenPrefillSegment> segments;
+    segments.reserve(selected.size());
+    for (const SelectedPrefill & sel : selected) {
+        segments.push_back({n_prefill, sel.chunk, sel.slot});
+        n_prefill += sel.chunk;
+        n_commits += sel.commit ? 1 : 0;
+        // Chunk rows are written and causally read in this same step, so
+        // the launch bound and each prefilling slot's device length must
+        // cover them. Decode rows never see a partial sequence: their
+        // extents clamp to their own positions, and prompts never see each
+        // other: each row's seq id selects its own block-table column.
+        max_kv_len = std::max(max_kv_len, sel.kv_pos + sel.chunk);
+        seq_lens[(size_t)sel.slot] = sel.kv_pos + sel.chunk;
     }
 
-    // A prefill graph build failure fails only the admission and falls back
-    // to the established decode graph for existing streams.
+    // A prefill graph build failure fails the in-flight admissions and
+    // falls back to the established decode graph for existing streams.
     auto fail_pending_build = [&]() {
-        fail_pending_prefill(outputs, "prefill step build failed",
-                             "prefill graph build failed");
+        for (const SelectedPrefill & sel : selected) {
+            fail_pending_prefill(sel.slot, outputs,
+                                 "prefill step build failed",
+                                 "prefill graph build failed");
+        }
+        selected.clear();
+        segments.clear();
+        n_prefill = 0;
+        n_commits = 0;
         with_prefill = false;
     };
+    // The logits gather (multi-prompt steps): committing rows lead in
+    // selected order, decode rows follow. Non-committing pure-prefill steps
+    // keep one dummy row so the output contract stays small.
+    const int gather_rows = with_decode
+        ? n_commits + decode_bucket
+        : std::max(1, n_commits);
 
     bool built = false;
     if (with_prefill && with_decode) {
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
-            /*kv_start=*/kv_pos,
-            /*n_tokens=*/chunk + decode_bucket,
+            /*kv_start=*/0,
+            /*n_tokens=*/n_prefill + decode_bucket,
             /*with_mask=*/false, /*capture=*/false,
             /*capture_delta_intermediate=*/false,
             /*fa_window=*/0,
-            /*logits_tail_rows=*/decode_bucket + (commit ? 1 : 0),
+            /*logits_tail_rows=*/0,
             b_.cfg_.kq_stride_pad,
             /*capture_moe_router=*/false,
             /*kvflash_mask=*/false,
             /*capture_qk=*/false,
             /*paged_attention=*/true,
             /*n_seqs=*/decode_bucket,
-            /*seq_slot=*/pending_prefill_->slot,
+            /*seq_slot=*/0,
             /*paged_max_kv_len=*/max_kv_len,
-            /*n_prefill_tokens=*/chunk,
+            /*n_prefill_tokens=*/n_prefill,
+            segments.data(), (int)segments.size(),
+            /*n_logits_rows=*/gather_rows,
             /*compact_slots=*/true);
-        if (!built || !sg.kv_write_rows || !sg.paged_query_seq_ids) {
+        if (!built || !sg.kv_write_rows || !sg.paged_query_seq_ids ||
+            !sg.logits_row_indices) {
             fail_pending_build();
         }
     } else if (with_prefill) {
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
-            /*kv_start=*/kv_pos, /*n_tokens=*/chunk,
+            /*kv_start=*/0, /*n_tokens=*/n_prefill,
             /*with_mask=*/false, /*capture=*/false,
             /*capture_delta_intermediate=*/false,
             /*fa_window=*/0,
-            /*logits_tail_rows=*/1,
+            /*logits_tail_rows=*/0,
             b_.cfg_.kq_stride_pad,
             /*capture_moe_router=*/false,
             /*kvflash_mask=*/false,
             /*capture_qk=*/false,
             /*paged_attention=*/true,
             /*n_seqs=*/1,
-            /*seq_slot=*/pending_prefill_->slot,
+            /*seq_slot=*/0,
             /*paged_max_kv_len=*/max_kv_len,
-            /*n_prefill_tokens=*/chunk);
-        if (!built || !sg.kv_write_rows || !sg.paged_query_seq_ids) {
+            /*n_prefill_tokens=*/n_prefill,
+            segments.data(), (int)segments.size(),
+            /*n_logits_rows=*/gather_rows);
+        if (!built || !sg.kv_write_rows || !sg.paged_query_seq_ids ||
+            !sg.logits_row_indices) {
             fail_pending_build();
             return true;
         }
@@ -362,6 +412,8 @@ bool Qwen35SeqEngine::step(
             /*seq_slot=*/0,
             /*paged_max_kv_len=*/max_kv_len,
             /*n_prefill_tokens=*/0,
+            /*prefill_segments=*/nullptr, 0,
+            /*n_logits_rows=*/0,
             /*compact_slots=*/true);
         if (!built || !sg.kv_write_rows) {
             std::fprintf(stderr, "[parallel] decode build failed\n");
@@ -371,15 +423,21 @@ bool Qwen35SeqEngine::step(
     }
     if (!with_prefill && !with_decode) return true;
 
-    // Token axis: [prefill chunk | compact bucketed decode rows].
-    const int n_prefill = with_prefill ? chunk : 0;
+    // Token axis: [prompt chunks in selected order | compact decode rows].
     const int n_decode  = with_decode ? decode_bucket : 0;
     const int n_total   = n_prefill + n_decode;
 
     std::vector<float> embed_buf((size_t)hidden * n_total);
-    if (n_prefill > 0) {
-        std::copy(prefill.embeddings.begin(), prefill.embeddings.end(),
-                  embed_buf.begin());
+    for (size_t i = 0; i < selected.size(); ++i) {
+        const SelectedPrefill & sel = selected[i];
+        const int seg_off = segments[i].token_offset;
+        const PendingPrefill & pending = *pending_prefills_[(size_t)sel.slot];
+        if (!w.embedder.embed(
+                pending.prompt.data() + sel.kv_pos, sel.chunk,
+                embed_buf.data() + (size_t)hidden * seg_off)) {
+            for (StepOutput & out : outputs) out.failed = true;
+            return false;
+        }
     }
     if (n_decode > 0 &&
         !w.embedder.embed(dec_tokens.data(), n_decode,
@@ -391,7 +449,12 @@ bool Qwen35SeqEngine::step(
                             sizeof(float) * (size_t)hidden * n_total);
 
     std::vector<int32_t> pos_buf((size_t)4 * n_total, 0);
-    fill_qwen35_mrope_positions(pos_buf.data(), kv_pos, n_prefill);
+    for (size_t i = 0; i < selected.size(); ++i) {
+        const SelectedPrefill & sel = selected[i];
+        const int seg_off = segments[i].token_offset;
+        fill_qwen35_mrope_positions(
+            pos_buf.data() + (size_t)4 * seg_off, sel.kv_pos, sel.chunk);
+    }
     if (n_decode > 0) {
         std::copy(dec_pos.begin(), dec_pos.end(),
                   pos_buf.begin() + (size_t)4 * n_prefill);
@@ -401,9 +464,13 @@ bool Qwen35SeqEngine::step(
 
     std::vector<int64_t> rows((size_t)n_total * n_head_kv, scratch_row_);
     for (int h = 0; h < n_head_kv; h++) {
-        for (int i = 0; i < n_prefill; i++) {
-            rows[(size_t)h * n_total + i] =
-                prefill.rows[(size_t)i];
+        for (size_t si = 0; si < selected.size(); ++si) {
+            const SelectedPrefill & sel = selected[si];
+            const int seg_off = segments[si].token_offset;
+            for (int i = 0; i < sel.chunk; i++) {
+                rows[(size_t)h * n_total + seg_off + i] =
+                    sel.rows[(size_t)i];
+            }
         }
         for (int s = 0; s < n_decode; s++) {
             rows[(size_t)h * n_total + n_prefill + s] =
@@ -413,15 +480,24 @@ bool Qwen35SeqEngine::step(
     ggml_backend_tensor_set(sg.kv_write_rows, rows.data(), 0,
                             sizeof(int64_t) * rows.size());
     if (n_prefill > 0) {
-        // Ragged read metadata: chunk rows carry the prefilling slot and
-        // their own inclusive positions; decode rows carry their slot and
-        // appended position; bucket padding stays -1.
+        // Ragged read metadata: chunk rows carry their slot and their own
+        // inclusive positions; decode rows carry their slot and appended
+        // position; bucket padding stays -1. The logits gather takes the
+        // committing chunks' last rows (selected order), then decode rows.
         std::vector<int32_t> query_slots((size_t)n_total, -1);
         std::vector<int32_t> query_positions((size_t)n_total, -1);
-        const int pf_slot = pending_prefill_->slot;
-        for (int i = 0; i < n_prefill; ++i) {
-            query_slots[(size_t)i] = pf_slot;
-            query_positions[(size_t)i] = kv_pos + i;
+        std::vector<int32_t> logits_rows;
+        logits_rows.reserve((size_t)gather_rows);
+        for (size_t si = 0; si < selected.size(); ++si) {
+            const SelectedPrefill & sel = selected[si];
+            const int seg_off = segments[si].token_offset;
+            for (int i = 0; i < sel.chunk; ++i) {
+                query_slots[(size_t)(seg_off + i)] = sel.slot;
+                query_positions[(size_t)(seg_off + i)] = sel.kv_pos + i;
+            }
+            if (sel.commit) {
+                logits_rows.push_back(seg_off + sel.chunk - 1);
+            }
         }
         for (int row = 0; row < live_count; ++row) {
             query_slots[(size_t)(n_prefill + row)] =
@@ -429,12 +505,22 @@ bool Qwen35SeqEngine::step(
             query_positions[(size_t)(n_prefill + row)] =
                 live_positions[(size_t)row];
         }
+        for (int row = 0; with_decode && row < decode_bucket; ++row) {
+            logits_rows.push_back(n_prefill + row);
+        }
+        if (logits_rows.empty()) {
+            // Non-committing pure prefill: one dummy, unsampled row.
+            logits_rows.push_back(n_total - 1);
+        }
         ggml_backend_tensor_set(
             sg.paged_query_seq_ids, query_slots.data(), 0,
             sizeof(int32_t) * query_slots.size());
         ggml_backend_tensor_set(
             sg.paged_query_positions, query_positions.data(), 0,
             sizeof(int32_t) * query_positions.size());
+        ggml_backend_tensor_set(
+            sg.logits_row_indices, logits_rows.data(), 0,
+            sizeof(int32_t) * logits_rows.size());
     }
     if (n_decode > 0) {
         ggml_backend_tensor_set(
@@ -452,15 +538,15 @@ bool Qwen35SeqEngine::step(
         ggml_backend_graph_compute(b_.target_backend_, sg.gf);
     if (st != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr,
-            "[parallel] step compute failed (chunk=%d live=%d)\n",
-            chunk, with_decode ? 1 : 0);
+            "[parallel] step compute failed (prefill=%d live=%d)\n",
+            n_prefill, with_decode ? 1 : 0);
         for (StepOutput & out : outputs) out.failed = true;
         return false;
     }
 
-    // Fused final chunks expose [prefill tail | decode rows]; otherwise the
-    // decode rows start at zero in the logits-tail tensor.
-    const int dec_row0 = (n_prefill > 0 && commit) ? 1 : 0;
+    // Prefill steps gather [commit rows | decode rows]; decode-only steps
+    // keep the whole bucket, starting at row zero.
+    const int dec_row0 = with_prefill ? n_commits : 0;
     if (n_decode > 0) {
         std::vector<int32_t> argmax((size_t)(dec_row0 + decode_bucket), -1);
         ggml_backend_tensor_get(sg.argmax_tokens, argmax.data(), 0,
@@ -476,26 +562,28 @@ bool Qwen35SeqEngine::step(
         }
     }
 
-    if (with_prefill) {
-        PendingPrefill & pending = *pending_prefill_;
-        pending.progress += chunk;
-        if (commit) {
+    int commit_row = 0;
+    for (const SelectedPrefill & sel : selected) {
+        auto & pending = pending_prefills_[(size_t)sel.slot];
+        if (!pending) continue;
+        pending->progress += sel.chunk;
+        if (sel.commit) {
             StepOutput out;
-            out.slot = pending.slot;
+            out.slot = sel.slot;
             out.prefill_done = true;
-            // The committing graph leaves the prompt's final logits at row 0.
-            out.token = sample_graph_row(pending.slot, /*logits_row=*/0);
-            slots_.commit_prefill(pending.slot, (int)pending.prompt.size());
+            // Committing rows lead the logits gather in selected order.
+            out.token = sample_graph_row(sel.slot, commit_row++);
+            slots_.commit_prefill(sel.slot, (int)pending->prompt.size());
             outputs.push_back(out);
-            pending_prefill_.reset();
+            pending.reset();
         }
     }
     return true;
 }
 
 void Qwen35SeqEngine::retire(int slot) {
-    if (pending_prefill_ && pending_prefill_->slot == slot) {
-        pending_prefill_.reset();
+    if (slot >= 0 && slot < (int)pending_prefills_.size()) {
+        pending_prefills_[(size_t)slot].reset();
     }
     if (!slots_.is_active(slot)) return;
     slots_.retire(slot);

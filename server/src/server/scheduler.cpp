@@ -476,10 +476,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     while (true) {
         // Phase 1 — Admission: deferred job first (FIFO), then the queue.
         // Blocking dequeue only when idle; between decode steps only a poll.
-        // The engine has one prefill staging set, so only one admission may
-        // be prefilling at a time.
-        while (live_count() < n_slots && !stopping_.load() &&
-               !engine.prefill_pending()) {
+        // Independent prompts prefill concurrently under the engine's shared
+        // per-step token budget, so admission never waits on another
+        // prompt's prefill — only on free slots and unreserved pool blocks.
+        while (live_count() < n_slots && !stopping_.load()) {
             // A deferred job owns the front of the line, so nothing else may
             // be admitted while its retry backoff is still running.
             if (deferred &&

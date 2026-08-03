@@ -1003,16 +1003,16 @@ static ggml_tensor * build_delta_net_block(
     // Supported shapes are one sequence with any number of timesteps
     // (prefill/verify), or compact decode with one timestep per mapped row.
     int n_seqs = 1,
-    // Fused prefill+decode: the first n_fused_prefill tokens are ONE
-    // sequence's prefill chunk advancing its recurrent state in its own
-    // slot's slab (passed as prefill_conv/ssm_state views); the remaining
-    // n_seqs tokens are the batched one-token-per-slot decode against the
-    // full state tensors. The projections and the output projection stay
+    // Concurrent prefill: leading token-axis segments, one per prefilling
+    // prompt (see QwenPrefillSegment). Each runs an independent S=1
+    // recurrence on its slot's own slab (views built here from the full
+    // state tensors); when active_slot_ids is present, the trailing n_seqs
+    // tokens are the batched one-token-per-slot decode against the full
+    // state tensors. The projections and the output projection stay
     // whole-batch (each weight read once); only the conv/recurrence core
-    // splits into two already-proven configurations.
-    int n_fused_prefill = 0,
-    ggml_tensor * prefill_conv_state = nullptr,
-    ggml_tensor * prefill_ssm_state = nullptr,
+    // splits into already-proven per-segment configurations.
+    const QwenPrefillSegment * prefill_segments = nullptr,
+    int n_prefill_segments = 0,
     ggml_tensor * active_slot_ids = nullptr,
     ggml_tensor * state_slot_ids = nullptr,
     bool allow_inplace_state = false
@@ -1022,21 +1022,23 @@ static ggml_tensor * build_delta_net_block(
     const int num_v_heads  = w.ssm_dt_rank;
     const int head_v_dim   = w.ssm_d_inner / w.ssm_dt_rank;
     const int conv_channels = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
-    const bool fused = n_fused_prefill > 0;
+    const bool ragged = n_prefill_segments > 0;
     GGML_ASSERT(n_seqs >= 1);
-    GGML_ASSERT(!fused || (prefill_conv_state && prefill_ssm_state &&
-                           active_slot_ids &&
-                           n_fused_prefill + n_seqs == n_tokens));
+    GGML_ASSERT(n_prefill_segments == 0 || prefill_segments);
+    int prefill_total = 0;
+    for (int i = 0; i < n_prefill_segments; ++i) {
+        GGML_ASSERT(prefill_segments[i].token_offset == prefill_total &&
+                    prefill_segments[i].n_tokens > 0);
+        prefill_total += prefill_segments[i].n_tokens;
+    }
     GGML_ASSERT((active_slot_ids == nullptr) == (state_slot_ids == nullptr));
     GGML_ASSERT(!active_slot_ids ||
-                (!cap && !parent_ids && n_fused_prefill + n_seqs == n_tokens));
-    if (!fused) {
-        if (active_slot_ids) {
-            GGML_ASSERT(n_tokens == n_seqs);
-        } else {
-            GGML_ASSERT(n_seqs == 1);
-        }
+                (!cap && !parent_ids && prefill_total + n_seqs == n_tokens));
+    if (!active_slot_ids) {
+        GGML_ASSERT(n_seqs == 1);
+        GGML_ASSERT(prefill_total == 0 || prefill_total == n_tokens);
     }
+    GGML_ASSERT(!ragged || (!cap && !parent_ids));
     const bool can_skip_gdn_intermediate = skip_gdn_intermediate && !parent_ids && !cap;
 
     // ── Whole-batch projections ─────────────────────────────────────
@@ -1057,26 +1059,39 @@ static ggml_tensor * build_delta_net_block(
     alpha = ggml_softplus(ctx, alpha);
     ggml_tensor * g_2d = ggml_mul(ctx, alpha, L.ssm_a);
 
-    // ── Token-axis segments: one for the classic modes, two when fused ──
+    // ── Token-axis segments: prompt chunks first, then the decode batch ──
     struct DeltaSeg {
         int off;                  // first token of the segment
         int T;                    // timesteps per sequence
         int S;                    // sequences
+        bool active;              // compact decode segment (slot-mapped)
         ggml_tensor * conv_st;
         ggml_tensor * ssm_st;
     };
-    DeltaSeg segs[2];
-    int n_segs = 0;
-    if (fused) {
-        segs[n_segs++] = {0, n_fused_prefill, 1,
-                          prefill_conv_state, prefill_ssm_state};
-        segs[n_segs++] = {n_fused_prefill, 1, n_seqs, conv_state, ssm_state};
-    } else {
-        // No general [timesteps x sequences] mode: this is either one
-        // multi-token sequence or one compact token per mapped sequence.
-        const int timesteps = active_slot_ids ? 1 : n_tokens;
-        segs[n_segs++] = {0, timesteps, n_seqs, conv_state, ssm_state};
+    std::vector<DeltaSeg> segs;
+    segs.reserve((size_t)n_prefill_segments + 1);
+    for (int i = 0; i < n_prefill_segments; ++i) {
+        const QwenPrefillSegment & pf = prefill_segments[i];
+        GGML_ASSERT(pf.seq_slot >= 0 &&
+                    pf.seq_slot < (int)conv_state->ne[2]);
+        ggml_tensor * c = ggml_view_3d(ctx, conv_state,
+            conv_state->ne[0], conv_state->ne[1], 1,
+            conv_state->nb[1], conv_state->nb[2],
+            (size_t)pf.seq_slot * conv_state->nb[2]);
+        ggml_tensor * s = ggml_view_4d(ctx, ssm_state,
+            ssm_state->ne[0], ssm_state->ne[1], ssm_state->ne[2], 1,
+            ssm_state->nb[1], ssm_state->nb[2], ssm_state->nb[3],
+            (size_t)pf.seq_slot * ssm_state->nb[3]);
+        segs.push_back({pf.token_offset, pf.n_tokens, 1, false, c, s});
     }
+    if (active_slot_ids) {
+        segs.push_back({prefill_total, 1, n_seqs, true,
+                        conv_state, ssm_state});
+    } else if (segs.empty()) {
+        // No general [timesteps x sequences] mode: one multi-token sequence.
+        segs.push_back({0, n_tokens, n_seqs, false, conv_state, ssm_state});
+    }
+    const int n_segs = (int)segs.size();
 
     // Column slice of a [C, n_tokens] projection; the tensor itself when the
     // segment spans the whole batch, so single-segment graphs keep today's
@@ -1087,14 +1102,13 @@ static ggml_tensor * build_delta_net_block(
                             (size_t)off * t->nb[1]);
     };
 
-    ggml_tensor * flat[2] = {nullptr, nullptr};
+    std::vector<ggml_tensor *> flat((size_t)n_segs, nullptr);
     for (int si = 0; si < n_segs; si++) {
-    const DeltaSeg & seg = segs[si];
+    const DeltaSeg & seg = segs[(size_t)si];
     const int n_seq_tokens = seg.T;
     const int seg_seqs     = seg.S;
     const int seg_tokens   = seg.T * seg.S;
-    const bool seg_active = active_slot_ids &&
-        ((!fused && si == 0) || (fused && si == 1));
+    const bool seg_active = seg.active;
     // Plain one-token decode has no in-graph consumer of the updated state:
     // the next graph evaluation is the first read. Write the final state
     // directly into its persistent slab and avoid materializing/copying a
@@ -1103,7 +1117,7 @@ static ggml_tensor * build_delta_net_block(
     // use the result tensor's retained scratch state region.
     const bool inplace_state = seg_active ||
         (allow_inplace_state && can_skip_gdn_intermediate &&
-         !fused && n_seq_tokens == 1);
+         !ragged && n_seq_tokens == 1);
 
     ggml_tensor * qkv_mixed = ggml_reshape_3d(ctx,
         seg_cols(qkv_2d, seg.off, seg_tokens),
@@ -1378,8 +1392,10 @@ static ggml_tensor * build_delta_net_block(
     }  // segment loop
 
     // ── Output projection over the whole batch (one weight read)
-    ggml_tensor * flat_all = (n_segs == 1)
-        ? flat[0] : ggml_concat(ctx, flat[0], flat[1], 1);
+    ggml_tensor * flat_all = flat[0];
+    for (int si = 1; si < n_segs; si++) {
+        flat_all = ggml_concat(ctx, flat_all, flat[(size_t)si], 1);
+    }
     ggml_tensor * out = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_out, flat_all), L.ssm_out_s);
     out = ggml_reshape_2d(ctx, out, w.n_embd, n_tokens);
     return out;
@@ -1599,47 +1615,31 @@ QwenGraphOutputs build_qwen35_graph(
             }
             ggml_tensor * conv_st = cache.conv_state[dn_idx];
             ggml_tensor * ssm_st  = cache.ssm_state[dn_idx];
-            ggml_tensor * pf_conv = nullptr;
-            ggml_tensor * pf_ssm  = nullptr;
-            // The prefilling sequence advances its recurrent state in its
-            // own slot's slab (zeroed at admission by reset_recurrent_slot).
-            // Safe alongside decode: the batched decode segment writes state
-            // only through active_slot_ids, which never name the prefilling
-            // slot.
-            auto slot_conv_view = [&](ggml_tensor * t) {
-                return ggml_view_3d(ctx, t,
-                    t->ne[0], t->ne[1], 1,
-                    t->nb[1], t->nb[2],
-                    (size_t)in.seq_slot * t->nb[2]);
-            };
-            auto slot_ssm_view = [&](ggml_tensor * t) {
-                return ggml_view_4d(ctx, t,
-                    t->ne[0], t->ne[1], t->ne[2], 1,
-                    t->nb[1], t->nb[2], t->nb[3],
-                    (size_t)in.seq_slot * t->nb[3]);
-            };
-            const bool fused_step =
-                in.n_prefill_tokens > 0 && in.n_prefill_tokens < n_tokens;
-            if (fused_step) {
-                // Fused prefill+decode: the decode segment runs on the full
-                // state tensors; the prefill segment on its slot's slab.
-                pf_conv = slot_conv_view(conv_st);
-                pf_ssm  = slot_ssm_view(ssm_st);
-            } else if (cache.n_seq_slots > 1 && in.n_seqs == 1 &&
-                       (in.n_prefill_tokens == n_tokens ||
-                        !in.active_slot_ids)) {
-                // Prefill-only chunk, or a plain single-sequence forward,
-                // against a multi-slot cache: this slot's contiguous slab.
-                conv_st = slot_conv_view(conv_st);
-                ssm_st  = slot_ssm_view(ssm_st);
+            // Prefill segments advance their recurrent state in their own
+            // slots' slabs (zeroed at admission by reset_recurrent_slot);
+            // build_delta_net_block views each slab itself. Safe alongside
+            // decode: the batched decode segment writes state only through
+            // active_slot_ids, which never name a prefilling slot.
+            if (cache.n_seq_slots > 1 && in.n_seqs == 1 &&
+                in.n_prefill_segments == 0 && !in.active_slot_ids) {
+                // Plain single-sequence forward against a multi-slot cache:
+                // this slot's contiguous slab.
+                conv_st = ggml_view_3d(ctx, conv_st,
+                    conv_st->ne[0], conv_st->ne[1], 1,
+                    conv_st->nb[1], conv_st->nb[2],
+                    (size_t)in.seq_slot * conv_st->nb[2]);
+                ssm_st = ggml_view_4d(ctx, ssm_st,
+                    ssm_st->ne[0], ssm_st->ne[1], ssm_st->ne[2], 1,
+                    ssm_st->nb[1], ssm_st->nb[2], ssm_st->nb[3],
+                    (size_t)in.seq_slot * ssm_st->nb[3]);
             }
             cur = build_delta_net_block(ctx, gf, w, L, cur,
                                         conv_st, ssm_st,
                                         n_tokens, cap_ptr, in.parent_ids,
                                         /*skip_gdn_intermediate=*/true,
                                         in.n_seqs,
-                                        fused_step ? in.n_prefill_tokens : 0,
-                                        pf_conv, pf_ssm,
+                                        in.prefill_segments,
+                                        in.n_prefill_segments,
                                         in.active_slot_ids,
                                         in.state_slot_ids,
                                         /*allow_inplace_state=*/
@@ -1717,13 +1717,16 @@ QwenGraphOutputs build_qwen35_graph(
     // 2. Final norm
     ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
 
-    // 3. LM head — optionally only for a tail of the token axis (prefill
-    //    computes just the last row; fused steps compute the decode rows
-    //    plus, on the committing chunk, the prompt's last row. Saves the
-    //    [vocab, n_tokens] matmul and ~233MB scratch at ubatch=384).
+    // 3. LM head — optionally only for sampled rows (prefill computes just
+    //    the last row; fused steps the decode rows plus committing prompts'
+    //    last rows. Saves the [vocab, n_tokens] matmul and ~233MB scratch
+    //    at ubatch=384). Multi-prompt steps sample scattered rows, so they
+    //    gather by explicit index instead of a tail view.
     ggml_tensor * logits = nullptr;
     if (w.output) {
-        if (in.logits_tail_rows > 0 && in.logits_tail_rows < n_tokens) {
+        if (in.logits_row_indices) {
+            out = ggml_get_rows(ctx, out, in.logits_row_indices);
+        } else if (in.logits_tail_rows > 0 && in.logits_tail_rows < n_tokens) {
             out = ggml_view_2d(ctx, out, hidden, in.logits_tail_rows,
                                out->nb[1],
                                (size_t)(n_tokens - in.logits_tail_rows) *

@@ -73,8 +73,11 @@ public:
 
     // Admit one request into a free slot and queue its prompt for chunked
     // prefill. No K/V blocks or compute are consumed here — subsequent step()
-    // calls allocate and advance one prefill chunk alongside the decode batch.
-    // At most one admission may prefill at a time.
+    // calls allocate and advance prefill chunks alongside the decode batch.
+    // Independent free slots may prefill concurrently under one shared
+    // per-step token budget; admission must not serialize on another
+    // prompt's prefill. Admission reserves the prompt's block count so
+    // concurrent prefills cannot be promised the same free pool pages.
     //
     // `sampler` is the only source of truth for how the slot samples:
     // sampler.needs_logit_processing() selects CPU sampling over GPU argmax
@@ -104,14 +107,15 @@ public:
     };
 
     // One scheduler iteration: commit each input token and advance every
-    // decoding slot, while also advancing the pending admission's prefill by
-    // one chunk when present. Every decoding slot must appear in `inputs`;
-    // the prefilling slot must not. A completed prefill contributes one extra
-    // output with prefill_done=true. Returns false on a whole-batch failure
-    // (outputs may be partial).
+    // decoding slot, while also advancing every pending admission's prefill
+    // under the shared chunk budget. Every decoding slot must appear in
+    // `inputs`; prefilling slots must not. Each prefill completed in this
+    // step contributes one extra output with prefill_done=true. Returns
+    // false on a whole-batch failure (outputs may be partial).
     virtual bool step(const std::vector<StepInput> & inputs,
                       std::vector<StepOutput> & outputs) = 0;
 
+    // True while any admission's prefill is in flight.
     virtual bool prefill_pending() const = 0;
 
     // Release a slot's KV blocks and mark it free. Safe on failed slots.

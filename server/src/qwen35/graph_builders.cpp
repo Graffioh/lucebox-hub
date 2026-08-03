@@ -285,6 +285,9 @@ bool build_target_step(
     int seq_slot,
     int paged_max_kv_len,
     int n_prefill_tokens,
+    const QwenPrefillSegment * prefill_segments,
+    int n_prefill_segments,
+    int n_logits_rows,
     bool compact_slots) {
     step_graph_free(sg);
 
@@ -309,6 +312,23 @@ bool build_target_step(
         (!paged_attention || compact_slots || n_seqs != 1 || with_mask)) {
         return false;
     }
+    // Prefill rows always arrive split into per-prompt segments: dense, in
+    // order, totalling n_prefill_tokens.
+    if ((n_prefill_tokens > 0) !=
+        (prefill_segments != nullptr && n_prefill_segments > 0)) {
+        return false;
+    }
+    int segment_total = 0;
+    for (int i = 0; i < n_prefill_segments; ++i) {
+        const QwenPrefillSegment & pf = prefill_segments[i];
+        if (pf.n_tokens < 1 || pf.token_offset != segment_total ||
+            pf.seq_slot < 0 || pf.seq_slot >= cache.n_seq_slots) {
+            return false;
+        }
+        segment_total += pf.n_tokens;
+    }
+    if (segment_total != n_prefill_tokens) return false;
+    if (n_logits_rows > 0 && n_prefill_tokens == 0) return false;
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
     // addresses, keeping the ggml-cuda CUDA-graph cache key (nodes[0]) and
@@ -419,6 +439,12 @@ bool build_target_step(
         ggml_set_input(sg.paged_query_seq_ids);
         ggml_set_input(sg.paged_query_positions);
     }
+    if (n_logits_rows > 0) {
+        sg.logits_row_indices =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_logits_rows);
+        ggml_set_name(sg.logits_row_indices, "logits_row_indices");
+        ggml_set_input(sg.logits_row_indices);
+    }
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
@@ -467,6 +493,9 @@ bool build_target_step(
     gi.n_prefill_tokens           = n_prefill_tokens;
     gi.paged_query_seq_ids        = sg.paged_query_seq_ids;
     gi.paged_query_positions      = sg.paged_query_positions;
+    gi.logits_row_indices         = sg.logits_row_indices;
+    gi.prefill_segments           = prefill_segments;
+    gi.n_prefill_segments         = n_prefill_segments;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

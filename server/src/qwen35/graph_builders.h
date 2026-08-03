@@ -95,12 +95,19 @@ bool build_hybrid_full_layer_step(
 //     INCLUDING the prefilling slot's rows written this step (kernel launch
 //     bound).
 //   `n_prefill_tokens` — concurrent prefill: the leading n_prefill_tokens
-//     rows are one slot's prompt chunk, reading the pool through the ragged
-//     paged path (per-row seq ids and inclusive causal positions — no mask;
-//     kv_write_rows covers the WHOLE batch). Fused steps append n_seqs
-//     compact decode rows (n_tokens == n_prefill_tokens + n_seqs, requires
-//     compact_slots); a prefill-only step has n_tokens == n_prefill_tokens,
-//     n_seqs == 1 and no compact map. Requires paged_attention.
+//     rows are prompt chunks, reading the pool through the ragged paged
+//     path (per-row seq ids and inclusive causal positions — no mask;
+//     kv_write_rows covers the WHOLE batch). `prefill_segments` (required
+//     when n_prefill_tokens > 0) describes the per-prompt split: dense,
+//     in order, totalling n_prefill_tokens; the array must stay alive
+//     through the call. Fused steps append n_seqs compact decode rows
+//     (n_tokens == n_prefill_tokens + n_seqs, requires compact_slots); a
+//     prefill-only step has n_tokens == n_prefill_tokens, n_seqs == 1 and
+//     no compact map. Requires paged_attention.
+//   `n_logits_rows` — allocate an i32 gather of this many final-norm rows
+//     for the LM head (sg.logits_row_indices, uploaded by the caller);
+//     overrides logits_tail_rows. Multi-prompt steps need it because
+//     committing rows are scattered. 0 keeps the tail-view behavior.
 //   `logits_tail_rows` — logits/argmax only for the last n rows (0 = all).
 bool build_target_step(
     StepGraph & sg,
@@ -123,6 +130,9 @@ bool build_target_step(
     int seq_slot = 0,
     int paged_max_kv_len = 0,
     int n_prefill_tokens = 0,
+    const QwenPrefillSegment * prefill_segments = nullptr,
+    int n_prefill_segments = 0,
+    int n_logits_rows = 0,
     bool compact_slots = false);
 
 // Full target forward: DDTree tree-verify mode.
