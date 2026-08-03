@@ -122,18 +122,28 @@ std::vector<float> reference_attention(
         const std::vector<float> & q,
         const std::vector<float> & k,
         const std::vector<float> & v,
-        const std::vector<int32_t> * active_slot_ids = nullptr) {
+        const std::vector<int32_t> * active_slot_ids = nullptr,
+        const std::vector<int32_t> * query_positions = nullptr) {
     std::vector<float> output(q.size(), 0.0f);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
     const int q_per_kv = N_HEAD / N_HEAD_KV;
+    const int physical_n_seq = static_cast<int>(test_case.kv_seq_lens.size());
     const int n_seq = active_slot_ids
         ? static_cast<int>(active_slot_ids->size())
-        : static_cast<int>(test_case.kv_seq_lens.size());
+        : physical_n_seq;
 
     for (int seq = 0; seq < n_seq; ++seq) {
         const int physical_seq = active_slot_ids ? (*active_slot_ids)[seq] : seq;
-        if (physical_seq < 0) continue;
-        const int kv_seq_len = clamped_seq_len(test_case, physical_seq);
+        // Mirrors the kernel: out-of-range slot ids and negative positions
+        // are padding rows and leave zero output.
+        if (physical_seq < 0 || physical_seq >= physical_n_seq) continue;
+        int kv_seq_len = clamped_seq_len(test_case, physical_seq);
+        if (query_positions) {
+            // The inclusive causal clamp: row seq attends its sequence's
+            // cached tokens [0, position].
+            kv_seq_len = std::min(
+                kv_seq_len, std::max(0, (*query_positions)[seq] + 1));
+        }
         for (int head = 0; head < N_HEAD; ++head) {
             const int kv_head = head / q_per_kv;
             const float * q_row =
@@ -191,11 +201,16 @@ bool run_case(ggml_backend_t backend,
               const TestCase & test_case,
               ggml_type k_type,
               ggml_type v_type,
-              const std::vector<int32_t> * active_slot_ids = nullptr) {
+              const std::vector<int32_t> * active_slot_ids = nullptr,
+              const std::vector<int32_t> * query_positions = nullptr) {
     const int physical_n_seq = static_cast<int>(test_case.kv_seq_lens.size());
     const int n_seq = active_slot_ids
         ? static_cast<int>(active_slot_ids->size())
         : physical_n_seq;
+    // Ragged causal positions ride on the compact row -> slot mapping.
+    GGML_ASSERT(!query_positions ||
+                (active_slot_ids &&
+                 query_positions->size() == active_slot_ids->size()));
     const int physical_blocks = count_physical_blocks(test_case);
     const int pool_tokens = physical_blocks * BLOCK_SIZE;
     const std::vector<int32_t> block_table =
@@ -226,12 +241,17 @@ bool run_case(ggml_backend_t backend,
         active = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq);
         ggml_set_input(active);
     }
+    ggml_tensor * positions = nullptr;
+    if (query_positions) {
+        positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq);
+        ggml_set_input(positions);
+    }
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
     const int max_kv_seq_len = *std::max_element(
         test_case.kv_seq_lens.begin(), test_case.kv_seq_lens.end());
     ggml_tensor * output = ggml_paged_attn_ext(
-        ctx, q, k, v, table, kv_seq_lens, active,
+        ctx, q, k, v, table, kv_seq_lens, active, positions,
         scale, BLOCK_SIZE, max_kv_seq_len);
     ggml_set_output(output);
     ggml_cgraph * graph = ggml_new_graph(ctx);
@@ -286,6 +306,11 @@ bool run_case(ggml_backend_t backend,
                 active, active_slot_ids->data(), 0,
                 active_slot_ids->size() * sizeof((*active_slot_ids)[0]));
         }
+        if (query_positions) {
+            ggml_backend_tensor_set(
+                positions, query_positions->data(), 0,
+                query_positions->size() * sizeof((*query_positions)[0]));
+        }
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
     }
 
@@ -297,7 +322,8 @@ bool run_case(ggml_backend_t backend,
         const std::vector<float> expected =
             reference_attention(
                 test_case, block_table, pool_tokens, physical_blocks,
-                q_data, k_reference, v_reference, active_slot_ids);
+                q_data, k_reference, v_reference, active_slot_ids,
+                query_positions);
         max_abs_error = 0.0f;
         for (size_t i = 0; i < actual.size(); ++i) {
             if (!std::isfinite(actual[i])) {
@@ -310,9 +336,10 @@ bool run_case(ggml_backend_t backend,
         ok = ok && max_abs_error < MAX_ABS_ERROR;
     }
 
-    std::printf("paged attention %-11s K=%-4s V=%-4s active=%s max_abs=%.6g %s\n",
+    std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s max_abs=%.6g %s\n",
                 test_case.name, ggml_type_name(k_type), ggml_type_name(v_type),
                 active_slot_ids ? "yes" : "no",
+                query_positions ? "yes" : "no",
                 max_abs_error, ok ? "PASS" : "FAIL");
     ggml_gallocr_free(allocator);
     ggml_free(ctx);
@@ -341,7 +368,7 @@ bool rejects_unlaunchable_gqa(ggml_backend_t backend) {
     ggml_tensor * kv_seq_lens =
         ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_tensor * output = ggml_paged_attn_ext(
-        ctx, q, k, v, table, kv_seq_lens, nullptr,
+        ctx, q, k, v, table, kv_seq_lens, nullptr, nullptr,
         1.0f / std::sqrt(static_cast<float>(D)), BLOCK_SIZE, 1);
 
     const bool rejected = !ggml_backend_supports_op(backend, output);
@@ -383,6 +410,15 @@ int main(int argc, char ** argv) {
         {1, 17, 31},
         false,
     };
+    // Ragged prefill chunk: interleaved query rows from two sequences attend
+    // the paged pool causally through per-row positions. Sequence 1 spans 65
+    // logical blocks, so its full-prefix row exercises the partitioned path.
+    const TestCase ragged_case{
+        "ragged",
+        65,
+        {33, 1025},
+        false,
+    };
     const bool direct =
         argc == 2 && std::strcmp(argv[1], "--direct") == 0;
     if (argc > 2 || (argc == 2 && !direct)) {
@@ -415,6 +451,16 @@ int main(int argc, char ** argv) {
     ok = run_case(backend, compact_three_slot_case,
                   GGML_TYPE_F16, GGML_TYPE_F16,
                   &compact_three_slot_ids) && ok;
+
+    // Per-row causal positions: a first-token row, a short prefix, a
+    // multi-partition full prefix, a block-aligned prefix, and a padding
+    // row, interleaved across the two block-table columns. Asymmetric
+    // quantized K/V pins both dequant paths under the causal clamp.
+    const std::vector<int32_t> ragged_slot_ids{1, 0, 1, 0, -1};
+    const std::vector<int32_t> ragged_positions{0, 4, 1024, 31, -1};
+    ok = run_case(backend, ragged_case,
+                  GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                  &ragged_slot_ids, &ragged_positions) && ok;
 
     ggml_backend_free(backend);
     return ok ? 0 : 1;
