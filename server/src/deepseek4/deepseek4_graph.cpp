@@ -6541,7 +6541,7 @@ bool deepseek4_step_layer_range(
         !w.moe_hybrid && cache.prefill_mode != PrefillAttentionMode::Exact &&
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
         layer_begin == 0 && is_last_shard && out_logits &&
-        ds4_backend_is_gpu(backend);
+        ds4_backend_is_gpu(backend) && !verify_hooks;
     // These graphs are rebuilt around an owner join on every layer, so tensor
     // metadata addresses can be recycled for different topologies.  Until
     // the full heterogeneous layer is captured as one stable scheduler graph,

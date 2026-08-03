@@ -104,6 +104,15 @@ private:
     void release_spec_drafter(bool mark_parked);
     void keep_spec_feature_tail(std::vector<float> & features,
                                 size_t max_rows) const;
+    // Limit a prefill batch to a region with a uniform DSpark capture policy.
+    // This keeps the fast unhooked path for the prompt bulk while ensuring
+    // every token in the final/checkpoint feature windows is actually hooked.
+    static int capture_safe_prefill_tokens(int token_offset,
+                                           int requested_tokens,
+                                           int final_capture_from,
+                                           bool snapshot_pending,
+                                           int snapshot_capture_from,
+                                           int snapshot_capture_to);
 
     // Prefill prompt tokens in chunks, return absolute committed position.
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,

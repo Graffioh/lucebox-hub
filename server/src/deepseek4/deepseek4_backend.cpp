@@ -795,6 +795,31 @@ void DeepSeek4Backend::keep_spec_feature_tail(
     features.resize(keep_floats);
 }
 
+int DeepSeek4Backend::capture_safe_prefill_tokens(
+        int token_offset,
+        int requested_tokens,
+        int final_capture_from,
+        bool snapshot_pending,
+        int snapshot_capture_from,
+        int snapshot_capture_to) {
+    if (requested_tokens <= 0) return 0;
+
+    int safe_tokens = requested_tokens;
+    const auto split_at = [&](int boundary) {
+        const int distance = boundary - token_offset;
+        if (distance > 0 && distance < safe_tokens) {
+            safe_tokens = distance;
+        }
+    };
+
+    split_at(final_capture_from);
+    if (snapshot_pending) {
+        split_at(snapshot_capture_from);
+        split_at(snapshot_capture_to);
+    }
+    return safe_tokens;
+}
+
 bool DeepSeek4Backend::init() {
     // The shared MMVQ/MMQ crossover defaults to q=3 for NVIDIA. On gfx1151,
     // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
@@ -1373,6 +1398,12 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (save_snapshot && !snapshot_saved &&
             snap_pos > pos && snap_pos < pos + n_tok) {
             n_tok = snap_pos - pos;
+        }
+        if (spec_enabled_ && spec_drafter_) {
+            n_tok = capture_safe_prefill_tokens(
+                i, n_tok, spec_final_from,
+                save_snapshot && !snapshot_saved,
+                spec_snap_from, spec_snap_to);
         }
 
         // Embed tokens
