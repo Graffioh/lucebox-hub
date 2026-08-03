@@ -494,7 +494,8 @@ static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
         return false;
     }
 
-    out.core_bytes = out.gpu_total - out.gpu_free;
+    out.core_bytes = moe_hybrid_core_bytes_from_memory(
+        "deepseek4", out.gpu_free, out.gpu_total);
     out.kv_bytes = estimate_ds4_cache_bytes(w, max_ctx);
 
     if (out.gpu_total > out.core_bytes + out.kv_bytes + out.warm_bytes + out.safety_bytes) {

@@ -112,7 +112,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_TP_CAPTURE_CACHE_SLOTS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_TP_SCHEDULE_BRANCHES` - deepseek4_fused_verify.inc
-- `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` - deepseek4_fused_verify.inc, moe_hybrid_ffn_eval.cpp
+- `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_DS4_TOPK` - deepseek4_graph.cpp
 - `DFLASH_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
 - `DFLASH_EXPERT_BUDGET_PCT` - laguna_backend.cpp
@@ -148,7 +148,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_LAGUNA_DSPARK_CONFIDENCE_THRESHOLD` - laguna_backend.cpp
 - `DFLASH_LAGUNA_DSPARK_TREE` - laguna_backend.cpp
 - `DFLASH_LAGUNA_EXPERT_CACHE` - moe_hybrid_ffn_eval.cpp
-- `DFLASH_MOE_TP_TARGETED_JOIN_SPLIT` - moe_hybrid_ffn_eval.cpp, deepseek4_fused_verify.inc
+- `DFLASH_MOE_TP_TARGETED_JOIN_SPLIT` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_LAGUNA_FUSED_DOMINO` - laguna_backend.cpp
 - `DFLASH_LAGUNA_FUSED_DSPARK` - laguna_backend.cpp
 - `DFLASH_LAGUNA_FUSED_QK` - laguna_target_loader.cpp
