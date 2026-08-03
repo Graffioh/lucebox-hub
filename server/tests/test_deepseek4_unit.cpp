@@ -2500,6 +2500,10 @@ static void test_ds4_flash_attention_keep_cap_gpu() {
 static void test_ds4_flash_attention_parallel_index_scan_gpu() {
     std::fprintf(stderr,
                  "  test_ds4_flash_attention_parallel_index_scan_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only contract)\n");
+    return;
+#endif
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, " skipped (no GPU backend)\n");
@@ -2535,7 +2539,7 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu() {
         ctx, q, kv, kv, mask, 1.0f / std::sqrt((float) head_dim),
         0.0f, 0.0f);
     // Negative keep_rows marks an exact externally indexed mask. This shape
-    // enters the compact four-head GPU path and exceeds the parallel threshold.
+    // enters the compact four-head HIP path and exceeds the parallel threshold.
     ggml_flash_attn_ext_set_ds4_sparse(
         output, raw_rows, raw_window, -selected_rows, 1);
     ggml_set_output(output);
