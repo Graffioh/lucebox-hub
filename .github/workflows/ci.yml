@@ -290,6 +290,7 @@ jobs:
             -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
             -DDFLASH27B_SERVER=OFF \
             -DDFLASH27B_TESTS=ON \
+            -DGGML_HIP_GRAPHS=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
