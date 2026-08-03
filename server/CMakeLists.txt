@@ -1,12 +1,44 @@
 cmake_minimum_required(VERSION 3.21)  # 3.21 adds first-class HIP language support (project(LANGUAGES ... HIP))
 set(DFLASH27B_GPU_BACKEND "cuda" CACHE STRING "GPU backend to build: cuda or hip")
 set_property(CACHE DFLASH27B_GPU_BACKEND PROPERTY STRINGS cuda hip)
+option(DFLASH27B_ENABLE_MIXED_CUDA_HIP
+    "Primary GPU runtime plus an isolated in-process CUDA/HIP peer (Linux only)"
+    OFF)
 string(TOLOWER "${DFLASH27B_GPU_BACKEND}" DFLASH27B_GPU_BACKEND)
+if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+    # Reject unsupported targets before project() tries to discover both GPU
+    # toolchains. Toolchain files define CMAKE_SYSTEM_NAME for cross builds;
+    # otherwise the host system is the native target.
+    if(CMAKE_SYSTEM_NAME)
+        set(_dflash_mixed_target_system "${CMAKE_SYSTEM_NAME}")
+    else()
+        set(_dflash_mixed_target_system "${CMAKE_HOST_SYSTEM_NAME}")
+    endif()
+    if(NOT _dflash_mixed_target_system STREQUAL "Linux")
+        message(FATAL_ERROR
+            "The in-process CUDA+HIP runtime is currently supported on Linux only")
+    endif()
+    unset(_dflash_mixed_target_system)
+endif()
+# These are internal build-shape switches rather than user-selectable backend
+# policy. Reset both on every configure so reusing a build directory after
+# changing the primary backend cannot leave the old peer as a module.
+set(GGML_CUDA_MODULE OFF CACHE BOOL "Build CUDA as a runtime-loadable module" FORCE)
+set(GGML_HIP_MODULE OFF CACHE BOOL "Build HIP as a runtime-loadable module" FORCE)
+
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     set(DFLASH27B_USER_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
     project(dflash LANGUAGES C CXX CUDA)
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-    project(dflash LANGUAGES C CXX HIP)
+    if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+        set(DFLASH27B_CUDA_ARCHITECTURES "86" CACHE STRING
+            "Secondary CUDA GPU targets, e.g. 86 for RTX 3090")
+        set(CMAKE_CUDA_ARCHITECTURES "${DFLASH27B_CUDA_ARCHITECTURES}"
+            CACHE STRING "" FORCE)
+        project(dflash LANGUAGES C CXX HIP CUDA)
+    else()
+        project(dflash LANGUAGES C CXX HIP)
+    endif()
 else()
     message(FATAL_ERROR "DFLASH27B_GPU_BACKEND must be 'cuda' or 'hip', got '${DFLASH27B_GPU_BACKEND}'")
 endif()
@@ -42,8 +74,9 @@ endif()
 
 # If we do not set this, ggml will output to bin and DLLs will not load
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-# ROCm root for HIP builds (rpath + rocwmma header discovery).
-if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+# ROCm root for HIP and mixed CUDA+HIP builds (rpath + header discovery).
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
+   DFLASH27B_ENABLE_MIXED_CUDA_HIP)
     if(DEFINED ROCM_PATH)
         set(_dflash_rocm_root "${ROCM_PATH}")
     elseif(DEFINED ENV{ROCM_PATH})
@@ -57,7 +90,8 @@ endif()
 # Bake portable rpath into all executables so bundled ggml backend libs / libggml-base
 # are found regardless of LD_LIBRARY_PATH or stale /usr/local/lib (closes #31).
 set(CMAKE_INSTALL_RPATH "$ORIGIN/deps/llama.cpp/ggml/src;$ORIGIN/deps/llama.cpp/ggml/src/ggml-cuda;$ORIGIN/deps/llama.cpp/ggml/src/ggml-hip;$ORIGIN/../deps/llama.cpp/ggml/src;$ORIGIN/../deps/llama.cpp/ggml/src/ggml-cuda;$ORIGIN/../deps/llama.cpp/ggml/src/ggml-hip")
-if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND _dflash_rocm_root)
+if((DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
+    DFLASH27B_ENABLE_MIXED_CUDA_HIP) AND _dflash_rocm_root)
     list(APPEND CMAKE_BUILD_RPATH "${_dflash_rocm_root}/lib" "${_dflash_rocm_root}/lib64")
     set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${_dflash_rocm_root}/lib;${_dflash_rocm_root}/lib64")
 endif()
@@ -78,20 +112,52 @@ endif()
 
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
-    set(GGML_HIP  OFF CACHE BOOL "" FORCE)
+    if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+        set(GGML_HIP ON CACHE BOOL "" FORCE)
+        set(GGML_HIP_RCCL OFF CACHE BOOL "" FORCE)
+        # Keep CUDA/CPU linked normally so every existing code path is
+        # unchanged. Build only HIP as an RTLD_LOCAL module: both GPU
+        # implementations use the historical ggml_backend_cuda_* symbol
+        # family and therefore cannot safely share the global symbol scope.
+        set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
+        set(GGML_HIP_MODULE ON CACHE BOOL
+            "Build HIP as an isolated runtime-loadable backend" FORCE)
+        # The peer module must link to a shared ggml core. Keep this as a
+        # scoped build requirement; do not overwrite the user's cached
+        # BUILD_SHARED_LIBS choice for later non-mixed reconfiguration.
+        set(DFLASH27B_MIXED_GGML_SHARED ON)
+        set(DFLASH27B_GGML_BACKEND_TARGET ggml-cuda)
+        set(DFLASH27B_HIP_ARCHITECTURES "" CACHE STRING
+            "Secondary HIP GPU targets, e.g. gfx1151")
+    else()
+        set(GGML_HIP OFF CACHE BOOL "" FORCE)
+        set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
+        set(DFLASH27B_GGML_BACKEND_TARGET ggml-cuda)
+    endif()
     set(GGML_CUDA_GRAPHS ON CACHE BOOL "Enable CUDA graphs for AR-decode replay (lucebox)" FORCE)
-    set(DFLASH27B_GGML_BACKEND_TARGET ggml-cuda)
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-    set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+    if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+        set(GGML_CUDA ON CACHE BOOL "" FORCE)
+        set(GGML_CUDA_MODULE ON CACHE BOOL
+            "Build CUDA as an isolated runtime-loadable backend" FORCE)
+        set(DFLASH27B_MIXED_GGML_SHARED ON)
+    else()
+        set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+        set(GGML_CUDA_MODULE OFF CACHE BOOL "" FORCE)
+    endif()
     set(GGML_HIP  ON  CACHE BOOL "" FORCE)
     set(GGML_HIP_RCCL OFF CACHE BOOL "" FORCE)
     set(DFLASH27B_GGML_BACKEND_TARGET ggml-hip)
     set(DFLASH27B_HIP_ARCHITECTURES "" CACHE STRING "HIP GPU targets, e.g. gfx906;gfx1100")
+    set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
     if(DFLASH27B_HIP_ARCHITECTURES AND NOT CMAKE_HIP_ARCHITECTURES)
         set(CMAKE_HIP_ARCHITECTURES "${DFLASH27B_HIP_ARCHITECTURES}" CACHE STRING "" FORCE)
     endif()
+    if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+        set(GGML_CUDA_GRAPHS ON CACHE BOOL
+            "Enable CUDA graphs in the secondary CUDA backend" FORCE)
+    endif()
 endif()
-set(GGML_BACKEND_DL   OFF CACHE BOOL "" FORCE)
 set(GGML_METAL        OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN       OFF CACHE BOOL "" FORCE)
 set(GGML_BLAS         OFF CACHE BOOL "" FORCE)
@@ -147,6 +213,16 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     # which triggers massive first-request PTX JIT on newer GPUs even though
     # dflash_common itself is compiled for the intended arch set.
     set(CMAKE_CUDA_ARCHITECTURES "${_dflash_archs}" CACHE STRING "" FORCE)
+    if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+        if(DFLASH27B_HIP_ARCHITECTURES)
+            set(_dflash_mixed_hip_archs "${DFLASH27B_HIP_ARCHITECTURES}")
+        elseif(AMDGPU_TARGETS)
+            set(_dflash_mixed_hip_archs "${AMDGPU_TARGETS}")
+        else()
+            set(_dflash_mixed_hip_archs "gfx1151")
+        endif()
+        set(CMAKE_HIP_ARCHITECTURES "${_dflash_mixed_hip_archs}" CACHE STRING "" FORCE)
+    endif()
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     # User override precedence: -DDFLASH27B_HIP_ARCHITECTURES → -DAMDGPU_TARGETS
     # → gfx1151 default (Strix Halo).
@@ -200,10 +276,44 @@ if(WIN32 AND NOT CMAKE_ASM_COMPILER)
     set(CMAKE_ASM_COMPILER "${CMAKE_CXX_COMPILER}" CACHE FILEPATH "" FORCE)
 endif()
 
-# Use only the ggml subtree of llama.cpp (skip libllama).
+# Resolve GPU runtime packages before creating the ggml targets so their build
+# rpaths include non-system toolkit installations. This matters when a peer
+# module is loaded with dlopen and cannot inherit link-time search paths from
+# the primary executable.
+if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+   DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+    find_package(CUDAToolkit REQUIRED)
+    if(UNIX AND CUDAToolkit_LIBRARY_DIR)
+        list(APPEND CMAKE_BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
+        list(APPEND CMAKE_INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}")
+    endif()
+endif()
+# Use only the ggml subtree of llama.cpp (skip libllama). Mixed builds need a
+# shared ggml core for the isolated peer module, but that requirement belongs
+# only to this sub-build. Restoring the previous value prevents a reused build
+# directory from silently changing ordinary builds after mixed mode is turned
+# off.
+if(DFLASH27B_MIXED_GGML_SHARED)
+    set(_dflash_build_shared_libs_was_defined OFF)
+    if(DEFINED BUILD_SHARED_LIBS)
+        set(_dflash_build_shared_libs_was_defined ON)
+        set(_dflash_saved_build_shared_libs "${BUILD_SHARED_LIBS}")
+    endif()
+    set(BUILD_SHARED_LIBS ON)
+endif()
 add_subdirectory(deps/llama.cpp/ggml EXCLUDE_FROM_ALL)
+if(DFLASH27B_MIXED_GGML_SHARED)
+    if(_dflash_build_shared_libs_was_defined)
+        set(BUILD_SHARED_LIBS "${_dflash_saved_build_shared_libs}")
+    else()
+        unset(BUILD_SHARED_LIBS)
+    endif()
+    unset(_dflash_saved_build_shared_libs)
+    unset(_dflash_build_shared_libs_was_defined)
+endif()
 
-if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
+   DFLASH27B_ENABLE_MIXED_CUDA_HIP)
     # The vendored ggml HIP shim still uses a few CUDA spellings that are not
     # mapped in this upstream snapshot. Keep the compatibility layer in this
     # repo so the build stays reproducible from a clean checkout.
@@ -217,11 +327,22 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
         ${CMAKE_CURRENT_SOURCE_DIR}/src/hip_compat)
 endif()
 
-if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-    # The CUDA-only sources include <cuda_runtime.h> directly, so the toolkit
-    # headers must be available when compiling the library.
-    find_package(CUDAToolkit REQUIRED)
-elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+    # CUDA and HIP are compiled from the same ggml-cuda implementation and
+    # therefore share C++ typeinfo, vtable, template, and data-symbol names.
+    # Bind every definition in the secondary module locally: limiting this to
+    # functions still permits the primary runtime's pool/vtable state to
+    # interpose and hand an allocation to the wrong vendor kernel.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        target_link_options(ggml-hip PRIVATE "LINKER:-Bsymbolic")
+    else()
+        target_link_options(ggml-cuda PRIVATE "LINKER:-Bsymbolic")
+    endif()
+endif()
+
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
+   DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+    # The ggml HIP subdirectory establishes ROCm's package search roots.
     find_package(hip REQUIRED)
 endif()
 
@@ -281,6 +402,7 @@ add_library(dflash_common STATIC
     src/laguna/laguna_layer_split_adapter.cpp
     src/laguna/laguna_dflash_target.cpp
     src/common/backend_ipc.cpp
+    src/common/dynamic_backend.cpp
     src/common/domino_head.cpp
     src/common/dspark_head.cpp
     src/common/target_shard_ipc.cpp
@@ -386,11 +508,19 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
         DFLASH27B_BACKEND_CUDA=1
         DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm}
         DFLASH27B_MIN_SM=${_dflash_cuda_min_sm})
+    if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+        target_compile_definitions(dflash_common PRIVATE
+            DFLASH27B_BACKEND_MIXED=1)
+    endif()
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     target_sources(dflash_common PRIVATE src/deepseek4/deepseek4_hc_cuda.cu)
     set_source_files_properties(src/deepseek4/deepseek4_hc_cuda.cu PROPERTIES LANGUAGE HIP)
     set_target_properties(dflash_common PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
     target_compile_definitions(dflash_common PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+    if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+        target_compile_definitions(dflash_common PRIVATE
+            DFLASH27B_BACKEND_MIXED=1)
+    endif()
     # hip_compat shim is needed by ALL dflash_common sources (peer_access.cpp,
     # dflash_feature_ring.cpp, flashprefill.cpp), not just the SM80_EQUIV path.
     target_include_directories(dflash_common PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
@@ -692,6 +822,14 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_cuda_comm_api PRIVATE
             ggml-cuda ggml ggml-base)
         add_test(NAME cuda_comm_api COMMAND test_cuda_comm_api)
+    endif()
+
+    if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+        add_executable(test_mixed_cuda_hip test/test_mixed_cuda_hip.cpp)
+        target_include_directories(test_mixed_cuda_hip PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_mixed_cuda_hip PRIVATE dflash_common)
+        add_test(NAME mixed_cuda_hip COMMAND test_mixed_cuda_hip)
     endif()
 
     add_executable(test_rocmfp4 deps/llama.cpp/ggml/rocmfp4/test_rocmfp4.c)
@@ -1308,10 +1446,18 @@ if(DFLASH27B_SERVER)
         target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+            if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+                target_compile_definitions(dflash_server PRIVATE
+                    DFLASH27B_BACKEND_MIXED=1)
+            endif()
         else()
             target_compile_definitions(dflash_server PRIVATE
                 DFLASH27B_BACKEND_CUDA=1
                 DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
+            if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+                target_compile_definitions(dflash_server PRIVATE
+                    DFLASH27B_BACKEND_MIXED=1)
+            endif()
         endif()
         if(NOT WIN32)
             target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
@@ -1352,10 +1498,18 @@ if(DFLASH27B_SERVER)
         target_include_directories(backend_ipc_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(backend_ipc_daemon PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+            if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+                target_compile_definitions(backend_ipc_daemon PRIVATE
+                    DFLASH27B_BACKEND_MIXED=1)
+            endif()
         else()
             target_compile_definitions(backend_ipc_daemon PRIVATE
                 DFLASH27B_BACKEND_CUDA=1
                 DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
+            if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
+                target_compile_definitions(backend_ipc_daemon PRIVATE
+                    DFLASH27B_BACKEND_MIXED=1)
+            endif()
         endif()
         if(NOT WIN32)
             target_link_libraries(backend_ipc_daemon PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)

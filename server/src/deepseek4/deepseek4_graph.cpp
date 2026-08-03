@@ -13,6 +13,7 @@
 #include "internal.h"
 #include "../common/step_graph.h"
 #include "../common/cuda_graph_overrides.h"
+#include "../common/dynamic_backend.h"
 #include "../common/moe_expert_compute.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_routing_stats.h"
@@ -1375,10 +1376,33 @@ static int ds4_comp_rows_used(const ggml_tensor * comp_cache, int n_cached, int 
 // rows in [n_comp, padded) are masked to -1e30 in the score matrix, which
 // underflows to exactly 0 in softmax, so a padded read is bit-identical to an
 // unpadded read of the first n_comp rows.
-static constexpr int DS4_COMP_PAD_STRIDE = 16;
+static int ds4_comp_pad_stride() {
+    static const int stride = [] {
+        constexpr int default_stride = 16;
+        const char * raw = std::getenv("DFLASH_DS4_COMP_PAD_STRIDE");
+        if (!raw || !*raw) return default_stride;
+        const int requested = std::atoi(raw);
+        switch (requested) {
+            case 16:
+            case 32:
+            case 64:
+            case 128:
+                return requested;
+            default:
+                std::fprintf(stderr,
+                    "[deepseek4] invalid DFLASH_DS4_COMP_PAD_STRIDE=%s; "
+                    "using %d\n",
+                    raw, default_stride);
+                return default_stride;
+        }
+    }();
+    return stride;
+}
+
 static int ds4_padded_comp_rows(int n_comp, int cap) {
     if (n_comp <= 0) return 0;
-    const int padded = ((n_comp + DS4_COMP_PAD_STRIDE - 1) / DS4_COMP_PAD_STRIDE) * DS4_COMP_PAD_STRIDE;
+    const int stride = ds4_comp_pad_stride();
+    const int padded = ((n_comp + stride - 1) / stride) * stride;
     return padded < cap ? padded : cap;
 }
 
@@ -2153,13 +2177,19 @@ static ggml_tensor * build_mla_attention(
     ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);
     // attn_low: [n_lora_o, n_tokens, n_out_group]
     ggml_tensor * out = nullptr;
-    if (n_tokens > 1) {
+    const bool grouped_output_projection =
+        n_tokens > 1 &&
+        !ds4_env_flag("DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
+    if (grouped_output_projection) {
         // Batched ROCmFPX MMQ consumes src1's channel stride directly. This
         // avoids materializing both permutations (~256 MiB/layer at 2K).
         out = ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);
     } else {
-        // Preserve the established single-token graph and its numerical
-        // behavior. Decode is intentionally outside the prefill fast path.
+        // Preserve the established single-token graph and provide an exact
+        // fallback for heterogeneous runtimes that cannot retain grouped-view
+        // metadata across a scheduler copy. At verifier widths (q <= 4), this
+        // materializes at most 128 KiB per layer rather than the long-prefill
+        // volume avoided by the grouped path.
         attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));
         attn_low = ggml_reshape_2d(
             ctx, attn_low, n_lora_o * n_out_group, n_tokens);
@@ -2885,7 +2915,8 @@ static bool eval_ds4_hybrid(
         ggml_tensor * ffn_normed_backend = nullptr,
         const MoeHybridDeviceOutputs * device_outputs = nullptr) {
     const auto ffn_t0 = Ds4TimingClock::now();
-    if (!storage.down_cold && !storage.gate_up_cold &&
+    if (!storage.cold_expert_ids.empty() &&
+        !storage.down_cold && !storage.gate_up_cold &&
         !(expert_compute && expert_layer)) {
         if (!hybrid_owner || !stream_engine || !stream_engine->is_ready() ||
             !hybrid_owner->has_mmap() ||
@@ -4444,10 +4475,13 @@ bool deepseek4_step(
 // while a variant recurs, which is what the ggml-cuda/HIP graph cache keys
 // on, enabling graph replay for the bulk of decode steps.
 
-static bool ds4_fused_decode_enabled() {
-    static const bool enabled =
+static bool ds4_fused_decode_enabled(const DeepSeek4Weights & w) {
+    // The supported control is --ds4-fused-decode, propagated through the
+    // loaded weights. Keep the old environment spelling as a compatibility
+    // fallback for existing launch scripts.
+    static const bool legacy_env_enabled =
         ds4_env_flag("DFLASH_DS4_FUSED_DECODE");
-    return enabled;
+    return w.fused_decode || legacy_env_enabled;
 }
 
 struct DeepSeek4FusedDecodeGraph {
@@ -6760,7 +6794,8 @@ bool deepseek4_step_layer_range(
     if (!moe_hybrid && n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
         !(verify_hooks && verify_hooks->capture_layer_ids &&
           verify_hooks->capture_out) &&
-        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_decode_enabled()) {
+        out_logits && ds4_backend_is_gpu(backend) &&
+        ds4_fused_decode_enabled(w)) {
         const int rc = ds4_try_fused_decode_step(
             fused_decode_graph_cache, backend, w, cache, hc_layer_weights_range,
             hc_output_weights_range, hash_routing_tables_range, scratch.hash_expert_ids,
@@ -6848,6 +6883,38 @@ bool deepseek4_step_layer_range(
                                 hc_state.data(), 0, sizeof(float) * hc_state.size());
         hc_state_backend = cached_decode_hc_post_graph.residual_hc;
     }
+    const auto capture_requested = [&](int layer) {
+        if (!verify_hooks || !verify_hooks->capture_layer_ids ||
+            !verify_hooks->capture_out) {
+            return false;
+        }
+        const std::vector<int> & ids = *verify_hooks->capture_layer_ids;
+        return std::find(ids.begin(), ids.end(), layer) != ids.end();
+    };
+    const auto capture_hc_layer = [&](int layer, const float * state) {
+        if (!state || !capture_requested(layer)) return;
+        const std::vector<int> & ids = *verify_hooks->capture_layer_ids;
+        std::vector<float> & capture = *verify_hooks->capture_out;
+        if ((int) capture.size() != (int) ids.size() * n_embd * n_tokens) {
+            capture.assign(
+                (size_t) ids.size() * n_embd * n_tokens, 0.0f);
+        }
+        for (size_t ci = 0; ci < ids.size(); ++ci) {
+            if (ids[ci] != layer) continue;
+            for (int t = 0; t < n_tokens; ++t) {
+                float * dst = capture.data() +
+                    (size_t) t * ids.size() * n_embd + ci * n_embd;
+                const float * hs = state + (size_t) t * hc_dim;
+                for (int d = 0; d < n_embd; ++d) {
+                    float sum = 0.0f;
+                    for (int h = 0; h < n_hc; ++h) {
+                        sum += hs[(size_t) h * n_embd + d];
+                    }
+                    dst[d] = sum / (float) n_hc;
+                }
+            }
+        }
+    };
     for (int il = layer_begin; il < layer_end; ++il) {
         const DeepSeek4Layer & L = w.layers[(size_t)il];
         DeepSeek4LayerCache & lc = cache.layers[(size_t)il];
@@ -7518,25 +7585,15 @@ bool deepseek4_step_layer_range(
                               n_hc);
                 std::memcpy(hc_state.data(), next_hc.data(), next_hc.size() * sizeof(float));
                 if (telemetry) telemetry->hc_post_ffn_us += ds4_elapsed_us(hc_post_ffn_t0, Ds4TimingClock::now());
-                if (verify_hooks && verify_hooks->capture_layer_ids && verify_hooks->capture_out) {
-                    const std::vector<int> & _ids = *verify_hooks->capture_layer_ids;
-                    for (size_t _ci = 0; _ci < _ids.size(); ++_ci) {
-                        if (_ids[_ci] != il) continue;
-                        const int _ncap = (int) _ids.size();
-                        std::vector<float> & _cap = *verify_hooks->capture_out;
-                        if ((int) _cap.size() != _ncap * n_embd * n_tokens)
-                            _cap.assign((size_t) _ncap * n_embd * n_tokens, 0.0f);
-                        for (int _t = 0; _t < n_tokens; ++_t) {
-                            float * _dst = _cap.data() + (size_t) _t * _ncap * n_embd + (size_t) _ci * n_embd;
-                            const float * _hs = hc_state.data() + (size_t) _t * hc_dim;
-                            for (int _d = 0; _d < n_embd; ++_d) {
-                                float _acc = 0.0f;
-                                for (int _h = 0; _h < n_hc; ++_h) _acc += _hs[(size_t) _h * n_embd + _d];
-                                _dst[_d] = _acc / (float) n_hc;
-                            }
-                        }
-                    }
-                }
+                capture_hc_layer(il, hc_state.data());
+            }
+            if ((use_backend_prefill_hc || use_backend_decode_hc_graph ||
+                 use_backend_decode_hc_direct) &&
+                hc_state_backend && capture_requested(il)) {
+                ggml_backend_tensor_get(
+                    hc_state_backend, hc_state.data(), 0,
+                    sizeof(float) * hc_state.size());
+                capture_hc_layer(il, hc_state.data());
             }
         }
     }
@@ -7585,7 +7642,9 @@ bool deepseek4_step_layer_range(
             ggml_context * ctx = ggml_init(params);
             if (!ctx) return false;
 
-            const bool last_only = n_tokens > 1;
+            const bool need_all_logits =
+                verify_hooks && verify_hooks->all_logits_out;
+            const bool last_only = n_tokens > 1 && !need_all_logits;
             const int output_tokens = last_only ? 1 : n_tokens;
             ggml_tensor * inp = ggml_new_tensor_2d(
                 ctx, GGML_TYPE_F32, n_embd, output_tokens);
