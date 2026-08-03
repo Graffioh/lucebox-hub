@@ -97,17 +97,19 @@ reserving `N x max_ctx` physical K/V at startup, and the exhaustion paths
 above stay unreachable unless memory pressure actually forces
 oversubscription — configurations that previously failed to start at all.
 
-**Non-pausing admission.** `SeqEngine::admit()` claims a slot and queues its
-prompt without allocating K/V or running the full prefill. Each scheduler
-iteration then allocates one prompt chunk and calls `SeqEngine::step()` with
-that chunk and every live decode slot in the same forward pass: one ragged
-paged attention call covers every row, with per-row causal extents. The
-prompt's recurrent state advances in its own slot's slab (zeroed at
-admission), so completion needs no state copy. This keeps existing streams
-advancing through an admission instead of stopping for the whole prefill.
-The engine still runs one prompt's prefill at a time, so cold-burst
-admissions are serialized; lifting that limit is the ragged multi-prompt
-follow-up.
+**Non-pausing admission.** `SeqEngine::admit()` claims a slot, reserves the
+prompt's block count (so concurrent prefills cannot be promised the same
+free pages), and queues the prompt without allocating K/V or running the
+full prefill. Each scheduler iteration then divides one chunk budget
+(default 512 tokens) across every pending prompt — an equal share
+recomputed against the residual budget, with the scan's starting slot
+rotating per step — and calls `SeqEngine::step()` with those chunks and
+every live decode slot in the same forward pass: one ragged paged attention
+call covers every row, with per-row causal extents. Each prompt's recurrent
+state advances in its own slot's slab (zeroed at admission), so completion
+needs no state copy. Existing streams keep advancing through admissions,
+and a burst of long prompts prefills as one shared wave instead of a serial
+queue — a short prompt is never stuck behind a long one's full prefill.
 
 ## Numbers
 
@@ -179,12 +181,14 @@ unrelated 100 GB tenant during the run):
    `set_rows` and attends them directly through the block table with per-row
    causal extents — no staging copy, no mask, any block layout.
 4. **Partly done.** On-demand block allocation, memory-derived physical-pool
-   sizing, client-disconnect cancellation, and non-pausing prefill/decode
-   fusion are in. Recompute preemption under pool pressure (retire and replay
-   a victim instead of failing it) remains follow-up work. Also open: more
-   than one in-flight prefill, and the stream-K decode kernel for ragged
+   sizing, client-disconnect cancellation, non-pausing prefill/decode
+   fusion, and concurrent multi-prompt prefill are in. Recompute preemption
+   under pool pressure (retire and replay a victim instead of failing it)
+   remains follow-up work, as does the stream-K decode kernel for ragged
    batches.
-5. **Variable-length batched prefill.**
+5. **Done.** Variable-length batched prefill: pending prompts of any lengths
+   share one per-step chunk budget, their ragged rows batched into a single
+   forward pass over the paged pool.
 6. **Prefix caching / CoW.** Shared prefix blocks with reference counting and
    copy-on-write.
 
