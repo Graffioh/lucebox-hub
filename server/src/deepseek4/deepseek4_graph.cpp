@@ -6534,6 +6534,14 @@ bool deepseek4_step_layer_range(
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend);
+    // The standard layer-major pipeline owns an exact batched compressor.
+    // Let it see the wide prompt before the generic boundary splitter turns
+    // the request into ratio-sized (typically four-token) forwards.
+    const bool standard_layer_major_prefill =
+        !w.moe_hybrid && cache.prefill_mode != PrefillAttentionMode::Exact &&
+        n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
+        layer_begin == 0 && is_last_shard && out_logits &&
+        ds4_backend_is_gpu(backend);
     // These graphs are rebuilt around an owner join on every layer, so tensor
     // metadata addresses can be recycled for different topologies.  Until
     // the full heterogeneous layer is captured as one stable scheduler graph,
@@ -6551,7 +6559,8 @@ bool deepseek4_step_layer_range(
     // as sequential execution while retaining safe batched prefixes.
     const int first_chunk = deepseek4_safe_compressor_batch_tokens(w, kv_start, n_tokens);
     if (first_chunk > 0 && first_chunk < n_tokens &&
-        !fused_verify_candidate && !heterogeneous_sparse_prefill) {
+        !fused_verify_candidate && !heterogeneous_sparse_prefill &&
+        !standard_layer_major_prefill) {
         const int input_width = layer_begin == 0 ? n_embd : hc_dim;
         std::vector<float> hc_all;
         std::vector<float> shard_out_all;
@@ -6709,9 +6718,7 @@ bool deepseek4_step_layer_range(
 
     // Large full-model prefill batches use the device-resident layer-major
     // pipeline. DSpark verification remains on its exact q=2..4 path below.
-    if (n_tokens > 4 &&
-        n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS && layer_begin == 0 &&
-        is_last_shard && out_logits && ds4_backend_is_gpu(backend)) {
+    if (standard_layer_major_prefill) {
         const int prc = ds4_try_layer_major_prefill(
             fused_decode_graph_cache, backend, w, cache,
             hc_layer_weights_range, hc_output_weights_range,
