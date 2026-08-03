@@ -22,6 +22,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <limits>
+#include <new>
 
 namespace dflash::common {
 
@@ -774,6 +775,26 @@ void DeepSeek4Backend::release_spec_drafter(bool mark_parked) {
     spec_drafter_parked_ = mark_parked && !spec_draft_path_.empty();
 }
 
+void DeepSeek4Backend::keep_spec_feature_tail(
+        std::vector<float> & features, size_t max_rows) const {
+    if (!spec_drafter_) return;
+    const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
+    if (feat_row <= 0 || features.size() % (size_t) feat_row != 0) {
+        features.clear();
+        return;
+    }
+    const size_t rows = features.size() / (size_t) feat_row;
+    const size_t keep_rows = std::min(rows, max_rows);
+    if (rows == keep_rows) return;
+    const size_t keep_floats = keep_rows * (size_t) feat_row;
+    const size_t drop_floats = features.size() - keep_floats;
+    if (keep_floats > 0) {
+        std::memmove(features.data(), features.data() + drop_floats,
+                     keep_floats * sizeof(float));
+    }
+    features.resize(keep_floats);
+}
+
 bool DeepSeek4Backend::init() {
     // The shared MMVQ/MMQ crossover defaults to q=3 for NVIDIA. On gfx1151,
     // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
@@ -1155,9 +1176,10 @@ bool DeepSeek4Backend::park(ParkTarget target) {
 
     maybe_save_routing_stats();
     for (int i = 0; i < PREFIX_SLOTS; ++i) {
-        free_deepseek4_snapshot(snapshots_[i]);
+        snapshot_free(i);
     }
     last_logits_.clear();
+    last_logits_pos_ = -1;
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
     stream_engine_.destroy();
@@ -1258,7 +1280,9 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
 
 int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   const DaemonIO & io,
-                                  int kv_offset) {
+                                  int kv_offset,
+                                  int snap_slot,
+                                  int snap_pos) {
     // The all-hot layer-range path supports causal chunked prefill. The
     // optimized graph snapshots the previous raw SWA window, attends over
     // that snapshot plus the current ubatch, and commits only the final SWA
@@ -1284,6 +1308,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         : std::max(1, std::min(requested_chunk,
                                layer_major_cap));
     int pos = kv_offset;
+    const bool save_snapshot =
+        snap_slot >= 0 && snap_slot < PREFIX_SLOTS &&
+        snap_pos > kv_offset && snap_pos <= kv_offset + n_total;
     // New sequence: clear the cache buffer so compressor state double-buffers
     // and compressed-KV rows start from zeros, exactly like a fresh server.
     // Without this, the first flush windows of a request pool over the
@@ -1293,19 +1320,34 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         reset_deepseek4_cache(cache_);
     }
     last_logits_.clear();
-    int spec_capture_from = n_total;
+    last_logits_pos_ = -1;
+    int spec_final_from = n_total;
+    int spec_snap_from = n_total;
+    int spec_snap_to = 0;
+    int spec_old_rows_for_final = 0;
     if (spec_enabled_ && spec_drafter_) {
         const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
-        if (kv_offset == 0 || n_total >= w_.n_swa || feat_row <= 0 ||
+        const int snap_tokens = save_snapshot ? snap_pos - kv_offset : n_total;
+        spec_final_from = std::max(0, n_total - w_.n_swa);
+        if (save_snapshot) {
+            spec_snap_from = std::max(0, snap_tokens - w_.n_swa);
+            spec_snap_to = snap_tokens;
+        }
+        if (kv_offset == 0 || feat_row <= 0 ||
             spec_feat_window_.size() % (size_t) feat_row != 0) {
             spec_feat_window_.clear();
-            spec_capture_from = std::max(0, n_total - w_.n_swa);
         } else {
-            // Keep enough prior rows for the new prompt suffix, then append all
-            // new rows. This bounds host capture storage at n_swa without
-            // shifting a multi-megabyte feature window after every token.
+            // Preserve enough restored rows for both the requested checkpoint
+            // and the final prompt tail. The live vector is trimmed after
+            // prefill; the snapshot copy is independently trimmed at save.
             const size_t old_rows = spec_feat_window_.size() / (size_t) feat_row;
-            const size_t keep_rows = (size_t) std::max(0, w_.n_swa - n_total);
+            spec_old_rows_for_final = std::max(0, w_.n_swa - n_total);
+            const int old_rows_for_snap = save_snapshot
+                ? std::max(0, w_.n_swa - snap_tokens) : 0;
+            const size_t keep_rows = std::min(
+                old_rows,
+                (size_t) std::max(spec_old_rows_for_final,
+                                  old_rows_for_snap));
             if (old_rows > keep_rows) {
                 const size_t drop_floats = (old_rows - keep_rows) * (size_t) feat_row;
                 const size_t keep_floats = keep_rows * (size_t) feat_row;
@@ -1314,7 +1356,6 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                              keep_floats * sizeof(float));
                 spec_feat_window_.resize(keep_floats);
             }
-            spec_capture_from = 0;
         }
     }
     const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
@@ -1322,10 +1363,17 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
     DeepSeek4StepTelemetry tel_acc;
     int steps = 0;
 
-    for (int i = 0; i < n_total; i += chunk) {
+    bool snapshot_saved = false;
+    for (int i = 0; i < n_total;) {
         if (io.cancelled) return pos;
 
-        const int n_tok = std::min(chunk, n_total - i);
+        int n_tok = std::min(chunk, n_total - i);
+        // A snapshot must represent an exact token boundary. Split a batched
+        // prefill chunk when the requested boundary falls inside it.
+        if (save_snapshot && !snapshot_saved &&
+            snap_pos > pos && snap_pos < pos + n_tok) {
+            n_tok = snap_pos - pos;
+        }
 
         // Embed tokens
         std::vector<float> embed(w_.n_embd * n_tok);
@@ -1340,7 +1388,12 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         Ds4VerifyHooks spec_hooks;
         std::vector<float> spec_cap;
         Ds4VerifyHooks * hp = nullptr;
-        if (spec_enabled_ && spec_drafter_ && i + n_tok > spec_capture_from) {
+        const bool capture_final = i + n_tok > spec_final_from;
+        const bool capture_snapshot =
+            !snapshot_saved && i < spec_snap_to &&
+            i + n_tok > spec_snap_from;
+        if (spec_enabled_ && spec_drafter_ &&
+            (capture_final || capture_snapshot)) {
             spec_hooks.capture_layer_ids = &spec_drafter_->capture_layer_ids;
             spec_hooks.capture_out = &spec_cap;
             hp = &spec_hooks;
@@ -1374,8 +1427,13 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         if (ok && hp && !spec_cap.empty()) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
-            const int first_capture = std::max(0, spec_capture_from - i);
-            for (int t = first_capture; t < n_tok; ++t) {
+            for (int t = 0; t < n_tok; ++t) {
+                const int token_index = i + t;
+                const bool keep_for_final = token_index >= spec_final_from;
+                const bool keep_for_snapshot =
+                    !snapshot_saved && token_index >= spec_snap_from &&
+                    token_index < spec_snap_to;
+                if (!keep_for_final && !keep_for_snapshot) continue;
                 spec_feat_window_.insert(spec_feat_window_.end(),
                     spec_cap.begin() + (size_t) t * feat_row,
                     spec_cap.begin() + (size_t) (t + 1) * feat_row);
@@ -1391,7 +1449,31 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         last_logits_ = std::move(logits);
         pos += n_tok;
+        last_logits_pos_ = cache_.cur_pos;
+        i += n_tok;
+        if (save_snapshot && !snapshot_saved && pos == snap_pos) {
+            snapshot_saved = snapshot_save(snap_slot);
+            if (!snapshot_saved) {
+                std::fprintf(stderr,
+                             "[deepseek4] failed to save snapshot slot=%d pos=%d\n",
+                             snap_slot, snap_pos);
+            } else if (spec_enabled_ && spec_drafter_) {
+                // Discard checkpoint-only rows once their snapshot is saved.
+                // Retain just the already-captured prefix of the final SWA
+                // window, so distant checkpoints do not bridge a huge gap in
+                // host feature memory.
+                const int processed = i;
+                const int final_new_rows =
+                    std::max(0, processed - spec_final_from);
+                keep_spec_feature_tail(
+                    spec_feat_window_,
+                    (size_t) spec_old_rows_for_final +
+                    (size_t) final_new_rows);
+            }
+        }
     }
+    keep_spec_feature_tail(spec_feat_window_,
+                           (size_t) std::max(0, w_.n_swa));
     if (timing) {
         log_step_tel("prefill", n_total, steps, elapsed_s(phase_t0), tel_acc);
     }
@@ -1505,6 +1587,13 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         if (process_logits) {
             history.push_back(next_token);
         }
+        if (generated > 0) {
+            // The forward above advanced cache_ through the previously
+            // emitted token. Retain its logits so a later manual/continued
+            // snapshot can resume at exactly cache_.cur_pos.
+            last_logits_ = std::move(logits);
+            last_logits_pos_ = cache_.cur_pos;
+        }
         out_tokens.push_back(next_token);
         const auto emit_t0 = Clock::now();
         io.emit(next_token);
@@ -1522,6 +1611,11 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
 
 GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
                                                 const DaemonIO & io) {
+    return generate_from_state(req, io, 0);
+}
+
+GenerateResult DeepSeek4Backend::generate_from_state(
+        const GenerateRequest & req, const DaemonIO & io, int kv_offset) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     auto t0 = Clock::now();
@@ -1530,8 +1624,25 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
         sampler_rng_.seed(sampler_.seed);
     }
 
-    // Prefill
-    int committed = do_prefill(req.prompt, out_io);
+    if (kv_offset < 0 || kv_offset > (int) req.prompt.size()) {
+        result.fail(GenerateErrorCode::PrefillFailed,
+                    "restored prefix exceeds prompt length");
+        return result;
+    }
+
+    // Prefill only the suffix that is not already represented by a restored
+    // snapshot. An exact full-prompt hit can decode immediately from the
+    // logits and speculative feature window saved with the cache state.
+    int committed = kv_offset;
+    if (kv_offset == 0) {
+        committed = do_prefill(req.prompt, out_io, 0,
+                               req.snap_slot, req.snap_pos);
+    } else if (kv_offset < (int) req.prompt.size()) {
+        std::vector<int32_t> suffix(req.prompt.begin() + kv_offset,
+                                    req.prompt.end());
+        committed = do_prefill(suffix, out_io, kv_offset,
+                               req.snap_slot, req.snap_pos);
+    }
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
@@ -1575,6 +1686,10 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
             const int win_len = feat_row > 0 ? (int) (spec_feat_window_.size() / feat_row) : 0;
             std::vector<int32_t> spec_toks;
             spec_ran = true;
+            // The DSpark API does not return the final target logits. Once it
+            // advances the target cache, reject post-decode snapshots rather
+            // than pairing that state with stale prefill logits.
+            last_logits_pos_ = -1;
             if (!run_deepseek4_dspark_spec_decode(
                     backend_, cfg_.device.gpu, w_, cache_, *spec_drafter_, committed, seed,
                     req.n_gen - 1,
@@ -1627,19 +1742,55 @@ GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
 // ── Snapshots ───────────────────────────────────────────────────────────
 
 bool DeepSeek4Backend::snapshot_save(int slot) {
-    if (slot < 0 || slot >= PREFIX_SLOTS) return false;
-    // TODO: Implement snapshot save (copy KV cache + HC state to CPU)
-    return false;
+    if (slot < 0 || slot >= PREFIX_SLOTS || !snap_backend_ ||
+        cache_.cur_pos <= 0 || last_logits_pos_ != cache_.cur_pos ||
+        w_.n_vocab <= 0 ||
+        last_logits_.size() != (size_t) w_.n_vocab) {
+        return false;
+    }
+
+    snapshot_free(slot);
+    if (!deepseek4_snapshot_save(cache_, snap_backend_, snapshots_[slot])) {
+        return false;
+    }
+
+    try {
+        auto & aux = snapshot_aux_[slot];
+        aux.last_logits = last_logits_;
+        aux.spec_feat_window = spec_feat_window_;
+        keep_spec_feature_tail(aux.spec_feat_window,
+                               (size_t) std::max(0, w_.n_swa));
+        aux.used = true;
+    } catch (const std::bad_alloc &) {
+        snapshot_free(slot);
+        return false;
+    }
+
+    const size_t core_bytes = snapshots_[slot].buf
+        ? ggml_backend_buffer_get_size(snapshots_[slot].buf) : 0;
+    const size_t aux_bytes =
+        (snapshot_aux_[slot].last_logits.size() +
+         snapshot_aux_[slot].spec_feat_window.size()) * sizeof(float);
+    std::fprintf(stderr,
+                 "[deepseek4] snapshot saved slot=%d pos=%d size=%.1f MiB\n",
+                 slot, snapshots_[slot].cur_pos,
+                 (double) (core_bytes + aux_bytes) / (1024.0 * 1024.0));
+    return true;
 }
 
 void DeepSeek4Backend::snapshot_free(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return;
     free_deepseek4_snapshot(snapshots_[slot]);
+    snapshot_aux_[slot] = SnapshotAux{};
 }
 
 bool DeepSeek4Backend::snapshot_used(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
-    return snapshots_[slot].ctx != nullptr;
+    const auto & snap = snapshots_[slot];
+    const auto & aux = snapshot_aux_[slot];
+    return snap.ctx != nullptr && snap.buf != nullptr && snap.cur_pos > 0 &&
+           aux.used && w_.n_vocab > 0 &&
+           aux.last_logits.size() == (size_t) w_.n_vocab;
 }
 
 int DeepSeek4Backend::snapshot_cur_pos(int slot) const {
@@ -1647,11 +1798,48 @@ int DeepSeek4Backend::snapshot_cur_pos(int slot) const {
     return snapshots_[slot].cur_pos;
 }
 
+bool DeepSeek4Backend::snapshot_restore(int slot) {
+    if (!snapshot_used(slot)) return false;
+
+    std::vector<float> restored_logits;
+    std::vector<float> restored_features;
+    try {
+        restored_logits = snapshot_aux_[slot].last_logits;
+        restored_features = snapshot_aux_[slot].spec_feat_window;
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+
+    if (!deepseek4_snapshot_restore(snapshots_[slot], cache_)) {
+        return false;
+    }
+    last_logits_ = std::move(restored_logits);
+    spec_feat_window_ = std::move(restored_features);
+    last_logits_pos_ = cache_.cur_pos;
+    return true;
+}
+
 GenerateResult DeepSeek4Backend::restore_and_generate_impl(
         int slot, const GenerateRequest & req, const DaemonIO & io) {
-    // TODO: Implement snapshot restore + generate
-    (void)slot;
-    return generate_impl(req, io);
+    GenerateResult result;
+    if (!snapshot_used(slot)) {
+        result.fail(GenerateErrorCode::InvalidSnapshotSlot);
+        return result;
+    }
+
+    const int snap_pos = snapshot_cur_pos(slot);
+    if (snap_pos > (int) req.prompt.size()) {
+        std::fprintf(stderr,
+                     "[pc] DeepSeek snapshot longer than prompt "
+                     "(snap=%d > prompt=%zu) -- fresh prefill fallback\n",
+                     snap_pos, req.prompt.size());
+        return generate_impl(req, io);
+    }
+    if (!snapshot_restore(slot)) {
+        result.fail(GenerateErrorCode::BackendSpecific, "snapshot restore");
+        return result;
+    }
+    return generate_from_state(req, io, snap_pos);
 }
 
 bool DeepSeek4Backend::handle_compress(const std::string & line,
@@ -1680,7 +1868,7 @@ void DeepSeek4Backend::shutdown() {
     maybe_save_routing_stats();
     free_drafter();
     for (int i = 0; i < PREFIX_SLOTS; i++) {
-        free_deepseek4_snapshot(snapshots_[i]);
+        snapshot_free(i);
     }
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
