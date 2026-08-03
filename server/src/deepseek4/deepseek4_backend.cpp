@@ -1176,9 +1176,10 @@ bool DeepSeek4Backend::park(ParkTarget target) {
 
     maybe_save_routing_stats();
     for (int i = 0; i < PREFIX_SLOTS; ++i) {
-        free_deepseek4_snapshot(snapshots_[i]);
+        snapshot_free(i);
     }
     last_logits_.clear();
+    last_logits_pos_ = -1;
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
     stream_engine_.destroy();
@@ -1319,6 +1320,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         reset_deepseek4_cache(cache_);
     }
     last_logits_.clear();
+    last_logits_pos_ = -1;
     int spec_final_from = n_total;
     int spec_snap_from = n_total;
     int spec_snap_to = 0;
@@ -1447,6 +1449,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
         last_logits_ = std::move(logits);
         pos += n_tok;
+        last_logits_pos_ = cache_.cur_pos;
         i += n_tok;
         if (save_snapshot && !snapshot_saved && pos == snap_pos) {
             snapshot_saved = snapshot_save(snap_slot);
@@ -1584,6 +1587,13 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         if (process_logits) {
             history.push_back(next_token);
         }
+        if (generated > 0) {
+            // The forward above advanced cache_ through the previously
+            // emitted token. Retain its logits so a later manual/continued
+            // snapshot can resume at exactly cache_.cur_pos.
+            last_logits_ = std::move(logits);
+            last_logits_pos_ = cache_.cur_pos;
+        }
         out_tokens.push_back(next_token);
         const auto emit_t0 = Clock::now();
         io.emit(next_token);
@@ -1676,6 +1686,10 @@ GenerateResult DeepSeek4Backend::generate_from_state(
             const int win_len = feat_row > 0 ? (int) (spec_feat_window_.size() / feat_row) : 0;
             std::vector<int32_t> spec_toks;
             spec_ran = true;
+            // The DSpark API does not return the final target logits. Once it
+            // advances the target cache, reject post-decode snapshots rather
+            // than pairing that state with stale prefill logits.
+            last_logits_pos_ = -1;
             if (!run_deepseek4_dspark_spec_decode(
                     backend_, cfg_.device.gpu, w_, cache_, *spec_drafter_, committed, seed,
                     req.n_gen - 1,
@@ -1729,7 +1743,9 @@ GenerateResult DeepSeek4Backend::generate_from_state(
 
 bool DeepSeek4Backend::snapshot_save(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS || !snap_backend_ ||
-        cache_.cur_pos <= 0 || last_logits_.empty()) {
+        cache_.cur_pos <= 0 || last_logits_pos_ != cache_.cur_pos ||
+        w_.n_vocab <= 0 ||
+        last_logits_.size() != (size_t) w_.n_vocab) {
         return false;
     }
 
@@ -1799,6 +1815,7 @@ bool DeepSeek4Backend::snapshot_restore(int slot) {
     }
     last_logits_ = std::move(restored_logits);
     spec_feat_window_ = std::move(restored_features);
+    last_logits_pos_ = cache_.cur_pos;
     return true;
 }
 

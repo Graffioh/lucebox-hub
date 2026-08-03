@@ -88,6 +88,9 @@ private:
     DeepSeek4Snapshot      snapshots_[PREFIX_SLOTS];
     SnapshotAux            snapshot_aux_[PREFIX_SLOTS];
     std::vector<float>     last_logits_;
+    // Absolute cache position represented by last_logits_. A snapshot is
+    // safe only when this matches cache_.cur_pos.
+    int                    last_logits_pos_ = -1;
 
     // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
     bool                           spec_enabled_ = false;

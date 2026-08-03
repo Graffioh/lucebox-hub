@@ -2913,6 +2913,10 @@ struct MockBackend : ModelBackend {
     void shutdown() override {}
 };
 
+struct MockMemoryOnlySnapshotBackend : MockBackend {
+    bool snapshot_used(int slot) const override { return slot == 0; }
+};
+
 // ─── MockBackendWithLayout ──────────────────────────────────────────────
 // Extends MockBackend with a real ggml_context so DiskPrefixCache can
 // iterate tensors in compute_layout_id and write a real .dkv file.
@@ -3118,6 +3122,19 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_disabled_when_no_dir) {
     std::vector<int32_t> ids = {1, 2, 3, 4, 5};
     TEST_ASSERT(!cache.lookup(ids, 0));
     TEST_ASSERT(!cache.save(0, ids));
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_disables_memory_only_backend) {
+    MockMemoryOnlySnapshotBackend backend;
+    DiskCacheConfig cfg;
+    cfg.cache_dir = "/tmp/dflash_test_disk_cache_memory_only";
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(!cache.disabled());
+
+    // A live in-memory snapshot with no SnapshotRef means this backend cannot
+    // serialize or adopt disk entries. Detect it once and skip later disk work.
+    cache.learn_layout(0);
+    TEST_ASSERT(cache.disabled());
 }
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {

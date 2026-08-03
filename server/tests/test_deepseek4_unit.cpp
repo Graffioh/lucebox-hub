@@ -1873,6 +1873,7 @@ static void test_monolithic_snapshot_preserves_decode_state() {
     layer.n_index_comp = 3;
     backend.cache_.cur_pos = 7;
     backend.last_logits_ = {1.0f, 4.0f, 2.0f};
+    backend.last_logits_pos_ = 7;
     backend.spec_feat_window_ = {9.0f, 8.0f, 7.0f, 6.0f};
 
     const auto raw_before = read_tensor_bytes(layer.raw_kv);
@@ -1892,6 +1893,7 @@ static void test_monolithic_snapshot_preserves_decode_state() {
     layer.n_comp = 0;
     layer.n_index_comp = 0;
     backend.last_logits_ = {-1.0f};
+    backend.last_logits_pos_ = -1;
     backend.spec_feat_window_.clear();
 
     TEST_ASSERT(backend.snapshot_restore(0));
@@ -1905,21 +1907,33 @@ static void test_monolithic_snapshot_preserves_decode_state() {
     TEST_ASSERT(backend.last_logits_ == std::vector<float>({1.0f, 4.0f, 2.0f}));
     TEST_ASSERT(backend.spec_feat_window_ ==
                 std::vector<float>({9.0f, 8.0f, 7.0f, 6.0f}));
+    TEST_ASSERT(backend.last_logits_pos_ == 7);
 
     GenerateRequest exact;
     exact.prompt.assign(7, 0);
-    exact.n_gen = 0;
-    TEST_ASSERT(backend.restore_and_generate_impl(0, exact, DaemonIO{}).ok());
+    exact.n_gen = 1;
+    const GenerateResult exact_result =
+        backend.restore_and_generate_impl(0, exact, DaemonIO{});
+    TEST_ASSERT(exact_result.ok());
+    TEST_ASSERT(exact_result.tokens == std::vector<int32_t>({1}));
     TEST_ASSERT(backend.cache_.cur_pos == 7);
     TEST_ASSERT(backend.last_logits_ == std::vector<float>({1.0f, 4.0f, 2.0f}));
 
-    backend.snapshot_free(0);
+    // A cache state that advanced without corresponding logits (for example,
+    // after DSpark) must not be persisted with stale decode state.
+    backend.cache_.cur_pos = 8;
+    TEST_ASSERT(!backend.snapshot_save(1));
+    backend.cache_.cur_pos = 7;
+    TEST_ASSERT(!backend.snapshot_save(-1));
+    TEST_ASSERT(!backend.snapshot_save(ModelBackend::kMaxSlots));
+
+    // Parking the target releases both the core tensors and the potentially
+    // large host-side logits/feature vectors for every populated slot.
+    TEST_ASSERT(backend.park(ParkTarget::TargetModel));
     TEST_ASSERT(!backend.snapshot_used(0));
     TEST_ASSERT(backend.snapshot_aux_[0].last_logits.empty());
     TEST_ASSERT(backend.snapshot_aux_[0].spec_feat_window.empty());
     TEST_ASSERT(!backend.snapshot_restore(0));
-    TEST_ASSERT(!backend.snapshot_save(-1));
-    TEST_ASSERT(!backend.snapshot_save(ModelBackend::kMaxSlots));
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
