@@ -105,11 +105,12 @@ private:
     void keep_spec_feature_tail(std::vector<float> & features,
                                 size_t max_rows) const;
     // Limit a prefill batch to a region with a uniform DSpark capture policy.
-    // This keeps the fast unhooked path for the prompt bulk while ensuring
-    // every token in the final/checkpoint feature windows is actually hooked.
+    // Layer-major prefill can capture a subrange without splitting the final
+    // feature window; other paths still stop exactly at capture boundaries.
     static int capture_safe_prefill_tokens(int token_offset,
                                            int requested_tokens,
                                            int final_capture_from,
+                                           bool batch_final_capture,
                                            bool snapshot_pending,
                                            int snapshot_capture_from,
                                            int snapshot_capture_to);

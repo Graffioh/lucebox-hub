@@ -1970,27 +1970,29 @@ static void test_dspark_prefill_capture_boundaries() {
     std::fprintf(stderr, "  test_dspark_prefill_capture_boundaries ...");
 
     using Backend = DeepSeek4Backend;
-    // A wide prompt keeps its fast, unhooked bulk batch and stops exactly at
-    // the final SWA feature window.
+    // Layer-major prefill captures only the requested tail from a wide graph,
+    // while generic paths still stop exactly at the final feature window.
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    0, 2048, 1920, false, 0, 0) == 1920);
+                    0, 2048, 1920, true, false, 0, 0) == 2048);
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    1920, 128, 1920, false, 0, 0) == 128);
+                    0, 2048, 1920, false, false, 0, 0) == 1920);
+    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
+                    1920, 128, 1920, false, false, 0, 0) == 128);
 
     // A pending checkpoint contributes both edges of its capture window. The
     // resulting batches are either wholly hooked or wholly unhooked.
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    0, 2048, 1920, true, 384, 512) == 384);
+                    0, 2048, 1920, true, true, 384, 512) == 384);
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    384, 1664, 1920, true, 384, 512) == 128);
+                    384, 1664, 1920, true, true, 384, 512) == 128);
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    512, 1536, 1920, false, 384, 512) == 1408);
+                    512, 1536, 1920, false, false, 384, 512) == 1408);
 
     // Boundaries at a batch edge and empty requests need no extra split.
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    0, 128, 128, true, 128, 256) == 128);
+                    0, 128, 128, false, true, 128, 256) == 128);
     TEST_ASSERT(Backend::capture_safe_prefill_tokens(
-                    10, 0, 20, true, 12, 18) == 0);
+                    10, 0, 20, false, true, 12, 18) == 0);
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }

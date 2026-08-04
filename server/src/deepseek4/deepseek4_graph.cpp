@@ -5977,6 +5977,14 @@ static int ds4_try_layer_major_prefill(
         verify_hooks ? verify_hooks->capture_out : nullptr;
     const bool capture_enabled = capture_layer_ids && capture_out &&
                                  !capture_layer_ids->empty();
+    const int capture_begin = verify_hooks
+        ? std::clamp(verify_hooks->capture_token_begin, 0, n_tokens) : 0;
+    const int requested_capture_end =
+        verify_hooks && verify_hooks->capture_token_end >= 0
+            ? verify_hooks->capture_token_end : n_tokens;
+    const int capture_end = std::clamp(
+        requested_capture_end, capture_begin, n_tokens);
+    const int capture_tokens = capture_end - capture_begin;
     std::vector<float> capture_hc_state;
     if (capture_out) {
         capture_out->clear();
@@ -5984,16 +5992,18 @@ static int ds4_try_layer_major_prefill(
     if (capture_enabled) {
         capture_out->assign(
             (size_t) n_tokens * capture_layer_ids->size() * n_embd, 0.0f);
-        capture_hc_state.resize((size_t) hc_dim * n_tokens);
+        capture_hc_state.resize((size_t) hc_dim * capture_tokens);
     }
     const auto capture_layer = [&](int layer, ggml_tensor * state) {
-        if (!capture_enabled || !state) return;
+        if (!capture_enabled || capture_tokens <= 0 || !state) return;
         const auto first = std::find(capture_layer_ids->begin(),
                                      capture_layer_ids->end(), layer);
         if (first == capture_layer_ids->end()) return;
 
         const auto read_t0 = Ds4TimingClock::now();
-        ggml_backend_tensor_get(state, capture_hc_state.data(), 0,
+        const size_t capture_offset =
+            (size_t) capture_begin * hc_dim * sizeof(float);
+        ggml_backend_tensor_get(state, capture_hc_state.data(), capture_offset,
                                 sizeof(float) * capture_hc_state.size());
         if (telemetry) {
             telemetry->full_graph_read_us += ds4_elapsed_us(
@@ -6003,11 +6013,11 @@ static int ds4_try_layer_major_prefill(
         const size_t n_capture = capture_layer_ids->size();
         for (size_t ci = 0; ci < n_capture; ++ci) {
             if ((*capture_layer_ids)[ci] != layer) continue;
-            for (int t = 0; t < n_tokens; ++t) {
+            for (int t = capture_begin; t < capture_end; ++t) {
                 float * dst = capture_out->data() +
                     ((size_t) t * n_capture + ci) * n_embd;
                 const float * src = capture_hc_state.data() +
-                    (size_t) t * hc_dim;
+                    (size_t) (t - capture_begin) * hc_dim;
                 for (int d = 0; d < n_embd; ++d) {
                     float sum = 0.0f;
                     for (int h = 0; h < n_hc; ++h) {
