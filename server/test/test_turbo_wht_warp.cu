@@ -150,7 +150,12 @@ static double benchmark_case(int64_t groups, bool warp_kernel, int iterations) {
 
 int main() {
     int device_count = 0;
-    TEST_CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    const cudaError_t device_status = cudaGetDeviceCount(&device_count);
+    if (device_status == cudaErrorNoDevice) {
+        std::puts("SKIP: no CUDA device");
+        return 0;
+    }
+    TEST_CUDA_CHECK(device_status);
     if (device_count == 0) {
         std::puts("SKIP: no CUDA device");
         return 0;
