@@ -464,7 +464,7 @@ bool Qwen3Backend::do_decode(int committed, int n_gen,
         io.emit(next);
         committed++;
         cache_.cur_pos = committed;
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
 
         // Check EOS
         if (next == 151643 || next == 151645) break;
@@ -596,7 +596,7 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
         }
         result.tokens.push_back(first);
         out_io.emit(first);
-        if (out_io.cancelled) {
+        if (out_io.is_cancelled()) {
             out_io.emit(-1);
             result.succeed();
             return result;
@@ -763,7 +763,7 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
         }
         result.tokens.push_back(first);
         out_io.emit(first);
-        if (out_io.cancelled) {
+        if (out_io.is_cancelled()) {
             out_io.emit(-1);
             result.succeed();
             return result;

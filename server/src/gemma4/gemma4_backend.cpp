@@ -463,7 +463,7 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
             kvflash_history_.push_back(next);
             kvflash_maybe_reselect((int)out_tokens.size());
         }
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
 
         // Check EOS
         if (next == w_.eos_id || next == w_.eos_chat_id) break;
@@ -682,7 +682,7 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
             out_tokens.push_back(tok);
             io.emit(tok);
             emitted++;
-            if (io.cancelled) break;
+            if (io.is_cancelled()) break;
             if (tok == w_.eos_id || tok == w_.eos_chat_id) {
                 hit_eos = true; break;
             }
@@ -692,7 +692,7 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
         n_generated += emitted;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
         if (hit_eos) break;
     }
 
@@ -807,7 +807,7 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
             }
             result.tokens.push_back(first);
             out_io.emit(first);
-            if (out_io.cancelled) {
+            if (out_io.is_cancelled()) {
                 out_io.emit(-1);
                 result.succeed();
                 return result;
@@ -1013,7 +1013,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
             }
             result.tokens.push_back(first);
             out_io.emit(first);
-            if (out_io.cancelled) {
+            if (out_io.is_cancelled()) {
                 out_io.emit(-1);
                 result.succeed();
                 return result;

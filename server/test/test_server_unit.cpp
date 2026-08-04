@@ -52,6 +52,9 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#endif
 
 #if defined(_WIN32)
 #define dflash_setenv(name, value) _putenv_s(name, value)
@@ -90,6 +93,38 @@ struct ServerUnitFixture {};
             std::to_string(__LINE__) + ": " + #expr + " — " + std::string(msg)); \
     } \
 } while (0)
+
+TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
+    bool cancel = false;
+    DaemonIO io;
+    io.should_cancel = [&cancel]() { return cancel; };
+
+    TEST_ASSERT(!io.is_cancelled());
+    cancel = true;
+    TEST_ASSERT(io.is_cancelled());
+    cancel = false;
+    TEST_ASSERT(io.is_cancelled());
+}
+
+#if !defined(_WIN32)
+TEST_CASE(ServerUnitFixture, test_http_peer_disconnect_probe_is_non_consuming) {
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    TEST_ASSERT(!http_detail::peer_disconnected(sockets[0]));
+
+    const char byte = 'x';
+    TEST_ASSERT(write(sockets[1], &byte, 1) == 1);
+    TEST_ASSERT(!http_detail::peer_disconnected(sockets[0]));
+
+    char received = 0;
+    TEST_ASSERT(read(sockets[0], &received, 1) == 1);
+    TEST_ASSERT(received == byte);
+    close(sockets[1]);
+    sockets[1] = -1;
+    TEST_ASSERT(http_detail::peer_disconnected(sockets[0]));
+    close(sockets[0]);
+}
+#endif
 
 // ─── Helper: create an SseEmitter with minimal config ──────────────────
 

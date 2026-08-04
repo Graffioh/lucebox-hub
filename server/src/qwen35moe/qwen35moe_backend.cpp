@@ -677,7 +677,7 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
             kvflash_history_.push_back(next_tok);
             kvflash_maybe_reselect((int)out_tokens.size());
         }
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
         if (is_eos_tok(next_tok, target_weights())) break;
     }
 
@@ -1325,7 +1325,7 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                         kvflash_history_.push_back(next_tok);
                         kvflash_maybe_reselect((int)result.tokens.size());
                     }
-                    if (out_io.cancelled) break;
+                    if (out_io.is_cancelled()) break;
                     if (is_eos_tok(next_tok, target_weights())) break;
                 }
                 if (hybrid_telemetry_) {
@@ -2147,7 +2147,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             out_tokens.push_back(replay_tok[i]);
             io.emit(replay_tok[i]);
             emitted++;
-            if (io.cancelled) break;
+            if (io.is_cancelled()) break;
             if (is_eos_tok(replay_tok[i], target_weights())) { hit_eos = true; break; }
         }
         committed += emitted;
@@ -2163,7 +2163,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
         const int fallback_steps = hybrid_spec_min_steps_before_ar();
-        if (!io.cancelled && !hit_eos && fallback_steps > 0 &&
+        if (!io.is_cancelled() && !hit_eos && fallback_steps > 0 &&
             n_draft_steps >= fallback_steps && n_generated < n_gen) {
             const int total_draft_pos_so_far = std::max(1, n_draft_steps * q_len);
             const float accept_rate_value =
@@ -2183,7 +2183,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
                 return ok;
             }
         }
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
         if (hit_eos) break;
     }
 

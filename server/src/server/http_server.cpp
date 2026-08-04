@@ -94,6 +94,43 @@ static inline bool sock_is_eagain(int e) { return e == EAGAIN || e == EWOULDBLOC
 
 namespace dflash::common {
 
+namespace {
+constexpr auto kClientMonitorInterval = std::chrono::milliseconds(250);
+constexpr auto kSseHeartbeatInterval = std::chrono::seconds(15);
+constexpr char kSseHeartbeat[] = ": keep-alive\n\n";
+}
+
+namespace http_detail {
+
+bool peer_disconnected(SocketHandle fd) {
+    struct pollfd pfd = {fd, POLLIN, 0};
+#if defined(POLLRDHUP)
+    pfd.events |= POLLRDHUP;
+#endif
+
+    int ret;
+    do {
+        ret = poll(&pfd, 1, 0);
+    } while (ret < 0 && sock_is_eintr(sock_errno()));
+    if (ret == 0) return false;
+    if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        return true;
+    }
+#if defined(POLLRDHUP)
+    if (pfd.revents & POLLRDHUP) return true;
+#endif
+    if (!(pfd.revents & POLLIN)) return false;
+
+    char byte = 0;
+    const ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0) return true;
+    if (n > 0) return false;
+    const int error = sock_errno();
+    return !sock_is_eintr(error) && !sock_is_eagain(error);
+}
+
+}  // namespace http_detail
+
 static std::string context_overflow_message(int max_ctx, int prompt_tokens, int max_output) {
     const int requested_tokens = prompt_tokens + max_output;
     return "This model's maximum context length is " + std::to_string(max_ctx) +
@@ -1811,8 +1848,24 @@ void HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req) {
     job.req = std::move(req);
     enqueue(&job);
 
+    // The worker can spend minutes in prefill before its first token. Keep the
+    // SSE response active and watch the read side independently so an orderly
+    // client close is observed before the kernel send buffer eventually fills.
     std::unique_lock<std::mutex> lock(job.mu);
-    job.cv.wait(lock, [&]() { return job.done; });
+    while (!job.done) {
+        if (job.cv.wait_for(lock, kClientMonitorInterval,
+                            [&]() { return job.done; })) {
+            break;
+        }
+
+        lock.unlock();
+        if (http_detail::peer_disconnected(fd)) {
+            job.client_disconnected.store(true, std::memory_order_release);
+        } else {
+            maybe_send_job_heartbeat(&job);
+        }
+        lock.lock();
+    }
 }
 
 bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
@@ -3153,9 +3206,12 @@ void HttpServer::prepare_generation_inputs(
 }
 
 void HttpServer::configure_generation_io(
-        SocketHandle fd, const ParsedRequest & req, SseEmitter & emitter,
+        ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io) {
     io.stream_fd = -1;
+    io.should_cancel = [job]() {
+        return job->client_disconnected.load(std::memory_order_acquire);
+    };
     io.observer = [this](const char *, const std::vector<int32_t> & tokens) {
         std::vector<std::string> token_strings;
         token_strings.reserve(tokens.size());
@@ -3166,9 +3222,13 @@ void HttpServer::configure_generation_io(
         broadcast_status();
     };
 
-    io.on_token = [this, fd, &req, &emitter, &output](
+    io.on_token = [this, job, &req, &emitter, &output](
             int32_t token) -> bool {
-        if (output.client_disconnected) return false;
+        if (output.client_disconnected ||
+            job->client_disconnected.load(std::memory_order_acquire)) {
+            output.client_disconnected = true;
+            return false;
+        }
         ++output.completion_tokens;
 
         if (output.completion_tokens % 10 == 0) {
@@ -3188,7 +3248,7 @@ void HttpServer::configure_generation_io(
         if (!req.stream || text.empty()) return true;
 
         for (const auto & chunk : emitter.emit_token(text)) {
-            if (!send_all(fd, chunk.data(), chunk.size())) {
+            if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 output.client_disconnected = true;
                 return false;
             }
@@ -3245,6 +3305,7 @@ void HttpServer::process_job(ServerJob * job) {
     StatusGuard status_guard{status_};
 
     auto finish_job = [&]() {
+        stop_job_stream(job);
         std::lock_guard<std::mutex> lk(job->mu);
         job->done = true;
         job->cv.notify_one();
@@ -3252,11 +3313,12 @@ void HttpServer::process_job(ServerJob * job) {
     auto fail_request = [&](int status, const std::string & message) {
         std::fprintf(stderr, "[server] request failed: %s\n", message.c_str());
         if (req.stream) {
+            stop_job_stream(job);
             json err = {{"error", {{"message", message}, {"type", "server_error"}}}};
             const std::string chunk = "data: " + err.dump() + "\n\n";
-            send_all(fd, chunk.data(), chunk.size());
+            send_job_bytes(job, chunk.data(), chunk.size());
             const char done[] = "data: [DONE]\n\n";
-            send_all(fd, done, sizeof(done) - 1);
+            send_job_bytes(job, done, sizeof(done) - 1);
         } else {
             send_error(fd, status, message);
         }
@@ -3275,7 +3337,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     // Send SSE headers (skip when proxying — curl_forward handles its own headers).
     if (req.stream && config_.pflash_upstream_base.empty()) {
-        if (!send_sse_headers(fd)) {
+        if (!send_sse_headers(job)) {
             finish_job();
             return;
         }
@@ -3292,7 +3354,7 @@ void HttpServer::process_job(ServerJob * job) {
     if (req.stream && config_.pflash_upstream_base.empty()) {
         bool start_ok = true;
         for (const auto & chunk : emitter.emit_start()) {
-            if (!send_all(fd, chunk.data(), chunk.size())) {
+            if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 start_ok = false;
                 break;
             }
@@ -3301,6 +3363,7 @@ void HttpServer::process_job(ServerJob * job) {
             finish_job();
             return;
         }
+        start_job_stream(job);
     }
 
     PreparedPrompt prepared = prepare_prompt(req);
@@ -3329,7 +3392,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     DaemonIO io;
     GenerationOutputState output;
-    configure_generation_io(fd, req, emitter, output, io);
+    configure_generation_io(job, req, emitter, output, io);
     int & completion_tokens = output.completion_tokens;
     bool & visible_output_seen = output.visible_output_seen;
     bool & client_disconnected = output.client_disconnected;
@@ -3366,6 +3429,10 @@ void HttpServer::process_job(ServerJob * job) {
     if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
         !config_.draft_path.empty()) {
         backend_.park(ParkTarget::DraftModel);
+    }
+
+    if (job->client_disconnected.load(std::memory_order_acquire)) {
+        client_disconnected = true;
     }
 
     // Release oversized scratch buffers (gallocr, BSA cache) so VRAM
@@ -3432,10 +3499,16 @@ void HttpServer::process_job(ServerJob * job) {
         status_.update_completion_tokens(completion_tokens);
         broadcast_status();
     }
+    // Serialize final frames after disabling heartbeat comments so no comment
+    // can appear after the protocol's [DONE] marker.
+    stop_job_stream(job);
+    if (job->client_disconnected.load(std::memory_order_acquire)) {
+        client_disconnected = true;
+    }
     if (req.stream && !client_disconnected) {
         auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
         for (const auto & chunk : final_chunks) {
-            if (!send_all(fd, chunk.data(), chunk.size())) {
+            if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 client_disconnected = true;
                 break;
             }
@@ -3667,6 +3740,48 @@ bool HttpServer::send_all(SocketHandle fd, const void * data, size_t len) {
     return true;
 }
 
+bool HttpServer::send_job_bytes(
+        ServerJob * job, const void * data, size_t len) {
+    std::lock_guard<std::mutex> lock(job->write_mu);
+    if (job->client_disconnected.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!send_all(job->fd, data, len)) {
+        job->client_disconnected.store(true, std::memory_order_release);
+        return false;
+    }
+    job->last_stream_write = std::chrono::steady_clock::now();
+    return true;
+}
+
+void HttpServer::start_job_stream(ServerJob * job) {
+    std::lock_guard<std::mutex> lock(job->write_mu);
+    if (job->client_disconnected.load(std::memory_order_acquire)) return;
+    job->stream_ready = true;
+    job->last_stream_write = std::chrono::steady_clock::now();
+}
+
+void HttpServer::stop_job_stream(ServerJob * job) {
+    std::lock_guard<std::mutex> lock(job->write_mu);
+    job->stream_ready = false;
+}
+
+void HttpServer::maybe_send_job_heartbeat(ServerJob * job) {
+    std::lock_guard<std::mutex> lock(job->write_mu);
+    if (!job->stream_ready ||
+        job->client_disconnected.load(std::memory_order_acquire)) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - job->last_stream_write < kSseHeartbeatInterval) return;
+
+    if (!send_all(job->fd, kSseHeartbeat, sizeof(kSseHeartbeat) - 1)) {
+        job->client_disconnected.store(true, std::memory_order_release);
+        return;
+    }
+    job->last_stream_write = now;
+}
+
 bool HttpServer::send_response(
         SocketHandle fd, int status, const std::string & content_type,
                                const std::string & body) {
@@ -3702,7 +3817,7 @@ bool HttpServer::send_error(
     return send_response(fd, status, "application/json", err.dump() + "\n");
 }
 
-bool HttpServer::send_sse_headers(SocketHandle fd) {
+bool HttpServer::send_sse_headers(ServerJob * job) {
     std::string header = "HTTP/1.1 200 OK\r\n";
     if (config_.enable_cors) {
         header += "Access-Control-Allow-Origin: *\r\n";
@@ -3710,7 +3825,7 @@ bool HttpServer::send_sse_headers(SocketHandle fd) {
     header += "Content-Type: text/event-stream\r\n"
               "Cache-Control: no-cache\r\n"
               "Connection: keep-alive\r\n\r\n";
-    return send_all(fd, header.data(), header.size());
+    return send_job_bytes(job, header.data(), header.size());
 }
 
 }  // namespace dflash::common
