@@ -90,6 +90,16 @@ put the same setting in `~/.pi/agent/settings.json`:
 {"httpIdleTimeoutMs": 0}
 ```
 
+The other real-client launchers also allow one hour by default. Override their
+deadlines with `CLAUDE_TIMEOUT`, `CODEX_TIMEOUT`, `OPENCODE_TIMEOUT`,
+`HERMES_TIMEOUT`, `OPENCLAW_TIMEOUT`, or (for Open WebUI's curl probe)
+`CURL_MAX_TIME`. The CLI launcher timeouts accept `0` to disable the outer
+deadline. OpenCode's provider-level request and chunk deadlines default to one
+hour too and can be changed with `OPENCODE_REQUEST_TIMEOUT_MS` and
+`OPENCODE_CHUNK_TIMEOUT_MS`. The server independently sends SSE heartbeat
+comments during silent prefill and cancels backend work when a client
+disconnects.
+
 Claude Code uses the real Anthropic Messages client path. Lucebox trims
 Claude-specific prompt boilerplate by default for local-model reliability. To
 test the raw prompt, set:
