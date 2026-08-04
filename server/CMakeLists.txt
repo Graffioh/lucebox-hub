@@ -400,6 +400,7 @@ add_library(dflash_common STATIC
     src/kv_cache.cpp
     src/kv_quant.cpp
     src/delta_net_chunked.cpp
+    src/delta_net_specla.cpp
     # Laguna-XS.2 (Poolside) target arch
     src/laguna/laguna_target_loader.cpp
     src/laguna/laguna_target_graph.cpp
@@ -1213,6 +1214,18 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_recurrent_snapshot)
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_delta_net_specla.cpp")
+        # GPU parity test: SpecLA topology-masked verify + factor-based state
+        # reconstruction vs the fused sequential gated-delta-net kernel.
+        # Exits 77 (ctest SKIP) when no GPU is present.
+        add_executable(test_delta_net_specla test/test_delta_net_specla.cpp)
+        target_include_directories(test_delta_net_specla PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_delta_net_specla PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_delta_net_specla)
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         set(_server_unit_sources
             test/test_unit_main.cpp
@@ -1364,7 +1377,8 @@ if(DFLASH27B_TESTS)
                     set(_unit_ctest_name recurrent_snapshot)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
-                if(_unit_target STREQUAL "test_deepseek4_mmid_grouped_cuda")
+                if(_unit_target STREQUAL "test_deepseek4_mmid_grouped_cuda" OR
+                   _unit_target STREQUAL "test_delta_net_specla")
                     set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
                 endif()
             endif()
