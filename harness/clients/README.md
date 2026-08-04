@@ -66,7 +66,7 @@ The defaults below are the current RTX 3090 starting points for
 | Codex | `run_codex.sh` | `MAX_CTX=32768 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | OpenCode | `run_opencode.sh` | `MAX_CTX=86016 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | Hermes Agent | `run_hermes.sh` | `MAX_CTX=98304 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
-| Pi | `run_pi.sh` | `MAX_CTX=65536 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
+| Pi | `run_pi.sh` | `MAX_CTX=65536 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft PI_TIMEOUT=3600` |
 | OpenClaw | `run_openclaw.sh` | `MAX_CTX=204800 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | Open WebUI chat | `run_openwebui.sh` | `MAX_CTX=262144 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
 | Open WebUI tools | `run_openwebui_tools.sh` | `MAX_CTX=65536 BUDGET=22 VERIFY_MODE=ddtree EXTRA_SERVER_ARGS=--lazy-draft` |
@@ -78,6 +78,10 @@ MAX_CTX=32768 harness/clients/run_claude_code.sh
 PROMPT='Explain the repo and end with lucebox-client-ok' harness/clients/run_opencode.sh
 PROMPT_FILE=harness/clients/prompts/repo_inspection.txt harness/clients/run_hermes.sh
 ```
+
+`PI_TIMEOUT` is Pi's total wall-clock limit in seconds. Its one-hour default
+allows long-context prefill and long generations to finish; set
+`PI_TIMEOUT=0` to run without a launcher deadline.
 
 Claude Code uses the real Anthropic Messages client path. Lucebox trims
 Claude-specific prompt boilerplate by default for local-model reliability. To
