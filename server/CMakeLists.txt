@@ -977,6 +977,17 @@ if(DFLASH27B_TESTS)
             ggml-base)
         list(APPEND _raw_unit_test_targets test_mmq_streamk_iq4_xs)
     endif()
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_turbo_wht_warp.cu")
+        find_package(CUDAToolkit REQUIRED)
+        add_executable(test_turbo_wht_warp test/test_turbo_wht_warp.cu)
+        set_target_properties(test_turbo_wht_warp PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_turbo_wht_warp PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_turbo_wht_warp PRIVATE CUDA::cudart)
+        list(APPEND _raw_unit_test_targets test_turbo_wht_warp)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
         # RED phase binary: same source WITHOUT the fix flag — documents the bug.
         add_executable(test_drafter_tail_capture_guard_red
