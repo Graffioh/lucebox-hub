@@ -5922,6 +5922,7 @@ static int ds4_try_layer_major_prefill(
         int kv_start,
         std::vector<float> & out_logits,
         const int32_t * token_ids,
+        Ds4VerifyHooks * verify_hooks,
         DeepSeek4StepTelemetry * telemetry) {
     if (!backend || !embed || n_tokens <= 4 ||
         n_tokens > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS ||
@@ -5929,6 +5930,14 @@ static int ds4_try_layer_major_prefill(
         return 0;
     }
     if (cache.prefill_mode == PrefillAttentionMode::Exact) return 0;
+    // Layer-major prefill returns only the final-position logits. DSpark's
+    // per-layer feature capture is supported below, but verifier requests for
+    // every position's logits/argmax must retain the generic path.
+    if (verify_hooks &&
+        (verify_hooks->all_logits_out || verify_hooks->argmax_out ||
+         verify_hooks->prefer_argmax_only)) {
+        return 0;
+    }
     if (!ds4_backend_is_gpu(backend) || !hc_out_weights.loaded ||
         hc_out_weights.scale_data.empty() || !w.output_hc_fn ||
         !w.output_hc_base) {
@@ -5961,6 +5970,54 @@ static int ds4_try_layer_major_prefill(
     const int64_t hc_dim = (int64_t) n_embd * n_hc;
     const int64_t mix_dim = 2 * (int64_t) n_hc + (int64_t) n_hc * n_hc;
     const int next_pos = kv_start + n_tokens;
+
+    const std::vector<int> * capture_layer_ids =
+        verify_hooks ? verify_hooks->capture_layer_ids : nullptr;
+    std::vector<float> * capture_out =
+        verify_hooks ? verify_hooks->capture_out : nullptr;
+    const bool capture_enabled = capture_layer_ids && capture_out &&
+                                 !capture_layer_ids->empty();
+    std::vector<float> capture_hc_state;
+    if (capture_out) {
+        capture_out->clear();
+    }
+    if (capture_enabled) {
+        capture_out->assign(
+            (size_t) n_tokens * capture_layer_ids->size() * n_embd, 0.0f);
+        capture_hc_state.resize((size_t) hc_dim * n_tokens);
+    }
+    const auto capture_layer = [&](int layer, ggml_tensor * state) {
+        if (!capture_enabled || !state) return;
+        const auto first = std::find(capture_layer_ids->begin(),
+                                     capture_layer_ids->end(), layer);
+        if (first == capture_layer_ids->end()) return;
+
+        const auto read_t0 = Ds4TimingClock::now();
+        ggml_backend_tensor_get(state, capture_hc_state.data(), 0,
+                                sizeof(float) * capture_hc_state.size());
+        if (telemetry) {
+            telemetry->full_graph_read_us += ds4_elapsed_us(
+                read_t0, Ds4TimingClock::now());
+        }
+
+        const size_t n_capture = capture_layer_ids->size();
+        for (size_t ci = 0; ci < n_capture; ++ci) {
+            if ((*capture_layer_ids)[ci] != layer) continue;
+            for (int t = 0; t < n_tokens; ++t) {
+                float * dst = capture_out->data() +
+                    ((size_t) t * n_capture + ci) * n_embd;
+                const float * src = capture_hc_state.data() +
+                    (size_t) t * hc_dim;
+                for (int d = 0; d < n_embd; ++d) {
+                    float sum = 0.0f;
+                    for (int h = 0; h < n_hc; ++h) {
+                        sum += src[(size_t) h * n_embd + d];
+                    }
+                    dst[d] = sum / (float) n_hc;
+                }
+            }
+        }
+    };
 
     Ds4LayerMajorGraphCache * graph_cache = nullptr;
     bool cache_hit = false;
@@ -6131,6 +6188,7 @@ static int ds4_try_layer_major_prefill(
                 telemetry->full_graph_compute_us += ds4_elapsed_us(
                     compute_t0, Ds4TimingClock::now());
             }
+            capture_layer(il, (il & 1) == 0 ? state_b : state_a);
             if (layer.logits) {
                 out_logits.resize((size_t) w.n_vocab);
                 ggml_backend_tensor_get(
@@ -6357,6 +6415,8 @@ static int ds4_try_layer_major_prefill(
                 compute_t0, Ds4TimingClock::now());
         }
 
+        capture_layer(il, state_out);
+
         if (logits) {
             out_logits.resize((size_t) w.n_vocab);
             ggml_backend_tensor_get(logits, out_logits.data(), 0,
@@ -6534,14 +6594,19 @@ bool deepseek4_step_layer_range(
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
         layer_begin == 0 && is_last_shard && out_logits &&
         ds4_backend_is_gpu(backend);
+    const bool layer_major_hooks_supported =
+        !verify_hooks ||
+        (!verify_hooks->all_logits_out && !verify_hooks->argmax_out &&
+         !verify_hooks->prefer_argmax_only);
     // The standard layer-major pipeline owns an exact batched compressor.
     // Let it see the wide prompt before the generic boundary splitter turns
-    // the request into ratio-sized (typically four-token) forwards.
+    // the request into ratio-sized (typically four-token) forwards. It also
+    // owns DSpark feature capture, so the final capture window stays batched.
     const bool standard_layer_major_prefill =
         !w.moe_hybrid && cache.prefill_mode != PrefillAttentionMode::Exact &&
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
         layer_begin == 0 && is_last_shard && out_logits &&
-        ds4_backend_is_gpu(backend) && !verify_hooks;
+        ds4_backend_is_gpu(backend) && layer_major_hooks_supported;
     // These graphs are rebuilt around an owner join on every layer, so tensor
     // metadata addresses can be recycled for different topologies.  Until
     // the full heterogeneous layer is captured as one stable scheduler graph,
@@ -6723,7 +6788,8 @@ bool deepseek4_step_layer_range(
             fused_decode_graph_cache, backend, w, cache,
             hc_layer_weights_range, hc_output_weights_range,
             hash_routing_tables_range, scratch.hash_expert_ids, embed,
-            n_tokens, kv_start, *out_logits, token_ids, telemetry);
+            n_tokens, kv_start, *out_logits, token_ids, verify_hooks,
+            telemetry);
         if (prc < 0) return false;
         if (prc > 0) {
             if (telemetry) {
