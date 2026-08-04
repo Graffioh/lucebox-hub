@@ -36,6 +36,11 @@ struct StepGraph {
     ggml_tensor *   positions = nullptr;
     ggml_tensor *   attn_mask = nullptr;     // may be null
     ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
+    // SpecLA topology masks ([n_tokens, n_tokens] f32, host-filled; see
+    // delta_net_specla.h). Created only when DFLASH_SPECLA capture is active.
+    ggml_tensor *   specla_m_strict = nullptr;
+    ggml_tensor *   specla_m_incl   = nullptr;
+    ggml_tensor *   specla_m_eye    = nullptr;
     ggml_tensor *   target_hidden_cat = nullptr;  // draft only
     ggml_tensor *   positions_k = nullptr;        // draft only
     ggml_tensor *   pad_mask_full = nullptr;      // draft only; padded-ctx mask
@@ -78,6 +83,7 @@ inline void step_graph_free(StepGraph & sg) {
     sg.built_view = false;
     sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
+    sg.specla_m_strict = sg.specla_m_incl = sg.specla_m_eye = nullptr;
     sg.kv_write_rows = nullptr;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;

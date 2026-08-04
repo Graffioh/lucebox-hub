@@ -1,6 +1,7 @@
 // Qwen35DFlashTarget — DFlashTarget adapter for qwen35 hybrid models.
 
 #include "qwen35_dflash_target.h"
+#include "delta_net_specla.h"
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
@@ -293,6 +294,19 @@ bool Qwen35DFlashTarget::verify_batch(
                                 sizeof(int64_t) * rows.size());
     }
 
+    // SpecLA chain verify: lower-triangular topology masks (parents[t] = t-1).
+    if (sg_.specla_m_strict) {
+        std::vector<int32_t> parents(n_tokens);
+        for (int t = 0; t < n_tokens; t++) parents[t] = t - 1;
+        std::vector<float> ms((size_t)n_tokens * n_tokens);
+        std::vector<float> mi((size_t)n_tokens * n_tokens);
+        std::vector<float> me((size_t)n_tokens * n_tokens);
+        fill_specla_masks(parents.data(), n_tokens, ms.data(), mi.data(), me.data());
+        ggml_backend_tensor_set(sg_.specla_m_strict, ms.data(), 0, sizeof(float) * ms.size());
+        ggml_backend_tensor_set(sg_.specla_m_incl,   mi.data(), 0, sizeof(float) * mi.size());
+        ggml_backend_tensor_set(sg_.specla_m_eye,    me.data(), 0, sizeof(float) * me.size());
+    }
+
     // Embed input tokens and fill positions.
     std::vector<float> embed((size_t)n_tokens * hidden);
     if (!w_.embedder.embed(tokens.data(), n_tokens, embed.data())) {
@@ -479,6 +493,19 @@ bool Qwen35DFlashTarget::verify_tree(
     for (int i = 1; i < N_actual; i++) parent_ids[i] = (int32_t)tree.parents[i];
     ggml_backend_tensor_set(sg_.parent_ids, parent_ids.data(), 0, sizeof(int32_t) * N);
 
+    // SpecLA tree verify: ancestor masks over the same root-inclusive flat
+    // node order. Padding nodes hang off the root; their outputs/factors are
+    // never read.
+    if (sg_.specla_m_strict) {
+        std::vector<float> ms((size_t)N * N);
+        std::vector<float> mi((size_t)N * N);
+        std::vector<float> me((size_t)N * N);
+        fill_specla_masks(parent_ids.data(), N, ms.data(), mi.data(), me.data());
+        ggml_backend_tensor_set(sg_.specla_m_strict, ms.data(), 0, sizeof(float) * ms.size());
+        ggml_backend_tensor_set(sg_.specla_m_incl,   mi.data(), 0, sizeof(float) * mi.size());
+        ggml_backend_tensor_set(sg_.specla_m_eye,    me.data(), 0, sizeof(float) * me.size());
+    }
+
     auto st = ggml_backend_graph_compute(backend_, sg_.gf);
     if (st != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "verify_tree: compute failed (status=%d)\n", (int)st);
@@ -548,12 +575,29 @@ bool Qwen35DFlashTarget::rollback_to_tree(
     const int n_delta = (int)sg_.delta_captures.size();
     GGML_ASSERT(!cache_.ssm_state.empty());
     const bool meta_backend = is_meta_tensor(cache_.ssm_state.front());
+    const bool specla = specla_active();
+    if (specla && meta_backend) return false;  // TP meta is outside SpecLA scope
+
+    // SpecLA: one DeltaConstruct graph advances all layers' SSM states along
+    // the accepted DFS path; the per-layer loop below then only commits conv
+    // state (plus the feature/KV compaction shared with the legacy path).
+    if (specla) {
+        std::vector<int32_t> idx(accepted_dfs.begin(), accepted_dfs.end());
+        if (!specla_commit_accepted(cache_, backend_, idx.data(), commit_n)) {
+            std::fprintf(stderr, "rollback_to_tree: specla commit graph failed\n");
+            return false;
+        }
+    }
+
     cudaStream_t stream = nullptr;
     for (int il = 0; il < n_delta; il++) {
         const DeltaNetCapture & cap = sg_.delta_captures[il];
-        if (!cap.ssm_intermediate_states || !cap.conv_input) {
+        if ((!specla && !cap.ssm_intermediate_states) || !cap.conv_input) {
             std::fprintf(stderr, "rollback_to_tree: missing capture at layer %d\n", il);
             return false;
+        }
+        if (specla) {
+            goto conv_commit;
         }
         if (rollback_dfs >= (int)cap.ssm_intermediate_states->ne[3]) {
             std::fprintf(stderr, "rollback_to_tree: rollback_dfs %d >= captured slots %d (layer %d)\n",
@@ -561,6 +605,7 @@ bool Qwen35DFlashTarget::rollback_to_tree(
             return false;
         }
         // SSM state ← intermediate[rollback_dfs] (dequantize Q8_0/F16 → f32).
+        {
         const size_t ssm_elems =
             (size_t)cache_.ssm_state[il]->ne[0] *
             (size_t)cache_.ssm_state[il]->ne[1] *
@@ -602,7 +647,9 @@ bool Qwen35DFlashTarget::rollback_to_tree(
                          (int64_t)ssm_elems, stream);
             }
         }
+        }  // end non-SpecLA SSM restore
 
+conv_commit:
         // Conv state ← the K-1 most recent inputs along rollback_dfs's ancestry.
         const int K_conv = 4;
         const int row_cnt = (int)cap.conv_input->ne[1];
@@ -756,6 +803,11 @@ bool Qwen35DFlashTarget::rollback_to_tree(
 }
 
 bool Qwen35DFlashTarget::snapshot_kv() {
+    // SpecLA: capture-mode verify never mutates the durable SSM/conv state,
+    // so the per-step snapshot (and its full-state copy cost) is unnecessary.
+    // Replay/prefill forwards run capture-off and keep their writebacks, so
+    // "restore" is trivially satisfied by the untouched state.
+    if (specla_active()) return true;
     if (!cache_.ssm_state.empty() && is_meta_tensor(cache_.ssm_state.front())) {
         return copy_meta_recurrent_state(
             cache_.ssm_state, cache_.conv_state,
@@ -765,6 +817,7 @@ bool Qwen35DFlashTarget::snapshot_kv() {
 }
 
 bool Qwen35DFlashTarget::restore_kv() {
+    if (specla_active()) return true;  // see snapshot_kv()
     if (!cache_.ssm_state.empty() && is_meta_tensor(cache_.ssm_state.front())) {
         return copy_meta_recurrent_state(
             cache_.ssm_state_snap, cache_.conv_state_snap,
@@ -813,6 +866,12 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             std::fprintf(stderr, "rollback_to: no delta_captures\n");
         }
         return false;
+    }
+
+    // SpecLA: verify was read-only, so the accepted state must be constructed
+    // even on full acceptance — no early-out.
+    if (specla_active()) {
+        return rollback_to_specla(base_pos, commit_n);
     }
 
     // If all tokens accepted, the SSM state after processing all q_len tokens
@@ -955,6 +1014,57 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
     } else {
         cudaStreamSynchronize(stream);
     }
+
+    cache_.cur_pos = base_pos + commit_n;
+    return true;
+}
+
+bool Qwen35DFlashTarget::rollback_to_specla(int base_pos, int commit_n) {
+    const int n_delta = (int)sg_.delta_captures.size();
+    const int q_len = cache_.cur_pos - base_pos;
+    if (n_delta == 0 || commit_n <= 0 || commit_n > q_len) return false;
+    if (!cache_.ssm_state.empty() && is_meta_tensor(cache_.ssm_state.front())) {
+        // Tensor-parallel meta backends are outside SpecLA's scope; fail so
+        // the caller degrades to restore+replay (which stays correct: the
+        // capture verify did not mutate state and replay runs writeback-on).
+        return false;
+    }
+
+    // SSM: DeltaConstruct along the accepted prefix (docs/SPECLA.md).
+    std::vector<int32_t> idx((size_t)commit_n);
+    for (int i = 0; i < commit_n; i++) idx[i] = i;
+    if (!specla_commit_accepted(cache_, backend_, idx.data(), commit_n)) {
+        std::fprintf(stderr, "rollback_to_specla: commit graph failed\n");
+        return false;
+    }
+
+    // Conv: same conv_input_cache slice commit as the legacy path — the
+    // in-graph conv_state writeback is disabled under SpecLA, so this also
+    // runs on full acceptance.
+    cudaStream_t stream = nullptr;
+    for (int il = 0; il < n_delta; il++) {
+        const DeltaNetCapture & cap = sg_.delta_captures[il];
+        const int K_conv = 4;
+        if (!cap.conv_input ||
+            commit_n + K_conv - 1 > (int)cap.conv_input->ne[0]) {
+            std::fprintf(stderr, "rollback_to_specla: conv capture bad layer=%d\n", il);
+            return false;
+        }
+        const int row_cnt = (int)cap.conv_input->ne[1];
+        const size_t elt = ggml_element_size(cap.conv_input);
+        cudaError_t ce = cudaMemcpy2DAsync(
+            cache_.conv_state[il]->data, (K_conv - 1) * elt,
+            (const char *)cap.conv_input->data + (size_t)commit_n * elt,
+            cap.conv_input->nb[1],
+            (K_conv - 1) * elt, row_cnt,
+            cudaMemcpyDeviceToDevice, stream);
+        if (ce != cudaSuccess) {
+            std::fprintf(stderr, "rollback_to_specla: conv copy layer=%d: %s\n",
+                         il, cudaGetErrorString(ce));
+            return false;
+        }
+    }
+    cudaStreamSynchronize(stream);
 
     cache_.cur_pos = base_pos + commit_n;
     return true;

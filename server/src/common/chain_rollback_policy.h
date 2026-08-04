@@ -1,5 +1,7 @@
 #pragma once
 
+#include "specla_mode.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +48,12 @@ inline ChainRollbackPolicy resolve_chain_rollback_policy(
     // state directly, so it is cheaper than replay even for one accepted
     // token and does not depend on the host checkpoint precision.
     if (tensor_parallel) {
+        policy.fast_rollback_threshold = 1;
+    }
+    // SpecLA factor commit (docs/SPECLA.md) is exact F32 math at any accepted
+    // length, so the F16-checkpoint breakeven behind the default threshold
+    // does not apply — always take the fast path.
+    if (specla_enabled()) {
         policy.fast_rollback_threshold = 1;
     }
     return policy;

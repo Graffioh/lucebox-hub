@@ -1,9 +1,12 @@
 #include "graph_builders.h"
 
+#include "common/specla_mode.h"
+
 #include "ggml-alloc.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 namespace dflash::common {
 
@@ -346,6 +349,21 @@ bool build_target_step(
         ggml_set_input(sg.kv_write_rows);
     }
 
+    // SpecLA (DFLASH_SPECLA=1): capture-mode verifies run the topology-masked
+    // factor-capture path. Masks are host-filled by the caller (chain =
+    // lower-triangular) after this build, like attn_mask.
+    if (capture_delta_intermediate && specla_enabled() && !cache.factor_k.empty()) {
+        sg.specla_m_strict = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        sg.specla_m_incl   = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        sg.specla_m_eye    = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        ggml_set_name(sg.specla_m_strict, "specla_m_strict");
+        ggml_set_name(sg.specla_m_incl,   "specla_m_incl");
+        ggml_set_name(sg.specla_m_eye,    "specla_m_eye");
+        ggml_set_input(sg.specla_m_strict);
+        ggml_set_input(sg.specla_m_incl);
+        ggml_set_input(sg.specla_m_eye);
+    }
+
     QwenGraphInputs gi{};
     gi.inp_embed                  = sg.inp_embed;
     gi.positions                  = sg.positions;
@@ -359,6 +377,9 @@ bool build_target_step(
     gi.last_token_logits_only     = last_token_logits_only;
     gi.kv_write_rows              = sg.kv_write_rows;
     gi.q_capture                  = capture_qk;
+    gi.specla_m_strict            = sg.specla_m_strict;
+    gi.specla_m_incl              = sg.specla_m_incl;
+    gi.specla_m_eye               = sg.specla_m_eye;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -418,6 +439,21 @@ bool build_target_step_tree(
     ggml_set_name(sg.parent_ids, "parent_ids");
     ggml_set_input(sg.parent_ids);
 
+    // SpecLA tree verify: ancestor masks over the DFS-ordered nodes replace
+    // the sequential kernel's parent_ids state fanout (parent_ids still
+    // steers the tree conv). Host-filled by verify_tree from tree.parents.
+    if (specla_enabled() && !cache.factor_k.empty()) {
+        sg.specla_m_strict = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        sg.specla_m_incl   = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        sg.specla_m_eye    = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        ggml_set_name(sg.specla_m_strict, "specla_m_strict");
+        ggml_set_name(sg.specla_m_incl,   "specla_m_incl");
+        ggml_set_name(sg.specla_m_eye,    "specla_m_eye");
+        ggml_set_input(sg.specla_m_strict);
+        ggml_set_input(sg.specla_m_incl);
+        ggml_set_input(sg.specla_m_eye);
+    }
+
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
     QwenGraphInputs gi{};
@@ -430,6 +466,9 @@ bool build_target_step_tree(
     gi.capture_layers             = true;
     gi.capture_delta_intermediate = true;
     gi.parent_ids                 = sg.parent_ids;
+    gi.specla_m_strict            = sg.specla_m_strict;
+    gi.specla_m_incl              = sg.specla_m_incl;
+    gi.specla_m_eye               = sg.specla_m_eye;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

@@ -99,6 +99,17 @@ private:
     KvFlashPager * pager_ = nullptr;
     bool fast_rollback_ = false;
 
+    // SpecLA (DFLASH_SPECLA=1, docs/SPECLA.md): true when the cache was
+    // migrated with factor buffers. Capture-verify then runs the
+    // topology-masked factor path, never mutates durable SSM/conv state
+    // (snapshot/restore become no-ops), and rollback commits via
+    // DeltaConstruct instead of dense checkpoint copies.
+    bool specla_active() const { return fast_rollback_ && !cache_.factor_k.empty(); }
+
+    // SpecLA chain commit: DeltaConstruct over the accepted prefix + conv
+    // slice commit from conv_input_cache.
+    bool rollback_to_specla(int base_pos, int commit_n);
+
     // Cached vector form of capture layer IDs (built once in constructor).
     std::vector<int> capture_ids_;
 

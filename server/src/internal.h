@@ -404,6 +404,12 @@ struct TargetCache {
     std::vector<ggml_tensor *> ssm_intermediate;    // size = n_delta (48)
     std::vector<ggml_tensor *> conv_input_cache;    // size = n_delta (48)
 
+    // SpecLA factor buffers (allocated instead of ssm_intermediate when
+    // DFLASH_SPECLA=1 on the single-target path). See DeltaNetCapture.
+    std::vector<ggml_tensor *> factor_k;            // [S_k, H_v, max_q_len] f32
+    std::vector<ggml_tensor *> factor_v_new;        // [S_v, H_v, max_q_len] f32
+    std::vector<ggml_tensor *> factor_g_ps;         // [H_v, max_q_len] f32
+
     // Rolling target layer features captured during target forward passes.
     // Shape [5 * hidden, target_feat_cap] bf16. target_feat_cap is typically
     // << max_ctx (e.g. 4096) so the buffer stays small at 128K context. The
@@ -574,6 +580,17 @@ bool migrate_prefill_cache(const TargetWeights & w,
                            ggml_backend_t backend,
                            TargetCache & cache);
 
+// SpecLA accepted-state commit (DeltaConstruct, docs/SPECLA.md): advance every
+// delta-net layer's durable SSM state along the accepted path using the factor
+// buffers captured by the last verify. accepted_idx holds the A accepted
+// verify-token (or DFS-node) indices in path order, deepest last. Runs one
+// small graph over all layers; conv state is NOT touched (the caller commits
+// it from conv_input_cache slices as before).
+bool specla_commit_accepted(TargetCache & cache,
+                            ggml_backend_t backend,
+                            const int32_t * accepted_idx,
+                            int A);
+
 // ─── Target forward graph ─────────────────────────────────────────
 
 // Per-delta-net-layer pointers exposed by the graph for spec-decode rollback.
@@ -594,6 +611,21 @@ bool migrate_prefill_cache(const TargetWeights & w,
 struct DeltaNetCapture {
     ggml_tensor * ssm_intermediate_states = nullptr;
     ggml_tensor * conv_input              = nullptr;
+
+    // SpecLA factor capture (DFLASH_SPECLA=1, docs/SPECLA.md). Compact
+    // per-token factors recorded during topology-masked verification in
+    // place of dense per-token state checkpoints. All persistent cache
+    // aliases (cache.factor_*[il]), F32:
+    //   factor_k:     [S_k, H_v, max_verify_tokens] — post-l2norm keys
+    //   factor_v_new: [S_v, H_v, max_verify_tokens] — corrected values ṽ
+    //   factor_g_ps:  [H_v, max_verify_tokens]      — path-cumulative gates g⁺
+    // Accepted-state commit reconstructs
+    //   S_A = exp(g⁺_A) S0 + Σ_{t∈path(A)} exp(g⁺_A − g⁺_t) k_t ⊗ ṽ_t
+    // via specla_commit_accepted(); ssm_intermediate_states stays null in
+    // SpecLA mode.
+    ggml_tensor * factor_k     = nullptr;
+    ggml_tensor * factor_v_new = nullptr;
+    ggml_tensor * factor_g_ps  = nullptr;
 };
 
 struct QwenGraphInputs {
@@ -614,6 +646,13 @@ struct QwenGraphInputs {
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.
     bool q_capture = false;
+
+    // SpecLA topology masks ([n_tokens, n_tokens] f32 host-filled inputs;
+    // see delta_net_specla.h). Non-null + capture_delta_intermediate routes
+    // delta-net layers through the topology-masked factor-capture verify.
+    ggml_tensor * specla_m_strict = nullptr;
+    ggml_tensor * specla_m_incl   = nullptr;
+    ggml_tensor * specla_m_eye    = nullptr;
 };
 
 struct QwenGraphOutputs {
