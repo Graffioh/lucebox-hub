@@ -29,9 +29,12 @@ static inline int mmq_stream_k_nblocks(
         return nsm;
     }
 
-    const int64_t iters_per_tile = 1 + (ncols_x - 1) / iter_k;
+    // The device aligns CTA boundaries down to complete iter_k/qk chunks.
+    // Keep a partial K tail with the tile's final CTA instead of counting it
+    // as another CTA; otherwise the aligned partition creates empty CTAs.
+    const int64_t iters_per_tile = ncols_x >= iter_k ? ncols_x / iter_k : 1;
     // We only need the exact product when it is below nsm. Saturate first so
-    // neither ceiling division nor multiplication can overflow.
+    // neither division nor multiplication can overflow.
     if (iters_per_tile >= nsm) {
         return nsm;
     }

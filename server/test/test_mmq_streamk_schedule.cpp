@@ -24,6 +24,16 @@ int main() {
     expect("sm86 single shallow",      mmq_stream_k_nblocks(1, 82, 256, kIterK, true, true), 1);
     expect("sm86 single deep capped",  mmq_stream_k_nblocks(1, 82, 5120, kIterK, true, true), 20);
 
+    // qk-aligned K tails stay with the tile's final CTA. Counting ceil(K/256)
+    // would produce alternating empty CTAs and a spurious fixup launch.
+    const int k320_stream_blocks = mmq_stream_k_nblocks(20, 82, 320, kIterK, true, true);
+    expect("sm86 K320 qk32 tail",       k320_stream_blocks, 20);
+    expect("sm86 K320 skips fixup",     mmq_stream_k_fixup_needed(20, k320_stream_blocks), 0);
+    expect("sm86 K384 qk32 tail",       mmq_stream_k_nblocks(20, 82, 384, kIterK, true, true), 20);
+    const int k576_stream_blocks = mmq_stream_k_nblocks(20, 82, 576, kIterK, true, true);
+    expect("sm86 K576 split remains",   k576_stream_blocks, 40);
+    expect("sm86 K576 needs fixup",     mmq_stream_k_fixup_needed(20, k576_stream_blocks), 1);
+
     // Existing >=90% NVIDIA tiling behavior remains unchanged.
     expect("nvidia 90pct tiling",       mmq_stream_k_nblocks(74, 82, 5120, kIterK, true, false), 74);
     expect("nvidia full SM tiling",     mmq_stream_k_nblocks(82, 82, 5120, kIterK, true, false), 82);
