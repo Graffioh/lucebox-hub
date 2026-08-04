@@ -191,6 +191,21 @@ allocation for gallocr reuse, so at a fixed budget the margin only changes
 which candidates are submitted (pruned slots become padding). Its intended
 use is enabling smaller budgets without the AL loss of naive truncation.
 
+**Server loop (`dflash_server` → `do_spec_decode`, ddtree budget 22,
+greedy, 256-token request, two interleaved reps within ±0.2%):**
+
+| | baseline | SpecLA |
+|---|---|---|
+| decode speed | 32.7 tok/s | **37.3 tok/s (+14%)** |
+| acceptance | 43.1% (avg commit 8.13) | 44.4% (avg commit 8.10) |
+| target forwards / step | 1.267 | **1.000** |
+
+The forwards-per-step counter shows the mechanism: with F16 checkpoints
+the loop replays whenever `accept_n < fast_rollback_threshold`, costing
+~27% extra target forwards on this workload; the exact factor commit
+never replays. (The renamed-binary trick is needed to run `dflash_server`
+on this machine — the shared-host reaper kills it by process name.)
+
 ## Deferred
 
 - **Chain-decomposed hybrid verification (paper §4.3)** — heavy-light
