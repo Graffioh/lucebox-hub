@@ -64,7 +64,8 @@ void extract_draft_topk(const float * logits,
 DDTree build_ddtree(const float * top_log_probs,
                     const int32_t * top_token_ids,
                     int L, int K, int budget,
-                    bool chain_seed) {
+                    bool chain_seed,
+                    float tau_tree) {
     DDTree tree;
     if (budget <= 0 || L <= 0) {
         tree.parents.push_back(-1);
@@ -137,9 +138,18 @@ DDTree build_ddtree(const float * top_log_probs,
         });
     }
 
+    // q* for the SpecLA confidence window: the best single candidate score.
+    // The rank-0 depth-1 path dominates every other candidate (q is
+    // monotonically non-increasing along paths and ranks are sorted), so it
+    // is q* whether or not the chain seed consumed it.
+    const float q_star = top_log_probs[0 * K + 0];
+
     while (!heap.empty() && tree.n_nodes < budget) {
         HeapEntry top = heap.top();
         heap.pop();
+        // Best-first pops in descending q(v): the first out-of-window
+        // candidate proves every remaining one is out of the window too.
+        if (q_star - top.logw > tau_tree) break;
 
         const int    depth_minus_1 = top.depth - 1;
         const int    rank          = top.rank;

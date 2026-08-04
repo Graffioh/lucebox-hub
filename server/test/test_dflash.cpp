@@ -19,6 +19,7 @@
 //                    <n_gen> <out_ids.bin>
 
 #include "dflash27b.h"
+#include <limits>
 #include "internal.h"
 #include "delta_net_specla.h"
 #include "draft_graph.h"
@@ -754,6 +755,7 @@ int main(int argc, char ** argv) {
     int   ddtree_budget = 64;
     float ddtree_temp   = 1.0f;   // softmax temperature for top-K extract
     bool  ddtree_chain_seed = true;  // pre-seed full chain (vs paper's pure best-first)
+    float ddtree_tau    = std::numeric_limits<float>::infinity();  // SpecLA confidence margin
     bool  profile_scaling = false;  // microbench: time target forward at varying N
     bool  time_breakdown  = false;  // one-token time breakdown: prefill/decode/verify × ctx size
     bool  hybrid_bench_only = false; // skip monolithic scenarios, run only hybrid/pipelined
@@ -809,6 +811,9 @@ int main(int argc, char ** argv) {
         else if (std::strncmp(argv[i], "--ddtree-budget=", 16) == 0) {
             ddtree_budget = std::atoi(argv[i] + 16);
             if (ddtree_budget <= 0) ddtree_budget = 64;
+        }
+        else if (std::strncmp(argv[i], "--ddtree-tau=", 13) == 0) {
+            ddtree_tau = (float)std::atof(argv[i] + 13);
         }
         else if (std::strncmp(argv[i], "--ddtree-temp=", 14) == 0) {
             ddtree_temp = (float)std::atof(argv[i] + 14);
@@ -3380,7 +3385,7 @@ int main(int argc, char ** argv) {
                 ddtree_top_log_probs.data(),
                 ddtree_top_token_ids.data(),
                 L, ddtree_K, ddtree_budget,
-                ddtree_chain_seed);
+                ddtree_chain_seed, ddtree_tau);
 
             const int N_actual = 1 + tree.n_nodes;  // actual tree size
             const int N = ddtree_budget + 1;         // fixed allocation size for gallocr reuse

@@ -1243,6 +1243,7 @@ if(DFLASH27B_TESTS)
             test/test_admission.cpp
             test/test_restore_delta.cpp
             test/test_chain_rollback_policy.cpp
+            test/test_ddtree_tau.cpp
             test/test_anchor_transitive.cpp
             test/test_drafter_early_exit_score_range.cpp
             test/test_drafter_tail_capture_guard.cpp

@@ -2208,7 +2208,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             // from one spine-conditioned block-draft forward, so a confident
             // draft may not beat the chain.
             DDTree tree = build_ddtree(top_lp.data() + (size_t)K, top_ids.data() + (size_t)K,
-                                       L, K, cfg_.ddtree_budget, cfg_.ddtree_chain_seed);
+                                       L, K, cfg_.ddtree_budget, cfg_.ddtree_chain_seed,
+                                       cfg_.ddtree_tau);
             const int N = cfg_.ddtree_budget + 1;   // fixed alloc width
 
             std::vector<int32_t> flat_tokens((size_t)N, 0);
