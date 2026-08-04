@@ -405,10 +405,25 @@ struct TargetCache {
     std::vector<ggml_tensor *> conv_input_cache;    // size = n_delta (48)
 
     // SpecLA factor buffers (allocated instead of ssm_intermediate when
-    // DFLASH_SPECLA=1 on the single-target path). See DeltaNetCapture.
-    std::vector<ggml_tensor *> factor_k;            // [S_k, H_v, max_q_len] f32
-    std::vector<ggml_tensor *> factor_v_new;        // [S_v, H_v, max_q_len] f32
-    std::vector<ggml_tensor *> factor_g_ps;         // [H_v, max_q_len] f32
+    // DFLASH_SPECLA=1 on the single-target path). One consolidated tensor per
+    // factor with the token axis outermost, so the accepted-state commit can
+    // gather and reduce ALL delta layers with a handful of batched ops:
+    //   factor_k_all:     [S_k, H_v, n_delta, max_q_len] f32
+    //   factor_v_new_all: [S_v, H_v, n_delta, max_q_len] f32
+    //   factor_g_ps_all:  [H_v, n_delta, max_q_len] f32
+    // The per-layer vectors below are persistent VIEWS into these (created
+    // after buffer allocation), shaped like independent per-layer buffers so
+    // the capture path treats them exactly like other cache tensors.
+    ggml_tensor * factor_k_all = nullptr;
+    ggml_tensor * factor_v_new_all = nullptr;
+    ggml_tensor * factor_g_ps_all = nullptr;
+    std::vector<ggml_tensor *> factor_k;            // view [S_k, H_v, max_q_len]
+    std::vector<ggml_tensor *> factor_v_new;        // view [S_v, H_v, max_q_len]
+    std::vector<ggml_tensor *> factor_g_ps;         // view [H_v, max_q_len]
+    // Device-side scratch for the fused commit kernel: the accepted-index
+    // upload buffer and the (uploaded-once) array of per-layer state pointers.
+    ggml_tensor * specla_idx = nullptr;             // i32 [max_q_len]
+    ggml_tensor * specla_state_ptrs = nullptr;      // i64 [n_delta]
 
     // Rolling target layer features captured during target forward passes.
     // Shape [5 * hidden, target_feat_cap] bf16. target_feat_cap is typically

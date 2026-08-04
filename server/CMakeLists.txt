@@ -561,6 +561,10 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     target_sources(dflash_common PRIVATE src/common/geometric_draft_topk_cuda.cu)
     set_source_files_properties(src/common/geometric_draft_topk_cuda.cu
         PROPERTIES LANGUAGE HIP)
+    # Fused SpecLA accepted-state commit (one launch for all delta layers).
+    target_sources(dflash_common PRIVATE src/common/specla_commit_cuda.cu)
+    set_source_files_properties(src/common/specla_commit_cuda.cu
+        PROPERTIES LANGUAGE HIP)
     # PUBLIC so test consumers (test_dflash / test_draft_topk_cuda) also take the
     # GPU draft top-K path instead of the CPU fallback.
     target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_DRAFT_TOPK=1)
@@ -595,7 +599,8 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_sources(dflash_common PRIVATE
         src/flashprefill_select.cpp
         src/flashprefill.cpp
-        src/common/geometric_draft_topk_cuda.cu)
+        src/common/geometric_draft_topk_cuda.cu
+        src/common/specla_commit_cuda.cu)
     # PUBLIC so consumers (e.g. the test_dflash executable) also see the macro
     # and take the GPU draft top-K path instead of the CPU fallback. Same macro
     # name as the HIP branch above (backend-neutral).

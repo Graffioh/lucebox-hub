@@ -37,6 +37,7 @@
 #include "qwen35_ops.h"
 #include "qwen35moe_ffn.h"
 #include "common/chain_rollback_policy.h"
+#include "common/specla_commit_cuda.h"
 #include "common/specla_mode.h"
 
 #include "ggml-alloc.h"
@@ -426,7 +427,7 @@ bool migrate_prefill_cache(const TargetWeights & w,
         cache.factor_g_ps.assign(n_delta, nullptr);
     }
 
-    const int rb_tensors = (specla ? 6 : 4) * n_delta;
+    const int rb_tensors = (specla ? 7 : 4) * n_delta;  // specla: +3 views/layer +3 big
     ggml_init_params ip{};
     ip.mem_size   = (size_t)(rb_tensors + 16) * ggml_tensor_overhead();
     ip.mem_buffer = nullptr;
@@ -441,6 +442,25 @@ bool migrate_prefill_cache(const TargetWeights & w,
         ? GGML_TYPE_F32 : GGML_TYPE_F16;
 
     const int head_k_dim = w.ssm_d_state;
+    if (specla) {
+        // Consolidated factor buffers: token axis outermost so the commit can
+        // gather + reduce every layer with a few batched ops.
+        cache.factor_k_all = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F32,
+            head_k_dim, w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_v_new_all = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F32,
+            head_v_dim, w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_g_ps_all = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+            w.ssm_dt_rank, n_delta, max_verify_tokens);
+        ggml_set_name(cache.factor_k_all,     "specla_factor_k_all");
+        ggml_set_name(cache.factor_v_new_all, "specla_factor_v_all");
+        ggml_set_name(cache.factor_g_ps_all,  "specla_factor_g_all");
+        cache.specla_idx = ggml_new_tensor_1d(cache.rollback_ctx, GGML_TYPE_I32,
+                                              max_verify_tokens);
+        cache.specla_state_ptrs = ggml_new_tensor_1d(cache.rollback_ctx, GGML_TYPE_I64,
+                                                     n_delta);
+        ggml_set_name(cache.specla_idx,        "specla_idx");
+        ggml_set_name(cache.specla_state_ptrs, "specla_state_ptrs");
+    }
     int dn_idx = 0;
     for (int il = 0; il < w.n_layer; il++) {
         if (((il + 1) % w.full_attention_interval) != 0) {
@@ -458,20 +478,7 @@ bool migrate_prefill_cache(const TargetWeights & w,
             cache.ssm_state_snap[dn_idx]  = Sn;
             cache.conv_state_snap[dn_idx] = Cn;
             cache.conv_input_cache[dn_idx] = Ci;
-            if (specla) {
-                ggml_tensor * Fk = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
-                                                       head_k_dim, w.ssm_dt_rank, max_verify_tokens);
-                ggml_tensor * Fv = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
-                                                       head_v_dim, w.ssm_dt_rank, max_verify_tokens);
-                ggml_tensor * Fg = ggml_new_tensor_2d(cache.rollback_ctx, GGML_TYPE_F32,
-                                                       w.ssm_dt_rank, max_verify_tokens);
-                std::snprintf(name, sizeof(name), "specla_factor_k_%d", il);  ggml_set_name(Fk, name);
-                std::snprintf(name, sizeof(name), "specla_factor_v_%d", il);  ggml_set_name(Fv, name);
-                std::snprintf(name, sizeof(name), "specla_factor_g_%d", il);  ggml_set_name(Fg, name);
-                cache.factor_k[dn_idx]     = Fk;
-                cache.factor_v_new[dn_idx] = Fv;
-                cache.factor_g_ps[dn_idx]  = Fg;
-            } else {
+            if (!specla) {
                 ggml_tensor * Si = ggml_new_tensor_4d(cache.rollback_ctx, checkpoint_type,
                                                        head_v_dim, head_v_dim,
                                                        w.ssm_dt_rank, max_verify_tokens);
@@ -520,6 +527,35 @@ bool migrate_prefill_cache(const TargetWeights & w,
         }
     }
 
+    // SpecLA: per-layer factor views into the consolidated buffers, created
+    // after allocation so they carry live data/buffer pointers. Shaped like
+    // stand-alone per-layer tensors ([.., max_q] with a cross-layer token
+    // stride) so the capture path treats them like any other cache tensor.
+    if (specla) {
+        ggml_tensor * Fk = cache.factor_k_all;
+        ggml_tensor * Fv = cache.factor_v_new_all;
+        ggml_tensor * Fg = cache.factor_g_ps_all;
+        for (int dn = 0; dn < n_delta; dn++) {
+            cache.factor_k[dn] = ggml_view_3d(cache.rollback_ctx, Fk,
+                Fk->ne[0], Fk->ne[1], max_verify_tokens,
+                Fk->nb[1], Fk->nb[3], (size_t)dn * Fk->nb[2]);
+            cache.factor_v_new[dn] = ggml_view_3d(cache.rollback_ctx, Fv,
+                Fv->ne[0], Fv->ne[1], max_verify_tokens,
+                Fv->nb[1], Fv->nb[3], (size_t)dn * Fv->nb[2]);
+            cache.factor_g_ps[dn] = ggml_view_2d(cache.rollback_ctx, Fg,
+                Fg->ne[0], max_verify_tokens,
+                Fg->nb[2], (size_t)dn * Fg->nb[1]);
+        }
+        // Per-layer state pointers for the fused commit kernel. ssm_state
+        // device pointers are stable for the cache's lifetime, so upload once.
+        std::vector<int64_t> ptrs((size_t)n_delta, 0);
+        for (int dn = 0; dn < n_delta; dn++) {
+            ptrs[(size_t)dn] = (int64_t)(intptr_t)cache.ssm_state[dn]->data;
+        }
+        ggml_backend_tensor_set(cache.specla_state_ptrs, ptrs.data(), 0,
+                                sizeof(int64_t) * ptrs.size());
+    }
+
     return true;
 }
 
@@ -533,12 +569,54 @@ bool specla_commit_accepted(TargetCache & cache,
                             const int32_t * accepted_idx,
                             int A) {
     const int n_delta = (int)cache.factor_k.size();
-    if (n_delta == 0 || A <= 0 || !accepted_idx || !backend) return false;
+    ggml_tensor * Fk = cache.factor_k_all;
+    ggml_tensor * Fv = cache.factor_v_new_all;
+    ggml_tensor * Fg = cache.factor_g_ps_all;
+    if (n_delta == 0 || A <= 0 || !accepted_idx || !backend ||
+        !Fk || !Fv || !Fg) {
+        return false;
+    }
+    if (accepted_idx[A - 1] >= Fk->ne[3]) return false;
 
-    const size_t graph_nodes = (size_t)n_delta * 32 + 64;
+    const int64_t S_k = Fk->ne[0];
+    const int64_t H   = Fk->ne[1];
+    const int64_t S_v = Fv->ne[0];
+    const int64_t HL  = H * n_delta;
+
+    // Fast path: one fused kernel updates every layer's state in place.
+    // Escape hatch DFLASH_SPECLA_FUSED_COMMIT=0 falls back to the ggml-graph
+    // implementation below (also the fallback on any launch failure).
+    static const bool kFusedCommit = []() {
+        const char * v = std::getenv("DFLASH_SPECLA_FUSED_COMMIT");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (kFusedCommit && cache.specla_idx && cache.specla_state_ptrs) {
+        ggml_backend_tensor_set(cache.specla_idx, accepted_idx, 0,
+                                sizeof(int32_t) * (size_t)A);
+        if (specla_commit_fused(
+                (float * const *)cache.specla_state_ptrs->data,
+                (const float *)Fk->data,
+                (const float *)Fv->data,
+                (const float *)Fg->data,
+                (const int32_t *)cache.specla_idx->data,
+                A, (int)S_k, (int)S_v, (int)H, n_delta,
+                /*stream=*/nullptr)) {
+            return true;
+        }
+        std::fprintf(stderr,
+            "specla_commit_accepted: fused kernel failed; using graph path\n");
+    }
+
+    // Persistent metadata arena + allocator, reused across steps like the
+    // verify step graph — avoids per-commit gallocr churn.
+    static thread_local std::vector<uint8_t> s_arena;
+    static thread_local ggml_gallocr_t s_galloc = nullptr;
+    const size_t graph_nodes = (size_t)n_delta * 8 + 64;
     ggml_init_params ip{};
-    ip.mem_size = graph_nodes * ggml_tensor_overhead() +
+    ip.mem_size = graph_nodes * 4 * ggml_tensor_overhead() +
                   ggml_graph_overhead_custom(graph_nodes, false);
+    if (s_arena.size() < ip.mem_size) s_arena.resize(ip.mem_size);
+    ip.mem_buffer = s_arena.data();
     ip.no_alloc = true;
     ggml_context * ctx = ggml_init(ip);
     if (!ctx) return false;
@@ -547,48 +625,50 @@ bool specla_commit_accepted(TargetCache & cache,
     ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, A);
     ggml_set_input(idx);
 
+    // Gather the accepted token slices across ALL layers at once (the token
+    // axis is outermost in the consolidated buffers).
+    ggml_tensor * k_sel = ggml_get_rows(ctx,
+        ggml_reshape_2d(ctx, Fk, S_k * HL, Fk->ne[3]), idx);           // [S_k*HL, A]
+    ggml_tensor * v_sel = ggml_get_rows(ctx,
+        ggml_reshape_2d(ctx, Fv, S_v * HL, Fv->ne[3]), idx);           // [S_v*HL, A]
+    ggml_tensor * g_sel = ggml_get_rows(ctx,
+        ggml_reshape_2d(ctx, Fg, HL, Fg->ne[2]), idx);                 // [HL, A]
+    k_sel = ggml_reshape_3d(ctx, k_sel, S_k, HL, A);
+    v_sel = ggml_reshape_3d(ctx, v_sel, S_v, HL, A);
+
+    // w[hl, t] = exp(g⁺_A − g⁺_t); the deepest accepted node is last.
+    ggml_tensor * gA = ggml_view_2d(ctx, g_sel, HL, 1, g_sel->nb[1],
+                                    (size_t)(A - 1) * g_sel->nb[1]);
+    ggml_tensor * w_dec = ggml_exp(ctx, ggml_neg(ctx, ggml_sub(ctx, g_sel, gA)));
+
+    // Σ_t (k_t · w_t) ⊗ ṽ_t for every (layer, head) in one batched matmul.
+    ggml_tensor * kg = ggml_mul(ctx, k_sel, ggml_reshape_3d(ctx, w_dec, 1, HL, A));
+    ggml_tensor * kg_t = ggml_cont(ctx, ggml_permute(ctx, kg,    1, 2, 0, 3)); // [A, S_k, HL]
+    ggml_tensor * v_t  = ggml_cont(ctx, ggml_permute(ctx, v_sel, 1, 2, 0, 3)); // [A, S_v, HL]
+    ggml_tensor * upd  = ggml_mul_mat(ctx, kg_t, v_t);                         // [S_k, S_v, HL]
+    ggml_tensor * gA_exp = ggml_exp(ctx, ggml_cont(ctx, gA));                  // [HL, 1]
+
+    // Per-layer tail: S ← exp(g⁺_A)·S + upd (states are separate tensors).
     for (int il = 0; il < n_delta; il++) {
-        ggml_tensor * Fk = cache.factor_k[il];
-        ggml_tensor * Fv = cache.factor_v_new[il];
-        ggml_tensor * Fg = cache.factor_g_ps[il];
-        ggml_tensor * S  = cache.ssm_state[il];
-        if (!Fk || !Fv || !Fg || !S) { ggml_free(ctx); return false; }
-        if (accepted_idx[A - 1] >= Fk->ne[2]) { ggml_free(ctx); return false; }
-        const int64_t S_k = Fk->ne[0], H = Fk->ne[1], S_v = Fv->ne[0];
-
-        // Gather the accepted rows (factors are token-major on the last axis).
-        ggml_tensor * k_sel = ggml_get_rows(ctx,
-            ggml_reshape_2d(ctx, Fk, S_k * H, Fk->ne[2]), idx);        // [S_k*H, A]
-        ggml_tensor * v_sel = ggml_get_rows(ctx,
-            ggml_reshape_2d(ctx, Fv, S_v * H, Fv->ne[2]), idx);        // [S_v*H, A]
-        ggml_tensor * g_sel = ggml_get_rows(ctx, Fg, idx);             // [H, A]
-        k_sel = ggml_reshape_3d(ctx, k_sel, S_k, H, A);
-        v_sel = ggml_reshape_3d(ctx, v_sel, S_v, H, A);
-
-        // w[h, t] = exp(g⁺_A − g⁺_t); the deepest accepted node is last.
-        ggml_tensor * gA = ggml_view_2d(ctx, g_sel, H, 1, g_sel->nb[1],
-                                        (size_t)(A - 1) * g_sel->nb[1]);
-        ggml_tensor * w_dec = ggml_exp(ctx, ggml_neg(ctx, ggml_sub(ctx, g_sel, gA)));
-
-        // Σ_t (k_t · w_t) ⊗ ṽ_t per head — mirrors the chunked state tail.
-        ggml_tensor * kg = ggml_mul(ctx, k_sel, ggml_reshape_3d(ctx, w_dec, 1, H, A));
-        ggml_tensor * kg_t = ggml_cont(ctx, ggml_permute(ctx, kg,    1, 2, 0, 3)); // [A, S_k, H]
-        ggml_tensor * v_t  = ggml_cont(ctx, ggml_permute(ctx, v_sel, 1, 2, 0, 3)); // [A, S_v, H]
-        ggml_tensor * upd  = ggml_mul_mat(ctx, kg_t, v_t);                         // [S_k, S_v, H]
-
-        ggml_tensor * gA_exp = ggml_exp(ctx,
-            ggml_reshape_3d(ctx, ggml_cont(ctx, gA), 1, 1, H));
-        ggml_tensor * s_new = ggml_add(ctx, ggml_mul(ctx, S, gA_exp), upd);
+        ggml_tensor * S = cache.ssm_state[il];
+        if (!S) { ggml_free(ctx); return false; }
+        ggml_tensor * upd_l = ggml_view_3d(ctx, upd, S_k, S_v, H,
+            upd->nb[1], upd->nb[2], (size_t)il * H * upd->nb[2]);
+        ggml_tensor * gA_l = ggml_reshape_3d(ctx,
+            ggml_cont(ctx, ggml_view_1d(ctx, gA_exp, H, (size_t)il * H * gA_exp->nb[0])),
+            1, 1, H);
+        ggml_tensor * s_new = ggml_add(ctx, ggml_mul(ctx, S, gA_l), upd_l);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, s_new, S));
     }
 
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    bool ok = galloc != nullptr && ggml_gallocr_alloc_graph(galloc, gf);
+    if (!s_galloc) {
+        s_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    bool ok = s_galloc != nullptr && ggml_gallocr_alloc_graph(s_galloc, gf);
     if (ok) {
         ggml_backend_tensor_set(idx, accepted_idx, 0, sizeof(int32_t) * A);
         ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
     }
-    if (galloc) ggml_gallocr_free(galloc);
     ggml_free(ctx);
     return ok;
 }
