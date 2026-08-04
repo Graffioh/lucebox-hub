@@ -1059,6 +1059,12 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_turbo_wht_warp PRIVATE CUDA::cudart)
         list(APPEND _raw_unit_test_targets test_turbo_wht_warp)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmq_streamk_schedule.cpp")
+        add_executable(test_mmq_streamk_schedule test/test_mmq_streamk_schedule.cpp)
+        target_include_directories(test_mmq_streamk_schedule PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        list(APPEND _raw_unit_test_targets test_mmq_streamk_schedule)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_drafter_tail_capture_guard.cpp")
         # RED phase binary: same source WITHOUT the fix flag — documents the bug.
         add_executable(test_drafter_tail_capture_guard_red
