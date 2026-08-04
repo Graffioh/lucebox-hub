@@ -107,22 +107,37 @@ TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
 }
 
 #if !defined(_WIN32)
-TEST_CASE(ServerUnitFixture, test_http_peer_disconnect_probe_is_non_consuming) {
+TEST_CASE(ServerUnitFixture, test_http_peer_socket_probe_preserves_half_close) {
     int sockets[2] = {-1, -1};
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
-    TEST_ASSERT(!http_detail::peer_disconnected(sockets[0]));
+    TEST_ASSERT(http_detail::inspect_peer_socket(sockets[0]) ==
+                http_detail::PeerSocketState::Connected);
 
     const char byte = 'x';
     TEST_ASSERT(write(sockets[1], &byte, 1) == 1);
-    TEST_ASSERT(!http_detail::peer_disconnected(sockets[0]));
+    TEST_ASSERT(http_detail::inspect_peer_socket(sockets[0]) ==
+                http_detail::PeerSocketState::Connected);
 
     char received = 0;
     TEST_ASSERT(read(sockets[0], &received, 1) == 1);
     TEST_ASSERT(received == byte);
+
+    // Finishing the request direction must not cancel a response that the
+    // peer is still reading.
+    TEST_ASSERT(shutdown(sockets[1], SHUT_WR) == 0);
+    TEST_ASSERT(http_detail::inspect_peer_socket(sockets[0]) ==
+                http_detail::PeerSocketState::ReadClosed);
+    const char response = 'y';
+    TEST_ASSERT(write(sockets[0], &response, 1) == 1);
+    TEST_ASSERT(read(sockets[1], &received, 1) == 1);
+    TEST_ASSERT(received == response);
+
+    const int closed_fd = sockets[0];
+    close(closed_fd);
+    sockets[0] = -1;
+    TEST_ASSERT(http_detail::inspect_peer_socket(closed_fd) ==
+                http_detail::PeerSocketState::Disconnected);
     close(sockets[1]);
-    sockets[1] = -1;
-    TEST_ASSERT(http_detail::peer_disconnected(sockets[0]));
-    close(sockets[0]);
 }
 #endif
 
@@ -2677,6 +2692,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     int shutdown_calls = 0;
     ModelBackend::CompressRequest last_compress_req;
     int prefill_chunk = 0;
+    std::function<void()> on_prefill;
 
     const char * name() const override { return "mock"; }
     bool init() override { return true; }
@@ -2694,6 +2710,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         current_pos = base_pos + (int)prompt.size();
         current_last = prompt.empty() ? current_last : prompt.back();
         last_tok = current_last;
+        if (on_prefill) on_prefill();
         return true;
     }
     bool decode_ar(int last_tok, int committed, int n_gen,
@@ -2869,6 +2886,29 @@ TEST_CASE(ServerUnitFixture, test_layer_split_backend_chunks_prefill_by_adapter_
     TEST_ASSERT(raw->prefill_sizes[1] == 3);
     TEST_ASSERT(raw->prefill_bases[2] == 6);
     TEST_ASSERT(raw->prefill_sizes[2] == 2);
+}
+
+TEST_CASE(ServerUnitFixture, test_layer_split_backend_cancels_between_prefill_chunks) {
+    auto * raw = new MockLayerSplitAdapter();
+    raw->prefill_chunk = 3;
+    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+    bool cancel = false;
+    raw->on_prefill = [&cancel]() { cancel = true; };
+    DaemonIO io;
+    io.should_cancel = [&cancel]() { return cancel; };
+
+    GenerateRequest req;
+    req.prompt = {1, 2, 3, 4, 5, 6, 7, 8};
+    req.n_gen = 4;
+    GenerateResult result = backend.generate(req, io);
+
+    TEST_ASSERT(result.ok());
+    TEST_ASSERT(io.is_cancelled());
+    TEST_ASSERT(raw->prefill_bases.size() == 1);
+    TEST_ASSERT(raw->prefill_sizes.size() == 1);
+    TEST_ASSERT(raw->prefill_sizes[0] == 3);
+    TEST_ASSERT(raw->emitted_tokens.empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_drafter_path) {

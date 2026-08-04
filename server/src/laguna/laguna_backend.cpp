@@ -1331,6 +1331,10 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     const KvFlashPager * kvf = kvflash_active() ? &kvflash_pager_ : nullptr;
 
     // ── Prefill ──
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
     std::vector<float> embed_pf((size_t)N * w_.n_embd);
     if (!w_.embedder.embed(req.prompt.data(), N, embed_pf.data())) {
         result.fail(GenerateErrorCode::BackendSpecific, "embed_prefill");
@@ -1348,6 +1352,7 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     const int pf_chunk = kvf_paged ? pf_pool_batch : args_.chunk;
     const int n_chunks = (N + pf_chunk - 1) / pf_chunk;
     for (int c = 0; c < n_chunks && ok; ++c) {
+        if (out_io.is_cancelled()) break;
         const int kv_start = c * pf_chunk;
         const int n_tok    = std::min(pf_chunk, N - c * pf_chunk);
         if (kvf_paged) {
@@ -1370,6 +1375,10 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
                           embed_pf.data() + (size_t)kv_start * w_.n_embd,
                           n_tok, kv_start, no_mask, last_logits, kvf,
                           /*capture=*/true);
+    }
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
     }
     if (!ok) { result.fail(GenerateErrorCode::PrefillFailed); return result; }
     auto t_pf1 = std::chrono::steady_clock::now();
@@ -1616,6 +1625,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     bool ok = true;
     const int n_chunks = (diff_n + args_.chunk - 1) / args_.chunk;
     for (int c = 0; c < n_chunks && ok; ++c) {
+        if (out_io.is_cancelled()) break;
         const int off   = c * args_.chunk;
         const int n_tok = std::min(args_.chunk, diff_n - off);
         const int starts = kv_start + off;
@@ -1624,6 +1634,10 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
                           embed_diff.data() + (size_t)off * w_.n_embd,
                           n_tok, starts, no_mask, last_logits, kvf,
                           /*capture=*/true);
+    }
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
     }
     if (!ok) { result.fail(GenerateErrorCode::PrefillFailed); return result; }
 
@@ -2745,6 +2759,10 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     const int n_expert_used = w_.n_expert_used;
     ggml_backend_t cpu_be = moe_hybrid_->cpu_backend;
 
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
     std::vector<float> embed_all((size_t)N * (size_t)hidden);
     if (!w_.embedder.embed(req.prompt.data(), N, embed_all.data())) {
         result.fail(GenerateErrorCode::BackendSpecific, "embed_prefill");
@@ -2763,6 +2781,13 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
         const bool is_full = laguna_is_full_attn_layer(w_, il);
 
         for (int chunk_start = 0; chunk_start < N; chunk_start += prefill_chunk) {
+            if (out_io.is_cancelled()) {
+                step_graph_destroy(prefill_sg);
+                if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
+                result.succeed();
+                return result;
+            }
             const int chunk_len = std::min(prefill_chunk, N - chunk_start);
 
             step_graph_free(prefill_sg);  // reset ctx/graph but keep gallocr buffer
@@ -2950,6 +2975,10 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     step_graph_destroy(prefill_sg);
     if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
     if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     // Project logits from last token's hidden state
     cache_.cur_pos = N;

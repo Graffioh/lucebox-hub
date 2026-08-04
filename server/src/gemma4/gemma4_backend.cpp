@@ -267,7 +267,6 @@ bool Gemma4Backend::kvflash_alloc_span(int kv_start, int n_tok) {
 
 int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io, int kv_offset) {
-    (void)io;
     const int n = (int)tokens.size();
     const int hidden = w_.n_embd;
     const int chunk = cfg_.chunk;
@@ -290,6 +289,7 @@ int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
 
     int pos = 0;
     while (pos < n) {
+        if (io.is_cancelled()) break;
         int len = std::min(chunk, n - pos);
 
         // Limit chunk to avoid ring-buffer wrap for SWA layers
@@ -745,6 +745,10 @@ GenerateResult Gemma4Backend::generate_impl(const GenerateRequest & req,
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
     }
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     // Inline snapshot at snap_pos for prefix cache
     if (req.snap_slot >= 0 && req.snap_pos > 0 && req.snap_pos <= committed) {
@@ -943,6 +947,10 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
     // else: prompt_len == snap_pos → no delta, committed stays at snap_pos
     result.prefill_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_prefill_start).count();
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     // Inline snapshot at snap_pos for prefix cache (new snap from this request)
     if (req.snap_slot >= 0 && req.snap_pos > 0 && req.snap_pos <= committed) {

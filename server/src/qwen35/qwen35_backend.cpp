@@ -813,6 +813,10 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     }
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     // Decode (speculative)
     if (req.n_gen > 0) {
@@ -968,6 +972,10 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             return result;
         }
     }
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     // Decode
     if (req.n_gen > 0) {
@@ -1022,8 +1030,6 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
                                int kv_offset) {
-    (void)io;
-
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     int prefill_ubatch = 512;
@@ -1083,6 +1089,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     std::vector<float> embed_buf((size_t)hidden * prefill_ubatch);
     int committed = kv_offset;
     for (int start = 0; start < prompt_len;) {
+        if (io.is_cancelled()) break;
         const int kv_pos = kv_offset + start;
 
         int n_tokens = std::min(prefill_ubatch, prompt_len - start);

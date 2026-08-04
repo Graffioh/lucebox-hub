@@ -384,6 +384,7 @@ int Qwen3Backend::do_prefill(const std::vector<int32_t> & tokens,
     std::vector<float> embed_buf((size_t)chunk * hidden);
 
     for (int start = 0; start < total; start += chunk) {
+        if (io.is_cancelled()) break;
         const int n = std::min(chunk, total - start);
 
         // CPU embedding: read rows from tok_embd (which is on GPU)
@@ -526,6 +527,10 @@ GenerateResult Qwen3Backend::generate_impl(const GenerateRequest & req,
     const int committed = do_prefill(req.prompt, out_io);
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
+        return result;
+    }
+    if (out_io.is_cancelled()) {
+        result.succeed();
         return result;
     }
 
@@ -694,6 +699,10 @@ GenerateResult Qwen3Backend::restore_and_generate_impl(int slot,
             result.fail(GenerateErrorCode::BackendSpecific, "prefill after restore");
             return result;
         }
+    }
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
     }
 
     // Now generate (decode) from here

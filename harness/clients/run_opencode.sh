@@ -12,8 +12,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 for timeout_ms in "$OPENCODE_REQUEST_TIMEOUT_MS" "$OPENCODE_CHUNK_TIMEOUT_MS"; do
-  if [[ ! "$timeout_ms" =~ ^[0-9]+$ ]]; then
-    echo "OpenCode timeouts must be non-negative integers (milliseconds)" >&2
+  if [[ ! "$timeout_ms" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "OpenCode timeouts must be canonical non-negative integers (milliseconds)" >&2
     exit 2
   fi
 done
