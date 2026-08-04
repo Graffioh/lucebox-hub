@@ -70,6 +70,11 @@ if ! grep -Fxq '3600s' "$default_capture"; then
     echo "Pi launcher must allow one hour by default" >&2
     exit 1
 fi
+if ! grep -Eq '"httpIdleTimeoutMs"[[:space:]]*:[[:space:]]*0' \
+        "$TMP_DIR/runs/default/pi-home/agent/settings.json"; then
+    echo "Pi launcher must disable Pi's five-minute HTTP idle timeout" >&2
+    exit 1
+fi
 
 custom_capture="$TMP_DIR/custom-timeout"
 run_harness custom "$custom_capture" PI_TIMEOUT=900 >/dev/null

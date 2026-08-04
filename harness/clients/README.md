@@ -81,7 +81,14 @@ PROMPT_FILE=harness/clients/prompts/repo_inspection.txt harness/clients/run_herm
 
 `PI_TIMEOUT` is Pi's total wall-clock limit in seconds. Its one-hour default
 allows long-context prefill and long generations to finish; set
-`PI_TIMEOUT=0` to run without a launcher deadline.
+`PI_TIMEOUT=0` to run without a launcher deadline. The launcher also disables
+Pi's separate five-minute HTTP idle timeout, which can otherwise terminate an
+SSE connection during a long prefill. For a manually configured Pi install,
+put the same setting in `~/.pi/agent/settings.json`:
+
+```json
+{"httpIdleTimeoutMs": 0}
+```
 
 Claude Code uses the real Anthropic Messages client path. Lucebox trims
 Claude-specific prompt boilerplate by default for local-model reliability. To

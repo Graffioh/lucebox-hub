@@ -26,7 +26,8 @@ cat > "$AGENT_DIR/settings.json" <<JSON
 {
   "compaction": {
     "enabled": false
-  }
+  },
+  "httpIdleTimeoutMs": 0
 }
 JSON
 
