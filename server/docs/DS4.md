@@ -248,6 +248,9 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
 | `GGML_BATCH_PEER_COPIES` | Batch peer-runtime copies and unlike-runtime pinned-host staging with one source wait per split. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. |
+| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of heterogeneous verifier graph slots. Defaults to `2`; each slot retains scheduler scratch on both GPUs. |
+| `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | Skip the expensive property scan only for a warmed verifier graph. Rebuilt scheduler generations are always validated. Leave unset for the conservative production profile. |
+| `GGML_DS4_FA_SERIAL_INDEX_SCAN` | Restore the serial compressed-row mask scan for an indexed-attention A/B. By default, HIP scans contexts above 512 compressed rows in parallel. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Long-prefill arena kill switch; set `0` to restore per-layer owner allocation. |
 
 `DFLASH_DS4_TIMING` enables the existing timing banners:
@@ -319,6 +322,24 @@ reported and falls back to normal autoregressive decode. The target cache and
 sampler stay on the main backend while routed target experts execute on their
 configured owners. `--ds4-expert-top-k 4` remains a separate approximate
 policy; omit it to retain the model's default six routed experts.
+
+### Verifier graph-cache safety
+
+Every heterogeneous verifier slot owns a scheduler and its per-backend scratch
+buffers. The production default is therefore two slots. Do not copy the old
+12-slot benchmark override into a long-lived service without measuring free
+VRAM across every intended context shape.
+
+Native CUDA/HIP graph executables are cached below the ggml scheduler. Before a
+DS4 slot is rebuilt, the runtime now synchronizes its backends and retires every
+native graph key that points into that slot's metadata arena. Forced replay is
+also generation-checked using the scheduler split uid. Consequently, an LRU
+slot rebuilt at the same address cannot replay the previous shape's executable.
+
+The required burn-in sequence is repeated requests at 2K, 4K, 8K, and 16K in
+one process, followed by another 2K request to force additional eviction. Run
+with `DFLASH_DS4_TP_FUSED_CACHE_SLOTS=2`; first qualify with forced replay
+unset, then repeat with it enabled as a separate performance A/B.
 
 On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
 the variable is unset. This keeps the four-row verifier on MMVQ. On a 128 GiB

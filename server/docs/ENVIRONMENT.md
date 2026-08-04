@@ -40,6 +40,9 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | auto-discovered beside the executable | Explicit peer module file path for a mixed CUDA+HIP build. |
 | `GGML_BATCH_PEER_COPIES` | unset | BURN-IN: batch peer-runtime copies and unlike-runtime host staging with one source wait per split. `GGML_CUDA_BATCH_PEER_COPIES` remains a compatibility alias. |
 | `GGML_SCHED_PROFILE` / `GGML_SCHED_PROFILE_MIN_SPLITS` | unset / 1 | DEBUG: report scheduler splits, copy volume, submission time, and source/destination synchronization time. |
+| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | 2 | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
+| `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
+| `GGML_DS4_FA_SERIAL_INDEX_SCAN` | unset | DEBUG/A-B: restore the serial indexed-attention mask scan instead of the long-context HIP parallel scan. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `DFLASH_MOE_TP_*` / `DFLASH_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `DFLASH_DS4_*` names remain compatibility aliases. |
 | `DFLASH_MMID_TELEMETRY` | unset | DEBUG: report MUL_MAT_ID dispatch, MMVQ variant, and per-node graph compatibility. |
@@ -113,6 +116,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_TP_SCHEDULE_BRANCHES` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_TOPK` - deepseek4_graph.cpp
 - `DFLASH_EXPERT_BUDGET_MB` - deepseek4_backend.cpp, laguna_backend.cpp, qwen35moe_backend.cpp
 - `DFLASH_EXPERT_BUDGET_PCT` - laguna_backend.cpp
