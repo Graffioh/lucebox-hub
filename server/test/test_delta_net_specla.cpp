@@ -346,6 +346,12 @@ int main() {
     run_case(backend, "tree-model-shape",
              make_inputs(128, 8, 31, random_tree_parents(31, 43), 8), true, kOutTol, kStateTol);
 
+    // Full qwen35-27B delta-net shape: S=128, H_v=48, 16-token verify window.
+    run_case(backend, "chain-qwen35-27b",
+             make_inputs(128, 48, 16, chain_parents(16), 9), false, kOutTol, kStateTol);
+    run_case(backend, "tree-qwen35-27b",
+             make_inputs(128, 48, 24, random_tree_parents(24, 44), 10), true, kOutTol, kStateTol);
+
     ggml_backend_free(backend);
     if (failures) {
         std::fprintf(stderr, "test_delta_net_specla: %d failure(s)\n", failures);

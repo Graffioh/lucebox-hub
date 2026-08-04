@@ -20,6 +20,7 @@
 
 #include "dflash27b.h"
 #include "internal.h"
+#include "delta_net_specla.h"
 #include "draft_graph.h"
 #include "qwen3_drafter.h"
 #include "gpu_runtime_compat.h"
@@ -3453,6 +3454,18 @@ int main(int argc, char ** argv) {
             ggml_backend_tensor_set(sg.parent_ids, parent_ids.data(), 0,
                                     sizeof(int32_t) * N);
 
+            // SpecLA: ancestor masks over the same root-inclusive node order.
+            if (sg.specla_m_strict) {
+                std::vector<float> sp_ms((size_t)N * N);
+                std::vector<float> sp_mi((size_t)N * N);
+                std::vector<float> sp_me((size_t)N * N);
+                fill_specla_masks(parent_ids.data(), N,
+                                  sp_ms.data(), sp_mi.data(), sp_me.data());
+                ggml_backend_tensor_set(sg.specla_m_strict, sp_ms.data(), 0, sizeof(float) * sp_ms.size());
+                ggml_backend_tensor_set(sg.specla_m_incl,   sp_mi.data(), 0, sizeof(float) * sp_mi.size());
+                ggml_backend_tensor_set(sg.specla_m_eye,    sp_me.data(), 0, sizeof(float) * sp_me.size());
+            }
+
             T_verify_set = sync_us();
             tt_verify_set += std::chrono::duration<double, std::micro>(T_verify_set - T_verify_build).count();
 
@@ -3611,12 +3624,26 @@ int main(int argc, char ** argv) {
             {
                 const int n_delta = (int)sg.delta_captures.size();
                 cudaStream_t stream = nullptr;
+                // SpecLA: one DeltaConstruct graph advances every layer's SSM
+                // state along the accepted DFS path; the loop below then only
+                // commits conv state.
+                const bool specla_commit = !cache.factor_k.empty();
+                if (specla_commit) {
+                    std::vector<int32_t> acc_idx(accepted.begin(),
+                                                 accepted.begin() + commit_n);
+                    if (!specla_commit_accepted(cache, target_backend,
+                                                acc_idx.data(), commit_n)) {
+                        std::fprintf(stderr, "ddtree specla commit failed\n");
+                        return 1;
+                    }
+                }
                 for (int il = 0; il < n_delta; il++) {
                     const DeltaNetCapture & cap = sg.delta_captures[il];
-                    if (!cap.ssm_intermediate_states || !cap.conv_input) {
+                    if ((!specla_commit && !cap.ssm_intermediate_states) || !cap.conv_input) {
                         std::fprintf(stderr, "ddtree rollback: missing capture layer %d\n", il);
                         return 1;
                     }
+                    if (!specla_commit) {
                     // SSM state rollback: source is cache.ssm_intermediate_states
                     // ([S_v, S_v, H_v, max_verify_tokens]) at slot rollback_dfs.
                     // Destination is cache.ssm_state[il] (f32). Use ggml's
@@ -3644,6 +3671,8 @@ int main(int argc, char ** argv) {
                                      il, cudaGetErrorString(ce));
                         return 1;
                     }
+                    }  // end non-SpecLA SSM rollback
+                    cudaError_t ce = cudaSuccess;
 
                     // Conv rollback: copy the K-1 most recent inputs along
                     // the rolled-back token's ANCESTRY (not DFS order). Two
@@ -3797,6 +3826,21 @@ int main(int argc, char ** argv) {
             ggml_backend_tensor_set(sg.inp_embed, verify_embed.data(), 0,
                                     sizeof(float) * verify_embed.size());
 
+            // SpecLA: chain topology masks (parents[t] = t-1), host-filled
+            // like the attention mask below.
+            if (sg.specla_m_strict) {
+                std::vector<int32_t> sp_parents(q_len);
+                for (int t = 0; t < q_len; t++) sp_parents[t] = t - 1;
+                std::vector<float> sp_ms((size_t)q_len * q_len);
+                std::vector<float> sp_mi((size_t)q_len * q_len);
+                std::vector<float> sp_me((size_t)q_len * q_len);
+                fill_specla_masks(sp_parents.data(), q_len,
+                                  sp_ms.data(), sp_mi.data(), sp_me.data());
+                ggml_backend_tensor_set(sg.specla_m_strict, sp_ms.data(), 0, sizeof(float) * sp_ms.size());
+                ggml_backend_tensor_set(sg.specla_m_incl,   sp_mi.data(), 0, sizeof(float) * sp_mi.size());
+                ggml_backend_tensor_set(sg.specla_m_eye,    sp_me.data(), 0, sizeof(float) * sp_me.size());
+            }
+
             // M-RoPE axis-major layout: [axis0_tok0..axis0_tokN-1, axis1_..., axis2_..., axis3_...].
             // First 3 axes hold the token position; axis 3 is always 0 for text.
             for (int i = 0; i < q_len; i++) {
@@ -3940,7 +3984,43 @@ int main(int argc, char ** argv) {
 
             // Rollback SSM + conv state unless we fully accepted (in which case
             // state after processing all q_len tokens is exactly what we want).
-            if (commit_n < q_len) {
+            //
+            // SpecLA (DFLASH_SPECLA=1): verify was read-only on the durable
+            // state, so the accepted state is constructed from the captured
+            // factors — including on full acceptance.
+            const bool specla_commit = !cache.factor_k.empty();
+            if (specla_commit) {
+                std::vector<int32_t> acc_idx((size_t)commit_n);
+                for (int i = 0; i < commit_n; i++) acc_idx[i] = i;
+                if (!specla_commit_accepted(cache, target_backend,
+                                            acc_idx.data(), commit_n)) {
+                    std::fprintf(stderr, "specla commit failed\n"); return 1;
+                }
+                const int n_delta = (int)sg.delta_captures.size();
+                cudaStream_t stream = nullptr;
+                for (int il = 0; il < n_delta; il++) {
+                    const DeltaNetCapture & cap = sg.delta_captures[il];
+                    if (!cap.conv_input) {
+                        std::fprintf(stderr, "specla rollback: missing conv capture layer %d\n", il);
+                        return 1;
+                    }
+                    const int K_conv = 4;
+                    const int row_cnt = (int)cap.conv_input->ne[1];
+                    const size_t elt = ggml_element_size(cap.conv_input);
+                    cudaError_t ce = cudaMemcpy2DAsync(
+                        cache.conv_state[il]->data, (K_conv - 1) * elt,
+                        (const char *)cap.conv_input->data + (size_t)commit_n * elt,
+                        cap.conv_input->nb[1],
+                        (K_conv - 1) * elt, row_cnt,
+                        cudaMemcpyDeviceToDevice, stream);
+                    if (ce != cudaSuccess) {
+                        std::fprintf(stderr, "specla conv rollback il=%d: %s\n",
+                                     il, cudaGetErrorString(ce));
+                        return 1;
+                    }
+                }
+                cudaStreamSynchronize(stream);
+            } else if (commit_n < q_len) {
                 const int rollback_idx = commit_n - 1;  // index into per-step intermediates
                 // Temporary ctx for view tensors (no data alloc — views inherit
                 // data pointers from their already-live sources).
