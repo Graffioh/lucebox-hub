@@ -1197,6 +1197,25 @@ if(DFLASH27B_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/scripts/entrypoint.sh")
     endif()
 
+    set(_pi_timeout_test "${CMAKE_CURRENT_SOURCE_DIR}/../harness/tests/test_run_pi_timeout.sh")
+    set(_pi_launcher "${CMAKE_CURRENT_SOURCE_DIR}/../harness/clients/run_pi.sh")
+    if(UNIX AND EXISTS "${_pi_timeout_test}" AND EXISTS "${_pi_launcher}")
+        add_test(
+            NAME server_unit_pi_harness_timeout
+            COMMAND bash "${_pi_timeout_test}" "${_pi_launcher}")
+    endif()
+    unset(_pi_timeout_test)
+    unset(_pi_launcher)
+
+    set(_client_timeout_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/../harness/tests/test_client_launcher_timeouts.sh")
+    if(UNIX AND EXISTS "${_client_timeout_test}")
+        add_test(
+            NAME server_unit_client_harness_timeouts
+            COMMAND bash "${_client_timeout_test}")
+    endif()
+    unset(_client_timeout_test)
+
     # CPU-only contract test for the fail-closed layer-split tree boundary.
     add_executable(test_qwen35_split_tree_guard
         test/test_qwen35_split_tree_guard.cpp)

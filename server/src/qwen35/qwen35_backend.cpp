@@ -813,6 +813,10 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     }
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     // Decode (speculative)
     if (req.n_gen > 0) {
@@ -968,6 +972,10 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
             return result;
         }
     }
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
 
     // Decode
     if (req.n_gen > 0) {
@@ -1022,8 +1030,6 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
                                int kv_offset) {
-    (void)io;
-
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     int prefill_ubatch = 512;
@@ -1083,6 +1089,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     std::vector<float> embed_buf((size_t)hidden * prefill_ubatch);
     int committed = kv_offset;
     for (int start = 0; start < prompt_len;) {
+        if (io.is_cancelled()) break;
         const int kv_pos = kv_offset + start;
 
         int n_tokens = std::min(prefill_ubatch, prompt_len - start);
@@ -1697,7 +1704,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             if (kvflash_qk_policy_) kvflash_qk_pool_to(committed);
             kvflash_maybe_reselect((int)(out_tokens.size() - out_tokens_at_entry));
         }
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
 
         if (IS_EOS_TOK(next_tok, w_)) break;
 
@@ -2276,7 +2283,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 out_tokens.push_back(tok);
                 io.emit(tok);
                 accepted_emitted++;
-                if (io.cancelled) { hit_eos = true; break; }
+                if (io.is_cancelled()) { hit_eos = true; break; }
                 if (target->is_eos(tok)) { hit_eos = true; break; }
             }
 
@@ -2318,7 +2325,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     cache_.cur_pos = committed;
                     n_generated += accepted_emitted;
                     n_draft_steps++;
-                    if (hit_eos || io.cancelled || n_generated >= n_gen ||
+                    if (hit_eos || io.is_cancelled() || n_generated >= n_gen ||
                         last_tok < 0 || target->is_eos(last_tok)) {
                         break;
                     }
@@ -2330,7 +2337,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 // path has already been emitted above; only emit the bonus here.
                 int total_emitted = accepted_emitted;
                 const bool can_commit_bonus =
-                    !hit_eos && !io.cancelled && next_token >= 0 &&
+                    !hit_eos && !io.is_cancelled() && next_token >= 0 &&
                     total_emitted < need_commit_budget;
 
                 std::vector<int32_t> replay_batch;
@@ -2359,7 +2366,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     out_tokens.push_back(next_token);
                     io.emit(next_token);
                     total_emitted++;
-                    if (io.cancelled) {
+                    if (io.is_cancelled()) {
                         hit_eos = true;
                     } else if (target->is_eos(next_token)) {
                         hit_eos = true;
@@ -2378,7 +2385,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 cache_.cur_pos = committed;
                 n_generated += total_emitted;
                 n_draft_steps++;
-                if (hit_eos || io.cancelled || n_generated >= n_gen ||
+                if (hit_eos || io.is_cancelled() || n_generated >= n_gen ||
                     last_tok < 0 || target->is_eos(last_tok)) {
                     break;
                 }
@@ -2399,7 +2406,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             int bonus_last_tok = -1;
             std::vector<float> bonus_logits;
             const bool can_commit_bonus =
-                !hit_eos && !io.cancelled && next_token >= 0 &&
+                !hit_eos && !io.is_cancelled() && next_token >= 0 &&
                 total_emitted < need_commit_budget;
             if (can_commit_bonus) {
                 const int bonus_pos = committed + total_emitted;
@@ -2424,7 +2431,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 out_tokens.push_back(next_token);
                 io.emit(next_token);
                 total_emitted++;
-                if (io.cancelled) {
+                if (io.is_cancelled()) {
                     hit_eos = true;
                 } else if (target->is_eos(next_token)) {
                     hit_eos = true;
@@ -2449,7 +2456,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.cur_pos = committed;
             n_generated += total_emitted;
             n_draft_steps++;
-            if (hit_eos || io.cancelled || n_generated >= n_gen || last_tok < 0) {
+            if (hit_eos || io.is_cancelled() || n_generated >= n_gen || last_tok < 0) {
                 break;
             }
             continue;
@@ -2717,7 +2724,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             out_tokens.push_back(replay_tok[i]);
             io.emit(replay_tok[i]);
             emitted++;
-            if (io.cancelled) break;
+            if (io.is_cancelled()) break;
             if (budget_close_fired) break;
             if (IS_EOS_TOK(replay_tok[i], w_)) { hit_eos = true; break; }
         }
@@ -2793,7 +2800,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             io.observer("verify", replay_tok);
         }
 
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
         if (floor_to_ar) {
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();

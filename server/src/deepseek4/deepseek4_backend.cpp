@@ -1393,7 +1393,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
 
     bool snapshot_saved = false;
     for (int i = 0; i < n_total;) {
-        if (io.cancelled) return pos;
+        if (io.is_cancelled()) return pos;
 
         int n_tok = std::min(chunk, n_total - i);
         // A snapshot must represent an exact token boundary. Split a batched
@@ -1555,7 +1555,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
     }
 
     for (int generated = 0; generated < n_gen; generated++) {
-        if (io.cancelled) break;
+        if (io.is_cancelled()) break;
 
         // Budget hook: force-close if remaining budget hits threshold
         if (!budget_hook.close_token_ids.empty() &&
@@ -1564,7 +1564,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             for (int32_t close_tok : budget_hook.close_token_ids) {
                 out_tokens.push_back(close_tok);
                 io.emit(close_tok);
-                if (io.cancelled) break;
+                if (io.is_cancelled()) break;
             }
             if (forced_close_out) *forced_close_out = true;
             break;
@@ -1703,7 +1703,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     }
     result.prefill_s = elapsed_s(t0);
 
-    if (out_io.cancelled) {
+    if (out_io.is_cancelled()) {
         result.succeed();
         maybe_save_routing_stats();
         return result;
@@ -1735,7 +1735,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         out_io.emit(seed);
         float accept_rate = 0.0f;
         bool spec_ran = false;
-        if (!out_io.cancelled && !deepseek4_is_eos_tok(seed, w_) && req.n_gen > 1) {
+        if (!out_io.is_cancelled() && !deepseek4_is_eos_tok(seed, w_) && req.n_gen > 1) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
             const int win_len = feat_row > 0 ? (int) (spec_feat_window_.size() / feat_row) : 0;
             std::vector<int32_t> spec_toks;
@@ -1750,9 +1750,9 @@ GenerateResult DeepSeek4Backend::generate_from_state(
                     win_len > 0 ? spec_feat_window_.data() : nullptr, win_len,
                     spec_toks, &accept_rate,
                     [&out_io](int32_t tok) {
-                        if (out_io.cancelled) return false;
+                        if (out_io.is_cancelled()) return false;
                         out_io.emit(tok);
-                        return !out_io.cancelled;
+                        return !out_io.is_cancelled();
                     },
                     (expert_runtime_.compute || expert_backend_)
                         ? moe_hybrid_.get() : nullptr,

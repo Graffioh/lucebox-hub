@@ -52,6 +52,9 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#endif
 
 #if defined(_WIN32)
 #define dflash_setenv(name, value) _putenv_s(name, value)
@@ -90,6 +93,79 @@ struct ServerUnitFixture {};
             std::to_string(__LINE__) + ": " + #expr + " — " + std::string(msg)); \
     } \
 } while (0)
+
+TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
+    bool cancel = false;
+    DaemonIO io;
+    io.should_cancel = [&cancel]() { return cancel; };
+
+    TEST_ASSERT(!io.is_cancelled());
+    cancel = true;
+    TEST_ASSERT(io.is_cancelled());
+    cancel = false;
+    TEST_ASSERT(io.is_cancelled());
+}
+
+#if !defined(_WIN32)
+TEST_CASE(ServerUnitFixture, test_http_peer_socket_probe_preserves_half_close) {
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    TEST_ASSERT(http_detail::inspect_peer_socket(sockets[0]) ==
+                http_detail::PeerSocketState::Connected);
+
+    const char byte = 'x';
+    TEST_ASSERT(write(sockets[1], &byte, 1) == 1);
+    TEST_ASSERT(http_detail::inspect_peer_socket(sockets[0]) ==
+                http_detail::PeerSocketState::Connected);
+
+    char received = 0;
+    TEST_ASSERT(read(sockets[0], &received, 1) == 1);
+    TEST_ASSERT(received == byte);
+
+    // Finishing the request direction must not cancel a response that the
+    // peer is still reading.
+    TEST_ASSERT(shutdown(sockets[1], SHUT_WR) == 0);
+    TEST_ASSERT(http_detail::inspect_peer_socket(sockets[0]) ==
+                http_detail::PeerSocketState::ReadClosed);
+    const char response = 'y';
+    TEST_ASSERT(write(sockets[0], &response, 1) == 1);
+    TEST_ASSERT(read(sockets[1], &received, 1) == 1);
+    TEST_ASSERT(received == response);
+
+    const int closed_fd = sockets[0];
+    close(closed_fd);
+    sockets[0] = -1;
+    TEST_ASSERT(http_detail::inspect_peer_socket(closed_fd) ==
+                http_detail::PeerSocketState::Disconnected);
+    close(sockets[1]);
+}
+#endif
+
+TEST_CASE(ServerUnitFixture, test_http_sse_done_scanner_requires_terminal_line) {
+    std::string partial_line;
+    const std::string content =
+        "data: {\"delta\":{\"content\":\"data: [DONE]\"}}\n\n";
+    TEST_ASSERT(!http_detail::sse_chunk_has_done(
+        partial_line, content.data(), content.size()));
+    TEST_ASSERT(partial_line.empty());
+
+    const std::string embedded_first =
+        "data: {\"delta\":\"data: [DONE]";
+    TEST_ASSERT(!http_detail::sse_chunk_has_done(
+        partial_line, embedded_first.data(), embedded_first.size()));
+    const std::string embedded_second = " still content\"}\n\n";
+    TEST_ASSERT(!http_detail::sse_chunk_has_done(
+        partial_line, embedded_second.data(), embedded_second.size()));
+    TEST_ASSERT(partial_line.empty());
+
+    const std::string first = "data: [DO";
+    TEST_ASSERT(!http_detail::sse_chunk_has_done(
+        partial_line, first.data(), first.size()));
+    const std::string second = "NE]\r\n\r\n";
+    TEST_ASSERT(http_detail::sse_chunk_has_done(
+        partial_line, second.data(), second.size()));
+    TEST_ASSERT(partial_line.empty());
+}
 
 // ─── Helper: create an SseEmitter with minimal config ──────────────────
 
@@ -2642,6 +2718,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
     int shutdown_calls = 0;
     ModelBackend::CompressRequest last_compress_req;
     int prefill_chunk = 0;
+    std::function<void()> on_prefill;
 
     const char * name() const override { return "mock"; }
     bool init() override { return true; }
@@ -2659,6 +2736,7 @@ struct MockLayerSplitAdapter : LayerSplitAdapter {
         current_pos = base_pos + (int)prompt.size();
         current_last = prompt.empty() ? current_last : prompt.back();
         last_tok = current_last;
+        if (on_prefill) on_prefill();
         return true;
     }
     bool decode_ar(int last_tok, int committed, int n_gen,
@@ -2834,6 +2912,29 @@ TEST_CASE(ServerUnitFixture, test_layer_split_backend_chunks_prefill_by_adapter_
     TEST_ASSERT(raw->prefill_sizes[1] == 3);
     TEST_ASSERT(raw->prefill_bases[2] == 6);
     TEST_ASSERT(raw->prefill_sizes[2] == 2);
+}
+
+TEST_CASE(ServerUnitFixture, test_layer_split_backend_cancels_between_prefill_chunks) {
+    auto * raw = new MockLayerSplitAdapter();
+    raw->prefill_chunk = 3;
+    LayerSplitBackend backend{std::unique_ptr<LayerSplitAdapter>(raw)};
+
+    bool cancel = false;
+    raw->on_prefill = [&cancel]() { cancel = true; };
+    DaemonIO io;
+    io.should_cancel = [&cancel]() { return cancel; };
+
+    GenerateRequest req;
+    req.prompt = {1, 2, 3, 4, 5, 6, 7, 8};
+    req.n_gen = 4;
+    GenerateResult result = backend.generate(req, io);
+
+    TEST_ASSERT(result.ok());
+    TEST_ASSERT(io.is_cancelled());
+    TEST_ASSERT(raw->prefill_bases.size() == 1);
+    TEST_ASSERT(raw->prefill_sizes.size() == 1);
+    TEST_ASSERT(raw->prefill_sizes[0] == 3);
+    TEST_ASSERT(raw->emitted_tokens.empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_drafter_path) {
