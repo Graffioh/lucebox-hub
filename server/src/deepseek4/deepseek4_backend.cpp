@@ -795,6 +795,34 @@ void DeepSeek4Backend::keep_spec_feature_tail(
     features.resize(keep_floats);
 }
 
+int DeepSeek4Backend::capture_safe_prefill_tokens(
+        int token_offset,
+        int requested_tokens,
+        int final_capture_from,
+        bool batch_final_capture,
+        bool snapshot_pending,
+        int snapshot_capture_from,
+        int snapshot_capture_to) {
+    if (requested_tokens <= 0) return 0;
+
+    int safe_tokens = requested_tokens;
+    const auto split_at = [&](int boundary) {
+        const int distance = boundary - token_offset;
+        if (distance > 0 && distance < safe_tokens) {
+            safe_tokens = distance;
+        }
+    };
+
+    if (!batch_final_capture) {
+        split_at(final_capture_from);
+    }
+    if (snapshot_pending) {
+        split_at(snapshot_capture_from);
+        split_at(snapshot_capture_to);
+    }
+    return safe_tokens;
+}
+
 bool DeepSeek4Backend::init() {
     // The shared MMVQ/MMQ crossover defaults to q=3 for NVIDIA. On gfx1151,
     // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
@@ -1374,6 +1402,17 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             snap_pos > pos && snap_pos < pos + n_tok) {
             n_tok = snap_pos - pos;
         }
+        if (spec_enabled_ && spec_drafter_) {
+            const bool batch_final_capture =
+                !w_.moe_hybrid &&
+                cache_.prefill_mode != PrefillAttentionMode::Exact &&
+                n_tok > 4 &&
+                n_tok <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+            n_tok = capture_safe_prefill_tokens(
+                i, n_tok, spec_final_from, batch_final_capture,
+                save_snapshot && !snapshot_saved,
+                spec_snap_from, spec_snap_to);
+        }
 
         // Embed tokens
         std::vector<float> embed(w_.n_embd * n_tok);
@@ -1396,6 +1435,21 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             (capture_final || capture_snapshot)) {
             spec_hooks.capture_layer_ids = &spec_drafter_->capture_layer_ids;
             spec_hooks.capture_out = &spec_cap;
+            int capture_begin = n_tok;
+            int capture_end = 0;
+            if (capture_final) {
+                capture_begin = std::min(
+                    capture_begin, std::max(0, spec_final_from - i));
+                capture_end = n_tok;
+            }
+            if (capture_snapshot) {
+                capture_begin = std::min(
+                    capture_begin, std::max(0, spec_snap_from - i));
+                capture_end = std::max(
+                    capture_end, std::min(n_tok, spec_snap_to - i));
+            }
+            spec_hooks.capture_token_begin = capture_begin;
+            spec_hooks.capture_token_end = capture_end;
             hp = &spec_hooks;
         }
         if (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)) {

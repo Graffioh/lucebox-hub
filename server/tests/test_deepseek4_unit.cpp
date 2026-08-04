@@ -1966,6 +1966,37 @@ static void test_spec_feature_tail_is_bounded() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_dspark_prefill_capture_boundaries() {
+    std::fprintf(stderr, "  test_dspark_prefill_capture_boundaries ...");
+
+    using Backend = DeepSeek4Backend;
+    // Layer-major prefill captures only the requested tail from a wide graph,
+    // while generic paths still stop exactly at the final feature window.
+    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
+                    0, 2048, 1920, true, false, 0, 0) == 2048);
+    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
+                    0, 2048, 1920, false, false, 0, 0) == 1920);
+    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
+                    1920, 128, 1920, false, false, 0, 0) == 128);
+
+    // A pending checkpoint contributes both edges of its capture window. The
+    // resulting batches are either wholly hooked or wholly unhooked.
+    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
+                    0, 2048, 1920, true, true, 384, 512) == 384);
+    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
+                    384, 1664, 1920, true, true, 384, 512) == 128);
+    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
+                    512, 1536, 1920, false, false, 384, 512) == 1408);
+
+    // Boundaries at a batch edge and empty requests need no extra split.
+    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
+                    0, 128, 128, false, true, 128, 256) == 128);
+    TEST_ASSERT(Backend::capture_safe_prefill_tokens(
+                    10, 0, 20, false, true, 12, 18) == 0);
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_reset_request_state() {
     std::fprintf(stderr, "  test_reset_request_state ...");
 
@@ -3418,6 +3449,7 @@ int main() {
     test_snapshot_save_restore();
     test_monolithic_snapshot_preserves_decode_state();
     test_spec_feature_tail_is_bounded();
+    test_dspark_prefill_capture_boundaries();
     test_reset_request_state();
     test_reset_deepseek4_cache(backend);
     test_adapter_guard_paths();
