@@ -135,6 +135,26 @@ PeerSocketState inspect_peer_socket(SocketHandle fd) {
         : PeerSocketState::Disconnected;
 }
 
+bool sse_chunk_has_done(
+        std::string & partial_line, const char * data, size_t size) {
+    static constexpr char kDoneLine[] = "data: [DONE]";
+    static constexpr size_t kDoneLineSize = sizeof(kDoneLine) - 1;
+
+    bool found = false;
+    for (size_t i = 0; i < size; ++i) {
+        const char ch = data[i];
+        if (ch == '\r' || ch == '\n') {
+            found = found || partial_line == kDoneLine;
+            partial_line.clear();
+        } else if (partial_line.size() <= kDoneLineSize) {
+            // One byte beyond the marker length is an overflow sentinel. It
+            // prevents a non-terminal SSE line from growing without bound.
+            partial_line.push_back(ch);
+        }
+    }
+    return found;
+}
+
 }  // namespace http_detail
 
 static std::string context_overflow_message(int max_ctx, int prompt_tokens, int max_output) {
@@ -184,7 +204,7 @@ struct CurlWriteCtx {
     bool first_chunk;
     bool chat_rewrite;   // rewrite completions → chat format
     std::string buffer;  // accumulates non-streaming response
-    std::string terminal_scan_tail;
+    std::string sse_partial_line;
     std::string response_id;
     std::string model;
     std::function<bool(const void *, size_t)> send_bytes;
@@ -192,26 +212,14 @@ struct CurlWriteCtx {
     std::function<bool()> cancelled;
 };
 
-static bool curl_chunk_has_done(
-        CurlWriteCtx & ctx, const char * data, size_t size) {
-    static constexpr char kDoneMarker[] = "data: [DONE]";
-    std::string scan = ctx.terminal_scan_tail;
-    scan.append(data, size);
-    const bool found = scan.find(kDoneMarker) != std::string::npos;
-    constexpr size_t keep = sizeof(kDoneMarker) - 2;
-    if (scan.size() > keep) {
-        ctx.terminal_scan_tail.assign(scan.end() - keep, scan.end());
-    } else {
-        ctx.terminal_scan_tail = std::move(scan);
-    }
-    return found;
-}
-
 static size_t curl_write_passthrough(char * ptr, size_t size, size_t nmemb, void * userdata) {
     size_t total = size * nmemb;
     auto * ctx = static_cast<CurlWriteCtx *>(userdata);
     if (ctx->streaming) {
-        if (curl_chunk_has_done(*ctx, ptr, total)) ctx->stop_stream();
+        if (http_detail::sse_chunk_has_done(
+                ctx->sse_partial_line, ptr, total)) {
+            ctx->stop_stream();
+        }
         if (!ctx->send_bytes(ptr, total)) return 0;
     } else {
         ctx->buffer.append(ptr, total);

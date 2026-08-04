@@ -63,6 +63,11 @@ enum class PeerSocketState {
     Disconnected,
 };
 PeerSocketState inspect_peer_socket(SocketHandle fd);
+
+// Incrementally inspect complete SSE lines for the terminal data event.
+// `partial_line` carries an unterminated line across transport chunks.
+bool sse_chunk_has_done(std::string & partial_line,
+                        const char * data, size_t size);
 }
 
 // ─── Server configuration ───────────────────────────────────────────────

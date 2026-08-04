@@ -1281,9 +1281,14 @@ bool LagunaBackend::do_spec_decode(int committed, int n_gen,
 
 GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
                                         const DaemonIO & io) {
+    if (io.is_cancelled()) {
+        GenerateResult result;
+        result.succeed();
+        return result;
+    }
     if (hybrid_mode_ && moe_hybrid_) {
         auto result = generate_hybrid(req, io);
-        if (result.ok()) {
+        if (result.ok() && !io.is_cancelled()) {
             // Flush routing-frequency profile if requested (independent of swap).
             if (!routing_stats_out_path_.empty() && routing_stats_) {
                 std::string serr;
@@ -1331,10 +1336,6 @@ GenerateResult LagunaBackend::generate_impl(const GenerateRequest & req,
     const KvFlashPager * kvf = kvflash_active() ? &kvflash_pager_ : nullptr;
 
     // ── Prefill ──
-    if (out_io.is_cancelled()) {
-        result.succeed();
-        return result;
-    }
     std::vector<float> embed_pf((size_t)N * w_.n_embd);
     if (!w_.embedder.embed(req.prompt.data(), N, embed_pf.data())) {
         result.fail(GenerateErrorCode::BackendSpecific, "embed_prefill");
@@ -1551,6 +1552,10 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
     const bool no_mask = (std::getenv("DFLASH_NO_MASK") != nullptr);
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
+    if (out_io.is_cancelled()) {
+        result.succeed();
+        return result;
+    }
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
@@ -2759,10 +2764,6 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     const int n_expert_used = w_.n_expert_used;
     ggml_backend_t cpu_be = moe_hybrid_->cpu_backend;
 
-    if (out_io.is_cancelled()) {
-        result.succeed();
-        return result;
-    }
     std::vector<float> embed_all((size_t)N * (size_t)hidden);
     if (!w_.embedder.embed(req.prompt.data(), N, embed_all.data())) {
         result.fail(GenerateErrorCode::BackendSpecific, "embed_prefill");

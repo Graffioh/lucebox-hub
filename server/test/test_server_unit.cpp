@@ -141,6 +141,32 @@ TEST_CASE(ServerUnitFixture, test_http_peer_socket_probe_preserves_half_close) {
 }
 #endif
 
+TEST_CASE(ServerUnitFixture, test_http_sse_done_scanner_requires_terminal_line) {
+    std::string partial_line;
+    const std::string content =
+        "data: {\"delta\":{\"content\":\"data: [DONE]\"}}\n\n";
+    TEST_ASSERT(!http_detail::sse_chunk_has_done(
+        partial_line, content.data(), content.size()));
+    TEST_ASSERT(partial_line.empty());
+
+    const std::string embedded_first =
+        "data: {\"delta\":\"data: [DONE]";
+    TEST_ASSERT(!http_detail::sse_chunk_has_done(
+        partial_line, embedded_first.data(), embedded_first.size()));
+    const std::string embedded_second = " still content\"}\n\n";
+    TEST_ASSERT(!http_detail::sse_chunk_has_done(
+        partial_line, embedded_second.data(), embedded_second.size()));
+    TEST_ASSERT(partial_line.empty());
+
+    const std::string first = "data: [DO";
+    TEST_ASSERT(!http_detail::sse_chunk_has_done(
+        partial_line, first.data(), first.size()));
+    const std::string second = "NE]\r\n\r\n";
+    TEST_ASSERT(http_detail::sse_chunk_has_done(
+        partial_line, second.data(), second.size()));
+    TEST_ASSERT(partial_line.empty());
+}
+
 // ─── Helper: create an SseEmitter with minimal config ──────────────────
 
 static json weather_tools() {
