@@ -1,0 +1,7 @@
+#!/bin/sh
+# Executable the engine execv()s for --oflash-trainer-bin. Resolves this
+# package's uv environment regardless of the server's cwd, then hands all
+# arguments (including the inherited --stream-fd) to the trainer module.
+# First run does `uv sync --extra train` implicitly via `uv run`.
+here="$(cd "$(dirname "$0")/.." && pwd)"
+exec uv run --project "$here" --extra train python -m oflash "$@"
