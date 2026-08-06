@@ -363,6 +363,7 @@ bool build_target_step(
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     sg.logits = go.logits;
+    sg.capture_ready = go.capture_ready;
     sg.delta_captures = std::move(go.delta_captures);
     sg.moe_selected = std::move(go.moe_selected);
     ggml_set_output(sg.logits);

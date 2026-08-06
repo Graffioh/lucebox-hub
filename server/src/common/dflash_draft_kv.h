@@ -99,4 +99,12 @@ bool draft_kv_begin_step(DraftKvState & st,
                          const DraftFeatureMirror & ring,
                          int committed);
 
+// Queue a device-local copy of the authoritative cache into an independently
+// allocated state with identical logical dimensions and graph topology. The
+// destination backend waits for all copies before executing later work.
+bool draft_kv_clone_cache_async(const DraftKvState & src,
+                                DraftKvState & dst,
+                                ggml_backend_t src_backend,
+                                ggml_backend_t dst_backend);
+
 }  // namespace dflash::common

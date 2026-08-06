@@ -53,6 +53,29 @@ static bool ensure_staging(DraftFeatureMirror & mirror, size_t bytes) {
     return true;
 }
 
+static bool copy_feature_device_data(DraftFeatureMirror & mirror,
+                                     void * dst,
+                                     const void * src,
+                                     int src_device,
+                                     size_t bytes) {
+    if (src_device == mirror.device) {
+        return copy_peer_async(dst, mirror.device, src, src_device,
+                               bytes, mirror.stream);
+    }
+    if (!cross_device_peer_memcpy_ok(src_device, mirror.device)) {
+        // Preserve the existing non-P2P fallback for callers outside the
+        // async-shadow lane. Async shadows fail closed before reaching here.
+        return copy_peer_async(dst, mirror.device, src, src_device, bytes);
+    }
+    cudaError_t err = cudaSetDevice(src_device);
+    if (feature_cuda_failed("cudaSetDevice", err)) return false;
+    err = cudaMemcpyPeerAsync(dst, mirror.device, src, src_device,
+                              bytes, mirror.transfer_stream);
+    if (feature_cuda_failed("cudaMemcpyPeerAsync", err)) return false;
+    err = cudaStreamSynchronize(mirror.transfer_stream);
+    return !feature_cuda_failed("cudaStreamSynchronize", err);
+}
+
 static ggml_type parse_feature_dtype() {
     const char * s = std::getenv("DFLASH_FEATURE_DTYPE");
     if (!s || !s[0] || std::strcmp(s, "f32") == 0 || std::strcmp(s, "F32") == 0) {
@@ -143,8 +166,8 @@ static bool convert_device_f32_to_feature_type(DraftFeatureMirror & mirror,
                                                void * dst,
                                                size_t elems) {
     if (mirror.storage_type == GGML_TYPE_F32) {
-        return copy_peer_async(dst, mirror.device, src, src_device,
-                               elems * sizeof(float));
+        return copy_feature_device_data(
+            mirror, dst, src, src_device, elems * sizeof(float));
     }
 
     std::vector<float> host(elems);
@@ -171,8 +194,33 @@ static bool convert_bf16_feature_to_storage(DraftFeatureMirror & mirror,
                                             void * dst,
                                             size_t elems) {
     if (mirror.storage_type == GGML_TYPE_BF16) {
-        return copy_peer_async(dst, mirror.device, src, src_device,
-                               elems * sizeof(ggml_bf16_t));
+        return copy_feature_device_data(
+            mirror, dst, src, src_device, elems * sizeof(ggml_bf16_t));
+    }
+
+    // The default cross-GPU path must not stage model features through host
+    // memory. Copy BF16 directly into draft-device scratch, then convert on the
+    // draft GPU into the F32 mirror. Other optional storage types retain their
+    // legacy host conversion path below.
+    if (mirror.storage_type == GGML_TYPE_F32) {
+        const size_t src_bytes = elems * sizeof(ggml_bf16_t);
+        if (!ensure_staging(mirror, src_bytes) ||
+            !copy_feature_device_data(
+                mirror, mirror.staging, src, src_device, src_bytes)) {
+            return false;
+        }
+        auto to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+        if (!to_f32) return false;
+        cudaError_t err = cudaSetDevice(mirror.device);
+        if (feature_cuda_failed("cudaSetDevice", err)) return false;
+        to_f32(mirror.staging, static_cast<float *>(dst),
+               (int64_t)elems, mirror.stream);
+        err = cudaGetLastError();
+        if (feature_cuda_failed("bf16_to_f32_cuda", err)) return false;
+        // The next ring run reuses staging from the transfer stream. Finish
+        // this conversion before that stream can overwrite its source bytes.
+        err = cudaStreamSynchronize(mirror.stream);
+        return !feature_cuda_failed("cudaStreamSynchronize", err);
     }
 
     const size_t blck = (size_t)ggml_blck_size(mirror.storage_type);
@@ -222,23 +270,23 @@ static bool copy_feature_to_f32(DraftFeatureMirror & mirror,
                                 float * dst,
                                 size_t elems) {
     if (mirror.storage_type == GGML_TYPE_F32) {
-        return copy_peer_async(dst, mirror.device, src, src_device,
-                               elems * sizeof(float));
+        return copy_feature_device_data(
+            mirror, dst, src, src_device, elems * sizeof(float));
     }
     auto to_f32 = ggml_get_to_fp32_cuda(mirror.storage_type);
     if (!to_f32) return false;
     const size_t src_bytes = ggml_row_size(mirror.storage_type, (int64_t)elems);
     if (src_device != mirror.device) {
         if (!ensure_staging(mirror, src_bytes)) return false;
-        if (!copy_peer_async(mirror.staging, mirror.device, src, src_device,
-                             src_bytes)) {
+        if (!copy_feature_device_data(
+                mirror, mirror.staging, src, src_device, src_bytes)) {
             return false;
         }
         src = mirror.staging;
     }
     cudaError_t err = cudaSetDevice(mirror.device);
     if (feature_cuda_failed("cudaSetDevice", err)) return false;
-    to_f32(src, dst, (int64_t)elems, nullptr);
+    to_f32(src, dst, (int64_t)elems, mirror.stream);
     err = cudaGetLastError();
     if (feature_cuda_failed("to_fp32_cuda", err)) return false;
     return true;
@@ -247,6 +295,18 @@ static bool copy_feature_to_f32(DraftFeatureMirror & mirror,
 // ── public API ──────────────────────────────────────────────────
 
 void draft_feature_mirror_free(DraftFeatureMirror & mirror) {
+    if (mirror.transfer_stream) {
+        (void)cudaSetDevice(mirror.target_device);
+        (void)cudaStreamSynchronize(mirror.transfer_stream);
+        (void)cudaStreamDestroy(mirror.transfer_stream);
+        mirror.transfer_stream = nullptr;
+    }
+    if (mirror.stream) {
+        (void)cudaSetDevice(mirror.device);
+        (void)cudaStreamSynchronize(mirror.stream);
+        (void)cudaStreamDestroy(mirror.stream);
+        mirror.stream = nullptr;
+    }
     if (mirror.staging) {
         (void)cudaSetDevice(mirror.device);
         (void)cudaFree(mirror.staging);
@@ -313,6 +373,22 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
     }
     err = cudaMemset(mirror.target_feat->data, 0, bytes);
     if (feature_cuda_failed("cudaMemset", err)) {
+        draft_feature_mirror_free(mirror);
+        return false;
+    }
+    err = cudaStreamCreateWithFlags(&mirror.stream, cudaStreamNonBlocking);
+    if (feature_cuda_failed("cudaStreamCreateWithFlags", err)) {
+        draft_feature_mirror_free(mirror);
+        return false;
+    }
+    err = cudaSetDevice(target_device);
+    if (feature_cuda_failed("cudaSetDevice", err)) {
+        draft_feature_mirror_free(mirror);
+        return false;
+    }
+    err = cudaStreamCreateWithFlags(
+        &mirror.transfer_stream, cudaStreamNonBlocking);
+    if (feature_cuda_failed("cudaStreamCreateWithFlags", err)) {
         draft_feature_mirror_free(mirror);
         return false;
     }
@@ -452,8 +528,8 @@ bool draft_feature_mirror_sync_range(const ggml_tensor * src_target_feat,
         if (feature_cuda_failed("cudaGetLastError", err)) return false;
         done += run;
     }
-    cudaError_t err = cudaDeviceSynchronize();
-    if (feature_cuda_failed("cudaDeviceSynchronize", err)) return false;
+    cudaError_t err = cudaStreamSynchronize(mirror.stream);
+    if (feature_cuda_failed("cudaStreamSynchronize", err)) return false;
     return true;
 }
 
@@ -498,8 +574,8 @@ bool copy_capture_slice_to_draft_ring(
             return false;
         }
     }
-    cudaError_t err = cudaDeviceSynchronize();
-    if (feature_cuda_failed("cudaDeviceSynchronize", err)) return false;
+    cudaError_t err = cudaStreamSynchronize(feature_ring.stream);
+    if (feature_cuda_failed("cudaStreamSynchronize", err)) return false;
     return true;
 }
 
@@ -555,7 +631,8 @@ bool copy_feature_ring_range_to_tensor(
             src_stride == row_bytes && dst_stride == row_bytes) {
             if (!copy_peer_async(dst_base, feature_ring.device,
                                  src_base, feature_ring.device,
-                                 row_bytes * (size_t)run)) {
+                                 row_bytes * (size_t)run,
+                                 feature_ring.stream)) {
                 return false;
             }
         } else {
@@ -572,8 +649,8 @@ bool copy_feature_ring_range_to_tensor(
         }
         done += run;
     }
-    cudaError_t err = cudaDeviceSynchronize();
-    if (feature_cuda_failed("cudaDeviceSynchronize", err)) return false;
+    cudaError_t err = cudaStreamSynchronize(feature_ring.stream);
+    if (feature_cuda_failed("cudaStreamSynchronize", err)) return false;
     return true;
 }
 

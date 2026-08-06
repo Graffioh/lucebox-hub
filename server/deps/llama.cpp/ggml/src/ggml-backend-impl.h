@@ -202,6 +202,7 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+        bool                 (*event_is_ready)    (ggml_backend_dev_t dev, ggml_backend_event_t event);
     };
 
     struct ggml_backend_device {

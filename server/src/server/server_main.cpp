@@ -111,6 +111,9 @@ static void print_usage(const char * prog) {
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
+        "  --async-shadow-batching  Draft likely next endpoints on a second GPU\n"
+        "                            while the target verifies (qwen35, local only)\n"
+        "  --async-shadow-branches <N>  Future alternatives (currently 1)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
         "                       trimmed per step by drafter confidence; N = fixed base)\n"
         "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
@@ -362,6 +365,17 @@ int main(int argc, char ** argv) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--async-shadow-batching") == 0) {
+            bargs.async_shadow_batching = true;
+            bargs.fast_rollback = true;
+            bargs.device.peer_access = true;
+        } else if (std::strcmp(argv[i], "--async-shadow-branches") == 0 && i + 1 < argc) {
+            bargs.async_shadow_branches = std::atoi(argv[++i]);
+            if (bargs.async_shadow_branches != 1) {
+                std::fprintf(stderr,
+                    "[server] --async-shadow-branches currently must be 1\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--adaptive-experts") == 0) {
             const char * tau = "0.80";
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -1030,6 +1044,13 @@ int main(int argc, char ** argv) {
                              "[server] │     Use --fa-window 0 for tool-call workloads.\n");
     }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  async_shadows   = %s",
+                 bargs.async_shadow_batching ? "ON" : "off");
+    if (bargs.async_shadow_batching) {
+        std::fprintf(stderr, " (%d branches, direct GPU ring)",
+                     bargs.async_shadow_branches);
+    }
+    std::fprintf(stderr, "\n");
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
     if (bargs.device.is_layer_split()) {
         std::fprintf(stderr, "[server] │  split_rollback  = %s\n",

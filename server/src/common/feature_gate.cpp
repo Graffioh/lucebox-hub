@@ -252,6 +252,13 @@ std::vector<std::string> collect_feature_warnings(
                arch_supports_ddtree(arch, false),
                split, arch, "--ddtree", "DDTree speculative decode");
 
+    const bool async_shadow_supported = arch == "qwen35" && !split;
+    warn_inert(out, args.async_shadow_batching,
+               async_shadow_supported,
+               arch == "qwen35",
+               split, arch, "--async-shadow-batching",
+               "same-process asynchronous shadow batching");
+
     warn_inert(out, args.verify_width != 0,
                arch_supports_verify_width(arch, split),
                arch_supports_verify_width(arch, false),

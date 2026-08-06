@@ -29,6 +29,8 @@ int run_qwen35_daemon(const Qwen35DaemonArgs & args) {
     cfg.ddtree_budget      = args.ddtree_budget;
     cfg.ddtree_temp        = args.ddtree_temp;
     cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
+    cfg.async_shadow_batching = args.async_shadow_batching;
+    cfg.async_shadow_branches = args.async_shadow_branches;
     cfg.use_feature_mirror = args.use_feature_mirror;
 
     Qwen35Backend backend(cfg);

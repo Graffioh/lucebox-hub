@@ -422,6 +422,18 @@ static void test_feature_warnings_report_inert_decode_tunables() {
     swa.draft_swa_window = 2048;
     TEST_ASSERT(!warns_about(warn_result(swa, "qwen35moe"), "--draft-swa"));
     TEST_ASSERT(warns_about(warn_result(swa, "gemma4"), "--draft-swa"));
+
+    BackendArgs shadow;
+    shadow.model_path = "/nonexistent/model.gguf";
+    shadow.async_shadow_batching = true;
+    TEST_ASSERT(!warns_about(
+        warn_result(shadow, "qwen35"), "--async-shadow-batching"));
+    TEST_ASSERT(warns_about(
+        warn_result(shadow, "laguna"), "--async-shadow-batching"));
+    TEST_ASSERT(parse_placement_device_list(
+        "cuda:0,cuda:1", shadow.device));
+    TEST_ASSERT(warns_about(
+        warn_result(shadow, "qwen35"), "--async-shadow-batching"));
 }
 
 static void test_feature_warnings_report_inert_moe_options() {

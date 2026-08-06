@@ -273,6 +273,8 @@ Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temper
 |---|---|---|
 | `--ddtree` | off (chain) | Enable tree verify |
 | `--ddtree-budget N` | `22` | Tree size. 22 on 3090 (default), 40 on 5090, re-sweep on GB10 |
+| `--async-shadow-batching` | off | Experimental qwen35 chain mode: cache one likely round-T+1 fast-rollback proposal on a distinct local draft GPU while ordinary target verification finishes. The target verify width and acceptance path are unchanged. Requires direct P2P; remote draft IPC and host feature staging are refused. |
+| `--async-shadow-branches N` | `1` | Future outcome branches. The equal-layout shadow-KV prototype currently requires exactly `1`. |
 | `--fa-window N` | `0` / `2048` (full attention) | Sliding FA window. Leave at 0: a finite window breaks tool calls (the full-attention layers lose the system prompt/tools). |
 | `--draft-residency {auto,persistent,request-scoped}` | `auto` | When draft weights are evicted from VRAM. `request-scoped` parks/frees them after each request's draft work (frees VRAM for the target on tight GPUs); `persistent` keeps them resident across requests; `auto` preserves current behavior while honoring the low-VRAM / `--lazy-draft` hint. Reported at `/props.runtime.draft_residency`. |
 | `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |
@@ -385,12 +387,31 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `--target-split-fast-rollback` | off | Qwen35 local layer-split only: enable exact F32 per-token checkpoints and skip accepted-token replay. Adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
 | `DFLASH_SPLIT_FAST_ROLLBACK=1` | off | Environment equivalent of `--target-split-fast-rollback`. |
 | `--draft-ipc-bin <path>` | — | Out-of-process draft binary (mixed CUDA/HIP) |
-| `--peer-access` | off | Enable P2P between target GPUs |
+| `--peer-access` | off | Enable direct P2P between GPUs, including host-free draft-hidden projection for ordinary local chain decoding. Implied by `--async-shadow-batching`. |
 | `--chunk N` | backend default | Prefill ubatch size |
 | `--no-cors` | CORS on | Disable CORS headers |
 | `DFLASH_TARGET_GPU=N` | `0` | Env var equivalent of `--target-gpu` |
 | `DFLASH_DRAFT_GPU=N` | same as target | Env var equivalent of `--draft-gpu` |
 | `DFLASH_MODEL_NAME=<name>` | `dflash` | Env var equivalent of `--model-name`; sets the `/v1/models` id and selects the matching `share/model_cards/<name>.json` |
+
+Async shadows are a constrained exact-endpoint cache inspired by the
+asynchronous lookahead in
+[Speculative Speculative Decoding / SAGUARO](https://arxiv.org/abs/2603.03251).
+Two same-process HIP/CUDA streams use direct device copies and the draft
+feature ring; they do not start a draft daemon or use process IPC. Unlike the
+paper's EAGLE extension, this prototype does not substitute self-generated
+activations: it waits for the exact target feature rows required by DFlash.
+The R9700 publishes the final feature capture with a mid-graph HIP/CUDA event
+and continues the unchanged target tail; it does not split or widen the target
+graph. Direct P2P feature transfer and Strix preparation overlap that tail.
+The Strix clones the authoritative draft KV into an equal-layout device-local
+bank while the R9700 verifies, then advances that bank to one predicted
+endpoint. A result is reusable only when ordinary verification produces its
+exact outcome key (source position, accepted count, and pending target token).
+A miss or a not-yet-ready shadow falls back to ordinary single-request
+drafting, and a missed deadline disables further launches for that request.
+Shadow work never widens target verification or changes target acceptance.
+Per-request telemetry is printed as `[async-shadow]`.
 
 Tensor parallelism uses NCCL collectives between the selected devices and does
 not include other visible GPUs in its communicator. For example, this runs the

@@ -420,6 +420,7 @@ add_library(dflash_common STATIC
     src/common/pflash_drafter_ipc.cpp
     src/common/dflash_draft_graph.cpp
     src/common/dflash_draft_kv.cpp
+    src/common/async_shadow_batch.cpp
     src/common/dflash_spec_decode.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
@@ -1244,6 +1245,7 @@ if(DFLASH27B_TESTS)
             test/test_admission.cpp
             test/test_restore_delta.cpp
             test/test_chain_rollback_policy.cpp
+            test/test_async_shadow_batch.cpp
             test/test_anchor_transitive.cpp
             test/test_drafter_early_exit_score_range.cpp
             test/test_drafter_tail_capture_guard.cpp

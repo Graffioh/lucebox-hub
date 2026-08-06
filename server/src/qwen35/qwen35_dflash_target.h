@@ -26,6 +26,7 @@ public:
                        TargetCache & cache,
                        ggml_backend_t backend,
                        StepGraph & sg,
+                       int target_device,
                        int kq_stride_pad,
                        int fa_window);
 
@@ -38,6 +39,17 @@ public:
                       int & last_tok,
                       std::vector<int32_t> * all_argmax = nullptr,
                       bool capture_ssm_intermediates = false) override;
+
+    // Submit the ordinary full verification graph asynchronously and publish
+    // `feature_ready` immediately after its final target-feature ring write.
+    // The target tail remains queued on the same stream and is not widened.
+    bool verify_batch_async_until_features(
+        const std::vector<int32_t> & tokens,
+        int base_pos,
+        ggml_backend_event_t feature_ready,
+        bool capture_ssm_intermediates = false);
+    bool finish_verify_batch(int & last_tok,
+                             std::vector<int32_t> * all_argmax = nullptr);
 
     bool read_verify_logits(int n_tokens, std::vector<float> & out) override;
 
@@ -73,6 +85,28 @@ public:
                                 std::vector<float> & top_log_probs,
                                 std::vector<int32_t> & top_token_ids) override;
 
+    // Same projection, but copy a ready F32 hidden buffer directly from a
+    // second GPU into the target projection graph. The caller owns source
+    // synchronization; no host round-trip is performed here.
+    bool project_device_hidden_to_topk(const void * hidden_device,
+                                       int source_device,
+                                       int n_tokens,
+                                       int K,
+                                       float temperature,
+                                       std::vector<float> & top_log_probs,
+                                       std::vector<int32_t> & top_token_ids);
+
+    bool project_device_hidden_to_tokens(const void * hidden_device,
+                                         int source_device,
+                                         int n_tokens,
+                                         std::vector<int32_t> & tokens_out);
+
+    // Read the ordinary ggml_argmax output from the most recent projection.
+    // Shadow planning uses top-K, but branch 0 must retain this exact baseline
+    // tie-breaking behavior rather than assuming top-K rank zero is identical.
+    bool read_projected_argmax(int n_tokens,
+                               std::vector<int32_t> & tokens_out) const;
+
     int hidden_size() const override { return w_.n_embd; }
     int mask_token_id() const override;
     const std::vector<int> & capture_layer_ids() const override;
@@ -94,16 +128,30 @@ private:
     TargetCache & cache_;
     ggml_backend_t backend_;
     StepGraph & sg_;
+    int target_device_;
     int kq_stride_pad_;
     int fa_window_;
     KvFlashPager * pager_ = nullptr;
     bool fast_rollback_ = false;
+    bool async_verify_pending_ = false;
+    int async_verify_tokens_ = 0;
+    int async_verify_base_pos_ = 0;
 
     // Cached vector form of capture layer IDs (built once in constructor).
     std::vector<int> capture_ids_;
 
     // LM-head projection graph (lazily built).
     StepGraph proj_sg_;
+
+    bool compute_device_hidden_projection(const void * hidden_device,
+                                          int source_device,
+                                          int n_tokens);
+    bool verify_batch_impl(const std::vector<int32_t> & tokens,
+                           int base_pos,
+                           int & last_tok,
+                           std::vector<int32_t> * all_argmax,
+                           bool capture_ssm_intermediates,
+                           ggml_backend_event_t feature_ready);
 };
 
 }  // namespace dflash::common

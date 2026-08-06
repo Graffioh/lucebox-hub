@@ -30,6 +30,15 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 GGML_BACKEND_API bool ggml_backend_cuda_set_low_priority_stream(
     ggml_backend_t backend);
 
+// Record `event` on the backend stream immediately after `node` is submitted
+// during the next/full graph evaluation. This publishes a mid-graph producer
+// boundary without splitting or synchronizing the graph. The node and event
+// remain configured until replaced or cleared with null arguments.
+GGML_BACKEND_API bool ggml_backend_cuda_set_graph_event_marker(
+    ggml_backend_t backend,
+    const struct ggml_tensor * node,
+    ggml_backend_event_t event);
+
 // Skip the expensive per-node CUDA/HIP graph property comparison on the
 // calling thread once a stable graph has already been captured.  Callers must
 // bracket only immutable-topology graphs whose tensor addresses and shapes do

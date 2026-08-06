@@ -16,6 +16,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "gpu_runtime_compat.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +30,10 @@ struct DraftFeatureMirror {
     ggml_tensor * target_feat = nullptr; // [n_target_layers*hidden_size, cap]
     void * staging = nullptr;
     size_t staging_bytes = 0;
+    // Cross-device P2P copies are submitted on a stream owned by the source
+    // (target) GPU. Conversion and ring-local copies use the draft stream.
+    cudaStream_t transfer_stream = nullptr;
+    cudaStream_t stream = nullptr;
     int device = 0;
     int target_device = 0;
     int cap = 0;
