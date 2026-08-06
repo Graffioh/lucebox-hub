@@ -779,6 +779,10 @@ json build_props_body(const ServerConfig & config,
             {"enabled",       config.speculative_enabled},
             {"ddtree_budget", config.speculative_enabled
                                 ? json(config.ddtree_budget) : json(nullptr)},
+            {"ddtree_adaptive", config.ddtree_adaptive},
+            {"ddtree_branch_margin", config.ddtree_adaptive
+                                        ? json(config.ddtree_branch_margin)
+                                        : json(nullptr)},
         }},
         {"sampling", {
             {"capabilities", {

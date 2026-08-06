@@ -32,6 +32,28 @@ std::string check_feature_compatibility(
         features.pflash_enabled || args.draft_path != nullptr;
     const bool mixed_draft_placement =
         draft_placement_used && target_backend != draft_backend;
+    // Adaptive DDTree is deliberately calibrated and narrow. Requiring an
+    // explicit threshold avoids baking a 3090 measurement into the intended
+    // R9700 + Strix Halo policy.
+    if (!args.ddtree_adaptive && args.ddtree_branch_margin >= 0.0f) {
+        return "--ddtree-branch-margin requires --ddtree-adaptive";
+    }
+    if (args.ddtree_adaptive) {
+        if (args.ddtree_branch_margin < 0.0f) {
+            return "--ddtree-adaptive requires --ddtree-branch-margin";
+        }
+        if (!args.ddtree_mode || !args.draft_path) {
+            return "--ddtree-adaptive requires --ddtree and --draft";
+        }
+        if (arch != "qwen35" || args.device.is_layer_split()) {
+            return "--ddtree-adaptive currently requires a single dense "
+                   "qwen35 target";
+        }
+        if (!args.fast_rollback) {
+            return "--ddtree-adaptive requires fast rollback";
+        }
+    }
+
 
     // ── IPC auxiliary options × IPC enablement
     if (!args.remote_draft.enabled() &&

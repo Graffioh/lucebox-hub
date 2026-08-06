@@ -266,6 +266,8 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.fast_rollback      = args.fast_rollback;
         cfg.seq_verify         = args.seq_verify;
         cfg.ddtree_mode        = args.ddtree_mode;
+        cfg.ddtree_adaptive    = args.ddtree_adaptive;
+        cfg.ddtree_branch_margin = args.ddtree_branch_margin;
         cfg.ddtree_budget      = args.ddtree_budget;
         cfg.ddtree_temp        = args.ddtree_temp;
         cfg.ddtree_chain_seed  = args.ddtree_chain_seed;

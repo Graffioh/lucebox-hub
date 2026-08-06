@@ -64,6 +64,8 @@ struct BackendArgs {
     bool            fast_rollback    = true;
     bool            seq_verify       = false;
     bool            ddtree_mode      = false;
+    bool            ddtree_adaptive  = false;
+    float           ddtree_branch_margin = -1.0f;
     int             ddtree_budget    = 22;
     float           ddtree_temp      = 1.0f;
     bool            ddtree_chain_seed = true;

@@ -367,6 +367,43 @@ static bool warns_about(const std::vector<std::string> & warnings,
     return false;
 }
 
+static void test_feature_gate_adaptive_ddtree_requirements() {
+    BackendArgs args;
+    args.model_path = "/nonexistent/model.gguf";
+    args.draft_path = "/nonexistent/draft.gguf";
+    args.ddtree_mode = true;
+    args.ddtree_adaptive = true;
+    args.ddtree_branch_margin = 0.35f;
+    args.fast_rollback = true;
+    TEST_ASSERT(gate_result(
+        args, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs missing_margin = args;
+    missing_margin.ddtree_branch_margin = -1.0f;
+    TEST_ASSERT(!gate_result(
+        missing_margin, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs inert_margin = args;
+    inert_margin.ddtree_adaptive = false;
+    TEST_ASSERT(!gate_result(
+        inert_margin, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs no_rollback = args;
+    no_rollback.fast_rollback = false;
+    TEST_ASSERT(!gate_result(
+        no_rollback, "qwen35", PlacementBackend::Cuda).empty());
+
+    TEST_ASSERT(!gate_result(
+        args, "qwen35moe", PlacementBackend::Cuda).empty());
+
+    BackendArgs mixed = args;
+    mixed.device.backend = PlacementBackend::Cuda;
+    mixed.draft_device.backend = PlacementBackend::Hip;
+    mixed.remote_draft.ipc_bin = "/usr/bin/draft-ipc";
+    TEST_ASSERT(gate_result(
+        mixed, "qwen35", PlacementBackend::Cuda).empty());
+}
+
 static void test_feature_warnings_silent_when_supported() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
@@ -487,6 +524,7 @@ int main() {
     RUN_TEST(test_feature_gate_ds4_decode_options_require_monolithic_hip);
     RUN_TEST(test_feature_gate_remote_draft_requires_supported_arch);
     RUN_TEST(test_feature_gate_layer_split_requires_supported_arch);
+    RUN_TEST(test_feature_gate_adaptive_ddtree_requirements);
     RUN_TEST(test_feature_warnings_silent_when_supported);
     RUN_TEST(test_feature_warnings_report_inert_draft);
     RUN_TEST(test_feature_warnings_report_inert_decode_tunables);

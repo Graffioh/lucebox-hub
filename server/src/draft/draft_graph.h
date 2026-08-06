@@ -11,10 +11,14 @@ struct DraftWeights; // fwd
 
 struct DraftGraphInputs {
     int           ctx_len;          // length of target_hidden_cat along ne[1]
-    ggml_tensor * noise_embed;      // [hidden, q_len=16, 1] f32
+    // Number of query rows. Zero keeps the legacy block_size-wide graph.
+    // Packed batches flatten independent blocks along this dimension and
+    // isolate them with the supplied attention masks.
+    int           q_len = 0;
+    ggml_tensor * noise_embed;      // [hidden, q_len, 1] f32
     ggml_tensor * target_hidden_cat;// [5*hidden, ctx_len, 1] f32
-    ggml_tensor * positions_q;      // [q_len] i32   values [ctx_len..ctx_len+q_len-1]
-    ggml_tensor * positions_k;      // [ctx_len+q_len] i32   values [0..ctx_len+q_len-1]
+    ggml_tensor * positions_q;      // [q_len] i32; packed blocks repeat positions
+    ggml_tensor * positions_k;      // [ctx_len+q_len] i32; prefix then query positions
     // Optional: if non-null, the graph projects final hidden states through
     // this LM head (shape [hidden, vocab]) and returns logits instead of
     // hidden states. Used for DFlash integration where the draft shares the

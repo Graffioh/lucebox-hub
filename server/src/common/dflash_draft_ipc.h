@@ -53,6 +53,13 @@ public:
                  const std::vector<float> & noise_embed,
                  std::vector<float> & hidden_out);
 
+    // Run independent draft blocks in one daemon command and one packed graph.
+    bool propose_batch(int committed,
+                       int ctx_len,
+                       int batch_size,
+                       const std::vector<float> & noise_embed,
+                       std::vector<float> & hidden_out);
+
     bool get_feature_range(int start_pos, int n_tokens, std::vector<float> & out);
     bool set_feature_range(int start_pos, int n_tokens,
                            const std::vector<float> & data);

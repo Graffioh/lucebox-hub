@@ -145,6 +145,8 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
     const int n_tgt_layers = draft_weights.n_target_layers;
     StepGraph draft_sg;
     std::vector<float> noise_embed((size_t)hidden * q_len);
+    std::vector<float> packed_noise_embed;
+    std::vector<float> packed_hidden_out;
     std::vector<int32_t> pos_q(q_len);
     std::vector<int32_t> pos_k;
     std::vector<float> hidden_out((size_t)hidden * q_len);
@@ -213,6 +215,54 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
             !write_exact_fd(stream_fd, hidden_out.data(),
                             hidden_out.size() * sizeof(float))) {
             std::fprintf(stderr, "[draft-ipc-daemon] stream write failed\n");
+            return ProposalResult::StreamFailed;
+        }
+        return ProposalResult::Ok;
+    };
+
+    auto run_packed_proposal =
+        [&](int committed, int ctx_len, int batch_size) -> ProposalResult {
+        int mirror_slot0 = 0;
+        const bool use_mirror_view =
+            draft_feature_mirror_can_view(
+                feature_ring, committed, ctx_len, mirror_slot0);
+        if (!build_draft_packed_batch_step(
+                draft_sg, draft_weights, backend, ctx_len, batch_size,
+                use_mirror_view ? &feature_ring : nullptr, committed)) {
+            std::fprintf(stderr,
+                         "[draft-ipc-daemon] packed draft build failed "
+                         "batch=%d\n", batch_size);
+            stream_status(stream_fd, -1);
+            return ProposalResult::CommandFailed;
+        }
+        if (!use_mirror_view &&
+            !copy_feature_ring_range_to_tensor(
+                feature_ring, draft_sg.target_hidden_cat,
+                committed - ctx_len, ctx_len)) {
+            std::fprintf(stderr,
+                         "[draft-ipc-daemon] packed feature copy failed\n");
+            stream_status(stream_fd, -1);
+            return ProposalResult::CommandFailed;
+        }
+        ggml_backend_tensor_set(
+            draft_sg.inp_embed, packed_noise_embed.data(), 0,
+            packed_noise_embed.size() * sizeof(float));
+        const auto st = ggml_backend_graph_compute(backend, draft_sg.gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr,
+                         "[draft-ipc-daemon] packed draft compute failed "
+                         "status=%d batch=%d\n", (int)st, batch_size);
+            stream_status(stream_fd, -1);
+            return ProposalResult::CommandFailed;
+        }
+        ggml_backend_tensor_get(
+            draft_sg.hidden_states, packed_hidden_out.data(), 0,
+            packed_hidden_out.size() * sizeof(float));
+        if (!stream_status(stream_fd, 0) ||
+            !write_exact_fd(stream_fd, packed_hidden_out.data(),
+                            packed_hidden_out.size() * sizeof(float))) {
+            std::fprintf(stderr,
+                         "[draft-ipc-daemon] packed stream write failed\n");
             return ProposalResult::StreamFailed;
         }
         return ProposalResult::Ok;
@@ -409,6 +459,117 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                 continue;
             }
             stream_status(stream_fd, 0);
+            continue;
+        }
+        if (cmd == "propose_batch") {
+            int committed = -1;
+            int ctx_len = 0;
+            int batch_size = 0;
+            iss >> committed >> ctx_len >> batch_size;
+            std::string path = read_line_tail(iss);
+            if (committed < 0 || ctx_len <= 0 ||
+                ctx_len > feature_ring.cap ||
+                batch_size <= 0 || batch_size > 8 || path.empty()) {
+                std::fprintf(stderr,
+                             "[draft-ipc-daemon] bad propose_batch: %s\n",
+                             line.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            const size_t elements =
+                (size_t)hidden * q_len * batch_size;
+            packed_noise_embed.assign(elements, 0.0f);
+            packed_hidden_out.assign(elements, 0.0f);
+            if (!read_binary_file_exact(
+                    path, packed_noise_embed.data(),
+                    packed_noise_embed.size() * sizeof(float))) {
+                std::fprintf(stderr,
+                             "[draft-ipc-daemon] read packed noise failed: %s\n",
+                             path.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            if (run_packed_proposal(
+                    committed, ctx_len, batch_size) ==
+                ProposalResult::StreamFailed) {
+                break;
+            }
+            continue;
+        }
+        if (cmd == "propose_batch_shared") {
+            int committed = -1;
+            int ctx_len = 0;
+            int batch_size = 0;
+            size_t bytes = 0;
+            uint64_t sequence = 0;
+            iss >> committed >> ctx_len >> batch_size >> bytes >> sequence;
+            const size_t expected_bytes =
+                (size_t)hidden * q_len * batch_size * sizeof(float);
+            const auto * header =
+                static_cast<const BackendIpcSharedPayloadHeader *>(
+                    shared_payload);
+            if (!iss || sequence == 0 ||
+                !shared_payload || !shared_payload_data ||
+                committed < 0 || ctx_len <= 0 ||
+                ctx_len > feature_ring.cap ||
+                batch_size <= 0 || batch_size > 8 ||
+                bytes != expected_bytes ||
+                !backend_ipc_payload_in_bounds(
+                    0, bytes, shared_payload_capacity) ||
+                !backend_ipc_shared_payload_header_matches(
+                    header, sequence, static_cast<uint64_t>(bytes))) {
+                std::fprintf(
+                    stderr,
+                    "[draft-ipc-daemon] bad propose_batch_shared: %s\n",
+                    line.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            packed_noise_embed.resize(bytes / sizeof(float));
+            packed_hidden_out.assign(bytes / sizeof(float), 0.0f);
+            std::memcpy(packed_noise_embed.data(),
+                        shared_payload_data, bytes);
+            if (run_packed_proposal(
+                    committed, ctx_len, batch_size) ==
+                ProposalResult::StreamFailed) {
+                break;
+            }
+            continue;
+        }
+        if (cmd == "propose_batch_pipe") {
+            int committed = -1;
+            int ctx_len = 0;
+            int batch_size = 0;
+            size_t bytes = 0;
+            iss >> committed >> ctx_len >> batch_size >> bytes;
+            const size_t expected_bytes =
+                (size_t)hidden * q_len * batch_size * sizeof(float);
+            if (payload_fd < 0 || committed < 0 || ctx_len <= 0 ||
+                ctx_len > feature_ring.cap ||
+                batch_size <= 0 || batch_size > 8 ||
+                bytes != expected_bytes) {
+                std::fprintf(
+                    stderr,
+                    "[draft-ipc-daemon] bad propose_batch_pipe: %s\n",
+                    line.c_str());
+                stream_status(stream_fd, -1);
+                continue;
+            }
+            packed_noise_embed.resize(bytes / sizeof(float));
+            packed_hidden_out.assign(bytes / sizeof(float), 0.0f);
+            if (!read_exact_fd(
+                    payload_fd, packed_noise_embed.data(), bytes)) {
+                std::fprintf(
+                    stderr,
+                    "[draft-ipc-daemon] read packed noise pipe failed\n");
+                stream_status(stream_fd, -1);
+                break;
+            }
+            if (run_packed_proposal(
+                    committed, ctx_len, batch_size) ==
+                ProposalResult::StreamFailed) {
+                break;
+            }
             continue;
         }
         if (cmd == "propose") {

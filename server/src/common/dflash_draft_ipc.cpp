@@ -51,8 +51,12 @@ size_t dflash_draft_ipc_required_shared_bytes(int hidden_size,
     if (hidden_size <= 0 || block_size <= 0 || ring_cap <= 0) {
         return 0;
     }
-    const size_t max_tokens =
-        (size_t)std::max(block_size, ring_cap);
+    // propose_batch supports up to eight independent draft blocks in one
+    // command, so the shared payload must hold the largest accepted batch even
+    // when the feature ring itself is smaller.
+    constexpr int MAX_PACKED_BATCH = 8;
+    const size_t max_tokens = std::max(
+        (size_t)block_size * MAX_PACKED_BATCH, (size_t)ring_cap);
     size_t elements = 0;
     size_t bytes = 0;
     if (!checked_mul_size(max_tokens, (size_t)hidden_size, elements) ||
@@ -297,6 +301,118 @@ bool DFlashDraftIpcClient::propose(
     std::remove(path.c_str());
     if (!ok) {
         std::fprintf(stderr, "draft-ipc propose failed status=%d\n", status);
+    }
+    return ok;
+#endif
+}
+
+bool DFlashDraftIpcClient::propose_batch(
+        int committed,
+        int ctx_len,
+        int batch_size,
+        const std::vector<float> & noise_embed,
+        std::vector<float> & hidden_out) {
+#if defined(_WIN32)
+    (void)committed; (void)ctx_len; (void)batch_size;
+    (void)noise_embed; (void)hidden_out;
+    return false;
+#else
+    constexpr int kMaxPackedBatch = 8;
+    FILE * cmd = process_.command_stream();
+    const int stream_fd = process_.stream_fd();
+    const int payload_fd = process_.payload_fd();
+    if (!active_ || !cmd || stream_fd < 0 || committed < 0 ||
+        ctx_len <= 0 || ctx_len > ring_cap_ ||
+        batch_size <= 0 || batch_size > kMaxPackedBatch) {
+        std::fprintf(stderr,
+                     "draft-ipc propose_batch rejected active=%d committed=%d "
+                     "ctx_len=%d ring_cap=%d batch=%d\n",
+                     (int)active_, committed, ctx_len, ring_cap_, batch_size);
+        return false;
+    }
+
+    size_t rows = 0;
+    size_t expected = 0;
+    if (!checked_mul_size((size_t)block_size_, (size_t)batch_size, rows) ||
+        !checked_mul_size((size_t)hidden_size_, rows, expected) ||
+        noise_embed.size() != expected) {
+        std::fprintf(stderr,
+                     "draft-ipc propose_batch noise size mismatch got=%zu "
+                     "hidden=%d block=%d batch=%d\n",
+                     noise_embed.size(), hidden_size_, block_size_, batch_size);
+        return false;
+    }
+
+    size_t bytes = 0;
+    if (!checked_mul_size(expected, sizeof(float), bytes)) return false;
+
+    auto read_result = [&](int32_t & status) {
+        bool ok = read_exact_fd(stream_fd, &status, sizeof(status)) && status == 0;
+        if (ok) {
+            hidden_out.assign(expected, 0.0f);
+            ok = read_exact_fd(stream_fd, hidden_out.data(),
+                               hidden_out.size() * sizeof(float));
+        }
+        return ok;
+    };
+
+    if (process_.resolved_payload_transport() ==
+        BackendIpcPayloadTransport::Shared) {
+        uint64_t seq = 0;
+        if (!process_.write_shared_payload(noise_embed.data(), bytes, seq)) {
+            std::fprintf(stderr,
+                         "draft-ipc propose_batch shared payload too large "
+                         "bytes=%zu capacity=%zu\n",
+                         bytes, process_.shared_payload_capacity());
+            return false;
+        }
+        std::fprintf(cmd,
+                     "propose_batch_shared %d %d %d %zu %" PRIu64 "\n",
+                     committed, ctx_len, batch_size, bytes, seq);
+        std::fflush(cmd);
+        int32_t status = -1;
+        const bool ok = read_result(status);
+        if (!ok) {
+            std::fprintf(stderr,
+                         "draft-ipc propose_batch_shared failed status=%d\n",
+                         status);
+        }
+        return ok;
+    }
+
+    if (payload_fd >= 0) {
+        std::fprintf(cmd, "propose_batch_pipe %d %d %d %zu\n",
+                     committed, ctx_len, batch_size, bytes);
+        std::fflush(cmd);
+        if (!write_exact_fd(payload_fd, noise_embed.data(), bytes)) {
+            std::fprintf(stderr,
+                         "draft-ipc propose_batch payload write failed\n");
+            return false;
+        }
+        int32_t status = -1;
+        const bool ok = read_result(status);
+        if (!ok) {
+            std::fprintf(stderr,
+                         "draft-ipc propose_batch failed status=%d\n", status);
+        }
+        return ok;
+    }
+
+    const std::string path = process_.next_path("noise-batch");
+    if (!write_binary_file(path, noise_embed.data(), bytes)) {
+        std::fprintf(stderr, "draft-ipc write packed noise failed: %s\n",
+                     path.c_str());
+        return false;
+    }
+    std::fprintf(cmd, "propose_batch %d %d %d %s\n",
+                 committed, ctx_len, batch_size, path.c_str());
+    std::fflush(cmd);
+    int32_t status = -1;
+    const bool ok = read_result(status);
+    std::remove(path.c_str());
+    if (!ok) {
+        std::fprintf(stderr, "draft-ipc propose_batch failed status=%d\n",
+                     status);
     }
     return ok;
 #endif

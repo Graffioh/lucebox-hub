@@ -2,7 +2,7 @@
 // (5-layer Qwen3-flavored block-diffusion model).
 //
 // Stateless: no KV cache. Each call takes:
-//   - noise_embed         [hidden,   q_len, 1]   f32    (target.tok_embd on [last_tok, MASK*15])
+//   - noise_embed         [hidden,   q_len, 1]   f32    (one block, or packed isolated blocks)
 //   - target_hidden_cat   [N*hidden, ctx_len, 1] f32    (N target layers concat along features)
 //   - positions_q         [q_len]                i32    values [ctx_len..ctx_len+q_len-1]
 //   - positions_k         [ctx_len+q_len]        i32    values [0..ctx_len+q_len-1]
@@ -77,7 +77,7 @@ DraftGraphOutputs build_draft_graph(
     const DraftWeights &      w,
     const DraftGraphInputs &  in) {
 
-    const int q_len    = w.block_size;
+    const int q_len    = in.q_len > 0 ? in.q_len : w.block_size;
     const int ctx_len  = in.ctx_len;
     const int n_head   = w.n_head;
     const int n_kv     = w.n_head_kv;

@@ -163,6 +163,8 @@ struct ServerConfig {
     std::string runtime_backend;       // "cuda" | "hip" | "cpu"
     int         fa_window           = 0;
     int         ddtree_budget       = 0;
+    bool        ddtree_adaptive     = false;
+    float       ddtree_branch_margin = -1.0f;
     bool        speculative_enabled = false;
     bool        target_sharding     = false;
     // Prefill chunk size (bargs.chunk). Exposed at /props.runtime.chunk so
