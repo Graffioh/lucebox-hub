@@ -1,15 +1,22 @@
-# GBatching: ghost batching for one request
+# GQBatching: quality-oriented ghost batching for one request
 
-Status: implemented behind `--gbatching`; GPU quality and latency measurements
+Status: implemented behind `--gqbatching`; GPU quality and latency measurements
 are still pending.
 
-GBatching turns one user generation into a temporary batch of short candidate
-paths. The target model processes that batch with wide matrix operations,
-selects one path and discards the rest.
+GQBatching is an experimental quality-oriented decoding policy. It turns one
+user generation into a temporary batch of short candidate paths, lets the
+target score them, commits the best path and discards the rest.
 
-“Ghost” means that the batch rows do not come from independent users: they are
-speculative alternatives of one request. This is unrelated to ghost batch
+The name means **Ghost Quality Batching**. “Ghost” means that the batch rows do
+not come from independent users: they are speculative alternatives of one
+request. “Quality” makes the goal explicit. This is unrelated to ghost batch
 normalization.
+
+This feature is not an exact speculative-decoding speedup. It deliberately
+changes the decoding policy by choosing among target-scored paths. Latency and
+throughput may improve or regress, but the design goal is better task quality
+for a bounded amount of extra compute. Speed-oriented adaptive branching
+belongs in DDTree, where exact speculative acceptance is preserved.
 
 ## In brief
 
@@ -31,12 +38,18 @@ The default batch contains four paths of seven tokens:
 target allocation = 32 rows
 ```
 
+The baseline draft is required to discover the four seeds and already provides
+branch 0. Only the other three seeds need expansion, hence a real batch-3
+(`K−1` for `K` total branches). Four branches also stay inside the target tile:
+29 rows round to 32, while five seven-token branches need 36 real rows and
+therefore the next 64-row allocation.
+
 Thirty-two rows match the current verify tile. The target weights are read
 once for the complete tree instead of once per candidate path. This raises
 arithmetic intensity on the R9700, although profiling is still required to
 show whether a particular model becomes compute-bound.
 
-GBatching runs one branching round per request. It does not keep multiple
+GQBatching runs one branching round per request. It does not keep multiple
 generations alive and it does not generate several complete answers.
 
 ## Hardware split
@@ -46,7 +59,7 @@ generations alive and it does not generate several complete answers.
 - Strix Halo: DFlash drafter and alternative-path expansion.
 - Cross-device traffic: captured prefix features, seed embeddings and a bounded
   buffer of hidden rows.
-- Disk and host RAM: no target KV spill is required by GBatching.
+- Disk and host RAM: no target KV spill is required by GQBatching.
 
 The main prefill runs on the R9700 because its large prompt matrices benefit
 most from the stronger GPU. Its target KV never moves: the committed prefix
@@ -96,12 +109,12 @@ whether real batching increases Strix utilization.
 
 1. Run one ancestor-masked target verify over the complete tree.
 2. Compute mean target log-probability for each path.
-3. Keep branch 0 unless another path beats it by `--gbatching-margin`.
+3. Keep branch 0 unless another path beats it by `--gqbatching-margin`.
 4. Compact target KV, DeltaNet state, convolution state and captured features
    onto the selected path with the existing tree rollback.
 5. Continue normal DFlash generation.
 
-The score is a cheap first selector, not proof of better reasoning. GBatching
+The score is a cheap first selector, not proof of better reasoning. GQBatching
 changes the decoding policy, so quality must be evaluated on task results.
 
 ## Usage
@@ -113,10 +126,10 @@ Example when the R9700 is HIP device 0 and Strix Halo is HIP device 1:
   --draft dflash-draft.gguf \
   --target-device hip:0 \
   --draft-device hip:1 \
-  --gbatching \
-  --gbatching-branches 4 \
-  --gbatching-horizon 7 \
-  --gbatching-margin 0.10
+  --gqbatching \
+  --gqbatching-branches 4 \
+  --gqbatching-horizon 7 \
+  --gqbatching-margin 0.10
 ```
 
 Check the actual HIP device order before launching. The ROCm build must contain
@@ -124,12 +137,12 @@ code objects for both GPUs.
 
 | Flag | Default | Meaning |
 |---|---:|---|
-| `--gbatching` | off | Enable one ghost batch per request |
-| `--gbatching-branches` | 4 | Candidate paths, from 2 to 8 |
-| `--gbatching-horizon` | 7 | Tokens in every path |
-| `--gbatching-margin` | 0.10 | Score gain required to replace branch 0 |
+| `--gqbatching` | off | Enable one quality-oriented ghost batch per request |
+| `--gqbatching-branches` | 4 | Candidate paths, from 2 to 8 |
+| `--gqbatching-horizon` | 7 | Tokens in every path |
+| `--gqbatching-margin` | 0.10 | Score gain required to replace branch 0 |
 
-The configuration is reported under `/props.speculative.gbatching`.
+The configuration is reported under `/props.speculative.gqbatching`.
 
 ## Current limits
 
@@ -138,7 +151,7 @@ The configuration is reported under `/props.speculative.gbatching`.
 - Greedy generation and fast tree rollback required.
 - Maximum 64 allocated verify rows.
 - Thinking-budget closure, tool hints, stall recovery and the minimum-token
-  floor keep their existing path; GBatching waits for the first safe round.
+  floor keep their existing path; GQBatching waits for the first safe round.
 - Local same-process expansion is one real packed drafter batch. Remote draft
   expansion is still serial because the IPC protocol is batch-1.
 - The packed expansion currently recomputes draft prefix K/V once for the
@@ -148,7 +161,7 @@ The configuration is reported under `/props.speculative.gbatching`.
 
 ## What to measure
 
-Compare normal DFlash and GBatching with identical prompts and seeds. Record:
+Compare normal DFlash and GQBatching with identical prompts and seeds. Record:
 
 - task pass rate or result quality;
 - end-to-end latency and time to first token;
@@ -166,10 +179,10 @@ optimization.
 
 ## Implementation map
 
-- `server/src/common/gbatching.{h,cpp}` builds and scores path trees.
+- `server/src/common/gqbatching.{h,cpp}` builds and scores path trees.
 - `server/src/common/dflash_draft_graph.{h,cpp}` builds the isolated packed
   Strix batch.
 - `server/src/qwen35/qwen35_backend.cpp` expands paths, batches projection,
   runs the 32-row target verify and commits the winner.
-- `server/test/test_gbatching.cpp` covers path construction, row allocation,
+- `server/test/test_gqbatching.cpp` covers path construction, row allocation,
   score margin and selection without requiring GPUs.

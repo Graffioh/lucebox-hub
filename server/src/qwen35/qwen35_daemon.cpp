@@ -29,10 +29,10 @@ int run_qwen35_daemon(const Qwen35DaemonArgs & args) {
     cfg.ddtree_budget      = args.ddtree_budget;
     cfg.ddtree_temp        = args.ddtree_temp;
     cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
-    cfg.gbatching_mode        = args.gbatching_mode;
-    cfg.gbatching_branches    = args.gbatching_branches;
-    cfg.gbatching_horizon     = args.gbatching_horizon;
-    cfg.gbatching_margin      = args.gbatching_margin;
+    cfg.gqbatching_mode        = args.gqbatching_mode;
+    cfg.gqbatching_branches    = args.gqbatching_branches;
+    cfg.gqbatching_horizon     = args.gqbatching_horizon;
+    cfg.gqbatching_margin      = args.gqbatching_margin;
     cfg.use_feature_mirror = args.use_feature_mirror;
 
     Qwen35Backend backend(cfg);

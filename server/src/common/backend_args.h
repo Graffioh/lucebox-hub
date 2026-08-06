@@ -67,10 +67,10 @@ struct BackendArgs {
     int             ddtree_budget    = 22;
     float           ddtree_temp      = 1.0f;
     bool            ddtree_chain_seed = true;
-    bool            gbatching_mode      = false;
-    int             gbatching_branches  = 4;
-    int             gbatching_horizon   = 7;
-    float           gbatching_margin    = 0.10f;
+    bool            gqbatching_mode      = false;
+    int             gqbatching_branches  = 4;
+    int             gqbatching_horizon   = 7;
+    float           gqbatching_margin    = 0.10f;
     int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
 };

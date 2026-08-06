@@ -1,4 +1,4 @@
-#include "gbatching.h"
+#include "gqbatching.h"
 
 #include <algorithm>
 #include <cmath>
@@ -25,7 +25,7 @@ float token_log_probability(const float * row, int vocab, int32_t token) {
 
 }  // namespace
 
-GBatchingTree build_gbatching_tree(const int32_t * top_token_ids,
+GQBatchingTree build_gqbatching_tree(const int32_t * top_token_ids,
                              int draft_rows,
                              int top_k,
                              int branch_count,
@@ -33,7 +33,7 @@ GBatchingTree build_gbatching_tree(const int32_t * top_token_ids,
     if (!top_token_ids || draft_rows <= 0 || top_k <= 0 ||
         branch_count <= 0 || horizon <= 0 ||
         branch_count > top_k || horizon > draft_rows) {
-        GBatchingTree out;
+        GQBatchingTree out;
         out.tree.parents.push_back(-1);
         out.tree.child_maps.emplace_back();
         out.tree.visibility.assign(1, 1);
@@ -48,14 +48,14 @@ GBatchingTree build_gbatching_tree(const int32_t * top_token_ids,
                 top_token_ids[(size_t)depth * top_k + rank];
         }
     }
-    return build_gbatching_tree_from_paths(branch_tokens.data(), branch_count,
+    return build_gqbatching_tree_from_paths(branch_tokens.data(), branch_count,
                                            horizon);
 }
 
-GBatchingTree build_gbatching_tree_from_paths(const int32_t * branch_tokens,
+GQBatchingTree build_gqbatching_tree_from_paths(const int32_t * branch_tokens,
                                               int branch_count,
                                               int horizon) {
-    GBatchingTree out;
+    GQBatchingTree out;
     out.tree.parents.push_back(-1);
     out.tree.child_maps.emplace_back();
 
@@ -105,19 +105,19 @@ GBatchingTree build_gbatching_tree_from_paths(const int32_t * branch_tokens,
     return out;
 }
 
-int gbatching_required_rows(int branch_count, int horizon, int tile) {
+int gqbatching_required_rows(int branch_count, int horizon, int tile) {
     if (branch_count <= 0 || horizon <= 0) return 0;
     const int rows = 1 + branch_count * horizon;
     if (tile <= 1) return rows;
     return ((rows + tile - 1) / tile) * tile;
 }
 
-GBatchingSelection select_gbatching_branch(const GBatchingTree & qtree,
+GQBatchingSelection select_gqbatching_branch(const GQBatchingTree & qtree,
                                      const float * logits,
                                      int logits_rows,
                                      int vocab,
                                      float margin) {
-    GBatchingSelection out;
+    GQBatchingSelection out;
     out.accepted.push_back(0);
     if (!logits || vocab <= 0 || logits_rows < qtree.tree.n_nodes + 1 ||
         qtree.branches.empty()) {

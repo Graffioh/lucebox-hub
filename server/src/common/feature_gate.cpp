@@ -47,28 +47,28 @@ std::string check_feature_compatibility(
         return "--target-shard-ipc-work-dir requires --target-shard-ipc-bin";
     }
 
-    // GBatching deliberately starts with the narrow path whose tree rollback is
+    // GQBatching deliberately starts with the narrow path whose tree rollback is
     // already production-tested. The small drafter may run on a second device;
     // target KV and the wide verify remain together on the qwen35 target.
-    if (args.gbatching_mode) {
+    if (args.gqbatching_mode) {
         if (!args.draft_path) {
-            return "--gbatching requires --draft";
+            return "--gqbatching requires --draft";
         }
         if (arch != "qwen35" || args.device.is_multi_device() ||
             args.device.split_mode == TargetSplitMode::Tensor) {
-            return "--gbatching currently requires a single-device dense qwen35 target";
+            return "--gqbatching currently requires a single-device dense qwen35 target";
         }
         if (!args.fast_rollback) {
-            return "--gbatching requires fast rollback; remove --no-fast-rollback";
+            return "--gqbatching requires fast rollback; remove --no-fast-rollback";
         }
-        if (args.gbatching_branches < 2 || args.gbatching_branches > 8 ||
-            args.gbatching_horizon < 1 ||
-            1 + static_cast<int64_t>(args.gbatching_branches) *
-                    args.gbatching_horizon > 64) {
-            return "--gbatching requires 2..8 branches and at most 64 total verify rows";
+        if (args.gqbatching_branches < 2 || args.gqbatching_branches > 8 ||
+            args.gqbatching_horizon < 1 ||
+            1 + static_cast<int64_t>(args.gqbatching_branches) *
+                    args.gqbatching_horizon > 64) {
+            return "--gqbatching requires 2..8 branches and at most 64 total verify rows";
         }
-        if (!std::isfinite(args.gbatching_margin) || args.gbatching_margin < 0.0f) {
-            return "--gbatching-margin must be a finite non-negative number";
+        if (!std::isfinite(args.gqbatching_margin) || args.gqbatching_margin < 0.0f) {
+            return "--gqbatching-margin must be a finite non-negative number";
         }
     }
 

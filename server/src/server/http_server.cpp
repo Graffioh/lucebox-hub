@@ -774,14 +774,14 @@ json build_props_body(const ServerConfig & config,
             {"enabled",       config.speculative_enabled},
             {"ddtree_budget", config.ddtree_enabled
                                 ? json(config.ddtree_budget) : json(nullptr)},
-            {"gbatching", {
-                {"enabled",  config.gbatching_enabled},
-                {"branches", config.gbatching_enabled
-                                ? json(config.gbatching_branches) : json(nullptr)},
-                {"horizon",  config.gbatching_enabled
-                                ? json(config.gbatching_horizon) : json(nullptr)},
-                {"margin",   config.gbatching_enabled
-                                ? json(config.gbatching_margin) : json(nullptr)},
+            {"gqbatching", {
+                {"enabled",  config.gqbatching_enabled},
+                {"branches", config.gqbatching_enabled
+                                ? json(config.gqbatching_branches) : json(nullptr)},
+                {"horizon",  config.gqbatching_enabled
+                                ? json(config.gqbatching_horizon) : json(nullptr)},
+                {"margin",   config.gqbatching_enabled
+                                ? json(config.gqbatching_margin) : json(nullptr)},
             }},
         }},
         {"sampling", {
