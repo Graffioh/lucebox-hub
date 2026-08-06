@@ -296,7 +296,9 @@ private:
                         const std::vector<int32_t> * stall_skip_tokens = nullptr,
                         const BudgetHook * budget_hook = nullptr,
                         bool * forced_close_out = nullptr,
-                        bool * degenerate_close_out = nullptr);
+                        bool * degenerate_close_out = nullptr,
+                        bool emit_done = true,
+                        bool force_sampled_verify = false);
 
     // AR decode fallback (no draft model or sampling mode).
     // budget_hook (when close_token_ids is non-empty) overrides the next
@@ -318,8 +320,10 @@ private:
                       bool * forced_close_out = nullptr,
                       bool * degenerate_close_out = nullptr);
 
-    // BTFlash BT1: fixed-fork, K-row target rollout, normalized-logprob
-    // selection, recurrent/KV winner compaction, then ordinary AR continuation.
+    // BTFlash BT1: local Strix draft-assisted fork, K-row target rollout,
+    // normalized-logprob selection, recurrent/KV winner compaction, then
+    // local split-device DFlash continuation. fixed remains as a target-only
+    // compatibility mode.
     bool do_btflash_decode(int committed, int n_gen,
                            std::vector<int32_t> & out_tokens,
                            const DaemonIO & io,
@@ -327,6 +331,12 @@ private:
                            const BudgetHook & budget_hook = {},
                            bool * forced_close_out = nullptr,
                            bool * degenerate_close_out = nullptr);
+
+    bool btflash_local_draft_fork(int committed,
+                                  int32_t last_token,
+                                  int width,
+                                  std::vector<int32_t> & candidates,
+                                  double & elapsed_s);
 
     bool sync_remote_draft_features(int start_pos, int n_tokens);
     bool sync_local_draft_features(int start_pos, int n_tokens);

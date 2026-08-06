@@ -26,6 +26,11 @@ TEST_CASE(BTFlashFixture, bt1_config_accepts_only_prototype_shape) {
     config.k = 4;
     config.select = "verifier";
     CHECK(!validate_btflash_config(config).empty());
+    config.select = "logprob";
+    config.fork = "fixed";
+    CHECK(validate_btflash_config(config).empty());
+    config.fork = "unsupported";
+    CHECK(!validate_btflash_config(config).empty());
 }
 
 TEST_CASE(BTFlashFixture, branch_seeds_are_stable_and_distinct) {
@@ -47,6 +52,25 @@ TEST_CASE(BTFlashFixture, normalized_logprob_selector_is_length_normalized) {
     const double p0 = btflash_token_logprob(logits, 3, 0);
     CHECK(std::isfinite(p2));
     CHECK(p2 > p0);
+}
+
+TEST_CASE(BTFlashFixture, draft_fork_uses_first_continuation_row) {
+    const std::vector<int32_t> top_ids = {
+        100, 101, 102, 103,
+        200, 201, 202, 203,
+        300, 301, 302, 303,
+    };
+    std::vector<int32_t> candidates;
+    CHECK(btflash_select_draft_fork_candidates(top_ids, 4, candidates));
+    CHECK(candidates == std::vector<int32_t>({200, 201, 202, 203}));
+
+    const std::vector<int32_t> duplicate_row = {
+        100, 101, 102, 103,
+        200, 200, 202, 203,
+    };
+    CHECK(!btflash_select_draft_fork_candidates(
+        duplicate_row, 4, candidates));
+    CHECK(!btflash_select_draft_fork_candidates(top_ids, 1, candidates));
 }
 
 TEST_CASE(BTFlashFixture, mask_exposes_shared_prefix_and_same_branch_only) {

@@ -1,9 +1,9 @@
 # BTFlash — short Branch Trees for single-request quality
 
-_Drafted 2026-08-06 against main (3f3d60b). Status: BT1 prototype implemented;
-later evaluator, two-GPU, and scheduler experiments remain design work.
-Initial target: Qwen3.6-27B through the `qwen35` backend on one R9700 + Strix
-Halo machine, serving one user request at a time._
+_Drafted 2026-08-06 against main (3f3d60b). Status: the BT1 local two-GPU
+prototype is implemented; evaluator and scheduler experiments remain design
+work. Initial target: Qwen3.6-27B through the `qwen35` backend on one R9700 +
+Strix Halo machine, serving one user request at a time without IPC._
 
 `COMPUTE_SATURATION.md` describes the row-budget/roofline frame. BTFlash is
 the quality lever: spend a bounded amount of otherwise underused compute on
@@ -34,10 +34,10 @@ is measured on the R9700 + Strix Halo box.
 
 The engine mechanism is a generalization of DDTree. DDTree creates short-lived
 drafter-proposed token branches and uses exact target acceptance to improve
-speed. BTFlash creates target-sampled semantic branches, keeps their state
-across several forward passes, and uses a task-aware evaluator to improve the
-eventual answer. Both should share one branch-tree runtime and one row-budget
-scheduler.
+speed. BTFlash keeps semantic branches across several target forwards and
+selects one trajectory. In BT1, an in-process DFlash drafter on Strix supplies
+the top-K fork candidates and speculative prefix/tail decode; the R9700 scores
+and advances every branch. Both paths reuse the local feature-mirror runtime.
 
 ## 1. Scope and non-goals
 
@@ -48,9 +48,9 @@ Initial scope:
 - **Target model:** Qwen3.6-27B Q4_K_M through the existing `qwen35` backend.
 - **Primary GPU:** R9700 (`gfx1201`, 32 GB) owns target weights, target KV,
   DeltaNet state, target forwards, branch compaction, and the final stream.
-- **Second GPU:** Strix Halo (`gfx1151`, unified memory) is used where it can
-  add useful work without moving the target cache: drafter execution and
-  evaluator/value-model inference.
+- **Second GPU:** Strix Halo (`gfx1151`, unified memory) runs the matched local
+  DFlash drafter for ordinary prefix/tail speculation and top-K fork
+  proposals. It does not own target KV or recurrent state.
 - **Output:** one selected answer. Losing reasoning branches stay internal.
 
 Non-goals for the first implementation:
@@ -132,10 +132,12 @@ uncertainty signal crosses a threshold. Forking at the first response token is
 not the default: early tokens are often formatting or boilerplate and forced
 top-K first tokens can create artificial rather than semantic diversity.
 
-At a fork, create K independent RNG substreams from the request seed and
-branch id. Sample normally with a conservative diversity policy. Optional
-temperature variation is small and configured; duplicate short prefixes are
-collapsed or resampled. Determinism specifies branch-major draw order.
+In the default `draft_topk` mode, one local Strix draft pass produces a
+continuation distribution and its first continuation row supplies K distinct
+top-ranked fork tokens. The R9700 scores those candidates under the target
+distribution, then creates K independent RNG substreams from the request seed
+and branch id for the remaining rollout. The `fixed` compatibility mode skips
+the Strix proposal and samples the fork directly from the target.
 
 ### 4.2 Short lockstep rollout
 
@@ -149,9 +151,10 @@ Physical cache rows append in branch-tree order while model positions follow
 semantic depth. The attention mask supplies lineage visibility. All target KV
 and recurrent state remain on the R9700.
 
-If DFlash is enabled, each semantic branch receives a small DDTree micro-tree
-and all micro-trees are verified in one target graph. The row-budget scheduler
-can move rows between width and depth at each fork.
+BT1 keeps this K-row branch interval target-only. DFlash runs before and after
+the interval, and its proposal is used at the fork, but per-branch DDTree
+micro-trees remain a later composition step. This deliberately keeps all
+persistent branch state and target verification on one device.
 
 ### 4.3 Evaluate, prune, continue
 
@@ -198,7 +201,7 @@ At K=4 this is about 0.6 GB f32 or 0.16 GB Q8_0; at K=8 it is about 1.2 GB or
 quantized bank must be measured. Calling this “DDTree with time extended” is
 conceptually useful, but the persistent state bank is a substantive change.
 
-## 6. Two-GPU execution plan
+## 6. Local two-GPU execution (no IPC)
 
 The two GPUs are separate compute and memory pools. BTFlash should exploit
 both without pretending they form one coherent target cache.
@@ -211,27 +214,30 @@ both without pretending they form one coherent target cache.
 - Multi-row BTFlash/DDTree verification graphs.
 - Winner compaction and final token streaming.
 
-### Strix Halo: asynchronous support plane
+### Strix Halo: local drafter
 
-Candidate responsibilities, enabled and measured independently:
+BT1 loads the matched DFlash GGUF on `hip:1` inside the same server process.
+It reuses the existing local split-device feature mirror; no sidecar, socket,
+shared-memory protocol, or draft IPC option is involved. The mirror copies
+compact captured target features as needed, while raw target KV and DeltaNet
+banks never leave the R9700.
 
-1. **DFlash drafter.** Run the matched small drafter via the existing remote
-   drafter/device boundary. Transfer compact target features/tokens rather
-   than target KV. Measure whether PCIe/control latency beats colocating the
-   drafter on the R9700.
-2. **BTFlash evaluator/value model.** Score partial branch token streams and
-   compact features while the R9700 finishes the rollout. A small verifier on
-   the iGPU avoids spending an additional target-model pass on the R9700.
+The Strix path has three bounded jobs:
 
-The support plane is failure-optional: if the Strix evaluator is late or
-unavailable, use an engine-local selector or skip the fork and continue K=1.
-The R9700 decode loop never blocks indefinitely on the second GPU. Transfers
-are bounded, versioned messages over the existing remote-drafter style IPC;
-raw target KV and DeltaNet banks never cross devices.
+1. speculative decode for the ordinary prefix;
+2. one draft pass, reusing persistent draft KV when enabled, whose first
+   continuation row supplies the K fork proposals;
+3. speculative decode after winner compaction.
 
-The scheduler must measure shared constraints that the ideal split omits:
-PCIe latency/bandwidth, the whole-box power/thermal limit, and contention
-between drafter and evaluator work on the Strix Halo.
+The H-step branch interval itself remains on the R9700 in BT1. If a draft fork
+proposal fails, selection falls back to target-sampled forks. If the winner's
+feature-mirror refresh fails, continuation falls back to ordinary target AR.
+This keeps the first prototype small while making both GPUs useful without a
+second process or IPC setup.
+
+The scheduler must still measure shared constraints: cross-device copy
+latency/bandwidth, whole-box power/thermal limits, and whether Strix draft work
+reduces end-to-end time enough to offset synchronization.
 
 ### Alternative two-GPU target topologies
 
@@ -327,16 +333,36 @@ Proposed experimental surface:
     "horizon": 16,
     "survivors": 1,
     "fork_tokens": 8,
-    "fork": "fixed",          // BT1 supports fixed only
+    "fork": "draft_topk",     // local Strix proposal; "fixed" is target-only
     "select": "logprob"       // BT1 supports logprob only
   }
 }
 ```
 
-All fields remain off by default until the measurements establish useful
-defaults. The BT1 implementation accepts K in {2,4}, H in {8,16}, and one
-survivor. Unsupported target topologies and request combinations fall back to
-ordinary autoregressive decoding; DFlash composition is deferred to BT6.
+BTFlash remains off unless the request includes an enabled configuration. The
+BT1 implementation accepts K in {2,4}, H in {8,16}, and one survivor. Launch
+one HIP process with the target on the R9700 and the matched drafter on Strix:
+
+```bash
+cmake -S server -B server/build-hip-dual \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES='gfx1151;gfx1201' \
+  -DGGML_HIP_GRAPHS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build server/build-hip-dual -j"$(nproc)"
+
+./server/build-hip-dual/dflash_server /path/to/qwen36-target.gguf \
+  --draft /path/to/matched-dflash-draft.gguf \
+  --target-device hip:0 \
+  --draft-device hip:1 \
+  --fa-window 0
+```
+
+The example assumes the R9700 enumerates as `hip:0` and Strix Halo as `hip:1`;
+confirm local enumeration before launch. Do not pass `--draft-ipc-bin` or any
+other draft IPC option. Unsupported target topologies and request combinations
+fall back to ordinary autoregressive decoding. `fixed` remains available for
+target-only comparison, while `draft_topk` requires the local split drafter.
 
 ## 9. Milestones
 
@@ -345,15 +371,18 @@ ordinary autoregressive decoding; DFlash composition is deferred to BT6.
   step latency, achieved bandwidth/FLOP/s, SQ/matrix activity, MMVQ/MMQ and FA
   dispatch, logits/sampling time, and VRAM. This replaces assumptions about a
   1.2× K=8 forward with data.
-- **BT1 — qwen35 persistent short branches.** Implement the DeltaNet bank,
-  K ∈ {2,4}, H ∈ {8,16}, early prune to one, compaction, deterministic sampler
-  state, and one final response. No DFlash composition yet.
+- **BT1 — qwen35 persistent short branches on R9700 + Strix.** Implement the
+  DeltaNet bank, K ∈ {2,4}, H ∈ {8,16}, early prune to one, compaction,
+  deterministic sampler state, and one final response. Use the local Strix
+  drafter for prefix/tail speculation and top-K fork proposals; keep the
+  branch interval target-only on R9700. No IPC.
 - **BT2 — selector A/B.** Measure oracle, vote, normalized-logprob, and a
   deployable verifier on Math500/GSM8K and HumanEval. Report selection regret.
-- **BT3 — two-GPU experiment A: support plane.** Keep the complete target and
-  cache on the R9700; put the drafter and/or evaluator on Strix Halo. Overlap
-  safe work, enforce deadlines/fallback, and establish the simplest two-GPU
-  baseline including PCIe, power, and thermal effects.
+- **BT3 — two-GPU experiment A: local support plane.** Keep the complete
+  target and cache on the R9700; extend the in-process Strix drafter path with
+  an evaluator if it earns its synchronization cost. Establish the simplest
+  two-GPU baseline including transfer, power, and thermal effects without a
+  sidecar or IPC protocol.
 - **BT4 — two-GPU experiment B: remote KV/attention.** First measure remote-KV
   storage as a falsifiable baseline, expected to lose at short context. Then
   move attention compute with its KV to Strix and transfer only current
@@ -428,8 +457,9 @@ Initial gates, all subject to measurement:
   currently unsafe in multi-row windowed batches.
 - **KVFlash and target split:** tree rows remain incompatible with active
   KVFlash paging, and the existing layer-split path verifies pure chains only.
-- **Second-GPU deadlines:** an evaluator that blocks the R9700 destroys the
-  latency argument; every remote operation needs a timeout and K=1 fallback.
+- **Second-GPU synchronization:** local draft or evaluator work that stalls the
+  R9700 destroys the latency argument; every support step needs a bounded
+  fallback and must justify its cross-device copy cost.
 - **Streaming perception:** total wall-clock can remain close while buffered
   reasoning increases TTFT or creates a visible pause.
 - **Task dependence:** literature gains do not transfer automatically to this

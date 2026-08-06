@@ -1780,6 +1780,124 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     return true;
 }
 
+bool Qwen35Backend::btflash_local_draft_fork(
+        int committed,
+        int32_t last_token,
+        int width,
+        std::vector<int32_t> & candidates,
+        double & elapsed_s) {
+    candidates.clear();
+    elapsed_s = 0.0;
+    if (!split_gpus_ || !cfg_.draft_path || !draft_backend_ ||
+        draft_parked_ || remote_draft_.active() ||
+        !feature_mirror_.target_feat || committed <= 0 || width <= 1) {
+        return false;
+    }
+
+    DFlashTarget * target = dflash_target();
+    const int q_len = dw_.block_size > 0
+        ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
+    if (!target || q_len < 2) return false;
+
+    const auto start = std::chrono::steady_clock::now();
+    const int hidden = w_.n_embd;
+    std::vector<int32_t> noise_ids((size_t)q_len, target->mask_token_id());
+    noise_ids.front() = last_token;
+    std::vector<float> noise_embed((size_t)hidden * (size_t)q_len);
+    if (!target->embed_tokens(noise_ids.data(), q_len, noise_embed.data())) {
+        return false;
+    }
+
+    constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
+    const int ring_cap = feature_mirror_.cap;
+    const int draft_ctx = std::min(
+        committed,
+        std::min(ring_cap,
+                 std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)));
+    if (draft_ctx <= 0) return false;
+    std::vector<float> hidden_rows((size_t)hidden * (size_t)q_len);
+    const bool use_draft_kv = draft_kv_.gf &&
+        draft_kv_.built_for == (const void *)&dw_;
+    if (use_draft_kv) {
+        // Prefix speculation already initialized the persistent Strix draft
+        // graph. Reuse its ring KV instead of rebuilding/re-encoding context
+        // solely to obtain the fork distribution.
+        if (!draft_kv_begin_step(draft_kv_, dw_, draft_backend_,
+                                 feature_mirror_, committed)) {
+            return false;
+        }
+        ggml_backend_tensor_set(draft_kv_.inp_embed, noise_embed.data(), 0,
+                                sizeof(float) * noise_embed.size());
+        if (ggml_backend_graph_compute(draft_backend_, draft_kv_.gf) !=
+            GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        ggml_backend_tensor_get(draft_kv_.hidden_states,
+                                hidden_rows.data(), 0,
+                                sizeof(float) * hidden_rows.size());
+    } else {
+        const int draft_start = committed - draft_ctx;
+        int mirror_slot0 = 0;
+        const bool use_mirror_view = draft_feature_mirror_can_view(
+            feature_mirror_, committed, draft_ctx, mirror_slot0);
+
+        StepGraph fork_draft_sg;
+        if (!build_draft_step(
+                fork_draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
+                draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
+                committed,
+                /*ctx_len_max=*/std::min(
+                    ring_cap,
+                    std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
+            step_graph_destroy(fork_draft_sg);
+            return false;
+        }
+        if (!use_mirror_view && !copy_feature_ring_range_to_tensor(
+                feature_mirror_, fork_draft_sg.target_hidden_cat,
+                draft_start, draft_ctx)) {
+            step_graph_destroy(fork_draft_sg);
+            return false;
+        }
+
+        ggml_backend_tensor_set(fork_draft_sg.inp_embed,
+                                noise_embed.data(), 0,
+                                sizeof(float) * noise_embed.size());
+        std::vector<int32_t> pos_q((size_t)q_len);
+        std::vector<int32_t> pos_k((size_t)draft_ctx + (size_t)q_len);
+        for (int i = 0; i < q_len; ++i) pos_q[(size_t)i] = draft_ctx + i;
+        for (int i = 0; i < draft_ctx + q_len; ++i) pos_k[(size_t)i] = i;
+        ggml_backend_tensor_set(fork_draft_sg.positions, pos_q.data(), 0,
+                                sizeof(int32_t) * pos_q.size());
+        ggml_backend_tensor_set(fork_draft_sg.positions_k, pos_k.data(), 0,
+                                sizeof(int32_t) * pos_k.size());
+
+        if (ggml_backend_graph_compute(draft_backend_, fork_draft_sg.gf) !=
+            GGML_STATUS_SUCCESS) {
+            step_graph_destroy(fork_draft_sg);
+            return false;
+        }
+        ggml_backend_tensor_get(fork_draft_sg.hidden_states,
+                                hidden_rows.data(), 0,
+                                sizeof(float) * hidden_rows.size());
+        step_graph_destroy(fork_draft_sg);
+    }
+
+    std::vector<float> top_log_probs;
+    std::vector<int32_t> top_token_ids;
+    const float temperature = std::max(0.05f, sampler_.temp);
+    if (!target->project_hidden_to_topk(
+            hidden_rows.data(), q_len, width, temperature,
+            top_log_probs, top_token_ids) ||
+        top_token_ids.size() < (size_t)(2 * width)) {
+        return false;
+    }
+
+    elapsed_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    return btflash_select_draft_fork_candidates(
+        top_token_ids, width, candidates);
+}
+
 bool Qwen35Backend::do_btflash_decode(int committed, int n_gen,
                                       std::vector<int32_t> & out_tokens,
                                       const DaemonIO & io,
@@ -1812,6 +1930,14 @@ bool Qwen35Backend::do_btflash_decode(int committed, int n_gen,
     if (cache_.attn_k.empty() || !cache_.attn_k.front()) {
         return ar_fallback("target attention cache is unavailable");
     }
+    const bool draft_assisted = config.fork == "draft_topk";
+    if (draft_assisted &&
+        (!cfg_.draft_path || !split_gpus_ || !draft_backend_ ||
+         draft_parked_ || cfg_.remote_draft.enabled() ||
+         !feature_mirror_.target_feat)) {
+        return ar_fallback(
+            "draft_topk requires a local drafter on a different GPU");
+    }
 
     // Prefer the configured short ordinary prefix, but leave at least two
     // tokens for a meaningful branch interval on short requests.
@@ -1832,19 +1958,36 @@ bool Qwen35Backend::do_btflash_decode(int committed, int n_gen,
     // Allocate before streaming the ordinary prefix. If the branch bank does
     // not fit, the request can still fall back to AR without having emitted a
     // partial result or advanced the target cache.
+    const auto bank_start = std::chrono::steady_clock::now();
     Qwen35BTFlashStateBank state_bank;
     if (!state_bank.allocate(w_, target_backend_, width)) {
         return ar_fallback("recurrent-state bank allocation failed");
     }
+    const double bank_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - bank_start).count();
 
-    // Prefix decode follows the established qwen35 cursor convention. Its
-    // last emitted token is then fed once to produce the common fork logits;
-    // every branch state is captured immediately after that shared forward.
+    // The dual-device path spec-decodes the ordinary prefix on the local
+    // Strix drafter. The target-only compatibility path keeps the original
+    // AR prefix. Neither path emits the terminal stream sentinel here.
     const size_t prefix_out_begin = out_tokens.size();
-    if (!do_ar_decode(committed, prefix_tokens, out_tokens, io, budget_hook,
-                      forced_close_out, degenerate_close_out)) {
+    const auto prefix_start = std::chrono::steady_clock::now();
+    float prefix_accept_rate = 0.0f;
+    bool prefix_spec_ran = false;
+    const bool prefix_ok = draft_assisted
+        ? do_spec_decode(
+            committed, prefix_tokens, out_tokens, io,
+            prefix_accept_rate, prefix_spec_ran,
+            nullptr, nullptr, nullptr, nullptr, &budget_hook,
+            forced_close_out, degenerate_close_out,
+            /*emit_done=*/false,
+            /*force_sampled_verify=*/true)
+        : do_ar_decode(committed, prefix_tokens, out_tokens, io, budget_hook,
+                       forced_close_out, degenerate_close_out);
+    if (!prefix_ok) {
         return false;
     }
+    const double prefix_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - prefix_start).count();
     const int prefix_emitted = (int)(out_tokens.size() - prefix_out_begin);
     committed += prefix_emitted;
     if (prefix_emitted < prefix_tokens || out_tokens.empty() ||
@@ -1855,9 +1998,22 @@ bool Qwen35Backend::do_btflash_decode(int committed, int n_gen,
 
     GGML_ASSERT(branch_start == committed + 1);
 
+    std::vector<int32_t> draft_fork_candidates;
+    double draft_fork_s = 0.0;
+    const bool draft_fork_ok = draft_assisted && prefix_spec_ran &&
+        btflash_local_draft_fork(
+            committed, out_tokens.back(), width,
+            draft_fork_candidates, draft_fork_s);
+    if (draft_assisted && !draft_fork_ok) {
+        std::fprintf(stderr,
+            "[btflash] Strix fork proposal unavailable; using target-sampled forks\n");
+    }
+
     const int hidden = w_.n_embd;
     const int vocab = w_.n_vocab;
+    const auto branch_start_time = std::chrono::steady_clock::now();
     std::vector<float> embed((size_t)hidden);
+    const int fork_kv_pos = committed;
     const int32_t prefix_tail = out_tokens.back();
     if (!w_.embedder.embed(&prefix_tail, 1, embed.data())) return false;
     if (!build_target_step(sg_, w_, cache_, target_backend_,
@@ -1901,20 +2057,23 @@ bool Qwen35Backend::do_btflash_decode(int committed, int n_gen,
     branch_rng.reserve((size_t)width);
     for (int branch = 0; branch < width; ++branch) {
         branch_rng.emplace_back(btflash_branch_seed(fork_seed, branch));
-        int32_t token = -1;
-        // Conservative duplicate avoidance at the fork only. If the sampler's
-        // support is narrower than K, retain the final duplicate rather than
-        // invent a token outside the configured target distribution.
-        for (int attempt = 0; attempt < 8; ++attempt) {
-            token = sample_logits(fork_logits.data(), vocab, sampler_,
-                                  branch_history[(size_t)branch],
-                                  branch_rng[(size_t)branch]);
-            bool duplicate = false;
-            for (int prior = 0; prior < branch; ++prior) {
-                duplicate = duplicate ||
-                    branch_tokens[(size_t)prior].front() == token;
+        int32_t token = draft_fork_ok
+            ? draft_fork_candidates[(size_t)branch] : -1;
+        if (!draft_fork_ok) {
+            // Conservative duplicate avoidance at the target-sampled fork.
+            // If the configured support is narrower than K, retain the final
+            // duplicate rather than invent a token outside the distribution.
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                token = sample_logits(fork_logits.data(), vocab, sampler_,
+                                      branch_history[(size_t)branch],
+                                      branch_rng[(size_t)branch]);
+                bool duplicate = false;
+                for (int prior = 0; prior < branch; ++prior) {
+                    duplicate = duplicate ||
+                        branch_tokens[(size_t)prior].front() == token;
+                }
+                if (!duplicate) break;
             }
-            if (!duplicate) break;
         }
         branch_tokens[(size_t)branch].push_back(token);
         branch_history[(size_t)branch].push_back(token);
@@ -2000,7 +2159,10 @@ bool Qwen35Backend::do_btflash_decode(int committed, int n_gen,
         }
     }
     step_graph_destroy(branch_sg);
+    const double branch_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - branch_start_time).count();
 
+    const auto compact_start = std::chrono::steady_clock::now();
     const int winner = btflash_select_normalized_logprob(logprob_sums,
                                                           logprob_counts);
     if (winner < 0 || !state_bank.restore(cache_, winner)) {
@@ -2013,6 +2175,15 @@ bool Qwen35Backend::do_btflash_decode(int committed, int n_gen,
         std::fprintf(stderr, "[btflash] winner KV compaction failed\n");
         return false;
     }
+    bool draft_tail_ready = draft_assisted && prefix_spec_ran;
+    if (draft_tail_ready && !sync_local_draft_features(
+            fork_kv_pos, fed_steps + 1)) {
+        std::fprintf(stderr,
+            "[btflash] winner feature sync to Strix failed; tailing off with AR\n");
+        draft_tail_ready = false;
+    }
+    const double compact_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - compact_start).count();
 
     sampler_rng_ = branch_rng[(size_t)winner];
     const auto & selected = branch_tokens[(size_t)winner];
@@ -2025,20 +2196,44 @@ bool Qwen35Backend::do_btflash_decode(int committed, int n_gen,
     cache_.cur_pos = committed;
     cache_.last_tok = selected.back();
     std::fprintf(stderr,
-        "[btflash] K=%d H=%zu prefix=%d winner=%d score=%.6f physical_rows=%d\n",
+        "[btflash] K=%d H=%zu prefix=%d winner=%d score=%.6f "
+        "physical_rows=%d fork=%s bank_ms=%.3f prefix_ms=%.3f "
+        "strix_fork_ms=%.3f branch_ms=%.3f compact_ms=%.3f "
+        "prefix_accept=%.3f\n",
         width, selected.size(), prefix_emitted, winner,
         logprob_sums[(size_t)winner] / logprob_counts[(size_t)winner],
-        fed_steps * width);
+        fed_steps * width, draft_fork_ok ? "draft_topk" : "target_sample",
+        bank_s * 1000.0, prefix_s * 1000.0, draft_fork_s * 1000.0,
+        branch_s * 1000.0, compact_s * 1000.0, prefix_accept_rate);
 
     if (io.is_cancelled() || IS_EOS_TOK(selected.back(), w_)) {
         io.emit(-1);
         return true;
     }
     const int remaining = n_gen - (int)out_tokens.size();
-    const bool ok = remaining <= 0 ||
-        do_ar_decode(committed, remaining, out_tokens, io, budget_hook,
-                     forced_close_out, degenerate_close_out);
-    io.emit(-1);
+    if (remaining <= 0) {
+        io.emit(-1);
+        return true;
+    }
+    bool ok = false;
+    if (draft_tail_ready) {
+        float tail_accept_rate = 0.0f;
+        bool tail_spec_ran = false;
+        ok = do_spec_decode(
+            committed, remaining, out_tokens, io,
+            tail_accept_rate, tail_spec_ran,
+            nullptr, nullptr, nullptr, nullptr, &budget_hook,
+            forced_close_out, degenerate_close_out,
+            /*emit_done=*/true,
+            /*force_sampled_verify=*/true);
+        std::fprintf(stderr,
+            "[btflash] Strix continuation spec=%d accept=%.3f\n",
+            tail_spec_ran ? 1 : 0, tail_accept_rate);
+    } else {
+        ok = do_ar_decode(committed, remaining, out_tokens, io, budget_hook,
+                          forced_close_out, degenerate_close_out);
+        io.emit(-1);
+    }
     return ok;
 }
 
@@ -2104,7 +2299,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     const std::vector<int32_t> * stall_skip_tokens,
                                     const BudgetHook * budget_hook,
                                     bool * forced_close_out,
-                                    bool * degenerate_close_out) {
+                                    bool * degenerate_close_out,
+                                    bool emit_done,
+                                    bool force_sampled_verify) {
     out_accept_rate = 0.0f;
     out_spec_ran    = false;
     // [TAG_DRAFT_KV] the drafter ring persists across requests but its rows
@@ -2139,7 +2336,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // verification is unaffected, but the logit TAIL drifts at long
     // context and top-k sampling draws degenerate tokens from it
     // (reproduced at 24K: 0/12 tool calls with fa-window 2048, 4/4 with 0).
-    const bool sampled_verify = kSampledVerify &&
+    const bool sampled_verify = (kSampledVerify || force_sampled_verify) &&
         sampler_.needs_logit_processing() &&
         cfg_.fa_window == 0;
 
@@ -2168,7 +2365,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         bool ok = do_ar_decode(committed, n_gen, out_tokens, io,
                                 budget_hook ? *budget_hook : BudgetHook{},
                                 forced_close_out, degenerate_close_out);
-        io.emit(-1);
+        if (emit_done) io.emit(-1);
         return ok;
     }
 
@@ -2301,7 +2498,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 log_target_forward_stats();
-                io.emit(-1);
+                if (emit_done) io.emit(-1);
                 return true;
             }
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
@@ -2309,7 +2506,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
             log_target_forward_stats();
-            io.emit(-1);
+            if (emit_done) io.emit(-1);
             return ok;
         }
 
@@ -3079,7 +3276,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 log_target_forward_stats();
-                io.emit(-1);
+                if (emit_done) io.emit(-1);
                 return true;
             }
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
@@ -3087,7 +3284,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
             log_target_forward_stats();
-            io.emit(-1);
+            if (emit_done) io.emit(-1);
             return ok;
         }
         // Budget hook close: close token was emitted during the emit phase.
@@ -3122,7 +3319,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 log_target_forward_stats();
-                io.emit(-1);
+                if (emit_done) io.emit(-1);
                 return true;
             }
             BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
@@ -3131,7 +3328,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
             log_target_forward_stats();
-            io.emit(-1);
+            if (emit_done) io.emit(-1);
             return ok;
         }
         if (hit_eos) break;
@@ -3166,7 +3363,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                      100.0 * (double)n_hint_accepted / (double)n_hint_proposed);
     }
 
-    io.emit(-1);
+    if (emit_done) io.emit(-1);
     return true;
 }
 

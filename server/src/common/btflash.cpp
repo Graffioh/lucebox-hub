@@ -22,8 +22,8 @@ std::string validate_btflash_config(const BTFlashConfig & config) {
     if (config.survivors != 1) {
         return "btflash.survivors must be 1 in the BT1 prototype";
     }
-    if (config.fork != "fixed") {
-        return "btflash.fork must be fixed in the BT1 prototype";
+    if (config.fork != "fixed" && config.fork != "draft_topk") {
+        return "btflash.fork must be fixed or draft_topk in the BT1 prototype";
     }
     if (config.select != "logprob") {
         return "btflash.select must be logprob in the BT1 prototype";
@@ -71,6 +71,25 @@ int btflash_select_normalized_logprob(const std::vector<double> & logprob_sums,
         }
     }
     return best;
+}
+
+bool btflash_select_draft_fork_candidates(
+        const std::vector<int32_t> & top_token_ids,
+        int width,
+        std::vector<int32_t> & candidates) {
+    candidates.clear();
+    if (width <= 1 || top_token_ids.size() < (size_t)(2 * width)) {
+        return false;
+    }
+    candidates.reserve((size_t)width);
+    for (int rank = 0; rank < width; ++rank) {
+        const int32_t token = top_token_ids[(size_t)width + (size_t)rank];
+        if (std::find(candidates.begin(), candidates.end(), token) ==
+            candidates.end()) {
+            candidates.push_back(token);
+        }
+    }
+    return (int)candidates.size() == width;
 }
 
 void build_btflash_mask(std::vector<uint16_t> & out,

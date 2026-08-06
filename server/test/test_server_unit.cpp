@@ -2143,7 +2143,17 @@ TEST_CASE(ServerUnitFixture, test_parse_btflash_config_defaults_and_validation) 
     CHECK(config.k == 2);
     CHECK(config.horizon == 8);
     CHECK(config.fork_tokens == 4);
+    CHECK(config.fork == "draft_topk");
     CHECK(config.select == "logprob");
+
+    const BTFlashConfig fixed = parse_btflash_config({
+        {"btflash", {
+            {"k", 2},
+            {"horizon", 8},
+            {"fork", "fixed"},
+        }},
+    });
+    CHECK(fixed.fork == "fixed");
 
     bool threw = false;
     try {

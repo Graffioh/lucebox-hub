@@ -18,7 +18,7 @@ struct BTFlashConfig {
     int         horizon     = 0;
     int         survivors   = 1;
     int         fork_tokens = 8;
-    std::string fork        = "fixed";
+    std::string fork        = "draft_topk";
     std::string select      = "logprob";
 
     bool enabled() const { return k > 1 && horizon > 0; }
@@ -40,6 +40,13 @@ double btflash_token_logprob(const float * logits, int vocab, int token);
 // stable and choose the lowest branch id.
 int btflash_select_normalized_logprob(const std::vector<double> & logprob_sums,
                                       const std::vector<int> & token_counts);
+
+// DFlash row 0 represents the seed token. Select K distinct candidates from
+// row 1 of the row-major [n_rows, K] top-token projection.
+bool btflash_select_draft_fork_candidates(
+    const std::vector<int32_t> & top_token_ids,
+    int width,
+    std::vector<int32_t> & candidates);
 
 // Build the F16 attention mask for one K-row lockstep branch forward.
 // shared_length is the physical prefix visible to every branch. Each earlier

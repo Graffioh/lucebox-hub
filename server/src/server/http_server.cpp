@@ -534,7 +534,7 @@ BTFlashConfig parse_btflash_config(const json & body) {
     config.horizon     = value->value("horizon", 16);
     config.survivors   = value->value("survivors", 1);
     config.fork_tokens = value->value("fork_tokens", 8);
-    config.fork        = value->value("fork", std::string("fixed"));
+    config.fork        = value->value("fork", std::string("draft_topk"));
     config.select      = value->value("select", std::string("logprob"));
     if (const std::string error = validate_btflash_config(config); !error.empty()) {
         throw std::invalid_argument(error);
