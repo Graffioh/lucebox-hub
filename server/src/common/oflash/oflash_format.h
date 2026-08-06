@@ -124,7 +124,13 @@ static_assert(sizeof(OFlashRecordHeader) == 32, "keep layout stable");
 //   topk_k       i32               K for the trailing top-K arrays (0 = none;
 //                                  when > 0 it equals header.topk)
 //   draft_tok    i32[n_labels]     drafter proposal; [0] is the seed token
-//   target_tok   i32[n_labels]     target argmax/sample per draft position
+//   target_tok   i32[n_labels]     target argmax/sample AFTER consuming
+//                                  draft_tok[0..i] — i.e. target_tok[i] is
+//                                  the ground truth for draft position i+1
+//                                  (drafter row i+1's training label is
+//                                  target_tok[i]; row 0 is the known seed
+//                                  and carries no training signal). The
+//                                  same holds for target_topk_* rows.
 //   accept_flags u8[n_labels]      1 = accepted, 0 = rejected
 //   (pad to 8-byte multiple)
 //   accept_len   i32               committed accepted length incl. the seed

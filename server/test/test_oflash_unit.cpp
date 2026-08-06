@@ -13,6 +13,7 @@
 #include "common/oflash/oflash_format.h"
 #include "common/oflash/oflash_guard.h"
 #include "common/oflash/oflash_ring.h"
+#include "common/oflash/oflash_supervisor.h"
 #include "internal.h"
 
 #include <nlohmann/json.hpp>
@@ -474,6 +475,65 @@ TEST_CASE(OFlashUnitFixture, adapter_load_refuses_mismatches) {
 
     std::remove(path.c_str());
 }
+
+// ── Supervisor process contract ─────────────────────────────────────
+
+#if !defined(_WIN32)
+TEST_CASE(OFlashUnitFixture, supervisor_spawns_and_relays_swap_events) {
+    // Fake trainer: sends the int32 ready handshake on --stream-fd, then a
+    // swap_ready event, echoes nothing else, exits on stdin EOF/quit.
+    const std::string script =
+        "/tmp/oflash-test-trainer-" + std::to_string((long)getpid()) + ".sh";
+    {
+        std::ofstream f(script);
+        f << "#!/bin/bash\n"  // bash: variable-fd redirection >&$fd
+             "fd=2\n"
+             "for a in \"$@\"; do case \"$a\" in --stream-fd=*) "
+             "fd=${a#--stream-fd=};; esac; done\n"
+             // int32 0, little-endian.
+             "printf '\\000\\000\\000\\000' >&$fd\n"
+             "printf '%s\\n' "
+             "'{\"event\":\"swap_ready\",\"path\":\"/tmp/a.st\","
+             "\"generation\":7}' >&$fd\n"
+             "while read line; do [ \"$line\" = quit ] && exit 0; done\n";
+    }
+    ::chmod(script.c_str(), 0755);
+
+    OFlashSupervisor sup;
+    OFlashSupervisorConfig cfg;
+    cfg.trainer_bin = script;
+    cfg.drafter_path = "/nonexistent.gguf";
+    cfg.args = {"--ring-name=/x"};
+    cfg.ready_timeout_ms = 5000;
+    REQUIRE(sup.start(cfg));
+
+    OFlashPendingSwap swap;
+    bool got = false;
+    for (int i = 0; i < 100 && !(got = sup.take_pending_swap(swap)); i++) {
+        ::usleep(50 * 1000);
+    }
+    REQUIRE(got);
+    CHECK_EQUAL(swap.path, std::string("/tmp/a.st"));
+    CHECK_EQUAL(swap.generation, (uint64_t)7);
+    CHECK(sup.trainer_alive());
+    sup.send_line("promote 7");
+    sup.stop();  // graceful: quit → clean child exit → reap
+    CHECK(!sup.trainer_alive());
+    std::remove(script.c_str());
+}
+
+TEST_CASE(OFlashUnitFixture, supervisor_survives_missing_binary) {
+    OFlashSupervisor sup;
+    OFlashSupervisorConfig cfg;
+    cfg.trainer_bin = "/nonexistent/oflash-trainer";
+    cfg.ready_timeout_ms = 500;
+    cfg.max_respawns = 0;
+    REQUIRE(sup.start(cfg));  // thread starts; spawn fails inside
+    for (int i = 0; i < 100 && sup.trainer_alive(); i++) ::usleep(20 * 1000);
+    CHECK(!sup.trainer_alive());
+    sup.stop();  // must not hang or crash
+}
+#endif
 
 // ── Profile store ───────────────────────────────────────────────────
 

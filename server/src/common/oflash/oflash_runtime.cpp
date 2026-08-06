@@ -151,6 +151,7 @@ bool OFlashRuntime::init(const OFlashConfig & cfg,
         std::fprintf(stderr, "[oflash] no --oflash-trainer-bin; "
                              "capture-only (M0) mode\n");
     }
+    refresh_props_cache();  // warm-start generation visible before step 1
     return true;
 }
 
