@@ -153,7 +153,12 @@ struct ServerConfig {
     std::string runtime_backend;       // "cuda" | "hip" | "cpu"
     int         fa_window           = 0;
     int         ddtree_budget       = 0;
+    bool        ddtree_enabled      = false;
     bool        speculative_enabled = false;
+    bool        qflash_enabled      = false;
+    int         qflash_branches     = 0;
+    int         qflash_horizon      = 0;
+    float       qflash_margin       = 0.0f;
     bool        target_sharding     = false;
     // Prefill chunk size (bargs.chunk). Exposed at /props.runtime.chunk so
     // bench/snapshot tooling can capture the full server config — needed

@@ -4,6 +4,9 @@
 
 #include "model_capabilities.h"
 
+#include <cmath>
+#include <cstdint>
+
 namespace dflash::common {
 
 std::string check_feature_compatibility(
@@ -42,6 +45,32 @@ std::string check_feature_compatibility(
     if (!args.remote_target_shard.enabled() &&
         args.remote_target_shard.has_aux_options()) {
         return "--target-shard-ipc-work-dir requires --target-shard-ipc-bin";
+    }
+
+    // QFlash deliberately starts with the narrow path whose tree rollback is
+    // already production-tested. Mixed-backend draft execution is allowed:
+    // only the small drafter runs remotely; target KV and verification remain
+    // together on the local qwen35 target.
+    if (args.qflash_mode) {
+        if (!args.draft_path) {
+            return "--qflash requires --draft";
+        }
+        if (arch != "qwen35" || args.device.is_multi_device() ||
+            args.device.split_mode == TargetSplitMode::Tensor) {
+            return "--qflash currently requires a single-device dense qwen35 target";
+        }
+        if (!args.fast_rollback) {
+            return "--qflash requires fast rollback; remove --no-fast-rollback";
+        }
+        if (args.qflash_branches < 2 || args.qflash_branches > 8 ||
+            args.qflash_horizon < 1 ||
+            1 + static_cast<int64_t>(args.qflash_branches) *
+                    args.qflash_horizon > 64) {
+            return "--qflash requires 2..8 branches and at most 64 total verify rows";
+        }
+        if (!std::isfinite(args.qflash_margin) || args.qflash_margin < 0.0f) {
+            return "--qflash-margin must be a finite non-negative number";
+        }
     }
 
     // ── PFlash enablement × drafter model

@@ -111,6 +111,10 @@ static void print_usage(const char * prog) {
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
+        "  --qflash             One quality-search fork per request (qwen35)\n"
+        "  --qflash-branches <N> Candidate branches (default: 4; range: 2..8)\n"
+        "  --qflash-horizon <N> Tokens per branch (default: 7)\n"
+        "  --qflash-margin <F>  Min target score gain in nats/token (default: 0.10)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
         "                       trimmed per step by drafter confidence; N = fixed base)\n"
         "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
@@ -362,6 +366,20 @@ int main(int argc, char ** argv) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--qflash") == 0) {
+            bargs.qflash_mode = true;
+            bargs.fast_rollback = true;
+        } else if (std::strcmp(argv[i], "--qflash-branches") == 0 && i + 1 < argc) {
+            bargs.qflash_branches = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--qflash-horizon") == 0 && i + 1 < argc) {
+            bargs.qflash_horizon = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--qflash-margin") == 0 && i + 1 < argc) {
+            char * end = nullptr;
+            bargs.qflash_margin = std::strtof(argv[++i], &end);
+            if (end == argv[i] || *end != '\0') {
+                std::fprintf(stderr, "[server] bad --qflash-margin value\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--adaptive-experts") == 0) {
             const char * tau = "0.80";
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -1030,6 +1048,13 @@ int main(int argc, char ** argv) {
                              "[server] │     Use --fa-window 0 for tool-call workloads.\n");
     }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  qflash          = %s\n", bargs.qflash_mode ? "ON" : "off");
+    if (bargs.qflash_mode) {
+        std::fprintf(stderr,
+                     "[server] │  qflash_shape    = %dx%d margin=%.3f\n",
+                     bargs.qflash_branches, bargs.qflash_horizon,
+                     bargs.qflash_margin);
+    }
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
     if (bargs.device.is_layer_split()) {
         std::fprintf(stderr, "[server] │  split_rollback  = %s\n",
@@ -1080,7 +1105,12 @@ int main(int argc, char ** argv) {
     sconfig.draft_path   = bargs.draft_path ? bargs.draft_path : "";
     sconfig.fa_window    = bargs.fa_window;
     sconfig.ddtree_budget = bargs.ddtree_budget;
-    sconfig.speculative_enabled = bargs.ddtree_mode;
+    sconfig.ddtree_enabled = bargs.ddtree_mode;
+    sconfig.speculative_enabled = bargs.ddtree_mode || bargs.qflash_mode;
+    sconfig.qflash_enabled = bargs.qflash_mode;
+    sconfig.qflash_branches = bargs.qflash_branches;
+    sconfig.qflash_horizon = bargs.qflash_horizon;
+    sconfig.qflash_margin = bargs.qflash_margin;
     sconfig.target_sharding     = bargs.device.is_layer_split();
     // KV type: report the operator's choice if set, else the family default
     // the backend resolves (the tq3_0 auto policy was removed; laguna uses

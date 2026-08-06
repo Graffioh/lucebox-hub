@@ -33,6 +33,10 @@ struct Qwen35DaemonArgs {
     int          ddtree_budget     = 22;
     float        ddtree_temp       = 1.0f;
     bool         ddtree_chain_seed = true;
+    bool         qflash_mode       = false;
+    int          qflash_branches   = 4;
+    int          qflash_horizon    = 7;
+    float        qflash_margin     = 0.10f;
     bool         use_feature_mirror = false;
 };
 

@@ -18,6 +18,7 @@
 #include "placement/remote_draft_config.h"
 #include "step_graph.h"
 #include "ddtree.h"
+#include "common/qflash.h"
 #include "dflash_feature_ring.h"
 #include "common/dflash_draft_kv.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
@@ -69,6 +70,10 @@ struct Qwen35Config {
     int          ddtree_budget   = 22;
     float        ddtree_temp     = 1.0f;
     bool         ddtree_chain_seed = true;
+    bool         qflash_mode     = false;
+    int          qflash_branches = 4;
+    int          qflash_horizon  = 7;
+    float        qflash_margin   = 0.10f;
     bool         use_feature_mirror = false;
 };
 

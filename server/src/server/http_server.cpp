@@ -772,8 +772,17 @@ json build_props_body(const ServerConfig & config,
         }},
         {"speculative", {
             {"enabled",       config.speculative_enabled},
-            {"ddtree_budget", config.speculative_enabled
+            {"ddtree_budget", config.ddtree_enabled
                                 ? json(config.ddtree_budget) : json(nullptr)},
+            {"qflash", {
+                {"enabled",  config.qflash_enabled},
+                {"branches", config.qflash_enabled
+                                ? json(config.qflash_branches) : json(nullptr)},
+                {"horizon",  config.qflash_enabled
+                                ? json(config.qflash_horizon) : json(nullptr)},
+                {"margin",   config.qflash_enabled
+                                ? json(config.qflash_margin) : json(nullptr)},
+            }},
         }},
         {"sampling", {
             {"capabilities", {

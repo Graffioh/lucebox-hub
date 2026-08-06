@@ -89,6 +89,17 @@ static int env_int_or_default(const char * name, int fallback) {
     return fallback;
 }
 
+static int qwen35_max_verify_tokens(const Qwen35Config & cfg, int draft_block) {
+    int rows = std::max(1, draft_block);
+    if (cfg.ddtree_mode) rows = std::max(rows, cfg.ddtree_budget + 1);
+    if (cfg.qflash_mode) {
+        rows = std::max(rows,
+                        qflash_required_rows(cfg.qflash_branches,
+                                             cfg.qflash_horizon));
+    }
+    return rows;
+}
+
 static int dflash_min_tokens_floor() {
     static const int value = env_int_or_default("DFLASH_MIN_TOKENS", 0);
     return value;
@@ -254,10 +265,15 @@ bool Qwen35Backend::init() {
         }
     }
 
+    if (cfg_.qflash_mode && cfg_.qflash_horizon >= dw_.block_size) {
+        std::fprintf(stderr,
+            "qflash: horizon %d needs a draft block of at least %d rows (got %d)\n",
+            cfg_.qflash_horizon, cfg_.qflash_horizon + 1, dw_.block_size);
+        return false;
+    }
+
     // Create KV cache
-    const int max_verify_tokens = cfg_.ddtree_mode
-        ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
-        : dw_.block_size;
+    const int max_verify_tokens = qwen35_max_verify_tokens(cfg_, dw_.block_size);
     // kvflash (bounded residency): pool size from the env, rounded/floored/
     // clamped by the shared reader (256-stride keeps FA vec-kernel
     // eligibility; the floor keeps eviction from deadlocking).
@@ -1073,9 +1089,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // already migrated when the snapshot was taken; re-running migrate would
     // clobber the restored state.
     if (kv_offset == 0) {
-        const int max_verify_tokens = cfg_.ddtree_mode
-            ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
-            : dw_.block_size;
+        const int max_verify_tokens =
+            qwen35_max_verify_tokens(cfg_, dw_.block_size);
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
                                    target_backend_, cache_)) {
@@ -1936,10 +1951,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     DFlashTarget * target = dflash_target();
     const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int max_verify_tokens = cfg_.ddtree_mode
-        ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
-        : dw_.block_size;
-    if ((cfg_.fast_rollback || cfg_.ddtree_mode) && !cache_.rollback_ctx) {
+    const int max_verify_tokens = qwen35_max_verify_tokens(cfg_, q_len);
+    if ((cfg_.fast_rollback || cfg_.ddtree_mode || cfg_.qflash_mode) &&
+        !cache_.rollback_ctx) {
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
                                    target_backend_, cache_)) {
@@ -1967,6 +1981,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
+    bool qflash_done    = false;
     const ChainRollbackPolicy rollback_policy =
         resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel());
     const int fast_rollback_threshold =
@@ -2154,14 +2169,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         profile_add(profile_draft_s, profile_draft_start);
 
-        // ── DDTree tree-structured verify ────────────────────────────────
-        // When --ddtree is on and the target supports tree verify, build a
-        // draft tree from per-position top-K, verify all nodes in one
-        // ancestor-masked target forward, walk the verified path, then roll
-        // recurrent/KV state forward to the accepted path. Higher acceptance
-        // per step than chain verify. Local draft only. On any failure we
-        // fall through is unsafe (draft graph already built for chain), so we
-        // bail to false.
+        // ── QFlash / DDTree tree-structured verify ───────────────────────
+        // DDTree follows exact speculative acceptance every round. QFlash
+        // uses the same tree graph once, scores complete short branches, and
+        // supports both the local and remote drafter paths. On any failure,
+        // falling through is unsafe because the tree graph has already
+        // mutated speculative state, so both paths fail closed.
         // The tree path handles plain generation only. Requests using features
         // the tree branch does not implement — thinking-budget forced close,
         // tool-call hint injection, stall recovery, or the min-tokens floor
@@ -2177,24 +2190,154 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // fits the resident pool. Full-attention only (windowed FA padding could
         // index past the pool). Otherwise the slot-mapped chain verify handles
         // it. Non-kvflash is unaffected.
-        const bool kvflash_tree_ok =
+        const int qflash_rows = qflash_required_rows(cfg_.qflash_branches,
+                                                      cfg_.qflash_horizon);
+        const bool kvflash_ddtree_ok =
             !kvflash_active() ||
             (cfg_.fa_window == 0 &&
              committed + cfg_.ddtree_budget + 1 + cfg_.kq_stride_pad <= kvflash_tokens_ &&
              kvflash_pager_.identity_prefix_covers(committed));
+        const bool kvflash_qflash_ok =
+            !kvflash_active() ||
+            (cfg_.fa_window == 0 &&
+             committed + qflash_rows + cfg_.kq_stride_pad <= kvflash_tokens_ &&
+             kvflash_pager_.identity_prefix_covers(committed));
+        const bool use_qflash_verify =
+            cfg_.qflash_mode && !qflash_done && !sampled_verify &&
+            target->supports_tree_verify() && kvflash_qflash_ok &&
+            q_len > cfg_.qflash_horizon && tree_special_inactive;
         const bool use_tree_verify =
-            cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
+            !use_qflash_verify && cfg_.ddtree_mode &&
+            target->supports_tree_verify() && kvflash_ddtree_ok &&
             !use_remote_draft && q_len > 1 && tree_special_inactive;
 
         // DDTree consumes top-K rows directly. Avoid projecting the same
         // hidden block once for argmax and again for top-K on every step.
-        if (!use_tree_verify) {
+        if (!use_qflash_verify && !use_tree_verify) {
             if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
                 std::fprintf(stderr, "spec-decode: projection failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
             draft_tok[0] = last_tok;
+        }
+
+        if (use_qflash_verify) {
+            const int K = cfg_.qflash_branches;
+            std::vector<float> top_lp;
+            std::vector<int32_t> top_ids;
+            const auto profile_project_start = profile_start();
+            if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
+                                                /*temperature=*/1.0f,
+                                                top_lp, top_ids)) {
+                std::fprintf(stderr, "spec-decode: qflash topk projection failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            profile_add(profile_project_s, profile_project_start);
+
+            // Row 0 is the current seed. QFlash fans out from draft row 1,
+            // then follows each candidate with the spine-conditioned top-1
+            // tail already produced by this single drafter forward.
+            QFlashTree qtree = build_qflash_tree(
+                top_ids.data() + (size_t)K,
+                q_len - 1, K, cfg_.qflash_branches, cfg_.qflash_horizon);
+            if (qtree.tree.n_nodes <= 0 || qtree.branches.empty()) {
+                std::fprintf(stderr, "spec-decode: qflash tree build failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+
+            std::vector<int32_t> flat_tokens((size_t)qflash_rows, 0);
+            flat_tokens[0] = last_tok;
+            for (int i = 0; i < qtree.tree.n_nodes; ++i) {
+                flat_tokens[1 + i] = qtree.tree.token_ids[i];
+            }
+
+            const auto profile_snapshot_start = profile_start();
+            if (!target->snapshot_kv()) {
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            profile_add(profile_snapshot_s, profile_snapshot_start);
+
+            std::vector<int32_t> posterior;
+            std::vector<float> node_logits;
+            const auto profile_verify_start = profile_start();
+            if (!target->verify_tree(committed, qtree.tree, flat_tokens,
+                                     qflash_rows, posterior, &node_logits)) {
+                std::fprintf(stderr, "spec-decode: qflash verify_tree failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            profile_add(profile_verify_s, profile_verify_start);
+            target_forwards++;
+
+            QFlashSelection selected = select_qflash_branch(
+                qtree, node_logits.data(), qtree.tree.n_nodes + 1,
+                w_.n_vocab, cfg_.qflash_margin);
+            if (selected.accepted.size() <= 1) {
+                std::fprintf(stderr, "spec-decode: qflash selection failed\n");
+                target->restore_kv();
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+
+            int accepted_n = std::min<int>((int)selected.accepted.size(),
+                                           need_commit_budget);
+            std::vector<int> accepted(selected.accepted.begin(),
+                                      selected.accepted.begin() + accepted_n);
+            bool hit_eos = false;
+            int emitted = 0;
+            for (int dfs : accepted) {
+                const int32_t token = dfs == 0
+                    ? last_tok
+                    : qtree.tree.token_ids[dfs - 1];
+                out_tokens.push_back(token);
+                io.emit(token);
+                emitted++;
+                if (io.is_cancelled() || target->is_eos(token)) {
+                    hit_eos = true;
+                    break;
+                }
+            }
+            accepted.resize(emitted);
+            if (accepted.empty() ||
+                !target->rollback_to_tree(committed, qtree.tree, accepted)) {
+                std::fprintf(stderr, "spec-decode: qflash rollback_to_tree failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+
+            last_tok = posterior[accepted.back()];
+            const auto profile_feature_start = profile_start();
+            const bool feature_ok = use_remote_draft
+                ? sync_remote_draft_features(committed, emitted)
+                : sync_local_draft_features(committed, emitted);
+            if (!feature_ok) {
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            profile_add(profile_feature_s, profile_feature_start);
+
+            std::fprintf(stderr,
+                "[qflash] branches=%d horizon=%d actual_rows=%d alloc_rows=%d "
+                "selected=%d score=%.4f main=%.4f margin=%.4f\n",
+                cfg_.qflash_branches, cfg_.qflash_horizon,
+                qtree.tree.n_nodes + 1, qflash_rows, selected.branch,
+                selected.score, selected.main_score, cfg_.qflash_margin);
+
+            qflash_done = true;
+            n_accept_sum += std::max(0, emitted - 1);
+            committed += emitted;
+            cache_.cur_pos = committed;
+            n_generated += emitted;
+            n_draft_steps++;
+            if (hit_eos || io.is_cancelled() || n_generated >= n_gen ||
+                last_tok < 0 || target->is_eos(last_tok)) {
+                break;
+            }
+            continue;
         }
 
         if (use_tree_verify) {

@@ -107,6 +107,27 @@ static void test_feature_gate_ipc_options_require_ipc_binary() {
         target, "qwen35", PlacementBackend::Cuda).empty());
 }
 
+static void test_feature_gate_qflash_is_narrow_and_fail_closed() {
+    BackendArgs args;
+    args.model_path = "/nonexistent/model.gguf";
+    args.qflash_mode = true;
+
+    TEST_ASSERT(gate_result(args, "qwen35", PlacementBackend::Cuda)
+                    .find("requires --draft") != std::string::npos);
+
+    args.draft_path = "/nonexistent/draft.gguf";
+    TEST_ASSERT(gate_result(args, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_result(args, "qwen35moe", PlacementBackend::Cuda).empty());
+
+    args.fast_rollback = false;
+    TEST_ASSERT(!gate_result(args, "qwen35", PlacementBackend::Cuda).empty());
+    args.fast_rollback = true;
+
+    args.qflash_branches = 8;
+    args.qflash_horizon = 8; // root + 64 candidates exceeds the MVP cap
+    TEST_ASSERT(!gate_result(args, "qwen35", PlacementBackend::Cuda).empty());
+}
+
 static void test_feature_gate_mixed_draft_placement_requires_ipc() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
@@ -478,6 +499,7 @@ int main() {
     RUN_TEST(test_feature_gate_rejects_undetected_arch);
     RUN_TEST(test_feature_gate_requires_compiled_target_backend);
     RUN_TEST(test_feature_gate_ipc_options_require_ipc_binary);
+    RUN_TEST(test_feature_gate_qflash_is_narrow_and_fail_closed);
     RUN_TEST(test_feature_gate_mixed_draft_placement_requires_ipc);
     RUN_TEST(test_feature_gate_pflash_requires_drafter_and_supported_arch);
     RUN_TEST(test_feature_gate_validates_target_split_topology);
