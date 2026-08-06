@@ -1811,6 +1811,13 @@ TEST_CASE(ServerUnitFixture, test_inline_snapshot_prefers_tools_boundary_until_r
     TEST_ASSERT(select_inline_snapshot_boundary({100}, 100, true) == 0);
 }
 
+TEST_CASE(ServerUnitFixture, test_ppp_master_toggle_gates_tools_boundary_pinning) {
+    TEST_ASSERT(ppp_prefers_tools_boundary(true, true));
+    TEST_ASSERT(!ppp_prefers_tools_boundary(false, true));
+    TEST_ASSERT(!ppp_prefers_tools_boundary(true, false));
+    TEST_ASSERT(!ppp_prefers_tools_boundary(false, false));
+}
+
 // ── Pin-Friendly Prompt Processor (PPP) ─────────────────────────────────
 
 TEST_CASE(ServerUnitFixture, test_ppp_lcp_and_safe_boundary) {

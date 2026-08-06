@@ -255,6 +255,10 @@ json require_messages_array(const json & body);
 // selected field is parsed, so malformed lower-priority aliases are ignored.
 int resolve_max_output_tokens(const json & body, int default_max_tokens);
 
+// Sticky tools-boundary pinning is part of PPP and must follow its master
+// toggle. Kept as a small policy helper so the disabled path is testable.
+bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools);
+
 // Build the /props response body. Exposed (non-static) so unit tests
 // can assert on its shape without spinning up a real socket. See
 // docs/specs/props-endpoint.md for the wire contract.

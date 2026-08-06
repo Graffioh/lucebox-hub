@@ -400,6 +400,10 @@ int resolve_max_output_tokens(const json & body, int default_max_tokens) {
     return default_max_tokens;
 }
 
+bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools) {
+    return ppp_enabled && has_tools;
+}
+
 // Sampler parameters. When the request omits a value, fall back to the
 // model card's sampling defaults (spec §3.3); when the card doesn't
 // supply one either, use the hard-coded default.
@@ -2717,7 +2721,8 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     auto & effective_prompt = prepared.tokens;
     // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
     const bool prefer_inline_snap = !req.tools.empty();
-    const bool prefer_tools_boundary = prefer_inline_snap;
+    const bool prefer_tools_boundary =
+        ppp_prefers_tools_boundary(config_.ppp_enabled, prefer_inline_snap);
     int forced_cut = req.pin_end_token;
 
     // PPP runs *before* lookup. Default (rearrange=0): annotate a sticky
