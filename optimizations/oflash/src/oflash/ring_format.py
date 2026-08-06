@@ -162,9 +162,20 @@ class RingReader:
         PAD records are consumed transparently.
         """
         while True:
-            if self.head - self.tail < RECORD_HEADER_SIZE:
+            if self.head - self.tail < 8:
                 return None
             at = self.tail
+            # A buffer-tail gap can be smaller than a full record header;
+            # PADs there carry only their first 8 bytes (type + size).
+            to_end = self.info.capacity - (at % self.info.capacity)
+            if to_end < RECORD_HEADER_SIZE:
+                rtype, size = struct.unpack("<II", self._read_span(at, 8))
+                if rtype != REC_PAD or size != to_end:
+                    raise RuntimeError(f"corrupt tail-gap record at {at}")
+                self.tail = at + size
+                continue
+            if self.head - self.tail < RECORD_HEADER_SIZE:
+                return None
             hdr = self._read_span(at, RECORD_HEADER_SIZE)
             rtype, size, seq_id, pos, n_rows, t_ns = struct.unpack(
                 "<IIQiiQ", hdr)
@@ -259,7 +270,7 @@ class RingWriter:
         to_end = self.capacity - (self._head % self.capacity)
         if size > to_end:
             pad = struct.pack("<IIQiiQ", REC_PAD, to_end, 0, 0, 0, 0)
-            self._write_at(self._head, pad)
+            self._write_at(self._head, pad[:min(to_end, len(pad))])
             self._head += to_end
         rec = struct.pack("<IIQiiQ", rtype, size, seq_id, pos, n_rows,
                           t_mono_ns) + payload

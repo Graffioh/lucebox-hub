@@ -89,6 +89,10 @@ enum OFlashRecordType : uint32_t {
     OFLASH_REC_STEP    = 2,  // one verify step: rows + labels + flags
     OFLASH_REC_SEQ_END = 3,  // request finished; seq_id is retired
 };
+// A buffer-tail gap can be smaller than sizeof(OFlashRecordHeader); the PAD
+// written there carries only its first 8 bytes (type + size_bytes), which is
+// all a reader needs to skip it. Readers must special-case
+// capacity - (tail % capacity) < sizeof(OFlashRecordHeader).
 
 struct OFlashRecordHeader {
     uint32_t type;        // OFlashRecordType

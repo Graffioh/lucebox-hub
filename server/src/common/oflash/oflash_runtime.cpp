@@ -7,6 +7,7 @@
 #include "internal.h"               // DraftWeights
 #include "common/gguf_inspect.h"    // read_gguf_metadata (drafter sha256)
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <ctime>

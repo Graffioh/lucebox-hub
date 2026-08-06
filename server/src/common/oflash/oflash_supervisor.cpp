@@ -130,8 +130,17 @@ bool OFlashSupervisor::spawn_once(std::string & error) {
 
     // Ready handshake: one int32 (0 = ok). The trainer sends it right after
     // attaching the ring, BEFORE loading torch/the mirror, so this is fast.
-    struct pollfd pfd { child_stream_, POLLIN, 0 };
-    const int pr = ::poll(&pfd, 1, cfg_.ready_timeout_ms);
+    // Poll in slices so stop() never waits the whole handshake timeout.
+    int pr = 0;
+    for (int waited = 0; waited < cfg_.ready_timeout_ms; waited += 200) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (stopping_) { reap_child(false); error = "stopping"; return false; }
+        }
+        struct pollfd pfd { child_stream_, POLLIN, 0 };
+        pr = ::poll(&pfd, 1, 200);
+        if (pr != 0) break;
+    }
     if (pr <= 0) {
         error = pr == 0 ? "trainer ready handshake timed out"
                         : "poll on trainer stream failed";

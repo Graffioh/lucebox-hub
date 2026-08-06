@@ -134,12 +134,14 @@ bool OFlashRing::reserve(size_t bytes, uint64_t & write_at) {
     if (pad + bytes > avail) return false;
 
     if (pad) {
-        // PAD always fits its header: every record size is a multiple of
-        // 8, so any buffer tail is too (capacity is 8-aligned).
+        // The buffer tail is a multiple of 8 but can be SMALLER than a full
+        // record header; a PAD needs only its first 8 bytes (type + size)
+        // to be skippable, so clamp the write to the space that exists.
         OFlashRecordHeader ph{};
         ph.type = OFLASH_REC_PAD;
         ph.size_bytes = (uint32_t)pad;
-        std::memcpy(slot(head), &ph, sizeof(ph));
+        std::memcpy(slot(head), &ph,
+                    pad < sizeof(ph) ? (size_t)pad : sizeof(ph));
         // Not published separately — the consumer sees PAD and the next
         // record together once the real record's head store lands.
     }
