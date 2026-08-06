@@ -92,10 +92,10 @@ static int env_int_or_default(const char * name, int fallback) {
 static int qwen35_max_verify_tokens(const Qwen35Config & cfg, int draft_block) {
     int rows = std::max(1, draft_block);
     if (cfg.ddtree_mode) rows = std::max(rows, cfg.ddtree_budget + 1);
-    if (cfg.qflash_mode) {
+    if (cfg.gbatching_mode) {
         rows = std::max(rows,
-                        qflash_required_rows(cfg.qflash_branches,
-                                             cfg.qflash_horizon));
+                        gbatching_required_rows(cfg.gbatching_branches,
+                                             cfg.gbatching_horizon));
     }
     return rows;
 }
@@ -265,10 +265,10 @@ bool Qwen35Backend::init() {
         }
     }
 
-    if (cfg_.qflash_mode && cfg_.qflash_horizon >= dw_.block_size) {
+    if (cfg_.gbatching_mode && cfg_.gbatching_horizon >= dw_.block_size) {
         std::fprintf(stderr,
-            "qflash: horizon %d needs a draft block of at least %d rows (got %d)\n",
-            cfg_.qflash_horizon, cfg_.qflash_horizon + 1, dw_.block_size);
+            "gbatching: horizon %d needs a draft block of at least %d rows (got %d)\n",
+            cfg_.gbatching_horizon, cfg_.gbatching_horizon + 1, dw_.block_size);
         return false;
     }
 
@@ -1952,7 +1952,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
     const int max_verify_tokens = qwen35_max_verify_tokens(cfg_, q_len);
-    if ((cfg_.fast_rollback || cfg_.ddtree_mode || cfg_.qflash_mode) &&
+    if ((cfg_.fast_rollback || cfg_.ddtree_mode || cfg_.gbatching_mode) &&
         !cache_.rollback_ctx) {
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
@@ -1981,7 +1981,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
-    bool qflash_done    = false;
+    bool gbatching_done    = false;
     const ChainRollbackPolicy rollback_policy =
         resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel());
     const int fast_rollback_threshold =
@@ -2080,6 +2080,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             !use_remote_draft &&
             draft_feature_mirror_can_view(feature_mirror_, committed, draft_ctx, mirror_slot0);
 
+        bool use_draft_kv = false;
         const auto profile_draft_start = profile_start();
         if (use_remote_draft) {
             local_hidden.clear();
@@ -2095,7 +2096,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 const char * e = std::getenv("DFLASH_DRAFT_KV");
                 return !(e && e[0] == '0' && e[1] == '\0');
             }();
-            bool use_draft_kv = draft_kv_on && feature_mirror_.target_feat != nullptr;
+            use_draft_kv = draft_kv_on && feature_mirror_.target_feat != nullptr;
             if (use_draft_kv && draft_kv_.gf &&
                 draft_kv_.built_for != (const void *)&dw_) {
                 draft_kv_free(draft_kv_);
@@ -2169,8 +2170,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         profile_add(profile_draft_s, profile_draft_start);
 
-        // ── QFlash / DDTree tree-structured verify ───────────────────────
-        // DDTree follows exact speculative acceptance every round. QFlash
+        // ── GBatching / DDTree tree-structured verify ───────────────────────
+        // DDTree follows exact speculative acceptance every round. GBatching
         // uses the same tree graph once, scores complete short branches, and
         // supports both the local and remote drafter paths. On any failure,
         // falling through is unsafe because the tree graph has already
@@ -2190,30 +2191,30 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // fits the resident pool. Full-attention only (windowed FA padding could
         // index past the pool). Otherwise the slot-mapped chain verify handles
         // it. Non-kvflash is unaffected.
-        const int qflash_rows = qflash_required_rows(cfg_.qflash_branches,
-                                                      cfg_.qflash_horizon);
+        const int gbatching_rows = gbatching_required_rows(cfg_.gbatching_branches,
+                                                      cfg_.gbatching_horizon);
         const bool kvflash_ddtree_ok =
             !kvflash_active() ||
             (cfg_.fa_window == 0 &&
              committed + cfg_.ddtree_budget + 1 + cfg_.kq_stride_pad <= kvflash_tokens_ &&
              kvflash_pager_.identity_prefix_covers(committed));
-        const bool kvflash_qflash_ok =
+        const bool kvflash_gbatching_ok =
             !kvflash_active() ||
             (cfg_.fa_window == 0 &&
-             committed + qflash_rows + cfg_.kq_stride_pad <= kvflash_tokens_ &&
+             committed + gbatching_rows + cfg_.kq_stride_pad <= kvflash_tokens_ &&
              kvflash_pager_.identity_prefix_covers(committed));
-        const bool use_qflash_verify =
-            cfg_.qflash_mode && !qflash_done && !sampled_verify &&
-            target->supports_tree_verify() && kvflash_qflash_ok &&
-            q_len > cfg_.qflash_horizon && tree_special_inactive;
+        const bool use_gbatching_verify =
+            cfg_.gbatching_mode && !gbatching_done && !sampled_verify &&
+            target->supports_tree_verify() && kvflash_gbatching_ok &&
+            q_len > cfg_.gbatching_horizon && tree_special_inactive;
         const bool use_tree_verify =
-            !use_qflash_verify && cfg_.ddtree_mode &&
+            !use_gbatching_verify && cfg_.ddtree_mode &&
             target->supports_tree_verify() && kvflash_ddtree_ok &&
             !use_remote_draft && q_len > 1 && tree_special_inactive;
 
         // DDTree consumes top-K rows directly. Avoid projecting the same
         // hidden block once for argmax and again for top-K on every step.
-        if (!use_qflash_verify && !use_tree_verify) {
+        if (!use_gbatching_verify && !use_tree_verify) {
             if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
                 std::fprintf(stderr, "spec-decode: projection failed\n");
                 step_graph_destroy(draft_sg);
@@ -2222,33 +2223,133 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             draft_tok[0] = last_tok;
         }
 
-        if (use_qflash_verify) {
-            const int K = cfg_.qflash_branches;
+        if (use_gbatching_verify) {
+            const int K = cfg_.gbatching_branches;
             std::vector<float> top_lp;
             std::vector<int32_t> top_ids;
             const auto profile_project_start = profile_start();
             if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
                                                 /*temperature=*/1.0f,
                                                 top_lp, top_ids)) {
-                std::fprintf(stderr, "spec-decode: qflash topk projection failed\n");
+                std::fprintf(stderr, "spec-decode: gbatching topk projection failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
             profile_add(profile_project_s, profile_project_start);
 
-            // Row 0 is the current seed. QFlash fans out from draft row 1,
-            // then follows each candidate with the spine-conditioned top-1
-            // tail already produced by this single drafter forward.
-            QFlashTree qtree = build_qflash_tree(
-                top_ids.data() + (size_t)K,
-                q_len - 1, K, cfg_.qflash_branches, cfg_.qflash_horizon);
+            // Seed-and-Expand. Branch 0 keeps the already-computed top-1
+            // spine. Every alternative starts from a different row-1 seed and
+            // reruns the small drafter against the same read-only prefix. The
+            // alternative hidden tails are projected together on the target
+            // GPU, so their LM-head matmul is a single wide batch.
+            const int horizon = cfg_.gbatching_horizon;
+            std::vector<int32_t> branch_tokens((size_t)K * horizon, 0);
+            for (int depth = 0; depth < horizon; ++depth) {
+                branch_tokens[(size_t)depth] =
+                    top_ids[(size_t)(depth + 1) * K];
+            }
+
+            if (K > 1) {
+                for (int branch = 1; branch < K; ++branch) {
+                    branch_tokens[(size_t)branch * horizon] =
+                        top_ids[(size_t)K + branch];
+                }
+            }
+
+            if (K > 1 && horizon > 1) {
+                const int expanded_rows = (K - 1) * (horizon - 1);
+                std::vector<float> expanded_hidden(
+                    (size_t)expanded_rows * hidden, 0.0f);
+                std::vector<float> branch_hidden;
+                std::vector<float> branch_noise(noise_embed.size(), 0.0f);
+                std::vector<int32_t> branch_noise_ids(
+                    (size_t)q_len, target->mask_token_id());
+
+                auto run_branch_draft = [&](const std::vector<float> & input,
+                                            std::vector<float> & output) -> bool {
+                    if (use_remote_draft) {
+                        output.clear();
+                        return remote_draft_.propose(
+                            committed, draft_ctx, input, output);
+                    }
+
+                    ggml_tensor * inp = use_draft_kv
+                        ? draft_kv_.inp_embed : draft_sg.inp_embed;
+                    ggml_tensor * hidden_out = use_draft_kv
+                        ? draft_kv_.hidden_states : draft_sg.hidden_states;
+                    ggml_cgraph * graph = use_draft_kv
+                        ? draft_kv_.gf : draft_sg.gf;
+                    if (!inp || !hidden_out || !graph) return false;
+
+                    ggml_backend_tensor_set(inp, input.data(), 0,
+                                            sizeof(float) * input.size());
+                    if (ggml_backend_graph_compute(draft_backend_, graph) !=
+                        GGML_STATUS_SUCCESS) {
+                        return false;
+                    }
+                    output.resize((size_t)hidden * q_len);
+                    ggml_backend_tensor_get(hidden_out, output.data(), 0,
+                                            sizeof(float) * output.size());
+                    return true;
+                };
+
+                const auto expand_draft_start = profile_start();
+                for (int branch = 1; branch < K; ++branch) {
+                    branch_noise_ids[0] =
+                        branch_tokens[(size_t)branch * horizon];
+                    if (!target->embed_tokens(branch_noise_ids.data(), q_len,
+                                              branch_noise.data()) ||
+                        !run_branch_draft(branch_noise, branch_hidden) ||
+                        branch_hidden.size() != (size_t)hidden * q_len) {
+                        std::fprintf(stderr,
+                            "spec-decode: gbatching branch expansion failed "
+                            "branch=%d\n", branch);
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    for (int depth = 1; depth < horizon; ++depth) {
+                        const size_t dst_row =
+                            (size_t)(branch - 1) * (horizon - 1) + depth - 1;
+                        const float * src = branch_hidden.data() +
+                            (size_t)depth * hidden;
+                        std::copy_n(src, hidden,
+                                    expanded_hidden.data() + dst_row * hidden);
+                    }
+                }
+                profile_add(profile_draft_s, expand_draft_start);
+
+                std::vector<int32_t> expanded_tokens;
+                const auto expand_project_start = profile_start();
+                if (!target->project_hidden_to_tokens(expanded_hidden.data(),
+                                                       expanded_rows,
+                                                       expanded_tokens) ||
+                    (int)expanded_tokens.size() != expanded_rows) {
+                    std::fprintf(stderr,
+                        "spec-decode: gbatching batched tail projection failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                profile_add(profile_project_s, expand_project_start);
+
+                for (int branch = 1; branch < K; ++branch) {
+                    for (int depth = 1; depth < horizon; ++depth) {
+                        const size_t src_row =
+                            (size_t)(branch - 1) * (horizon - 1) + depth - 1;
+                        branch_tokens[(size_t)branch * horizon + depth] =
+                            expanded_tokens[src_row];
+                    }
+                }
+            }
+
+            GBatchingTree qtree = build_gbatching_tree_from_paths(
+                branch_tokens.data(), K, horizon);
             if (qtree.tree.n_nodes <= 0 || qtree.branches.empty()) {
-                std::fprintf(stderr, "spec-decode: qflash tree build failed\n");
+                std::fprintf(stderr, "spec-decode: gbatching tree build failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
 
-            std::vector<int32_t> flat_tokens((size_t)qflash_rows, 0);
+            std::vector<int32_t> flat_tokens((size_t)gbatching_rows, 0);
             flat_tokens[0] = last_tok;
             for (int i = 0; i < qtree.tree.n_nodes; ++i) {
                 flat_tokens[1 + i] = qtree.tree.token_ids[i];
@@ -2265,19 +2366,19 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             std::vector<float> node_logits;
             const auto profile_verify_start = profile_start();
             if (!target->verify_tree(committed, qtree.tree, flat_tokens,
-                                     qflash_rows, posterior, &node_logits)) {
-                std::fprintf(stderr, "spec-decode: qflash verify_tree failed\n");
+                                     gbatching_rows, posterior, &node_logits)) {
+                std::fprintf(stderr, "spec-decode: gbatching verify_tree failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
             profile_add(profile_verify_s, profile_verify_start);
             target_forwards++;
 
-            QFlashSelection selected = select_qflash_branch(
+            GBatchingSelection selected = select_gbatching_branch(
                 qtree, node_logits.data(), qtree.tree.n_nodes + 1,
-                w_.n_vocab, cfg_.qflash_margin);
+                w_.n_vocab, cfg_.gbatching_margin);
             if (selected.accepted.size() <= 1) {
-                std::fprintf(stderr, "spec-decode: qflash selection failed\n");
+                std::fprintf(stderr, "spec-decode: gbatching selection failed\n");
                 target->restore_kv();
                 step_graph_destroy(draft_sg);
                 return false;
@@ -2304,7 +2405,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             accepted.resize(emitted);
             if (accepted.empty() ||
                 !target->rollback_to_tree(committed, qtree.tree, accepted)) {
-                std::fprintf(stderr, "spec-decode: qflash rollback_to_tree failed\n");
+                std::fprintf(stderr, "spec-decode: gbatching rollback_to_tree failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
@@ -2321,13 +2422,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             profile_add(profile_feature_s, profile_feature_start);
 
             std::fprintf(stderr,
-                "[qflash] branches=%d horizon=%d actual_rows=%d alloc_rows=%d "
-                "selected=%d score=%.4f main=%.4f margin=%.4f\n",
-                cfg_.qflash_branches, cfg_.qflash_horizon,
-                qtree.tree.n_nodes + 1, qflash_rows, selected.branch,
-                selected.score, selected.main_score, cfg_.qflash_margin);
+                "[gbatching] branches=%d horizon=%d actual_rows=%d alloc_rows=%d "
+                "draft_passes=%d projection_rows=%d selected=%d score=%.4f "
+                "main=%.4f margin=%.4f\n",
+                cfg_.gbatching_branches, cfg_.gbatching_horizon,
+                qtree.tree.n_nodes + 1, gbatching_rows,
+                cfg_.gbatching_branches,
+                (cfg_.gbatching_branches - 1) *
+                    std::max(0, cfg_.gbatching_horizon - 1), selected.branch,
+                selected.score, selected.main_score, cfg_.gbatching_margin);
 
-            qflash_done = true;
+            gbatching_done = true;
             n_accept_sum += std::max(0, emitted - 1);
             committed += emitted;
             cache_.cur_pos = committed;

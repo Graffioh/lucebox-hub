@@ -47,29 +47,28 @@ std::string check_feature_compatibility(
         return "--target-shard-ipc-work-dir requires --target-shard-ipc-bin";
     }
 
-    // QFlash deliberately starts with the narrow path whose tree rollback is
-    // already production-tested. Mixed-backend draft execution is allowed:
-    // only the small drafter runs remotely; target KV and verification remain
-    // together on the local qwen35 target.
-    if (args.qflash_mode) {
+    // GBatching deliberately starts with the narrow path whose tree rollback is
+    // already production-tested. The small drafter may run on a second device;
+    // target KV and the wide verify remain together on the qwen35 target.
+    if (args.gbatching_mode) {
         if (!args.draft_path) {
-            return "--qflash requires --draft";
+            return "--gbatching requires --draft";
         }
         if (arch != "qwen35" || args.device.is_multi_device() ||
             args.device.split_mode == TargetSplitMode::Tensor) {
-            return "--qflash currently requires a single-device dense qwen35 target";
+            return "--gbatching currently requires a single-device dense qwen35 target";
         }
         if (!args.fast_rollback) {
-            return "--qflash requires fast rollback; remove --no-fast-rollback";
+            return "--gbatching requires fast rollback; remove --no-fast-rollback";
         }
-        if (args.qflash_branches < 2 || args.qflash_branches > 8 ||
-            args.qflash_horizon < 1 ||
-            1 + static_cast<int64_t>(args.qflash_branches) *
-                    args.qflash_horizon > 64) {
-            return "--qflash requires 2..8 branches and at most 64 total verify rows";
+        if (args.gbatching_branches < 2 || args.gbatching_branches > 8 ||
+            args.gbatching_horizon < 1 ||
+            1 + static_cast<int64_t>(args.gbatching_branches) *
+                    args.gbatching_horizon > 64) {
+            return "--gbatching requires 2..8 branches and at most 64 total verify rows";
         }
-        if (!std::isfinite(args.qflash_margin) || args.qflash_margin < 0.0f) {
-            return "--qflash-margin must be a finite non-negative number";
+        if (!std::isfinite(args.gbatching_margin) || args.gbatching_margin < 0.0f) {
+            return "--gbatching-margin must be a finite non-negative number";
         }
     }
 

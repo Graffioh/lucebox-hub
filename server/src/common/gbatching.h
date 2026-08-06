@@ -1,6 +1,6 @@
-// QFlash — one-shot quality branching for a single generation.
+// GBatching — turn one generation into a wide target batch.
 //
-// QFlash reuses the existing DDTree verify/rollback machinery, but builds a
+// GBatching reuses the existing DDTree verify/rollback machinery, but builds a
 // deliberately simple shape: K independent short chains sharing one root.
 // The target scores every complete chain and keeps the normal top-1 chain
 // unless another candidate clears a conservative margin.
@@ -16,7 +16,7 @@
 
 namespace dflash::common {
 
-struct QFlashTree {
+struct GBatchingTree {
     DDTree tree;
 
     // Flat-tree indices for each candidate, excluding the shared root.
@@ -24,7 +24,7 @@ struct QFlashTree {
     std::vector<std::vector<int>> branches;
 };
 
-struct QFlashSelection {
+struct GBatchingSelection {
     int branch = 0;
     float score = 0.0f;       // mean target log-probability, nats/token
     float main_score = 0.0f;
@@ -35,19 +35,26 @@ struct QFlashSelection {
 // of branch b uses rank b from draft row 0; descendants use the top-1 token
 // from subsequent rows. This is intentionally compatible with the existing
 // single spine-conditioned draft block.
-QFlashTree build_qflash_tree(const int32_t * top_token_ids,
+GBatchingTree build_gbatching_tree(const int32_t * top_token_ids,
                              int draft_rows,
                              int top_k,
                              int branch_count,
                              int horizon);
 
-// Number of target rows needed by QFlash, rounded to the target's verify tile.
-int qflash_required_rows(int branch_count, int horizon, int tile = 32);
+// Build the same tree from fully conditioned, branch-major paths:
+//   branch_tokens[branch * horizon + depth].
+// This is the Seed-and-Expand entry point used by GBatching.
+GBatchingTree build_gbatching_tree_from_paths(const int32_t * branch_tokens,
+                                              int branch_count,
+                                              int horizon);
+
+// Number of target rows needed by GBatching, rounded to the target's verify tile.
+int gbatching_required_rows(int branch_count, int horizon, int tile = 32);
 
 // Score complete branches under target logits. Logits row 0 predicts the
 // first branch token; the row for each branch node predicts its child.
 // Branch 0 wins ties and alternatives must exceed it by `margin` nats/token.
-QFlashSelection select_qflash_branch(const QFlashTree & qtree,
+GBatchingSelection select_gbatching_branch(const GBatchingTree & qtree,
                                      const float * logits,
                                      int logits_rows,
                                      int vocab,

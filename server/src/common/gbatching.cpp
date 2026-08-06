@@ -1,4 +1,4 @@
-#include "qflash.h"
+#include "gbatching.h"
 
 #include <algorithm>
 #include <cmath>
@@ -25,18 +25,41 @@ float token_log_probability(const float * row, int vocab, int32_t token) {
 
 }  // namespace
 
-QFlashTree build_qflash_tree(const int32_t * top_token_ids,
+GBatchingTree build_gbatching_tree(const int32_t * top_token_ids,
                              int draft_rows,
                              int top_k,
                              int branch_count,
                              int horizon) {
-    QFlashTree out;
-    out.tree.parents.push_back(-1);
-    out.tree.child_maps.emplace_back();
-
     if (!top_token_ids || draft_rows <= 0 || top_k <= 0 ||
         branch_count <= 0 || horizon <= 0 ||
         branch_count > top_k || horizon > draft_rows) {
+        GBatchingTree out;
+        out.tree.parents.push_back(-1);
+        out.tree.child_maps.emplace_back();
+        out.tree.visibility.assign(1, 1);
+        return out;
+    }
+
+    std::vector<int32_t> branch_tokens((size_t)branch_count * horizon);
+    for (int branch = 0; branch < branch_count; ++branch) {
+        for (int depth = 0; depth < horizon; ++depth) {
+            const int rank = depth == 0 ? branch : 0;
+            branch_tokens[(size_t)branch * horizon + depth] =
+                top_token_ids[(size_t)depth * top_k + rank];
+        }
+    }
+    return build_gbatching_tree_from_paths(branch_tokens.data(), branch_count,
+                                           horizon);
+}
+
+GBatchingTree build_gbatching_tree_from_paths(const int32_t * branch_tokens,
+                                              int branch_count,
+                                              int horizon) {
+    GBatchingTree out;
+    out.tree.parents.push_back(-1);
+    out.tree.child_maps.emplace_back();
+
+    if (!branch_tokens || branch_count <= 0 || horizon <= 0) {
         out.tree.visibility.assign(1, 1);
         return out;
     }
@@ -54,8 +77,8 @@ QFlashTree build_qflash_tree(const int32_t * top_token_ids,
         auto & path = out.branches[branch];
         path.reserve(horizon);
         for (int depth = 0; depth < horizon; ++depth) {
-            const int rank = depth == 0 ? branch : 0;
-            const int32_t token = top_token_ids[(size_t)depth * top_k + rank];
+            const int32_t token =
+                branch_tokens[(size_t)branch * horizon + depth];
             const int node = ++out.tree.n_nodes;
 
             out.tree.token_ids.push_back(token);
@@ -82,19 +105,19 @@ QFlashTree build_qflash_tree(const int32_t * top_token_ids,
     return out;
 }
 
-int qflash_required_rows(int branch_count, int horizon, int tile) {
+int gbatching_required_rows(int branch_count, int horizon, int tile) {
     if (branch_count <= 0 || horizon <= 0) return 0;
     const int rows = 1 + branch_count * horizon;
     if (tile <= 1) return rows;
     return ((rows + tile - 1) / tile) * tile;
 }
 
-QFlashSelection select_qflash_branch(const QFlashTree & qtree,
+GBatchingSelection select_gbatching_branch(const GBatchingTree & qtree,
                                      const float * logits,
                                      int logits_rows,
                                      int vocab,
                                      float margin) {
-    QFlashSelection out;
+    GBatchingSelection out;
     out.accepted.push_back(0);
     if (!logits || vocab <= 0 || logits_rows < qtree.tree.n_nodes + 1 ||
         qtree.branches.empty()) {

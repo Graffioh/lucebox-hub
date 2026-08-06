@@ -111,10 +111,10 @@ static void print_usage(const char * prog) {
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
-        "  --qflash             One quality-search fork per request (qwen35)\n"
-        "  --qflash-branches <N> Candidate branches (default: 4; range: 2..8)\n"
-        "  --qflash-horizon <N> Tokens per branch (default: 7)\n"
-        "  --qflash-margin <F>  Min target score gain in nats/token (default: 0.10)\n"
+        "  --gbatching             One wide ghost batch per request (qwen35)\n"
+        "  --gbatching-branches <N> Candidate paths (default: 4; range: 2..8)\n"
+        "  --gbatching-horizon <N> Tokens per path (default: 7)\n"
+        "  --gbatching-margin <F>  Min target score gain in nats/token (default: 0.10)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
         "                       trimmed per step by drafter confidence; N = fixed base)\n"
         "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
@@ -366,18 +366,18 @@ int main(int argc, char ** argv) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--qflash") == 0) {
-            bargs.qflash_mode = true;
+        } else if (std::strcmp(argv[i], "--gbatching") == 0) {
+            bargs.gbatching_mode = true;
             bargs.fast_rollback = true;
-        } else if (std::strcmp(argv[i], "--qflash-branches") == 0 && i + 1 < argc) {
-            bargs.qflash_branches = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--qflash-horizon") == 0 && i + 1 < argc) {
-            bargs.qflash_horizon = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--qflash-margin") == 0 && i + 1 < argc) {
+        } else if (std::strcmp(argv[i], "--gbatching-branches") == 0 && i + 1 < argc) {
+            bargs.gbatching_branches = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--gbatching-horizon") == 0 && i + 1 < argc) {
+            bargs.gbatching_horizon = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--gbatching-margin") == 0 && i + 1 < argc) {
             char * end = nullptr;
-            bargs.qflash_margin = std::strtof(argv[++i], &end);
+            bargs.gbatching_margin = std::strtof(argv[++i], &end);
             if (end == argv[i] || *end != '\0') {
-                std::fprintf(stderr, "[server] bad --qflash-margin value\n");
+                std::fprintf(stderr, "[server] bad --gbatching-margin value\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--adaptive-experts") == 0) {
@@ -1048,12 +1048,12 @@ int main(int argc, char ** argv) {
                              "[server] │     Use --fa-window 0 for tool-call workloads.\n");
     }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
-    std::fprintf(stderr, "[server] │  qflash          = %s\n", bargs.qflash_mode ? "ON" : "off");
-    if (bargs.qflash_mode) {
+    std::fprintf(stderr, "[server] │  gbatching          = %s\n", bargs.gbatching_mode ? "ON" : "off");
+    if (bargs.gbatching_mode) {
         std::fprintf(stderr,
-                     "[server] │  qflash_shape    = %dx%d margin=%.3f\n",
-                     bargs.qflash_branches, bargs.qflash_horizon,
-                     bargs.qflash_margin);
+                     "[server] │  gbatching_shape    = %dx%d margin=%.3f\n",
+                     bargs.gbatching_branches, bargs.gbatching_horizon,
+                     bargs.gbatching_margin);
     }
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
     if (bargs.device.is_layer_split()) {
@@ -1106,11 +1106,11 @@ int main(int argc, char ** argv) {
     sconfig.fa_window    = bargs.fa_window;
     sconfig.ddtree_budget = bargs.ddtree_budget;
     sconfig.ddtree_enabled = bargs.ddtree_mode;
-    sconfig.speculative_enabled = bargs.ddtree_mode || bargs.qflash_mode;
-    sconfig.qflash_enabled = bargs.qflash_mode;
-    sconfig.qflash_branches = bargs.qflash_branches;
-    sconfig.qflash_horizon = bargs.qflash_horizon;
-    sconfig.qflash_margin = bargs.qflash_margin;
+    sconfig.speculative_enabled = bargs.ddtree_mode || bargs.gbatching_mode;
+    sconfig.gbatching_enabled = bargs.gbatching_mode;
+    sconfig.gbatching_branches = bargs.gbatching_branches;
+    sconfig.gbatching_horizon = bargs.gbatching_horizon;
+    sconfig.gbatching_margin = bargs.gbatching_margin;
     sconfig.target_sharding     = bargs.device.is_layer_split();
     // KV type: report the operator's choice if set, else the family default
     // the backend resolves (the tq3_0 auto policy was removed; laguna uses
