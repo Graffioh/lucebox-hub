@@ -157,10 +157,12 @@ std::vector<OFlashLoraTensorSpec> oflash_lora_expected_tensors(
         const std::string blk = "blk." + std::to_string(i);
         // The GGUF scalar can drift during re-export. LoRA shapes must match
         // the loaded matrices that ggml_mul_mat actually consumes.
-        const int64_t up_out = dw.layers[i].w_up
-            ? dw.layers[i].w_up->ne[1] : dw.n_ff;
-        const int64_t down_in = dw.layers[i].w_down
-            ? dw.layers[i].w_down->ne[0] : dw.n_ff;
+        const DraftLayer * layer = (size_t)i < dw.layers.size()
+            ? &dw.layers[(size_t)i] : nullptr;
+        const int64_t up_out = layer && layer->w_up
+            ? layer->w_up->ne[1] : dw.n_ff;
+        const int64_t down_in = layer && layer->w_down
+            ? layer->w_down->ne[0] : dw.n_ff;
         pair(blk + ".attn_q",      hidden, q_dim);
         pair(blk + ".attn_k",      hidden, kv_dim);
         pair(blk + ".attn_v",      hidden, kv_dim);
