@@ -1563,11 +1563,17 @@ def _run_bench_case(
     text = ""
     usage: dict[str, Any] = {}
     status = 0
+    # Per-delta arrival times relative to t0. The server emits one SSE chunk
+    # per committed visible token, so these recover decode tok/s as a
+    # function of decode-step index / wall-clock (OFLASH.md §10). Timestamp
+    # is taken before json parsing to minimize client-side skew.
+    token_times_s: list[float] = []
 
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
             status = resp.status
             for raw in resp:
+                t_arrive = time.perf_counter() - t0
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
                     continue
@@ -1593,6 +1599,7 @@ def _run_bench_case(
                         if first_token_time is None:
                             first_token_time = time.perf_counter()
                         token_deltas += 1
+                        token_times_s.append(round(t_arrive, 4))
                         text += str(piece)
     except urllib.error.HTTPError as exc:
         return {
@@ -1618,6 +1625,17 @@ def _run_bench_case(
     decode_s = (wall_s - ttft_s) if ttft_s else None
     output_tok_s = completion_tokens / decode_s if (decode_s and decode_s > 0 and completion_tokens > 0) else None
 
+    # Windowed decode speed over visible-token arrivals: tok/s for each
+    # consecutive window of 32 deltas — the client-observable curve for
+    # OFlash within-session speedup claims (server-side truth lives in the
+    # capture ring / /props.oflash).
+    decode_tok_s_by_window: list[float] = []
+    win = 32
+    for i in range(win, len(token_times_s), win):
+        dt = token_times_s[i] - token_times_s[i - win]
+        if dt > 0:
+            decode_tok_s_by_window.append(round(win / dt, 2))
+
     return {
         "id": case["id"],
         "ok": status == 200 and bool(text.strip()),
@@ -1628,6 +1646,9 @@ def _run_bench_case(
         "completion_tokens": completion_tokens,
         "prefill_tok_s": round(prefill_tok_s, 1) if prefill_tok_s else None,
         "output_tok_s": round(output_tok_s, 2) if output_tok_s else None,
+        "token_times_s": token_times_s,
+        "decode_tok_s_by_window": decode_tok_s_by_window,
+        "server_timings": usage.get("timings") or None,
     }
 
 

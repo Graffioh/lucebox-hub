@@ -478,6 +478,39 @@ configuration drift between runs is possible.
 - `draft_device` — resolved draft-model device placement, or
   `null` when no draft model is loaded.
 
+### 4.17 `oflash`
+
+```json
+"oflash": {
+  "enabled":            true,
+  "profile":            "default",
+  "adapter_generation": 4,
+  "swaps":              5,
+  "promotes":           4,
+  "rollbacks":          1,
+  "rolling_al":         6.25,
+  "probation_al":       null,
+  "training_disabled":  false,
+  "trainer_alive":      true,
+  "steps":              1234,
+  "records_written":    1200,
+  "records_dropped":    3,
+  "ring_backlog_bytes": 4096
+}
+```
+
+Online drafter adaptation (server/docs/OFLASH.md §6.5). `{"enabled":
+false}` (single key) when `--oflash` is off or the backend does not
+support it. Live counters come from a lock-free backend snapshot, not
+the startup-frozen config: `rolling_al` is the acceptance guard's
+baseline mean accepted length (tokens per verify step, incl. the
+seed), `probation_al` the in-probation window mean or `null` when not
+in probation. `swaps`/`promotes`/`rollbacks` count adapter-generation
+transitions; `training_disabled` latches after repeated guard
+rollbacks. `records_*`/`ring_backlog_bytes` describe the capture ring
+(dashboard use only — this section was added without a `props_schema`
+bump per §5.1).
+
 ## 5. Schema versioning
 
 `build_info` includes `props_schema=<n>`. The integer `n` bumps
