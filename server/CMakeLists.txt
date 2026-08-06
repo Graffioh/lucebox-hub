@@ -445,6 +445,7 @@ add_library(dflash_common STATIC
     src/qwen35/qwen35_target_shard_ipc_daemon.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
+    src/qwen35/qwen35_btflash.cpp
     src/qwen35/qwen35_tensor_parallel.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
     src/qwen35/qwen35_dflash_target.cpp
@@ -452,6 +453,7 @@ add_library(dflash_common STATIC
     src/qwen35/layer_split_daemon_loop.cpp
     src/qwen35/qwen35_daemon.cpp
     src/common/sampler.cpp
+    src/common/btflash.cpp
     src/common/backend_precision.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
@@ -793,6 +795,17 @@ option(DFLASH27B_SERVER "Build dflash_server + backend_ipc_daemon" ON)
 if(DFLASH27B_TESTS)
     set(_raw_unit_test_targets)
     enable_testing()
+
+    # BTFlash policy/mask/selector coverage is deliberately CPU-only so the
+    # prototype remains testable while the target GPUs are occupied.
+    add_executable(test_btflash_cpu
+        test/test_unit_main.cpp
+        test/test_btflash.cpp
+        src/common/btflash.cpp)
+    target_include_directories(test_btflash_cpu PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/test
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+    add_test(NAME btflash_cpu COMMAND test_btflash_cpu)
 
     # Header-only platform shims must remain independently buildable and
     # runnable on hosted Windows workers without a GPU.

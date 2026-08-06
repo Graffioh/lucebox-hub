@@ -608,6 +608,13 @@ struct QwenGraphInputs {
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
+    // BTFlash lockstep mode represents K independent one-token sequences in
+    // one graph. Optional recurrent tensors are width-indexed banks with
+    // shapes [state..., n_seqs] and [conv..., n_seqs]. Existing callers keep
+    // n_seqs=1 and use TargetCache's live state.
+    int           n_seqs = 1;
+    const std::vector<ggml_tensor *> * recurrent_ssm_state = nullptr;
+    const std::vector<ggml_tensor *> * recurrent_conv_state = nullptr;
     // [n_tokens,n_head_kv] i64; non-null = step-invariant KV write via ggml_set_rows (carries kv_start).
     ggml_tensor * kv_write_rows = nullptr;
     // Capture the LAST token's post-RoPE/post-rotation Q per full-attention

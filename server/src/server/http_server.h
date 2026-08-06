@@ -217,6 +217,7 @@ struct ParsedRequest {
     int                       max_output   = 4096;
     bool                      stream       = true;
     SamplerCfg                sampler;
+    BTFlashConfig             btflash;
     std::string               model;
     // Tool definitions (stored as JSON for response formatting)
     json                      tools;
@@ -253,6 +254,11 @@ struct ParsedRequest {
 // Parse request sampler fields, applying model-card defaults where present.
 SamplerCfg parse_request_sampler(const json & body,
                                  const SamplingDefaults & defaults);
+
+// Parse the experimental request-scoped BTFlash object. Absence/false keeps
+// the feature disabled. Invalid BT1 combinations throw std::invalid_argument
+// and are returned by route_request as HTTP 400.
+BTFlashConfig parse_btflash_config(const json & body);
 
 // Read the required `messages` field. Throws std::invalid_argument when
 // it is missing or not a non-empty array; route_request's catch turns

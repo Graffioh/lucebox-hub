@@ -844,6 +844,7 @@ static ggml_tensor * build_delta_net_block(
     ggml_tensor * conv_state,     // [kernel-1, conv_channels] persistent
     ggml_tensor * ssm_state,      // [head_v_dim, head_v_dim, num_v_heads] persistent
     int n_tokens,
+    int n_seqs,
     DeltaNetCapture * cap,        // optional: populated on capture_delta_intermediate
     ggml_tensor * parent_ids,     // optional [n_tokens] i32; tree mode when non-null
     bool skip_gdn_intermediate
@@ -853,8 +854,8 @@ static ggml_tensor * build_delta_net_block(
     const int num_v_heads  = w.ssm_dt_rank;
     const int head_v_dim   = w.ssm_d_inner / w.ssm_dt_rank;
     const int conv_channels = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
-    const int n_seqs       = 1;
-    const int n_seq_tokens = n_tokens;
+    GGML_ASSERT(n_seqs > 0 && n_tokens > 0 && n_tokens % n_seqs == 0);
+    const int n_seq_tokens = n_tokens / n_seqs;
     const bool can_skip_gdn_intermediate = skip_gdn_intermediate && !parent_ids && !cap;
 
     // ── qkv_mixed = wqkv @ cur         [10240, n_tokens]
@@ -1186,7 +1187,7 @@ static ggml_tensor * build_single_layer(
         }
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
-                                    n_tokens, cap_ptr, parent_ids,
+                                    n_tokens, /*n_seqs=*/1, cap_ptr, parent_ids,
                                     /*skip_gdn_intermediate=*/true);
     }
 
@@ -1328,9 +1329,15 @@ QwenGraphOutputs build_qwen35_graph(
                 cap_ptr->ssm_intermediate_states = cache.ssm_intermediate[dn_idx];
                 cap_ptr->conv_input              = cache.conv_input_cache[dn_idx];
             }
+            const auto & conv_states = in.recurrent_conv_state
+                ? *in.recurrent_conv_state : cache.conv_state;
+            const auto & ssm_states = in.recurrent_ssm_state
+                ? *in.recurrent_ssm_state : cache.ssm_state;
+            GGML_ASSERT(dn_idx < (int)conv_states.size());
+            GGML_ASSERT(dn_idx < (int)ssm_states.size());
             cur = build_delta_net_block(ctx, gf, w, L, cur,
-                                        cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
-                                        n_tokens, cap_ptr, in.parent_ids,
+                                        conv_states[dn_idx], ssm_states[dn_idx],
+                                        n_tokens, in.n_seqs, cap_ptr, in.parent_ids,
                                         /*skip_gdn_intermediate=*/true);
             dn_idx++;
         }
@@ -1519,7 +1526,7 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
         }
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
-                                    n_tokens, nullptr, nullptr,
+                                    n_tokens, /*n_seqs=*/1, nullptr, nullptr,
                                     skip_gdn_intermediate);
     }
 

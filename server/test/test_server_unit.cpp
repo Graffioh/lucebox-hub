@@ -32,6 +32,7 @@
 #include "common/kvflash_pager.h"
 #include "placement/draft_residency.h"
 #include "common/gguf_bounds.h"
+#include "qwen35/qwen35_btflash.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter_model.h"
@@ -2124,6 +2125,137 @@ TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_ove
     TEST_ASSERT(sampler.seed == 42);
     TEST_ASSERT(std::fabs(sampler.pres_pen - 0.3f) < 0.001f);
     TEST_ASSERT(std::fabs(sampler.rep_pen - 1.1f) < 0.001f);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_btflash_config_defaults_and_validation) {
+    CHECK(!parse_btflash_config(json::object()).enabled());
+    CHECK(!parse_btflash_config({{"btflash", false}}).enabled());
+
+    const BTFlashConfig config = parse_btflash_config({
+        {"btflash", {
+            {"k", 2},
+            {"horizon", 8},
+            {"row_budget", 16},
+            {"fork_tokens", 4},
+        }},
+    });
+    CHECK(config.enabled());
+    CHECK(config.k == 2);
+    CHECK(config.horizon == 8);
+    CHECK(config.fork_tokens == 4);
+    CHECK(config.select == "logprob");
+
+    bool threw = false;
+    try {
+        (void)parse_btflash_config({
+            {"btflash", {{"k", 8}, {"horizon", 16}}},
+        });
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST_CASE(ServerUnitFixture, test_btflash_state_bank_cpu_capture_restore) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    CHECK(backend != nullptr);
+
+    TargetWeights weights;
+    weights.n_layer = 2;
+    weights.full_attention_interval = 2;
+    weights.ssm_d_inner = 4;
+    weights.ssm_dt_rank = 2;
+    weights.ssm_n_group = 1;
+    weights.ssm_d_state = 1;
+    weights.ssm_d_conv = 3;
+
+    ggml_init_params params{};
+    params.mem_size = 16 * ggml_tensor_overhead();
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    CHECK(ctx != nullptr);
+
+    TargetCache cache;
+    cache.ssm_state.push_back(ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, 2, 2, 2));
+    cache.conv_state.push_back(ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, 2, 6));
+    cache.attn_k.push_back(ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, 2, 8, 1));
+    cache.attn_v.push_back(ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, 2, 8, 1));
+    cache.target_feat = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, 2, 8);
+    cache.target_feat_cap = 8;
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    CHECK(buffer != nullptr);
+
+    const std::vector<float> expected_ssm = {
+        1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f,
+    };
+    const std::vector<float> expected_conv = {
+        11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f,
+        17.0f, 18.0f, 19.0f, 20.0f, 21.0f, 22.0f,
+    };
+    ggml_backend_tensor_set(cache.ssm_state.front(), expected_ssm.data(), 0,
+                            expected_ssm.size() * sizeof(float));
+    ggml_backend_tensor_set(cache.conv_state.front(), expected_conv.data(), 0,
+                            expected_conv.size() * sizeof(float));
+
+    {
+        Qwen35BTFlashStateBank bank;
+        CHECK(bank.allocate(weights, backend, 2));
+        CHECK(bank.capture(cache));
+        ggml_backend_buffer_clear(buffer, 0);
+        CHECK(bank.restore(cache, 1));
+
+        std::vector<float> actual_ssm(expected_ssm.size());
+        std::vector<float> actual_conv(expected_conv.size());
+        ggml_backend_tensor_get(cache.ssm_state.front(), actual_ssm.data(), 0,
+                                actual_ssm.size() * sizeof(float));
+        ggml_backend_tensor_get(cache.conv_state.front(), actual_conv.data(), 0,
+                                actual_conv.size() * sizeof(float));
+        CHECK(actual_ssm == expected_ssm);
+        CHECK(actual_conv == expected_conv);
+
+        std::vector<float> key(16), value(16), feature(16);
+        for (size_t i = 0; i < key.size(); ++i) {
+            key[i] = (float)i;
+            value[i] = 100.0f + (float)i;
+            feature[i] = 200.0f + (float)i;
+        }
+        ggml_backend_tensor_set(cache.attn_k.front(), key.data(), 0,
+                                key.size() * sizeof(float));
+        ggml_backend_tensor_set(cache.attn_v.front(), value.data(), 0,
+                                value.size() * sizeof(float));
+        ggml_backend_tensor_set(cache.target_feat, feature.data(), 0,
+                                feature.size() * sizeof(float));
+        CHECK(compact_qwen35_btflash_winner(
+            cache, /*branch_start=*/2, /*width=*/2,
+            /*fed_steps=*/2, /*winner=*/1));
+
+        std::vector<float> compacted_key(key.size());
+        std::vector<float> compacted_value(value.size());
+        std::vector<float> compacted_feature(feature.size());
+        ggml_backend_tensor_get(cache.attn_k.front(), compacted_key.data(), 0,
+                                compacted_key.size() * sizeof(float));
+        ggml_backend_tensor_get(cache.attn_v.front(), compacted_value.data(), 0,
+                                compacted_value.size() * sizeof(float));
+        ggml_backend_tensor_get(cache.target_feat, compacted_feature.data(), 0,
+                                compacted_feature.size() * sizeof(float));
+        CHECK(compacted_key[4] == key[6]);
+        CHECK(compacted_key[5] == key[7]);
+        CHECK(compacted_key[6] == key[10]);
+        CHECK(compacted_key[7] == key[11]);
+        CHECK(compacted_value[4] == value[6]);
+        CHECK(compacted_value[6] == value[10]);
+        CHECK(compacted_feature[4] == feature[6]);
+        CHECK(compacted_feature[6] == feature[10]);
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
 }
 
 TEST_CASE(ServerUnitFixture, test_require_messages_array_rejects_invalid) {

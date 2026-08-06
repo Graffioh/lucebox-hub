@@ -2,6 +2,7 @@
 #include "common/chain_rollback_policy.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
+#include "qwen35_btflash.h"
 #include "graph_builders.h"
 #include "dflash_feature_ring.h"
 #include "dflash_capture.h"
@@ -834,6 +835,11 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                      &result.budget_forced_close,
                                      &result.degenerate_decode_close);
             out_io.emit(-1);
+        } else if (req.btflash.enabled()) {
+            decode_ok = do_btflash_decode(committed, req.n_gen, result.tokens,
+                                          out_io, req.btflash, req.budget_hook,
+                                          &result.budget_forced_close,
+                                          &result.degenerate_decode_close);
         } else {
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
@@ -844,15 +850,13 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
-            if (decode_ok) {
-                result.empty_visible_output =
-                    qwen35_empty_visible_output(result.tokens, w_);
-            }
         }
         if (!decode_ok) {
             result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
+        result.empty_visible_output =
+            qwen35_empty_visible_output(result.tokens, w_);
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
@@ -993,6 +997,11 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                      &result.budget_forced_close,
                                      &result.degenerate_decode_close);
             out_io.emit(-1);
+        } else if (req.btflash.enabled()) {
+            decode_ok = do_btflash_decode(committed, req.n_gen, result.tokens,
+                                          out_io, req.btflash, req.budget_hook,
+                                          &result.budget_forced_close,
+                                          &result.degenerate_decode_close);
         } else {
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
@@ -1003,15 +1012,13 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
-            if (decode_ok) {
-                result.empty_visible_output =
-                    qwen35_empty_visible_output(result.tokens, w_);
-            }
         }
         if (!decode_ok) {
             result.fail(GenerateErrorCode::DecodeFailed);
             return result;
         }
+        result.empty_visible_output =
+            qwen35_empty_visible_output(result.tokens, w_);
         result.decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_decode_start).count();
     }
@@ -1771,6 +1778,268 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                  ar_tokens, ar_decode_s,
                  ar_tokens > 0 && ar_decode_s > 0 ? ar_tokens / ar_decode_s : 0.0);
     return true;
+}
+
+bool Qwen35Backend::do_btflash_decode(int committed, int n_gen,
+                                      std::vector<int32_t> & out_tokens,
+                                      const DaemonIO & io,
+                                      const BTFlashConfig & config,
+                                      const BudgetHook & budget_hook,
+                                      bool * forced_close_out,
+                                      bool * degenerate_close_out) {
+    auto ar_fallback = [&](const char * reason) {
+        std::fprintf(stderr, "[btflash] disabled for request: %s; using AR\n", reason);
+        const bool ok = do_ar_decode(committed, n_gen, out_tokens, io, budget_hook,
+                                     forced_close_out, degenerate_close_out);
+        io.emit(-1);
+        return ok;
+    };
+
+    if (const std::string error = validate_btflash_config(config); !error.empty()) {
+        return ar_fallback(error.c_str());
+    }
+    if (n_gen < 3) return ar_fallback("generation is too short for a branch interval");
+    if (sampler_.temp <= 0.0f) {
+        return ar_fallback("temperature must be positive to create target-sampled diversity");
+    }
+    if (!budget_hook.close_token_ids.empty()) {
+        return ar_fallback("thinking-budget force-close is not composed with BT1 yet");
+    }
+    if (cfg_.fa_window != 0) return ar_fallback("fa_window must be zero");
+    if (kvflash_active()) return ar_fallback("KVFlash paging is active");
+    if (cfg_.device.is_multi_device()) return ar_fallback("multi-device target is not a BT1 topology");
+    if (w_.is_moe) return ar_fallback("BT1 currently targets dense qwen35/qwen36");
+    if (cache_.attn_k.empty() || !cache_.attn_k.front()) {
+        return ar_fallback("target attention cache is unavailable");
+    }
+
+    // Prefer the configured short ordinary prefix, but leave at least two
+    // tokens for a meaningful branch interval on short requests.
+    int prefix_tokens = std::min(config.fork_tokens,
+                                 std::max(1, n_gen - config.horizon));
+    prefix_tokens = std::min(prefix_tokens, n_gen - 2);
+    const int horizon = std::min(config.horizon, n_gen - prefix_tokens);
+    if (horizon < 2) return ar_fallback("effective horizon is shorter than two tokens");
+
+    const int width = config.k;
+    const int branch_start = committed + prefix_tokens + 1;
+    const int fed_steps_max = horizon - 1;
+    const int physical_capacity = (int)cache_.attn_k.front()->ne[1];
+    if (branch_start + fed_steps_max * width > physical_capacity) {
+        return ar_fallback("branch suffix exceeds physical KV capacity");
+    }
+
+    // Allocate before streaming the ordinary prefix. If the branch bank does
+    // not fit, the request can still fall back to AR without having emitted a
+    // partial result or advanced the target cache.
+    Qwen35BTFlashStateBank state_bank;
+    if (!state_bank.allocate(w_, target_backend_, width)) {
+        return ar_fallback("recurrent-state bank allocation failed");
+    }
+
+    // Prefix decode follows the established qwen35 cursor convention. Its
+    // last emitted token is then fed once to produce the common fork logits;
+    // every branch state is captured immediately after that shared forward.
+    const size_t prefix_out_begin = out_tokens.size();
+    if (!do_ar_decode(committed, prefix_tokens, out_tokens, io, budget_hook,
+                      forced_close_out, degenerate_close_out)) {
+        return false;
+    }
+    const int prefix_emitted = (int)(out_tokens.size() - prefix_out_begin);
+    committed += prefix_emitted;
+    if (prefix_emitted < prefix_tokens || out_tokens.empty() ||
+        IS_EOS_TOK(out_tokens.back(), w_) || io.is_cancelled()) {
+        io.emit(-1);
+        return true;
+    }
+
+    GGML_ASSERT(branch_start == committed + 1);
+
+    const int hidden = w_.n_embd;
+    const int vocab = w_.n_vocab;
+    std::vector<float> embed((size_t)hidden);
+    const int32_t prefix_tail = out_tokens.back();
+    if (!w_.embedder.embed(&prefix_tail, 1, embed.data())) return false;
+    if (!build_target_step(sg_, w_, cache_, target_backend_,
+                           /*kv_start=*/committed, /*n_tokens=*/1,
+                           /*with_mask=*/false, /*capture=*/true,
+                           /*capture_delta_intermediate=*/false,
+                           /*fa_window=*/0,
+                           /*last_token_logits_only=*/false,
+                           cfg_.kq_stride_pad,
+                           /*capture_moe_router=*/false,
+                           /*kvflash_mask=*/false,
+                           /*capture_qk=*/false)) {
+        return false;
+    }
+    ggml_backend_tensor_set(sg_.inp_embed, embed.data(), 0,
+                            sizeof(float) * (size_t)hidden);
+    const int32_t fork_pos[4] = {committed, committed, committed, 0};
+    ggml_backend_tensor_set(sg_.positions, fork_pos, 0, sizeof(fork_pos));
+    if (ggml_backend_graph_compute(target_backend_, sg_.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    after_target_compute(sg_, committed, 1);
+
+    std::vector<float> fork_logits((size_t)vocab);
+    ggml_backend_tensor_get(sg_.logits, fork_logits.data(), 0,
+                            sizeof(float) * (size_t)vocab);
+    if (!state_bank.capture(cache_)) {
+        std::fprintf(stderr, "[btflash] recurrent-state bank capture failed\n");
+        return false;
+    }
+
+    // One fork draw from the request stream, then independent deterministic
+    // substreams. Restoring the winning substream after pruning makes the
+    // serial continuation reproducible for a fixed request seed.
+    const uint64_t fork_seed = sampler_rng_();
+    std::vector<std::mt19937_64> branch_rng;
+    std::vector<std::vector<int32_t>> branch_tokens((size_t)width);
+    std::vector<std::vector<int32_t>> branch_history((size_t)width, out_tokens);
+    std::vector<double> logprob_sums((size_t)width, 0.0);
+    std::vector<int> logprob_counts((size_t)width, 0);
+    branch_rng.reserve((size_t)width);
+    for (int branch = 0; branch < width; ++branch) {
+        branch_rng.emplace_back(btflash_branch_seed(fork_seed, branch));
+        int32_t token = -1;
+        // Conservative duplicate avoidance at the fork only. If the sampler's
+        // support is narrower than K, retain the final duplicate rather than
+        // invent a token outside the configured target distribution.
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            token = sample_logits(fork_logits.data(), vocab, sampler_,
+                                  branch_history[(size_t)branch],
+                                  branch_rng[(size_t)branch]);
+            bool duplicate = false;
+            for (int prior = 0; prior < branch; ++prior) {
+                duplicate = duplicate ||
+                    branch_tokens[(size_t)prior].front() == token;
+            }
+            if (!duplicate) break;
+        }
+        branch_tokens[(size_t)branch].push_back(token);
+        branch_history[(size_t)branch].push_back(token);
+        logprob_sums[(size_t)branch] +=
+            btflash_token_logprob(fork_logits.data(), vocab, token);
+        logprob_counts[(size_t)branch]++;
+    }
+
+    StepGraph branch_sg;
+    std::vector<float> branch_embed((size_t)hidden * (size_t)width);
+    std::vector<float> branch_logits((size_t)vocab * (size_t)width);
+    std::vector<uint16_t> branch_mask;
+    bool terminal_seen = false;
+    for (const auto & tokens : branch_tokens) {
+        terminal_seen = terminal_seen || IS_EOS_TOK(tokens.back(), w_);
+    }
+
+    while ((int)branch_tokens.front().size() < horizon && !terminal_seen) {
+        const int step = (int)branch_tokens.front().size() - 1;
+        std::vector<int32_t> input_tokens((size_t)width);
+        for (int branch = 0; branch < width; ++branch) {
+            input_tokens[(size_t)branch] = branch_tokens[(size_t)branch].back();
+        }
+        if (!w_.embedder.embed(input_tokens.data(), width, branch_embed.data())) {
+            step_graph_destroy(branch_sg);
+            return false;
+        }
+
+        const int physical_start = branch_start + step * width;
+        if (!build_target_step(branch_sg, w_, cache_, target_backend_,
+                               physical_start, width,
+                               /*with_mask=*/true, /*capture=*/true,
+                               /*capture_delta_intermediate=*/false,
+                               /*fa_window=*/0,
+                               /*last_token_logits_only=*/false,
+                               cfg_.kq_stride_pad,
+                               /*capture_moe_router=*/false,
+                               /*kvflash_mask=*/false,
+                               /*capture_qk=*/false,
+                               /*recurrent_sequences=*/width,
+                               &state_bank.ssm_state,
+                               &state_bank.conv_state)) {
+            step_graph_destroy(branch_sg);
+            return false;
+        }
+        ggml_backend_tensor_set(branch_sg.inp_embed, branch_embed.data(), 0,
+                                sizeof(float) * branch_embed.size());
+        std::vector<int32_t> positions((size_t)4 * (size_t)width, 0);
+        const int semantic_pos = branch_start + step;
+        for (int axis = 0; axis < 3; ++axis) {
+            for (int branch = 0; branch < width; ++branch) {
+                positions[(size_t)axis * width + branch] = semantic_pos;
+            }
+        }
+        ggml_backend_tensor_set(branch_sg.positions, positions.data(), 0,
+                                sizeof(int32_t) * positions.size());
+
+        build_btflash_mask(branch_mask, branch_start, step, width,
+                           (int)branch_sg.attn_mask->ne[0],
+                           (int)branch_sg.attn_mask->ne[1]);
+        ggml_backend_tensor_set(branch_sg.attn_mask, branch_mask.data(), 0,
+                                sizeof(uint16_t) * branch_mask.size());
+        if (ggml_backend_graph_compute(target_backend_, branch_sg.gf) !=
+            GGML_STATUS_SUCCESS) {
+            step_graph_destroy(branch_sg);
+            return false;
+        }
+        after_target_compute(branch_sg, physical_start, width);
+        ggml_backend_tensor_get(branch_sg.logits, branch_logits.data(), 0,
+                                sizeof(float) * branch_logits.size());
+
+        for (int branch = 0; branch < width; ++branch) {
+            const float * row = branch_logits.data() + (size_t)branch * vocab;
+            const int32_t token = sample_logits(
+                row, vocab, sampler_, branch_history[(size_t)branch],
+                branch_rng[(size_t)branch]);
+            branch_tokens[(size_t)branch].push_back(token);
+            branch_history[(size_t)branch].push_back(token);
+            logprob_sums[(size_t)branch] +=
+                btflash_token_logprob(row, vocab, token);
+            logprob_counts[(size_t)branch]++;
+            terminal_seen = terminal_seen || IS_EOS_TOK(token, w_);
+        }
+    }
+    step_graph_destroy(branch_sg);
+
+    const int winner = btflash_select_normalized_logprob(logprob_sums,
+                                                          logprob_counts);
+    if (winner < 0 || !state_bank.restore(cache_, winner)) {
+        std::fprintf(stderr, "[btflash] winner recurrent-state restore failed\n");
+        return false;
+    }
+    const int fed_steps = (int)branch_tokens[(size_t)winner].size() - 1;
+    if (!compact_qwen35_btflash_winner(cache_, branch_start, width,
+                                       fed_steps, winner)) {
+        std::fprintf(stderr, "[btflash] winner KV compaction failed\n");
+        return false;
+    }
+
+    sampler_rng_ = branch_rng[(size_t)winner];
+    const auto & selected = branch_tokens[(size_t)winner];
+    for (int32_t token : selected) {
+        out_tokens.push_back(token);
+        io.emit(token);
+        if (io.is_cancelled()) break;
+    }
+    committed += (int)selected.size();
+    cache_.cur_pos = committed;
+    cache_.last_tok = selected.back();
+    std::fprintf(stderr,
+        "[btflash] K=%d H=%zu prefix=%d winner=%d score=%.6f physical_rows=%d\n",
+        width, selected.size(), prefix_emitted, winner,
+        logprob_sums[(size_t)winner] / logprob_counts[(size_t)winner],
+        fed_steps * width);
+
+    if (io.is_cancelled() || IS_EOS_TOK(selected.back(), w_)) {
+        io.emit(-1);
+        return true;
+    }
+    const int remaining = n_gen - (int)out_tokens.size();
+    const bool ok = remaining <= 0 ||
+        do_ar_decode(committed, remaining, out_tokens, io, budget_hook,
+                     forced_close_out, degenerate_close_out);
+    io.emit(-1);
+    return ok;
 }
 
 bool Qwen35Backend::sync_remote_draft_features(int start_pos, int n_tokens) {

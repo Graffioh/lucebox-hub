@@ -22,6 +22,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "sampler.h"
+#include "btflash.h"
 #include "placement/draft_residency.h"
 
 namespace dflash::common {
@@ -196,6 +197,9 @@ struct GenerateRequest {
     // path returns success but emits no tokens, so each backend can route the
     // retry through its existing AR path without copying retry policy.
     bool                       force_ar_decode = false;
+    // Optional request-scoped BTFlash BT1 branch interval. Disabled by
+    // default; the qwen35 single-target backend is the initial consumer.
+    BTFlashConfig              btflash;
 };
 
 // Stable, backend-independent generation failure categories. Backends should

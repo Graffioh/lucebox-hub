@@ -94,7 +94,10 @@ bool build_target_step(
     int kq_stride_pad = KQ_MASK_PAD,
     bool capture_moe_router = false,
     bool kvflash_mask = false,
-    bool capture_qk = false);
+    bool capture_qk = false,
+    int recurrent_sequences = 1,
+    const std::vector<ggml_tensor *> * recurrent_ssm_state = nullptr,
+    const std::vector<ggml_tensor *> * recurrent_conv_state = nullptr);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

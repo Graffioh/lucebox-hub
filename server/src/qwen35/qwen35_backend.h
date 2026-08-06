@@ -318,6 +318,16 @@ private:
                       bool * forced_close_out = nullptr,
                       bool * degenerate_close_out = nullptr);
 
+    // BTFlash BT1: fixed-fork, K-row target rollout, normalized-logprob
+    // selection, recurrent/KV winner compaction, then ordinary AR continuation.
+    bool do_btflash_decode(int committed, int n_gen,
+                           std::vector<int32_t> & out_tokens,
+                           const DaemonIO & io,
+                           const BTFlashConfig & config,
+                           const BudgetHook & budget_hook = {},
+                           bool * forced_close_out = nullptr,
+                           bool * degenerate_close_out = nullptr);
+
     bool sync_remote_draft_features(int start_pos, int n_tokens);
     bool sync_local_draft_features(int start_pos, int n_tokens);
 

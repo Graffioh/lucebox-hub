@@ -279,7 +279,10 @@ bool build_target_step(
     int kq_stride_pad,
     bool capture_moe_router,
     bool kvflash_mask,
-    bool capture_qk) {
+    bool capture_qk,
+    int recurrent_sequences,
+    const std::vector<ggml_tensor *> * recurrent_ssm_state,
+    const std::vector<ggml_tensor *> * recurrent_conv_state) {
     step_graph_free(sg);
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
@@ -359,6 +362,9 @@ bool build_target_step(
     gi.last_token_logits_only     = last_token_logits_only;
     gi.kv_write_rows              = sg.kv_write_rows;
     gi.q_capture                  = capture_qk;
+    gi.n_seqs                    = recurrent_sequences;
+    gi.recurrent_ssm_state       = recurrent_ssm_state;
+    gi.recurrent_conv_state      = recurrent_conv_state;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

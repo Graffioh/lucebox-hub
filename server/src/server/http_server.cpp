@@ -513,6 +513,35 @@ SamplerCfg parse_request_sampler(const json & body,
     return sampler;
 }
 
+BTFlashConfig parse_btflash_config(const json & body) {
+    BTFlashConfig config;
+    if (!body.contains("btflash") || body["btflash"].is_null() ||
+        (body["btflash"].is_boolean() && !body["btflash"].get<bool>())) {
+        return config;
+    }
+
+    const json * value = &body["btflash"];
+    json defaults;
+    if (value->is_boolean() && value->get<bool>()) {
+        defaults = json::object();
+        value = &defaults;
+    } else if (!value->is_object()) {
+        throw std::invalid_argument("btflash must be an object or false");
+    }
+
+    config.row_budget  = value->value("row_budget", 16);
+    config.k           = value->value("k", 4);
+    config.horizon     = value->value("horizon", 16);
+    config.survivors   = value->value("survivors", 1);
+    config.fork_tokens = value->value("fork_tokens", 8);
+    config.fork        = value->value("fork", std::string("fixed"));
+    config.select      = value->value("select", std::string("logprob"));
+    if (const std::string error = validate_btflash_config(config); !error.empty()) {
+        throw std::invalid_argument(error);
+    }
+    return config;
+}
+
 json require_messages_array(const json & body) {
     if (!body.contains("messages") || !body["messages"].is_array() ||
         body["messages"].empty()) {
@@ -1571,6 +1600,7 @@ bool HttpServer::parse_common_request_fields(
     }
 
     req.sampler = parse_request_sampler(body, config_.sampler_defaults);
+    req.btflash = parse_btflash_config(body);
     if (body.contains("tools")) req.tools = body["tools"];
     // Tool choice constraint for hint generation.
     if (body.contains("tool_choice")) req.tool_choice = body["tool_choice"];
@@ -3210,6 +3240,7 @@ void HttpServer::prepare_generation_inputs(
     inputs.request.prompt = prepared.tokens;
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
+    inputs.request.btflash = req.btflash;
     inputs.request.do_sample = req.sampler.needs_logit_processing();
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.
