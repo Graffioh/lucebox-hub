@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 namespace dflash::common {
@@ -36,7 +37,8 @@ static bool build_draft_graph_internal(
     const DraftFeatureMirror * mirror,
     int mirror_slot0,
     bool mirror_view,
-    bool pad_masked = false) {
+    bool pad_masked = false,
+    int draft_batch = 1) {
 
     const size_t arena_sz = 32u * 1024 * 1024;
     if (sg.meta_arena.size() < arena_sz) sg.meta_arena.resize(arena_sz);
@@ -48,7 +50,7 @@ static bool build_draft_graph_internal(
     if (!sg.ctx) return false;
 
     const int hidden = dw.n_embd;
-    const int q_len  = dw.block_size;
+    const int q_len  = dw.block_size * draft_batch;
     const int fc_in  = dw.n_target_layers * hidden;
 
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, q_len, 1);
@@ -97,7 +99,7 @@ static bool build_draft_graph_internal(
     for (int i = 0; i < dw.n_layer; i++)
         if (!dw.layers[i].is_swa) { any_full_layer = true; break; }
     sg.pad_mask_full = nullptr;
-    if (pad_masked && any_full_layer) {
+    if ((pad_masked && any_full_layer) || draft_batch > 1) {
         const int total_k = ctx_len + q_len;
         const int kv_pad = mask_align_up(total_k, MASK_KV_PAD);
         sg.pad_mask_full = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_len);
@@ -109,6 +111,7 @@ static bool build_draft_graph_internal(
 
     DraftGraphInputs gi{};
     gi.ctx_len           = ctx_len;
+    gi.q_len             = q_len;
     gi.noise_embed       = sg.inp_embed;
     gi.target_hidden_cat = sg.target_hidden_cat;
     gi.positions_q       = sg.positions;
@@ -131,6 +134,71 @@ static bool build_draft_graph_internal(
     } else {
         ggml_set_output(sg.hidden_states);
         ggml_build_forward_expand(sg.gf, sg.hidden_states);
+    }
+    return true;
+}
+
+bool make_draft_packed_batch_layout(
+    int ctx_len,
+    int block_size,
+    int batch_size,
+    int swa_window,
+    DraftPackedBatchLayout & out) {
+    out = {};
+    if (ctx_len < 0 || block_size <= 0 || batch_size <= 0 ||
+        batch_size > std::numeric_limits<int>::max() / block_size) {
+        return false;
+    }
+
+    const int query_count = block_size * batch_size;
+    if (ctx_len > std::numeric_limits<int>::max() - query_count) return false;
+    const int full_kv = ctx_len + query_count;
+    const int eff_ctx = swa_window > 0 && ctx_len > swa_window
+        ? swa_window : ctx_len;
+    const int swa_kv = eff_ctx + query_count;
+
+    out.query_count = query_count;
+    out.full_kv_stride = mask_align_up(full_kv, MASK_KV_PAD);
+    out.swa_kv_stride = mask_align_up(swa_kv, MASK_KV_PAD);
+    out.positions_q.resize(query_count);
+    out.positions_k.resize(full_kv);
+
+    for (int i = 0; i < ctx_len; ++i) out.positions_k[i] = i;
+    for (int branch = 0; branch < batch_size; ++branch) {
+        for (int depth = 0; depth < block_size; ++depth) {
+            const int row = branch * block_size + depth;
+            const int32_t pos = ctx_len + depth;
+            out.positions_q[row] = pos;
+            out.positions_k[ctx_len + row] = pos;
+        }
+    }
+
+    static constexpr uint16_t ZERO = 0x0000;
+    static constexpr uint16_t NEG_INF = 0xFC00;
+    out.mask_full.assign((size_t)out.full_kv_stride * query_count, NEG_INF);
+    out.mask_swa.assign((size_t)out.swa_kv_stride * query_count, NEG_INF);
+
+    for (int branch = 0; branch < batch_size; ++branch) {
+        const int branch_key0 = branch * block_size;
+        for (int depth = 0; depth < block_size; ++depth) {
+            const int row = branch_key0 + depth;
+            uint16_t * full = out.mask_full.data() +
+                (size_t)row * out.full_kv_stride;
+            uint16_t * swa = out.mask_swa.data() +
+                (size_t)row * out.swa_kv_stride;
+
+            for (int k = 0; k < ctx_len; ++k) full[k] = ZERO;
+            for (int k = 0; k < eff_ctx; ++k) swa[k] = ZERO;
+
+            // Full-attention draft layers are non-causal inside one block.
+            // SWA layers keep their existing causal noise semantics.
+            for (int j = 0; j < block_size; ++j) {
+                full[ctx_len + branch_key0 + j] = ZERO;
+            }
+            for (int j = 0; j <= depth; ++j) {
+                swa[eff_ctx + branch_key0 + j] = ZERO;
+            }
+        }
     }
     return true;
 }
@@ -316,6 +384,62 @@ bool build_draft_step(
                                 sizeof(uint16_t) * mask_data.size());
     }
 
+    return true;
+}
+
+bool build_draft_packed_batch_step(
+    StepGraph & sg,
+    const DraftWeights & dw,
+    ggml_backend_t backend,
+    int ctx_len,
+    int batch_size,
+    const DraftFeatureMirror * mirror,
+    int committed) {
+    if (!backend || ctx_len < 0 || batch_size <= 0) return false;
+
+    DraftPackedBatchLayout layout;
+    if (!make_draft_packed_batch_layout(
+            ctx_len, dw.block_size, batch_size, dw.swa_window, layout)) {
+        return false;
+    }
+
+    step_graph_free(sg);
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    if (!sg.alloc) return false;
+
+    int mirror_slot0 = 0;
+    const bool use_view = mirror &&
+        draft_feature_mirror_can_view(*mirror, committed, ctx_len, mirror_slot0);
+
+    if (!build_draft_graph_internal(
+            sg, dw, /*lm_head=*/nullptr, ctx_len,
+            mirror, mirror_slot0, use_view,
+            /*pad_masked=*/false, batch_size) ||
+        !ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) {
+        step_graph_free(sg);
+        return false;
+    }
+    sg.built_view = use_view;
+
+    if (!sg.positions || !sg.positions_k) {
+        step_graph_free(sg);
+        return false;
+    }
+
+    ggml_backend_tensor_set(sg.positions, layout.positions_q.data(), 0,
+                            sizeof(int32_t) * layout.positions_q.size());
+    ggml_backend_tensor_set(sg.positions_k, layout.positions_k.data(), 0,
+                            sizeof(int32_t) * layout.positions_k.size());
+    if (sg.pad_mask_full) {
+        ggml_backend_tensor_set(sg.pad_mask_full, layout.mask_full.data(), 0,
+                                sizeof(uint16_t) * layout.mask_full.size());
+    }
+    if (sg.attn_mask) {
+        ggml_backend_tensor_set(sg.attn_mask, layout.mask_swa.data(), 0,
+                                sizeof(uint16_t) * layout.mask_swa.size());
+    }
     return true;
 }
 

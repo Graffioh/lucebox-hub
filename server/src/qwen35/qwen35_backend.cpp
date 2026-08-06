@@ -2225,6 +2225,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
         if (use_gbatching_verify) {
             const int K = cfg_.gbatching_branches;
+            int gbatching_draft_graphs = 1; // initial seed-producing block
+            int gbatching_draft_batch = 1;
             std::vector<float> top_lp;
             std::vector<int32_t> top_ids;
             const auto profile_project_start = profile_start();
@@ -2238,10 +2240,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             profile_add(profile_project_s, profile_project_start);
 
             // Seed-and-Expand. Branch 0 keeps the already-computed top-1
-            // spine. Every alternative starts from a different row-1 seed and
-            // reruns the small drafter against the same read-only prefix. The
-            // alternative hidden tails are projected together on the target
-            // GPU, so their LM-head matmul is a single wide batch.
+            // spine. Alternatives start from distinct row-1 seeds and share
+            // one packed Strix graph. Attention masks isolate their noise
+            // rows, while context feature fusion and draft weight reads are
+            // shared across the batch. The remote protocol does not carry a
+            // batch yet and therefore keeps an explicit serial fallback.
             const int horizon = cfg_.gbatching_horizon;
             std::vector<int32_t> branch_tokens((size_t)K * horizon, 0);
             for (int depth = 0; depth < horizon; ++depth) {
@@ -2260,61 +2263,98 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 const int expanded_rows = (K - 1) * (horizon - 1);
                 std::vector<float> expanded_hidden(
                     (size_t)expanded_rows * hidden, 0.0f);
-                std::vector<float> branch_hidden;
-                std::vector<float> branch_noise(noise_embed.size(), 0.0f);
-                std::vector<int32_t> branch_noise_ids(
-                    (size_t)q_len, target->mask_token_id());
-
-                auto run_branch_draft = [&](const std::vector<float> & input,
-                                            std::vector<float> & output) -> bool {
-                    if (use_remote_draft) {
-                        output.clear();
-                        return remote_draft_.propose(
-                            committed, draft_ctx, input, output);
-                    }
-
-                    ggml_tensor * inp = use_draft_kv
-                        ? draft_kv_.inp_embed : draft_sg.inp_embed;
-                    ggml_tensor * hidden_out = use_draft_kv
-                        ? draft_kv_.hidden_states : draft_sg.hidden_states;
-                    ggml_cgraph * graph = use_draft_kv
-                        ? draft_kv_.gf : draft_sg.gf;
-                    if (!inp || !hidden_out || !graph) return false;
-
-                    ggml_backend_tensor_set(inp, input.data(), 0,
-                                            sizeof(float) * input.size());
-                    if (ggml_backend_graph_compute(draft_backend_, graph) !=
-                        GGML_STATUS_SUCCESS) {
-                        return false;
-                    }
-                    output.resize((size_t)hidden * q_len);
-                    ggml_backend_tensor_get(hidden_out, output.data(), 0,
-                                            sizeof(float) * output.size());
-                    return true;
-                };
-
                 const auto expand_draft_start = profile_start();
-                for (int branch = 1; branch < K; ++branch) {
-                    branch_noise_ids[0] =
-                        branch_tokens[(size_t)branch * horizon];
-                    if (!target->embed_tokens(branch_noise_ids.data(), q_len,
-                                              branch_noise.data()) ||
-                        !run_branch_draft(branch_noise, branch_hidden) ||
-                        branch_hidden.size() != (size_t)hidden * q_len) {
+                if (use_remote_draft) {
+                    std::vector<float> branch_hidden;
+                    std::vector<float> branch_noise(noise_embed.size(), 0.0f);
+                    std::vector<int32_t> branch_noise_ids(
+                        (size_t)q_len, target->mask_token_id());
+                    for (int branch = 1; branch < K; ++branch) {
+                        branch_noise_ids[0] =
+                            branch_tokens[(size_t)branch * horizon];
+                        branch_hidden.clear();
+                        if (!target->embed_tokens(branch_noise_ids.data(), q_len,
+                                                  branch_noise.data()) ||
+                            !remote_draft_.propose(
+                                committed, draft_ctx, branch_noise,
+                                branch_hidden) ||
+                            branch_hidden.size() != (size_t)hidden * q_len) {
+                            std::fprintf(stderr,
+                                "spec-decode: gbatching remote branch expansion "
+                                "failed branch=%d\n", branch);
+                            step_graph_destroy(draft_sg);
+                            return false;
+                        }
+                        for (int depth = 1; depth < horizon; ++depth) {
+                            const size_t dst_row =
+                                (size_t)(branch - 1) * (horizon - 1) + depth - 1;
+                            const float * src = branch_hidden.data() +
+                                (size_t)depth * hidden;
+                            std::copy_n(src, hidden,
+                                        expanded_hidden.data() + dst_row * hidden);
+                        }
+                    }
+                    gbatching_draft_graphs += K - 1;
+                } else {
+                    const int draft_batch = K - 1;
+                    const int packed_rows = draft_batch * q_len;
+                    std::vector<int32_t> packed_ids(
+                        (size_t)packed_rows, target->mask_token_id());
+                    for (int batch = 0; batch < draft_batch; ++batch) {
+                        packed_ids[(size_t)batch * q_len] =
+                            branch_tokens[(size_t)(batch + 1) * horizon];
+                    }
+                    std::vector<float> packed_noise(
+                        (size_t)packed_rows * hidden, 0.0f);
+                    std::vector<float> packed_hidden(
+                        (size_t)packed_rows * hidden, 0.0f);
+                    StepGraph batch_sg;
+                    bool batch_ok = build_draft_packed_batch_step(
+                        batch_sg, dw_, draft_backend_, draft_ctx, draft_batch,
+                        use_mirror_view ? &feature_mirror_ : nullptr,
+                        committed);
+                    if (batch_ok && !batch_sg.built_view) {
+                        batch_ok = copy_feature_ring_range_to_tensor(
+                            feature_mirror_, batch_sg.target_hidden_cat,
+                            draft_start, draft_ctx);
+                    }
+                    if (batch_ok) {
+                        batch_ok = target->embed_tokens(
+                            packed_ids.data(), packed_rows, packed_noise.data());
+                    }
+                    if (batch_ok) {
+                        ggml_backend_tensor_set(
+                            batch_sg.inp_embed, packed_noise.data(), 0,
+                            sizeof(float) * packed_noise.size());
+                        batch_ok = ggml_backend_graph_compute(
+                            draft_backend_, batch_sg.gf) == GGML_STATUS_SUCCESS;
+                    }
+                    if (batch_ok) {
+                        ggml_backend_tensor_get(
+                            batch_sg.hidden_states, packed_hidden.data(), 0,
+                            sizeof(float) * packed_hidden.size());
+                    }
+                    step_graph_destroy(batch_sg);
+                    if (!batch_ok) {
                         std::fprintf(stderr,
-                            "spec-decode: gbatching branch expansion failed "
-                            "branch=%d\n", branch);
+                            "spec-decode: gbatching packed draft batch failed "
+                            "batch=%d rows=%d\n", draft_batch, packed_rows);
                         step_graph_destroy(draft_sg);
                         return false;
                     }
-                    for (int depth = 1; depth < horizon; ++depth) {
-                        const size_t dst_row =
-                            (size_t)(branch - 1) * (horizon - 1) + depth - 1;
-                        const float * src = branch_hidden.data() +
-                            (size_t)depth * hidden;
-                        std::copy_n(src, hidden,
-                                    expanded_hidden.data() + dst_row * hidden);
+
+                    for (int batch = 0; batch < draft_batch; ++batch) {
+                        for (int depth = 1; depth < horizon; ++depth) {
+                            const size_t dst_row =
+                                (size_t)batch * (horizon - 1) + depth - 1;
+                            const float * src = packed_hidden.data() +
+                                ((size_t)batch * q_len + depth) * hidden;
+                            std::copy_n(src, hidden,
+                                        expanded_hidden.data() + dst_row * hidden);
+                        }
                     }
+                    gbatching_draft_graphs++;
+                    gbatching_draft_batch = draft_batch;
                 }
                 profile_add(profile_draft_s, expand_draft_start);
 
@@ -2423,11 +2463,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
             std::fprintf(stderr,
                 "[gbatching] branches=%d horizon=%d actual_rows=%d alloc_rows=%d "
-                "draft_passes=%d projection_rows=%d selected=%d score=%.4f "
+                "draft_graphs=%d draft_batch=%d projection_rows=%d "
+                "selected=%d score=%.4f "
                 "main=%.4f margin=%.4f\n",
                 cfg_.gbatching_branches, cfg_.gbatching_horizon,
                 qtree.tree.n_nodes + 1, gbatching_rows,
-                cfg_.gbatching_branches,
+                gbatching_draft_graphs, gbatching_draft_batch,
                 (cfg_.gbatching_branches - 1) *
                     std::max(0, cfg_.gbatching_horizon - 1), selected.branch,
                 selected.score, selected.main_score, cfg_.gbatching_margin);

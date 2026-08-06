@@ -14,9 +14,12 @@ normalization.
 ## In brief
 
 ```text
-Strix Halo: create four short paths from one committed prefix
-                         │ one combined hidden buffer
-                         ▼
+R9700: prefill + canonical target KV
+                    │ captured prefix features + branch seeds
+                    ▼
+Strix Halo: baseline draft + one real batch-3 expansion
+                    │ one combined hidden buffer
+                    ▼
 R9700: batched projection → one 32-row tree verify → score → commit one path
 ```
 
@@ -38,16 +41,22 @@ generations alive and it does not generate several complete answers.
 
 ## Hardware split
 
-- R9700: target weights, target KV, LM-head projection, tree verification,
-  scoring, sampler and commit.
+- R9700: target prefill, target weights, canonical target KV, LM-head
+  projection, tree verification, scoring, sampler and commit.
 - Strix Halo: DFlash drafter and alternative-path expansion.
-- Cross-device traffic: seed embeddings and a bounded buffer of hidden rows.
+- Cross-device traffic: captured prefix features, seed embeddings and a bounded
+  buffer of hidden rows.
 - Disk and host RAM: no target KV spill is required by GBatching.
 
-The target KV never moves. The committed prefix and temporary target suffixes
-stay on the R9700, next to attention. The two AMD GPUs can run in the same HIP
-process; the existing remote-drafter mode remains supported but is not needed
-for this machine.
+The main prefill runs on the R9700 because its large prompt matrices benefit
+most from the stronger GPU. Its target KV never moves: the committed prefix
+and temporary target suffixes stay next to target attention. The Strix receives
+only the captured features required by DFlash; it does not repeat the target
+prefill.
+
+The two AMD GPUs run in the same HIP process. This local path is the intended
+mode for real drafter batching. The existing remote-drafter protocol remains
+functional, but expands alternatives serially until it gains a batch request.
 
 ## Seed-and-Expand
 
@@ -56,8 +65,8 @@ The paths are built as follows:
 1. Run one normal DFlash block and project its hidden rows on the R9700.
 2. Take the top four tokens at the first candidate position.
 3. Keep branch 0 and its existing top-1 tail as the baseline.
-4. For branches 1–3, run the Strix drafter again with the alternative token as
-   seed and the same read-only committed prefix.
+4. Put branches 1–3 into one Strix graph with the alternative tokens as seeds
+   and the same read-only committed prefix.
 5. Collect six hidden tail rows from each alternative: 18 rows in total.
 6. Project all 18 rows together in one R9700 LM-head graph.
 7. Build the four fully conditioned paths and verify their complete tree in
@@ -65,15 +74,23 @@ The paths are built as follows:
 
 ```text
 shared draft prefix ─┬─ baseline seed → existing 6-token tail
-                     ├─ seed 1 → newly conditioned 6-token tail
-                     ├─ seed 2 → newly conditioned 6-token tail
-                     └─ seed 3 → newly conditioned 6-token tail
+                     └─ one packed Strix batch
+                         ├─ seed 1 → newly conditioned 6-token tail
+                         ├─ seed 2 → newly conditioned 6-token tail
+                         └─ seed 3 → newly conditioned 6-token tail
 ```
 
-The first prototype executes the three extra Strix passes sequentially. This
-keeps the implementation small and answers the important question first:
-does genuine branch diversity improve results enough to justify its latency?
-If it does, the next optimization is one batch-3 drafter graph on the Strix.
+This is a real batch, not three calls grouped by the host. With the defaults,
+the graph flattens `3 × 16` draft rows into one 48-row forward. Dense layers
+operate on all 48 rows together. Block-diagonal attention masks let every
+branch read the shared prefix and its own 16 noise rows, never another branch.
+Repeated positions preserve the semantics of three independent draft blocks.
+
+For this first implementation, the packed expansion uses the stateless DFlash
+path instead of the persistent drafter-KV path. The prefix features are fused
+once inside the batch, not once per branch. Supporting the same batch directly
+over the persistent drafter KV is a later optimization, not required to test
+whether real batching increases Strix utilization.
 
 ## Selection and commit
 
@@ -122,7 +139,10 @@ The configuration is reported under `/props.speculative.gbatching`.
 - Maximum 64 allocated verify rows.
 - Thinking-budget closure, tool hints, stall recovery and the minimum-token
   floor keep their existing path; GBatching waits for the first safe round.
-- Alternative Strix expansions are sequential, not yet a drafter batch.
+- Local same-process expansion is one real packed drafter batch. Remote draft
+  expansion is still serial because the IPC protocol is batch-1.
+- The packed expansion currently recomputes draft prefix K/V once for the
+  whole batch instead of reading the persistent drafter KV cache.
 - Uncertainty-triggered activation and a proposal deadline are not implemented.
 - Target KV on the Strix and remote-KV attention are not part of the design.
 
@@ -133,18 +153,22 @@ Compare normal DFlash and GBatching with identical prompts and seeds. Record:
 - task pass rate or result quality;
 - end-to-end latency and time to first token;
 - alternative-path win rate and score gain over branch 0;
-- initial projection, Strix expansion, 18-row projection and 32-row verify time;
+- initial projection, Strix batch-3 expansion, 18-row projection and 32-row
+  verify time;
 - R9700 matrix utilization and memory bandwidth;
 - Strix compute, bandwidth, power and thermal utilization.
 
 Keep Seed-and-Expand only if independent paths improve task results or produce
-useful alternative wins at an acceptable latency cost. If that succeeds, batch
-the three Strix expansions. After that, an uncertainty trigger and a deadline
-can keep average latency close to normal DFlash.
+useful alternative wins at an acceptable latency cost. If that succeeds, an
+uncertainty trigger and a deadline can keep average latency close to normal
+DFlash. Persistent-KV support for the packed Strix graph is the next low-level
+optimization.
 
 ## Implementation map
 
 - `server/src/common/gbatching.{h,cpp}` builds and scores path trees.
+- `server/src/common/dflash_draft_graph.{h,cpp}` builds the isolated packed
+  Strix batch.
 - `server/src/qwen35/qwen35_backend.cpp` expands paths, batches projection,
   runs the 32-row target verify and commits the winner.
 - `server/test/test_gbatching.cpp` covers path construction, row allocation,

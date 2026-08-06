@@ -1,4 +1,5 @@
 #include "CppUnitTestFramework.hpp"
+#include "dflash_draft_graph.h"
 #include "gbatching.h"
 
 #include <vector>
@@ -63,6 +64,38 @@ TEST_CASE(GBatchingFixture, rows_round_to_verify_tile) {
     CHECK_EQUAL(gbatching_required_rows(4, 7), 32);
     CHECK_EQUAL(gbatching_required_rows(2, 15), 32);
     CHECK_EQUAL(gbatching_required_rows(4, 8), 64);
+}
+
+TEST_CASE(GBatchingFixture, packed_draft_layout_isolates_branches) {
+    DraftPackedBatchLayout layout;
+    CHECK(make_draft_packed_batch_layout(
+        /*ctx_len=*/3, /*block_size=*/2, /*batch_size=*/3,
+        /*swa_window=*/2, layout));
+
+    CHECK_EQUAL(layout.query_count, 6);
+    CHECK(layout.positions_q ==
+          (std::vector<int32_t>{3, 4, 3, 4, 3, 4}));
+    CHECK(layout.positions_k ==
+          (std::vector<int32_t>{0, 1, 2, 3, 4, 3, 4, 3, 4}));
+
+    static constexpr uint16_t ZERO = 0x0000;
+    static constexpr uint16_t NEG_INF = 0xFC00;
+    const int row = 2; // branch 1, depth 0
+    const uint16_t * full = layout.mask_full.data() +
+        (size_t)row * layout.full_kv_stride;
+    CHECK_EQUAL(full[0], ZERO); // shared prefix
+    CHECK_EQUAL(full[3], NEG_INF); // branch 0 noise is isolated
+    CHECK_EQUAL(full[5], ZERO); // own branch, depth 0
+    CHECK_EQUAL(full[6], ZERO); // full attention sees own complete block
+    CHECK_EQUAL(full[7], NEG_INF); // branch 2 noise is isolated
+
+    const uint16_t * swa = layout.mask_swa.data() +
+        (size_t)row * layout.swa_kv_stride;
+    CHECK_EQUAL(swa[0], ZERO); // shared SWA prefix
+    CHECK_EQUAL(swa[2], NEG_INF); // branch 0 noise is isolated
+    CHECK_EQUAL(swa[4], ZERO); // own causal key at depth 0
+    CHECK_EQUAL(swa[5], NEG_INF); // own future key is hidden
+    CHECK_EQUAL(swa[6], NEG_INF); // branch 2 noise is isolated
 }
 
 TEST_CASE(GBatchingFixture, main_branch_wins_without_clear_improvement) {
