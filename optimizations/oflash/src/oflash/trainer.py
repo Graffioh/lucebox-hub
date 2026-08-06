@@ -330,8 +330,14 @@ class Trainer:
             if rec is None:
                 break
             consumed = True
-            if self._enabled:
+            if not self._enabled:
+                continue
+            try:
                 self._ingest(rec)
+            except Exception as e:
+                # The tail already advanced past this record; dropping it is
+                # safe and beats taking the sidecar down.
+                self._control.log(f"record ingest failed: {e!r}; dropped")
         return consumed
 
     def _ingest(self, rec: Record) -> None:
@@ -499,7 +505,16 @@ class Trainer:
 
     def _sample_loss(self, store: SeqStore, sample: StepSample,
                      win_start: int) -> torch.Tensor:
-        """Weighted CE + λ·KL(target top-K ‖ drafter) for one step sample."""
+        """Weighted CE + λ·KL(target top-K ‖ drafter) for one step sample.
+
+        Label alignment (oflash_format.h §STEP): target_tok[i] is the
+        target's choice AFTER consuming draft_tok[0..i], i.e. the ground
+        truth for draft position i+1. Drafter row j therefore trains
+        against target_tok[j-1] (and topk[j-1]); row 0 reproduces the
+        known seed and carries no signal. accept_flags[j] describes
+        draft_tok[j] — the row the drafter produced — so the rejection
+        upweight indexes rows, not labels.
+        """
         assert self._mirror is not None
         m = self._mirror
         rows = np.stack([store.feat[p]
@@ -512,26 +527,28 @@ class Trainer:
         logits = m.forward(feat, noise.to(self._device))  # [q_len, vocab] f32
 
         n = min(sample.n_labels, q_len)
-        logp = torch.log_softmax(logits[:n].float(), dim=-1)  # [n, vocab]
+        if n < 2:
+            return logits.sum() * 0.0  # no trainable rows; keep the graph
+        logp = torch.log_softmax(logits[1:n].float(), dim=-1)  # rows 1..n-1
         tgt = torch.from_numpy(
-            sample.target_tok[:n].astype(np.int64)).to(self._device)
-        ce = -logp.gather(1, tgt.unsqueeze(1)).squeeze(1)  # [n]
+            sample.target_tok[:n - 1].astype(np.int64)).to(self._device)
+        ce = -logp.gather(1, tgt.unsqueeze(1)).squeeze(1)  # [n-1]
 
         rej = torch.from_numpy(
-            sample.accept_flags[:n] == 0).to(self._device)
-        w = torch.ones(n, dtype=torch.float32, device=self._device)
+            sample.accept_flags[1:n] == 0).to(self._device)
+        w = torch.ones(n - 1, dtype=torch.float32, device=self._device)
         w = w.masked_fill(rej, float(self.cfg.reject_weight))
         loss_vec = w * ce
 
         if (sample.topk_ids is not None and sample.topk_lp is not None
                 and self.cfg.kl_lambda > 0.0):
-            lp = torch.from_numpy(sample.topk_lp[:n]).to(self._device)
+            lp = torch.from_numpy(sample.topk_lp[:n - 1]).to(self._device)
             ids = torch.from_numpy(
-                sample.topk_ids[:n].astype(np.int64)).to(self._device)
+                sample.topk_ids[:n - 1].astype(np.int64)).to(self._device)
             log_p = torch.log_softmax(lp, dim=-1)  # renormalized over top-K
             p = log_p.exp()
-            q_lp = logp.gather(1, ids)             # [n, K]
-            kl = (p * (log_p - q_lp)).sum(dim=-1)  # [n]
+            q_lp = logp.gather(1, ids)             # [n-1, K]
+            kl = (p * (log_p - q_lp)).sum(dim=-1)  # [n-1]
             loss_vec = loss_vec + self.cfg.kl_lambda * kl
 
         return loss_vec.mean()
