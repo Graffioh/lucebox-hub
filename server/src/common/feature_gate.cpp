@@ -50,6 +50,22 @@ std::string check_feature_compatibility(
         return "--prefill-compression requires --prefill-drafter";
     }
 
+    // ── OFlash (online drafter adaptation) prerequisites
+    if (features.oflash_requested) {
+        if (arch != "qwen35") {
+            return "--oflash is qwen35-only in this iteration (arch=" +
+                   arch + ")";
+        }
+        if (args.draft_path == nullptr) {
+            return "--oflash requires a --draft model (it adapts the DFlash "
+                   "drafter)";
+        }
+        if (args.remote_draft.enabled()) {
+            return "--oflash requires a locally loaded drafter "
+                   "(incompatible with --draft-ipc-bin)";
+        }
+    }
+
     // ── target/draft backend mixing × remote draft IPC
     if (mixed_draft_placement && !args.remote_draft.enabled()) {
         return "mixed target/draft backends require --draft-ipc-bin "

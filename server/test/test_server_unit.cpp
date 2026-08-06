@@ -4418,6 +4418,55 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
 }
 
+TEST_CASE(ServerUnitFixture, test_props_oflash_shape) {
+    // /props.oflash (docs/OFLASH.md §6.5): additive section, so no
+    // props_schema bump. enabled=false without a snapshot; full counter set
+    // when the backend supplies one.
+    ServerConfig cfg = make_props_config_with_sidecar(json{
+        {"name", "Qwen3.6 27B"},
+        {"source", "https://huggingface.co/Qwen/Qwen3.6-27B"},
+        {"verified_at", "2026-05-23"},
+        {"max_tokens", 32768},
+    });
+    Tokenizer    tok;
+    PrefixCache  pc(0, tok);
+    ToolMemory   tm;
+
+    json body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body.contains("oflash"));
+    TEST_ASSERT(body["oflash"]["enabled"].get<bool>() == false);
+    // Additive section: schema stays at 2 (props-endpoint.md §5.1).
+    TEST_ASSERT(body["server"]["props_schema"].get<int>() == 2);
+
+    oflash::OFlashPropsSnapshot snap;
+    snap.enabled = true;
+    snap.profile = "coding";
+    snap.adapter_generation = 4;
+    snap.swaps = 5;
+    snap.promotes = 4;
+    snap.rollbacks = 1;
+    snap.rolling_al = 6.25;
+    snap.probation_al = 0.0;
+    snap.trainer_alive = true;
+    snap.steps = 1234;
+    snap.records_written = 1200;
+    snap.records_dropped = 3;
+    snap.ring_backlog_bytes = 4096;
+    body = build_props_body(cfg, pc, tm, &snap);
+    const json & of = body["oflash"];
+    TEST_ASSERT(of["enabled"].get<bool>() == true);
+    TEST_ASSERT(of["profile"].get<std::string>() == "coding");
+    TEST_ASSERT(of["adapter_generation"].get<uint64_t>() == 4);
+    TEST_ASSERT(of["swaps"].get<uint64_t>() == 5);
+    TEST_ASSERT(of["promotes"].get<uint64_t>() == 4);
+    TEST_ASSERT(of["rollbacks"].get<uint64_t>() == 1);
+    TEST_ASSERT(of["rolling_al"].get<double>() == 6.25);
+    TEST_ASSERT(of["probation_al"].is_null());  // not in probation
+    TEST_ASSERT(of["training_disabled"].get<bool>() == false);
+    TEST_ASSERT(of["trainer_alive"].get<bool>() == true);
+    TEST_ASSERT(of["records_dropped"].get<uint64_t>() == 3);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // usage.timings — per-request prefill / decode wall-clock breakdown
 // surfaced under usage.timings (spec §6.3). Tests cover all three

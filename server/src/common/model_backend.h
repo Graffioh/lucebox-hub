@@ -23,6 +23,7 @@
 #include "ggml-backend.h"
 #include "sampler.h"
 #include "placement/draft_residency.h"
+#include "common/oflash/oflash_props.h"  // OFlashPropsSnapshot
 
 namespace dflash::common {
 
@@ -442,6 +443,14 @@ struct ModelBackend {
     // Return the DFlashTarget adapter for this backend. Only valid when
     // supports_dflash_spec_decode() returns true. Default returns nullptr.
     virtual class DFlashTarget * dflash_target() { return nullptr; }
+
+    // OFlash online drafter adaptation stats for /props. Returns false when
+    // OFlash is not active on this backend (the /props section then reports
+    // enabled=false). Snapshot is cheap and thread-safe.
+    virtual bool oflash_props(oflash::OFlashPropsSnapshot & out) const {
+        (void)out;
+        return false;
+    }
 
     // Release oversized scratch buffers between requests to prevent VRAM
     // growth over time. Default is a no-op.

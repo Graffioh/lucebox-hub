@@ -9,6 +9,7 @@
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
 #include "prefill_attention_mode.h"
+#include "common/oflash/oflash_config.h"
 
 namespace dflash::common {
 
@@ -19,6 +20,10 @@ namespace dflash::common {
 struct BackendFeatureConfig {
     bool pflash_enabled = false;
     bool pflash_drafter_configured = false;
+
+    // --oflash online drafter adaptation (qwen35 + local draft only; the
+    // admission gate rejects unsupported combinations).
+    bool oflash_requested = false;
 
     // MoE-only server features. Recorded here so the gate can report them as
     // inert on a dense architecture; both are applied via env vars at parse
@@ -69,6 +74,9 @@ struct BackendArgs {
     bool            ddtree_chain_seed = true;
     int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
+
+    // OFlash online drafter adaptation (docs/OFLASH.md; qwen35 only).
+    oflash::OFlashConfig oflash;
 };
 
 }  // namespace dflash::common

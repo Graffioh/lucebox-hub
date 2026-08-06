@@ -26,6 +26,8 @@
 
 #include "dflash27b.h"
 
+#include "common/oflash/oflash_lora.h"
+
 namespace dflash::common {
 
 struct MoeHybridStorage;
@@ -323,6 +325,12 @@ struct DraftWeights {
     // Optional DSpark/DeepSpec-style Markov correction head. When present,
     // greedy chain decode adds a low-rank previous-token bias before argmax.
     DraftDSparkWeights dspark;
+
+    // Optional OFlash online-adaptation LoRA (common/oflash/oflash_lora.h).
+    // nullptr = graphs are built without LoRA nodes (zero overhead). The
+    // pointee's tensors are pointer-stable across adapter swaps; only their
+    // contents change (see oflash_lora.h swap discipline).
+    const oflash::OFlashLoraWeights * oflash = nullptr;
 };
 
 bool load_draft_safetensors(const std::string & path,

@@ -84,6 +84,19 @@ static void print_usage(const char * prog) {
         "  --draft-swa <N>                Draft sliding-window attention size (0=off; e.g.\n"
         "                                 2048 for unsloth Qwen3.6 targets, per server/README.md.\n"
         "                                 Env: DFLASH27B_DRAFT_SWA)\n"
+        "  --oflash                       Online drafter adaptation (docs/OFLASH.md;\n"
+        "                                 qwen35 + local --draft only)\n"
+        "  --oflash-device <cpu|N>        Trainer sidecar device: cpu or a HIP\n"
+        "                                 ordinal (default: 1, the iGPU)\n"
+        "  --oflash-profile <name>        Adapter profile (default: default)\n"
+        "  --oflash-lora-rank <N>         LoRA rank (default: 16)\n"
+        "  --oflash-alpha <F>             LoRA alpha (default: 32)\n"
+        "  --oflash-dir <path>            Adapter store (default: ~/.lucebox/oflash)\n"
+        "  --oflash-ring-mb <N>           Capture ring size in MiB (default: 2048)\n"
+        "  --oflash-topk <K>              Target top-K captured per position\n"
+        "                                 (default: 32; 0 = skip)\n"
+        "  --oflash-trainer-bin <path>    Trainer sidecar executable; empty =\n"
+        "                                 capture-only (M0 telemetry) mode\n"
         "  --target-shard-ipc-bin <path>  Remote target shard IPC daemon for mixed target split\n"
         "  --target-shard-ipc-work-dir <path>  Remote target shard IPC scratch directory\n"
         "  --target-devices <list>        Target devices, e.g. cuda:0,cuda:1\n"
@@ -284,6 +297,56 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "[server] bad --draft-device value (expected backend:gpu)\n");
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--oflash") == 0) {
+            bargs.oflash.enabled = true;
+        } else if (std::strcmp(argv[i], "--oflash-device") == 0 && i + 1 < argc) {
+            bargs.oflash.device = argv[++i];
+            if (bargs.oflash.device != "cpu" &&
+                (bargs.oflash.device.empty() ||
+                 bargs.oflash.device.find_first_not_of("0123456789") !=
+                     std::string::npos)) {
+                std::fprintf(stderr,
+                    "[server] bad --oflash-device value (expected cpu or a "
+                    "GPU ordinal)\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--oflash-profile") == 0 && i + 1 < argc) {
+            bargs.oflash.profile = argv[++i];
+            if (bargs.oflash.profile.empty() ||
+                bargs.oflash.profile.find('/') != std::string::npos) {
+                std::fprintf(stderr, "[server] bad --oflash-profile value\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--oflash-lora-rank") == 0 && i + 1 < argc) {
+            bargs.oflash.lora_rank = std::atoi(argv[++i]);
+            if (bargs.oflash.lora_rank <= 0 || bargs.oflash.lora_rank > 256) {
+                std::fprintf(stderr,
+                    "[server] --oflash-lora-rank must be in [1,256]\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--oflash-alpha") == 0 && i + 1 < argc) {
+            bargs.oflash.lora_alpha = (float)std::atof(argv[++i]);
+            if (!(bargs.oflash.lora_alpha > 0.0f)) {
+                std::fprintf(stderr, "[server] --oflash-alpha must be > 0\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--oflash-dir") == 0 && i + 1 < argc) {
+            bargs.oflash.dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--oflash-ring-mb") == 0 && i + 1 < argc) {
+            bargs.oflash.ring_mb = std::atoi(argv[++i]);
+            if (bargs.oflash.ring_mb <= 0) {
+                std::fprintf(stderr, "[server] --oflash-ring-mb must be > 0\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--oflash-topk") == 0 && i + 1 < argc) {
+            bargs.oflash.topk = std::atoi(argv[++i]);
+            if (bargs.oflash.topk < 0 || bargs.oflash.topk > 256) {
+                std::fprintf(stderr,
+                    "[server] --oflash-topk must be in [0,256]\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--oflash-trainer-bin") == 0 && i + 1 < argc) {
+            bargs.oflash.trainer_bin = argv[++i];
         } else if (std::strcmp(argv[i], "--draft-ipc-bin") == 0 && i + 1 < argc) {
             bargs.remote_draft.ipc_bin = argv[++i];
         } else if (std::strcmp(argv[i], "--draft-ipc-work-dir") == 0 && i + 1 < argc) {
@@ -601,7 +664,15 @@ int main(int argc, char ** argv) {
     // Ask the factory to resolve model/placement facts and apply its feature
     // admission policy before any setup work. server_main only maps the
     // categorized result to the existing process exit convention.
+    // OFlash: resolve the default adapter store now so every later consumer
+    // (backend, banner, /props) sees the same absolute path.
+    if (bargs.oflash.enabled && bargs.oflash.dir.empty()) {
+        const char * home = std::getenv("HOME");
+        bargs.oflash.dir = std::string(home ? home : ".") + "/.lucebox/oflash";
+    }
+
     BackendFeatureConfig backend_features;
+    backend_features.oflash_requested = bargs.oflash.enabled;
     backend_features.pflash_enabled =
         sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
     backend_features.pflash_drafter_configured =
@@ -1007,6 +1078,18 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(stderr, "[server] │  draft_ipc_cap  = %d\n",
                      bargs.remote_draft.ring_cap);
+    }
+    if (bargs.oflash.enabled) {
+        std::fprintf(stderr, "[server] │  oflash          = ON (profile=%s rank=%d "
+                             "device=%s)\n",
+                     bargs.oflash.profile.c_str(), bargs.oflash.lora_rank,
+                     bargs.oflash.device.c_str());
+        std::fprintf(stderr, "[server] │  oflash_dir      = %s\n",
+                     bargs.oflash.dir.c_str());
+        std::fprintf(stderr, "[server] │  oflash_trainer  = %s\n",
+                     bargs.oflash.trainer_bin.empty()
+                         ? "(capture-only)"
+                         : bargs.oflash.trainer_bin.c_str());
     }
     std::fprintf(stderr, "[server] │  peer_access     = %s\n",
                  bargs.device.peer_access ? "ON" : "off");

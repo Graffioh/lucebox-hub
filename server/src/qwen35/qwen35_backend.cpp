@@ -13,6 +13,7 @@
 #include "common/geometric_sampler_cuda.h"
 #include <random>
 #endif
+#include "common/geometric_draft_topk_cuda.h"
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
 #include "qwen35_tensor_parallel.h"
@@ -254,6 +255,25 @@ bool Qwen35Backend::init() {
         }
     }
 
+    // OFlash online drafter adaptation (docs/OFLASH.md): local qwen35 draft
+    // only; never fatal — a failed init just serves the static drafter.
+    if (cfg_.oflash.enabled) {
+        if (use_remote_draft || !cfg_.draft_path) {
+            std::fprintf(stderr,
+                "[oflash] requires a locally loaded --draft model; disabled\n");
+        } else if (tensor_parallel) {
+            std::fprintf(stderr,
+                "[oflash] not supported with tensor-parallel targets; disabled\n");
+        } else {
+            oflash_ = std::make_unique<oflash::OFlashRuntime>();
+            if (!oflash_->init(cfg_.oflash, cfg_.draft_path, dw_,
+                               draft_backend_, w_.n_vocab)) {
+                oflash_.reset();
+                std::fprintf(stderr, "[oflash] disabled (init failed)\n");
+            }
+        }
+    }
+
     // Create KV cache
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
@@ -362,6 +382,14 @@ bool Qwen35Backend::park(ParkTarget target) {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
 
     if (want_draft_model && !draft_parked_) {
+        if (oflash_) {
+            // Adapter tensors live beside the draft weights; adaptation ends
+            // when the drafter is parked (persisted state survives).
+            oflash_->shutdown();
+            oflash_.reset();
+            std::fprintf(stderr, "[oflash] off (draft parked); "
+                                 "restart the server to resume adaptation\n");
+        }
         if (use_remote_draft) {
             remote_draft_.close();
         } else {
@@ -734,6 +762,12 @@ DFlashTarget * Qwen35Backend::dflash_target() {
 
 void Qwen35Backend::shutdown() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
+    if (oflash_) {
+        // Must precede draft weight/backend teardown: the adapter buffer
+        // lives on draft_backend_ and dw_.oflash points into the runtime.
+        oflash_->shutdown();
+        oflash_.reset();
+    }
     free_drafter();
     step_graph_destroy(sg_);
     step_graph_destroy(draft_sg_);
@@ -1822,6 +1856,52 @@ bool Qwen35Backend::sync_local_draft_features(int start_pos, int n_tokens) {
     return false;
 }
 
+// ── OFlash capture helpers ─────────────────────────────────────────────
+
+bool Qwen35Backend::oflash_read_feat_row(int pos, uint16_t * dst) const {
+    if (!cache_.target_feat || cache_.target_feat_cap <= 0 ||
+        cache_.target_feat->type != GGML_TYPE_BF16 || pos < 0) {
+        return false;
+    }
+    const int slot = pos % cache_.target_feat_cap;
+    const size_t row_bytes =
+        (size_t)w_.n_capture_layers * (size_t)w_.n_embd * sizeof(uint16_t);
+    ggml_backend_tensor_get(cache_.target_feat, dst,
+                            (size_t)slot * cache_.target_feat->nb[1],
+                            row_bytes);
+    return true;
+}
+
+bool Qwen35Backend::oflash_capture_verify_topk(int n_rows, int K,
+                                               std::vector<float> & lp,
+                                               std::vector<int32_t> & ids) {
+    if (!sg_.logits || n_rows <= 0 || K <= 0) return false;
+    const int vocab = (int)sg_.logits->ne[0];
+    if (n_rows > (int)sg_.logits->ne[1] || K > vocab) return false;
+    lp.assign((size_t)n_rows * K, 0.0f);
+    ids.assign((size_t)n_rows * K, 0);
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK
+    // OFlash is disabled on tensor-parallel targets, so sg_.logits->data is
+    // a single-device pointer here (no meta-tensor branch needed).
+    static const bool kGpuTopk = []() {
+        const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (kGpuTopk &&
+        geometric_extract_draft_topk_cuda(sg_.logits->data, n_rows, vocab, K,
+                                          lp.data(), ids.data(),
+                                          /*temperature=*/1.0f)) {
+        return true;
+    }
+#endif
+    std::vector<float> logits;
+    DFlashTarget * t = dflash_target();
+    if (!t || !t->read_verify_logits(n_rows, logits)) return false;
+    extract_draft_topk(logits.data(), n_rows, vocab, K,
+                       lp.data(), ids.data(), /*temperature=*/1.0f);
+    return true;
+}
+
 // ── DFlash speculative decode loop ─────────────────────────────────────
 
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
@@ -1904,6 +1984,22 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     }
 
     out_spec_ran = true;
+
+    // OFlash: request-scoped capture. The RAII guard emits SEQ_END on every
+    // exit path so the trainer retires the sequence.
+    struct OFlashReqScope {
+        oflash::OFlashRuntime * o = nullptr;
+        const int * committed = nullptr;
+        ~OFlashReqScope() { if (o) o->on_request_end(*committed); }
+    } oflash_scope;
+    auto oflash_feat_reader = [this](int pos, uint16_t * dst) {
+        return oflash_read_feat_row(pos, dst);
+    };
+    if (oflash_) {
+        oflash_->on_request_begin();
+        oflash_scope.o = oflash_.get();
+        oflash_scope.committed = &committed;
+    }
 
     // Sampled-verify: cache_.last_tok is do_prefill's argmax, and the spec
     // loop commits it verbatim as the first generated token. The first token
@@ -2014,8 +2110,32 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
+    // OFlash: backfill the prompt-window features once per request so the
+    // trainer's shadow feature window matches what the drafter conditions on
+    // (prefill already wrote these rows into cache_.target_feat).
+    if (oflash_ && oflash_->want_context() && cache_.target_feat) {
+        const int n_ctx_rows = std::min(committed,
+            std::min(cache_.target_feat_cap, cfg_.oflash.backfill_rows));
+        if (n_ctx_rows > 0) {
+            ggml_backend_synchronize(target_backend_);
+            oflash_->emit_context(committed - n_ctx_rows, n_ctx_rows,
+                                  oflash_feat_reader);
+        }
+    }
+
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
+
+        // OFlash: draft-block boundary — the only point where no draft or
+        // verify attribution is in flight. Apply pending adapter swaps and,
+        // whenever adapter tensors changed (swap or guard rollback), reset
+        // the drafter's ctx-KV ring: cached rows embed the old wk/wv delta.
+        if (oflash_) {
+            oflash_->maybe_apply_swap();
+            if (oflash_->consume_adapter_dirty() && draft_kv_.gf) {
+                draft_kv_reset(draft_kv_);
+            }
+        }
 
         // Budget hook: no tail-off here. The close-token injection fires
         // during the emit phase (step 8) after acceptance+replay, mirroring
@@ -2243,6 +2363,24 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             profile_add(profile_verify_s, profile_verify_start);
             target_forwards++;
 
+            // OFlash: per-node top-K must be read before any replay reuses
+            // sg_ and clobbers the logits; spine rows are gathered at emit
+            // time. The root token is snapshotted now — last_tok is
+            // overwritten before the capture points below.
+            std::vector<float>   oflash_tree_lp;
+            std::vector<int32_t> oflash_tree_ids;
+            const int32_t oflash_tree_root_tok = last_tok;
+            if (oflash_ && oflash_->capture_active() && oflash_->topk() > 0 &&
+                !sampled_verify) {
+                if (!oflash_capture_verify_topk(1 + tree.n_nodes,
+                                                oflash_->topk(),
+                                                oflash_tree_lp,
+                                                oflash_tree_ids)) {
+                    oflash_tree_lp.clear();
+                    oflash_tree_ids.clear();
+                }
+            }
+
             int next_token = -1, bonus_node = 0;
             std::vector<int> accepted;
             if (!sampled_verify) {
@@ -2292,6 +2430,61 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
             if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
 
+            // OFlash: one STEP record per tree step, shared by the three
+            // commit paths below. n_spine labels cover the accepted path
+            // (all flag 1 — the rejection signal is bonus_tok); n_rows may
+            // additionally include a committed bonus row whose features are
+            // final after that path's rollback/replay + mirror sync.
+            auto oflash_emit_tree_step = [&](int n_spine, int n_rows,
+                                             int32_t bonus) {
+                if (!oflash_) return;
+                oflash::OFlashStepCapture cap;
+                cap.accept_len = n_spine;
+                std::vector<int32_t> sp_draft, sp_target;
+                std::vector<uint8_t> sp_flags;
+                std::vector<float>   sp_lp;
+                std::vector<int32_t> sp_ids;
+                if (oflash_->capture_active() && n_spine > 0) {
+                    sp_draft.resize((size_t)n_spine);
+                    sp_target.resize((size_t)n_spine);
+                    sp_flags.assign((size_t)n_spine, 1);
+                    const int K = oflash_->topk();
+                    const bool have_topk = !oflash_tree_ids.empty();
+                    if (have_topk) {
+                        sp_lp.resize((size_t)n_spine * K);
+                        sp_ids.resize((size_t)n_spine * K);
+                    }
+                    for (int i = 0; i < n_spine; i++) {
+                        const int dfs = accepted[(size_t)i];
+                        sp_draft[(size_t)i]  = (dfs == 0)
+                            ? oflash_tree_root_tok
+                            : tree.token_ids[dfs - 1];
+                        sp_target[(size_t)i] = posterior[(size_t)dfs];
+                        if (have_topk) {
+                            std::memcpy(sp_ids.data() + (size_t)i * K,
+                                        oflash_tree_ids.data() + (size_t)dfs * K,
+                                        (size_t)K * sizeof(int32_t));
+                            std::memcpy(sp_lp.data() + (size_t)i * K,
+                                        oflash_tree_lp.data() + (size_t)dfs * K,
+                                        (size_t)K * sizeof(float));
+                        }
+                    }
+                    cap.pos = committed;
+                    cap.n_rows = n_rows;
+                    cap.block = n_spine;
+                    cap.draft_tok = sp_draft.data();
+                    cap.target_tok = sp_target.data();
+                    cap.accept_flags = sp_flags.data();
+                    cap.bonus_tok = bonus;
+                    if (!sp_ids.empty()) {
+                        cap.topk_lp  = sp_lp.data();
+                        cap.topk_ids = sp_ids.data();
+                    }
+                    ggml_backend_synchronize(target_backend_);
+                }
+                oflash_->emit_step(cap, oflash_feat_reader);
+            };
+
             if (!sampled_verify) {
                 const int root_last_tok = last_tok;
                 const bool use_tree_fast_rollback =
@@ -2320,6 +2513,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         }
                         profile_add(profile_feature_s, profile_feature_start);
                     }
+
+                    // Bonus deferred to the next step's root — not committed.
+                    oflash_emit_tree_step(accepted_emitted, accepted_emitted,
+                                          /*bonus=*/-1);
 
                     committed   += accepted_emitted;
                     cache_.cur_pos = committed;
@@ -2380,6 +2577,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         return false;
                     }
                 }
+
+                oflash_emit_tree_step(accepted_emitted, total_emitted,
+                                      can_commit_bonus ? next_token : -1);
 
                 committed   += total_emitted;
                 cache_.cur_pos = committed;
@@ -2451,6 +2651,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     return false;
                 }
             }
+
+            // Labels are the sampled-accepted spine (posterior = per-node
+            // argmax); no top-K in the sampled tree path.
+            oflash_emit_tree_step(accepted_emitted, total_emitted,
+                                  can_commit_bonus ? next_token : -1);
 
             committed   += total_emitted;
             cache_.cur_pos = committed;
@@ -2580,6 +2785,19 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             if (commit_n <= accept_n) bonus_tok = -1;
         }
 
+        // OFlash: materialize verify top-K now — sg_.logits is only valid
+        // until the next graph build/compute (the replay verify below reuses
+        // the same step graph).
+        std::vector<float>   oflash_topk_lp;
+        std::vector<int32_t> oflash_topk_ids;
+        if (oflash_ && oflash_->capture_active() && oflash_->topk() > 0) {
+            if (!oflash_capture_verify_topk(q_len, oflash_->topk(),
+                                            oflash_topk_lp, oflash_topk_ids)) {
+                oflash_topk_lp.clear();
+                oflash_topk_ids.clear();
+            }
+        }
+
         // 6. Fix state: adaptive fast-rollback vs legacy replay.
         //    Fast-rollback (implicit bonus, skip replay) is profitable when
         //    accept_n is large enough that skipping the replay saves more compute
@@ -2652,6 +2870,34 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 step_graph_destroy(draft_sg);
                 return false;
             }
+        }
+
+        // OFlash: one STEP record per verify step. Feature rows for the
+        // committed range are final here (same rows the mirror sync above
+        // consumed); accept_len also feeds the guard.
+        if (oflash_) {
+            oflash::OFlashStepCapture cap;
+            cap.accept_len = accept_n;
+            std::vector<uint8_t> oflash_flags;
+            if (oflash_->capture_active()) {
+                oflash_flags.assign((size_t)q_len, 0);
+                for (int i = 0; i < accept_n && i < q_len; i++) {
+                    oflash_flags[(size_t)i] = 1;
+                }
+                cap.pos = committed;
+                cap.n_rows = commit_n;
+                cap.block = q_len;
+                cap.draft_tok = draft_tok.data();
+                cap.target_tok = target_tok.data();
+                cap.accept_flags = oflash_flags.data();
+                cap.bonus_tok = bonus_tok;
+                if (!oflash_topk_ids.empty()) {
+                    cap.topk_lp  = oflash_topk_lp.data();
+                    cap.topk_ids = oflash_topk_ids.data();
+                }
+                ggml_backend_synchronize(target_backend_);
+            }
+            oflash_->emit_step(cap, oflash_feat_reader);
         }
 
         // 8. Emit committed tokens (stop at EOS)

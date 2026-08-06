@@ -266,9 +266,13 @@ int resolve_max_output_tokens(const json & body, int default_max_tokens);
 // Build the /props response body. Exposed (non-static) so unit tests
 // can assert on its shape without spinning up a real socket. See
 // docs/specs/props-endpoint.md for the wire contract.
+// `oflash` is the live OFlash stats snapshot (nullptr = feature off; the
+// section is still emitted with enabled=false). Defaulted so existing unit
+// test call sites keep compiling.
 json build_props_body(const ServerConfig & config,
                       const PrefixCache & prefix_cache,
-                      const ToolMemory & tool_memory);
+                      const ToolMemory & tool_memory,
+                      const oflash::OFlashPropsSnapshot * oflash = nullptr);
 
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {
