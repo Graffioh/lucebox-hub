@@ -1,120 +1,78 @@
-# QFlash — one-shot quality branching
+# QFlash: one-shot quality branching
 
-_Status: CPU-tested MVP, pending R9700 + Strix Halo measurements._
+Status: implemented behind `--qflash`; GPU quality and latency measurements
+are still pending.
 
-QFlash spends one wider target forward on several short continuations of a
-single user request. It is the small, testable replacement for BTFlash.
+QFlash spends one wider target-model forward on several short continuations
+of one user request. The goal is to use more of the R9700's matrix compute and
+select a better continuation without generating several complete answers.
 
-## The idea in one minute
+## In breve
 
-Normal autoregressive generation processes one new row at a time. That keeps
-loading a large target model to do relatively little matrix work. QFlash asks
-the DFlash drafter for four short candidate continuations, verifies all of
-them together on the R9700, and keeps the one that the target scores clearly
-better than the normal draft continuation.
+The DFlash drafter proposes four continuations of seven tokens. The R9700
+verifies the four paths together, scores them with the target model and commits
+one path. Generation then continues normally.
 
 ```text
-                               candidate 0 (baseline, 7 tokens) ─┐
-prompt + committed response ─── candidate 1 (7 tokens) ──────────┼─ one target tree verify
-          shared prefix KV      candidate 2 (7 tokens) ──────────┤  → score → commit one
-                               candidate 3 (7 tokens) ───────────┘
+                              branch 0: 7 tokens ─┐
+shared committed prefix ───── branch 1: 7 tokens ├─ one target tree verify
+                              branch 2: 7 tokens ┤  → score → commit one path
+                              branch 3: 7 tokens ─┘
 
-Strix Halo: DFlash proposal                 R9700: target KV + verify + commit
+Strix Halo: draft proposal          R9700: target model, KV, score and commit
 ```
 
-The default shape is `4 × 7`: 28 candidate nodes plus one shared root. The
-target allocates 32 rows, matching the existing 32-wide verify tile. QFlash
-runs once per request; normal DFlash then continues the selected path.
+"One-shot" means one branching round per request: one fork, one selection and
+no persistent branches. It does not mean that the whole response uses one
+forward pass.
 
-This is useful test-time compute, not four complete answers and not four
-independent target forwards.
+## Why one wide forward
 
-## What “shared KV” means here
+Running four independent batch-1 target forwards would load the target weights
+four times and remain mostly memory-bound. QFlash instead places all candidate
+nodes in one tree-shaped batch so the same weight stream performs more useful
+matrix work.
 
-All candidates share the same committed prefix, so the branch tree has one
-logical prefix KV cache. The physical target KV stays on the R9700, next to
-the target weights and attention compute. Only temporary suffix rows differ
-between branches.
+The default shape is:
 
-QFlash does **not** put the target KV on the Strix and read it over PCIe. That
-would add a remote dependency to every target attention layer. It also does
-not make the Strix and R9700 memories coherent. The Strix runs the small
-drafter and returns candidate hidden states; the existing feature-mirror path
-synchronizes the compact target features it needs after the winner is
-committed.
+```text
+4 branches × 7 tokens = 28 candidate nodes
+28 nodes + 1 shared root = 29 real rows
+target allocation = 32 rows
+```
 
-This separation is intentional:
+Thirty-two rows match the current verify tile well. This raises arithmetic
+intensity, but it does not by itself prove that the R9700 is fully
+compute-bound; that requires GPU profiling.
 
-- R9700 owns target weights, target KV, DeltaNet state, target scoring and
-  rollback.
-- Strix Halo owns the DFlash drafter and its local state.
-- Tokens/features cross the device boundary; the large target KV does not.
+## Where the KV cache lives
 
-If both GPUs are visible to the same ROCm build, use separate HIP device
-indices. The existing IPC drafter boundary remains available for a genuinely
-mixed backend.
+All branches logically share the committed prefix. The physical target KV
+cache stays on the R9700, next to the target weights and attention compute.
+Temporary branch suffixes are also created there and only the winning suffix
+is retained.
 
-### Why canonical KV on Strix is MVP 2
+The Strix Halo runs the smaller DFlash drafter. Tokens and compact target
+features cross the device boundary; the target KV does not. QFlash therefore
+does not require coherent GPU memory or remote-KV attention over PCIe.
 
-A read-only canonical prefix on the Strix is a reasonable capacity experiment,
-but it combines a second hypothesis with quality branching. The target cannot
-consume that cache today without either:
+## How selection works
 
-1. staging the required prefix Strix → R9700 once before the branch round; or
-2. a new attention path that combines a remote prefix with local branch
-   suffixes.
+1. Run one normal DFlash draft block.
+2. Take the top `K` draft tokens at the first branch position.
+3. Build `K` short, disjoint chains. Branch 0 is the drafter's normal top-1
+   continuation.
+4. Verify the complete tree with one ancestor-masked target forward.
+5. Compute the mean target log-probability of every path.
+6. Keep branch 0 unless another path beats it by `--qflash-margin`.
+7. Use the existing tree rollback to compact KV, DeltaNet state, convolution
+   state and captured features onto the selected path.
+8. Continue with normal DFlash generation.
 
-Neither makes the 32-row target graph more compute-dense. They add transfer
-and synchronization costs, so a failed combined test would not tell us whether
-branching or remote KV caused the regression.
-
-The staged roadmap is therefore:
-
-1. QFlash with target KV local: validate branch quality and wide-verify cost.
-2. A standalone read-only KV transfer benchmark over realistic context sizes.
-3. If both pass, stage one prefix copy per QFlash round and measure end to end.
-4. Only then consider direct remote-prefix attention with local suffixes.
-
-The canonical Strix cache is thus a follow-up to QFlash, not discarded work.
-
-## Algorithm
-
-QFlash reuses the production DDTree primitives instead of adding a persistent
-branch runtime:
-
-1. Run the existing DFlash drafter once.
-2. Project top-K draft tokens with `K = qflash_branches`.
-3. Build K disjoint chains. Branch 0 begins with draft rank 0 and is the
-   baseline; branch `b` begins with draft rank `b`. All short tails use the
-   already available spine-conditioned top-1 draft rows.
-4. Run one ancestor-masked `verify_tree` on the target.
-5. Score every complete path by mean target log-probability.
-6. Keep branch 0 unless an alternative beats it by `qflash_margin` nats per
-   token.
-7. Reuse `rollback_to_tree` to compact target KV, DeltaNet state, convolution
-   state and captured features onto the winning path.
-8. Continue with normal DFlash. QFlash does not fork again in this request.
-
-The margin makes selection conservative. A branch that is merely different
-does not replace the baseline.
-
-## Why this is simpler than BTFlash
-
-BTFlash proposed branches that lived across several target forwards. Qwen3.6
-would then need a persistent per-branch bank for KV, 48 DeltaNet states,
-convolution tails and sampler histories. It would also need scheduling,
-multi-stage pruning and failure recovery for those long-lived states.
-
-QFlash keeps every branch inside one existing tree graph. Therefore it needs:
-
-- no persistent branch-state bank;
-- no cross-forward branch lifecycle;
-- no target KV replication between GPUs;
-- no new attention or remote-KV kernel;
-- no evaluator model for the first experiment.
-
-It validates the important hypothesis first: whether a 32-row target step can
-buy a better selected continuation at acceptable latency.
+The margin avoids replacing the baseline with a branch that is only
+marginally different. Target likelihood is a cheap first selector, not a
+correctness verifier. QFlash deliberately changes the generation policy, so
+higher quality must be demonstrated on task-level evaluations.
 
 ## Usage
 
@@ -131,75 +89,51 @@ Example when the R9700 is HIP device 0 and Strix Halo is HIP device 1:
   --qflash-margin 0.10
 ```
 
-Device numbering must be checked on the actual machine. A build containing
-both `gfx1201` and `gfx1151` code objects is required when both GPUs execute
-inside the same ROCm process.
-
-Flags:
+Check the actual device order before launching. A same-process ROCm build must
+contain code objects for both GPUs.
 
 | Flag | Default | Meaning |
 |---|---:|---|
 | `--qflash` | off | Enable one QFlash round per request |
-| `--qflash-branches` | 4 | Candidate chains, from 2 to 8 |
-| `--qflash-horizon` | 7 | Candidate tokens per chain |
-| `--qflash-margin` | 0.10 | Required mean target log-probability gain |
+| `--qflash-branches` | 4 | Number of candidate chains, from 2 to 8 |
+| `--qflash-horizon` | 7 | Tokens in each candidate chain |
+| `--qflash-margin` | 0.10 | Required target-score gain in nats per token |
 
-The MVP is admitted only for a single-device dense `qwen35` target with a
-DFlash drafter and fast rollback. The drafter may run on the second GPU.
-Sampling requests and special decode regions (forced thinking close, tool
-hints, stall recovery and the minimum-token floor) keep their existing path;
-QFlash waits for the first safe greedy round.
+The active configuration is also reported under `/props.speculative.qflash`.
 
-## What this prototype can and cannot prove
+## Current limits
 
-It can measure:
+- Dense `qwen35` target on one target GPU.
+- A local or second-GPU DFlash drafter is required.
+- Fast tree rollback is required.
+- QFlash currently runs only for greedy generation.
+- Thinking-budget closure, tool hints, stall recovery and the minimum-token
+  floor keep their existing path; QFlash waits for the first safe round.
+- Branches differ at their first token. Their remaining tokens come from the
+  same spine-conditioned draft block, so diversity is intentionally limited in
+  this first version.
+- Target KV on the Strix Halo and direct remote attention are not implemented.
 
-- target step time for 29 actual / 32 allocated rows;
-- whether the R9700 executes a more useful MMQ shape;
-- total request latency with the drafter on Strix Halo;
-- how often a non-baseline branch wins;
-- whether selected outputs improve on task-level evaluation.
+## What to measure on the GPUs
 
-It cannot yet prove that the R9700 is fully compute-bound. Thirty-two rows
-raise arithmetic intensity but remain below the ideal roofline knee. A busy
-matrix kernel is also not the same as peak FLOP utilization.
+Compare the same prompts and seeds with normal DFlash, DDTree and QFlash.
+Record:
 
-It also cannot guarantee higher quality from log-probability alone. Target
-likelihood is a cheap baseline selector, not a correctness verifier. Code
-tests, math checkers or a small evaluator on the Strix are follow-ups only if
-the one-shot mechanism passes the latency test.
+- end-to-end latency and time to first token;
+- target tree-verify time;
+- selected branch and score difference from branch 0;
+- task result or test pass rate;
+- R9700 matrix utilization and memory bandwidth;
+- drafter colocated on the R9700 versus running on the Strix Halo.
 
-## GPU validation plan
+The first go/no-go point is simple: keep the design only if branch selection
+improves task results at an acceptable latency cost. If branch 0 almost always
+wins, improve proposal diversity before increasing the target batch.
 
-When the machine is ready, compare the same greedy prompts and seeds:
+## Implementation map
 
-1. normal DFlash chain;
-2. DDTree budget 22;
-3. QFlash `4 × 7`, margin `0.10`;
-4. QFlash with drafter colocated on R9700 versus drafter on Strix Halo.
-
-Record end-to-end latency, time to first token, target verify time, selected
-branch, score delta, generated tokens and task result. Then sweep only:
-
-```text
-shape:   4×7 (32 allocated rows) → 2×15 (32) → 4×8 (64)
-margin:  0.00 → 0.10 → 0.25
-```
-
-Go/no-go for a larger design: keep QFlash only if it improves task results at
-a latency cost small enough for the product. If branch 0 almost always wins,
-improve proposal diversity before increasing the target row budget. If 32
-rows are already expensive, optimize the target kernel before adding more
-branch machinery.
-
-## Interview summary
-
-> We first considered a KV cache physically shared between two GPUs, but the
-> GPUs have separate memory domains and remote target KV would put PCIe in the
-> attention critical path. QFlash uses the safer meaning of shared KV: one
-> prefix on the R9700, logically shared by several short branches. The Strix
-> proposes candidates with the small drafter; the R9700 verifies 28 candidate
-> nodes in one 32-row tree forward, conservatively selects one, compacts the
-> existing KV/state with the existing rollback code, and continues normally.
-> It is one optional round, so it tests compute utilization and quality without
-> building a persistent multi-branch inference engine.
+- `server/src/common/qflash.{h,cpp}` builds and scores candidate trees.
+- `server/src/qwen35/qwen35_backend.cpp` runs the one-shot round and commits
+  the selected path.
+- `server/test/test_qflash.cpp` covers tree shape, row allocation, margin and
+  branch selection without requiring a GPU.
