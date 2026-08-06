@@ -470,6 +470,7 @@ add_library(dflash_common STATIC
     src/server/tool_memory.cpp
     src/server/sse_emitter.cpp
     src/server/prefix_cache.cpp
+    src/server/pin_friendly_prompt.cpp
     src/server/disk_prefix_cache.cpp
     src/server/freeze_history.cpp
     # ── Jinja chat-template engine (vendored under deps/llama.cpp/common/) ──
