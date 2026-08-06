@@ -1,4 +1,4 @@
-#include "ddtree_adaptive.h"
+#include "ddtree_ghost_batch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -31,12 +31,12 @@ void finish_visibility(DDTree & tree) {
     }
 }
 
-bool checked_shape(int baseline_nodes, int branch_count, int branch_nodes) {
-    if (baseline_nodes <= 0 || branch_count <= 0 || branch_nodes <= 0) {
+bool checked_shape(int baseline_nodes, int ghost_count, int ghost_nodes) {
+    if (baseline_nodes <= 0 || ghost_count <= 0 || ghost_nodes <= 0) {
         return false;
     }
     const int max = std::numeric_limits<int>::max();
-    return branch_count <= (max - baseline_nodes) / branch_nodes;
+    return ghost_count <= (max - baseline_nodes) / ghost_nodes;
 }
 
 }  // namespace
@@ -59,19 +59,19 @@ DDTreeConfidenceDecision ddtree_confidence_gate(
     return out;
 }
 
-DDTree build_adaptive_ddtree(
+DDTree build_ghost_batch_ddtree(
     const int32_t * baseline_tokens,
     int baseline_nodes,
-    const int32_t * branch_tokens,
-    int branch_count,
-    int branch_nodes) {
-    if (!baseline_tokens || !branch_tokens ||
-        !checked_shape(baseline_nodes, branch_count, branch_nodes)) {
+    const int32_t * ghost_tokens,
+    int ghost_count,
+    int ghost_nodes) {
+    if (!baseline_tokens || !ghost_tokens ||
+        !checked_shape(baseline_nodes, ghost_count, ghost_nodes)) {
         return root_only_tree();
     }
 
     DDTree tree;
-    const int nodes = baseline_nodes + branch_count * branch_nodes;
+    const int nodes = baseline_nodes + ghost_count * ghost_nodes;
     tree.token_ids.reserve(nodes);
     tree.depths.reserve(nodes);
     tree.parents.reserve(nodes + 1);
@@ -98,13 +98,13 @@ DDTree build_adaptive_ddtree(
     // path unreachable during exact target following.
     std::unordered_map<int32_t, bool> root_tokens;
     root_tokens.emplace(baseline_tokens[0], true);
-    for (int branch = 0; branch < branch_count; ++branch) {
-        const int32_t seed = branch_tokens[(size_t)branch * branch_nodes];
+    for (int ghost = 0; ghost < ghost_count; ++ghost) {
+        const int32_t seed = ghost_tokens[(size_t)ghost * ghost_nodes];
         if (!root_tokens.emplace(seed, true).second) return root_only_tree();
         parent = 0;
-        for (int depth = 0; depth < branch_nodes; ++depth) {
+        for (int depth = 0; depth < ghost_nodes; ++depth) {
             const int32_t token =
-                branch_tokens[(size_t)branch * branch_nodes + depth];
+                ghost_tokens[(size_t)ghost * ghost_nodes + depth];
             parent = append(token, depth + 1, parent);
         }
     }
@@ -113,32 +113,32 @@ DDTree build_adaptive_ddtree(
     return tree;
 }
 
-int ddtree_adaptive_required_rows(
+int ddtree_ghost_batch_required_rows(
     int baseline_nodes,
-    int branch_count,
-    int branch_nodes,
+    int ghost_count,
+    int ghost_nodes,
     int tile) {
-    if (!checked_shape(baseline_nodes, branch_count, branch_nodes)) return 0;
-    const int rows = 1 + baseline_nodes + branch_count * branch_nodes;
+    if (!checked_shape(baseline_nodes, ghost_count, ghost_nodes)) return 0;
+    const int rows = 1 + baseline_nodes + ghost_count * ghost_nodes;
     if (tile <= 1) return rows;
     if (rows > std::numeric_limits<int>::max() - (tile - 1)) return 0;
     return ((rows + tile - 1) / tile) * tile;
 }
 
-bool ddtree_adaptive_seed_tokens(
+bool ddtree_ghost_batch_seed_tokens(
     const int32_t * top_token_ids,
     int positions,
     int top_k,
-    int branch_count,
+    int ghost_count,
     std::vector<int32_t> & seeds) {
     seeds.clear();
-    if (!top_token_ids || positions <= 0 || top_k <= branch_count ||
-        branch_count <= 0) {
+    if (!top_token_ids || positions <= 0 || top_k <= ghost_count ||
+        ghost_count <= 0) {
         return false;
     }
-    seeds.reserve(branch_count);
-    for (int branch = 0; branch < branch_count; ++branch) {
-        seeds.push_back(top_token_ids[branch + 1]);
+    seeds.reserve(ghost_count);
+    for (int ghost = 0; ghost < ghost_count; ++ghost) {
+        seeds.push_back(top_token_ids[ghost + 1]);
     }
     return true;
 }

@@ -460,7 +460,7 @@ add_library(dflash_common STATIC
     src/placement/placement_config.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
-    src/common/ddtree_adaptive.cpp
+    src/common/ddtree_ghost_batch.cpp
     src/common/peer_access.cpp
     # ── Server components (tokenizer, chat template) ──
     src/server/tokenizer.cpp
@@ -1241,7 +1241,7 @@ if(DFLASH27B_TESTS)
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_keep_ratio.cpp
-            test/test_ddtree_adaptive.cpp
+            test/test_ddtree_ghost_batch.cpp
             test/test_skip_park_guard.cpp
             test/test_bandit_integration.cpp
             test/test_admission.cpp

@@ -111,9 +111,9 @@ static void print_usage(const char * prog) {
         "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
-        "  --ddtree-adaptive    Gate exact packed DDTree branches by uncertainty\n"
-        "  --ddtree-branch-margin <F>  Required top-1/top-2 log-prob margin\n"
-        "                       threshold for --ddtree-adaptive (no default)\n"
+        "  --ddtree-ghost-batch    Gate one packed ghost batch by DDTree uncertainty\n"
+        "  --ddtree-ghost-margin <F>  Required top-1/top-2 log-prob margin\n"
+        "                       threshold for --ddtree-ghost-batch (no default)\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
         "                       trimmed per step by drafter confidence; N = fixed base)\n"
@@ -364,11 +364,11 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--ddtree") == 0) {
             bargs.ddtree_mode = true;
             bargs.fast_rollback = true;
-        } else if (std::strcmp(argv[i], "--ddtree-adaptive") == 0) {
-            bargs.ddtree_adaptive = true;
+        } else if (std::strcmp(argv[i], "--ddtree-ghost-batch") == 0) {
+            bargs.ddtree_ghost_batch = true;
             bargs.ddtree_mode = true;
             bargs.fast_rollback = true;
-        } else if (std::strcmp(argv[i], "--ddtree-branch-margin") == 0 &&
+        } else if (std::strcmp(argv[i], "--ddtree-ghost-margin") == 0 &&
                    i + 1 < argc) {
             const char * raw = argv[++i];
             char * end = nullptr;
@@ -376,11 +376,11 @@ int main(int argc, char ** argv) {
             if (end == raw || *end != '\0' ||
                 !std::isfinite(margin) || margin < 0.0f) {
                 std::fprintf(stderr,
-                    "--ddtree-branch-margin must be a finite non-negative "
+                    "--ddtree-ghost-margin must be a finite non-negative "
                     "float, got \"%s\"\n", raw);
                 return 2;
             }
-            bargs.ddtree_branch_margin = margin;
+            bargs.ddtree_ghost_margin = margin;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--adaptive-experts") == 0) {
@@ -1051,11 +1051,11 @@ int main(int argc, char ** argv) {
                              "[server] │     Use --fa-window 0 for tool-call workloads.\n");
     }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
-    std::fprintf(stderr, "[server] │  ddtree_adaptive = %s\n",
-                 bargs.ddtree_adaptive ? "ON" : "off");
-    if (bargs.ddtree_adaptive) {
-        std::fprintf(stderr, "[server] │  branch_margin   = %.6f\n",
-                     bargs.ddtree_branch_margin);
+    std::fprintf(stderr, "[server] │  ddtree_ghost_batch = %s\n",
+                 bargs.ddtree_ghost_batch ? "ON" : "off");
+    if (bargs.ddtree_ghost_batch) {
+        std::fprintf(stderr, "[server] │  ghost_margin    = %.6f\n",
+                     bargs.ddtree_ghost_margin);
     }
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
     if (bargs.device.is_layer_split()) {
@@ -1107,8 +1107,8 @@ int main(int argc, char ** argv) {
     sconfig.draft_path   = bargs.draft_path ? bargs.draft_path : "";
     sconfig.fa_window    = bargs.fa_window;
     sconfig.ddtree_budget = bargs.ddtree_budget;
-    sconfig.ddtree_adaptive = bargs.ddtree_adaptive;
-    sconfig.ddtree_branch_margin = bargs.ddtree_branch_margin;
+    sconfig.ddtree_ghost_batch = bargs.ddtree_ghost_batch;
+    sconfig.ddtree_ghost_margin = bargs.ddtree_ghost_margin;
     sconfig.speculative_enabled = bargs.ddtree_mode;
     sconfig.target_sharding     = bargs.device.is_layer_split();
     // KV type: report the operator's choice if set, else the family default

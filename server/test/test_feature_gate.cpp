@@ -367,24 +367,24 @@ static bool warns_about(const std::vector<std::string> & warnings,
     return false;
 }
 
-static void test_feature_gate_adaptive_ddtree_requirements() {
+static void test_feature_gate_ghost_batch_ddtree_requirements() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.draft_path = "/nonexistent/draft.gguf";
     args.ddtree_mode = true;
-    args.ddtree_adaptive = true;
-    args.ddtree_branch_margin = 0.35f;
+    args.ddtree_ghost_batch = true;
+    args.ddtree_ghost_margin = 0.35f;
     args.fast_rollback = true;
     TEST_ASSERT(gate_result(
         args, "qwen35", PlacementBackend::Cuda).empty());
 
     BackendArgs missing_margin = args;
-    missing_margin.ddtree_branch_margin = -1.0f;
+    missing_margin.ddtree_ghost_margin = -1.0f;
     TEST_ASSERT(!gate_result(
         missing_margin, "qwen35", PlacementBackend::Cuda).empty());
 
     BackendArgs inert_margin = args;
-    inert_margin.ddtree_adaptive = false;
+    inert_margin.ddtree_ghost_batch = false;
     TEST_ASSERT(!gate_result(
         inert_margin, "qwen35", PlacementBackend::Cuda).empty());
 
@@ -524,7 +524,7 @@ int main() {
     RUN_TEST(test_feature_gate_ds4_decode_options_require_monolithic_hip);
     RUN_TEST(test_feature_gate_remote_draft_requires_supported_arch);
     RUN_TEST(test_feature_gate_layer_split_requires_supported_arch);
-    RUN_TEST(test_feature_gate_adaptive_ddtree_requirements);
+    RUN_TEST(test_feature_gate_ghost_batch_ddtree_requirements);
     RUN_TEST(test_feature_warnings_silent_when_supported);
     RUN_TEST(test_feature_warnings_report_inert_draft);
     RUN_TEST(test_feature_warnings_report_inert_decode_tunables);

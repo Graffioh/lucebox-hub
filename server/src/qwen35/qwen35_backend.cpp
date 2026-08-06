@@ -6,7 +6,7 @@
 #include "dflash_feature_ring.h"
 #include "dflash_capture.h"
 #include "common/dflash_draft_graph.h"
-#include "common/ddtree_adaptive.h"
+#include "common/ddtree_ghost_batch.h"
 #include "peer_access.h"
 #include "attn_masks.h"
 #include "common/sampler.h"
@@ -255,20 +255,20 @@ bool Qwen35Backend::init() {
         }
     }
 
-    if (cfg_.ddtree_adaptive &&
-        (!cfg_.ddtree_mode || cfg_.ddtree_branch_margin < 0.0f ||
-         dw_.block_size < DDTREE_ADAPTIVE_BASELINE_NODES + 1)) {
+    if (cfg_.ddtree_ghost_batch &&
+        (!cfg_.ddtree_mode || cfg_.ddtree_ghost_margin < 0.0f ||
+         dw_.block_size < DDTREE_GHOST_BASELINE_NODES + 1)) {
         std::fprintf(
             stderr,
-            "adaptive ddtree requires DDTree, an explicit non-negative "
+            "ghost-batch ddtree requires DDTree, an explicit non-negative "
             "margin, and a draft block of at least %d rows (got %d)\n",
-            DDTREE_ADAPTIVE_BASELINE_NODES + 1, dw_.block_size);
+            DDTREE_GHOST_BASELINE_NODES + 1, dw_.block_size);
         return false;
     }
 
     // Create KV cache
-    const int max_verify_tokens = cfg_.ddtree_adaptive
-        ? std::max<int>(dw_.block_size, DDTREE_ADAPTIVE_ALLOC_ROWS)
+    const int max_verify_tokens = cfg_.ddtree_ghost_batch
+        ? std::max<int>(dw_.block_size, DDTREE_GHOST_ALLOC_ROWS)
         : (cfg_.ddtree_mode
             ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
             : dw_.block_size);
@@ -1087,8 +1087,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     // already migrated when the snapshot was taken; re-running migrate would
     // clobber the restored state.
     if (kv_offset == 0) {
-        const int max_verify_tokens = cfg_.ddtree_adaptive
-            ? std::max<int>(dw_.block_size, DDTREE_ADAPTIVE_ALLOC_ROWS)
+        const int max_verify_tokens = cfg_.ddtree_ghost_batch
+            ? std::max<int>(dw_.block_size, DDTREE_GHOST_ALLOC_ROWS)
             : (cfg_.ddtree_mode
                 ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
                 : dw_.block_size);
@@ -1952,8 +1952,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     DFlashTarget * target = dflash_target();
     const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int max_verify_tokens = cfg_.ddtree_adaptive
-        ? std::max<int>(dw_.block_size, DDTREE_ADAPTIVE_ALLOC_ROWS)
+    const int max_verify_tokens = cfg_.ddtree_ghost_batch
+        ? std::max<int>(dw_.block_size, DDTREE_GHOST_ALLOC_ROWS)
         : (cfg_.ddtree_mode
             ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
             : dw_.block_size);
@@ -1985,20 +1985,20 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
-    int adaptive_gate_rounds = 0;
-    int adaptive_confident_rounds = 0;
-    int adaptive_uncertain_rounds = 0;
-    int adaptive_packed_graphs = 0;
-    int adaptive_packed_rows = 0;
-    int adaptive_target_forwards = 0;
-    int adaptive_target_rows = 0;
-    int adaptive_accepted_tokens = 0;
-    double adaptive_margin_sum = 0.0;
-    double adaptive_baseline_draft_ms = 0.0;
-    double adaptive_expand_ms = 0.0;
-    double adaptive_projection_ms = 0.0;
-    double adaptive_verify_ms = 0.0;
-    double adaptive_rollback_ms = 0.0;
+    int ghost_gate_rounds = 0;
+    int ghost_baseline_rounds = 0;
+    int ghost_batch_rounds = 0;
+    int ghost_packed_graphs = 0;
+    int ghost_packed_rows = 0;
+    int ghost_target_forwards = 0;
+    int ghost_target_rows = 0;
+    int ghost_accepted_tokens = 0;
+    double ghost_margin_sum = 0.0;
+    double ghost_baseline_draft_ms = 0.0;
+    double ghost_expand_ms = 0.0;
+    double ghost_projection_ms = 0.0;
+    double ghost_verify_ms = 0.0;
+    double ghost_rollback_ms = 0.0;
     const ChainRollbackPolicy rollback_policy =
         resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel());
     const int fast_rollback_threshold =
@@ -2032,43 +2032,43 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                      target_forwards,
                      n_generated > 0 ? (double)target_forwards / n_generated : 0.0,
                      n_draft_steps > 0 ? (double)target_forwards / n_draft_steps : 0.0);
-        if (adaptive_gate_rounds > 0) {
+        if (ghost_gate_rounds > 0) {
             const double activation =
-                (double)adaptive_uncertain_rounds / adaptive_gate_rounds;
+                (double)ghost_batch_rounds / ghost_gate_rounds;
             std::fprintf(
                 stderr,
-                "[ddtree-adaptive-summary] confident=%d uncertain=%d "
-                "activation=%.6f margin_avg=%.6f threshold=%.6f "
+                "[ddtree-ghost-batch-summary] baseline_rounds=%d ghost_batch_rounds=%d "
+                "ghost_activation=%.6f margin_avg=%.6f threshold=%.6f "
                 "draft_graphs=%d packed_graphs=%d packed_width_avg=%.2f "
                 "target_rows=%d accepted_per_round=%.3f "
                 "accepted_per_target_forward=%.3f "
                 "baseline_draft_ms=%.3f packed_expand_ms=%.3f "
                 "projection_ms=%.3f verify_ms=%.3f rollback_ms=%.3f\n",
-                adaptive_confident_rounds,
-                adaptive_uncertain_rounds,
+                ghost_baseline_rounds,
+                ghost_batch_rounds,
                 activation,
-                adaptive_margin_sum / adaptive_gate_rounds,
-                cfg_.ddtree_branch_margin,
-                adaptive_gate_rounds + adaptive_packed_graphs,
-                adaptive_packed_graphs,
-                adaptive_packed_graphs > 0
-                    ? (double)adaptive_packed_rows /
-                        adaptive_packed_graphs
+                ghost_margin_sum / ghost_gate_rounds,
+                cfg_.ddtree_ghost_margin,
+                ghost_gate_rounds + ghost_packed_graphs,
+                ghost_packed_graphs,
+                ghost_packed_graphs > 0
+                    ? (double)ghost_packed_rows /
+                        ghost_packed_graphs
                     : 0.0,
-                adaptive_target_rows,
-                adaptive_gate_rounds > 0
-                    ? (double)adaptive_accepted_tokens /
-                        adaptive_gate_rounds
+                ghost_target_rows,
+                ghost_gate_rounds > 0
+                    ? (double)ghost_accepted_tokens /
+                        ghost_gate_rounds
                     : 0.0,
-                adaptive_target_forwards > 0
-                    ? (double)adaptive_accepted_tokens /
-                        adaptive_target_forwards
+                ghost_target_forwards > 0
+                    ? (double)ghost_accepted_tokens /
+                        ghost_target_forwards
                     : 0.0,
-                adaptive_baseline_draft_ms,
-                adaptive_expand_ms,
-                adaptive_projection_ms,
-                adaptive_verify_ms,
-                adaptive_rollback_ms);
+                ghost_baseline_draft_ms,
+                ghost_expand_ms,
+                ghost_projection_ms,
+                ghost_verify_ms,
+                ghost_rollback_ms);
         }
         rollback_diag.print(rollback_policy, stderr);
     };
@@ -2263,8 +2263,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // fits the resident pool. Full-attention only (windowed FA padding could
         // index past the pool). Otherwise the slot-mapped chain verify handles
         // it. Non-kvflash is unaffected.
-        const int requested_tree_rows = cfg_.ddtree_adaptive
-            ? DDTREE_ADAPTIVE_ALLOC_ROWS
+        const int requested_tree_rows = cfg_.ddtree_ghost_batch
+            ? DDTREE_GHOST_ALLOC_ROWS
             : cfg_.ddtree_budget + 1;
         const bool kvflash_tree_ok =
             !kvflash_active() ||
@@ -2272,24 +2272,24 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
              committed + requested_tree_rows + cfg_.kq_stride_pad <=
                  kvflash_tokens_ &&
              kvflash_pager_.identity_prefix_covers(committed));
-        const bool adaptive_gate_available =
-            cfg_.ddtree_adaptive && target->supports_tree_verify() &&
-            kvflash_tree_ok && q_len >= DDTREE_ADAPTIVE_BASELINE_NODES + 1 &&
+        const bool ghost_gate_available =
+            cfg_.ddtree_ghost_batch && target->supports_tree_verify() &&
+            kvflash_tree_ok && q_len >= DDTREE_GHOST_BASELINE_NODES + 1 &&
             tree_special_inactive;
         const bool regular_tree_available =
-            cfg_.ddtree_mode && !cfg_.ddtree_adaptive &&
+            cfg_.ddtree_mode && !cfg_.ddtree_ghost_batch &&
             target->supports_tree_verify() && kvflash_tree_ok &&
             !use_remote_draft && q_len > 1 && tree_special_inactive;
 
         bool execute_tree = false;
-        bool adaptive_branch_round = false;
-        bool adaptive_chain_round = false;
-        float adaptive_margin = 0.0f;
+        bool ghost_batch_round = false;
+        bool ghost_baseline_round = false;
+        float ghost_margin = 0.0f;
         DDTree tree;
         int N = 0;
 
-        if (adaptive_gate_available) {
-            constexpr int K = DDTREE_ADAPTIVE_BRANCHES + 1;
+        if (ghost_gate_available) {
+            constexpr int K = DDTREE_GHOST_BRANCHES + 1;
             std::vector<float> top_lp;
             std::vector<int32_t> top_ids;
             const auto project_wall_start = std::chrono::steady_clock::now();
@@ -2300,13 +2300,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 top_lp.size() != (size_t)q_len * K ||
                 top_ids.size() != (size_t)q_len * K) {
                 std::fprintf(stderr,
-                             "spec-decode: adaptive ddtree topk projection "
+                             "spec-decode: ghost-batch ddtree topk projection "
                              "failed\n");
                 step_graph_destroy(draft_sg);
                 return false;
             }
             profile_add(profile_project_s, profile_project_start);
-            adaptive_projection_ms +=
+            ghost_projection_ms +=
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() -
                     project_wall_start).count();
@@ -2314,47 +2314,47 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             const DDTreeConfidenceDecision decision =
                 ddtree_confidence_gate(
                     top_lp.data() + K, q_len - 1, K,
-                    cfg_.ddtree_branch_margin);
-            adaptive_margin = decision.margin;
-            adaptive_margin_sum += decision.margin;
-            adaptive_gate_rounds++;
-            adaptive_baseline_draft_ms += round_baseline_draft_ms;
+                    cfg_.ddtree_ghost_margin);
+            ghost_margin = decision.margin;
+            ghost_margin_sum += decision.margin;
+            ghost_gate_rounds++;
+            ghost_baseline_draft_ms += round_baseline_draft_ms;
 
             if (!decision.uncertain) {
-                adaptive_chain_round = true;
-                adaptive_confident_rounds++;
+                ghost_baseline_round = true;
+                ghost_baseline_rounds++;
                 draft_tok[0] = last_tok;
                 for (int row = 1; row < q_len; ++row) {
                     draft_tok[row] = top_ids[(size_t)row * K];
                 }
                 std::fprintf(
                     stderr,
-                    "[ddtree-adaptive] route=chain margin=%.6f "
+                    "[ddtree-ghost-batch] route=chain margin=%.6f "
                     "threshold=%.6f draft_graphs=1 packed_width=1 "
                     "target_verify_rows=%d baseline_draft_ms=%.3f\n",
-                    adaptive_margin, cfg_.ddtree_branch_margin,
+                    ghost_margin, cfg_.ddtree_ghost_margin,
                     q_len, round_baseline_draft_ms);
             } else {
-                adaptive_branch_round = true;
-                adaptive_uncertain_rounds++;
+                ghost_batch_round = true;
+                ghost_batch_rounds++;
 
                 std::vector<int32_t> seeds;
-                if (!ddtree_adaptive_seed_tokens(
+                if (!ddtree_ghost_batch_seed_tokens(
                         top_ids.data() + K, q_len - 1, K,
-                        DDTREE_ADAPTIVE_BRANCHES, seeds)) {
+                        DDTREE_GHOST_BRANCHES, seeds)) {
                     std::fprintf(stderr,
-                                 "spec-decode: adaptive seed extraction "
+                                 "spec-decode: ghost seed extraction "
                                  "failed\n");
                     step_graph_destroy(draft_sg);
                     return false;
                 }
 
-                const int draft_batch = DDTREE_ADAPTIVE_BRANCHES;
+                const int draft_batch = DDTREE_GHOST_BRANCHES;
                 const int packed_rows = draft_batch * q_len;
                 std::vector<int32_t> packed_ids(
                     (size_t)packed_rows, target->mask_token_id());
-                for (int branch = 0; branch < draft_batch; ++branch) {
-                    packed_ids[(size_t)branch * q_len] = seeds[branch];
+                for (int ghost = 0; ghost < draft_batch; ++ghost) {
+                    packed_ids[(size_t)ghost * q_len] = seeds[ghost];
                 }
 
                 std::vector<float> packed_noise(
@@ -2364,7 +2364,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         packed_ids.data(), packed_rows,
                         packed_noise.data())) {
                     std::fprintf(stderr,
-                                 "spec-decode: adaptive packed embedding "
+                                 "spec-decode: ghost-batch embedding "
                                  "failed\n");
                     step_graph_destroy(draft_sg);
                     return false;
@@ -2408,7 +2408,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     }
                     step_graph_destroy(packed_sg);
                 }
-                adaptive_expand_ms +=
+                ghost_expand_ms +=
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() -
                         expand_start).count();
@@ -2416,31 +2416,31 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     packed_hidden.size() !=
                         (size_t)packed_rows * hidden) {
                     std::fprintf(stderr,
-                                 "spec-decode: adaptive packed expansion "
+                                 "spec-decode: ghost-batch expansion "
                                  "failed batch=%d rows=%d remote=%d\n",
                                  draft_batch, packed_rows,
                                  (int)use_remote_draft);
                     step_graph_destroy(draft_sg);
                     return false;
                 }
-                adaptive_packed_graphs++;
-                adaptive_packed_rows += packed_rows;
+                ghost_packed_graphs++;
+                ghost_packed_rows += packed_rows;
 
-                constexpr int tail_per_branch =
-                    DDTREE_ADAPTIVE_BRANCH_NODES - 1;
+                constexpr int tail_per_ghost =
+                    DDTREE_GHOST_BRANCH_NODES - 1;
                 const int expanded_rows =
-                    draft_batch * tail_per_branch;
+                    draft_batch * tail_per_ghost;
                 std::vector<float> expanded_hidden(
                     (size_t)expanded_rows * hidden);
-                for (int branch = 0; branch < draft_batch; ++branch) {
+                for (int ghost = 0; ghost < draft_batch; ++ghost) {
                     for (int depth = 1;
-                         depth < DDTREE_ADAPTIVE_BRANCH_NODES;
+                         depth < DDTREE_GHOST_BRANCH_NODES;
                          ++depth) {
                         const size_t dst_row =
-                            (size_t)branch * tail_per_branch +
+                            (size_t)ghost * tail_per_ghost +
                             depth - 1;
                         const float * src = packed_hidden.data() +
-                            ((size_t)branch * q_len + depth) * hidden;
+                            ((size_t)ghost * q_len + depth) * hidden;
                         std::copy_n(
                             src, hidden,
                             expanded_hidden.data() + dst_row * hidden);
@@ -2455,54 +2455,54 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         expanded_tokens) ||
                     (int)expanded_tokens.size() != expanded_rows) {
                     std::fprintf(stderr,
-                                 "spec-decode: adaptive packed tail "
+                                 "spec-decode: ghost-batch tail "
                                  "projection failed\n");
                     step_graph_destroy(draft_sg);
                     return false;
                 }
-                adaptive_projection_ms +=
+                ghost_projection_ms +=
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() -
                         tail_project_start).count();
 
                 std::vector<int32_t> baseline(
-                    DDTREE_ADAPTIVE_BASELINE_NODES);
+                    DDTREE_GHOST_BASELINE_NODES);
                 for (int depth = 0;
-                     depth < DDTREE_ADAPTIVE_BASELINE_NODES;
+                     depth < DDTREE_GHOST_BASELINE_NODES;
                      ++depth) {
                     baseline[depth] =
                         top_ids[(size_t)(depth + 1) * K];
                 }
-                std::vector<int32_t> branches(
-                    DDTREE_ADAPTIVE_BRANCHES *
-                    DDTREE_ADAPTIVE_BRANCH_NODES);
-                for (int branch = 0;
-                     branch < DDTREE_ADAPTIVE_BRANCHES;
-                     ++branch) {
-                    branches[(size_t)branch *
-                             DDTREE_ADAPTIVE_BRANCH_NODES] =
-                        seeds[branch];
+                std::vector<int32_t> ghost_tokens(
+                    DDTREE_GHOST_BRANCHES *
+                    DDTREE_GHOST_BRANCH_NODES);
+                for (int ghost = 0;
+                     ghost < DDTREE_GHOST_BRANCHES;
+                     ++ghost) {
+                    ghost_tokens[(size_t)ghost *
+                             DDTREE_GHOST_BRANCH_NODES] =
+                        seeds[ghost];
                     for (int depth = 1;
-                         depth < DDTREE_ADAPTIVE_BRANCH_NODES;
+                         depth < DDTREE_GHOST_BRANCH_NODES;
                          ++depth) {
-                        branches[(size_t)branch *
-                                 DDTREE_ADAPTIVE_BRANCH_NODES +
+                        ghost_tokens[(size_t)ghost *
+                                 DDTREE_GHOST_BRANCH_NODES +
                                  depth] =
                             expanded_tokens[
-                                (size_t)branch * tail_per_branch +
+                                (size_t)ghost * tail_per_ghost +
                                 depth - 1];
                     }
                 }
 
-                tree = build_adaptive_ddtree(
+                tree = build_ghost_batch_ddtree(
                     baseline.data(), baseline.size(),
-                    branches.data(), DDTREE_ADAPTIVE_BRANCHES,
-                    DDTREE_ADAPTIVE_BRANCH_NODES);
-                N = DDTREE_ADAPTIVE_ALLOC_ROWS;
+                    ghost_tokens.data(), DDTREE_GHOST_BRANCHES,
+                    DDTREE_GHOST_BRANCH_NODES);
+                N = DDTREE_GHOST_ALLOC_ROWS;
                 if (tree.n_nodes + 1 != 31 ||
-                    ddtree_adaptive_required_rows() != N) {
+                    ddtree_ghost_batch_required_rows() != N) {
                     std::fprintf(stderr,
-                                 "spec-decode: adaptive tree shape failed "
+                                 "spec-decode: ghost-batch tree shape failed "
                                  "actual=%d alloc=%d\n",
                                  tree.n_nodes + 1, N);
                     step_graph_destroy(draft_sg);
@@ -2511,12 +2511,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 execute_tree = true;
                 std::fprintf(
                     stderr,
-                    "[ddtree-adaptive] route=branch margin=%.6f "
+                    "[ddtree-ghost-batch] route=ghost_batch margin=%.6f "
                     "threshold=%.6f draft_graphs=2 packed_width=%d "
                     "target_verify_rows=%d actual_rows=%d "
                     "baseline_draft_ms=%.3f remote_ipc=%d\n",
-                    adaptive_margin, cfg_.ddtree_branch_margin,
-                    DDTREE_ADAPTIVE_BRANCHES * q_len, N,
+                    ghost_margin, cfg_.ddtree_ghost_margin,
+                    DDTREE_GHOST_BRANCHES * q_len, N,
                     tree.n_nodes + 1, round_baseline_draft_ms,
                     (int)use_remote_draft);
             }
@@ -2582,13 +2582,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
             profile_add(profile_verify_s, profile_verify_start);
             target_forwards++;
-            if (adaptive_branch_round) {
-                adaptive_verify_ms +=
+            if (ghost_batch_round) {
+                ghost_verify_ms +=
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() -
                         verify_wall_start).count();
-                adaptive_target_forwards++;
-                adaptive_target_rows += N;
+                ghost_target_forwards++;
+                ghost_target_rows += N;
             }
 
             int next_token = -1, bonus_node = 0;
@@ -2637,20 +2637,20 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
             // Telemetry: accepted children (exclude the always-committed root).
             n_accept_sum += std::max(0, accepted_emitted - 1);
-            if (adaptive_branch_round) {
+            if (ghost_batch_round) {
                 const int accepted_children =
                     std::max(0, accepted_emitted - 1);
-                adaptive_accepted_tokens += accepted_children;
+                ghost_accepted_tokens += accepted_children;
                 std::fprintf(
                     stderr,
-                    "[ddtree-adaptive] accepted_tokens=%d "
+                    "[ddtree-ghost-batch] accepted_tokens=%d "
                     "accepted_per_target_forward=%.3f margin=%.6f\n",
                     accepted_children,
-                    adaptive_target_forwards > 0
-                        ? (double)adaptive_accepted_tokens /
-                            adaptive_target_forwards
+                    ghost_target_forwards > 0
+                        ? (double)ghost_accepted_tokens /
+                            ghost_target_forwards
                         : 0.0,
-                    adaptive_margin);
+                    ghost_margin);
             }
 
             if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
@@ -2675,8 +2675,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         return false;
                     }
                     profile_add(profile_rollback_s, profile_rollback_start);
-                    if (adaptive_branch_round) {
-                        adaptive_rollback_ms +=
+                    if (ghost_batch_round) {
+                        ghost_rollback_ms +=
                             std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() -
                                 rollback_wall_start).count();
@@ -2733,9 +2733,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
                 profile_add(profile_replay_s, profile_replay_start);
                 target_forwards++;
-                if (adaptive_branch_round) {
-                    adaptive_target_forwards++;
-                    adaptive_rollback_ms +=
+                if (ghost_batch_round) {
+                    ghost_target_forwards++;
+                    ghost_rollback_ms +=
                         std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() -
                             replay_wall_start).count();
@@ -2781,8 +2781,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 step_graph_destroy(draft_sg);
                 return false;
             }
-            if (adaptive_branch_round) {
-                adaptive_rollback_ms +=
+            if (ghost_batch_round) {
+                ghost_rollback_ms +=
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() -
                         sampled_rollback_wall_start).count();
@@ -2803,8 +2803,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     return false;
                 }
                 target_forwards++;
-                if (adaptive_branch_round) {
-                    adaptive_target_forwards++;
+                if (ghost_batch_round) {
+                    ghost_target_forwards++;
                 }
                 if (!target->read_verify_logits(1, bonus_logits)) {
                     std::fprintf(stderr, "spec-decode: tree bonus logits read failed\n");
@@ -2881,9 +2881,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             return false;
         }
         target_forwards++;
-        if (adaptive_chain_round) {
-            adaptive_target_forwards++;
-            adaptive_target_rows += q_len;
+        if (ghost_baseline_round) {
+            ghost_target_forwards++;
+            ghost_target_rows += q_len;
         }
 
         // 5. Acceptance. Greedy: longest matching prefix between draft and
@@ -2971,20 +2971,20 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             commit_n = need_commit_budget;
             if (commit_n <= accept_n) bonus_tok = -1;
         }
-        if (adaptive_chain_round) {
+        if (ghost_baseline_round) {
             const int accepted_children =
                 std::max(0, std::min(accept_n, need_commit_budget) - 1);
-            adaptive_accepted_tokens += accepted_children;
+            ghost_accepted_tokens += accepted_children;
             std::fprintf(
                 stderr,
-                "[ddtree-adaptive] accepted_tokens=%d "
+                "[ddtree-ghost-batch] accepted_tokens=%d "
                 "accepted_per_target_forward=%.3f margin=%.6f\n",
                 accepted_children,
-                adaptive_target_forwards > 0
-                    ? (double)adaptive_accepted_tokens /
-                        adaptive_target_forwards
+                ghost_target_forwards > 0
+                    ? (double)ghost_accepted_tokens /
+                        ghost_target_forwards
                     : 0.0,
-                adaptive_margin);
+                ghost_margin);
         }
 
         // 6. Fix state: adaptive fast-rollback vs legacy replay.
@@ -3040,8 +3040,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 return false;
             }
             target_forwards++;
-            if (adaptive_chain_round) {
-                adaptive_target_forwards++;
+            if (ghost_baseline_round) {
+                ghost_target_forwards++;
             }
         }
 
