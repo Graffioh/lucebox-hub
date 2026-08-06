@@ -1,7 +1,7 @@
 # QFlash: one-shot quality branching
 
-Status: implemented behind `--qflash`; GPU quality and latency measurements
-are still pending.
+Status: the base MVP is implemented behind `--qflash`; independent branch
+expansion and GPU quality/latency measurements are still pending.
 
 QFlash spends one wider target-model forward on several short continuations
 of one user request. The goal is to use more of the R9700's matrix compute and
@@ -9,9 +9,9 @@ select a better continuation without generating several complete answers.
 
 ## In breve
 
-The DFlash drafter proposes four continuations of seven tokens. The R9700
-verifies the four paths together, scores them with the target model and commits
-one path. Generation then continues normally.
+The DFlash drafter proposes four short paths. The R9700 verifies them together,
+scores them with the target model and commits one path. Generation then
+continues normally.
 
 ```text
                               branch 0: 7 tokens ─┐
@@ -56,18 +56,71 @@ The Strix Halo runs the smaller DFlash drafter. Tokens and compact target
 features cross the device boundary; the target KV does not. QFlash therefore
 does not require coherent GPU memory or remote-KV attention over PCIe.
 
+This asymmetric split is intentional:
+
+- the R9700 owns the latency-sensitive target path, KV and sampler;
+- the Strix uses its otherwise idle compute to create candidate continuations;
+- proposals cross the boundary in one bounded transfer;
+- the expensive target work stays in one wide graph.
+
+## Current MVP limitation
+
+The current implementation runs one DFlash block, takes the top `K` tokens at
+the first branch position and reuses that block's top-1 tail for every branch.
+The first token is different, but the remaining tokens were produced from the
+same spine and are not conditioned on the alternative first token.
+
+This is enough to validate tree construction, wide target verification,
+scoring and rollback. It is not yet a strong quality-search proposal because
+the branches are only weakly diverse.
+
+## Recommended next MVP: Seed-and-Expand
+
+Keep the same `4 × 7` target tree, but make the Strix produce genuine tails:
+
+1. Run the normal DFlash block and obtain four candidate first tokens.
+2. Keep branch 0 and its top-1 tail as the baseline at no extra cost.
+3. Re-run the drafter for the other three seeds, always against the same
+   read-only committed prefix, and take six new tail tokens from each run.
+4. Return all alternative hidden rows in one combined buffer.
+5. Project those rows together on the R9700, build the same 32-row tree and
+   perform one target verify.
+6. Score, commit and roll back exactly as in the current MVP.
+
+```text
+Strix Halo
+  shared draft prefix ─┬─ baseline seed → existing tail
+                       ├─ seed 1 → newly conditioned tail
+                       ├─ seed 2 → newly conditioned tail
+                       └─ seed 3 → newly conditioned tail
+                                      │ one batched transfer
+                                      ▼
+R9700: batched projection → one 32-row tree verify → score → commit
+```
+
+The simplest prototype may execute the three extra drafter passes sequentially
+behind one `propose_branches` call and combine their output before transfer.
+The two AMD GPUs can stay in the existing process; IPC is needed only for the
+already-supported remote-drafter topology. This validates whether real
+diversity improves task results. Only after a positive result should the three
+expansions be fused into one batch-3 drafter graph.
+
+No target KV is copied or replicated for this flow. The Strix reuses only its
+local drafter prefix state; the target prefix and all temporary target suffixes
+remain on the R9700.
+
 ## How selection works
 
-1. Run one normal DFlash draft block.
-2. Take the top `K` draft tokens at the first branch position.
-3. Build `K` short, disjoint chains. Branch 0 is the drafter's normal top-1
-   continuation.
-4. Verify the complete tree with one ancestor-masked target forward.
-5. Compute the mean target log-probability of every path.
-6. Keep branch 0 unless another path beats it by `--qflash-margin`.
-7. Use the existing tree rollback to compact KV, DeltaNet state, convolution
+1. Obtain `K` short draft paths. In the base MVP their tails share one spine;
+   Seed-and-Expand will condition every alternative tail independently.
+2. Build `K` disjoint chains. Branch 0 is the drafter's normal top-1
+   continuation and remains the fallback.
+3. Verify the complete tree with one ancestor-masked target forward.
+4. Compute the mean target log-probability of every path.
+5. Keep branch 0 unless another path beats it by `--qflash-margin`.
+6. Use the existing tree rollback to compact KV, DeltaNet state, convolution
    state and captured features onto the selected path.
-8. Continue with normal DFlash generation.
+7. Continue with normal DFlash generation.
 
 The margin avoids replacing the baseline with a branch that is only
 marginally different. Target likelihood is a cheap first selector, not a
@@ -112,23 +165,30 @@ The active configuration is also reported under `/props.speculative.qflash`.
 - Branches differ at their first token. Their remaining tokens come from the
   same spine-conditioned draft block, so diversity is intentionally limited in
   this first version.
+- Seed-and-Expand, uncertainty-triggered branching and a proposal deadline are
+  design steps, not implemented behavior.
 - Target KV on the Strix Halo and direct remote attention are not implemented.
 
 ## What to measure on the GPUs
 
-Compare the same prompts and seeds with normal DFlash, DDTree and QFlash.
-Record:
+First compare the current shared-tail MVP against Seed-and-Expand with the same
+`4 × 7` shape, prompts and seeds. Record:
 
 - end-to-end latency and time to first token;
 - target tree-verify time;
 - selected branch and score difference from branch 0;
+- alternative-branch win rate;
 - task result or test pass rate;
+- Strix proposal and cross-device transfer time;
 - R9700 matrix utilization and memory bandwidth;
 - drafter colocated on the R9700 versus running on the Strix Halo.
 
-The first go/no-go point is simple: keep the design only if branch selection
-improves task results at an acceptable latency cost. If branch 0 almost always
-wins, improve proposal diversity before increasing the target batch.
+The first go/no-go point is whether independent tails improve task results or
+produce useful alternative wins at an acceptable latency cost. If they do,
+batch the three Strix expansions. After that, trigger the one-shot only when
+the draft top-1/top-2 gap is small and add a deadline that falls back to branch
+0 when alternatives arrive too late. These two guards keep average latency
+close to normal DFlash without complicating the first experiment.
 
 ## Implementation map
 
