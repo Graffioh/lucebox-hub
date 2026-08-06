@@ -267,16 +267,16 @@ Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temper
 | `--model-name S` | filename | OpenAI `model` field |
 | `--chat-template-file <path>` | autodetect | Override Jinja template |
 
-**Decode (DFlash + DDTree + GQBatching)**
+**Decode (DFlash + DDTree + QGBatching)**
 
 | Flag | Default | Effect |
 |---|---|---|
 | `--ddtree` | off (chain) | Enable tree verify |
 | `--ddtree-budget N` | `22` | Tree size. 22 on 3090 (default), 40 on 5090, re-sweep on GB10 |
-| `--gqbatching` | off | Run one quality-oriented ghost batch for a greedy request ([design and limits](server/docs/GQBATCHING.md)) |
-| `--gqbatching-branches N` | `4` | Ghost-batch candidate paths (2–8) |
-| `--gqbatching-horizon N` | `7` | Tokens in each candidate path |
-| `--gqbatching-margin F` | `0.10` | Required target-score gain in nats/token before replacing branch 0 |
+| `--qgbatching` | off | Run one Quality Ghost Batching round for a greedy request ([design and limits](server/docs/QGBATCHING.md)) |
+| `--qgbatching-ghost-branches N` | `4` | Hypothetical short continuations (2–8) |
+| `--qgbatching-horizon N` | `7` | Tokens in each ghost branch |
+| `--qgbatching-margin F` | `0.10` | Required target-score gain before replacing ghost branch 0 |
 | `--fa-window N` | `0` / `2048` (full attention) | Sliding FA window. Leave at 0: a finite window breaks tool calls (the full-attention layers lose the system prompt/tools). |
 | `--draft-residency {auto,persistent,request-scoped}` | `auto` | When draft weights are evicted from VRAM. `request-scoped` parks/frees them after each request's draft work (frees VRAM for the target on tight GPUs); `persistent` keeps them resident across requests; `auto` preserves current behavior while honoring the low-VRAM / `--lazy-draft` hint. Reported at `/props.runtime.draft_residency`. |
 | `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |

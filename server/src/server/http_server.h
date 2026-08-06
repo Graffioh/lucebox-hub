@@ -155,10 +155,10 @@ struct ServerConfig {
     int         ddtree_budget       = 0;
     bool        ddtree_enabled      = false;
     bool        speculative_enabled = false;
-    bool        gqbatching_enabled      = false;
-    int         gqbatching_branches     = 0;
-    int         gqbatching_horizon      = 0;
-    float       gqbatching_margin       = 0.0f;
+    bool        qgbatching_enabled        = false;
+    int         qgbatching_ghost_branches = 0;
+    int         qgbatching_horizon        = 0;
+    float       qgbatching_margin         = 0.0f;
     bool        target_sharding     = false;
     // Prefill chunk size (bargs.chunk). Exposed at /props.runtime.chunk so
     // bench/snapshot tooling can capture the full server config — needed

@@ -269,10 +269,10 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.ddtree_budget      = args.ddtree_budget;
         cfg.ddtree_temp        = args.ddtree_temp;
         cfg.ddtree_chain_seed  = args.ddtree_chain_seed;
-        cfg.gqbatching_mode        = args.gqbatching_mode;
-        cfg.gqbatching_branches    = args.gqbatching_branches;
-        cfg.gqbatching_horizon     = args.gqbatching_horizon;
-        cfg.gqbatching_margin      = args.gqbatching_margin;
+        cfg.qgbatching_mode           = args.qgbatching_mode;
+        cfg.qgbatching_ghost_branches = args.qgbatching_ghost_branches;
+        cfg.qgbatching_horizon        = args.qgbatching_horizon;
+        cfg.qgbatching_margin         = args.qgbatching_margin;
         cfg.use_feature_mirror = args.use_feature_mirror;
 
         auto backend = std::make_unique<Qwen35Backend>(cfg);

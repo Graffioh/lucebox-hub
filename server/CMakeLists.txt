@@ -460,7 +460,7 @@ add_library(dflash_common STATIC
     src/placement/placement_config.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
-    src/common/gqbatching.cpp
+    src/common/qgbatching.cpp
     src/common/peer_access.cpp
     # ── Server components (tokenizer, chat template) ──
     src/server/tokenizer.cpp
@@ -1259,7 +1259,7 @@ if(DFLASH27B_TESTS)
             test/test_qwen35moe_expert_placement.cpp
             test/test_qwen35moe_swap_manager.cpp
             test/test_moe_hybrid_storage.cpp
-            test/test_gqbatching.cpp)
+            test/test_qgbatching.cpp)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
                 test/test_gpu_sampler_cuda.cpp

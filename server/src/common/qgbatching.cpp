@@ -1,4 +1,4 @@
-#include "gqbatching.h"
+#include "qgbatching.h"
 
 #include <algorithm>
 #include <cmath>
@@ -25,60 +25,62 @@ float token_log_probability(const float * row, int vocab, int32_t token) {
 
 }  // namespace
 
-GQBatchingTree build_gqbatching_tree(const int32_t * top_token_ids,
-                             int draft_rows,
-                             int top_k,
-                             int branch_count,
-                             int horizon) {
+QGBatchingTree build_qgbatching_tree(const int32_t * top_token_ids,
+                                     int draft_rows,
+                                     int top_k,
+                                     int ghost_branch_count,
+                                     int horizon) {
     if (!top_token_ids || draft_rows <= 0 || top_k <= 0 ||
-        branch_count <= 0 || horizon <= 0 ||
-        branch_count > top_k || horizon > draft_rows) {
-        GQBatchingTree out;
+        ghost_branch_count <= 0 || horizon <= 0 ||
+        ghost_branch_count > top_k || horizon > draft_rows) {
+        QGBatchingTree out;
         out.tree.parents.push_back(-1);
         out.tree.child_maps.emplace_back();
         out.tree.visibility.assign(1, 1);
         return out;
     }
 
-    std::vector<int32_t> branch_tokens((size_t)branch_count * horizon);
-    for (int branch = 0; branch < branch_count; ++branch) {
+    std::vector<int32_t> ghost_branch_tokens(
+        (size_t)ghost_branch_count * horizon);
+    for (int ghost_branch = 0; ghost_branch < ghost_branch_count; ++ghost_branch) {
         for (int depth = 0; depth < horizon; ++depth) {
-            const int rank = depth == 0 ? branch : 0;
-            branch_tokens[(size_t)branch * horizon + depth] =
+            const int rank = depth == 0 ? ghost_branch : 0;
+            ghost_branch_tokens[(size_t)ghost_branch * horizon + depth] =
                 top_token_ids[(size_t)depth * top_k + rank];
         }
     }
-    return build_gqbatching_tree_from_paths(branch_tokens.data(), branch_count,
-                                           horizon);
+    return build_qgbatching_tree_from_paths(
+        ghost_branch_tokens.data(), ghost_branch_count, horizon);
 }
 
-GQBatchingTree build_gqbatching_tree_from_paths(const int32_t * branch_tokens,
-                                              int branch_count,
-                                              int horizon) {
-    GQBatchingTree out;
+QGBatchingTree build_qgbatching_tree_from_paths(
+    const int32_t * ghost_branch_tokens,
+    int ghost_branch_count,
+    int horizon) {
+    QGBatchingTree out;
     out.tree.parents.push_back(-1);
     out.tree.child_maps.emplace_back();
 
-    if (!branch_tokens || branch_count <= 0 || horizon <= 0) {
+    if (!ghost_branch_tokens || ghost_branch_count <= 0 || horizon <= 0) {
         out.tree.visibility.assign(1, 1);
         return out;
     }
 
-    const int nodes = branch_count * horizon;
+    const int nodes = ghost_branch_count * horizon;
     out.tree.token_ids.reserve(nodes);
     out.tree.depths.reserve(nodes);
     out.tree.parents.reserve(nodes + 1);
     out.tree.child_maps.reserve(nodes + 1);
-    out.branches.resize(branch_count);
+    out.ghost_branches.resize(ghost_branch_count);
 
-    // Branch-major order is DFS order for this tree shape.
-    for (int branch = 0; branch < branch_count; ++branch) {
+    // Ghost-branch-major order is DFS order for this tree shape.
+    for (int ghost_branch = 0; ghost_branch < ghost_branch_count; ++ghost_branch) {
         int parent = 0;
-        auto & path = out.branches[branch];
+        auto & path = out.ghost_branches[ghost_branch];
         path.reserve(horizon);
         for (int depth = 0; depth < horizon; ++depth) {
             const int32_t token =
-                branch_tokens[(size_t)branch * horizon + depth];
+                ghost_branch_tokens[(size_t)ghost_branch * horizon + depth];
             const int node = ++out.tree.n_nodes;
 
             out.tree.token_ids.push_back(token);
@@ -105,30 +107,33 @@ GQBatchingTree build_gqbatching_tree_from_paths(const int32_t * branch_tokens,
     return out;
 }
 
-int gqbatching_required_rows(int branch_count, int horizon, int tile) {
-    if (branch_count <= 0 || horizon <= 0) return 0;
-    const int rows = 1 + branch_count * horizon;
+int qgbatching_required_rows(int ghost_branch_count, int horizon, int tile) {
+    if (ghost_branch_count <= 0 || horizon <= 0) return 0;
+    const int rows = 1 + ghost_branch_count * horizon;
     if (tile <= 1) return rows;
     return ((rows + tile - 1) / tile) * tile;
 }
 
-GQBatchingSelection select_gqbatching_branch(const GQBatchingTree & qtree,
-                                     const float * logits,
-                                     int logits_rows,
-                                     int vocab,
-                                     float margin) {
-    GQBatchingSelection out;
+QGBatchingSelection select_qgbatching_ghost_branch(
+    const QGBatchingTree & qtree,
+    const float * logits,
+    int logits_rows,
+    int vocab,
+    float margin) {
+    QGBatchingSelection out;
     out.accepted.push_back(0);
     if (!logits || vocab <= 0 || logits_rows < qtree.tree.n_nodes + 1 ||
-        qtree.branches.empty()) {
+        qtree.ghost_branches.empty()) {
         out.score = out.main_score = -std::numeric_limits<float>::infinity();
         return out;
     }
 
-    std::vector<float> scores(qtree.branches.size(),
+    std::vector<float> scores(qtree.ghost_branches.size(),
                               -std::numeric_limits<float>::infinity());
-    for (size_t branch = 0; branch < qtree.branches.size(); ++branch) {
-        const auto & path = qtree.branches[branch];
+    for (size_t ghost_branch = 0;
+         ghost_branch < qtree.ghost_branches.size();
+         ++ghost_branch) {
+        const auto & path = qtree.ghost_branches[ghost_branch];
         if (path.empty()) continue;
 
         float total = 0.0f;
@@ -150,21 +155,23 @@ GQBatchingSelection select_gqbatching_branch(const GQBatchingTree & qtree,
             total += lp;
             parent = node;
         }
-        if (valid) scores[branch] = total / static_cast<float>(path.size());
+        if (valid) {
+            scores[ghost_branch] = total / static_cast<float>(path.size());
+        }
     }
 
     out.main_score = scores[0];
     out.score = scores[0];
     const float required = scores[0] + std::max(0.0f, margin);
-    for (size_t branch = 1; branch < scores.size(); ++branch) {
-        if (scores[branch] > required && scores[branch] > out.score) {
-            out.branch = static_cast<int>(branch);
-            out.score = scores[branch];
+    for (size_t ghost_branch = 1; ghost_branch < scores.size(); ++ghost_branch) {
+        if (scores[ghost_branch] > required && scores[ghost_branch] > out.score) {
+            out.ghost_branch = static_cast<int>(ghost_branch);
+            out.score = scores[ghost_branch];
         }
     }
     out.accepted.insert(out.accepted.end(),
-                        qtree.branches[out.branch].begin(),
-                        qtree.branches[out.branch].end());
+                        qtree.ghost_branches[out.ghost_branch].begin(),
+                        qtree.ghost_branches[out.ghost_branch].end());
     return out;
 }
 
