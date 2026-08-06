@@ -24,6 +24,8 @@ struct BackendFeatureConfig {
     // --oflash online drafter adaptation (qwen35 + local draft only; the
     // admission gate rejects unsupported combinations).
     bool oflash_requested = false;
+    bool oflash_aux_options_set = false;
+    bool request_scoped_draft_residency = false;
 
     // MoE-only server features. Recorded here so the gate can report them as
     // inert on a dense architecture; both are applied via env vars at parse

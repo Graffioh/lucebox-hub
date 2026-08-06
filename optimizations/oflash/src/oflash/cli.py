@@ -130,20 +130,37 @@ def main(argv: list[str] | None = None) -> int:
             os.write(args.stream_fd, struct.pack("<i", -1))
         return 1
 
+    target = args.target or os.environ.get("OFLASH_TARGET_GGUF", "")
+    try:
+        if not target:
+            cfg_path = os.path.join(args.out_dir, "trainer.json")
+            if os.path.exists(cfg_path):
+                with open(cfg_path) as f:
+                    target = json.load(f).get("target_gguf", "")
+    except (OSError, ValueError, TypeError) as e:
+        sys.stderr.write(f"[oflash-trainer] target config failed: {e}\n")
+        if args.stream_fd >= 0:
+            os.write(args.stream_fd, struct.pack("<i", -1))
+        ring.close()
+        return 1
+    if not isinstance(target, str) or not target or not os.path.exists(target):
+        sys.stderr.write(
+            "[oflash-trainer] no target GGUF configured (--target / "
+            "$OFLASH_TARGET_GGUF / trainer.json target_gguf)\n")
+        if args.stream_fd >= 0:
+            os.write(args.stream_fd, struct.pack("<i", -1))
+        ring.close()
+        return 1
+    if args.train_ctx < 64:  # keep in sync with trainer.MIN_WINDOW_ROWS
+        sys.stderr.write(
+            f"[oflash-trainer] --train-ctx {args.train_ctx} must be >= 64\n")
+        if args.stream_fd >= 0:
+            os.write(args.stream_fd, struct.pack("<i", -1))
+        ring.close()
+        return 1
+
     control = Control(args.stream_fd)
     control.send_ready()
-
-    target = args.target or os.environ.get("OFLASH_TARGET_GGUF", "")
-    if not target:
-        cfg_path = os.path.join(args.out_dir, "trainer.json")
-        if os.path.exists(cfg_path):
-            with open(cfg_path) as f:
-                target = json.load(f).get("target_gguf", "")
-    if not target or not os.path.exists(target):
-        control.log("no target GGUF configured (--target / "
-                    "$OFLASH_TARGET_GGUF / trainer.json target_gguf); "
-                    "cannot train — exiting")
-        return 1
 
     # Heavy imports only after ready.
     try:

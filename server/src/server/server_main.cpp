@@ -26,6 +26,8 @@
 #include "placement/draft_residency.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -238,6 +240,7 @@ int main(int argc, char ** argv) {
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
     bool adaptive_experts_set = false;  // --adaptive-experts (MoE architectures only)
+    bool oflash_aux_options_set = false;
 
     // Track which thinking-budget tunables the operator set via CLI.
     // Those values win over the model card (spec §3.1: "Explicit CLI
@@ -300,6 +303,7 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--oflash") == 0) {
             bargs.oflash.enabled = true;
         } else if (std::strcmp(argv[i], "--oflash-device") == 0 && i + 1 < argc) {
+            oflash_aux_options_set = true;
             bargs.oflash.device = argv[++i];
             if (bargs.oflash.device != "cpu" &&
                 (bargs.oflash.device.empty() ||
@@ -311,13 +315,17 @@ int main(int argc, char ** argv) {
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--oflash-profile") == 0 && i + 1 < argc) {
+            oflash_aux_options_set = true;
             bargs.oflash.profile = argv[++i];
             if (bargs.oflash.profile.empty() ||
-                bargs.oflash.profile.find('/') != std::string::npos) {
+                bargs.oflash.profile == "." || bargs.oflash.profile == ".." ||
+                bargs.oflash.profile.find('/') != std::string::npos ||
+                bargs.oflash.profile.find('\\') != std::string::npos) {
                 std::fprintf(stderr, "[server] bad --oflash-profile value\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--oflash-lora-rank") == 0 && i + 1 < argc) {
+            oflash_aux_options_set = true;
             bargs.oflash.lora_rank = std::atoi(argv[++i]);
             if (bargs.oflash.lora_rank <= 0 || bargs.oflash.lora_rank > 256) {
                 std::fprintf(stderr,
@@ -325,20 +333,31 @@ int main(int argc, char ** argv) {
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--oflash-alpha") == 0 && i + 1 < argc) {
+            oflash_aux_options_set = true;
             bargs.oflash.lora_alpha = (float)std::atof(argv[++i]);
             if (!(bargs.oflash.lora_alpha > 0.0f)) {
                 std::fprintf(stderr, "[server] --oflash-alpha must be > 0\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--oflash-dir") == 0 && i + 1 < argc) {
+            oflash_aux_options_set = true;
             bargs.oflash.dir = argv[++i];
         } else if (std::strcmp(argv[i], "--oflash-ring-mb") == 0 && i + 1 < argc) {
-            bargs.oflash.ring_mb = std::atoi(argv[++i]);
-            if (bargs.oflash.ring_mb <= 0) {
-                std::fprintf(stderr, "[server] --oflash-ring-mb must be > 0\n");
+            oflash_aux_options_set = true;
+            const char * value = argv[++i];
+            char * end = nullptr;
+            errno = 0;
+            const long parsed = std::strtol(value, &end, 10);
+            if (errno != 0 || !end || *end != '\0' ||
+                parsed <= 0 || parsed > INT_MAX) {
+                std::fprintf(stderr,
+                    "[server] --oflash-ring-mb must be an integer in [1,%d]\n",
+                    INT_MAX);
                 return 2;
             }
+            bargs.oflash.ring_mb = (int)parsed;
         } else if (std::strcmp(argv[i], "--oflash-topk") == 0 && i + 1 < argc) {
+            oflash_aux_options_set = true;
             bargs.oflash.topk = std::atoi(argv[++i]);
             if (bargs.oflash.topk < 0 || bargs.oflash.topk > 256) {
                 std::fprintf(stderr,
@@ -346,6 +365,7 @@ int main(int argc, char ** argv) {
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--oflash-trainer-bin") == 0 && i + 1 < argc) {
+            oflash_aux_options_set = true;
             bargs.oflash.trainer_bin = argv[++i];
         } else if (std::strcmp(argv[i], "--draft-ipc-bin") == 0 && i + 1 < argc) {
             bargs.remote_draft.ipc_bin = argv[++i];
@@ -673,6 +693,9 @@ int main(int argc, char ** argv) {
 
     BackendFeatureConfig backend_features;
     backend_features.oflash_requested = bargs.oflash.enabled;
+    backend_features.oflash_aux_options_set = oflash_aux_options_set;
+    backend_features.request_scoped_draft_residency =
+        sconfig.draft_residency == DraftResidencyPolicy::RequestScoped;
     backend_features.pflash_enabled =
         sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
     backend_features.pflash_drafter_configured =

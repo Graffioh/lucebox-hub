@@ -51,6 +51,9 @@ std::string check_feature_compatibility(
     }
 
     // ── OFlash (online drafter adaptation) prerequisites
+    if (features.oflash_aux_options_set && !features.oflash_requested) {
+        return "--oflash-* options require the --oflash master switch";
+    }
     if (features.oflash_requested) {
         if (arch != "qwen35") {
             return "--oflash is qwen35-only in this iteration (arch=" +
@@ -63,6 +66,19 @@ std::string check_feature_compatibility(
         if (args.remote_draft.enabled()) {
             return "--oflash requires a locally loaded drafter "
                    "(incompatible with --draft-ipc-bin)";
+        }
+        if (features.pflash_enabled) {
+            return "--oflash is incompatible with prefill compression: "
+                   "PFlash parks the adapted drafter";
+        }
+        if (features.request_scoped_draft_residency) {
+            return "--oflash requires persistent draft residency "
+                   "(incompatible with --lazy-draft / request-scoped)";
+        }
+        if (args.device.is_layer_split() ||
+            args.device.split_mode == TargetSplitMode::Tensor) {
+            return "--oflash currently requires single-device target "
+                   "placement";
         }
     }
 

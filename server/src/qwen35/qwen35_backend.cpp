@@ -382,17 +382,24 @@ bool Qwen35Backend::park(ParkTarget target) {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
 
     if (want_draft_model && !draft_parked_) {
-        if (oflash_) {
-            // Adapter tensors live beside the draft weights; adaptation ends
-            // when the drafter is parked (persisted state survives).
-            oflash_->shutdown();
-            oflash_.reset();
-            std::fprintf(stderr, "[oflash] off (draft parked); "
-                                 "restart the server to resume adaptation\n");
+        {
+            std::lock_guard<std::mutex> lock(oflash_mu_);
+            if (oflash_) {
+                // Adapter tensors live beside the draft weights; suspend
+                // adaptation while the drafter is parked. Persisted state is
+                // restored when unpark recreates the runtime below.
+                oflash_->shutdown();
+                oflash_.reset();
+                std::fprintf(stderr,
+                    "[oflash] suspended while the draft is parked\n");
+            }
         }
         if (use_remote_draft) {
             remote_draft_.close();
         } else {
+            // Persistent draft-kv graphs retain pointers to draft weights and
+            // OFlash LoRA slots; invalidate them before either buffer dies.
+            draft_kv_free(draft_kv_);
             step_graph_destroy(draft_sg_);
             free_draft_weights(dw_);
         }
@@ -457,6 +464,16 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.swa_window = cfg_.draft_swa_window;
                 for (int il = 0; il < dw_.n_layer - 1; il++)
                     dw_.layers[il].is_swa = true;
+            }
+            if (cfg_.oflash.enabled) {
+                std::lock_guard<std::mutex> lock(oflash_mu_);
+                oflash_ = std::make_unique<oflash::OFlashRuntime>();
+                if (!oflash_->init(cfg_.oflash, cfg_.draft_path, dw_,
+                                   draft_backend_, w_.n_vocab)) {
+                    oflash_.reset();
+                    std::fprintf(stderr,
+                        "[oflash] disabled after draft unpark (init failed)\n");
+                }
             }
         }
         draft_parked_ = false;
@@ -762,11 +779,14 @@ DFlashTarget * Qwen35Backend::dflash_target() {
 
 void Qwen35Backend::shutdown() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
-    if (oflash_) {
-        // Must precede draft weight/backend teardown: the adapter buffer
-        // lives on draft_backend_ and dw_.oflash points into the runtime.
-        oflash_->shutdown();
-        oflash_.reset();
+    {
+        std::lock_guard<std::mutex> lock(oflash_mu_);
+        if (oflash_) {
+            // Must precede draft weight/backend teardown: the adapter buffer
+            // lives on draft_backend_ and dw_.oflash points into the runtime.
+            oflash_->shutdown();
+            oflash_.reset();
+        }
     }
     free_drafter();
     step_graph_destroy(sg_);
@@ -2383,10 +2403,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
             int next_token = -1, bonus_node = 0;
             std::vector<int> accepted;
+            std::vector<int32_t> sampled_tree_target;
             if (!sampled_verify) {
                 accepted =
                     follow_verified_tree(tree, posterior.data(), next_token, &bonus_node);
             } else {
+                sampled_tree_target.assign((size_t)N, -1);
                 accepted.reserve((size_t)tree.n_nodes + 1);
                 accepted.push_back(0);
                 std::vector<int32_t> hist = out_tokens;
@@ -2395,6 +2417,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 int cur = 0;
                 int stok = sample_logits(node_logits.data() + (size_t)cur * vocab,
                                          vocab, sampler_, hist, sampler_rng_);
+                sampled_tree_target[(size_t)cur] = stok;
                 while (true) {
                     auto it = tree.child_maps[cur].find(stok);
                     if (it == tree.child_maps[cur].end()) break;
@@ -2403,6 +2426,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     hist.push_back(stok);
                     stok = sample_logits(node_logits.data() + (size_t)cur * vocab,
                                          vocab, sampler_, hist, sampler_rng_);
+                    sampled_tree_target[(size_t)cur] = stok;
                 }
                 next_token = stok;
             }
@@ -2431,8 +2455,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
 
             // OFlash: one STEP record per tree step, shared by the three
-            // commit paths below. n_spine labels cover the accepted path
-            // (all flag 1 — the rejection signal is bonus_tok); n_rows may
+            // commit paths below. n_spine labels cover the accepted path;
+            // bonus_tok or a short spine carries the following rejection
+            // signal for trainer fresh-sample selection. n_rows may
             // additionally include a committed bonus row whose features are
             // final after that path's rollback/replay + mirror sync.
             auto oflash_emit_tree_step = [&](int n_spine, int n_rows,
@@ -2459,7 +2484,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         sp_draft[(size_t)i]  = (dfs == 0)
                             ? oflash_tree_root_tok
                             : tree.token_ids[dfs - 1];
-                        sp_target[(size_t)i] = posterior[(size_t)dfs];
+                        sp_target[(size_t)i] = sampled_verify
+                            ? sampled_tree_target[(size_t)dfs]
+                            : posterior[(size_t)dfs];
                         if (have_topk) {
                             std::memcpy(sp_ids.data() + (size_t)i * K,
                                         oflash_tree_ids.data() + (size_t)dfs * K,
@@ -2706,7 +2733,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // token (it is already a valid target sample at that position).
         int accept_n = 1;
         int bonus_tok = -1;
+        // Greedy verification fills target_tok with argmax ids. Sampled
+        // verification must replace the positions it actually visits so the
+        // captured labels agree with acceptance and committed corrections.
+        std::vector<int32_t> sampled_target_tok;
         if (sampled_verify) {
+            sampled_target_tok = target_tok;
             if (!target->read_verify_logits(q_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
                 target->restore_kv();
@@ -2751,6 +2783,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 const int s = sample_logits(
                     verify_logits.data() + (size_t)i * vocab_v, vocab_v,
                     sampler_, verify_history, sampler_rng_);
+                sampled_target_tok[(size_t)i] = s;
                 if (kSvDebug && n_draft_steps < 3 && i < 4) {
                     std::fprintf(stderr,
                         "[sv-debug] step=%d pos=%d seed/draft0=%d draft=%d "
@@ -2854,6 +2887,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
 
         // Build replay_tok for emitting committed tokens.
+        const int step_pos = committed;
         std::vector<int32_t> replay_tok((size_t)commit_n);
         for (int i = 0; i < commit_n; i++) {
             replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
@@ -2872,25 +2906,30 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
         }
 
-        // OFlash: one STEP record per verify step. Feature rows for the
-        // committed range are final here (same rows the mirror sync above
-        // consumed); accept_len also feeds the guard.
-        if (oflash_) {
+        // Capture only after the emit phase decides the exact committed
+        // prefix. This avoids phantom rows after EOS/cancel and lets policy
+        // overrides replay their final features before the ring reads them.
+        auto emit_oflash_chain = [&](int n_rows, bool labels_valid) {
+            if (!oflash_) return;
             oflash::OFlashStepCapture cap;
-            cap.accept_len = accept_n;
+            cap.pos = step_pos;
+            cap.n_rows = n_rows;
+            cap.accept_len = std::min(accept_n, n_rows);
             std::vector<uint8_t> oflash_flags;
-            if (oflash_->capture_active()) {
+            if (oflash_->capture_active() && labels_valid) {
                 oflash_flags.assign((size_t)q_len, 0);
                 for (int i = 0; i < accept_n && i < q_len; i++) {
                     oflash_flags[(size_t)i] = 1;
                 }
-                cap.pos = committed;
-                cap.n_rows = commit_n;
                 cap.block = q_len;
                 cap.draft_tok = draft_tok.data();
-                cap.target_tok = target_tok.data();
+                cap.target_tok = sampled_verify
+                    ? sampled_target_tok.data() : target_tok.data();
                 cap.accept_flags = oflash_flags.data();
-                cap.bonus_tok = bonus_tok;
+                cap.bonus_tok =
+                    bonus_tok >= 0 && n_rows > accept_n &&
+                    replay_tok[(size_t)accept_n] == bonus_tok
+                        ? bonus_tok : -1;
                 if (!oflash_topk_ids.empty()) {
                     cap.topk_lp  = oflash_topk_lp.data();
                     cap.topk_ids = oflash_topk_ids.data();
@@ -2898,13 +2937,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 ggml_backend_synchronize(target_backend_);
             }
             oflash_->emit_step(cap, oflash_feat_reader);
-        }
+        };
 
         // 8. Emit committed tokens (stop at EOS)
         bool hit_eos = false;
         bool floor_to_ar = false;
         bool inject_tool_prefix = false;
         bool budget_close_fired = false;
+        bool budget_token_overridden = false;
         constexpr size_t kActionSuffixLookback = 16;
         constexpr size_t kSkipSequenceLookback = 64;
         int emitted = 0;
@@ -2958,6 +2998,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         // Force-close: override sampled token with close[0].
                         replay_tok[i] = first_close;
                         budget_close_fired = true;
+                        budget_token_overridden = true;
                         if (forced_close_out) *forced_close_out = true;
                     }
                     std::fprintf(stderr,
@@ -3041,6 +3082,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
 
+        if (!budget_close_fired) {
+            emit_oflash_chain(emitted, /*labels_valid=*/true);
+        }
+
         // Notify observer with accepted tokens for this step.
         if (io.observer) {
             io.observer("verify", replay_tok);
@@ -3063,6 +3108,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
+            committed = cache_.cur_pos;
             log_target_forward_stats();
             io.emit(-1);
             return ok;
@@ -3076,12 +3122,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 step_graph_destroy(draft_sg);
                 return false;
             }
-            cache_.cur_pos = committed;
+            cache_.cur_pos = step_pos;
             if (emitted > 0) {
                 std::vector<int32_t> replay_prefix(replay_tok.begin(),
                                                    replay_tok.begin() + emitted);
                 int prefix_last_tok = -1;
-                if (!target->verify_batch(replay_prefix, committed,
+                if (!target->verify_batch(replay_prefix, step_pos,
                                           prefix_last_tok, nullptr)) {
                     std::fprintf(stderr, "spec-decode: budget-close prefix replay failed\n");
                     step_graph_destroy(draft_sg);
@@ -3089,8 +3135,25 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
                 target_forwards++;
             }
-            committed += emitted;
+            // The first mirror sync above reflected the pre-policy replay.
+            // A forced close token changes that row, so refresh the exact
+            // emitted prefix before OFlash captures its final features.
+            if (emitted > 0) {
+                if (use_remote_draft && cache_.target_feat) {
+                    if (!sync_remote_draft_features(step_pos, emitted)) {
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                } else if (feature_mirror_.target_feat && cache_.target_feat) {
+                    if (!sync_local_draft_features(step_pos, emitted)) {
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                }
+            }
+            committed = step_pos + emitted;
             cache_.cur_pos = committed;
+            emit_oflash_chain(emitted, !budget_token_overridden);
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
             const int total_draft_pos = std::max(1, n_draft_steps * q_len);
@@ -3107,6 +3170,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
                                     tail_hook, forced_close_out,
                                     degenerate_close_out);
+            committed = cache_.cur_pos;
             log_target_forward_stats();
             io.emit(-1);
             return ok;

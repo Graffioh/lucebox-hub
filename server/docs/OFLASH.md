@@ -346,3 +346,11 @@ tests on both sides. The trainer builds its bf16 mirror by dequantizing the
 drafter GGUF (§11's mitigation — no safetensors drafter ships on this box)
 and dequantizes the target's `output.weight` + `token_embd` for the loss
 head and noise embeddings.
+
+Admission is intentionally narrower than qwen35 generally: the server rejects
+OFlash with PFlash compression, request-scoped/`--lazy-draft` residency, and
+layer-split or tensor-parallel targets. Those modes park or replace the local
+decode drafter and cannot yet preserve the pointer-stable LoRA graph. Shared
+memory is fully reserved at startup so capacity failures disable capture
+instead of surfacing later as SIGBUS; stale dead-process rings are reclaimed
+on the next OFlash startup.

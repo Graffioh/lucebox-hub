@@ -6,6 +6,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 
@@ -14,6 +15,9 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -36,12 +40,39 @@ void OFlashSupervisor::drain_outbox_locked() {}
 
 #else
 
+namespace {
+
+void close_inherited_fds_except(int keep_fd) {
+#if defined(__linux__) && defined(SYS_close_range)
+    bool range_ok = true;
+    if (keep_fd > 3) {
+        range_ok = ::syscall(SYS_close_range, 3u,
+                             (unsigned)keep_fd - 1, 0u) == 0;
+    }
+    range_ok = ::syscall(SYS_close_range, (unsigned)keep_fd + 1,
+                         UINT_MAX, 0u) == 0 && range_ok;
+    if (range_ok) return;
+#endif
+    const long open_max = ::sysconf(_SC_OPEN_MAX);
+    const int limit = open_max > 0 ? (int)open_max : 65536;
+    for (int fd = 3; fd < limit; ++fd) {
+        if (fd != keep_fd) ::close(fd);
+    }
+}
+
+}  // namespace
+
 bool OFlashSupervisor::start(const OFlashSupervisorConfig & cfg) {
     if (cfg.trainer_bin.empty()) return false;
-    cfg_ = cfg;
     {
         std::lock_guard<std::mutex> lock(mu_);
+        if (thread_.joinable()) return false;
+        cfg_ = cfg;
         stopping_ = false;
+        alive_ = false;
+        outbox_.clear();
+        has_pending_ = false;
+        respawns_ = 0;
     }
     try {
         thread_ = std::thread([this] { run(); });
@@ -112,6 +143,10 @@ bool OFlashSupervisor::spawn_once(std::string & error) {
         ::close(in_pipe[0]);
         ::close(in_pipe[1]);
         ::close(strm_pipe[0]);
+        // The server is multi-threaded and owns listening/client sockets.
+        // The trainer needs only stdin, stdout/stderr, and its event stream;
+        // close every other inherited descriptor before exec.
+        close_inherited_fds_except(strm_pipe[1]);
         std::vector<char *> argv;
         argv.reserve(argv_s.size() + 1);
         for (auto & s : argv_s) argv.push_back(const_cast<char *>(s.c_str()));
@@ -150,8 +185,6 @@ bool OFlashSupervisor::spawn_once(std::string & error) {
     int32_t status = -1;
     ssize_t n = ::read(child_stream_, &status, sizeof(status));
     if (n != (ssize_t)sizeof(status) || status != 0) {
-        int wstatus = 0;
-        ::waitpid(child_pid_, &wstatus, WNOHANG);
         error = "trainer init failed (status=" + std::to_string(status) + ")";
         reap_child(false);
         return false;
@@ -167,7 +200,8 @@ void OFlashSupervisor::reap_child(bool graceful) {
     int waited = 0;
     int wstatus = 0;
     while (waited < grace_ms) {
-        if (::waitpid(pid, &wstatus, WNOHANG) == pid) {
+        const pid_t wr = ::waitpid(pid, &wstatus, WNOHANG);
+        if (wr == pid || (wr == -1 && errno == ECHILD)) {
             goto reaped;
         }
         ::usleep(50 * 1000);
@@ -297,6 +331,14 @@ void OFlashSupervisor::run() {
                 "[oflash] trainer respawn limit reached; capture-only\n");
             break;
         }
+        for (int slept = 0; slept < backoff_ms; slept += 100) {
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                if (stopping_) return;
+            }
+            ::usleep(100 * 1000);
+        }
+        backoff_ms *= 2;
     }
 
     {

@@ -98,6 +98,7 @@ class StepSample:
     bonus_tok: int
     topk_ids: np.ndarray | None    # i32 [n_labels, K] or None
     topk_lp: np.ndarray | None     # f32 [n_labels, K] or None
+    block_size: int = 0            # full proposal width from ring header
 
     @property
     def n_labels(self) -> int:
@@ -105,7 +106,10 @@ class StepSample:
 
     @property
     def has_reject(self) -> bool:
-        return bool((self.accept_flags == 0).any())
+        return bool((self.accept_flags == 0).any()
+                    or self.bonus_tok >= 0
+                    or (self.block_size > 0
+                        and self.n_labels < self.block_size))
 
 
 @dataclass
@@ -163,6 +167,11 @@ class Trainer:
 
     def run(self) -> int:
         """Main loop; returns the process exit code."""
+        if self.cfg.train_ctx < MIN_WINDOW_ROWS:
+            self._control.log(
+                f"--train-ctx {self.cfg.train_ctx} is below the minimum "
+                f"window {MIN_WINDOW_ROWS}; no sample could train — exiting")
+            return 1
         if not self._validate_ring_identity():
             return 1
         try:
@@ -260,6 +269,11 @@ class Trainer:
             self._control.log(
                 f"warning: ring block_size {info.block_size} != mirror "
                 f"{self._mirror.block_size}; scoring the overlap only")
+        if info.vocab != self._mirror.vocab:
+            self._control.log(
+                f"ring vocab {info.vocab} != mirror target vocab "
+                f"{self._mirror.vocab}; incompatible labels — exiting")
+            return False
         return True
 
     def _make_optimizer(self) -> None:
@@ -341,6 +355,12 @@ class Trainer:
         return consumed
 
     def _ingest(self, rec: Record) -> None:
+        # Records are globally ordered and request ids increase strictly.
+        # If SEQ_END was dropped under ring pressure, the first record for a
+        # newer request proves that older live stores are complete.
+        for old_id in [sid for sid in self._seqs if sid < rec.seq_id]:
+            self._retire(old_id)
+
         if rec.type == REC_SEQ_END:
             self._retire(rec.seq_id)
             return
@@ -368,6 +388,7 @@ class Trainer:
                 bonus_tok=rec.bonus_tok,
                 topk_ids=rec.topk_ids,
                 topk_lp=rec.topk_lp,
+                block_size=self._ring.info.block_size,
             )
             store.steps.append(sample)
             self._fresh.append((store, sample))
@@ -434,14 +455,21 @@ class Trainer:
         recency-biased draws from the reservoir, capped at _micro_max."""
         cap = self._micro_max
         batch: list[tuple[SeqStore, StepSample, int]] = []
+        remaining: list[tuple[SeqStore, StepSample]] = []
         for store, sample in self._fresh:
-            if len(batch) >= cap:
-                break
             if store.evicted or not sample.has_reject:
                 continue
             start = self._window_start(store, sample)
             if start is not None:
-                batch.append((store, sample, start))
+                if len(batch) < cap:
+                    batch.append((store, sample, start))
+                else:
+                    remaining.append((store, sample))
+        # Keep valid fresh samples that did not fit this micro-batch. Invalid
+        # or permanently incomplete samples are discarded once, not retried
+        # forever. The main loop drains remaining batches on later turns.
+        self._fresh = remaining
+        self._fresh_rows = sum(s.n_labels for _, s in remaining)
         n_res = len(self._reservoir)
         attempts = 0
         while len(batch) < cap and n_res > 0 and attempts < 4 * cap:
@@ -459,8 +487,6 @@ class Trainer:
         """One optimizer step over a micro-batch; never raises."""
         assert self._optimizer is not None
         batch = self._build_batch()
-        self._fresh.clear()
-        self._fresh_rows = 0
         if not batch:
             return
         try:
@@ -484,6 +510,7 @@ class Trainer:
         self._loss_ema = (loss if self._loss_ema is None else
                           EMA_DECAY * self._loss_ema
                           + (1.0 - EMA_DECAY) * loss)
+        self._micro_max = min(MICRO_BATCH_MAX, self._micro_max + 1)
         if self._opt_steps % self.cfg.export_every == 0:
             self._export()
 
@@ -526,29 +553,39 @@ class Trainer:
         noise[0] = int(sample.draft_tok[0])
         logits = m.forward(feat, noise.to(self._device))  # [q_len, vocab] f32
 
-        n = min(sample.n_labels, q_len)
-        if n < 2:
+        # Chain records carry q_len labels, of which q_len-1 train rows fit.
+        # Tree records carry only the accepted spine; their final label is
+        # precisely the correction for the boundary row after that spine and
+        # must not be dropped (root-only rejection still yields one row).
+        n_train = min(sample.n_labels, q_len - 1)
+        if n_train < 1:
             return logits.sum() * 0.0  # no trainable rows; keep the graph
-        logp = torch.log_softmax(logits[1:n].float(), dim=-1)  # rows 1..n-1
+        logp = torch.log_softmax(
+            logits[1:n_train + 1].float(), dim=-1)
         tgt = torch.from_numpy(
-            sample.target_tok[:n - 1].astype(np.int64)).to(self._device)
-        ce = -logp.gather(1, tgt.unsqueeze(1)).squeeze(1)  # [n-1]
+            sample.target_tok[:n_train].astype(np.int64)).to(self._device)
+        ce = -logp.gather(1, tgt.unsqueeze(1)).squeeze(1)
 
-        rej = torch.from_numpy(
-            sample.accept_flags[1:n] == 0).to(self._device)
-        w = torch.ones(n - 1, dtype=torch.float32, device=self._device)
+        reject_rows = np.zeros(n_train, dtype=bool)
+        n_flagged = min(n_train, max(0, sample.accept_flags.size - 1))
+        reject_rows[:n_flagged] = \
+            sample.accept_flags[1:1 + n_flagged] == 0
+        if n_train >= sample.n_labels and sample.has_reject:
+            reject_rows[sample.n_labels - 1] = True
+        rej = torch.from_numpy(reject_rows).to(self._device)
+        w = torch.ones(n_train, dtype=torch.float32, device=self._device)
         w = w.masked_fill(rej, float(self.cfg.reject_weight))
         loss_vec = w * ce
 
         if (sample.topk_ids is not None and sample.topk_lp is not None
                 and self.cfg.kl_lambda > 0.0):
-            lp = torch.from_numpy(sample.topk_lp[:n - 1]).to(self._device)
+            lp = torch.from_numpy(sample.topk_lp[:n_train]).to(self._device)
             ids = torch.from_numpy(
-                sample.topk_ids[:n - 1].astype(np.int64)).to(self._device)
+                sample.topk_ids[:n_train].astype(np.int64)).to(self._device)
             log_p = torch.log_softmax(lp, dim=-1)  # renormalized over top-K
             p = log_p.exp()
-            q_lp = logp.gather(1, ids)             # [n-1, K]
-            kl = (p * (log_p - q_lp)).sum(dim=-1)  # [n-1]
+            q_lp = logp.gather(1, ids)
+            kl = (p * (log_p - q_lp)).sum(dim=-1)
             loss_vec = loss_vec + self.cfg.kl_lambda * kl
 
         return loss_vec.mean()

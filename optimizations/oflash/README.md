@@ -120,7 +120,8 @@ from the promoted generation.
 
 ## Engine knobs
 
-All flags on `dflash_server` (qwen35 + local `--draft` only; off by default):
+All flags on `dflash_server` (qwen35 + local `--draft`, single-device target,
+persistent draft residency, and no PFlash compression; off by default):
 
 | Flag | Purpose |
 |---|---|
@@ -149,7 +150,7 @@ All flags on `dflash_server` (qwen35 + local `--draft` only; off by default):
 | `--reject-weight <F>` | `3.0` | loss up-weight on rejection-adjacent rows |
 | `--batch-rows <N>` | `512` | fresh rows accumulated per training step |
 | `--export-every <N>` | `8` | training steps between adapter exports |
-| `--train-ctx <N>` | `512` | feature-window length per training sample |
+| `--train-ctx <N>` | `512` | feature-window length per training sample (minimum: 64) |
 | `--reservoir-rows <N>` | `50000` | replay reservoir size (forgetting knob) |
 | `--keep-generations <N>` | `4` | adapter generations kept on disk per profile |
 
@@ -180,6 +181,9 @@ What's ours is the production engine integration and the hardware split, per
 
 - **qwen35 DFlash path + local `--draft` only.** No remote-IPC drafters, no gemma4/laguna wiring
   yet (the capture contract is target-agnostic; that's later work).
+- **Persistent, single-device decode drafter.** OFlash is rejected with PFlash compression,
+  request-scoped/`--lazy-draft` residency, layer-split, or tensor-parallel targets; those paths do
+  not preserve the adapted drafter and its pointer-stable graph today.
 - **Single box, low concurrency.** No multi-tenant or batched-serving concerns, no tensor-parallel
   targets.
 - **Correctness-safe, speed-only risk.** Verification is exact-match against the target, so output

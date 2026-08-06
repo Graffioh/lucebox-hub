@@ -8,8 +8,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cerrno>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 
@@ -58,32 +62,40 @@ bool st_open(const std::string & path, StFile & f, std::string & error) {
         error = "safetensors header is not valid JSON";
         return false;
     }
-    for (auto it = h.begin(); it != h.end(); ++it) {
-        if (it.key() == "__metadata__") {
-            if (!it.value().is_object()) continue;
-            for (auto mit = it.value().begin(); mit != it.value().end(); ++mit) {
-                if (mit.value().is_string()) {
-                    f.metadata[mit.key()] = mit.value().get<std::string>();
+    try {
+        for (auto it = h.begin(); it != h.end(); ++it) {
+            if (it.key() == "__metadata__") {
+                if (!it.value().is_object()) continue;
+                for (auto mit = it.value().begin(); mit != it.value().end(); ++mit) {
+                    if (mit.value().is_string()) {
+                        f.metadata[mit.key()] = mit.value().get<std::string>();
+                    }
                 }
+                continue;
             }
-            continue;
+            const json & v = it.value();
+            if (!v.is_object() || !v.contains("dtype") ||
+                !v.contains("shape") || !v.contains("data_offsets")) {
+                error = "safetensors entry malformed: " + it.key();
+                return false;
+            }
+            StTensor t;
+            t.dtype = v["dtype"].get<std::string>();
+            for (const auto & d : v["shape"]) {
+                t.shape.push_back(d.get<int64_t>());
+            }
+            t.begin = v["data_offsets"][0].get<uint64_t>();
+            t.end   = v["data_offsets"][1].get<uint64_t>();
+            if (t.begin > t.end || t.end > size - f.data_start) {
+                error = "safetensors tensor out of bounds: " + it.key();
+                return false;
+            }
+            f.tensors.emplace(it.key(), std::move(t));
         }
-        const json & v = it.value();
-        if (!v.is_object() || !v.contains("dtype") || !v.contains("shape") ||
-            !v.contains("data_offsets")) {
-            error = "safetensors entry malformed: " + it.key();
-            return false;
-        }
-        StTensor t;
-        t.dtype = v["dtype"].get<std::string>();
-        for (const auto & d : v["shape"]) t.shape.push_back(d.get<int64_t>());
-        t.begin = v["data_offsets"][0].get<uint64_t>();
-        t.end   = v["data_offsets"][1].get<uint64_t>();
-        if (t.begin > t.end || f.data_start + t.end > size) {
-            error = "safetensors tensor out of bounds: " + it.key();
-            return false;
-        }
-        f.tensors.emplace(it.key(), std::move(t));
+    } catch (const json::exception & e) {
+        error = std::string("safetensors header has invalid field types: ") +
+                e.what();
+        return false;
     }
     return true;
 }
@@ -135,7 +147,6 @@ std::vector<OFlashLoraTensorSpec> oflash_lora_expected_tensors(
     const int64_t hidden = dw.n_embd;
     const int64_t q_dim  = (int64_t)dw.head_dim * dw.n_head;
     const int64_t kv_dim = (int64_t)dw.head_dim * dw.n_head_kv;
-    const int64_t inter  = dw.n_ff;
     const int64_t fc_in  = (int64_t)dw.n_target_layers * hidden;
     auto pair = [&](const std::string & base, int64_t in, int64_t out) {
         v.push_back({base + ".lora_a", in, rank});
@@ -144,12 +155,18 @@ std::vector<OFlashLoraTensorSpec> oflash_lora_expected_tensors(
     pair("dflash.fc", fc_in, hidden);
     for (int i = 0; i < dw.n_layer; i++) {
         const std::string blk = "blk." + std::to_string(i);
+        // The GGUF scalar can drift during re-export. LoRA shapes must match
+        // the loaded matrices that ggml_mul_mat actually consumes.
+        const int64_t up_out = dw.layers[i].w_up
+            ? dw.layers[i].w_up->ne[1] : dw.n_ff;
+        const int64_t down_in = dw.layers[i].w_down
+            ? dw.layers[i].w_down->ne[0] : dw.n_ff;
         pair(blk + ".attn_q",      hidden, q_dim);
         pair(blk + ".attn_k",      hidden, kv_dim);
         pair(blk + ".attn_v",      hidden, kv_dim);
         pair(blk + ".attn_output", q_dim,  hidden);
-        pair(blk + ".ffn_up",      hidden, inter);
-        pair(blk + ".ffn_down",    inter,  hidden);
+        pair(blk + ".ffn_up",      hidden, up_out);
+        pair(blk + ".ffn_down",    down_in, hidden);
     }
     return v;
 }
@@ -157,6 +174,7 @@ std::vector<OFlashLoraTensorSpec> oflash_lora_expected_tensors(
 bool oflash_adapter_load(const std::string & path,
                          const DraftWeights & dw,
                          int rank,
+                         float alpha,
                          const std::string & drafter_sha256,
                          OFlashAdapterHost & out,
                          std::string & error) {
@@ -186,11 +204,28 @@ bool oflash_adapter_load(const std::string & path,
                 std::to_string(rank);
         return false;
     }
+    const std::string alpha_s = meta("oflash.alpha");
+    char * alpha_end = nullptr;
+    errno = 0;
+    const float file_alpha = std::strtof(alpha_s.c_str(), &alpha_end);
+    if (alpha_s.empty() || errno != 0 || !alpha_end || *alpha_end != '\0' ||
+        !std::isfinite(file_alpha) ||
+        std::fabs(file_alpha - alpha) >
+            1e-6f * std::max(1.0f, std::fabs(alpha))) {
+        error = "adapter alpha " + alpha_s + " != engine alpha " +
+                std::to_string(alpha);
+        return false;
+    }
     uint64_t generation = 0;
     {
         const std::string g = meta("oflash.generation");
-        if (g.empty()) { error = "adapter missing oflash.generation"; return false; }
-        generation = std::strtoull(g.c_str(), nullptr, 10);
+        char * end = nullptr;
+        errno = 0;
+        generation = std::strtoull(g.c_str(), &end, 10);
+        if (g.empty() || errno != 0 || !end || *end != '\0') {
+            error = "adapter has invalid oflash.generation";
+            return false;
+        }
     }
 
     // Every expected tensor must exist with the exact shape; extras refuse
@@ -225,6 +260,13 @@ bool oflash_adapter_load(const std::string & path,
         }
         if (st_numel(t) != s.in_dim * s.out_dim) {
             error = "adapter tensor numel mismatch: " + s.name;
+            return false;
+        }
+        const size_t elem_size = st_dtype_size(t.dtype);
+        const uint64_t expected_bytes =
+            (uint64_t)s.in_dim * (uint64_t)s.out_dim * elem_size;
+        if (elem_size == 0 || t.end - t.begin != expected_bytes) {
+            error = "adapter tensor byte size mismatch: " + s.name;
             return false;
         }
         std::vector<uint16_t> data;
@@ -355,8 +397,12 @@ bool oflash_store_read_promoted(const std::string & profile_dir,
         !j.contains("adapter") || !j.contains("generation")) {
         return false;
     }
-    adapter_path = j["adapter"].get<std::string>();
-    generation   = j["generation"].get<uint64_t>();
+    try {
+        adapter_path = j["adapter"].get<std::string>();
+        generation   = j["generation"].get<uint64_t>();
+    } catch (const json::exception &) {
+        return false;
+    }
     // Relative paths are relative to the profile dir (portable store).
     if (!adapter_path.empty() && adapter_path[0] != '/') {
         adapter_path = profile_dir + "/" + adapter_path;

@@ -817,7 +817,7 @@ json build_props_body(const ServerConfig & config,
                 {"promotes",           oflash->promotes},
                 {"rollbacks",          oflash->rollbacks},
                 {"rolling_al",         oflash->rolling_al},
-                {"probation_al",       oflash->probation_al > 0.0
+                {"probation_al",       oflash->in_probation
                                            ? json(oflash->probation_al)
                                            : json(nullptr)},
                 {"training_disabled",  oflash->training_disabled},

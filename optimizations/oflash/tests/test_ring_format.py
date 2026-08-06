@@ -11,6 +11,7 @@ from __future__ import annotations
 import struct
 
 import numpy as np
+import pytest
 
 from oflash.ring_format import (
     HEADER_SIZE,
@@ -177,6 +178,40 @@ def test_wrap_emits_pad_and_reader_skips_it(tmp_path):
     np.testing.assert_array_equal(rec.feat_u16, feat_b)
     assert r.read_next() is None
     assert r.tail == head
+    r.close()
+    w.close()
+
+
+def test_zero_length_pad_is_corruption_not_an_infinite_loop(tmp_path):
+    path = str(tmp_path / "ring")
+    w = RingWriter(path, capacity=256)
+    # Fresh ring data is zero-filled, which decodes as PAD(size=0). A torn or
+    # corrupt head must fail fast rather than repeatedly advancing by zero.
+    struct.pack_into("<Q", w._mm, OFF_HEAD, RECORD_HEADER_SIZE)
+    r = RingReader(path)
+    with pytest.raises(RuntimeError, match="corrupt record size 0"):
+        r.read_next()
+    r.close()
+    w.close()
+
+
+def test_reader_skips_sub_header_tail_gap_pad(tmp_path):
+    path = str(tmp_path / "ring")
+    w = RingWriter(path, capacity=256)  # row width = 4 bytes
+    first = np.arange(52 * 2, dtype=np.uint16).reshape(52, 2)
+    # 32-byte header + 208-byte features = 240, leaving a 16-byte tail gap.
+    w.push(REC_CONTEXT, seq_id=1, pos=0, n_rows=52,
+           payload=first.tobytes())
+    r = RingReader(path)
+    assert r.read_next() is not None
+    assert r.tail == 240
+
+    second = np.arange(2 * 2, dtype=np.uint16).reshape(2, 2)
+    w.push(REC_CONTEXT, seq_id=1, pos=52, n_rows=2,
+           payload=second.tobytes())
+    rec = r.read_next()
+    assert rec is not None and rec.pos == 52
+    np.testing.assert_array_equal(rec.feat_u16, second)
     r.close()
     w.close()
 

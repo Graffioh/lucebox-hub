@@ -32,6 +32,7 @@
 #include "ggml-backend.h"
 
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <cstddef>
@@ -130,6 +131,7 @@ public:
     bool supports_remote_draft() const override { return true; }
 
     bool oflash_props(oflash::OFlashPropsSnapshot & out) const override {
+        std::lock_guard<std::mutex> lock(oflash_mu_);
         if (!oflash_) return false;
         out = oflash_->props();
         return true;
@@ -257,6 +259,7 @@ private:
     // Created in init() when cfg_.oflash.enabled (local qwen35 draft only);
     // torn down before the draft weights/backend it references.
     std::unique_ptr<oflash::OFlashRuntime> oflash_;
+    mutable std::mutex oflash_mu_;
 
     // ── Prefix cache (snapshots) ─────────────────────────────────────
     static constexpr int PREFIX_SLOTS = 64;

@@ -179,16 +179,24 @@ class RingReader:
             hdr = self._read_span(at, RECORD_HEADER_SIZE)
             rtype, size, seq_id, pos, n_rows, t_ns = struct.unpack(
                 "<IIQiiQ", hdr)
-            if size < RECORD_HEADER_SIZE and rtype != REC_PAD:
+            if (size < RECORD_HEADER_SIZE or size % 8 != 0
+                    or size > to_end):
                 raise RuntimeError(f"corrupt record size {size} at {at}")
             if rtype == REC_PAD:
                 self.tail = at + size
                 continue
+            if rtype not in (REC_CONTEXT, REC_STEP, REC_SEQ_END):
+                raise RuntimeError(f"unknown record type {rtype} at {at}")
+            if n_rows < 0:
+                raise RuntimeError(f"negative row count {n_rows} at {at}")
             if self.head - at < size:
                 return None  # producer mid-publish; retry later
             body = self._read_span(at + RECORD_HEADER_SIZE,
                                    size - RECORD_HEADER_SIZE)
-            rec = self._parse(rtype, seq_id, pos, n_rows, t_ns, body)
+            try:
+                rec = self._parse(rtype, seq_id, pos, n_rows, t_ns, body)
+            except (ValueError, struct.error, OverflowError, IndexError) as e:
+                raise RuntimeError(f"corrupt record body at {at}: {e}") from e
             self.tail = at + size
             return rec
 

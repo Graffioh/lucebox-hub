@@ -328,7 +328,8 @@ bool OFlashRuntime::load_and_upload(const std::string & path,
     if (!lora_ || !dw_ || !staging_) return false;
     OFlashAdapterHost host;
     std::string error;
-    if (!oflash_adapter_load(path, *dw_, cfg_.lora_rank, drafter_sha256_,
+    if (!oflash_adapter_load(path, *dw_, cfg_.lora_rank, cfg_.lora_alpha,
+                             drafter_sha256_,
                              host, error)) {
         std::fprintf(stderr, "[oflash] adapter refused (%s): %s\n",
                      path.c_str(), error.c_str());
@@ -363,9 +364,8 @@ void OFlashRuntime::refresh_props_cache() {
     s.promotes = guard_.promotes();
     s.rollbacks = guard_.rollbacks();
     s.rolling_al = guard_.baseline_al();
-    s.probation_al =
-        guard_.state() == OFlashGuard::State::Probation ? guard_.probation_al()
-                                                        : 0.0;
+    s.in_probation = guard_.state() == OFlashGuard::State::Probation;
+    s.probation_al = s.in_probation ? guard_.probation_al() : 0.0;
     s.training_disabled =
         training_disabled_ || guard_.state() == OFlashGuard::State::Disabled;
     s.records_written = ring_.written();

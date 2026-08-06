@@ -46,6 +46,7 @@ struct OFlashAdapterHost {
 bool oflash_adapter_load(const std::string & path,
                          const DraftWeights & dw,
                          int rank,
+                         float alpha,
                          const std::string & drafter_sha256,
                          OFlashAdapterHost & out,
                          std::string & error);

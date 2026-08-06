@@ -4447,6 +4447,7 @@ TEST_CASE(ServerUnitFixture, test_props_oflash_shape) {
     snap.rollbacks = 1;
     snap.rolling_al = 6.25;
     snap.probation_al = 0.0;
+    snap.in_probation = false;
     snap.trainer_alive = true;
     snap.steps = 1234;
     snap.records_written = 1200;
@@ -4465,6 +4466,12 @@ TEST_CASE(ServerUnitFixture, test_props_oflash_shape) {
     TEST_ASSERT(of["training_disabled"].get<bool>() == false);
     TEST_ASSERT(of["trainer_alive"].get<bool>() == true);
     TEST_ASSERT(of["records_dropped"].get<uint64_t>() == 3);
+
+    snap.in_probation = true;
+    snap.probation_al = 0.0;
+    body = build_props_body(cfg, pc, tm, &snap);
+    TEST_ASSERT(body["oflash"]["probation_al"].is_number());
+    TEST_ASSERT(body["oflash"]["probation_al"].get<double>() == 0.0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -2,11 +2,15 @@
 
 #include "oflash_ring.h"
 
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #if !defined(_WIN32)
+#include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -18,8 +22,20 @@ namespace {
 
 // The header lives in shared memory; cursor accesses must be atomic with
 // the right ordering. std::atomic_ref is C++20, so wrap the primitives.
+#if defined(_WIN32)
+// Shared-memory capture is disabled on Windows. Keep the translation unit
+// MSVC-buildable without GCC's __atomic intrinsics; these fallbacks are
+// unreachable while create() returns false.
+inline uint64_t load_acquire(const uint64_t * p) { return *p; }
+inline uint64_t load_relaxed(const uint64_t * p) { return *p; }
+inline void store_release(uint64_t * p, uint64_t v) { *p = v; }
+inline void add_relaxed(uint64_t * p, uint64_t v) { *p += v; }
+#else
 inline uint64_t load_acquire(const uint64_t * p) {
     return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+inline uint64_t load_relaxed(const uint64_t * p) {
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
 }
 inline void store_release(uint64_t * p, uint64_t v) {
     __atomic_store_n(p, v, __ATOMIC_RELEASE);
@@ -27,8 +43,36 @@ inline void store_release(uint64_t * p, uint64_t v) {
 inline void add_relaxed(uint64_t * p, uint64_t v) {
     __atomic_fetch_add(p, v, __ATOMIC_RELAXED);
 }
+#endif
 
 constexpr size_t align8(size_t n) { return (n + 7) & ~(size_t)7; }
+
+#if !defined(_WIN32)
+void cleanup_stale_segments() {
+    constexpr const char * prefix = "lucebox-oflash-";
+    constexpr size_t prefix_len = sizeof("lucebox-oflash-") - 1;
+    DIR * dir = ::opendir("/dev/shm");
+    if (!dir) return;
+    while (dirent * ent = ::readdir(dir)) {
+        if (std::strncmp(ent->d_name, prefix, prefix_len) != 0) continue;
+        const char * suffix = ent->d_name + prefix_len;
+        char * end = nullptr;
+        errno = 0;
+        const long pid = std::strtol(suffix, &end, 10);
+        if (errno != 0 || pid <= 0 || !end || *end != '\0' ||
+            pid == (long)::getpid()) continue;
+        errno = 0;
+        if (::kill((pid_t)pid, 0) == -1 && errno == ESRCH) {
+            const std::string shm_name = std::string("/") + ent->d_name;
+            if (::shm_unlink(shm_name.c_str()) == 0) {
+                std::fprintf(stderr, "[oflash] removed stale ring %s\n",
+                             shm_name.c_str());
+            }
+        }
+    }
+    ::closedir(dir);
+}
+#endif
 
 }  // namespace
 
@@ -47,6 +91,7 @@ bool OFlashRing::create(const std::string & name,
     return false;
 #else
     close();
+    cleanup_stale_segments();
     capacity_bytes = align8(capacity_bytes);
     if (capacity_bytes < (uint64_t)1 << 20) {
         std::fprintf(stderr, "[oflash] ring capacity too small (%llu)\n",
@@ -67,6 +112,21 @@ bool OFlashRing::create(const std::string & name,
         ::shm_unlink(name.c_str());
         return false;
     }
+    // Linux tmpfs ftruncate is sparse: without reserving backing store, a ring
+    // can mmap successfully and SIGBUS the decode thread hours later when
+    // writes exhaust /dev/shm. Fail initialization instead; capture is
+    // optional. Other POSIX hosts do not necessarily provide
+    // posix_fallocate(), so retain their previous mmap behavior.
+#if defined(__linux__)
+    const int alloc_rc = ::posix_fallocate(fd, 0, (off_t)total);
+    if (alloc_rc != 0) {
+        errno = alloc_rc;
+        std::perror("[oflash] posix_fallocate");
+        ::close(fd);
+        ::shm_unlink(name.c_str());
+        return false;
+    }
+#endif
     void * mapped = ::mmap(nullptr, total, PROT_READ | PROT_WRITE,
                            MAP_SHARED, fd, 0);
     ::close(fd);
@@ -188,7 +248,7 @@ bool OFlashRing::push2(OFlashRecordHeader header,
 }
 
 uint64_t OFlashRing::dropped() const {
-    return hdr_ ? __atomic_load_n(&hdr_->dropped_records, __ATOMIC_RELAXED) : 0;
+    return hdr_ ? load_relaxed(&hdr_->dropped_records) : 0;
 }
 
 uint64_t OFlashRing::backlog() const {

@@ -24,7 +24,10 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -54,14 +57,15 @@ void write_adapter_file(const std::string & path,
                         int rank,
                         const std::string & sha,
                         uint64_t generation,
-                        bool corrupt_shape = false) {
+                        bool corrupt_shape = false,
+                        const std::string & alpha = "32") {
     const auto specs = oflash_lora_expected_tensors(dw, rank);
     nlohmann::json header;
     header["__metadata__"] = {
         {"oflash.format", "1"},
         {"oflash.drafter_sha256", sha},
         {"oflash.rank", std::to_string(rank)},
-        {"oflash.alpha", "32"},
+        {"oflash.alpha", alpha},
         {"oflash.generation", std::to_string(generation)},
         {"oflash.profile", "default"},
     };
@@ -179,6 +183,34 @@ TEST_CASE(OFlashUnitFixture, ring_create_publishes_stream_facts) {
     ring.close();
     // close() unlinks the segment.
     CHECK(::access(v.path.c_str(), F_OK) != 0);
+}
+
+TEST_CASE(OFlashUnitFixture, ring_create_removes_dead_engine_segment) {
+    std::string stale_name;
+    const pid_t child = ::fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+        stale_name = "/lucebox-oflash-" +
+                     std::to_string((long)::getpid());
+        const int fd = ::shm_open(stale_name.c_str(), O_CREAT | O_EXCL | O_RDWR,
+                                  0600);
+        if (fd < 0) ::_exit(2);
+        ::close(fd);
+        ::_exit(0);  // deliberately leave the segment linked
+    }
+    int status = 0;
+    REQUIRE(::waitpid(child, &status, 0) == child);
+    REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    stale_name = "/lucebox-oflash-" + std::to_string((long)child);
+    const std::string stale_path = "/dev/shm" + stale_name;
+    REQUIRE(::access(stale_path.c_str(), F_OK) == 0);
+
+    OFlashRing ring;
+    const std::string name =
+        "/oflash-test-" + std::to_string((long)getpid()) + "-cleanup";
+    REQUIRE(ring.create(name, 1 << 20, 1, 1, 4, 2, 0, 100));
+    CHECK(::access(stale_path.c_str(), F_OK) != 0);
+    ring.close();
 }
 
 TEST_CASE(OFlashUnitFixture, ring_push_roundtrips_records) {
@@ -443,7 +475,7 @@ TEST_CASE(OFlashUnitFixture, adapter_load_accepts_valid_file) {
     write_adapter_file(path, dw, 4, test_sha(), 3);
     OFlashAdapterHost host;
     std::string err;
-    REQUIRE(oflash_adapter_load(path, dw, 4, test_sha(), host, err));
+    REQUIRE(oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
     CHECK_EQUAL(host.generation, (uint64_t)3);
     CHECK_EQUAL(host.tensors.size(), (size_t)26);
     // F32 → F16 conversion preserves element count.
@@ -460,19 +492,49 @@ TEST_CASE(OFlashUnitFixture, adapter_load_refuses_mismatches) {
 
     // Wrong drafter hash.
     write_adapter_file(path, dw, 4, std::string(64, 'b'), 1);
-    CHECK(!oflash_adapter_load(path, dw, 4, test_sha(), host, err));
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
     CHECK(err.find("hash") != std::string::npos);
 
     // Wrong rank.
     write_adapter_file(path, dw, 4, test_sha(), 1);
-    CHECK(!oflash_adapter_load(path, dw, 8, test_sha(), host, err));
+    CHECK(!oflash_adapter_load(path, dw, 8, 32.0f, test_sha(), host, err));
     CHECK(err.find("rank") != std::string::npos);
+
+    // Same rank but incompatible LoRA scale.
+    write_adapter_file(path, dw, 4, test_sha(), 1,
+                       /*corrupt_shape=*/false, /*alpha=*/"16");
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
+    CHECK(err.find("alpha") != std::string::npos);
 
     // Corrupt tensor shape.
     write_adapter_file(path, dw, 4, test_sha(), 1, /*corrupt_shape=*/true);
-    CHECK(!oflash_adapter_load(path, dw, 4, test_sha(), host, err));
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
     CHECK(err.find("shape") != std::string::npos);
 
+    std::remove(path.c_str());
+}
+
+TEST_CASE(OFlashUnitFixture, adapter_load_refuses_malformed_field_types) {
+    const std::string path =
+        "/tmp/oflash-test-adapter-" + std::to_string((long)getpid()) + "j.st";
+    nlohmann::json header;
+    header["bad"] = {
+        {"dtype", 7},
+        {"shape", "not-an-array"},
+        {"data_offsets", {0, 0}},
+    };
+    const std::string hjson = header.dump();
+    const uint64_t hlen = hjson.size();
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f.write((const char *)&hlen, 8);
+        f.write(hjson.data(), (std::streamsize)hjson.size());
+    }
+    DraftWeights dw = tiny_drafter();
+    OFlashAdapterHost host;
+    std::string err;
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
+    CHECK(err.find("invalid field types") != std::string::npos);
     std::remove(path.c_str());
 }
 
@@ -505,7 +567,9 @@ TEST_CASE(OFlashUnitFixture, supervisor_spawns_and_relays_swap_events) {
     cfg.drafter_path = "/nonexistent.gguf";
     cfg.args = {"--ring-name=/x"};
     cfg.ready_timeout_ms = 5000;
+    sup.stop();  // stop-before-start must not poison the first launch
     REQUIRE(sup.start(cfg));
+    CHECK(!sup.start(cfg));  // a live supervisor cannot be double-started
 
     OFlashPendingSwap swap;
     bool got = false;
@@ -529,9 +593,49 @@ TEST_CASE(OFlashUnitFixture, supervisor_survives_missing_binary) {
     cfg.ready_timeout_ms = 500;
     cfg.max_respawns = 0;
     REQUIRE(sup.start(cfg));  // thread starts; spawn fails inside
-    for (int i = 0; i < 100 && sup.trainer_alive(); i++) ::usleep(20 * 1000);
+    // Let fork/exec + failed ready handshake actually run; checking alive
+    // immediately lets stop() win before the path under test starts.
+    ::usleep(500 * 1000);
     CHECK(!sup.trainer_alive());
     sup.stop();  // must not hang or crash
+}
+
+TEST_CASE(OFlashUnitFixture, supervisor_closes_unrelated_fds_before_exec) {
+    const std::string probe_path =
+        "/tmp/oflash-fd-probe-" + std::to_string((long)getpid());
+    const int probe_fd = ::open(probe_path.c_str(), O_CREAT | O_RDWR, 0600);
+    REQUIRE(probe_fd >= 3);
+
+    const std::string script =
+        "/tmp/oflash-fd-trainer-" + std::to_string((long)getpid()) + ".sh";
+    {
+        std::ofstream f(script);
+        f << "#!/bin/bash\n"
+             "stream=2\nprobe=-1\n"
+             "for a in \"$@\"; do case \"$a\" in "
+             "--stream-fd=*) stream=${a#--stream-fd=};; "
+             "--probe-fd=*) probe=${a#--probe-fd=};; esac; done\n"
+             "if [ -e /proc/$$/fd/$probe ]; then "
+             "printf '\\001\\000\\000\\000' >&$stream; exit 1; fi\n"
+             "printf '\\000\\000\\000\\000' >&$stream\n"
+             "while read line; do [ \"$line\" = quit ] && exit 0; done\n";
+    }
+    ::chmod(script.c_str(), 0755);
+
+    OFlashSupervisor sup;
+    OFlashSupervisorConfig cfg;
+    cfg.trainer_bin = script;
+    cfg.args = {"--probe-fd=" + std::to_string(probe_fd)};
+    cfg.ready_timeout_ms = 5000;
+    REQUIRE(sup.start(cfg));
+    for (int i = 0; i < 100 && !sup.trainer_alive(); i++) {
+        ::usleep(20 * 1000);
+    }
+    CHECK(sup.trainer_alive());
+    sup.stop();
+    ::close(probe_fd);
+    std::remove(probe_path.c_str());
+    std::remove(script.c_str());
 }
 #endif
 
@@ -548,6 +652,22 @@ TEST_CASE(OFlashUnitFixture, store_promoted_roundtrip) {
     REQUIRE(oflash_store_read_promoted(dir, path, gen));
     CHECK_EQUAL(gen, (uint64_t)3);
     CHECK_EQUAL(path, dir + "/gen3.safetensors");  // relative made absolute
+    std::remove((dir + "/promoted.json").c_str());
+    ::rmdir(dir.c_str());
+}
+
+
+TEST_CASE(OFlashUnitFixture, store_promoted_rejects_malformed_types) {
+    const std::string dir =
+        "/tmp/oflash-test-store-bad-" + std::to_string((long)getpid());
+    ::mkdir(dir.c_str(), 0700);
+    {
+        std::ofstream f(dir + "/promoted.json");
+        f << "{\"adapter\":7,\"generation\":\"bad\"}\n";
+    }
+    std::string path;
+    uint64_t gen = 0;
+    CHECK(!oflash_store_read_promoted(dir, path, gen));
     std::remove((dir + "/promoted.json").c_str());
     ::rmdir(dir.c_str());
 }
