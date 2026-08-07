@@ -12,8 +12,9 @@ namespace dflash::common {
 DeepSeek4SeqEngine::DeepSeek4SeqEngine(
         DeepSeek4Backend & backend, PagedKvPool & pool, int max_ctx,
         uint32_t table_stride)
-    : b_(backend), slots_(pool, max_ctx), stride_(table_stride),
-      host_tables_((size_t)pool.max_sequences() * table_stride, -1) {}
+    : b_(backend), pool_(pool), slots_(pool, max_ctx), stride_(table_stride),
+      host_tables_((size_t)pool.max_sequences() * table_stride, -1),
+      pending_((size_t)pool.max_sequences()) {}
 
 bool DeepSeek4SeqEngine::token_is_eos(int32_t token) const {
     return deepseek4_is_eos_tok(token, b_.w_);
@@ -22,12 +23,45 @@ bool DeepSeek4SeqEngine::token_is_eos(int32_t token) const {
 SeqEngine::AdmitResult DeepSeek4SeqEngine::admit(
         uint64_t request_id, const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler) {
-    if (pending_) return {false, true, -1, "another admission is still prefilling"};
+    if (prompt.empty()) return {false, false, -1, "empty prompt"};
+    const uint32_t block_size = pool_.block_size();
+    const uint32_t prompt_blocks =
+        1 + ((uint32_t) prompt.size() - 1) / block_size;
+    if ((uint64_t) prompt_blocks + reserved_prefill_blocks() >
+        pool_.free_block_count()) {
+        return {false, pool_.active_sequence_count() > 0, -1,
+                "not enough unreserved KV blocks for the prompt"};
+    }
     AdmitResult result = slots_.admit(request_id, (int)prompt.size(), sampler);
     if (!result.ok) return result;
+    if ((size_t) result.slot >= pending_.size() || pending_[(size_t) result.slot]) {
+        slots_.retire(result.slot);
+        return {false, false, -1, "invalid DeepSeek4 prefill slot state"};
+    }
     std::fill_n(host_tables_.data() + (size_t)result.slot * stride_, stride_, -1);
-    pending_ = PendingPrefill{result.slot, 0, prompt};
+    reset_deepseek4_paged_slot(b_.paged_cache_, (uint32_t) result.slot);
+    pending_[(size_t) result.slot] = PendingPrefill{result.slot, 0, prompt};
     return result;
+}
+
+bool DeepSeek4SeqEngine::prefill_pending() const {
+    for (const auto & pending : pending_)
+        if (pending) return true;
+    return false;
+}
+
+uint32_t DeepSeek4SeqEngine::reserved_prefill_blocks() const {
+    uint64_t reserved = 0;
+    const uint32_t block_size = pool_.block_size();
+    for (const auto & value : pending_) {
+        if (!value) continue;
+        const uint32_t total =
+            1 + ((uint32_t) value->prompt.size() - 1) / block_size;
+        const uint32_t allocated = value->progress == 0 ? 0
+            : 1 + ((uint32_t) value->progress - 1) / block_size;
+        reserved += total - allocated;
+    }
+    return (uint32_t) std::min<uint64_t>(reserved, UINT32_MAX);
 }
 
 bool DeepSeek4SeqEngine::set_block(int slot, int logical, int32_t physical) {
@@ -42,12 +76,13 @@ bool DeepSeek4SeqEngine::set_block(int slot, int logical, int32_t physical) {
 }
 
 void DeepSeek4SeqEngine::fail_prefill(
-        std::vector<StepOutput> & outputs, const std::string & error) {
-    if (!pending_) return;
+        int slot, std::vector<StepOutput> & outputs, const std::string & error) {
+    if (slot < 0 || (size_t) slot >= pending_.size() ||
+        !pending_[(size_t) slot]) return;
     std::fprintf(stderr, "[deepseek4-parallel] reference prefill slot %d: %s\n",
-                 pending_->slot, error.c_str());
-    outputs.push_back({pending_->slot, -1, true, error, true});
-    pending_.reset();
+                 slot, error.c_str());
+    outputs.push_back({slot, -1, true, error, true});
+    pending_[(size_t) slot].reset();
 }
 
 bool DeepSeek4SeqEngine::step(
@@ -66,7 +101,7 @@ bool DeepSeek4SeqEngine::step(
     for (int slot = 0; slot < slots_.slot_count(); ++slot)
         if (slots_.is_active(slot) && !slots_.is_prefilling(slot) &&
             !supplied.count(slot)) return false;
-    if (inputs.empty() && !pending_) return true;
+    if (inputs.empty() && !prefill_pending()) return true;
 
     std::vector<int32_t> lane_tokens;
     std::vector<int64_t> lane_positions;
@@ -75,6 +110,16 @@ bool DeepSeek4SeqEngine::step(
     outputs.reserve(inputs.size() + 1);
     for (const StepInput & in : inputs) {
         StepOutput out; out.slot = in.slot;
+        const SeqSlot & seq = slots_.slot(in.slot);
+        const bool needs_block =
+            seq.cur_pos % (int) pool_.block_size() == 0;
+        if (needs_block &&
+            pool_.free_block_count() <= reserved_prefill_blocks()) {
+            out.failed = true;
+            out.error = "paged KV pool reserved for pending prefills; raise --kv-pool-tokens";
+            outputs.push_back(std::move(out)); output_lanes.push_back(-1);
+            continue;
+        }
         const auto app = slots_.append_token(in.slot, in.token);
         if (!app.ok) {
             out.failed = true;
@@ -96,26 +141,35 @@ bool DeepSeek4SeqEngine::step(
         outputs.push_back(std::move(out));
     }
 
-    bool prefill_commit = false;
-    int prefill_lane = -1;
-    if (pending_) {
-        auto chunk = slots_.append_prefill(pending_->slot, 1);
+    struct PrefillLane {
+        int slot = -1;
+        int lane = -1;
+        bool commit = false;
+    };
+    std::vector<PrefillLane> prefill_lanes;
+    for (size_t pending_slot = 0; pending_slot < pending_.size(); ++pending_slot) {
+        if (!pending_[pending_slot]) continue;
+        PendingPrefill & pending = *pending_[pending_slot];
+        auto chunk = slots_.append_prefill(pending.slot, 1);
         if (chunk.busy) {
             // Admission does not reserve the prompt's future blocks. A live
             // decoder may temporarily claim the last free block; retry after
             // another sequence retires rather than failing the admission.
         } else if (!chunk.ok || chunk.rows.size() != 1) {
-            fail_prefill(outputs, "reference prefill K/V append failed");
+            fail_prefill(pending.slot, outputs,
+                         "reference prefill K/V append failed");
         } else if (!chunk.new_blocks.empty() &&
-                   !set_block(pending_->slot, chunk.first_new_block,
+                   !set_block(pending.slot, chunk.first_new_block,
                               chunk.new_blocks.front())) {
-            fail_prefill(outputs, "reference prefill block-table update failed");
+            fail_prefill(pending.slot, outputs,
+                         "reference prefill block-table update failed");
         } else {
-            prefill_lane = (int)lane_tokens.size();
-            lane_tokens.push_back(pending_->prompt[pending_->progress]);
-            lane_positions.push_back((int64_t)pending_->progress);
-            lane_slots.push_back(pending_->slot);
-            prefill_commit = pending_->progress + 1 == pending_->prompt.size();
+            prefill_lanes.push_back({
+                pending.slot, (int) lane_tokens.size(),
+                pending.progress + 1 == pending.prompt.size()});
+            lane_tokens.push_back(pending.prompt[pending.progress]);
+            lane_positions.push_back((int64_t)pending.progress);
+            lane_slots.push_back(pending.slot);
         }
     }
     if (lane_tokens.empty()) return true;
@@ -126,7 +180,9 @@ bool DeepSeek4SeqEngine::step(
         for (StepOutput & out : outputs) if (!out.failed) {
             out.failed = true; out.error = "token embedding failed";
         }
-        if (prefill_lane >= 0) fail_prefill(outputs, "reference prefill embedding failed");
+        for (const PrefillLane & prefill : prefill_lanes)
+            fail_prefill(prefill.slot, outputs,
+                         "reference prefill embedding failed");
         return false;
     }
     std::vector<int32_t> compact_tables(lane_tokens.size() * stride_, -1);
@@ -156,7 +212,8 @@ bool DeepSeek4SeqEngine::step(
         for (StepOutput & out : outputs) if (!out.failed) {
             out.failed = true; out.error = "DeepSeek4 gathered paged graph failed";
         }
-        if (prefill_lane >= 0) fail_prefill(outputs, "gathered paged graph failed");
+        for (const PrefillLane & prefill : prefill_lanes)
+            fail_prefill(prefill.slot, outputs, "gathered paged graph failed");
         return false;
     }
 
@@ -172,26 +229,29 @@ bool DeepSeek4SeqEngine::step(
         slots_.commit_step(inputs[i].slot);
         outputs[i].token = sample_lane(inputs[i].slot, output_lanes[i]);
     }
-    if (prefill_lane >= 0) {
-        ++pending_->progress;
-        if (prefill_commit) {
-            StepOutput out; out.slot = pending_->slot; out.prefill_done = true;
+    for (const PrefillLane & prefill : prefill_lanes) {
+        PendingPrefill & pending = *pending_[(size_t) prefill.slot];
+        ++pending.progress;
+        if (prefill.commit) {
+            StepOutput out; out.slot = pending.slot; out.prefill_done = true;
             SeqSlot & seq = slots_.slot(out.slot);
             if (seq.sampler.needs_logit_processing()) {
                 // Match single-request DS4: first-token penalties see the
                 // prompt, then append_token records each token actually fed.
-                seq.sample_history = pending_->prompt;
+                seq.sample_history = pending.prompt;
             }
-            out.token = sample_lane(out.slot, prefill_lane);
-            slots_.commit_prefill(out.slot, (int)pending_->prompt.size());
-            outputs.push_back(std::move(out)); pending_.reset();
+            out.token = sample_lane(out.slot, prefill.lane);
+            slots_.commit_prefill(out.slot, (int)pending.prompt.size());
+            outputs.push_back(std::move(out));
+            pending_[(size_t) prefill.slot].reset();
         }
     }
     return true;
 }
 
 void DeepSeek4SeqEngine::retire(int slot) {
-    if (pending_ && pending_->slot == slot) pending_.reset();
+    if (slot >= 0 && (size_t) slot < pending_.size())
+        pending_[(size_t) slot].reset();
     slots_.retire(slot);
     if (slot >= 0 && slot < slots_.slot_count())
         std::fill_n(host_tables_.data() + (size_t)slot * stride_, stride_, -1);

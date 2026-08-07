@@ -365,8 +365,9 @@ bool create_deepseek4_paged_cache(ggml_backend_t backend,
                                   uint32_t slots, uint32_t max_ctx,
                                   uint32_t physical_blocks,
                                   DeepSeek4PagedCache & out);
+void reset_deepseek4_paged_slot(DeepSeek4PagedCache & c, uint32_t slot);
 void free_deepseek4_paged_cache(DeepSeek4PagedCache & c);
-// Exact gathered-reference decode for 1..4 independent lanes. Inputs are
+// Exact gathered-reference decode for 1..16 independent lanes. Inputs are
 // lane-major; negative slots are inactive padding lanes. `out_logits` is
 // [n_vocab, lanes] and `out_argmax` is [lanes].
 bool deepseek4_paged_gathered_step(

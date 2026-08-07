@@ -174,6 +174,39 @@ bool create_deepseek4_paged_cache(ggml_backend_t backend,
     return true;
 }
 
+void reset_deepseek4_paged_slot(DeepSeek4PagedCache & c, uint32_t slot) {
+    if (!c.buf || slot >= c.plan.slots) return;
+    auto clear_slot = [slot](ggml_tensor * tensor) {
+        if (!tensor || tensor->ne[2] <= (int64_t) slot) return;
+        const size_t bytes = tensor->nb[2];
+        std::vector<uint8_t> zeros(bytes, 0);
+        ggml_backend_tensor_set(tensor, zeros.data(), (size_t) slot * bytes,
+                                bytes);
+    };
+    for (DeepSeek4PagedLayerCache & layer : c.layers) {
+        clear_slot(layer.attn_compressor.state_kv);
+        clear_slot(layer.attn_compressor.state_score);
+        clear_slot(layer.indexer_compressor.state_kv);
+        clear_slot(layer.indexer_compressor.state_score);
+    }
+    if (c.block_table) {
+        std::vector<int32_t> empty(c.plan.max_blocks_per_sequence, -1);
+        ggml_backend_tensor_set(c.block_table, empty.data(),
+            (size_t) slot * c.block_table->nb[1],
+            empty.size() * sizeof(int32_t));
+    }
+    const int32_t zero = 0;
+    const int32_t inactive = -1;
+    if (c.sequence_lengths) {
+        ggml_backend_tensor_set(c.sequence_lengths, &zero,
+                                (size_t) slot * sizeof(int32_t), sizeof(zero));
+    }
+    if (c.active_slot_ids) {
+        ggml_backend_tensor_set(c.active_slot_ids, &inactive,
+                                (size_t) slot * sizeof(int32_t), sizeof(inactive));
+    }
+}
+
 void free_deepseek4_paged_cache(DeepSeek4PagedCache & c) {
     deepseek4_release_paged_gathered_runtime(c);
     free_deepseek4_cache(c.prefill_staging);

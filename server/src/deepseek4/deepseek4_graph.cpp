@@ -6693,7 +6693,7 @@ bool deepseek4_paged_gathered_step(
         std::vector<int32_t> & out_argmax, MoeHybridStorage * hybrid,
         MoeHybridRoutingStats * routing_stats) {
     if (!backend || !embeddings || !positions || !slots || !block_tables ||
-        lanes < 1 || lanes > 4 || cache.layers.size() != (size_t) w.n_layer ||
+        lanes < 1 || lanes > 16 || cache.layers.size() != (size_t) w.n_layer ||
         block_table_stride < cache.plan.max_blocks_per_sequence) return false;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
         if (slots[lane] < 0) continue;

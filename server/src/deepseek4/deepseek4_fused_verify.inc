@@ -377,7 +377,11 @@ static bool ds4_build_fused_verify_graph(
     fg.sg.ctx = ggml_init(params);
     if (!fg.sg.ctx) return false;
     ggml_context * ctx = fg.sg.ctx;
-    constexpr size_t graph_capacity = 65536u;
+    // Gathered paged attention builds one q=1 MLA lane per concurrent
+    // sequence. Above eight lanes the resulting whole-model graph exceeds
+    // the verifier-era 64K scheduler hash table even though the metadata
+    // arena still has ample room.
+    const size_t graph_capacity = q > 8 ? 131072u : 65536u;
     fg.sg.gf = ggml_new_graph_custom(ctx, graph_capacity, false);
     ggml_cgraph * gf = fg.sg.gf;
 
@@ -467,7 +471,7 @@ static bool ds4_build_fused_verify_graph(
             // Gather each lane's immutable chronological history and run the
             // established MLA lane core at q=1; all surrounding HC/MoE/output
             // machinery remains q-wide and unchanged.
-            if (q < 1 || q > 4 || paged_rows->size() != (size_t) w.n_layer ||
+            if (q < 1 || q > 16 || paged_rows->size() != (size_t) w.n_layer ||
                 (*paged_rows)[(size_t) il].size() != (size_t) q) return false;
             DeepSeek4PagedLayerCache & plc = paged_cache->layers[(size_t) il];
             ggml_tensor * raw_flat = ggml_reshape_2d(

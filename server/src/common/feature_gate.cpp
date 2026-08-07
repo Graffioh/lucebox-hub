@@ -232,7 +232,7 @@ std::string check_feature_compatibility(
         // The paged pool addresses tokens with uint32; 64 slots is far above
         // any batch the decode kernel has been sized for and keeps the
         // fixed-width decode batch bounded.
-        const int concurrency_limit = arch == "deepseek4" ? 4 : 64;
+        const int concurrency_limit = arch == "deepseek4" ? 16 : 64;
         if (args.max_concurrency > concurrency_limit) {
             return "--max-concurrency must be at most " +
                    std::to_string(concurrency_limit) + " for architecture '" +

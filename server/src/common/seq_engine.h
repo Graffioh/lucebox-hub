@@ -6,8 +6,8 @@
 // paged KV cache and execute a batched decode step. Any additional
 // per-sequence model state is owned by the concrete engine, not by this
 // interface. admit() claims a slot and queues its prompt without compute.
-// Each step() then advances that prefill by one chunk alongside the live
-// decode batch. Once prefilling completes, the scheduler advances the slot
+// Each step() then advances pending prefill chunks alongside the live decode
+// batch. Once prefilling completes, the scheduler advances the slot
 // one token per step(), feeding each sampled token back as the next step's
 // input — which is what lets it override a token (thinking-budget
 // force-close) before it is committed to the cache.
@@ -74,7 +74,8 @@ public:
     // Admit one request into a free slot and queue its prompt for chunked
     // prefill. No K/V blocks or compute are consumed here — subsequent step()
     // calls allocate and advance one prefill chunk alongside the decode batch.
-    // At most one admission may prefill at a time.
+    // Engines serialize admissions by default; a slot-local implementation
+    // can opt in to accumulating several pending prefills below.
     //
     // `sampler` is the only source of truth for how the slot samples:
     // sampler.needs_logit_processing() selects CPU sampling over GPU argmax
@@ -104,15 +105,22 @@ public:
     };
 
     // One scheduler iteration: commit each input token and advance every
-    // decoding slot, while also advancing the pending admission's prefill by
-    // one chunk when present. Every decoding slot must appear in `inputs`;
-    // the prefilling slot must not. A completed prefill contributes one extra
-    // output with prefill_done=true. Returns false on a whole-batch failure
-    // (outputs may be partial).
+    // decoding slot, while also advancing pending admissions by one chunk
+    // when present. Every decoding slot must appear in `inputs`; prefilling
+    // slots must not. Each completed prefill contributes one extra output
+    // with prefill_done=true. Returns false on a whole-batch failure (outputs
+    // may be partial).
     virtual bool step(const std::vector<StepInput> & inputs,
                       std::vector<StepOutput> & outputs) = 0;
 
     virtual bool prefill_pending() const = 0;
+
+    // Most engines own one prefill staging set and must finish it before the
+    // scheduler admits another request. Engines whose persistent state is
+    // slot-local may opt in to accumulating pending admissions; each step()
+    // is then responsible for advancing all of them without exceeding the
+    // engine's fixed slot count.
+    virtual bool admits_during_prefill() const { return false; }
 
     // Release a slot's KV blocks and mark it free. Safe on failed slots.
     virtual void retire(int slot) = 0;

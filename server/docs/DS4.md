@@ -178,7 +178,7 @@ Paged concurrent serving composes with the same asymmetric expert ownership.
 The target GPU remains the sole owner of MLA cache pages, compressor state,
 sampling, and dense layers; both GPU owners execute their selected experts per
 layer. The initial implementation uses a gathered exact-reference attention
-graph and tokenwise exact prefill, so it validates state isolation and
+graph and batched tokenwise exact prefill, so it validates state isolation and
 iteration-level concurrency rather than claiming final throughput:
 
 ```bash
@@ -193,17 +193,19 @@ export GGML_BATCH_PEER_COPIES=1
 ./build-cuda-hip/dflash_server /path/to/deepseek4-target.gguf \
   --target-device cuda:0 \
   --paged-attention \
-  --max-concurrency 2 \
+  --max-concurrency 16 \
   --kv-pool-tokens 8192 \
   --max-ctx 4096 \
   --ds4-prefill exact \
   --prefix-cache-slots 0
 ```
 
-This mode requires static in-process expert ownership and supports at most four
+This mode requires static in-process expert ownership and supports at most 16
 concurrent slots. DSpark, approximate prefill, mutable/streamed expert caches,
 target park, and layer-split execution fail closed until their state becomes
-page- and slot-aware.
+page- and slot-aware. Automatic expert placement reserves the persistent paged
+state and wide-graph scratch envelope before assigning primary-device experts;
+`DFLASH_EXPERT_BUDGET_MB` can still impose a lower experimental cap.
 
 ### Local single-shard
 

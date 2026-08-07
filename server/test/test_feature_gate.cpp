@@ -386,12 +386,12 @@ static void test_feature_gate_deepseek4_paged_reference_constraints() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.paged_attention = true;
-    args.max_concurrency = 4;
+    args.max_concurrency = 16;
     TEST_ASSERT(gate_accepts(args, "deepseek4", PlacementBackend::Cuda));
 
-    args.max_concurrency = 5;
+    args.max_concurrency = 17;
     TEST_ASSERT(!gate_accepts(args, "deepseek4", PlacementBackend::Cuda));
-    args.max_concurrency = 4;
+    args.max_concurrency = 16;
     args.ds4_fused_decode = true;
     TEST_ASSERT(!gate_accepts(args, "deepseek4", PlacementBackend::Cuda));
     args.ds4_fused_decode = false;

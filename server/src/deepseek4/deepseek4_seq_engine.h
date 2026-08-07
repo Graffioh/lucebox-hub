@@ -25,7 +25,8 @@ public:
                       const SamplerCfg & sampler) override;
     bool step(const std::vector<StepInput> & inputs,
               std::vector<StepOutput> & outputs) override;
-    bool prefill_pending() const override { return pending_.has_value(); }
+    bool prefill_pending() const override;
+    bool admits_during_prefill() const override { return true; }
     void retire(int slot) override;
     bool token_is_eos(int32_t token) const override;
 
@@ -37,14 +38,16 @@ private:
     };
 
     bool set_block(int slot, int logical, int32_t physical);
-    void fail_prefill(std::vector<StepOutput> & outputs,
+    uint32_t reserved_prefill_blocks() const;
+    void fail_prefill(int slot, std::vector<StepOutput> & outputs,
                       const std::string & error);
 
     DeepSeek4Backend & b_;
+    PagedKvPool & pool_;
     SeqSlotManager slots_;
     uint32_t stride_ = 0;
     std::vector<int32_t> host_tables_;
-    std::optional<PendingPrefill> pending_;
+    std::vector<std::optional<PendingPrefill>> pending_;
 };
 
 } // namespace dflash::common

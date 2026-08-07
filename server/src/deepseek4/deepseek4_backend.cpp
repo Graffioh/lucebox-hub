@@ -333,13 +333,14 @@ static uint64_t estimate_ds4_cache_bytes(const DeepSeek4Weights & w, int max_ctx
         const size_t comp_cap = (size_t) (max_ctx / (int) ratio) + 16;
         total_bytes += comp_cap * head_dim * sizeof(uint16_t);
 
-        const size_t window = (ratio == 4) ? 8 : ratio;
-        total_bytes += window * head_dim * sizeof(float) * 2;
+        const size_t state_rows = (ratio == 4) ? 8 : ratio;
+        const size_t comp_width = head_dim * (ratio == 4 ? 2 : 1);
+        total_bytes += state_rows * comp_width * sizeof(float) * 2;
 
         if (ratio == 4) {
-            const size_t index_comp_width = (size_t) w.n_indexer_head * (size_t) w.n_indexer_head_dim;
-            total_bytes += comp_cap * index_comp_width * sizeof(uint16_t);
-            total_bytes += window * index_comp_width * sizeof(float) * 2;
+            const size_t index_dim = (size_t) w.n_indexer_head_dim;
+            total_bytes += comp_cap * index_dim * sizeof(uint16_t);
+            total_bytes += 8 * (2 * index_dim) * sizeof(float) * 2;
         }
     }
 
@@ -477,6 +478,7 @@ static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
 static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
                                            ggml_backend_t backend,
                                            int max_ctx,
+                                           const DeepSeek4BackendConfig * cfg,
                                            Ds4HybridBudgetInfo & out,
                                            std::string * err) {
     out = {};
@@ -498,6 +500,41 @@ static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
     out.core_bytes = moe_hybrid_core_bytes_from_memory(
         "deepseek4", out.gpu_free, out.gpu_total);
     out.kv_bytes = estimate_ds4_cache_bytes(w, max_ctx);
+    if (cfg && cfg->paged_attention) {
+        const uint64_t requested = cfg->kv_pool_tokens > 0
+            ? (uint64_t) cfg->kv_pool_tokens
+            : (uint64_t) max_ctx * (uint64_t) cfg->max_concurrency;
+        const uint64_t physical_blocks =
+            (std::max<uint64_t>(requested, (uint64_t) max_ctx) +
+             DS4_PAGE_TOKENS - 1) / DS4_PAGE_TOKENS;
+        DeepSeek4PagedCachePlan paged;
+        if (physical_blocks > UINT32_MAX ||
+            !plan_deepseek4_paged_cache(
+                (uint32_t) w.head_dim, (uint32_t) w.n_indexer_head_dim,
+                (uint32_t) cfg->max_concurrency, (uint32_t) max_ctx,
+                (uint32_t) physical_blocks, w.compress_ratios, paged)) {
+            if (err) *err = "could not plan paged cache for expert budget";
+            return false;
+        }
+        if (out.kv_bytes > UINT64_MAX - paged.total_persistent_bytes) {
+            if (err) *err = "paged cache budget overflow";
+            return false;
+        }
+        out.kv_bytes += paged.total_persistent_bytes;
+        // The gathered reference graph materializes an independent MLA lane
+        // per slot and retains a two-shape mixed-backend cache. Reserve the
+        // measured 3090 worst-case scratch envelope before expert placement;
+        // otherwise an expert-heavy automatic placement can load correctly
+        // and then OOM when the first wide graph is built.
+        constexpr uint64_t graph_bytes_per_lane = 320ULL * 1024 * 1024;
+        const uint64_t graph_bytes =
+            (uint64_t) cfg->max_concurrency * graph_bytes_per_lane;
+        if (out.kv_bytes > UINT64_MAX - graph_bytes) {
+            if (err) *err = "paged graph budget overflow";
+            return false;
+        }
+        out.kv_bytes += graph_bytes;
+    }
 
     if (out.gpu_total > out.core_bytes + out.kv_bytes + out.warm_bytes + out.safety_bytes) {
         out.expert_budget = out.gpu_total - out.core_bytes - out.kv_bytes - out.warm_bytes - out.safety_bytes;
@@ -783,13 +820,13 @@ bool DeepSeek4Backend::init() {
     configure_gfx1201_hybrid_sub_batch_default(cfg_.device.gpu);
 
     if (cfg_.paged_attention &&
-        (cfg_.max_concurrency < 1 || cfg_.max_concurrency > 4 ||
+        (cfg_.max_concurrency < 1 || cfg_.max_concurrency > 16 ||
          cfg_.device.is_layer_split() ||
          cfg_.prefill_mode != PrefillAttentionMode::Exact ||
          cfg_.fused_decode || env_flag_enabled("DFLASH_DS4_FUSED_DECODE") ||
          env_flag_enabled("DFLASH_DS4_SPEC"))) {
         std::fprintf(stderr,
-            "[deepseek4] paged serving requires 1..4 local slots, exact "
+            "[deepseek4] paged serving requires 1..16 local slots, exact "
             "prefill, and autoregressive non-fused decode\n");
         return false;
     }
@@ -889,7 +926,7 @@ bool DeepSeek4Backend::init() {
             paged_cache_.plan.max_blocks_per_sequence);
         std::fprintf(stderr,
             "[deepseek4-parallel] enabled %d slots, %u x %d-token physical "
-            "blocks; prefill is exact reference mode at one prompt token per scheduler iteration\n",
+            "blocks; prefill is exact reference mode at one prompt token per slot per scheduler iteration\n",
             cfg_.max_concurrency, paged_cache_.plan.physical_blocks,
             DS4_PAGE_TOKENS);
     }
@@ -986,7 +1023,8 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
                                                        MoeHybridPlacement & out,
                                                        std::string * err) const {
     Ds4HybridBudgetInfo budget;
-    if (!compute_ds4_hybrid_budget_info(w, backend_, max_ctx, budget, err)) {
+    if (!compute_ds4_hybrid_budget_info(
+            w, backend_, max_ctx, &cfg_, budget, err)) {
         return false;
     }
 

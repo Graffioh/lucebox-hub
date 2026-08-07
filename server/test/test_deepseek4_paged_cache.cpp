@@ -15,6 +15,12 @@ int main() {
     // Paged rows are shared; only raw rings, metadata, and compressor state scale by slots.
     CHECK(twice.compressed_bytes == p.compressed_bytes);
     CHECK(twice.raw_bytes == p.raw_bytes * 2 && twice.state_bytes == p.state_bytes * 2);
+    DeepSeek4PagedCachePlan sixteen;
+    CHECK(plan_deepseek4_paged_cache(512, 128, 16, 4096, 40,
+                                     {0, 4, 128}, sixteen));
+    CHECK(sixteen.slots == 16 && sixteen.max_blocks_per_sequence == 32);
+    CHECK(sixteen.compressed_bytes == p.compressed_bytes);
+    CHECK(sixteen.raw_bytes == p.raw_bytes / 3 * 16);
     CHECK(!plan_deepseek4_paged_cache(512, 128, 1, 4096, 40, {4, 16}, twice));
     CHECK(!plan_deepseek4_paged_cache(512, 128, 1, 4096,
           std::numeric_limits<uint32_t>::max(), {4}, twice));
@@ -41,6 +47,23 @@ int main() {
     CHECK(rows[1].compressed_emitted && rows[1].compressed_scatter == 7 * 32);
     CHECK(rows[2].raw_history.empty() && rows[2].compressed_history.empty());
     CHECK(rows[2].raw_scatter == -1 && rows[2].compressed_scatter == -1);
+
+    std::vector<int32_t> sixteen_slots(16);
+    std::vector<int64_t> sixteen_positions(16, 0);
+    std::vector<int32_t> sixteen_tables(16);
+    for (int i = 0; i < 16; ++i) {
+        sixteen_slots[(size_t) i] = i;
+        sixteen_tables[(size_t) i] = i;
+    }
+    CHECK(prepare_deepseek4_gathered_lane_rows(
+        sixteen_slots.data(), sixteen_positions.data(), 16,
+        sixteen_tables.data(), 1, 16, 4, rows));
+    CHECK(rows.size() == 16);
+    for (int i = 0; i < 16; ++i) {
+        CHECK(rows[(size_t) i].slot == i);
+        CHECK(rows[(size_t) i].raw_history.empty());
+        CHECK(rows[(size_t) i].raw_scatter == int64_t(i * 128));
+    }
 
     const int32_t boundary_slot[] = {1};
     const int32_t boundary_table[] = {0, 1};
