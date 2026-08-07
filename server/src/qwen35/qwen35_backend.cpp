@@ -727,7 +727,6 @@ bool Qwen35Backend::unpark(ParkTarget target) {
     if (want_target_model && target_parked_) {
         if (!load_target_model(target_backend_, w_)) {
             std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
-            free_target_weights(w_);
             return false;
         }
         kvflash_drafter_failed_ = false;   // fresh VRAM: allow a retry
@@ -1110,19 +1109,15 @@ void Qwen35Backend::shutdown() {
         ggml_backend_free(draft_backend_);
         draft_backend_ = nullptr;
     }
-    // On unified-memory devices the snapshot backend aliases the compute
-    // backend. Preserve that identity while deciding whether it is separately
-    // owned; nulling target_backend_ first would turn the alias into an
-    // apparent second allocation and double-free it.
-    if (snap_backend_) {
-        free_snapshot_backend(snap_backend_, target_backend_);
-        snap_backend_ = nullptr;
-    }
     if (target_backend_) {
         ggml_backend_free(target_backend_);
         target_backend_ = nullptr;
     }
     tensor_parallel_.reset();
+    if (snap_backend_) {
+        free_snapshot_backend(snap_backend_, target_backend_);
+        snap_backend_ = nullptr;
+    }
 }
 
 // ── Release scratch buffers between requests ────────────────────────────

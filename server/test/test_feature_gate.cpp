@@ -347,26 +347,27 @@ static void test_feature_gate_layer_split_requires_supported_arch() {
     TEST_ASSERT(gate_accepts(single, "qwen3", PlacementBackend::Cuda));
 }
 
-static void test_feature_gate_paged_attention_requires_qwen35_family_monolithic() {
+static void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.paged_attention = true;
-    for (const char * arch : {"qwen35", "qwen35moe"}) {
-        TEST_ASSERT(gate_accepts(args, arch, PlacementBackend::Cuda));
-        TEST_ASSERT(gate_accepts(args, arch, PlacementBackend::Hip));
-    }
+    TEST_ASSERT(gate_accepts(args, "qwen35", PlacementBackend::Cuda));
+    TEST_ASSERT(gate_accepts(args, "qwen35", PlacementBackend::Hip));
 
-    // Other architectures do not implement the qwen35-family paged graph.
-    for (const char * arch : {"laguna", "qwen3", "gemma4", "deepseek4"}) {
+    // Only qwen35 has a paged decode path. qwen35moe shares Qwen35Config, so
+    // its rejection is this gate's job — the factory's field-presence
+    // cross-check cannot tell the two apart.
+    for (const char * arch : {"qwen35moe", "laguna", "qwen3",
+                              "gemma4", "deepseek4"}) {
         TEST_ASSERT(!gate_accepts(args, arch, PlacementBackend::Cuda));
     }
 
-    // Only monolithic qwen35-family backends own a paged K/V pool.
+    // Only the monolithic qwen35 backend owns a paged K/V pool. Both
+    // placements are supported qwen35 launches without the flag, so the
+    // rejection has to come from the paged rule.
     BackendArgs split = args;
     TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1", split.device));
-    for (const char * arch : {"qwen35", "qwen35moe"}) {
-        TEST_ASSERT(!gate_accepts(split, arch, PlacementBackend::Cuda));
-    }
+    TEST_ASSERT(!gate_accepts(split, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs remote_shard = args;
     remote_shard.remote_target_shard.ipc_bin = "/usr/bin/target-shard";
@@ -467,24 +468,6 @@ static void test_feature_gate_parallel_and_kv_pool_rules() {
     parallel.max_concurrency = 3;
     TEST_ASSERT(gate_accepts(
         parallel, "qwen35", PlacementBackend::Cuda));
-    TEST_ASSERT(gate_accepts(
-        parallel, "qwen35moe", PlacementBackend::Cuda));
-
-    // The concurrent engine does not capture router selections yet. Reject a
-    // stats request rather than writing an empty placement profile.
-    BackendFeatureConfig routing_stats;
-    routing_stats.routing_stats_requested = true;
-    TEST_ASSERT(!gate_accepts(
-        parallel, "qwen35moe", PlacementBackend::Cuda, routing_stats));
-    TEST_ASSERT(gate_accepts(
-        parallel, "qwen35", PlacementBackend::Cuda, routing_stats));
-
-    BackendFeatureConfig spark;
-    spark.spark_requested = true;
-    TEST_ASSERT(!gate_accepts(
-        parallel, "qwen35moe", PlacementBackend::Cuda, spark));
-    TEST_ASSERT(gate_accepts(
-        parallel, "qwen35", PlacementBackend::Cuda, spark));
 
     // 64 slots is the top of the supported range.
     parallel.max_concurrency = 64;
@@ -655,11 +638,10 @@ static void test_model_capability_tables() {
     TEST_ASSERT(!arch_supports_draft_swa("qwen36", false));
     TEST_ASSERT(!arch_supports_paged_attention("qwen36", false));
 
-    // Paged decode lives in the monolithic qwen35-family backends.
+    // Paged decode lives in the monolithic qwen35 backend alone.
     TEST_ASSERT(arch_supports_paged_attention("qwen35", false));
     TEST_ASSERT(!arch_supports_paged_attention("qwen35", true));
-    TEST_ASSERT(arch_supports_paged_attention("qwen35moe", false));
-    TEST_ASSERT(!arch_supports_paged_attention("qwen35moe", true));
+    TEST_ASSERT(!arch_supports_paged_attention("qwen35moe", false));
 }
 
 int main() {
@@ -677,7 +659,7 @@ int main() {
     RUN_TEST(test_feature_gate_ds4_decode_options_require_monolithic_hip);
     RUN_TEST(test_feature_gate_remote_draft_requires_supported_arch);
     RUN_TEST(test_feature_gate_layer_split_requires_supported_arch);
-    RUN_TEST(test_feature_gate_paged_attention_requires_qwen35_family_monolithic);
+    RUN_TEST(test_feature_gate_paged_attention_requires_qwen35_monolithic);
     RUN_TEST(test_feature_gate_paged_attention_requires_plain_ar_decode);
     RUN_TEST(test_feature_gate_parallel_and_kv_pool_rules);
     RUN_TEST(test_feature_warnings_silent_when_supported);

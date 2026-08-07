@@ -81,20 +81,6 @@ bool Qwen35MoeBackend::init() {
     if (!Qwen35Backend::init()) {
         return false;
     }
-    // The paged sequence engine executes the qwen35-family whole-model graph,
-    // whose MoE branch is already batch- and slot-agnostic. Partial placement
-    // instead needs a host-visible route partition between every pair of
-    // layers; the legacy per-request pipeline cannot safely stand in for that
-    // graph when multiple sequence slots are live. Refuse that combination
-    // rather than silently dropping cold experts or serializing requests.
-    if (cfg_.paged_attention && target_weights().moe_hybrid) {
-        set_last_error(
-            "qwen35moe paged attention currently requires all routed experts "
-            "to fit on the primary GPU; reduce --max-ctx, use a smaller "
-            "quantization, or disable --paged-attention");
-        std::fprintf(stderr, "[qwen35moe] %s\n", dflash27b_last_error());
-        return false;
-    }
     if (!target_weights().moe_hybrid) {
         return true;
     }
@@ -112,14 +98,6 @@ bool Qwen35MoeBackend::init() {
 }
 
 bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights & out) {
-    // The initial paged load proved that the complete routed-expert set fits
-    // alongside its cache. That cache remains allocated while target weights
-    // are parked, so rerunning placement on unpark would count it once as
-    // existing device use and again as a future reservation.
-    if (cfg_.paged_attention && placement_all_hot_) {
-        return load_target_gguf(cfg_.target_path, backend, out);
-    }
-
     // Phase 1: Load core model (non-expert tensors) to GPU.
     // Expert tensors get metadata descriptors but are NOT allocated on GPU.
     TargetLoadPlan plan;
@@ -153,33 +131,15 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
         ? std::string("hotness:") + hotness_path
         : std::string("uniform");
 
-    // Paged serving uses the qwen35-family whole-model graph. It can execute
-    // the routed FFN directly when every expert tensor is resident, but a
-    // partial placement requires a host-visible route partition between
-    // layers. Enforce this at model-load time so it also holds after unpark,
-    // before any hybrid storage or sequence engine can be constructed.
-    if (cfg_.paged_attention &&
-        placement.total_hot < out.n_layer * out.n_expert) {
-        set_last_error(
-            "qwen35moe paged attention currently requires all routed experts "
-            "to fit on the primary GPU; reduce --max-ctx, use a smaller "
-            "quantization, or disable --paged-attention");
-        free_target_weights(out);
-        return false;
-    }
-
     // If all experts fit on GPU, reload with experts included
     if (placement.total_hot >= out.n_layer * out.n_expert) {
         std::printf("[qwen35moe] all experts fit in VRAM, loading fully to GPU\n");
         std::fflush(stdout);
-        free_target_weights(out);
-        if (!load_target_gguf(cfg_.target_path, backend, out)) {
-            return false;
-        }
-        // Record only a successful complete load. Paged unpark can then avoid
-        // rerunning placement while its persistent cache is resident.
+        // Record the placement result so post_kvflash_init_gate() can disable
+        // the KVFlash pool (moe_hybrid is null on this all-hot path).
         placement_all_hot_ = true;
-        return true;
+        free_target_weights(out);
+        return load_target_gguf(cfg_.target_path, backend, out);
     }
 
     if (const char * telemetry = std::getenv("DFLASH_QWEN35MOE_TELEMETRY")) {
@@ -349,18 +309,13 @@ void Qwen35MoeBackend::after_target_compute(StepGraph & sg, int, int) {
 }
 
 bool Qwen35MoeBackend::spark_wants_bootstrap() const {
-    return !cfg_.paged_attention && routing_stats_ &&
-           !layer_expert_bytes_.empty() && spark_expert_budget_ > 0;
+    return routing_stats_ && !layer_expert_bytes_.empty() && spark_expert_budget_ > 0;
 }
 
 // Re-mmap the GGUF and rebuild the hot/cold storage for a new placement. Used by
 // the Spark bootstrap to apply the calibrated placement in-process.
 bool Qwen35MoeBackend::rebuild_hybrid_from_placement(const MoeHybridPlacement & placement,
                                                      std::string & err) {
-    if (cfg_.paged_attention) {
-        err = "qwen35moe paged attention cannot rebuild hybrid expert storage";
-        return false;
-    }
     TargetWeights & out = target_weights();
     ggml_backend_t backend = target_backend();
 
@@ -419,7 +374,6 @@ bool Qwen35MoeBackend::rebuild_hybrid_from_placement(const MoeHybridPlacement & 
 }
 
 bool Qwen35MoeBackend::spark_bootstrap_finalize(const std::string & profile_path) {
-    if (cfg_.paged_attention) return false;
     if (!spark_wants_bootstrap()) return false;
     std::string err;
     routing_stats_->save_csv(profile_path, &err);  // persist the observed routing

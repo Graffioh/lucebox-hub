@@ -2,7 +2,6 @@
 #include "gguf.h"
 
 #include <algorithm>
-#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -36,26 +35,12 @@ GgufModelInfo inspect_gguf_model_info(const char * path) {
         if (v) info.name = v;
     }
 
-    // Read executable layer count. Current Qwen3.5 GGUFs can append NextN/MTP
-    // predictor blocks and include them in block_count; target execution and
-    // layer-split ranges cover only the base transformer blocks.
+    // Read layer count: <arch>.block_count
     if (!info.arch.empty()) {
         std::string key = info.arch + ".block_count";
         int64_t kid = gguf_find_key(gctx, key.c_str());
         if (kid >= 0) {
-            const uint32_t block_count = gguf_get_val_u32(gctx, kid);
-            uint32_t nextn_layers = 0;
-            if (info.arch == "qwen35" || info.arch == "qwen35moe") {
-                key = info.arch + ".nextn_predict_layers";
-                const int64_t nextn_id = gguf_find_key(gctx, key.c_str());
-                if (nextn_id >= 0) {
-                    nextn_layers = gguf_get_val_u32(gctx, nextn_id);
-                }
-            }
-            if (nextn_layers < block_count &&
-                block_count - nextn_layers <= (uint32_t)INT_MAX) {
-                info.n_layer = (int)(block_count - nextn_layers);
-            }
+            info.n_layer = (int)gguf_get_val_u32(gctx, kid);
         }
     }
 

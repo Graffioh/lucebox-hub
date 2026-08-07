@@ -21,10 +21,10 @@ struct BackendFeatureConfig {
     bool pflash_drafter_configured = false;
 
     // MoE-only server features. Recorded here so the gate can report them as
-    // inert on a dense architecture or reject incompatible combinations.
+    // inert on a dense architecture; both are applied via env vars at parse
+    // time rather than through BackendArgs.
     bool routing_stats_requested = false;    // --freq / --collect-routing
     bool adaptive_experts_requested = false; // --adaptive-experts
-    bool spark_requested = false;            // --spark
 
     // A fixed KVFlash pool requested through DFLASH_KVFLASH. "auto" is
     // resolved later by the backend because only it has the VRAM budget needed

@@ -54,7 +54,7 @@ up to a 16-token block) for testing or intentionally tighter oversubscription:
 
 | | |
 |---|---|
-| Architecture | `qwen35` dense, or `qwen35moe` with every routed expert resident on the primary GPU |
+| Architecture | `qwen35` — dense Qwen3.5 / Qwen3.6 |
 | Placement | one local CUDA or HIP device |
 | Attention | full only (`--fa-window 0`) |
 | K/V types | F16, Q4_0, Q8_0 |
@@ -66,16 +66,6 @@ up to a 16-token block) for testing or intentionally tighter oversubscription:
 `--prefill-compression`, and `DFLASH_KVFLASH`. The rules live with every other
 launch-admission rule in `check_feature_compatibility()`; which architecture and
 placement they are allowed on is one row in `model_capabilities.h`.
-
-For Qwen35MoE, paged serving deliberately uses the same whole-model sequence
-graph as dense Qwen. Its per-layer FFN dispatch selects the routed MoE graph,
-while paged K/V, DeltaNet state, sampling, and slot lifecycle remain owned by
-the Qwen engine. Partial expert placement is rejected before hybrid storage is
-built: the legacy host-routed pipeline owns one request's activation buffers
-and cannot safely stand in for a batched sequence graph. This boundary also
-keeps the common `SeqEngine` contract model-neutral; a future DeepSeek4 engine
-can implement its MLA and compressed-cache state without inheriting Qwen's
-paged or recurrent-state representation.
 
 **Disabled, not rejected:** prefix, prefill, and disk snapshots. Their format
 assumes contiguous K/V rows, so `--paged-attention` zeroes the caps and says so.

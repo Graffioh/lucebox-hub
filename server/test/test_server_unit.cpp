@@ -32,7 +32,6 @@
 #include "common/kvflash_pager.h"
 #include "placement/draft_residency.h"
 #include "common/gguf_bounds.h"
-#include "common/gguf_inspect.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter_model.h"
@@ -91,21 +90,6 @@ struct ServerUnitFixture {};
             std::to_string(__LINE__) + ": " + #expr + " — " + std::string(msg)); \
     } \
 } while (0)
-
-TEST_CASE(ServerUnitFixture, test_gguf_inspect_excludes_qwen35_nextn_layers) {
-    const std::string path = "/tmp/dflash_test_qwen35_nextn_metadata.gguf";
-    gguf_context * g = gguf_init_empty();
-    gguf_set_val_str(g, "general.architecture", "qwen35");
-    gguf_set_val_u32(g, "qwen35.block_count", 66);
-    gguf_set_val_u32(g, "qwen35.nextn_predict_layers", 2);
-    gguf_write_to_file(g, path.c_str(), /*only_meta=*/true);
-    gguf_free(g);
-
-    const GgufModelInfo info = inspect_gguf_model_info(path.c_str());
-    TEST_ASSERT(info.arch == "qwen35");
-    TEST_ASSERT(info.n_layer == 64);
-    std::remove(path.c_str());
-}
 
 // ─── Helper: create an SseEmitter with minimal config ──────────────────
 
