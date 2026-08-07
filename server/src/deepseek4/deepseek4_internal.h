@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,8 @@
 #include "internal.h"
 #include "common/layer_split_utils.h"
 #include "common/prefill_attention_mode.h"
+#include "common/paged_kv_pool.h"
+#include "deepseek4_paged_cache.h"
 
 namespace dflash::common {
 
@@ -291,6 +294,23 @@ struct DeepSeek4Cache {
     ggml_backend_buffer_t buf = nullptr;
 };
 
+struct DeepSeek4PagedLayerCache : DeepSeek4LayerCache {
+    uint32_t ratio = 0;
+    uint64_t physical_rows = 0;
+};
+
+struct DeepSeek4PagedCache {
+    std::unique_ptr<PagedKvPool> pool;
+    DeepSeek4PagedCachePlan plan;
+    ggml_tensor * block_table = nullptr;
+    ggml_tensor * sequence_lengths = nullptr;
+    ggml_tensor * active_slot_ids = nullptr;
+    std::vector<DeepSeek4PagedLayerCache> layers;
+    DeepSeek4Cache prefill_staging;
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+};
+
 struct DeepSeek4Snapshot;
 
 struct DeepSeek4RawRingSpan {
@@ -334,6 +354,12 @@ bool create_deepseek4_cache(ggml_backend_t backend,
                              DeepSeek4Cache & out);
 
 void free_deepseek4_cache(DeepSeek4Cache & c);
+bool create_deepseek4_paged_cache(ggml_backend_t backend,
+                                  const DeepSeek4Weights & w,
+                                  uint32_t slots, uint32_t max_ctx,
+                                  uint32_t physical_blocks,
+                                  DeepSeek4PagedCache & out);
+void free_deepseek4_paged_cache(DeepSeek4PagedCache & c);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
 int deepseek4_previous_raw_ring_spans(
     int kv_start,
