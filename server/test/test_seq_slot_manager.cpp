@@ -163,6 +163,20 @@ int main() {
         CHECK(!still_never.ok && !still_never.busy);
     }
 
+    // Admission rounding follows the pool geometry rather than Qwen's
+    // 16-token page size.
+    {
+        PagedKvPool pool(2, 2, /*block_size=*/128);
+        SeqSlotManager mgr(pool, /*max_ctx=*/256);
+        auto a = mgr.admit(1, 128, greedy_sampler());
+        CHECK(a.ok);
+        CHECK(mgr.append_prefill(a.slot, 128).ok);
+        auto needs_two = mgr.admit(2, 129, greedy_sampler());
+        CHECK(!needs_two.ok && needs_two.busy);
+        auto fits_one = mgr.admit(2, 128, greedy_sampler());
+        CHECK(fits_one.ok);
+    }
+
     // Chunk exhaustion is retryable and all-or-nothing: neither length nor
     // block table changes when a whole chunk cannot be allocated.
     {

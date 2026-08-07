@@ -1,7 +1,5 @@
 #include "common/seq_slot_manager.h"
 
-#include "common/paged_attention_config.h"
-
 #include <algorithm>
 #include <cstdio>
 
@@ -61,7 +59,9 @@ SeqAdmissionResult SeqSlotManager::admit(
     // A prompt that fits the whole pool but not the blocks currently free can
     // be admitted later. Gate on the exact prompt, never the speculative
     // output cap.
-    const uint32_t need = (uint32_t)paged_block_count(prompt_len);
+    const uint32_t block_size = pool_.block_size();
+    const uint32_t need =
+        1 + (static_cast<uint32_t>(prompt_len) - 1) / block_size;
     if (need > pool_.free_block_count()) {
         r.busy = pool_.active_sequence_count() > 0;
         r.error = "not enough free KV blocks for the prompt";
