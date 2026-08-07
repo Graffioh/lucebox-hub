@@ -329,7 +329,18 @@ bool load_target_gguf_partial(const std::string & path,
 
     const uint32_t n_embd  = get_u32_or(gctx, key("embedding_length").c_str(), 0);
     const uint32_t n_ff    = get_u32_or(gctx, key("feed_forward_length").c_str(), 0);
-    const uint32_t n_layer = get_u32_or(gctx, key("block_count").c_str(), 0);
+    const uint32_t block_count =
+        get_u32_or(gctx, key("block_count").c_str(), 0);
+    // Current Qwen3.5 MoE GGUFs append MTP/NextN predictor blocks to the
+    // ordinary transformer blocks and include both in block_count. They carry
+    // nextn.* tensors and are not part of target autoregressive execution.
+    // Restrict every layer range and allocation below to the base model; this
+    // also keeps the four-layer DeltaNet/attention cadence well-defined.
+    const uint32_t nextn_layers =
+        get_u32_or(gctx, key("nextn_predict_layers").c_str(), 0);
+    const uint32_t n_layer = nextn_layers < block_count
+        ? block_count - nextn_layers
+        : 0;
     const uint32_t n_head  = get_u32_or(gctx, key("attention.head_count").c_str(), 0);
     const uint32_t n_headkv= get_u32_or(gctx, key("attention.head_count_kv").c_str(), 0);
     const uint32_t kl      = get_u32_or(gctx, key("attention.key_length").c_str(), 0);
@@ -361,10 +372,12 @@ bool load_target_gguf_partial(const std::string & path,
     if (invalid_common || invalid_dense || invalid_moe) {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
-            "invalid %s hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
+            "invalid %s hparams: n_embd=%u n_layer=%u block_count=%u nextn=%u "
+            "n_head=%u n_head_kv=%u "
             "kl=%u vl=%u n_ff=%u n_ff_exp=%u n_ff_shexp=%u n_expert=%u used=%u "
             "fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u}",
-            arch_str.c_str(), n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff,
+            arch_str.c_str(), n_embd, n_layer, block_count, nextn_layers,
+            n_head, n_headkv, kl, vl, n_ff,
             n_ff_exp, n_ff_shexp, n_expert, n_expert_used,
             fai, ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
             set_last_error(buf);
@@ -378,8 +391,11 @@ bool load_target_gguf_partial(const std::string & path,
         gguf_free(gctx); return false;
     }
     if (n_layer % fai != 0) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "block_count=%u not divisible by full_attention_interval=%u", n_layer, fai);
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+            "target layer count=%u (block_count=%u minus nextn=%u) not "
+            "divisible by full_attention_interval=%u",
+            n_layer, block_count, nextn_layers, fai);
         set_last_error(buf);
         gguf_free(gctx); return false;
     }

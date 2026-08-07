@@ -29,7 +29,9 @@ public:
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
-    bool supports_dflash_spec_decode() const override { return true; }
+    bool supports_dflash_spec_decode() const override {
+        return !cfg_.paged_attention;
+    }
 
     bool set_routing_collector(MoeRoutingCollector * c) override { routing_collector_ = c; return true; }
     const MoeHybridRoutingStats * get_routing_stats() const override { return routing_stats_.get(); }

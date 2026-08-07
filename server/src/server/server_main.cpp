@@ -105,8 +105,9 @@ static void print_usage(const char * prog) {
         "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
         "                       WARNING: >0 drops system prompt / tool definitions\n"
         "                       from attention at long contexts. Use 0 for tools.\n"
-        "  --paged-attention   Use 16-token paged KV blocks for Qwen3.6-27B\n"
-        "                       autoregressive decode (experimental)\n"
+        "  --paged-attention   Use 16-token paged KV blocks for Qwen3.5/3.6\n"
+        "                       dense or all-GPU MoE autoregressive decode\n"
+        "                       (experimental)\n"
         "  --max-concurrency <N>  Maximum concurrent decode sequences\n"
         "                         (requires --paged-attention; default: 1)\n"
         "  --kv-pool-tokens <N> Total paged K/V pool shared by all\n"
@@ -623,6 +624,7 @@ int main(int argc, char ** argv) {
     backend_features.routing_stats_requested =
         sconfig.freq_tracking || !sconfig.collect_routing_path.empty();
     backend_features.adaptive_experts_requested = adaptive_experts_set;
+    backend_features.spark_requested = spark_autotune;
     // Fixed pools are known incompatibilities before model setup. Automatic
     // sizing needs the backend's real VRAM budget; if it produces a live pool,
     // the backend rejects the pairing after sizing.

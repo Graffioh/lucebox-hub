@@ -71,7 +71,7 @@ inline constexpr FeatureSupport kBoth  = FeatureSupport::Both;
 inline constexpr ArchCapabilities kArchCapabilities[] = {
 //   arch          split  rdraft pflash offload  draft  ddtree vwidth fa_win dswa    paged
     {"qwen35",     true,  true,  true,  false,   kBoth, kBoth, kNever, kBoth, kBoth,  kMono},
-    {"qwen35moe",  false, false, false, true,    kMono, kMono, kNever, kMono, kMono,  kNever},
+    {"qwen35moe",  false, false, false, true,    kMono, kMono, kNever, kMono, kMono,  kMono},
     {"laguna",     true,  false, false, true,    kMono, kMono, kMono,  kNever, kNever, kNever},
     {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever, kNever},
     {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kBoth, kNever, kNever},
