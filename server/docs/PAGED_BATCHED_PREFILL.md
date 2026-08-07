@@ -19,6 +19,50 @@ Today the two backends prove different parts of the serving model:
 The target combines both properties: several prompts make progress together,
 and every prompt advances by a useful multi-token chunk.
 
+## Current DeepSeek4 experiment
+
+The current DS4 work implements paged attention and continuous concurrency for
+up to 16 requests while preserving the existing two-GPU asymmetric MoE design.
+It is the correctness and measurement platform from which the optimized design
+in this document will be built.
+
+On the tested RTX 3090 + Strix Halo system, execution is divided by
+responsibility rather than by contiguous layers:
+
+- the RTX 3090 owns dense layers, routing, paged MLA and compressor state,
+  sampling, and the final expert join;
+- routed experts have static ownership on either the RTX 3090 or Strix Halo;
+- both devices execute their selected expert routes for every MoE layer, with
+  Strix Halo results staged back to the RTX 3090;
+- each request has independent pages, compressor state, sampler state, and
+  lifecycle metadata.
+
+This is asymmetric expert parallelism, not pipeline or layer-split execution.
+The current exact-reference prefill advances one token per pending request per
+iteration, and its attention graph gathers chronological MLA history. It is
+intentionally a correctness path, not the final performance architecture.
+
+We benchmark this path against a current upstream, monolithic llama.cpp server
+using the same DS4 model, prompt, 128-token output cap, temperature, 16 HTTP
+clients, and continuous-batching workload:
+
+| Server | Device placement | Successful | Aggregate tok/s | TTFT p95 | Wall time |
+|--------|------------------|-----------:|----------------:|----------:|----------:|
+| DFlash gathered exact/reference | RTX 3090 + Strix Halo asymmetric experts | 16/16 | 17.79 | 37.920 s | 115.11 s |
+| llama.cpp `4cb22cd` | Strix Halo monolithic | 16/16 | 45.23 | 6.436 s | 44.94 s |
+
+The current DFlash path is about 2.54 times slower in aggregate throughput.
+That result establishes the optimization gap this design must close; it is not
+hidden as a favorable concurrency claim. The comparison controls the model and
+request workload but not device placement, so it is useful as an end-to-end
+serving baseline rather than an apples-to-apples kernel comparison.
+
+Future measurements must retain the monolithic llama.cpp baseline and add
+DFlash monolithic and asymmetric runs on the same hardware where possible.
+Results must report prompt throughput, TTFT, decode inter-token latency, and
+aggregate decode throughput separately so improvements in one phase cannot
+hide regressions in another.
+
 ## Goals
 
 1. Preserve exact model semantics for paged attention, recurrent state, and
