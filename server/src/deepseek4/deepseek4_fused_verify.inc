@@ -477,6 +477,7 @@ static bool ds4_build_fused_verify_graph(
                 const auto & rows = (*paged_rows)[(size_t) il][(size_t) t];
                 auto & px = ex.paged.emplace_back();
                 px.pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1); ggml_set_input(px.pos);
+                px.neg_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1); ggml_set_input(px.neg_pos);
                 px.raw_gather = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,
                     std::max<size_t>(rows.raw_history.size(), 1)); ggml_set_input(px.raw_gather);
                 ggml_tensor * raw_history = rows.raw_history.empty() ? nullptr
@@ -500,6 +501,7 @@ static bool ds4_build_fused_verify_graph(
                 px.raw_write = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1); ggml_set_input(px.raw_write);
                 if (ratio > 0) {
                     px.comp_write = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1); ggml_set_input(px.comp_write);
+                    px.comp_read = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1); ggml_set_input(px.comp_read);
                     px.ape = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1); ggml_set_input(px.ape);
                     px.state_row = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1); ggml_set_input(px.state_row);
                     px.comp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1); ggml_set_input(px.comp_pos);
@@ -535,10 +537,13 @@ static bool ds4_build_fused_verify_graph(
                 lane.index_comp_kv = plc.index_comp_kv;
                 lane.raw_write_rows = px.raw_write; lane.comp_write_rows = px.comp_write;
                 lane.index_comp_write_rows = px.comp_write;
+                lane.comp_read_rows = px.comp_read;
+                lane.index_comp_read_rows = px.comp_read;
                 lane.write_enabled = rows.slot >= 0;
                 lane.attn_compressor = &attn_state; lane.indexer_compressor = &index_state;
                 DeepSeek4AttentionGraphInputs ci{};
-                ci.rope_pos = px.pos; ci.attn_ape_row = px.ape; ci.attn_state_rows = px.state_row;
+                ci.rope_pos = px.pos; ci.neg_pos = px.neg_pos;
+                ci.attn_ape_row = px.ape; ci.attn_state_rows = px.state_row;
                 ci.attn_comp_pos = px.comp_pos; ci.index_ape_row = px.ape;
                 ci.index_state_rows = px.state_row; ci.index_comp_pos = px.comp_pos;
                 std::vector<DeepSeek4I32InputBinding> ib;
@@ -550,7 +555,16 @@ static bool ds4_build_fused_verify_graph(
                     ctx, gf, build_rms_norm(ctx, col, L.attn_norm, w.rms_eps),
                     w, L, lane, il, (int) rows.position, 1, &ci, ib, iab, lab,
                     nullptr, DeepSeek4AttentionImpl::Explicit);
-                if (!one || !ib.empty() || !iab.empty() || !lab.empty()) return false;
+                if (!one || !ib.empty() || !iab.empty() || !lab.empty()) {
+                    std::fprintf(stderr,
+                        "[deepseek4-paged] layer %d lane %d attention build "
+                        "failed (graph=%d i32=%zu arrays=%zu i64=%zu, "
+                        "first_array=%d)\n",
+                        il, t, one != nullptr, ib.size(), iab.size(), lab.size(),
+                        iab.empty() || iab[0].values.empty()
+                            ? INT32_MIN : iab[0].values[0]);
+                    return false;
+                }
                 attn_out = attn_out ? ggml_concat(ctx, attn_out, one, 1) : one;
             }
         } else {
@@ -814,7 +828,11 @@ static bool ds4_build_fused_verify_graph(
                 }
             }
         }
-        if (!ffn_out) return false;
+        if (!ffn_out) {
+            std::fprintf(stderr,
+                "[deepseek4-paged] layer %d FFN graph build failed\n", il);
+            return false;
+        }
 
         // ── HC post (FFN), per token; capture at drafter layers ──
         for (int t = 0; t < lane_q; ++t) {
@@ -1003,9 +1021,9 @@ static bool ds4_build_fused_verify_graph(
         pin_main(fg.i64_bundle);
         pin_main(fg.mask_bundle);
         for (const auto & px : ex.paged) {
-            pin_main(px.pos); pin_main(px.raw_gather); pin_main(px.comp_gather);
+            pin_main(px.pos); pin_main(px.neg_pos); pin_main(px.raw_gather); pin_main(px.comp_gather);
             pin_main(px.index_gather);
-            pin_main(px.raw_write); pin_main(px.comp_write); pin_main(px.ape);
+            pin_main(px.raw_write); pin_main(px.comp_write); pin_main(px.comp_read); pin_main(px.ape);
             pin_main(px.state_row); pin_main(px.comp_pos);
         }
         for (ggml_tensor * hids : fg.hash_ids) pin_main(hids);

@@ -174,6 +174,37 @@ performance profile held 48.1 tok/s median on the deterministic 128-token
 workload. The all-6-expert reference-exact mode is a correctness profile, not
 a throughput profile.
 
+Paged concurrent serving composes with the same asymmetric expert ownership.
+The target GPU remains the sole owner of MLA cache pages, compressor state,
+sampling, and dense layers; both GPU owners execute their selected experts per
+layer. The initial implementation uses a gathered exact-reference attention
+graph and tokenwise exact prefill, so it validates state isolation and
+iteration-level concurrency rather than claiming final throughput:
+
+```bash
+export DFLASH_DS4_MOE_TP=1
+export DFLASH_DS4_MOE_TP_INPROC=1
+export DFLASH_DS4_MOE_TP_BACKEND=hip
+export DFLASH_DS4_MOE_TP_GPU=0
+export DFLASH_DS4_TP_SCHEDULE_BRANCHES=1
+export DFLASH_DS4_TP_TARGETED_JOIN_SPLIT=1
+export GGML_BATCH_PEER_COPIES=1
+
+./build-cuda-hip/dflash_server /path/to/deepseek4-target.gguf \
+  --target-device cuda:0 \
+  --paged-attention \
+  --max-concurrency 2 \
+  --kv-pool-tokens 8192 \
+  --max-ctx 4096 \
+  --ds4-prefill exact \
+  --prefix-cache-slots 0
+```
+
+This mode requires static in-process expert ownership and supports at most four
+concurrent slots. DSpark, approximate prefill, mutable/streamed expert caches,
+target park, and layer-split execution fail closed until their state becomes
+page- and slot-aware.
+
 ### Local single-shard
 
 If the adapter decides all 43 layers fit on one CUDA GPU, it loads a single shard locally and no IPC daemon is involved.

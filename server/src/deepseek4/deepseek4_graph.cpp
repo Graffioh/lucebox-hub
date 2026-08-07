@@ -1544,6 +1544,8 @@ struct DeepSeek4MlaLaneBindings {
     ggml_tensor * raw_write_rows = nullptr;
     ggml_tensor * comp_write_rows = nullptr;
     ggml_tensor * index_comp_write_rows = nullptr;
+    ggml_tensor * comp_read_rows = nullptr;       // GET_ROWS requires I32
+    ggml_tensor * index_comp_read_rows = nullptr;
 
     // Optional passive outputs let a future adapter scatter current products.
     ggml_tensor ** current_raw_out = nullptr;
@@ -1862,12 +1864,12 @@ static ggml_tensor * build_mla_attention_lane_core(
         // graph dependency.  Reading the F16 cache row preserves ordinary q=1
         // rounding at a boundary instead of feeding the transient F32 pool.
         ggml_tensor * emitted = ggml_get_rows(
-            ctx, comp_kv_source, lane.comp_write_rows);
+            ctx, comp_kv_source, lane.comp_read_rows);
         comp_history_source = lane.comp_history
             ? ggml_concat(ctx, lane.comp_history, emitted, 1) : emitted;
         if (ratio == 4) {
             ggml_tensor * index_emitted = ggml_get_rows(
-                ctx, index_comp_kv_source, lane.index_comp_write_rows);
+                ctx, index_comp_kv_source, lane.index_comp_read_rows);
             index_comp_history_source = lane.index_comp_history
                 ? ggml_concat(ctx, lane.index_comp_history, index_emitted, 1)
                 : index_emitted;
@@ -4749,11 +4751,13 @@ struct Ds4FusedVerifyCache {
     struct Extra {
         struct PagedLane {
             ggml_tensor * pos = nullptr;
+            ggml_tensor * neg_pos = nullptr;
             ggml_tensor * raw_gather = nullptr;
             ggml_tensor * comp_gather = nullptr;
             ggml_tensor * index_gather = nullptr;
             ggml_tensor * raw_write = nullptr;
             ggml_tensor * comp_write = nullptr;
+            ggml_tensor * comp_read = nullptr;
             ggml_tensor * ape = nullptr;
             ggml_tensor * state_row = nullptr;
             ggml_tensor * comp_pos = nullptr;
@@ -6715,8 +6719,14 @@ bool deepseek4_paged_gathered_step(
         }
     }
     if (hybrid) {
-        for (const MoeHybridLayerStorage & layer : hybrid->layers)
-            if (layer.cache_slots > 0) return false;
+        for (size_t il = 0; il < hybrid->layers.size(); ++il) {
+            if (hybrid->layers[il].cache_slots > 0) {
+                std::fprintf(stderr,
+                    "[deepseek4-paged] layer %zu uses mutable expert-cache "
+                    "placement, which gathered serving cannot capture\n", il);
+                return false;
+            }
+        }
     }
     auto * rt = static_cast<Ds4PagedGatheredRuntime *>(cache.gathered_runtime);
     if (!rt) {
@@ -6734,7 +6744,11 @@ bool deepseek4_paged_gathered_step(
     }
     if (!rt->model.matches(w, backend, device, 0, w.n_layer, true) &&
         !initialize_layer_range_cache(rt->model, backend, device, w,
-                                      0, w.n_layer, true)) return false;
+                                      0, w.n_layer, true)) {
+        std::fprintf(stderr,
+            "[deepseek4-paged] failed to initialize whole-model graph cache\n");
+        return false;
+    }
 
     std::vector<std::vector<DeepSeek4GatheredLaneRows>> prepared((size_t) w.n_layer);
     std::vector<int64_t> key = {0x5041474544LL, (int64_t) lanes,
@@ -6787,7 +6801,12 @@ bool deepseek4_paged_gathered_step(
                 rt->model.hc_layer_weights, rt->model.hc_output_weights,
                 rt->model.hash_routing_tables, 0, (int) lanes,
                 token_ids != nullptr, {}, hybrid, std::move(key),
-                &cache, &prepared)) return false;
+                &cache, &prepared)) {
+            std::fprintf(stderr,
+                "[deepseek4-paged] failed to build gathered graph "
+                "(lanes=%u)\n", lanes);
+            return false;
+        }
     }
     fg->last_use = vc.counter;
     ds4_fv_set(fg->inp_embed, embeddings,
@@ -6799,7 +6818,9 @@ bool deepseek4_paged_gathered_step(
             const auto & row = prepared[(size_t) il][lane];
             const auto & px = ex->paged[pi];
             const int32_t pos = (int32_t) row.position;
+            const int32_t neg_pos = -pos;
             ds4_fv_set(px.pos, &pos, sizeof(pos));
+            ds4_fv_set(px.neg_pos, &neg_pos, sizeof(neg_pos));
             std::vector<int32_t> idx(std::max<size_t>(row.raw_history.size(), 1), 0);
             for (size_t i = 0; i < row.raw_history.size(); ++i) idx[i] = (int32_t) row.raw_history[i];
             ds4_fv_set(px.raw_gather, idx.data(), idx.size() * sizeof(int32_t));
@@ -6813,10 +6834,12 @@ bool deepseek4_paged_gathered_step(
                 if (px.index_gather)
                     ds4_fv_set(px.index_gather, idx.data(), idx.size() * sizeof(int32_t));
                 const int64_t cw = std::max<int64_t>(row.compressed_scatter, 0);
+                const int32_t cr = (int32_t) cw;
                 const int32_t ape = pos % ratio;
                 const int64_t state = ratio == 4 ? 4 + ape : ape;
                 const int32_t comp_pos = pos + 1 - ratio;
                 ds4_fv_set(px.comp_write, &cw, sizeof(cw));
+                ds4_fv_set(px.comp_read, &cr, sizeof(cr));
                 ds4_fv_set(px.ape, &ape, sizeof(ape));
                 ds4_fv_set(px.state_row, &state, sizeof(state));
                 ds4_fv_set(px.comp_pos, &comp_pos, sizeof(comp_pos));
@@ -6841,7 +6864,12 @@ bool deepseek4_paged_gathered_step(
     const enum ggml_status status = fg->sched
         ? ggml_backend_sched_graph_compute(fg->sched, fg->sg.gf)
         : ggml_backend_graph_compute(backend, fg->sg.gf);
-    if (status != GGML_STATUS_SUCCESS) return false;
+    if (status != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr,
+            "[deepseek4-paged] gathered graph compute failed: status=%d\n",
+            (int) status);
+        return false;
+    }
     ds4_fused_consume_route_diagnostics(*fg, hybrid, routing_stats, slots);
     out_logits.resize((size_t) w.n_vocab * lanes);
     out_argmax.resize(lanes);
