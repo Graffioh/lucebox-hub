@@ -332,6 +332,9 @@ struct DeepSeek4BackendConfig {
     int          max_ctx      = 0;     // 0 = auto from SWA + compression capacity
     int          expert_top_k = 0;     // 0 = use all model-routed experts
     bool         fused_decode = false; // single-graph GPU decode
+    bool         paged_attention = false;
+    int          max_concurrency = 1;
+    long long    kv_pool_tokens = 0;
 };
 
 // ─── Function declarations ──────────────────────────────────────────────

@@ -385,6 +385,7 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
     src/deepseek4/deepseek4_paged_cache.cpp
+    src/deepseek4/deepseek4_seq_engine.cpp
     src/deepseek4/deepseek4_backend.cpp
     src/deepseek4/deepseek4_daemon.cpp
     src/deepseek4/deepseek4_layer_split_adapter.cpp

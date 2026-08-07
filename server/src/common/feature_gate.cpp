@@ -168,12 +168,12 @@ std::string check_feature_compatibility(
 
     // ── --paged-attention × architecture, placement, and decode features
     // Paged decode swaps the contiguous K/V cache for a block table owned by
-    // the monolithic qwen35 backend, so every rule below is about reaching
-    // that one code path. All are errors rather than warnings: running dense
+    // a monolithic model backend, so every rule below is about reaching
+    // that code path. All are errors rather than warnings: running dense
     // instead would hide the memory behavior the flag was chosen for.
     if (args.paged_attention) {
         if (!arch_supports_paged_attention(arch, /*is_layer_split=*/false)) {
-            return "--paged-attention requires a Qwen3.5/Qwen3.6 dense target "
+            return "--paged-attention requires a supported monolithic target "
                    "(architecture '" + arch + "' has no paged decode path)";
         }
         // No rule for "requires a CUDA or HIP build": those are the only two
@@ -197,6 +197,14 @@ std::string check_feature_compatibility(
         }
         if (features.kvflash_enabled) {
             return "--paged-attention cannot be combined with KVFlash";
+        }
+        if (arch == "deepseek4") {
+            if (args.ds4_prefill_mode != PrefillAttentionMode::Exact) {
+                return "DeepSeek4 --paged-attention requires --ds4-prefill exact";
+            }
+            if (args.ds4_fused_decode) {
+                return "DeepSeek4 --paged-attention uses the gathered reference graph and cannot combine with --ds4-fused-decode";
+            }
         }
         // The pool rounds max_ctx up to a whole number of blocks, so the top
         // of the range is what can be rounded without overflowing int.
@@ -224,8 +232,11 @@ std::string check_feature_compatibility(
         // The paged pool addresses tokens with uint32; 64 slots is far above
         // any batch the decode kernel has been sized for and keeps the
         // fixed-width decode batch bounded.
-        if (args.max_concurrency > 64) {
-            return "--max-concurrency must be at most 64";
+        const int concurrency_limit = arch == "deepseek4" ? 4 : 64;
+        if (args.max_concurrency > concurrency_limit) {
+            return "--max-concurrency must be at most " +
+                   std::to_string(concurrency_limit) + " for architecture '" +
+                   arch + "'";
         }
         // Physical capacity is memory-derived and capped independently of the
         // logical slot count, so max-concurrency no longer multiplies max_ctx

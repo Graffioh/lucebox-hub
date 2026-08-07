@@ -347,18 +347,18 @@ static void test_feature_gate_layer_split_requires_supported_arch() {
     TEST_ASSERT(gate_accepts(single, "qwen3", PlacementBackend::Cuda));
 }
 
-static void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
+static void test_feature_gate_paged_attention_requires_supported_monolithic() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.paged_attention = true;
     TEST_ASSERT(gate_accepts(args, "qwen35", PlacementBackend::Cuda));
     TEST_ASSERT(gate_accepts(args, "qwen35", PlacementBackend::Hip));
+    TEST_ASSERT(gate_accepts(args, "deepseek4", PlacementBackend::Cuda));
 
     // Only qwen35 has a paged decode path. qwen35moe shares Qwen35Config, so
     // its rejection is this gate's job — the factory's field-presence
     // cross-check cannot tell the two apart.
-    for (const char * arch : {"qwen35moe", "laguna", "qwen3",
-                              "gemma4", "deepseek4"}) {
+    for (const char * arch : {"qwen35moe", "laguna", "qwen3", "gemma4"}) {
         TEST_ASSERT(!gate_accepts(args, arch, PlacementBackend::Cuda));
     }
 
@@ -368,6 +368,7 @@ static void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
     BackendArgs split = args;
     TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1", split.device));
     TEST_ASSERT(!gate_accepts(split, "qwen35", PlacementBackend::Cuda));
+    TEST_ASSERT(!gate_accepts(split, "deepseek4", PlacementBackend::Cuda));
 
     BackendArgs remote_shard = args;
     remote_shard.remote_target_shard.ipc_bin = "/usr/bin/target-shard";
@@ -379,6 +380,23 @@ static void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
         TEST_ASSERT(gate_accepts(
             *relaxed, "qwen35", PlacementBackend::Cuda));
     }
+}
+
+static void test_feature_gate_deepseek4_paged_reference_constraints() {
+    BackendArgs args;
+    args.model_path = "/nonexistent/model.gguf";
+    args.paged_attention = true;
+    args.max_concurrency = 4;
+    TEST_ASSERT(gate_accepts(args, "deepseek4", PlacementBackend::Cuda));
+
+    args.max_concurrency = 5;
+    TEST_ASSERT(!gate_accepts(args, "deepseek4", PlacementBackend::Cuda));
+    args.max_concurrency = 4;
+    args.ds4_fused_decode = true;
+    TEST_ASSERT(!gate_accepts(args, "deepseek4", PlacementBackend::Cuda));
+    args.ds4_fused_decode = false;
+    args.ds4_prefill_mode = PrefillAttentionMode::Dense;
+    TEST_ASSERT(!gate_accepts(args, "deepseek4", PlacementBackend::Cuda));
 }
 
 static void test_feature_gate_paged_attention_requires_plain_ar_decode() {
@@ -659,7 +677,8 @@ int main() {
     RUN_TEST(test_feature_gate_ds4_decode_options_require_monolithic_hip);
     RUN_TEST(test_feature_gate_remote_draft_requires_supported_arch);
     RUN_TEST(test_feature_gate_layer_split_requires_supported_arch);
-    RUN_TEST(test_feature_gate_paged_attention_requires_qwen35_monolithic);
+    RUN_TEST(test_feature_gate_paged_attention_requires_supported_monolithic);
+    RUN_TEST(test_feature_gate_deepseek4_paged_reference_constraints);
     RUN_TEST(test_feature_gate_paged_attention_requires_plain_ar_decode);
     RUN_TEST(test_feature_gate_parallel_and_kv_pool_rules);
     RUN_TEST(test_feature_warnings_silent_when_supported);

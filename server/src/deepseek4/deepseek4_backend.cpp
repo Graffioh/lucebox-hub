@@ -2,6 +2,7 @@
 
 #include "deepseek4_backend.h"
 #include "deepseek4_internal.h"
+#include "deepseek4_page_layout.h"
 #include "common/dynamic_backend.h"
 #include "common/peer_access.h"
 #include "common/sampler.h"
@@ -781,6 +782,18 @@ bool DeepSeek4Backend::init() {
     configure_gfx1151_dspark_mmvq_default(cfg_.device.gpu);
     configure_gfx1201_hybrid_sub_batch_default(cfg_.device.gpu);
 
+    if (cfg_.paged_attention &&
+        (cfg_.max_concurrency < 1 || cfg_.max_concurrency > 4 ||
+         cfg_.device.is_layer_split() ||
+         cfg_.prefill_mode != PrefillAttentionMode::Exact ||
+         cfg_.fused_decode || env_flag_enabled("DFLASH_DS4_FUSED_DECODE") ||
+         env_flag_enabled("DFLASH_DS4_SPEC"))) {
+        std::fprintf(stderr,
+            "[deepseek4] paged serving requires 1..4 local slots, exact "
+            "prefill, and autoregressive non-fused decode\n");
+        return false;
+    }
+
     backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
     if (!backend_) {
         std::fprintf(stderr, "[deepseek4] failed to create CUDA backend (gpu=%d)\n",
@@ -804,13 +817,46 @@ bool DeepSeek4Backend::init() {
     }
 
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
-    if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
-        std::fprintf(stderr, "[deepseek4] failed to allocate KV cache (ctx=%d)\n", max_ctx);
-        return false;
+    if (cfg_.paged_attention) {
+        uint64_t requested = cfg_.kv_pool_tokens > 0
+            ? (uint64_t)cfg_.kv_pool_tokens
+            : (uint64_t)max_ctx * (uint64_t)cfg_.max_concurrency;
+        requested = std::max<uint64_t>(requested, (uint64_t)max_ctx);
+        const uint64_t blocks64 =
+            (requested + DS4_PAGE_TOKENS - 1) / DS4_PAGE_TOKENS;
+        if (blocks64 == 0 || blocks64 > UINT32_MAX ||
+            !create_deepseek4_paged_cache(
+                backend_, w_, (uint32_t)cfg_.max_concurrency,
+                (uint32_t)max_ctx, (uint32_t)blocks64, paged_cache_)) {
+            std::fprintf(stderr,
+                "[deepseek4] paged cache allocation failed (ctx=%d slots=%d "
+                "requested_pool_tokens=%llu); reduce --max-ctx/--max-concurrency "
+                "or set --kv-pool-tokens\n", max_ctx, cfg_.max_concurrency,
+                (unsigned long long)requested);
+            return false;
+        }
+    } else {
+        if (!create_deepseek4_cache(backend_, w_, max_ctx, cache_)) {
+            std::fprintf(stderr, "[deepseek4] failed to allocate KV cache (ctx=%d)\n", max_ctx);
+            return false;
+        }
+        cache_.prefill_mode = cfg_.prefill_mode;
     }
-    cache_.prefill_mode = cfg_.prefill_mode;
 
     if (env_flag_enabled("DFLASH_DS4_MOE_TP") && !init_moe_tensor_parallel()) {
+        return false;
+    }
+    if (cfg_.paged_attention && expert_runtime_.compute) {
+        std::fprintf(stderr,
+            "[deepseek4] paged serving cannot use the out-of-process expert "
+            "compute callback; select in-process DFLASH_DS4_MOE_TP or disable paged attention\n");
+        return false;
+    }
+    if (cfg_.paged_attention && moe_hybrid_ &&
+        !moe_hybrid_->materialized_cold_experts) {
+        std::fprintf(stderr,
+            "[deepseek4] paged serving requires statically materialized "
+            "expert ownership; enable in-process DFLASH_DS4_MOE_TP\n");
         return false;
     }
 
@@ -837,6 +883,16 @@ bool DeepSeek4Backend::init() {
         std::fprintf(stderr,
                      "[deepseek4-moe-tp] in-memory routing stats enabled\n");
     }
+    if (cfg_.paged_attention) {
+        seq_engine_ = std::make_unique<DeepSeek4SeqEngine>(
+            *this, *paged_cache_.pool, max_ctx,
+            paged_cache_.plan.max_blocks_per_sequence);
+        std::fprintf(stderr,
+            "[deepseek4-parallel] enabled %d slots, %u x %d-token physical "
+            "blocks; prefill is exact reference mode at one prompt token per scheduler iteration\n",
+            cfg_.max_concurrency, paged_cache_.plan.physical_blocks,
+            DS4_PAGE_TOKENS);
+    }
     const int active_experts =
         w_.routed_expert_top_k > 0 ? w_.routed_expert_top_k : w_.n_expert_used;
     std::fprintf(stderr,
@@ -847,7 +903,7 @@ bool DeepSeek4Backend::init() {
                  prefill_attention_mode_name(cfg_.prefill_mode),
                  moe_hybrid_ ? " [hybrid]" : "");
 
-    if (env_flag_enabled("DFLASH_DS4_SPEC")) {
+    if (!cfg_.paged_attention && env_flag_enabled("DFLASH_DS4_SPEC")) {
         const char * dp = std::getenv("DFLASH_DS4_DRAFT");
         if (dp && *dp) {
             spec_draft_path_ = dp;
@@ -1138,7 +1194,10 @@ bool DeepSeek4Backend::init_hybrid_model() {
 
 void DeepSeek4Backend::print_ready_banner() const {
     std::printf("[deepseek4-daemon] ready layers=%d ctx=%d experts=%d/%d\n",
-                w_.n_layer, cache_.max_ctx, w_.n_expert_used, w_.n_expert);
+                w_.n_layer,
+                cfg_.paged_attention ? (int)paged_cache_.plan.max_ctx
+                                     : cache_.max_ctx,
+                w_.n_expert_used, w_.n_expert);
     std::fflush(stdout);
 }
 
@@ -1152,6 +1211,12 @@ bool DeepSeek4Backend::park(ParkTarget target) {
         std::fflush(stdout);
     }
     if (!want_target_model || parked_) return true;
+    if (cfg_.paged_attention) {
+        std::fprintf(stderr,
+            "[deepseek4] target park is unavailable while paged serving owns "
+            "live graph and slot state\n");
+        return false;
+    }
 
     maybe_save_routing_stats();
     for (int i = 0; i < PREFIX_SLOTS; ++i) {
@@ -1682,6 +1747,8 @@ void DeepSeek4Backend::shutdown() {
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         free_deepseek4_snapshot(snapshots_[i]);
     }
+    seq_engine_.reset();
+    free_deepseek4_paged_cache(paged_cache_);
     free_deepseek4_cache(cache_);
     expert_runtime_.reset();
     stream_engine_.destroy();
