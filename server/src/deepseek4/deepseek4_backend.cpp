@@ -31,6 +31,10 @@
 
 namespace dflash::common {
 
+bool deepseek4_env_flag_value_enabled(const char * value) {
+    return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
 namespace {
 using Clock = std::chrono::steady_clock;
 
@@ -43,8 +47,7 @@ static uint64_t elapsed_us(Clock::time_point start, Clock::time_point end) {
 }
 
 static bool env_flag_enabled(const char * name) {
-    const char * value = std::getenv(name);
-    return value && value[0] && std::strcmp(value, "0") != 0;
+    return deepseek4_env_flag_value_enabled(std::getenv(name));
 }
 
 struct AffineMmqPrefillScope {
@@ -778,6 +781,29 @@ bool deepseek4_prefill_chunk_needs_logits(bool is_final_chunk,
                                           bool execution_requires_logits) {
     return is_final_chunk || ends_at_snapshot || capture_requires_logits ||
            execution_requires_logits;
+}
+
+void deepseek4_invalidate_prefill_logits_if_skipped(
+        bool need_logits,
+        std::vector<float> & last_logits,
+        int & last_logits_pos) {
+    if (need_logits) return;
+    last_logits.clear();
+    last_logits_pos = -1;
+}
+
+Ds4VerifyHooks deepseek4_make_prefill_capture_hooks(
+        const std::vector<int> * capture_layer_ids,
+        std::vector<float> * capture_out,
+        int capture_token_begin,
+        int capture_token_end) {
+    Ds4VerifyHooks hooks;
+    hooks.capture_layer_ids = capture_layer_ids;
+    hooks.capture_out = capture_out;
+    hooks.capture_token_begin = capture_token_begin;
+    hooks.capture_token_end = capture_token_end;
+    hooks.allow_fused_verify = false;
+    return hooks;
 }
 
 DeepSeek4Backend::DeepSeek4Backend(const DeepSeek4BackendConfig & cfg)
@@ -2235,14 +2261,17 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             capture_requires_logits, execution_requires_logits);
         std::vector<float> logits;
         std::vector<float> * logits_out = need_logits ? &logits : nullptr;
+        // A snapshot boundary may have left valid logits for an older cache
+        // position. Invalidate them before a no-readout forward so a partial
+        // failure cannot expose stale state.
+        deepseek4_invalidate_prefill_logits_if_skipped(
+            need_logits, last_logits_, last_logits_pos_);
         bool ok = false;
         std::vector<float> hc_state;
         Ds4VerifyHooks spec_hooks;
         std::vector<float> spec_cap;
         Ds4VerifyHooks * hp = nullptr;
         if (capture_requested) {
-            spec_hooks.capture_layer_ids = &spec_drafter_->capture_layer_ids;
-            spec_hooks.capture_out = &spec_cap;
             int capture_begin = n_tok;
             int capture_end = 0;
             if (capture_final) {
@@ -2256,9 +2285,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 capture_end = std::max(
                     capture_end, std::min(n_tok, spec_snap_to - i));
             }
-            spec_hooks.capture_token_begin = capture_begin;
-            spec_hooks.capture_token_end = capture_end;
-            spec_hooks.allow_fused_verify = false;
+            spec_hooks = deepseek4_make_prefill_capture_hooks(
+                &spec_drafter_->capture_layer_ids, &spec_cap,
+                capture_begin, capture_end);
             hp = &spec_hooks;
         }
         // DSpark consumes the final SWA-width target features directly. Keep
@@ -2415,7 +2444,17 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
 
         // Get last logits and sample
         std::vector<float> logits;
-        if (generated == 0 && !last_logits_.empty()) {
+        if (generated == 0 && committed > 0) {
+            if (last_logits_.size() != (size_t) w_.n_vocab ||
+                last_logits_pos_ != committed ||
+                last_logits_pos_ != cache_.cur_pos) {
+                std::fprintf(stderr,
+                             "[deepseek4] refusing missing or stale prefill logits "
+                             "(logits_pos=%d committed=%d cache_pos=%d size=%zu)\n",
+                             last_logits_pos_, committed, cache_.cur_pos,
+                             last_logits_.size());
+                return false;
+            }
             logits = last_logits_;
         } else {
             std::vector<float> embed(w_.n_embd);
@@ -2599,8 +2638,11 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     }
     if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
         !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
-        if (last_logits_.empty()) {
-            result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");
+        if (last_logits_.size() != (size_t) w_.n_vocab ||
+            last_logits_pos_ != committed ||
+            last_logits_pos_ != cache_.cur_pos) {
+            result.fail(GenerateErrorCode::DecodeFailed,
+                        "spec: missing or stale prefill logits");
             return result;
         }
         int seed = 0;
