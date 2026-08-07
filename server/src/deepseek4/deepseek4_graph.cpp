@@ -993,7 +993,8 @@ static void build_compressor_step(
         ggml_tensor * cur_all = nullptr,
         int n_tokens_all = 1,
         int kv_start_all = -1,
-        bool indexer_qat = false) {
+        bool indexer_qat = false,
+        ggml_tensor ** current_comp_out = nullptr) {
     if (!gf || !cur_last || !ape || !kv_proj || !gate_proj || !norm_weight ||
         !state.state_kv || !state.state_score || !comp_cache || ratio <= 0) {
         return;
@@ -1201,6 +1202,9 @@ static void build_compressor_step(
     if (indexer_qat) {
         pooled = ggml_ds4_indexer_qat(ctx, ggml_cont(ctx, pooled));
     }
+    if (current_comp_out) {
+        *current_comp_out = pooled;
+    }
 
     ggml_tensor * pooled_f16 = ggml_cast(ctx, pooled, GGML_TYPE_F16);
     const int comp_row = token_pos / ratio;
@@ -1328,7 +1332,8 @@ static void build_indexer_compressor_step(
         ggml_tensor * cur_all = nullptr,
         int n_tokens_all = 1,
         int kv_start_all = -1,
-        bool indexer_qat = false) {
+        bool indexer_qat = false,
+        ggml_tensor ** current_comp_out = nullptr) {
     build_compressor_step(ctx, gf, cur_last,
                           L.indexer_compressor_ape,
                           L.indexer_compressor_kv,
@@ -1357,7 +1362,8 @@ static void build_indexer_compressor_step(
                           cur_all,
                           n_tokens_all,
                           kv_start_all,
-                          indexer_qat);
+                          indexer_qat,
+                          current_comp_out);
 }
 
 static int ds4_comp_rows_used(const ggml_tensor * comp_cache, int n_cached, int ratio, int token_pos) {
@@ -1511,9 +1517,36 @@ static ggml_tensor * build_indexer_topk(
 // supply gathered history and slot-specific compressor state without the
 // graph builder consulting DeepSeek4LayerCache or host cache counters.
 struct DeepSeek4MlaLaneBindings {
+    enum class HistoryMode {
+        ContiguousRing,
+        ChronologicalGathered,
+    };
+
+    HistoryMode history_mode = HistoryMode::ContiguousRing;
+    // In gathered mode these are immutable, chronological attention inputs.
+    // Counts are explicit so adapters may bind capacity-padded tensors.
+    ggml_tensor * raw_history = nullptr;
+    int n_raw_history = 0;
+    ggml_tensor * comp_history = nullptr;
+    int n_comp_history = 0;
+    ggml_tensor * index_comp_history = nullptr;
+    int n_index_comp_history = 0;
+
+    // Persistent mutation targets are deliberately independent of history.
     ggml_tensor * raw_kv = nullptr;
     ggml_tensor * comp_kv = nullptr;
     ggml_tensor * index_comp_kv = nullptr;
+    ggml_tensor * raw_write_rows = nullptr;
+    ggml_tensor * comp_write_rows = nullptr;
+    ggml_tensor * index_comp_write_rows = nullptr;
+
+    // Optional passive outputs let a future adapter scatter current products.
+    ggml_tensor ** current_raw_out = nullptr;
+    ggml_tensor ** current_comp_out = nullptr;
+    ggml_tensor ** current_index_comp_out = nullptr;
+    // False is the padding/inactive-lane contract: build attention against the
+    // supplied padded history, but emit no persistent current-row mutations.
+    bool write_enabled = true;
     DeepSeek4CompressorState * attn_compressor = nullptr;
     DeepSeek4CompressorState * indexer_compressor = nullptr;
     int n_comp_live = 0;
@@ -1535,16 +1568,19 @@ static DeepSeek4MlaLaneBindings deepseek4_contiguous_lane_bindings(
         DeepSeek4LayerCache & lc,
         int ratio,
         int token_pos) {
-    return {
-        lc.raw_kv,
-        lc.comp_kv,
-        lc.index_comp_kv,
-        &lc.attn_compressor,
-        &lc.indexer_compressor,
-        ratio > 0 ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0,
-        ratio == 4 ? ds4_comp_rows_used(lc.index_comp_kv, lc.n_index_comp, 4, token_pos) : 0,
-        lc.n_comp,
-    };
+    DeepSeek4MlaLaneBindings lane;
+    lane.history_mode = DeepSeek4MlaLaneBindings::HistoryMode::ContiguousRing;
+    lane.raw_kv = lc.raw_kv;
+    lane.comp_kv = lc.comp_kv;
+    lane.index_comp_kv = lc.index_comp_kv;
+    lane.attn_compressor = &lc.attn_compressor;
+    lane.indexer_compressor = &lc.indexer_compressor;
+    lane.n_comp_live = ratio > 0
+        ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
+    lane.n_index_comp_live = ratio == 4
+        ? ds4_comp_rows_used(lc.index_comp_kv, lc.n_index_comp, 4, token_pos) : 0;
+    lane.n_comp_committed = lc.n_comp;
+    return lane;
 }
 
 static ggml_tensor * build_mla_attention_lane_core(
@@ -1571,6 +1607,8 @@ static ggml_tensor * build_mla_attention_lane_core(
     const int n_out_group = w.n_out_group;
     const int n_lora_o  = w.n_lora_o;
     const int ratio     = w.compress_ratios[layer_idx];
+    const bool gathered_history = lane.history_mode ==
+        DeepSeek4MlaLaneBindings::HistoryMode::ChronologicalGathered;
 
     // ── Q path: cur → q_a → norm → q_b → per-head norm ─────────────
     // q_a: [n_embd, n_tokens] → [n_lora_q, n_tokens]
@@ -1647,9 +1685,9 @@ static ggml_tensor * build_mla_attention_lane_core(
     ggml_tensor * old_rows_scratch = nullptr;
     int n_old_rows = 0;
     ggml_tensor * prior_rows_scratch = nullptr;
-    int n_prior_rows = 0;
+    int n_prior_rows = gathered_history ? lane.n_raw_history : 0;
     const bool fused_causal = cached_inputs && cached_inputs->attn_row_mask && n_tokens > 1;
-    if (fused_causal) {
+    if (!gathered_history && fused_causal) {
         // Fused verify: ALWAYS q preserved rows so the topology is stable;
         // unwrapped/garbage rows are masked by the host-filled mask values.
         for (int ti = 0; ti < n_tokens; ti++) {
@@ -1663,7 +1701,7 @@ static ggml_tensor * build_mla_attention_lane_core(
             n_old_rows++;
         }
         old_rows_scratch = ds4_cast_if_needed(ctx, old_rows_scratch, GGML_TYPE_F32);
-    } else if (causal_batch && !layer_major_batch) {
+    } else if (!gathered_history && causal_batch && !layer_major_batch) {
         // Copy the to-be-overwritten rows FIRST; same-stream build order runs
         // these before the ring writes below.
         for (int ti = 0; ti < n_tokens; ti++) {
@@ -1680,7 +1718,7 @@ static ggml_tensor * build_mla_attention_lane_core(
         if (old_rows_scratch) {
             old_rows_scratch = ds4_cast_if_needed(ctx, old_rows_scratch, GGML_TYPE_F32);
         }
-    } else if (layer_major_batch) {
+    } else if (!gathered_history && layer_major_batch) {
         // Snapshot the chronological pre-chunk window before any ring writes.
         // Attention then consumes [prior F16 rows | current F32 rows], matching
         // the single-token path and avoiding an F16 round-trip for this chunk.
@@ -1710,10 +1748,15 @@ static ggml_tensor * build_mla_attention_lane_core(
     // ── Store ALL KV rows in the raw SWA ring ─────────────────────
     // For decode (n_tokens=1): write single row. For prefill: write all rows.
     ggml_tensor * raw_kv_source = lane.raw_kv;
-    ggml_tensor * raw_kv_rows = cached_inputs
-        ? cached_inputs->raw_kv_rows
-        : nullptr;
-    if (raw_kv_rows) {
+    ggml_tensor * raw_kv_rows = lane.raw_write_rows
+        ? lane.raw_write_rows
+        : (cached_inputs ? cached_inputs->raw_kv_rows : nullptr);
+    if (lane.current_raw_out) {
+        *lane.current_raw_out = kv;
+    }
+    if (!lane.write_enabled) {
+        // Inactive/padding lanes intentionally have no cache mutation.
+    } else if (raw_kv_rows) {
         ggml_tensor * kv_f32 = ggml_is_contiguous(kv) ? kv : ggml_cont(ctx, kv);
         raw_kv_source = ggml_set_rows(ctx, lane.raw_kv, kv_f32, raw_kv_rows);
         ggml_build_forward_expand(gf, raw_kv_source);
@@ -1738,7 +1781,7 @@ static ggml_tensor * build_mla_attention_lane_core(
     ggml_tensor * cur_last = ggml_view_2d(
         ctx, cur, n_embd, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
     ggml_tensor * comp_kv_source = lane.comp_kv;
-    if (ratio > 0 && L.attn_compressor_kv) {
+    if (lane.write_enabled && ratio > 0 && L.attn_compressor_kv) {
         build_compressor_step(ctx, gf, cur_last,
                               L.attn_compressor_ape,
                               L.attn_compressor_kv,
@@ -1758,7 +1801,8 @@ static ggml_tensor * build_mla_attention_lane_core(
                               (int)w.rope_orig_ctx,
                               cached_inputs ? cached_inputs->attn_ape_row : nullptr,
                               cached_inputs ? cached_inputs->attn_state_rows : nullptr,
-                              cached_inputs ? cached_inputs->attn_comp_rows : nullptr,
+                              lane.comp_write_rows ? lane.comp_write_rows :
+                                  (cached_inputs ? cached_inputs->attn_comp_rows : nullptr),
                               cached_inputs ? cached_inputs->attn_comp_pos : nullptr,
                               i64_array_inputs,
                               i32_array_inputs,
@@ -1766,16 +1810,19 @@ static ggml_tensor * build_mla_attention_lane_core(
                               cached_inputs ? cached_inputs->flush_rows : nullptr,
                               (causal_batch || fused_causal) ? cur : nullptr,
                               n_tokens,
-                              kv_start);
+                              kv_start,
+                              false,
+                              lane.current_comp_out);
     }
 
     ggml_tensor * index_comp_kv_source = lane.index_comp_kv;
-    if (ratio == 4 && L.indexer_compressor_kv) {
+    if (lane.write_enabled && ratio == 4 && L.indexer_compressor_kv) {
         build_indexer_compressor_step(ctx, gf, cur_last, w, L,
                                       *lane.indexer_compressor, lane.index_comp_kv, token_pos,
                                       cached_inputs ? cached_inputs->index_ape_row : nullptr,
                                       cached_inputs ? cached_inputs->index_state_rows : nullptr,
-                                      cached_inputs ? cached_inputs->index_comp_rows : nullptr,
+                                      lane.index_comp_write_rows ? lane.index_comp_write_rows :
+                                          (cached_inputs ? cached_inputs->index_comp_rows : nullptr),
                                       cached_inputs ? cached_inputs->index_comp_pos : nullptr,
                                       i64_array_inputs,
                                       i32_array_inputs,
@@ -1785,7 +1832,8 @@ static ggml_tensor * build_mla_attention_lane_core(
                                       n_tokens,
                                       kv_start,
                                       attention_impl ==
-                                          DeepSeek4AttentionImpl::SparseFlash);
+                                          DeepSeek4AttentionImpl::SparseFlash,
+                                      lane.current_index_comp_out);
     }
 
     // ── MLA Dot-Product Attention (SWA + compressed KV) ────────────
@@ -1794,19 +1842,26 @@ static ggml_tensor * build_mla_attention_lane_core(
     // comp_kv: [head_dim, comp_cap] F16 compressed rows.
     // n_raw = min(kv_start + n_tokens, n_swa)
     const bool masked_kv = cached_inputs && cached_inputs->attn_row_mask;
-    const int n_comp_live = lane.n_comp_live;
+    const int n_comp_live = gathered_history
+        ? lane.n_comp_history : lane.n_comp_live;
+    ggml_tensor * comp_history_source = gathered_history
+        ? lane.comp_history : comp_kv_source;
+    ggml_tensor * index_comp_history_source = gathered_history
+        ? lane.index_comp_history : index_comp_kv_source;
     ggml_tensor * indexer_topk = nullptr;
     if (attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
         ratio == 4 && f32_array_inputs) {
-        const int n_index_comp = lane.n_index_comp_live;
+        const int n_index_comp = gathered_history
+            ? lane.n_index_comp_history : lane.n_index_comp_live;
         indexer_topk = build_indexer_topk(
-            ctx, qr, cur, w, L, index_comp_kv_source,
+            ctx, qr, cur, w, L, index_comp_history_source,
             n_index_comp, kv_start, n_tokens, rope_pos,
             i32_array_inputs);
     }
     // Stable path reads the full physical ring (masking not-yet-written slots)
     // and a padded compressed-row span; the plain path reads only valid rows.
-    const int n_raw = masked_kv ? w.n_swa
+    const int n_raw = gathered_history ? lane.n_raw_history + n_tokens
+                    : masked_kv ? w.n_swa
                     : layer_major_batch ? n_prior_rows + n_tokens
                     : std::min(kv_start + n_tokens, w.n_swa);
     const int n_comp_attn = masked_kv ? cached_inputs->padded_comp : n_comp_live;
@@ -1824,7 +1879,18 @@ static ggml_tensor * build_mla_attention_lane_core(
     };
 
     ggml_tensor * kv_attn = nullptr;
-    if (masked_kv) {
+    if (gathered_history) {
+        ggml_tensor * current = ds4_cast_if_needed(ctx, kv, GGML_TYPE_F32);
+        if (lane.n_raw_history > 0 && lane.raw_history) {
+            ggml_tensor * history = ggml_view_2d(
+                ctx, lane.raw_history, head_dim, lane.n_raw_history,
+                lane.raw_history->nb[1], 0);
+            history = ds4_cast_if_needed(ctx, history, GGML_TYPE_F32);
+            kv_attn = ggml_concat(ctx, history, current, 1);
+        } else {
+            kv_attn = current;
+        }
+    } else if (masked_kv) {
         // Fused stable-KV path: read the full physical ring; rows not yet
         // written are masked to -1e30 in the score matrix (exact 0 after
         // softmax). Only the fused decode graph sets attn_row_mask. Read
@@ -1868,8 +1934,8 @@ static ggml_tensor * build_mla_attention_lane_core(
     } else {
         kv_attn = raw_kv_view(0, n_raw);
     }
-    if (n_comp_attn > 0 && comp_kv_source) {
-        ggml_tensor * comp = ggml_view_2d(ctx, comp_kv_source, head_dim, n_comp_attn, comp_kv_source->nb[1], 0);
+    if (n_comp_attn > 0 && comp_history_source) {
+        ggml_tensor * comp = ggml_view_2d(ctx, comp_history_source, head_dim, n_comp_attn, comp_history_source->nb[1], 0);
         comp = ds4_cast_if_needed(ctx, comp, GGML_TYPE_F32);
         kv_attn = ggml_concat(ctx, kv_attn, comp, 1);
     }
@@ -1915,8 +1981,9 @@ static ggml_tensor * build_mla_attention_lane_core(
                     }
                 }
                 if (n_comp_attn > 0) {
-                    const int vis = ds4_comp_rows_used(
-                        lane.comp_kv, lane.n_comp_committed, ratio, pos_i);
+                    const int vis = gathered_history ? n_comp_attn
+                        : ds4_comp_rows_used(
+                            lane.comp_kv, lane.n_comp_committed, ratio, pos_i);
                     for (int c = vis; c < n_comp_attn; c++) col[n_raw + c] = -1e30f;
                 }
             }
@@ -1940,8 +2007,9 @@ static ggml_tensor * build_mla_attention_lane_core(
                     if (pos_r > pos_i) col[r] = -1e30f;
                 }
                 if (n_comp_attn > 0) {
-                    const int visible = ds4_comp_rows_used(
-                        lane.comp_kv, lane.n_comp_committed, ratio, pos_i);
+                    const int visible = gathered_history ? n_comp_attn
+                        : ds4_comp_rows_used(
+                            lane.comp_kv, lane.n_comp_committed, ratio, pos_i);
                     for (int c = visible; c < n_comp_attn; ++c) {
                         col[n_raw + c] = -1e30f;
                     }
