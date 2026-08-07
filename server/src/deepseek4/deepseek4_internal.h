@@ -309,6 +309,9 @@ struct DeepSeek4PagedCache {
     DeepSeek4Cache prefill_staging;
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+    // Dedicated bounded gathered-reference graph cache (opaque here because
+    // its implementation shares the fused verifier's private machinery).
+    void * gathered_runtime = nullptr;
 };
 
 struct DeepSeek4Snapshot;
@@ -360,6 +363,19 @@ bool create_deepseek4_paged_cache(ggml_backend_t backend,
                                   uint32_t physical_blocks,
                                   DeepSeek4PagedCache & out);
 void free_deepseek4_paged_cache(DeepSeek4PagedCache & c);
+// Exact gathered-reference decode for 1..4 independent lanes. Inputs are
+// lane-major; negative slots are inactive padding lanes. `out_logits` is
+// [n_vocab, lanes] and `out_argmax` is [lanes].
+bool deepseek4_paged_gathered_step(
+    ggml_backend_t backend, int device, const DeepSeek4Weights & w,
+    DeepSeek4PagedCache & cache, const float * embeddings,
+    const int32_t * token_ids, const int64_t * positions,
+    const int32_t * slots, uint32_t lanes, const int32_t * block_tables,
+    uint32_t block_table_stride, std::vector<float> & out_logits,
+    std::vector<int32_t> & out_argmax,
+    MoeHybridStorage * moe_hybrid = nullptr,
+    MoeHybridRoutingStats * routing_stats = nullptr);
+void deepseek4_release_paged_gathered_runtime(DeepSeek4PagedCache & cache);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
 int deepseek4_previous_raw_ring_spans(
     int kv_start,

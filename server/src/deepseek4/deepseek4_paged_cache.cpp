@@ -38,8 +38,10 @@ bool prepare_deepseek4_gathered_lane_rows(
         if (rows.slot < 0) continue; // Padding must remain entirely passive.
         if (rows.position < 0) return false;
         const uint64_t pos = static_cast<uint64_t>(rows.position);
-        const uint64_t first_raw = pos > DS4_PAGE_TOKENS
-            ? pos - DS4_PAGE_TOKENS : 0;
+        // The current row is appended in-graph, so retain at most the 127
+        // preceding rows that can coexist with it in the 128-row SWA window.
+        const uint64_t first_raw = pos >= DS4_PAGE_TOKENS
+            ? pos - DS4_PAGE_TOKENS + 1 : 0;
         rows.raw_history.reserve(static_cast<size_t>(pos - first_raw));
         for (uint64_t p = first_raw; p < pos; ++p) {
             rows.raw_history.push_back(
@@ -173,6 +175,7 @@ bool create_deepseek4_paged_cache(ggml_backend_t backend,
 }
 
 void free_deepseek4_paged_cache(DeepSeek4PagedCache & c) {
+    deepseek4_release_paged_gathered_runtime(c);
     free_deepseek4_cache(c.prefill_staging);
     if (c.buf) { ggml_backend_buffer_free(c.buf); c.buf = nullptr; }
     if (c.ctx) { ggml_free(c.ctx); c.ctx = nullptr; }

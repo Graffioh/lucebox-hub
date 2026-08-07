@@ -30,8 +30,8 @@ int main() {
     CHECK(rows[0].raw_scatter == 259);
     CHECK(rows[0].compressed_emitted && rows[0].compressed_scatter == 4 * 32);
     CHECK(rows[0].compressed_history.empty());
-    CHECK(rows[1].raw_history.size() == 128);
-    CHECK(rows[1].raw_history.front() == 5 * 128 + 3);
+    CHECK(rows[1].raw_history.size() == 127);
+    CHECK(rows[1].raw_history.front() == 5 * 128 + 4);
     CHECK(rows[1].raw_history.back() == 5 * 128 + 2);
     CHECK(rows[1].compressed_history.size() == 64);
     CHECK(rows[1].compressed_history.front() == 6 * 32);
@@ -41,6 +41,16 @@ int main() {
     CHECK(rows[1].compressed_emitted && rows[1].compressed_scatter == 7 * 32);
     CHECK(rows[2].raw_history.empty() && rows[2].compressed_history.empty());
     CHECK(rows[2].raw_scatter == -1 && rows[2].compressed_scatter == -1);
+
+    const int32_t boundary_slot[] = {1};
+    const int32_t boundary_table[] = {0, 1};
+    for (int64_t pos : {127LL, 128LL, 129LL}) {
+        CHECK(prepare_deepseek4_gathered_lane_rows(
+            boundary_slot, &pos, 1, boundary_table, 2, 2, 0, rows));
+        CHECK(rows[0].raw_history.size() == (pos == 127 ? 127u : 127u));
+        CHECK(rows[0].raw_history.front() == 128 + (pos == 127 ? 0 : pos - 127));
+        CHECK(rows[0].raw_history.back() == 128 + ((pos - 1) % 128));
+    }
 
     const int64_t ratio128_pos[] = {255};
     CHECK(prepare_deepseek4_gathered_lane_rows(
