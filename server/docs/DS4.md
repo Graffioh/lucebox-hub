@@ -207,6 +207,9 @@ page- and slot-aware. Automatic expert placement reserves the persistent paged
 state and wide-graph scratch envelope before assigning primary-device experts;
 `DFLASH_EXPERT_BUDGET_MB` can still impose a lower experimental cap.
 
+The multi-sequence, multi-token replacement for the gathered reference path is
+specified in [Paged Multi-Sequence Prefill](PAGED_BATCHED_PREFILL.md).
+
 ### Local single-shard
 
 If the adapter decides all 43 layers fit on one CUDA GPU, it loads a single shard locally and no IPC daemon is involved.
