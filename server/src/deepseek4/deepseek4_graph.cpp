@@ -1314,7 +1314,8 @@ static void build_indexer_compressor_step(
         ggml_tensor * cur_last,
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
-        DeepSeek4LayerCache & lc,
+        DeepSeek4CompressorState & indexer_compressor,
+        ggml_tensor * index_comp_kv,
         int token_pos,
         ggml_tensor * ape_row_inp,
         ggml_tensor * state_rows_inp,
@@ -1333,8 +1334,8 @@ static void build_indexer_compressor_step(
                           L.indexer_compressor_kv,
                           L.indexer_compressor_gate,
                           L.indexer_compressor_norm,
-                          lc.indexer_compressor,
-                          lc.index_comp_kv,
+                          indexer_compressor,
+                          index_comp_kv,
                           4,
                           w.n_indexer_head_dim,  // indexer head_dim = 128
                           token_pos,
@@ -1505,13 +1506,54 @@ static ggml_tensor * build_indexer_topk(
 
 // ─── MLA Attention Block ────────────────────────────────────────────────
 
-static ggml_tensor * build_mla_attention(
+// All persistent and live-state bindings consumed by one MLA lane.  Keeping
+// this internal seam tensor-based is intentional: a paged adapter can later
+// supply gathered history and slot-specific compressor state without the
+// graph builder consulting DeepSeek4LayerCache or host cache counters.
+struct DeepSeek4MlaLaneBindings {
+    ggml_tensor * raw_kv = nullptr;
+    ggml_tensor * comp_kv = nullptr;
+    ggml_tensor * index_comp_kv = nullptr;
+    DeepSeek4CompressorState * attn_compressor = nullptr;
+    DeepSeek4CompressorState * indexer_compressor = nullptr;
+    int n_comp_live = 0;
+    int n_index_comp_live = 0;
+    int n_comp_committed = 0;
+};
+
+// Projection/RoPE products handed to the history/update portion of a lane.
+// This is deliberately a passive bundle: introducing graph operations in a
+// separate builder would risk changing decode graph ordering.
+struct DeepSeek4PreparedProjectedLane {
+    ggml_tensor * normalized_q_lora = nullptr;
+    ggml_tensor * q = nullptr;
+    ggml_tensor * kv = nullptr;
+    ggml_tensor * rope_pos = nullptr;
+};
+
+static DeepSeek4MlaLaneBindings deepseek4_contiguous_lane_bindings(
+        DeepSeek4LayerCache & lc,
+        int ratio,
+        int token_pos) {
+    return {
+        lc.raw_kv,
+        lc.comp_kv,
+        lc.index_comp_kv,
+        &lc.attn_compressor,
+        &lc.indexer_compressor,
+        ratio > 0 ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0,
+        ratio == 4 ? ds4_comp_rows_used(lc.index_comp_kv, lc.n_index_comp, 4, token_pos) : 0,
+        lc.n_comp,
+    };
+}
+
+static ggml_tensor * build_mla_attention_lane_core(
         ggml_context * ctx,
         ggml_cgraph * gf,
         ggml_tensor * cur,           // [n_embd, n_tokens]
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
-        DeepSeek4LayerCache & lc,
+        const DeepSeek4MlaLaneBindings & lane,
         int layer_idx,
         int kv_start,
         int n_tokens,
@@ -1586,6 +1628,11 @@ static ggml_tensor * build_mla_attention(
                             rope_freq, rope_scale, rope_ext, rope_attn,
                             w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_n_ctx_orig);
 
+    const DeepSeek4PreparedProjectedLane projected = {qr, q, kv, rope_pos};
+    // Keep the established local names below to make the no-topology-change
+    // property obvious; the bundle is the handoff seam for a future adapter.
+    (void) projected;
+
     // ── Causal batched step (exact multi-token target semantics) ───
     // The target model is causal: token i must not attend to batch tokens
     // j > i, must see the compressed-row count as of its own position, and —
@@ -1607,8 +1654,8 @@ static ggml_tensor * build_mla_attention(
         // unwrapped/garbage rows are masked by the host-filled mask values.
         for (int ti = 0; ti < n_tokens; ti++) {
             ggml_tensor * slot = ggml_view_2d(
-                ctx, lc.raw_kv, head_dim, 1, lc.raw_kv->nb[1],
-                (size_t)((kv_start + ti) % w.n_swa) * lc.raw_kv->nb[1]);
+                ctx, lane.raw_kv, head_dim, 1, lane.raw_kv->nb[1],
+                (size_t)((kv_start + ti) % w.n_swa) * lane.raw_kv->nb[1]);
             ggml_tensor * saved = ggml_cont(ctx, slot);
             ggml_build_forward_expand(gf, saved);
             old_rows_scratch = old_rows_scratch
@@ -1622,8 +1669,8 @@ static ggml_tensor * build_mla_attention(
         for (int ti = 0; ti < n_tokens; ti++) {
             if (kv_start + ti < w.n_swa) continue;   // slot never held an older pos
             ggml_tensor * slot = ggml_view_2d(
-                ctx, lc.raw_kv, head_dim, 1, lc.raw_kv->nb[1],
-                (size_t)((kv_start + ti) % w.n_swa) * lc.raw_kv->nb[1]);
+                ctx, lane.raw_kv, head_dim, 1, lane.raw_kv->nb[1],
+                (size_t)((kv_start + ti) % w.n_swa) * lane.raw_kv->nb[1]);
             ggml_tensor * saved = ggml_cont(ctx, slot);
             ggml_build_forward_expand(gf, saved);
             old_rows_scratch = old_rows_scratch
@@ -1643,8 +1690,8 @@ static ggml_tensor * build_mla_attention(
             const int tail = std::min(n_prior_rows, w.n_swa - first);
             auto snapshot_span = [&](int row, int count) {
                 ggml_tensor * span = ggml_view_2d(
-                    ctx, lc.raw_kv, head_dim, count, lc.raw_kv->nb[1],
-                    (size_t) row * lc.raw_kv->nb[1]);
+                    ctx, lane.raw_kv, head_dim, count, lane.raw_kv->nb[1],
+                    (size_t) row * lane.raw_kv->nb[1]);
                 return ggml_cont(ctx, span);
             };
             prior_rows_scratch = snapshot_span(first, tail);
@@ -1662,13 +1709,13 @@ static ggml_tensor * build_mla_attention(
 
     // ── Store ALL KV rows in the raw SWA ring ─────────────────────
     // For decode (n_tokens=1): write single row. For prefill: write all rows.
-    ggml_tensor * raw_kv_source = lc.raw_kv;
+    ggml_tensor * raw_kv_source = lane.raw_kv;
     ggml_tensor * raw_kv_rows = cached_inputs
         ? cached_inputs->raw_kv_rows
         : nullptr;
     if (raw_kv_rows) {
         ggml_tensor * kv_f32 = ggml_is_contiguous(kv) ? kv : ggml_cont(ctx, kv);
-        raw_kv_source = ggml_set_rows(ctx, lc.raw_kv, kv_f32, raw_kv_rows);
+        raw_kv_source = ggml_set_rows(ctx, lane.raw_kv, kv_f32, raw_kv_rows);
         ggml_build_forward_expand(gf, raw_kv_source);
     } else {
         // The attention graph consumes the whole current ubatch directly.
@@ -1680,8 +1727,8 @@ static ggml_tensor * build_mla_attention(
             ggml_tensor * kv_row = ggml_view_2d(
                 ctx, kv, head_dim, 1, kv->nb[1], (size_t)ti * kv->nb[1]);
             ggml_tensor * kv_slot = ggml_view_2d(
-                ctx, lc.raw_kv, head_dim, 1, lc.raw_kv->nb[1],
-                (size_t)(pos_ti % w.n_swa) * lc.raw_kv->nb[1]);
+                ctx, lane.raw_kv, head_dim, 1, lane.raw_kv->nb[1],
+                (size_t)(pos_ti % w.n_swa) * lane.raw_kv->nb[1]);
             ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cast(ctx, kv_row, GGML_TYPE_F16), kv_slot));
         }
     }
@@ -1690,15 +1737,15 @@ static ggml_tensor * build_mla_attention(
     // ── Learned compression update ──────────────────────────────────
     ggml_tensor * cur_last = ggml_view_2d(
         ctx, cur, n_embd, 1, cur->nb[1], (size_t)(n_tokens - 1) * cur->nb[1]);
-    ggml_tensor * comp_kv_source = lc.comp_kv;
+    ggml_tensor * comp_kv_source = lane.comp_kv;
     if (ratio > 0 && L.attn_compressor_kv) {
         build_compressor_step(ctx, gf, cur_last,
                               L.attn_compressor_ape,
                               L.attn_compressor_kv,
                               L.attn_compressor_gate,
                               L.attn_compressor_norm,
-                              lc.attn_compressor,
-                              lc.comp_kv,
+                              *lane.attn_compressor,
+                              lane.comp_kv,
                               ratio,
                               head_dim,
                               token_pos,
@@ -1722,9 +1769,10 @@ static ggml_tensor * build_mla_attention(
                               kv_start);
     }
 
-    ggml_tensor * index_comp_kv_source = lc.index_comp_kv;
+    ggml_tensor * index_comp_kv_source = lane.index_comp_kv;
     if (ratio == 4 && L.indexer_compressor_kv) {
-        build_indexer_compressor_step(ctx, gf, cur_last, w, L, lc, token_pos,
+        build_indexer_compressor_step(ctx, gf, cur_last, w, L,
+                                      *lane.indexer_compressor, lane.index_comp_kv, token_pos,
                                       cached_inputs ? cached_inputs->index_ape_row : nullptr,
                                       cached_inputs ? cached_inputs->index_state_rows : nullptr,
                                       cached_inputs ? cached_inputs->index_comp_rows : nullptr,
@@ -1746,12 +1794,11 @@ static ggml_tensor * build_mla_attention(
     // comp_kv: [head_dim, comp_cap] F16 compressed rows.
     // n_raw = min(kv_start + n_tokens, n_swa)
     const bool masked_kv = cached_inputs && cached_inputs->attn_row_mask;
-    const int n_comp_live = (ratio > 0) ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, token_pos) : 0;
+    const int n_comp_live = lane.n_comp_live;
     ggml_tensor * indexer_topk = nullptr;
     if (attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
         ratio == 4 && f32_array_inputs) {
-        const int n_index_comp = ds4_comp_rows_used(
-            lc.index_comp_kv, lc.n_index_comp, 4, token_pos);
+        const int n_index_comp = lane.n_index_comp_live;
         indexer_topk = build_indexer_topk(
             ctx, qr, cur, w, L, index_comp_kv_source,
             n_index_comp, kv_start, n_tokens, rope_pos,
@@ -1771,8 +1818,8 @@ static ggml_tensor * build_mla_attention(
     // write and see the previous contents of the raw KV slot.
     auto raw_kv_view = [&](int row, int count) -> ggml_tensor * {
         ggml_tensor * view = ggml_view_2d(
-            ctx, lc.raw_kv, head_dim, count, lc.raw_kv->nb[1],
-            (size_t)row * lc.raw_kv->nb[1]);
+            ctx, lane.raw_kv, head_dim, count, lane.raw_kv->nb[1],
+            (size_t)row * lane.raw_kv->nb[1]);
         return ds4_cast_if_needed(ctx, view, GGML_TYPE_F32);
     };
 
@@ -1801,7 +1848,7 @@ static ggml_tensor * build_mla_attention(
             // KV at its runtime row in an F32 snapshot instead. The tokenwise
             // prefill helper takes the same branch and row ordering.
             ggml_tensor * ring = ggml_view_2d(
-                ctx, lc.raw_kv, head_dim, w.n_swa, lc.raw_kv->nb[1], 0);
+                ctx, lane.raw_kv, head_dim, w.n_swa, lane.raw_kv->nb[1], 0);
             ring = ds4_cast_if_needed(ctx, ring, GGML_TYPE_F32);
             kv_attn = ggml_set_rows(ctx, ring, cur_kv, raw_kv_rows);
             ggml_build_forward_expand(gf, kv_attn);
@@ -1868,7 +1915,8 @@ static ggml_tensor * build_mla_attention(
                     }
                 }
                 if (n_comp_attn > 0) {
-                    const int vis = ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio, pos_i);
+                    const int vis = ds4_comp_rows_used(
+                        lane.comp_kv, lane.n_comp_committed, ratio, pos_i);
                     for (int c = vis; c < n_comp_attn; c++) col[n_raw + c] = -1e30f;
                 }
             }
@@ -1893,7 +1941,7 @@ static ggml_tensor * build_mla_attention(
                 }
                 if (n_comp_attn > 0) {
                     const int visible = ds4_comp_rows_used(
-                        lc.comp_kv, lc.n_comp, ratio, pos_i);
+                        lane.comp_kv, lane.n_comp_committed, ratio, pos_i);
                     for (int c = visible; c < n_comp_attn; ++c) {
                         col[n_raw + c] = -1e30f;
                     }
@@ -1938,7 +1986,7 @@ static ggml_tensor * build_mla_attention(
             const int first_count = DS4_NUMERICAL_PREFILL_BAND;
             const int second_count = n_tokens - first_count;
             const int first_comp = ratio > 0
-                ? ds4_comp_rows_used(lc.comp_kv, lc.n_comp, ratio,
+                ? ds4_comp_rows_used(lane.comp_kv, lane.n_comp_committed, ratio,
                                      kv_start + first_count - 1)
                 : 0;
             const int second_comp = n_comp_live;
@@ -1982,7 +2030,7 @@ static ggml_tensor * build_mla_attention(
                     }
                     if (comp_count > 0) {
                         const int visible = ds4_comp_rows_used(
-                            lc.comp_kv, lc.n_comp, ratio, pos_i);
+                            lane.comp_kv, lane.n_comp_committed, ratio, pos_i);
                         for (int c = visible; c < comp_count; ++c) {
                             col[raw_count + c] = -1e30f;
                         }
@@ -2197,6 +2245,34 @@ static ggml_tensor * build_mla_attention(
     }
 
     return out;
+}
+
+// Legacy contiguous-cache adapter.  Both decode and the consecutive q>1
+// verifier/prefill path enter through here, so their graph construction order
+// remains exactly the order in build_mla_attention_lane_core.
+static ggml_tensor * build_mla_attention(
+        ggml_context * ctx,
+        ggml_cgraph * gf,
+        ggml_tensor * cur,
+        const DeepSeek4Weights & w,
+        const DeepSeek4Layer & L,
+        DeepSeek4LayerCache & lc,
+        int layer_idx,
+        int kv_start,
+        int n_tokens,
+        const DeepSeek4AttentionGraphInputs * cached_inputs,
+        std::vector<DeepSeek4I32InputBinding> & i32_inputs,
+        std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
+        std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
+        std::vector<DeepSeek4F32ArrayBinding> * f32_array_inputs = nullptr,
+        DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit) {
+    const int ratio = w.compress_ratios[layer_idx];
+    DeepSeek4MlaLaneBindings lane = deepseek4_contiguous_lane_bindings(
+        lc, ratio, kv_start + n_tokens - 1);
+    return build_mla_attention_lane_core(
+        ctx, gf, cur, w, L, lane, layer_idx, kv_start, n_tokens,
+        cached_inputs, i32_inputs, i32_array_inputs, i64_array_inputs,
+        f32_array_inputs, attention_impl);
 }
 
 struct DeepSeek4CachedDecodeHcPreGraph {
