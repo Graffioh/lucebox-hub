@@ -22,6 +22,34 @@ struct DeepSeek4PagedCachePlan {
     std::vector<uint64_t> physical_rows;
 };
 
+// Host metadata for the gathered-reference decode graph.  Rows are expressed
+// in the flattened persistent tensors: raw rows are [slot, ring-row], while
+// compressed rows use the physical page geometry from deepseek4_page_layout.h.
+// A negative slot denotes a padding lane and consequently has no scatter rows.
+struct DeepSeek4GatheredLaneRows {
+    int32_t slot = -1;
+    int64_t position = 0;
+    std::vector<int64_t> raw_history;
+    std::vector<int64_t> compressed_history;
+    int64_t raw_scatter = -1;
+    int64_t compressed_scatter = -1;
+    bool compressed_emitted = false;
+};
+
+// block_tables is lane-major with block_table_stride entries per lane.
+// Physical block IDs may be fragmented and are validated against
+// physical_blocks.  History excludes the current token; compressed history is
+// in chronological group order.  Returns false for malformed active lanes.
+bool prepare_deepseek4_gathered_lane_rows(
+    const int32_t * slots,
+    const int64_t * positions,
+    uint32_t lanes,
+    const int32_t * block_tables,
+    uint32_t block_table_stride,
+    uint32_t physical_blocks,
+    uint32_t ratio,
+    std::vector<DeepSeek4GatheredLaneRows> & out);
+
 // Ratios must contain only 0, 4, or 128. A ratio-zero layer has a raw ring
 // but no compressed storage or compressor state.
 bool plan_deepseek4_paged_cache(uint32_t head_dim,

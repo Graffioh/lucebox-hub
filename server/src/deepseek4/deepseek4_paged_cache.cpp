@@ -21,6 +21,67 @@ bool add_mul(uint64_t & dst, uint64_t a, uint64_t b) {
 }
 }
 
+bool prepare_deepseek4_gathered_lane_rows(
+        const int32_t * slots, const int64_t * positions, uint32_t lanes,
+        const int32_t * block_tables, uint32_t block_table_stride,
+        uint32_t physical_blocks, uint32_t ratio,
+        std::vector<DeepSeek4GatheredLaneRows> & out) {
+    if (!slots || !positions || !block_tables || !block_table_stride ||
+        !physical_blocks || (ratio != 0 && ratio != 4 && ratio != 128)) {
+        return false;
+    }
+    std::vector<DeepSeek4GatheredLaneRows> prepared(lanes);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+        auto & rows = prepared[lane];
+        rows.slot = slots[lane];
+        rows.position = positions[lane];
+        if (rows.slot < 0) continue; // Padding must remain entirely passive.
+        if (rows.position < 0) return false;
+        const uint64_t pos = static_cast<uint64_t>(rows.position);
+        const uint64_t first_raw = pos > DS4_PAGE_TOKENS
+            ? pos - DS4_PAGE_TOKENS : 0;
+        rows.raw_history.reserve(static_cast<size_t>(pos - first_raw));
+        for (uint64_t p = first_raw; p < pos; ++p) {
+            rows.raw_history.push_back(
+                int64_t(rows.slot) * DS4_PAGE_TOKENS + ds4_raw_ring_row(p));
+        }
+        rows.raw_scatter = int64_t(rows.slot) * DS4_PAGE_TOKENS +
+                           ds4_raw_ring_row(pos);
+        if (!ratio) continue;
+
+        // Every completed group before the current token contributes one
+        // chronological row.  Looking up each logical page (rather than
+        // assuming contiguous physical pages) is the reference behaviour.
+        const uint64_t completed = pos / ratio;
+        rows.compressed_history.reserve(static_cast<size_t>(completed));
+        for (uint64_t group = 0; group < completed; ++group) {
+            const uint64_t end_token = group * ratio + ratio - 1;
+            const uint64_t logical_block = end_token / DS4_PAGE_TOKENS;
+            if (logical_block >= block_table_stride) return false;
+            const int32_t physical =
+                block_tables[size_t(lane) * block_table_stride + logical_block];
+            if (physical < 0 || uint32_t(physical) >= physical_blocks) return false;
+            uint64_t row = 0; bool emitted = false;
+            if (!ds4_compressed_page_row(end_token, uint32_t(physical), ratio,
+                                         row, emitted) || !emitted ||
+                row > uint64_t(INT64_MAX)) return false;
+            rows.compressed_history.push_back(static_cast<int64_t>(row));
+        }
+        const uint64_t logical_block = pos / DS4_PAGE_TOKENS;
+        if (logical_block >= block_table_stride) return false;
+        const int32_t physical =
+            block_tables[size_t(lane) * block_table_stride + logical_block];
+        if (physical < 0 || uint32_t(physical) >= physical_blocks) return false;
+        uint64_t scatter = 0;
+        if (!ds4_compressed_page_row(pos, uint32_t(physical), ratio, scatter,
+                                     rows.compressed_emitted) ||
+            scatter > uint64_t(INT64_MAX)) return false;
+        if (rows.compressed_emitted) rows.compressed_scatter = int64_t(scatter);
+    }
+    out = std::move(prepared);
+    return true;
+}
+
 bool plan_deepseek4_paged_cache(uint32_t head_dim, uint32_t indexer_head_dim,
                                 uint32_t slots, uint32_t max_ctx,
                                 uint32_t physical_blocks,
