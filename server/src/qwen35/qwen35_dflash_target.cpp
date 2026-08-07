@@ -7,7 +7,6 @@
 #include "common/geometric_draft_topk_cuda.h"
 #include "common/peer_access.h"
 #include "ggml-backend-impl.h"
-#include "ggml-cuda.h"
 // gpu_runtime_compat.h maps the raw cudaStream_t / cudaMemcpy* symbols used
 // below (rollback_to / rollback_to_tree) onto their HIP equivalents. Without
 // it the file only compiles on CUDA via a transitive <cuda_runtime.h>; HIP
@@ -240,31 +239,6 @@ bool Qwen35DFlashTarget::verify_batch(
         int & last_tok,
         std::vector<int32_t> * all_argmax,
         bool capture_ssm_intermediates) {
-    return verify_batch_impl(tokens, base_pos, last_tok, all_argmax,
-                             capture_ssm_intermediates,
-                             /*feature_ready=*/nullptr);
-}
-
-bool Qwen35DFlashTarget::verify_batch_async_until_features(
-        const std::vector<int32_t> & tokens,
-        int base_pos,
-        ggml_backend_event_t feature_ready,
-        bool capture_ssm_intermediates) {
-    if (!feature_ready) return false;
-    int unused_last_tok = -1;
-    return verify_batch_impl(tokens, base_pos, unused_last_tok, nullptr,
-                             capture_ssm_intermediates,
-                             feature_ready);
-}
-
-bool Qwen35DFlashTarget::verify_batch_impl(
-        const std::vector<int32_t> & tokens,
-        int base_pos,
-        int & last_tok,
-        std::vector<int32_t> * all_argmax,
-        bool capture_ssm_intermediates,
-        ggml_backend_event_t feature_ready) {
-    if (async_verify_pending_) return false;
     const int n_tokens = (int)tokens.size();
     if (n_tokens <= 0) return false;
 
@@ -382,38 +356,6 @@ bool Qwen35DFlashTarget::verify_batch_impl(
                                 sizeof(uint16_t) * mask_buf.size());
     }
 
-    if (feature_ready) {
-        if (!sg_.capture_ready ||
-            !ggml_backend_cuda_set_graph_event_marker(
-                backend_, sg_.capture_ready, feature_ready)) {
-            return false;
-        }
-        // A graph executable captured by an earlier unmarked verification
-        // would not contain the mid-graph event record. Submit this marked
-        // evaluation directly; topology and target arithmetic are unchanged.
-        const bool graphs_were_disabled =
-            ggml_backend_cuda_set_graphs_disabled_override(true);
-        const ggml_status status =
-            ggml_backend_graph_compute_async(backend_, sg_.gf);
-        (void)ggml_backend_cuda_set_graphs_disabled_override(
-            graphs_were_disabled);
-        if (status != GGML_STATUS_SUCCESS) {
-            (void)ggml_backend_cuda_set_graph_event_marker(
-                backend_, nullptr, nullptr);
-            std::fprintf(stderr,
-                "verify_batch: async feature-marked compute failed (status=%d)\n",
-                (int)status);
-            return false;
-        }
-        async_verify_pending_ = true;
-        async_verify_tokens_ = n_tokens;
-        async_verify_base_pos_ = base_pos;
-        return true;
-    }
-
-    (void)ggml_backend_cuda_set_graph_event_marker(
-        backend_, nullptr, nullptr);
-
     auto st = ggml_backend_graph_compute(backend_, sg_.gf);
     if (st != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "verify_batch: compute failed (status=%d)\n", (int)st);
@@ -430,31 +372,6 @@ bool Qwen35DFlashTarget::verify_batch_impl(
         *all_argmax = std::move(argmax_buf);
     }
 
-    cache_.cur_pos = base_pos + n_tokens;
-    return true;
-}
-
-bool Qwen35DFlashTarget::finish_verify_batch(
-        int & last_tok,
-        std::vector<int32_t> * all_argmax) {
-    if (!async_verify_pending_ || async_verify_tokens_ <= 0) {
-        return false;
-    }
-    const int n_tokens = async_verify_tokens_;
-    const int base_pos = async_verify_base_pos_;
-    async_verify_pending_ = false;
-    async_verify_tokens_ = 0;
-    async_verify_base_pos_ = 0;
-
-    ggml_backend_synchronize(backend_);
-    (void)ggml_backend_cuda_set_graph_event_marker(
-        backend_, nullptr, nullptr);
-
-    std::vector<int32_t> argmax_buf((size_t)n_tokens);
-    ggml_backend_tensor_get(sg_.argmax_tokens, argmax_buf.data(), 0,
-                            sizeof(int32_t) * (size_t)n_tokens);
-    last_tok = argmax_buf[(size_t)n_tokens - 1];
-    if (all_argmax) *all_argmax = std::move(argmax_buf);
     cache_.cur_pos = base_pos + n_tokens;
     return true;
 }
@@ -1129,54 +1046,22 @@ bool Qwen35DFlashTarget::project_hidden_to_topk(
     return true;
 }
 
-bool Qwen35DFlashTarget::project_device_hidden_to_topk(
-        const void * hidden_device,
-        int source_device,
-        int n_tokens,
-        int K,
-        float temperature,
-        std::vector<float> & top_log_probs,
-        std::vector<int32_t> & top_token_ids) {
-    if (K <= 0 || !compute_device_hidden_projection(
-                      hidden_device, source_device, n_tokens)) {
-        return false;
-    }
-
-    const int vocab = (int)proj_sg_.logits->ne[0];
-    top_log_probs.assign((size_t)n_tokens * K, 0.0f);
-    top_token_ids.assign((size_t)n_tokens * K, 0);
-#ifdef DFLASH27B_HAVE_DRAFT_TOPK
-    static const bool kGpuDraftTopk = []() {
-        const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
-        return v == nullptr || v[0] != '0';
-    }();
-    ggml_tensor * local_logits = proj_sg_.logits;
-    if (is_meta_tensor(local_logits)) {
-        local_logits = ggml_backend_meta_simple_tensor(local_logits, 0);
-    }
-    if (kGpuDraftTopk && local_logits &&
-        geometric_extract_draft_topk_cuda(
-            local_logits->data, n_tokens, vocab, K,
-            top_log_probs.data(), top_token_ids.data(), temperature)) {
-        return true;
-    }
-#endif
-    std::vector<float> logits((size_t)vocab * n_tokens);
-    ggml_backend_tensor_get(proj_sg_.logits, logits.data(), 0,
-                            sizeof(float) * logits.size());
-    extract_draft_topk(logits.data(), n_tokens, vocab, K,
-                       top_log_probs.data(), top_token_ids.data(), temperature);
-    return true;
-}
-
 bool Qwen35DFlashTarget::project_device_hidden_to_tokens(
         const void * hidden_device,
         int source_device,
         int n_tokens,
         std::vector<int32_t> & tokens_out) {
-    return compute_device_hidden_projection(
-               hidden_device, source_device, n_tokens) &&
-           read_projected_argmax(n_tokens, tokens_out);
+    if (!compute_device_hidden_projection(
+            hidden_device, source_device, n_tokens) ||
+        !proj_sg_.argmax_tokens ||
+        n_tokens > (int)proj_sg_.argmax_tokens->ne[0]) {
+        return false;
+    }
+    tokens_out.resize((size_t)n_tokens);
+    ggml_backend_tensor_get(
+        proj_sg_.argmax_tokens, tokens_out.data(), 0,
+        sizeof(int32_t) * tokens_out.size());
+    return true;
 }
 
 bool Qwen35DFlashTarget::compute_device_hidden_projection(
@@ -1200,20 +1085,6 @@ bool Qwen35DFlashTarget::compute_device_hidden_projection(
         GGML_STATUS_SUCCESS) {
         return false;
     }
-    return true;
-}
-
-bool Qwen35DFlashTarget::read_projected_argmax(
-        int n_tokens,
-        std::vector<int32_t> & tokens_out) const {
-    if (n_tokens <= 0 || !proj_sg_.argmax_tokens ||
-        n_tokens > (int)proj_sg_.argmax_tokens->ne[0]) {
-        return false;
-    }
-    tokens_out.resize((size_t)n_tokens);
-    ggml_backend_tensor_get(
-        proj_sg_.argmax_tokens, tokens_out.data(), 0,
-        sizeof(int32_t) * tokens_out.size());
     return true;
 }
 

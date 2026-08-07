@@ -1403,8 +1403,6 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
-    const ggml_tensor * graph_event_marker_node = nullptr;
-    cudaEvent_t graph_event_marker_event = nullptr;
 
     // LUCE_Q8_MEMO=1: memoize q8_1-quantized src1 activations across the
     // quantized matmuls of ONE graph evaluation (Q/K/V/gate/router/shexp all

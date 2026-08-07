@@ -618,11 +618,6 @@ struct QwenGraphInputs {
 
 struct QwenGraphOutputs {
     ggml_tensor * logits;      // [vocab, n_tokens] f32
-    // Last target-feature ring write. Async shadow drafting may execute the
-    // full graph asynchronously, publish a stream event at this node, and
-    // launch an exact dependent draft on another GPU while the target stream
-    // continues through its remaining layers and LM head.
-    ggml_tensor * capture_ready = nullptr;
     // One entry per delta-net layer (48 for qwen35-27b). Only populated when
     // QwenGraphInputs::capture_delta_intermediate is true. Tensors are graph
     // views marked as ggml_set_output() so their data persists after

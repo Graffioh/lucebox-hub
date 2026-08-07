@@ -4716,13 +4716,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
-                if (node == cuda_ctx->graph_event_marker_node &&
-                    cuda_ctx->graph_event_marker_event != nullptr) {
-                    CUDA_CHECK(cudaEventRecord(
-                        cuda_ctx->graph_event_marker_event,
-                        cuda_ctx->stream()));
-                }
-
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
@@ -5291,26 +5284,6 @@ bool ggml_backend_cuda_set_low_priority_stream(ggml_backend_t backend) {
         __func__, ctx->device, least_priority, greatest_priority,
         ctx->stream_priority);
     return least_priority != greatest_priority;
-}
-
-bool ggml_backend_cuda_set_graph_event_marker(
-        ggml_backend_t backend,
-        const ggml_tensor * node,
-        ggml_backend_event_t event) {
-    if (!ggml_backend_is_cuda(backend) ||
-        ((node == nullptr) != (event == nullptr))) {
-        return false;
-    }
-    if (event != nullptr &&
-        event->device != ggml_backend_get_device(backend)) {
-        return false;
-    }
-    ggml_backend_cuda_context * ctx =
-        (ggml_backend_cuda_context *) backend->context;
-    ctx->graph_event_marker_node = node;
-    ctx->graph_event_marker_event =
-        event ? (cudaEvent_t) event->context : nullptr;
-    return true;
 }
 
 int ggml_backend_cuda_get_device_count() {
@@ -6078,30 +6051,6 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
-static bool ggml_backend_cuda_device_event_is_ready(ggml_backend_dev_t dev, ggml_backend_event_t event) {
-    GGML_UNUSED(dev);
-#if defined(GGML_USE_HIP)
-    const hipError_t status = hipEventQuery((hipEvent_t)event->context);
-    if (status == hipSuccess) {
-        return true;
-    }
-    if (status == hipErrorNotReady) {
-        return false;
-    }
-    CUDA_CHECK(status);
-#else
-    const cudaError_t status = cudaEventQuery((cudaEvent_t)event->context);
-    if (status == cudaSuccess) {
-        return true;
-    }
-    if (status == cudaErrorNotReady) {
-        return false;
-    }
-    CUDA_CHECK(status);
-#endif
-    return false;
-}
-
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .get_name                = */ ggml_backend_cuda_device_get_name,
     /* .get_description         = */ ggml_backend_cuda_device_get_description,
@@ -6118,7 +6067,6 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .event_new               = */ ggml_backend_cuda_device_event_new,
     /* .event_free              = */ ggml_backend_cuda_device_event_free,
     /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
-    /* .event_is_ready          = */ ggml_backend_cuda_device_event_is_ready,
 };
 
 // backend reg

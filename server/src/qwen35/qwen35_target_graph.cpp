@@ -1382,12 +1382,7 @@ QwenGraphOutputs build_qwen35_graph(
                         hidden, pre_n, col_stride, offset);
                     ggml_tensor * src  = ggml_view_2d(ctx, cur_2d,
                         hidden, pre_n, cur_2d->nb[1], 0);
-                    ggml_tensor * capture_copy = ggml_cpy(ctx, src, slot);
-                    ggml_build_forward_expand(gf, capture_copy);
-                    // Layers are built in execution order, while the capture
-                    // ids stored in the model need not be sorted. Reassign on
-                    // every capture so the final value is the last ring write.
-                    og_early.capture_ready = capture_copy;
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx, src, slot));
                 }
 
                 // Second slice: wrap-around at [0..post_n) if needed.
@@ -1399,9 +1394,7 @@ QwenGraphOutputs build_qwen35_graph(
                     ggml_tensor * src  = ggml_view_2d(ctx, cur_2d,
                         hidden, post_n, cur_2d->nb[1],
                         (size_t)pre_n * cur_2d->nb[1]);
-                    ggml_tensor * capture_copy = ggml_cpy(ctx, src, slot);
-                    ggml_build_forward_expand(gf, capture_copy);
-                    og_early.capture_ready = capture_copy;
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx, src, slot));
                 }
             }
         }

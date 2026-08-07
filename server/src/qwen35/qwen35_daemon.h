@@ -33,8 +33,6 @@ struct Qwen35DaemonArgs {
     int          ddtree_budget     = 22;
     float        ddtree_temp       = 1.0f;
     bool         ddtree_chain_seed = true;
-    bool         async_shadow_batching = false;
-    int          async_shadow_branches = 1;
     bool         use_feature_mirror = false;
 };
 

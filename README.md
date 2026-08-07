@@ -273,8 +273,9 @@ Requests that omit `temperature` use the model card's sampling (Qwen3.6: `temper
 |---|---|---|
 | `--ddtree` | off (chain) | Enable tree verify |
 | `--ddtree-budget N` | `22` | Tree size. 22 on 3090 (default), 40 on 5090, re-sweep on GB10 |
-| `--async-shadow-batching` | off | Experimental qwen35 chain mode: cache one likely round-T+1 fast-rollback proposal on a distinct local draft GPU while ordinary target verification finishes. The target verify width and acceptance path are unchanged. Requires direct P2P; remote draft IPC and host feature staging are refused. |
-| `--async-shadow-branches N` | `1` | Future outcome branches. The equal-layout shadow-KV prototype currently requires exactly `1`. |
+| `--async-shadow-batching` | off | Experimental qwen35 chain mode: build a draft-only round-T+1 outcome cache on a distinct local draft GPU while ordinary fixed-width target verification runs. Target acceptance remains authoritative; remote draft IPC and target splitting are refused. |
+| `--async-shadow-model <path>` | — | Dense, vocabulary-compatible Qwen3.5 GGUF used by the AR shadow worker. Required with `--async-shadow-batching`; a small model such as Qwen3.5-0.8B is intended. |
+| `--async-shadow-branches N` | `1` | Predicted accepted-length outcomes. The current AR prototype supports exactly `1`. |
 | `--fa-window N` | `0` / `2048` (full attention) | Sliding FA window. Leave at 0: a finite window breaks tool calls (the full-attention layers lose the system prompt/tools). |
 | `--draft-residency {auto,persistent,request-scoped}` | `auto` | When draft weights are evicted from VRAM. `request-scoped` parks/frees them after each request's draft work (frees VRAM for the target on tight GPUs); `persistent` keeps them resident across requests; `auto` preserves current behavior while honoring the low-VRAM / `--lazy-draft` hint. Reported at `/props.runtime.draft_residency`. |
 | `--lazy-draft` | off | Legacy alias for `--draft-residency=request-scoped` (defer draft load until first request, release after) |
@@ -397,21 +398,26 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 Async shadows are a constrained exact-endpoint cache inspired by the
 asynchronous lookahead in
 [Speculative Speculative Decoding / SAGUARO](https://arxiv.org/abs/2603.03251).
-Two same-process HIP/CUDA streams use direct device copies and the draft
-feature ring; they do not start a draft daemon or use process IPC. Unlike the
-paper's EAGLE extension, this prototype does not substitute self-generated
-activations: it waits for the exact target feature rows required by DFlash.
-The R9700 publishes the final feature capture with a mid-graph HIP/CUDA event
-and continues the unchanged target tail; it does not split or widen the target
-graph. Direct P2P feature transfer and Strix preparation overlap that tail.
-The Strix clones the authoritative draft KV into an equal-layout device-local
-bank while the R9700 verifies, then advances that bank to one predicted
-endpoint. A result is reusable only when ordinary verification produces its
-exact outcome key (source position, accepted count, and pending target token).
-A miss or a not-yet-ready shadow falls back to ordinary single-request
-drafting, and a missed deadline disables further launches for that request.
-Shadow work never widens target verification or changes target acceptance.
-Per-request telemetry is printed as `[async-shadow]`.
+The shadow worker loads a small generic Qwen on a low-priority stream of the
+local draft GPU. It asynchronously prefills the prompt, keeps persistent
+device-local attention and DeltaNet state, predicts one likely accepted-length
+endpoint, and autoregressively prepares that endpoint's next proposal while
+the target GPU performs the unchanged ordinary verification batch.
+
+This path does not start a daemon and does not use sockets, process IPC, NCCL,
+or host-staged KV/activations. Only small token-ID control messages cross the
+same-process CPU worker; all shadow weights and recurrent state remain on the
+draft GPU. The existing ordinary DFlash target-feature path remains separate,
+so async shadows are not coupled to QGBatching or DDTree.
+
+A result is reusable only when ordinary target verification produces the exact
+fast-rollback key (source position, accepted count, endpoint position, and
+pending target token). A miss or unfinished result immediately falls back to
+ordinary single-request DFlash. Every authoritative transition is queued back
+to the worker so a late branch can catch up instead of permanently
+desynchronizing its AR state. Shadow work never widens target verification,
+changes target acceptance, or makes the target wait. Per-request telemetry is
+printed as `[async-shadow]`.
 
 Tensor parallelism uses NCCL collectives between the selected devices and does
 not include other visible GPUs in its communicator. For example, this runs the

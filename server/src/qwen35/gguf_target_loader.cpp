@@ -160,8 +160,11 @@ static bool should_load_target_tensor(const char * name,
                                       int layer_begin,
                                       int layer_end,
                                       bool load_output,
-                                      bool skip_expert_tensors = false) {
-    if (std::strcmp(name, "token_embd.weight") == 0) return false;
+                                      bool skip_expert_tensors,
+                                      bool tied_output) {
+    if (std::strcmp(name, "token_embd.weight") == 0) {
+        return load_output && tied_output;
+    }
     if (std::strcmp(name, "output_norm.weight") == 0 ||
         std::strcmp(name, "output.weight") == 0) {
         return load_output;
@@ -500,6 +503,13 @@ bool load_target_gguf_partial(const std::string & path,
     out.tok_embd = g("token_embd.weight");
     out.out_norm = g("output_norm.weight");
     out.output   = g("output.weight");
+    // Small Qwen3.5 models tie the language-model head to token embeddings
+    // and therefore omit output.weight from GGUF. Keep the CPU embedding
+    // copy below, but also place the shared tensor on the compute backend so
+    // it can serve as the LM head. Untied target models retain the existing
+    // output.weight path and still leave token_embd.weight CPU-only.
+    const bool tied_output = out.output == nullptr && out.tok_embd != nullptr;
+    if (tied_output) out.output = out.tok_embd;
     if (!out.tok_embd || !out.out_norm || !out.output) {
         set_last_error("missing top-level tensors (token_embd/output_norm/output)");
         gguf_free(gctx);
@@ -615,7 +625,9 @@ bool load_target_gguf_partial(const std::string & path,
     for (int64_t tid = 0; tid < n_tensors; tid++) {
         const char * tname = gguf_get_tensor_name(gctx, tid);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
-        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
+        if (!t || !should_load_target_tensor(
+                tname, plan.layer_begin, plan.layer_end, plan.load_output,
+                plan.skip_expert_tensors, tied_output)) {
             continue;
         }
         alloc_total = align_up_size(alloc_total, alignment);
@@ -816,15 +828,18 @@ bool load_target_gguf_partial(const std::string & path,
             return false;
         }
         if (std::string(tname) == "token_embd.weight") {
-            // Remember offset + size for the CPU embedder; don't upload to GPU.
+            // Always retain a CPU copy for embedding lookup. Tied-output
+            // models additionally upload this tensor as their LM head.
             tok_embd_off  = off;
             tok_embd_sz   = sz;
             tok_embd_type = gguf_get_tensor_type(gctx, tid);
-            continue;
+            if (!tied_output) continue;
         }
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
         if (!t) continue;
-        if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
+        if (!should_load_target_tensor(
+                tname, plan.layer_begin, plan.layer_end, plan.load_output,
+                plan.skip_expert_tensors, tied_output)) {
             continue;
         }
         ggml_backend_tensor_set(t, mm_addr + off, 0, sz);
@@ -884,10 +899,12 @@ bool load_target_gguf_partial(const std::string & path,
     // Stash the total for callers that want to print it
     char summary[192];
     std::snprintf(summary, sizeof(summary),
-        "target loaded: layers [%d,%d) output=%d, %zu tensors on GPU %.2f GiB, tok_embd %.0f MiB CPU-only (%s)",
+        "target loaded: layers [%d,%d) output=%d, %zu tensors on GPU %.2f GiB, tok_embd %.0f MiB CPU%s (%s)",
         plan.layer_begin, plan.layer_end, (int)plan.load_output, allocs.size(),
         total / (1024.0 * 1024.0 * 1024.0),
-        tok_embd_sz / (1024.0 * 1024.0), ggml_type_name(tok_embd_type));
+        tok_embd_sz / (1024.0 * 1024.0),
+        tied_output ? "+GPU tied head" : "-only",
+        ggml_type_name(tok_embd_type));
     set_last_error(summary);
 
     return true;

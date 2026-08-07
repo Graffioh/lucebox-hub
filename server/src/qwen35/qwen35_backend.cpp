@@ -1,4 +1,5 @@
 #include "qwen35_backend.h"
+#include "qwen35_shadow_drafter.h"
 #include "common/chain_rollback_policy.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
@@ -182,13 +183,15 @@ bool Qwen35Backend::init() {
                   (tensor_parallel || cfg_.device.gpu != cfg_.draft_gpu);
 
     if (cfg_.async_shadow_batching &&
-        (use_remote_draft || !cfg_.draft_path || tensor_parallel ||
+        (use_remote_draft || !cfg_.draft_path || !cfg_.async_shadow_model ||
+         tensor_parallel ||
          cfg_.device.gpu == cfg_.draft_gpu || cfg_.ddtree_mode ||
          !cfg_.fast_rollback || cfg_.async_shadow_branches != 1)) {
         std::fprintf(stderr,
-            "async-shadow: requires local qwen35 chain drafting on a distinct "
-            "draft GPU with ordinary fast rollback and exactly one shadow-KV "
-            "branch (remote IPC, target split, and DDTree are unsupported)\n");
+            "async-shadow: requires --async-shadow-model plus local qwen35 "
+            "chain drafting on a distinct draft GPU, ordinary fast rollback, "
+            "and one AR outcome branch (IPC, target split, and DDTree are "
+            "unsupported)\n");
         return false;
     }
 
@@ -213,36 +216,12 @@ bool Qwen35Backend::init() {
     if (split_gpus_ && g_peer_access_opt_in) {
         enable_peer_access_pair(cfg_.device.gpu, cfg_.draft_gpu);
     }
-    if (cfg_.async_shadow_batching) {
-        if (!cross_device_peer_memcpy_ok(cfg_.device.gpu, cfg_.draft_gpu)) {
-            std::fprintf(stderr,
-                "async-shadow: direct target/draft GPU peer access is unavailable; "
-                "refusing host staging\n");
-            return false;
-        }
-        shadow_backend_ = ggml_backend_cuda_init(cfg_.draft_gpu);
-        if (!shadow_backend_) {
-            std::fprintf(stderr, "async-shadow: dedicated draft stream init failed\n");
-            return false;
-        }
-        const bool low_priority =
-            ggml_backend_cuda_set_low_priority_stream(shadow_backend_);
+    if (cfg_.async_shadow_batching &&
+        !cross_device_peer_memcpy_ok(cfg_.device.gpu, cfg_.draft_gpu)) {
         std::fprintf(stderr,
-            "async-shadow: dedicated draft stream priority=%s\n",
-            low_priority ? "low" : "device-default (no priority range)");
-        shadow_done_ = ggml_backend_event_new(
-            ggml_backend_get_device(shadow_backend_));
-        if (!shadow_done_) {
-            std::fprintf(stderr, "async-shadow: backend events unavailable\n");
-            return false;
-        }
-        target_features_ready_ = ggml_backend_event_new(
-            ggml_backend_get_device(target_backend_));
-        if (!target_features_ready_) {
-            std::fprintf(stderr,
-                "async-shadow: target feature-marker events unavailable\n");
-            return false;
-        }
+            "async-shadow: direct target/draft GPU peer access is unavailable; "
+            "refusing host staging\n");
+        return false;
     }
 
     // Snapshot backend: on discrete GPU uses system RAM; on unified memory
@@ -376,42 +355,17 @@ bool Qwen35Backend::init() {
         }
     }
 
-    if (cfg_.async_shadow_batching &&
-        (!feature_mirror_.target_feat ||
-         feature_mirror_.storage_type != GGML_TYPE_F32)) {
-        std::fprintf(stderr,
-            "async-shadow: direct BF16-to-F32 feature-ring conversion requires "
-            "the default F32 mirror (unset DFLASH_FEATURE_DTYPE)\n");
-        return false;
-    }
-
     if (cfg_.async_shadow_batching) {
-        const int kv_cap = std::min(
-            feature_mirror_.cap,
-            std::max(2048, cfg_.draft_ctx_max));
-        if (!draft_kv_init(
-                draft_kv_, dw_, draft_backend_, kv_cap, nullptr) ||
-            !draft_kv_init(
-                shadow_draft_kv_, dw_, shadow_backend_, kv_cap, nullptr)) {
+        shadow_drafter_ = std::make_unique<Qwen35ShadowDrafter>();
+        const int shadow_ctx = std::min(cfg_.device.max_ctx,
+                                        cfg_.draft_ctx_max);
+        if (!shadow_drafter_->init(
+                cfg_.async_shadow_model, cfg_.draft_gpu, shadow_ctx,
+                w_.n_vocab, w_.eos_id, w_.eos_chat_id)) {
             std::fprintf(stderr,
-                "async-shadow: failed to initialize equal-layout draft KV banks\n");
+                "async-shadow: autoregressive outcome-cache init failed\n");
             return false;
         }
-        // Compile/capture the fixed shadow topology before the server accepts
-        // traffic. The all-zero shadow state is discarded by the first
-        // device-local authoritative clone; this removes first-hit graph
-        // compilation from request latency.
-        if (ggml_backend_graph_compute(
-                shadow_backend_, shadow_draft_kv_.gf) !=
-            GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr,
-                "async-shadow: shadow graph warmup failed\n");
-            return false;
-        }
-        draft_kv_reset(draft_kv_);
-        draft_kv_reset(shadow_draft_kv_);
-        std::fprintf(stderr,
-            "async-shadow: fixed draft graph warmed before serving\n");
     }
 
     return true;
@@ -442,13 +396,12 @@ bool Qwen35Backend::park(ParkTarget target) {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
 
     if (want_draft_model && !draft_parked_) {
-        clear_async_shadow(/*wait=*/true);
+        shadow_drafter_.reset();
         if (use_remote_draft) {
             remote_draft_.close();
         } else {
             step_graph_destroy(draft_sg_);
             draft_kv_free(draft_kv_);
-            draft_kv_free(shadow_draft_kv_);
             free_draft_weights(dw_);
         }
         draft_parked_ = true;
@@ -512,6 +465,19 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.swa_window = cfg_.draft_swa_window;
                 for (int il = 0; il < dw_.n_layer - 1; il++)
                     dw_.layers[il].is_swa = true;
+            }
+            if (cfg_.async_shadow_batching) {
+                shadow_drafter_ = std::make_unique<Qwen35ShadowDrafter>();
+                const int shadow_ctx = std::min(cfg_.device.max_ctx,
+                                                cfg_.draft_ctx_max);
+                if (!shadow_drafter_->init(
+                        cfg_.async_shadow_model, cfg_.draft_gpu, shadow_ctx,
+                        w_.n_vocab, w_.eos_id, w_.eos_chat_id)) {
+                    shadow_drafter_.reset();
+                    std::fprintf(stderr,
+                        "[unpark] async-shadow outcome-cache init failed\n");
+                    return false;
+                }
             }
         }
         draft_parked_ = false;
@@ -817,22 +783,13 @@ DFlashTarget * Qwen35Backend::dflash_target() {
 
 void Qwen35Backend::shutdown() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
-    clear_async_shadow(/*wait=*/true);
+    shadow_drafter_.reset();
     free_drafter();
     step_graph_destroy(sg_);
     step_graph_destroy(draft_sg_);
     step_graph_destroy(proj_sg_);
-    if (shadow_done_) {
-        ggml_backend_event_free(shadow_done_);
-        shadow_done_ = nullptr;
-    }
-    if (target_features_ready_) {
-        ggml_backend_event_free(target_features_ready_);
-        target_features_ready_ = nullptr;
-    }
     remote_draft_.close();
     draft_kv_free(draft_kv_);
-    draft_kv_free(shadow_draft_kv_);
     draft_feature_mirror_free(feature_mirror_);
     for (int i = 0; i < PREFIX_SLOTS; i++) {
         free_prefix_snapshot(prefix_snapshots_[i]);
@@ -843,10 +800,6 @@ void Qwen35Backend::shutdown() {
     if (split_gpus_ && draft_backend_) {
         ggml_backend_free(draft_backend_);
         draft_backend_ = nullptr;
-    }
-    if (shadow_backend_) {
-        ggml_backend_free(shadow_backend_);
-        shadow_backend_ = nullptr;
     }
     if (target_backend_) {
         ggml_backend_free(target_backend_);
@@ -862,7 +815,7 @@ void Qwen35Backend::shutdown() {
 // ── Release scratch buffers between requests ────────────────────────────
 
 void Qwen35Backend::release_scratch() {
-    clear_async_shadow(/*wait=*/false);
+    if (shadow_drafter_) shadow_drafter_->finish_request();
     // Target graph allocator: grows during large prefill batches, not needed
     // between requests. Will be lazily recreated on next build_target_step().
     if (sg_.alloc) {
@@ -891,9 +844,7 @@ void Qwen35Backend::release_scratch() {
 GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                             const DaemonIO & io) {
     GenerateResult result;
-    // An unused shadow must not delay the preceding response. Reap it here,
-    // before prefill can overwrite the shared feature history it may read.
-    clear_async_shadow(/*wait=*/true);
+    if (shadow_drafter_) shadow_drafter_->begin_request(req.prompt);
     DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
@@ -968,9 +919,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                                         const GenerateRequest & req,
                                                         const DaemonIO & io) {
     GenerateResult result;
-    // Restore and mirror synchronization mutate the same feature history read
-    // by a shadow left over from the preceding response.
-    clear_async_shadow(/*wait=*/true);
+    if (shadow_drafter_) shadow_drafter_->begin_request(req.prompt);
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
         result.fail(GenerateErrorCode::InvalidSnapshotSlot);
@@ -1926,23 +1875,6 @@ bool Qwen35Backend::sync_local_draft_features(int start_pos, int n_tokens) {
     return false;
 }
 
-void Qwen35Backend::clear_async_shadow(bool wait) {
-    const bool work_pending = shadow_in_flight_ || shadow_plan_pending_;
-    if (work_pending && wait && shadow_done_) {
-        ggml_backend_event_synchronize(shadow_done_);
-    }
-    const bool compute_done = !work_pending || wait ||
-        (shadow_done_ && ggml_backend_event_is_ready(shadow_done_));
-    if (compute_done) {
-        shadow_in_flight_ = false;
-        shadow_plan_pending_ = false;
-        shadow_reuse_allowed_ = false;
-        shadow_matched_branch_ = -1;
-        shadow_q_len_ = 0;
-        shadow_plan_ = {};
-    }
-}
-
 // ── DFlash speculative decode loop ─────────────────────────────────────
 
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
@@ -1957,14 +1889,19 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     const BudgetHook * budget_hook,
                                     bool * forced_close_out,
                                     bool * degenerate_close_out) {
+    struct ShadowRequestGuard {
+        Qwen35ShadowDrafter * worker;
+        ~ShadowRequestGuard() {
+            if (worker) worker->finish_request();
+        }
+    } shadow_request_guard{shadow_drafter_.get()};
+
     out_accept_rate = 0.0f;
     out_spec_ran    = false;
     // [TAG_DRAFT_KV] the drafter ring persists across requests but its rows
     // belong to the previous conversation; start every request empty (the
     // first begin_step bulk-appends the live window from the feature mirror).
-    clear_async_shadow(/*wait=*/true);
     if (draft_kv_.gf) draft_kv_reset(draft_kv_);
-    if (shadow_draft_kv_.gf) draft_kv_reset(shadow_draft_kv_);
     const int hidden = w_.n_embd;
 
     // First token: use the argmax that do_prefill already sampled and stored.
@@ -2067,19 +2004,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         !cfg_.device.is_tensor_parallel() &&
         cross_device_peer_memcpy_ok(cfg_.draft_gpu, cfg_.device.gpu);
     const bool async_shadow_enabled =
-        cfg_.async_shadow_batching && direct_draft_projection &&
-        shadow_backend_ && shadow_done_ && target_features_ready_ &&
+        cfg_.async_shadow_batching && shadow_drafter_ &&
         !sampled_verify && !cfg_.ddtree_mode && !use_remote_draft &&
         hint_tokens == nullptr && stall_tool_prefix_tokens == nullptr &&
-        !(budget_hook && !budget_hook->close_token_ids.empty()) &&
-        cache_.target_feat != nullptr;
-    const char * async_shadow_reuse_env =
-        std::getenv("DFLASH_ASYNC_SHADOW_REUSE");
-    const bool async_shadow_reuse =
-        !async_shadow_reuse_env || std::strcmp(async_shadow_reuse_env, "0") != 0;
+        !(budget_hook && !budget_hook->close_token_ids.empty());
     const bool async_shadow_debug =
         std::getenv("DFLASH_ASYNC_SHADOW_DEBUG") != nullptr;
-    const int shadow_top_k = cfg_.async_shadow_branches + 1;
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
@@ -2104,8 +2034,6 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     std::vector<int32_t> pos_q(q_len);
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;
-    std::vector<float>   shadow_top_lp;
-    std::vector<int32_t> shadow_top_ids;
 
     int n_generated     = 0;
     int n_draft_steps   = 0;
@@ -2113,17 +2041,6 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
-    int shadow_launches = 0;
-    int shadow_hits = 0;
-    int shadow_key_misses = 0;
-    int shadow_not_ready = 0;
-    int shadow_launch_skips = 0;
-    bool shadow_launches_disabled = false;
-    double shadow_ready_age_ms = 0.0;
-    double shadow_target_prefix_ms = 0.0;
-    double shadow_prepare_ms = 0.0;
-    double shadow_clone_wait_ms = 0.0;
-    double shadow_target_tail_wait_ms = 0.0;
     const ChainRollbackPolicy rollback_policy =
         resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel());
     const int fast_rollback_threshold =
@@ -2201,47 +2118,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             return ok;
         }
 
-        // A ready shadow is useful only for the exact fast-rollback outcome
-        // it predicted. Ordinary target verification remains authoritative.
-        bool used_shadow = false;
+        // A shadow proposal is consumed only for the exact target-authoritative
+        // endpoint it modeled. A miss or unfinished worker falls through to
+        // ordinary DFlash drafting without waiting.
+        const bool used_shadow = async_shadow_enabled &&
+            shadow_drafter_->try_take(committed, last_tok, draft_tok);
         ggml_tensor * draft_hidden_device = nullptr;
-        if (async_shadow_enabled && shadow_in_flight_) {
-            const bool ready = ggml_backend_event_is_ready(shadow_done_);
-            const int branch = async_shadow_reuse && shadow_reuse_allowed_ &&
-                shadow_matched_branch_ >= 0 &&
-                shadow_matched_branch_ < (int)shadow_plan_.candidates.size() &&
-                shadow_plan_.candidates[(size_t)shadow_matched_branch_].endpoint_pos ==
-                    committed &&
-                shadow_plan_.candidates[(size_t)shadow_matched_branch_].pending_token ==
-                    last_tok
-                    ? shadow_matched_branch_ : -1;
-            if (ready) {
-                shadow_ready_age_ms += std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - shadow_started_).count();
-            }
-            if (ready && branch >= 0 && shadow_q_len_ == q_len) {
-                auto * qtarget = static_cast<Qwen35DFlashTarget *>(target);
-                if (qtarget->project_device_hidden_to_topk(
-                        shadow_draft_kv_.hidden_states->data,
-                        cfg_.draft_gpu, q_len, shadow_top_k,
-                        /*temperature=*/1.0f,
-                        shadow_top_lp, shadow_top_ids)) {
-                    used_shadow = true;
-                    shadow_hits++;
-                }
-                clear_async_shadow(/*wait=*/true);
-            } else if (ready) {
-                shadow_key_misses++;
-                clear_async_shadow(/*wait=*/true);
-            } else {
-                // An unfinished result has missed the only deadline at which
-                // it could save this ordinary draft. Keep this fallback
-                // authoritative and stop admitting more shadow work for the
-                // request; HIP kernels cannot be cancelled cheaply.
-                shadow_not_ready++;
-                shadow_launches_disabled = true;
-            }
-        }
 
         if (!used_shadow) {
             // 1. Build noise input for draft
@@ -2280,35 +2162,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 const char * e = std::getenv("DFLASH_DRAFT_KV");
                 return !(e && e[0] == '0' && e[1] == '\0');
             }();
-            // Async shadows source their surrogate rows from this persistent
-            // output buffer. Keep the cached-KV graph active even when the
-            // legacy escape hatch disables it, so no request-local graph can
-            // be freed while a same-device source copy is queued.
-            bool use_draft_kv = feature_mirror_.target_feat != nullptr &&
-                (draft_kv_on || async_shadow_enabled);
+            bool use_draft_kv = draft_kv_on &&
+                feature_mirror_.target_feat != nullptr;
             if (use_draft_kv && draft_kv_.gf &&
                 draft_kv_.built_for != (const void *)&dw_) {
                 draft_kv_free(draft_kv_);
-                draft_kv_free(shadow_draft_kv_);
             }
             if (use_draft_kv && !draft_kv_.gf) {
                 const int kv_cap = std::min(ring_cap,
                     std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max));
-                const bool ordinary_ok = draft_kv_init(
-                    draft_kv_, dw_, draft_backend_, kv_cap, nullptr);
-                const bool shadow_ok = !async_shadow_enabled ||
-                    draft_kv_init(shadow_draft_kv_, dw_, shadow_backend_,
-                                  kv_cap, nullptr);
-                if (!ordinary_ok || !shadow_ok) {
+                if (!draft_kv_init(
+                        draft_kv_, dw_, draft_backend_, kv_cap, nullptr)) {
                     draft_kv_free(draft_kv_);
-                    draft_kv_free(shadow_draft_kv_);
-                    if (async_shadow_enabled) {
-                        std::fprintf(stderr,
-                            "spec-decode: async-shadow requires persistent "
-                            "draft-kv state\n");
-                        step_graph_destroy(draft_sg);
-                        return false;
-                    }
                     use_draft_kv = false;
                     std::fprintf(stderr,
                         "spec-decode: draft-kv init failed; using legacy draft path\n");
@@ -2414,56 +2279,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
             !use_remote_draft && q_len > 1 && tree_special_inactive;
 
-        AsyncShadowPlan launch_shadow_plan;
-
         // DDTree consumes top-K rows directly. Avoid projecting the same
         // hidden block once for argmax and again for top-K on every step.
         if (!use_tree_verify) {
             const auto profile_project_start = profile_start();
-            if (async_shadow_enabled) {
-                if (!used_shadow &&
-                    (!draft_hidden_device ||
-                     !static_cast<Qwen35DFlashTarget *>(target)->
-                         project_device_hidden_to_topk(
-                        draft_hidden_device->data, cfg_.draft_gpu,
-                        q_len, shadow_top_k,
-                        /*temperature=*/1.0f,
-                        shadow_top_lp, shadow_top_ids))) {
-                    std::fprintf(stderr,
-                        "spec-decode: async-shadow direct top-k projection failed\n");
-                    step_graph_destroy(draft_sg);
-                    return false;
-                }
-                if (shadow_top_ids.size() !=
-                    (size_t)q_len * (size_t)shadow_top_k) {
-                    std::fprintf(stderr,
-                        "spec-decode: async-shadow projection shape mismatch\n");
-                    step_graph_destroy(draft_sg);
-                    return false;
-                }
-                auto * qtarget = static_cast<Qwen35DFlashTarget *>(target);
-                if (!qtarget->read_projected_argmax(q_len, draft_tok)) {
-                    std::fprintf(stderr,
-                        "spec-decode: async-shadow argmax read failed\n");
-                    step_graph_destroy(draft_sg);
-                    return false;
-                }
-                if (q_len > fast_rollback_threshold) {
-                    launch_shadow_plan = plan_async_shadow_batch(
-                        shadow_top_lp, shadow_top_ids,
-                        q_len, shadow_top_k, cfg_.async_shadow_branches,
-                        fast_rollback_threshold, q_len, committed);
-                    if (async_shadow_debug &&
-                        !launch_shadow_plan.candidates.empty()) {
-                        std::fprintf(stderr,
-                            "[async-shadow-debug] plan base=%d depth=%d "
-                            "pending=%d margin=%.6f\n",
-                            committed, launch_shadow_plan.branch_depth,
-                            launch_shadow_plan.candidates.front().pending_token,
-                            launch_shadow_plan.confidence_margin);
-                    }
-                }
-            } else if (direct_draft_projection) {
+            if (!used_shadow && direct_draft_projection) {
                 if (!draft_hidden_device ||
                     !static_cast<Qwen35DFlashTarget *>(target)->
                         project_device_hidden_to_tokens(
@@ -2474,7 +2294,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     step_graph_destroy(draft_sg);
                     return false;
                 }
-            } else if (!target->project_hidden_to_tokens(
+            } else if (!used_shadow && !target->project_hidden_to_tokens(
                            local_hidden.data(), q_len, draft_tok)) {
                     std::fprintf(stderr, "spec-decode: projection failed\n");
                     step_graph_destroy(draft_sg);
@@ -2773,152 +2593,27 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             io.observer("draft", draft_tok);
         }
 
-        // Clone the authoritative Strix KV into an equal-layout shadow bank
-        // before target verification. The device-local copy overlaps the
-        // target prefix; later endpoint preparation uses the ordinary graph
-        // and slot ordering, preserving draft arithmetic topology.
-        if (async_shadow_enabled && !used_shadow && draft_hidden_device &&
-            !shadow_launches_disabled &&
-            need_commit_budget > 2 * q_len &&
-            committed + q_len <= draft_kv_.cap &&
-            !launch_shadow_plan.candidates.empty()) {
-            clear_async_shadow(/*wait=*/false);
-            if (!shadow_in_flight_ && !shadow_plan_pending_) {
-                if (draft_kv_clone_cache_async(
-                        draft_kv_, shadow_draft_kv_, draft_backend_,
-                        shadow_backend_)) {
-                    shadow_plan_ = launch_shadow_plan;
-                    shadow_q_len_ = q_len;
-                    shadow_plan_pending_ = true;
-                    shadow_reuse_allowed_ = false;
-                    shadow_matched_branch_ = -1;
-                    // The destination stream waits for every cache copy; this
-                    // event lets feature-ready preparation join only that work.
-                    ggml_backend_event_record(shadow_done_, shadow_backend_);
-                } else {
-                    shadow_launches_disabled = true;
-                    shadow_launch_skips++;
-                }
-            }
-        } else if (async_shadow_enabled && !used_shadow &&
-                   shadow_launches_disabled &&
-                   !launch_shadow_plan.candidates.empty()) {
-            shadow_launch_skips++;
+        // Start future endpoint work before the target verification begins.
+        // The AR worker owns only draft-device-local model/KV state and never
+        // widens this target batch. Failure or lateness is a no-wait cache miss.
+        if (async_shadow_enabled && need_commit_budget > 2 * q_len) {
+            shadow_drafter_->launch(
+                draft_tok, committed, fast_rollback_threshold);
         }
 
         // 4. Verify: snapshot KV, run target forward over draft tokens
         if (!target->snapshot_kv()) {
-            // A clone may already be queued for this round. A failed request
-            // must not leave its pending plan to be reaped implicitly later.
-            clear_async_shadow(/*wait=*/true);
             step_graph_destroy(draft_sg);
             return false;
         }
 
         int verify_last_tok = -1;
-        bool verify_ok = false;
-        auto * qtarget = static_cast<Qwen35DFlashTarget *>(target);
-        const bool marked_shadow_verify =
-            async_shadow_enabled && shadow_plan_pending_ &&
-            !shadow_plan_.candidates.empty();
-        if (marked_shadow_verify) {
-            const auto target_prefix_start =
-                std::chrono::steady_clock::now();
-            verify_ok = qtarget->verify_batch_async_until_features(
-                draft_tok, committed,
-                target_features_ready_,
-                /*capture_ssm_intermediates=*/true);
-            if (verify_ok) {
-                // The ordinary target tail is already queued behind this
-                // marker on the R9700 stream. Waiting only for the marker lets
-                // feature P2P/conversion and shadow submission overlap that
-                // tail without splitting or widening the verification graph.
-                ggml_backend_event_synchronize(target_features_ready_);
-                shadow_target_prefix_ms +=
-                    std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() -
-                        target_prefix_start).count();
-                const auto shadow_prepare_start =
-                    std::chrono::steady_clock::now();
-                const int future_count = shadow_plan_.branch_depth;
-                const int pending =
-                    shadow_plan_.candidates.front().pending_token;
-                if (future_count > 0 &&
-                    sync_local_draft_features(committed, future_count)) {
-                    // Cache cloning was queued before the target prefix. Join
-                    // it now, immediately before mutating the shadow inputs.
-                    const auto clone_wait_start =
-                        std::chrono::steady_clock::now();
-                    ggml_backend_event_synchronize(shadow_done_);
-                    shadow_clone_wait_ms +=
-                        std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() -
-                            clone_wait_start).count();
-                    noise_ids[0] = pending;
-                    for (int i = 1; i < q_len; ++i) {
-                        noise_ids[i] = target->mask_token_id();
-                    }
-                    const bool branch_ready =
-                        draft_kv_begin_step(
-                            shadow_draft_kv_, dw_, shadow_backend_,
-                            feature_mirror_, committed + future_count) &&
-                        target->embed_tokens(
-                            noise_ids.data(), q_len, noise_embed.data());
-                    if (branch_ready) {
-                        ggml_backend_tensor_set(
-                            shadow_draft_kv_.inp_embed,
-                            noise_embed.data(), 0,
-                            sizeof(float) * noise_embed.size());
-                        const ggml_status shadow_status =
-                            ggml_backend_graph_compute_async(
-                                shadow_backend_, shadow_draft_kv_.gf);
-                        if (shadow_status == GGML_STATUS_SUCCESS) {
-                            ggml_backend_event_record(
-                                shadow_done_, shadow_backend_);
-                            shadow_plan_pending_ = false;
-                            shadow_in_flight_ = true;
-                            shadow_reuse_allowed_ = false;
-                            shadow_matched_branch_ = -1;
-                            shadow_started_ =
-                                std::chrono::steady_clock::now();
-                            shadow_launches++;
-                        } else {
-                            std::fprintf(stderr,
-                                "spec-decode: exact async shadow compute failed "
-                                "(status=%d); continuing ordinary drafting\n",
-                                (int)shadow_status);
-                            shadow_plan_pending_ = false;
-                        }
-                    } else {
-                        shadow_plan_pending_ = false;
-                    }
-                } else {
-                    shadow_plan_pending_ = false;
-                }
-                shadow_prepare_ms +=
-                    std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() -
-                        shadow_prepare_start).count();
-            }
-            if (verify_ok) {
-                const auto target_tail_wait_start =
-                    std::chrono::steady_clock::now();
-                verify_ok = qtarget->finish_verify_batch(
-                    verify_last_tok, &target_tok);
-                shadow_target_tail_wait_ms +=
-                    std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() -
-                        target_tail_wait_start).count();
-            }
-        } else {
-            verify_ok = target->verify_batch(
-                draft_tok, committed, verify_last_tok, &target_tok,
-                /*capture_ssm_intermediates=*/true);
-        }
+        const bool verify_ok = target->verify_batch(
+            draft_tok, committed, verify_last_tok, &target_tok,
+            /*capture_ssm_intermediates=*/true);
         if (!verify_ok) {
             std::fprintf(stderr, "spec-decode: verify failed\n");
             target->restore_kv();
-            clear_async_shadow(/*wait=*/true);
             step_graph_destroy(draft_sg);
             return false;
         }
@@ -3073,17 +2768,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             target_forwards++;
         }
 
-        if (shadow_in_flight_) {
-            shadow_matched_branch_ = match_async_shadow_candidate(
-                shadow_plan_, committed + commit_n, replay_last_tok,
-                fast_rolled_back, commit_n);
-            shadow_reuse_allowed_ = shadow_matched_branch_ >= 0;
-        }
-
         // Build replay_tok for emitting committed tokens.
         std::vector<int32_t> replay_tok((size_t)commit_n);
         for (int i = 0; i < commit_n; i++) {
             replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
+        }
+        if (async_shadow_enabled) {
+            shadow_drafter_->resolve(
+                committed + commit_n, replay_last_tok,
+                fast_rolled_back, commit_n, replay_tok);
         }
 
         // 7. Sync features for replayed range to mirror (needed for next draft step)
@@ -3313,10 +3006,6 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (hit_eos) break;
     }
 
-    // Response completion never waits for an unused shadow. The graph and its
-    // shared-history read stay alive until the next request reaps it before
-    // prefill, or until park/shutdown synchronizes it.
-    clear_async_shadow(/*wait=*/false);
     step_graph_destroy(draft_sg);
 
     auto t_dec1 = std::chrono::steady_clock::now();
@@ -3346,22 +3035,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                      100.0 * (double)n_hint_accepted / (double)n_hint_proposed);
     }
     if (async_shadow_enabled) {
-        const bool deferred_reap = shadow_in_flight_ || shadow_plan_pending_;
+        const Qwen35ShadowStats stats = shadow_drafter_->stats();
         std::fprintf(stderr,
             "[async-shadow] launches=%d hits=%d key_misses=%d not_ready=%d "
-            "launch_skips=%d hit_rate=%.3f ready_age_ms=%.3f "
-            "draft_rows_saved=%d prefix_ms=%.3f prepare_ms=%.3f "
-            "clone_wait_ms=%.3f tail_wait_ms=%.3f deferred_reap=%d "
+            "launch_skips=%d hit_rate=%.3f draft_rows_saved=%d "
+            "shadow_compute_ms=%.3f "
             "target_verify_rows=%d response_wait_ms=0.000 "
-            "transport=direct-gpu-ring\n",
-            shadow_launches, shadow_hits, shadow_key_misses, shadow_not_ready,
-            shadow_launch_skips,
-            shadow_launches > 0
-                ? (double)shadow_hits / (double)shadow_launches : 0.0,
-            shadow_ready_age_ms, shadow_hits * q_len,
-            shadow_target_prefix_ms, shadow_prepare_ms,
-            shadow_clone_wait_ms, shadow_target_tail_wait_ms,
-            deferred_reap ? 1 : 0, q_len);
+            "transport=same-process-device host_staging=none\n",
+            stats.launches, stats.hits, stats.key_misses, stats.not_ready,
+            stats.launch_skips,
+            stats.launches > 0
+                ? (double)stats.hits / (double)stats.launches : 0.0,
+            stats.draft_rows_saved, stats.compute_ms, q_len);
     }
 
     io.emit(-1);

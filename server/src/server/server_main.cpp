@@ -111,9 +111,11 @@ static void print_usage(const char * prog) {
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
-        "  --async-shadow-batching  Draft likely next endpoints on a second GPU\n"
-        "                            while the target verifies (qwen35, local only)\n"
-        "  --async-shadow-branches <N>  Future alternatives (currently 1)\n"
+        "  --async-shadow-batching  Build a draft-side future outcome cache while\n"
+        "                            the target verifies (qwen35, local only)\n"
+        "  --async-shadow-model <path>  Small vocabulary-compatible qwen35 GGUF\n"
+        "                            for AR shadow drafting (required when enabled)\n"
+        "  --async-shadow-branches <N>  AR outcome alternatives (currently 1)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
         "                       trimmed per step by drafter confidence; N = fixed base)\n"
         "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
@@ -369,6 +371,8 @@ int main(int argc, char ** argv) {
             bargs.async_shadow_batching = true;
             bargs.fast_rollback = true;
             bargs.device.peer_access = true;
+        } else if (std::strcmp(argv[i], "--async-shadow-model") == 0 && i + 1 < argc) {
+            bargs.async_shadow_model = argv[++i];
         } else if (std::strcmp(argv[i], "--async-shadow-branches") == 0 && i + 1 < argc) {
             bargs.async_shadow_branches = std::atoi(argv[++i]);
             if (bargs.async_shadow_branches != 1) {
@@ -610,6 +614,18 @@ int main(int argc, char ** argv) {
         if (const char * e = std::getenv("DFLASH27B_DRAFT_SWA")) {
             bargs.draft_swa_window = std::atoi(e);
         }
+    }
+    if (bargs.async_shadow_batching && !bargs.async_shadow_model) {
+        std::fprintf(stderr,
+            "[server] --async-shadow-batching requires "
+            "--async-shadow-model <qwen35.gguf>\n");
+        return 2;
+    }
+    if (bargs.async_shadow_model && !bargs.async_shadow_batching) {
+        std::fprintf(stderr,
+            "[server] --async-shadow-model requires "
+            "--async-shadow-batching\n");
+        return 2;
     }
 
     // Ask the factory to resolve model/placement facts and apply its feature
@@ -1047,10 +1063,14 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  async_shadows   = %s",
                  bargs.async_shadow_batching ? "ON" : "off");
     if (bargs.async_shadow_batching) {
-        std::fprintf(stderr, " (%d branches, direct GPU ring)",
+        std::fprintf(stderr, " (%d AR outcome branch, same-process device stream)",
                      bargs.async_shadow_branches);
     }
     std::fprintf(stderr, "\n");
+    if (bargs.async_shadow_model) {
+        std::fprintf(stderr, "[server] │  shadow_model   = %s\n",
+                     bargs.async_shadow_model);
+    }
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
     if (bargs.device.is_layer_split()) {
         std::fprintf(stderr, "[server] │  split_rollback  = %s\n",

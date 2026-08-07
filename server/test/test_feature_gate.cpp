@@ -426,14 +426,21 @@ static void test_feature_warnings_report_inert_decode_tunables() {
     BackendArgs shadow;
     shadow.model_path = "/nonexistent/model.gguf";
     shadow.async_shadow_batching = true;
+    shadow.async_shadow_model = "/nonexistent/shadow.gguf";
     TEST_ASSERT(!warns_about(
         warn_result(shadow, "qwen35"), "--async-shadow-batching"));
+    TEST_ASSERT(!warns_about(
+        warn_result(shadow, "qwen35"), "--async-shadow-model"));
     TEST_ASSERT(warns_about(
         warn_result(shadow, "laguna"), "--async-shadow-batching"));
+    TEST_ASSERT(warns_about(
+        warn_result(shadow, "laguna"), "--async-shadow-model"));
     TEST_ASSERT(parse_placement_device_list(
         "cuda:0,cuda:1", shadow.device));
     TEST_ASSERT(warns_about(
         warn_result(shadow, "qwen35"), "--async-shadow-batching"));
+    TEST_ASSERT(warns_about(
+        warn_result(shadow, "qwen35"), "--async-shadow-model"));
 }
 
 static void test_feature_warnings_report_inert_moe_options() {

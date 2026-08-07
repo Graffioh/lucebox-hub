@@ -420,7 +420,6 @@ add_library(dflash_common STATIC
     src/common/pflash_drafter_ipc.cpp
     src/common/dflash_draft_graph.cpp
     src/common/dflash_draft_kv.cpp
-    src/common/async_shadow_batch.cpp
     src/common/dflash_spec_decode.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
@@ -445,6 +444,7 @@ add_library(dflash_common STATIC
     src/qwen35/qwen35_target_shard_ipc.cpp
     src/qwen35/qwen35_target_shard_ipc_daemon.cpp
     src/qwen35/layer_split_daemon.cpp
+    src/qwen35/qwen35_shadow_drafter.cpp
     src/qwen35/qwen35_backend.cpp
     src/qwen35/qwen35_tensor_parallel.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp

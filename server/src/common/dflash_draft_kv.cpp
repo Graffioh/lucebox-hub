@@ -318,26 +318,4 @@ bool draft_kv_begin_step(DraftKvState & st,
     return true;
 }
 
-bool draft_kv_clone_cache_async(const DraftKvState & src,
-                                DraftKvState & dst,
-                                ggml_backend_t src_backend,
-                                ggml_backend_t dst_backend) {
-    if (!src_backend || !dst_backend || !src.gf || !dst.gf ||
-        src.built_for != dst.built_for || src.cap != dst.cap ||
-        src.q_len != dst.q_len || src.kv_total != dst.kv_total ||
-        src.cache.k.size() != dst.cache.k.size() ||
-        src.cache.v.size() != dst.cache.v.size()) {
-        return false;
-    }
-    for (size_t il = 0; il < src.cache.k.size(); ++il) {
-        ggml_backend_tensor_copy_async(
-            src_backend, dst_backend, src.cache.k[il], dst.cache.k[il]);
-        ggml_backend_tensor_copy_async(
-            src_backend, dst_backend, src.cache.v[il], dst.cache.v[il]);
-    }
-    dst.slot_pos = src.slot_pos;
-    dst.next_pos = src.next_pos;
-    return true;
-}
-
 }  // namespace dflash::common

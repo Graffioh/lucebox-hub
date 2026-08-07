@@ -68,6 +68,7 @@ struct BackendArgs {
     float           ddtree_temp      = 1.0f;
     bool            ddtree_chain_seed = true;
     bool            async_shadow_batching = false;
+    const char *    async_shadow_model = nullptr;
     int             async_shadow_branches = 1;
     int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;

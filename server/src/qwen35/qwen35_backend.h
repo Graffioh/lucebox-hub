@@ -14,7 +14,6 @@
 #include "common/model_backend.h"
 #include "common/dflash_target.h"
 #include "common/dflash_draft_ipc.h"
-#include "common/async_shadow_batch.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "step_graph.h"
@@ -34,11 +33,11 @@
 #include <random>
 #include <string>
 #include <cstddef>
-#include <chrono>
 
 namespace dflash::common {
 
 class Qwen35TensorParallelContext;
+class Qwen35ShadowDrafter;
 
 // ── Configuration passed at construction ────────────────────────────────
 
@@ -72,6 +71,7 @@ struct Qwen35Config {
     float        ddtree_temp     = 1.0f;
     bool         ddtree_chain_seed = true;
     bool         async_shadow_batching = false;
+    const char * async_shadow_model = nullptr;
     int          async_shadow_branches = 1;
     bool         use_feature_mirror = false;
 };
@@ -225,7 +225,6 @@ private:
     // ── GPU backends ─────────────────────────────────────────────────
     ggml_backend_t target_backend_ = nullptr;
     ggml_backend_t draft_backend_  = nullptr;
-    ggml_backend_t shadow_backend_ = nullptr;
     ggml_backend_t snap_backend_   = nullptr;  // snapshot storage (CPU or unified)
     std::unique_ptr<Qwen35TensorParallelContext> tensor_parallel_;
     bool           split_gpus_     = false;
@@ -239,25 +238,13 @@ private:
     StepGraph      sg_;           // target forward (verify / prefill)
     StepGraph      draft_sg_;    // draft forward
     StepGraph      proj_sg_;     // lm-head projection (remote-lm-head mode)
-    ggml_backend_event_t shadow_done_ = nullptr;
-    ggml_backend_event_t target_features_ready_ = nullptr;
-    AsyncShadowPlan shadow_plan_;
-    bool           shadow_in_flight_ = false;
-    bool           shadow_plan_pending_ = false;
-    bool           shadow_reuse_allowed_ = false;
-    int            shadow_matched_branch_ = -1;
-    int            shadow_q_len_ = 0;
-    std::chrono::steady_clock::time_point shadow_started_{};
+    std::unique_ptr<Qwen35ShadowDrafter> shadow_drafter_;
 
     // ── Draft feature mirror (cross-GPU feature transfer) ────────────
     DraftFeatureMirror feature_mirror_;
     // [TAG_DRAFT_KV] drafter context-KV ring cache (lazy-init; kill with
     // DFLASH_DRAFT_KV=0). Shared module: common/dflash_draft_kv.h.
     DraftKvState draft_kv_;
-    // Same logical layout as draft_kv_. Its cache is cloned on the draft
-    // device while target verification runs, then advanced to one predicted
-    // exact endpoint without mutating the authoritative state.
-    DraftKvState shadow_draft_kv_;
     DFlashDraftIpcClient remote_draft_;
 
     // ── Prefix cache (snapshots) ─────────────────────────────────────
@@ -338,7 +325,6 @@ private:
 
     bool sync_remote_draft_features(int start_pos, int n_tokens);
     bool sync_local_draft_features(int start_pos, int n_tokens);
-    void clear_async_shadow(bool wait);
 
     // Chain-mode verify (single batch of q_len tokens).
     int verify_chain(int committed, const int32_t * draft_tok, int q_len);
