@@ -4848,7 +4848,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // SM86 always uses the regular MMQ iteration width. MXFP4 only switches
     // to MMQ_ITER_K_MXFP4_FP4 in the Blackwell device path.
     const int iter_k = MMQ_ITER_K;
-    const bool enable_useful_chunk_cap = cc == 860; // NVIDIA SM86 only; fail closed elsewhere.
+    const bool enable_useful_chunk_cap = (cc == 860); // NVIDIA SM86 only; fail closed elsewhere.
     const int stream_k_blocks = mmq_stream_k_nblocks(
         ntiles_dst, nsm, args.ncols_x, iter_k, GGML_CUDA_CC_IS_NVIDIA(cc), enable_useful_chunk_cap);
     const dim3 block_nums_stream_k(stream_k_blocks, 1, 1);
