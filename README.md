@@ -351,6 +351,8 @@ When compression is on, the request path picks one of three modes automatically,
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
 | `--kv-cache-budget N` | — | On-disk cache size cap |
 | `--paged-attention` | off | Exact 16-token block-table decode for single-device Qwen3.6-27B AR; see [paged attention](optimizations/paged_attention/README.md) |
+| `--max-concurrency N` | `1` | Maximum concurrent AR decode sequences; requires `--paged-attention` |
+| `--kv-pool-tokens N` | auto | Shared paged K/V pool size in tokens; rounded to 16-token blocks |
 
 **Bounded KV residency (KVFlash)**
 
