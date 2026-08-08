@@ -390,6 +390,7 @@ add_library(dflash_common STATIC
     # DeepSeek V4 Flash target arch
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
+    src/deepseek4/deepseek4_roctx.cpp
     src/deepseek4/deepseek4_backend.cpp
     src/deepseek4/deepseek4_daemon.cpp
     src/deepseek4/deepseek4_layer_split_adapter.cpp
@@ -757,6 +758,8 @@ target_link_libraries(dflash_common
         ${DFLASH27B_GGML_BACKEND_TARGET}
         ggml-base
         nlohmann_json::nlohmann_json
+    PRIVATE
+        ${CMAKE_DL_LIBS}
 )
 # OpenMP for parallel MoE expert compute kernel (saturate memory bandwidth).
 find_package(OpenMP)
@@ -1017,6 +1020,23 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_deepseek4_unit PRIVATE hip::host)
         endif()
         list(APPEND _raw_unit_test_targets test_deepseek4_unit)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_roctx.cpp")
+        add_executable(test_deepseek4_roctx
+            test/test_deepseek4_roctx.cpp
+            src/deepseek4/deepseek4_roctx.cpp
+            src/common/target_shard_ipc_daemon.cpp)
+        target_include_directories(test_deepseek4_roctx PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_deepseek4_roctx PRIVATE
+                DFLASH27B_BACKEND_HIP=1)
+        endif()
+        if(NOT WIN32)
+            set_target_properties(test_deepseek4_roctx PROPERTIES ENABLE_EXPORTS ON)
+        endif()
+        target_link_libraries(test_deepseek4_roctx PRIVATE ${CMAKE_DL_LIBS})
+        list(APPEND _raw_unit_test_targets test_deepseek4_roctx)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ggml_rmsnorm_batch.cpp")
         add_executable(test_ggml_rmsnorm_batch test/test_ggml_rmsnorm_batch.cpp)
