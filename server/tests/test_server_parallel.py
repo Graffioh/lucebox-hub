@@ -166,6 +166,7 @@ class ParallelTestSuite:
 
     def _nonstream_worker(self, idx: int, prompt: str, max_tokens: int,
                           results: list, barrier: threading.Barrier | None = None,
+                          start_delay: float = 0.0,
                           timeout: float = 600.0):
         """Run one non-streaming chat completion."""
         r = {"ok": False, "error": None, "content": "", "reasoning": "",
@@ -174,6 +175,8 @@ class ParallelTestSuite:
         try:
             if barrier is not None:
                 barrier.wait(timeout=60)
+            if start_delay > 0:
+                time.sleep(start_delay)
             resp = self._req("POST", "/v1/chat/completions",
                              self._chat_body(prompt, max_tokens, stream=False),
                              timeout=timeout)
@@ -398,6 +401,52 @@ class ParallelTestSuite:
                         f"reasoning={r['reasoning'][:200]!r}")
         print(f"    → {count} requests completed in {elapsed:.1f}s")
 
+    def test_unequal_prefill_staging_leases(self):
+        """A multi-chunk prefill must keep its staging identity after an
+        earlier short prefill commits and leaves the FIFO head."""
+        print("\n[PAR-5] Unequal prefills retain isolated staging state")
+        if self.parallel < 2:
+            self._skip("unequal prefill staging lease",
+                       "--max-concurrency 1: multiple staging sets unavailable")
+            return
+
+        short_prompt = "What is 55+56? Answer with just the number."
+        filler = "\n".join(
+            f"record {i}: alpha beta gamma delta epsilon zeta eta theta"
+            for i in range(360))
+        long_prompt = (
+            f"Read and then ignore these padding records:\n{filler}\n"
+            "What is 4500+4501? Answer with just the number.")
+
+        # Both requests land inside the server's burst-coalescing window, but
+        # the small delay makes the short request the older FIFO admission.
+        # It should finish first while the long request retains staging set 1.
+        kwargs = [
+            {"prompt": short_prompt, "max_tokens": 512,
+             "start_delay": 0.0},
+            {"prompt": long_prompt, "max_tokens": 512,
+             "start_delay": 0.001},
+        ]
+        results = self._run_workers(
+            self._nonstream_worker, 2, kwargs, join_timeout=1800.0)
+        if not self._all_completed(results, "unequal-prefill"):
+            return
+
+        self._check(
+            "short prefill answers 111",
+            contains_number(self._combined(results[0]), "111"),
+            f"content={results[0]['content']!r}")
+        self._check(
+            "long prefill answers 9001 after the short prefill commits",
+            contains_number(self._combined(results[1]), "9001"),
+            f"content={results[1]['content']!r} "
+            f"reasoning={results[1]['reasoning'][:200]!r}")
+        long_prompt_tokens = results[1]["usage"].get("prompt_tokens", 0)
+        self._check(
+            "long prompt crosses the 2048-token initial prefill chunk",
+            long_prompt_tokens > 2048,
+            f"usage={results[1]['usage']}")
+
     def test_parallel_prefill_no_pause(self):
         """A long admission must not pause a stream that is already decoding."""
         n = self.parallel
@@ -489,6 +538,7 @@ class ParallelTestSuite:
         self.test_parallel_isolation()
         self.test_parallel_nonstream()
         self.test_parallel_more_than_slots()
+        self.test_unequal_prefill_staging_leases()
         self.test_parallel_prefill_no_pause()
 
         print("\n" + "=" * 60)

@@ -1,24 +1,10 @@
-// Host-side test for the SeqEngine contract checker (seq_engine_contract.h).
-//
-// Two jobs, and the second is the one that matters:
-//
-//   1. FakeSeqEngine, a conforming in-memory engine, passes the checker. It
-//      doubles as the reference a new backend can read to see what admit /
-//      step / retire owe the scheduler, with no GPU.
-//   2. Every deliberately broken variant of it is REJECTED, with the expected
-//      violation named. Without this half, a checker that returned an empty
-//      list unconditionally would still "pass" — the mutants are what make
-//      its assertions load-bearing.
-//
-// No model, ggml, or GPU. Run it against a real engine (Qwen3.5's or a new
-// backend's) by calling check_seq_engine_contract() from a GPU-side test.
+// Host-only mutation test for the model-neutral SeqEngine contract.
 
 #include "seq_engine_contract.h"
 #include "host_check.h"
 
+#include <algorithm>
 #include <cstdio>
-#include <cstdlib>
-#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -26,200 +12,336 @@ using namespace dflash::common;
 
 static int g_checks = 0;
 
-// Each flag breaks exactly one clause of the contract; the default (all
-// false) is the conforming engine.
 struct Faults {
-    bool hard_error_when_full       = false; // busy condition reports false
-    bool reuse_live_slot            = false; // hands slot 0 to every request
-    bool drop_one_output            = false; // answers n-1 decode inputs
-    bool pause_decode_during_prefill = false; // omits live decode outputs
-    bool accept_partial_batch       = false; // steps a batch missing a slot
-    bool retire_leaks               = false; // retire() never frees the slot
-    bool keeps_stale_outputs        = false; // appends to `outputs` as-is
+    bool hard_error_when_full = false;
+    bool reuse_live_slot = false;
+    bool drop_decode_output = false;
+    bool serialize_prefills = false;
+    bool accept_omitted_decode = false;
+    bool accept_invalid_prefill = false;
+    bool block_forever = false;
+    bool lose_other_pending = false;
+    bool overconsume_prefill = false;
+    bool drop_second_completion = false;
+    bool retire_leaks = false;
 };
 
-// ── A conforming SeqEngine with no model behind it ──────────────────────
-//
-// Slots hold nothing but a fed-token log; the "sampler" is arithmetic.
+struct FakeCapabilities {
+    StepPlanLimits idle{2, 2, 4};
+    StepPlanLimits mixed{2, 1, 2};
+};
+
 class FakeSeqEngine final : public SeqEngine {
 public:
-    explicit FakeSeqEngine(int slots, Faults faults = Faults())
-        : faults_(faults),
-          active_((size_t)slots, false),
-          fed_((size_t)slots) {}
+    explicit FakeSeqEngine(int count, Faults faults = {},
+                           FakeCapabilities capabilities = {})
+        : slots_((size_t)count), faults_(faults),
+          capabilities_(capabilities) {}
 
-    int slot_count() const override { return (int)active_.size(); }
+    int slot_count() const override { return (int)slots_.size(); }
     int max_context() const override { return 128; }
+    StepPlanLimits step_plan_limits(int decode_rows) const override {
+        return decode_rows > 0 ? capabilities_.mixed : capabilities_.idle;
+    }
+    bool token_is_eos(int32_t token) const override { return token == 2; }
 
-    bool token_is_eos(int32_t token) const override { return token == kEos; }
-
-    bool prefill_pending() const override { return pending_slot_ >= 0; }
-
-    AdmitResult admit(uint64_t request_id,
-                      const std::vector<int32_t> & prompt,
-                      const SamplerCfg &) override {
-        (void)request_id;
-        AdmitResult r;
-        if (prompt.empty() || prompt.size() > (size_t)max_context()) {
-            r.error = "invalid request";   // hard error: retrying cannot help
-            return r;
+    bool prefill_pending() const override {
+        for (const Slot & slot : slots_) {
+            if (slot.active && slot.prefilling) return true;
         }
-        if (pending_slot_ >= 0) {
-            r.busy = !faults_.hard_error_when_full;
-            r.error = "one prefill is already pending";
-            return r;
-        }
-        int slot = -1;
-        if (faults_.reuse_live_slot) {
-            slot = 0;
-        } else {
-            for (size_t i = 0; i < active_.size(); i++) {
-                if (!active_[i]) { slot = (int)i; break; }
-            }
-        }
-        if (slot < 0) {
-            r.busy  = !faults_.hard_error_when_full;
-            r.error = "all slots are live";
-            return r;
-        }
-        active_[(size_t)slot] = true;
-        fed_[(size_t)slot].clear();
-        pending_slot_ = slot;
-        prefill_steps_left_ = 2;
-        r.ok = true;
-        r.slot = slot;
-        return r;
+        return false;
     }
 
-    bool step(const std::vector<StepInput> & inputs,
-              std::vector<StepOutput> & outputs) override {
-        if (!faults_.keeps_stale_outputs) outputs.clear();
-        if (!faults_.accept_partial_batch &&
-            (int)inputs.size() != decoding_count()) {
-            return false;   // never advance state for a slot we were not given
-        }
-        if (inputs.empty() && pending_slot_ < 0) return true;
-        size_t emit = inputs.size();
-        if (faults_.drop_one_output && emit > 0) emit--;
-        if (faults_.pause_decode_during_prefill && pending_slot_ >= 0) {
-            emit = 0;
-        }
-        for (size_t i = 0; i < emit; i++) {
-            const StepInput & in = inputs[i];
-            StepOutput out;
-            out.slot = in.slot;
-            if (in.slot < 0 || in.slot >= slot_count() ||
-                !active_[(size_t)in.slot] || in.token < 0) {
-                out.failed = true;
-                outputs.push_back(out);
-                continue;
-            }
-            fed_[(size_t)in.slot].push_back(in.token);
-            out.token  = kFirstToken + in.slot +
-                         (int32_t)fed_[(size_t)in.slot].size();
-            outputs.push_back(out);
+    AdmitResult admit(uint64_t,
+                      const std::vector<int32_t> & prompt,
+                      const SamplerCfg &) override {
+        AdmitResult result;
+        if (prompt.empty() || prompt.size() > (size_t)max_context()) {
+            result.error = "invalid prompt";
+            return result;
         }
 
-        if (pending_slot_ >= 0 && --prefill_steps_left_ == 0) {
-            const int slot = pending_slot_;
-            pending_slot_ = -1;
-            StepOutput out;
-            out.slot = slot;
-            out.token = kFirstToken + slot;
-            out.prefill_done = true;
-            outputs.push_back(out);
+        int chosen = -1;
+        if (faults_.reuse_live_slot) {
+            chosen = 0;
+        } else {
+            for (size_t i = 0; i < slots_.size(); ++i) {
+                if (!slots_[i].active) {
+                    chosen = (int)i;
+                    break;
+                }
+            }
+        }
+        if (chosen < 0) {
+            result.busy = !faults_.hard_error_when_full;
+            result.error = "all slots are live";
+            return result;
+        }
+
+        Slot & slot = slots_[(size_t)chosen];
+        slot.active = true;
+        slot.prefilling = true;
+        slot.remaining = (int)prompt.size();
+        slot.fed.clear();
+        result.ok = true;
+        result.slot = chosen;
+        return result;
+    }
+
+    StepResult step(const StepPlan & plan) override {
+        StepResult result;
+        std::string validation_error;
+        if (!valid_decode(plan, validation_error) &&
+            !faults_.accept_omitted_decode) {
+            result.status = StepResult::Status::failed;
+            result.error = validation_error;
+            return result;
+        }
+        if (!valid_prefills(plan, validation_error) &&
+            !faults_.accept_invalid_prefill) {
+            result.status = StepResult::Status::failed;
+            result.error = validation_error;
+            return result;
+        }
+
+        if (!plan.prefills.empty() &&
+            (faults_.block_forever || !blocked_once_)) {
+            blocked_once_ = true;
+            result.status = StepResult::Status::resource_blocked;
+            result.error = "transient staging contention";
+            return result;
+        }
+
+        size_t decode_count = plan.decode.size();
+        if (faults_.drop_decode_output && decode_count > 0) --decode_count;
+        for (size_t i = 0; i < decode_count; ++i) {
+            const StepInput & input = plan.decode[i];
+            if (input.slot < 0 || input.slot >= slot_count()) continue;
+            Slot & slot = slots_[(size_t)input.slot];
+            slot.fed.push_back(input.token);
+            result.outputs.push_back({
+                input.slot,
+                100 + input.slot + (int32_t)slot.fed.size(),
+                false,
+                {},
+                false,
+            });
+        }
+
+        std::vector<int> completed_this_step;
+        for (size_t i = 0; i < plan.prefills.size(); ++i) {
+            if (faults_.serialize_prefills && i > 0) continue;
+            const PrefillSlice & slice = plan.prefills[i];
+            if (slice.slot < 0 || slice.slot >= slot_count()) continue;
+            Slot & slot = slots_[(size_t)slice.slot];
+            if (!slot.active || !slot.prefilling || slot.remaining <= 0) {
+                continue;
+            }
+            int consumed = std::min(slice.max_tokens, slot.remaining);
+            if (faults_.overconsume_prefill) consumed = slice.max_tokens + 1;
+            result.prefill_progress.push_back({slice.slot, consumed});
+            slot.remaining -= consumed;
+            if (slot.remaining <= 0) {
+                slot.prefilling = false;
+                completed_this_step.push_back(slice.slot);
+                const bool omit = faults_.drop_second_completion && i > 0;
+                if (!omit) {
+                    result.outputs.push_back({
+                        slice.slot,
+                        100 + slice.slot,
+                        false,
+                        {},
+                        true,
+                    });
+                }
+            }
+        }
+
+        if (faults_.lose_other_pending && !completed_this_step.empty()) {
+            for (Slot & slot : slots_) {
+                if (slot.active && slot.prefilling) slot.prefilling = false;
+            }
+        }
+
+        if (!result.outputs.empty() || !result.prefill_progress.empty()) {
+            result.status = StepResult::Status::progressed;
+        } else if (plan.decode.empty() && plan.prefills.empty()) {
+            result.status = StepResult::Status::idle;
+        } else {
+            result.status = StepResult::Status::resource_blocked;
+            result.error = "no logical row progressed";
+        }
+        return result;
+    }
+
+    void retire(int slot) override {
+        if (slot < 0 || slot >= slot_count() || faults_.retire_leaks) return;
+        slots_[(size_t)slot] = Slot{};
+    }
+
+private:
+    struct Slot {
+        bool active = false;
+        bool prefilling = false;
+        int remaining = 0;
+        std::vector<int32_t> fed;
+    };
+
+    int decoding_count() const {
+        int count = 0;
+        for (const Slot & slot : slots_) {
+            if (slot.active && !slot.prefilling) ++count;
+        }
+        return count;
+    }
+
+    bool valid_decode(const StepPlan & plan, std::string & error) const {
+        std::vector<bool> seen(slots_.size(), false);
+        if ((int)plan.decode.size() != decoding_count()) {
+            error = "plan omits a decoding slot";
+            return false;
+        }
+        for (const StepInput & input : plan.decode) {
+            if (input.slot < 0 || input.slot >= slot_count() ||
+                seen[(size_t)input.slot] || input.token < 0 ||
+                !slots_[(size_t)input.slot].active ||
+                slots_[(size_t)input.slot].prefilling) {
+                error = "invalid decode input";
+                return false;
+            }
+            seen[(size_t)input.slot] = true;
+        }
+        for (int slot = 0; slot < slot_count(); ++slot) {
+            if (slots_[(size_t)slot].active &&
+                !slots_[(size_t)slot].prefilling &&
+                !seen[(size_t)slot]) {
+                error = "plan omits a decoding slot";
+                return false;
+            }
         }
         return true;
     }
 
-    void retire(int slot) override {
-        if (slot < 0 || slot >= slot_count()) return;
-        if (faults_.retire_leaks) return;
-        if (pending_slot_ == slot) {
-            pending_slot_ = -1;
-            prefill_steps_left_ = 0;
+    bool valid_prefills(const StepPlan & plan, std::string & error) const {
+        const StepPlanLimits limits =
+            step_plan_limits((int)plan.decode.size());
+        const int token_limit = limits.max_prefill_tokens_per_sequence;
+        if ((int)plan.prefills.size() > limits.max_prefill_sequences) {
+            error = "too many prefills";
+            return false;
         }
-        active_[(size_t)slot] = false;
-        fed_[(size_t)slot].clear();
+        std::vector<bool> seen(slots_.size(), false);
+        int total_tokens = 0;
+        for (const PrefillSlice & slice : plan.prefills) {
+            if (slice.slot < 0 || slice.slot >= slot_count() ||
+                seen[(size_t)slice.slot] || slice.max_tokens <= 0 ||
+                slice.max_tokens > token_limit ||
+                !slots_[(size_t)slice.slot].active ||
+                !slots_[(size_t)slice.slot].prefilling) {
+                error = "invalid prefill slice";
+                return false;
+            }
+            seen[(size_t)slice.slot] = true;
+            total_tokens += slice.max_tokens;
+            if (total_tokens > limits.max_prefill_tokens_total) {
+                error = "too many total prefill tokens";
+                return false;
+            }
+        }
+        return true;
     }
 
-private:
-    static constexpr int32_t kEos        = 2;
-    static constexpr int32_t kFirstToken = 100;   // generated ids never hit EOS
-
-    int decoding_count() const {
-        int n = 0;
-        for (bool active : active_) n += active ? 1 : 0;
-        return n - (pending_slot_ >= 0 ? 1 : 0);
-    }
-
-    Faults                            faults_;
-    std::vector<bool>                 active_;
-    std::vector<std::vector<int32_t>> fed_;
-    int                               pending_slot_ = -1;
-    int                               prefill_steps_left_ = 0;
+    std::vector<Slot> slots_;
+    Faults faults_;
+    FakeCapabilities capabilities_;
+    bool blocked_once_ = false;
 };
 
 static void print_violations(const char * label,
-                             const std::vector<std::string> & v) {
-    for (const std::string & s : v) {
-        std::fprintf(stderr, "  [%s] %s\n", label, s.c_str());
+                             const std::vector<std::string> & violations) {
+    for (const std::string & violation : violations) {
+        std::fprintf(stderr, "  [%s] %s\n", label, violation.c_str());
     }
 }
 
-static bool mentions(const std::vector<std::string> & v,
-                     const std::string & needle) {
-    for (const std::string & s : v) {
-        if (s.find(needle) != std::string::npos) return true;
-    }
-    return false;
+static bool mentions(const std::vector<std::string> & violations,
+                     const char * needle) {
+    return std::any_of(
+        violations.begin(), violations.end(),
+        [&](const std::string & violation) {
+            return violation.find(needle) != std::string::npos;
+        });
 }
 
 int main() {
-    // ── A conforming engine passes, at several slot counts ──────────────
-    // slot_count()==1 matters on its own: the checker must not depend on
-    // there being a second slot to omit from a batch.
-    for (const int slots : {1, 2, 4, 8}) {
+    for (const int slots : {2, 4}) {
         FakeSeqEngine engine(slots);
-        const std::vector<std::string> v = check_seq_engine_contract(engine);
-        if (!v.empty()) print_violations("conforming", v);
-        CHECK(v.empty());
+        const auto violations = check_seq_engine_contract(engine);
+        if (!violations.empty()) print_violations("conforming", violations);
+        CHECK(violations.empty());
     }
 
-    // ── Every broken clause is caught, and named ────────────────────────
+    {
+        FakeCapabilities capabilities;
+        capabilities.idle = {1, 2, 2};
+        capabilities.mixed = {1, 1, 1};
+        FakeSeqEngine engine(2, {}, capabilities);
+        const auto violations = check_seq_engine_contract(engine);
+        if (!violations.empty()) print_violations("conforming-k1", violations);
+        CHECK(violations.empty());
+    }
+
+    {
+        FakeCapabilities capabilities;
+        capabilities.idle = {2, 2, 2};
+        capabilities.mixed = {1, 1, 1};
+        FakeSeqEngine engine(2, {}, capabilities);
+        const auto violations = check_seq_engine_contract(engine);
+        if (!violations.empty()) {
+            print_violations("conforming-width-dependent", violations);
+        }
+        CHECK(violations.empty());
+    }
+
     struct Case {
         const char * label;
-        bool Faults::*broken;   // the one clause this variant violates
-        const char * expect;    // substring of the violation it must produce
+        bool Faults::*fault;
+        const char * expected;
     };
     const Case cases[] = {
-        {"hard-error-when-full", &Faults::hard_error_when_full,
-         "must report busy=true"},
-        {"reuse-live-slot", &Faults::reuse_live_slot,
-         "reused a slot that is live"},
-        {"drop-one-output", &Faults::drop_one_output,
-         "one output per input"},
-        {"pause-decode-during-prefill", &Faults::pause_decode_during_prefill,
-         "prefill step left a decoding slot without an output"},
-        {"accept-partial-batch", &Faults::accept_partial_batch,
-         "omits a live slot"},
-        {"retire-leaks", &Faults::retire_leaks,
-         "after a retire() freed a slot"},
-        {"keeps-stale-outputs", &Faults::keeps_stale_outputs,
-         "must clear `outputs`"},
+        {"hard-error-full", &Faults::hard_error_when_full, "full engine"},
+        {"reuse-live", &Faults::reuse_live_slot, "reused a live slot"},
+        {"drop-decode", &Faults::drop_decode_output, "without an output"},
+        {"serialize-prefill", &Faults::serialize_prefills,
+         "selected prefill without progress"},
+        {"accept-omitted", &Faults::accept_omitted_decode,
+         "omits a decoding slot"},
+        {"accept-invalid-prefill", &Faults::accept_invalid_prefill,
+         "prefill work for a decoding slot"},
+        {"block-forever", &Faults::block_forever,
+         "no-progress must be bounded"},
+        {"lose-pending", &Faults::lose_other_pending,
+         "unfinished long prompt"},
+        {"overconsume", &Faults::overconsume_prefill,
+         "exceeded its selected slice"},
+        {"scalar-completion", &Faults::drop_second_completion,
+         "prefill_done disagrees"},
+        {"retire-leak", &Faults::retire_leaks,
+         "succeed while a slot is free"},
     };
-    for (const Case & c : cases) {
+
+    for (const Case & test : cases) {
         Faults faults;
-        faults.*c.broken = true;
-        FakeSeqEngine engine(4, faults);
-        const std::vector<std::string> v = check_seq_engine_contract(engine);
-        if (!mentions(v, c.expect)) {
+        faults.*test.fault = true;
+        FakeSeqEngine engine(2, faults);
+        const auto violations = check_seq_engine_contract(engine);
+        if (!mentions(violations, test.expected)) {
             std::fprintf(stderr,
-                         "FAIL %s: expected a violation mentioning \"%s\"\n",
-                         c.label, c.expect);
-            print_violations(c.label, v);
+                         "FAIL %s: expected violation containing '%s'\n",
+                         test.label, test.expected);
+            print_violations(test.label, violations);
         }
-        CHECK(mentions(v, c.expect));
+        CHECK(mentions(violations, test.expected));
     }
 
     std::printf("test_seq_engine_contract: %d checks passed\n", g_checks);

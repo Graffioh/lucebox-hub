@@ -37,9 +37,17 @@ public:
     // `pool` and `backend` must outlive the engine. `scratch_row` is the
     // first row of the block appended past the pool's index space, used as
     // the K/V write destination of graph-bucket padding rows.
+    // `max_prefills` controls how many prefills can advance per step()
+    // (each uses its own staging set; must match the count allocated in
+    // TargetCache).
     Qwen35SeqEngine(Qwen35Backend & backend, PagedKvPool & pool,
-                    int max_ctx, int64_t scratch_row)
-        : b_(backend), slots_(pool, max_ctx), scratch_row_(scratch_row) {}
+                    int max_ctx, int64_t scratch_row,
+                    int max_prefills = 2)
+        : max_prefills_(std::max(1, max_prefills)), b_(backend),
+          slots_(pool, max_ctx), scratch_row_(scratch_row) {
+        pending_.resize(slots_.slot_count());
+        prefill_slots_.reserve((size_t)slots_.slot_count());
+    }
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
@@ -48,20 +56,32 @@ public:
                       const std::vector<int32_t> & prompt,
                       const SamplerCfg & sampler) override;
 
-    bool step(const std::vector<StepInput> & inputs,
-              std::vector<StepOutput> & outputs) override;
+    StepResult step(const StepPlan & plan) override;
+    StepPlanLimits step_plan_limits(int decode_rows) const override {
+        const int per_sequence = decode_rows > 0 ? 512 : 2048;
+        return {
+            max_prefills_,
+            per_sequence,
+            max_prefills_ * per_sequence,
+        };
+    }
 
     bool prefill_pending() const override {
-        return pending_prefill_.has_value();
+        for (const auto & p : pending_)
+            if (p) return true;
+        return false;
     }
 
     void retire(int slot) override;
 
     bool token_is_eos(int32_t token) const override;
 
+
 private:
     struct PendingPrefill {
         int slot = -1;
+        // Leased at admission and retained until completion/failure/retire.
+        int staging_idx = -1;
         std::vector<int32_t> prompt;
         int progress = 0;
     };
@@ -71,25 +91,51 @@ private:
         int kv_pos = 0;
         int chunk = 0;
         bool commit = false;
+        int staging_idx = 0;
         std::vector<int64_t> rows;
         std::vector<float> embeddings;
     };
 
-    std::optional<PendingPrefill> pending_prefill_;
+    std::vector<std::optional<PendingPrefill>> pending_;
+    int max_prefills_;
 
     bool upload_block_table_delta(int slot, int first_block,
                                   const int32_t * blocks, size_t count);
-    void fail_pending_prefill(std::vector<StepOutput> & outputs,
+    void fail_pending_prefill(int slot, std::vector<StepOutput> & outputs,
                               const char * log_message,
                               const char * client_message);
-    PrefillStage stage_prefill_chunk(std::vector<StepOutput> & outputs);
+    PrefillStage stage_prefill_chunk(int slot, int max_tokens,
+                                     int staging_idx,
+                                     std::vector<StepOutput> & outputs);
+    bool run_prefill_graph(const PrefillStage & prefill, int prefill_slot,
+                          std::vector<StepOutput> & outputs);
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
                              std::vector<float> * logits_scratch = nullptr);
 
     Qwen35Backend & b_;
     SeqSlotManager  slots_;
-    int64_t         scratch_row_ = 0;   // bucket-padding KV write destination
+    int64_t         scratch_row_ = 0;
+
+    // Hoisted per-step buffers (reused across step() calls).
+    std::vector<int>         prefill_slots_;
+    std::vector<int>         prefill_token_limits_;
+    std::vector<int>         output_rows_;
+    std::vector<int32_t>     live_tokens_;
+    std::vector<int32_t>     live_positions_;
+    std::vector<int64_t>     live_physical_rows_;
+    std::vector<int32_t>     live_slot_ids_;
+    std::vector<int32_t>     dec_tokens_;
+    std::vector<int32_t>     dec_pos_;
+    std::vector<int64_t>     dec_rows_;
+    std::vector<int32_t>     active_slot_ids_;
+    std::vector<int32_t>     state_slot_ids_;
+    std::vector<int32_t>     seq_lens_;
+    std::vector<float>       embed_buf_;
+    std::vector<int32_t>     pos_buf_;
+    std::vector<int64_t>     rows_buf_;
+    std::vector<int32_t>     argmax_buf_;
+    std::vector<float>       logits_buf_;
 };
 
 }  // namespace dflash::common

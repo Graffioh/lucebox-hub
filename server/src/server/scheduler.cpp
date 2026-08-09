@@ -9,6 +9,8 @@
 // matching wire formats.
 
 #include "http_server.h"
+#include "common/seq_batch_plan.h"
+#include "common/seq_step_validation.h"
 
 #include <algorithm>
 #include <chrono>
@@ -30,6 +32,7 @@ struct SchedSlot {
     SocketHandle fd = kInvalidSocket;
     std::unique_ptr<SseEmitter> emitter;
     bool prefilling = false;
+    uint64_t admission_order = 0;
     std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
     double prefill_s = 0.0;
@@ -70,6 +73,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     const int n_slots = engine.slot_count();
     std::vector<SchedSlot> slots((size_t)n_slots);
     uint64_t next_request_id = 1;
+    uint64_t next_admission_order = 0;
+    const StepPlanPolicy step_policy{
+        config_.prefill_quantum,
+        config_.prefill_token_budget,
+        config_.mixed_prefill_token_budget,
+    };
+
     // Admission-deferred job (pool blocks/slots exhausted). Kept at the head
     // of the line so FIFO order survives the deferral.
     ServerJob * deferred = nullptr;
@@ -86,18 +96,15 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         return (f && std::atoi(f) > 0) ? 32 : 0;
     }();
 
-    auto live_count = [&]() {
-        int n = 0;
-        for (const SchedSlot & s : slots) n += s.job ? 1 : 0;
-        return n;
-    };
+    // Cached live-slot count — incremented on admit, decremented on retire.
+    // Replaces the O(n_slots) scan that was called 2-3× per iteration.
+    int live_slots = 0;
 
     int published_live_count = -1;
     auto publish_live_count = [&]() {
-        const int n = live_count();
-        if (n == published_live_count) return;
-        published_live_count = n;
-        if (n > 0) status_.set_concurrent_requests(n);
+        if (live_slots == published_live_count) return;
+        published_live_count = live_slots;
+        if (live_slots > 0) status_.set_concurrent_requests(live_slots);
         else status_.set_idle();
         broadcast_status();
     };
@@ -125,6 +132,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     std::vector<DrainJob> drains;
 
     auto service_drains = [&]() {
+        if (drains.empty()) return;
         const auto now = std::chrono::steady_clock::now();
         for (size_t i = 0; i < drains.size();) {
             DrainJob & d = drains[i];
@@ -313,12 +321,17 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             drains.push_back(std::move(d));
         }
         s = SchedSlot{};
+        live_slots--;
         publish_live_count();
     };
 
     auto admit_job = [&](ServerJob * job) -> AdmissionDisposition {
         const ParsedRequest & req = job->req;
-        const auto started_at = std::chrono::steady_clock::now();
+        if (job->parallel_started_at ==
+                std::chrono::steady_clock::time_point{}) {
+            job->parallel_started_at = std::chrono::steady_clock::now();
+        }
+        const auto started_at = job->parallel_started_at;
 
         // Same thinking-budget n_gen math as the classic worker loop.
         const bool budget_active = req.thinking_opt_in;
@@ -374,7 +387,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 "max_tokens=%d live=%d parallel\n",
                 req.response_id.c_str(), api_format_name(req.format),
                 req.stream ? "true" : "false", req.prompt_tokens.size(),
-                req.max_output, live_count());
+                req.max_output, live_slots);
         }
 
         // Commit the SSE preamble BEFORE the (multi-second) prefill so
@@ -400,15 +413,6 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 }
             }
             if (!ok) {
-                finish_job(job);
-                return AdmissionDisposition::Retired;
-            }
-        } else if (req.stream) {
-            // A busy admission can sit deferred after its SSE preamble was
-            // committed. Probe it again before paying for a long prefill.
-            ClientSendBuffer probe;
-            probe.append(": admission retry\n\n");
-            if (!probe.flush(job->fd) || !probe.empty()) {
                 finish_job(job);
                 return AdmissionDisposition::Retired;
             }
@@ -442,6 +446,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.job = job;
         s.fd = job->fd;
         s.prefilling = true;
+        s.admission_order = next_admission_order++;
         s.started_at = started_at;
         s.decode_started_at = started_at;  // sane on prefill failure
         s.n_gen_cap = std::min(
@@ -454,14 +459,15 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             s.hook.close_token_ids = config_.think_close_token_ids;
             s.hook.hard_limit_remaining = eff_reply_for_n_gen;
         }
+        live_slots++;
         publish_live_count();
         return AdmissionDisposition::Admitted;
     };
 
     // Scheduler loop. Every iteration walks the same five phases:
     //
-    //   1. Admit    — seat at most one new job (deferred first, then the
-    //                 queue). Its prefill advances inside later steps.
+    //   1. Admit    — fill every available slot (deferred first, then the
+    //                 queue). Their prefills advance inside later steps.
     //   2. Idle     — nothing live: service drains and loop back, where the
     //                 admission phase parks in the blocking dequeue.
     //   3. Step     — advance one pending prefill chunk alongside every
@@ -473,13 +479,22 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     //
     // Exits on stopping_ (checked after admission), leaving the teardown
     // below to answer every client still parked in a slot, drain, or queue.
+    // Hoisted per-iteration buffers — capacity persists across iterations.
+    SeqEngine::StepPlan step_plan;
+    step_plan.decode.reserve((size_t)n_slots);
+    step_plan.prefills.reserve((size_t)n_slots);
+    std::vector<PrefillCandidate> prefill_candidates;
+    prefill_candidates.reserve((size_t)n_slots);
+    size_t prefill_round_robin_start = 0;
+
     while (true) {
         // Phase 1 — Admission: deferred job first (FIFO), then the queue.
         // Blocking dequeue only when idle; between decode steps only a poll.
-        // The engine has one prefill staging set, so only one admission may
-        // be prefilling at a time.
-        while (live_count() < n_slots && !stopping_.load() &&
-               !engine.prefill_pending()) {
+        // Engines reject atomically when their current slot, staging, or
+        // reserved-capacity limit is reached, so policy stays model-neutral.
+        auto idle_admission_deadline =
+            std::chrono::steady_clock::time_point{};
+        while (live_slots < n_slots && !stopping_.load()) {
             // A deferred job owns the front of the line, so nothing else may
             // be admitted while its retry backoff is still running.
             if (deferred &&
@@ -490,17 +505,28 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             // everything still in the queue.
             ServerJob * job = deferred;
             deferred = nullptr;
+            bool woke_from_idle = false;
             if (!job) {
-                if (live_count() == 0 && drains.empty()) {
+                if (live_slots == 0 && drains.empty()) {
                     // Fully idle: no stream is waiting on us, so give the
                     // scratch memory back and park in a blocking dequeue.
                     publish_live_count();
                     backend_.release_scratch();
                     job = dequeue();
+                    woke_from_idle = job != nullptr;
                 } else {
-                    // Live slots (or drains) still need decode steps — only
-                    // peek at the queue so we return to the loop immediately.
-                    job = try_dequeue();
+                    // A fresh idle transition may spend its bounded batching
+                    // window here; all ongoing decode paths only poll.
+                    const auto now = std::chrono::steady_clock::now();
+                    if (idle_admission_deadline > now) {
+                        // An already queued job returns immediately; otherwise
+                        // wait only for the unspent part of the idle window.
+                        job = dequeue_for(idle_admission_deadline - now);
+                        if (!job) idle_admission_deadline = {};
+                    } else {
+                        // Ongoing decode never waits for a new admission.
+                        job = try_dequeue();
+                    }
                 }
             }
             if (!job) break;  // queue empty: go decode what is already live
@@ -512,15 +538,32 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 break;  // wait for a retire to free blocks
             }
             if (outcome == AdmissionDisposition::Admitted) {
-                break;  // its prefill now advances through step()
+                if (woke_from_idle && n_slots > 1 &&
+                    config_.admission_coalesce_ms > 0) {
+                    idle_admission_deadline =
+                        std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(
+                            config_.admission_coalesce_ms);
+                }
+                continue;  // fill the remaining slots before step()
             }
         }
         if (stopping_.load()) break;
 
         // Phase 2 — Idle: no slot to step, so only the drains need service.
-        if (live_count() == 0) {
+        if (live_slots == 0) {
             service_drains();
-            if (deferred) continue;   // freed everything; admit it now
+            if (deferred) {
+                // A defensive busy response with no live sequence must not
+                // turn the worker into a tight retry loop. Real capacity
+                // releases clear deferred_retry_at in retire_slot().
+                const auto now = std::chrono::steady_clock::now();
+                if (deferred_retry_at > now) {
+                    std::this_thread::sleep_until(std::min(
+                        deferred_retry_at, now + std::chrono::milliseconds(5)));
+                }
+                continue;
+            }
             if (!drains.empty()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 continue;             // keep draining; don't block in dequeue
@@ -528,28 +571,83 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             continue;                 // dequeue() blocks in admission
         }
 
-        // Phase 3 — One iteration over every decoding slot plus one prefill
-        // chunk, fused into the same engine pass.
-        std::vector<SeqEngine::StepInput> inputs;
-        inputs.reserve((size_t)n_slots);
+        // Phase 3 — Build one model-neutral batch plan: every decode row plus
+        // a FIFO, token-budgeted subset of pending prompt work. The engine
+        // lowers this plan into whatever graph/state representation it owns.
+        step_plan.decode.clear();
+        prefill_candidates.clear();
         for (int i = 0; i < n_slots; i++) {
             if (slots[(size_t)i].job && !slots[(size_t)i].prefilling) {
-                inputs.push_back({i, slots[(size_t)i].pending_tok});
+                step_plan.decode.push_back(
+                    {i, slots[(size_t)i].pending_tok});
+            } else if (slots[(size_t)i].job) {
+                prefill_candidates.push_back(
+                    {i, slots[(size_t)i].admission_order});
             }
         }
-        std::vector<SeqEngine::StepOutput> outputs;
-        if (!engine.step(inputs, outputs)) {
-            std::fprintf(stderr, "[parallel] engine step failed — "
-                                 "failing all live requests\n");
+        const StepPlanLimits step_limits =
+            engine.step_plan_limits((int)step_plan.decode.size());
+        step_plan.prefills = plan_prefill_slices(
+            prefill_candidates, !step_plan.decode.empty(),
+            step_limits, step_policy, prefill_round_robin_start);
+        if (!prefill_candidates.empty()) {
+            ++prefill_round_robin_start;
+        }
+
+        SeqEngine::StepResult step_result;
+        constexpr int kMaxBlockedRetries = 3;
+        for (int attempt = 0; attempt < kMaxBlockedRetries; ++attempt) {
+            step_result = engine.step(step_plan);
+            const std::string protocol_error =
+                validate_step_result(step_plan, step_result, n_slots);
+            if (!protocol_error.empty()) {
+                step_result.status = SeqEngine::StepResult::Status::failed;
+                step_result.outputs.clear();
+                step_result.prefill_progress.clear();
+                step_result.error =
+                    "engine step protocol violation: " + protocol_error;
+                break;
+            }
+            if (step_result.status !=
+                    SeqEngine::StepResult::Status::resource_blocked) {
+                break;
+            }
+            if (attempt + 1 < kMaxBlockedRetries) {
+                service_drains();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        if (step_result.status ==
+                SeqEngine::StepResult::Status::resource_blocked) {
+            // Nothing else can free engine-owned capacity while this sole
+            // scheduler thread is parked. Retrying the exact same atomic plan
+            // is bounded so pressure cannot become a no-progress loop.
+            std::fprintf(stderr,
+                "[parallel] engine resource remained blocked: %s — "
+                "failing all live requests\n", step_result.error.c_str());
+        }
+
+        bool step_failed =
+            step_result.status == SeqEngine::StepResult::Status::failed ||
+            step_result.status == SeqEngine::StepResult::Status::idle ||
+            step_result.status ==
+                SeqEngine::StepResult::Status::resource_blocked;
+        if (step_failed) {
+            const std::string error = step_result.error.empty()
+                ? "engine step failed" : step_result.error;
+            std::fprintf(stderr,
+                "[parallel] engine step failed: %s — "
+                "failing all live requests\n", error.c_str());
             for (int i = 0; i < n_slots; i++) {
                 if (slots[(size_t)i].job) {
                     slots[(size_t)i].failed = true;
+                    slots[(size_t)i].error = error;
                     retire_slot(i, false);
                 }
             }
             continue;
         }
-        for (const auto & out : outputs) {
+        for (const auto & out : step_result.outputs) {
             if (out.slot < 0 || out.slot >= n_slots) continue;
             SchedSlot & s = slots[(size_t)out.slot];
             if (!s.job) continue;
@@ -561,6 +659,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
             if (out.prefill_done) {
                 s.prefilling = false;
+                // A prefill lane just became reusable, so the FIFO head may
+                // be admissible even though no KV blocks were retired.
+                deferred_retry_at = {};
                 s.decode_started_at = std::chrono::steady_clock::now();
                 s.prefill_s = std::chrono::duration<double>(
                     s.decode_started_at - s.started_at).count();

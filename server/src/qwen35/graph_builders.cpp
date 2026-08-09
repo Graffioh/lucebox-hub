@@ -287,10 +287,11 @@ bool build_target_step(
     int paged_max_kv_len,
     int n_prefill_tokens,
     bool prefill_commit,
-    bool compact_slots) {
+    bool compact_slots,
+    int staging_idx) {
     step_graph_free(sg);
 
-    // Compact n_seqs is a power-of-two graph bucket width, not the physical
+    // Compact n_seqs is a decode graph bucket width, not the physical
     // slot count. active_slot_ids maps live rows to cache columns and uses -1
     // for padding, so a valid bucket may be wider than cache.n_seq_slots.
     const bool invalid_compact_width = n_seqs < 1 || n_seqs > 64;
@@ -323,11 +324,24 @@ bool build_target_step(
     // single 512 MiB metadata arena.
     int graph_key_slot = 0;
     if (compact_slots) {
-        graph_key_slot = 1;
-        for (int width = n_seqs; width > 1; width >>= 1) {
-            ++graph_key_slot;
+        static constexpr int decode_buckets[] = {
+            1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,
+        };
+        bool found = false;
+        for (int i = 0; i < (int)(sizeof(decode_buckets) /
+                                  sizeof(decode_buckets[0])); ++i) {
+            if (decode_buckets[i] == n_seqs) {
+                graph_key_slot = i + 1;
+                found = true;
+                break;
+            }
         }
+        if (!found) return false;
     }
+    // Keep prefill and committing-prefill graphs away from stable decode
+    // captures, even when they use the same compact decode width.
+    if (paged_prefill)  graph_key_slot += 16;
+    if (prefill_commit) graph_key_slot += 32;
     for (int i = 0; i < graph_key_slot; ++i) {
         (void)ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
     }
@@ -458,6 +472,7 @@ bool build_target_step(
     gi.paged_max_kv_len           = paged_max_kv_len;
     gi.n_prefill_tokens           = n_prefill_tokens;
     gi.prefill_commit             = prefill_commit;
+    gi.staging_idx                = staging_idx;
 
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;

@@ -3996,6 +3996,10 @@ TEST_CASE(ServerUnitFixture, test_server_config_cache_defaults) {
     ServerConfig cfg;
     TEST_ASSERT(cfg.prefix_cache_cap == 32);
     TEST_ASSERT(cfg.prefill_cache_cap == 0);
+    TEST_ASSERT(cfg.admission_coalesce_ms == 0);
+    TEST_ASSERT(cfg.prefill_quantum == 512);
+    TEST_ASSERT(cfg.prefill_token_budget == 4096);
+    TEST_ASSERT(cfg.mixed_prefill_token_budget == 2048);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4014,6 +4018,10 @@ static ServerConfig make_props_config_with_sidecar(const json & sidecar) {
     cfg.default_max_tokens      = 32768;
     cfg.hard_limit_reply_budget = 512;
     cfg.think_max_tokens        = 32256;
+    cfg.admission_coalesce_ms      = 7;
+    cfg.prefill_quantum            = 256;
+    cfg.prefill_token_budget       = 3072;
+    cfg.mixed_prefill_token_budget = 1536;
     cfg.effort_tiers.low    = 4032;
     cfg.effort_tiers.medium = 16128;
     cfg.effort_tiers.high   = 32256;
@@ -4051,6 +4059,14 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     PrefixCache  pc(0, tok);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body["runtime"].contains("continuous_batching"));
+    const json & batching = body["runtime"]["continuous_batching"];
+    TEST_ASSERT(batching["admission_coalesce_ms"].get<int>() == 7);
+    TEST_ASSERT(batching["prefill_quantum"].get<int>() == 256);
+    TEST_ASSERT(batching["prefill_token_budget"].get<int>() == 3072);
+    TEST_ASSERT(
+        batching["mixed_prefill_token_budget"].get<int>() == 1536);
+
 
     TEST_ASSERT(body.contains("model_card"));
     TEST_ASSERT(!body["model_card"].is_null());

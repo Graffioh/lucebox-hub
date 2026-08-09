@@ -644,6 +644,13 @@ json build_props_body(const ServerConfig & config,
             // (dflash/scripts/bench_http_capability.py) read
             // /props.runtime wholesale into result.json.server_info.
             {"chunk",           config.chunk},
+            {"continuous_batching", {
+                {"admission_coalesce_ms", config.admission_coalesce_ms},
+                {"prefill_quantum", config.prefill_quantum},
+                {"prefill_token_budget", config.prefill_token_budget},
+                {"mixed_prefill_token_budget",
+                    config.mixed_prefill_token_budget},
+            }},
             // Device placement strings (e.g. "auto:0", "cuda:0"). Empty
             // string when no draft model is loaded.
             {"target_device",   config.target_device},
@@ -3594,6 +3601,23 @@ ServerJob * HttpServer::dequeue() {
 
 ServerJob * HttpServer::try_dequeue() {
     std::lock_guard<std::mutex> lk(queue_mu_);
+    if (!queue_head_) return nullptr;
+    ServerJob * job = queue_head_;
+    queue_head_ = job->next;
+    if (!queue_head_) queue_tail_ = nullptr;
+    job->next = nullptr;
+    return job;
+}
+
+ServerJob * HttpServer::dequeue_for(
+        std::chrono::steady_clock::duration timeout) {
+    std::unique_lock<std::mutex> lk(queue_mu_);
+    if (!queue_head_ && !stopping_.load() &&
+        timeout > std::chrono::steady_clock::duration::zero()) {
+        queue_cv_.wait_for(lk, timeout, [&] {
+            return queue_head_ != nullptr || stopping_.load();
+        });
+    }
     if (!queue_head_) return nullptr;
     ServerJob * job = queue_head_;
     queue_head_ = job->next;

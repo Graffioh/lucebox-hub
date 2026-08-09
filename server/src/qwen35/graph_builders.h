@@ -129,7 +129,8 @@ bool build_target_step(
     int paged_max_kv_len = 0,
     int n_prefill_tokens = 0,
     bool prefill_commit = false,
-    bool compact_slots = false);
+    bool compact_slots = false,
+    int staging_idx = 0);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(

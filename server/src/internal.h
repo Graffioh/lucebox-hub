@@ -390,28 +390,22 @@ struct TargetCache {
     std::vector<ggml_tensor *> ssm_state;    // size = n_delta_layers (48)
     std::vector<ggml_tensor *> conv_state;
 
-    // Concurrent prefill staging (only when n_seq_slots > 1): one sequence's
-    // contiguous K/V per full-attention layer, [head_dim,
-    // paged_token_capacity(max_ctx), n_head_kv] in the cache K/V types.
-    // Chunked prefill reads/writes these exactly like the dense path reads
-    // the cache, while the same rows are dual-written through kv_write_rows
-    // into the scattered pool blocks.
-    // Only one prefill runs at a time, so a single staging set serves all
-    // slots. Dead outside prefill.
-    std::vector<ggml_tensor *> staging_k;    // size = n_full_attn_layers or empty
+    // Concurrent prefill staging (only when n_seq_slots > 1). When
+    // max_concurrent_prefills > 1, additional staging sets are allocated
+    // so multiple prefills can advance in parallel. Set 0 is the existing
+    // staging_k/v; sets 1..K-1 live in staging_k_extra etc.
+    // Only staged caches (n_seq_slots > 1) carry staging tensors.
+    std::vector<ggml_tensor *> staging_k;    // set 0: size = n_full_attn_layers or empty
     std::vector<ggml_tensor *> staging_v;
-
-    // Prefill staging for the DeltaNet recurrent state (only when
-    // n_seq_slots > 1): a single-sequence conv/ssm slab per delta layer.
-    // The prefilling sequence carries its chunk-to-chunk state HERE instead
-    // of its slot's slab: slots are reused without a device-side state
-    // reset, so the slab may still hold the previous occupant's state,
-    // while the staging slabs start zeroed. The final prefill chunk's
-    // graph copies them into the admitted slot's slabs (prefill_commit).
-    //   staging_ssm_state:  [S_v, S_v, H_v, 1] f32
-    //   staging_conv_state: [(kernel-1), conv_channels, 1] f32
-    std::vector<ggml_tensor *> staging_ssm_state;   // size = n_delta or empty
+    std::vector<ggml_tensor *> staging_ssm_state;   // set 0: size = n_delta or empty
     std::vector<ggml_tensor *> staging_conv_state;
+
+    // Additional staging sets (indices 1..K-1), each a full per-layer set.
+    // Empty when max_concurrent_prefills <= 1. Indexed by staging_idx - 1.
+    std::vector<std::vector<ggml_tensor *>> staging_k_extra;
+    std::vector<std::vector<ggml_tensor *>> staging_v_extra;
+    std::vector<std::vector<ggml_tensor *>> staging_ssm_state_extra;
+    std::vector<std::vector<ggml_tensor *>> staging_conv_state_extra;
 
     // Snapshot buffers for speculative decoding rollback. Sized identically
     // to ssm_state/conv_state above. Populated by snapshot_ssm_state() and
@@ -591,7 +585,8 @@ bool create_target_cache(const TargetWeights & w,
                          bool prefill_only = false,
                          int ctx_alloc = 0,
                          bool paged_attention = false,
-                         int n_seq_slots = 1);
+                         int n_seq_slots = 1,
+                         int max_concurrent_prefills = 1);
 
 // `f32_ssm_intermediates` enables exact per-token checkpoints for the opt-in
 // layer-split fast rollback path. The default preserves the established Q8_0
@@ -608,7 +603,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  int ctx_alloc = 0,
                                  bool f32_ssm_intermediates = false,
                                  bool paged_attention = false,
-                                 int n_seq_slots = 1);
+                                 int n_seq_slots = 1,
+                                 int max_concurrent_prefills = 1);
 
 void free_target_cache(TargetCache & c);
 
@@ -626,8 +622,16 @@ void reset_recurrent_state(TargetCache & c);
 // Zero the prefill staging tensors — K/V and the staging conv/ssm state
 // slabs (multi-slot caches only; no-op otherwise). Called at each admission
 // so the staging region behaves exactly like the freshly reset cache the
-// dense prefill path expects.
-void reset_prefill_staging(TargetCache & c);
+// dense prefill path expects. When staging_idx > 0, zeroes the extra set.
+void reset_prefill_staging(TargetCache & c, int staging_idx = 0);
+
+// Access a staging set by index: 0 = staging_k/v, 1..K-1 =
+// staging_k_extra[idx-1]/etc. Returns empty vectors when the set doesn't
+// exist (single-staging caches still work with staging_idx=0).
+const std::vector<ggml_tensor *> & staging_k_for(const TargetCache & c, int idx);
+const std::vector<ggml_tensor *> & staging_v_for(const TargetCache & c, int idx);
+const std::vector<ggml_tensor *> & staging_ssm_for(const TargetCache & c, int idx);
+const std::vector<ggml_tensor *> & staging_conv_for(const TargetCache & c, int idx);
 
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
 // state (KV, SSM, conv, target_feat) device-to-device. Frees the old cache.
@@ -719,6 +723,10 @@ struct QwenGraphInputs {
     int  paged_max_kv_len = 0;
     int  n_prefill_tokens = 0;
     bool prefill_commit = false;
+    // Which staging set the prefill uses (0 = set 0 = cache.staging_k,
+    // 1..K-1 = cache.staging_k_extra[idx-1]). 0 by default for all
+    // existing callers.
+    int  staging_idx = 0;
     // Capture the LAST token's post-RoPE/post-rotation Q per full-attention
     // layer into cache.q_cap (KVFlash target-QK scorer). Step-invariant:
     // node properties depend only on n_tokens and the layer index.

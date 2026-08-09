@@ -80,12 +80,14 @@ bool create_target_cache(const TargetWeights & w,
                          bool prefill_only,
                          int ctx_alloc,
                          bool paged_attention,
-                         int n_seq_slots) {
+                         int n_seq_slots,
+                         int max_concurrent_prefills) {
     return create_target_cache_partial(w, max_ctx, max_verify_tokens, backend,
                                        out, prefill_only,
                                        0, w.n_layer, true, ctx_alloc,
                                        /*f32_ssm_intermediates=*/false,
-                                       paged_attention, n_seq_slots);
+                                       paged_attention, n_seq_slots,
+                                       max_concurrent_prefills);
 }
 
 // concurrent_fixed_cache_bytes() in qwen35_backend.cpp mirrors this
@@ -103,7 +105,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  int ctx_alloc,
                                  bool f32_ssm_intermediates,
                                  bool paged_attention,
-                                 int n_seq_slots) {
+                                 int n_seq_slots,
+                                 int max_concurrent_prefills) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
     if (layer_begin > layer_end) {
@@ -111,6 +114,7 @@ bool create_target_cache_partial(const TargetWeights & w,
         return false;
     }
     if (n_seq_slots < 1) n_seq_slots = 1;
+    if (max_concurrent_prefills < 1) max_concurrent_prefills = 1;
     if (n_seq_slots > 1 && !paged_attention) {
         set_last_error("multi-slot target cache requires paged attention");
         return false;
@@ -135,11 +139,27 @@ bool create_target_cache_partial(const TargetWeights & w,
     out.staging_v.clear();
     out.staging_ssm_state.clear();
     out.staging_conv_state.clear();
+    out.staging_k_extra.clear();
+    out.staging_v_extra.clear();
+    out.staging_ssm_state_extra.clear();
+    out.staging_conv_state_extra.clear();
     if (n_seq_slots > 1) {
         out.staging_k.assign(n_full_attn, nullptr);
         out.staging_v.assign(n_full_attn, nullptr);
         out.staging_ssm_state.assign(n_delta, nullptr);
         out.staging_conv_state.assign(n_delta, nullptr);
+
+        // Additional staging sets for concurrent prefill.
+        if (max_concurrent_prefills > 1) {
+            out.staging_k_extra.resize(max_concurrent_prefills - 1);
+            out.staging_v_extra.resize(max_concurrent_prefills - 1);
+            out.staging_ssm_state_extra.resize(max_concurrent_prefills - 1);
+            out.staging_conv_state_extra.resize(max_concurrent_prefills - 1);
+            for (auto & v : out.staging_k_extra) v.assign(n_full_attn, nullptr);
+            for (auto & v : out.staging_v_extra) v.assign(n_full_attn, nullptr);
+            for (auto & v : out.staging_ssm_state_extra) v.assign(n_delta, nullptr);
+            for (auto & v : out.staging_conv_state_extra) v.assign(n_delta, nullptr);
+        }
     }
     out.ssm_state.assign(n_delta, nullptr);
     out.conv_state.assign(n_delta, nullptr);
@@ -186,8 +206,11 @@ bool create_target_cache_partial(const TargetWeights & w,
 
     // ── Base context: KV cache + SSM/conv state + target_feat ────────
     {
+        const int extra_staging = multi_slot && max_concurrent_prefills > 1
+            ? (max_concurrent_prefills - 1) * (2 * n_full_attn + 2 * n_delta) : 0;
         const int base_tensors = 2 * n_full_attn + 2 * n_delta + 2
-                               + (multi_slot ? 2 * n_full_attn + 2 * n_delta : 0);
+                               + (multi_slot ? 2 * n_full_attn + 2 * n_delta : 0)
+                               + extra_staging;
         ggml_init_params ip{};
         ip.mem_size   = (size_t)(base_tensors + 16) * ggml_tensor_overhead();
         ip.mem_buffer = nullptr;
@@ -228,6 +251,19 @@ bool create_target_cache_partial(const TargetWeights & w,
                     ggml_set_name(SV, name);
                     out.staging_k[fa_idx] = SK;
                     out.staging_v[fa_idx] = SV;
+                    // Extra staging sets for concurrent prefill.
+                    for (size_t si = 0; si < out.staging_k_extra.size(); ++si) {
+                        ggml_tensor * EK = ggml_new_tensor_3d(out.base_ctx, kv_k_type,
+                                                              head_dim, staging_rows, w.n_head_kv);
+                        ggml_tensor * EV = ggml_new_tensor_3d(out.base_ctx, kv_v_type,
+                                                              head_dim, staging_rows, w.n_head_kv);
+                        std::snprintf(name, sizeof(name), "staging_k_%d_s%zu", il, si + 1);
+                        ggml_set_name(EK, name);
+                        std::snprintf(name, sizeof(name), "staging_v_%d_s%zu", il, si + 1);
+                        ggml_set_name(EV, name);
+                        out.staging_k_extra[si][fa_idx] = EK;
+                        out.staging_v_extra[si][fa_idx] = EV;
+                    }
                 }
                 fa_idx++;
             } else {
@@ -261,6 +297,20 @@ bool create_target_cache_partial(const TargetWeights & w,
                     ggml_set_name(SC, name);
                     out.staging_ssm_state[dn_idx]  = SS;
                     out.staging_conv_state[dn_idx] = SC;
+                    // Extra staging sets for concurrent prefill.
+                    for (size_t si = 0; si < out.staging_ssm_state_extra.size(); ++si) {
+                        ggml_tensor * ESS = ggml_new_tensor_4d(out.base_ctx, GGML_TYPE_F32,
+                                                               head_v_dim, head_v_dim,
+                                                               w.ssm_dt_rank, 1);
+                        ggml_tensor * ESC = ggml_new_tensor_3d(out.base_ctx, GGML_TYPE_F32,
+                                                               w.ssm_d_conv - 1, conv_ch, 1);
+                        std::snprintf(name, sizeof(name), "staging_ssm_%d_s%zu", il, si + 1);
+                        ggml_set_name(ESS, name);
+                        std::snprintf(name, sizeof(name), "staging_conv_%d_s%zu", il, si + 1);
+                        ggml_set_name(ESC, name);
+                        out.staging_ssm_state_extra[si][dn_idx]  = ESS;
+                        out.staging_conv_state_extra[si][dn_idx] = ESC;
+                    }
                 }
                 dn_idx++;
             }
@@ -425,6 +475,10 @@ void free_target_cache(TargetCache & c) {
     c.staging_v.clear();
     c.staging_ssm_state.clear();
     c.staging_conv_state.clear();
+    c.staging_k_extra.clear();
+    c.staging_v_extra.clear();
+    c.staging_ssm_state_extra.clear();
+    c.staging_conv_state_extra.clear();
     c.ssm_state.clear();
     c.conv_state.clear();
     c.ssm_state_snap.clear();
@@ -485,17 +539,83 @@ void reset_recurrent_state(TargetCache & c) {
     zero_tensors(c.conv_state);
 }
 
-void reset_prefill_staging(TargetCache & c) {
-    for (ggml_tensor * t : c.staging_k) {
+namespace {
+
+const std::vector<ggml_tensor *> & empty_staging_set() {
+    static const std::vector<ggml_tensor *> empty;
+    return empty;
+}
+
+const std::vector<ggml_tensor *> & staging_set_for(
+        const std::vector<ggml_tensor *> & primary,
+        const std::vector<std::vector<ggml_tensor *>> & extra,
+        int idx) {
+    if (idx == 0) return primary;
+    if (idx < 1 || (size_t)(idx - 1) >= extra.size()) {
+        return empty_staging_set();
+    }
+    return extra[(size_t)(idx - 1)];
+}
+
+bool staging_index_in_bounds(const TargetCache & c, int idx) {
+    if (idx < 0) return false;
+    if (idx == 0) return true;
+    const size_t extra_idx = (size_t)(idx - 1);
+    return extra_idx < c.staging_k_extra.size() &&
+           extra_idx < c.staging_v_extra.size() &&
+           extra_idx < c.staging_ssm_state_extra.size() &&
+           extra_idx < c.staging_conv_state_extra.size();
+}
+
+bool staging_set_complete(const TargetCache & c, int idx,
+                          size_t n_full_attn, size_t n_delta) {
+    if (!staging_index_in_bounds(c, idx)) return false;
+    const auto & sk = staging_set_for(c.staging_k, c.staging_k_extra, idx);
+    const auto & sv = staging_set_for(c.staging_v, c.staging_v_extra, idx);
+    const auto & ss = staging_set_for(
+        c.staging_ssm_state, c.staging_ssm_state_extra, idx);
+    const auto & sc = staging_set_for(
+        c.staging_conv_state, c.staging_conv_state_extra, idx);
+    return sk.size() == n_full_attn && sv.size() == n_full_attn &&
+           ss.size() == n_delta && sc.size() == n_delta;
+}
+
+} // namespace
+
+const std::vector<ggml_tensor *> & staging_k_for(const TargetCache & c, int idx) {
+    return staging_set_for(c.staging_k, c.staging_k_extra, idx);
+}
+const std::vector<ggml_tensor *> & staging_v_for(const TargetCache & c, int idx) {
+    return staging_set_for(c.staging_v, c.staging_v_extra, idx);
+}
+const std::vector<ggml_tensor *> & staging_ssm_for(const TargetCache & c, int idx) {
+    return staging_set_for(c.staging_ssm_state,
+                           c.staging_ssm_state_extra, idx);
+}
+const std::vector<ggml_tensor *> & staging_conv_for(const TargetCache & c, int idx) {
+    return staging_set_for(c.staging_conv_state,
+                           c.staging_conv_state_extra, idx);
+}
+
+void reset_prefill_staging(TargetCache & c, int staging_idx) {
+    if (!staging_index_in_bounds(c, staging_idx)) {
+        set_last_error("invalid prefill staging index");
+        return;
+    }
+    const auto & sk = staging_k_for(c, staging_idx);
+    const auto & sv = staging_v_for(c, staging_idx);
+    const auto & ss = staging_ssm_for(c, staging_idx);
+    const auto & sc = staging_conv_for(c, staging_idx);
+    for (ggml_tensor * t : sk) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
-    for (ggml_tensor * t : c.staging_v) {
+    for (ggml_tensor * t : sv) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
-    for (ggml_tensor * t : c.staging_ssm_state) {
+    for (ggml_tensor * t : ss) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
-    for (ggml_tensor * t : c.staging_conv_state) {
+    for (ggml_tensor * t : sc) {
         if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
     }
 }
@@ -1606,6 +1726,20 @@ QwenGraphOutputs build_qwen35_graph(
     TargetCache &          cache,
     const QwenGraphInputs & in) {
 
+    const bool needs_staging = cache.n_seq_slots > 1 &&
+        (in.paged_prefill || in.n_prefill_tokens > 0 ||
+         in.prefill_commit);
+    if (needs_staging) {
+        const size_t n_full_attn =
+            (size_t)(w.n_layer / w.full_attention_interval);
+        const size_t n_delta = (size_t)w.n_layer - n_full_attn;
+        if (!staging_set_complete(
+                cache, in.staging_idx, n_full_attn, n_delta)) {
+            set_last_error("invalid or incomplete prefill staging set");
+            return {};
+        }
+    }
+
     const int n_tokens = in.n_tokens;
 
     // 1. Caller supplies pre-embedded inputs via in.inp_embed (CPU lookup done
@@ -1647,24 +1781,26 @@ QwenGraphOutputs build_qwen35_graph(
             const bool want_q_cap = in.q_capture && cache.q_cap;
             ggml_tensor * q_fa = nullptr;
             const bool use_staging = in.paged_prefill &&
-                fa_idx < (int)cache.staging_k.size();
-            cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
-                                        cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                                        in.attn_mask, in.kv_start, n_tokens,
-                                        cache.kv_k_type, cache.kv_v_type,
-                                        cache.kv_k_rotated,
-                                        in.fa_window,
-                                        /*q_tail_capture=*/nullptr,
-                                        /*q_tail_start=*/0,
-                                        in.kv_write_rows,
-                                        want_q_cap ? &q_fa : nullptr,
-                                        in.paged_block_table,
-                                        in.paged_kv_seq_lens,
-                                        use_staging ? cache.staging_k[fa_idx] : nullptr,
-                                        use_staging ? cache.staging_v[fa_idx] : nullptr,
-                                        in.paged_max_kv_len,
-                                        in.active_slot_ids,
-                                        in.n_prefill_tokens);
+            fa_idx < (int)staging_k_for(cache, in.staging_idx).size();
+        const auto & sk_set = staging_k_for(cache, in.staging_idx);
+        const auto & sv_set = staging_v_for(cache, in.staging_idx);
+        cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
+                                    cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                                    in.attn_mask, in.kv_start, n_tokens,
+                                    cache.kv_k_type, cache.kv_v_type,
+                                    cache.kv_k_rotated,
+                                    in.fa_window,
+                                    /*q_tail_capture=*/nullptr,
+                                    /*q_tail_start=*/0,
+                                    in.kv_write_rows,
+                                    want_q_cap ? &q_fa : nullptr,
+                                    in.paged_block_table,
+                                    in.paged_kv_seq_lens,
+                                    use_staging ? sk_set[fa_idx] : nullptr,
+                                    use_staging ? sv_set[fa_idx] : nullptr,
+                                    in.paged_max_kv_len,
+                                    in.active_slot_ids,
+                                    in.n_prefill_tokens);
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
                 // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx
@@ -1697,12 +1833,14 @@ QwenGraphOutputs build_qwen35_graph(
             ggml_tensor * ssm_st  = cache.ssm_state[dn_idx];
             ggml_tensor * pf_conv = nullptr;
             ggml_tensor * pf_ssm  = nullptr;
+            const auto & stage_conv = staging_conv_for(cache, in.staging_idx);
+            const auto & stage_ssm  = staging_ssm_for(cache, in.staging_idx);
             if (in.n_prefill_tokens > 0) {
                 // Fused prefill+decode: the decode segment runs on the full
                 // state tensors; the prefill segment carries its state in
                 // the staging slabs (committed to the slot on prefill_commit).
-                pf_conv = cache.staging_conv_state[dn_idx];
-                pf_ssm  = cache.staging_ssm_state[dn_idx];
+                pf_conv = stage_conv[dn_idx];
+                pf_ssm  = stage_ssm[dn_idx];
             } else if (cache.n_seq_slots > 1 && in.n_seqs == 1 &&
                        in.paged_prefill) {
                 // Pure prefill chunk against a multi-slot cache: run on the
@@ -1711,8 +1849,8 @@ QwenGraphOutputs build_qwen35_graph(
                 // hold a previous occupant's state, while staging is zeroed
                 // at admission. The final chunk (prefill_commit) copies
                 // staging into the slot's slabs.
-                conv_st = cache.staging_conv_state[dn_idx];
-                ssm_st  = cache.staging_ssm_state[dn_idx];
+                conv_st = stage_conv[dn_idx];
+                ssm_st  = stage_ssm[dn_idx];
             } else if (cache.n_seq_slots > 1 && in.n_seqs == 1 &&
                        !in.active_slot_ids) {
                 // Single-sequence forward against a multi-slot cache: this
@@ -1813,9 +1951,11 @@ QwenGraphOutputs build_qwen35_graph(
     // the batched decode state write-back — the decode dummy-row garbage in
     // the slot's slabs loses to the committed prefill state.
     if (in.prefill_commit && cache.n_seq_slots > 1) {
+        const auto & stage_conv = staging_conv_for(cache, in.staging_idx);
+        const auto & stage_ssm  = staging_ssm_for(cache, in.staging_idx);
         for (size_t dn = 0; dn < cache.conv_state.size(); dn++) {
-            ggml_tensor * c_src = cache.staging_conv_state[dn];
-            ggml_tensor * s_src = cache.staging_ssm_state[dn];
+            ggml_tensor * c_src = stage_conv[dn];
+            ggml_tensor * s_src = stage_ssm[dn];
             ggml_tensor * c_full = cache.conv_state[dn];
             ggml_tensor * s_full = cache.ssm_state[dn];
             if (!c_src || !s_src || !c_full || !s_full) continue;

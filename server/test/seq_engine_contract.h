@@ -1,28 +1,16 @@
-// Executable conformance check for the SeqEngine contract.
+// Host-side executable contract for common/seq_engine.h.
 //
-// The concurrent scheduler (server/scheduler.cpp) drives a backend through
-// common/seq_engine.h and nothing else, so that header's prose is the whole
-// agreement between the two sides. This turns it into code: hand the checker
-// any SeqEngine whose slots are all free and it returns the list of contract
-// violations — empty means the engine is safe to pass to scheduler_loop().
-//
-// It exists so the second, third, … model's engine is held to the same rules
-// as the Qwen3.5 one without either side importing the other's internals: the
-// checker only ever calls slot_count/admit/step/prefill_pending/retire/
-// token_is_eos, and it knows nothing about block tables, graphs, or recurrent
-// state.
-//
-// No ggml and no GPU, so a host-only test can use it (test_seq_engine_contract
-// runs it against an in-memory fake). A device-backed engine can be checked
-// with the same call — the checker allocates nothing device-side; it just
-// costs a handful of real prefills.
-//
-// Entry condition: every slot free. On return every slot is free again.
+// The checker deliberately knows only logical slots, decode inputs, and
+// scheduler-selected prefill slices. It exercises the largest useful cohort
+// up to two sequences allowed by the advertised limits, mixed
+// decode/prefill, validation failures, retryable blocking, and slot reuse
+// without importing a model graph or cache representation.
 
 #pragma once
 
 #include "common/seq_engine.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -30,299 +18,405 @@
 namespace dflash::common {
 
 inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
+    using Status = SeqEngine::StepResult::Status;
+
     std::vector<std::string> violations;
-    auto require = [&violations](bool ok, const char * msg) {
-        if (!ok) violations.emplace_back(msg);
+    auto require = [&violations](bool ok, const char * message) {
+        if (!ok) violations.emplace_back(message);
     };
 
     const int n_slots = engine.slot_count();
-    require(n_slots >= 1, "slot_count() must be at least 1");
-    if (n_slots < 1) return violations;
+    require(n_slots >= 2,
+            "slot_count() must be at least 2 for the concurrency contract");
+    if (n_slots < 2) return violations;
+
+    const StepPlanLimits idle_limits = engine.step_plan_limits(0);
+    const StepPlanLimits mixed_limits = engine.step_plan_limits(1);
+    const auto supports_one_prefill = [](const StepPlanLimits & limits) {
+        return limits.max_prefill_sequences >= 1 &&
+               limits.max_prefill_tokens_per_sequence >= 1 &&
+               limits.max_prefill_tokens_total >= 1;
+    };
+    require(supports_one_prefill(idle_limits),
+            "idle step_plan_limits() must permit one prefill token");
+    require(supports_one_prefill(mixed_limits),
+            "mixed step_plan_limits() must permit one prefill token");
+    require(engine.max_context() >= 3,
+            "max_context() must fit the contract-check prompts");
+    if (!supports_one_prefill(idle_limits) ||
+        !supports_one_prefill(mixed_limits) || engine.max_context() < 3) {
+        return violations;
+    }
+
+    // Exercise at most two concurrent prefills, but never infer K=2 support
+    // from slot_count(): sequence count and the total-token cap are separate
+    // engine capabilities.
+    const int idle_cohort_size = std::min({
+        2,
+        n_slots,
+        idle_limits.max_prefill_sequences,
+        idle_limits.max_prefill_tokens_total,
+    });
 
     const SamplerCfg greedy{};
-    // The sampler is the engine's only signal for how a slot draws, so admit
-    // through both of its branches: greedy takes the GPU-argmax path, seeded
-    // sampling takes the CPU sample_logits path. An engine that reads the two
-    // out of step fails here rather than in production.
     SamplerCfg seeded{};
-    seeded.temp = 0.7f;             // needs_logit_processing() -> true
-    seeded.seed = 20260729;
-    const std::vector<int32_t> prompt{11, 12, 13, 14};
-    require(engine.max_context() >= (int)prompt.size(),
-            "max_context() must fit the contract-check prompt");
-    if (engine.max_context() < (int)prompt.size()) return violations;
+    seeded.temp = 0.7f;
+    seeded.seed = 20260809;
 
-    std::vector<int>     live;      // decoding slot ids, in admission order
-    std::vector<int32_t> pending;   // token to feed each decoding slot next
-    std::vector<bool>    taken((size_t)n_slots, false);
+    std::vector<bool> active((size_t)n_slots, false);
+    std::vector<bool> decoding((size_t)n_slots, false);
+    std::vector<int> remaining((size_t)n_slots, 0);
+    std::vector<int32_t> next_token((size_t)n_slots, -1);
 
-    // Common shape checks for both prefill and decode outputs. `answered` is
-    // supplied for a batched decode, where every slot must appear once.
-    auto validate_output = [&](const SeqEngine::StepOutput & output,
-                               std::vector<bool> * answered = nullptr) {
-        if (output.slot < 0 || output.slot >= n_slots) {
-            require(false, "step() returned an output for an unknown slot");
-            return false;
+    auto retire_all = [&]() {
+        for (int slot = 0; slot < n_slots; ++slot) {
+            if (active[(size_t)slot]) engine.retire(slot);
+            active[(size_t)slot] = false;
+            decoding[(size_t)slot] = false;
+            remaining[(size_t)slot] = 0;
         }
-        if (answered) {
-            require(!(*answered)[(size_t)output.slot],
-                    "step() returned two outputs for one slot");
-            if ((*answered)[(size_t)output.slot]) return false;
-            (*answered)[(size_t)output.slot] = true;
+    };
+
+    auto record_admit = [&](uint64_t request_id,
+                            const std::vector<int32_t> & prompt,
+                            const SamplerCfg & sampler) {
+        const SeqEngine::AdmitResult result =
+            engine.admit(request_id, prompt, sampler);
+        require(result.ok, "admit() must succeed while a slot is free");
+        if (!result.ok) return -1;
+        require(result.slot >= 0 && result.slot < n_slots,
+                "admit() returned an unknown slot");
+        if (result.slot < 0 || result.slot >= n_slots) return -1;
+        require(!active[(size_t)result.slot],
+                "admit() reused a live slot");
+        if (active[(size_t)result.slot]) return -1;
+        active[(size_t)result.slot] = true;
+        decoding[(size_t)result.slot] = false;
+        remaining[(size_t)result.slot] = (int)prompt.size();
+        return result.slot;
+    };
+
+    auto validate_status_helpers = [&](const SeqEngine::StepResult & result) {
+        require(result.ok() == (result.status != Status::failed),
+                "StepResult::ok() disagrees with status");
+        require(result.made_progress() ==
+                    (result.status == Status::progressed),
+                "StepResult::made_progress() disagrees with status");
+    };
+
+    // A blocked step is atomic and may be retried unchanged. A backend must
+    // not report retryable no-progress forever: that would deadlock the only
+    // worker able to retire sequences and release capacity.
+    auto run_bounded = [&](const SeqEngine::StepPlan & plan,
+                           SeqEngine::StepResult & result) {
+        constexpr int kMaxBlockedRetries = 3;
+        for (int attempt = 0; attempt < kMaxBlockedRetries; ++attempt) {
+            result = engine.step(plan);
+            validate_status_helpers(result);
+            if (result.status != Status::resource_blocked) return true;
+            require(result.outputs.empty() && result.prefill_progress.empty(),
+                    "resource_blocked must not report partial progress");
         }
-        if (!output.failed) {
-            require(output.token >= 0,
-                    "a non-failed step() output must carry a token");
+        require(false,
+                "resource_blocked no-progress must be bounded");
+        return false;
+    };
+
+    auto slice_limit = [&](const SeqEngine::StepPlan & plan) {
+        return engine.step_plan_limits((int)plan.decode.size())
+            .max_prefill_tokens_per_sequence;
+    };
+
+    // Validate and apply one successful logical step to the checker's mirror.
+    auto apply_progress = [&](const SeqEngine::StepPlan & plan,
+                              const SeqEngine::StepResult & result) {
+        require(result.status == Status::progressed,
+                "valid planned work must return progressed");
+        require(result.ok() && result.made_progress(),
+                "progressed result helpers must report progress");
+        require(result.error.empty(),
+                "a successful step must not carry a whole-step error");
+        if (result.status != Status::progressed) return false;
+
+        std::vector<bool> decode_answered((size_t)n_slots, false);
+        std::vector<bool> prefill_answered((size_t)n_slots, false);
+        std::vector<bool> completed((size_t)n_slots, false);
+
+        for (const SeqEngine::StepOutput & output : result.outputs) {
+            require(output.slot >= 0 && output.slot < n_slots,
+                    "step() returned an output for an unknown slot");
+            if (output.slot < 0 || output.slot >= n_slots) continue;
+            require(!output.failed,
+                    "contract-check work must not fail a request");
+            if (!output.failed) {
+                require(output.token >= 0,
+                        "successful output must carry a token");
+            }
+
+            if (output.prefill_done) {
+                const bool selected = std::any_of(
+                    plan.prefills.begin(), plan.prefills.end(),
+                    [&](const PrefillSlice & slice) {
+                        return slice.slot == output.slot;
+                    });
+                require(selected,
+                        "prefill_done must name a selected prefill slot");
+                require(!completed[(size_t)output.slot],
+                        "prefill completion was reported twice");
+                completed[(size_t)output.slot] = true;
+                next_token[(size_t)output.slot] = output.token;
+                continue;
+            }
+
+            const bool planned = std::any_of(
+                plan.decode.begin(), plan.decode.end(),
+                [&](const SeqEngine::StepInput & input) {
+                    return input.slot == output.slot;
+                });
+            require(planned,
+                    "step() returned an output for an unplanned decode slot");
+            require(!decode_answered[(size_t)output.slot],
+                    "step() returned two decode outputs for one slot");
+            decode_answered[(size_t)output.slot] = true;
+            next_token[(size_t)output.slot] = output.token;
+        }
+
+        for (const SeqEngine::PrefillProgress & progress :
+             result.prefill_progress) {
+            require(progress.slot >= 0 && progress.slot < n_slots,
+                    "prefill progress named an unknown slot");
+            if (progress.slot < 0 || progress.slot >= n_slots) continue;
+            auto selected = std::find_if(
+                plan.prefills.begin(), plan.prefills.end(),
+                [&](const PrefillSlice & slice) {
+                    return slice.slot == progress.slot;
+                });
+            require(selected != plan.prefills.end(),
+                    "prefill progress named an unselected slot");
+            if (selected == plan.prefills.end()) continue;
+            require(!prefill_answered[(size_t)progress.slot],
+                    "step() returned two progress records for one prefill");
+            prefill_answered[(size_t)progress.slot] = true;
+            require(progress.tokens > 0 &&
+                        progress.tokens <= selected->max_tokens,
+                    "prefill progress exceeded its selected slice");
+            require(progress.tokens <= remaining[(size_t)progress.slot],
+                    "prefill progress exceeded the prompt remainder");
+            remaining[(size_t)progress.slot] -= progress.tokens;
+        }
+
+        for (const SeqEngine::StepInput & input : plan.decode) {
+            if (input.slot >= 0 && input.slot < n_slots) {
+                require(decode_answered[(size_t)input.slot],
+                        "step() left a decoding slot without an output");
+            }
+        }
+        for (const PrefillSlice & slice : plan.prefills) {
+            require(slice.max_tokens > 0 &&
+                        slice.max_tokens <= slice_limit(plan),
+                    "StepPlan prefill slice exceeded engine limits");
+            if (slice.slot < 0 || slice.slot >= n_slots) continue;
+            require(prefill_answered[(size_t)slice.slot],
+                    "step() left a selected prefill without progress");
+            const bool done = remaining[(size_t)slice.slot] == 0;
+            require(completed[(size_t)slice.slot] == done,
+                    "prefill_done disagrees with reported token progress");
+            if (done) decoding[(size_t)slice.slot] = true;
         }
         return true;
     };
 
-    // Advance the one pending prefill to completion. Every decoding slot must
-    // still produce exactly one output on every intervening step: this is the
-    // non-pausing-admission guarantee, expressed without model internals.
-    auto complete_prefill = [&](int prefill_slot) {
-        for (int iteration = 0; iteration < 1024; iteration++) {
-            std::vector<SeqEngine::StepInput> inputs;
-            for (size_t i = 0; i < live.size(); i++) {
-                inputs.push_back({live[i], pending[i]});
-            }
-            std::vector<SeqEngine::StepOutput> outputs;
-            if (!engine.step(inputs, outputs)) {
-                require(false, "step() must advance a pending prefill");
-                return false;
-            }
-
-            std::vector<bool> answered((size_t)n_slots, false);
-            bool completed = false;
-            int32_t first_token = -1;
-            for (const SeqEngine::StepOutput & o : outputs) {
-                if (!validate_output(o)) continue;
-                require(!o.failed,
-                        "a contract-check prefill step must not fail a slot");
-                if (o.failed) continue;
-                if (o.prefill_done) {
-                    require(o.slot == prefill_slot,
-                            "prefill_done reported the wrong slot");
-                    require(!completed,
-                            "step() reported prefill completion twice");
-                    completed = true;
-                    first_token = o.token;
-                    continue;
-                }
-
-                bool known = false;
-                for (size_t i = 0; i < live.size(); i++) {
-                    if (live[i] != o.slot) continue;
-                    require(!answered[(size_t)o.slot],
-                            "step() returned two decode outputs for one slot");
-                    answered[(size_t)o.slot] = true;
-                    pending[i] = o.token;
-                    known = true;
-                    break;
-                }
-                require(known,
-                        "step() returned a non-prefill output for a non-decoding slot");
-            }
-            for (const int slot : live) {
-                require(answered[(size_t)slot],
-                        "prefill step left a decoding slot without an output");
-            }
-
-            if (completed) {
-                require(!engine.prefill_pending(),
-                        "prefill_pending() stayed true after completion");
-                live.push_back(prefill_slot);
-                pending.push_back(first_token);
-                return true;
-            }
-            require(engine.prefill_pending(),
-                    "prefill_pending() cleared before prefill_done");
-        }
-        require(false, "pending prefill did not complete");
-        return false;
+    auto execute = [&](const SeqEngine::StepPlan & plan) {
+        SeqEngine::StepResult result;
+        if (!run_bounded(plan, result)) return false;
+        return apply_progress(plan, result);
     };
 
-    // ── 1. Admission is non-computing and completes through step() ───────
-    SeqEngine::AdmitResult first =
-        engine.admit(1, prompt, greedy);
-    require(first.ok, "admit() must succeed on an idle engine");
-    if (!first.ok) return violations;
-    require(first.slot >= 0 && first.slot < n_slots,
-            "admit() returned a slot outside [0, slot_count())");
-    if (first.slot < 0 || first.slot >= n_slots) return violations;
-    taken[(size_t)first.slot] = true;
-    require(engine.prefill_pending(),
-            "successful admit() must leave a prefill pending");
+    auto decode_inputs = [&]() {
+        std::vector<SeqEngine::StepInput> inputs;
+        for (int slot = 0; slot < n_slots; ++slot) {
+            if (active[(size_t)slot] && decoding[(size_t)slot]) {
+                inputs.push_back({slot, next_token[(size_t)slot]});
+            }
+        }
+        return inputs;
+    };
 
-    // A single staging set permits only one admission prefill at a time.
-    const SeqEngine::AdmitResult while_pending =
-        engine.admit(9000, prompt, greedy);
-    require(!while_pending.ok && while_pending.busy,
-            "admit() while a prefill is pending must report busy=true");
-    if (!complete_prefill(first.slot)) {
-        engine.retire(first.slot);
+    // Admit the long prompt in the same idle cohort only when the engine can
+    // actually execute two slices. K=1 engines admit it after the short
+    // prompt releases its staging resource, then exercise the same mixed path.
+    const int short_slot = record_admit(1, {11}, greedy);
+    int long_slot = -1;
+    if (idle_cohort_size >= 2) {
+        long_slot = record_admit(2, {21, 22, 23}, seeded);
+    }
+    if (short_slot < 0 || (idle_cohort_size >= 2 && long_slot < 0)) {
+        retire_all();
         return violations;
     }
+    if (long_slot >= 0) {
+        require(short_slot != long_slot,
+                "two pending admissions must own distinct slots");
+    }
+    require(engine.prefill_pending(),
+            "successful admissions must leave prefill work pending");
 
-    // ── 2. Fill the remaining slots one asynchronous admission at a time ─
-    bool filled_all = true;
-    for (int i = 1; i < n_slots; i++) {
-        const SeqEngine::AdmitResult r = engine.admit(
-            (uint64_t)(i + 1), prompt, (i % 2) ? seeded : greedy);
-        if (!r.ok) {
-            require(r.busy,
-                    "a failed admit() with a free slot must report busy=true");
-            filled_all = false;
-            break;
-        }
-        require(r.slot >= 0 && r.slot < n_slots,
-                "admit() returned a slot outside [0, slot_count())");
-        if (r.slot < 0 || r.slot >= n_slots) {
-            filled_all = false;
-            break;
-        }
-        require(!taken[(size_t)r.slot], "admit() reused a slot that is live");
-        if (taken[(size_t)r.slot]) {
-            engine.retire(r.slot);
-            for (const int slot : live) engine.retire(slot);
+    SeqEngine::StepPlan first_plan;
+    first_plan.prefills.push_back({short_slot, 1});
+    if (long_slot >= 0) {
+        const int long_grant = std::min({
+            2,
+            idle_limits.max_prefill_tokens_per_sequence,
+            idle_limits.max_prefill_tokens_total - 1,
+        });
+        first_plan.prefills.push_back({long_slot, long_grant});
+    }
+    if (!execute(first_plan)) {
+        retire_all();
+        return violations;
+    }
+    require(decoding[(size_t)short_slot],
+            "the short prefill must complete in its selected slice");
+
+    if (long_slot < 0) {
+        long_slot = record_admit(2, {21, 22, 23}, seeded);
+        if (long_slot < 0) {
+            retire_all();
             return violations;
         }
-        taken[(size_t)r.slot] = true;
-        require(engine.prefill_pending(),
-                "successful admit() must leave a prefill pending");
-        if (!complete_prefill(r.slot)) {
-            filled_all = false;
-            break;
-        }
     }
-    require(!live.empty(), "no request completed admission");
+    require(!decoding[(size_t)long_slot] &&
+                remaining[(size_t)long_slot] > 0,
+            "long member must remain pending after the short member completes");
+    require(engine.prefill_pending(),
+            "prefill_pending() must report the unfinished long prompt");
 
-    // ── 3. A full engine is busy, never a hard error ─────────────────────
-    // The scheduler re-queues a busy job and retries it after the next
-    // retire; a hard error fails a request that only needed to wait.
-    if (filled_all) {
-        const SeqEngine::AdmitResult over =
-            engine.admit(9001, prompt, greedy);
-        require(!over.ok, "admit() must fail when every slot is live");
-        if (!over.ok) {
-            require(over.busy,
-                    "a full engine must report busy=true, not a hard error");
-            require(over.slot < 0, "a failed admit() must not claim a slot");
-        }
+    for (int iteration = 0;
+         remaining[(size_t)long_slot] > 0 && iteration < 8;
+         ++iteration) {
+        SeqEngine::StepPlan mixed;
+        mixed.decode = decode_inputs();
+        const StepPlanLimits limits =
+            engine.step_plan_limits((int)mixed.decode.size());
+        require(supports_one_prefill(limits),
+                "mixed step_plan_limits() must permit continued prefill");
+        if (!supports_one_prefill(limits)) break;
+        mixed.prefills.push_back({
+            long_slot,
+            std::min({
+                remaining[(size_t)long_slot],
+                limits.max_prefill_tokens_per_sequence,
+                limits.max_prefill_tokens_total,
+            }),
+        });
+        if (!execute(mixed)) break;
     }
+    require(remaining[(size_t)long_slot] == 0,
+            "mixed prefill did not complete within bounded progress steps");
+    require(!engine.prefill_pending(),
+            "prefill_pending() stayed true after the cohort completed");
 
-    // ── 4. A batched decode step answers every live slot exactly once ────
-    for (int iter = 0; iter < 3; iter++) {
-        std::vector<SeqEngine::StepInput> inputs;
-        inputs.reserve(live.size());
-        for (size_t i = 0; i < live.size(); i++) {
-            inputs.push_back({live[i], pending[i]});
-        }
-        std::vector<SeqEngine::StepOutput> outputs;
-        if (!engine.step(inputs, outputs)) {
-            require(false, "step() over every live slot must succeed");
-            break;
-        }
-        if (outputs.size() != inputs.size()) {
-            require(false, "step() must return one output per input");
-            break;
-        }
+    // Full decode coverage, including the token handoff back into the engine.
+    SeqEngine::StepPlan decode_plan;
+    decode_plan.decode = decode_inputs();
+    require(decode_plan.decode.size() == 2,
+            "both completed admissions must enter decode");
+    execute(decode_plan);
 
-        std::vector<bool> answered((size_t)n_slots, false);
-        bool shape_ok = true;
-        for (const SeqEngine::StepOutput & o : outputs) {
-            if (!validate_output(o, &answered)) {
-                shape_ok = false;
-                continue;
-            }
-            if (o.failed) continue;
-            require(!o.prefill_done,
-                    "decode-only step reported a prefill completion");
-        }
-        for (const int s : live) {
-            if (!answered[(size_t)s]) {
-                require(false, "step() left a live slot without an output");
-                shape_ok = false;
-                break;
-            }
-        }
-        if (!shape_ok) break;
-
-        // Feed each sampled token back as the next step's input — the handoff
-        // that lets the scheduler override a token (thinking-budget close)
-        // before it is committed to the cache.
-        bool ended = false;
-        for (const SeqEngine::StepOutput & o : outputs) {
-            if (o.failed || engine.token_is_eos(o.token)) {
-                ended = true;
-                continue;
-            }
-            for (size_t i = 0; i < live.size(); i++) {
-                if (live[i] == o.slot) { pending[i] = o.token; break; }
-            }
-        }
-        if (ended) break;   // the scheduler would retire that slot here
+    // A full engine is retryable admission pressure, not a request error.
+    if (n_slots == 2) {
+        const SeqEngine::AdmitResult full = engine.admit(3, {31}, greedy);
+        require(!full.ok && full.busy && full.slot < 0,
+                "a full engine must report busy=true without claiming a slot");
     }
 
-    // ── 5. A short batch is refused, not silently advanced ───────────────
-    // One forward covers every row, so an omitted live slot would have its
-    // backend-owned state advanced by whatever filler the engine substitutes.
-    if (live.size() >= 2) {
-        const std::vector<SeqEngine::StepInput> partial{{live[0], pending[0]}};
-        std::vector<SeqEngine::StepOutput> outputs;
-        require(!engine.step(partial, outputs),
-                "step() must reject a batch that omits a live slot");
+    // Omitting a decoder or attaching prefill work to a decoding slot is a
+    // terminal plan-validation failure and must not partially advance state.
+    auto require_failed = [&](const SeqEngine::StepPlan & invalid,
+                              const char * message) {
+        const SeqEngine::StepResult result = engine.step(invalid);
+        validate_status_helpers(result);
+        require(result.status == Status::failed, message);
+        require(!result.ok() && !result.made_progress(),
+                "failed result helpers must reject the step");
+        require(!result.error.empty(),
+                "failed step must explain the validation error");
+        require(result.outputs.empty() && result.prefill_progress.empty(),
+                "failed step must not report partial progress");
+    };
+
+    SeqEngine::StepPlan omitted;
+    omitted.decode.push_back(decode_plan.decode.front());
+    require_failed(omitted,
+                   "step() must reject a plan that omits a decoding slot");
+
+    SeqEngine::StepPlan invalid_prefill = decode_plan;
+    invalid_prefill.prefills.push_back({short_slot, 1});
+    require_failed(invalid_prefill,
+                   "step() must reject prefill work for a decoding slot");
+
+    // Start fresh and complete the advertised idle cohort in one step. When
+    // K=2 is available, this still catches engines that accidentally retain a
+    // scalar completion/output path.
+    retire_all();
+    const int simultaneous_a = record_admit(10, {41}, greedy);
+    int simultaneous_b = -1;
+    if (idle_cohort_size >= 2) {
+        simultaneous_b = record_admit(11, {51}, seeded);
+    }
+    if (simultaneous_a >= 0 &&
+        (idle_cohort_size < 2 || simultaneous_b >= 0)) {
+        SeqEngine::StepPlan simultaneous;
+        simultaneous.prefills.push_back({simultaneous_a, 1});
+        if (simultaneous_b >= 0) {
+            simultaneous.prefills.push_back({simultaneous_b, 1});
+        }
+        execute(simultaneous);
+        require(decoding[(size_t)simultaneous_a],
+                "selected prefill must report completion");
+        if (simultaneous_b >= 0) {
+            require(decoding[(size_t)simultaneous_b],
+                    "one K=2 step must report simultaneous completions");
+        }
     }
 
-    // ── 6. An empty batch cannot omit decoding slots ─────────────────────
-    if (!live.empty()) {
-        std::vector<SeqEngine::StepOutput> outputs(1);
-        require(!engine.step({}, outputs),
-                "step() must reject an empty batch while slots are decoding");
-    }
-
-    // ── 7. retire() frees decoding and prefilling slots safely ───────────
-    {
-        const int freed = live.front();
+    // Retire is idempotent, frees capacity, and cancels unfinished prefill.
+    const int freed = simultaneous_a;
+    if (freed >= 0) {
         engine.retire(freed);
-        engine.retire(freed);   // must be a no-op on an already-free slot
-        live.erase(live.begin());
-        pending.erase(pending.begin());
-
-        const SeqEngine::AdmitResult again =
-            engine.admit(9002, prompt, greedy);
-        require(again.ok, "admit() must succeed after a retire() freed a slot");
-        if (again.ok) {
-            require(engine.prefill_pending(),
-                    "replacement admission must start a prefill");
-            engine.retire(again.slot);
+        engine.retire(freed);
+        active[(size_t)freed] = false;
+        decoding[(size_t)freed] = false;
+        const int replacement = record_admit(12, {61, 62}, greedy);
+        require(replacement >= 0,
+                "admit() must reuse capacity after retire()");
+        if (replacement >= 0) {
+            engine.retire(replacement);
+            engine.retire(replacement);
+            active[(size_t)replacement] = false;
+            decoding[(size_t)replacement] = false;
+            remaining[(size_t)replacement] = 0;
             require(!engine.prefill_pending(),
-                    "retiring a prefilling slot must clear pending state");
-            engine.retire(again.slot);
+                    "retiring the only pending prefill must clear it");
         }
     }
 
-    // ── 8. Retiring everything returns the engine to idle ────────────────
-    for (const int s : live) engine.retire(s);
-    live.clear();
-    {
-        std::vector<SeqEngine::StepOutput> outputs(1);
-        require(engine.step({}, outputs),
-                "step() with no work must succeed");
-        require(outputs.empty(),
-                "idle step() must clear `outputs` before returning");
-    }
-    {
-        const SeqEngine::AdmitResult fresh =
-            engine.admit(9003, prompt, greedy);
-        require(fresh.ok, "admit() must succeed once every slot has retired");
-        if (fresh.ok) {
-            engine.retire(fresh.slot);
-            require(!engine.prefill_pending(),
-                    "idle engine must not retain a pending prefill");
-        }
-    }
+    retire_all();
+    const SeqEngine::StepResult idle = engine.step({});
+    validate_status_helpers(idle);
+    require(idle.status == Status::idle && idle.ok() &&
+                !idle.made_progress(),
+            "step() with no work must return idle");
+    require(idle.outputs.empty() && idle.prefill_progress.empty() &&
+                idle.error.empty(),
+            "idle result must not retain work or errors");
 
+    const int reused = record_admit(13, {71}, greedy);
+    require(reused >= 0,
+            "an engine must admit again after every slot retires");
+    retire_all();
+    require(!engine.prefill_pending(),
+            "fully retired engine must have no pending prefill");
     return violations;
 }
 

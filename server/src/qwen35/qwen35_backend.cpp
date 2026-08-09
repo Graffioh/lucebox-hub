@@ -143,7 +143,7 @@ static FILE * open_dflash_floor_log() {
 // target features, paged metadata, Q capture, and the dead-row scratch block.
 static int64_t concurrent_fixed_cache_bytes(
         const TargetWeights & w, int max_ctx, int n_slots,
-        int64_t kv_bytes_per_token) {
+        int64_t kv_bytes_per_token, int max_concurrent_prefills = 1) {
     const int64_t n_full_attn =
         w.n_layer / w.full_attention_interval;
     const int64_t n_delta = w.n_layer - n_full_attn;
@@ -154,10 +154,13 @@ static int64_t concurrent_fixed_cache_bytes(
         (head_v_dim * head_v_dim * w.ssm_dt_rank +
          (int64_t)(w.ssm_d_conv - 1) * conv_ch) *
         (int64_t)sizeof(float);
+    const int64_t staging_state =
+        state_per_layer * n_delta * (int64_t)(max_concurrent_prefills - 1);
     const int64_t recurrent =
         state_per_layer * n_delta * (n_slots + 1LL);
     const int64_t staging_kv =
-        kv_bytes_per_token * paged_token_capacity(max_ctx);
+        kv_bytes_per_token * paged_token_capacity(max_ctx) *
+        (int64_t)max_concurrent_prefills;
     const int64_t target_feat =
         (int64_t)w.n_capture_layers * w.n_embd *
         std::min(max_ctx, 4096) * (int64_t)sizeof(uint16_t);
@@ -169,8 +172,8 @@ static int64_t concurrent_fixed_cache_bytes(
         (int64_t)sizeof(int32_t);
     const int64_t scratch =
         kv_bytes_per_token * PAGED_BLOCK_SIZE;
-    return recurrent + staging_kv + target_feat + q_capture +
-           paged_metadata + scratch;
+    return recurrent + staging_state + staging_kv + target_feat +
+           q_capture + paged_metadata + scratch;
 }
 }  // namespace
 
@@ -346,6 +349,11 @@ bool Qwen35Backend::init() {
     // Paged mode sizes the KV cache to whole blocks; otherwise KVFlash
     // decides the allocation (0 = full max_ctx).
     const int n_slots = concurrent_slots();
+    const int max_concurrent_prefills = n_slots > 1
+        ? std::clamp(
+              env_int_or_default("DFLASH_MAX_CONCURRENT_PREFILLS", 2),
+              1, 2)
+        : 1;
     if (n_slots > 1 && !cfg_.paged_attention) {
         set_last_error("--max-concurrency requires --paged-attention");
         return false;
@@ -371,7 +379,8 @@ bool Qwen35Backend::init() {
             budget.bytes_per_token = kvf_budget.bytes_per_token;
             budget.reserve_bytes = kvf_budget.reserve_bytes;
             budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
-                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token);
+                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
+                max_concurrent_prefills);
             pool_tokens = paged_kv_auto_pool_tokens(
                 cfg_.device.max_ctx, n_slots, budget);
             const int64_t one_context =
@@ -405,7 +414,8 @@ bool Qwen35Backend::init() {
                : kvflash_tokens_);
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
-                             cfg_.paged_attention, n_slots)) {
+                             cfg_.paged_attention, n_slots,
+                             max_concurrent_prefills)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
     }
@@ -439,10 +449,14 @@ bool Qwen35Backend::init() {
         if (n_slots > 1) {
             seq_engine_ = std::make_unique<Qwen35SeqEngine>(
                 *this, *paged_kv_pool_, cfg_.device.max_ctx,
-                /*scratch_row=*/pool_tokens);  // first row of the scratch block
-            std::printf("[parallel] %d decode slots, pool %u blocks x %u tokens"
+                /*scratch_row=*/pool_tokens,
+                max_concurrent_prefills);  // first row of the scratch block
+            std::printf("[parallel] %d decode slots, %d prefill staging set%s, "
+                        "pool %u blocks x %u tokens"
                         " (%lld shared tokens, per-seq max_ctx %d)\n",
-                        n_slots, paged_kv_pool_->physical_block_count(),
+                        n_slots, max_concurrent_prefills,
+                        max_concurrent_prefills == 1 ? "" : "s",
+                        paged_kv_pool_->physical_block_count(),
                         paged_kv_pool_->block_size(),
                         (long long)pool_tokens, cfg_.device.max_ctx);
         }

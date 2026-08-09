@@ -6,11 +6,11 @@
 // paged KV cache and execute a batched decode step. Any additional
 // per-sequence model state is owned by the concrete engine, not by this
 // interface. admit() claims a slot and queues its prompt without compute.
-// Each step() then advances that prefill by one chunk alongside the live
-// decode batch. Once prefilling completes, the scheduler advances the slot
-// one token per step(), feeding each sampled token back as the next step's
-// input — which is what lets it override a token (thinking-budget
-// force-close) before it is committed to the cache.
+// Each step() then advances a scheduler-selected cohort of prompt slices
+// alongside the complete live decode batch. Once a prefill completes, the
+// scheduler advances that slot one token per step(), feeding each sampled
+// token back as the next step's input — which is what lets it override a token
+// (thinking-budget force-close) before it is committed to the cache.
 //
 // The split of duties is deliberate and is the reason this interface exists
 // apart from ModelBackend:
@@ -54,6 +54,7 @@
 
 #include "sampler.h"
 #include "seq_admission.h"
+#include "seq_batch_plan.h"
 
 namespace dflash::common {
 
@@ -72,9 +73,9 @@ public:
     using AdmitResult = SeqAdmissionResult;
 
     // Admit one request into a free slot and queue its prompt for chunked
-    // prefill. No K/V blocks or compute are consumed here — subsequent step()
-    // calls allocate and advance one prefill chunk alongside the decode batch.
-    // At most one admission may prefill at a time.
+    // prefill. No model compute is performed here. Implementations may reserve
+    // persistent capacity atomically so that every admitted prompt can finish;
+    // subsequent step() calls advance scheduler-selected prompt slices.
     //
     // `sampler` is the only source of truth for how the slot samples:
     // sampler.needs_logit_processing() selects CPU sampling over GPU argmax
@@ -103,14 +104,62 @@ public:
         bool    prefill_done = false;
     };
 
-    // One scheduler iteration: commit each input token and advance every
-    // decoding slot, while also advancing the pending admission's prefill by
-    // one chunk when present. Every decoding slot must appear in `inputs`;
-    // the prefilling slot must not. A completed prefill contributes one extra
-    // output with prefill_done=true. Returns false on a whole-batch failure
-    // (outputs may be partial).
-    virtual bool step(const std::vector<StepInput> & inputs,
-                      std::vector<StepOutput> & outputs) = 0;
+    // One scheduler iteration owns both kinds of logical work. `decode` must
+    // contain every currently decoding slot exactly once; `prefills` is the
+    // bounded subset of pending prompt work selected by scheduler policy.
+    // Device graph shapes, staging indices, cache blocks, and model state stay
+    // behind the engine boundary.
+    struct StepPlan {
+        std::vector<StepInput>    decode;
+        std::vector<PrefillSlice> prefills;
+    };
+
+    struct PrefillProgress {
+        int slot   = -1;
+        int tokens = 0;
+    };
+
+    struct StepResult {
+        enum class Status {
+            idle,
+            progressed,
+            resource_blocked,
+            failed,
+        };
+
+        Status                       status = Status::idle;
+        std::vector<StepOutput>      outputs;
+        std::vector<PrefillProgress> prefill_progress;
+        // Whole-step diagnostic. A failed result must explain the terminal
+        // validation/execution error; resource_blocked may explain which
+        // retryable resource prevented an otherwise valid plan from running.
+        // A failed result carries no usable outputs/progress. Validation
+        // failures occur before mutation; a device/build/compute failure may
+        // leave backend state partially advanced, so the caller must retire
+        // every live sequence before invoking step() again. Only
+        // resource_blocked promises an atomic, unchanged state.
+        std::string error;
+
+        bool ok() const { return status != Status::failed; }
+        bool made_progress() const { return status == Status::progressed; }
+    };
+
+    // Hard per-step capabilities at the requested live decode width. Global
+    // token budgets and fairness remain scheduler policy; an engine may
+    // advertise different sequence, per-sequence, and total-token limits for
+    // idle, mixed, or larger decode buckets.
+    virtual StepPlanLimits step_plan_limits(int decode_rows) const = 0;
+
+    // A valid progressed result returns one output for every decode input.
+    // Every selected prefill returns positive PrefillProgress (never exceeding
+    // its slice), unless it instead terminates with a failed prefill_done
+    // output. A successful completion contributes both progress and an output
+    // with prefill_done=true. Invalid plans return failed without advancing
+    // state. Runtime failures are terminal for the
+    // live cohort and may follow partial backend mutation, but expose no
+    // consumable payload. resource_blocked is retryable, atomic, and likewise
+    // reports no partial progress.
+    virtual StepResult step(const StepPlan & plan) = 0;
 
     virtual bool prefill_pending() const = 0;
 

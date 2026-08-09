@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -148,6 +149,13 @@ struct ServerConfig {
     // server_main after CLI parse.
     std::string target_device;
     std::string draft_device;
+    // Model-neutral continuous-batching policy. The engine advertises hard
+    // graph/state limits; these values decide how scheduler-owned token
+    // budget is distributed across pending requests.
+    int admission_coalesce_ms      = 0;
+    int prefill_quantum            = 512;
+    int prefill_token_budget       = 4096;
+    int mixed_prefill_token_budget = 2048;
 
     // PFlash (speculative prefill compression)
     enum class PflashMode { OFF, AUTO, ALWAYS };
@@ -366,6 +374,9 @@ private:
 
     // Non-blocking dequeue used for admission polling between decode steps.
     ServerJob * try_dequeue();
+    // Bounded wait used only during an idle-to-busy admission window.
+    ServerJob * dequeue_for(
+        std::chrono::steady_clock::duration timeout);
 
     // Concurrent-scheduler token delivery and shared response construction.
     // A send buffer keeps slow clients off the shared decode loop.
@@ -511,6 +522,9 @@ struct ServerJob {
     // The classic worker leaves these fields untouched.
     bool          announced = false;
     bool          sse_started = false;
+    // First concurrent-scheduler attempt; retained across busy deferrals so
+    // server-side prefill/elapsed telemetry does not erase queueing delay.
+    std::chrono::steady_clock::time_point parallel_started_at{};
     std::unique_ptr<SseEmitter> emitter;
 };
 
