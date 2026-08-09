@@ -350,6 +350,7 @@ When compression is on, the request path picks one of three modes automatically,
 | `DFLASH_PREFILL_CACHE_SLOTS=N` | `0` | Container-entrypoint equivalent of `--prefill-cache-slots`; the native binary itself uses the CLI flag. |
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
 | `--kv-cache-budget N` | — | On-disk cache size cap |
+| `--paged-attention` | off | Exact 16-token block-table decode for single-device Qwen3.6-27B AR; see [paged attention](optimizations/paged_attention/README.md) |
 
 **Bounded KV residency (KVFlash)**
 
