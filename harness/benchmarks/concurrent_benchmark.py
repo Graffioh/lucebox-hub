@@ -26,19 +26,29 @@ Example:
 Metric definitions:
 - TTFT: request start to the first SSE chunk carrying a content or
   reasoning_content delta (the role-only chunk does not count).
-- Per-stream decode tok/s: completion_tokens / (stream end - first token).
+- Per-request stream tok/s: server-reported completion_tokens divided by the
+  full request interval (request start to stream end). It includes queueing,
+  prefill, and decode; no SSE chunk is treated as one tokenizer token.
 - Aggregate tok/s: sum of completion_tokens across all successful requests
   in the level divided by the level's wall-clock (first request start to
-  last request end).
+  last request end). This metric is unavailable unless every successful
+  request has a server-reported completion-token count.
+
+SSE content deltas are transport chunks, not necessarily tokenizer tokens.
+The harness records their count and timing separately and never substitutes
+them for completion_tokens.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
+import platform
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -220,12 +230,15 @@ def load_prompts(path: Path | None) -> list[str]:
     return prompts
 
 
-def request_prompts(prompts: list[str], count: int) -> list[str]:
-    """Return `count` distinct prompts for one concurrency level."""
-    width = len(str(count))
+def request_prompts(
+    prompts: list[str], count: int, offset: int = 0,
+) -> list[str]:
+    """Return `count` distinct prompts starting at the global request offset."""
+    width = len(str(offset + count))
     return [
-        prompts[i] if i < len(prompts) else
-        f"Benchmark request {i + 1:0{width}d}.\n\n{prompts[i % len(prompts)]}"
+        prompts[offset + i] if offset + i < len(prompts) else
+        (f"Benchmark request {offset + i + 1:0{width}d}.\n\n"
+         f"{prompts[(offset + i) % len(prompts)]}")
         for i in range(count)
     ]
 
@@ -238,6 +251,192 @@ def percentile(values: list[float], pct: float) -> float | None:
     return xs[k]
 
 
+def percentile_if_sufficient(
+    values: list[float], pct: float, min_samples: int,
+) -> float | None:
+    """Return a nearest-rank percentile only for an adequate sample."""
+    if len(values) < min_samples:
+        return None
+    return percentile(values, pct)
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def text_identity(text: str) -> dict[str, Any]:
+    """Return a chunk-boundary-independent identity for generated text.
+
+    Character length is Python's Unicode code-point count. Byte length and
+    SHA-256 are over the exact UTF-8 encoding used by the JSON/SSE protocol.
+    """
+    encoded = text.encode("utf-8")
+    return {
+        "sha256": sha256_bytes(encoded),
+        "char_length": len(text),
+        "byte_length": len(encoded),
+    }
+
+
+def sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
+def prompt_content_sha256(prompts: list[str]) -> str:
+    """Hash parsed prompt content independently of its file formatting."""
+    canonical = json.dumps(
+        prompts, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256_bytes(canonical)
+
+
+def sanitize_argv(argv: list[str]) -> list[str]:
+    """Copy argv while redacting API-key values from reproducibility data."""
+    sanitized: list[str] = []
+    redact_next = False
+    for arg in argv:
+        if redact_next:
+            sanitized.append("<redacted>")
+            redact_next = False
+        elif arg == "--api-key":
+            sanitized.append(arg)
+            redact_next = True
+        elif arg.startswith("--api-key="):
+            sanitized.append("--api-key=<redacted>")
+        else:
+            sanitized.append(arg)
+    return sanitized
+
+
+def git_provenance(path: Path) -> dict[str, Any] | None:
+    """Capture the revision and dirty-state digest without requiring git."""
+    try:
+        root_result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            check=True, capture_output=True, timeout=10,
+        )
+        root = Path(root_result.stdout.decode("utf-8", errors="replace").strip())
+
+        def git(*args: str) -> bytes:
+            result = subprocess.run(
+                ["git", "-C", str(root), *args], check=True,
+                capture_output=True, timeout=30,
+            )
+            return result.stdout
+
+        head = git("rev-parse", "HEAD").decode().strip()
+        branch = git("branch", "--show-current").decode().strip() or None
+        status = git("status", "--short", "--untracked-files=normal").decode(
+            "utf-8", errors="replace",
+        ).splitlines()
+        tracked_diff = git("diff", "--no-ext-diff", "--full-index", "HEAD")
+        return {
+            "root": str(root),
+            "head": head,
+            "branch": branch,
+            "dirty": bool(status),
+            "status_short": status,
+            "tracked_diff_sha256": sha256_bytes(tracked_diff),
+        }
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+
+
+def load_metadata_json(
+    path: Path | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Load optional launcher-supplied server/build metadata."""
+    if path is None:
+        return None, None
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: server metadata must be a JSON object")
+    return value, {
+        "path": str(path.resolve()),
+        "sha256": sha256_bytes(raw),
+    }
+
+
+def server_props_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base.rstrip("/") + "/props"
+
+
+def fetch_server_props(
+    base_url: str, api_key: str, timeout: float,
+) -> dict[str, Any]:
+    """Snapshot a compatible server's read-only /props endpoint if present."""
+    url = server_props_url(base_url)
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    result: dict[str, Any] = {"url": url, "available": False}
+    try:
+        with urllib.request.urlopen(req, timeout=min(timeout, 10.0)) as resp:
+            raw = resp.read(4 * 1024 * 1024 + 1)
+            result["http_status"] = getattr(resp, "status", None)
+            result["http_server_header"] = resp.headers.get("Server")
+        if len(raw) > 4 * 1024 * 1024:
+            result["error"] = "response exceeded 4 MiB capture limit"
+            return result
+        result["body_sha256"] = sha256_bytes(raw)
+        body = json.loads(raw)
+        result["body"] = body
+        result["available"] = True
+    except urllib.error.HTTPError as exc:
+        result["http_status"] = exc.code
+        result["error"] = f"HTTP {exc.code}"
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def finalize_token_accounting(
+    record: dict[str, Any], max_tokens: int, fixed_tokens_requested: bool,
+) -> None:
+    """Validate server-reported counts without treating SSE deltas as tokens."""
+    completion_tokens = record.get("completion_tokens")
+    if (
+        not isinstance(completion_tokens, int)
+        or isinstance(completion_tokens, bool)
+        or completion_tokens < 0
+    ):
+        completion_tokens = None
+
+    record["completion_tokens"] = completion_tokens
+    record["token_count_available"] = completion_tokens is not None
+
+    if fixed_tokens_requested:
+        validated = (
+            record.get("error") is None
+            and completion_tokens == max_tokens
+        )
+        record["fixed_token_count_validated"] = validated
+        if not validated:
+            if completion_tokens is None:
+                record["token_count_warning"] = (
+                    "fixed-token request has no exact completion-token count"
+                )
+            else:
+                record["token_count_warning"] = (
+                    f"fixed-token request returned {completion_tokens} tokens; "
+                    f"expected {max_tokens}"
+                )
+    else:
+        record["fixed_token_count_validated"] = None
+
+    if completion_tokens is None:
+        record["token_count_source"] = "unavailable"
+
+
 def stream_request(
     base_url: str,
     api_key: str,
@@ -246,6 +445,9 @@ def stream_request(
     max_tokens: int,
     temperature: float,
     timeout: float,
+    ignore_eos: bool = False,
+    request_stream_usage: bool = True,
+    capture_output_text: bool = False,
 ) -> dict[str, Any]:
     """POST one streaming chat completion and timestamp every content chunk.
 
@@ -261,6 +463,10 @@ def stream_request(
         "temperature": temperature,
         "stream": True,
     }
+    if request_stream_usage:
+        payload["stream_options"] = {"include_usage": True}
+    if ignore_eos:
+        payload["ignore_eos"] = True
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     if api_key:
@@ -276,10 +482,18 @@ def stream_request(
         "completion_tokens": None,
         "prompt_tokens": None,
         "token_count_source": None,
+        "token_count_available": False,
+        "fixed_token_count_validated": None,
+        "token_count_warning": None,
         "server_decode_tok_s": None,
+        "response_model": None,
+        "system_fingerprint": None,
+        "http_server_header": None,
         "finish_reason": None,
         "done_seen": False,
         "error": None,
+        "_content_parts": [],
+        "_reasoning_content_parts": [],
     }
     deadline = record["t_start"] + timeout
 
@@ -297,9 +511,22 @@ def stream_request(
             raise RuntimeError(f"server error event: {err}")
         if not isinstance(obj, dict):
             return False
+        if isinstance(obj.get("model"), str):
+            record["response_model"] = obj["model"]
+        if isinstance(obj.get("system_fingerprint"), str):
+            record["system_fingerprint"] = obj["system_fingerprint"]
         choices = obj.get("choices") or []
         delta = (choices[0].get("delta") or {}) if choices else {}
-        if delta.get("content") or delta.get("reasoning_content"):
+        content_delta = delta.get("content")
+        reasoning_delta = delta.get("reasoning_content")
+        if isinstance(content_delta, str):
+            record["_content_parts"].append(content_delta)
+        if isinstance(reasoning_delta, str):
+            record["_reasoning_content_parts"].append(reasoning_delta)
+        if (
+            (isinstance(content_delta, str) and content_delta)
+            or (isinstance(reasoning_delta, str) and reasoning_delta)
+        ):
             now = time.perf_counter()
             if record["t_first"] is None:
                 record["t_first"] = now
@@ -324,6 +551,7 @@ def stream_request(
         # so every request opens a fresh connection; urllib handles the
         # chunked transfer coding and yields the body line by line.
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            record["http_server_header"] = resp.headers.get("Server")
             event_type = ""
             data_lines: list[str] = []
             for raw in resp:
@@ -356,66 +584,128 @@ def stream_request(
 
     if record["error"] is None and not record["done_seen"]:
         record["error"] = "stream ended without [DONE]"
-    if record["error"] is None and record["completion_tokens"] is None:
-        # Fall back to counting received delta chunks (holdback batching in
-        # the emitter can merge tokens, so this undercounts slightly).
-        record["completion_tokens"] = record["delta_chunks"]
-        record["token_count_source"] = "delta_chunks"
+    for field in ("content", "reasoning_content"):
+        parts = record.pop(f"_{field}_parts")
+        text = "".join(parts)
+        identity = text_identity(text)
+        record[f"{field}_sha256"] = identity["sha256"]
+        record[f"{field}_char_length"] = identity["char_length"]
+        record[f"{field}_byte_length"] = identity["byte_length"]
+        if capture_output_text:
+            record[f"{field}_text"] = text
+    finalize_token_accounting(record, max_tokens, ignore_eos)
     return record
 
 
-def finalize_request(record: dict[str, Any], level_start: float) -> dict[str, Any]:
+def finalize_request(
+    record: dict[str, Any], level_start: float, min_percentile_samples: int = 100,
+) -> dict[str, Any]:
     ttft = None
-    decode_tok_s = None
+    request_tok_s = None
+    elapsed_s = record["t_end"] - record["t_start"]
     if record["t_first"] is not None:
         ttft = record["t_first"] - record["t_start"]
-        decode_s = record["t_end"] - record["t_first"]
-        ct = record["completion_tokens"]
-        # From first-token arrival to stream end there are ct - 1 decode
-        # intervals. Counting the already-arrived first token overstates the
-        # rate, especially for short completions.
-        if record["error"] is None and ct and ct > 1 and decode_s > 0:
-            decode_tok_s = (ct - 1) / decode_s
+    ct = record["completion_tokens"]
+    if (
+        record["error"] is None
+        and record.get("token_count_source") == "usage"
+        and ct is not None
+        and elapsed_s > 0
+    ):
+        request_tok_s = ct / elapsed_s
     times = record["chunk_times"]
     gaps = [b - a for a, b in zip(times, times[1:])]
-    return {
+    gap_p95 = percentile_if_sufficient(gaps, 95.0, min_percentile_samples)
+    finalized = {
         "prompt_index": record["prompt_index"],
+        "global_prompt_index": record["global_prompt_index"],
+        "prompt_sha256": record["prompt_sha256"],
         "start_offset_s": record["t_start"] - level_start,
-        "elapsed_s": record["t_end"] - record["t_start"],
+        "elapsed_s": elapsed_s,
         "ttft_s": ttft,
-        "decode_tok_s": decode_tok_s,
+        "request_tok_s": request_tok_s,
+        "request_tok_s_interval": "request_start_to_stream_end",
+        "request_tok_s_source": (
+            "usage.completion_tokens" if request_tok_s is not None else None
+        ),
+        "decode_tok_s": None,
+        "decode_tok_s_status": "unavailable_from_sse_chunks",
         "completion_tokens": record["completion_tokens"],
         "prompt_tokens": record["prompt_tokens"],
         "token_count_source": record["token_count_source"],
+        "token_count_available": record["token_count_available"],
+        "fixed_token_count_validated": record["fixed_token_count_validated"],
+        "token_count_warning": record["token_count_warning"],
         "delta_chunks": record["delta_chunks"],
-        "itl_mean_ms": statistics.mean(gaps) * 1000.0 if gaps else None,
-        "itl_p95_ms": percentile(gaps, 95.0) * 1000.0 if gaps else None,
+        "content_sha256": record.get("content_sha256"),
+        "content_char_length": record.get("content_char_length"),
+        "content_byte_length": record.get("content_byte_length"),
+        "reasoning_content_sha256": record.get("reasoning_content_sha256"),
+        "reasoning_content_char_length": record.get(
+            "reasoning_content_char_length",
+        ),
+        "reasoning_content_byte_length": record.get(
+            "reasoning_content_byte_length",
+        ),
+        "sse_delta_gap_mean_ms": statistics.mean(gaps) * 1000.0 if gaps else None,
+        "sse_delta_gap_p95_ms": gap_p95 * 1000.0 if gap_p95 is not None else None,
+        "sse_delta_gap_max_ms": max(gaps) * 1000.0 if gaps else None,
+        "sse_delta_gap_sample_count": len(gaps),
+        "sse_delta_gap_p95_min_samples": min_percentile_samples,
+        "sse_delta_gap_p95_status": (
+            "reported" if gap_p95 is not None else "insufficient_samples"
+        ),
+        # SSE emitters may split or merge token text arbitrarily, so these
+        # legacy token-latency names cannot be populated from chunk timing.
+        "itl_mean_ms": None,
+        "itl_p95_ms": None,
+        "itl_status": "unavailable_from_sse_chunks",
         "server_decode_tok_s": record["server_decode_tok_s"],
+        "response_model": record["response_model"],
+        "system_fingerprint": record["system_fingerprint"],
+        "http_server_header": record["http_server_header"],
         "finish_reason": record["finish_reason"],
         "error": record["error"],
     }
+    for field in ("content", "reasoning_content"):
+        if f"{field}_text" in record:
+            finalized[f"{field}_text"] = record[f"{field}_text"]
+    return finalized
 
 
-def run_level(n: int, args: argparse.Namespace, prompts: list[str]) -> dict[str, Any]:
+def run_level(
+    n: int, args: argparse.Namespace, prompts: list[str], prompt_offset: int = 0,
+) -> dict[str, Any]:
+    level_started_at = dt.datetime.now(dt.timezone.utc).isoformat()
     barrier = threading.Barrier(n)
     stream_records: list[list[dict[str, Any]] | None] = [None] * n
-    level_prompts = request_prompts(prompts, n * args.requests_per_stream)
+    level_prompts = request_prompts(
+        prompts, n * args.requests_per_stream, prompt_offset,
+    )
 
     def worker(stream_index: int) -> None:
         barrier.wait()
         records: list[dict[str, Any]] = []
         for j in range(args.requests_per_stream):
             prompt_index = stream_index * args.requests_per_stream + j
+            prompt = level_prompts[prompt_index]
             record = stream_request(
                 base_url=args.base_url,
                 api_key=args.api_key,
                 model=args.model,
-                prompt=level_prompts[prompt_index],
+                prompt=prompt,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
                 timeout=args.timeout,
+                ignore_eos=args.ignore_eos,
+                request_stream_usage=args.request_stream_usage,
+                capture_output_text=getattr(
+                    args, "capture_output_text", False,
+                ),
             )
             record["prompt_index"] = prompt_index
+            record["global_prompt_index"] = prompt_offset + prompt_index
+            record["prompt_sha256"] = sha256_bytes(prompt.encode("utf-8"))
             records.append(record)
             if record["error"] is not None:
                 break  # a broken stream stops issuing follow-up requests
@@ -433,6 +723,7 @@ def run_level(n: int, args: argparse.Namespace, prompts: list[str]) -> dict[str,
     for t in threads:
         t.join(timeout=max(0.0, join_deadline - time.monotonic()))
     hung = sum(1 for t in threads if t.is_alive())
+    level_finished_at = dt.datetime.now(dt.timezone.utc).isoformat()
 
     raw = [r for records in stream_records if records for r in records]
     level_start = min((r["t_start"] for r in raw), default=time.perf_counter())
@@ -443,39 +734,99 @@ def run_level(n: int, args: argparse.Namespace, prompts: list[str]) -> dict[str,
     streams: list[dict[str, Any]] = []
     for i, records in enumerate(stream_records):
         if records is None:
-            streams.append({"stream_index": i, "completion_tokens": 0,
+            streams.append({"stream_index": i, "completion_tokens": None,
                             "error": "stream did not finish", "requests": []})
             continue
-        requests = [finalize_request(r, level_start) for r in records]
+        requests = [
+            finalize_request(r, level_start, args.min_percentile_samples)
+            for r in records
+        ]
         failures += sum(1 for r in requests if r["error"] is not None)
+        successful = [r for r in requests if r["error"] is None]
+        stream_counts = [
+            r["completion_tokens"] for r in successful
+            if r["completion_tokens"] is not None
+        ]
+        stream_count_complete = len(stream_counts) == len(successful)
         streams.append({
             "stream_index": i,
-            "completion_tokens": sum(
-                r["completion_tokens"] or 0 for r in requests if r["error"] is None),
+            "completion_tokens": (
+                sum(stream_counts) if stream_count_complete and successful else None
+            ),
+            "token_count_complete": stream_count_complete and bool(successful),
             "requests": requests,
         })
 
     ok = [r for s in streams for r in s["requests"] if r["error"] is None]
-    total_tokens = sum(r["completion_tokens"] or 0 for r in ok)
+    known_counts = [
+        r["completion_tokens"] for r in ok if r["completion_tokens"] is not None
+    ]
+    token_count_complete = bool(ok) and len(known_counts) == len(ok)
+    total_tokens = sum(known_counts) if token_count_complete else None
+    delta_chunks_total = sum(r["delta_chunks"] for r in ok)
     ttfts = [r["ttft_s"] for r in ok if r["ttft_s"] is not None]
-    tok_s = [r["decode_tok_s"] for r in ok if r["decode_tok_s"] is not None]
+    tok_s = [r["request_tok_s"] for r in ok if r["request_tok_s"] is not None]
+    p95 = percentile_if_sufficient(
+        ttfts, 95.0, args.min_percentile_samples,
+    )
+    start_times = [r["t_start"] for r in raw]
+    fixed_token_workload_valid = None
+    if args.ignore_eos:
+        fixed_token_workload_valid = (
+            failures == 0
+            and len(ok) == n * args.requests_per_stream
+            and all(r["fixed_token_count_validated"] is True for r in ok)
+        )
+
+    def distinct(field: str) -> list[str]:
+        return sorted({
+            value for value in (r.get(field) for r in ok)
+            if isinstance(value, str) and value
+        })
+
     return {
         "clients": n,
+        "started_at": level_started_at,
+        "finished_at": level_finished_at,
         "requests_per_stream": args.requests_per_stream,
         "requests": n * args.requests_per_stream,
         "requests_ok": len(ok),
         "failures": failures,
         "wall_s": wall,
+        "start_skew_s": (
+            max(start_times) - min(start_times) if start_times else None
+        ),
         "completion_tokens_total": total_tokens,
-        "aggregate_tok_s": total_tokens / wall if wall > 0 else 0.0,
+        "completion_tokens_known_total": sum(known_counts),
+        "completion_tokens_known_requests": len(known_counts),
+        "token_count_complete": token_count_complete,
+        "fixed_token_workload_valid": fixed_token_workload_valid,
+        "aggregate_tok_s": (
+            total_tokens / wall
+            if total_tokens is not None and wall > 0 else None
+        ),
+        "sse_delta_chunks_total": delta_chunks_total,
+        "aggregate_sse_delta_chunks_s": (
+            delta_chunks_total / wall if wall > 0 else None
+        ),
         "ttft_mean_s": statistics.mean(ttfts) if ttfts else None,
         "ttft_median_s": statistics.median(ttfts) if ttfts else None,
-        "ttft_p95_s": percentile(ttfts, 95.0),
+        "ttft_max_s": max(ttfts) if ttfts else None,
+        "ttft_sample_count": len(ttfts),
+        "ttft_p95_s": p95,
+        "ttft_p95_min_samples": args.min_percentile_samples,
+        "ttft_p95_status": (
+            "reported" if p95 is not None else "insufficient_samples"
+        ),
+        "stream_tok_s_interval": "request_start_to_stream_end",
         "stream_tok_s_mean": statistics.mean(tok_s) if tok_s else None,
         "stream_tok_s_median": statistics.median(tok_s) if tok_s else None,
         "stream_tok_s_min": min(tok_s) if tok_s else None,
         "stream_tok_s_max": max(tok_s) if tok_s else None,
         "stream_completion_tokens": [s["completion_tokens"] for s in streams],
+        "response_models": distinct("response_model"),
+        "system_fingerprints": distinct("system_fingerprint"),
+        "http_server_headers": distinct("http_server_header"),
         "streams": streams,
     }
 
@@ -496,11 +847,26 @@ def markdown_lines(report: dict[str, Any]) -> list[str]:
         f"Server: `{report['base_url']}` model `{report['model']}` "
         f"max_tokens={report['max_tokens']} temperature={report['temperature']}",
         "",
-        "| Clients | Ok/Req | Agg tok/s | Stream tok/s mean | Stream tok/s median "
-        "| TTFT mean s | TTFT median s | TTFT p95 s | Wall s | Tokens |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        f"TTFT p95 uses nearest-rank and is withheld below "
+        f"{report['min_percentile_samples']} samples; TTFT max and sample count "
+        f"remain visible.",
+        "",
+        "| Clients | Ok/Req | Agg tok/s | Request tok/s mean | Request tok/s median "
+        "| TTFT mean s | TTFT median s | TTFT p95 s | TTFT max s | TTFT n "
+        "| Wall s | Tokens | Token counts |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| ---: | ---: | ---: | :--- |",
     ]
     for level in report["levels"]:
+        fixed_status = level.get("fixed_token_workload_valid")
+        if fixed_status is True:
+            count_status = "fixed valid"
+        elif fixed_status is False:
+            count_status = "fixed mismatch"
+        elif level["token_count_complete"]:
+            count_status = "complete"
+        else:
+            count_status = "missing"
         lines.append(
             f"| {level['clients']} "
             f"| {level['requests_ok']}/{level['requests']} "
@@ -510,8 +876,11 @@ def markdown_lines(report: dict[str, Any]) -> list[str]:
             f"| {fmt(level['ttft_mean_s'], '.3f')} "
             f"| {fmt(level['ttft_median_s'], '.3f')} "
             f"| {fmt(level['ttft_p95_s'], '.3f')} "
+            f"| {fmt(level['ttft_max_s'], '.3f')} "
+            f"| {level['ttft_sample_count']} "
             f"| {fmt(level['wall_s'])} "
-            f"| {level['completion_tokens_total']} |"
+            f"| {fmt(level['completion_tokens_total'], '.0f')} "
+            f"| {count_status} |"
         )
     lines.append("")
     return lines
@@ -535,48 +904,164 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-file", default="",
                         help="Prompt file, one prompt per line (or JSONL with a "
                              "'prompt' field); default: 8 built-in prompts")
+    parser.add_argument("--disjoint-level-prompts", action="store_true",
+                        help="Do not reuse prompts between client levels; avoids "
+                             "cross-level slot/prefix-cache hits")
+    parser.add_argument("--ignore-eos", action="store_true",
+                        help="Request fixed-length generation by suppressing EOS "
+                             "until max_tokens (server support required)")
+    parser.add_argument(
+        "--no-stream-usage", dest="request_stream_usage", action="store_false",
+        help="Do not request stream_options.include_usage; exact counts then "
+             "depend on unsolicited server usage",
+    )
+    parser.set_defaults(request_stream_usage=True)
+    parser.add_argument(
+        "--capture-output-text", action="store_true",
+        help="Store generated content and reasoning text in the JSON report; "
+             "off by default because hashes and lengths usually suffice",
+    )
+
     parser.add_argument("--timeout", type=float, default=600.0,
                         help="Per-request timeout in seconds (default 600)")
     parser.add_argument("--cooldown", type=float, default=2.0,
                         help="Seconds to sleep between levels (default 2)")
+    parser.add_argument(
+        "--min-percentile-samples", type=int, default=100,
+        help="Withhold p95 below this many observations (default 100)",
+    )
+    parser.add_argument(
+        "--server-metadata-json", default="",
+        help="Optional JSON object with exact server command, build/model "
+             "hashes, and hardware metadata supplied by the launcher",
+    )
     parser.add_argument("--out", default="", help="Write the JSON report here")
     parser.add_argument("--label", default="", help="Free-form run label for the report")
     return parser
 
 
 def run(args: argparse.Namespace) -> int:
+    run_started_at = dt.datetime.now(dt.timezone.utc).isoformat()
     levels_arg = args.client_levels or [1, 4, 8, 16]
     for n in levels_arg:
         if n < 1:
             raise ValueError(f"--clients must be >= 1, got {n}")
     if args.requests_per_stream < 1:
         raise ValueError("--requests-per-stream must be >= 1")
-    prompts = load_prompts(Path(args.prompt_file) if args.prompt_file else None)
+    if args.max_tokens < 1:
+        raise ValueError("--max-tokens must be >= 1")
+    if args.timeout <= 0:
+        raise ValueError("--timeout must be > 0")
+    if args.cooldown < 0:
+        raise ValueError("--cooldown must be >= 0")
+    if args.min_percentile_samples < 1:
+        raise ValueError("--min-percentile-samples must be >= 1")
+
+    prompt_path = Path(args.prompt_file) if args.prompt_file else None
+    prompts = load_prompts(prompt_path)
+    metadata_path = (
+        Path(args.server_metadata_json) if args.server_metadata_json else None
+    )
+    server_metadata, server_metadata_source = load_metadata_json(metadata_path)
+    server_props = fetch_server_props(args.base_url, args.api_key, args.timeout)
 
     levels: list[dict[str, Any]] = []
+    prompt_offset = 0
     for idx, n in enumerate(levels_arg):
         if idx > 0 and args.cooldown > 0:
             time.sleep(args.cooldown)
         print(f"[bench] level N={n}: {n} stream(s) x {args.requests_per_stream} "
               f"request(s), max_tokens={args.max_tokens}", flush=True)
-        level = run_level(n, args, prompts)
+        level = run_level(n, args, prompts, prompt_offset)
         levels.append(level)
-        print(f"[bench] level N={n}: {level['requests_ok']}/{level['requests']} ok, "
-              f"agg {fmt(level['aggregate_tok_s'])} tok/s, "
-              f"stream mean {fmt(level['stream_tok_s_mean'])} tok/s, "
-              f"ttft p95 {fmt(level['ttft_p95_s'], '.3f')}s, "
-              f"wall {fmt(level['wall_s'])}s", flush=True)
+        if args.disjoint_level_prompts:
+            prompt_offset += n * args.requests_per_stream
+        if level["ttft_p95_s"] is not None:
+            ttft_summary = f"p95 {fmt(level['ttft_p95_s'], '.3f')}s"
+        else:
+            ttft_summary = (
+                f"max {fmt(level['ttft_max_s'], '.3f')}s "
+                f"(n={level['ttft_sample_count']}; p95 withheld)"
+            )
+        print(
+            f"[bench] level N={n}: {level['requests_ok']}/{level['requests']} ok, "
+            f"agg {fmt(level['aggregate_tok_s'])} tok/s, "
+            f"request mean {fmt(level['stream_tok_s_mean'])} tok/s, "
+            f"ttft {ttft_summary}, wall {fmt(level['wall_s'])}s",
+            flush=True,
+        )
 
+    run_finished_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    script_path = Path(__file__).resolve()
+    resolved_prompt_path = prompt_path.resolve() if prompt_path else None
+    observed_server = {
+        "response_models": sorted({
+            value for level in levels for value in level["response_models"]
+        }),
+        "system_fingerprints": sorted({
+            value for level in levels for value in level["system_fingerprints"]
+        }),
+        "http_server_headers": sorted({
+            value for level in levels for value in level["http_server_headers"]
+        }),
+    }
     report = {
+        "schema_version": 2,
         "label": args.label,
-        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "timestamp": run_started_at,
+        "run_started_at": run_started_at,
+        "run_finished_at": run_finished_at,
         "base_url": args.base_url,
         "model": args.model,
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
+        "client_levels": levels_arg,
         "requests_per_stream": args.requests_per_stream,
         "timeout_s": args.timeout,
+        "cooldown_s": args.cooldown,
         "prompt_source": args.prompt_file or f"builtin ({len(BUILTIN_PROMPTS)} prompts)",
+        "prompt_metadata": {
+            "source": "file" if prompt_path else "builtin",
+            "path": str(resolved_prompt_path) if resolved_prompt_path else None,
+            "file_sha256": (
+                sha256_file(resolved_prompt_path) if resolved_prompt_path else None
+            ),
+            "content_sha256": prompt_content_sha256(prompts),
+            "prompt_count": len(prompts),
+        },
+        "disjoint_level_prompts": args.disjoint_level_prompts,
+        "ignore_eos": args.ignore_eos,
+        "request_stream_usage": args.request_stream_usage,
+        "capture_output_text": args.capture_output_text,
+        "token_count_policy": {
+            "preferred": "usage.completion_tokens",
+            "exact_fallback": None,
+            "sse_delta_chunks_are_tokens": False,
+            "per_request_tok_s_interval": "request_start_to_stream_end",
+            "per_request_tok_s_includes": ["queueing", "prefill", "decode"],
+            "decode_tok_s_from_sse": False,
+        },
+        "percentile_method": "nearest_rank",
+        "min_percentile_samples": args.min_percentile_samples,
+        "client_provenance": {
+            "argv": sanitize_argv([sys.executable, *sys.argv]),
+            "script_path": str(script_path),
+            "script_sha256": sha256_file(script_path),
+            "python_version": platform.python_version(),
+            "python_implementation": platform.python_implementation(),
+            "platform": {
+                "system": platform.system(),
+                "release": platform.release(),
+                "version": platform.version(),
+                "machine": platform.machine(),
+                "processor": platform.processor(),
+            },
+            "git": git_provenance(script_path.parent),
+        },
+        "server_metadata": server_metadata,
+        "server_metadata_source": server_metadata_source,
+        "server_props_snapshot": server_props,
+        "observed_server": observed_server,
         "levels": levels,
     }
     if args.out:
@@ -591,6 +1076,27 @@ def run(args: argparse.Namespace) -> int:
     total_failures = sum(level["failures"] for level in levels)
     if total_failures:
         print(f"[bench] {total_failures} stream request(s) failed", file=sys.stderr)
+        return 1
+    missing_counts = [
+        level["clients"] for level in levels if not level["token_count_complete"]
+    ]
+    if missing_counts:
+        print(
+            f"[bench] exact completion-token counts unavailable at client "
+            f"level(s): {missing_counts}",
+            file=sys.stderr,
+        )
+        return 1
+    invalid_fixed = [
+        level["clients"] for level in levels
+        if level["fixed_token_workload_valid"] is False
+    ]
+    if invalid_fixed:
+        print(
+            f"[bench] fixed-token workload validation failed at client "
+            f"level(s): {invalid_fixed}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 
