@@ -2496,6 +2496,12 @@ extern "C" {
     // active_slot_ids optionally maps compact query rows to physical block-
     // table columns / length entries. A negative id is a padding row and
     // produces a zero attention output. NULL selects row identity.
+    // query_positions optionally carries per-row inclusive causal positions
+    // (I32 [n_query], requires active_slot_ids): row i attends the first
+    // min(kv_seq_len, positions[i]+1) cached tokens of its sequence, so
+    // prefill chunks can attend the paged pool causally. A negative position
+    // marks a padding row. NULL keeps the decode semantics (full cached
+    // length per row).
     GGML_API struct ggml_tensor * ggml_paged_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2504,6 +2510,7 @@ extern "C" {
             struct ggml_tensor  * block_table,
             struct ggml_tensor  * kv_seq_lens,
             struct ggml_tensor  * active_slot_ids,
+            struct ggml_tensor  * query_positions,
             float                 scale,
             int                   block_size,
             int                   max_kv_seq_len);
