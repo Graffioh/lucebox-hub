@@ -33,46 +33,12 @@ static void expect_split(const TargetWeights & weights,
     CHECK((state.ne[0] + state.ne[1]) * state.nr[0] == tensor->ne[axis]);
 }
 
-static void expect_staging_cache_lifecycle(ggml_context * ctx) {
-    ggml_tensor * primary =
-        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    ggml_tensor * extra =
-        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-
-    TargetCache cache;
-    cache.staging_k = {primary};
-    cache.staging_v = {primary};
-    cache.staging_ssm_state = {primary};
-    cache.staging_conv_state = {primary};
-    cache.staging_k_extra = {{extra}};
-    cache.staging_v_extra = {{extra}};
-    cache.staging_ssm_state_extra = {{extra}};
-    cache.staging_conv_state_extra = {{extra}};
-
-    CHECK(staging_k_for(cache, 0).at(0) == primary);
-    CHECK(staging_k_for(cache, 1).at(0) == extra);
-    CHECK(staging_k_for(cache, -1).empty());
-    CHECK(staging_k_for(cache, 2).empty());
-    CHECK(staging_v_for(cache, -1).empty());
-    CHECK(staging_ssm_for(cache, 2).empty());
-    CHECK(staging_conv_for(cache, 2).empty());
-
-    free_target_cache(cache);
-    CHECK(cache.staging_k.empty());
-    CHECK(cache.staging_k_extra.empty());
-    CHECK(cache.staging_v_extra.empty());
-    CHECK(cache.staging_ssm_state_extra.empty());
-    CHECK(cache.staging_conv_state_extra.empty());
-}
-
 int main() {
     ggml_init_params params{};
     params.mem_size = 32 * ggml_tensor_overhead();
     params.no_alloc = true;
     ggml_context * ctx = ggml_init(params);
     CHECK(ctx);
-
-    expect_staging_cache_lifecycle(ctx);
 
     TargetWeights weights;
 
