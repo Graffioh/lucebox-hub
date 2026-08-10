@@ -26,9 +26,8 @@ static std::vector<int32_t> prompt_tokens(int count) {
 static SeqEngine::AdmitResult admit(
         Qwen35SlotManager & manager, uint64_t request_id,
         const std::vector<int32_t> & prompt, const SamplerCfg & sampler) {
-    static int next_staging_lease = 0;
     return manager.admit(
-        request_id, prompt, sampler, next_staging_lease++);
+        request_id, prompt, sampler);
 }
 
 static bool is_admitted(const SeqEngine::AdmitResult & result) {

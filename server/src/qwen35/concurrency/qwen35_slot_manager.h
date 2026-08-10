@@ -8,8 +8,8 @@
 // state, and the position counters.
 //
 // It deliberately owns NO device state. Prefill/decode allocation returns
-// physical rows and block-table deltas as plain vectors. Prompt, staging lease,
-// KV ownership, sampler, and progress live together here; the scheduler keeps
+// physical rows and block-table deltas as plain vectors. Prompt, KV ownership,
+// sampler, and progress live together here; the scheduler keeps
 // only its coarse request phase.
 //
 // Not thread-safe; the single scheduler thread is the only caller.
@@ -40,7 +40,6 @@ struct Qwen35Slot {
     // append to the same allocation, avoiding a second full prompt copy.
     int prompt_len = 0;
     int cur_pos = 0;
-    int staging_idx = -1;
     SamplerCfg sampler;
     std::mt19937_64 rng{0x9E3779B97F4A7C15ull};
     // Penalty history is recorded as fed rather than sampled: the scheduler
@@ -73,8 +72,7 @@ public:
     // actually draws, else nondeterministically.
     SeqEngine::AdmitResult admit(uint64_t request_id,
                                  const std::vector<int32_t> & prompt,
-                                 const SamplerCfg & sampler,
-                                 int staging_idx);
+                                 const SamplerCfg & sampler);
 
     struct PrefillChunk {
         bool ok = false;

@@ -32,12 +32,6 @@ int decode_bucket_width(int live_count) {
     return 64;
 }
 
-// A multi-slot cache owns one cohesive object per prefill staging lane.
-int staging_set_capacity(const TargetCache & cache) {
-    return cache.n_seq_slots <= 1 ? 1 : (int)cache.prefill_staging.size();
-}
-
-
 } // namespace
 
 bool Qwen35SeqEngine::token_is_eos(int32_t token) const {
@@ -48,24 +42,11 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
         uint64_t request_id,
         const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler) {
-    const int lease_capacity =
-        std::min(max_prefills_, staging_set_capacity(b_.cache_));
-    std::vector<uint8_t> staging_in_use((size_t)lease_capacity, 0);
-    for (int i = 0; i < slots_.slot_count(); ++i) {
-        if (!slots_.is_prefilling(i)) continue;
-        const int idx = slots_.slot(i).staging_idx;
-        if (idx >= 0 && idx < lease_capacity) {
-            staging_in_use[(size_t)idx] = 1;
-        }
+    AdmitResult result = slots_.admit(request_id, prompt, sampler);
+    if (result.status == AdmitResult::Status::admitted) {
+        reset_recurrent_slot(b_.cache_, result.slot);
     }
-    const auto free_lease = std::find(
-        staging_in_use.begin(), staging_in_use.end(), (uint8_t)0);
-    if (free_lease == staging_in_use.end()) {
-        return {AdmitResult::Status::busy, -1,
-                "all prefill staging lanes are busy"};
-    }
-    const int staging_idx = (int)(free_lease - staging_in_use.begin());
-    return slots_.admit(request_id, prompt, sampler, staging_idx);
+    return result;
 }
 
 int32_t Qwen35SeqEngine::sample_graph_row(
@@ -121,7 +102,7 @@ bool Qwen35SeqEngine::upload_block_table_delta(
 }
 
 void Qwen35SeqEngine::fail_prefill(
-        int slot, std::vector<PrefillOutput> & outputs,
+        int slot, std::vector<PrefillOutput> & prefill_outputs,
         const char * log_message, const char * client_message) {
     if (!slots_.is_prefilling(slot)) return;
     std::fprintf(stderr, "[parallel] %s — failing slot %d\n",
@@ -130,38 +111,34 @@ void Qwen35SeqEngine::fail_prefill(
     out.slot = slot;
     out.status = PrefillOutput::Status::failed;
     out.error = client_message;
-    outputs.push_back(std::move(out));
+    prefill_outputs.push_back(std::move(out));
 }
 
 Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
-        int slot, int max_tokens, int staging_idx,
-        std::vector<PrefillOutput> & outputs) {
+        int slot, int max_tokens,
+        std::vector<PrefillOutput> & prefill_outputs) {
     PrefillStage stage;
     if (!slots_.is_prefilling(slot)) return stage;
 
-    Qwen35Slot & pending = slots_.slot(slot);
-    stage.kv_pos = pending.cur_pos;
-    stage.staging_idx = staging_idx;
-    if (stage.kv_pos == 0) {
-        reset_prefill_staging(b_.cache_, staging_idx);
-    }
+    Qwen35Slot & seq = slots_.slot(slot);
+    stage.kv_pos = seq.cur_pos;
     stage.chunk = std::min(
-        max_tokens, pending.prompt_len - stage.kv_pos);
+        max_tokens, seq.prompt_len - stage.kv_pos);
     if (stage.chunk <= 0) return PrefillStage{};
-    stage.commit = stage.kv_pos + stage.chunk >= pending.prompt_len;
+    stage.commit = stage.kv_pos + stage.chunk >= seq.prompt_len;
 
     Qwen35SlotManager::PrefillChunk chunk =
         slots_.append_prefill(slot, stage.chunk);
     if (!chunk.ok || chunk.rows.size() != (size_t)stage.chunk) {
-        fail_prefill(slot, outputs, "prefill K/V allocation failed",
-                             "prefill K/V allocation failed");
+        fail_prefill(slot, prefill_outputs, "prefill K/V allocation failed",
+                     "prefill K/V allocation failed");
         return PrefillStage{};
     }
     if (!upload_block_table_delta(
             slot, chunk.first_new_block, chunk.new_blocks.data(),
             chunk.new_blocks.size())) {
         fail_prefill(
-            slot, outputs, "prefill block-table delta exceeds device capacity",
+            slot, prefill_outputs, "prefill block-table delta exceeds device capacity",
             "prefill block-table update failed");
         return PrefillStage{};
     }
@@ -169,89 +146,14 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
     stage.rows = std::move(chunk.rows);
     stage.embeddings.resize((size_t)b_.w_.n_embd * stage.chunk);
     if (!b_.w_.embedder.embed(
-            pending.sample_history.data() + stage.kv_pos, stage.chunk,
+            seq.sample_history.data() + stage.kv_pos, stage.chunk,
             stage.embeddings.data())) {
-        fail_prefill(slot, outputs, "prefill embed failed",
-                             "prefill embedding failed");
+        fail_prefill(slot, prefill_outputs, "prefill embed failed",
+                     "prefill embedding failed");
         return PrefillStage{};
     }
     stage.ready = true;
     return stage;
-}
-
-bool Qwen35SeqEngine::run_prefill_graph(
-        const PrefillStage & prefill, int prefill_slot,
-        std::vector<PrefillOutput> & outputs) {
-    const TargetWeights & w = b_.w_;
-    StepGraph & sg = b_.sg_;
-    const int hidden = w.n_embd;
-    const int chunk = prefill.chunk;
-    const bool commit = prefill.commit;
-    const int kv_pos = prefill.kv_pos;
-    const int staging_idx = prefill.staging_idx;
-
-    const bool with_mask =
-        (b_.cfg_.kq_stride_pad > KQ_MASK_PAD) || (chunk > 1);
-    bool built = build_target_step(
-        sg, w, b_.cache_, b_.target_backend_,
-        /*kv_start=*/kv_pos, /*n_tokens=*/chunk,
-        with_mask, /*capture=*/false,
-        /*capture_delta_intermediate=*/false,
-        /*fa_window=*/0,
-        /*logits_tail_rows=*/1,
-        b_.cfg_.kq_stride_pad,
-        /*capture_moe_router=*/false,
-        /*kvflash_mask=*/false,
-        /*capture_qk=*/false,
-        /*paged_attention=*/false,
-        /*n_seqs=*/1,
-        /*seq_slot=*/prefill_slot,
-        /*paged_prefill=*/true,
-        /*paged_max_kv_len=*/0,
-        /*n_prefill_tokens=*/0,
-        /*prefill_commit=*/commit,
-        /*compact_slots=*/false,
-        /*staging_idx=*/staging_idx);
-    if (!built || !sg.kv_write_rows) {
-        fail_prefill(prefill_slot, outputs,
-                             "prefill graph build failed",
-                             "prefill graph build failed");
-        return false;
-    }
-
-    const int n_total = chunk;
-    embed_buf_.resize((size_t)hidden * n_total);
-    std::copy(prefill.embeddings.begin(), prefill.embeddings.end(),
-              embed_buf_.begin());
-    ggml_backend_tensor_set_async(
-        b_.target_backend_, sg.inp_embed, embed_buf_.data(), 0,
-        sizeof(float) * (size_t)hidden * n_total);
-
-    pos_buf_.resize((size_t)4 * n_total);
-    fill_qwen35_mrope_positions(pos_buf_.data(), kv_pos, n_total);
-    ggml_backend_tensor_set_async(
-        b_.target_backend_, sg.positions, pos_buf_.data(), 0,
-        sizeof(int32_t) * pos_buf_.size());
-
-    rows_buf_.resize((size_t)n_total * w.n_head_kv);
-    for (int h = 0; h < w.n_head_kv; h++)
-        for (int i = 0; i < chunk; i++)
-            rows_buf_[(size_t)h * n_total + i] = prefill.rows[(size_t)i];
-    ggml_backend_tensor_set_async(
-        b_.target_backend_, sg.kv_write_rows, rows_buf_.data(), 0,
-        sizeof(int64_t) * rows_buf_.size());
-
-    upload_qwen35_causal_mask(
-        sg.attn_mask, kv_pos, chunk, b_.cfg_.kq_stride_pad);
-
-    const auto st = ggml_backend_graph_compute(b_.target_backend_, sg.gf);
-    if (st != GGML_STATUS_SUCCESS) {
-        fail_prefill(prefill_slot, outputs,
-                             "prefill compute failed",
-                             "prefill compute failed");
-        return false;
-    }
-    return true;
 }
 
 SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
@@ -281,43 +183,46 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         decode_seen[(size_t)in.slot] = 1;
     }
 
-    const StepPlanLimits limits =
-        step_plan_limits((int)inputs.size());
-    const int slice_limit = limits.max_prefill_tokens_per_sequence;
+    const StepPlanLimits limits = step_plan_limits((int)inputs.size());
     if ((int)plan.prefills.size() > limits.max_prefill_sequences) {
         return fail_step("prefill plan exceeds engine sequence capacity");
     }
-    int prefill_tokens_total = 0;
+    int planned_prefill_tokens = 0;
     std::vector<uint8_t> prefill_seen((size_t)n_slots, 0);
     for (const PrefillSlice & slice : plan.prefills) {
         if (slice.slot < 0 || slice.slot >= n_slots ||
-            slice.max_tokens <= 0 || slice.max_tokens > slice_limit ||
+            slice.max_tokens <= 0 ||
+            slice.max_tokens > limits.max_prefill_tokens_per_sequence ||
             prefill_seen[(size_t)slice.slot] ||
             decode_seen[(size_t)slice.slot] ||
             !slots_.is_prefilling(slice.slot)) {
             return fail_step("invalid or duplicate prefill slice in step plan");
         }
         prefill_seen[(size_t)slice.slot] = 1;
-        prefill_tokens_total += slice.max_tokens;
-        if (prefill_tokens_total > limits.max_prefill_tokens_total) {
-            return fail_step(
-                "prefill plan exceeds engine total-token capacity");
+        planned_prefill_tokens += slice.max_tokens;
+        if (planned_prefill_tokens > limits.max_prefill_tokens_total) {
+            return fail_step("prefill plan exceeds engine total-token capacity");
         }
     }
     if (inputs.empty() && plan.prefills.empty()) return result;
 
     const TargetWeights & w = b_.w_;
     StepGraph & sg = b_.sg_;
-    const int hidden    = w.n_embd;
+    const int hidden = w.n_embd;
     const int n_head_kv = w.n_head_kv;
 
     decode_outputs.reserve(inputs.size());
     prefill_outputs.reserve(plan.prefills.size());
-    output_rows_.clear();        output_rows_.reserve(inputs.size());
-    live_tokens_.clear();        live_tokens_.reserve(inputs.size());
-    live_positions_.clear();     live_positions_.reserve(inputs.size());
-    live_physical_rows_.clear(); live_physical_rows_.reserve(inputs.size());
-    live_slot_ids_.clear();      live_slot_ids_.reserve(inputs.size());
+    output_rows_.clear();
+    live_tokens_.clear();
+    live_positions_.clear();
+    live_physical_rows_.clear();
+    live_slot_ids_.clear();
+    output_rows_.reserve(inputs.size());
+    live_tokens_.reserve(inputs.size());
+    live_positions_.reserve(inputs.size());
+    live_physical_rows_.reserve(inputs.size());
+    live_slot_ids_.reserve(inputs.size());
 
     int max_kv_len = 1;
     for (const StepInput & in : inputs) {
@@ -325,12 +230,6 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         out.slot = in.slot;
         out.failed = true;
         int compact_row = -1;
-        if (in.slot < 0 || in.slot >= n_slots) {
-            out.error = "invalid decode slot";
-            decode_outputs.push_back(out);
-            output_rows_.push_back(compact_row);
-            continue;
-        }
         const Qwen35SlotManager::StepAppend app =
             slots_.append_token(in.slot, in.token);
         if (!app.ok) {
@@ -338,18 +237,17 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                 ? "paged KV pool exhausted during decode; raise "
                   "--kv-pool-tokens or lower --max-ctx/--max-concurrency"
                 : "decode K/V append failed";
-            decode_outputs.push_back(out);
+            decode_outputs.push_back(std::move(out));
             output_rows_.push_back(compact_row);
             continue;
         }
-        if (app.new_block >= 0) {
-            if (!upload_block_table_delta(
-                    in.slot, app.new_block_index, &app.new_block, 1)) {
-                out.error = "decode block-table entry exceeds device capacity";
-                decode_outputs.push_back(out);
-                output_rows_.push_back(compact_row);
-                continue;
-            }
+        if (app.new_block >= 0 &&
+            !upload_block_table_delta(
+                in.slot, app.new_block_index, &app.new_block, 1)) {
+            out.error = "decode block-table entry exceeds device capacity";
+            decode_outputs.push_back(std::move(out));
+            output_rows_.push_back(compact_row);
+            continue;
         }
         compact_row = (int)live_tokens_.size();
         live_tokens_.push_back(in.token);
@@ -358,82 +256,33 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         live_slot_ids_.push_back(in.slot);
         max_kv_len = std::max(max_kv_len, app.position + 1);
         out.failed = false;
-        decode_outputs.push_back(out);
+        decode_outputs.push_back(std::move(out));
         output_rows_.push_back(compact_row);
     }
-    const int live_count = (int)live_tokens_.size();
-    const bool with_decode = live_count > 0;
-    // Prefill membership, ordering, and token limits come from the common
-    // scheduler. Staging identity remains request-owned below this boundary.
-    prefill_slots_.clear();
-    prefill_token_limits_.clear();
-    for (const PrefillSlice & slice : plan.prefills) {
-        prefill_slots_.push_back(slice.slot);
-        prefill_token_limits_.push_back(slice.max_tokens);
-    }
 
-    auto advance_prefill_only = [&](int pslot, int max_tokens) {
-        const int staging_idx = slots_.slot(pslot).staging_idx;
-        const size_t results_before = prefill_outputs.size();
-        PrefillStage prefill = stage_prefill_chunk(
-            pslot, max_tokens, staging_idx, prefill_outputs);
+    std::vector<PrefillStage> prefills;
+    prefills.reserve(plan.prefills.size());
+    for (const PrefillSlice & slice : plan.prefills) {
+        const size_t outputs_before = prefill_outputs.size();
+        PrefillStage prefill =
+            stage_prefill_chunk(slice.slot, slice.max_tokens, prefill_outputs);
         if (!prefill.ready) {
-            if (prefill_outputs.size() == results_before) {
+            if (prefill_outputs.size() == outputs_before) {
                 fail_prefill(
-                    pslot, prefill_outputs,
+                    slice.slot, prefill_outputs,
                     "prefill made no progress despite reserved capacity",
                     "prefill scheduler made no progress");
             }
-            return false;
-        }
-        if (!run_prefill_graph(prefill, pslot, prefill_outputs)) return false;
-
-        int32_t argmax = -1;
-        if (prefill.commit) {
-            ggml_backend_tensor_get_async(
-                b_.target_backend_, b_.sg_.argmax_tokens, &argmax, 0,
-                sizeof(argmax));
-        }
-        ggml_backend_synchronize(b_.target_backend_);
-
-        PrefillOutput out;
-        out.slot = pslot;
-        if (prefill.commit) {
-            out.status = PrefillOutput::Status::completed;
-            out.token = sample_graph_row(
-                pslot, 0, &argmax, &logits_buf_);
-            slots_.commit_prefill(pslot);
-        }
-        prefill_outputs.push_back(std::move(out));
-        return true;
-    };
-
-    // With no live decode rows, advance up to K independent prefills.
-    if (!with_decode) {
-        const int n_prefills_this_step =
-            std::min((int)prefill_slots_.size(), max_prefills_);
-        for (int pi = 0; pi < n_prefills_this_step; ++pi) {
-            advance_prefill_only(
-                prefill_slots_[(size_t)pi],
-                prefill_token_limits_[(size_t)pi]);
-        }
-        if (prefill_outputs.size() != plan.prefills.size()) {
             return fail_step("selected prefill work made no progress");
         }
-        return result;
+        prefills.push_back(std::move(prefill));
     }
 
-    // Keep K prefills moving while decode is active: one gets a standalone
-    // staging set, and the FIFO head is fused into the decode graph below.
-    if (max_prefills_ > 1 && prefill_slots_.size() > 1) {
-        advance_prefill_only(prefill_slots_[1], prefill_token_limits_[1]);
-    }
-
-    // ── Build and compute the fused/decode graph ───────────────────────
-    const int decode_bucket = decode_bucket_width(live_count);
+    const int live_count = (int)live_tokens_.size();
+    const bool with_decode = live_count > 0;
+    const int decode_bucket = with_decode ? decode_bucket_width(live_count) : 0;
 
     dec_tokens_.assign((size_t)decode_bucket, 0);
-    dec_pos_.assign((size_t)4 * decode_bucket, 0);
     dec_rows_.assign((size_t)decode_bucket * n_head_kv, scratch_row_);
     active_slot_ids_.assign((size_t)decode_bucket, -1);
     state_slot_ids_.assign((size_t)decode_bucket, 0);
@@ -441,9 +290,6 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     for (int row = 0; row < live_count; ++row) {
         dec_tokens_[(size_t)row] = live_tokens_[(size_t)row];
         const int pos = live_positions_[(size_t)row];
-        dec_pos_[(size_t)4 * row + 0] = pos;
-        dec_pos_[(size_t)4 * row + 1] = pos;
-        dec_pos_[(size_t)4 * row + 2] = pos;
         active_slot_ids_[(size_t)row] = live_slot_ids_[(size_t)row];
         state_slot_ids_[(size_t)row] = live_slot_ids_[(size_t)row];
         seq_lens_[(size_t)live_slot_ids_[(size_t)row]] = pos + 1;
@@ -452,68 +298,53 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                 live_physical_rows_[(size_t)row];
         }
     }
-    PrefillStage prefill;
-    int prefill_slot = -1;
-    if (!prefill_slots_.empty()) {
-        prefill_slot = prefill_slots_.front();
-        const size_t results_before = prefill_outputs.size();
-        prefill = stage_prefill_chunk(
-            prefill_slot, prefill_token_limits_.front(),
-            slots_.slot(prefill_slot).staging_idx, prefill_outputs);
-        if (!prefill.ready && prefill_outputs.size() == results_before) {
-            fail_prefill(
-                prefill_slot, prefill_outputs,
-                "prefill made no progress despite reserved capacity",
-                "prefill scheduler made no progress");
-        }
-    }
-    bool with_prefill = prefill.ready;
-    const int chunk = prefill.chunk;
-    const bool commit = prefill.commit;
-    const int kv_pos = prefill.kv_pos;
 
-    auto fail_fused_prefill = [&]() {
-        fail_prefill(prefill_slot, prefill_outputs,
-                             "fused prefill graph build failed",
-                             "prefill graph build failed");
-        with_prefill = false;
-    };
+    int n_prefill = 0;
+    int n_commits = 0;
+    std::vector<QwenPrefillSegment> segments;
+    segments.reserve(prefills.size());
+    for (size_t i = 0; i < prefills.size(); ++i) {
+        const PrefillStage & prefill = prefills[i];
+        const int slot = plan.prefills[i].slot;
+        segments.push_back({n_prefill, prefill.chunk, slot});
+        n_prefill += prefill.chunk;
+        n_commits += prefill.commit ? 1 : 0;
+        max_kv_len = std::max(max_kv_len, prefill.kv_pos + prefill.chunk);
+        seq_lens_[(size_t)slot] = prefill.kv_pos + prefill.chunk;
+    }
+    const bool with_prefill = n_prefill > 0;
+    const int n_total = n_prefill + decode_bucket;
+    const int gather_rows = with_prefill
+        ? (with_decode ? n_commits + decode_bucket
+                       : std::max(1, n_commits))
+        : 0;
 
     bool built = false;
     if (with_prefill) {
-        const bool with_mask =
-            (b_.cfg_.kq_stride_pad > KQ_MASK_PAD) || (chunk > 1);
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
-            /*kv_start=*/kv_pos,
-            /*n_tokens=*/chunk + decode_bucket,
-            with_mask, /*capture=*/false,
+            /*kv_start=*/0, /*n_tokens=*/n_total,
+            /*with_mask=*/false, /*capture=*/false,
             /*capture_delta_intermediate=*/false,
-            /*fa_window=*/0,
-            /*logits_tail_rows=*/decode_bucket + (commit ? 1 : 0),
+            /*fa_window=*/0, /*logits_tail_rows=*/0,
             b_.cfg_.kq_stride_pad,
             /*capture_moe_router=*/false,
             /*kvflash_mask=*/false,
             /*capture_qk=*/false,
             /*paged_attention=*/true,
-            /*n_seqs=*/decode_bucket,
-            /*seq_slot=*/prefill_slot,
-            /*paged_prefill=*/true,
+            /*n_seqs=*/with_decode ? decode_bucket : 1,
+            /*seq_slot=*/0,
             /*paged_max_kv_len=*/max_kv_len,
-            /*n_prefill_tokens=*/chunk,
-            /*prefill_commit=*/commit,
-            /*compact_slots=*/true,
-            /*staging_idx=*/prefill.staging_idx);
-        if (!built || !sg.kv_write_rows) fail_fused_prefill();
-    }
-    if (!with_prefill) {
+            /*n_prefill_tokens=*/n_prefill,
+            segments.data(), (int)segments.size(), gather_rows,
+            /*compact_slots=*/with_decode);
+    } else {
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
             /*kv_start=*/0, /*n_tokens=*/decode_bucket,
             /*with_mask=*/false, /*capture=*/false,
             /*capture_delta_intermediate=*/false,
-            /*fa_window=*/0,
-            /*logits_tail_rows=*/0,
+            /*fa_window=*/0, /*logits_tail_rows=*/0,
             b_.cfg_.kq_stride_pad,
             /*capture_moe_router=*/false,
             /*kvflash_mask=*/false,
@@ -521,111 +352,170 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             /*paged_attention=*/true,
             /*n_seqs=*/decode_bucket,
             /*seq_slot=*/0,
-            /*paged_prefill=*/false,
             /*paged_max_kv_len=*/max_kv_len,
             /*n_prefill_tokens=*/0,
-            /*prefill_commit=*/false,
+            /*prefill_segments=*/nullptr,
+            /*n_prefill_segments=*/0,
+            /*n_logits_rows=*/0,
             /*compact_slots=*/true);
     }
-    if (!built || !sg.kv_write_rows) {
-        std::fprintf(stderr, "[parallel] fused/decode build failed\n");
-        for (DecodeOutput & out : decode_outputs) out.failed = true;
-        return fail_step("fused/decode graph build failed");
+    if (!built || !sg.kv_write_rows ||
+        (with_prefill &&
+         (!sg.paged_query_seq_ids || !sg.paged_query_positions ||
+          !sg.logits_row_indices))) {
+        return fail_step("packed prefill/decode graph build failed");
     }
 
-    const int n_prefill = with_prefill ? chunk : 0;
-    const int n_decode = decode_bucket;
-    const int n_total = n_prefill + n_decode;
     embed_buf_.resize((size_t)hidden * n_total);
-    if (n_prefill > 0) {
+    int token_offset = 0;
+    for (const PrefillStage & prefill : prefills) {
         std::copy(prefill.embeddings.begin(), prefill.embeddings.end(),
-                  embed_buf_.begin());
+                  embed_buf_.begin() + (size_t)hidden * token_offset);
+        token_offset += prefill.chunk;
     }
-    if (!w.embedder.embed(dec_tokens_.data(), n_decode,
-                          embed_buf_.data() + (size_t)hidden * n_prefill)) {
-        for (DecodeOutput & out : decode_outputs) out.failed = true;
+    if (with_decode &&
+        !w.embedder.embed(
+            dec_tokens_.data(), decode_bucket,
+            embed_buf_.data() + (size_t)hidden * n_prefill)) {
         return fail_step("decode embedding failed");
     }
     ggml_backend_tensor_set_async(
         b_.target_backend_, sg.inp_embed, embed_buf_.data(), 0,
         sizeof(float) * (size_t)hidden * n_total);
 
-    pos_buf_.resize((size_t)4 * n_total);
-    if (n_prefill > 0) {
-        fill_qwen35_mrope_positions(pos_buf_.data(), kv_pos, n_prefill);
+    pos_buf_.assign((size_t)4 * n_total, 0);
+    token_offset = 0;
+    for (const PrefillStage & prefill : prefills) {
+        fill_qwen35_mrope_positions(
+            pos_buf_.data(), n_total, token_offset,
+            prefill.kv_pos, prefill.chunk);
+        token_offset += prefill.chunk;
     }
-    std::copy(dec_pos_.begin(), dec_pos_.begin() + (size_t)4 * n_decode,
-              pos_buf_.begin() + (size_t)4 * n_prefill);
+    if (with_decode) {
+        for (int row = 0; row < live_count; ++row) {
+            const int pos = live_positions_[(size_t)row];
+            const int packed_row = n_prefill + row;
+            pos_buf_[(size_t)0 * n_total + packed_row] = pos;
+            pos_buf_[(size_t)1 * n_total + packed_row] = pos;
+            pos_buf_[(size_t)2 * n_total + packed_row] = pos;
+        }
+    }
     ggml_backend_tensor_set_async(
         b_.target_backend_, sg.positions, pos_buf_.data(), 0,
         sizeof(int32_t) * pos_buf_.size());
 
     rows_buf_.assign((size_t)n_total * n_head_kv, scratch_row_);
-    for (int h = 0; h < n_head_kv; h++) {
-        for (int i = 0; i < n_prefill; i++) {
-            rows_buf_[(size_t)h * n_total + i] =
-                prefill.rows[(size_t)i];
+    for (int h = 0; h < n_head_kv; ++h) {
+        token_offset = 0;
+        for (const PrefillStage & prefill : prefills) {
+            for (int i = 0; i < prefill.chunk; ++i) {
+                rows_buf_[(size_t)h * n_total + token_offset + i] =
+                    prefill.rows[(size_t)i];
+            }
+            token_offset += prefill.chunk;
         }
-        for (int s = 0; s < n_decode; s++) {
-            rows_buf_[(size_t)h * n_total + n_prefill + s] =
-                dec_rows_[(size_t)h * decode_bucket + s];
+        for (int row = 0; row < decode_bucket; ++row) {
+            rows_buf_[(size_t)h * n_total + n_prefill + row] =
+                dec_rows_[(size_t)h * decode_bucket + row];
         }
     }
     ggml_backend_tensor_set_async(
         b_.target_backend_, sg.kv_write_rows, rows_buf_.data(), 0,
         sizeof(int64_t) * rows_buf_.size());
 
-    ggml_backend_tensor_set_async(
-        b_.target_backend_, sg.active_slot_ids,
-        active_slot_ids_.data(), 0,
-        sizeof(int32_t) * active_slot_ids_.size());
-
-    if (n_prefill > 0) {
-        upload_qwen35_causal_mask(
-            sg.attn_mask, kv_pos, n_prefill, b_.cfg_.kq_stride_pad);
+    if (with_prefill) {
+        query_slot_ids_.assign((size_t)n_total, -1);
+        query_positions_.assign((size_t)n_total, -1);
+        logits_rows_.clear();
+        logits_rows_.reserve((size_t)gather_rows);
+        token_offset = 0;
+        for (size_t i = 0; i < prefills.size(); ++i) {
+            const PrefillStage & prefill = prefills[i];
+            const int slot = plan.prefills[i].slot;
+            for (int row = 0; row < prefill.chunk; ++row) {
+                query_slot_ids_[(size_t)(token_offset + row)] = slot;
+                query_positions_[(size_t)(token_offset + row)] =
+                    prefill.kv_pos + row;
+            }
+            if (prefill.commit) {
+                logits_rows_.push_back(token_offset + prefill.chunk - 1);
+            }
+            token_offset += prefill.chunk;
+        }
+        for (int row = 0; row < live_count; ++row) {
+            query_slot_ids_[(size_t)(n_prefill + row)] =
+                live_slot_ids_[(size_t)row];
+            query_positions_[(size_t)(n_prefill + row)] =
+                live_positions_[(size_t)row];
+        }
+        for (int row = 0; row < decode_bucket; ++row) {
+            logits_rows_.push_back(n_prefill + row);
+        }
+        if (logits_rows_.empty()) {
+            logits_rows_.push_back(n_total - 1);
+        }
+        ggml_backend_tensor_set_async(
+            b_.target_backend_, sg.paged_query_seq_ids,
+            query_slot_ids_.data(), 0,
+            sizeof(int32_t) * query_slot_ids_.size());
+        ggml_backend_tensor_set_async(
+            b_.target_backend_, sg.paged_query_positions,
+            query_positions_.data(), 0,
+            sizeof(int32_t) * query_positions_.size());
+        ggml_backend_tensor_set_async(
+            b_.target_backend_, sg.logits_row_indices,
+            logits_rows_.data(), 0,
+            sizeof(int32_t) * logits_rows_.size());
+    }
+    if (with_decode) {
+        ggml_backend_tensor_set_async(
+            b_.target_backend_, sg.active_slot_ids,
+            active_slot_ids_.data(), 0,
+            sizeof(int32_t) * active_slot_ids_.size());
+        ggml_backend_tensor_set_async(
+            b_.target_backend_, sg.state_slot_ids,
+            state_slot_ids_.data(), 0,
+            sizeof(int32_t) * state_slot_ids_.size());
     }
     ggml_backend_tensor_set_async(
-        b_.target_backend_, sg.state_slot_ids,
-        state_slot_ids_.data(), 0,
-        sizeof(int32_t) * state_slot_ids_.size());
-    ggml_backend_tensor_set_async(
         b_.target_backend_, b_.cache_.paged_kv_seq_lens,
-        seq_lens_.data(), 0,
-        sizeof(int32_t) * seq_lens_.size());
+        seq_lens_.data(), 0, sizeof(int32_t) * seq_lens_.size());
 
     const auto st =
         ggml_backend_graph_compute(b_.target_backend_, sg.gf);
     if (st != GGML_STATUS_SUCCESS) {
-        std::fprintf(stderr, "[parallel] fused/decode compute failed\n");
-        for (DecodeOutput & out : decode_outputs) out.failed = true;
-        return fail_step("fused/decode compute failed");
+        return fail_step("packed prefill/decode compute failed");
     }
 
-    // A committing fused graph exposes [prefill tail | decode rows].
-    // Non-committing prefill chunks expose only the decode rows.
-    const int dec_row0 = (n_prefill > 0 && commit) ? 1 : 0;
-    argmax_buf_.assign((size_t)(dec_row0 + n_decode), -1);
+    const int decode_row0 = with_prefill ? n_commits : 0;
+    const int argmax_rows = with_prefill ? gather_rows : decode_bucket;
+    argmax_buf_.assign((size_t)argmax_rows, -1);
     ggml_backend_tensor_get_async(
         b_.target_backend_, sg.argmax_tokens, argmax_buf_.data(), 0,
         sizeof(int32_t) * argmax_buf_.size());
     ggml_backend_synchronize(b_.target_backend_);
-    for (size_t oi = 0; oi < decode_outputs.size(); ++oi) {
+
+    for (size_t oi = 0; oi < inputs.size(); ++oi) {
         DecodeOutput & out = decode_outputs[oi];
         if (out.failed) continue;
         slots_.commit_step(out.slot);
-        const int row = dec_row0 + output_rows_[oi];
+        const int row = decode_row0 + output_rows_[oi];
         out.token = sample_graph_row(
             out.slot, row, &argmax_buf_[(size_t)row], &logits_buf_);
     }
 
-    if (with_prefill) {
+    int commit_row = 0;
+    for (size_t i = 0; i < prefills.size(); ++i) {
+        const int slot = plan.prefills[i].slot;
         PrefillOutput out;
-        out.slot = prefill_slot;
-        if (commit) {
+        out.slot = slot;
+        if (prefills[i].commit) {
             out.status = PrefillOutput::Status::completed;
             out.token = sample_graph_row(
-                prefill_slot, 0, &argmax_buf_[0], &logits_buf_);
-            slots_.commit_prefill(prefill_slot);
+                slot, commit_row, &argmax_buf_[(size_t)commit_row],
+                &logits_buf_);
+            ++commit_row;
+            slots_.commit_prefill(slot);
         }
         prefill_outputs.push_back(std::move(out));
     }

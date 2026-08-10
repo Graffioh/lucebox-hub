@@ -86,11 +86,11 @@ bool Qwen35SlotManager::is_prefilling(int slot) const {
 
 SeqEngine::AdmitResult Qwen35SlotManager::admit(
         uint64_t request_id, const std::vector<int32_t> & prompt,
-        const SamplerCfg & sampler, int staging_idx) {
+        const SamplerCfg & sampler) {
     using AdmitStatus = SeqEngine::AdmitResult::Status;
     SeqEngine::AdmitResult r;
-    if (prompt.empty() || staging_idx < 0) {
-        r.error = prompt.empty() ? "empty prompt" : "invalid staging lease";
+    if (prompt.empty()) {
+        r.error = "empty prompt";
         return r;
     }
     if (prompt.size() > static_cast<size_t>(max_ctx_)) {
@@ -160,7 +160,6 @@ SeqEngine::AdmitResult Qwen35SlotManager::admit(
     s.handle = handle;
     s.cur_pos = 0;
     s.prompt_len = prompt_len;
-    s.staging_idx = staging_idx;
     s.sampler = sampler;
     s.sample_history = prompt;
     // Same predicate the engine uses to pick CPU sampling over GPU argmax:

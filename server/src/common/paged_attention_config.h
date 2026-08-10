@@ -30,8 +30,8 @@ constexpr int64_t paged_kv_address_cap() {
 
 // Inputs for sizing a concurrent paged pool from memory that remains after
 // model weights have loaded. `fixed_cache_bytes` covers cache allocations that
-// do not shrink with the pool (one prefill staging K/V, per-slot recurrent
-// state, and metadata); `reserve_bytes` leaves room for runtime graph buffers.
+// do not shrink with the pool (per-slot recurrent state and metadata);
+// `reserve_bytes` leaves room for runtime graph buffers.
 struct PagedKvAutoBudget {
     int64_t free_bytes        = 0;
     int64_t fixed_cache_bytes = 0;
