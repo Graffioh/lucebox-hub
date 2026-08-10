@@ -115,7 +115,6 @@ private:
     std::vector<int64_t>     live_physical_rows_;
     std::vector<int32_t>     live_slot_ids_;
     std::vector<int32_t>     dec_tokens_;
-    std::vector<int32_t>     dec_pos_;
     std::vector<int64_t>     dec_rows_;
     std::vector<int32_t>     active_slot_ids_;
     std::vector<int32_t>     state_slot_ids_;

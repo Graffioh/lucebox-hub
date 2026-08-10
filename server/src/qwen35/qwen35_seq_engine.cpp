@@ -303,7 +303,6 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     const int decode_bucket = with_decode ? decode_bucket_width(live_count) : 0;
 
     dec_tokens_.assign((size_t)decode_bucket, 0);
-    dec_pos_.assign((size_t)4 * decode_bucket, 0);
     dec_rows_.assign((size_t)decode_bucket * n_head_kv, scratch_row_);
     active_slot_ids_.assign((size_t)decode_bucket, -1);
     state_slot_ids_.assign((size_t)decode_bucket, 0);
@@ -311,9 +310,6 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     for (int row = 0; row < live_count; ++row) {
         dec_tokens_[(size_t)row] = live_tokens_[(size_t)row];
         const int pos = live_positions_[(size_t)row];
-        dec_pos_[(size_t)4 * row + 0] = pos;
-        dec_pos_[(size_t)4 * row + 1] = pos;
-        dec_pos_[(size_t)4 * row + 2] = pos;
         active_slot_ids_[(size_t)row] = live_slot_ids_[(size_t)row];
         state_slot_ids_[(size_t)row] = live_slot_ids_[(size_t)row];
         seq_lens_[(size_t)live_slot_ids_[(size_t)row]] = pos + 1;
@@ -411,13 +407,18 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     token_offset = 0;
     for (const PrefillStage & prefill : prefills) {
         fill_qwen35_mrope_positions(
-            pos_buf_.data() + (size_t)4 * token_offset,
+            pos_buf_.data(), n_total, token_offset,
             prefill.kv_pos, prefill.chunk);
         token_offset += prefill.chunk;
     }
     if (with_decode) {
-        std::copy(dec_pos_.begin(), dec_pos_.end(),
-                  pos_buf_.begin() + (size_t)4 * n_prefill);
+        for (int row = 0; row < live_count; ++row) {
+            const int pos = live_positions_[(size_t)row];
+            const int packed_row = n_prefill + row;
+            pos_buf_[(size_t)0 * n_total + packed_row] = pos;
+            pos_buf_[(size_t)1 * n_total + packed_row] = pos;
+            pos_buf_[(size_t)2 * n_total + packed_row] = pos;
+        }
     }
     ggml_backend_tensor_set_async(
         b_.target_backend_, sg.positions, pos_buf_.data(), 0,
