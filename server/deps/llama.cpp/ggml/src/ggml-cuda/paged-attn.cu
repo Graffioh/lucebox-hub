@@ -178,6 +178,7 @@ static __global__ void paged_attn_decode(
         const float2  * __restrict__ q_ds_glob,
         const char    * __restrict__ block_table,
         const char    * __restrict__ kv_seq_lens,
+        const char    * __restrict__ active_slot_ids,
         char          * __restrict__ dst,
         half          * __restrict__ partial_acc,
         float2        * __restrict__ partial_meta,
@@ -186,6 +187,7 @@ static __global__ void paged_attn_decode(
         int64_t v_nb1,   int64_t v_nb2,
         int64_t bt_nb0,  int64_t bt_nb1,
         int64_t ksl_nb0,
+        int64_t asi_nb0,
         int64_t dst_nb1, int64_t dst_nb2,
         int32_t n_head,
         int32_t n_head_kv,
@@ -218,8 +220,13 @@ static __global__ void paged_attn_decode(
     const int n_seq        = gridDim.y;
     const int n_partitions = gridDim.z;
 
-    const int32_t kv_seq_len_raw =
-        *(const int32_t *) (kv_seq_lens + (int64_t) seq * ksl_nb0);
+    const int32_t physical_seq = active_slot_ids
+        ? *(const int32_t *) (active_slot_ids + (int64_t) seq * asi_nb0)
+        : seq;
+    const int32_t kv_seq_len_raw = physical_seq < 0
+        ? 0
+        : *(const int32_t *) (kv_seq_lens +
+                              (int64_t) physical_seq * ksl_nb0);
     const int64_t table_capacity =
         (int64_t) max_blocks * block_size;
     const int32_t kv_seq_len = kv_seq_len_raw <= 0
@@ -358,7 +365,7 @@ static __global__ void paged_attn_decode(
             const int32_t physical_block =
                 *(const int32_t *) (block_table +
                     (int64_t) logical_block * bt_nb0 +
-                    (int64_t) seq * bt_nb1);
+                    (int64_t) physical_seq * bt_nb1);
             if (physical_block >= 0 && physical_block < n_physical_blocks) {
                 phys_mine =
                     physical_block * block_size + my_token % block_size;
@@ -590,6 +597,7 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
     const ggml_tensor * v             = dst->src[2];
     const ggml_tensor * block_table   = dst->src[3];
     const ggml_tensor * kv_seq_lens   = dst->src[4];
+    const ggml_tensor * active_slot_ids = dst->src[5];
 
     if (!q || !k || !v || !block_table || !kv_seq_lens) {
         return false;
@@ -600,7 +608,8 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
         !paged_attn_type_supported(k->type) ||
         !paged_attn_type_supported(v->type) ||
         block_table->type != GGML_TYPE_I32 ||
-        kv_seq_lens->type != GGML_TYPE_I32) {
+        kv_seq_lens->type != GGML_TYPE_I32 ||
+        (active_slot_ids && active_slot_ids->type != GGML_TYPE_I32)) {
         return false;
     }
 
@@ -609,6 +618,7 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
         v->nb[0] != ggml_type_size(v->type) ||
         block_table->nb[0] != sizeof(int32_t) ||
         kv_seq_lens->nb[0] != sizeof(int32_t) ||
+        (active_slot_ids && active_slot_ids->nb[0] != sizeof(int32_t)) ||
         dst->nb[0] != sizeof(float)) {
         return false;
     }
@@ -634,13 +644,23 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
     }
 
     if (block_table->ne[0] <= 0 ||
-        block_table->ne[1] != q->ne[1] ||
+        block_table->ne[1] != kv_seq_lens->ne[0] ||
         block_table->ne[2] != 1 ||
         block_table->ne[3] != 1 ||
-        kv_seq_lens->ne[0] != q->ne[1] ||
         kv_seq_lens->ne[1] != 1 ||
         kv_seq_lens->ne[2] != 1 ||
         kv_seq_lens->ne[3] != 1) {
+        return false;
+    }
+
+    // Compacted batches address slots through active_slot_ids (one entry per
+    // query token); dense batches require one table column per query token.
+    if (active_slot_ids
+            ? (active_slot_ids->ne[0] != q->ne[1] ||
+               active_slot_ids->ne[1] != 1 ||
+               active_slot_ids->ne[2] != 1 ||
+               active_slot_ids->ne[3] != 1)
+            : block_table->ne[1] != q->ne[1]) {
         return false;
     }
 
@@ -707,6 +727,7 @@ static bool try_launch_paged_attn(
     const ggml_tensor * v            = dst->src[2];
     const ggml_tensor * block_table  = dst->src[3];
     const ggml_tensor * kv_seq_lens = dst->src[4];
+    const ggml_tensor * active_slot_ids = dst->src[5];
 
     const int32_t n_head    = (int32_t) q->ne[2];
     const int32_t n_head_kv = (int32_t) k->ne[2];
@@ -855,6 +876,7 @@ static bool try_launch_paged_attn(
         q_ds_glob,
         (const char *) block_table->data,
         (const char *) kv_seq_lens->data,
+        active_slot_ids ? (const char *) active_slot_ids->data : nullptr,
         (char *) dst->data,
         partial_acc,
         partial_meta,
@@ -863,6 +885,7 @@ static bool try_launch_paged_attn(
         v->nb[1], v->nb[2],
         block_table->nb[0], block_table->nb[1],
         kv_seq_lens->nb[0],
+        active_slot_ids ? active_slot_ids->nb[0] : 0,
         dst->nb[1], dst->nb[2],
         n_head,
         n_head_kv,

@@ -79,12 +79,13 @@ endif()
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
     set(GGML_HIP  OFF CACHE BOOL "" FORCE)
-    set(GGML_CUDA_GRAPHS ON CACHE BOOL "Enable CUDA graphs for AR-decode replay (lucebox)" FORCE)
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "Enable CUDA graphs for AR-decode replay (lucebox)")
     set(DFLASH27B_GGML_BACKEND_TARGET ggml-cuda)
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     set(GGML_CUDA OFF CACHE BOOL "" FORCE)
     set(GGML_HIP  ON  CACHE BOOL "" FORCE)
     set(GGML_HIP_RCCL OFF CACHE BOOL "" FORCE)
+    set(GGML_HIP_GRAPHS OFF CACHE BOOL "Enable experimental HIP graph replay")
     set(DFLASH27B_GGML_BACKEND_TARGET ggml-hip)
     set(DFLASH27B_HIP_ARCHITECTURES "" CACHE STRING "HIP GPU targets, e.g. gfx906;gfx1100")
     if(DFLASH27B_HIP_ARCHITECTURES AND NOT CMAKE_HIP_ARCHITECTURES)
@@ -294,6 +295,7 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_kv.cpp
     src/common/dflash_spec_decode.cpp
     src/common/paged_kv_pool.cpp
+    src/common/seq_slot_manager.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -319,6 +321,7 @@ add_library(dflash_common STATIC
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
     src/qwen35/qwen35_tensor_parallel.cpp
+    src/qwen35/qwen35_seq_engine.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
     src/qwen35/qwen35_dflash_target.cpp
     src/qwen35/qwen35_layer_split_dflash_target.cpp
@@ -979,7 +982,9 @@ if(DFLASH27B_TESTS)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_generate.cpp")
         add_executable(test_generate test/test_generate.cpp)
-        target_include_directories(test_generate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_include_directories(test_generate PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
         target_link_libraries(test_generate PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash.cpp")
@@ -1003,6 +1008,39 @@ if(DFLASH27B_TESTS)
         target_include_directories(test_paged_kv_pool PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_slot_manager.cpp")
+        # Host-side slot bookkeeping test (concurrent serving): no GPU.
+        add_executable(test_seq_slot_manager
+            test/test_seq_slot_manager.cpp
+            src/common/seq_slot_manager.cpp
+            src/common/paged_kv_pool.cpp)
+        target_include_directories(test_seq_slot_manager PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_seq_slot_manager)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_engine_contract.cpp")
+        # SeqEngine conformance checker + the fakes that prove it bites: no GPU.
+        add_executable(test_seq_engine_contract test/test_seq_engine_contract.cpp)
+        target_include_directories(test_seq_engine_contract PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_seq_engine_contract)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_batch_plan.cpp")
+        # Pure-host tests for model-neutral token-budget/FIFO planning.
+        add_executable(test_seq_batch_plan test/test_seq_batch_plan.cpp)
+        target_include_directories(test_seq_batch_plan PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_seq_batch_plan)
+    endif()
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_client_send_buffer.cpp")
+        # Buffered non-blocking client writer test (socketpair): no GPU.
+        add_executable(test_client_send_buffer test/test_client_send_buffer.cpp)
+        target_include_directories(test_client_send_buffer PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_client_send_buffer)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash.cpp")
         add_executable(test_dflash test/test_dflash.cpp)
@@ -1113,6 +1151,7 @@ if(DFLASH27B_TESTS)
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
+            src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
             src/qwen3/anchor_scan.cpp)
@@ -1206,29 +1245,12 @@ if(DFLASH27B_TESTS)
                 # Preserve the established CTest names used by CI filters and
                 # downstream scripts even though dependency tracking uses the
                 # executable target names.
-                set(_unit_ctest_name "${_unit_target}")
-                if(_unit_target STREQUAL "test_cuda_pool_shutdown")
-                    set(_unit_ctest_name cuda_pool_shutdown)
-                elseif(_unit_target STREQUAL "test_rocmfp4")
+                string(REGEX REPLACE "^test_" "" _unit_ctest_name
+                    "${_unit_target}")
+                if(_unit_target STREQUAL "test_rocmfp4")
                     set(_unit_ctest_name rocmfp4_reference)
                 elseif(_unit_target STREQUAL "test_rocmfpx")
                     set(_unit_ctest_name rocmfpx_reference)
-                elseif(_unit_target STREQUAL "test_rms_norm_hip")
-                    set(_unit_ctest_name rms_norm_hip)
-                elseif(_unit_target STREQUAL "test_deepseek4_hc_cuda")
-                    set(_unit_ctest_name deepseek4_hc_cuda)
-                elseif(_unit_target STREQUAL "test_deepseek4_mmid_grouped_cuda")
-                    set(_unit_ctest_name deepseek4_mmid_grouped_cuda)
-                elseif(_unit_target STREQUAL "test_draft_topk_cuda")
-                    set(_unit_ctest_name draft_topk_cuda)
-                elseif(_unit_target STREQUAL "test_deepseek4_unit")
-                    set(_unit_ctest_name deepseek4_unit)
-                elseif(_unit_target STREQUAL "test_qwen35_split_tree_guard")
-                    set(_unit_ctest_name qwen35_split_tree_guard)
-                elseif(_unit_target STREQUAL "test_recurrent_snapshot")
-                    set(_unit_ctest_name recurrent_snapshot)
-                elseif(_unit_target STREQUAL "test_paged_kv_pool")
-                    set(_unit_ctest_name paged_kv_pool)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
                 if(_unit_target STREQUAL "test_deepseek4_mmid_grouped_cuda")
@@ -1301,20 +1323,25 @@ if(DFLASH27B_TESTS)
     endif()
     endif()
 
+    function(dflash_add_ggml_gpu_executable target source)
+        add_executable(${target} ${source})
+        target_link_libraries(${target} PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(${target} PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(${target} PRIVATE hip::host)
+        endif()
+        target_include_directories(${target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+    endfunction()
+
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_paged_attention.cpp")
-        add_executable(test_paged_attention test/test_paged_attention.cpp)
-        target_link_libraries(test_paged_attention PRIVATE
-            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            target_link_libraries(test_paged_attention PRIVATE CUDA::cudart)
-        else()
-            target_link_libraries(test_paged_attention PRIVATE hip::host)
-        endif()
-        target_include_directories(test_paged_attention PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        dflash_add_ggml_gpu_executable(
+            test_paged_attention test/test_paged_attention.cpp)
         add_test(NAME paged_attention COMMAND test_paged_attention)
         add_test(NAME paged_attention_direct
                  COMMAND test_paged_attention --direct)
@@ -1326,18 +1353,20 @@ if(DFLASH27B_TESTS)
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_paged_attention.cpp")
-        add_executable(bench_paged_attention test/bench_paged_attention.cpp)
-        target_link_libraries(bench_paged_attention PRIVATE
-            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            target_link_libraries(bench_paged_attention PRIVATE CUDA::cudart)
-        else()
-            target_link_libraries(bench_paged_attention PRIVATE hip::host)
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_batched_gdn.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_batched_gdn test/test_batched_gdn.cpp)
+        add_test(NAME batched_gdn COMMAND test_batched_gdn)
+        add_test(NAME batched_gdn_cpu COMMAND test_batched_gdn --cpu)
+        if(TARGET check)
+            add_dependencies(check test_batched_gdn)
         endif()
-        target_include_directories(bench_paged_attention PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_paged_attention.cpp")
+        dflash_add_ggml_gpu_executable(
+            bench_paged_attention test/bench_paged_attention.cpp)
     endif()
 endif()
 
@@ -1352,6 +1381,7 @@ if(DFLASH27B_SERVER)
         add_executable(dflash_server
             src/server/server_main.cpp
             src/server/http_server.cpp
+            src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
         )

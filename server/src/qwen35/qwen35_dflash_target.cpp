@@ -76,7 +76,7 @@ bool Qwen35DFlashTarget::verify_batch(
                            need_mask, /*capture=*/true,
                            /*capture_delta_intermediate=*/do_capture,
                            pool ? 0 : fa_window_,
-                           /*last_token_logits_only=*/false,
+                           /*logits_tail_rows=*/0,
                            kq_stride_pad_,
                            /*capture_moe_router=*/false,
                            /*kvflash_mask=*/pool)) {
