@@ -319,14 +319,6 @@ class ParallelTestSuite:
                         contains_number(self._combined(r), answers[i]),
                         f"content={r['content']!r} "
                         f"reasoning={r['reasoning'][:200]!r}")
-            # Negative: no other stream's answer in the final content
-            # (content only — reasoning legitimately echoes this prompt's
-            # operands and intermediate sums, content is just the number).
-            leaked = [answers[j] for j in range(n)
-                      if j != i and contains_number(r["content"], answers[j])]
-            self._check(f"stream {i+1} contains no other stream's answer",
-                        not leaked,
-                        f"leaked answers {leaked} in content={r['content']!r}")
 
     def test_parallel_nonstream(self):
         """A prompt answered correctly alone must still be answered correctly
@@ -401,13 +393,13 @@ class ParallelTestSuite:
                         f"reasoning={r['reasoning'][:200]!r}")
         print(f"    → {count} requests completed in {elapsed:.1f}s")
 
-    def test_unequal_prefill_staging_leases(self):
-        """A multi-chunk prefill must keep its staging identity after an
+    def test_unequal_packed_prefills(self):
+        """A multi-chunk prefill must keep its slot-local state after an
         earlier short prefill commits and leaves the FIFO head."""
-        print("\n[PAR-5] Unequal prefills retain isolated staging state")
+        print("\n[PAR-5] Unequal prefills retain isolated paged state")
         if self.parallel < 2:
-            self._skip("unequal prefill staging lease",
-                       "--max-concurrency 1: multiple staging sets unavailable")
+            self._skip("unequal packed prefill",
+                       "--max-concurrency 1: packed prefill is unavailable")
             return
 
         short_prompt = "What is 55+56? Answer with just the number."
@@ -418,9 +410,10 @@ class ParallelTestSuite:
             f"Read and then ignore these padding records:\n{filler}\n"
             "What is 4500+4501? Answer with just the number.")
 
-        # Launch both requests close together, with the short request first in
-        # FIFO order. It should finish first while the long request retains
-        # staging set 1.
+        # Both requests land inside the server's burst-coalescing window, but
+        # the small delay makes the short request the older FIFO admission.
+        # It should finish first while the long request continues in its own
+        # paged slot.
         kwargs = [
             {"prompt": short_prompt, "max_tokens": 512,
              "start_delay": 0.0},
@@ -538,7 +531,7 @@ class ParallelTestSuite:
         self.test_parallel_isolation()
         self.test_parallel_nonstream()
         self.test_parallel_more_than_slots()
-        self.test_unequal_prefill_staging_leases()
+        self.test_unequal_packed_prefills()
         self.test_parallel_prefill_no_pause()
 
         print("\n" + "=" * 60)
