@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <utility>
 #include <vector>
@@ -30,6 +31,17 @@ int decode_bucket_width(int live_count) {
     for (int b : buckets)
         if (b >= live_count) return b;
     return 64;
+}
+
+bool batched_sampling_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("DFLASH_BATCHED_SAMPLING");
+        return value != nullptr && value[0] != '\0' &&
+            std::strcmp(value, "0") != 0 &&
+            std::strcmp(value, "false") != 0 &&
+            std::strcmp(value, "off") != 0;
+    }();
+    return enabled;
 }
 
 } // namespace
@@ -64,23 +76,23 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
 
 int32_t Qwen35SeqEngine::sample_graph_row(
         int slot, int logits_row, const int32_t * cached_argmax,
-        std::vector<float> * logits_scratch) {
+        const float * cached_logits) {
     const TargetWeights & w = b_.w_;
     const int vocab = w.n_vocab;
     SeqSlot & seq = slots_.slot(slot);
     int32_t token = -1;
     if (seq.sampler.needs_logit_processing()) {
-        std::vector<float> local_logits;
-        std::vector<float> & logits = logits_scratch
-            ? *logits_scratch
-            : local_logits;
-        if (logits.empty()) logits.resize((size_t)vocab);
-        ggml_backend_tensor_get_async(
-            b_.target_backend_, b_.sg_.logits, logits.data(),
-            (size_t)logits_row * (size_t)vocab * sizeof(float),
-            sizeof(float) * (size_t)vocab);
-        ggml_backend_synchronize(b_.target_backend_);
-        token = sample_logits(logits.data(), vocab, seq.sampler,
+        const float * logits = cached_logits;
+        if (!logits) {
+            if (logits_buf_.empty()) logits_buf_.resize((size_t)vocab);
+            ggml_backend_tensor_get_async(
+                b_.target_backend_, b_.sg_.logits, logits_buf_.data(),
+                (size_t)logits_row * (size_t)vocab * sizeof(float),
+                sizeof(float) * (size_t)vocab);
+            ggml_backend_synchronize(b_.target_backend_);
+            logits = logits_buf_.data();
+        }
+        token = sample_logits(logits, vocab, seq.sampler,
                               seq.sample_history, seq.rng);
     } else if (cached_argmax) {
         token = *cached_argmax;
@@ -513,6 +525,29 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     ggml_backend_tensor_get_async(
         b_.target_backend_, sg.argmax_tokens, argmax_buf_.data(), 0,
         sizeof(int32_t) * argmax_buf_.size());
+
+    const bool batch_sampling = batched_sampling_enabled();
+    bool needs_logits = false;
+    for (size_t oi = 0;
+         batch_sampling && oi < inputs.size() && !needs_logits; ++oi) {
+        const StepOutput & out = outputs[oi];
+        needs_logits = !out.failed &&
+            slots_.slot(out.slot).sampler.needs_logit_processing();
+    }
+    for (size_t i = 0;
+         batch_sampling && i < prefills.size() && !needs_logits; ++i) {
+        if (!prefills[i].commit) continue;
+        const int slot = plan.prefills[i].slot;
+        needs_logits = slots_.slot(slot).sampler.needs_logit_processing();
+    }
+    if (needs_logits) {
+        const size_t logits_count =
+            (size_t)argmax_rows * (size_t)w.n_vocab;
+        logits_buf_.resize(logits_count);
+        ggml_backend_tensor_get_async(
+            b_.target_backend_, sg.logits, logits_buf_.data(), 0,
+            logits_count * sizeof(float));
+    }
     ggml_backend_synchronize(b_.target_backend_);
 
     for (size_t oi = 0; oi < inputs.size(); ++oi) {
@@ -520,8 +555,13 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         if (out.failed) continue;
         slots_.commit_step(out.slot);
         const int row = decode_row0 + output_rows_[oi];
+        const float * logits =
+            batch_sampling &&
+                slots_.slot(out.slot).sampler.needs_logit_processing()
+                ? logits_buf_.data() + (size_t)row * (size_t)w.n_vocab
+                : nullptr;
         out.token = sample_graph_row(
-            out.slot, row, &argmax_buf_[(size_t)row], &logits_buf_);
+            out.slot, row, &argmax_buf_[(size_t)row], logits);
     }
 
     int commit_row = 0;
@@ -536,9 +576,15 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         StepOutput out;
         out.slot = slot;
         out.prefill_done = true;
+        const float * logits =
+            batch_sampling &&
+                slots_.slot(slot).sampler.needs_logit_processing()
+                ? logits_buf_.data() +
+                    (size_t)commit_row * (size_t)w.n_vocab
+                : nullptr;
         out.token = sample_graph_row(
             slot, commit_row, &argmax_buf_[(size_t)commit_row],
-            &logits_buf_);
+            logits);
         ++commit_row;
         slots_.commit_prefill(slot, (int)pending.prompt.size());
         outputs.push_back(std::move(out));

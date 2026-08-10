@@ -106,7 +106,7 @@ private:
                                      std::vector<StepOutput> & outputs);
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
-                             std::vector<float> * logits_scratch = nullptr);
+                             const float * cached_logits = nullptr);
 
     Qwen35Backend & b_;
     SeqSlotManager  slots_;
