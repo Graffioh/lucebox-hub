@@ -21,6 +21,10 @@ COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-3}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-600}"
 MAX_TOKENS="${MAX_TOKENS:-64}"
 WARMUP_TOKENS="${WARMUP_TOKENS:-8}"
+TEMPERATURE="${TEMPERATURE:-0}"
+SEED="${SEED:-1}"
+HIPBLASLT_MODE="${HIPBLASLT_MODE:-auto}"
+BATCHED_SAMPLING_MODE="${BATCHED_SAMPLING_MODE:-auto}"
 SLOTS=16
 
 usage() {
@@ -30,8 +34,9 @@ Usage: MODEL=/path/model.gguf [REPEATS=5] run_qwen36_concurrency.sh
 Runs fresh-server, same-concurrency warmup + measurement cases for luce-k8,
 luce-k1, and llama at C=1/4/8/16. Defaults to one repeat for screening; use at
 least five paired repeats for publication. For a decode-heavy comparison, set
-WORKLOADS=short MAX_TOKENS=256 VARIANTS=luce-k8,llama. OUT must not already
-exist.
+WORKLOADS=short MAX_TOKENS=256 VARIANTS=luce-k8,llama. Set TEMPERATURE=0.7 to
+exercise sampling; HIPBLASLT_MODE and BATCHED_SAMPLING_MODE accept 0 or 1 for
+Lucebox A/Bs. OUT must not already exist.
 EOF
 }
 
@@ -42,6 +47,8 @@ for cmd in python3 curl sha256sum; do command -v "$cmd" >/dev/null || { echo "mi
 [[ -x "$LUCE_SERVER_BIN" ]] || { echo "missing Lucebox server: $LUCE_SERVER_BIN" >&2; exit 2; }
 [[ -x "$LLAMA_SERVER_BIN" ]] || { echo "missing llama.cpp server: $LLAMA_SERVER_BIN" >&2; exit 2; }
 [[ "$REPEATS" =~ ^[1-9][0-9]*$ ]] || { echo "REPEATS must be positive" >&2; exit 2; }
+[[ "$HIPBLASLT_MODE" == auto || "$HIPBLASLT_MODE" == 0 || "$HIPBLASLT_MODE" == 1 ]] || { echo "HIPBLASLT_MODE must be auto, 0, or 1" >&2; exit 2; }
+[[ "$BATCHED_SAMPLING_MODE" == auto || "$BATCHED_SAMPLING_MODE" == 0 || "$BATCHED_SAMPLING_MODE" == 1 ]] || { echo "BATCHED_SAMPLING_MODE must be auto, 0, or 1" >&2; exit 2; }
 [[ ! -e "$OUT" ]] || { echo "refusing to overwrite $OUT" >&2; exit 2; }
 ambient_tuning="$(env | grep -E '^(GGML_|DFLASH_|LUCE_|HIP_|ROCR_|HSA_|LD_PRELOAD=|LD_LIBRARY_PATH=)' \
   | grep -v '^LUCE_SERVER_BIN=' || true)"
@@ -132,7 +139,7 @@ run_case() {
   capacity=$((SLOTS * max_ctx))
   local case_dir="$OUT/$workload/c$clients/r$repeat/$variant"
   mkdir -p "$case_dir"
-  local -a command
+  local -a command server_env=()
   if [[ "$variant" == llama ]]; then
     binary="$LLAMA_SERVER_BIN"; model_id=qwen36-llama; max_prefills=0
     command=("$binary" -m "$MODEL" -ngl all --parallel "$SLOTS" -c "$capacity"
@@ -146,16 +153,23 @@ run_case() {
       --cache-type-k q4_0 --cache-type-v q4_0 --fa-window 0
       --prefix-cache-slots 0 --prefill-cache-slots 0 --admission-coalesce-ms 5
       --host 127.0.0.1 --port "$PORT" --model-name "$model_id")
+    server_env=(DFLASH_MIN_TOKENS="$WARMUP_TOKENS" DFLASH_MAX_CONCURRENT_PREFILLS="$max_prefills")
+    [[ "$HIPBLASLT_MODE" == auto ]] || server_env+=(DFLASH_HIPBLASLT="$HIPBLASLT_MODE")
+    [[ "$BATCHED_SAMPLING_MODE" == auto ]] || server_env+=(DFLASH_BATCHED_SAMPLING="$BATCHED_SAMPLING_MODE")
   fi
-  printf '%q ' "${command[@]}" > "$case_dir/server-command.txt"; printf '\n' >> "$case_dir/server-command.txt"
+  if [[ "$variant" == llama ]]; then
+    printf '%q ' "${command[@]}" > "$case_dir/server-command.txt"
+  else
+    printf 'env ' > "$case_dir/server-command.txt"; printf '%q ' "${server_env[@]}" "${command[@]}" >> "$case_dir/server-command.txt"
+  fi
+  printf '\n' >> "$case_dir/server-command.txt"
   write_metadata "$case_dir/server-metadata.json" "$variant" "$workload" "$clients" "$repeat" "$binary" "$max_prefills" "$case_dir/server-command.txt"
 
   echo "[run] $workload C=$clients repeat=$repeat variant=$variant"
   if [[ "$variant" == llama ]]; then
     "${command[@]}" > "$case_dir/server.log" 2>&1 &
   else
-    env DFLASH_MIN_TOKENS="$WARMUP_TOKENS" DFLASH_MAX_CONCURRENT_PREFILLS="$max_prefills" \
-      "${command[@]}" > "$case_dir/server.log" 2>&1 &
+    env "${server_env[@]}" "${command[@]}" > "$case_dir/server.log" 2>&1 &
   fi
   server_pid=$!
   if ! wait_health; then tail -n 80 "$case_dir/server.log" >&2 || true; return 1; fi
@@ -163,12 +177,12 @@ run_case() {
   local offset="${prompt_offsets[$clients]}" prompts="$OUT/prompts/$workload.jsonl"
   python3 "$CLIENT" --base-url "http://127.0.0.1:$PORT/v1" --model "$model_id" \
     --clients "$clients" --prompt-file "$prompts" --prompt-offset "$offset" \
-    --require-distinct-prompts --max-tokens "$WARMUP_TOKENS" --temperature 0 \
+    --require-distinct-prompts --max-tokens "$WARMUP_TOKENS" --temperature "$TEMPERATURE" --seed "$SEED" \
     --ignore-eos --timeout "$timeout" --cooldown 0 --out "$case_dir/warmup.json" \
     --label "$variant $workload C=$clients warmup" > "$case_dir/warmup.txt"
   python3 "$CLIENT" --base-url "http://127.0.0.1:$PORT/v1" --model "$model_id" \
     --clients "$clients" --prompt-file "$prompts" --prompt-offset "$offset" \
-    --require-distinct-prompts --max-tokens "$MAX_TOKENS" --temperature 0 \
+    --require-distinct-prompts --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE" --seed "$SEED" \
     --ignore-eos --timeout "$timeout" --cooldown 0 \
     --server-metadata-json "$case_dir/server-metadata.json" --out "$case_dir/bench.json" \
     --label "$variant $workload C=$clients repeat=$repeat" | tee "$case_dir/bench.txt"
