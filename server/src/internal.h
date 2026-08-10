@@ -678,6 +678,9 @@ struct QwenGraphInputs {
     // each row's KV extent to position+1, which IS the causal mask. -1 on
     // padding rows.
     ggml_tensor * paged_query_positions = nullptr;
+    // Optional I32 [3,n_tiles] query-tile schedule. Present only when at
+    // least one prompt segment contains adjacent rows that can reuse K/V.
+    ggml_tensor * paged_query_tiles = nullptr;
     // Optional [n_rows] i32 gather of final-norm rows before the LM head:
     // multi-prompt steps sample scattered rows (each committing segment's
     // last row plus the decode rows), which a tail view cannot express.

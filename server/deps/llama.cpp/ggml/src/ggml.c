@@ -5630,7 +5630,7 @@ struct ggml_tensor * ggml_flash_attn_sparse(
 
 // ggml_paged_attn
 
-struct ggml_tensor * ggml_paged_attn_ext(
+static struct ggml_tensor * ggml_paged_attn_ext_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -5639,6 +5639,7 @@ struct ggml_tensor * ggml_paged_attn_ext(
         struct ggml_tensor  * kv_seq_lens,
         struct ggml_tensor  * active_slot_ids,
         struct ggml_tensor  * query_positions,
+        struct ggml_tensor  * query_tiles,
         float                 scale,
         int                   block_size,
         int                   max_kv_seq_len) {
@@ -5652,6 +5653,8 @@ struct ggml_tensor * ggml_paged_attn_ext(
     // an explicit row -> block-table-column mapping.
     GGML_ASSERT(query_positions == NULL || active_slot_ids != NULL);
     GGML_ASSERT(query_positions == NULL || query_positions->type == GGML_TYPE_I32);
+    GGML_ASSERT(query_tiles == NULL || (active_slot_ids != NULL && query_positions != NULL));
+    GGML_ASSERT(query_tiles == NULL || query_tiles->type == GGML_TYPE_I32);
 
     GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
     GGML_ASSERT(k->ne[1] == v->ne[1]);
@@ -5673,6 +5676,11 @@ struct ggml_tensor * ggml_paged_attn_ext(
             GGML_ASSERT(ggml_is_contiguous(query_positions));
             GGML_ASSERT(query_positions->ne[0] == q->ne[1]);
             GGML_ASSERT(query_positions->ne[1] == 1 && query_positions->ne[2] == 1 && query_positions->ne[3] == 1);
+        }
+        if (query_tiles) {
+            GGML_ASSERT(ggml_is_contiguous(query_tiles));
+            GGML_ASSERT(query_tiles->ne[0] == 3 && query_tiles->ne[1] > 0);
+            GGML_ASSERT(query_tiles->ne[2] == 1 && query_tiles->ne[3] == 1);
         }
     } else {
         GGML_ASSERT(block_table->ne[1] == q->ne[1]);
@@ -5697,8 +5705,45 @@ struct ggml_tensor * ggml_paged_attn_ext(
     result->src[4] = kv_seq_lens;
     result->src[5] = active_slot_ids;
     result->src[6] = query_positions;
+    result->src[7] = query_tiles;
 
     return result;
+}
+
+struct ggml_tensor * ggml_paged_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * active_slot_ids,
+        struct ggml_tensor  * query_positions,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len) {
+    return ggml_paged_attn_ext_impl(
+        ctx, q, k, v, block_table, kv_seq_lens, active_slot_ids,
+        query_positions, NULL, scale, block_size, max_kv_seq_len);
+}
+
+struct ggml_tensor * ggml_paged_attn_ext_tiled(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * kv_seq_lens,
+        struct ggml_tensor  * active_slot_ids,
+        struct ggml_tensor  * query_positions,
+        struct ggml_tensor  * query_tiles,
+        float                 scale,
+        int                   block_size,
+        int                   max_kv_seq_len) {
+    GGML_ASSERT(query_tiles != NULL);
+    return ggml_paged_attn_ext_impl(
+        ctx, q, k, v, block_table, kv_seq_lens, active_slot_ids,
+        query_positions, query_tiles, scale, block_size, max_kv_seq_len);
 }
 
 // ggml_flash_attn_back

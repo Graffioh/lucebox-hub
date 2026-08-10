@@ -446,6 +446,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     if (with_prefill) {
         query_slot_ids_.assign((size_t)n_total, -1);
         query_positions_.assign((size_t)n_total, -1);
+        query_tiles_.clear();
         logits_rows_.clear();
         logits_rows_.reserve((size_t)gather_rows);
         token_offset = 0;
@@ -482,6 +483,32 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             b_.target_backend_, sg.paged_query_positions,
             query_positions_.data(), 0,
             sizeof(int32_t) * query_positions_.size());
+        if (sg.paged_query_tiles) {
+            query_tiles_.reserve(
+                (size_t)3 * (size_t)sg.paged_query_tiles->ne[1]);
+            for (const QwenPrefillSegment & segment : segments) {
+                for (int row = 0; row < segment.n_tokens; row += 4) {
+                    query_tiles_.push_back(segment.token_offset + row);
+                    query_tiles_.push_back(
+                        std::min(4, segment.n_tokens - row));
+                    query_tiles_.push_back(segment.seq_slot);
+                }
+            }
+            for (int row = 0; row < decode_bucket; ++row) {
+                query_tiles_.push_back(n_prefill + row);
+                query_tiles_.push_back(1);
+                query_tiles_.push_back(
+                    row < live_count ? live_slot_ids_[(size_t)row] : -1);
+            }
+            if (query_tiles_.size() !=
+                (size_t)ggml_nelements(sg.paged_query_tiles)) {
+                return fail_step("query-tile descriptor shape mismatch");
+            }
+            ggml_backend_tensor_set_async(
+                b_.target_backend_, sg.paged_query_tiles,
+                query_tiles_.data(), 0,
+                sizeof(int32_t) * query_tiles_.size());
+        }
         ggml_backend_tensor_set_async(
             b_.target_backend_, sg.logits_row_indices,
             logits_rows_.data(), 0,

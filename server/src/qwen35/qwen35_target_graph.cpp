@@ -722,7 +722,9 @@ static ggml_tensor * build_full_attn_block(
     int paged_max_kv_len = 0,
     // Compact decode row -> physical block-table column. Negative ids are
     // graph-bucket padding rows.
-    ggml_tensor * active_slot_ids = nullptr
+    ggml_tensor * active_slot_ids = nullptr,
+    // Optional [3,n_tiles] execution schedule for the ragged paged read.
+    ggml_tensor * paged_query_tiles = nullptr
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -813,6 +815,7 @@ static ggml_tensor * build_full_attn_block(
     const bool ragged = paged_query_seq_ids != nullptr;
     GGML_ASSERT(!ragged || (paged_block_table && paged_query_positions &&
                             kv_write_rows));
+    GGML_ASSERT(!paged_query_tiles || ragged);
     if (kv_write_rows) {
         // Step-invariant: the destination tensor stays fixed while the input
         // indices carry contiguous, KVFlash, or paged physical rows.
@@ -880,10 +883,15 @@ static ggml_tensor * build_full_attn_block(
                           bool dense_token_layout) {
         const int padded = ((std::max(1, launch_kv_len) + 255) / 256) * 256;
         const int launch_len = std::min(padded, (int)cache_k->ne[1]);
-        ggml_tensor * out = ggml_paged_attn_ext(
-            ctx, q, cache_k, cache_v, paged_block_table,
-            paged_kv_seq_lens, row_seq_ids, row_positions, kq_scale,
-            PAGED_BLOCK_SIZE, launch_len);
+        ggml_tensor * out = paged_query_tiles
+            ? ggml_paged_attn_ext_tiled(
+                  ctx, q, cache_k, cache_v, paged_block_table,
+                  paged_kv_seq_lens, row_seq_ids, row_positions,
+                  paged_query_tiles, kq_scale, PAGED_BLOCK_SIZE, launch_len)
+            : ggml_paged_attn_ext(
+                  ctx, q, cache_k, cache_v, paged_block_table,
+                  paged_kv_seq_lens, row_seq_ids, row_positions, kq_scale,
+                  PAGED_BLOCK_SIZE, launch_len);
         if (dense_token_layout) {
             out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
         }
@@ -1584,7 +1592,8 @@ QwenGraphOutputs build_qwen35_graph(
                                         in.paged_query_seq_ids,
                                         in.paged_query_positions,
                                         in.paged_max_kv_len,
-                                        in.active_slot_ids);
+                                        in.active_slot_ids,
+                                        in.paged_query_tiles);
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
                 // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx

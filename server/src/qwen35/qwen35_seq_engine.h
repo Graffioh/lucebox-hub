@@ -121,6 +121,7 @@ private:
     std::vector<int32_t>     seq_lens_;
     std::vector<int32_t>     query_slot_ids_;
     std::vector<int32_t>     query_positions_;
+    std::vector<int32_t>     query_tiles_;
     std::vector<int32_t>     logits_rows_;
     std::vector<float>       embed_buf_;
     std::vector<int32_t>     pos_buf_;

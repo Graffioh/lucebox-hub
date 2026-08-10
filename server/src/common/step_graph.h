@@ -60,6 +60,8 @@ struct StepGraph {
     // inclusive causal position, [n_tokens] i32 each. Padding rows carry -1.
     ggml_tensor *   paged_query_seq_ids = nullptr;
     ggml_tensor *   paged_query_positions = nullptr;
+    // Optional ragged execution schedule: [row_begin,row_count,slot] columns.
+    ggml_tensor *   paged_query_tiles = nullptr;
     // Multi-prompt steps: i32 row indices gathered from the final norm
     // before the LM head (committing rows + decode rows).
     ggml_tensor *   logits_row_indices = nullptr;
@@ -97,6 +99,7 @@ inline void step_graph_free(StepGraph & sg) {
     sg.state_slot_ids = nullptr;
     sg.paged_query_seq_ids = nullptr;
     sg.paged_query_positions = nullptr;
+    sg.paged_query_tiles = nullptr;
     sg.logits_row_indices = nullptr;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;

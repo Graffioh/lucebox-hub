@@ -1347,6 +1347,16 @@ if(DFLASH27B_TESTS)
                  COMMAND test_paged_attention --direct)
         set_tests_properties(paged_attention_direct PROPERTIES
             ENVIRONMENT "GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS=1")
+        add_test(NAME paged_attention_qtile_direct
+                 COMMAND test_paged_attention --qtile-direct)
+        set_tests_properties(paged_attention_qtile_direct PROPERTIES
+            ENVIRONMENT
+                "GGML_CUDA_PAGED_ATTN_QTILE=force;GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS=1")
+        add_test(NAME paged_attention_qtile_partitioned
+                 COMMAND test_paged_attention --qtile-partitioned)
+        set_tests_properties(paged_attention_qtile_partitioned PROPERTIES
+            ENVIRONMENT
+                "GGML_CUDA_PAGED_ATTN_QTILE=force;GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS=2")
         if(TARGET check)
             add_dependencies(check test_paged_attention)
         endif()

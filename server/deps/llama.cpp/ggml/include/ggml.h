@@ -2503,6 +2503,25 @@ extern "C" {
             int                   block_size,
             int                   max_kv_seq_len);
 
+    // Optional execution schedule for query-tiled paged prefill.
+    // query_tiles is contiguous I32 [3, n_tiles], with columns
+    // {row_begin, row_count, physical_slot}. It is an optimization schedule;
+    // active_slot_ids and query_positions remain the source of row identity
+    // and causality, and unsupported backends may ignore the schedule.
+    GGML_API struct ggml_tensor * ggml_paged_attn_ext_tiled(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * block_table,
+            struct ggml_tensor  * kv_seq_lens,
+            struct ggml_tensor  * active_slot_ids,
+            struct ggml_tensor  * query_positions,
+            struct ggml_tensor  * query_tiles,
+            float                 scale,
+            int                   block_size,
+            int                   max_kv_seq_len);
+
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).
     // Used for KV cache rotation in TurboQuant quantization types (TQ3_0).

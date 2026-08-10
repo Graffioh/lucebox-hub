@@ -11,6 +11,8 @@ static constexpr int PAGED_ATTN_MAX_PARTITIONS = 128;
 static constexpr int PAGED_ATTN_BLOCKS_PER_PARTITION = 64;
 static constexpr int PAGED_ATTN_HEAD_DIM = 256;
 static constexpr int PAGED_ATTN_MAX_PACKED_WARPS = 8;
+static constexpr int PAGED_ATTN_QUERY_TILE = 4;
+static constexpr int PAGED_ATTN_KV_TILE = WARP_SIZE;
 
 // Partition count for n_blocks of context: enough partitions to cover the
 // blocks and to reach min_partitions for occupancy, but never more than the
@@ -519,6 +521,400 @@ static __global__ void paged_attn_decode(
     }
 }
 
+// gfx1151 Q4_0 prefill specialization. One workgroup handles one K/V head
+// and up to four adjacent query rows from one physical sequence. Each wave
+// retains the proven six-head GQA math while the workgroup stages one
+// 32-token compressed K/V tile in LDS.
+template<bool write_partials>
+static __global__ void paged_attn_qtile_q4_0(
+        const char    * __restrict__ k,
+        const char    * __restrict__ v,
+        const int     * __restrict__ q_i32_glob,
+        const float2  * __restrict__ q_ds_glob,
+        const char    * __restrict__ block_table,
+        const char    * __restrict__ kv_seq_lens,
+        const char    * __restrict__ active_slot_ids,
+        const char    * __restrict__ query_positions,
+        const char    * __restrict__ query_tiles,
+        char          * __restrict__ dst,
+        half          * __restrict__ partial_acc,
+        float2        * __restrict__ partial_meta,
+        int64_t k_nb1,   int64_t k_nb2,
+        int64_t v_nb1,   int64_t v_nb2,
+        int64_t bt_nb0,  int64_t bt_nb1,
+        int64_t ksl_nb0,
+        int64_t asi_nb0, int64_t qpos_nb0,
+        int64_t qt_nb1,
+        int64_t dst_nb1, int64_t dst_nb2,
+        int32_t n_seq,
+        int32_t n_table_seq,
+        int32_t pool_tokens,
+        int32_t max_blocks,
+        int32_t block_size,
+        int32_t min_partitions) {
+    constexpr int D = PAGED_ATTN_HEAD_DIM;
+    constexpr int n_batch_heads = 6;
+    constexpr int values_per_load = 4;
+    constexpr int values_per_lane = D / WARP_SIZE;
+    constexpr int q_i32_per_lane = D / (sizeof(int) * WARP_SIZE);
+    constexpr int q4_row_bytes =
+        (D / QK4_0) * (int) sizeof(block_q4_0);
+    constexpr int stage_bytes = PAGED_ATTN_KV_TILE * q4_row_bytes;
+    constexpr int copy_bytes = 16;
+    constexpr int stage_chunks = stage_bytes / copy_bytes;
+    static_assert(q4_row_bytes == 144, "unexpected D=256 Q4_0 row size");
+    static_assert(stage_bytes % copy_bytes == 0, "unaligned Q4_0 stage");
+
+    __shared__ __align__(16) unsigned char k_stage[stage_bytes];
+    __shared__ __align__(16) unsigned char v_stage[stage_bytes];
+    __shared__ int32_t physical_rows[PAGED_ATTN_KV_TILE];
+    __shared__ int32_t descriptor[3];
+    __shared__ int32_t row_positions[PAGED_ATTN_QUERY_TILE];
+    __shared__ int32_t row_valid[PAGED_ATTN_QUERY_TILE];
+    __shared__ int32_t slot_kv_len;
+    __shared__ int32_t tile_kv_len;
+
+    const int lane = threadIdx.x;
+    const int row_in_tile = threadIdx.y;
+    const int tile = blockIdx.y;
+    const int kv_head = blockIdx.x;
+    const int partition = blockIdx.z;
+    const int n_partitions = gridDim.z;
+    const int tid = row_in_tile * WARP_SIZE + lane;
+
+    if (tid < 3) {
+        const char * tile_desc = query_tiles + (int64_t) tile * qt_nb1;
+        descriptor[tid] =
+            *(const int32_t *) (tile_desc + tid * sizeof(int32_t));
+    }
+    __syncthreads();
+
+    const int32_t row_begin = descriptor[0];
+    const int32_t row_count = descriptor[1];
+    const int32_t physical_slot = descriptor[2];
+    const bool descriptor_valid =
+        row_begin >= 0 && row_begin < n_seq &&
+        row_count >= 1 && row_count <= PAGED_ATTN_QUERY_TILE &&
+        row_begin <= n_seq - row_count &&
+        physical_slot >= -1 && physical_slot < n_table_seq;
+    const int32_t row = row_begin + row_in_tile;
+    const bool row_covered =
+        descriptor_valid && row_in_tile < row_count &&
+        row >= 0 && row < n_seq;
+
+    if (lane == 0) {
+        int32_t position = -1;
+        bool valid = false;
+        if (row_covered) {
+            const int32_t row_slot =
+                *(const int32_t *) (active_slot_ids +
+                    (int64_t) row * asi_nb0);
+            position =
+                *(const int32_t *) (query_positions +
+                    (int64_t) row * qpos_nb0);
+            // The descriptor is never trusted as causal or request identity:
+            // every live row must independently agree with its slot metadata.
+            valid = physical_slot >= 0 && row_slot == physical_slot &&
+                    position >= 0;
+        }
+        row_positions[row_in_tile] = position;
+        row_valid[row_in_tile] = valid ? 1 : 0;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int32_t max_position = -1;
+        for (int i = 0; i < PAGED_ATTN_QUERY_TILE; ++i) {
+            if (row_valid[i]) {
+                max_position =
+                    max_position > row_positions[i]
+                        ? max_position
+                        : row_positions[i];
+            }
+        }
+        const int64_t table_capacity =
+            (int64_t) max_blocks * block_size;
+        int32_t raw_len =
+            physical_slot >= 0 && max_position >= 0
+                ? *(const int32_t *) (kv_seq_lens +
+                    (int64_t) physical_slot * ksl_nb0)
+                : 0;
+        if (raw_len < 0) raw_len = 0;
+        if (raw_len > table_capacity) raw_len = (int32_t) table_capacity;
+        slot_kv_len = raw_len;
+        const int32_t causal_len =
+            max_position >= 0 ? max_position + 1 : 0;
+        tile_kv_len = raw_len < causal_len ? raw_len : causal_len;
+    }
+    __syncthreads();
+
+    const bool valid_query = row_valid[row_in_tile] != 0;
+    const int32_t query_pos = row_positions[row_in_tile];
+    const int32_t row_kv_len =
+        valid_query
+            ? (slot_kv_len < query_pos + 1
+                ? slot_kv_len
+                : query_pos + 1)
+            : 0;
+    const int32_t n_logical_blocks =
+        (tile_kv_len + block_size - 1) / block_size;
+    const int32_t active_partitions =
+        paged_attn_partitions(
+            n_logical_blocks, min_partitions, n_partitions);
+    const int head0 = kv_head * n_batch_heads;
+
+    if (partition >= active_partitions) {
+#pragma unroll
+        for (int h = 0; h < n_batch_heads; ++h) {
+            if (!row_covered) continue;
+            const int64_t output_row =
+                (int64_t) (head0 + h) * n_seq + row;
+            if constexpr (write_partials) {
+                if (lane == 0) {
+                    partial_meta[
+                        output_row * n_partitions + partition] =
+                        make_float2(-FLT_MAX, 0.0f);
+                }
+            } else {
+                float * o_row =
+                    (float *) (dst + (int64_t) row * dst_nb1 +
+                                     (int64_t) (head0 + h) * dst_nb2);
+#pragma unroll
+                for (int i = lane; i < D; i += WARP_SIZE) {
+                    o_row[i] = 0.0f;
+                }
+            }
+        }
+        return;
+    }
+
+    const int32_t logical_block_begin =
+        ((int64_t) n_logical_blocks * partition) / active_partitions;
+    const int32_t logical_block_end =
+        ((int64_t) n_logical_blocks * (partition + 1)) /
+        active_partitions;
+    const int32_t token_begin = logical_block_begin * block_size;
+    const int32_t common_token_end_blocks =
+        logical_block_end * block_size;
+    const int32_t common_token_end =
+        tile_kv_len < common_token_end_blocks
+            ? tile_kv_len
+            : common_token_end_blocks;
+    const int32_t row_token_end =
+        row_kv_len < common_token_end
+            ? row_kv_len
+            : common_token_end;
+
+    int q_i32[n_batch_heads][q_i32_per_lane];
+    float2 q_ds[n_batch_heads][q_i32_per_lane];
+    if (valid_query) {
+#pragma unroll
+        for (int h = 0; h < n_batch_heads; ++h) {
+            const int64_t q_row =
+                (int64_t) (head0 + h) * n_seq + row;
+            const int * yq32 =
+                q_i32_glob + q_row * (D / (int) sizeof(int));
+            const float2 * yds =
+                q_ds_glob + q_row * (D / QK8_1);
+#pragma unroll
+            for (int i0 = 0;
+                 i0 < D / (int) sizeof(int);
+                 i0 += WARP_SIZE) {
+                const int i = i0 + lane;
+                q_i32[h][i0 / WARP_SIZE] = yq32[i];
+                q_ds[h][i0 / WARP_SIZE] = yds[i / QI8_1];
+            }
+        }
+    }
+
+    constexpr dequantize_V_t dequantize_v =
+        get_dequantize_V<GGML_TYPE_Q4_0, float, values_per_load>();
+    float acc[n_batch_heads][values_per_lane] = {{0.0f}};
+    float qk_max[n_batch_heads];
+    float qk_sum[n_batch_heads];
+#pragma unroll
+    for (int h = 0; h < n_batch_heads; ++h) {
+        qk_max[h] = -FLT_MAX;
+        qk_sum[h] = 0.0f;
+    }
+
+    const int32_t n_physical_blocks = pool_tokens / block_size;
+    for (int32_t tile_begin = token_begin;
+         tile_begin < common_token_end;
+         tile_begin += PAGED_ATTN_KV_TILE) {
+        const int32_t tile_len =
+            common_token_end - tile_begin < PAGED_ATTN_KV_TILE
+                ? common_token_end - tile_begin
+                : PAGED_ATTN_KV_TILE;
+
+        if (row_in_tile == 0) {
+            int32_t physical_row = -1;
+            const int32_t token = tile_begin + lane;
+            if (token < common_token_end) {
+                const int32_t logical_block = token / block_size;
+                const int32_t physical_block =
+                    *(const int32_t *) (block_table +
+                        (int64_t) logical_block * bt_nb0 +
+                        (int64_t) physical_slot * bt_nb1);
+                if (physical_block >= 0 &&
+                    physical_block < n_physical_blocks) {
+                    physical_row =
+                        physical_block * block_size +
+                        token % block_size;
+                }
+            }
+            physical_rows[lane] = physical_row;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int chunk = tid;
+             chunk < stage_chunks;
+             chunk += WARP_SIZE * PAGED_ATTN_QUERY_TILE) {
+            const int byte_offset = chunk * copy_bytes;
+            const int token = byte_offset / q4_row_bytes;
+            const int row_byte =
+                byte_offset - token * q4_row_bytes;
+            const int32_t physical_row = physical_rows[token];
+            if (physical_row >= 0) {
+                ggml_cuda_memcpy_1<copy_bytes>(
+                    k_stage + byte_offset,
+                    k + (int64_t) physical_row * k_nb1 +
+                        (int64_t) kv_head * k_nb2 + row_byte);
+                ggml_cuda_memcpy_1<copy_bytes>(
+                    v_stage + byte_offset,
+                    v + (int64_t) physical_row * v_nb1 +
+                        (int64_t) kv_head * v_nb2 + row_byte);
+            }
+        }
+        __syncthreads();
+
+        if (valid_query && tile_begin < row_token_end) {
+            const int32_t row_tile_len =
+                row_token_end - tile_begin < tile_len
+                    ? row_token_end - tile_begin
+                    : tile_len;
+            float score_mine[n_batch_heads];
+#pragma unroll
+            for (int h = 0; h < n_batch_heads; ++h) {
+                score_mine[h] = -FLT_MAX;
+            }
+
+            for (int j = 0; j < row_tile_len; ++j) {
+                if (physical_rows[j] < 0) continue;
+                const char * k_row =
+                    (const char *) k_stage + j * q4_row_bytes;
+                float sums[n_batch_heads] = {0.0f};
+                multi_vec_dot_kq_q4_0<D, n_batch_heads>(
+                    k_row, q_i32, q_ds, sums);
+#pragma unroll
+                for (int h = 0; h < n_batch_heads; ++h) {
+                    const float score = warp_reduce_sum(sums[h]);
+                    if (lane == j) score_mine[h] = score;
+                }
+            }
+
+            float w_mine[n_batch_heads];
+#pragma unroll
+            for (int h = 0; h < n_batch_heads; ++h) {
+                const float tile_max =
+                    warp_reduce_max(score_mine[h]);
+                if (tile_max > qk_max[h]) {
+                    const float old_scale =
+                        exp2f(qk_max[h] - tile_max);
+                    qk_sum[h] *= old_scale;
+#pragma unroll
+                    for (int i = 0; i < values_per_lane; ++i) {
+                        acc[h][i] *= old_scale;
+                    }
+                    qk_max[h] = tile_max;
+                }
+                w_mine[h] = score_mine[h] > -FLT_MAX / 2
+                    ? exp2f(score_mine[h] - qk_max[h])
+                    : 0.0f;
+                qk_sum[h] += warp_reduce_sum(w_mine[h]);
+            }
+
+            for (int j = 0; j < row_tile_len; ++j) {
+                if (physical_rows[j] < 0) continue;
+                const char * v_row =
+                    (const char *) v_stage + j * q4_row_bytes;
+                float weight[n_batch_heads];
+#pragma unroll
+                for (int h = 0; h < n_batch_heads; ++h) {
+                    weight[h] =
+                        __shfl_sync(
+                            0xFFFFFFFF, w_mine[h], j, WARP_SIZE);
+                }
+#pragma unroll
+                for (int segment = 0;
+                     segment <
+                         D / (WARP_SIZE * values_per_load);
+                     ++segment) {
+                    float values[values_per_load];
+                    const int value0 =
+                        segment * WARP_SIZE * values_per_load +
+                        lane * values_per_load;
+                    dequantize_v(v_row, values, value0);
+#pragma unroll
+                    for (int i = 0; i < values_per_load; ++i) {
+                        const int ai =
+                            segment * values_per_load + i;
+#pragma unroll
+                        for (int h = 0; h < n_batch_heads; ++h) {
+                            acc[h][ai] +=
+                                weight[h] * values[i];
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row_covered) {
+#pragma unroll
+        for (int h = 0; h < n_batch_heads; ++h) {
+            const int64_t output_row =
+                (int64_t) (head0 + h) * n_seq + row;
+            const int64_t partial_row =
+                output_row * n_partitions + partition;
+            const float inv_sum =
+                qk_sum[h] > 0.0f ? 1.0f / qk_sum[h] : 0.0f;
+            float * o_row =
+                (float *) (dst + (int64_t) row * dst_nb1 +
+                                 (int64_t) (head0 + h) * dst_nb2);
+#pragma unroll
+            for (int segment = 0;
+                 segment < D / (WARP_SIZE * values_per_load);
+                 ++segment) {
+                const int value0 =
+                    segment * WARP_SIZE * values_per_load +
+                    lane * values_per_load;
+#pragma unroll
+                for (int i = 0; i < values_per_load; ++i) {
+                    const float value =
+                        acc[h][segment * values_per_load + i] *
+                        inv_sum;
+                    if constexpr (write_partials) {
+                        partial_acc[
+                            partial_row * D + value0 + i] =
+                            __float2half(value);
+                    } else {
+                        o_row[value0 + i] = value;
+                    }
+                }
+            }
+            if constexpr (write_partials) {
+                if (lane == 0) {
+                    partial_meta[partial_row] =
+                        make_float2(qk_max[h], qk_sum[h]);
+                }
+            }
+        }
+    }
+}
+
 template<int D>
 __launch_bounds__(D, 1)
 static __global__ void paged_attn_combine(
@@ -619,6 +1015,7 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
     const ggml_tensor * kv_seq_lens   = dst->src[4];
     const ggml_tensor * active_slot_ids = dst->src[5];
     const ggml_tensor * query_positions = dst->src[6];
+    const ggml_tensor * query_tiles     = dst->src[7];
 
     if (!q || !k || !v || !block_table || !kv_seq_lens) {
         return false;
@@ -626,6 +1023,9 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
 
     // Ragged causal positions require the explicit row -> column mapping.
     if (query_positions && !active_slot_ids) {
+        return false;
+    }
+    if (query_tiles && (!active_slot_ids || !query_positions)) {
         return false;
     }
 
@@ -636,7 +1036,8 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
         block_table->type != GGML_TYPE_I32 ||
         kv_seq_lens->type != GGML_TYPE_I32 ||
         (active_slot_ids && active_slot_ids->type != GGML_TYPE_I32) ||
-        (query_positions && query_positions->type != GGML_TYPE_I32)) {
+        (query_positions && query_positions->type != GGML_TYPE_I32) ||
+        (query_tiles && query_tiles->type != GGML_TYPE_I32)) {
         return false;
     }
 
@@ -647,6 +1048,7 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
         kv_seq_lens->nb[0] != sizeof(int32_t) ||
         (active_slot_ids && active_slot_ids->nb[0] != sizeof(int32_t)) ||
         (query_positions && query_positions->nb[0] != sizeof(int32_t)) ||
+        (query_tiles && query_tiles->nb[0] != sizeof(int32_t)) ||
         dst->nb[0] != sizeof(float)) {
         return false;
     }
@@ -698,6 +1100,14 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
          query_positions->ne[3] != 1)) {
         return false;
     }
+    if (query_tiles &&
+        (!ggml_is_contiguous(query_tiles) ||
+         query_tiles->ne[0] != 3 ||
+         query_tiles->ne[1] <= 0 ||
+         query_tiles->ne[2] != 1 ||
+         query_tiles->ne[3] != 1)) {
+        return false;
+    }
 
     const int32_t block_size = ggml_get_op_params_i32(dst, 1);
     const int32_t max_kv_seq_len = ggml_get_op_params_i32(dst, 2);
@@ -743,6 +1153,235 @@ static int paged_attn_cached_occupancy(int device, int warps_per_block) {
                      std::memory_order_release);
     }
     return probe > 0 ? probe : 0;
+}
+
+enum class paged_attn_qtile_mode {
+    off,
+    on,
+    force,
+};
+
+static paged_attn_qtile_mode paged_attn_get_qtile_mode() {
+    static const paged_attn_qtile_mode mode = []() {
+        const char * env =
+            std::getenv("GGML_CUDA_PAGED_ATTN_QTILE");
+        if (!env || std::strcmp(env, "off") == 0 ||
+            std::strcmp(env, "0") == 0) {
+            return paged_attn_qtile_mode::off;
+        }
+        if (std::strcmp(env, "force") == 0) {
+            return paged_attn_qtile_mode::force;
+        }
+        if (std::strcmp(env, "on") == 0 ||
+            std::strcmp(env, "1") == 0) {
+            return paged_attn_qtile_mode::on;
+        }
+        GGML_LOG_WARN(
+            "unknown GGML_CUDA_PAGED_ATTN_QTILE=%s; using off\n",
+            env);
+        return paged_attn_qtile_mode::off;
+    }();
+    return mode;
+}
+
+static bool paged_attn_qtile_eligible(
+        const ggml_backend_cuda_context & ctx,
+        const ggml_tensor * dst,
+        int32_t block_size) {
+#if defined(GGML_USE_HIP)
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * active_slot_ids = dst->src[5];
+    const ggml_tensor * query_positions = dst->src[6];
+    const ggml_tensor * query_tiles = dst->src[7];
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    return query_tiles &&
+           ggml_is_contiguous(active_slot_ids) &&
+           ggml_is_contiguous(query_positions) &&
+           ggml_is_contiguous(query_tiles) &&
+           query_tiles->ne[1] <= 65535 &&
+           device.cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+           device.warp_size == WARP_SIZE &&
+           WARP_SIZE == 32 &&
+           q->ne[0] == PAGED_ATTN_HEAD_DIM &&
+           q->ne[2] == 24 &&
+           k->ne[2] == 4 &&
+           v->ne[2] == 4 &&
+           k->type == GGML_TYPE_Q4_0 &&
+           v->type == GGML_TYPE_Q4_0 &&
+           block_size == 16;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(block_size);
+    return false;
+#endif
+}
+
+static int paged_attn_qtile_cached_occupancy(int device) {
+    constexpr int UNLAUNCHABLE = -1;
+    static std::atomic<int>
+        occupancy[GGML_CUDA_MAX_DEVICES] = {};
+    std::atomic<int> & cached = occupancy[device];
+    int probe = cached.load(std::memory_order_acquire);
+    if (probe == 0) {
+        const cudaError_t err =
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &probe, paged_attn_qtile_q4_0<true>,
+                WARP_SIZE * PAGED_ATTN_QUERY_TILE, 0);
+        if (err != cudaSuccess) {
+            probe = UNLAUNCHABLE;
+            (void) cudaGetLastError();
+        }
+        cached.store(
+            probe > 0 ? probe : UNLAUNCHABLE,
+            std::memory_order_release);
+    }
+    return probe > 0 ? probe : 0;
+}
+
+static bool try_launch_paged_attn_qtile(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        float scale,
+        int32_t block_size,
+        int32_t max_kv_seq_len) {
+    constexpr int D = PAGED_ATTN_HEAD_DIM;
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * block_table = dst->src[3];
+    const ggml_tensor * kv_seq_lens = dst->src[4];
+    const ggml_tensor * active_slot_ids = dst->src[5];
+    const ggml_tensor * query_positions = dst->src[6];
+    const ggml_tensor * query_tiles = dst->src[7];
+    const int max_blocks_per_sm =
+        paged_attn_qtile_cached_occupancy(ctx.device);
+    if (max_blocks_per_sm <= 0) return false;
+
+    const int64_t output_rows = q->ne[1] * q->ne[2];
+    const int64_t work_groups =
+        query_tiles->ne[1] * k->ne[2];
+    const int64_t target_blocks =
+        (int64_t) ggml_cuda_info().devices[ctx.device].nsm *
+        max_blocks_per_sm;
+    int32_t min_partitions = (int32_t)
+        ((target_blocks + work_groups - 1) / work_groups);
+    if (min_partitions < 1) min_partitions = 1;
+    int32_t partition_limit =
+        PAGED_ATTN_MAX_PARTITIONS /
+        (int32_t) query_tiles->ne[1];
+    if (partition_limit < 32) partition_limit = 32;
+    if (min_partitions > partition_limit) {
+        min_partitions = partition_limit;
+    }
+    if (min_partitions > block_table->ne[0]) {
+        min_partitions = (int32_t) block_table->ne[0];
+    }
+
+    const int32_t live_blocks =
+        (max_kv_seq_len + block_size - 1) / block_size;
+    int32_t n_partitions = paged_attn_partitions(
+        live_blocks, min_partitions, PAGED_ATTN_MAX_PARTITIONS);
+    static const int forced_partitions = []() {
+        const char * env =
+            std::getenv("GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS");
+        return env ? std::atoi(env) : 0;
+    }();
+    if (forced_partitions >= 1 &&
+        forced_partitions <= PAGED_ATTN_MAX_PARTITIONS &&
+        forced_partitions <= block_table->ne[0]) {
+        min_partitions = forced_partitions;
+        n_partitions = forced_partitions;
+    }
+
+    ggml_cuda_pool_alloc<int> q_i32_alloc(ctx.pool());
+    ggml_cuda_pool_alloc<float2> q_ds_alloc(ctx.pool());
+    int * q_i32_glob =
+        q_i32_alloc.alloc(output_rows * (D / sizeof(int)));
+    float2 * q_ds_glob =
+        q_ds_alloc.alloc(output_rows * (D / QK8_1));
+    const dim3 quantize_grid(
+        (unsigned int) q->ne[2],
+        (unsigned int) q->ne[1], 1);
+    paged_attn_quantize_q<D>
+        <<<quantize_grid, dim3(WARP_SIZE, 1, 1), 0, ctx.stream()>>>(
+        (const char *) q->data,
+        q_i32_glob,
+        q_ds_glob,
+        q->nb[1], q->nb[2],
+        (int32_t) q->ne[1],
+        scale * PAGED_ATTN_LOG2E);
+
+    ggml_cuda_pool_alloc<half> acc_scratch(ctx.pool());
+    ggml_cuda_pool_alloc<float2> meta_scratch(ctx.pool());
+    half * partial_acc = nullptr;
+    float2 * partial_meta = nullptr;
+    if (n_partitions > 1) {
+        const size_t partial_rows =
+            (size_t) output_rows * n_partitions;
+        partial_acc = acc_scratch.alloc(partial_rows * D);
+        partial_meta = meta_scratch.alloc(partial_rows);
+    }
+
+    const dim3 grid(
+        (unsigned int) k->ne[2],
+        (unsigned int) query_tiles->ne[1],
+        (unsigned int) n_partitions);
+    const dim3 block(
+        WARP_SIZE, PAGED_ATTN_QUERY_TILE, 1);
+    auto * kernel = n_partitions == 1
+        ? paged_attn_qtile_q4_0<false>
+        : paged_attn_qtile_q4_0<true>;
+    kernel<<<grid, block, 0, ctx.stream()>>>(
+        (const char *) k->data,
+        (const char *) v->data,
+        q_i32_glob,
+        q_ds_glob,
+        (const char *) block_table->data,
+        (const char *) kv_seq_lens->data,
+        (const char *) active_slot_ids->data,
+        (const char *) query_positions->data,
+        (const char *) query_tiles->data,
+        (char *) dst->data,
+        partial_acc,
+        partial_meta,
+        k->nb[1], k->nb[2],
+        v->nb[1], v->nb[2],
+        block_table->nb[0], block_table->nb[1],
+        kv_seq_lens->nb[0],
+        active_slot_ids->nb[0],
+        query_positions->nb[0],
+        query_tiles->nb[1],
+        dst->nb[1], dst->nb[2],
+        (int32_t) q->ne[1],
+        (int32_t) block_table->ne[1],
+        (int32_t) k->ne[1],
+        (int32_t) block_table->ne[0],
+        block_size,
+        min_partitions);
+
+    if (n_partitions > 1) {
+        const dim3 combine_grid(
+            (unsigned int) q->ne[2],
+            (unsigned int) q->ne[1], 1);
+        paged_attn_combine<D>
+            <<<combine_grid, dim3(D, 1, 1), 0, ctx.stream()>>>(
+            partial_acc,
+            partial_meta,
+            (char *) dst->data,
+            dst->nb[1],
+            dst->nb[2],
+            n_partitions);
+    }
+    static std::atomic<bool> logged = false;
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        GGML_LOG_INFO(
+            "paged attention: selected gfx1151 Q4_0 query-tiled path "
+            "(Q_TILE=4, KV_TILE=32)\n");
+    }
+    return true;
 }
 
 // Attempts a launch with n_batch_heads query heads per warp. Returns false
@@ -1016,6 +1655,22 @@ void ggml_cuda_paged_attn(
     memcpy(&scale, dst->op_params, sizeof(scale));
     const int32_t block_size = ggml_get_op_params_i32(dst, 1);
     const int32_t max_kv_seq_len = ggml_get_op_params_i32(dst, 2);
+
+    const paged_attn_qtile_mode qtile_mode =
+        paged_attn_get_qtile_mode();
+    if (dst->src[7] && qtile_mode != paged_attn_qtile_mode::off) {
+        if (paged_attn_qtile_eligible(ctx, dst, block_size) &&
+            try_launch_paged_attn_qtile(
+                ctx, dst, scale, block_size, max_kv_seq_len)) {
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        if (qtile_mode == paged_attn_qtile_mode::force) {
+            GGML_ABORT(
+                "forced query-tiled paged attention is not eligible or "
+                "has zero occupancy");
+        }
+    }
 
     switch (dst->src[1]->type) {
         case GGML_TYPE_F16:

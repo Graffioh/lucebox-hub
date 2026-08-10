@@ -463,6 +463,24 @@ bool build_target_step(
         ggml_set_name(sg.paged_query_positions, "paged_query_positions");
         ggml_set_input(sg.paged_query_seq_ids);
         ggml_set_input(sg.paged_query_positions);
+
+        bool has_reusable_tile = false;
+        int n_query_tiles = 0;
+        for (int i = 0; i < n_prefill_segments; ++i) {
+            const int rows = prefill_segments[i].n_tokens;
+            has_reusable_tile = has_reusable_tile || rows >= 2;
+            n_query_tiles += (rows + 3) / 4;
+        }
+        if (has_reusable_tile) {
+            // Fused steps append the full decode bucket, including padding,
+            // as singleton descriptors. Prefill-only steps have no suffix.
+            if (fused) n_query_tiles += n_seqs;
+            sg.paged_query_tiles =
+                ggml_new_tensor_2d(
+                    sg.ctx, GGML_TYPE_I32, 3, n_query_tiles);
+            ggml_set_name(sg.paged_query_tiles, "paged_query_tiles");
+            ggml_set_input(sg.paged_query_tiles);
+        }
     }
     if (n_logits_rows > 0) {
         sg.logits_row_indices =
@@ -518,6 +536,7 @@ bool build_target_step(
     gi.n_prefill_tokens           = n_prefill_tokens;
     gi.paged_query_seq_ids        = sg.paged_query_seq_ids;
     gi.paged_query_positions      = sg.paged_query_positions;
+    gi.paged_query_tiles          = sg.paged_query_tiles;
     gi.logits_row_indices         = sg.logits_row_indices;
     gi.prefill_segments           = prefill_segments;
     gi.n_prefill_segments         = n_prefill_segments;

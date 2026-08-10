@@ -202,7 +202,8 @@ bool run_case(ggml_backend_t backend,
               ggml_type k_type,
               ggml_type v_type,
               const std::vector<int32_t> * active_slot_ids = nullptr,
-              const std::vector<int32_t> * query_positions = nullptr) {
+              const std::vector<int32_t> * query_positions = nullptr,
+              const std::vector<int32_t> * query_tiles = nullptr) {
     const int physical_n_seq = static_cast<int>(test_case.kv_seq_lens.size());
     const int n_seq = active_slot_ids
         ? static_cast<int>(active_slot_ids->size())
@@ -211,6 +212,8 @@ bool run_case(ggml_backend_t backend,
     GGML_ASSERT(!query_positions ||
                 (active_slot_ids &&
                  query_positions->size() == active_slot_ids->size()));
+    GGML_ASSERT(!query_tiles ||
+                (query_positions && query_tiles->size() % 3 == 0));
     const int physical_blocks = count_physical_blocks(test_case);
     const int pool_tokens = physical_blocks * BLOCK_SIZE;
     const std::vector<int32_t> block_table =
@@ -246,13 +249,23 @@ bool run_case(ggml_backend_t backend,
         positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq);
         ggml_set_input(positions);
     }
+    ggml_tensor * tiles = nullptr;
+    if (query_tiles) {
+        tiles = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_I32, 3, query_tiles->size() / 3);
+        ggml_set_input(tiles);
+    }
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
     const int max_kv_seq_len = *std::max_element(
         test_case.kv_seq_lens.begin(), test_case.kv_seq_lens.end());
-    ggml_tensor * output = ggml_paged_attn_ext(
-        ctx, q, k, v, table, kv_seq_lens, active, positions,
-        scale, BLOCK_SIZE, max_kv_seq_len);
+    ggml_tensor * output = tiles
+        ? ggml_paged_attn_ext_tiled(
+              ctx, q, k, v, table, kv_seq_lens, active, positions,
+              tiles, scale, BLOCK_SIZE, max_kv_seq_len)
+        : ggml_paged_attn_ext(
+              ctx, q, k, v, table, kv_seq_lens, active, positions,
+              scale, BLOCK_SIZE, max_kv_seq_len);
     ggml_set_output(output);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
@@ -311,6 +324,11 @@ bool run_case(ggml_backend_t backend,
                 positions, query_positions->data(), 0,
                 query_positions->size() * sizeof((*query_positions)[0]));
         }
+        if (query_tiles) {
+            ggml_backend_tensor_set(
+                tiles, query_tiles->data(), 0,
+                query_tiles->size() * sizeof((*query_tiles)[0]));
+        }
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
     }
 
@@ -336,10 +354,11 @@ bool run_case(ggml_backend_t backend,
         ok = ok && max_abs_error < MAX_ABS_ERROR;
     }
 
-    std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s max_abs=%.6g %s\n",
+    std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s tiles=%s max_abs=%.6g %s\n",
                 test_case.name, ggml_type_name(k_type), ggml_type_name(v_type),
                 active_slot_ids ? "yes" : "no",
                 query_positions ? "yes" : "no",
+                query_tiles ? "yes" : "no",
                 max_abs_error, ok ? "PASS" : "FAIL");
     ggml_gallocr_free(allocator);
     ggml_free(ctx);
@@ -376,6 +395,70 @@ bool rejects_unlaunchable_gqa(ggml_backend_t backend) {
                 rejected ? "PASS" : "FAIL");
     ggml_free(ctx);
     return rejected;
+}
+
+bool run_qtile_direct_cases(ggml_backend_t backend) {
+    // Four adjacent causal rows cross both 15/16 and 31/32 boundaries.
+    const TestCase boundary_case{
+        "qtile-edge", 3, {33}, false,
+    };
+    const std::vector<int32_t> boundary_slots{0, 0, 0, 0};
+    const std::vector<int32_t> boundary_positions{15, 16, 31, 32};
+    const std::vector<int32_t> boundary_tiles{0, 4, 0};
+    bool ok = run_case(
+        backend, boundary_case, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+        &boundary_slots, &boundary_positions, &boundary_tiles);
+
+    // Unequal prompt segments retain their 3- and 2-row tails. Decode rows
+    // are singleton descriptors and the two bucket padding rows carry -1.
+    const TestCase mixed_case{
+        "qtile-mixed",
+        3,
+        {1, 1, 33, 7, 1, 1, 1, 1, 1, 10, 1, 26},
+        false,
+    };
+    const std::vector<int32_t> mixed_slots{
+        3, 3, 3, 3, 3, 3, 3,
+        11, 11, 11, 11, 11, 11,
+        2, 9, -1, -1,
+    };
+    const std::vector<int32_t> mixed_positions{
+        0, 1, 2, 3, 4, 5, 6,
+        20, 21, 22, 23, 24, 25,
+        32, 9, -1, -1,
+    };
+    const std::vector<int32_t> mixed_tiles{
+        0, 4, 3,
+        4, 3, 3,
+        7, 4, 11,
+        11, 2, 11,
+        13, 1, 2,
+        14, 1, 9,
+        15, 1, -1,
+        16, 1, -1,
+    };
+    ok = run_case(
+        backend, mixed_case, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+        &mixed_slots, &mixed_positions, &mixed_tiles) && ok;
+    return ok;
+}
+
+bool run_qtile_partitioned_case(ggml_backend_t backend) {
+    // Sequence 9 spans 65 logical blocks and has one deliberately invalid
+    // block-table entry. The four rows straddle the final page boundary and
+    // force the partial/combine layout in this CTest process.
+    const TestCase partitioned_case{
+        "qtile-part",
+        65,
+        {-7, 1, 15, 16, 17, 31, 33, 257, 511, 1025, 2000},
+        true,
+    };
+    const std::vector<int32_t> slots{9, 9, 9, 9};
+    const std::vector<int32_t> positions{1021, 1022, 1023, 1024};
+    const std::vector<int32_t> tiles{0, 4, 9};
+    return run_case(
+        backend, partitioned_case, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+        &slots, &positions, &tiles);
 }
 
 }  // namespace
@@ -421,10 +504,26 @@ int main(int argc, char ** argv) {
     };
     const bool direct =
         argc == 2 && std::strcmp(argv[1], "--direct") == 0;
-    if (argc > 2 || (argc == 2 && !direct)) {
-        std::fprintf(stderr, "usage: %s [--direct]\n", argv[0]);
+    const bool qtile_direct =
+        argc == 2 && std::strcmp(argv[1], "--qtile-direct") == 0;
+    const bool qtile_partitioned =
+        argc == 2 && std::strcmp(argv[1], "--qtile-partitioned") == 0;
+    if (argc > 2 ||
+        (argc == 2 && !direct && !qtile_direct &&
+         !qtile_partitioned)) {
+        std::fprintf(
+            stderr,
+            "usage: %s [--direct|--qtile-direct|--qtile-partitioned]\n",
+            argv[0]);
         ggml_backend_free(backend);
         return 2;
+    }
+    if (qtile_direct || qtile_partitioned) {
+        const bool ok = qtile_direct
+            ? run_qtile_direct_cases(backend)
+            : run_qtile_partitioned_case(backend);
+        ggml_backend_free(backend);
+        return ok ? 0 : 1;
     }
     const TestCase & test_case = direct ? direct_case : partitioned_case;
 
