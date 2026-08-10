@@ -431,6 +431,7 @@ bool build_deepseek4_head4_tail2_routes(
     int n_tokens,
     DeepSeek4Head4Tail2Routes & out);
 bool deepseek4_exact_tokenwise_uses_runtime_raw_row(
+    bool exact_prefill_stable_raw_order,
     int token_position,
     int n_swa);
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
@@ -586,7 +587,8 @@ bool deepseek4_step_layer_range(
     MoeHybridStorage *          moe_hybrid = nullptr,
     MoeExpertComputeRuntime *   expert_runtime = nullptr,
     MoeHybridRoutingStats *     routing_stats = nullptr,
-    bool                        execute_output_path = false);
+    bool                        execute_output_path = false,
+    bool                        exact_prefill_stable_raw_order = false);
 
 bool build_deepseek4_moe_hybrid_storage_from_file(
     const std::string &         path,
