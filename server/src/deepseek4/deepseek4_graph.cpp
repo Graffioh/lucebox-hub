@@ -6237,8 +6237,9 @@ static bool ds4_build_fused_decode_graph(
 
 #include "deepseek4_fused_verify.inc"
 
-// Returns 1 on success (out_logits filled), 0 to fall back to the per-layer
-// path, -1 on a hard failure after cache state may have been touched.
+// Returns 1 on success, 0 to fall back to the per-layer path, or -1 on a hard
+// failure after cache state may have been touched. The output graph always
+// executes; a null out_logits suppresses only the host vocabulary readback.
 static int ds4_try_fused_decode_step(
         DeepSeek4FusedDecodeCache & fc,
         ggml_backend_t backend,
@@ -6250,7 +6251,7 @@ static int ds4_try_fused_decode_step(
         std::vector<int32_t> & hash_scratch,
         const float * embed,
         int kv_start,
-        std::vector<float> & out_logits,
+        std::vector<float> * out_logits,
         const int32_t * token_ids,
         DeepSeek4StepTelemetry * telemetry) {
     if (fc.disabled) return 0;
@@ -6427,11 +6428,16 @@ static int ds4_try_fused_decode_step(
     if (telemetry) telemetry->full_graph_compute_us += ds4_elapsed_us(compute_t0, Ds4TimingClock::now());
 
     // ── Read logits ─────────────────────────────────────────────────
-    const auto read_t0 = Ds4TimingClock::now();
-    out_logits.resize((size_t) w.n_vocab);
-    ggml_backend_tensor_get(fg->logits, out_logits.data(), 0,
-                            sizeof(float) * (size_t) w.n_vocab);
-    if (telemetry) telemetry->full_graph_read_us += ds4_elapsed_us(read_t0, Ds4TimingClock::now());
+    if (out_logits) {
+        const auto read_t0 = Ds4TimingClock::now();
+        out_logits->resize((size_t) w.n_vocab);
+        ggml_backend_tensor_get(fg->logits, out_logits->data(), 0,
+                                sizeof(float) * (size_t) w.n_vocab);
+        if (telemetry) {
+            telemetry->full_graph_read_us +=
+                ds4_elapsed_us(read_t0, Ds4TimingClock::now());
+        }
+    }
     return 1;
 }
 
@@ -8542,12 +8548,12 @@ bool deepseek4_should_attempt_fused_verify(
         const Ds4VerifyHooks * verify_hooks,
         bool owner_topology_supported,
         bool full_layer_range,
-        bool has_logits_output,
+        bool execute_output_path,
         bool gpu_backend,
         bool fused_verify_enabled) {
     return owner_topology_supported && n_tokens >= 2 && n_tokens <= 4 &&
            verify_hooks && verify_hooks->allow_fused_verify &&
-           full_layer_range && has_logits_output && gpu_backend &&
+           full_layer_range && execute_output_path && gpu_backend &&
            fused_verify_enabled;
 }
 
@@ -8569,7 +8575,8 @@ bool deepseek4_step_layer_range(
         Ds4VerifyHooks * verify_hooks,
         MoeHybridStorage * moe_hybrid,
         MoeExpertComputeRuntime * expert_runtime,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats,
+        bool execute_output_path) {
     const auto step_t0 = Ds4TimingClock::now();
 
     if (!deepseek4_cuda_hc_set_device(device)) {
@@ -8584,6 +8591,13 @@ bool deepseek4_step_layer_range(
     const int n_hc = w.n_hc;
     const int hc_dim = n_hc * n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
+    const bool readback_logits = out_logits != nullptr;
+    const bool external_output_consumer =
+        verify_hooks &&
+        (verify_hooks->all_logits_out || verify_hooks->argmax_out);
+    execute_output_path =
+        execute_output_path || readback_logits || external_output_consumer;
+
     const bool fused_hybrid_ready =
         moe_hybrid && !expert_runtime &&
         moe_hybrid->materialized_cold_experts &&
@@ -8598,7 +8612,7 @@ bool deepseek4_step_layer_range(
         (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
          wide_verify_candidate) && verify_hooks &&
         verify_hooks->allow_fused_verify &&
-        layer_begin == 0 && is_last_shard && out_logits &&
+        layer_begin == 0 && is_last_shard && execute_output_path &&
         ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
     // Fused verify has many preconditions and declining any of them is
     // invisible: the request still decodes, still reports a healthy acceptance
@@ -8702,18 +8716,28 @@ bool deepseek4_step_layer_range(
                 chunk_hooks.allow_fused_verify = verify_hooks->allow_fused_verify;
                 chunk_hooks_ptr = &chunk_hooks;
             }
+            const bool final_chunk = off + chunk == n_tokens;
+            std::vector<float> * chunk_output = nullptr;
+            if (out_logits && (!is_last_shard || final_chunk)) {
+                chunk_output = &chunk_out;
+            }
+            const bool chunk_execute_output_path =
+                (cache.prefill_mode == PrefillAttentionMode::Exact &&
+                 chunk == 1) ||
+                (final_chunk && execute_output_path);
             if (!deepseek4_step_layer_range(
                     backend, device, w, cache, chunk_hc,
                     embed + (size_t) off * input_width,
                     chunk, kv_start + off, layer_begin, layer_end,
-                    out_logits ? &chunk_out : nullptr,
+                    chunk_output,
                     token_ids ? token_ids + off : nullptr,
                     telemetry, allow_decode_graph_reuse, chunk_hooks_ptr,
-                    moe_hybrid, expert_runtime, routing_stats)) {
+                    moe_hybrid, expert_runtime, routing_stats,
+                    chunk_execute_output_path)) {
                 return false;
             }
             hc_all.insert(hc_all.end(), chunk_hc.begin(), chunk_hc.end());
-            if (out_logits) {
+            if (chunk_output) {
                 if (is_last_shard) {
                     last_out = std::move(chunk_out);
                 } else {
@@ -8912,7 +8936,7 @@ bool deepseek4_step_layer_range(
             ? &fused_hybrid_decode_hooks : verify_hooks;
     const bool fused_hybrid_decode_candidate =
         fused_hybrid_decode && layer_begin == 0 && is_last_shard &&
-        out_logits && ds4_backend_is_gpu(backend) &&
+        execute_output_path && ds4_backend_is_gpu(backend) &&
         ds4_fused_verify_enabled();
     if (fused_verify_candidate || fused_hybrid_decode_candidate) {
         const bool q1_feature_capture =
@@ -8927,7 +8951,7 @@ bool deepseek4_step_layer_range(
             graph_cache, q1_feature_capture, fused_decode_graph_cache,
             backend, w, cache,
             hc_layer_weights_range, hc_output_weights_range, hash_routing_tables_range,
-            scratch.hash_expert_ids, embed, n_tokens, kv_start, *out_logits, token_ids,
+            scratch.hash_expert_ids, embed, n_tokens, kv_start, out_logits, token_ids,
             fused_graph_hooks, telemetry, fused_hybrid_ready ? moe_hybrid : nullptr,
             routing_stats);
         if (vrc < 0) return false;
@@ -8960,12 +8984,12 @@ bool deepseek4_step_layer_range(
     if (!moe_hybrid && n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
         !(verify_hooks && verify_hooks->capture_layer_ids &&
           verify_hooks->capture_out) &&
-        out_logits && ds4_backend_is_gpu(backend) &&
+        execute_output_path && ds4_backend_is_gpu(backend) &&
         ds4_fused_decode_enabled(w)) {
         const int rc = ds4_try_fused_decode_step(
             fused_decode_graph_cache, backend, w, cache, hc_layer_weights_range,
             hc_output_weights_range, hash_routing_tables_range, scratch.hash_expert_ids,
-            embed, kv_start, *out_logits, token_ids, telemetry);
+            embed, kv_start, out_logits, token_ids, telemetry);
         if (rc < 0) return false;
         if (rc > 0) {
             const int np = kv_start + 1;
@@ -10028,7 +10052,7 @@ bool deepseek4_step_layer_range(
     }
 
     // ── Output: HC pre → norm → lm_head (or return hidden state) ────────
-    if (is_last_shard && out_logits) {
+    if (is_last_shard && execute_output_path) {
         // Final HC pre for output
         const auto output_t0 = Ds4TimingClock::now();
         std::vector<float> & final_embd = scratch.final_embd;
@@ -10054,9 +10078,13 @@ bool deepseek4_step_layer_range(
             if (ggml_backend_graph_compute(backend, cached_decode_output_graph.sg.gf) != GGML_STATUS_SUCCESS) {
                 return false;
             }
-            out_logits->resize((size_t)w.n_vocab);
-            ggml_backend_tensor_get(cached_decode_output_graph.sg.logits,
-                                    out_logits->data(), 0, sizeof(float) * (size_t)w.n_vocab);
+            if (readback_logits) {
+                out_logits->resize((size_t)w.n_vocab);
+                ggml_backend_tensor_get(
+                    cached_decode_output_graph.sg.logits,
+                    out_logits->data(), 0,
+                    sizeof(float) * (size_t)w.n_vocab);
+            }
         } else {
             const size_t ctx_size = 16 * 1024 * 1024;
             ggml_init_params params{};
@@ -10102,11 +10130,14 @@ bool deepseek4_step_layer_range(
                 return false;
             }
 
-            out_logits->resize((size_t)w.n_vocab);
-            const size_t logits_offset = last_only ? 0 :
-                (size_t)(n_tokens - 1) * (size_t)w.n_vocab * sizeof(float);
-            ggml_backend_tensor_get(logits, out_logits->data(), logits_offset,
-                                    sizeof(float) * (size_t)w.n_vocab);
+            if (readback_logits) {
+                out_logits->resize((size_t)w.n_vocab);
+                const size_t logits_offset = last_only ? 0 :
+                    (size_t)(n_tokens - 1) * (size_t)w.n_vocab * sizeof(float);
+                ggml_backend_tensor_get(
+                    logits, out_logits->data(), logits_offset,
+                    sizeof(float) * (size_t)w.n_vocab);
+            }
             if (verify_hooks && verify_hooks->all_logits_out) {
                 verify_hooks->all_logits_out->resize((size_t) w.n_vocab * n_tokens);
                 ggml_backend_tensor_get(logits, verify_hooks->all_logits_out->data(), 0,
