@@ -202,7 +202,8 @@ bool run_case(ggml_backend_t backend,
               ggml_type k_type,
               ggml_type v_type,
               const std::vector<int32_t> * active_slot_ids = nullptr,
-              const std::vector<int32_t> * query_positions = nullptr) {
+              const std::vector<int32_t> * query_positions = nullptr,
+              bool strided_q = false) {
     const int physical_n_seq = static_cast<int>(test_case.kv_seq_lens.size());
     const int n_seq = active_slot_ids
         ? static_cast<int>(active_slot_ids->size())
@@ -222,8 +223,12 @@ bool run_case(ggml_backend_t backend,
     ggml_context * ctx = ggml_init(params);
     if (!ctx) return false;
 
-    ggml_tensor * q =
-        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_seq, N_HEAD);
+    ggml_tensor * q_storage = strided_q
+        ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_HEAD, n_seq)
+        : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_seq, N_HEAD);
+    ggml_tensor * q = strided_q
+        ? ggml_permute(ctx, q_storage, 0, 2, 1, 3)
+        : q_storage;
     ggml_tensor * k =
         ggml_new_tensor_3d(ctx, k_type, D, pool_tokens, N_HEAD_KV);
     ggml_tensor * v =
@@ -233,7 +238,7 @@ bool run_case(ggml_backend_t backend,
             ctx, GGML_TYPE_I32, test_case.max_blocks, physical_n_seq);
     ggml_tensor * kv_seq_lens =
         ggml_new_tensor_1d(ctx, GGML_TYPE_I32, physical_n_seq);
-    for (ggml_tensor * input : {q, k, v, table, kv_seq_lens}) {
+    for (ggml_tensor * input : {q_storage, k, v, table, kv_seq_lens}) {
         ggml_set_input(input);
     }
     ggml_tensor * active = nullptr;
@@ -290,8 +295,29 @@ bool run_case(ggml_backend_t backend,
               !k_reference.empty() && !v_reference.empty();
 
     if (ok) {
-        ggml_backend_tensor_set(q, q_data.data(), 0,
-                                q_data.size() * sizeof(q_data[0]));
+        if (strided_q) {
+            // q_storage is [D,H,T], while the paged op consumes its permuted
+            // [D,T,H] view. Preserve the same logical q_data values used by
+            // the contiguous reference cases.
+            std::vector<float> q_storage_data(q_data.size());
+            for (int seq = 0; seq < n_seq; ++seq) {
+                for (int head = 0; head < N_HEAD; ++head) {
+                    for (int d = 0; d < D; ++d) {
+                        q_storage_data[
+                            (static_cast<size_t>(seq) * N_HEAD + head) * D + d] =
+                            q_data[
+                                (static_cast<size_t>(head) * n_seq + seq) * D + d];
+                    }
+                }
+            }
+            ggml_backend_tensor_set(
+                q_storage, q_storage_data.data(), 0,
+                q_storage_data.size() * sizeof(q_storage_data[0]));
+        } else {
+            ggml_backend_tensor_set(
+                q_storage, q_data.data(), 0,
+                q_data.size() * sizeof(q_data[0]));
+        }
         ggml_backend_tensor_set(k, k_data.data(), 0, k_data.size());
         ggml_backend_tensor_set(v, v_data.data(), 0, v_data.size());
         ggml_backend_tensor_set(
@@ -336,11 +362,90 @@ bool run_case(ggml_backend_t backend,
         ok = ok && max_abs_error < MAX_ABS_ERROR;
     }
 
-    std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s max_abs=%.6g %s\n",
+    std::printf("paged attention %-11s K=%-4s V=%-4s active=%s pos=%s q=%s max_abs=%.6g %s\n",
                 test_case.name, ggml_type_name(k_type), ggml_type_name(v_type),
                 active_slot_ids ? "yes" : "no",
                 query_positions ? "yes" : "no",
+                strided_q ? "strided" : "packed",
                 max_abs_error, ok ? "PASS" : "FAIL");
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool strided_set_rows_source(ggml_backend_t backend) {
+    constexpr int N_TOKEN = 3;
+    constexpr int N_CACHE = 7;
+
+    ggml_init_params params{};
+    params.mem_size = 2 * 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    // Model projections produce [D,H,T]. The cache scatter consumes the
+    // row-contiguous [D,T,H] permute directly.
+    ggml_tensor * source_storage =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_HEAD_KV, N_TOKEN);
+    ggml_tensor * source =
+        ggml_permute(ctx, source_storage, 0, 2, 1, 3);
+    ggml_tensor * cache =
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N_CACHE, N_HEAD_KV);
+    ggml_tensor * rows =
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N_TOKEN);
+    ggml_set_input(source_storage);
+    ggml_set_input(cache);
+    ggml_set_input(rows);
+
+    const bool layout_ok =
+        ggml_is_contiguous_rows(source) && !ggml_is_contiguous(source);
+    ggml_tensor * output = ggml_set_rows(ctx, cache, source, rows);
+    ggml_set_output(output);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_gallocr_t allocator =
+        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    bool ok = layout_ok && ggml_gallocr_alloc_graph(allocator, graph);
+
+    std::vector<float> source_data(ggml_nelements(source_storage));
+    for (size_t i = 0; i < source_data.size(); ++i) {
+        source_data[i] = static_cast<float>(i % 997) * 0.001f;
+    }
+    const std::vector<float> zero_cache(ggml_nelements(cache), 0.0f);
+    const int32_t row_data[N_TOKEN] = {5, 1, 6};
+    if (ok) {
+        ggml_backend_tensor_set(
+            source_storage, source_data.data(), 0,
+            source_data.size() * sizeof(source_data[0]));
+        ggml_backend_tensor_set(
+            cache, zero_cache.data(), 0,
+            zero_cache.size() * sizeof(zero_cache[0]));
+        ggml_backend_tensor_set(rows, row_data, 0, sizeof(row_data));
+        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+    }
+
+    if (ok) {
+        std::vector<float> actual(ggml_nelements(output));
+        ggml_backend_tensor_get(
+            output, actual.data(), 0, actual.size() * sizeof(actual[0]));
+        for (int head = 0; head < N_HEAD_KV && ok; ++head) {
+            for (int token = 0; token < N_TOKEN && ok; ++token) {
+                for (int d = 0; d < D; ++d) {
+                    const float expected = source_data[
+                        (static_cast<size_t>(token) * N_HEAD_KV + head) * D + d];
+                    const float got = actual[
+                        (static_cast<size_t>(head) * N_CACHE + row_data[token]) * D + d];
+                    if (got != expected) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    std::printf("strided set_rows source %s\n", ok ? "PASS" : "FAIL");
     ggml_gallocr_free(allocator);
     ggml_free(ctx);
     return ok;
@@ -432,6 +537,7 @@ int main(int argc, char ** argv) {
         GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
     };
     bool ok = rejects_unlaunchable_gqa(backend);
+    ok = strided_set_rows_source(backend) && ok;
     for (ggml_type k_type : types) {
         for (ggml_type v_type : types) {
             ok = run_case(backend, test_case, k_type, v_type) && ok;
@@ -461,6 +567,10 @@ int main(int argc, char ** argv) {
     ok = run_case(backend, ragged_case,
                   GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
                   &ragged_slot_ids, &ragged_positions) && ok;
+    ok = run_case(backend, ragged_case,
+                  GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                  &ragged_slot_ids, &ragged_positions,
+                  /*strided_q=*/true) && ok;
 
     ggml_backend_free(backend);
     return ok ? 0 : 1;

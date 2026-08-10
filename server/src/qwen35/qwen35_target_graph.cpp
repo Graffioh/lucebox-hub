@@ -816,13 +816,15 @@ static ggml_tensor * build_full_attn_block(
     if (kv_write_rows) {
         // Step-invariant: the destination tensor stays fixed while the input
         // indices carry contiguous, KVFlash, or paged physical rows.
-        // ggml_set_rows requires a contiguous source. Expanded before the
-        // attention node, so a ragged step's own chunk rows are already in
-        // the pool when its causal reads run.
-        ggml_tensor * Kcur_cont = ggml_is_contiguous(Kcur_T) ? Kcur_T : ggml_cont(ctx, Kcur_T);
-        ggml_tensor * Vcur_cont = ggml_is_contiguous(Vcur_T) ? Vcur_T : ggml_cont(ctx, Vcur_T);
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Kcur_cont, kv_write_rows));
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, Vcur_cont, kv_write_rows));
+        // SET_ROWS accepts a row-contiguous strided source and carries the
+        // token/head strides into the backend kernel. Avoid materializing the
+        // [D,T,Hkv] permutes: the scatter already reads that layout directly.
+        // Expanded before attention, so a ragged step's own chunk rows are
+        // already in the pool when its causal reads run.
+        GGML_ASSERT(ggml_is_contiguous_rows(Kcur_T));
+        GGML_ASSERT(ggml_is_contiguous_rows(Vcur_T));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Kcur_T, kv_write_rows));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, Vcur_T, kv_write_rows));
     } else {
         // Legacy: kv_start as literal view offset (not step-invariant;
         // prefill/verify/non-graph).
@@ -864,13 +866,19 @@ static ggml_tensor * build_full_attn_block(
     // ggml_cont — the rotation kernel makes the output contiguous. Fused mode
     // conts each segment on its own: a slice of one whole-batch cont would
     // stay strided on the token axis.
-    auto q_segment = [&](int off, int len) {
+    auto q_segment = [&](int off, int len, bool require_contiguous) {
         ggml_tensor * q = (off == 0 && len == n_tokens)
             ? Qperm
             : ggml_view_3d(ctx, Qperm, head_dim, len, n_head,
                            Qperm->nb[1], Qperm->nb[2],
                            (size_t)off * Qperm->nb[1]);
-        return q_rotate ? ggml_turbo_wht(ctx, q, 0) : ggml_cont(ctx, q);
+        if (q_rotate) {
+            return ggml_turbo_wht(ctx, q, 0);
+        }
+        // Paged attention consumes q->nb[1]/nb[2] directly, so its [D,T,H]
+        // permute need not be materialized. Dense flash attention retains its
+        // existing packed-input contract.
+        return require_contiguous ? ggml_cont(ctx, q) : q;
     };
 
     const float kq_scale = 1.0f / std::sqrt((float)head_dim);
@@ -898,14 +906,14 @@ static ggml_tensor * build_full_attn_block(
         // own causal reads because the set_rows pool write above precedes
         // attention in the graph; cross-sequence isolation is structural
         // (each row's seq id selects its own block-table column).
-        ggml_tensor * Qfa = q_segment(0, n_tokens);
+        ggml_tensor * Qfa = q_segment(0, n_tokens, /*require_contiguous=*/false);
         const int launch_kv_len = paged_max_kv_len > 0 ? paged_max_kv_len
                                                        : kv_start + n_tokens;
         attn = paged_read(Qfa, launch_kv_len,
                           paged_query_seq_ids, paged_query_positions,
                           /*dense_token_layout=*/n_tokens > 1);
     } else if (paged_block_table) {
-        ggml_tensor * Qfa = q_segment(0, n_tokens);
+        ggml_tensor * Qfa = q_segment(0, n_tokens, /*require_contiguous=*/false);
         // Post-rotation Q matches the basis of the K rows in the cache, so a
         // cosine between this Q and pooled cache keys equals the unrotated
         // cosine (orthogonal transform).
@@ -952,7 +960,7 @@ static ggml_tensor * build_full_attn_block(
             head_dim, win_len_padded, n_head_kv,
             cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * win_start);
 
-        ggml_tensor * Qfa = q_segment(0, n_tokens);
+        ggml_tensor * Qfa = q_segment(0, n_tokens, /*require_contiguous=*/true);
         if (q_fa_out) *q_fa_out = Qfa;
         // A single query needs no causal mask. Multi-token callers supply one.
         attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
