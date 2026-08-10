@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO="${REPO:-$(cd -- "$SCRIPT_DIR/../.." && pwd -P)}"
+REPO="${REPO:-$(cd -- "$SCRIPT_DIR/../../.." && pwd -P)}"
 CLIENT="${CLIENT:-$SCRIPT_DIR/concurrent_benchmark.py}"
 GENERATOR="${GENERATOR:-$SCRIPT_DIR/generate_ragged_prompts.py}"
 SUMMARIZER="${SUMMARIZER:-$SCRIPT_DIR/summarize_concurrency.py}"

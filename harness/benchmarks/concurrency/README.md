@@ -10,7 +10,7 @@ Run a quick screening repeat:
 MODEL=/path/to/Qwen3.6-27B-Q4_K_M.gguf \
 LUCE_SERVER_BIN=server/build-hip/dflash_server \
 LLAMA_SERVER_BIN=/path/to/llama-server \
-harness/benchmarks/run_qwen36_concurrency.sh
+harness/benchmarks/concurrency/run_qwen36_concurrency.sh
 ```
 
 Use `REPEATS=5` for publication. Every measured case starts a fresh server and
