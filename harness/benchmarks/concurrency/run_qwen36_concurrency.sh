@@ -13,7 +13,7 @@ LUCE_SERVER_BIN="${LUCE_SERVER_BIN:-$REPO/server/build-hip/dflash_server}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$(command -v llama-server 2>/dev/null || true)}"
 OUT="${OUT:-$REPO/.harness-runs/qwen36-concurrency-$(date -u +%Y%m%dT%H%M%SZ)}"
 REPEATS="${REPEATS:-1}"
-WORKLOADS="${WORKLOADS:-short,medium}"
+WORKLOADS="${WORKLOADS:-short,medium,long}"
 VARIANTS="${VARIANTS:-luce-k8,luce-k1,llama}"
 CLIENTS="${CLIENTS:-1,4,8,16}"
 PORT="${PORT:-18114}"
@@ -114,7 +114,11 @@ pathlib.Path(p).write_text(json.dumps(obj,indent=2,sort_keys=True)+"\n")' \
 run_case() {
   local repeat="$1" workload="$2" clients="$3" variant="$4"
   local max_ctx timeout capacity max_prefills binary model_id
-  if [[ "$workload" == short ]]; then max_ctx=4096; timeout=900; else max_ctx=8192; timeout=1200; fi
+  if [[ "$workload" == long ]]; then
+    max_ctx=8192; timeout=1800
+  else
+    max_ctx=4096; timeout=1200
+  fi
   capacity=$((SLOTS * max_ctx))
   local case_dir="$OUT/$workload/c$clients/r$repeat/$variant"
   mkdir -p "$case_dir"

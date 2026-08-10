@@ -22,7 +22,9 @@ first runs a discarded warmup at the same concurrency. The variants are:
 
 The 29 generated prompts are disjoint cohorts for C1/C4/C8/C16. C4 and above
 contain four substantial length strata while holding the mean target length
-constant. The client refuses to wrap or reuse a prompt.
+constant. The default short, medium, and long profiles target approximately
+400, 1,000, and 3,000 input tokens per request. The client refuses to wrap or
+reuse a prompt; reports retain the exact server-observed token counts.
 
 The headline metric is aggregate output goodput: exact server-reported
 completion tokens divided by level wall time. It includes queueing, prefill,

@@ -9,8 +9,9 @@ from pathlib import Path
 
 
 PROFILES = {
-    "short": (300, 500, 750, 1050),
-    "medium": (1700, 2800, 4200, 5700),
+    "short": (250, 350, 450, 550),
+    "medium": (650, 850, 1150, 1350),
+    "long": (2000, 2600, 3400, 4000),
 }
 
 WORD_BANK = (
