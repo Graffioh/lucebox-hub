@@ -70,6 +70,7 @@ def stream_request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
     completion_tokens = None
     prompt_tokens = None
     finish_reason = None
+    done_received = False
     error = None
     payload = {
         "model": args.model,
@@ -93,6 +94,7 @@ def stream_request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
         with urllib.request.urlopen(request, timeout=args.timeout) as response:
             for data in iter_sse_data(response):
                 if data == "[DONE]":
+                    done_received = True
                     break
                 event = json.loads(data)
                 usage = event.get("usage") or {}
@@ -114,6 +116,10 @@ def stream_request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
                         reasoning.append(thought)
     except Exception as exc:  # preserve partial timing/output for diagnosis
         error = f"{type(exc).__name__}: {exc}"
+    if error is None and not done_received:
+        error = "ProtocolError: stream ended before [DONE]"
+    elif error is None and finish_reason is None:
+        error = "ProtocolError: stream ended without a terminal finish_reason"
     ended = time.perf_counter()
     output = "".join(content)
     reasoning_output = "".join(reasoning)
@@ -129,7 +135,7 @@ def stream_request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
         "ttft_s": first - started if first is not None else None,
         "decode_duration_s": decode_duration,
         "completion_tokens": completion_tokens, "prompt_tokens": prompt_tokens,
-        "finish_reason": finish_reason, "error": error,
+        "finish_reason": finish_reason, "done_received": done_received, "error": error,
         "content_sha256": sha256_text(output),
         "reasoning_content_sha256": sha256_text(reasoning_output),
         "content_chars": len(output), "reasoning_content_chars": len(reasoning_output),
@@ -265,6 +271,15 @@ def markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def level_failed(level: dict[str, Any], ignore_eos: bool) -> bool:
+    return bool(
+        level["failures"]
+        or not level["token_count_complete"]
+        or not level["prompt_token_count_complete"]
+        or (ignore_eos and level["fixed_token_workload_valid"] is not True)
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:18080/v1")
@@ -317,11 +332,7 @@ def run(args: argparse.Namespace) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(markdown(report), end="")
-    bad = any(
-        level["failures"] or not level["token_count_complete"]
-        or (args.ignore_eos and level["fixed_token_workload_valid"] is not True)
-        for level in results
-    )
+    bad = any(level_failed(level, args.ignore_eos) for level in results)
     return 1 if bad else 0
 
 

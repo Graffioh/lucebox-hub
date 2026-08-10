@@ -74,6 +74,7 @@ class BenchmarkTests(unittest.TestCase):
             def __iter__(self):
                 return iter([
                     b'data: {"choices":[{"delta":{"content":"one chunk"}}]}\n', b"\n",
+                    b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n', b"\n",
                     b'data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":64}}\n', b"\n",
                     b"data: [DONE]\n", b"\n",
                 ])
@@ -86,8 +87,39 @@ class BenchmarkTests(unittest.TestCase):
             record = benchmark.stream_request(args, "prompt")
         self.assertEqual(record["completion_tokens"], 64)
         self.assertEqual(record["prompt_tokens"], 12)
+        self.assertTrue(record["done_received"])
+        self.assertIsNone(record["error"])
         self.assertIsNotNone(record["request_decode_tok_s"])
         self.assertEqual(record["content_sha256"], benchmark.sha256_text("one chunk"))
+
+    def test_stream_request_rejects_clean_eof_without_done(self) -> None:
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self):
+                return iter([
+                    b'data: {"choices":[{"delta":{"content":"partial"}}]}\n', b"\n",
+                    b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n', b"\n",
+                    b'data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":64}}\n', b"\n",
+                ])
+
+        args = argparse.Namespace(
+            model="m", max_tokens=64, temperature=0.0, seed=1, ignore_eos=True,
+            api_key="", base_url="http://localhost/v1", timeout=2.0,
+        )
+        with mock.patch.object(benchmark.urllib.request, "urlopen", return_value=Response()):
+            record = benchmark.stream_request(args, "prompt")
+        self.assertFalse(record["done_received"])
+        self.assertIn("before [DONE]", record["error"])
+
+    def test_missing_prompt_usage_fails_level(self) -> None:
+        level = {
+            "failures": 0,
+            "token_count_complete": True,
+            "prompt_token_count_complete": False,
+            "fixed_token_workload_valid": True,
+        }
+        self.assertTrue(benchmark.level_failed(level, ignore_eos=True))
 
 
 if __name__ == "__main__":

@@ -103,12 +103,20 @@ for line in subprocess.run(["ldd",binary],text=True,capture_output=True).stdout.
     fields=line.replace("=>"," ").split()
     paths=[x for x in fields if x.startswith("/") and pathlib.Path(x).is_file()]
     for lib in paths: libs[str(pathlib.Path(lib).resolve())]=digest(lib)
-git_head=subprocess.run(["git","-C",repo,"rev-parse","HEAD"],text=True,capture_output=True).stdout.strip() or None
+lucebox_git_head=subprocess.run(["git","-C",repo,"rev-parse","HEAD"],text=True,capture_output=True).stdout.strip() or None
+server_version=None
+if variant == "llama":
+    version=subprocess.run([binary,"--version"],text=True,capture_output=True,timeout=30)
+    server_version="\n".join(x.strip() for x in (version.stdout,version.stderr) if x.strip()) or None
+    if version.returncode != 0 or server_version is None:
+        raise RuntimeError(f"cannot identify llama.cpp source version from {binary} --version")
 obj={"variant":variant,"workload":workload,"clients":int(clients),"repeat":int(repeat),
      "max_concurrent_prefills":int(max_prefills),"server_binary":str(pathlib.Path(binary).resolve()),
      "server_binary_sha256":digest(binary),"model_sha256":model_sha,
      "prompt_file_sha256":digest(prompts),"server_command":pathlib.Path(cmd_file).read_text().strip(),
-     "resolved_shared_library_sha256":libs,"git_head":git_head}
+     "resolved_shared_library_sha256":libs,
+     "lucebox_git_head":lucebox_git_head if variant != "llama" else None,
+     "server_version":server_version}
 pathlib.Path(p).write_text(json.dumps(obj,indent=2,sort_keys=True)+"\n")' \
     "$path" "$variant" "$workload" "$clients" "$repeat" "$binary" "$max_prefills" "$command_file" "$MODEL_SHA256" "$OUT/prompts/$workload.jsonl" "$REPO"
 }
@@ -137,8 +145,7 @@ run_case() {
       --max-concurrency "$SLOTS" --kv-pool-tokens "$capacity" --max-ctx "$max_ctx"
       --cache-type-k q4_0 --cache-type-v q4_0 --fa-window 0
       --prefix-cache-slots 0 --prefill-cache-slots 0 --admission-coalesce-ms 5
-      --prefill-quantum 512 --prefill-token-budget 4096
-      --mixed-prefill-token-budget 2048 --host 127.0.0.1 --port "$PORT" --model-name "$model_id")
+      --host 127.0.0.1 --port "$PORT" --model-name "$model_id")
   fi
   printf '%q ' "${command[@]}" > "$case_dir/server-command.txt"; printf '\n' >> "$case_dir/server-command.txt"
   write_metadata "$case_dir/server-metadata.json" "$variant" "$workload" "$clients" "$repeat" "$binary" "$max_prefills" "$case_dir/server-command.txt"

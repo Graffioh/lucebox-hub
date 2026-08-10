@@ -18,7 +18,11 @@ def load_reports(root: Path) -> list[dict]:
         if len(report.get("levels", [])) != 1:
             raise ValueError(f"{path}: expected exactly one client level")
         level = report["levels"][0]
-        if level.get("failures") or not level.get("token_count_complete"):
+        if (
+            level.get("failures")
+            or not level.get("token_count_complete")
+            or not level.get("prompt_token_count_complete")
+        ):
             raise ValueError(f"{path}: failed or incomplete token accounting")
         if report.get("ignore_eos") and level.get("fixed_token_workload_valid") is not True:
             raise ValueError(f"{path}: fixed-token validation failed")
@@ -38,6 +42,10 @@ def summarize(reports: list[dict]) -> str:
         meta, level = item["meta"], item["level"]
         key = (str(meta["workload"]), int(level["clients"]), str(meta["variant"]))
         grouped[key].append(item)
+    for key, items in grouped.items():
+        repeats = [int(item["meta"]["repeat"]) for item in items]
+        if len(repeats) != len(set(repeats)):
+            raise ValueError(f"{key}: duplicate repeat")
 
     lines = [
         "# Concurrency benchmark summary", "",
@@ -76,32 +84,49 @@ def summarize(reports: list[dict]) -> str:
         output_hashes = {
             item["level"].get("selected_output_set_sha256") for item in items
         }
-        stable = "yes" if len(output_hashes) == 1 else "NO"
+        stable = (
+            "n/a" if len(items) < 2
+            else "yes" if len(output_hashes) == 1
+            else "NO"
+        )
 
-        def delta(other: str, metric: str, value: float | None) -> str:
+        def delta(other: str, metric: str) -> str:
             peers = grouped.get((workload, clients, other), [])
-            peer_values = [
-                p["level"].get(metric) for p in peers
-                if p["level"].get(metric) is not None
-            ]
-            if not peers or value is None or not peer_values:
+            if not peers:
                 return "n/a"
             peer_hashes = {p["level"]["selected_prompt_set_sha256"] for p in peers}
             if peer_hashes != hashes:
                 raise ValueError(f"{workload} C={clients}: {variant}/{other} prompts differ")
-            base = median(peer_values)
-            return f"{(value / base - 1.0) * 100:+.1f}%"
+            by_repeat = {int(item["meta"]["repeat"]): item for item in items}
+            peers_by_repeat = {int(item["meta"]["repeat"]): item for item in peers}
+            if by_repeat.keys() != peers_by_repeat.keys():
+                raise ValueError(
+                    f"{workload} C={clients}: {variant}/{other} repeat sets differ"
+                )
+            ratios = []
+            for repeat in sorted(by_repeat):
+                value = by_repeat[repeat]["level"].get(metric)
+                base = peers_by_repeat[repeat]["level"].get(metric)
+                if value is None or base is None:
+                    return "n/a"
+                if base <= 0:
+                    raise ValueError(
+                        f"{workload} C={clients} repeat={repeat}: "
+                        f"non-positive {other} {metric}"
+                    )
+                ratios.append(value / base - 1.0)
+            return f"{median(ratios) * 100:+.1f}%"
 
         vs_llama = (
-            delta("llama", "aggregate_tok_s", goodput)
+            delta("llama", "aggregate_tok_s")
             if variant == "luce-k8" else "—"
         )
         decode_vs_llama = (
-            delta("llama", "output_window_tok_s", output_window)
+            delta("llama", "output_window_tok_s")
             if variant == "luce-k8" else "—"
         )
         vs_k1 = (
-            delta("luce-k1", "aggregate_tok_s", goodput)
+            delta("luce-k1", "aggregate_tok_s")
             if variant == "luce-k8" else "—"
         )
         output_window_text = f"{output_window:.2f}" if output_window is not None else "n/a"

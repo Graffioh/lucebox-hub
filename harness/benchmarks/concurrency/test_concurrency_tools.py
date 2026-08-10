@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -50,9 +52,16 @@ class PromptGeneratorTests(unittest.TestCase):
 
 class SummarizerTests(unittest.TestCase):
     @staticmethod
-    def item(variant: str, goodput: float, output_window: float | None = None) -> dict:
+    def item(
+        variant: str,
+        goodput: float,
+        output_window: float | None = None,
+        *,
+        repeat: int = 1,
+        output_hash: str = "same-outputs",
+    ) -> dict:
         return {
-            "meta": {"workload": "short", "variant": variant},
+            "meta": {"workload": "short", "variant": variant, "repeat": repeat},
             "level": {
                 "clients": 8,
                 "aggregate_tok_s": goodput,
@@ -61,7 +70,7 @@ class SummarizerTests(unittest.TestCase):
                 "prompt_tokens_per_s_to_first_token": 100.0,
                 "ttft_max_s": 2.0,
                 "selected_prompt_set_sha256": "same-prompts",
-                "selected_output_set_sha256": "same-outputs",
+                "selected_output_set_sha256": output_hash,
             },
         }
 
@@ -74,6 +83,68 @@ class SummarizerTests(unittest.TestCase):
         self.assertIn("+150.0%", text)
         self.assertIn("+100.0%", text)
         self.assertIn("Decode vs llama", text)
+
+    def test_summary_uses_same_repeat_ratios(self) -> None:
+        reports = []
+        for repeat, luce, llama in (
+            (1, 10.0, 1.0),
+            (2, 20.0, 90.0),
+            (3, 100.0, 50.0),
+        ):
+            reports.extend([
+                self.item("luce-k8", luce, repeat=repeat),
+                self.item("llama", llama, repeat=repeat),
+            ])
+        text = summarizer.summarize(reports)
+        luce_row = next(line for line in text.splitlines() if "| luce-k8 |" in line)
+        self.assertIn("+100.0%", luce_row)
+        self.assertNotIn("-60.0%", luce_row)
+
+    def test_summary_rejects_mismatched_repeat_sets(self) -> None:
+        reports = [
+            self.item("luce-k8", 20.0, repeat=1),
+            self.item("luce-k8", 22.0, repeat=2),
+            self.item("llama", 10.0, repeat=1),
+        ]
+        with self.assertRaisesRegex(ValueError, "repeat sets differ"):
+            summarizer.summarize(reports)
+
+    def test_single_repeat_does_not_claim_stability(self) -> None:
+        text = summarizer.summarize([self.item("llama", 8.0)])
+        row = next(line for line in text.splitlines() if "| llama |" in line)
+        self.assertEqual(row.split("|")[10].strip(), "n/a")
+
+    def test_multiple_repeats_report_output_stability(self) -> None:
+        stable = summarizer.summarize([
+            self.item("llama", 8.0, repeat=1),
+            self.item("llama", 9.0, repeat=2),
+        ])
+        stable_row = next(line for line in stable.splitlines() if "| llama |" in line)
+        self.assertEqual(stable_row.split("|")[10].strip(), "yes")
+
+        unstable = summarizer.summarize([
+            self.item("llama", 8.0, repeat=1, output_hash="first"),
+            self.item("llama", 9.0, repeat=2, output_hash="second"),
+        ])
+        unstable_row = next(line for line in unstable.splitlines() if "| llama |" in line)
+        self.assertEqual(unstable_row.split("|")[10].strip(), "NO")
+
+    def test_load_reports_rejects_missing_prompt_usage(self) -> None:
+        report = {
+            "ignore_eos": True,
+            "server_metadata": {"workload": "short", "variant": "llama", "repeat": 1},
+            "levels": [{
+                "failures": 0,
+                "token_count_complete": True,
+                "prompt_token_count_complete": False,
+                "fixed_token_workload_valid": True,
+            }],
+        }
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "bench.json"
+            path.write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "incomplete token accounting"):
+                summarizer.load_reports(Path(root))
 
 
 if __name__ == "__main__":

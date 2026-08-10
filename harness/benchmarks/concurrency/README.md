@@ -62,6 +62,8 @@ comparison is the product comparison. Five paired repeats, the exact command
 and hashes recorded in each case, zero failures, and a fixed declared output
 length are required before using results in a post. The standard prefill-facing
 protocol uses 64 output tokens; the decode-heavy protocol above uses 256.
-The summary also marks whether each variant produced the same ordered output
-hashes across repeats; an unstable result is a correctness warning, not a
-performance win.
+Variant gains are computed as the median of same-repeat ratios, not as a ratio
+of independently aggregated medians. The summarizer rejects mismatched repeat
+sets. It also marks whether each variant produced the same ordered output
+hashes across at least two repeats; a one-repeat screen reports stability as
+`n/a`, and an unstable result is a correctness warning, not a performance win.
