@@ -42,13 +42,13 @@ class BenchmarkTests(unittest.TestCase):
             start = time.perf_counter()
             return {
                 "t_start": start, "t_first": start + 0.5, "t_end": start + 1.0,
-                "duration_s": 1.0, "ttft_s": 0.5,
+                "duration_s": 1.0, "ttft_s": 0.5, "decode_duration_s": 0.5,
                 "completion_tokens": 8, "prompt_tokens": next(prompt_counts),
                 "finish_reason": "length", "error": None,
                 "content_sha256": benchmark.sha256_text(prompt + " output"),
                 "reasoning_content_sha256": benchmark.sha256_text(""),
                 "content_chars": 6, "reasoning_content_chars": 0,
-                "request_output_tok_s": 8.0,
+                "request_output_tok_s": 8.0, "request_decode_tok_s": 14.0,
             }
 
         args = argparse.Namespace(max_tokens=8, ignore_eos=True, timeout=2.0)
@@ -57,6 +57,11 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(level["completion_tokens_total"], 16)
         self.assertEqual(level["prompt_tokens_total"], 40)
         self.assertTrue(level["fixed_token_workload_valid"])
+        self.assertAlmostEqual(
+            level["output_window_tok_s"],
+            16 / level["output_window_s"],
+        )
+        self.assertEqual(level["request_decode_tok_s_median"], 14.0)
         self.assertAlmostEqual(
             level["prompt_tokens_per_s_to_first_token"],
             40 / level["prompt_to_first_token_s"],
@@ -81,6 +86,7 @@ class BenchmarkTests(unittest.TestCase):
             record = benchmark.stream_request(args, "prompt")
         self.assertEqual(record["completion_tokens"], 64)
         self.assertEqual(record["prompt_tokens"], 12)
+        self.assertIsNotNone(record["request_decode_tok_s"])
         self.assertEqual(record["content_sha256"], benchmark.sha256_text("one chunk"))
 
 

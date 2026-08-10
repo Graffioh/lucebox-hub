@@ -117,10 +117,17 @@ def stream_request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
     ended = time.perf_counter()
     output = "".join(content)
     reasoning_output = "".join(reasoning)
+    decode_duration = ended - first if first is not None and ended > first else None
+    request_decode_tok_s = (
+        (completion_tokens - 1) / decode_duration
+        if isinstance(completion_tokens, int) and completion_tokens > 0
+        and decode_duration is not None else None
+    )
     return {
         "t_start": started, "t_first": first, "t_end": ended,
         "duration_s": ended - started,
         "ttft_s": first - started if first is not None else None,
+        "decode_duration_s": decode_duration,
         "completion_tokens": completion_tokens, "prompt_tokens": prompt_tokens,
         "finish_reason": finish_reason, "error": error,
         "content_sha256": sha256_text(output),
@@ -130,6 +137,7 @@ def stream_request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
             completion_tokens / (ended - started)
             if completion_tokens is not None and ended > started else None
         ),
+        "request_decode_tok_s": request_decode_tok_s,
     }
 
 
@@ -172,6 +180,15 @@ def run_level(
         max(r["start_offset_s"] + r["ttft_s"] for r in ok)
         if len(ttfts) == len(ok) and ok else None
     )
+    first_times = [r["t_first"] for r in ok if r["t_first"] is not None]
+    output_window = (
+        max(r["t_end"] for r in ok) - min(first_times)
+        if len(first_times) == len(ok) and ok else None
+    )
+    request_decode_rates = [
+        r["request_decode_tok_s"] for r in ok
+        if r.get("request_decode_tok_s") is not None
+    ]
     fixed_valid = (
         failures == 0 and len(ok) == clients
         and completion_complete
@@ -193,6 +210,17 @@ def run_level(
             sum(completion_counts) / wall if completion_complete and wall > 0 else None
         ),
         "aggregate_metric": "completion_tokens_per_level_wall_second",
+        "output_window_s": output_window,
+        "output_window_tok_s": (
+            sum(completion_counts) / output_window
+            if completion_complete and output_window is not None and output_window > 0
+            else None
+        ),
+        "output_window_metric": "completion_tokens_per_first_output_to_final_completion_second",
+        "request_decode_tok_s_median": (
+            statistics.median(request_decode_rates)
+            if len(request_decode_rates) == len(ok) and ok else None
+        ),
         "prompt_tokens_total": sum(prompt_counts) if prompt_complete else None,
         "prompt_tokens_min": min(prompt_counts) if prompt_complete else None,
         "prompt_tokens_max": max(prompt_counts) if prompt_complete else None,
@@ -218,14 +246,17 @@ def fmt(value: Any, spec: str = ".2f") -> str:
 def markdown(report: dict[str, Any]) -> str:
     lines = [
         f"# Concurrent benchmark — {report['label']}", "",
-        "| C | Ok | Output goodput tok/s | Prompt tok/s to first | Prompt range | "
+        "| C | Ok | Output goodput tok/s | Output-window tok/s | "
+        "Request decode tok/s | Prompt tok/s to first | Prompt range | "
         "TTFT median s | TTFT max s | Wall s |",
-        "| ---: | ---: | ---: | ---: | :--- | ---: | ---: | ---: |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | :--- | ---: | ---: | ---: |",
     ]
     for level in report["levels"]:
         lines.append(
             f"| {level['clients']} | {level['requests_ok']}/{level['requests']} | "
             f"{fmt(level['aggregate_tok_s'])} | "
+            f"{fmt(level['output_window_tok_s'])} | "
+            f"{fmt(level['request_decode_tok_s_median'])} | "
             f"{fmt(level['prompt_tokens_per_s_to_first_token'])} | "
             f"{fmt(level['prompt_tokens_min'], '.0f')}–{fmt(level['prompt_tokens_max'], '.0f')} | "
             f"{fmt(level['ttft_median_s'], '.3f')} | {fmt(level['ttft_max_s'], '.3f')} | "
@@ -276,7 +307,7 @@ def run(args: argparse.Namespace) -> int:
         if args.server_metadata_json else {}
     )
     report = {
-        "schema_version": 1, "label": args.label, "base_url": args.base_url,
+        "schema_version": 2, "label": args.label, "base_url": args.base_url,
         "model": args.model, "max_tokens": args.max_tokens,
         "temperature": args.temperature, "seed": args.seed,
         "ignore_eos": args.ignore_eos, "prompt_offset": args.prompt_offset,

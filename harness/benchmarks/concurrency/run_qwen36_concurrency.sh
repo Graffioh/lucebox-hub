@@ -29,7 +29,9 @@ Usage: MODEL=/path/model.gguf [REPEATS=5] run_qwen36_concurrency.sh
 
 Runs fresh-server, same-concurrency warmup + measurement cases for luce-k8,
 luce-k1, and llama at C=1/4/8/16. Defaults to one repeat for screening; use at
-least five paired repeats for publication. OUT must not already exist.
+least five paired repeats for publication. For a decode-heavy comparison, set
+WORKLOADS=short MAX_TOKENS=256 VARIANTS=luce-k8,llama. OUT must not already
+exist.
 EOF
 }
 

@@ -50,12 +50,14 @@ class PromptGeneratorTests(unittest.TestCase):
 
 class SummarizerTests(unittest.TestCase):
     @staticmethod
-    def item(variant: str, goodput: float) -> dict:
+    def item(variant: str, goodput: float, output_window: float | None = None) -> dict:
         return {
             "meta": {"workload": "short", "variant": variant},
             "level": {
                 "clients": 8,
                 "aggregate_tok_s": goodput,
+                "output_window_tok_s": output_window if output_window is not None else goodput,
+                "request_decode_tok_s_median": goodput / 8,
                 "prompt_tokens_per_s_to_first_token": 100.0,
                 "ttft_max_s": 2.0,
                 "selected_prompt_set_sha256": "same-prompts",
@@ -71,6 +73,7 @@ class SummarizerTests(unittest.TestCase):
         ])
         self.assertIn("+150.0%", text)
         self.assertIn("+100.0%", text)
+        self.assertIn("Decode vs llama", text)
 
 
 if __name__ == "__main__":

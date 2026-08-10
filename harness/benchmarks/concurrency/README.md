@@ -1,8 +1,9 @@
 # Qwen3.6 concurrency benchmark
 
 This protocol measures the serving behavior targeted by packed continuous
-prefill. It is intentionally small: one streaming client, one fresh-process
-runner, one deterministic prompt generator, and one summary script.
+prefill and concurrent decode. It is intentionally small: one streaming client,
+one fresh-process runner, one deterministic prompt generator, and one summary
+script.
 
 Run a quick screening repeat:
 
@@ -13,8 +14,20 @@ LLAMA_SERVER_BIN=/path/to/llama-server \
 harness/benchmarks/concurrency/run_qwen36_concurrency.sh
 ```
 
-Use `REPEATS=5` for publication. Every measured case starts a fresh server and
-first runs a discarded warmup at the same concurrency. The variants are:
+Run a decode-heavy comparison with the same harness:
+
+```bash
+MODEL=/path/to/Qwen3.6-27B-Q4_K_M.gguf \
+LUCE_SERVER_BIN=server/build-hip/dflash_server \
+LLAMA_SERVER_BIN=/path/to/llama-server \
+WORKLOADS=short MAX_TOKENS=256 VARIANTS=luce-k8,llama REPEATS=3 \
+harness/benchmarks/concurrency/run_qwen36_concurrency.sh
+```
+
+The short ragged prompts keep admission realistic while 256 forced output
+tokens make generation dominate the measured window. Use `REPEATS=5` for
+publication. Every measured case starts a fresh server and first runs a
+discarded warmup at the same concurrency. The variants are:
 
 - `luce-k8`: packed prefill with up to eight concurrent prefills.
 - `luce-k1`: the same binary/configuration with packing width limited to one.
@@ -28,15 +41,27 @@ reuse a prompt; reports retain the exact server-observed token counts.
 
 The headline metric is aggregate output goodput: exact server-reported
 completion tokens divided by level wall time. It includes queueing, prefill,
-and decode and must not be called decode throughput. `Prompt tok/s to first`
-is the sum of server-reported prompt tokens divided by the latest first-token
-arrival; it is a useful prefill-facing metric but still includes admission,
-queueing, and transport. Report TTFT median/max alongside both metrics.
+and decode and must not be called decode throughput.
+
+`Output-window tok/s` divides exact completion tokens by the interval from the
+earliest observed first output to the final request completion. It removes the
+initial all-prefill interval and is decode-facing, but it can still contain
+staggered prefill while later requests await their first token.
+`Request decode tok/s` is the median per-request estimate
+`(completion_tokens - 1) / (end - first_output)`; it assumes the first
+observed streaming event accounts for one token. Neither metric is pure kernel
+decode throughput.
+
+`Prompt tok/s to first` is the sum of server-reported prompt tokens divided by
+the latest first-token arrival; it is a useful prefill-facing metric but still
+includes admission, queueing, and transport. Report TTFT median/max alongside
+all throughput metrics.
 
 The K8-vs-K1 comparison is the causal packing ablation. The K8-vs-llama
 comparison is the product comparison. Five paired repeats, the exact command
-and hashes recorded in each case, zero failures, and fixed 64-token outputs are
-required before using results in a post.
+and hashes recorded in each case, zero failures, and a fixed declared output
+length are required before using results in a post. The standard prefill-facing
+protocol uses 64 output tokens; the decode-heavy protocol above uses 256.
 The summary also marks whether each variant produced the same ordered output
 hashes across repeats; an unstable result is a correctness warning, not a
 performance win.

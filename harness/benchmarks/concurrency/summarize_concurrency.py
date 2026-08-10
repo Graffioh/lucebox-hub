@@ -42,10 +42,14 @@ def summarize(reports: list[dict]) -> str:
     lines = [
         "# Concurrency benchmark summary", "",
         "Aggregate output goodput includes queueing, prefill, and decode. "
-        "Prompt tok/s to first token includes admission and TTFT.", "",
+        "Output-window goodput starts at the first observed output and is decode-facing, "
+        "but it can include staggered prefill. Prompt tok/s to first token includes "
+        "admission and TTFT.", "",
         "| Workload | C | Variant | Repeats | Output goodput tok/s | "
-        "Prompt tok/s to first | TTFT max s | Stable output | vs llama | K8 vs K1 |",
-        "| :--- | ---: | :--- | ---: | ---: | ---: | ---: | :---: | ---: | ---: |",
+        "Output-window tok/s | Request decode tok/s | Prompt tok/s to first | "
+        "TTFT max s | Stable output | vs llama | Decode vs llama | K8 vs K1 |",
+        "| :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | "
+        ":---: | ---: | ---: | ---: |",
     ]
     for workload, clients, variant in sorted(grouped):
         items = grouped[(workload, clients, variant)]
@@ -53,6 +57,16 @@ def summarize(reports: list[dict]) -> str:
         if len(hashes) != 1:
             raise ValueError(f"{workload} C={clients} {variant}: prompt sets differ")
         goodput = median([item["level"]["aggregate_tok_s"] for item in items])
+        output_window_values = [
+            item["level"].get("output_window_tok_s") for item in items
+            if item["level"].get("output_window_tok_s") is not None
+        ]
+        output_window = median(output_window_values) if output_window_values else None
+        request_decode_values = [
+            item["level"].get("request_decode_tok_s_median") for item in items
+            if item["level"].get("request_decode_tok_s_median") is not None
+        ]
+        request_decode = median(request_decode_values) if request_decode_values else None
         prompt_rate_values = [
             item["level"]["prompt_tokens_per_s_to_first_token"] for item in items
             if item["level"].get("prompt_tokens_per_s_to_first_token") is not None
@@ -64,24 +78,39 @@ def summarize(reports: list[dict]) -> str:
         }
         stable = "yes" if len(output_hashes) == 1 else "NO"
 
-        def delta(other: str) -> str:
+        def delta(other: str, metric: str, value: float | None) -> str:
             peers = grouped.get((workload, clients, other), [])
-            if not peers:
+            peer_values = [
+                p["level"].get(metric) for p in peers
+                if p["level"].get(metric) is not None
+            ]
+            if not peers or value is None or not peer_values:
                 return "n/a"
             peer_hashes = {p["level"]["selected_prompt_set_sha256"] for p in peers}
             if peer_hashes != hashes:
                 raise ValueError(f"{workload} C={clients}: {variant}/{other} prompts differ")
-            base = median([p["level"]["aggregate_tok_s"] for p in peers])
-            return f"{(goodput / base - 1.0) * 100:+.1f}%"
+            base = median(peer_values)
+            return f"{(value / base - 1.0) * 100:+.1f}%"
 
-        vs_llama = delta("llama") if variant == "luce-k8" else "—"
-        vs_k1 = delta("luce-k1") if variant == "luce-k8" else "—"
+        vs_llama = (
+            delta("llama", "aggregate_tok_s", goodput)
+            if variant == "luce-k8" else "—"
+        )
+        decode_vs_llama = (
+            delta("llama", "output_window_tok_s", output_window)
+            if variant == "luce-k8" else "—"
+        )
+        vs_k1 = (
+            delta("luce-k1", "aggregate_tok_s", goodput)
+            if variant == "luce-k8" else "—"
+        )
+        output_window_text = f"{output_window:.2f}" if output_window is not None else "n/a"
+        request_decode_text = f"{request_decode:.2f}" if request_decode is not None else "n/a"
+        prompt_rate_text = f"{prompt_rate:.2f}" if prompt_rate is not None else "n/a"
         lines.append(
             f"| {workload} | {clients} | {variant} | {len(items)} | {goodput:.2f} | "
-            f"{prompt_rate:.2f} | {ttft:.3f} | {stable} | {vs_llama} | {vs_k1} |"
-            if prompt_rate is not None else
-            f"| {workload} | {clients} | {variant} | {len(items)} | {goodput:.2f} | "
-            f"n/a | {ttft:.3f} | {stable} | {vs_llama} | {vs_k1} |"
+            f"{output_window_text} | {request_decode_text} | {prompt_rate_text} | "
+            f"{ttft:.3f} | {stable} | {vs_llama} | {decode_vs_llama} | {vs_k1} |"
         )
     lines.append("")
     return "\n".join(lines)
