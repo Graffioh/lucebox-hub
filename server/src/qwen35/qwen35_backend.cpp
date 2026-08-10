@@ -91,6 +91,35 @@ static int env_int_or_default(const char * name, int fallback) {
     return fallback;
 }
 
+static void configure_concurrent_hipblaslt_default(
+        const Qwen35Config & cfg) {
+#if (defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)) && !defined(_WIN32)
+    if (!cfg.paged_attention || cfg.max_concurrency <= 1 ||
+        std::getenv("ROCBLAS_USE_HIPBLASLT") != nullptr) {
+        return;
+    }
+
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, cfg.device.gpu) != cudaSuccess ||
+        std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0) {
+        return;
+    }
+
+    // The concurrent Qwen workload spends most of its time in wide Q4_K
+    // dequantize + GEMM steps. ROCm 7.2's hipBLASLt route is consistently
+    // faster for those gfx1151 shapes. Preserve an explicit environment value
+    // so ROCBLAS_USE_HIPBLASLT=0 remains an opt-out.
+    if (::setenv("ROCBLAS_USE_HIPBLASLT", "1", 0) == 0) {
+        std::fprintf(
+            stderr,
+            "[qwen35] gfx1151 concurrent mode: enabled rocBLAS hipBLASLt "
+            "(set ROCBLAS_USE_HIPBLASLT=0 to disable)\n");
+    }
+#else
+    (void)cfg;
+#endif
+}
+
 static int dflash_min_tokens_floor() {
     static const int value = env_int_or_default("DFLASH_MIN_TOKENS", 0);
     return value;
@@ -213,6 +242,8 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
 // ── init() ──────────────────────────────────────────────────────────────
 
 bool Qwen35Backend::init() {
+    configure_concurrent_hipblaslt_default(cfg_);
+
     const bool use_remote_draft = cfg_.remote_draft.enabled();
     const bool tensor_parallel = cfg_.device.is_tensor_parallel();
     split_gpus_ = !use_remote_draft && cfg_.draft_path &&
