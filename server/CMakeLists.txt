@@ -1364,6 +1364,16 @@ if(DFLASH27B_TESTS)
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_concat_transpose.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_concat_transpose test/test_concat_transpose.cpp)
+        add_test(NAME concat_transpose COMMAND test_concat_transpose)
+        if(TARGET check)
+            add_dependencies(check test_concat_transpose)
+        endif()
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_paged_attention.cpp")
         dflash_add_ggml_gpu_executable(
             bench_paged_attention test/bench_paged_attention.cpp)
