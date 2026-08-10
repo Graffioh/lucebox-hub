@@ -1419,6 +1419,9 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+#if defined(GGML_HIPBLASLT)
+    void * hipblaslt_contexts[GGML_CUDA_MAX_DEVICES] = {nullptr};
+#endif
 
     int curr_stream_no = 0;
     bool low_priority_streams = false;

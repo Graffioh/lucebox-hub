@@ -30,6 +30,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/hipblaslt.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -738,6 +739,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
             }
         }
+#if defined(GGML_HIPBLASLT)
+        if (hipblaslt_contexts[i] != nullptr) {
+            ggml_cuda_hipblaslt_destroy(hipblaslt_contexts[i]);
+        }
+#endif
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
@@ -1782,14 +1788,27 @@ static void ggml_cuda_op_mul_mat_cublas(
             const half alpha_f16 = 1.0f;
             const half beta_f16 = 0.0f;
 
-            CUBLAS_CHECK(
-                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                        row_diff, src1_ncols, ne10,
-                        &alpha_f16, src0_ptr,      CUDA_R_16F, ne00,
-                                    src1_ptr,      CUDA_R_16F, ne10,
-                        &beta_f16,  dst_f16.get(), CUDA_R_16F, ldc,
-                        CUBLAS_COMPUTE_16F,
-                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            bool used_hipblaslt = false;
+#if defined(GGML_HIPBLASLT)
+            if (cc == GGML_CUDA_CC_RDNA3_5 &&
+                src0->type == GGML_TYPE_Q4_K && src1_ncols > 256) {
+                used_hipblaslt = ggml_cuda_hipblaslt_gemm_f16(
+                    ctx, ctx.hipblaslt_contexts[id], id,
+                    src0_ptr, src1_ptr, dst_f16.get(),
+                    row_diff, src1_ncols, ne10,
+                    ne00, ne10, ldc, stream);
+            }
+#endif
+            if (!used_hipblaslt) {
+                CUBLAS_CHECK(
+                    cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                            row_diff, src1_ncols, ne10,
+                            &alpha_f16, src0_ptr,      CUDA_R_16F, ne00,
+                                        src1_ptr,      CUDA_R_16F, ne10,
+                            &beta_f16,  dst_f16.get(), CUDA_R_16F, ldc,
+                            CUBLAS_COMPUTE_16F,
+                            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
 
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
             to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
