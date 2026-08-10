@@ -77,6 +77,9 @@ struct PagedKvAppendResult {
 struct PagedKvSequenceSnapshot {
     uint32_t kv_seq_len = 0;
     std::vector<uint32_t> block_table;
+    // Physical blocks held for future append() calls by this sequence. They
+    // are not visible in block_table until append consumes them.
+    uint32_t reserved_block_count = 0;
 };
 
 // Allocator front-end: hands out sequence slots and physical block indices.
@@ -98,6 +101,7 @@ public:
     uint32_t active_sequence_count() const {
         return static_cast<uint32_t>(request_to_slot_.size());
     }
+    // Blocks that are neither appended nor reserved by an active sequence.
     uint32_t free_block_count() const {
         return static_cast<uint32_t>(free_blocks_.size());
     }
@@ -106,6 +110,25 @@ public:
     // empty; no blocks are allocated until append().
     PagedKvStatus acquire(PagedKvRequestId request_id,
                           PagedKvSequenceHandle & out_handle);
+
+    // Claim a sequence slot and atomically reserve enough physical blocks for
+    // `token_capacity` future tokens. The logical sequence still starts empty;
+    // append() moves reserved blocks into its visible block table as needed.
+    // On any status failure, no slot or block is consumed and `out_handle` is
+    // unchanged. This is the admission primitive for chunked prompt prefill:
+    // once it succeeds, another sequence cannot strand this prompt halfway
+    // through by consuming the remainder of its capacity.
+    PagedKvStatus acquire_reserved(PagedKvRequestId request_id,
+                                   uint32_t token_capacity,
+                                   PagedKvSequenceHandle & out_handle);
+
+    // Atomically ensure an active sequence owns enough appended plus reserved
+    // blocks to cover `token_capacity` logical tokens. This does not advance
+    // kv_seq_len or expose new block-table entries; append() consumes the
+    // private reservation later. Existing excess capacity is retained. On a
+    // status failure no block moves and the sequence is unchanged.
+    PagedKvStatus reserve_capacity(PagedKvSequenceHandle handle,
+                                   uint32_t token_capacity);
 
     // Advance kv_seq_len by `token_count`, allocating new blocks as needed.
     // By default return every appended token's cache destination; when
@@ -129,6 +152,10 @@ public:
     PagedKvStatus sequence(PagedKvSequenceHandle handle,
                            PagedKvSequenceSnapshot & out_sequence) const;
 
+    // Return appended plus reserved blocks without copying the block table.
+    PagedKvStatus owned_block_count(PagedKvSequenceHandle handle,
+                                    uint32_t & out_count) const;
+
 private:
     // Bookkeeping for one sequence slot. `generation` survives release so
     // the next acquire on this slot invalidates old handles.
@@ -138,6 +165,10 @@ private:
         uint32_t kv_seq_len = 0;
         bool active = false;
         std::vector<uint32_t> block_table;
+        // Min-heap of blocks promised to this sequence but not yet made
+        // visible by append(). Reserved blocks are excluded from the global
+        // free list and returned by release()/reset().
+        std::vector<uint32_t> reserved_blocks;
     };
 
     // Blocks needed to hold `token_count` tokens (ceiling division).
@@ -151,6 +182,11 @@ private:
     // does). All-or-nothing on BlocksExhausted.
     PagedKvStatus extend_block_table(SequenceState & sequence,
                                      uint32_t required_blocks);
+
+    // Move exactly `additional_blocks` globally free blocks into a sequence's
+    // private reservation. Caller must preflight availability.
+    void take_reserved_blocks(SequenceState & sequence,
+                              uint32_t additional_blocks);
 
     // Take the lowest free index off `free_list`, which must be non-empty.
     static uint32_t take_lowest(std::vector<uint32_t> & free_list);

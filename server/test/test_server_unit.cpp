@@ -95,6 +95,13 @@ struct ServerUnitFixture {};
     } \
 } while (0)
 
+TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {
+    CHECK(std::string(api_format_name(ApiFormat::OPENAI_CHAT)) == "chat");
+    CHECK(std::string(api_format_name(ApiFormat::ANTHROPIC)) == "anthropic");
+    CHECK(std::string(api_format_name(ApiFormat::RESPONSES)) == "responses");
+    CHECK(std::string(api_format_name(ApiFormat::COMPLETIONS)) == "completions");
+}
+
 TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
     bool cancel = false;
     DaemonIO io;
@@ -2164,6 +2171,28 @@ TEST_CASE(ServerUnitFixture, test_pflash_config_defaults) {
     TEST_ASSERT(cfg.pflash_drafter_path.empty());
     TEST_ASSERT(!cfg.pflash_skip_park);
     TEST_ASSERT(cfg.draft_residency == DraftResidencyPolicy::Auto);
+}
+
+TEST_CASE(ServerUnitFixture, test_concurrent_status_is_aggregate_only) {
+    ServerStatus status;
+    ServerStatus::RequestInfo info;
+    info.model = "classic-model";
+    status.set_running("classic prompt", 12, true, info);
+    json snapshot = status.to_json();
+    TEST_ASSERT(snapshot["active_requests"] == 0);
+    TEST_ASSERT(snapshot["current"]["model"] == "classic-model");
+
+    status.set_concurrent_requests(2);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "decode");
+    TEST_ASSERT(snapshot["active_requests"] == 2);
+    TEST_ASSERT(snapshot["current"].is_null());
+
+    status.set_idle();
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "idle");
+    TEST_ASSERT(snapshot["active_requests"] == 0);
+    TEST_ASSERT(snapshot["current"].is_null());
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
@@ -4470,7 +4499,6 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     PrefixCache  pc(0, tok);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
-
     TEST_ASSERT(body.contains("model_card"));
     TEST_ASSERT(!body["model_card"].is_null());
     // `source` is the upstream URL, NOT the filepath. The filepath label
@@ -4583,6 +4611,7 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     cfg.chunk           = 512;
     cfg.target_device   = "auto:0";
     cfg.draft_device    = "auto:0";
+    TEST_ASSERT(cfg.admission_coalesce_ms == 20);
 
     Tokenizer    tok;
     PrefixCache  pc(0, tok);
@@ -4601,12 +4630,17 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
     TEST_ASSERT(rt["target_device"].get<std::string>()   == "auto:0");
     TEST_ASSERT(rt["draft_device"].get<std::string>()    == "auto:0");
+    TEST_ASSERT(rt["continuous_batching"]["admission_coalesce_ms"]
+                    .get<int>() == 20);
     TEST_ASSERT(body["pflash"]["draft_residency"].get<std::string>() == "persistent");
 
     // draft_device is null when no draft model is loaded.
     cfg.draft_device.clear();
+    cfg.admission_coalesce_ms = 7;
     body = build_props_body(cfg, pc, tm);
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
+    TEST_ASSERT(body["runtime"]["continuous_batching"]
+                    ["admission_coalesce_ms"].get<int>() == 7);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

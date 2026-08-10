@@ -1252,6 +1252,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET_ROWS:
             {
+                if (ggml_get_op_params_i32(op, 0) != 0) {
+                    return false;
+                }
+
                 if (op->src[0]->type != GGML_TYPE_F32) {
                     return false;
                 }

@@ -53,13 +53,13 @@ static BackendArgs gate_args_hip_deepseek4() {
     return args;
 }
 
-static std::string gate_result(
+static bool gate_accepts(
     const BackendArgs & args,
     const std::string & arch,
     PlacementBackend backend,
     const BackendFeatureConfig & features = {}) {
     return check_feature_compatibility(
-        args, features, arch, backend, backend);
+        args, features, arch, backend, backend).empty();
 }
 
 static std::string gate_result_for_binary(
@@ -75,15 +75,15 @@ static std::string gate_result_for_binary(
 static void test_feature_gate_accepts_plain_launch() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
-    TEST_ASSERT(gate_result(
-        args, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(gate_accepts(
+        args, "qwen35", PlacementBackend::Cuda));
 }
 
 static void test_feature_gate_rejects_undetected_arch() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
-    TEST_ASSERT(!gate_result(
-        args, "", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        args, "", PlacementBackend::Cuda));
 }
 
 static void test_feature_gate_requires_compiled_target_backend() {
@@ -99,14 +99,14 @@ static void test_feature_gate_ipc_options_require_ipc_binary() {
     BackendArgs draft;
     draft.model_path = "/nonexistent/model.gguf";
     draft.remote_draft.work_dir = "/tmp/draft";
-    TEST_ASSERT(!gate_result(
-        draft, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        draft, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs target;
     target.model_path = "/nonexistent/model.gguf";
     target.remote_target_shard.work_dir = "/tmp/target";
-    TEST_ASSERT(!gate_result(
-        target, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        target, "qwen35", PlacementBackend::Cuda));
 }
 
 static void test_feature_gate_mixed_draft_placement_requires_ipc() {
@@ -116,16 +116,16 @@ static void test_feature_gate_mixed_draft_placement_requires_ipc() {
     args.device.backend = PlacementBackend::Cuda;
     args.draft_device.backend = PlacementBackend::Hip;
 
-    TEST_ASSERT(!gate_result(
-        args, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        args, "qwen35", PlacementBackend::Cuda));
 
     args.remote_draft.ipc_bin = "/usr/bin/draft-ipc";
-    TEST_ASSERT(gate_result(
-        args, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(gate_accepts(
+        args, "qwen35", PlacementBackend::Cuda));
 
     args.draft_device.backend = PlacementBackend::Cuda;
-    TEST_ASSERT(!gate_result(
-        args, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        args, "qwen35", PlacementBackend::Cuda));
 }
 
 static void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
@@ -134,39 +134,39 @@ static void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
 
     BackendFeatureConfig features;
     features.pflash_enabled = true;
-    TEST_ASSERT(!gate_result(
-        args, "qwen35", PlacementBackend::Cuda, features).empty());
+    TEST_ASSERT(!gate_accepts(
+        args, "qwen35", PlacementBackend::Cuda, features));
 
     features.pflash_drafter_configured = true;
-    TEST_ASSERT(gate_result(
-        args, "gemma4", PlacementBackend::Cuda, features).empty());
+    TEST_ASSERT(gate_accepts(
+        args, "gemma4", PlacementBackend::Cuda, features));
 
     args.device.backend = PlacementBackend::Cuda;
     args.draft_device.backend = PlacementBackend::Hip;
     args.remote_draft.ipc_bin = "/usr/bin/draft-ipc";
-    TEST_ASSERT(!gate_result(
-        args, "gemma4", PlacementBackend::Cuda, features).empty());
-    TEST_ASSERT(gate_result(
-        args, "qwen35", PlacementBackend::Cuda, features).empty());
+    TEST_ASSERT(!gate_accepts(
+        args, "gemma4", PlacementBackend::Cuda, features));
+    TEST_ASSERT(gate_accepts(
+        args, "qwen35", PlacementBackend::Cuda, features));
 }
 
 static void test_feature_gate_validates_target_split_topology() {
     BackendArgs weights;
     weights.model_path = "/nonexistent/model.gguf";
     weights.device.layer_split_weights = {1.0, 1.0};
-    TEST_ASSERT(!gate_result(
-        weights, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        weights, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs mixed;
     mixed.model_path = "/nonexistent/model.gguf";
     TEST_ASSERT(parse_placement_device_list(
         "cuda:0,hip:0", mixed.device));
-    TEST_ASSERT(!gate_result(
-        mixed, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        mixed, "qwen35", PlacementBackend::Cuda));
 
     mixed.remote_target_shard.ipc_bin = "/usr/bin/target-shard";
-    TEST_ASSERT(gate_result(
-        mixed, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(gate_accepts(
+        mixed, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs two_boundaries;
     two_boundaries.model_path = "/nonexistent/model.gguf";
@@ -174,8 +174,8 @@ static void test_feature_gate_validates_target_split_topology() {
         "cuda:0,hip:0,cuda:1", two_boundaries.device));
     two_boundaries.remote_target_shard.ipc_bin =
         "/usr/bin/target-shard";
-    TEST_ASSERT(!gate_result(
-        two_boundaries, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        two_boundaries, "qwen35", PlacementBackend::Cuda));
 }
 
 static void test_feature_gate_tensor_parallel_requirements() {
@@ -184,52 +184,52 @@ static void test_feature_gate_tensor_parallel_requirements() {
     TEST_ASSERT(parse_placement_device_list(
         "cuda:0,cuda:1", valid.device));
     valid.device.split_mode = TargetSplitMode::Tensor;
-    TEST_ASSERT(gate_result(
-        valid, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(gate_accepts(
+        valid, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs missing_devices;
     missing_devices.model_path = "/nonexistent/model.gguf";
     missing_devices.device.split_mode = TargetSplitMode::Tensor;
-    TEST_ASSERT(!gate_result(
-        missing_devices, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        missing_devices, "qwen35", PlacementBackend::Cuda));
 
-    TEST_ASSERT(!gate_result(
-        valid, "laguna", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        valid, "laguna", PlacementBackend::Cuda));
 
     BackendArgs hip;
     hip.model_path = "/nonexistent/model.gguf";
     TEST_ASSERT(parse_placement_device_list("hip:0,hip:1", hip.device));
     hip.device.split_mode = TargetSplitMode::Tensor;
-    TEST_ASSERT(!gate_result(
-        hip, "qwen35", PlacementBackend::Hip).empty());
+    TEST_ASSERT(!gate_accepts(
+        hip, "qwen35", PlacementBackend::Hip));
 
     BackendArgs mixed = valid;
     TEST_ASSERT(parse_placement_device_list(
         "cuda:0,hip:0", mixed.device));
     mixed.device.split_mode = TargetSplitMode::Tensor;
-    TEST_ASSERT(!gate_result(
-        mixed, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        mixed, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs weighted = valid;
     weighted.device.layer_split_weights = {1.0, 1.0};
-    TEST_ASSERT(!gate_result(
-        weighted, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        weighted, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs remote = valid;
     remote.remote_target_shard.ipc_bin = "/usr/bin/target-shard";
-    TEST_ASSERT(!gate_result(
-        remote, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        remote, "qwen35", PlacementBackend::Cuda));
 
     BackendFeatureConfig pflash;
     pflash.pflash_enabled = true;
     pflash.pflash_drafter_configured = true;
-    TEST_ASSERT(!gate_result(
-        valid, "qwen35", PlacementBackend::Cuda, pflash).empty());
+    TEST_ASSERT(!gate_accepts(
+        valid, "qwen35", PlacementBackend::Cuda, pflash));
 
     BackendArgs draft = valid;
     draft.draft_path = "/nonexistent/draft.gguf";
-    TEST_ASSERT(gate_result(
-        draft, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(gate_accepts(
+        draft, "qwen35", PlacementBackend::Cuda));
 }
 
 static void test_feature_gate_ds4_prefill_requires_deepseek4() {
@@ -237,10 +237,10 @@ static void test_feature_gate_ds4_prefill_requires_deepseek4() {
     args.ds4_prefill_mode_set = true;
     args.ds4_prefill_mode = PrefillAttentionMode::Dense;
 
-    TEST_ASSERT(!gate_result(
-        args, "qwen35", PlacementBackend::Hip).empty());
-    TEST_ASSERT(gate_result(
-        args, "deepseek4", PlacementBackend::Hip).empty());
+    TEST_ASSERT(!gate_accepts(
+        args, "qwen35", PlacementBackend::Hip));
+    TEST_ASSERT(gate_accepts(
+        args, "deepseek4", PlacementBackend::Hip));
 }
 
 static void test_feature_gate_approximate_ds4_prefill_requires_local_hip() {
@@ -249,60 +249,60 @@ static void test_feature_gate_approximate_ds4_prefill_requires_local_hip() {
     args.ds4_prefill_mode = PrefillAttentionMode::Sparse;
 
     // CUDA has no approximate prefill path.
-    TEST_ASSERT(!gate_result(
-        args, "deepseek4", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        args, "deepseek4", PlacementBackend::Cuda));
 
     // Neither does the layer-split adapter, even on HIP.
     BackendArgs split = args;
     TEST_ASSERT(parse_placement_device_list("hip:0,hip:1", split.device));
-    TEST_ASSERT(!gate_result(
-        split, "deepseek4", PlacementBackend::Hip).empty());
+    TEST_ASSERT(!gate_accepts(
+        split, "deepseek4", PlacementBackend::Hip));
 
     // Nor a remote target shard.
     BackendArgs remote = args;
     remote.remote_target_shard.ipc_bin = "/usr/bin/shard";
-    TEST_ASSERT(!gate_result(
-        remote, "deepseek4", PlacementBackend::Hip).empty());
+    TEST_ASSERT(!gate_accepts(
+        remote, "deepseek4", PlacementBackend::Hip));
 
     // Single local HIP device is the supported placement.
-    TEST_ASSERT(gate_result(
-        args, "deepseek4", PlacementBackend::Hip).empty());
+    TEST_ASSERT(gate_accepts(
+        args, "deepseek4", PlacementBackend::Hip));
 
     // Exact prefill is unrestricted.
     BackendArgs exact = gate_args_hip_deepseek4();
     exact.ds4_prefill_mode_set = true;
     exact.ds4_prefill_mode = PrefillAttentionMode::Exact;
-    TEST_ASSERT(gate_result(
-        exact, "deepseek4", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(gate_accepts(
+        exact, "deepseek4", PlacementBackend::Cuda));
 }
 
 static void test_feature_gate_ds4_decode_options_require_monolithic_hip() {
     BackendArgs fused = gate_args_hip_deepseek4();
     fused.ds4_fused_decode = true;
-    TEST_ASSERT(!gate_result(
-        fused, "deepseek4", PlacementBackend::Cuda).empty());
-    TEST_ASSERT(gate_result(
-        fused, "deepseek4", PlacementBackend::Hip).empty());
+    TEST_ASSERT(!gate_accepts(
+        fused, "deepseek4", PlacementBackend::Cuda));
+    TEST_ASSERT(gate_accepts(
+        fused, "deepseek4", PlacementBackend::Hip));
 
     BackendArgs topk = gate_args_hip_deepseek4();
     topk.ds4_expert_top_k = 4;
-    TEST_ASSERT(!gate_result(
-        topk, "qwen35", PlacementBackend::Hip).empty());
-    TEST_ASSERT(gate_result(
-        topk, "deepseek4", PlacementBackend::Hip).empty());
+    TEST_ASSERT(!gate_accepts(
+        topk, "qwen35", PlacementBackend::Hip));
+    TEST_ASSERT(gate_accepts(
+        topk, "deepseek4", PlacementBackend::Hip));
 
     // Top-k is a model policy in the monolithic backend and is independent of
     // the GPU vendor. Unlike fused decode, mixed CUDA-primary expert
     // placement can therefore use it.
     BackendArgs cuda_topk = topk;
     cuda_topk.device.backend = PlacementBackend::Cuda;
-    TEST_ASSERT(gate_result(
-        cuda_topk, "deepseek4", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(gate_accepts(
+        cuda_topk, "deepseek4", PlacementBackend::Cuda));
 
     BackendArgs split_topk = topk;
     split_topk.device.layer_split_gpus = {0, 1};
-    TEST_ASSERT(!gate_result(
-        split_topk, "deepseek4", PlacementBackend::Hip).empty());
+    TEST_ASSERT(!gate_accepts(
+        split_topk, "deepseek4", PlacementBackend::Hip));
 }
 
 static void test_feature_gate_remote_draft_requires_supported_arch() {
@@ -313,16 +313,16 @@ static void test_feature_gate_remote_draft_requires_supported_arch() {
     args.draft_device.backend = PlacementBackend::Hip;
     args.remote_draft.ipc_bin = "/usr/bin/draft-ipc";
 
-    TEST_ASSERT(!gate_result(
-        args, "gemma4", PlacementBackend::Cuda).empty());
-    TEST_ASSERT(gate_result(
-        args, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        args, "gemma4", PlacementBackend::Cuda));
+    TEST_ASSERT(gate_accepts(
+        args, "qwen35", PlacementBackend::Cuda));
 
     // Without a draft model or PFlash, remote draft IPC is unnecessary.
     BackendArgs no_draft = args;
     no_draft.draft_path = nullptr;
-    TEST_ASSERT(!gate_result(
-        no_draft, "gemma4", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        no_draft, "gemma4", PlacementBackend::Cuda));
 }
 
 static void test_feature_gate_layer_split_requires_supported_arch() {
@@ -332,34 +332,34 @@ static void test_feature_gate_layer_split_requires_supported_arch() {
 
     // These four have a layer-split adapter.
     for (const char * arch : {"qwen35", "laguna", "gemma4", "deepseek4"}) {
-        TEST_ASSERT(gate_result(args, arch, PlacementBackend::Cuda).empty());
+        TEST_ASSERT(gate_accepts(args, arch, PlacementBackend::Cuda));
     }
     // These two do not: the factory would hand the split placement to a
     // monolithic backend, which reads only the primary GPU.
     for (const char * arch : {"qwen35moe", "qwen3"}) {
-        TEST_ASSERT(!gate_result(args, arch, PlacementBackend::Cuda).empty());
+        TEST_ASSERT(!gate_accepts(args, arch, PlacementBackend::Cuda));
     }
 
     // Single-device placement is unaffected for the same architectures.
     BackendArgs single;
     single.model_path = "/nonexistent/model.gguf";
-    TEST_ASSERT(gate_result(single, "qwen35moe", PlacementBackend::Cuda).empty());
-    TEST_ASSERT(gate_result(single, "qwen3", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(gate_accepts(single, "qwen35moe", PlacementBackend::Cuda));
+    TEST_ASSERT(gate_accepts(single, "qwen3", PlacementBackend::Cuda));
 }
 
 static void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.paged_attention = true;
-    TEST_ASSERT(gate_result(args, "qwen35", PlacementBackend::Cuda).empty());
-    TEST_ASSERT(gate_result(args, "qwen35", PlacementBackend::Hip).empty());
+    TEST_ASSERT(gate_accepts(args, "qwen35", PlacementBackend::Cuda));
+    TEST_ASSERT(gate_accepts(args, "qwen35", PlacementBackend::Hip));
 
     // Only qwen35 has a paged decode path. qwen35moe shares Qwen35Config, so
     // its rejection is this gate's job — the factory's field-presence
     // cross-check cannot tell the two apart.
     for (const char * arch : {"qwen35moe", "laguna", "qwen3",
                               "gemma4", "deepseek4"}) {
-        TEST_ASSERT(!gate_result(args, arch, PlacementBackend::Cuda).empty());
+        TEST_ASSERT(!gate_accepts(args, arch, PlacementBackend::Cuda));
     }
 
     // Only the monolithic qwen35 backend owns a paged K/V pool. Both
@@ -367,17 +367,17 @@ static void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
     // rejection has to come from the paged rule.
     BackendArgs split = args;
     TEST_ASSERT(parse_placement_device_list("cuda:0,cuda:1", split.device));
-    TEST_ASSERT(!gate_result(split, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(split, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs remote_shard = args;
     remote_shard.remote_target_shard.ipc_bin = "/usr/bin/target-shard";
-    TEST_ASSERT(!gate_result(
-        remote_shard, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        remote_shard, "qwen35", PlacementBackend::Cuda));
 
     for (BackendArgs * relaxed : {&split, &remote_shard}) {
         relaxed->paged_attention = false;
-        TEST_ASSERT(gate_result(
-            *relaxed, "qwen35", PlacementBackend::Cuda).empty());
+        TEST_ASSERT(gate_accepts(
+            *relaxed, "qwen35", PlacementBackend::Cuda));
     }
 }
 
@@ -388,47 +388,127 @@ static void test_feature_gate_paged_attention_requires_plain_ar_decode() {
 
     BackendArgs draft = base;
     draft.draft_path = "/nonexistent/draft.gguf";
-    TEST_ASSERT(!gate_result(draft, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(draft, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs ddtree = base;
     ddtree.ddtree_mode = true;
-    TEST_ASSERT(!gate_result(ddtree, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(ddtree, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs windowed = base;
     windowed.fa_window = 4096;
-    TEST_ASSERT(!gate_result(
-        windowed, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        windowed, "qwen35", PlacementBackend::Cuda));
 
     BackendFeatureConfig pflash;
     pflash.pflash_enabled = true;
     pflash.pflash_drafter_configured = true;
-    TEST_ASSERT(!gate_result(
-        base, "qwen35", PlacementBackend::Cuda, pflash).empty());
+    TEST_ASSERT(!gate_accepts(
+        base, "qwen35", PlacementBackend::Cuda, pflash));
+
+    BackendFeatureConfig kvflash;
+    kvflash.kvflash_enabled = true;
+    TEST_ASSERT(!gate_accepts(
+        base, "qwen35", PlacementBackend::Cuda, kvflash));
 
     // The pool rounds max_ctx up to whole blocks, so both ends of the range
     // are rejected: nothing to allocate, and rounding that overflows int.
     BackendArgs empty_ctx = base;
     empty_ctx.device.max_ctx = 0;
-    TEST_ASSERT(!gate_result(
-        empty_ctx, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        empty_ctx, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs huge_ctx = base;
     huge_ctx.device.max_ctx = INT_MAX;
-    TEST_ASSERT(!gate_result(
-        huge_ctx, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(!gate_accepts(
+        huge_ctx, "qwen35", PlacementBackend::Cuda));
 
     BackendArgs max_ctx = base;
     max_ctx.device.max_ctx = INT_MAX - PAGED_BLOCK_SIZE + 1;
-    TEST_ASSERT(gate_result(
-        max_ctx, "qwen35", PlacementBackend::Cuda).empty());
+    TEST_ASSERT(gate_accepts(
+        max_ctx, "qwen35", PlacementBackend::Cuda));
 
     // None of these are rules about paged attention itself: without the flag
     // every one of them is a supported qwen35 launch.
     for (BackendArgs * args : {&draft, &ddtree, &windowed, &empty_ctx,
                                &huge_ctx}) {
         args->paged_attention = false;
-        TEST_ASSERT(gate_result(*args, "qwen35", PlacementBackend::Cuda).empty());
+        TEST_ASSERT(gate_accepts(*args, "qwen35", PlacementBackend::Cuda));
     }
+}
+
+static void test_feature_gate_parallel_and_kv_pool_rules() {
+    // A valid paged qwen35 monolithic launch is the baseline every rule
+    // below perturbs.
+    BackendArgs paged;
+    paged.model_path = "/nonexistent/model.gguf";
+    paged.paged_attention = true;
+
+    // --max-concurrency is validated even without any other flag: zero decode
+    // slots is meaningless on every backend.
+    BackendArgs plain;
+    plain.model_path = "/nonexistent/model.gguf";
+    plain.max_concurrency = 0;
+    TEST_ASSERT(!gate_accepts(plain, "qwen35", PlacementBackend::Cuda));
+    plain.max_concurrency = 1;
+    TEST_ASSERT(gate_accepts(plain, "qwen35", PlacementBackend::Cuda));
+
+    // More than one slot exists only in the paged qwen35 backend.
+    BackendArgs dense;
+    dense.model_path = "/nonexistent/model.gguf";
+    dense.max_concurrency = 2;
+    TEST_ASSERT(!gate_accepts(dense, "qwen35", PlacementBackend::Cuda));
+
+    BackendArgs parallel = paged;
+    parallel.max_concurrency = 2;
+    TEST_ASSERT(gate_accepts(
+        parallel, "qwen35", PlacementBackend::Cuda));
+
+    // Slot counts need not be powers of two. Decode graph buckets pad via
+    // active_slot_ids rather than changing the physical slot allocation.
+    parallel.max_concurrency = 3;
+    TEST_ASSERT(gate_accepts(
+        parallel, "qwen35", PlacementBackend::Cuda));
+
+    // 64 slots is the top of the supported range.
+    parallel.max_concurrency = 64;
+    TEST_ASSERT(gate_accepts(
+        parallel, "qwen35", PlacementBackend::Cuda));
+    parallel.max_concurrency = 65;
+    TEST_ASSERT(!gate_accepts(
+        parallel, "qwen35", PlacementBackend::Cuda));
+
+    // --kv-pool-tokens sizes the shared pool, so it needs slots to share.
+    BackendArgs pool = paged;
+    pool.kv_pool_tokens = 4096;
+    TEST_ASSERT(!gate_accepts(pool, "qwen35", PlacementBackend::Cuda));
+    pool.max_concurrency = 2;
+    TEST_ASSERT(gate_accepts(pool, "qwen35", PlacementBackend::Cuda));
+
+    // The pool must hold at least one block, and stay addressable with int
+    // after rounding up to whole blocks.
+    pool.kv_pool_tokens = PAGED_BLOCK_SIZE - 1;
+    TEST_ASSERT(!gate_accepts(pool, "qwen35", PlacementBackend::Cuda));
+    pool.kv_pool_tokens = PAGED_BLOCK_SIZE;
+    TEST_ASSERT(gate_accepts(pool, "qwen35", PlacementBackend::Cuda));
+    const long long max_pool_tokens =
+        ((long long)INT_MAX - PAGED_BLOCK_SIZE) /
+        PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
+    pool.kv_pool_tokens = max_pool_tokens + 1;
+    TEST_ASSERT(!gate_accepts(pool, "qwen35", PlacementBackend::Cuda));
+    pool.kv_pool_tokens = max_pool_tokens;
+    TEST_ASSERT(gate_accepts(pool, "qwen35", PlacementBackend::Cuda));
+
+    // The automatic pool is memory-derived, so a logical slot/context product
+    // larger than the physical tensor address space is legal.
+    BackendArgs overflow = paged;
+    overflow.max_concurrency = 2;
+    overflow.device.max_ctx = 1 << 30;
+    TEST_ASSERT(gate_accepts(
+        overflow, "qwen35", PlacementBackend::Cuda));
+    // An explicit addressable pool remains accepted as well.
+    overflow.kv_pool_tokens = 1 << 20;
+    TEST_ASSERT(gate_accepts(
+        overflow, "qwen35", PlacementBackend::Cuda));
 }
 
 // ── Inert-flag warnings ─────────────────────────────────────────────────
@@ -581,6 +661,7 @@ int main() {
     RUN_TEST(test_feature_gate_layer_split_requires_supported_arch);
     RUN_TEST(test_feature_gate_paged_attention_requires_qwen35_monolithic);
     RUN_TEST(test_feature_gate_paged_attention_requires_plain_ar_decode);
+    RUN_TEST(test_feature_gate_parallel_and_kv_pool_rules);
     RUN_TEST(test_feature_warnings_silent_when_supported);
     RUN_TEST(test_feature_warnings_report_inert_draft);
     RUN_TEST(test_feature_warnings_report_inert_decode_tunables);

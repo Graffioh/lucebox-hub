@@ -24,8 +24,10 @@
 #include "common/peer_access.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
+#include "kvflash_pager.h"
 
 #include <algorithm>
+#include <charconv>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -106,6 +108,13 @@ static void print_usage(const char * prog) {
         "                       from attention at long contexts. Use 0 for tools.\n"
         "  --paged-attention   Use 16-token paged KV blocks for Qwen3.6-27B\n"
         "                       autoregressive decode (experimental)\n"
+        "  --max-concurrency <N>  Maximum concurrent decode sequences\n"
+        "                         (requires --paged-attention; default: 1)\n"
+        "  --admission-coalesce-ms <N>  Idle-to-busy batching window\n"
+        "                               (default: 20; 0 disables)\n"
+        "  --kv-pool-tokens <N> Total paged K/V pool shared by all\n"
+        "                       --max-concurrency slots, in tokens\n"
+        "                       (default: sized from available device memory)\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
@@ -353,6 +362,27 @@ int main(int argc, char ** argv) {
             bargs.fa_window = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--paged-attention") == 0) {
             bargs.paged_attention = true;
+        } else if (std::strcmp(argv[i], "--max-concurrency") == 0 && i + 1 < argc) {
+            bargs.max_concurrency = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--admission-coalesce-ms") == 0 &&
+                   i + 1 < argc) {
+            sconfig.admission_coalesce_ms = std::atoi(argv[++i]);
+            if (sconfig.admission_coalesce_ms < 0 ||
+                sconfig.admission_coalesce_ms > 1000) {
+                std::fprintf(stderr,
+                    "[server] --admission-coalesce-ms must be in [0,1000]\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--kv-pool-tokens") == 0 && i + 1 < argc) {
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(
+                value, end, bargs.kv_pool_tokens);
+            if (parsed.ec != std::errc{} || parsed.ptr != end) {
+                std::fprintf(stderr,
+                    "[server] --kv-pool-tokens must be an integer\n");
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--model-name") == 0 && i + 1 < argc) {
             sconfig.model_name = argv[++i];
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
@@ -613,6 +643,11 @@ int main(int argc, char ** argv) {
     backend_features.routing_stats_requested =
         sconfig.freq_tracking || !sconfig.collect_routing_path.empty();
     backend_features.adaptive_experts_requested = adaptive_experts_set;
+    // Fixed pools are known incompatibilities before model setup. Automatic
+    // sizing needs the backend's real VRAM budget; if it produces a live pool,
+    // the backend rejects the pairing after sizing.
+    backend_features.kvflash_enabled =
+        kvflash_fixed_pool_requested(std::getenv("DFLASH_KVFLASH"));
     const BackendPreparation backend_preparation =
         prepare_backend(bargs, backend_features);
     if (!backend_preparation.ok()) {
@@ -1029,6 +1064,8 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  peer_access     = %s\n",
                  bargs.device.peer_access ? "ON" : "off");
     std::fprintf(stderr, "[server] │  chunk           = %d\n", bargs.chunk);
+    std::fprintf(stderr, "[server] │  admission_wait  = %d ms\n",
+                 sconfig.admission_coalesce_ms);
     if (arch == "deepseek4") {
         std::fprintf(stderr, "[server] │  ds4_fused      = %s\n",
                      bargs.ds4_fused_decode ? "ON" : "off");

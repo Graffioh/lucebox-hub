@@ -350,7 +350,9 @@ When compression is on, the request path picks one of three modes automatically,
 | `DFLASH_PREFILL_CACHE_SLOTS=N` | `0` | Container-entrypoint equivalent of `--prefill-cache-slots`; the native binary itself uses the CLI flag. |
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
 | `--kv-cache-budget N` | — | On-disk cache size cap |
-| `--paged-attention` | off | Exact 16-token block-table decode for single-device Qwen3.6-27B AR; see [paged attention](optimizations/paged_attention/README.md) |
+| `--paged-attention` | off | Exact 16-token block-table attention for Qwen3.6-27B; see [paged attention](optimizations/paged_attention/README.md) |
+| `--max-concurrency N` | `1` | Maximum concurrent sequence slots. Values 2–64 require `--paged-attention`. |
+| `--kv-pool-tokens N` | `0` (auto) | Shared physical K/V capacity for concurrent paged serving. Requires `--paged-attention` and `--max-concurrency` greater than 1. Zero derives capacity from available device memory; explicit values are rounded to whole 16-token blocks. |
 
 **Bounded KV residency (KVFlash)**
 
@@ -388,6 +390,7 @@ Pages the attention KV cache through a fixed pool of GPU slots; cold 64-token ch
 | `--draft-ipc-bin <path>` | — | Out-of-process draft binary (mixed CUDA/HIP) |
 | `--peer-access` | off | Enable P2P between target GPUs |
 | `--chunk N` | backend default | Prefill ubatch size |
+| `--admission-coalesce-ms N` | `20` | Idle-to-busy batching window for concurrent serving, from 0 to 1000 ms; `0` disables it. |
 | `--no-cors` | CORS on | Disable CORS headers |
 | `DFLASH_TARGET_GPU=N` | `0` | Env var equivalent of `--target-gpu` |
 | `DFLASH_DRAFT_GPU=N` | same as target | Env var equivalent of `--draft-gpu` |

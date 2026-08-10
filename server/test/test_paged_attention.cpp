@@ -54,7 +54,7 @@ std::vector<int32_t> make_block_table(
     std::vector<int32_t> result(
         static_cast<size_t>(test_case.max_blocks) * n_seq, -1);
 
-    // 37 is coprime with both cases' live-block counts, so this maps every
+    // 37 is coprime with the test cases' live-block counts, so this maps every
     // logical page to a unique shuffled physical page.
     int ordinal = 0;
     for (int seq = 0; seq < n_seq; ++seq) {
@@ -121,14 +121,19 @@ std::vector<float> reference_attention(
         int physical_blocks,
         const std::vector<float> & q,
         const std::vector<float> & k,
-        const std::vector<float> & v) {
+        const std::vector<float> & v,
+        const std::vector<int32_t> * active_slot_ids = nullptr) {
     std::vector<float> output(q.size(), 0.0f);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
     const int q_per_kv = N_HEAD / N_HEAD_KV;
-    const int n_seq = static_cast<int>(test_case.kv_seq_lens.size());
+    const int n_seq = active_slot_ids
+        ? static_cast<int>(active_slot_ids->size())
+        : static_cast<int>(test_case.kv_seq_lens.size());
 
     for (int seq = 0; seq < n_seq; ++seq) {
-        const int kv_seq_len = clamped_seq_len(test_case, seq);
+        const int physical_seq = active_slot_ids ? (*active_slot_ids)[seq] : seq;
+        if (physical_seq < 0) continue;
+        const int kv_seq_len = clamped_seq_len(test_case, physical_seq);
         for (int head = 0; head < N_HEAD; ++head) {
             const int kv_head = head / q_per_kv;
             const float * q_row =
@@ -139,7 +144,7 @@ std::vector<float> reference_attention(
             for (int token = 0; token < kv_seq_len; ++token) {
                 const int block =
                     block_table[
-                        seq * test_case.max_blocks + token / BLOCK_SIZE];
+                        physical_seq * test_case.max_blocks + token / BLOCK_SIZE];
                 if (!block_is_valid(block, physical_blocks)) {
                     // Mirrors the kernel: invalid blocks contribute nothing.
                     scores[token] = -INFINITY;
@@ -166,7 +171,7 @@ std::vector<float> reference_attention(
             for (int token = 0; token < kv_seq_len; ++token) {
                 const int block =
                     block_table[
-                        seq * test_case.max_blocks + token / BLOCK_SIZE];
+                        physical_seq * test_case.max_blocks + token / BLOCK_SIZE];
                 if (!block_is_valid(block, physical_blocks)) continue;
                 const int physical = block * BLOCK_SIZE + token % BLOCK_SIZE;
                 const float * v_row =
@@ -185,8 +190,12 @@ std::vector<float> reference_attention(
 bool run_case(ggml_backend_t backend,
               const TestCase & test_case,
               ggml_type k_type,
-              ggml_type v_type) {
-    const int n_seq = static_cast<int>(test_case.kv_seq_lens.size());
+              ggml_type v_type,
+              const std::vector<int32_t> * active_slot_ids = nullptr) {
+    const int physical_n_seq = static_cast<int>(test_case.kv_seq_lens.size());
+    const int n_seq = active_slot_ids
+        ? static_cast<int>(active_slot_ids->size())
+        : physical_n_seq;
     const int physical_blocks = count_physical_blocks(test_case);
     const int pool_tokens = physical_blocks * BLOCK_SIZE;
     const std::vector<int32_t> block_table =
@@ -206,18 +215,24 @@ bool run_case(ggml_backend_t backend,
         ggml_new_tensor_3d(ctx, v_type, D, pool_tokens, N_HEAD_KV);
     ggml_tensor * table =
         ggml_new_tensor_2d(
-            ctx, GGML_TYPE_I32, test_case.max_blocks, n_seq);
+            ctx, GGML_TYPE_I32, test_case.max_blocks, physical_n_seq);
     ggml_tensor * kv_seq_lens =
-        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq);
+        ggml_new_tensor_1d(ctx, GGML_TYPE_I32, physical_n_seq);
     for (ggml_tensor * input : {q, k, v, table, kv_seq_lens}) {
         ggml_set_input(input);
     }
+    ggml_tensor * active = nullptr;
+    if (active_slot_ids) {
+        active = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq);
+        ggml_set_input(active);
+    }
 
-    ggml_tensor * output = ggml_paged_attn(
-        ctx, q, k, v, table, kv_seq_lens,
-        1.0f / std::sqrt(static_cast<float>(D)), BLOCK_SIZE,
-        *std::max_element(test_case.kv_seq_lens.begin(),
-                          test_case.kv_seq_lens.end()));
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+    const int max_kv_seq_len = *std::max_element(
+        test_case.kv_seq_lens.begin(), test_case.kv_seq_lens.end());
+    ggml_tensor * output = ggml_paged_attn_ext(
+        ctx, q, k, v, table, kv_seq_lens, active,
+        scale, BLOCK_SIZE, max_kv_seq_len);
     ggml_set_output(output);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
@@ -266,6 +281,11 @@ bool run_case(ggml_backend_t backend,
             kv_seq_lens, test_case.kv_seq_lens.data(), 0,
             test_case.kv_seq_lens.size() *
                 sizeof(test_case.kv_seq_lens[0]));
+        if (active_slot_ids) {
+            ggml_backend_tensor_set(
+                active, active_slot_ids->data(), 0,
+                active_slot_ids->size() * sizeof((*active_slot_ids)[0]));
+        }
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
     }
 
@@ -277,7 +297,7 @@ bool run_case(ggml_backend_t backend,
         const std::vector<float> expected =
             reference_attention(
                 test_case, block_table, pool_tokens, physical_blocks,
-                q_data, k_reference, v_reference);
+                q_data, k_reference, v_reference, active_slot_ids);
         max_abs_error = 0.0f;
         for (size_t i = 0; i < actual.size(); ++i) {
             if (!std::isfinite(actual[i])) {
@@ -290,8 +310,9 @@ bool run_case(ggml_backend_t backend,
         ok = ok && max_abs_error < MAX_ABS_ERROR;
     }
 
-    std::printf("paged attention %-11s K=%-4s V=%-4s max_abs=%.6g %s\n",
+    std::printf("paged attention %-11s K=%-4s V=%-4s active=%s max_abs=%.6g %s\n",
                 test_case.name, ggml_type_name(k_type), ggml_type_name(v_type),
+                active_slot_ids ? "yes" : "no",
                 max_abs_error, ok ? "PASS" : "FAIL");
     ggml_gallocr_free(allocator);
     ggml_free(ctx);
@@ -319,8 +340,8 @@ bool rejects_unlaunchable_gqa(ggml_backend_t backend) {
         ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
     ggml_tensor * kv_seq_lens =
         ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-    ggml_tensor * output = ggml_paged_attn(
-        ctx, q, k, v, table, kv_seq_lens,
+    ggml_tensor * output = ggml_paged_attn_ext(
+        ctx, q, k, v, table, kv_seq_lens, nullptr,
         1.0f / std::sqrt(static_cast<float>(D)), BLOCK_SIZE, 1);
 
     const bool rejected = !ggml_backend_supports_op(backend, output);
@@ -356,6 +377,12 @@ int main(int argc, char ** argv) {
         {0, 1, 15, 16, 17, 257, 511},
         false,
     };
+    const TestCase compact_three_slot_case{
+        "compact-3",
+        2,
+        {1, 17, 31},
+        false,
+    };
     const bool direct =
         argc == 2 && std::strcmp(argv[1], "--direct") == 0;
     if (argc > 2 || (argc == 2 && !direct)) {
@@ -374,6 +401,20 @@ int main(int argc, char ** argv) {
             ok = run_case(backend, test_case, k_type, v_type) && ok;
         }
     }
+    const int physical_n_seq = static_cast<int>(test_case.kv_seq_lens.size());
+    const std::vector<int32_t> active_slot_ids{
+        physical_n_seq - 1, physical_n_seq - 2, -1, 4,
+    };
+    ok = run_case(backend, test_case, GGML_TYPE_F16, GGML_TYPE_F16,
+                  &active_slot_ids) && ok;
+
+    // Compact graph buckets may be wider than physical metadata. This is the
+    // shape produced by three live server slots: four query rows, with the
+    // final row padded and mapped to no physical block-table column.
+    const std::vector<int32_t> compact_three_slot_ids{2, 1, 0, -1};
+    ok = run_case(backend, compact_three_slot_case,
+                  GGML_TYPE_F16, GGML_TYPE_F16,
+                  &compact_three_slot_ids) && ok;
 
     ggml_backend_free(backend);
     return ok ? 0 : 1;
