@@ -82,12 +82,16 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
             test_dflash test_generate test_flash_attn_sparse test_server_unit \
-            test_deepseek4_unit -j$(nproc)
+            test_deepseek4_unit test_feature_gate test_seq_slot_manager \
+            test_seq_engine_contract test_seq_batch_plan test_client_send_buffer \
+            test_model_smoke test_batched_gdn -j$(nproc)
 
       - name: Run C++ server unit tests
         run: |
           cd server/build
-          ctest --output-on-failure -R "server_unit|deepseek4_unit" --no-tests=error
+          ctest --output-on-failure \
+            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|batched_gdn_cpu" \
+            --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
         # First pass: install the workspace's default deps. dflash declares
@@ -207,6 +211,8 @@ jobs:
             test_rocmfp_mix_slice_matvec
             test_rocmfp_mix_gateup_glu
             test_ds4_mix_registry_teardown
+            test_model_smoke
+            test_batched_gdn
           )
           if [[ "$RUN_SPARSE_ATTENTION_TEST" == "true" ]]; then
             targets+=(test_flash_attn_sparse)
@@ -222,6 +228,11 @@ jobs:
           ./server/build/test_deepseek4_unit
           ctest --test-dir server/build --output-on-failure \
             -R 'rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown'
+
+      - name: Run concurrent-serving kernel tests
+        run: |
+          ctest --test-dir server/build --output-on-failure \
+            -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$)' --no-tests=error
 
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
       # disabled by default because it builds dflash_server and lazy-loads the
@@ -338,11 +349,11 @@ jobs:
               test_deepseek4_mmid_grouped_cuda test_deepseek4_unit \
               test_recurrent_snapshot test_server_unit test_rocmfp3_mix_registry \
               test_rocmfp_mix_slice_matvec test_rocmfp_mix_gateup_glu \
-              test_ds4_mix_registry_teardown \
+              test_ds4_mix_registry_teardown test_model_smoke test_batched_gdn \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|recurrent_snapshot|ChainRollbackPolicy|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown'
+            -R 'rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|recurrent_snapshot|ChainRollbackPolicy|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|test_model_smoke\.PagedAttention\.|batched_gdn$'
 
   build-windows:
     name: Build Windows (MSVC + CUDA, library + server targets)

@@ -392,6 +392,11 @@ void test_feature_gate_paged_attention_requires_plain_ar_decode() {
     CHECK(!gate_result(
         base, "qwen35", PlacementBackend::Cuda, pflash).empty());
 
+    BackendFeatureConfig kvflash;
+    kvflash.kvflash_enabled = true;
+    CHECK(!gate_result(
+        base, "qwen35", PlacementBackend::Cuda, kvflash).empty());
+
     // The pool rounds max_ctx up to whole blocks, so both ends of the range
     // are rejected: nothing to allocate, and rounding that overflows int.
     BackendArgs empty_ctx = base;
@@ -416,6 +421,75 @@ void test_feature_gate_paged_attention_requires_plain_ar_decode() {
         args->paged_attention = false;
         CHECK(gate_result(*args, "qwen35", PlacementBackend::Cuda).empty());
     }
+}
+
+void test_feature_gate_parallel_and_kv_pool_rules() {
+    // A valid paged qwen35 monolithic launch is the baseline every rule
+    // below perturbs.
+    BackendArgs paged;
+    paged.model_path = "/nonexistent/model.gguf";
+    paged.paged_attention = true;
+
+    // --max-concurrency is validated even without any other flag: zero decode
+    // slots is meaningless on every backend.
+    BackendArgs plain;
+    plain.model_path = "/nonexistent/model.gguf";
+    plain.max_concurrency = 0;
+    CHECK(!gate_result(plain, "qwen35", PlacementBackend::Cuda).empty());
+    plain.max_concurrency = 1;
+    CHECK(gate_result(plain, "qwen35", PlacementBackend::Cuda).empty());
+
+    // More than one slot exists only in the paged qwen35 backend.
+    BackendArgs dense;
+    dense.model_path = "/nonexistent/model.gguf";
+    dense.max_concurrency = 2;
+    CHECK(!gate_result(dense, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs parallel = paged;
+    parallel.max_concurrency = 2;
+    CHECK(gate_result(parallel, "qwen35", PlacementBackend::Cuda).empty());
+
+    // Slot counts need not be powers of two. Decode graph buckets pad via
+    // active_slot_ids rather than changing the physical slot allocation.
+    parallel.max_concurrency = 3;
+    CHECK(gate_result(parallel, "qwen35", PlacementBackend::Cuda).empty());
+
+    // 64 slots is the top of the supported range.
+    parallel.max_concurrency = 64;
+    CHECK(gate_result(parallel, "qwen35", PlacementBackend::Cuda).empty());
+    parallel.max_concurrency = 65;
+    CHECK(!gate_result(parallel, "qwen35", PlacementBackend::Cuda).empty());
+
+    // --kv-pool-tokens sizes the shared pool, so it needs slots to share.
+    BackendArgs pool = paged;
+    pool.kv_pool_tokens = 4096;
+    CHECK(!gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+    pool.max_concurrency = 2;
+    CHECK(gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+
+    // The pool must hold at least one block, and stay addressable with int
+    // after rounding up to whole blocks.
+    pool.kv_pool_tokens = PAGED_BLOCK_SIZE - 1;
+    CHECK(!gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+    pool.kv_pool_tokens = PAGED_BLOCK_SIZE;
+    CHECK(gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+    const long long max_pool_tokens =
+        ((long long)INT_MAX - PAGED_BLOCK_SIZE) /
+        PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
+    pool.kv_pool_tokens = max_pool_tokens + 1;
+    CHECK(!gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+    pool.kv_pool_tokens = max_pool_tokens;
+    CHECK(gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+
+    // The automatic pool is memory-derived, so a logical slot/context product
+    // larger than the physical tensor address space is legal.
+    BackendArgs overflow = paged;
+    overflow.max_concurrency = 2;
+    overflow.device.max_ctx = 1 << 30;
+    CHECK(gate_result(overflow, "qwen35", PlacementBackend::Cuda).empty());
+    // An explicit addressable pool remains accepted as well.
+    overflow.kv_pool_tokens = 1 << 20;
+    CHECK(gate_result(overflow, "qwen35", PlacementBackend::Cuda).empty());
 }
 
 // ── Inert-flag warnings ─────────────────────────────────────────────────
@@ -570,6 +644,7 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_layer_split_requires_supported_arch();
     test_feature_gate_paged_attention_requires_qwen35_monolithic();
     test_feature_gate_paged_attention_requires_plain_ar_decode();
+    test_feature_gate_parallel_and_kv_pool_rules();
     test_feature_warnings_silent_when_supported();
     test_feature_warnings_report_inert_draft();
     test_feature_warnings_report_inert_decode_tunables();

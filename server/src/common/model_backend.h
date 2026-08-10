@@ -22,6 +22,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "sampler.h"
+#include "concurrency/seq_engine.h"
 #include "placement/draft_residency.h"
 
 namespace dflash::common {
@@ -320,6 +321,19 @@ struct ModelBackend {
 
     virtual GenerateResult generate_impl(const GenerateRequest & req,
                                          const DaemonIO & io) = 0;
+
+    // ── Concurrent serving ───────────────────────────────────────────
+    // Backends that can hold several live sequences at once and execute a
+    // batched decode over paged KV expose them as decode slots through a
+    // SeqEngine (common/concurrency/seq_engine.h). Any additional
+    // per-sequence model state is an implementation detail of that engine.
+    // nullptr — the
+    // default — means this backend serves one request at a time and the
+    // server drives it through generate().
+    //
+    // The engine is owned by the backend; the returned pointer is borrowed
+    // and stays valid until shutdown().
+    virtual SeqEngine * seq_engine() { return nullptr; }
 
     // ── Snapshots ────────────────────────────────────────────────────
     // With right-sized CPU-resident snapshots, each slot costs only
