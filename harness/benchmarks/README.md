@@ -4,6 +4,9 @@ These checks are separate from the client harness launchers. They compare Lucebo
 generation against a llama.cpp baseline on the same target GGUF, using small
 deterministic prompts.
 
+For the paired ragged C1/C4/C8/C16 serving benchmark, see
+[`concurrency/`](concurrency/README.md).
+
 Use this when you want to know whether a server change affects output quality or
 decode speed. Use `harness/clients/` when you want to know whether Codex,
 OpenCode, Open WebUI, Pi, and the other clients still work.
