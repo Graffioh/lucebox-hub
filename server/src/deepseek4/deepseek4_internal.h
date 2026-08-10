@@ -430,6 +430,9 @@ bool build_deepseek4_head4_tail2_routes(
     ggml_tensor * router_weights,
     int n_tokens,
     DeepSeek4Head4Tail2Routes & out);
+bool deepseek4_exact_tokenwise_uses_runtime_raw_row(
+    int token_position,
+    int n_swa);
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
                              DeepSeek4Snapshot & out);
