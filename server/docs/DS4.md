@@ -311,6 +311,87 @@ performance profile held 48.1 tok/s median on the deterministic 128-token
 workload. The all-6-expert reference-exact mode is a correctness profile, not
 a throughput profile.
 
+### Strix Halo concurrent serving
+
+DeepSeek4 paged concurrency supports two resident HIP deployments:
+
+- one monolithic Strix Halo (`gfx1151`) target with every expert on that
+  device, through 6 lanes; and
+- the in-process R9700 (`gfx1201`) target + Strix Halo expert-parallel
+  deployment, through 6 lanes. The target keeps dense work and its selected
+  experts while the secondary owns the remaining materialized experts.
+
+The heterogeneous mode is route-level expert parallelism. It is not an
+explicit `--target-device hip:0,hip:1` layer split and does not use a remote
+target shard or host-streamed experts.
+
+The backend keeps raw MLA rows, compressed rows, and indexer state in a
+persistent 128-token paged cache. The shared
+HTTP scheduler performs admission, cancellation, slow-client isolation, and
+fair continuous batching. DeepSeek4 lowers each scheduler plan into one exact
+gathered graph with up to 6 independent lanes. Decode rows share the weight
+pass; each selected prompt advances by one exact token because the graph must
+not contain two rows from the same sequence.
+
+```bash
+hf download Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3 \
+  DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf \
+  --local-dir /path/to/models
+
+cmake -S server -B server/build-hip \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
+  -DDFLASH27B_SERVER=ON \
+  -DGGML_HIP_GRAPHS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build server/build-hip -j
+
+./server/build-hip/dflash_server \
+  /path/to/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf \
+  --target-device hip:0 \
+  --paged-attention \
+  --max-concurrency 6 \
+  --kv-pool-tokens 24576 \
+  --max-ctx 4096 \
+  --ds4-prefill exact \
+  --prefix-cache-slots 0
+```
+
+For the R9700 + Strix Halo path, build `server/build-hip-dual` for
+`gfx1151;gfx1201` as shown in
+[In-process heterogeneous expert parallel](#in-process-heterogeneous-expert-parallel).
+Then expose the R9700 first and select the static in-process expert split:
+
+```bash
+export HIP_VISIBLE_DEVICES=<r9700-index>,<strix-index>
+export DFLASH_DS4_MOE_TP=1
+export DFLASH_DS4_MOE_TP_INPROC=1
+export DFLASH_DS4_MOE_TP_GPU=1
+export DFLASH_EXPERT_BUDGET_MB=11700
+
+./server/build-hip-dual/dflash_server \
+  /path/to/models/DeepSeek-V4-Flash.gguf \
+  --target-device hip:0 \
+  --peer-access \
+  --paged-attention \
+  --max-concurrency 6 \
+  --kv-pool-tokens 24576 \
+  --max-ctx 4096 \
+  --ds4-prefill exact \
+  --prefix-cache-slots 0
+```
+
+The heterogeneous paged cache is charged against the R9700 before selecting
+resident experts. Increase `--kv-pool-tokens` only when the primary has enough
+memory for the larger
+shared history pool.
+
+Paged concurrency fails closed for other primary/secondary architecture pairs,
+CUDA or out-of-process expert ownership, explicit layer or remote target
+splits, drafts/DSpark, DDTree, PFlash/KVFlash, fused decode, approximate
+prefill, windowed attention, mutable expert caching, and prefix-cache parking.
+There is no automatic fallback to a slower or asymmetric execution mode.
+
 ### Local single-shard
 
 If the adapter decides all 43 layers fit on one CUDA GPU, it loads a single shard locally and no IPC daemon is involved.
@@ -385,7 +466,8 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | Optional explicit peer backend module path. |
 | `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
-| `GGML_BATCH_PEER_COPIES` | Batch peer-runtime copies and unlike-runtime pinned-host staging with one source wait per split. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. |
+| `DFLASH_DS4_TP_BATCH_SPLIT_COPIES` | Establish destination readiness once per scheduler split without combining backend copy dependencies. The qualified dual-ROCm launcher enables this exact path. |
+| `GGML_BATCH_PEER_COPIES` | Additionally combine HIP peer-copy dependency publication. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. Keep these event-batching variables unset for the exact qualified profile. |
 | `DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT` | Use the routing profile and measured owner-rate ratio to minimize the predicted two-owner MoE critical path instead of maximizing aggregate hot-hit rate. Requires `DFLASH_DS4_HOTNESS_CSV`. |
 | `DFLASH_DS4_TP_MAIN_TO_PEER_RATE` | Relative main/peer routed-expert rate used by critical-path placement. It must be finite and greater than zero; the default is `3.4`. |
 | `DFLASH_DS4_TP_BALANCE_MIN_HOT` | Minimum hot experts retained on every routed layer by critical-path placement. Defaults to `0`. |

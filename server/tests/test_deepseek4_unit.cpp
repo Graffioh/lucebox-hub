@@ -688,6 +688,152 @@ static void test_moe_routing_correctness(ggml_backend_t backend) {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_top6_head4_tail2_route_slices(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_top6_head4_tail2_route_slices ...");
+
+    constexpr int route_width = 6;
+    constexpr int n_tokens = 4;
+    std::vector<int32_t> selected_values(route_width * n_tokens);
+    std::vector<float> weight_values(route_width * n_tokens);
+    std::vector<int32_t> expected_head_ids;
+    std::vector<int32_t> expected_tail_ids;
+    std::vector<float> expected_head_weights;
+    std::vector<float> expected_tail_weights;
+    for (int token = 0; token < n_tokens; ++token) {
+        for (int route = 0; route < route_width; ++route) {
+            const size_t index = (size_t) token * route_width + route;
+            selected_values[index] = token * 10 + route;
+            weight_values[index] = (float) (token * 10 + route) + 0.25f;
+            if (route < 4) {
+                expected_head_ids.push_back(selected_values[index]);
+                expected_head_weights.push_back(weight_values[index]);
+            } else {
+                expected_tail_ids.push_back(selected_values[index]);
+                expected_tail_weights.push_back(weight_values[index]);
+            }
+        }
+    }
+
+    ggml_context * ctx = make_test_context();
+    TEST_ASSERT_MSG(ctx != nullptr, "ggml_init failed");
+    if (!ctx) {
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    ggml_tensor * selected = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, route_width, n_tokens);
+    ggml_tensor * weights = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, route_width, n_tokens);
+    ggml_set_input(selected);
+    ggml_set_input(weights);
+
+    DeepSeek4Head4Tail2Routes routes;
+    TEST_ASSERT(build_deepseek4_head4_tail2_routes(
+        ctx, selected, weights, n_tokens, routes));
+    TEST_ASSERT(routes.head_ids && routes.head_weights &&
+                routes.tail_ids && routes.tail_weights);
+    if (!routes.head_ids || !routes.head_weights ||
+        !routes.tail_ids || !routes.tail_weights) {
+        ggml_free(ctx);
+        std::fprintf(stderr, " FAIL\n");
+        return;
+    }
+
+    TEST_ASSERT(routes.head_ids->ne[0] == 4);
+    TEST_ASSERT(routes.head_ids->ne[1] == n_tokens);
+    TEST_ASSERT(routes.head_weights->ne[0] == 4);
+    TEST_ASSERT(routes.head_weights->ne[1] == n_tokens);
+    TEST_ASSERT(routes.tail_ids->ne[0] == 2);
+    TEST_ASSERT(routes.tail_ids->ne[1] == n_tokens);
+    TEST_ASSERT(routes.tail_weights->ne[0] == 2);
+    TEST_ASSERT(routes.tail_weights->ne[1] == n_tokens);
+
+    const ggml_tensor * outputs[] = {
+        routes.head_ids,
+        routes.head_weights,
+        routes.tail_ids,
+        routes.tail_weights,
+    };
+    const ggml_tensor * sources[] = {
+        selected,
+        weights,
+        selected,
+        weights,
+    };
+    for (size_t i = 0; i < 4; ++i) {
+        TEST_ASSERT(outputs[i]->op == GGML_OP_CONT);
+        TEST_ASSERT(outputs[i]->src[0] != nullptr);
+        if (outputs[i]->src[0]) {
+            TEST_ASSERT(outputs[i]->src[0]->view_src == sources[i]);
+            TEST_ASSERT(outputs[i]->src[0]->nb[1] == sources[i]->nb[1]);
+        }
+        ggml_set_output(const_cast<ggml_tensor *>(outputs[i]));
+    }
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    for (ggml_tensor * output : {
+             routes.head_ids,
+             routes.head_weights,
+             routes.tail_ids,
+             routes.tail_weights}) {
+        ggml_build_forward_expand(graph, output);
+    }
+    int cont_nodes = 0;
+    int concat_nodes = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        const ggml_tensor * node = ggml_graph_node(graph, i);
+        cont_nodes += node->op == GGML_OP_CONT;
+        concat_nodes += node->op == GGML_OP_CONCAT;
+    }
+    TEST_ASSERT(cont_nodes == 4);
+    TEST_ASSERT(concat_nodes == 0);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    TEST_ASSERT(ggml_gallocr_alloc_graph(alloc, graph));
+    ggml_backend_tensor_set(selected, selected_values.data(), 0,
+                            selected_values.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(weights, weight_values.data(), 0,
+                            weight_values.size() * sizeof(float));
+    TEST_ASSERT(ggml_backend_graph_compute(backend, graph) ==
+                GGML_STATUS_SUCCESS);
+
+    std::vector<int32_t> actual_head_ids(expected_head_ids.size());
+    std::vector<int32_t> actual_tail_ids(expected_tail_ids.size());
+    std::vector<float> actual_head_weights(expected_head_weights.size());
+    std::vector<float> actual_tail_weights(expected_tail_weights.size());
+    ggml_backend_tensor_get(routes.head_ids, actual_head_ids.data(), 0,
+                            actual_head_ids.size() * sizeof(int32_t));
+    ggml_backend_tensor_get(routes.tail_ids, actual_tail_ids.data(), 0,
+                            actual_tail_ids.size() * sizeof(int32_t));
+    ggml_backend_tensor_get(routes.head_weights,
+                            actual_head_weights.data(), 0,
+                            actual_head_weights.size() * sizeof(float));
+    ggml_backend_tensor_get(routes.tail_weights,
+                            actual_tail_weights.data(), 0,
+                            actual_tail_weights.size() * sizeof(float));
+    TEST_ASSERT(actual_head_ids == expected_head_ids);
+    TEST_ASSERT(actual_tail_ids == expected_tail_ids);
+    TEST_ASSERT(actual_head_weights == expected_head_weights);
+    TEST_ASSERT(actual_tail_weights == expected_tail_weights);
+
+    DeepSeek4Head4Tail2Routes invalid;
+    ggml_tensor * five_routes = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, 5, n_tokens);
+    ggml_tensor * integer_weights = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, route_width, n_tokens);
+    TEST_ASSERT(!build_deepseek4_head4_tail2_routes(
+        ctx, five_routes, weights, n_tokens, invalid));
+    TEST_ASSERT(!build_deepseek4_head4_tail2_routes(
+        ctx, selected, integer_weights, n_tokens, invalid));
+    TEST_ASSERT(!build_deepseek4_head4_tail2_routes(
+        ctx, selected, weights, 0, invalid));
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_rmsnorm_correctness(ggml_backend_t backend) {
     std::fprintf(stderr, "  test_rmsnorm_correctness ...");
 
@@ -4126,6 +4272,7 @@ int main() {
     test_chunked_graph_allocator(backend);
     test_swiglu_ds4_cpu_correctness(backend);
     test_moe_routing_correctness(backend);
+    test_top6_head4_tail2_route_slices(backend);
     test_rmsnorm_correctness(backend);
     test_grouped_output_projection_shape();
     test_grouped_output_projection_cpu(backend);
