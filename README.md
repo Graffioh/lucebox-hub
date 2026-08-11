@@ -64,7 +64,7 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Qwen 3.6 27B HIP | **~2.6×** |
 | Gemma 4 26B-A4B | **1.31×** |
 | Gemma 4 31B IT | **3.2×** |
-| [`DeepSeek V4 Flash ROCMFPX HIP`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-ROCMFPX) | **2×** |
+| [`DeepSeek V4 Flash ROCMFPX HIP`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) | **2×** |
 
 </td>
 <td valign="top">
@@ -76,7 +76,7 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | [`gemma 4 31B`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | decode |
 | [`Laguna XS 2.1 33B`](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF) | decode |
 | [`Qwen3 0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) | prefill |
-| [`DeepSeek V4 Flash DSpark Drafter`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-DSpark-Drafter-GGUF) | decode |
+| [`DeepSeek V4 Flash DSpark Drafter`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF) | decode |
 
 </td>
 </tr>
