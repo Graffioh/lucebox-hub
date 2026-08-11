@@ -7,6 +7,7 @@
 #include "qwen35_seq_engine.h"
 
 #include "qwen35_backend.h"
+#include "qwen35_roctx.h"
 #include "graph_builders.h"
 #include "attn_masks.h"
 #include "prefill_helpers.h"
@@ -314,6 +315,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     }
     const bool with_prefill = n_prefill > 0;
     const int n_total = n_prefill + decode_bucket;
+    const Qwen35RoctxMetadata roctx_metadata{
+        live_count, decode_bucket, n_prefill, (int)segments.size(),
+        n_total, max_kv_len};
+    const Qwen35RoctxRange roctx_step("qwen35.concurrent_step", roctx_metadata);
     const int gather_rows = with_prefill
         ? (with_decode ? n_commits + decode_bucket
                        : std::max(1, n_commits))
@@ -481,8 +486,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         b_.target_backend_, b_.cache_.paged_kv_seq_lens,
         seq_lens_.data(), 0, sizeof(int32_t) * seq_lens_.size());
 
-    const auto st =
-        ggml_backend_graph_compute(b_.target_backend_, sg.gf);
+    ggml_status st = GGML_STATUS_FAILED;
+    {
+        const Qwen35RoctxRange roctx_compute(
+            "qwen35.graph_compute", roctx_metadata);
+        st = ggml_backend_graph_compute(b_.target_backend_, sg.gf);
+    }
     if (st != GGML_STATUS_SUCCESS) {
         return fail_step("packed prefill/decode compute failed");
     }
@@ -493,7 +502,11 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     ggml_backend_tensor_get_async(
         b_.target_backend_, sg.argmax_tokens, argmax_buf_.data(), 0,
         sizeof(int32_t) * argmax_buf_.size());
-    ggml_backend_synchronize(b_.target_backend_);
+    {
+        const Qwen35RoctxRange roctx_sync(
+            "qwen35.argmax_readback", roctx_metadata);
+        ggml_backend_synchronize(b_.target_backend_);
+    }
 
     for (size_t oi = 0; oi < inputs.size(); ++oi) {
         DecodeOutput & out = decode_outputs[oi];
