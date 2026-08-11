@@ -291,6 +291,43 @@ performance profile held 48.1 tok/s median on the deterministic 128-token
 workload. The all-6-expert reference-exact mode is a correctness profile, not
 a throughput profile.
 
+### Strix Halo concurrent serving
+
+DeepSeek4 paged concurrency is deliberately a single-device path: one local
+HIP target on Strix Halo (`gfx1151`), with the complete model and every expert
+resident on that device. It does not use layer splitting, CUDA/HIP expert
+ownership, host-streamed experts, or DSpark.
+
+The backend keeps raw MLA rows, compressed rows, indexer state, sequence
+lengths, and block tables in a persistent 128-token paged cache. The shared
+HTTP scheduler performs admission, cancellation, slow-client isolation, and
+fair continuous batching. DeepSeek4 lowers each scheduler plan into one exact
+gathered graph with up to 16 independent lanes. Decode rows share the weight
+pass; each selected prompt advances by one exact token because the graph must
+not contain two rows from the same sequence.
+
+```bash
+cmake -S . -B build-hip \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
+  -DDFLASH27B_SERVER=ON
+cmake --build build-hip -j
+
+./build-hip/dflash_server /path/to/deepseek4-target.gguf \
+  --target-device hip:0 \
+  --paged-attention \
+  --max-concurrency 16 \
+  --kv-pool-tokens 8192 \
+  --max-ctx 4096 \
+  --ds4-prefill exact \
+  --prefix-cache-slots 0
+```
+
+This mode fails closed for non-gfx1151 devices, CUDA, layer or remote target
+splits, `DFLASH_DS4_MOE_TP`, drafts/DSpark, DDTree, PFlash/KVFlash, fused
+decode, approximate prefill, windowed attention, and prefix-cache parking.
+There is no automatic fallback to a slower or asymmetric execution mode.
+
 ### Local single-shard
 
 If the adapter decides all 43 layers fit on one CUDA GPU, it loads a single shard locally and no IPC daemon is involved.

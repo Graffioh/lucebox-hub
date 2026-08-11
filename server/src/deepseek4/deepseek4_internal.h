@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,8 @@
 #include "internal.h"
 #include "common/layer_split_utils.h"
 #include "common/prefill_attention_mode.h"
+#include "common/paged_kv_pool.h"
+#include "deepseek4_paged_cache.h"
 
 namespace dflash::common {
 
@@ -296,6 +299,26 @@ struct DeepSeek4Cache {
     ggml_backend_buffer_t buf = nullptr;
 };
 
+struct DeepSeek4PagedLayerCache : DeepSeek4LayerCache {
+    uint32_t ratio = 0;
+    uint64_t physical_rows = 0;
+};
+
+struct DeepSeek4PagedCache {
+    std::unique_ptr<PagedKvPool> pool;
+    DeepSeek4PagedCachePlan plan;
+    ggml_tensor * block_table = nullptr;
+    ggml_tensor * sequence_lengths = nullptr;
+    ggml_tensor * active_slot_ids = nullptr;
+    std::vector<DeepSeek4PagedLayerCache> layers;
+    DeepSeek4Cache prefill_staging;
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    // Dedicated bounded gathered-reference graph cache (opaque here because
+    // its implementation shares the fused verifier's private machinery).
+    void * gathered_runtime = nullptr;
+};
+
 struct DeepSeek4Snapshot;
 
 struct DeepSeek4RawRingSpan {
@@ -315,6 +338,9 @@ struct DeepSeek4BackendConfig {
     int          expert_top_k = 0;     // 0 = use all model-routed experts
     bool         fused_decode = false; // single-graph GPU decode
     bool         fused_verify_f16_kv = false; // F16 KV in batched verifier attention
+    bool         paged_attention = false;
+    int          max_concurrency = 1;
+    long long    kv_pool_tokens = 0;
 };
 
 // ─── Function declarations ──────────────────────────────────────────────
@@ -340,6 +366,26 @@ bool create_deepseek4_cache(ggml_backend_t backend,
                              DeepSeek4Cache & out);
 
 void free_deepseek4_cache(DeepSeek4Cache & c);
+bool create_deepseek4_paged_cache(ggml_backend_t backend,
+                                  const DeepSeek4Weights & w,
+                                  uint32_t slots, uint32_t max_ctx,
+                                  uint32_t physical_blocks,
+                                  DeepSeek4PagedCache & out);
+void reset_deepseek4_paged_slot(DeepSeek4PagedCache & c, uint32_t slot);
+void free_deepseek4_paged_cache(DeepSeek4PagedCache & c);
+// Exact gathered-reference decode for 1..16 independent lanes. Inputs are
+// lane-major; negative slots are inactive padding lanes. `out_logits` is
+// [n_vocab, lanes] and `out_argmax` is [lanes].
+bool deepseek4_paged_gathered_step(
+    ggml_backend_t backend, int device, const DeepSeek4Weights & w,
+    DeepSeek4PagedCache & cache, const float * embeddings,
+    const int32_t * token_ids, const int64_t * positions,
+    const int32_t * slots, uint32_t lanes, const int32_t * block_tables,
+    uint32_t block_table_stride, std::vector<float> & out_logits,
+    std::vector<int32_t> & out_argmax,
+    MoeHybridStorage * moe_hybrid = nullptr,
+    MoeHybridRoutingStats * routing_stats = nullptr);
+void deepseek4_release_paged_gathered_runtime(DeepSeek4PagedCache & cache);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
 // Release only reproducible large-batch graph arenas after prefill. KV/model
 // state and the DSpark feature tail remain live for the following decode.
