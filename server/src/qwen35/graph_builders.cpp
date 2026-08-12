@@ -5,9 +5,55 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 namespace dflash::common {
+
+bool detail::target_graph_capacity_for_parallel_segments(
+        int n_parallel_segments,
+        size_t & capacity) {
+    static constexpr int k_max_parallel_segments = 64;
+    static constexpr size_t k_base_capacity = 16384;
+    static constexpr int k_segments_per_capacity = 8;
+    static constexpr size_t k_max_capacity =
+        k_base_capacity *
+        (k_max_parallel_segments / k_segments_per_capacity);
+
+    if (n_parallel_segments < 0 ||
+        n_parallel_segments > k_max_parallel_segments) {
+        return false;
+    }
+    const int64_t scale = std::max<int64_t>(
+        1, ((int64_t)n_parallel_segments +
+            k_segments_per_capacity - 1) /
+               k_segments_per_capacity);
+    if ((uint64_t)scale >
+        std::numeric_limits<size_t>::max() / k_base_capacity) {
+        return false;
+    }
+    const size_t computed = k_base_capacity * (size_t)scale;
+    if (computed > k_max_capacity) return false;
+    capacity = computed;
+    return true;
+}
+
+bool detail::target_paged_tree_graph_capacity(
+        int tree_width,
+        int n_tree_seqs,
+        size_t & capacity) {
+    static constexpr int tree_buckets[] = {
+        1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,
+    };
+    if (tree_width < 1 || tree_width > 256 ||
+        std::find(std::begin(tree_buckets), std::end(tree_buckets),
+                  n_tree_seqs) == std::end(tree_buckets) ||
+        (int64_t)tree_width * n_tree_seqs > INT32_MAX) {
+        return false;
+    }
+    return target_graph_capacity_for_parallel_segments(
+        n_tree_seqs, capacity);
+}
 
 bool detail::validate_target_paged_tree_layout(
     const TargetCache & cache,
@@ -16,12 +62,9 @@ bool detail::validate_target_paged_tree_layout(
     int paged_max_kv_len,
     int tree_scratch_base,
     int tree_scratch_stride) {
-    static constexpr int tree_buckets[] = {
-        1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,
-    };
-    if (tree_width < 1 ||
-        std::find(std::begin(tree_buckets), std::end(tree_buckets),
-                  n_tree_seqs) == std::end(tree_buckets) ||
+    size_t graph_capacity = 0;
+    if (!target_paged_tree_graph_capacity(
+            tree_width, n_tree_seqs, graph_capacity) ||
         cache.n_seq_slots <= 1 || !cache.paged_block_table ||
         !cache.paged_kv_seq_lens || paged_max_kv_len < 1 ||
         tree_scratch_base <= 0 ||
@@ -43,8 +86,7 @@ bool detail::validate_target_paged_tree_layout(
         (int64_t)tree_scratch_base +
         (int64_t)(cache.n_seq_slots - 1) * tree_scratch_stride +
         tree_width;
-    return scratch_end <= physical_kv_rows &&
-           (int64_t)tree_width * n_tree_seqs <= INT32_MAX;
+    return scratch_end <= physical_kv_rows;
 }
 
 // ── build_layer_step ────────────────────────────────────────────
@@ -370,6 +412,11 @@ bool build_target_step(
     }
     if (segment_total != n_prefill_tokens) return false;
     if (n_logits_rows > 0 && n_prefill_tokens == 0) return false;
+    size_t graph_capacity = 0;
+    if (!detail::target_graph_capacity_for_parallel_segments(
+            n_prefill_segments, graph_capacity)) {
+        return false;
+    }
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
     // addresses, keeping the ggml-cuda CUDA-graph cache key (nodes[0]) and
@@ -535,7 +582,7 @@ bool build_target_step(
         ggml_set_input(sg.target_feat_rows);
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    sg.gf = ggml_new_graph_custom(sg.ctx, graph_capacity, false);
 
     // Step-invariant KV write: only when topology can't vary per step.
     // DFLASH_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length
@@ -696,6 +743,11 @@ bool build_target_step_paged_tree(
             tree_scratch_base, tree_scratch_stride)) {
         return false;
     }
+    size_t graph_capacity = 0;
+    if (!detail::target_paged_tree_graph_capacity(
+            tree_width, n_tree_seqs, graph_capacity)) {
+        return false;
+    }
     const int n_tokens = tree_width * n_tree_seqs;
 
     ggml_init_params ip{};
@@ -748,7 +800,7 @@ bool build_target_step_paged_tree(
         ggml_set_input(input.tensor);
     }
 
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    sg.gf = ggml_new_graph_custom(sg.ctx, graph_capacity, false);
     QwenGraphInputs gi{};
     gi.inp_embed = sg.inp_embed;
     gi.positions = sg.positions;
@@ -783,7 +835,8 @@ bool build_target_step_paged_tree(
         sg.alloc = ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(backend));
     }
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf) &&
+           detail::target_paged_tree_uploads_ready(sg);
 }
 
 

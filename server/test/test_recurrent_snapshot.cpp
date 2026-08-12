@@ -12,6 +12,7 @@
 using namespace CppUnitTestFramework;
 
 using dflash::common::TargetCache;
+using dflash::common::StepGraph;
 using dflash::common::restore_ssm_state;
 using dflash::common::snapshot_ssm_state;
 
@@ -31,6 +32,90 @@ static std::vector<float> get_tensor(const ggml_tensor * tensor) {
     ggml_backend_tensor_get(tensor, values.data(), 0,
                             values.size() * sizeof(float));
     return values;
+}
+
+TEST_CASE(RecurrentSnapshotFixture, hardens_feature_smoke_paths) {
+    size_t graph_capacity = 0;
+    CHECK(dflash::common::detail::
+              target_graph_capacity_for_parallel_segments(
+                  0, graph_capacity) && graph_capacity == 16384);
+    CHECK(dflash::common::detail::
+              target_graph_capacity_for_parallel_segments(
+                  8, graph_capacity) && graph_capacity == 16384);
+    CHECK(dflash::common::detail::
+              target_graph_capacity_for_parallel_segments(
+                  16, graph_capacity) && graph_capacity == 32768);
+    CHECK(dflash::common::detail::
+              target_graph_capacity_for_parallel_segments(
+                  64, graph_capacity) && graph_capacity == 131072);
+    CHECK(!dflash::common::detail::
+               target_graph_capacity_for_parallel_segments(
+                   65, graph_capacity));
+    CHECK(dflash::common::detail::target_paged_tree_graph_capacity(
+              23, 16, graph_capacity) && graph_capacity == 32768);
+    CHECK(!dflash::common::detail::target_paged_tree_graph_capacity(
+               257, 16, graph_capacity));
+
+    // Mapped-tree active_slot_ids is a topology marker and can legitimately
+    // be left without gallocr storage. Required state/query/write metadata
+    // remains allocated and uploadable.
+    {
+        ggml_backend_t tree_backend = ggml_backend_cpu_init();
+        CHECK(tree_backend != nullptr);
+        ggml_init_params marker_params{};
+        marker_params.mem_size = 4 * ggml_tensor_overhead();
+        marker_params.no_alloc = true;
+        ggml_context * marker_ctx = ggml_init(marker_params);
+        ggml_init_params live_params{};
+        live_params.mem_size = 16 * ggml_tensor_overhead();
+        live_params.no_alloc = true;
+        ggml_context * live_ctx = ggml_init(live_params);
+        CHECK(marker_ctx != nullptr);
+        CHECK(live_ctx != nullptr);
+        if (tree_backend && marker_ctx && live_ctx) {
+            StepGraph tree;
+            tree.active_slot_ids =
+                ggml_new_tensor_1d(marker_ctx, GGML_TYPE_I32, 2);
+            ggml_tensor * unallocated_state_ids =
+                ggml_new_tensor_1d(marker_ctx, GGML_TYPE_I32, 2);
+            tree.inp_embed = ggml_new_tensor_2d(
+                live_ctx, GGML_TYPE_F32, 4, 4);
+            tree.positions =
+                ggml_new_tensor_1d(live_ctx, GGML_TYPE_I32, 16);
+            tree.parent_ids =
+                ggml_new_tensor_2d(live_ctx, GGML_TYPE_I32, 2, 2);
+            tree.tree_sizes =
+                ggml_new_tensor_1d(live_ctx, GGML_TYPE_I32, 2);
+            tree.state_slot_ids =
+                ggml_new_tensor_1d(live_ctx, GGML_TYPE_I32, 2);
+            tree.paged_query_seq_ids =
+                ggml_new_tensor_1d(live_ctx, GGML_TYPE_I32, 4);
+            tree.kv_write_rows =
+                ggml_new_tensor_2d(live_ctx, GGML_TYPE_I64, 4, 1);
+            ggml_backend_buffer_t live_buffer =
+                ggml_backend_alloc_ctx_tensors(live_ctx, tree_backend);
+            CHECK(live_buffer != nullptr);
+            if (live_buffer) {
+                CHECK(tree.active_slot_ids->buffer == nullptr);
+                CHECK(dflash::common::detail::
+                          target_paged_tree_uploads_ready(tree));
+                CHECK(!dflash::common::detail::
+                           target_paged_tree_active_slots_need_upload(tree));
+
+                const int32_t state_ids[] = {0, 1};
+                ggml_backend_tensor_set(tree.state_slot_ids, state_ids, 0,
+                                        sizeof(state_ids));
+                tree.state_slot_ids = unallocated_state_ids;
+                CHECK(!dflash::common::detail::
+                           target_paged_tree_uploads_ready(tree));
+                ggml_backend_buffer_free(live_buffer);
+            }
+        }
+        if (live_ctx) ggml_free(live_ctx);
+        if (marker_ctx) ggml_free(marker_ctx);
+        if (tree_backend) ggml_backend_free(tree_backend);
+    }
+
 }
 
 TEST_CASE(RecurrentSnapshotFixture, validates_paged_tree_layout) {
@@ -69,6 +154,37 @@ TEST_CASE(RecurrentSnapshotFixture, snapshot_and_restore_recurrent_state) {
     ggml_backend_t backend = ggml_backend_cpu_init();
     CHECK(backend != nullptr);
     if (!backend) SKIP("CPU backend is unavailable");
+
+    // C16 x width-23 selects a 32K graph. Prove that graph traversal and
+    // gallocr can cross the old 16K hard ceiling without asserting.
+    {
+        CHECK(dflash::common::detail::target_paged_tree_graph_capacity(
+            23, 16, graph_capacity));
+        ggml_init_params graph_params{};
+        graph_params.mem_size = 32 * 1024 * 1024;
+        graph_params.no_alloc = true;
+        ggml_context * graph_ctx = ggml_init(graph_params);
+        CHECK(graph_ctx != nullptr);
+        if (graph_ctx) {
+            ggml_tensor * input =
+                ggml_new_tensor_1d(graph_ctx, GGML_TYPE_F32, 1);
+            ggml_set_input(input);
+            ggml_cgraph * graph = ggml_new_graph_custom(
+                graph_ctx, graph_capacity, false);
+            for (int i = 0; i < 16385; ++i) {
+                ggml_build_forward_expand(
+                    graph, ggml_dup(graph_ctx, input));
+            }
+            CHECK(ggml_graph_n_nodes(graph) == 16385);
+            ggml_gallocr_t graph_alloc = ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(backend));
+            CHECK(graph_alloc != nullptr);
+            CHECK(graph_alloc &&
+                  ggml_gallocr_alloc_graph(graph_alloc, graph));
+            if (graph_alloc) ggml_gallocr_free(graph_alloc);
+            ggml_free(graph_ctx);
+        }
+    }
 
     ggml_init_params params{};
     params.mem_size = 8 * ggml_tensor_overhead();

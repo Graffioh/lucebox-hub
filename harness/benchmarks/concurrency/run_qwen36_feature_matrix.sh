@@ -322,18 +322,33 @@ run_case() {
     --require-distinct-prompts --temperature 0 --ignore-eos --timeout "$timeout" --cooldown 0)
   local -a telemetry_arg=()
   [[ "$variant" != llama ]] && telemetry_arg+=(--require-effective-prompt-telemetry)
-  python3 "$CLIENT" "${common_client[@]}" --max-tokens "$WARMUP_TOKENS"
-    "${telemetry_arg[@]}" --out "$case_dir/warmup.json"
-    --label "$variant $workload C=$clients warmup" > "$case_dir/warmup.txt"
-  python3 "$CLIENT" "${common_client[@]}" --max-tokens "$MAX_TOKENS"
-    "${telemetry_arg[@]}" --server-metadata-json "$case_dir/server-metadata.json"
-    --out "$case_dir/bench.json" --label "$variant $workload C=$clients repeat=$repeat" \
-    | tee "$case_dir/bench.txt"
+  local -a warmup_cmd=(
+    python3 "$CLIENT" "${common_client[@]}"
+    --max-tokens "$WARMUP_TOKENS" "${telemetry_arg[@]}"
+    --out "$case_dir/warmup.json"
+    --label "$variant $workload C=$clients warmup"
+  )
+  "${warmup_cmd[@]}" > "$case_dir/warmup.txt"
+
+  local -a benchmark_cmd=(
+    python3 "$CLIENT" "${common_client[@]}"
+    --max-tokens "$MAX_TOKENS" "${telemetry_arg[@]}"
+    --server-metadata-json "$case_dir/server-metadata.json"
+    --out "$case_dir/bench.json"
+    --label "$variant $workload C=$clients repeat=$repeat"
+  )
+  "${benchmark_cmd[@]}" | tee "$case_dir/bench.txt"
   stop_server
 
   if [[ "$variant" != llama ]]; then
-    python3 "$PROOF_TOOL" --bench "$case_dir/bench.json" --server-log "$case_dir/server.log"
-      "${expected[@]}" --out "$case_dir/feature-proof.json"
+    local -a proof_cmd=(
+      python3 "$PROOF_TOOL"
+      --bench "$case_dir/bench.json"
+      --server-log "$case_dir/server.log"
+      "${expected[@]}"
+      --out "$case_dir/feature-proof.json"
+    )
+    "${proof_cmd[@]}"
   fi
   sleep "$COOLDOWN_SECONDS"
 }

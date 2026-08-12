@@ -339,8 +339,14 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
                             sizeof(int32_t) * parents.size());
     ggml_backend_tensor_set(tree_sg.tree_sizes, sizes.data(), 0,
                             sizeof(int32_t) * sizes.size());
-    ggml_backend_tensor_set(tree_sg.active_slot_ids, tree_slots.data(), 0,
-                            sizeof(int32_t) * tree_slots.size());
+    // Mapped-tree DeltaNet uses active_slot_ids only as a topology marker;
+    // gallocr may therefore optimize away its backing buffer. The actual
+    // state/attention mappings below are live graph inputs and remain
+    // mandatory. Upload the marker only if a future topology consumes it.
+    if (detail::target_paged_tree_active_slots_need_upload(tree_sg)) {
+        ggml_backend_tensor_set(tree_sg.active_slot_ids, tree_slots.data(), 0,
+                                sizeof(int32_t) * tree_slots.size());
+    }
     ggml_backend_tensor_set(tree_sg.state_slot_ids, tree_state_slots.data(), 0,
                             sizeof(int32_t) * tree_state_slots.size());
     ggml_backend_tensor_set(tree_sg.paged_query_seq_ids, query_slots.data(), 0,

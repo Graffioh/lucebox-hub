@@ -25,6 +25,20 @@ namespace dflash::common {
 
 namespace detail {
 
+// Qwen's recurrent graph duplicates one small subgraph per ragged sequence.
+// Return a graph capacity that covers every supported concurrent bucket while
+// keeping the legacy allocation for the common <= 8-sequence case.
+bool target_graph_capacity_for_parallel_segments(
+    int n_parallel_segments,
+    size_t & capacity);
+
+// Checked packed-tree shape/capacity contract. The public DDTree budget allows
+// at most 255 children plus the root, and concurrent serving at most 64 slots.
+bool target_paged_tree_graph_capacity(
+    int tree_width,
+    int n_tree_seqs,
+    size_t & capacity);
+
 // Model-free validation shared by the packed-tree builder and its shape
 // tests. paged_max_kv_len is a logical launch bound and may exceed the
 // bounded physical K/V pool; only the per-slot scratch slabs must fit in the
@@ -36,6 +50,28 @@ bool validate_target_paged_tree_layout(
     int paged_max_kv_len,
     int tree_scratch_base,
     int tree_scratch_stride);
+
+// `active_slot_ids` is a topology marker in mapped-tree graphs. It may be
+// optimized out by gallocr because the actual recurrent and attention row
+// mappings are carried by state_slot_ids and paged_query_seq_ids. Every other
+// tensor listed here is read by a graph node and must have backend storage
+// before the engine uploads metadata.
+inline bool target_paged_tree_uploads_ready(const StepGraph & sg) {
+    const auto allocated = [](const ggml_tensor * tensor) {
+        return tensor && tensor->buffer;
+    };
+    return sg.active_slot_ids &&
+           allocated(sg.inp_embed) && allocated(sg.positions) &&
+           allocated(sg.parent_ids) && allocated(sg.tree_sizes) &&
+           allocated(sg.state_slot_ids) &&
+           allocated(sg.paged_query_seq_ids) &&
+           allocated(sg.kv_write_rows);
+}
+
+inline bool target_paged_tree_active_slots_need_upload(
+        const StepGraph & sg) {
+    return sg.active_slot_ids && sg.active_slot_ids->buffer;
+}
 
 }  // namespace detail
 
