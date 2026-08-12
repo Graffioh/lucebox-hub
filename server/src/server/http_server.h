@@ -250,6 +250,49 @@ bool should_clamp_flowkv_disk_cache(
     bool flowkv, const DiskPrefixCachePolicy & policy);
 
 }  // namespace http_detail
+// Resolve the prompt-compression contract for a backend-provided sequence
+// engine. Concurrent PFlash must keep both models resident: parking either
+// model while another slot owns live device state invalidates that slot. The
+// explicit persistent policy is therefore the opt-in that also implies the
+// effective skip-park behavior; callers do not need a second, redundant CLI
+// flag on large-memory concurrent hosts.
+struct ConcurrentPflashPlan {
+    bool enabled = false;
+    bool force_skip_park = false;
+    std::string error;
+
+    bool ok() const { return error.empty(); }
+};
+
+inline ConcurrentPflashPlan resolve_concurrent_pflash_plan(
+        const ServerConfig & config, bool drafter_tokenizer_available) {
+    ConcurrentPflashPlan plan;
+    if (config.pflash_mode == ServerConfig::PflashMode::OFF ||
+        !config.pflash_upstream_base.empty()) {
+        return plan;
+    }
+    plan.enabled = true;
+    if (!drafter_tokenizer_available) {
+        plan.error =
+            "concurrent PFlash requires a loaded --prefill-drafter tokenizer";
+        return plan;
+    }
+    if (config.draft_residency != DraftResidencyPolicy::Persistent) {
+        plan.error =
+            "concurrent PFlash requires --draft-residency persistent so "
+            "prompt compression cannot park live target/draft state";
+        return plan;
+    }
+    if (config.prefix_cache_cap > 0 || config.prefill_cache_cap > 0 ||
+        !config.disk_cache_dir.empty()) {
+        plan.error =
+            "concurrent paged PFlash does not support prefix/prefill "
+            "snapshots; disable the snapshot caches";
+        return plan;
+    }
+    plan.force_skip_park = true;
+    return plan;
+}
 
 // ─── Parsed request ─────────────────────────────────────────────────────
 
@@ -605,6 +648,13 @@ struct ServerJob {
     // server-side prefill/elapsed telemetry does not erase queueing delay.
     std::chrono::steady_clock::time_point parallel_started_at{};
     std::unique_ptr<SseEmitter> emitter;
+    // Prompt preparation (FlowKV/PFlash) is expensive and may load a resident
+    // drafter. Cache its result on the job so a pool-full retry never runs it
+    // twice. The original request tokens remain untouched for API accounting;
+    // this vector is the effective prompt admitted to the sequence engine.
+    bool parallel_prompt_prepared = false;
+    bool parallel_prompt_compressed = false;
+    std::vector<int32_t> parallel_prompt_tokens;
 };
 
 // ─── Parse session_id from a chat-completion JSON body ──────────────────

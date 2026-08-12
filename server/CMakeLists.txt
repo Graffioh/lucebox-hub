@@ -450,6 +450,9 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_kv.cpp
     src/common/dflash_spec_decode.cpp
     src/common/concurrency/paged_kv_pool.cpp
+    src/common/concurrency/paged_kv_residency.cpp
+    src/common/concurrency/qwen_paged_kv_transfer_layout.cpp
+    src/common/concurrency/qwen_paged_kv_transfer.cpp
     src/qwen35/concurrency/qwen35_slot_manager.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
@@ -1391,12 +1394,33 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_paged_kv_residency.cpp")
+        # Pure host-side multi-sequence residency policy + mock DMA test.
+        add_executable(test_paged_kv_residency
+            test/test_paged_kv_residency.cpp
+            src/common/concurrency/paged_kv_pool.cpp
+            src/common/concurrency/paged_kv_residency.cpp)
+        target_include_directories(test_paged_kv_residency PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_paged_kv_residency)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen_paged_kv_transfer_layout.cpp")
+        # Pure host-side validation of packed K/V block byte/stride math.
+        add_executable(test_qwen_paged_kv_transfer_layout
+            test/test_qwen_paged_kv_transfer_layout.cpp
+            src/common/concurrency/qwen_paged_kv_transfer_layout.cpp)
+        target_include_directories(test_qwen_paged_kv_transfer_layout PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        list(APPEND _raw_unit_test_targets test_qwen_paged_kv_transfer_layout)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_slot_manager.cpp")
         # Host-side slot bookkeeping test (concurrent serving): no GPU.
         add_executable(test_seq_slot_manager
             test/test_seq_slot_manager.cpp
             src/qwen35/concurrency/qwen35_slot_manager.cpp
-            src/common/concurrency/paged_kv_pool.cpp)
+            src/common/concurrency/paged_kv_pool.cpp
+            src/common/concurrency/paged_kv_residency.cpp)
         target_include_directories(test_seq_slot_manager PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_seq_slot_manager)
@@ -1408,6 +1432,15 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/test)
         list(APPEND _raw_unit_test_targets test_seq_engine_contract)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ddtree_path.cpp")
+        # Pure host-side accepted-path/pending-token contract tests.
+        add_executable(test_ddtree_path
+            test/test_ddtree_path.cpp
+            src/common/ddtree.cpp)
+        target_include_directories(test_ddtree_path PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_ddtree_path)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_batch_plan.cpp")
         # Pure-host tests for model-neutral token-budget/FIFO planning.
@@ -1791,6 +1824,8 @@ if(DFLASH27B_TESTS)
                     set(_unit_ctest_name recurrent_snapshot)
                 elseif(_unit_target STREQUAL "test_paged_kv_pool")
                     set(_unit_ctest_name paged_kv_pool)
+                elseif(_unit_target STREQUAL "test_paged_kv_residency")
+                    set(_unit_ctest_name paged_kv_residency)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
                 set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)

@@ -35,7 +35,8 @@ struct StepGraph {
     ggml_tensor *   inp_embed = nullptr;
     ggml_tensor *   positions = nullptr;
     ggml_tensor *   attn_mask = nullptr;     // may be null
-    ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
+    ggml_tensor *   parent_ids = nullptr;    // DDTree [tree_width,n_tree_seqs]
+    ggml_tensor *   tree_sizes = nullptr;    // DDTree [n_tree_seqs], 0 = padding
     ggml_tensor *   target_hidden_cat = nullptr;  // draft only
     ggml_tensor *   positions_k = nullptr;        // draft only
     ggml_tensor *   pad_mask_full = nullptr;      // draft only; padded-ctx mask
@@ -55,11 +56,16 @@ struct StepGraph {
     // state_slot_ids has the same shape but maps padding to a safe readable
     // slot for graph-level conv-state gathers.
     ggml_tensor *   active_slot_ids = nullptr;
+    // Recurrent gather rows. Unlike active/paged IDs, padding must name a
+    // valid harmless slot (normally 0): ggml_get_rows does not mask -1.
     ggml_tensor *   state_slot_ids = nullptr;
     // Ragged paged read (concurrent prefill): per-row block-table column and
     // inclusive causal position, [n_tokens] i32 each. Padding rows carry -1.
     ggml_tensor *   paged_query_seq_ids = nullptr;
     ggml_tensor *   paged_query_positions = nullptr;
+    // DFlash target-feature destination rows. Multi-slot replay maps each
+    // token to its slot-local ring; padding maps to the cache's dead row.
+    ggml_tensor *   target_feat_rows = nullptr;
     // Multi-prompt steps: i32 row indices gathered from the final norm
     // before the LM head (committing rows + decode rows).
     ggml_tensor *   logits_row_indices = nullptr;
@@ -92,11 +98,13 @@ inline void step_graph_free(StepGraph & sg) {
     sg.built_view = false;
     sg.hidden_input = nullptr;
     sg.parent_ids = nullptr;
+    sg.tree_sizes = nullptr;
     sg.kv_write_rows = nullptr;
     sg.active_slot_ids = nullptr;
     sg.state_slot_ids = nullptr;
     sg.paged_query_seq_ids = nullptr;
     sg.paged_query_positions = nullptr;
+    sg.target_feat_rows = nullptr;
     sg.logits_row_indices = nullptr;
     sg.logits = nullptr;
     sg.hidden_states = nullptr;

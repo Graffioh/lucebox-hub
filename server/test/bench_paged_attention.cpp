@@ -725,7 +725,8 @@ bool run_case(
     ggml_tensor * paged_output = ggml_paged_attn_ext(
         ctx.value, q_paged, k_paged, v_paged, table, kv_seq_lens_tensor,
         nullptr, nullptr, 1.0f / std::sqrt(static_cast<float>(D)),
-        BLOCK_SIZE, max_context);
+        BLOCK_SIZE, max_context,
+        nullptr, nullptr, 0, 0, 0);
     ggml_tensor * contiguous_output = ggml_flash_attn_ext(
         ctx.value, q_contiguous, k_contiguous, v_contiguous,
         padding_mask, 1.0f / std::sqrt(static_cast<float>(D)),

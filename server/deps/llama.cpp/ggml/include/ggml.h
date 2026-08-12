@@ -2502,6 +2502,18 @@ extern "C" {
     // prefill chunks can attend the paged pool causally. A negative position
     // marks a padding row. NULL keeps the decode semantics (full cached
     // length per row).
+    //
+    // parent_ids/tree_sizes optionally enable packed tree verification.
+    // Queries are flattened sequence-major: tree sequence s occupies rows
+    // [s*tree_width, (s+1)*tree_width). parent_ids is contiguous I32
+    // [tree_width, n_tree_seq] (root parent -1), and tree_sizes is contiguous
+    // I32 [n_tree_seq]. active_slot_ids is required and remains per query row;
+    // it selects the physical block-table column and scratch slab. Each live
+    // query attends its complete committed prefix from the block table plus
+    // its own candidate node and ancestors from physical K/V rows
+    // tree_scratch_base + slot*tree_scratch_stride + node. Siblings and rows
+    // at or beyond tree_sizes[s] are excluded. query_positions must be NULL
+    // in tree mode. Pass NULL/NULL/0/0/0 to retain standard paged attention.
     GGML_API struct ggml_tensor * ggml_paged_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2513,7 +2525,12 @@ extern "C" {
             struct ggml_tensor  * query_positions,
             float                 scale,
             int                   block_size,
-            int                   max_kv_seq_len);
+            int                   max_kv_seq_len,
+            struct ggml_tensor  * parent_ids,
+            struct ggml_tensor  * tree_sizes,
+            int                   tree_width,
+            int                   tree_scratch_base,
+            int                   tree_scratch_stride);
 
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).

@@ -21,6 +21,7 @@
 #include "server/http_server.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
+#include "common/concurrency/seq_engine.h"
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
 #include "common/moe_hybrid_ffn_eval.h"
@@ -1947,6 +1948,33 @@ TEST_CASE(ServerUnitFixture, test_stop_sequence_holdback_extends) {
     TEST_ASSERT(em.accumulated_text().find("suffix") == std::string::npos);
 }
 
+TEST_CASE(ServerUnitFixture,
+          test_concurrent_scheduler_burst_stops_at_eos) {
+    SeqEngine::DecodeOutput burst;
+    burst.slot = 0;
+    burst.committed_tokens = {101, 2, 103};
+    burst.token = 104;
+
+    std::vector<int32_t> emitted;
+    int completion_tokens = 0;
+    const bool consumed_all = consume_decode_output_tokens(
+        burst, [&](int32_t token) {
+            emitted.push_back(token);
+            ++completion_tokens;
+            // Mirrors scheduler.cpp: advance_slot marks the slot finished on
+            // EOS and its callback immediately stops the rest of the burst.
+            return token != 2;
+        });
+
+    TEST_ASSERT(!consumed_all);
+    TEST_ASSERT((emitted == std::vector<int32_t>{101, 2}));
+    TEST_ASSERT(completion_tokens == 2);
+    TEST_ASSERT(std::find(emitted.begin(), emitted.end(), 103) ==
+                emitted.end());
+    TEST_ASSERT(std::find(emitted.begin(), emitted.end(), 104) ==
+                emitted.end());
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Prefix cache hash tests (model-free)
 // ═══════════════════════════════════════════════════════════════════════
@@ -2367,6 +2395,49 @@ TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
     cfg.pflash_mode = ServerConfig::PflashMode::ALWAYS;
     TEST_ASSERT(cfg.pflash_mode != ServerConfig::PflashMode::OFF);
     TEST_ASSERT(cfg.pflash_mode != ServerConfig::PflashMode::AUTO);
+}
+
+TEST_CASE(ServerUnitFixture, test_concurrent_pflash_persistent_forces_skip_park) {
+    ServerConfig cfg;
+    cfg.pflash_mode = ServerConfig::PflashMode::AUTO;
+    cfg.draft_residency = DraftResidencyPolicy::Persistent;
+    cfg.prefix_cache_cap = 0;
+
+    const auto plan = resolve_concurrent_pflash_plan(
+        cfg, /*drafter_tokenizer_available=*/true);
+    TEST_ASSERT(plan.ok());
+    TEST_ASSERT(plan.enabled);
+    TEST_ASSERT(plan.force_skip_park);
+}
+
+TEST_CASE(ServerUnitFixture, test_concurrent_pflash_rejects_unsafe_residency) {
+    ServerConfig cfg;
+    cfg.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    cfg.draft_residency = DraftResidencyPolicy::Auto;
+    cfg.prefix_cache_cap = 0;
+
+    auto plan = resolve_concurrent_pflash_plan(
+        cfg, /*drafter_tokenizer_available=*/true);
+    TEST_ASSERT(!plan.ok());
+    TEST_ASSERT(plan.error.find("--draft-residency persistent") !=
+                std::string::npos);
+
+    cfg.draft_residency = DraftResidencyPolicy::Persistent;
+    plan = resolve_concurrent_pflash_plan(
+        cfg, /*drafter_tokenizer_available=*/false);
+    TEST_ASSERT(!plan.ok());
+    TEST_ASSERT(plan.error.find("--prefill-drafter") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_concurrent_pflash_rejects_snapshot_caches) {
+    ServerConfig cfg;
+    cfg.pflash_mode = ServerConfig::PflashMode::AUTO;
+    cfg.draft_residency = DraftResidencyPolicy::Persistent;
+    // Default prefix_cache_cap is intentionally non-zero.
+    const auto plan = resolve_concurrent_pflash_plan(
+        cfg, /*drafter_tokenizer_available=*/true);
+    TEST_ASSERT(!plan.ok());
+    TEST_ASSERT(plan.error.find("snapshots") != std::string::npos);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_compress_request_struct) {

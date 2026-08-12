@@ -381,6 +381,53 @@ void test_feature_gate_paged_attention_requires_plain_ar_decode() {
     ddtree.ddtree_mode = true;
     CHECK(!gate_result(ddtree, "qwen35", PlacementBackend::Cuda).empty());
 
+    BackendArgs concurrent_ddtree = base;
+    concurrent_ddtree.max_concurrency = 16;
+    concurrent_ddtree.draft_path = "/nonexistent/draft.gguf";
+    concurrent_ddtree.ddtree_mode = true;
+    concurrent_ddtree.ddtree_budget = 22;
+    TEST_ASSERT(gate_accepts(
+        concurrent_ddtree, "qwen35", PlacementBackend::Cuda));
+    TEST_ASSERT(gate_accepts(
+        concurrent_ddtree, "qwen35", PlacementBackend::Hip));
+
+    BackendArgs tensor_ddtree = concurrent_ddtree;
+    TEST_ASSERT(parse_placement_device_list(
+        "cuda:0,cuda:1", tensor_ddtree.device));
+    tensor_ddtree.device.split_mode = TargetSplitMode::Tensor;
+    TEST_ASSERT(!gate_accepts(
+        tensor_ddtree, "qwen35", PlacementBackend::Cuda));
+
+
+    BackendFeatureConfig concurrent_pflash;
+    concurrent_pflash.pflash_enabled = true;
+    concurrent_pflash.pflash_drafter_configured = true;
+    TEST_ASSERT(gate_accepts(concurrent_ddtree, "qwen35",
+                             PlacementBackend::Hip, concurrent_pflash));
+
+    BackendArgs concurrent_plain = base;
+    concurrent_plain.max_concurrency = 16;
+    TEST_ASSERT(gate_accepts(concurrent_plain, "qwen35",
+                             PlacementBackend::Hip, concurrent_pflash));
+    BackendFeatureConfig concurrent_kvflash;
+    concurrent_kvflash.kvflash_enabled = true;
+    TEST_ASSERT(gate_accepts(concurrent_plain, "qwen35",
+                             PlacementBackend::Hip, concurrent_kvflash));
+
+    BackendArgs bad_budget = concurrent_ddtree;
+    for (int value : {0, -1, 256, INT_MAX}) {
+        bad_budget.ddtree_budget = value;
+        TEST_ASSERT(!gate_accepts(
+            bad_budget, "qwen35", PlacementBackend::Hip));
+    }
+
+    BackendArgs remote_ddtree = concurrent_ddtree;
+    remote_ddtree.remote_draft.ipc_bin = "/usr/bin/draft-ipc";
+    remote_ddtree.draft_device.backend = PlacementBackend::Cuda;
+    remote_ddtree.device.backend = PlacementBackend::Hip;
+    TEST_ASSERT(!gate_accepts(
+        remote_ddtree, "qwen35", PlacementBackend::Hip));
+
     BackendArgs windowed = base;
     windowed.fa_window = 4096;
     CHECK(!gate_result(
@@ -480,6 +527,22 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     CHECK(!gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
     pool.kv_pool_tokens = max_pool_tokens;
     CHECK(gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs tree_pool = paged;
+    tree_pool.max_concurrency = 16;
+    tree_pool.draft_path = "/nonexistent/draft.gguf";
+    tree_pool.ddtree_mode = true;
+    tree_pool.ddtree_budget = 22;
+    const long long tree_scratch =
+        (long long)tree_pool.max_concurrency *
+        paged_token_capacity(tree_pool.ddtree_budget + 1);
+    const long long max_tree_pool_tokens =
+        ((long long)INT_MAX - PAGED_BLOCK_SIZE - tree_scratch) /
+        PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
+    tree_pool.kv_pool_tokens = max_tree_pool_tokens;
+    TEST_ASSERT(gate_accepts(tree_pool, "qwen35", PlacementBackend::Cuda));
+    tree_pool.kv_pool_tokens = max_tree_pool_tokens + PAGED_BLOCK_SIZE;
+    TEST_ASSERT(!gate_accepts(tree_pool, "qwen35", PlacementBackend::Cuda));
 
     // The automatic pool is memory-derived, so a logical slot/context product
     // larger than the physical tensor address space is legal.

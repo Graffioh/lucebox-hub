@@ -33,6 +33,9 @@ enum class PagedKvStatus : uint8_t {
     SequenceSlotsExhausted,  // all max_sequences slots are in use
     BlocksExhausted,         // not enough free physical blocks for the growth
     StaleHandle,             // handle refers to a released or reused slot
+    LogicalBlockOutOfRange,  // logical block is not materialized by the sequence
+    BlockNotResident,        // page_out_block() targeted an already-cold block
+    BlockAlreadyResident,    // page_in_block() targeted a resident block
 };
 
 // Human-readable status name for logs and error messages.
@@ -57,6 +60,23 @@ struct PagedKvWriteSlot {
     uint64_t physical_token_index = 0;
 };
 
+// Sentinel in PagedKvSequenceSnapshot::block_table for a logical block whose
+// full-attention K/V bytes are host-backed by PagedKvResidencyManager. It is
+// never returned as a PagedKvWriteSlot::physical_block.
+inline constexpr uint32_t PAGED_KV_COLD_BLOCK =
+    std::numeric_limits<uint32_t>::max();
+
+// A formerly-cold append-head block that append() had to remap. The caller
+// must restore the block's host-backed bytes before consuming or overwriting
+// any row in the returned physical block. PagedKvResidencyManager::append()
+// and prepare_append() do that before returning to the engine; this record
+// primarily makes a direct pool append fail-obvious instead of losing the
+// remap information.
+struct PagedKvBlockRemap {
+    uint32_t logical_block = 0;
+    uint32_t physical_block = 0;
+};
+
 // Outcome of append(). On success, `token_count` is the number of appended
 // tokens. By default, `write_slots` holds one entry per token in logical
 // order. With `only_first_last_slots`, it is empty and `first` and `last`
@@ -68,6 +88,7 @@ struct PagedKvAppendResult {
     std::vector<PagedKvWriteSlot> write_slots;
     PagedKvWriteSlot first;
     PagedKvWriteSlot last;
+    std::vector<PagedKvBlockRemap> remapped_cold_blocks;
 
     explicit operator bool() const { return status == PagedKvStatus::Ok; }
 };
@@ -75,6 +96,8 @@ struct PagedKvAppendResult {
 // Copy of one sequence's bookkeeping state, as returned by sequence().
 struct PagedKvSequenceSnapshot {
     uint32_t kv_seq_len = 0;
+    // Entries are physical block indices or PAGED_KV_COLD_BLOCK. Logical
+    // length and block-table length do not shrink when a block is paged out.
     std::vector<uint32_t> block_table;
     // Physical blocks held for future append() calls by this sequence. They
     // are not visible in block_table until append consumes them.
@@ -155,6 +178,26 @@ public:
     PagedKvStatus owned_block_count(PagedKvSequenceHandle handle,
                                     uint32_t & out_count) const;
 
+    // Relinquish one materialized physical block while preserving its logical
+    // block-table position as PAGED_KV_COLD_BLOCK. The caller must first copy
+    // the complete block to host backing. On success, out_physical_block is
+    // the returned pool block and may be reused immediately.
+    PagedKvStatus page_out_block(PagedKvSequenceHandle handle,
+                                 uint32_t logical_block,
+                                 uint32_t & out_physical_block);
+
+    // Allocate a physical block for one cold logical entry. The caller must
+    // restore its complete host-backed bytes before attention or append reads
+    // it. On failure, the cold mapping and output argument are unchanged.
+    PagedKvStatus page_in_block(PagedKvSequenceHandle handle,
+                                uint32_t logical_block,
+                                uint32_t & out_physical_block);
+
+    // Number of materialized logical blocks that currently own physical
+    // storage. Reserved append capacity is deliberately excluded.
+    PagedKvStatus resident_block_count(PagedKvSequenceHandle handle,
+                                       uint32_t & out_count) const;
+
 private:
     // Bookkeeping for one sequence slot. `generation` survives release so
     // the next acquire on this slot invalidates old handles.
@@ -181,6 +224,11 @@ private:
     // does). All-or-nothing on BlocksExhausted.
     PagedKvStatus extend_block_table(SequenceState & sequence,
                                      uint32_t required_blocks);
+
+    // Allocate a physical block from a sequence's reservation first, then the
+    // global free list. Used only by append(), where consuming promised future
+    // capacity is correct.
+    uint32_t take_append_block(SequenceState & sequence);
 
     // Move exactly `additional_blocks` globally free blocks into a sequence's
     // private reservation. Caller must preflight availability.

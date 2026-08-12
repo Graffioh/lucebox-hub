@@ -24,7 +24,9 @@
 #include "concurrency/qwen35_seq_engine.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
-#include "kvflash_pager.h"         // bounded KV residency pool
+#include "kvflash_pager.h"
+#include "common/concurrency/paged_kv_residency.h"
+#include "common/concurrency/qwen_paged_kv_transfer.h"
 #include "kvflash_scorer.h"        // chunk-relevance policy interface
 #include "kvflash_qk.h"            // target-QK scorer (pooled keys + query)
 
@@ -295,6 +297,8 @@ private:
     // Page size comes from PAGED_BLOCK_SIZE (paged_attention_config.h),
     // shared with the graph builder and the cache's block-aligned sizing.
     std::unique_ptr<PagedKvPool> paged_kv_pool_;
+    std::unique_ptr<QwenPagedKvResidencyTransfer> paged_kv_transfer_;
+    std::unique_ptr<PagedKvResidencyManager> paged_kv_residency_;
     std::optional<PagedKvSequenceHandle> paged_sequence_;
     PagedKvRequestId paged_request_id_ = 0;
 

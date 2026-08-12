@@ -8,9 +8,10 @@
 // interface. admit() claims a slot and queues its prompt without compute.
 // Each step() then advances a scheduler-selected cohort of prompt slices
 // alongside the complete live decode batch. Once a prefill completes, the
-// scheduler advances that slot one token per step(), feeding each sampled
-// token back as the next step's input — which is what lets it override a token
-// (thinking-budget force-close) before it is committed to the cache.
+// scheduler feeds the final sampled token back as the next step's input. An
+// engine may also return speculative children it already committed before that
+// final pending token. The scheduler can disable that burst path per slot when
+// it must retain authority to substitute a thinking-budget close token.
 //
 // The split of duties is deliberate and is the reason this interface exists
 // apart from ModelBackend:
@@ -181,14 +182,31 @@ public:
     struct StepInput {
         int     slot  = -1;
         int32_t token = -1;   // token to commit at this slot's next position
+        // False when scheduler-side policy may replace the sampled token
+        // before it is committed (currently the thinking-budget close hook).
+        bool allow_speculation = true;
     };
     struct DecodeOutput {
         int     slot   = -1;
-        int32_t token  = -1;  // newly sampled token (pending until next step)
+        // Final newly sampled token, pending until the scheduler feeds it into
+        // the next step. `committed_tokens`, when non-empty, precede this token
+        // and are already present in backend state.
+        int32_t token  = -1;
         bool    failed = false;
         // Present when failed=true so the scheduler can report an honest
         // per-request error instead of silently truncating generation.
         std::string error;
+        std::vector<int32_t> committed_tokens;
+
+        // Per-slot deltas for this engine step. The scheduler aggregates them
+        // until retirement and emits one machine-readable proof record.
+        uint64_t ddtree_steps = 0;
+        uint64_t ddtree_accepted_tokens = 0;
+        uint64_t target_forwards = 0;
+        uint64_t kvflash_page_ins = 0;
+        uint64_t kvflash_page_outs = 0;
+        uint64_t kvflash_resident_blocks = 0;
+        uint64_t kvflash_reselects = 0;
     };
 
     struct PrefillOutput {
@@ -250,6 +268,19 @@ public:
     virtual bool token_is_eos(int32_t token) const = 0;
 };
 
+// Deliver a successful decode result in wire order. The visitor returns false
+// after a stop/EOS/output-cap decision; in that case later committed children
+// and the final pending token are intentionally hidden and the slot is retired.
+template <typename Advance>
+inline bool consume_decode_output_tokens(
+        const SeqEngine::DecodeOutput & output, Advance advance) {
+    if (output.failed) return false;
+    for (int32_t token : output.committed_tokens) {
+        if (!advance(token)) return false;
+    }
+    return advance(output.token);
+}
+
 // Validate the model-neutral step protocol before the scheduler consumes any
 // output. Malformed row ownership is fatal because re-feeding a token after an
 // omitted output would silently corrupt that sequence.
@@ -265,6 +296,7 @@ inline std::string validate_step_result(
     }
 
     std::vector<uint8_t> decode_planned((size_t)slot_count, 0);
+    std::vector<uint8_t> speculation_allowed((size_t)slot_count, 0);
     std::vector<uint8_t> prefill_planned((size_t)slot_count, 0);
     for (const SeqEngine::StepInput & input : plan.decode) {
         if (input.slot < 0 || input.slot >= slot_count || input.token < 0)
@@ -272,6 +304,8 @@ inline std::string validate_step_result(
         if (decode_planned[(size_t)input.slot])
             return "decode plan contains a duplicate slot";
         decode_planned[(size_t)input.slot] = 1;
+        speculation_allowed[(size_t)input.slot] =
+            input.allow_speculation ? 1 : 0;
     }
     for (const PrefillSlice & slice : plan.prefills) {
         if (slice.slot < 0 || slice.slot >= slot_count ||
@@ -290,10 +324,25 @@ inline std::string validate_step_result(
             return "decode output names an unplanned slot";
         if (decode_seen[(size_t)output.slot])
             return "step returned duplicate decode outputs";
-        if (output.failed && (output.token >= 0 || output.error.empty()))
-            return "failed decode has invalid payload";
-        if (!output.failed && (output.token < 0 || !output.error.empty()))
-            return "successful decode has invalid payload";
+        if (output.failed) {
+            if (output.error.empty())
+                return "failed decode has no diagnostic";
+            if (output.token >= 0 || !output.committed_tokens.empty())
+                return "failed decode exposes token payload";
+        } else {
+            if (output.token < 0)
+                return "successful decode has no pending token";
+            if (!output.error.empty())
+                return "successful decode carries an error diagnostic";
+            if (!speculation_allowed[(size_t)output.slot] &&
+                !output.committed_tokens.empty())
+                return "decode output burst violates disabled speculation";
+            if (std::any_of(
+                    output.committed_tokens.begin(),
+                    output.committed_tokens.end(),
+                    [](int32_t token) { return token < 0; }))
+                return "decode output burst contains an invalid token";
+        }
         decode_seen[(size_t)output.slot] = 1;
     }
 

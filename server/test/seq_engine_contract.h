@@ -258,6 +258,19 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
         return violations;
     }
 
+    // Scheduler policy can retain commit authority for selected slots. A
+    // conforming engine may still use its ordinary AR implementation, but it
+    // must not return already-committed children for a disabled input.
+    SeqEngine::StepPlan no_speculation;
+    no_speculation.decode = decode_inputs();
+    for (SeqEngine::StepInput & input : no_speculation.decode) {
+        input.allow_speculation = false;
+    }
+    if (!execute(no_speculation)) {
+        retire_all();
+        return violations;
+    }
+
     // A full engine is retryable admission pressure, not a request error.
     if (n_slots == 2) {
         const SeqEngine::AdmitResult full = engine.admit(3, {31}, greedy);

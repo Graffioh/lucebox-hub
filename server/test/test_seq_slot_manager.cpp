@@ -8,6 +8,7 @@
 #include "qwen35/concurrency/qwen35_slot_manager.h"
 #include "host_check.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -85,18 +86,22 @@ int main() {
         mgr.commit_prefill(0);
         CHECK(mgr.slot(0).cur_pos == 20);
 
-        // Decode appends: row allocation + sample_history; cur_pos advances
-        // separately after the step's compute.
+        // Decode append stages row allocation and fed-token history; both
+        // history and cur_pos publish only after the target compute succeeds.
         auto st = mgr.append_token(0, /*fed_token=*/42);
         CHECK(st.ok);
         CHECK(st.position == 20);
         CHECK(st.physical_row == 20);     // tail of the prompt's last block
         CHECK(st.new_block < 0 && st.new_block_index < 0);
         CHECK(mgr.slot(0).cur_pos == 20);
-        CHECK(mgr.slot(0).sample_history.size() == 21 &&
-              mgr.slot(0).sample_history.back() == 42);
+        CHECK(mgr.slot(0).sample_history.size() == 20);
+        CHECK(mgr.slot(0).staged_tokens.size() == 1 &&
+              mgr.slot(0).staged_tokens.back() == 42);
         mgr.commit_step(0);
         CHECK(mgr.slot(0).cur_pos == 21);
+        CHECK(mgr.slot(0).sample_history.size() == 21 &&
+              mgr.slot(0).sample_history.back() == 42);
+        CHECK(mgr.slot(0).staged_tokens.empty());
 
         // Second admission lands in slot 1 with non-identity rows.
         auto b = admit(mgr, 2, prompt_tokens(20), greedy_sampler());
@@ -331,6 +336,51 @@ int main() {
         auto boundary_append = mgr.append_token(boundary.slot, 31);
         CHECK(boundary_append.ok && boundary_append.new_block_index == 2);
         CHECK(pool.free_block_count() == 0);
+    }
+
+    // Accepted-path replay stages multiple rows and publishes history and
+    // logical position only after the target compute succeeds.
+    {
+        PagedKvPool pool(8, 1, /*block_size=*/4);
+        Qwen35SlotManager mgr(pool, /*max_ctx=*/32,
+                              /*speculative_headroom=*/7);
+        auto a = admit(mgr, 1, prompt_tokens(3), greedy_sampler());
+        CHECK(is_admitted(a));
+        CHECK(mgr.append_prefill(a.slot, 3).ok);
+        mgr.commit_prefill(a.slot);
+
+        const int32_t accepted[] = {41, 42, 43, 44, 45, 46};
+        auto staged = mgr.append_tokens(a.slot, accepted, 6);
+        CHECK(staged.ok && !staged.busy && staged.count == 6);
+        CHECK(staged.position == 3 && staged.physical_rows.size() == 6);
+        CHECK(staged.first_new_block == 1);
+        CHECK(staged.new_blocks.size() == 2);
+        CHECK(mgr.slot(a.slot).cur_pos == 3);
+        CHECK(mgr.slot(a.slot).sample_history.size() == 3);
+        CHECK(mgr.slot(a.slot).staged_tokens ==
+              std::vector<int32_t>(accepted, accepted + 6));
+        CHECK(!mgr.append_token(a.slot, 99).ok);
+
+        // A failed target step never publishes staged history. Scheduler
+        // retirement releases both materialized rows and the staged host range.
+        const uint32_t free_while_staged = pool.free_block_count();
+        mgr.retire(a.slot);
+        CHECK(!mgr.is_active(a.slot));
+        CHECK(pool.free_block_count() > free_while_staged);
+
+        a = admit(mgr, 2, prompt_tokens(3), greedy_sampler());
+        CHECK(is_admitted(a));
+        CHECK(mgr.append_prefill(a.slot, 3).ok);
+        mgr.commit_prefill(a.slot);
+        staged = mgr.append_tokens(a.slot, accepted, 6);
+        CHECK(staged.ok);
+
+        mgr.commit_step(a.slot);
+        CHECK(mgr.slot(a.slot).cur_pos == 9);
+        CHECK(mgr.slot(a.slot).staged_tokens.empty());
+        CHECK(mgr.slot(a.slot).sample_history.size() == 9);
+        CHECK(std::equal(accepted, accepted + 6,
+                         mgr.slot(a.slot).sample_history.end() - 6));
     }
 
     // Context exhaustion: append_token refuses past max_ctx.

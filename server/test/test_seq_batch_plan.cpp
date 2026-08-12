@@ -119,12 +119,42 @@ int main() {
     SeqEngine::StepPlan work;
     work.decode = {{0, 7}};
     work.prefills = {{1, 4}};
+    CHECK(work.decode[0].allow_speculation);
 
     SeqEngine::StepResult good;
     good.decode.push_back({0, 11, false, {}});
     good.prefills.push_back({
         1, SeqEngine::PrefillOutput::Status::advanced, -1, {}});
     CHECK(validate_step_result(work, good, 2).empty());
+
+    SeqEngine::StepResult burst = good;
+    burst.decode[0].committed_tokens = {8, 9, 10};
+    burst.decode[0].ddtree_steps = 1;
+    burst.decode[0].ddtree_accepted_tokens = 3;
+    burst.decode[0].target_forwards = 1;
+    CHECK(validate_step_result(work, burst, 2).empty());
+
+    // A scheduler stop in the committed prefix must hide the remaining burst
+    // and final pending token. The backend state is discarded at retirement.
+    std::vector<int32_t> delivered;
+    const bool delivered_all = consume_decode_output_tokens(
+        burst.decode[0], [&](int32_t token) {
+            delivered.push_back(token);
+            return token != 9;
+        });
+    CHECK(!delivered_all);
+    CHECK((delivered == std::vector<int32_t>{8, 9}));
+
+    SeqEngine::StepResult malformed_burst = burst;
+    malformed_burst.decode[0].committed_tokens = {8, -1};
+    CHECK(!validate_step_result(work, malformed_burst, 2).empty());
+
+    SeqEngine::StepPlan speculation_disabled = work;
+    speculation_disabled.decode[0].allow_speculation = false;
+    CHECK(!validate_step_result(
+        speculation_disabled, burst, 2).empty());
+    CHECK(validate_step_result(
+        speculation_disabled, good, 2).empty());
 
     SeqEngine::StepResult complete = good;
     complete.prefills[0] = {
@@ -170,6 +200,13 @@ int main() {
     SeqEngine::StepResult success_with_error = good;
     success_with_error.decode[0].error = "contradictory diagnostic";
     CHECK(!validate_step_result(work, success_with_error, 2).empty());
+
+    SeqEngine::StepResult failed_burst = good;
+    failed_burst.decode[0].failed = true;
+    failed_burst.decode[0].token = -1;
+    failed_burst.decode[0].error = "decode failed";
+    failed_burst.decode[0].committed_tokens = {8};
+    CHECK(!validate_step_result(work, failed_burst, 2).empty());
 
     SeqEngine::StepResult failed;
     failed.error = "device compute failed";

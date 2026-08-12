@@ -20,6 +20,12 @@ const char * paged_kv_status_string(PagedKvStatus status) {
             return "physical blocks exhausted";
         case PagedKvStatus::StaleHandle:
             return "stale sequence handle";
+        case PagedKvStatus::LogicalBlockOutOfRange:
+            return "logical block out of range";
+        case PagedKvStatus::BlockNotResident:
+            return "logical block is not resident";
+        case PagedKvStatus::BlockAlreadyResident:
+            return "logical block is already resident";
     }
     return "unknown paged KV status";
 }
@@ -138,8 +144,35 @@ PagedKvAppendResult PagedKvPool::append(PagedKvSequenceHandle handle,
 
     const uint32_t old_kv_seq_len = sequence.kv_seq_len;
     const uint32_t new_kv_seq_len = old_kv_seq_len + token_count;
-    result.status =
-        extend_block_table(sequence, blocks_for_tokens(new_kv_seq_len));
+    const uint32_t required_blocks = blocks_for_tokens(new_kv_seq_len);
+    const uint32_t additional_blocks =
+        required_blocks - static_cast<uint32_t>(sequence.block_table.size());
+
+    // Appending into a partially-filled cold head needs one physical remap in
+    // addition to any newly opened logical blocks. Preflight the aggregate so
+    // append remains all-or-nothing on BlocksExhausted.
+    const bool remap_head =
+        old_kv_seq_len % block_size_ != 0 &&
+        sequence.block_table[old_kv_seq_len / block_size_] ==
+            PAGED_KV_COLD_BLOCK;
+    const uint32_t allocations = additional_blocks + (remap_head ? 1u : 0u);
+    const uint64_t available =
+        static_cast<uint64_t>(sequence.reserved_blocks.size()) +
+        free_blocks_.size();
+    if (allocations > available) {
+        result.status = PagedKvStatus::BlocksExhausted;
+        return result;
+    }
+
+    sequence.block_table.reserve(required_blocks);
+    if (remap_head) {
+        const uint32_t logical_block = old_kv_seq_len / block_size_;
+        const uint32_t physical_block = take_append_block(sequence);
+        sequence.block_table[logical_block] = physical_block;
+        result.remapped_cold_blocks.push_back(
+            {logical_block, physical_block});
+    }
+    result.status = extend_block_table(sequence, required_blocks);
     if (result.status != PagedKvStatus::Ok) return result;
 
     const auto make_slot = [&](uint32_t logical_position) {
@@ -176,7 +209,9 @@ PagedKvStatus PagedKvPool::release(PagedKvSequenceHandle handle) {
     SequenceState & sequence = sequences_[handle.slot];
     request_to_slot_.erase(sequence.request_id);
     for (uint32_t block : sequence.block_table) {
-        give_back(free_blocks_, block);
+        if (block != PAGED_KV_COLD_BLOCK) {
+            give_back(free_blocks_, block);
+        }
     }
     for (uint32_t block : sequence.reserved_blocks) {
         give_back(free_blocks_, block);
@@ -226,8 +261,67 @@ PagedKvStatus PagedKvPool::owned_block_count(
     if (status != PagedKvStatus::Ok) return status;
 
     const SequenceState & sequence = sequences_[handle.slot];
+    // Cold logical blocks remain appended sequence capacity even though they
+    // no longer own a physical page. Preserve the pre-residency API contract:
+    // appended logical blocks plus blocks reserved for future append.
     out_count = static_cast<uint32_t>(
         sequence.block_table.size() + sequence.reserved_blocks.size());
+    return PagedKvStatus::Ok;
+}
+
+PagedKvStatus PagedKvPool::page_out_block(
+        PagedKvSequenceHandle handle, uint32_t logical_block,
+        uint32_t & out_physical_block) {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+
+    SequenceState & sequence = sequences_[handle.slot];
+    if (logical_block >= sequence.block_table.size()) {
+        return PagedKvStatus::LogicalBlockOutOfRange;
+    }
+    const uint32_t physical_block = sequence.block_table[logical_block];
+    if (physical_block == PAGED_KV_COLD_BLOCK) {
+        return PagedKvStatus::BlockNotResident;
+    }
+
+    sequence.block_table[logical_block] = PAGED_KV_COLD_BLOCK;
+    give_back(free_blocks_, physical_block);
+    out_physical_block = physical_block;
+    return PagedKvStatus::Ok;
+}
+
+PagedKvStatus PagedKvPool::page_in_block(
+        PagedKvSequenceHandle handle, uint32_t logical_block,
+        uint32_t & out_physical_block) {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+
+    SequenceState & sequence = sequences_[handle.slot];
+    if (logical_block >= sequence.block_table.size()) {
+        return PagedKvStatus::LogicalBlockOutOfRange;
+    }
+    if (sequence.block_table[logical_block] != PAGED_KV_COLD_BLOCK) {
+        return PagedKvStatus::BlockAlreadyResident;
+    }
+    if (free_blocks_.empty()) {
+        return PagedKvStatus::BlocksExhausted;
+    }
+
+    const uint32_t physical_block = take_lowest(free_blocks_);
+    sequence.block_table[logical_block] = physical_block;
+    out_physical_block = physical_block;
+    return PagedKvStatus::Ok;
+}
+
+PagedKvStatus PagedKvPool::resident_block_count(
+        PagedKvSequenceHandle handle, uint32_t & out_count) const {
+    const PagedKvStatus status = validate(handle);
+    if (status != PagedKvStatus::Ok) return status;
+
+    const SequenceState & sequence = sequences_[handle.slot];
+    out_count = static_cast<uint32_t>(std::count_if(
+        sequence.block_table.begin(), sequence.block_table.end(),
+        [](uint32_t block) { return block != PAGED_KV_COLD_BLOCK; }));
     return PagedKvStatus::Ok;
 }
 
@@ -262,11 +356,15 @@ PagedKvStatus PagedKvPool::extend_block_table(SequenceState & sequence,
 
     sequence.block_table.reserve(required_blocks);
     for (uint32_t i = 0; i < additional_blocks; ++i) {
-        std::vector<uint32_t> & source = sequence.reserved_blocks.empty()
-            ? free_blocks_ : sequence.reserved_blocks;
-        sequence.block_table.push_back(take_lowest(source));
+        sequence.block_table.push_back(take_append_block(sequence));
     }
     return PagedKvStatus::Ok;
+}
+
+uint32_t PagedKvPool::take_append_block(SequenceState & sequence) {
+    std::vector<uint32_t> & source = sequence.reserved_blocks.empty()
+        ? free_blocks_ : sequence.reserved_blocks;
+    return take_lowest(source);
 }
 
 void PagedKvPool::take_reserved_blocks(SequenceState & sequence,

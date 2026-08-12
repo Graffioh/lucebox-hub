@@ -5708,7 +5708,12 @@ struct ggml_tensor * ggml_paged_attn_ext(
         struct ggml_tensor  * query_positions,
         float                 scale,
         int                   block_size,
-        int                   max_kv_seq_len) {
+        int                   max_kv_seq_len,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * tree_sizes,
+        int                   tree_width,
+        int                   tree_scratch_base,
+        int                   tree_scratch_stride) {
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q4_0 || v->type == GGML_TYPE_Q8_0);
@@ -5719,6 +5724,13 @@ struct ggml_tensor * ggml_paged_attn_ext(
     // an explicit row -> block-table-column mapping.
     GGML_ASSERT(query_positions == NULL || active_slot_ids != NULL);
     GGML_ASSERT(query_positions == NULL || query_positions->type == GGML_TYPE_I32);
+
+    const bool tree_mode = parent_ids != NULL || tree_sizes != NULL;
+    GGML_ASSERT((parent_ids == NULL) == (tree_sizes == NULL));
+    GGML_ASSERT(!tree_mode || active_slot_ids != NULL);
+    GGML_ASSERT(!tree_mode || query_positions == NULL);
+    GGML_ASSERT(!tree_mode || parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(!tree_mode || tree_sizes->type == GGML_TYPE_I32);
 
     GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
     GGML_ASSERT(k->ne[1] == v->ne[1]);
@@ -5749,13 +5761,49 @@ struct ggml_tensor * ggml_paged_attn_ext(
     GGML_ASSERT(block_size > 0);
     GGML_ASSERT(k->ne[1] % block_size == 0);
     GGML_ASSERT(max_kv_seq_len > 0);
-    GGML_ASSERT(max_kv_seq_len <= k->ne[1]);
+    // This is a padded logical launch bound, not a physical-cache extent.
+    // Each row clamps its actual sequence length to the block-table capacity
+    // and validates every resolved physical block before dereferencing K/V.
+    GGML_ASSERT((int64_t) max_kv_seq_len + tree_width <= INT32_MAX);
+
+    if (tree_mode) {
+        GGML_ASSERT(tree_width > 0);
+        GGML_ASSERT(tree_scratch_base > 0);
+        GGML_ASSERT(tree_scratch_base % block_size == 0);
+        GGML_ASSERT(tree_scratch_stride >= tree_width);
+        GGML_ASSERT(ggml_is_contiguous(parent_ids));
+        GGML_ASSERT(ggml_is_contiguous(tree_sizes));
+        GGML_ASSERT(parent_ids->ne[0] == tree_width);
+        GGML_ASSERT(parent_ids->ne[1] == tree_sizes->ne[0]);
+        GGML_ASSERT(parent_ids->ne[2] == 1 && parent_ids->ne[3] == 1);
+        GGML_ASSERT(tree_sizes->ne[1] == 1 && tree_sizes->ne[2] == 1 && tree_sizes->ne[3] == 1);
+        GGML_ASSERT(parent_ids->ne[1] > 0);
+        GGML_ASSERT(parent_ids->ne[1] <= INT64_MAX / tree_width);
+        GGML_ASSERT(q->ne[1] == parent_ids->ne[1] * tree_width);
+
+        // Every physical sequence slot owns one non-overlapping scratch slab.
+        // Bound the largest address with int64 arithmetic before the GPU sees
+        // the int32 op parameters.
+        const int64_t scratch_end =
+            (int64_t) tree_scratch_base +
+            (block_table->ne[1] - 1) * (int64_t) tree_scratch_stride +
+            tree_width;
+        GGML_ASSERT(scratch_end <= k->ne[1]);
+        GGML_ASSERT((int64_t) max_kv_seq_len + tree_width <= INT32_MAX);
+    } else {
+        GGML_ASSERT(tree_width == 0);
+        GGML_ASSERT(tree_scratch_base == 0);
+        GGML_ASSERT(tree_scratch_stride == 0);
+    }
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, q->ne);
 
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, block_size);
     ggml_set_op_params_i32(result, 2, max_kv_seq_len);
+    ggml_set_op_params_i32(result, 3, tree_width);
+    ggml_set_op_params_i32(result, 4, tree_scratch_base);
+    ggml_set_op_params_i32(result, 5, tree_scratch_stride);
 
     result->op     = GGML_OP_PAGED_ATTN;
     result->src[0] = q;
@@ -5765,6 +5813,8 @@ struct ggml_tensor * ggml_paged_attn_ext(
     result->src[4] = kv_seq_lens;
     result->src[5] = active_slot_ids;
     result->src[6] = query_positions;
+    result->src[7] = parent_ids;
+    result->src[8] = tree_sizes;
 
     return result;
 }

@@ -1379,11 +1379,27 @@ int HttpServer::run() {
     std::fprintf(stderr, "[server] listening on http://%s:%d\n",
                  config_.host.c_str(), config_.port);
 
-    // A backend-provided sequence engine replaces the one-request worker
-    // with the concurrent scheduler. Upstream forwarding stays on the
-    // classic path even when the local backend exposes an engine.
-    if (SeqEngine * engine = backend_.seq_engine();
-        engine && config_.pflash_upstream_base.empty()) {
+    // A backend-provided sequence engine replaces the one-request worker.
+    // Local PFlash stays on this path too: scheduler admission prepares each
+    // prompt exactly once, then admits the effective tokens. Persistent
+    // residency is the explicit safety contract that lets compression run
+    // without parking model state owned by other live slots.
+    SeqEngine * engine = backend_.seq_engine();
+    if (engine && config_.pflash_upstream_base.empty()) {
+        const ConcurrentPflashPlan pflash_plan =
+            resolve_concurrent_pflash_plan(config_, drafter_tokenizer_ != nullptr);
+        if (!pflash_plan.ok()) {
+            std::fprintf(stderr, "[server] %s\n", pflash_plan.error.c_str());
+            socket_close(listen_fd_);
+            listen_fd_ = kInvalidSocket;
+            return 2;
+        }
+        if (pflash_plan.force_skip_park && !config_.pflash_skip_park) {
+            config_.pflash_skip_park = true;
+            std::fprintf(stderr,
+                "[server] concurrent PFlash: persistent residency enables "
+                "skip-park for live sequence safety\n");
+        }
         worker_thread_ =
             std::thread([this, engine]() { scheduler_loop(*engine); });
     } else {
@@ -4231,6 +4247,7 @@ std::string HttpServer::format_http_response(
         case 400: reason = "Bad Request"; break;
         case 404: reason = "Not Found"; break;
         case 405: reason = "Method Not Allowed"; break;
+        case 409: reason = "Conflict"; break;
         case 413: reason = "Payload Too Large"; break;
         case 500: reason = "Internal Server Error"; break;
         case 503: reason = "Service Unavailable"; break;

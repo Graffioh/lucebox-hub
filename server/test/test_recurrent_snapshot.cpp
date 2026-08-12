@@ -1,5 +1,6 @@
 #include "CppUnitTestFramework.hpp"
 #include "internal.h"
+#include "qwen35/graph_builders.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -30,6 +31,38 @@ static std::vector<float> get_tensor(const ggml_tensor * tensor) {
     ggml_backend_tensor_get(tensor, values.data(), 0,
                             values.size() * sizeof(float));
     return values;
+}
+
+TEST_CASE(RecurrentSnapshotFixture, validates_paged_tree_layout) {
+    // The packed-tree launch length is logical. KVFlash may keep a much
+    // smaller physical resident pool, provided every tree scratch slab still
+    // fits within that pool.
+    {
+        ggml_init_params shape_params{};
+        shape_params.mem_size = 8 * ggml_tensor_overhead();
+        shape_params.no_alloc = true;
+        ggml_context * shape_ctx = ggml_init(shape_params);
+        CHECK(shape_ctx != nullptr);
+        if (shape_ctx) {
+            TargetCache shape_cache;
+            shape_cache.n_seq_slots = 2;
+            shape_cache.paged_block_table =
+                ggml_new_tensor_2d(shape_ctx, GGML_TYPE_I32, 4, 2);
+            shape_cache.paged_kv_seq_lens =
+                ggml_new_tensor_1d(shape_ctx, GGML_TYPE_I32, 2);
+            shape_cache.attn_k = {
+                ggml_new_tensor_4d(shape_ctx, GGML_TYPE_F16, 4, 64, 1, 1),
+            };
+            CHECK(dflash::common::detail::validate_target_paged_tree_layout(
+                shape_cache, 8, 2, 4096, 32, 16));
+            CHECK(!dflash::common::detail::validate_target_paged_tree_layout(
+                shape_cache, 8, 2, 4096, 48, 16));
+            CHECK(!dflash::common::detail::validate_target_paged_tree_layout(
+                shape_cache, 8, 5, 4096, 32, 16));
+            ggml_free(shape_ctx);
+        }
+    }
+
 }
 
 TEST_CASE(RecurrentSnapshotFixture, snapshot_and_restore_recurrent_state) {

@@ -12,6 +12,8 @@
 #include "attn_masks.h"
 #include "prefill_helpers.h"
 #include "common/sampler.h"
+#include "common/ddtree.h"
+#include "common/geometric_draft_topk_cuda.h"
 #include "internal.h"
 
 #include <algorithm>
@@ -35,6 +37,506 @@ int decode_bucket_width(int live_count) {
 
 } // namespace
 
+Qwen35SeqEngine::Qwen35SeqEngine(
+        Qwen35Backend & backend, PagedKvPool & pool, int max_ctx,
+        int64_t scratch_row, int tree_width, int tree_scratch_base,
+        int tree_scratch_stride, int max_prefills,
+        int mixed_prefill_tokens, int long_mixed_prefill_tokens,
+        int long_prefill_threshold, int idle_prefill_tokens,
+        int prefill_quantum)
+    : max_prefills_(std::max(1, max_prefills)),
+      mixed_prefill_tokens_(std::max(1, mixed_prefill_tokens)),
+      long_mixed_prefill_tokens_(std::max(1, long_mixed_prefill_tokens)),
+      long_prefill_threshold_(std::max(1, long_prefill_threshold)),
+      idle_prefill_tokens_(std::max(1, idle_prefill_tokens)),
+      prefill_quantum_(std::max(1, prefill_quantum)), b_(backend),
+      slots_(pool, max_ctx, std::max(1, tree_width),
+             backend.paged_kv_residency_.get()),
+      scratch_row_(scratch_row), tree_width_(tree_width),
+      tree_scratch_base_(tree_scratch_base),
+      tree_scratch_stride_(tree_scratch_stride) {
+    const int n_slots = slots_.slot_count();
+    slot_draft_kv_.resize((size_t)n_slots);
+
+    // The concurrent DDTree stack is gated to a local same-device drafter.
+    // Build metadata-only BF16 views over each slot's disjoint target feature
+    // ring; draft_kv_begin_step converts only newly committed rows to its F32
+    // append input instead of syncing the entire 200 MiB ring per round.
+    capture_features_ = tree_width_ > 0 && b_.cache_.target_feat &&
+        b_.cache_.target_feat_cap > 0 && b_.cfg_.draft_path &&
+        !b_.cfg_.remote_draft.enabled() && !b_.split_gpus_ &&
+        b_.cfg_.draft_gpu == b_.cfg_.device.gpu;
+    if (!capture_features_) return;
+
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * (size_t)(n_slots + 1);
+    ip.no_alloc = true;
+    feature_view_ctx_ = ggml_init(ip);
+    if (!feature_view_ctx_) {
+        capture_features_ = false;
+        return;
+    }
+
+    const int cap = b_.cache_.target_feat_cap;
+    const int64_t fc_in =
+        (int64_t)b_.w_.n_capture_layers * b_.w_.n_embd;
+    slot_feature_mirrors_.resize((size_t)n_slots);
+    for (int slot = 0; slot < n_slots; ++slot) {
+        DraftFeatureMirror & mirror = slot_feature_mirrors_[(size_t)slot];
+        mirror.target_feat = ggml_view_2d(
+            feature_view_ctx_, b_.cache_.target_feat, fc_in, cap,
+            b_.cache_.target_feat->nb[1],
+            (size_t)slot * (size_t)cap * b_.cache_.target_feat->nb[1]);
+        mirror.device = b_.cfg_.draft_gpu;
+        mirror.target_device = b_.cfg_.device.gpu;
+        mirror.cap = cap;
+        mirror.n_target_layers = b_.w_.n_capture_layers;
+        mirror.hidden_size = b_.w_.n_embd;
+        mirror.storage_type = b_.cache_.target_feat->type;
+    }
+}
+
+Qwen35SeqEngine::~Qwen35SeqEngine() {
+    for (std::unique_ptr<DraftKvState> & state : slot_draft_kv_) {
+        if (state) draft_kv_free(*state);
+    }
+    slot_draft_kv_.clear();
+    for (DraftFeatureMirror & mirror : slot_feature_mirrors_) {
+        draft_feature_mirror_free(mirror);
+    }
+    slot_feature_mirrors_.clear();
+    if (feature_view_ctx_) {
+        ggml_free(feature_view_ctx_);
+        feature_view_ctx_ = nullptr;
+    }
+}
+
+DraftFeatureMirror * Qwen35SeqEngine::slot_feature_mirror(int slot) {
+    if (!capture_features_ || slot < 0 ||
+        slot >= (int)slot_feature_mirrors_.size()) {
+        return nullptr;
+    }
+    return &slot_feature_mirrors_[(size_t)slot];
+}
+
+DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
+    DraftFeatureMirror * mirror = slot_feature_mirror(slot);
+    if (!mirror || slot < 0 || slot >= (int)slot_draft_kv_.size()) {
+        return nullptr;
+    }
+    std::unique_ptr<DraftKvState> & state = slot_draft_kv_[(size_t)slot];
+    if (state && state->gf && state->built_for == (const void *)&b_.dw_) {
+        return state.get();
+    }
+    if (state) draft_kv_free(*state);
+    state = std::make_unique<DraftKvState>();
+    const int cap = std::min(
+        mirror->cap, std::max(1, b_.cfg_.draft_ctx_max));
+    if (!draft_kv_init(*state, b_.dw_, b_.draft_backend_, cap, nullptr)) {
+        draft_kv_free(*state);
+        state.reset();
+        return nullptr;
+    }
+    return state.get();
+}
+
+bool Qwen35SeqEngine::ddtree_eligible(const StepPlan & plan) const {
+    if (tree_width_ <= 1 || !capture_features_ || !plan.prefills.empty() ||
+        plan.decode.empty() || b_.dw_.block_size <= 1 ||
+        b_.cfg_.ddtree_budget + 1 != tree_width_) {
+        return false;
+    }
+    const int min_floor = []() {
+        const char * value = std::getenv("DFLASH_MIN_TOKENS");
+        return value ? std::max(0, std::atoi(value)) : 0;
+    }();
+    for (const StepInput & in : plan.decode) {
+        if (!in.allow_speculation || in.slot < 0 ||
+            in.slot >= slots_.slot_count() ||
+            !slots_.slot(in.slot).decoding() ||
+            slots_.slot(in.slot).sampler.needs_logit_processing() ||
+            slots_.slot(in.slot).cur_pos < 1 ||
+            slots_.slot(in.slot).cur_pos >= slots_.max_context()) {
+            return false;
+        }
+        const Qwen35Slot & seq = slots_.slot(in.slot);
+        const int generated = seq.generated_tokens();
+        if (generated < min_floor) return false;
+    }
+    return true;
+}
+
+std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
+        const StepPlan & plan) {
+    StepResult result;
+    const int active = (int)plan.decode.size();
+    const int bucket = decode_bucket_width(active);
+    const int T = tree_width_;
+    const int q_len = b_.dw_.block_size;
+    const int hidden = b_.w_.n_embd;
+    const int n_head_kv = b_.w_.n_head_kv;
+    const int n_slots = slots_.slot_count();
+    const int K = b_.cfg_.ddtree_budget > q_len - 1 ? 8 : 1;
+
+    struct Proposal {
+        int slot = -1;
+        int32_t root = -1;
+        DDTree tree;
+        std::vector<int32_t> flat;
+        std::vector<int> accepted;
+        int32_t bonus = -1;
+    };
+    std::vector<Proposal> proposals;
+    proposals.reserve((size_t)active);
+    std::vector<int32_t> noise((size_t)q_len, b_.w_.mask_token_id);
+    std::vector<float> noise_embed((size_t)hidden * q_len);
+    std::vector<float> logits((size_t)b_.w_.n_vocab * q_len);
+    std::vector<float> top_lp((size_t)q_len * K);
+    std::vector<int32_t> top_ids((size_t)q_len * K);
+
+    auto proposal_fallback = [&]() -> std::optional<StepResult> {
+        // begin_step updates persistent drafter bookkeeping before compute.
+        // A failed proposal graph may therefore leave only part of that
+        // cache valid. Reset all participating draft rings so a later
+        // speculative round rebuilds them from committed target features.
+        for (const StepInput & in : plan.decode) {
+            if (in.slot >= 0 && in.slot < (int)slot_draft_kv_.size() &&
+                slot_draft_kv_[(size_t)in.slot]) {
+                draft_kv_reset(*slot_draft_kv_[(size_t)in.slot]);
+            }
+        }
+        return std::nullopt;
+    };
+
+    if (!build_lm_head_projection_step(
+            b_.proj_sg_, b_.w_, b_.target_backend_, q_len)) {
+        return proposal_fallback();
+    }
+
+    // Proposal is sequential by slot: immutable draft weights are shared,
+    // while each slot owns an independent persistent context-KV ring.
+    for (const StepInput & in : plan.decode) {
+        DraftKvState * draft = ensure_slot_draft_kv(in.slot);
+        DraftFeatureMirror * mirror = slot_feature_mirror(in.slot);
+        if (!draft || !mirror) return proposal_fallback();
+        noise[0] = in.token;
+        std::fill(noise.begin() + 1, noise.end(), b_.w_.mask_token_id);
+        if (!b_.w_.embedder.embed(
+                noise.data(), q_len, noise_embed.data()) ||
+            !draft_kv_begin_step(*draft, b_.dw_, b_.draft_backend_,
+                                 *mirror, slots_.slot(in.slot).cur_pos)) {
+            return proposal_fallback();
+        }
+        ggml_backend_tensor_set(
+            draft->inp_embed, noise_embed.data(), 0,
+            sizeof(float) * noise_embed.size());
+        if (ggml_backend_graph_compute(b_.draft_backend_, draft->gf) !=
+            GGML_STATUS_SUCCESS) {
+            return proposal_fallback();
+        }
+        ggml_backend_tensor_copy(
+            draft->hidden_states, b_.proj_sg_.hidden_input);
+        if (ggml_backend_graph_compute(
+                b_.target_backend_, b_.proj_sg_.gf) != GGML_STATUS_SUCCESS) {
+            return proposal_fallback();
+        }
+        bool topk_ready = false;
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK
+        topk_ready = geometric_extract_draft_topk_cuda(
+            b_.proj_sg_.logits->data, q_len, b_.w_.n_vocab, K,
+            top_lp.data(), top_ids.data(), b_.cfg_.ddtree_temp);
+#endif
+        if (!topk_ready) {
+            ggml_backend_tensor_get(
+                b_.proj_sg_.logits, logits.data(), 0,
+                sizeof(float) * logits.size());
+            extract_draft_topk(
+                logits.data(), q_len, b_.w_.n_vocab, K,
+                top_lp.data(), top_ids.data(), b_.cfg_.ddtree_temp);
+        }
+
+        Proposal p;
+        p.slot = in.slot;
+        p.root = in.token;
+        p.tree = build_ddtree(
+            top_lp.data() + K, top_ids.data() + K,
+            q_len - 1, K, b_.cfg_.ddtree_budget,
+            b_.cfg_.ddtree_chain_seed);
+        p.flat.assign((size_t)T, 0);
+        p.flat[0] = in.token;
+        for (int node = 0; node < p.tree.n_nodes; ++node) {
+            p.flat[(size_t)node + 1] = p.tree.token_ids[(size_t)node];
+        }
+        proposals.push_back(std::move(p));
+    }
+
+    StepGraph & tree_sg = b_.sg_;
+    int max_prefix = 1;
+    for (const Proposal & p : proposals) {
+        max_prefix = std::max(max_prefix, slots_.slot(p.slot).cur_pos);
+    }
+    if (!build_target_step_paged_tree(
+            tree_sg, b_.w_, b_.cache_, b_.target_backend_, T, bucket,
+            max_prefix, tree_scratch_base_, tree_scratch_stride_,
+            b_.cfg_.kq_stride_pad)) {
+        result.error = "packed DDTree verify graph build failed";
+        return result;
+    }
+
+    const int total_tree = T * bucket;
+    std::vector<int32_t> flat_tokens((size_t)total_tree, 0);
+    std::vector<int32_t> parents((size_t)total_tree, -1);
+    std::vector<int32_t> sizes((size_t)bucket, 0);
+    // Negative active IDs identify bucket padding. Recurrent gathers cannot
+    // index a negative slab, so padded trees use slot 0 only for their
+    // read-only base-state gather; tree_size=0/query_slot=-1 keeps all of
+    // their attention/output rows inactive and tree mode never persists it.
+    std::vector<int32_t> tree_slots((size_t)bucket, -1);
+    std::vector<int32_t> tree_state_slots((size_t)bucket, 0);
+    std::vector<int32_t> query_slots((size_t)total_tree, -1);
+    std::vector<int64_t> tree_rows(
+        (size_t)total_tree * n_head_kv, scratch_row_);
+    std::vector<int32_t> tree_pos((size_t)4 * total_tree, 0);
+    std::vector<float> tree_embed((size_t)hidden * total_tree, 0.0f);
+    seq_lens_.assign((size_t)n_slots, 0);
+
+    for (int s = 0; s < active; ++s) {
+        const Proposal & p = proposals[(size_t)s];
+        const int base = s * T;
+        sizes[(size_t)s] = p.tree.n_nodes + 1;
+        tree_slots[(size_t)s] = p.slot;
+        tree_state_slots[(size_t)s] = p.slot;
+        seq_lens_[(size_t)p.slot] = slots_.slot(p.slot).cur_pos;
+        for (int node = 0; node < sizes[(size_t)s]; ++node) {
+            const int row = base + node;
+            flat_tokens[(size_t)row] = p.flat[(size_t)node];
+            parents[(size_t)row] = node == 0 ? -1 :
+                p.tree.parents[(size_t)node];
+            query_slots[(size_t)row] = p.slot;
+            const int depth = node == 0 ? 0 :
+                p.tree.depths[(size_t)node - 1];
+            const int pos = slots_.slot(p.slot).cur_pos + depth;
+            tree_pos[(size_t)0 * total_tree + row] = pos;
+            tree_pos[(size_t)1 * total_tree + row] = pos;
+            tree_pos[(size_t)2 * total_tree + row] = pos;
+            for (int h = 0; h < n_head_kv; ++h) {
+                tree_rows[(size_t)h * total_tree + row] =
+                    (int64_t)tree_scratch_base_ +
+                    (int64_t)p.slot * tree_scratch_stride_ + node;
+            }
+        }
+    }
+    if (!b_.w_.embedder.embed(
+            flat_tokens.data(), total_tree, tree_embed.data())) {
+        result.error = "packed DDTree embedding failed";
+        return result;
+    }
+    ggml_backend_tensor_set(tree_sg.inp_embed, tree_embed.data(), 0,
+                            sizeof(float) * tree_embed.size());
+    ggml_backend_tensor_set(tree_sg.positions, tree_pos.data(), 0,
+                            sizeof(int32_t) * tree_pos.size());
+    ggml_backend_tensor_set(tree_sg.parent_ids, parents.data(), 0,
+                            sizeof(int32_t) * parents.size());
+    ggml_backend_tensor_set(tree_sg.tree_sizes, sizes.data(), 0,
+                            sizeof(int32_t) * sizes.size());
+    ggml_backend_tensor_set(tree_sg.active_slot_ids, tree_slots.data(), 0,
+                            sizeof(int32_t) * tree_slots.size());
+    ggml_backend_tensor_set(tree_sg.state_slot_ids, tree_state_slots.data(), 0,
+                            sizeof(int32_t) * tree_state_slots.size());
+    ggml_backend_tensor_set(tree_sg.paged_query_seq_ids, query_slots.data(), 0,
+                            sizeof(int32_t) * query_slots.size());
+    ggml_backend_tensor_set(tree_sg.kv_write_rows, tree_rows.data(), 0,
+                            sizeof(int64_t) * tree_rows.size());
+    ggml_backend_tensor_set(b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
+                            sizeof(int32_t) * seq_lens_.size());
+    if (ggml_backend_graph_compute(b_.target_backend_, tree_sg.gf) !=
+        GGML_STATUS_SUCCESS) {
+        result.error = "packed DDTree verify compute failed";
+        return result;
+    }
+    std::vector<int32_t> posterior((size_t)total_tree, -1);
+    ggml_backend_tensor_get(tree_sg.argmax_tokens, posterior.data(), 0,
+                            sizeof(int32_t) * posterior.size());
+
+    int replay_total = 0;
+    for (int s = 0; s < active; ++s) {
+        Proposal & p = proposals[(size_t)s];
+        p.accepted = follow_verified_tree(
+            p.tree, posterior.data() + (size_t)s * T, p.bonus);
+        const int room = slots_.max_context() - slots_.slot(p.slot).cur_pos;
+        truncate_verified_path(
+            p.accepted, (size_t)std::max(0, room),
+            posterior.data() + (size_t)s * T, p.bonus);
+        if (p.accepted.empty()) {
+            result.error = "DDTree accepted path has no context headroom";
+            return result;
+        }
+        replay_total += (int)p.accepted.size();
+    }
+
+    std::vector<QwenPrefillSegment> replay_segments;
+    std::vector<int32_t> replay_tokens;
+    std::vector<int32_t> replay_slots;
+    std::vector<int32_t> replay_positions;
+    std::vector<int64_t> replay_rows;
+    std::vector<int32_t> replay_logits_rows;
+    replay_segments.reserve((size_t)active);
+    replay_tokens.reserve((size_t)replay_total);
+    replay_slots.reserve((size_t)replay_total);
+    replay_positions.reserve((size_t)replay_total);
+    replay_rows.assign((size_t)replay_total * n_head_kv, scratch_row_);
+    replay_logits_rows.reserve((size_t)active);
+    seq_lens_.assign((size_t)n_slots, 0);
+
+    int replay_offset = 0;
+    for (Proposal & p : proposals) {
+        std::vector<int32_t> path;
+        path.reserve(p.accepted.size());
+        for (int dfs : p.accepted) {
+            path.push_back(dfs == 0 ? p.root :
+                p.tree.token_ids[(size_t)dfs - 1]);
+        }
+        const Qwen35SlotManager::StepAppend app = slots_.append_tokens(
+            p.slot, path.data(), (int)path.size());
+        const bool table_ok = slots_.residency_active() ||
+            upload_block_table_delta(p.slot, app.first_new_block,
+                app.new_blocks.data(), app.new_blocks.size());
+        if (!app.ok || app.physical_rows.size() != path.size() ||
+            !table_ok) {
+            result.error = app.busy
+                ? "paged KV pool exhausted during DDTree replay"
+                : "DDTree replay K/V append failed";
+            return result;
+        }
+        replay_segments.push_back(
+            {replay_offset, (int)path.size(), p.slot});
+        for (size_t i = 0; i < path.size(); ++i) {
+            replay_tokens.push_back(path[i]);
+            replay_slots.push_back(p.slot);
+            replay_positions.push_back(app.position + (int)i);
+            for (int h = 0; h < n_head_kv; ++h) {
+                replay_rows[(size_t)h * replay_total + replay_offset + i] =
+                    app.physical_rows[i];
+            }
+        }
+        replay_offset += (int)path.size();
+        replay_logits_rows.push_back(replay_offset - 1);
+        seq_lens_[(size_t)p.slot] = app.position + (int)path.size();
+    }
+
+    if (!upload_all_active_block_tables()) {
+        result.error = "DDTree replay block-table refresh failed";
+        return result;
+    }
+
+    StepGraph & replay_sg = b_.sg_;
+    if (!build_target_step(
+            replay_sg, b_.w_, b_.cache_, b_.target_backend_,
+            0, replay_total, false, true, false, 0, 0,
+            b_.cfg_.kq_stride_pad, false, false, false, true,
+            1, 0, *std::max_element(seq_lens_.begin(), seq_lens_.end()),
+            replay_total, replay_segments.data(),
+            (int)replay_segments.size(), active, false) ||
+        !replay_sg.target_feat_rows || !replay_sg.paged_query_seq_ids ||
+        !replay_sg.paged_query_positions || !replay_sg.logits_row_indices ||
+        !replay_sg.argmax_tokens) {
+        result.error = "DDTree accepted-path replay graph build failed";
+        return result;
+    }
+    embed_buf_.resize((size_t)hidden * replay_total);
+    if (!b_.w_.embedder.embed(
+            replay_tokens.data(), replay_total, embed_buf_.data())) {
+        result.error = "DDTree replay embedding failed";
+        return result;
+    }
+    pos_buf_.assign((size_t)4 * replay_total, 0);
+    feature_rows_.resize((size_t)replay_total);
+    const int cap = b_.cache_.target_feat_cap;
+    for (int row = 0; row < replay_total; ++row) {
+        const int pos = replay_positions[(size_t)row];
+        pos_buf_[(size_t)0 * replay_total + row] = pos;
+        pos_buf_[(size_t)1 * replay_total + row] = pos;
+        pos_buf_[(size_t)2 * replay_total + row] = pos;
+        feature_rows_[(size_t)row] =
+            replay_slots[(size_t)row] * cap + pos % cap;
+    }
+    ggml_backend_tensor_set(replay_sg.inp_embed, embed_buf_.data(), 0,
+                            sizeof(float) * embed_buf_.size());
+    ggml_backend_tensor_set(replay_sg.positions, pos_buf_.data(), 0,
+                            sizeof(int32_t) * pos_buf_.size());
+    ggml_backend_tensor_set(replay_sg.kv_write_rows, replay_rows.data(), 0,
+                            sizeof(int64_t) * replay_rows.size());
+    ggml_backend_tensor_set(replay_sg.paged_query_seq_ids,
+                            replay_slots.data(), 0,
+                            sizeof(int32_t) * replay_slots.size());
+    ggml_backend_tensor_set(replay_sg.paged_query_positions,
+                            replay_positions.data(), 0,
+                            sizeof(int32_t) * replay_positions.size());
+    ggml_backend_tensor_set(replay_sg.logits_row_indices,
+                            replay_logits_rows.data(), 0,
+                            sizeof(int32_t) * replay_logits_rows.size());
+    ggml_backend_tensor_set(replay_sg.target_feat_rows,
+                            feature_rows_.data(), 0,
+                            sizeof(int32_t) * feature_rows_.size());
+    ggml_backend_tensor_set(b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
+                            sizeof(int32_t) * seq_lens_.size());
+    if (ggml_backend_graph_compute(b_.target_backend_, replay_sg.gf) !=
+        GGML_STATUS_SUCCESS) {
+        result.error = "DDTree accepted-path replay compute failed";
+        return result;
+    }
+    std::vector<int> replay_write_slots;
+    replay_write_slots.reserve(proposals.size());
+    for (const Proposal & p : proposals) replay_write_slots.push_back(p.slot);
+    if (!commit_residency_writes(replay_write_slots)) {
+        result.error = "DDTree replay KV write commit failed";
+        return result;
+    }
+
+    // The replay is the durable target forward: its recurrent/KV/feature
+    // state is what the next step consumes. Use its posterior rather than
+    // the tree-verify posterior so the pending scalar remains exact even if
+    // the two graph shapes differ numerically.
+    std::vector<int32_t> replay_next((size_t)active, -1);
+    ggml_backend_tensor_get(
+        replay_sg.argmax_tokens, replay_next.data(), 0,
+        sizeof(int32_t) * replay_next.size());
+    for (int s = 0; s < active; ++s) {
+        if (replay_next[(size_t)s] < 0) {
+            result.error = "DDTree replay produced an invalid pending token";
+            return result;
+        }
+        proposals[(size_t)s].bonus = replay_next[(size_t)s];
+    }
+
+    for (Proposal & p : proposals) {
+        slots_.commit_step(p.slot);
+        std::string reselect_error;
+        if (!maybe_reselect_residency(p.slot, reselect_error)) {
+            result.error = reselect_error.empty()
+                ? "KVFlash reselect failed" : reselect_error;
+            return result;
+        }
+    }
+    result.decode.reserve((size_t)active);
+    for (Proposal & p : proposals) {
+        DecodeOutput out;
+        out.slot = p.slot;
+        out.token = p.bonus;
+        out.ddtree_steps = 1;
+        out.ddtree_accepted_tokens = p.accepted.size() - 1;
+        out.target_forwards = 2;
+        for (size_t i = 1; i < p.accepted.size(); ++i) {
+            const int dfs = p.accepted[i];
+            out.committed_tokens.push_back(
+                p.tree.token_ids[(size_t)dfs - 1]);
+        }
+        attach_residency_telemetry(out);
+        result.decode.push_back(std::move(out));
+    }
+    return result;
+}
+
 bool Qwen35SeqEngine::token_is_eos(int32_t token) const {
     return b_.token_is_eos(token);
 }
@@ -46,6 +548,14 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
     AdmitResult result = slots_.admit(request_id, prompt, sampler);
     if (result.status == AdmitResult::Status::admitted) {
         reset_recurrent_slot(b_.cache_, result.slot);
+        if (slots_.residency_active()) {
+            slots_.slot(result.slot).kvflash_last_reselect_generated =
+                -std::max(1, b_.kvflash_tau_);
+        }
+        if (result.slot >= 0 && result.slot < (int)slot_draft_kv_.size() &&
+            slot_draft_kv_[(size_t)result.slot]) {
+            draft_kv_reset(*slot_draft_kv_[(size_t)result.slot]);
+        }
     }
     return result;
 }
@@ -102,6 +612,77 @@ bool Qwen35SeqEngine::upload_block_table_delta(
     return true;
 }
 
+bool Qwen35SeqEngine::upload_all_active_block_tables() {
+    if (!slots_.residency_active()) return true;
+    ggml_tensor * table = b_.cache_.paged_block_table;
+    if (!table) return false;
+    std::vector<int32_t> column((size_t)table->ne[0], -1);
+    std::vector<int32_t> snapshot;
+    for (int slot = 0; slot < slots_.slot_count(); ++slot) {
+        if (!slots_.is_active(slot)) continue;
+        std::fill(column.begin(), column.end(), -1);
+        if (!slots_.block_table_snapshot(slot, snapshot) ||
+            snapshot.size() > column.size()) {
+            return false;
+        }
+        std::copy(snapshot.begin(), snapshot.end(), column.begin());
+        ggml_backend_tensor_set(
+            table, column.data(), (size_t)slot * table->nb[1],
+            sizeof(int32_t) * column.size());
+    }
+    return true;
+}
+
+bool Qwen35SeqEngine::commit_residency_writes(
+        const std::vector<int> & slots) {
+    if (!slots_.residency_active()) return true;
+    // Graph completion is not a host barrier for every backend. Pending pages
+    // become evictable only after all target writes are device-complete.
+    ggml_backend_synchronize(b_.target_backend_);
+    for (int slot : slots) {
+        if (!slots_.commit_residency_writes(slot)) return false;
+    }
+    return true;
+}
+
+bool Qwen35SeqEngine::maybe_reselect_residency(
+        int slot, std::string & error) {
+    if (!slots_.residency_active()) return true;
+    Qwen35Slot & seq = slots_.slot(slot);
+    const int generated = seq.generated_tokens();
+    const int tau = std::max<int>(
+        b_.kvflash_tau_, (int)(seq.sample_history.size() / 45));
+    if (generated - seq.kvflash_last_reselect_generated < tau) return true;
+
+    b_.kvflash_ensure_scorer();
+    std::vector<float> scores;
+    const std::vector<float> * score_ptr = nullptr;
+    if (b_.kvflash_scorer_) {
+        if (!b_.kvflash_scorer_->score_chunks(
+                seq.sample_history, PAGED_BLOCK_SIZE, scores)) {
+            // Short histories and recoverable drafter failures are expected
+            // scorer outcomes. Preserve service with the pager's explicit
+            // recency/LRU policy; only residency or transfer errors below are
+            // fatal to the request.
+            std::fprintf(stderr,
+                "[parallel-kvflash] scorer unavailable for slot %d; using LRU\n",
+                slot);
+        } else {
+            const size_t blocks = (seq.sample_history.size() +
+                PAGED_BLOCK_SIZE - 1) / PAGED_BLOCK_SIZE;
+            scores.resize(blocks, scores.empty() ? 0.0f : scores.back());
+            score_ptr = &scores;
+        }
+    }
+    if (!slots_.reselect_residency(slot, score_ptr, &error)) return false;
+    seq.kvflash_last_reselect_generated = generated;
+    return upload_all_active_block_tables();
+}
+
+void Qwen35SeqEngine::attach_residency_telemetry(DecodeOutput & out) {
+    slots_.take_residency_telemetry(out.slot, out);
+}
+
 void Qwen35SeqEngine::fail_prefill(
         int slot, std::vector<PrefillOutput> & prefill_outputs,
         const char * log_message, const char * client_message) {
@@ -135,9 +716,10 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
                      "prefill K/V allocation failed");
         return PrefillStage{};
     }
-    if (!upload_block_table_delta(
-            slot, chunk.first_new_block, chunk.new_blocks.data(),
-            chunk.new_blocks.size())) {
+    const bool table_ok = slots_.residency_active() || upload_block_table_delta(
+              slot, chunk.first_new_block, chunk.new_blocks.data(),
+              chunk.new_blocks.size());
+    if (!table_ok) {
         fail_prefill(
             slot, prefill_outputs, "prefill block-table delta exceeds device capacity",
             "prefill block-table update failed");
@@ -207,6 +789,13 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     }
     if (inputs.empty() && plan.prefills.empty()) return result;
 
+    if (ddtree_eligible(plan)) {
+        std::optional<StepResult> speculative = step_ddtree(plan);
+        if (speculative) return std::move(*speculative);
+        // Proposal setup failed before target/cache mutation. Preserve service
+        // by taking the existing packed AR path for this iteration.
+    }
+
     const TargetWeights & w = b_.w_;
     StepGraph & sg = b_.sg_;
     const int hidden = w.n_embd;
@@ -242,9 +831,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             output_rows_.push_back(compact_row);
             continue;
         }
-        if (app.new_block >= 0 &&
-            !upload_block_table_delta(
-                in.slot, app.new_block_index, &app.new_block, 1)) {
+        const bool table_ok = slots_.residency_active() || app.new_block < 0 ||
+            upload_block_table_delta(in.slot, app.new_block_index,
+                                     &app.new_block, 1);
+        if (!table_ok) {
             out.error = "decode block-table entry exceeds device capacity";
             decode_outputs.push_back(std::move(out));
             output_rows_.push_back(compact_row);
@@ -277,6 +867,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             return fail_step("selected prefill work made no progress");
         }
         prefills.push_back(std::move(prefill));
+    }
+    if (!upload_all_active_block_tables()) {
+        return fail_step("active KVFlash block-table refresh failed");
     }
 
     const int live_count = (int)live_tokens_.size();
@@ -329,7 +922,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
             /*kv_start=*/0, /*n_tokens=*/n_total,
-            /*with_mask=*/false, /*capture=*/false,
+            /*with_mask=*/false, /*capture=*/capture_features_,
             /*capture_delta_intermediate=*/false,
             /*fa_window=*/0, /*logits_tail_rows=*/0,
             b_.cfg_.kq_stride_pad,
@@ -347,7 +940,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
             /*kv_start=*/0, /*n_tokens=*/decode_bucket,
-            /*with_mask=*/false, /*capture=*/false,
+            /*with_mask=*/false, /*capture=*/capture_features_,
             /*capture_delta_intermediate=*/false,
             /*fa_window=*/0, /*logits_tail_rows=*/0,
             b_.cfg_.kq_stride_pad,
@@ -365,6 +958,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             /*compact_slots=*/true);
     }
     if (!built || !sg.kv_write_rows ||
+        (capture_features_ && !sg.target_feat_rows) ||
         (with_prefill &&
          (!sg.paged_query_seq_ids || !sg.paged_query_positions ||
           !sg.logits_row_indices))) {
@@ -427,6 +1021,30 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     ggml_backend_tensor_set_async(
         b_.target_backend_, sg.kv_write_rows, rows_buf_.data(), 0,
         sizeof(int64_t) * rows_buf_.size());
+
+    if (capture_features_) {
+        const int cap = b_.cache_.target_feat_cap;
+        const int dead_row = cap * n_slots;
+        feature_rows_.assign((size_t)n_total, dead_row);
+        int feature_offset = 0;
+        for (size_t i = 0; i < prefills.size(); ++i) {
+            const PrefillStage & prefill = prefills[i];
+            const int slot = plan.prefills[i].slot;
+            for (int row = 0; row < prefill.chunk; ++row) {
+                feature_rows_[(size_t)(feature_offset + row)] =
+                    slot * cap + (prefill.kv_pos + row) % cap;
+            }
+            feature_offset += prefill.chunk;
+        }
+        for (int row = 0; row < live_count; ++row) {
+            feature_rows_[(size_t)(n_prefill + row)] =
+                live_slot_ids_[(size_t)row] * cap +
+                live_positions_[(size_t)row] % cap;
+        }
+        ggml_backend_tensor_set_async(
+            b_.target_backend_, sg.target_feat_rows, feature_rows_.data(), 0,
+            sizeof(int32_t) * feature_rows_.size());
+    }
 
     if (with_prefill) {
         query_slot_ids_.assign((size_t)n_total, -1);
@@ -507,6 +1125,16 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             "qwen35.argmax_readback", roctx_metadata);
         ggml_backend_synchronize(b_.target_backend_);
     }
+    std::vector<int> write_slots;
+    write_slots.reserve(live_slot_ids_.size() + prefills.size());
+    write_slots.insert(write_slots.end(),
+                       live_slot_ids_.begin(), live_slot_ids_.end());
+    for (size_t i = 0; i < prefills.size(); ++i) {
+        write_slots.push_back(plan.prefills[i].slot);
+    }
+    if (!commit_residency_writes(write_slots)) {
+        return fail_step("KVFlash pending write commit failed");
+    }
 
     for (size_t oi = 0; oi < inputs.size(); ++oi) {
         DecodeOutput & out = decode_outputs[oi];
@@ -515,6 +1143,17 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         const int row = decode_row0 + output_rows_[oi];
         out.token = sample_graph_row(
             out.slot, row, &argmax_buf_[(size_t)row], &logits_buf_);
+    }
+
+    for (DecodeOutput & out : decode_outputs) {
+        if (out.failed) continue;
+        std::string reselect_error;
+        if (!maybe_reselect_residency(out.slot, reselect_error)) {
+            return fail_step(reselect_error.empty()
+                ? "KVFlash reselect failed" : reselect_error);
+        }
+        out.target_forwards = 1;
+        attach_residency_telemetry(out);
     }
 
     int commit_row = 0;

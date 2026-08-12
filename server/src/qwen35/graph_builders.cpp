@@ -9,6 +9,44 @@
 
 namespace dflash::common {
 
+bool detail::validate_target_paged_tree_layout(
+    const TargetCache & cache,
+    int tree_width,
+    int n_tree_seqs,
+    int paged_max_kv_len,
+    int tree_scratch_base,
+    int tree_scratch_stride) {
+    static constexpr int tree_buckets[] = {
+        1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,
+    };
+    if (tree_width < 1 ||
+        std::find(std::begin(tree_buckets), std::end(tree_buckets),
+                  n_tree_seqs) == std::end(tree_buckets) ||
+        cache.n_seq_slots <= 1 || !cache.paged_block_table ||
+        !cache.paged_kv_seq_lens || paged_max_kv_len < 1 ||
+        tree_scratch_base <= 0 ||
+        tree_scratch_base % PAGED_BLOCK_SIZE != 0 ||
+        tree_scratch_stride < tree_width) {
+        return false;
+    }
+
+    int physical_kv_rows = 0;
+    for (ggml_tensor * tensor : cache.attn_k) {
+        if (tensor) {
+            physical_kv_rows = (int)tensor->ne[1];
+            break;
+        }
+    }
+    if (physical_kv_rows < 1) return false;
+
+    const int64_t scratch_end =
+        (int64_t)tree_scratch_base +
+        (int64_t)(cache.n_seq_slots - 1) * tree_scratch_stride +
+        tree_width;
+    return scratch_end <= physical_kv_rows &&
+           (int64_t)tree_width * n_tree_seqs <= INT32_MAX;
+}
+
 // ── build_layer_step ────────────────────────────────────────────
 
 bool build_layer_step(
@@ -490,6 +528,12 @@ bool build_target_step(
         ggml_set_name(sg.logits_row_indices, "logits_row_indices");
         ggml_set_input(sg.logits_row_indices);
     }
+    if (capture && paged_attention && cache.target_feat) {
+        sg.target_feat_rows =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_name(sg.target_feat_rows, "target_feat_rows");
+        ggml_set_input(sg.target_feat_rows);
+    }
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
@@ -539,6 +583,7 @@ bool build_target_step(
     gi.paged_query_seq_ids        = sg.paged_query_seq_ids;
     gi.paged_query_positions      = sg.paged_query_positions;
     gi.logits_row_indices         = sg.logits_row_indices;
+    gi.target_feat_rows           = sg.target_feat_rows;
     gi.prefill_segments           = prefill_segments;
     gi.n_prefill_segments         = n_prefill_segments;
 
@@ -626,6 +671,117 @@ bool build_target_step_tree(
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
+// ── build_target_step_paged_tree ────────────────────────────────
+
+bool build_target_step_paged_tree(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int tree_width,
+    int n_tree_seqs,
+    int paged_max_kv_len,
+    int tree_scratch_base,
+    int tree_scratch_stride,
+    int kq_stride_pad) {
+    (void)kq_stride_pad;
+    step_graph_free(sg);
+
+    if (!detail::validate_target_paged_tree_layout(
+            cache, tree_width, n_tree_seqs, paged_max_kv_len,
+            tree_scratch_base, tree_scratch_stride)) {
+        return false;
+    }
+    const int n_tokens = tree_width * n_tree_seqs;
+
+    ggml_init_params ip{};
+    ip.mem_size = 512 * 1024 * 1024;
+    static thread_local std::vector<uint8_t> g_tree_arena;
+    if (g_tree_arena.size() < ip.mem_size) g_tree_arena.resize(ip.mem_size);
+    ip.mem_buffer = g_tree_arena.data();
+    ip.no_alloc = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+
+    // Salt graph addresses by the stable bucket shape so captured graphs for
+    // different T/S buckets never alias in ggml-cuda's topology cache.
+    for (int i = 0; i < tree_width + n_tree_seqs; ++i) {
+        (void)ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
+    }
+
+    sg.inp_embed = ggml_new_tensor_3d(
+        sg.ctx, GGML_TYPE_F32, w.n_embd, n_tokens, 1);
+    sg.positions =
+        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
+    sg.parent_ids = ggml_new_tensor_2d(
+        sg.ctx, GGML_TYPE_I32, tree_width, n_tree_seqs);
+    sg.tree_sizes =
+        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tree_seqs);
+    sg.active_slot_ids =
+        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tree_seqs);
+    sg.state_slot_ids =
+        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tree_seqs);
+    sg.paged_query_seq_ids =
+        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    sg.kv_write_rows = ggml_new_tensor_2d(
+        sg.ctx, GGML_TYPE_I64, n_tokens, w.n_head_kv);
+
+    const struct NamedInput {
+        ggml_tensor * tensor;
+        const char * name;
+    } inputs[] = {
+        {sg.inp_embed, "inp_embed"},
+        {sg.positions, "positions"},
+        {sg.parent_ids, "parent_ids"},
+        {sg.tree_sizes, "tree_sizes"},
+        {sg.active_slot_ids, "active_slot_ids"},
+        {sg.state_slot_ids, "state_slot_ids"},
+        {sg.paged_query_seq_ids, "paged_query_seq_ids"},
+        {sg.kv_write_rows, "kv_write_rows"},
+    };
+    for (const NamedInput & input : inputs) {
+        ggml_set_name(input.tensor, input.name);
+        ggml_set_input(input.tensor);
+    }
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+    QwenGraphInputs gi{};
+    gi.inp_embed = sg.inp_embed;
+    gi.positions = sg.positions;
+    gi.n_tokens = n_tokens;
+    gi.kv_start = 0;
+    gi.capture_layers = false;
+    gi.capture_delta_intermediate = false;
+    gi.parent_ids = sg.parent_ids;
+    gi.tree_sizes = sg.tree_sizes;
+    gi.kv_write_rows = sg.kv_write_rows;
+    gi.paged_block_table = cache.paged_block_table;
+    gi.paged_kv_seq_lens = cache.paged_kv_seq_lens;
+    gi.active_slot_ids = sg.active_slot_ids;
+    gi.state_slot_ids = sg.state_slot_ids;
+    gi.paged_query_seq_ids = sg.paged_query_seq_ids;
+    gi.n_seqs = n_tree_seqs;
+    gi.paged_max_kv_len = paged_max_kv_len;
+    gi.tree_width = tree_width;
+    gi.tree_scratch_base = tree_scratch_base;
+    gi.tree_scratch_stride = tree_scratch_stride;
+
+    QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
+    if (!go.logits) return false;
+    sg.logits = go.logits;
+    ggml_set_output(sg.logits);
+    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
+    ggml_set_name(sg.argmax_tokens, "paged_tree_verify_argmax");
+    ggml_set_output(sg.argmax_tokens);
+    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
+
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
     }
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }

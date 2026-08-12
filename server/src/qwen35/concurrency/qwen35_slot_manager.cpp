@@ -5,8 +5,12 @@
 
 namespace dflash::common {
 
-Qwen35SlotManager::Qwen35SlotManager(PagedKvPool & pool, int max_ctx)
-    : pool_(pool), max_ctx_(max_ctx) {
+Qwen35SlotManager::Qwen35SlotManager(
+        PagedKvPool & pool, int max_ctx, int speculative_headroom,
+        PagedKvResidencyManager * residency)
+    : pool_(pool), max_ctx_(max_ctx),
+      headroom_tokens_(std::max<int>(pool.block_size(), speculative_headroom)),
+      residency_(residency) {
     slots_.assign(pool.max_sequences(), Qwen35Slot{});
 }
 
@@ -21,7 +25,7 @@ int Qwen35SlotManager::decoding_count() const {
 uint32_t Qwen35SlotManager::decode_headroom_capacity(int logical_tokens) const {
     const uint64_t extended =
         static_cast<uint64_t>(std::max(0, logical_tokens)) +
-        pool_.block_size();
+        static_cast<uint64_t>(headroom_tokens_);
     return static_cast<uint32_t>(std::min<uint64_t>(
         static_cast<uint64_t>(max_ctx_), extended));
 }
@@ -83,6 +87,20 @@ bool Qwen35SlotManager::is_active(int slot) const {
 bool Qwen35SlotManager::is_prefilling(int slot) const {
     return is_active(slot) && slots_[(size_t)slot].prefilling();
 }
+void Qwen35SlotManager::accumulate_residency_delta(
+        Qwen35Slot & slot, const PagedKvResidencyStats & before) {
+    if (!residency_) return;
+    const PagedKvResidencyStats after = residency_->stats();
+    if (after.page_ins >= before.page_ins) {
+        slot.kvflash_page_ins_pending += after.page_ins - before.page_ins;
+    }
+    if (after.page_outs >= before.page_outs) {
+        slot.kvflash_page_outs_pending += after.page_outs - before.page_outs;
+    }
+    if (after.reselects >= before.reselects) {
+        slot.kvflash_reselects_pending += after.reselects - before.reselects;
+    }
+}
 
 bool Qwen35SlotManager::has_prefill_prompt_at_least(int tokens) const {
     if (tokens <= 0) return true;
@@ -112,7 +130,7 @@ SeqEngine::AdmitResult Qwen35SlotManager::admit(
     // fail anyway. Hard-fail it up front instead of reporting busy.
     const uint64_t pool_capacity =
         (uint64_t)pool_.physical_block_count() * pool_.block_size();
-    if ((uint64_t)prompt_len > pool_capacity) {
+    if (!residency_ && (uint64_t)prompt_len > pool_capacity) {
         r.error = "prompt needs " + std::to_string(prompt_len) +
                   " KV tokens but the pool holds " +
                   std::to_string(pool_capacity) +
@@ -132,7 +150,8 @@ SeqEngine::AdmitResult Qwen35SlotManager::admit(
 
     // A newly freed block belongs to any older decoder missing its rolling
     // next-page reserve before it can belong to this admission.
-    const PagedKvStatus headroom_status = protect_decode_headroom();
+    const PagedKvStatus headroom_status = residency_
+        ? PagedKvStatus::Ok : protect_decode_headroom();
     if (headroom_status != PagedKvStatus::Ok) {
         r.status = headroom_status == PagedKvStatus::BlocksExhausted
             ? AdmitStatus::busy : AdmitStatus::failed;
@@ -143,7 +162,7 @@ SeqEngine::AdmitResult Qwen35SlotManager::admit(
     }
 
     PagedKvSequenceHandle handle;
-    uint32_t reservation_capacity =
+    uint32_t reservation_capacity = residency_ ? 0 :
         decode_headroom_capacity(prompt_len);
     if (!capacity_fits_pool(reservation_capacity)) {
         // The prompt itself fits, but this physical pool can never hold its
@@ -151,8 +170,9 @@ SeqEngine::AdmitResult Qwen35SlotManager::admit(
         // decode exhaustion later if the sequence reaches that boundary.
         reservation_capacity = static_cast<uint32_t>(prompt_len);
     }
-    const PagedKvStatus status = pool_.acquire_reserved(
-        request_id, reservation_capacity, handle);
+    const PagedKvStatus status = residency_
+        ? pool_.acquire(request_id, handle)
+        : pool_.acquire_reserved(request_id, reservation_capacity, handle);
     if (status != PagedKvStatus::Ok) {
         r.status = status == PagedKvStatus::SequenceSlotsExhausted ||
                            status == PagedKvStatus::BlocksExhausted
@@ -161,6 +181,17 @@ SeqEngine::AdmitResult Qwen35SlotManager::admit(
             ? "not enough unreserved KV blocks for the prompt and decode headroom"
             : paged_kv_status_string(status);
         return r;
+    }
+
+    if (residency_) {
+        const PagedKvResidencyStatus resident_status =
+            residency_->register_sequence(handle);
+        if (resident_status != PagedKvResidencyStatus::Ok) {
+            (void)pool_.release(handle);
+            r.error = std::string("KV residency registration failed: ") +
+                paged_kv_residency_status_string(resident_status);
+            return r;
+        }
     }
 
     Qwen35Slot & s = slots_[(size_t)slot];
@@ -194,7 +225,22 @@ Qwen35SlotManager::PrefillChunk Qwen35SlotManager::append_prefill(
         return out;
     }
 
-    PagedKvAppendResult app = pool_.append(s.handle, (uint32_t)n_tokens);
+    PagedKvAppendResult app;
+    if (residency_) {
+        const PagedKvResidencyStats before = residency_->stats();
+        PagedKvResidentAppendResult resident = residency_->append(
+            s.handle, (uint32_t)n_tokens);
+        accumulate_residency_delta(s, before);
+        if (!resident) {
+            std::fprintf(stderr,
+                "[parallel-kvflash] prefill append failed for slot %d: %s\n",
+                slot, paged_kv_residency_status_string(resident.status));
+            return out;
+        }
+        app = std::move(resident.pool_result);
+    } else {
+        app = pool_.append(s.handle, (uint32_t)n_tokens);
+    }
     if (!app) {
         // Admission reserved the whole prompt. Treat exhaustion here as a
         // broken invariant, not a retryable condition: retrying a batch of
@@ -218,6 +264,17 @@ Qwen35SlotManager::PrefillChunk Qwen35SlotManager::append_prefill(
             out.new_blocks.push_back((int32_t)write.physical_block);
         }
     }
+    if (residency_) {
+        PagedKvSequenceSnapshot snapshot;
+        if (pool_.sequence(s.handle, snapshot) != PagedKvStatus::Ok) {
+            return out;
+        }
+        out.full_block_table.reserve(snapshot.block_table.size());
+        for (uint32_t block : snapshot.block_table) {
+            out.full_block_table.push_back(
+                block == PAGED_KV_COLD_BLOCK ? -1 : (int32_t)block);
+        }
+    }
     s.cur_pos += n_tokens;
     out.ok = true;
     return out;
@@ -230,43 +287,189 @@ void Qwen35SlotManager::commit_prefill(int slot) {
     s.phase = Qwen35SlotPhase::decode;
 }
 
-Qwen35SlotManager::StepAppend Qwen35SlotManager::append_token(int slot,
-                                                        int32_t fed_token) {
+Qwen35SlotManager::StepAppend Qwen35SlotManager::append_tokens(
+        int slot, const int32_t * fed_tokens, int n_tokens) {
     StepAppend out;
-    if (!is_active(slot) || !slots_[(size_t)slot].decoding()) return out;
-    Qwen35Slot & s = slots_[(size_t)slot];
-    if (s.cur_pos >= max_ctx_) {
-        // No context left; the scheduler should have stopped this slot.
+    if (!is_active(slot) || !slots_[(size_t)slot].decoding() ||
+        !fed_tokens || n_tokens < 1) {
         return out;
     }
-    PagedKvAppendResult app = pool_.append(
-        s.handle, 1, /*only_first_last_slots=*/true);
-    if (!app || app.token_count != 1 ||
-        app.last.logical_position != (uint32_t)s.cur_pos) {
+    Qwen35Slot & s = slots_[(size_t)slot];
+    if (!s.staged_tokens.empty() || s.cur_pos > max_ctx_ ||
+        n_tokens > max_ctx_ - s.cur_pos) {
+        return out;
+    }
+
+    PagedKvAppendResult app;
+    if (residency_) {
+        const PagedKvResidencyStats before = residency_->stats();
+        PagedKvResidentAppendResult resident = residency_->append(
+            s.handle, static_cast<uint32_t>(n_tokens));
+        accumulate_residency_delta(s, before);
+        if (!resident) {
+            out.busy = resident.status ==
+                    PagedKvResidencyStatus::PoolExhausted ||
+                resident.status == PagedKvResidencyStatus::NoEvictableBlock;
+            return out;
+        }
+        app = std::move(resident.pool_result);
+    } else {
+        app = pool_.append(s.handle, static_cast<uint32_t>(n_tokens));
+    }
+    if (!app || app.token_count != static_cast<uint32_t>(n_tokens)) {
         out.busy = app.status == PagedKvStatus::BlocksExhausted;
         return out;
     }
-    s.sample_history.push_back(fed_token);
+    if (app.write_slots.size() != static_cast<size_t>(n_tokens) ||
+        app.write_slots.front().logical_position !=
+            static_cast<uint32_t>(s.cur_pos) ||
+        app.write_slots.back().logical_position !=
+            static_cast<uint32_t>(s.cur_pos + n_tokens - 1)) {
+        // Pool success guarantees this shape. Retain staged ownership so a
+        // fatal caller retires the sequence rather than double-appending.
+        s.staged_tokens.assign(fed_tokens, fed_tokens + n_tokens);
+        return out;
+    }
+
+    out.physical_rows.reserve(app.write_slots.size());
+    for (const PagedKvWriteSlot & write : app.write_slots) {
+        out.physical_rows.push_back(
+            static_cast<int64_t>(write.physical_token_index));
+        if (write.block_offset == 0) {
+            if (out.first_new_block < 0) {
+                out.first_new_block = static_cast<int>(
+                    write.logical_position / pool_.block_size());
+            }
+            out.new_blocks.push_back(
+                static_cast<int32_t>(write.physical_block));
+        }
+    }
+    s.staged_tokens.assign(fed_tokens, fed_tokens + n_tokens);
+    if (residency_) {
+        PagedKvSequenceSnapshot snapshot;
+        if (pool_.sequence(s.handle, snapshot) != PagedKvStatus::Ok) {
+            return out;
+        }
+        out.full_block_table.reserve(snapshot.block_table.size());
+        for (uint32_t block : snapshot.block_table) {
+            out.full_block_table.push_back(
+                block == PAGED_KV_COLD_BLOCK ? -1 : (int32_t)block);
+        }
+    }
 
     out.ok = true;
-    out.physical_row = (int64_t)app.last.physical_token_index;
+    out.count = n_tokens;
     out.position = s.cur_pos;
-    if ((uint32_t)s.cur_pos % pool_.block_size() == 0) {
-        out.new_block = (int32_t)app.last.physical_block;
-        out.new_block_index = s.cur_pos / (int)pool_.block_size();
+    if (n_tokens == 1) {
+        out.physical_row = out.physical_rows.front();
+        if (!out.new_blocks.empty()) {
+            out.new_block = out.new_blocks.front();
+            out.new_block_index = out.first_new_block;
+        }
     }
     return out;
 }
 
+Qwen35SlotManager::StepAppend Qwen35SlotManager::append_token(
+        int slot, int32_t fed_token) {
+    return append_tokens(slot, &fed_token, 1);
+}
+
 void Qwen35SlotManager::commit_step(int slot) {
     if (!is_active(slot)) return;
-    slots_[(size_t)slot].cur_pos += 1;
+    Qwen35Slot & s = slots_[(size_t)slot];
+    if (s.staged_tokens.empty()) return;
+    s.sample_history.insert(
+        s.sample_history.end(), s.staged_tokens.begin(),
+        s.staged_tokens.end());
+    s.cur_pos += static_cast<int>(s.staged_tokens.size());
+    s.staged_tokens.clear();
+}
+
+bool Qwen35SlotManager::block_table_snapshot(
+        int slot, std::vector<int32_t> & out) const {
+    out.clear();
+    if (!is_active(slot)) return false;
+    PagedKvSequenceSnapshot snapshot;
+    if (pool_.sequence(slots_[(size_t)slot].handle, snapshot) !=
+        PagedKvStatus::Ok) {
+        return false;
+    }
+    out.reserve(snapshot.block_table.size());
+    for (uint32_t block : snapshot.block_table) {
+        out.push_back(block == PAGED_KV_COLD_BLOCK ? -1 : (int32_t)block);
+    }
+    return true;
+}
+
+bool Qwen35SlotManager::commit_residency_writes(int slot) {
+    if (!residency_) return true;
+    if (!is_active(slot)) return false;
+    return residency_->commit_pending_writes(slots_[(size_t)slot].handle) ==
+        PagedKvResidencyStatus::Ok;
+}
+
+bool Qwen35SlotManager::reselect_residency(
+        int slot, const std::vector<float> * scores, std::string * error) {
+    if (!residency_) return true;
+    if (!is_active(slot)) {
+        if (error) *error = "inactive KVFlash slot";
+        return false;
+    }
+    Qwen35Slot & s = slots_[(size_t)slot];
+    const PagedKvResidencyStats before = residency_->stats();
+    const std::vector<float> no_scores;
+    PagedKvResidencyStatus status = residency_->set_scores(
+        s.handle, scores ? *scores : no_scores);
+    if (status == PagedKvResidencyStatus::Ok) {
+        status = residency_->reselect(s.handle);
+    }
+    accumulate_residency_delta(s, before);
+    if (status != PagedKvResidencyStatus::Ok) {
+        if (error) {
+            *error = std::string("KVFlash reselect failed: ") +
+                paged_kv_residency_status_string(status);
+        }
+        return false;
+    }
+    return true;
+}
+
+void Qwen35SlotManager::take_residency_telemetry(
+        int slot, SeqEngine::DecodeOutput & out) {
+    if (!residency_ || !is_active(slot)) return;
+    Qwen35Slot & s = slots_[(size_t)slot];
+    out.kvflash_page_ins = s.kvflash_page_ins_pending;
+    out.kvflash_page_outs = s.kvflash_page_outs_pending;
+    out.kvflash_reselects = s.kvflash_reselects_pending;
+    uint32_t resident = 0;
+    if (pool_.resident_block_count(s.handle, resident) == PagedKvStatus::Ok) {
+        out.kvflash_resident_blocks = resident;
+    }
+    s.kvflash_page_ins_pending = 0;
+    s.kvflash_page_outs_pending = 0;
+    s.kvflash_reselects_pending = 0;
 }
 
 void Qwen35SlotManager::retire(int slot) {
     if (slot < 0 || slot >= (int)slots_.size()) return;
     Qwen35Slot & s = slots_[(size_t)slot];
     if (!s.active()) return;
+    if (residency_) {
+        const PagedKvResidencyStatus resident_status =
+            residency_->forget_sequence(s.handle);
+        if (resident_status != PagedKvResidencyStatus::Ok &&
+            resident_status != PagedKvResidencyStatus::StaleHandle &&
+            resident_status != PagedKvResidencyStatus::SequenceNotRegistered) {
+            std::fprintf(stderr,
+                "[parallel-kvflash] slot %d residency release failed: %s\n",
+                slot, paged_kv_residency_status_string(resident_status));
+            // A failed copy-stream barrier leaves physical pages in flight.
+            // Keep the slot and its pool handle intact so a later retirement
+            // can retry forget_sequence without recycling those pages.
+            return;
+        }
+    }
     const PagedKvStatus status = pool_.release(s.handle);
     if (status != PagedKvStatus::Ok && status != PagedKvStatus::StaleHandle) {
         std::fprintf(stderr, "[parallel] slot %d release failed: %s\n",

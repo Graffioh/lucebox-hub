@@ -23,6 +23,22 @@
 
 namespace dflash::common {
 
+namespace detail {
+
+// Model-free validation shared by the packed-tree builder and its shape
+// tests. paged_max_kv_len is a logical launch bound and may exceed the
+// bounded physical K/V pool; only the per-slot scratch slabs must fit in the
+// physical tensor rows.
+bool validate_target_paged_tree_layout(
+    const TargetCache & cache,
+    int tree_width,
+    int n_tree_seqs,
+    int paged_max_kv_len,
+    int tree_scratch_base,
+    int tree_scratch_stride);
+
+}  // namespace detail
+
 // Layer-segmented prefill: process one target layer for chunk_start..chunk_start+n_tokens.
 bool build_layer_step(
     StepGraph & sg,
@@ -109,6 +125,10 @@ bool build_hybrid_full_layer_step(
 //     overrides logits_tail_rows. Multi-prompt steps need it because
 //     committing rows are scattered. 0 keeps the tail-view behavior.
 //   `logits_tail_rows` — logits/argmax only for the last n rows (0 = all).
+// When `capture && paged_attention`, sg.target_feat_rows is an I32 graph
+// input mapping every token to its slot-local feature-ring destination. This
+// keeps accepted-path replay graph-stable and leaves legacy offset capture
+// unchanged for callers that do not use paged serving.
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -144,6 +164,26 @@ bool build_target_step_tree(
     int kv_start,
     int n_tokens,
     int fa_window = 0,
+    int kq_stride_pad = KQ_MASK_PAD);
+
+// Packed concurrent DDTree verify over a paged multi-slot cache. Tokens are
+// flattened sequence-major as [tree_width*n_tree_seqs]. n_tree_seqs is a
+// stable graph-bucket width; inactive trees use tree_size=0 and dead/safe row
+// mappings. In particular state_slot_ids padding must map to a valid harmless
+// slot (normally 0), while active/paged sequence IDs may use -1. The graph
+// writes candidate K/V into per-slot scratch slabs but
+// does not mutate persistent recurrent state or target features. Accepted
+// paths are committed by a later row-indexed replay through build_target_step.
+bool build_target_step_paged_tree(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int tree_width,
+    int n_tree_seqs,
+    int paged_max_kv_len,
+    int tree_scratch_base,
+    int tree_scratch_stride,
     int kq_stride_pad = KQ_MASK_PAD);
 
 // LM-head projection: project draft hidden states through the target output matrix.

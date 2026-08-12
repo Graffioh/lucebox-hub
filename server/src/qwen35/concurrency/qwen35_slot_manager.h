@@ -17,6 +17,7 @@
 #pragma once
 
 #include "common/concurrency/paged_kv_pool.h"
+#include "common/concurrency/paged_kv_residency.h"
 #include "common/sampler.h"
 #include "common/concurrency/seq_engine.h"
 
@@ -45,6 +46,17 @@ struct Qwen35Slot {
     // Penalty history is recorded as fed rather than sampled: the scheduler
     // may override a sample before the model consumes it.
     std::vector<int32_t> sample_history;
+    // Decode rows allocated from the pool but not yet made durable by a
+    // successful target forward. A step stages one contiguous token range
+    // per slot, then commit_step() publishes all of it atomically.
+    std::vector<int32_t> staged_tokens;
+
+    // Residency operation deltas are attributed to the requesting slot and
+    // held across prefill until a DecodeOutput can carry them upstream.
+    uint64_t kvflash_page_ins_pending = 0;
+    uint64_t kvflash_page_outs_pending = 0;
+    uint64_t kvflash_reselects_pending = 0;
+    int kvflash_last_reselect_generated = 0;
 
     int generated_tokens() const {
         return sample_history.size() > (size_t)prompt_len
@@ -61,7 +73,13 @@ class Qwen35SlotManager {
 public:
     // `max_ctx` is the per-sequence logical bound; slot count comes from the
     // pool's max_sequences. The pool must outlive the manager.
-    Qwen35SlotManager(PagedKvPool & pool, int max_ctx);
+    Qwen35SlotManager(PagedKvPool & pool, int max_ctx,
+                      int speculative_headroom = 1,
+                      PagedKvResidencyManager * residency = nullptr);
+    Qwen35SlotManager(const Qwen35SlotManager &) = delete;
+    Qwen35SlotManager & operator=(const Qwen35SlotManager &) = delete;
+    Qwen35SlotManager(Qwen35SlotManager &&) = delete;
+    Qwen35SlotManager & operator=(Qwen35SlotManager &&) = delete;
 
     // Claim a free slot and atomically reserve all K/V blocks needed by the
     // known prompt plus its next logical decode page when that page can exist
@@ -80,6 +98,7 @@ public:
         // Delta to patch into the slot's device block-table column.
         std::vector<int32_t> new_blocks;
         int first_new_block = -1;
+        std::vector<int32_t> full_block_table;
     };
 
     // Append `n_tokens` more prompt rows for a prefilling slot. Physical block
@@ -93,17 +112,37 @@ public:
     struct StepAppend {
         bool ok = false;
         bool busy = false;    // no physical block available right now
+        std::vector<int64_t> physical_rows;
+        std::vector<int32_t> new_blocks;
+        int first_new_block = -1;
+        int count = 0;
+        // Compatibility fields for the common one-token append.
         int64_t physical_row = -1;
-        int position = -1;   // logical position the fed token is written at
+        int position = -1;   // logical position of the first staged token
         int32_t new_block = -1;
         int new_block_index = -1;
+        std::vector<int32_t> full_block_table;
     };
 
-    // Allocate the next decode token's cache row, report any new block-table
-    // entry, and log it to sample_history. cur_pos waits for commit_step().
+    // Atomically allocate and stage a contiguous accepted path. The pool
+    // append is all-or-nothing; sample_history and cur_pos remain unchanged
+    // until commit_step(). A slot may have only one staged range at a time.
+    StepAppend append_tokens(int slot, const int32_t * fed_tokens,
+                             int n_tokens);
+
+    // Complete residency snapshots encode cold logical pages as -1. The
+    // engine pads each device column before upload.
+    bool residency_active() const { return residency_ != nullptr; }
+    bool block_table_snapshot(int slot, std::vector<int32_t> & out) const;
+    bool commit_residency_writes(int slot);
+    bool reselect_residency(int slot, const std::vector<float> * scores,
+                            std::string * error = nullptr);
+    void take_residency_telemetry(int slot, SeqEngine::DecodeOutput & out);
+
+    // One-token compatibility wrapper used by ordinary autoregressive decode.
     StepAppend append_token(int slot, int32_t fed_token);
 
-    // The batched step's compute succeeded: cur_pos++.
+    // Publish every staged token after a successful target forward.
     void commit_step(int slot);
 
     // Release the slot's blocks and clear its state. Safe on inactive slots
@@ -111,6 +150,8 @@ public:
     void retire(int slot);
 
     int slot_count() const { return (int)slots_.size(); }
+    void accumulate_residency_delta(Qwen35Slot & slot,
+                                    const PagedKvResidencyStats & before);
     int max_context() const { return max_ctx_; }
     int decoding_count() const;
     bool is_active(int slot) const;
@@ -131,6 +172,8 @@ private:
 
     PagedKvPool & pool_;
     int max_ctx_ = 0;
+    int headroom_tokens_;
+    PagedKvResidencyManager * residency_ = nullptr;
     std::vector<Qwen35Slot> slots_;
 };
 

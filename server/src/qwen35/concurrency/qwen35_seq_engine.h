@@ -22,10 +22,15 @@
 #pragma once
 
 #include "common/concurrency/seq_engine.h"
+#include "common/dflash_draft_kv.h"
+#include "common/dflash_feature_ring.h"
+#include "common/ddtree.h"
 #include "qwen35_slot_manager.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <vector>
 
 namespace dflash::common {
@@ -40,19 +45,14 @@ public:
     // `max_prefills` bounds scheduler-selected prompt slices per traversal.
     Qwen35SeqEngine(Qwen35Backend & backend, PagedKvPool & pool,
                     int max_ctx, int64_t scratch_row,
-                    int max_prefills = 8,
+                    int tree_width = 0, int tree_scratch_base = 0,
+                    int tree_scratch_stride = 0, int max_prefills = 8,
                     int mixed_prefill_tokens = 2048,
                     int long_mixed_prefill_tokens = 4096,
                     int long_prefill_threshold = 768,
                     int idle_prefill_tokens = 4096,
-                    int prefill_quantum = 512)
-        : max_prefills_(std::max(1, max_prefills)),
-          mixed_prefill_tokens_(std::max(1, mixed_prefill_tokens)),
-          long_mixed_prefill_tokens_(std::max(1, long_mixed_prefill_tokens)),
-          long_prefill_threshold_(std::max(1, long_prefill_threshold)),
-          idle_prefill_tokens_(std::max(1, idle_prefill_tokens)),
-          prefill_quantum_(std::max(1, prefill_quantum)), b_(backend),
-          slots_(pool, max_ctx), scratch_row_(scratch_row) {}
+                    int prefill_quantum = 512);
+    ~Qwen35SeqEngine() override;
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
@@ -104,6 +104,10 @@ private:
 
     bool upload_block_table_delta(int slot, int first_block,
                                   const int32_t * blocks, size_t count);
+    bool upload_all_active_block_tables();
+    bool commit_residency_writes(const std::vector<int> & slots);
+    bool maybe_reselect_residency(int slot, std::string & error);
+    void attach_residency_telemetry(DecodeOutput & out);
     void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
                               const char * log_message,
                               const char * client_message);
@@ -112,10 +116,23 @@ private:
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
                              std::vector<float> * logits_scratch = nullptr);
+    DraftFeatureMirror * slot_feature_mirror(int slot);
+    DraftKvState * ensure_slot_draft_kv(int slot);
+    bool ddtree_eligible(const StepPlan & plan) const;
+    // nullopt means proposal setup failed before target/cache mutation and the
+    // caller may safely use the ordinary packed AR path for this iteration.
+    std::optional<StepResult> step_ddtree(const StepPlan & plan);
 
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
     int64_t         scratch_row_ = 0;
+    int             tree_width_ = 0;
+    int             tree_scratch_base_ = 0;
+    int             tree_scratch_stride_ = 0;
+    bool            capture_features_ = false;
+    ggml_context *  feature_view_ctx_ = nullptr;
+    std::vector<DraftFeatureMirror> slot_feature_mirrors_;
+    std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;
 
     // Hoisted per-step buffers (reused across step() calls).
     std::vector<int>         output_rows_;
@@ -131,6 +148,7 @@ private:
     std::vector<int32_t>     query_slot_ids_;
     std::vector<int32_t>     query_positions_;
     std::vector<int32_t>     logits_rows_;
+    std::vector<int32_t>     feature_rows_;
     std::vector<float>       embed_buf_;
     std::vector<int32_t>     pos_buf_;
     std::vector<int64_t>     rows_buf_;
