@@ -47,6 +47,7 @@ int main() {
     CHECK(rows[1].compressed_emitted && rows[1].compressed_scatter == 7 * 32);
     CHECK(rows[2].raw_history.empty() && rows[2].compressed_history.empty());
     CHECK(rows[2].raw_scatter == -1 && rows[2].compressed_scatter == -1);
+    CHECK(rows[2].position == 0);
 
     std::vector<int32_t> sixteen_slots(16);
     std::vector<int64_t> sixteen_positions(16, 0);

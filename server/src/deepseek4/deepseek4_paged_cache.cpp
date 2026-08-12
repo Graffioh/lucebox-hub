@@ -34,8 +34,11 @@ bool prepare_deepseek4_gathered_lane_rows(
     for (uint32_t lane = 0; lane < lanes; ++lane) {
         auto & rows = prepared[lane];
         rows.slot = slots[lane];
-        rows.position = positions[lane];
         if (rows.slot < 0) continue; // Padding must remain entirely passive.
+        // Padding lanes do not have a validated position. Keep the default
+        // zero so inverse RoPE and compressor bookkeeping cannot inherit an
+        // arbitrary positions[] value once callers use constant-width steps.
+        rows.position = positions[lane];
         if (rows.position < 0) return false;
         const uint64_t pos = static_cast<uint64_t>(rows.position);
         // The current row is appended in-graph, so retain at most the 127

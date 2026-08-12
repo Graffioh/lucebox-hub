@@ -1679,6 +1679,130 @@ struct DeepSeek4PreparedProjectedLane {
     ggml_tensor * rope_pos = nullptr;
 };
 
+// Per-layer RoPE parameters. Compressed layers use YaRN scaling, and
+// attn_factor cancels the magnitude scaling rope_yarn applies.
+struct Ds4RopeParams {
+    float freq = 0.0f;
+    float scale = 1.0f;
+    float ext = 0.0f;
+    float attn = 1.0f;
+    int n_ctx_orig = 0;
+};
+
+static Ds4RopeParams ds4_rope_params(const DeepSeek4Weights & w, int ratio) {
+    const bool compressed = ratio > 0;
+    Ds4RopeParams p;
+    p.freq = compressed ? w.compress_rope_freq_base : w.rope_freq_base;
+    p.scale = compressed ? (1.0f / w.rope_scale_factor) : 1.0f;
+    p.ext = compressed ? 1.0f : 0.0f;
+    if (p.ext != 0.0f && p.scale > 0.0f) {
+        p.attn /= (1.0f + 0.1f * logf(1.0f / p.scale));
+    }
+    p.n_ctx_orig = (int) w.rope_orig_ctx;
+    return p;
+}
+
+// Q/KV projections and their tail RoPE are independent per token. A paged
+// caller can evaluate them once at width q and hand each lane a column view,
+// avoiding one reread of all three projection weights per active lane.
+static DeepSeek4PreparedProjectedLane build_mla_qkv_projection(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        const DeepSeek4Weights & w,
+        const DeepSeek4Layer & L,
+        int n_tokens) {
+    DeepSeek4PreparedProjectedLane out;
+    ggml_tensor * qr = ggml_mul_mat(ctx, L.attn_q_a, cur);
+    qr = build_rms_norm(ctx, qr, L.attn_q_a_norm, w.rms_eps);
+    ggml_tensor * q = ggml_mul_mat(ctx, L.attn_q_b, qr);
+    q = ggml_reshape_3d(ctx, q, w.head_dim, w.n_head, n_tokens);
+    q = ggml_rms_norm(ctx, q, w.rms_eps);
+
+    ggml_tensor * kv = ggml_mul_mat(ctx, L.attn_kv, cur);
+    kv = build_rms_norm(ctx, kv, L.attn_kv_a_norm, w.rms_eps);
+
+    out.normalized_q_lora = qr;
+    out.q = q;
+    out.kv = kv;
+    return out;
+}
+
+static void build_mla_qkv_rope(
+        ggml_context * ctx,
+        DeepSeek4PreparedProjectedLane & p,
+        const DeepSeek4Weights & w,
+        const Ds4RopeParams & rope,
+        int n_tokens,
+        ggml_tensor * rope_pos,
+        bool fuse_q_rope) {
+    if (!fuse_q_rope) {
+        p.q = build_tail_rope_3d(ctx, p.q, rope_pos, w.n_rot, w.head_dim,
+                                 w.n_head, n_tokens, rope.freq, rope.scale,
+                                 rope.ext, rope.attn, w.rope_yarn_beta_fast,
+                                 w.rope_yarn_beta_slow, rope.n_ctx_orig);
+    }
+    p.kv = build_tail_rope_2d(ctx, p.kv, rope_pos, w.n_rot, w.head_dim,
+                              n_tokens, rope.freq, rope.scale, rope.ext,
+                              rope.attn, w.rope_yarn_beta_fast,
+                              w.rope_yarn_beta_slow, rope.n_ctx_orig);
+    p.rope_pos = rope_pos;
+}
+
+// Grouped low-rank output projection. Several independent gathered lanes can
+// concatenate their pre-projection contexts and share one q-wide evaluation.
+static ggml_tensor * build_mla_output_projection(
+        ggml_context * ctx,
+        ggml_tensor * attn_out,
+        const DeepSeek4Weights & w,
+        const DeepSeek4Layer & L,
+        int n_tokens,
+        bool allow_grouped) {
+    const int group_dim = w.head_dim * (w.n_head / w.n_out_group);
+    attn_out = ggml_reshape_3d(
+        ctx, attn_out, group_dim, w.n_out_group, n_tokens);
+    attn_out = ggml_permute(ctx, attn_out, 0, 2, 1, 3);
+    if (n_tokens == 1) {
+        attn_out = ggml_cont(ctx, attn_out);
+    }
+    ggml_tensor * out_a_3d = ggml_reshape_3d(
+        ctx, L.attn_output_a, group_dim, w.n_lora_o, w.n_out_group);
+    ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);
+
+    const bool grouped_output_projection =
+        allow_grouped && n_tokens > 1 &&
+        !ds4_env_flag("DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
+    if (grouped_output_projection) {
+        return ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);
+    }
+    attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));
+    attn_low = ggml_reshape_2d(
+        ctx, attn_low, (int64_t) w.n_lora_o * w.n_out_group, n_tokens);
+    return ggml_mul_mat(ctx, L.attn_output_b, attn_low);
+}
+
+// One lane's column of a batched prologue. These are views only.
+static DeepSeek4PreparedProjectedLane ds4_slice_projected_lane(
+        ggml_context * ctx,
+        const DeepSeek4PreparedProjectedLane & batched,
+        const DeepSeek4Weights & w,
+        int lane,
+        ggml_tensor * lane_rope_pos) {
+    DeepSeek4PreparedProjectedLane out;
+    out.normalized_q_lora = ggml_view_2d(
+        ctx, batched.normalized_q_lora, batched.normalized_q_lora->ne[0], 1,
+        batched.normalized_q_lora->nb[1],
+        (size_t) lane * batched.normalized_q_lora->nb[1]);
+    out.q = ggml_view_3d(
+        ctx, batched.q, w.head_dim, w.n_head, 1,
+        batched.q->nb[1], batched.q->nb[2],
+        (size_t) lane * batched.q->nb[2]);
+    out.kv = ggml_view_2d(
+        ctx, batched.kv, batched.kv->ne[0], 1, batched.kv->nb[1],
+        (size_t) lane * batched.kv->nb[1]);
+    out.rope_pos = lane_rope_pos;
+    return out;
+}
+
 static DeepSeek4MlaLaneBindings deepseek4_contiguous_lane_bindings(
         DeepSeek4LayerCache & lc,
         int ratio,
@@ -1713,49 +1837,36 @@ static ggml_tensor * build_mla_attention_lane_core(
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4F32ArrayBinding> * f32_array_inputs = nullptr,
-        DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit) {
+        DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit,
+        const DeepSeek4PreparedProjectedLane * prepared = nullptr,
+        ggml_tensor ** out_attn_context = nullptr) {
 
     const int n_embd    = w.n_embd;
     const int head_dim  = w.head_dim;
     const int n_head    = w.n_head;
     const int n_rot     = w.n_rot;
-    const int n_out_group = w.n_out_group;
-    const int n_lora_o  = w.n_lora_o;
     const int ratio     = w.compress_ratios[layer_idx];
     const bool gathered_history = lane.history_mode ==
         DeepSeek4MlaLaneBindings::HistoryMode::ChronologicalGathered;
 
-    // ── Q path: cur → q_a → norm → q_b → per-head norm ─────────────
-    // q_a: [n_embd, n_tokens] → [n_lora_q, n_tokens]
-    ggml_tensor * qr = ggml_mul_mat(ctx, L.attn_q_a, cur);
-    // qr_norm is reused by the ratio-4 indexer before the main q_b projection.
-    qr = build_rms_norm(ctx, qr, L.attn_q_a_norm, w.rms_eps);
-    // q_b: [n_lora_q, n_tokens] → [n_head * head_dim, n_tokens]
-    ggml_tensor * q = ggml_mul_mat(ctx, L.attn_q_b, qr);
-    // Reshape to [head_dim, n_head, n_tokens] for per-head ops
-    q = ggml_reshape_3d(ctx, q, head_dim, n_head, n_tokens);
-    // Reference DS4 applies unweighted RMSNorm independently to every Q head.
-    q = ggml_rms_norm(ctx, q, w.rms_eps);
-
-    // ── KV path: cur → kv → norm ───────────────────────────────────
-    // kv: [n_embd, n_tokens] → [head_dim, n_tokens]
-    ggml_tensor * kv = ggml_mul_mat(ctx, L.attn_kv, cur);
-    kv = build_rms_norm(ctx, kv, L.attn_kv_a_norm, w.rms_eps);
-
-    // ── RoPE on Q and KV (tail rotation on last n_rot dims) ────────
-    // DS4 uses per-layer RoPE params: compressed layers get YaRN scaling.
-    const bool compressed = (ratio > 0);
-    const float rope_freq = compressed ? w.compress_rope_freq_base : w.rope_freq_base;
-    const float rope_scale = compressed ? (1.0f / w.rope_scale_factor) : 1.0f;
-    const float rope_ext = compressed ? 1.0f : 0.0f;
-    // For YaRN: attn_factor cancels the magnitude scaling in rope_yarn
-    float rope_attn = 1.0f;
-    if (rope_ext != 0.0f && rope_scale > 0.0f) {
-        rope_attn /= (1.0f + 0.1f * logf(1.0f / rope_scale));
+    // Existing callers leave prepared null and emit the original prologue in
+    // place. Only gathered paged concurrency supplies a q-wide projection.
+    DeepSeek4PreparedProjectedLane projected;
+    if (!prepared) {
+        projected = build_mla_qkv_projection(ctx, cur, w, L, n_tokens);
     }
 
+    // ── RoPE on Q and KV (tail rotation on last n_rot dims) ────────
+    const Ds4RopeParams rope = ds4_rope_params(w, ratio);
+    const float rope_freq = rope.freq;
+    const float rope_scale = rope.scale;
+    const float rope_ext = rope.ext;
+    const float rope_attn = rope.attn;
+    const int rope_n_ctx_orig = rope.n_ctx_orig;
+
     // Position tensor for this token batch
-    ggml_tensor * rope_pos = cached_inputs ? cached_inputs->rope_pos : nullptr;
+    ggml_tensor * rope_pos = prepared ? prepared->rope_pos
+                                      : (cached_inputs ? cached_inputs->rope_pos : nullptr);
     if (!rope_pos) {
         rope_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
         ggml_set_input(rope_pos);
@@ -1764,27 +1875,20 @@ static ggml_tensor * build_mla_attention_lane_core(
         i32_array_inputs.push_back({rope_pos, std::move(pos_vals)});
     }
 
-    // n_ctx_orig is critical for YaRN correction on compressed layers
-    const int rope_n_ctx_orig = (int)w.rope_orig_ctx;  // 65536
-
     // D=512 flash prefill can rotate Q's 64-d tail inside the exact attention
     // kernel. This avoids materializing cont(nope), cont(tail), rope(tail),
     // and concat(nope, tail) while retaining the same F32 rounding boundary.
     const bool fuse_q_rope = attention_impl != DeepSeek4AttentionImpl::Explicit &&
                              n_tokens > 1 && head_dim == 512 && n_rot == 64;
-    if (!fuse_q_rope) {
-        q = build_tail_rope_3d(ctx, q, rope_pos, n_rot, head_dim, n_head, n_tokens,
-                               rope_freq, rope_scale, rope_ext, rope_attn,
-                               w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_n_ctx_orig);
+    if (prepared) {
+        projected = *prepared;
+    } else {
+        build_mla_qkv_rope(
+            ctx, projected, w, rope, n_tokens, rope_pos, fuse_q_rope);
     }
-    kv = build_tail_rope_2d(ctx, kv, rope_pos, n_rot, head_dim, n_tokens,
-                            rope_freq, rope_scale, rope_ext, rope_attn,
-                            w.rope_yarn_beta_fast, w.rope_yarn_beta_slow, rope_n_ctx_orig);
-
-    const DeepSeek4PreparedProjectedLane projected = {qr, q, kv, rope_pos};
-    // Keep the established local names below to make the no-topology-change
-    // property obvious; the bundle is the handoff seam for a future adapter.
-    (void) projected;
+    ggml_tensor * qr = projected.normalized_q_lora;
+    ggml_tensor * q = projected.q;
+    ggml_tensor * kv = projected.kv;
 
     // ── Causal batched step (exact multi-token target semantics) ───
     // The target model is causal: token i must not attend to batch tokens
@@ -1934,7 +2038,13 @@ static ggml_tensor * build_mla_attention_lane_core(
     }
 
     ggml_tensor * index_comp_kv_source = lane.index_comp_kv;
-    if (lane.write_enabled && ratio == 4 && L.indexer_compressor_kv) {
+    // Gathered paged concurrency always uses Explicit attention, whose
+    // build_indexer_topk path is disabled. In that mode the indexer compressor
+    // only writes state that no graph node reads, so omit the dead subgraph.
+    const bool indexer_compressor_is_dead =
+        gathered_history && attention_impl != DeepSeek4AttentionImpl::SparseFlash;
+    if (lane.write_enabled && ratio == 4 && L.indexer_compressor_kv &&
+        !indexer_compressor_is_dead) {
         build_indexer_compressor_step(ctx, gf, cur_last, w, L,
                                       *lane.indexer_compressor, lane.index_comp_kv, token_pos,
                                       cached_inputs ? cached_inputs->index_ape_row : nullptr,
@@ -2502,46 +2612,13 @@ static ggml_tensor * build_mla_attention_lane_core(
     // Flatten to [head_dim*n_head, n_tokens] for output projection
     ggml_tensor * attn_out = ggml_reshape_2d(ctx, context, head_dim * n_head, n_tokens);
 
-    // ── Grouped output projection ──────────────────────────────────
-    // DS4 output uses grouped low-rank projection:
-    //   attn_out: [head_dim*n_head, n_tokens] → reshape [group_dim, n_tokens, n_groups]
-    //   out_a: [group_dim, n_groups*n_lora_o] → reshape [group_dim, n_lora_o, n_groups]
-    //   batched matmul over n_groups: → [n_lora_o, n_tokens, n_groups]
-    //   → reshape [n_lora_o*n_groups, n_tokens]
-    //   out_b: [n_lora_o*n_groups, n_embd] → final: [n_embd, n_tokens]
-    const int group_dim = head_dim * (n_head / n_out_group);  // 512 * 8 = 4096
-    // Reshape attn_out: [32768, n_tokens] → [4096, 8, n_tokens] → permute to [4096, n_tokens, 8]
-    attn_out = ggml_reshape_3d(ctx, attn_out, group_dim, n_out_group, n_tokens);
-    attn_out = ggml_permute(ctx, attn_out, 0, 2, 1, 3);
-    if (n_tokens == 1) {
-        attn_out = ggml_cont(ctx, attn_out);
-    }
-    // attn_out is now [group_dim, n_tokens, n_out_group]
-    ggml_tensor * out_a_3d = ggml_reshape_3d(ctx, L.attn_output_a, group_dim, n_lora_o, n_out_group);
-    // out_a_3d: [group_dim, n_lora_o, n_out_group] — ne[2] matches
-    ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);
-    // attn_low: [n_lora_o, n_tokens, n_out_group]
-    ggml_tensor * out = nullptr;
-    const bool grouped_output_projection =
-        n_tokens > 1 &&
-        !ds4_env_flag("DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
-    if (grouped_output_projection) {
-        // Batched ROCmFPX MMQ consumes src1's channel stride directly. This
-        // avoids materializing both permutations (~256 MiB/layer at 2K).
-        out = ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);
-    } else {
-        // Preserve the established single-token graph and provide an exact
-        // fallback for heterogeneous runtimes that cannot retain grouped-view
-        // metadata across a scheduler copy. At verifier widths (q <= 4), this
-        // materializes at most 128 KiB per layer rather than the long-prefill
-        // volume avoided by the grouped path.
-        attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));
-        attn_low = ggml_reshape_2d(
-            ctx, attn_low, n_lora_o * n_out_group, n_tokens);
-        out = ggml_mul_mat(ctx, L.attn_output_b, attn_low);
+    if (out_attn_context) {
+        *out_attn_context = attn_out;
+        return attn_out;
     }
 
-    return out;
+    return build_mla_output_projection(ctx, attn_out, w, L, n_tokens,
+                                       /*allow_grouped=*/true);
 }
 
 // Legacy contiguous-cache adapter.  Both decode and the consecutive q>1
@@ -4878,6 +4955,16 @@ struct DeepSeek4FusedDecodeGraph {
     std::vector<AuthoritativeRouteOutput> authoritative_routes;
     ggml_tensor * logits = nullptr;
     ggml_backend_sched_t sched = nullptr;
+    // The scheduler owns large pinned cross-backend staging buffers. Retain it
+    // across gathered-paged shape rebuilds when its backend set and capacity
+    // still match.
+    size_t sched_capacity = 0;
+    std::array<ggml_backend_t, 3> sched_backends{};
+
+    bool sched_reusable(const std::array<ggml_backend_t, 3> & backends,
+                        size_t capacity) const {
+        return sched && sched_capacity >= capacity && sched_backends == backends;
+    }
 
     void reset_nodes() {
         inp_embed = nullptr;
@@ -4913,6 +5000,22 @@ struct DeepSeek4FusedDecodeGraph {
         }
     }
 
+    // Retain shape-independent resources, but first retire native graph
+    // executables whose keys point into this metadata arena. The allocator and
+    // scheduler remain alive; the builder resets their per-graph state.
+    void release_for_rebuild(ggml_backend_t main_backend,
+                             ggml_backend_t peer_backend = nullptr) {
+        invalidate_native_graphs(main_backend, peer_backend);
+        // Clear scheduler registrations while their tensor metadata is still
+        // valid. The builder may reset again after deciding to reuse it; that
+        // second reset is a no-op but keeps the builder self-contained.
+        if (sched) {
+            ggml_backend_sched_reset(sched);
+        }
+        step_graph_free(sg);
+        reset_nodes();
+    }
+
     void destroy(ggml_backend_t main_backend,
                  ggml_backend_t peer_backend = nullptr) {
         // Native graph executables outlive ggml graph metadata in the backend
@@ -4923,6 +5026,8 @@ struct DeepSeek4FusedDecodeGraph {
             ggml_backend_sched_free(sched);
             sched = nullptr;
         }
+        sched_capacity = 0;
+        sched_backends = {};
         step_graph_destroy(sg);
         reset_nodes();
     }
@@ -4991,6 +5096,15 @@ struct Ds4FusedVerifyCache {
             ggml_tensor * ape = nullptr;
             ggml_tensor * state_row = nullptr;
             ggml_tensor * comp_pos = nullptr;
+            // Element offsets into the shared per-dtype upload bundles.
+            int64_t i32_base = -1;      // pos, neg_pos, comp_read, ape, comp_pos
+            int64_t i64_base = -1;      // raw_write, comp_write, state_row
+            int64_t raw_off = -1;
+            int64_t raw_n = 0;
+            int64_t comp_off = -1;
+            int64_t comp_n = 0;
+            int64_t index_off = -1;
+            int64_t index_n = 0;
         };
         ggml_tensor * pos_q = nullptr;    // i32 [q]
         ggml_tensor * neg_q = nullptr;    // i32 [q]
@@ -5005,6 +5119,12 @@ struct Ds4FusedVerifyCache {
         // Keeping it per slot removes one allocation from every verify step.
         std::vector<float> mask_values;
         std::vector<PagedLane> paged;     // [layer*q], paged mode only
+        ggml_tensor * paged_i32 = nullptr;
+        ggml_tensor * paged_i64 = nullptr;
+        ggml_tensor * paged_gather = nullptr;
+        int64_t paged_i32_n = 0;
+        int64_t paged_i64_n = 0;
+        int64_t paged_gather_n = 0;
         int q = 0;
 
         void reset() { *this = Extra{}; }
@@ -7162,7 +7282,8 @@ bool deepseek4_paged_gathered_step(
             if (vc.slots[i].last_use < vc.slots[pick].last_use) pick = i;
         }
         fg = &vc.slots[pick]; ex = &vc.extra[pick];
-        fg->destroy(vc.backend, vc.peer_backend); ex->reset();
+        fg->release_for_rebuild(vc.backend, vc.peer_backend);
+        ex->reset();
         if (!ds4_build_fused_verify_graph(
                 mc, *fg, *ex, backend, w, cache.prefill_staging,
                 rt->model.hc_layer_weights, rt->model.hc_output_weights,
@@ -7172,47 +7293,83 @@ bool deepseek4_paged_gathered_step(
             std::fprintf(stderr,
                 "[deepseek4-paged] failed to build gathered graph "
                 "(lanes=%u)\n", lanes);
+            fg->destroy(vc.backend, vc.peer_backend);
+            ex->reset();
             return false;
         }
     }
     fg->last_use = vc.counter;
     ds4_fv_set(fg->inp_embed, embeddings,
                sizeof(float) * (size_t) w.n_embd * lanes);
+    // The shared Q/KV prologue rotates all gathered lanes at once. Padding
+    // lanes use position zero, matching their passive prepared row record.
+    {
+        std::vector<int32_t> pos_batch(lanes, 0);
+        std::vector<int32_t> neg_batch(lanes, 0);
+        for (uint32_t lane = 0; lane < lanes; ++lane) {
+            if (slots[lane] < 0) continue;
+            pos_batch[lane] = (int32_t) positions[lane];
+            neg_batch[lane] = -(int32_t) positions[lane];
+        }
+        ds4_fv_set(ex->pos_q, pos_batch.data(), sizeof(int32_t) * lanes);
+        ds4_fv_set(ex->neg_q, neg_batch.data(), sizeof(int32_t) * lanes);
+    }
+
+    std::vector<int32_t> bundle_i32(
+        (size_t) std::max<int64_t>(ex->paged_i32_n, 0), 0);
+    std::vector<int64_t> bundle_i64(
+        (size_t) std::max<int64_t>(ex->paged_i64_n, 0), 0);
+    std::vector<int32_t> bundle_gather(
+        (size_t) std::max<int64_t>(ex->paged_gather_n, 0), 0);
     size_t pi = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) cache.layers[(size_t) il].ratio;
         for (uint32_t lane = 0; lane < lanes; ++lane, ++pi) {
             const auto & row = prepared[(size_t) il][lane];
             const auto & px = ex->paged[pi];
+            if (px.i32_base < 0 || px.i64_base < 0) return false;
             const int32_t pos = (int32_t) row.position;
-            const int32_t neg_pos = -pos;
-            ds4_fv_set(px.pos, &pos, sizeof(pos));
-            ds4_fv_set(px.neg_pos, &neg_pos, sizeof(neg_pos));
-            std::vector<int32_t> idx(std::max<size_t>(row.raw_history.size(), 1), 0);
-            for (size_t i = 0; i < row.raw_history.size(); ++i) idx[i] = (int32_t) row.raw_history[i];
-            ds4_fv_set(px.raw_gather, idx.data(), idx.size() * sizeof(int32_t));
-            const int64_t raw_write = std::max<int64_t>(row.raw_scatter, 0);
-            ds4_fv_set(px.raw_write, &raw_write, sizeof(raw_write));
-            if (ratio > 0) {
-                idx.assign(std::max<size_t>(row.compressed_history.size(), 1), 0);
-                for (size_t i = 0; i < row.compressed_history.size(); ++i)
-                    idx[i] = (int32_t) row.compressed_history[i];
-                ds4_fv_set(px.comp_gather, idx.data(), idx.size() * sizeof(int32_t));
-                if (px.index_gather)
-                    ds4_fv_set(px.index_gather, idx.data(), idx.size() * sizeof(int32_t));
+            bundle_i32[(size_t) px.i32_base + 0] = pos;
+            bundle_i32[(size_t) px.i32_base + 1] = -pos;
+            if (px.raw_off < 0 ||
+                px.raw_off + px.raw_n > ex->paged_gather_n ||
+                (int64_t) row.raw_history.size() > px.raw_n) return false;
+            for (size_t i = 0; i < row.raw_history.size(); ++i) {
+                bundle_gather[(size_t) px.raw_off + i] =
+                    (int32_t) row.raw_history[i];
+            }
+            bundle_i64[(size_t) px.i64_base + 0] =
+                std::max<int64_t>(row.raw_scatter, 0);
+            if (ratio > 0 && px.comp_off >= 0) {
+                if (px.comp_off + px.comp_n > ex->paged_gather_n ||
+                    (int64_t) row.compressed_history.size() > px.comp_n) {
+                    return false;
+                }
+                for (size_t i = 0; i < row.compressed_history.size(); ++i) {
+                    const int32_t value =
+                        (int32_t) row.compressed_history[i];
+                    bundle_gather[(size_t) px.comp_off + i] = value;
+                    if (px.index_off >= 0) {
+                        bundle_gather[(size_t) px.index_off + i] = value;
+                    }
+                }
                 const int64_t cw = std::max<int64_t>(row.compressed_scatter, 0);
-                const int32_t cr = (int32_t) cw;
                 const int32_t ape = pos % ratio;
-                const int64_t state = ratio == 4 ? 4 + ape : ape;
-                const int32_t comp_pos = pos + 1 - ratio;
-                ds4_fv_set(px.comp_write, &cw, sizeof(cw));
-                ds4_fv_set(px.comp_read, &cr, sizeof(cr));
-                ds4_fv_set(px.ape, &ape, sizeof(ape));
-                ds4_fv_set(px.state_row, &state, sizeof(state));
-                ds4_fv_set(px.comp_pos, &comp_pos, sizeof(comp_pos));
+                bundle_i64[(size_t) px.i64_base + 1] = cw;
+                bundle_i64[(size_t) px.i64_base + 2] =
+                    ratio == 4 ? 4 + ape : ape;
+                bundle_i32[(size_t) px.i32_base + 2] = (int32_t) cw;
+                bundle_i32[(size_t) px.i32_base + 3] = ape;
+                bundle_i32[(size_t) px.i32_base + 4] = pos + 1 - ratio;
             }
         }
     }
+    ds4_fv_set(ex->paged_i32, bundle_i32.data(),
+               bundle_i32.size() * sizeof(int32_t));
+    ds4_fv_set(ex->paged_i64, bundle_i64.data(),
+               bundle_i64.size() * sizeof(int64_t));
+    ds4_fv_set(ex->paged_gather, bundle_gather.data(),
+               bundle_gather.size() * sizeof(int32_t));
     if (token_ids) {
         for (int il = 0; il < w.n_layer; ++il) {
             ggml_tensor * ids = fg->hash_ids[(size_t) il]; if (!ids) continue;
