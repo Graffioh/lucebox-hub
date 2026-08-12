@@ -81,6 +81,16 @@ struct ServerConfig {
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
 
+    // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
+    // See docs/PIN_FRIENDLY_PROMPT.md. Env: DFLASH_PPP=0|1,
+    // DFLASH_PPP_REARRANGE=0|1, DFLASH_PPP_LCP_WINDOW=N,
+    // DFLASH_PPP_MIN_PIN_TOKENS=N, DFLASH_PPP_MAX_EPHEMERAL=N.
+    bool        ppp_enabled = true;
+    bool        ppp_rearrange = false;
+    int         ppp_lcp_window = 8;
+    int         ppp_min_pin_tokens = 512;
+    int         ppp_max_ephemeral_tokens = 256;  // diff hunk relocate cap
+
     // Thinking-budget v2. Applied when a request opts in via
     // `thinking: {type: "enabled"}` or `reasoning: {effort: ...}`.
     // think_max_tokens caps phase-1 reasoning generation; the combined
@@ -248,6 +258,8 @@ struct ParsedRequest {
     // Bandit: per-session adaptive keep_ratio opt-in
     std::string               session_id;
     DiskPrefixCachePolicy     disk_cache_policy;
+    // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
+    int                       pin_end_token = 0;
 };
 
 // Parse request sampler fields, applying model-card defaults where present.
@@ -262,6 +274,10 @@ json require_messages_array(const json & body);
 // Resolve the supported output-token aliases in precedence order. Only the
 // selected field is parsed, so malformed lower-priority aliases are ignored.
 int resolve_max_output_tokens(const json & body, int default_max_tokens);
+
+// Sticky tools-boundary pinning is part of PPP and must follow its master
+// toggle. Kept as a small policy helper so the disabled path is testable.
+bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools);
 
 // Build the /props response body. Exposed (non-static) so unit tests
 // can assert on its shape without spinning up a real socket. See
@@ -344,6 +360,9 @@ private:
         int full_snap_slot = -1;
         int full_snap_pos = 0;
         bool full_snap_prepared = false;
+        // When DiffPin rewrote tokens, full-cache keys must use
+        // prepared.tokens (effective), not req.prompt_tokens.
+        bool full_snap_key_effective = false;
         int snap_slot = -1;
         int snap_cut = 0;
         bool snap_prepared = false;
@@ -461,6 +480,8 @@ private:
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
     std::vector<std::vector<int32_t>> recent_disk_prompts_;
+    // Recent tool-bearing prompt prefixes for PPP LCP annotate.
+    std::vector<std::vector<int32_t>> recent_tool_prefixes_;
 
     // FlowKV freeze-history: per-message compression cache.
     // Key: SHA-1 hash of the drafter-token slice for an aged message.

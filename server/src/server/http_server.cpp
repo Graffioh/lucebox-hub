@@ -21,6 +21,7 @@
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
 #include "tool_hint.h"
+#include "pin_friendly_prompt.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
 
@@ -475,6 +476,10 @@ int resolve_max_output_tokens(const json & body, int default_max_tokens) {
         return body.at("max_completion_tokens").get<int>();
     }
     return default_max_tokens;
+}
+
+bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools) {
+    return ppp_enabled && has_tools;
 }
 
 // Sampler parameters. When the request omits a value, fall back to the
@@ -1055,6 +1060,36 @@ HttpServer::HttpServer(ModelBackend & backend,
     }
     disk_cache_.init();
     status_html_path_ = resolve_status_html();
+
+    // PPP env overrides (operator-facing; no CLI flags required).
+    auto env_truthy = [](const char * v) -> bool {
+        if (!v || !*v) return false;
+        return !(v[0] == '0' && v[1] == '\0') &&
+               !(v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
+    };
+    if (const char * e = std::getenv("DFLASH_PPP")) {
+        config_.ppp_enabled = env_truthy(e);
+    }
+    if (const char * e = std::getenv("DFLASH_PPP_REARRANGE")) {
+        config_.ppp_rearrange = env_truthy(e);
+    }
+    if (const char * e = std::getenv("DFLASH_PPP_LCP_WINDOW")) {
+        const int n = std::atoi(e);
+        if (n > 0) config_.ppp_lcp_window = n;
+    }
+    if (const char * e = std::getenv("DFLASH_PPP_MIN_PIN_TOKENS")) {
+        const int n = std::atoi(e);
+        if (n > 0) config_.ppp_min_pin_tokens = n;
+    }
+    if (const char * e = std::getenv("DFLASH_PPP_MAX_EPHEMERAL")) {
+        const int n = std::atoi(e);
+        if (n > 0) config_.ppp_max_ephemeral_tokens = n;
+    }
+    std::fprintf(stderr,
+        "[ppp] enabled=%d rearrange=%d lcp_window=%d min_pin=%d max_ephemeral=%d\n",
+        (int)config_.ppp_enabled, (int)config_.ppp_rearrange,
+        config_.ppp_lcp_window, config_.ppp_min_pin_tokens,
+        config_.ppp_max_ephemeral_tokens);
 }
 
 // Resolve path to share/status.html at startup.
@@ -1961,7 +1996,32 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         apply_request_reasoning(body, req);
         // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
         req.session_id = parse_session_id_from_body(body);
-        if (!render_and_tokenize_request(fd, chat_messages, req)) return true;
+
+        // PPP rearrange (optional): peel ephemeral system banners into a
+        // following system message so the first chat boundary is stable.
+        std::vector<ChatMessage> render_messages = chat_messages;
+        if (config_.ppp_enabled && config_.ppp_rearrange && !req.tools.empty()) {
+            auto layout = PinFriendlyPrompt::rearrange(chat_messages, true);
+            if (layout.rearranged) {
+                render_messages = std::move(layout.messages);
+                // Keep FlowKV / response formatting aligned with the served
+                // layout (FlowKV re-renders from req.messages).
+                if (req.messages.is_array() && !req.messages.empty() &&
+                    req.messages[0].value("role", "") == "system" &&
+                    render_messages.size() >= 2) {
+                    req.messages[0]["content"] = render_messages[0].content;
+                    json meta = {
+                        {"role", "system"},
+                        {"content", render_messages[1].content},
+                    };
+                    req.messages.insert(req.messages.begin() + 1, std::move(meta));
+                }
+                std::fprintf(stderr,
+                    "[ppp] rearranged: peeled ephemeral system tail\n");
+            }
+        }
+
+        if (!render_and_tokenize_request(fd, render_messages, req)) return true;
 
         // count_tokens: short-circuit after tokenization. Skip generation
         // entirely — Anthropic's contract is just {"input_tokens": N}.
@@ -2799,16 +2859,80 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request) {
     auto & effective_prompt = prepared.tokens;
+    // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
+    const bool prefer_inline_snap = !req.tools.empty();
+    const bool prefer_tools_boundary =
+        ppp_prefers_tools_boundary(config_.ppp_enabled, prefer_inline_snap);
+    int forced_cut = req.pin_end_token;
+
+    // PPP runs *before* lookup. Default (rearrange=0): annotate a sticky
+    // pin_end only — never mutate tokens. Token-level DiffPin rewrite
+    // (prefix|suffix|middle float) is opt-in via DFLASH_PPP_REARRANGE=1;
+    // unconstrained middle peels can scramble tool-schema JSON and yield
+    // empty post-tool completions.
+    bool ppp_rewrote = false;
+    if (config_.ppp_enabled && prefer_tools_boundary) {
+        const auto boundaries = find_all_boundaries(
+            effective_prompt, prefix_cache_.chat_markers());
+        if (config_.ppp_rearrange) {
+            auto rewrite = PinFriendlyPrompt::diff_make_pin_friendly(
+                effective_prompt, boundaries, recent_tool_prefixes_,
+                prefix_cache_.chat_markers(),
+                config_.ppp_lcp_window, config_.ppp_min_pin_tokens,
+                config_.ppp_max_ephemeral_tokens);
+            if (rewrite.rewritten) {
+                effective_prompt = std::move(rewrite.tokens);
+                generate_request.prompt = effective_prompt;
+                ppp_rewrote = true;
+                // Full-cache hits/keys from unrearranged tokens are stale.
+                prepared.full_cache_hit_slot = -1;
+                prepared.full_cache_hit_len = 0;
+                prepared.full_cache_served_tokens = -1;
+                std::fprintf(stderr,
+                    "[ppp] diff-rewrite prefix=%d suffix=%d middle=%d "
+                    "pin_end=%d prompt=%zu\n",
+                    rewrite.prefix_len, rewrite.suffix_len, rewrite.middle_len,
+                    rewrite.pin_end, effective_prompt.size());
+            }
+            if (forced_cut <= 0) forced_cut = rewrite.pin_end;
+            if (forced_cut > 0 && !rewrite.rewritten) {
+                std::fprintf(stderr,
+                    "[ppp] pin_end=%d (no rewrite; prompt=%zu)\n",
+                    forced_cut, effective_prompt.size());
+            }
+        } else if (forced_cut <= 0) {
+            forced_cut = PinFriendlyPrompt::annotate_pin_end(
+                effective_prompt, boundaries, recent_tool_prefixes_,
+                config_.ppp_lcp_window, config_.ppp_min_pin_tokens);
+            if (forced_cut > 0) {
+                std::fprintf(stderr,
+                    "[ppp] pin_end=%d (pin-only; prompt=%zu)\n",
+                    forced_cut, effective_prompt.size());
+            }
+        }
+        const auto remember_bounds = find_all_boundaries(
+            effective_prompt, prefix_cache_.chat_markers());
+        const int remember_n = !remember_bounds.empty()
+            ? remember_bounds.front()
+            : (int)effective_prompt.size();
+        PinFriendlyPrompt::remember_tool_prefix(
+            recent_tool_prefixes_, effective_prompt, remember_n,
+            config_.ppp_lcp_window);
+    }
+
     GenerationCacheState cache;
     cache.cache_slot = prepared.full_cache_hit_slot;
     cache.prefix_len = prepared.full_cache_hit_len;
     cache.using_restore = cache.cache_slot >= 0;
     cache.disk_policy = req.disk_cache_policy;
+    cache.full_snap_key_effective = ppp_rewrote;
 
-    // Exact raw-prompt snapshots take priority over inline turn boundaries.
+    // Exact full-prompt snapshots. After a DiffPin rewrite, key by the
+    // tokens we actually serve (effective_prompt), not the client wire form.
     if (!cache.using_restore) {
-        auto [full_slot, full_len] =
-            prefix_cache_.lookup_full(req.prompt_tokens);
+        const auto & full_key =
+            ppp_rewrote ? effective_prompt : req.prompt_tokens;
+        auto [full_slot, full_len] = prefix_cache_.lookup_full(full_key);
         if (full_slot >= 0) {
             cache.cache_slot = full_slot;
             cache.prefix_len = full_len;
@@ -3047,17 +3171,19 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     // A generation can save only one snapshot during prefill. Tool-heavy
     // requests prefer the reusable system/tool boundary; otherwise an
     // enabled exact full-prompt cache retains its existing priority.
-    const bool prefer_inline_snap = !req.tools.empty();
     auto prepare_inline = [&]() {
         const auto prepared_snapshot = prefix_cache_.prepare_inline_snap(
             effective_prompt,
-            cache.using_restore ? cache.prefix_len : 0);
+            cache.using_restore ? cache.prefix_len : 0,
+            prefer_tools_boundary,
+            forced_cut);
         cache.snap_slot = prepared_snapshot.first;
         cache.snap_cut = prepared_snapshot.second;
     };
     auto prepare_full = [&]() {
-        cache.full_snap_slot =
-            prefix_cache_.prepare_full_snap(req.prompt_tokens);
+        const auto & full_key = cache.full_snap_key_effective
+            ? effective_prompt : req.prompt_tokens;
+        cache.full_snap_slot = prefix_cache_.prepare_full_snap(full_key);
         if (cache.full_snap_slot >= 0) {
             cache.full_snap_pos = (int) effective_prompt.size();
             generate_request.snap_slot = cache.full_snap_slot;
@@ -3134,8 +3260,10 @@ void HttpServer::finalize_generation_cache(
                 backend_.snapshot_cur_pos(cache.full_snap_slot);
             if (saved_position > 0 &&
                 saved_position <= cache.full_snap_pos) {
+                const auto & full_key = cache.full_snap_key_effective
+                    ? effective_prompt : req.prompt_tokens;
                 prefix_cache_.confirm_full_snap(
-                    cache.full_snap_slot, req.prompt_tokens, saved_position);
+                    cache.full_snap_slot, full_key, saved_position);
             } else {
                 backend_.snapshot_free(cache.full_snap_slot);
                 prefix_cache_.abort_full_snap(cache.full_snap_slot);

@@ -170,32 +170,48 @@ static bool is_strict_prefix(const std::vector<int32_t> & a,
     return std::equal(a.begin(), a.end(), b.begin());
 }
 
-int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru) {
+int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru,
+                               const std::vector<bool> * protected_lru) {
     const int n = (int)ids_lru.size();
     if (n <= 0) return 0;
-    // Oldest-first scan: evict the first entry that is not a strict prefix of any
-    // other entry (a leaf). Shared ancestor prefixes are thereby kept resident.
+    auto is_protected = [&](int i) {
+        return protected_lru && i >= 0 && i < (int)protected_lru->size() &&
+               (*protected_lru)[(size_t)i];
+    };
+    // Oldest-first scan: prefer an unprotected leaf so sticky tools pins survive.
+    int oldest_protected_leaf = -1;
     for (int i = 0; i < n; i++) {
         bool is_ancestor = false;
         for (int j = 0; j < n; j++) {
             if (j == i) continue;
             if (is_strict_prefix(*ids_lru[i], *ids_lru[j])) { is_ancestor = true; break; }
         }
-        if (!is_ancestor) return i;  // oldest leaf
+        if (is_ancestor) continue;
+        if (!is_protected(i)) return i;  // oldest unprotected leaf
+        if (oldest_protected_leaf < 0) oldest_protected_leaf = i;
     }
+    if (oldest_protected_leaf >= 0) return oldest_protected_leaf;
     return 0;  // unreachable (the longest entry is always a leaf); pure-LRU fallback
 }
 
-int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru) {
+int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru,
+                               const std::vector<bool> * protected_lru) {
     std::vector<const std::vector<int32_t> *> ptrs;
     ptrs.reserve(ids_lru.size());
     for (const auto & v : ids_lru) ptrs.push_back(&v);
-    return select_inline_evict_victim(ptrs);
+    return select_inline_evict_victim(ptrs, protected_lru);
 }
 
 int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
-                                    int restored_prefix_len) {
+                                    int restored_prefix_len,
+                                    bool prefer_tools_boundary) {
     if (boundaries.empty()) return 0;
+    // Tool-heavy cold path: pin the system+tools head (first marker) before
+    // deepening into conversation turns. Matches Python thin-pin semantics.
+    if (prefer_tools_boundary) {
+        const int tools_cut = boundaries.front();
+        if (tools_cut > restored_prefix_len) return tools_cut;
+    }
     const int target = boundaries.size() >= 2
         ? boundaries[boundaries.size() - 2]
         : boundaries.back();
@@ -259,6 +275,7 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
 
     auto boundaries = find_all_boundaries(prompt_ids, markers_);
     int best_slot = -1, best_len = 0;
+    int best_idx = -1;
 
     for (int cut : boundaries) {
         auto key = hash_prefix(prompt_ids.data(), cut);
@@ -278,12 +295,27 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
             if (cut > best_len) {
                 best_slot = entries_[idx].slot;
                 best_len = cut;
+                best_idx = idx;
             }
-            move_to_end(idx);
         }
     }
 
-    if (best_slot >= 0) {
+    // Match committed entry prefixes directly. Required for PPP mid-message
+    // pin_end cuts that are not chat-template boundaries.
+    for (int i = 0; i < (int)entries_.size(); ++i) {
+        const auto & e = entries_[(size_t)i];
+        const int len = (int)e.ids.size();
+        if (len <= best_len || len > (int)prompt_ids.size()) continue;
+        if (!std::equal(e.ids.begin(), e.ids.end(), prompt_ids.begin())) {
+            continue;
+        }
+        best_slot = e.slot;
+        best_len = len;
+        best_idx = i;
+    }
+
+    if (best_idx >= 0) {
+        move_to_end(best_idx);
         lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
         std::fprintf(stderr, "[pc] lookup hit slot=%d prefix_len=%d (of %zu total)\n",
                      best_slot, best_len, prompt_ids.size());
@@ -293,34 +325,57 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
 
 std::pair<int, int> PrefixCache::prepare_inline_snap(
         const std::vector<int32_t> & prompt_ids,
-        int restored_prefix_len) {
+        int restored_prefix_len,
+        bool prefer_tools_boundary,
+        int forced_cut) {
     if (disabled_) return {-1, 0};
 
     auto candidates = find_all_boundaries(prompt_ids, markers_);
-    const int target_cut =
-        select_inline_snapshot_boundary(candidates, restored_prefix_len);
+    int target_cut = 0;
+    bool forced = false;
+    if (forced_cut > restored_prefix_len &&
+        forced_cut <= (int)prompt_ids.size()) {
+        target_cut = forced_cut;
+        forced = true;
+    } else {
+        target_cut = select_inline_snapshot_boundary(
+            candidates, restored_prefix_len, prefer_tools_boundary);
+    }
     if (target_cut <= 0) return {-1, 0};
 
     auto key = hash_prefix(prompt_ids.data(), target_cut);
     if (find_entry(key) >= 0) return {-1, 0};  // already cached
 
+    // Protect the tools head pin for tool-heavy requests so multi-chat deepen
+    // snaps cannot thrash the ~18k system+tools KV away. PPP forced cuts are
+    // the stable tools/identity span and stay protected as well.
+    pending_protect_ = prefer_tools_boundary &&
+                       (forced ||
+                        (!candidates.empty() && target_cut == candidates.front()));
+
     int slot;
     if ((int)entries_.size() >= cap_) {
         // At capacity — reserve a slot without evicting yet. Prefix-aware: prefer
         // the oldest leaf so shared ancestor prefixes (reused by later branches)
-        // stay resident. entries_ is already in LRU order (front = oldest).
+        // stay resident. Skip protected tools pins when an unprotected leaf exists.
         std::vector<const std::vector<int32_t> *> ids_lru;
+        std::vector<bool> protected_lru;
         ids_lru.reserve(entries_.size());
-        for (const auto & e : entries_) ids_lru.push_back(&e.ids);
-        int victim = select_inline_evict_victim(ids_lru);
+        protected_lru.reserve(entries_.size());
+        for (const auto & e : entries_) {
+            ids_lru.push_back(&e.ids);
+            protected_lru.push_back(e.protect);
+        }
+        int victim = select_inline_evict_victim(ids_lru, &protected_lru);
         pending_evict_key_ = entries_[victim].hash;
         has_pending_evict_ = true;
         slot = entries_[victim].slot;
-        if (victim != 0) {
+        if (victim != 0 || entries_[victim].protect) {
             std::fprintf(stderr,
-                "[pc] prefix-aware evict: victim idx=%d (len=%zu) kept oldest "
-                "ancestor (len=%zu)\n",
-                victim, entries_[victim].ids.size(), entries_.front().ids.size());
+                "[pc] prefix-aware evict: victim idx=%d protect=%d (len=%zu) "
+                "kept oldest ancestor (len=%zu)\n",
+                victim, (int)entries_[victim].protect,
+                entries_[victim].ids.size(), entries_.front().ids.size());
         }
     } else {
         slot = next_slot_;
@@ -332,7 +387,8 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
 }
 
 void PrefixCache::confirm_inline_snap(int slot, int target_cut,
-                                      const std::vector<int32_t> & prompt_ids) {
+                                      const std::vector<int32_t> & prompt_ids,
+                                      bool protect) {
     if (disabled_) return;
 
     // Evict the reserved entry (if any).
@@ -360,12 +416,16 @@ void PrefixCache::confirm_inline_snap(int slot, int target_cut,
         }
     }
 
+    const bool protect_entry = protect || pending_protect_;
+    pending_protect_ = false;
+
     auto key = hash_prefix(prompt_ids.data(), target_cut);
     std::vector<int32_t> ids(prompt_ids.begin(), prompt_ids.begin() + target_cut);
-    entries_.push_back({key, slot, std::move(ids)});
+    entries_.push_back({key, slot, std::move(ids), protect_entry});
     entries_size_count_.fetch_add(1, std::memory_order_relaxed);
-    std::fprintf(stderr, "[pc] inline-snap committed slot=%d prefix_len=%d\n",
-                 slot, target_cut);
+    std::fprintf(stderr,
+                 "[pc] inline-snap committed slot=%d prefix_len=%d protect=%d\n",
+                 slot, target_cut, (int)protect_entry);
 }
 
 void PrefixCache::abort_inline_snap(int slot) {
@@ -381,6 +441,7 @@ void PrefixCache::abort_inline_snap(int slot) {
         }
     }
     has_pending_evict_ = false;
+    pending_protect_ = false;
 }
 
 void PrefixCache::cancel_inline_snap(int slot) {
@@ -390,6 +451,7 @@ void PrefixCache::cancel_inline_snap(int slot) {
         if (idx >= 0 && entries_[idx].slot != slot) return;
     }
     has_pending_evict_ = false;
+    pending_protect_ = false;
 }
 
 void PrefixCache::mark_all_cleared() {
@@ -399,6 +461,7 @@ void PrefixCache::mark_all_cleared() {
     entries_size_count_.store(0, std::memory_order_relaxed);
     next_slot_ = 0;
     has_pending_evict_ = false;
+    pending_protect_ = false;
     std::fprintf(stderr, "[pc] all-cleared — dropped %d LRU entries\n", n);
 }
 
