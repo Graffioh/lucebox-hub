@@ -1,13 +1,14 @@
 # OFlash results
 
-**Nothing below is measured yet.** This file is the methodology skeleton the measurements will land
-in; every number that arrives must arrive with the exact command that produced it
+**No acceptance or throughput result is measured yet.** The 2026-08-12 qualification below covers
+build, model integrity, device execution, and a capture-only server boot; the remaining sections are
+the performance methodology. Every number must arrive with the exact command that produced it
 (CONTRIBUTING.md: numbers without methodology don't get merged). Sections mirror the milestones in
 [`server/docs/OFLASH.md`](../../server/docs/OFLASH.md) §9.
 
 All measurements on one box: **AMD Radeon AI PRO R9700** (gfx1201, 32 GB GDDR6) serving the target,
 **AMD Ryzen AI Max "Strix Halo" iGPU** (gfx1151, 128 GB unified memory) running the trainer.
-Target **Qwen3.6-27B Q4_K_M**; drafter **dflash-draft-3.6 q4_k_m** (EAGLE-style DFlash block
+Target **Qwen3.6-27B Q4_K_M**; drafter **dflash-draft-3.6 Q8_0** (EAGLE-style DFlash block
 drafter, 16-token blocks). Single-stream decode, same seeds for static-vs-adaptive pairs, same
 power limit, same warmup.
 
@@ -15,6 +16,41 @@ Primary metric: decode tok/s as a function of decode-step index and wall-clock s
 static vs adaptive. Secondary: mean accepted length (AL), acceptance rate α per draft position,
 swap/rollback counts, TTFT (must be unchanged), trainer interference on target tok/s, peak memory
 on both devices.
+
+## 0. 2026-08-12 hardware qualification
+
+Measured on the intended box with ROCm 7.2.2: R9700 `gfx1201` (31.86 GiB), Strix Halo `gfx1151`
+(96 GiB GPU-accessible KFD heap), and 128 GiB host RAM.
+
+- Pinned target and drafter downloads matched their published SHA-256 values:
+  `41ae55b347988dca8352ed4c85f3d8ee3804a23cc89aaea165c071d61ec3cca0` for the
+  16,817,244,064-byte Q4_K_M target and
+  `29ba8b816eedea674e8bdabbd29db8da69539117c76da40e40d2207c0fb224db` for the
+  1,849,481,856-byte Q8_0 drafter.
+- The release `gfx1201` build passed all 373 C++ server tests; the trainer passed all 40 Python
+  tests with AMD PyTorch 2.9.1 / ROCm 7.2.1.
+- R9700 flash-prefill numerical checks passed (maximum error 0.00027); the 8K kernel smoke averaged
+  14.6 ms over five iterations.
+- A Strix FP16 GEMM/backward smoke passed on `gfx1151` with a 96 GiB-visible heap.
+- The command below loaded both GGUFs, created the 256 MiB capture ring, and reached the listen
+  socket. The target loader reported 14.99 GiB of GPU tensors plus a 682 MiB CPU-only embedding.
+
+```bash
+server/build/dflash_server /models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft /models/dflash-draft-3.6-q8_0.gguf \
+  --target-device hip:0 --draft-device hip:0 \
+  --host 127.0.0.1 --port 18080 --max-ctx 4096 \
+  --chunk 128 --cache-type-k q4_0 --cache-type-v q4_0 \
+  --prefix-cache-slots 0 --prefill-cache-slots 0 \
+  --ddtree --ddtree-budget 22 \
+  --oflash --oflash-ring-mb 256 --oflash-topk 8
+```
+
+The request/capture and full-mirror training phases were not run: a concurrent persistent
+DeepSeek-V4 process repeatedly reclaimed both GPUs during the qualification window, reaching about
+32 GiB R9700 VRAM and 127 GiB across KFD allocations. OFlash was stopped instead of competing past
+the documented reserve. An exclusive GPU window is therefore the next prerequisite; the successful
+model boot is a capacity result, not an online-distillation or performance result.
 
 ## 1. M0 — acceptance-vs-step baseline curves
 
@@ -26,7 +62,9 @@ later claim is measured against.
 
 ```bash
 server/build/dflash_server qwen36-27b-Q4_K_M.gguf \
-    --draft dflash-draft-3.6-q4_k_m.gguf --oflash        # no trainer bin: capture-only
+    --draft dflash-draft-3.6-q8_0.gguf \
+    --target-device hip:0 --draft-device hip:0 \
+    --oflash                                               # no trainer bin: capture-only
 
 python3 harness/benchmarks/generation_benchmark.py run \
     --name oflash-m0-he --url http://127.0.0.1:8080/v1 --model qwen36 \
@@ -45,12 +83,12 @@ for HumanEval / Math500 / GSM8K and the agentic session, plus the capture-overhe
 
 Train the LoRA on M0-captured data offline, then re-run the M0 benchmarks with the adapter loaded
 statically (promoted at startup, trainer off). Proves the loss/rank/λ recipe moves α on our drafter
-before any online machinery is trusted. This is also where the bf16-mirror → Q4_K_M transfer gap is
+before any online machinery is trusted. This is also where the FP16-mirror → Q4_K_M transfer gap is
 quantified: α in the PyTorch mirror vs α on the quantized engine, same adapter.
 
 ```bash
 # replay the captured ring into the trainer (same args the engine would pass)
-optimizations/oflash/bin/oflash-trainer dflash-draft-3.6-q4_k_m.gguf \
+optimizations/oflash/bin/oflash-trainer dflash-draft-3.6-q8_0.gguf \
     --ring-name /lucebox-oflash-<pid> \
     --out-dir ~/.lucebox/oflash/<hash16>/default --profile default \
     --rank 16 --alpha 32 --device 1 --drafter-sha256 <sha256> \
@@ -73,7 +111,8 @@ drafter speed).
 
 ```bash
 server/build/dflash_server qwen36-27b-Q4_K_M.gguf \
-    --draft dflash-draft-3.6-q4_k_m.gguf \
+    --draft dflash-draft-3.6-q8_0.gguf \
+    --target-device hip:0 --draft-device hip:0 \
     --oflash --oflash-trainer-bin optimizations/oflash/bin/oflash-trainer
 # domain-shifted workload through the same per-step harness client as M0
 ```

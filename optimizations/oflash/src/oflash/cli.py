@@ -8,10 +8,12 @@ Process contract (server/src/common/oflash/oflash_supervisor.cpp):
               --drafter-sha256=<hex> --start-generation=N --stream-fd=N
   ready:  one int32 0 on --stream-fd, sent AFTER attaching the ring but
           BEFORE any heavy import (torch) or model load, so server startup
-          never blocks on us. Init failures after ready surface as exit;
-          the supervisor respawns with backoff.
+          never blocks on us. Accelerator/model-load failures after ready
+          enter drain-only capture mode instead of retrying a large allocation.
   events: newline JSON on --stream-fd afterwards:
               {"event":"swap_ready","path":...,"generation":N}
+              {"event":"rollback_ack","generation":N}
+              {"event":"training_disabled","reason":...}
               {"event":"log","message":...}
   stdin:  newline commands from the engine:
               promote <gen> | rollback <gen> | disable | quit
@@ -43,6 +45,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--drafter-sha256", default="")
     ap.add_argument("--start-generation", type=int, default=0)
     ap.add_argument("--stream-fd", type=int, default=-1)
+    ap.add_argument("--dtype", choices=("auto", "fp16", "bf16", "fp32"),
+                    default="auto",
+                    help="mirror compute dtype; auto uses fp16 on GPU and "
+                         "fp32 on CPU")
     ap.add_argument("--target", default="",
                     help="target GGUF for lm_head/token_embd; defaults to "
                          "the value stored in <out-dir>/trainer.json or "
@@ -51,10 +57,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--kl-lambda", type=float, default=0.5)
     ap.add_argument("--reject-weight", type=float, default=3.0)
-    ap.add_argument("--batch-rows", type=int, default=512)
+    ap.add_argument("--batch-rows", type=int, default=128)
     ap.add_argument("--export-every", type=int, default=8)
-    ap.add_argument("--train-ctx", type=int, default=512)
-    ap.add_argument("--reservoir-rows", type=int, default=50_000)
+    ap.add_argument("--train-ctx", type=int, default=128)
+    ap.add_argument("--reservoir-rows", type=int, default=10_000)
     ap.add_argument("--keep-generations", type=int, default=4)
     return ap.parse_args(argv)
 
@@ -158,6 +164,15 @@ def main(argv: list[str] | None = None) -> int:
             os.write(args.stream_fd, struct.pack("<i", -1))
         ring.close()
         return 1
+    if args.batch_rows <= 0 or args.export_every <= 0 \
+            or args.reservoir_rows <= 0 or args.keep_generations <= 0:
+        sys.stderr.write(
+            "[oflash-trainer] batch/export/reservoir/generation limits must "
+            "be positive\n")
+        if args.stream_fd >= 0:
+            os.write(args.stream_fd, struct.pack("<i", -1))
+        ring.close()
+        return 1
 
     control = Control(args.stream_fd)
     control.send_ready()
@@ -179,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
         alpha=args.alpha,
         drafter_sha256=args.drafter_sha256,
         start_generation=args.start_generation,
+        requested_device=args.device,
+        dtype=args.dtype,
         lr=args.lr,
         kl_lambda=args.kl_lambda,
         reject_weight=args.reject_weight,

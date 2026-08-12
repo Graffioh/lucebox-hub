@@ -22,7 +22,7 @@ LoRA (scale alpha/rank) wraps fc, attn_q/k/v, attn_output, ffn_up, ffn_down
 — exactly the engine's oflash_lora_mm call sites; ffn_gate and the
 target-owned lm_head are excluded. The k/v pairs apply to both context and
 noise activations because they wrap the shared wk/wv modules. Base weights
-are frozen buffers in the compute dtype (bf16 by default); LoRA params stay
+are frozen buffers in the compute dtype (fp16 by default on GPU); LoRA params stay
 float32 for optimizer stability and are used in f32 inside forward.
 
 Adapter tensor names/shapes match adapter_export.expected_tensor_shapes():
@@ -149,7 +149,8 @@ class _DraftLayer(nn.Module):
     """Frozen weights + LoRA pairs of one drafter decoder layer."""
 
     def __init__(self, il: int, weights: dict[str, np.ndarray],
-                 meta: DrafterMeta, rank: int, dtype: torch.dtype):
+                 meta: DrafterMeta, rank: int, dtype: torch.dtype,
+                 device: str | torch.device):
         super().__init__()
         blk = f"blk.{il}"
         hidden, q_dim, kv_dim = meta.hidden, meta.q_dim, meta.kv_dim
@@ -159,7 +160,8 @@ class _DraftLayer(nn.Module):
                 raise ValueError(f"{blk}.{name}: shape {tuple(arr.shape)} "
                                  f"!= expected {want}")
             self.register_buffer(
-                name, torch.tensor(np.ascontiguousarray(arr), dtype=dtype),
+                name, torch.tensor(np.ascontiguousarray(arr), dtype=dtype,
+                                   device=device),
                 persistent=False)
 
         buf("attn_norm", _get_weight(weights, f"{blk}.attn_norm.weight"),
@@ -198,7 +200,8 @@ class _DraftLayer(nn.Module):
                                  f"{tuple(gate.shape)}")
             self.register_buffer(
                 "attn_gate",
-                torch.tensor(np.ascontiguousarray(gate), dtype=dtype),
+                torch.tensor(np.ascontiguousarray(gate), dtype=dtype,
+                             device=device),
                 persistent=False)
 
         self.is_swa = meta.layer_is_swa(il)
@@ -212,7 +215,7 @@ class _DraftLayer(nn.Module):
 
 
 class DrafterMirror(nn.Module):
-    """bf16 drafter mirror; only the LoRA pairs are trainable parameters."""
+    """Low-precision mirror; only the LoRA pairs are trainable parameters."""
 
     def __init__(self, weights: dict[str, np.ndarray],
                  meta: DrafterMeta | Mapping[str, Any],
@@ -239,7 +242,8 @@ class DrafterMirror(nn.Module):
                 raise ValueError(f"{name}: shape {tuple(arr.shape)} != "
                                  f"expected {want}")
             self.register_buffer(
-                name, torch.tensor(np.ascontiguousarray(arr), dtype=dtype),
+                name, torch.tensor(np.ascontiguousarray(arr), dtype=dtype,
+                                   device=device),
                 persistent=False)
 
         buf("fc", _get_weight(weights, "dflash.fc.weight",
@@ -265,15 +269,27 @@ class DrafterMirror(nn.Module):
         if token_embd.shape != lm_head.shape:
             raise ValueError(f"token_embd shape {tuple(token_embd.shape)} != "
                              f"lm_head shape {tuple(lm_head.shape)}")
-        buf("lm_head", lm_head, tuple(lm_head.shape))
-        buf("token_embd", token_embd, tuple(token_embd.shape))
+        # Most targets tie output.weight to token_embd.weight. Preserve that
+        # alias on-device instead of consuming several extra GiB for an
+        # identical second tensor.
+        if np.shares_memory(lm_head, token_embd):
+            shared = torch.tensor(np.ascontiguousarray(token_embd),
+                                  dtype=dtype, device=device)
+            self.register_buffer("lm_head", shared, persistent=False)
+            self.register_buffer("token_embd", shared, persistent=False)
+        else:
+            buf("lm_head", lm_head, tuple(lm_head.shape))
+            buf("token_embd", token_embd, tuple(token_embd.shape))
         self._vocab = int(lm_head.shape[0])
 
         self.lora_fc = _LoraPair(fc_in, hidden, rank)
         self.layers = nn.ModuleList(
-            _DraftLayer(il, weights, meta, rank, dtype)
+            _DraftLayer(il, weights, meta, rank, dtype, device)
             for il in range(meta.n_layer))
 
+        # Base buffers were allocated directly on the destination to avoid a
+        # full CPU mirror plus a full GPU mirror during startup. This moves
+        # only the much smaller float32 LoRA parameters.
         self.to(device)
 
     # ── constructors ─────────────────────────────────────────────────
@@ -293,12 +309,22 @@ class DrafterMirror(nn.Module):
                   rank: int, alpha: float,
                   device: str | torch.device = "cpu",
                   dtype: torch.dtype = torch.bfloat16) -> DrafterMirror:
-        """Dequantize the drafter + target-head GGUFs and build the mirror."""
+        """Dequantize the drafter + target-head GGUFs and build the mirror.
+
+        GPU mirrors stage weights as float16, avoiding the old all-float32
+        host copy during startup. bf16 compute still uses float16 staging
+        because NumPy has no broadly portable bfloat16 dtype.
+        """
         from .gguf_reader import load_drafter, load_target_head
-        weights, meta = load_drafter(drafter_path)
-        lm_head, token_embd, _vocab = load_target_head(target_path)
-        return cls(weights, meta, lm_head, token_embd, rank=rank,
-                   alpha=alpha, device=device, dtype=dtype)
+        load_dtype = (np.float16 if dtype in (torch.float16, torch.bfloat16)
+                      else np.float32)
+        weights, meta = load_drafter(drafter_path, dtype=load_dtype)
+        lm_head, token_embd, _vocab = load_target_head(
+            target_path, dtype=load_dtype)
+        mirror = cls(weights, meta, lm_head, token_embd, rank=rank,
+                     alpha=alpha, device=device, dtype=dtype)
+        weights.clear()
+        return mirror
 
     # ── properties ───────────────────────────────────────────────────
     @property
@@ -473,6 +499,9 @@ class DrafterMirror(nn.Module):
                         raise ValueError(
                             f"{name}.{suffix}: shape {tuple(arr.shape)} != "
                             f"{tuple(param.shape)}")
+                    if not np.isfinite(arr).all():
+                        raise ValueError(
+                            f"{name}.{suffix}: state contains NaN or infinity")
                     param.copy_(torch.from_numpy(arr))
 
     # Spec-test spelling (tests/test_mirror.py) — same operation.

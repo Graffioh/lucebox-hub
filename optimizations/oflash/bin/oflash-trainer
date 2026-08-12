@@ -3,16 +3,17 @@
 # package's environment regardless of the server's cwd, then hands all
 # arguments (including the inherited --stream-fd) to the trainer module.
 #
-# Preferred: uv (`uv run` syncs the [train] extra on first use). Fallback:
-# a plain venv at optimizations/oflash/.venv (python -m venv .venv &&
-# .venv/bin/pip install -e '.[train]').
+# Use the explicitly provisioned environment first. On ROCm hosts this must
+# contain AMD's torch wheel; automatically resolving generic PyPI torch can
+# silently install an unusable CUDA/CPU build. Set OFLASH_ALLOW_UV=1 only for
+# an intentional CPU/dev environment.
 here="$(cd "$(dirname "$0")/.." && pwd)"
-if command -v uv >/dev/null 2>&1; then
-    exec uv run --project "$here" --extra train python -m oflash "$@"
-fi
 if [ -x "$here/.venv/bin/python" ]; then
     PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}" \
         exec "$here/.venv/bin/python" -m oflash "$@"
 fi
-echo "[oflash-trainer] neither uv nor $here/.venv found; see $here/README.md" >&2
+if [ "${OFLASH_ALLOW_UV:-0}" = "1" ] && command -v uv >/dev/null 2>&1; then
+    exec uv run --project "$here" --extra train python -m oflash "$@"
+fi
+echo "[oflash-trainer] no provisioned $here/.venv; see $here/README.md" >&2
 exit 1

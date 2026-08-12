@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <new>
 
 #if !defined(_WIN32)
 #include <sys/stat.h>
@@ -59,13 +60,36 @@ bool make_dirs(const std::string & path) {
 }  // namespace
 
 bool OFlashRuntime::init(const OFlashConfig & cfg,
+                         const std::string & target_path,
                          const std::string & drafter_path,
                          DraftWeights & dw,
                          ggml_backend_t draft_backend,
+                         int target_capture_layers,
+                         int target_hidden,
                          int vocab) {
     cfg_ = cfg;
-    dw_  = &dw;
-    staging_ = new OFlashAdapterHostHolder();
+
+    // The capture callback copies target-owned feature rows while record sizing
+    // is derived from the drafter's fc input. A mismatch would make that copy
+    // overrun its staging vector, so refuse OFlash before allocating any slots.
+    if (target_capture_layers <= 0 || target_hidden <= 0 ||
+        dw.n_target_layers != target_capture_layers ||
+        dw.n_embd != target_hidden) {
+        std::fprintf(stderr,
+            "[oflash] incompatible target/draft features: target=%dx%d "
+            "draft=%dx%d; disabled\n",
+            target_capture_layers, target_hidden,
+            dw.n_target_layers, dw.n_embd);
+        return false;
+    }
+
+    staging_ = new (std::nothrow) OFlashAdapterHostHolder();
+    if (!staging_) {
+        std::fprintf(stderr,
+            "[oflash] host staging allocation failed; disabled\n");
+        return false;
+    }
+    dw_ = &dw;
 
     // 1. LoRA slots — the only hard requirement. Without them there is no
     //    adaptation, so a failure here disables OFlash entirely.
@@ -108,6 +132,7 @@ bool OFlashRuntime::init(const OFlashConfig & cfg,
             }
         }
     }
+    generation_high_water_ = lora_->generation;
 
     // 4. Capture ring.
 #if !defined(_WIN32)
@@ -135,11 +160,13 @@ bool OFlashRuntime::init(const OFlashConfig & cfg,
         scfg.drafter_path = drafter_path;
         scfg.args = {
             "--ring-name=" + ring_name_,
+            "--target=" + target_path,
             "--out-dir=" + profile_dir_,
             "--profile=" + cfg.profile,
             "--rank=" + std::to_string(cfg.lora_rank),
             "--alpha=" + std::to_string(cfg.lora_alpha),
             "--device=" + cfg.device,
+            "--dtype=" + cfg.dtype,
             "--drafter-sha256=" + drafter_sha256_,
             "--start-generation=" + std::to_string(lora_->generation),
         };
@@ -185,18 +212,25 @@ void OFlashRuntime::emit_context(int pos0, int n_rows,
                                  const FeatReader & read) {
     want_context_ = false;
     if (!ring_.active() || n_rows <= 0 || !dw_) return;
-    const size_t row_elems = (size_t)dw_->n_target_layers * dw_->n_embd;
-    std::vector<uint16_t> feat((size_t)n_rows * row_elems);
-    for (int i = 0; i < n_rows; i++) {
-        if (!read(pos0 + i, feat.data() + (size_t)i * row_elems)) return;
+    try {
+        const size_t row_elems = (size_t)dw_->n_target_layers * dw_->n_embd;
+        std::vector<uint16_t> feat((size_t)n_rows * row_elems);
+        for (int i = 0; i < n_rows; i++) {
+            if (!read(pos0 + i, feat.data() + (size_t)i * row_elems)) return;
+        }
+        OFlashRecordHeader h{};
+        h.type = OFLASH_REC_CONTEXT;
+        h.seq_id = seq_id_;
+        h.pos = pos0;
+        h.n_rows = n_rows;
+        h.t_mono_ns = mono_ns();
+        ring_.push(h, feat.data(), feat.size() * sizeof(uint16_t));
+    } catch (const std::bad_alloc &) {
+        // Capture is optional. In particular, never let UMA/host pressure turn
+        // a backfill allocation failure into a failed inference request.
+        std::fprintf(stderr,
+            "[oflash] context capture allocation failed; record dropped\n");
     }
-    OFlashRecordHeader h{};
-    h.type = OFLASH_REC_CONTEXT;
-    h.seq_id = seq_id_;
-    h.pos = pos0;
-    h.n_rows = n_rows;
-    h.t_mono_ns = mono_ns();
-    ring_.push(h, feat.data(), feat.size() * sizeof(uint16_t));
 }
 
 void OFlashRuntime::emit_step(const OFlashStepCapture & s,
@@ -208,56 +242,81 @@ void OFlashRuntime::emit_step(const OFlashStepCapture & s,
 
     if (!ring_.active() || !dw_) return;
 
-    const size_t row_elems = (size_t)dw_->n_target_layers * dw_->n_embd;
-    std::vector<uint16_t> feat((size_t)s.n_rows * row_elems);
-    for (int i = 0; i < s.n_rows; i++) {
-        if (!read(s.pos + i, feat.data() + (size_t)i * row_elems)) return;
-    }
+    try {
+        const size_t row_elems = (size_t)dw_->n_target_layers * dw_->n_embd;
+        std::vector<uint16_t> feat((size_t)s.n_rows * row_elems);
+        for (int i = 0; i < s.n_rows; i++) {
+            if (!read(s.pos + i, feat.data() + (size_t)i * row_elems)) return;
+        }
 
-    // Label section, mirroring the STEP payload layout in oflash_format.h.
-    const int32_t B = s.block;
-    const int32_t K = (s.topk_ids && s.topk_lp) ? cfg_.topk : 0;
-    const size_t flags_padded = ((size_t)B + 7) & ~(size_t)7;
-    const size_t label_bytes = 8                 // n_labels + topk_k
-                       + (size_t)B * 4 * 2       // draft_tok + target_tok
-                       + flags_padded            // accept_flags (+pad)
-                       + 8                       // accept_len + bonus_tok
-                       + (size_t)B * (size_t)K * 8;
-    std::vector<uint8_t> labels(label_bytes, 0);
-    uint8_t * p = labels.data();
-    std::memcpy(p, &B, 4);                       p += 4;
-    std::memcpy(p, &K, 4);                       p += 4;
-    if (B > 0) {
-        std::memcpy(p, s.draft_tok, (size_t)B * 4);  p += (size_t)B * 4;
-        std::memcpy(p, s.target_tok, (size_t)B * 4); p += (size_t)B * 4;
-        std::memcpy(p, s.accept_flags, (size_t)B);   p += flags_padded;
-    }
-    std::memcpy(p, &s.accept_len, 4);            p += 4;
-    std::memcpy(p, &s.bonus_tok, 4);             p += 4;
-    if (K > 0) {
-        std::memcpy(p, s.topk_ids, (size_t)B * K * 4); p += (size_t)B * K * 4;
-        std::memcpy(p, s.topk_lp,  (size_t)B * K * 4); p += (size_t)B * K * 4;
-    }
+        // Label section, mirroring the STEP payload layout in oflash_format.h.
+        const int32_t B = s.block;
+        const int32_t K = (s.topk_ids && s.topk_lp) ? cfg_.topk : 0;
+        const size_t flags_padded = ((size_t)B + 7) & ~(size_t)7;
+        const size_t label_bytes = 8                 // n_labels + topk_k
+                           + (size_t)B * 4 * 2       // draft_tok + target_tok
+                           + flags_padded            // accept_flags (+pad)
+                           + 8                       // accept_len + bonus_tok
+                           + (size_t)B * (size_t)K * 8;
+        std::vector<uint8_t> labels(label_bytes, 0);
+        uint8_t * p = labels.data();
+        std::memcpy(p, &B, 4);                       p += 4;
+        std::memcpy(p, &K, 4);                       p += 4;
+        if (B > 0) {
+            std::memcpy(p, s.draft_tok, (size_t)B * 4);  p += (size_t)B * 4;
+            std::memcpy(p, s.target_tok, (size_t)B * 4); p += (size_t)B * 4;
+            std::memcpy(p, s.accept_flags, (size_t)B);   p += flags_padded;
+        }
+        std::memcpy(p, &s.accept_len, 4);            p += 4;
+        std::memcpy(p, &s.bonus_tok, 4);             p += 4;
+        if (K > 0) {
+            std::memcpy(p, s.topk_ids, (size_t)B * K * 4); p += (size_t)B * K * 4;
+            std::memcpy(p, s.topk_lp,  (size_t)B * K * 4); p += (size_t)B * K * 4;
+        }
 
-    OFlashRecordHeader h{};
-    h.type = OFLASH_REC_STEP;
-    h.seq_id = seq_id_;
-    h.pos = s.pos;
-    h.n_rows = s.n_rows;
-    h.t_mono_ns = mono_ns();
-    ring_.push2(h, feat.data(), feat.size() * sizeof(uint16_t),
-                labels.data(), labels.size());
+        OFlashRecordHeader h{};
+        h.type = OFLASH_REC_STEP;
+        h.seq_id = seq_id_;
+        h.pos = s.pos;
+        h.n_rows = s.n_rows;
+        h.t_mono_ns = mono_ns();
+        ring_.push2(h, feat.data(), feat.size() * sizeof(uint16_t),
+                    labels.data(), labels.size());
+    } catch (const std::bad_alloc &) {
+        std::fprintf(stderr,
+            "[oflash] step capture allocation failed; record dropped\n");
+    }
 }
 
 void OFlashRuntime::maybe_apply_swap() {
     if (training_disabled_ || !lora_) return;
     OFlashPendingSwap swap;
     if (supervisor_.take_pending_swap(swap)) {
-        // A newer trainer export supersedes any deferred one.
-        pending_local_ = swap;
-        has_pending_local_ = true;
+        const uint64_t pending_generation =
+            has_pending_local_ ? pending_local_.generation : 0;
+        if (oflash_generation_is_newer(swap.generation, lora_->generation,
+                                       pending_generation,
+                                       generation_high_water_)) {
+            // A newer trainer export supersedes any deferred one.
+            pending_local_ = swap;
+            has_pending_local_ = true;
+            generation_high_water_ = swap.generation;
+        } else {
+            std::fprintf(stderr,
+                "[oflash] ignoring nonmonotonic adapter gen %llu "
+                "(resident=%llu pending=%llu high-water=%llu)\n",
+                (unsigned long long)swap.generation,
+                (unsigned long long)lora_->generation,
+                (unsigned long long)pending_generation,
+                (unsigned long long)generation_high_water_);
+        }
     }
     if (!has_pending_local_ || !guard_.can_swap()) return;
+    if (!oflash_generation_is_newer(pending_local_.generation,
+                                    lora_->generation)) {
+        has_pending_local_ = false;
+        return;
+    }
     has_pending_local_ = false;
     if (load_and_upload(pending_local_.path, pending_local_.generation,
                         /*warm_start=*/false)) {
@@ -288,6 +347,15 @@ void OFlashRuntime::apply_guard_action(OFlashGuardAction action) {
         case OFlashGuardAction::Rollback:
         case OFlashGuardAction::Disable: {
             const uint64_t bad_gen = lora_ ? lora_->generation : 0;
+            // Any queued adapter was trained from (or announced while serving)
+            // the rejected generation. It must not survive the rollback.
+            pending_local_ = {};
+            has_pending_local_ = false;
+            if (action == OFlashGuardAction::Rollback) {
+                supervisor_.begin_rollback(bad_gen);
+            } else {
+                supervisor_.clear_pending_swaps();
+            }
             std::fprintf(stderr,
                 "[oflash] %s gen %llu (probation AL %.2f < baseline %.2f)\n",
                 action == OFlashGuardAction::Disable ? "DISABLE after rollback of"
@@ -310,12 +378,9 @@ void OFlashRuntime::apply_guard_action(OFlashGuardAction action) {
                 staging_->current = staging_->previous;
                 adapter_dirty_ = true;
             }
-            supervisor_.send_line(
-                (action == OFlashGuardAction::Disable ? "disable"
-                 : "rollback " + std::to_string(bad_gen)));
             if (action == OFlashGuardAction::Disable) {
+                supervisor_.send_line("disable");
                 training_disabled_ = true;
-                has_pending_local_ = false;
             }
             break;
         }
@@ -340,6 +405,15 @@ bool OFlashRuntime::load_and_upload(const std::string & path,
             "[oflash] adapter %s generation %llu != announced %llu\n",
             path.c_str(), (unsigned long long)host.generation,
             (unsigned long long)generation);
+        return false;
+    }
+    if (!warm_start &&
+        !oflash_generation_is_newer(host.generation, lora_->generation)) {
+        std::fprintf(stderr,
+            "[oflash] adapter %s generation %llu does not advance resident "
+            "generation %llu\n",
+            path.c_str(), (unsigned long long)host.generation,
+            (unsigned long long)lora_->generation);
         return false;
     }
     if (!oflash_lora_upload(*lora_, host, error)) {
@@ -384,6 +458,8 @@ OFlashPropsSnapshot OFlashRuntime::props() const {
     s.profile = cfg_.profile;
     // Cross-thread-safe live values (shm atomics / supervisor mutex).
     s.trainer_alive = supervisor_.trainer_alive();
+    s.training_disabled =
+        s.training_disabled || supervisor_.trainer_disabled();
     s.records_dropped = ring_.dropped();
     s.ring_backlog_bytes = ring_.backlog();
     return s;

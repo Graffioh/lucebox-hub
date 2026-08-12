@@ -64,7 +64,14 @@ def export_adapter(path: str,
                    drafter_sha256: str,
                    generation: int,
                    profile: str) -> None:
-    """Validate against the engine's expectation and write atomically."""
+    """Validate against the engine's expectation and write atomically.
+
+    Generations are immutable. Refusing an existing destination prevents a
+    restarted trainer from silently replacing an adapter the engine may
+    still have resident or queued for validation.
+    """
+    if os.path.exists(path):
+        raise FileExistsError(f"adapter generation already exists: {path}")
     expected = expected_tensor_shapes(dims, rank)
     if set(tensors) != set(expected):
         missing = sorted(set(expected) - set(tensors))
@@ -77,7 +84,13 @@ def export_adapter(path: str,
         if tuple(arr.shape) != want:
             raise ValueError(
                 f"{name}: shape {tuple(arr.shape)} != expected {want}")
-        out[name] = np.ascontiguousarray(arr.astype(np.float16))
+        if not np.isfinite(arr).all():
+            raise ValueError(f"{name}: adapter contains NaN or infinity")
+        with np.errstate(over="ignore", invalid="ignore"):
+            packed = np.ascontiguousarray(arr.astype(np.float16))
+        if not np.isfinite(packed).all():
+            raise ValueError(f"{name}: adapter overflows float16 export")
+        out[name] = packed
     metadata = {
         "oflash.format": "1",
         "oflash.drafter_sha256": drafter_sha256,
@@ -86,9 +99,17 @@ def export_adapter(path: str,
         "oflash.generation": str(generation),
         "oflash.profile": profile,
     }
-    tmp = path + ".tmp"
-    save_file(out, tmp, metadata=metadata)
-    os.replace(tmp, path)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        save_file(out, tmp, metadata=metadata)
+        # A same-filesystem hard link is atomic and, unlike os.replace,
+        # refuses to clobber a generation that appeared concurrently.
+        os.link(tmp, path)
+    finally:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def gc_generations(profile_dir: str, keep: int = 4,

@@ -18,7 +18,7 @@
 ---
 
 ```
-Qwen3.6-27B Q4_K_M target · dflash-draft-3.6 q4_k_m drafter
+Qwen3.6-27B Q4_K_M target · dflash-draft-3.6 Q8_0 drafter
 R9700 (gfx1201) serves · Strix Halo iGPU (gfx1151) trains
 
   measurement plan                            acceptance α    decode tok/s
@@ -26,18 +26,21 @@ R9700 (gfx1201) serves · Strix Halo iGPU (gfx1151) trains
   M1  + offline replay LoRA (static load)       pending         pending
   M2  + online loop (within-session climb)      pending         pending
 
-  No results yet — this card is the plan, not a claim. Numbers land in
+  No acceptance/speed results yet — this card is the plan, not a claim.
+  Hardware qualification evidence and future performance numbers land in
   RESULTS.md first, each with the command that produced it (CONTRIBUTING.md:
   numbers without methodology don't get merged).
-  reproduce: server/build/dflash_server target.gguf --draft drafter.gguf --oflash   # M0 capture-only
+  reproduce: server/build/dflash_server target.gguf --draft drafter.gguf --oflash \
+               --cache-type-k q4_0 --cache-type-v q4_0   # M0 capture-only
 ```
 
 > Every verify step already computes the exact training data the drafter is missing — target hidden
 > states and target tokens at every draft position — and throws it away. OFlash keeps it: a capture
 > hook streams verify-step records into a lock-free shared-memory ring, a sidecar trains a LoRA on a
 > mirror of the drafter, and the engine swaps the adapter in at draft-block boundaries behind an
-> acceptance guard that auto-rolls-back regressions. Decode is bandwidth-bound on the dGPU while the
-> iGPU sits idle, so the training compute is (to be measured, not assumed) roughly free.
+> acceptance guard that auto-rolls-back regressions. Serving/training interference on the shared
+> memory controller, power and thermal budgets remains to be measured; the split is a capacity
+> strategy, not a claim that training is free.
 
 ## What OFlash is
 
@@ -80,6 +83,11 @@ against the target, and the guard bounds the speed downside at "static drafter".
 └───────────────────────────────┘      └─────────────────────────────────┘
 ```
 
+The ring lives in host RAM. Capturing a row uses the backend tensor-read path, so features cross
+from R9700 VRAM to host memory before Python reads them; selected windows are then copied to the
+Strix device. Strix unified memory avoids a separate discrete iGPU VRAM pool, but it does **not**
+make the R9700-to-host leg copy-free.
+
 Per verify step the engine emits one record: bf16 feature rows (the same `target_hidden_cat` slices
 the drafter conditions on), draft + target tokens per position, accept flags, and the target's
 top-K logprobs. The push never blocks — if the ring is full the record is dropped and a counter
@@ -92,28 +100,90 @@ engine keeps serving on the last promoted adapter — this feature must never ta
 ## Quick start
 
 ```bash
-# 1. Engine: build the server as usual (server/README.md) — OFlash is a runtime flag.
-cd server && cmake -B build && cmake --build build -j
-
-# 2. Trainer env (this directory). Installs numpy/safetensors + torch/gguf extras.
-#    For iGPU training install the ROCm torch build; CPU torch works at lower cadence.
-cd optimizations/oflash && uv sync --extra train
-
-# 3. Serve with online adaptation: the engine spawns bin/oflash-trainer itself.
-server/build/dflash_server qwen36-27b-Q4_K_M.gguf \
-    --draft dflash-draft-3.6-q4_k_m.gguf \
-    --oflash --oflash-trainer-bin optimizations/oflash/bin/oflash-trainer
-
-# Capture-only (M0 telemetry): omit the trainer bin. Ring + acceptance stats,
-# no training, no Python needed.
-server/build/dflash_server qwen36-27b-Q4_K_M.gguf \
-    --draft dflash-draft-3.6-q4_k_m.gguf --oflash
+# From the repository root: build for the R9700 serving GPU.
+cmake -S server -B server/build -DCMAKE_BUILD_TYPE=Release \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES=gfx1201 \
+  -DDFLASH27B_HIP_SM80_EQUIV=ON
+cmake --build server/build --target dflash_server -j
 ```
 
-The trainer also needs the **target** GGUF (the drafter shares the target's LM head, and noise
-embeddings come from its `token_embd`). Configure it once via any of:
-`$OFLASH_TARGET_GGUF`, a `--target` argument (wrap `bin/oflash-trainer`), or
-`{"target_gguf": "/path/to/target.gguf"}` in `<oflash-dir>/<drafter-hash>/<profile>/trainer.json`.
+Provision the trainer in an explicit `.venv`; do not use an unpinned `uv sync` for the production
+HIP sidecar. These Ubuntu 24.04 / Python 3.12 pins are AMD's official Ryzen Linux ROCm 7.2.1,
+PyTorch 2.9.1 set. Use AMD's
+[Ryzen PyTorch guide](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/native_linux/install-pytorch.html)
+to select a different OS/Python ABI.
+
+```bash
+cd optimizations/oflash
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip wheel
+python -m pip install --no-cache-dir \
+  'https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1.lw.gitff65f5bc-cp312-cp312-linux_x86_64.whl' \
+  'https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/torchvision-0.24.0%2Brocm7.2.1.gitb919bd0c-cp312-cp312-linux_x86_64.whl' \
+  'https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/torchaudio-2.9.0%2Brocm7.2.1.gite3c6ee2b-cp312-cp312-linux_x86_64.whl' \
+  'https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/triton-3.5.1%2Brocm7.2.1.gita272dfa8-cp312-cp312-linux_x86_64.whl'
+python -m pip install 'numpy==1.26.4' 'safetensors>=0.4' 'gguf>=0.10'
+python -m pip install --no-deps -e .
+cd ../..
+```
+
+Confirm device ordering with `rocm-smi --showproductname`; on the audited box the R9700 is ordinal
+0 and Strix is ordinal 1. Exercise FP16 forward/backward and MIOpen on Strix before a large mirror
+allocation:
+
+```bash
+HIP_VISIBLE_DEVICES=1 optimizations/oflash/.venv/bin/python - <<'PY'
+import torch
+import torch.nn.functional as F
+assert torch.version.hip and torch.cuda.is_available()
+print(torch.__version__, torch.version.hip, torch.cuda.get_device_name(0))
+x = torch.randn(1, 8, 16, 16, device="cuda", dtype=torch.float16,
+                requires_grad=True)
+w = torch.randn(8, 8, 3, 3, device="cuda", dtype=torch.float16,
+                requires_grad=True)
+F.conv2d(x, w, padding=1).float().mean().backward()
+torch.cuda.synchronize()
+print("Strix FP16 backward passed; free/total bytes:", torch.cuda.mem_get_info())
+PY
+HIP_VISIBLE_DEVICES=1 optimizations/oflash/.venv/bin/python -m torch.utils.collect_env
+```
+
+`collect_env` must report ROCm and a MIOpen runtime (3.5.1 for this ROCm 7.2 set). The wheels may
+already provide it. If MIOpen is absent or the convolution fails with a MIOpen link error, install
+`miopen-hip` from the matching ROCm 7.2 system repository and rerun the test:
+`sudo apt-get install miopen-hip`. That fallback is a host package, not something to pip-install. A
+gfx-specific kernel database is optional and affects warm-up only.
+
+Get an exclusive window on both GPUs before loading either model. Visibility variables only filter
+the devices a process can see; they do not reserve the R9700 or Strix against another ROCm process.
+Check `rocm-smi --showpids --showmeminfo vram` and the host stop thresholds below immediately before
+each stage. Keep both devices visible in the server process: explicit `hip:0` flags place inference,
+then the child scopes itself to ordinal 1 before importing PyTorch.
+
+The first server run must be capture-only, with an intentionally smaller ring and explicit Q4_0 KV:
+
+```bash
+server/build/dflash_server \
+  /models/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft /models/dflash-draft-3.6-q8_0.gguf \
+  --target-device hip:0 --draft-device hip:0 \
+  --max-ctx 4096 --cache-type-k q4_0 --cache-type-v q4_0 \
+  --oflash --oflash-ring-mb 256 --oflash-topk 8
+```
+
+The normal ring default is 512 MiB; 256 MiB is only the first-smoke override. Follow the staged
+trainer test and stop thresholds in
+[`server/docs/OFLASH.md`](../../server/docs/OFLASH.md#r9700-and-strix-halo-qualification-ladder)
+before enabling the integrated sidecar. The engine passes the target path to an integrated trainer;
+`--target`, `$OFLASH_TARGET_GGUF`, or `trainer.json` is needed only for direct trainer invocation.
+
+Use the published Q8_0 Qwen3.6 drafter on this 32 GiB card. Its
+[model card](https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF)
+reports that Q8_0 preserves F16 acceptance while Q4_K_M loses roughly 17 acceptance points. The
+Q8_0 GGUF already embeds the 2048-token `[S,S,S,S,F]` sliding-window layout, so do not pass
+`--draft-swa`; OFlash refuses a runtime override that would make the engine and trainer disagree.
 
 Adapters persist under `~/.lucebox/oflash/<drafter-hash>/<profile>/`; the next session warm-starts
 from the promoted generation.
@@ -127,12 +197,13 @@ persistent draft residency, and no PFlash compression; off by default):
 |---|---|
 | `--oflash` | enable online drafter adaptation |
 | `--oflash-device <cpu\|N>` | trainer sidecar device: `cpu` or a HIP ordinal (default: `1`, the iGPU) |
+| `--oflash-dtype <type>` | mirror dtype: `auto`, `fp16`, `bf16`, or `fp32` (default: `auto`; GPU = fp16, CPU = fp32) |
 | `--oflash-profile <name>` | adapter profile (default: `default`) |
 | `--oflash-lora-rank <N>` | LoRA rank (default: 16) |
 | `--oflash-alpha <F>` | LoRA alpha (default: 32) |
 | `--oflash-dir <path>` | adapter store (default: `~/.lucebox/oflash`) |
-| `--oflash-ring-mb <N>` | capture ring size in MiB (default: 2048) |
-| `--oflash-topk <K>` | target top-K captured per position (default: 32; 0 = skip) |
+| `--oflash-ring-mb <N>` | capture ring size in MiB (default: 512) |
+| `--oflash-topk <K>` | target top-K captured per position (default: 8; 0 = skip) |
 | `--oflash-trainer-bin <path>` | trainer sidecar executable; empty = capture-only (M0 telemetry) mode |
 
 ## Trainer knobs
@@ -145,13 +216,14 @@ persistent draft residency, and no PFlash compression; off by default):
 | Flag | Default | Purpose |
 |---|---|---|
 | `--target <path>` | trainer.json / `$OFLASH_TARGET_GGUF` | target GGUF for lm_head + token_embd |
+| `--dtype <type>` | `auto` | `fp16` on a GPU and `fp32` on CPU; explicit `bf16`/`fp32` are opt-ins |
 | `--lr <F>` | `1e-4` | AdamW learning rate (constant; non-stationary stream) |
 | `--kl-lambda <F>` | `0.5` | weight of the top-K KL term vs CE |
 | `--reject-weight <F>` | `3.0` | loss up-weight on rejection-adjacent rows |
-| `--batch-rows <N>` | `512` | fresh rows accumulated per training step |
+| `--batch-rows <N>` | `128` | fresh rows accumulated per training step |
 | `--export-every <N>` | `8` | training steps between adapter exports |
-| `--train-ctx <N>` | `512` | feature-window length per training sample (minimum: 64) |
-| `--reservoir-rows <N>` | `50000` | replay reservoir size (forgetting knob) |
+| `--train-ctx <N>` | `128` | feature-window length per training sample (minimum: 64) |
+| `--reservoir-rows <N>` | `10000` | replay reservoir size (forgetting knob) |
 | `--keep-generations <N>` | `4` | adapter generations kept on disk per profile |
 
 ## What's ours, what isn't
@@ -174,8 +246,9 @@ What's ours is the production engine integration and the hardware split, per
   overwrites at draft-block boundaries, drafter-KV reset, host-side generation staging for instant
   rollback.
 - The acceptance guard: probation windows, auto-rollback, exponential backoff, session kill-switch.
-- The **iGPU-trains / dGPU-serves split** on Strix Halo + R9700 class machines: unified memory
-  carries features to the trainer without PCIe copies while the dGPU keeps serving.
+- The **iGPU-trains / dGPU-serves split** on Strix Halo + R9700 class machines: a bounded host ring
+  decouples the processes. Capture still copies features from discrete R9700 VRAM into host memory;
+  Strix then reads/copies selected windows into its unified-memory allocation.
 
 ## Scope and limits
 
@@ -188,11 +261,12 @@ What's ours is the production engine integration and the hardware split, per
   targets.
 - **Correctness-safe, speed-only risk.** Verification is exact-match against the target, so output
   is byte-identical with any adapter; the guard bounds the downside at static-drafter speed.
-- **bf16-mirror → Q4_K_M transfer is measured, not assumed.** The trainer fits a LoRA on a
-  dequantized mirror while the engine serves the quantized base; M1 evaluates the adapter on the
-  engine, not in PyTorch.
-- **ROCm torch on gfx1151 is less battle-tested** than dGPU targets; `--oflash-device cpu` is the
-  supported fallback (the trainer is cadence-tolerant by design).
+- **FP16-mirror → Q4_K_M transfer must be measured, not assumed.** `auto` uses FP16 for the GPU mirror
+  (FP32 on CPU) while the engine serves the quantized base; M1 evaluates the adapter in the engine,
+  not only in PyTorch.
+- **There is no implicit GPU-to-CPU fallback.** If the requested HIP device or accelerator preflight
+  fails, the sidecar sheds the mirror and drains the ring in capture-only mode. Use
+  `--oflash-device cpu` explicitly if CPU training is desired, with the same host-RAM guards.
 
 ## Citation
 

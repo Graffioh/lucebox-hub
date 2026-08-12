@@ -2,20 +2,21 @@
 
 Consumes the engine's capture ring (ring_format.RingReader), maintains a
 per-sequence shadow of the drafter's feature window plus verify-step labels,
-and fine-tunes a LoRA on the bf16 drafter mirror (mirror.DrafterMirror).
+and fine-tunes a LoRA on the low-precision mirror (mirror.DrafterMirror).
 Every `export_every` optimizer steps the adapter is written via
 adapter_export and a `swap_ready` event is emitted; the engine A/B-swaps it
 behind the acceptance guard and answers with promote/rollback commands.
 
-Robustness contract: a failed train step (bad record, transient torch error,
-OOM) is logged and skipped — this process keeps draining the ring no matter
-what, because the engine sizes its drop-on-full budget assuming a live
-consumer. Only ring corruption or a broken mirror load exits (the supervisor
-respawns with backoff).
+Robustness contract: bad records and transient errors are dropped; OOM,
+accelerator faults and mirror-load failures shed the training model and enter
+capture-only drain mode. The process keeps draining the ring because the
+engine sizes its drop-on-full budget assuming a live consumer. Only corrupt
+ring framing exits for a supervisor respawn.
 """
 
 from __future__ import annotations
 
+import gc
 import math
 import os
 import queue
@@ -43,7 +44,8 @@ from .ring_format import (
 # A training window shorter than this carries too little context to teach the
 # drafter anything its block-attention will see at serve time; skip it.
 MIN_WINDOW_ROWS = 64
-# Upper bound on StepSamples per optimizer step (halved on OOM, floor 1).
+# Upper bound on StepSamples per optimizer step. Samples backprop serially;
+# context length, not this work/cadence bound, controls peak activation memory.
 MICRO_BATCH_MAX = 16
 # Main-loop sleep when the ring is drained and nothing trained.
 POLL_SLEEP_S = 0.05
@@ -52,6 +54,47 @@ POLL_SLEEP_S = 0.05
 INGEST_CHUNK = 256
 # Loss EMA smoothing (per optimizer step).
 EMA_DECAY = 0.98
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """Recognize both host and torch allocator exhaustion."""
+    torch_oom = getattr(torch, "OutOfMemoryError", None)
+    return (isinstance(exc, MemoryError)
+            or (torch_oom is not None and isinstance(exc, torch_oom))
+            or "out of memory" in str(exc).lower())
+
+
+def _is_fatal_accelerator_error(exc: BaseException) -> bool:
+    """Errors after which retrying work in the same HIP context is unsafe."""
+    message = str(exc).lower()
+    return any(marker in message for marker in (
+        "device-side assert",
+        "illegal memory access",
+        "unspecified launch failure",
+        "hip error",
+        "device lost",
+    ))
+
+
+def _max_adapter_generation(out_dir: str) -> int:
+    """Highest immutable adapter generation already present on disk."""
+    highest = 0
+    try:
+        entries = os.scandir(out_dir)
+    except OSError:
+        return highest
+    with entries:
+        for entry in entries:
+            name = entry.name
+            prefix, suffix = "adapter-gen", ".safetensors"
+            if not name.startswith(prefix) or not name.endswith(suffix):
+                continue
+            try:
+                highest = max(highest,
+                              int(name[len(prefix):-len(suffix)]))
+            except ValueError:
+                continue
+    return highest
 
 
 class ControlLike(Protocol):
@@ -76,6 +119,8 @@ class TrainerConfig:
     alpha: float
     drafter_sha256: str
     start_generation: int
+    requested_device: str
+    dtype: str
     lr: float
     kl_lambda: float
     reject_weight: float
@@ -111,6 +156,16 @@ class StepSample:
                     or (self.block_size > 0
                         and self.n_labels < self.block_size))
 
+    def valid_train_rows(self, q_len: int) -> int:
+        """Rows whose target logits have valid autoregressive conditioning.
+
+        Verification after the first mismatch is conditioned on an
+        uncommitted draft suffix and cannot supervise the mirror. accept_len
+        includes the seed, so it also counts the accepted transitions plus
+        the first target correction that remain safe to train on.
+        """
+        return max(0, min(self.accept_len, self.n_labels, q_len - 1))
+
 
 @dataclass
 class SeqStore:
@@ -139,9 +194,17 @@ class Trainer:
 
         self._mirror: DrafterMirror | None = None
         self._optimizer: torch.optim.AdamW | None = None
-        self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._dtype = (torch.bfloat16 if self._device == "cuda"
-                       else torch.float32)
+        self._requested_device = getattr(cfg, "requested_device", "cpu")
+        self._device = ("cpu" if self._requested_device == "cpu" else
+                        "cuda")
+        dtype_name = getattr(cfg, "dtype", "auto")
+        if dtype_name == "auto":
+            dtype_name = "fp32" if self._device == "cpu" else "fp16"
+        self._dtype = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+            "fp32": torch.float32,
+        }[dtype_name]
 
         # Live sequences and the replay reservoir of retired ones (oldest
         # first; evicted whole when the global row budget is exceeded).
@@ -155,7 +218,9 @@ class Trainer:
 
         self._enabled = True
         self._micro_max = MICRO_BATCH_MAX
-        self._generation = cfg.start_generation
+        self._train_ctx = cfg.train_ctx
+        self._generation = max(
+            cfg.start_generation, _max_adapter_generation(cfg.out_dir))
         self._promoted_path: str | None = None
 
         self._opt_steps = 0
@@ -174,13 +239,43 @@ class Trainer:
             return 1
         if not self._validate_ring_identity():
             return 1
+        if self._device == "cuda" and not torch.cuda.is_available():
+            self._disable(
+                f"requested HIP device {self._requested_device!r} is not "
+                "available; refusing unsafe CPU fallback",
+                release_model=True)
+        if not self._enabled:
+            return self._drain_only_loop()
+        try:
+            self._preflight_accelerator()
+        except Exception as e:
+            self._disable(
+                f"accelerator preflight failed ({e!r}); refusing a large "
+                "mirror allocation",
+                release_model=True)
+        # Entering the never-returning drain loop from inside the except block
+        # would keep `e` and its traceback alive.  In particular, a failed
+        # mirror constructor's traceback can own several GiB of partially
+        # allocated device buffers and dequantized host arrays.
+        if not self._enabled:
+            self._release_training_memory()
+            return self._drain_only_loop()
         try:
             self._load_mirror()
         except Exception as e:
-            self._control.log(f"mirror load failed: {e!r}; exiting")
-            return 1
+            reason = ("mirror load exhausted memory" if _is_oom(e)
+                      else "mirror load failed")
+            self._disable(
+                f"{reason} ({e!r}); capture-only mode avoids a supervisor "
+                "allocation retry loop",
+                release_model=True)
+        if not self._enabled:
+            self._release_training_memory()
+            return self._drain_only_loop()
         if not self._validate_ring_dims():
-            return 1
+            self._disable("incompatible capture/mirror dimensions",
+                          release_model=True)
+            return self._drain_only_loop()
 
         while True:
             rc = self._drain_commands()
@@ -198,6 +293,20 @@ class Trainer:
                 self._train_step()
                 trained = True
             if not progressed and not trained:
+                time.sleep(POLL_SLEEP_S)
+
+    def _drain_only_loop(self) -> int:
+        """Stay attached after a safety shutdown so the ring cannot fill."""
+        while True:
+            rc = self._drain_commands()
+            if rc is not None:
+                return rc
+            try:
+                progressed = self._consume_ring()
+            except RuntimeError as e:
+                self._control.log(f"ring read failed: {e!r}; exiting")
+                return 1
+            if not progressed:
                 time.sleep(POLL_SLEEP_S)
 
     def _validate_ring_identity(self) -> bool:
@@ -222,6 +331,13 @@ class Trainer:
 
     def _load_mirror(self) -> None:
         os.makedirs(self.cfg.out_dir, exist_ok=True)
+        if self._device == "cuda":
+            props = torch.cuda.get_device_properties(0)
+            free, total = torch.cuda.mem_get_info(0)
+            self._control.log(
+                f"trainer GPU: requested ordinal={self._requested_device} "
+                f"visible={props.name!r} free={free / 2**30:.1f}GiB "
+                f"total={total / 2**30:.1f}GiB dtype={self._dtype}")
         t0 = time.monotonic()
         self._mirror = DrafterMirror.from_gguf(
             self.cfg.drafter_gguf, self.cfg.target_gguf, self.cfg.rank,
@@ -235,6 +351,50 @@ class Trainer:
             f"block={m.block_size} rank={self.cfg.rank}")
         self._warm_start()
         self._make_optimizer()
+
+    def _preflight_accelerator(self) -> None:
+        """Exercise mixed-precision forward/backward before the multi-GiB load.
+
+        The probe stays below one MiB (apart from lazy runtime workspaces) and
+        rejects a generic CUDA/CPU torch wheel on a requested HIP device.
+        """
+        if self._device != "cuda":
+            return
+        if not getattr(torch.version, "hip", None):
+            raise RuntimeError(
+                "requested a HIP device but torch is not a ROCm build")
+        x = w = lora_a = lora_b = optimizer = None
+        try:
+            x = torch.randn((16, 64), device="cuda", dtype=self._dtype)
+            w = torch.randn((64, 64), device="cuda", dtype=self._dtype)
+            lora_a = torch.nn.Parameter(torch.randn(
+                (4, 64), device="cuda", dtype=torch.float32) * 0.01)
+            lora_b = torch.nn.Parameter(torch.zeros(
+                (64, 4), device="cuda", dtype=torch.float32))
+            optimizer = torch.optim.AdamW(
+                (lora_a, lora_b), lr=1e-4, weight_decay=0.0)
+            y = (torch.nn.functional.linear(x, w).float()
+                 + (x.float() @ lora_a.t()) @ lora_b.t())
+            loss = y.square().mean()
+            if not torch.isfinite(loss):
+                raise FloatingPointError("nonfinite preflight loss")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                (lora_a, lora_b), 1.0, error_if_nonfinite=True)
+            optimizer.step()
+            torch.cuda.synchronize()
+            if not all(torch.isfinite(p).all() for p in (lora_a, lora_b)):
+                raise FloatingPointError("nonfinite preflight parameter")
+            self._control.log(
+                f"accelerator preflight passed: ROCm {torch.version.hip} "
+                f"dtype={self._dtype}")
+        finally:
+            del optimizer, lora_b, lora_a, w, x
+            gc.collect()
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                pass
 
     def _warm_start(self) -> None:
         """Resume from the generation the engine is serving, if it exists."""
@@ -263,7 +423,7 @@ class Trainer:
         if info.row_elems != self._mirror.dims.fc_in:
             self._control.log(
                 f"ring feature width {info.row_elems} != mirror fc_in "
-                f"{self._mirror.dims.fc_in}; incompatible capture — exiting")
+                f"{self._mirror.dims.fc_in}; incompatible capture")
             return False
         if info.block_size != self._mirror.block_size:
             self._control.log(
@@ -272,7 +432,7 @@ class Trainer:
         if info.vocab != self._mirror.vocab:
             self._control.log(
                 f"ring vocab {info.vocab} != mirror target vocab "
-                f"{self._mirror.vocab}; incompatible labels — exiting")
+                f"{self._mirror.vocab}; incompatible labels")
             return False
         return True
 
@@ -300,6 +460,9 @@ class Trainer:
                 self._control.log(f"promote: gen {gen} is now the baseline")
             elif cmd == "rollback":
                 self._rollback(gen)
+                # This shares the ordered event stream with swap_ready. The
+                # engine drops stale announcements until this matching ack.
+                self._control.send_event("rollback_ack", generation=gen)
             elif cmd == "disable":
                 self._disable()
             else:
@@ -307,7 +470,10 @@ class Trainer:
 
     def _rollback(self, gen: int) -> None:
         """Quarantined generation: retreat to the last promoted weights."""
-        assert self._mirror is not None
+        if self._mirror is None:
+            self._control.log(
+                f"rollback gen {gen} ignored: trainer is capture-only")
+            return
         try:
             if self._promoted_path and os.path.exists(self._promoted_path):
                 self._mirror.load_lora_state_numpy(
@@ -324,15 +490,31 @@ class Trainer:
         # Optimizer moments were fitted to the rejected trajectory.
         self._make_optimizer()
 
-    def _disable(self) -> None:
-        """Stop training/exporting but keep draining the ring."""
+    def _release_training_memory(self) -> None:
+        """Collect dead model objects, then return cached device allocations."""
+        gc.collect()
+        if self._device == "cuda" and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                pass
+
+    def _disable(self, reason: str = "engine command",
+                 release_model: bool = True) -> None:
+        """Stop training/exporting, shed memory, but keep draining the ring."""
         self._enabled = False
         self._seqs.clear()
         self._reservoir.clear()
         self._reservoir_row_count = 0
         self._fresh.clear()
         self._fresh_rows = 0
-        self._control.log("training disabled; ring consumption continues")
+        if release_model:
+            self._optimizer = None
+            self._mirror = None
+            self._release_training_memory()
+        self._control.log(
+            f"training disabled ({reason}); ring consumption continues")
+        self._control.send_event("training_disabled", reason=reason)
 
     # ── ring ingestion ───────────────────────────────────────────────
 
@@ -439,7 +621,7 @@ class Trainer:
                       sample: StepSample) -> int | None:
         """First row of the sample's training context, or None if the window
         is incomplete or shorter than MIN_WINDOW_ROWS."""
-        start = max(sample.pos - self.cfg.train_ctx, store.first_pos)
+        start = max(sample.pos - self._train_ctx, store.first_pos)
         if sample.pos - start < MIN_WINDOW_ROWS:
             return None
         feat = store.feat
@@ -491,20 +673,38 @@ class Trainer:
             return
         try:
             loss = self._optimize(batch)
-        except RuntimeError as e:
-            self._optimizer.zero_grad(set_to_none=True)
-            if "out of memory" in str(e).lower():
-                self._micro_max = max(1, self._micro_max // 2)
-                if self._device == "cuda":
-                    torch.cuda.empty_cache()
-                self._control.log(
-                    f"OOM in train step; micro-batch cap now "
-                    f"{self._micro_max}")
+        except (RuntimeError, MemoryError) as e:
+            optimizer = self._optimizer
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+            if _is_oom(e):
+                old_ctx = self._train_ctx
+                if old_ctx > MIN_WINDOW_ROWS:
+                    self._train_ctx = max(MIN_WINDOW_ROWS, old_ctx // 2)
+                    if self._device == "cuda":
+                        try:
+                            torch.cuda.empty_cache()
+                        except RuntimeError:
+                            pass
+                    self._control.log(
+                        f"OOM in train step; context reduced "
+                        f"{old_ctx}->{self._train_ctx} rows")
+                else:
+                    self._disable(
+                        f"repeated OOM at minimum {MIN_WINDOW_ROWS}-row "
+                        "training context",
+                        release_model=True)
+            elif _is_fatal_accelerator_error(e):
+                self._disable(
+                    f"accelerator context is unsafe after {e!r}",
+                    release_model=True)
             else:
                 self._control.log(f"train step failed: {e!r}; skipped")
             return
         except Exception as e:
-            self._optimizer.zero_grad(set_to_none=True)
+            optimizer = self._optimizer
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
             self._control.log(f"train step failed: {e!r}; skipped")
             return
         self._loss_ema = (loss if self._loss_ema is None else
@@ -523,10 +723,26 @@ class Trainer:
         total = 0.0
         for store, sample, win_start in batch:
             loss = self._sample_loss(store, sample, win_start)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("nonfinite training loss")
             (loss * inv).backward()
             total += float(loss.detach())
-        torch.nn.utils.clip_grad_norm_(self._mirror.lora_parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(
+            self._mirror.lora_parameters(), 1.0, error_if_nonfinite=True)
         self._optimizer.step()
+        params_finite = all(
+            torch.isfinite(p).all()
+            for p in self._mirror.lora_parameters())
+        state_finite = all(
+            torch.isfinite(value).all()
+            for state in self._optimizer.state.values()
+            for value in state.values()
+            if torch.is_tensor(value))
+        if not params_finite or not state_finite:
+            # The candidate is poisoned. Restore the promoted adapter (or
+            # zero LoRA) and discard all optimizer moments before any export.
+            self._rollback(self._generation)
+            raise FloatingPointError("nonfinite optimizer state; rolled back")
         self._opt_steps += 1
         return total * inv
 
@@ -546,20 +762,40 @@ class Trainer:
         m = self._mirror
         rows = np.stack([store.feat[p]
                          for p in range(win_start, sample.pos)])
-        feat = torch.from_numpy(bf16_bits_to_f32(rows)).to(self._device)
+        feat_np = bf16_bits_to_f32(rows)
+        if not np.isfinite(feat_np).all():
+            raise ValueError("capture contains nonfinite feature values")
 
         q_len = m.block_size
-        noise = torch.full((q_len,), m.mask_token_id, dtype=torch.long)
-        noise[0] = int(sample.draft_tok[0])
-        logits = m.forward(feat, noise.to(self._device))  # [q_len, vocab] f32
-
-        # Chain records carry q_len labels, of which q_len-1 train rows fit.
-        # Tree records carry only the accepted spine; their final label is
-        # precisely the correction for the boundary row after that spine and
-        # must not be dropped (root-only rejection still yields one row).
-        n_train = min(sample.n_labels, q_len - 1)
+        n_train = sample.valid_train_rows(q_len)
         if n_train < 1:
-            return logits.sum() * 0.0  # no trainable rows; keep the graph
+            # Preserve the old zero-loss behavior without touching a device.
+            return next(iter(m.lora_parameters())).sum() * 0.0
+        seed = int(sample.draft_tok[0])
+        target_ids = sample.target_tok[:n_train]
+        if seed < 0 or seed >= m.vocab:
+            raise ValueError(f"draft seed token {seed} outside vocabulary")
+        if ((target_ids < 0) | (target_ids >= m.vocab)).any():
+            raise ValueError("target token outside vocabulary")
+        if sample.topk_ids is not None:
+            topk_ids = sample.topk_ids[:n_train]
+            if ((topk_ids < 0) | (topk_ids >= m.vocab)).any():
+                raise ValueError("top-K token outside vocabulary")
+        if (sample.topk_lp is not None
+                and not np.isfinite(sample.topk_lp[:n_train]).all()):
+            raise ValueError("top-K log-probability is nonfinite")
+
+        feat = torch.from_numpy(feat_np).to(
+            self._device, dtype=m.dtype)
+
+        noise = torch.full((q_len,), m.mask_token_id, dtype=torch.long)
+        noise[0] = seed
+        logits = m.forward(feat, noise.to(self._device))  # [q_len, vocab] f32
+        if not torch.isfinite(logits).all():
+            raise FloatingPointError("mirror produced nonfinite logits")
+
+        # Only the accepted span plus its first correction is valid. Target
+        # logits later in the verify batch saw an uncommitted draft suffix.
         logp = torch.log_softmax(
             logits[1:n_train + 1].float(), dim=-1)
         tgt = torch.from_numpy(
@@ -570,8 +806,8 @@ class Trainer:
         n_flagged = min(n_train, max(0, sample.accept_flags.size - 1))
         reject_rows[:n_flagged] = \
             sample.accept_flags[1:1 + n_flagged] == 0
-        if n_train >= sample.n_labels and sample.has_reject:
-            reject_rows[sample.n_labels - 1] = True
+        if sample.has_reject:
+            reject_rows[n_train - 1] = True
         rej = torch.from_numpy(reject_rows).to(self._device)
         w = torch.ones(n_train, dtype=torch.float32, device=self._device)
         w = w.masked_fill(rej, float(self.cfg.reject_weight))

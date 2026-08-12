@@ -90,13 +90,15 @@ static void print_usage(const char * prog) {
         "                                 qwen35 + local --draft only)\n"
         "  --oflash-device <cpu|N>        Trainer sidecar device: cpu or a HIP\n"
         "                                 ordinal (default: 1, the iGPU)\n"
+        "  --oflash-dtype <type>          Trainer mirror dtype: auto, fp16, bf16,\n"
+        "                                 or fp32 (default: auto)\n"
         "  --oflash-profile <name>        Adapter profile (default: default)\n"
         "  --oflash-lora-rank <N>         LoRA rank (default: 16)\n"
         "  --oflash-alpha <F>             LoRA alpha (default: 32)\n"
         "  --oflash-dir <path>            Adapter store (default: ~/.lucebox/oflash)\n"
-        "  --oflash-ring-mb <N>           Capture ring size in MiB (default: 2048)\n"
+        "  --oflash-ring-mb <N>           Capture ring size in MiB (default: 512)\n"
         "  --oflash-topk <K>              Target top-K captured per position\n"
-        "                                 (default: 32; 0 = skip)\n"
+        "                                 (default: 8; 0 = skip)\n"
         "  --oflash-trainer-bin <path>    Trainer sidecar executable; empty =\n"
         "                                 capture-only (M0 telemetry) mode\n"
         "  --target-shard-ipc-bin <path>  Remote target shard IPC daemon for mixed target split\n"
@@ -314,6 +316,18 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr,
                     "[server] bad --oflash-device value (expected cpu or a "
                     "GPU ordinal)\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--oflash-dtype") == 0 && i + 1 < argc) {
+            oflash_aux_options_set = true;
+            bargs.oflash.dtype = argv[++i];
+            if (bargs.oflash.dtype != "auto" &&
+                bargs.oflash.dtype != "fp16" &&
+                bargs.oflash.dtype != "bf16" &&
+                bargs.oflash.dtype != "fp32") {
+                std::fprintf(stderr,
+                    "[server] bad --oflash-dtype value (expected auto, fp16, "
+                    "bf16, or fp32)\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--oflash-profile") == 0 && i + 1 < argc) {
@@ -1122,9 +1136,9 @@ int main(int argc, char ** argv) {
     }
     if (bargs.oflash.enabled) {
         std::fprintf(stderr, "[server] │  oflash          = ON (profile=%s rank=%d "
-                             "device=%s)\n",
+                             "device=%s dtype=%s)\n",
                      bargs.oflash.profile.c_str(), bargs.oflash.lora_rank,
-                     bargs.oflash.device.c_str());
+                     bargs.oflash.device.c_str(), bargs.oflash.dtype.c_str());
         std::fprintf(stderr, "[server] │  oflash_dir      = %s\n",
                      bargs.oflash.dir.c_str());
         std::fprintf(stderr, "[server] │  oflash_trainer  = %s\n",

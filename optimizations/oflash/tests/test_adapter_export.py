@@ -119,6 +119,33 @@ def test_export_rejects_missing_and_extra_tensors(tmp_path):
     assert not os.listdir(tmp_path)
 
 
+def test_export_never_overwrites_an_existing_generation(tmp_path):
+    path = str(tmp_path / "adapter-gen1.safetensors")
+    export_adapter(path, make_tensors(seed=1), DIMS, RANK, alpha=32.0,
+                   drafter_sha256=SHA, generation=1, profile="default")
+    original = (tmp_path / "adapter-gen1.safetensors").read_bytes()
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        export_adapter(path, make_tensors(seed=2), DIMS, RANK, alpha=32.0,
+                       drafter_sha256=SHA, generation=1, profile="default")
+
+    assert (tmp_path / "adapter-gen1.safetensors").read_bytes() == original
+    assert not list(tmp_path.glob("*.tmp.*"))
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, 70_000.0])
+def test_export_rejects_nonfinite_or_float16_overflow(tmp_path, bad):
+    tensors = make_tensors()
+    tensors["dflash.fc.lora_a"][0, 0] = bad
+    path = str(tmp_path / "adapter-gen1.safetensors")
+
+    with pytest.raises(ValueError, match="NaN|infinity|overflows"):
+        export_adapter(path, tensors, DIMS, RANK, alpha=32.0,
+                       drafter_sha256=SHA, generation=1, profile="default")
+
+    assert not os.listdir(tmp_path)
+
+
 def test_adapter_path_naming(tmp_path):
     assert adapter_path(str(tmp_path), 12) == str(tmp_path / "adapter-gen12.safetensors")
 

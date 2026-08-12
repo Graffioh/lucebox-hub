@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The bf16 mirror + LoRA training loop. gguf provides GGUF parsing and
+# The low-precision mirror + LoRA training loop. gguf provides GGUF parsing and
 # dequantization (Q4_K/Q6_K/Q8_0 → f32) for the drafter mirror and the
 # target's lm_head/token_embd. torch: install the ROCm build for iGPU
 # training (see README) — the CPU build works at reduced cadence.
@@ -34,6 +34,10 @@ train = [
 ]
 dev = [
     "pytest>=8",
+    # Trainer state tests import the real torch-backed implementation. ROCm
+    # users may preinstall AMD's wheel and it will satisfy this requirement.
+    "torch>=2.4",
+    "gguf>=0.10",
 ]
 
 [project.urls]

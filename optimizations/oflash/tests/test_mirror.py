@@ -160,3 +160,24 @@ def test_lora_state_matches_adapter_export_shapes(tiny_mirror):
     assert set(state) == set(expected)
     for name, want in expected.items():
         assert tuple(state[name].shape) == want, name
+
+
+def test_tied_target_head_stays_tied_in_mirror():
+    weights, lm_head, _token_embd = synthetic_weights()
+    m = mirror.DrafterMirror.from_arrays(
+        weights, META, lm_head, lm_head, rank=RANK, alpha=ALPHA)
+    assert m.lm_head.data_ptr() == m.token_embd.data_ptr()
+
+
+def test_lora_state_rejects_nonfinite_values(tiny_mirror):
+    state = tiny_mirror.lora_state_numpy()
+    state["dflash.fc.lora_a"][0, 0] = np.nan
+    with pytest.raises(ValueError, match="NaN or infinity"):
+        tiny_mirror.load_lora_state_numpy(state)
+
+
+def test_untied_target_weights_use_distinct_storage():
+    weights, lm_head, token_embd = synthetic_weights()
+    m = mirror.DrafterMirror.from_arrays(
+        weights, META, lm_head, token_embd, rank=RANK, alpha=ALPHA)
+    assert m.lm_head.data_ptr() != m.token_embd.data_ptr()

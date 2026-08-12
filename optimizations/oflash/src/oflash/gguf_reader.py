@@ -1,10 +1,10 @@
 """GGUF loading + dequantization for the OFlash trainer sidecar.
 
-The trainer builds its bf16 drafter mirror by dequantizing the same GGUFs the
+The trainer builds its low-precision drafter mirror by dequantizing the same GGUFs the
 engine serves (OFLASH.md §11/§12) — no safetensors drafter ships on this box.
 Two loaders live here:
 
-  load_drafter(path)      -> (f32 weight dict, DrafterMeta) for the DFlash
+  load_drafter(path)      -> (dense weight dict, DrafterMeta) for the DFlash
                              drafter GGUF (arch "qwen35-dflash-draft"). Key
                              handling mirrors server/src/draft/
                              draft_gguf_loader.cpp: metadata fills hparams,
@@ -120,7 +120,9 @@ def _check_shape(arr: np.ndarray, want: tuple[int, ...], name: str) -> None:
 
 # ── Drafter ──────────────────────────────────────────────────────────
 
-def load_drafter(path: str) -> tuple[dict[str, np.ndarray], DrafterMeta]:
+def load_drafter(path: str,
+                 dtype: Any = np.float32,
+                 ) -> tuple[dict[str, np.ndarray], DrafterMeta]:
     """Load and dequantize the DFlash drafter GGUF.
 
     Returns (weights, meta). `weights` maps canonical GGUF tensor names
@@ -128,7 +130,8 @@ def load_drafter(path: str) -> tuple[dict[str, np.ndarray], DrafterMeta]:
     torch/row-major orientation [out_features, in_features] (numpy sees ggml
     ne reversed, which is exactly that). Alternate spellings the engine
     accepts (dflash_fc.weight, blk.<i>.post_attention_norm.weight) are
-    canonicalized.
+    canonicalized. Pass dtype=np.float16 for a low-peak-memory GPU load; the
+    mirror converts to its requested torch dtype while copying each tensor.
     """
     from gguf import GGUFReader
 
@@ -198,7 +201,7 @@ def load_drafter(path: str) -> tuple[dict[str, np.ndarray], DrafterMeta]:
     kv_dim = n_head_kv * head_dim
     weights: dict[str, np.ndarray] = {}
 
-    fc = _dequantize(pick("dflash.fc.weight", "dflash_fc.weight"))
+    fc = _dequantize(pick("dflash.fc.weight", "dflash_fc.weight"), dtype)
     if fc.ndim != 2 or fc.shape[0] != hidden or fc.shape[1] % hidden != 0:
         raise ValueError(f"{path}: dflash.fc.weight shape {tuple(fc.shape)} "
                          f"inconsistent with hidden={hidden}")
@@ -208,18 +211,18 @@ def load_drafter(path: str) -> tuple[dict[str, np.ndarray], DrafterMeta]:
     weights["dflash.fc.weight"] = fc
 
     hidden_norm = _dequantize(
-        pick("dflash.hidden_norm.weight", "dflash_hidden_norm.weight"))
+        pick("dflash.hidden_norm.weight", "dflash_hidden_norm.weight"), dtype)
     _check_shape(hidden_norm, (hidden,), "dflash.hidden_norm.weight")
     weights["dflash.hidden_norm.weight"] = hidden_norm
 
-    out_norm = _dequantize(pick("output_norm.weight"))
+    out_norm = _dequantize(pick("output_norm.weight"), dtype)
     _check_shape(out_norm, (hidden,), "output_norm.weight")
     weights["output_norm.weight"] = out_norm
 
     n_aux = 0
     while f"dflash.aux_hidden_norm.{n_aux}.weight" in tmap:
         name = f"dflash.aux_hidden_norm.{n_aux}.weight"
-        aux = _dequantize(tmap[name])
+        aux = _dequantize(tmap[name], dtype)
         _check_shape(aux, (hidden,), name)
         weights[name] = aux
         n_aux += 1
@@ -243,16 +246,16 @@ def load_drafter(path: str) -> tuple[dict[str, np.ndarray], DrafterMeta]:
             "ffn_down.weight": (hidden, n_ff),
         }
         for suffix, want in shapes.items():
-            arr = _dequantize(pick(f"{blk}.{suffix}"))
+            arr = _dequantize(pick(f"{blk}.{suffix}"), dtype)
             _check_shape(arr, want, f"{blk}.{suffix}")
             weights[f"{blk}.{suffix}"] = arr
         ffn_norm = _dequantize(pick(f"{blk}.ffn_norm.weight",
-                                    f"{blk}.post_attention_norm.weight"))
+                                    f"{blk}.post_attention_norm.weight"), dtype)
         _check_shape(ffn_norm, (hidden,), f"{blk}.ffn_norm.weight")
         weights[f"{blk}.ffn_norm.weight"] = ffn_norm
         gate_t = tmap.get(f"{blk}.attn_gate.weight")
         if gate_t is not None:
-            gate = _dequantize(gate_t)
+            gate = _dequantize(gate_t, dtype)
             if tuple(gate.shape) not in ((n_head, hidden), (q_dim, hidden)):
                 raise ValueError(
                     f"{path}: {blk}.attn_gate.weight shape {tuple(gate.shape)} "

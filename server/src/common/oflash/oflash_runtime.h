@@ -33,6 +33,19 @@ struct DraftWeights;
 
 namespace dflash::common::oflash {
 
+// Adapter generations are strictly monotonic within one runtime. A queued
+// candidate must advance the resident generation, any newer candidate already
+// waiting locally, and the announcement high-water mark retained across guard
+// rollbacks. Kept pure so refusal behavior has a CPU-only test.
+inline constexpr bool oflash_generation_is_newer(uint64_t candidate,
+                                                 uint64_t resident,
+                                                 uint64_t pending = 0,
+                                                 uint64_t high_water = 0) {
+    return candidate > resident &&
+           (pending == 0 || candidate > pending) &&
+           (high_water == 0 || candidate > high_water);
+}
+
 // pimpl holder so this header need not include oflash_adapter.h.
 struct OFlashAdapterHostHolder;
 
@@ -65,12 +78,16 @@ public:
 
     // Hashes the drafter, creates ring + LoRA slots (wired into dw.oflash),
     // warm-starts from the profile store, spawns the trainer. Any failure
-    // logs and leaves the affected sub-feature off; only allocation of the
-    // LoRA slots failing returns false (caller then disables OFlash).
+    // logs and leaves the affected sub-feature off. Returns false for an
+    // incompatible capture shape or failed LoRA slot allocation; the caller
+    // then disables OFlash while leaving inference available.
     bool init(const OFlashConfig & cfg,
+              const std::string & target_path,
               const std::string & drafter_path,
               DraftWeights & dw,
               ggml_backend_t draft_backend,
+              int target_capture_layers,
+              int target_hidden,
               int vocab);
 
     void shutdown();  // detach dw.oflash BEFORE freeing the draft backend
@@ -127,6 +144,9 @@ private:
     // Swap deferred by the guard (probation/backoff) until can_swap().
     OFlashPendingSwap pending_local_;
     bool has_pending_local_ = false;
+    // Never decreases on rollback: an old/rejected generation must not be
+    // accepted again merely because the resident adapter moved backwards.
+    uint64_t generation_high_water_ = 0;
 
     // Guard state is only touched by the decode thread; props() serves HTTP
     // threads from this mutex-guarded cache refreshed after every mutation.

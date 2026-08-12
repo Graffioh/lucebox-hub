@@ -13,6 +13,8 @@
 //   child → parent  one int32 ready-status after attaching the ring, then
 //                   newline JSON events on the inherited --stream-fd:
 //                   {"event":"swap_ready","path":"...","generation":N}
+//                   {"event":"rollback_ack","generation":N}
+//                   {"event":"training_disabled","reason":"..."}
 //
 // All child I/O happens on the supervisor thread; the decode thread only
 // polls take_pending_swap() (mutex'd mailbox) and enqueues outbound lines.
@@ -56,11 +58,24 @@ public:
     void stop();
 
     bool trainer_alive() const;
+    bool trainer_disabled() const;
     uint64_t respawns() const;
 
     // Decode-thread API: newest swap request, if any (newer overwrites
     // older — only the latest adapter matters).
     bool take_pending_swap(OFlashPendingSwap & out);
+
+    // Discard an adapter announcement that is no longer valid after a guard
+    // rollback/disable. Returns true when a queued announcement was cleared.
+    bool clear_pending_swaps();
+
+    // Atomically clear queued candidates, install a barrier that discards all
+    // swap_ready events still ahead of the trainer's ordered rollback ack, and
+    // enqueue "rollback <generation>". The barrier survives a child restart;
+    // the command is resent after the next ready handshake until acknowledged.
+    void begin_rollback(uint64_t generation);
+
+    bool rollback_pending() const;
 
     // Queue a control line for the child ("promote 3", "rollback 3", ...).
     void send_line(const std::string & line);
@@ -79,6 +94,9 @@ private:
     bool has_pending_ = false;
     bool stopping_ = false;
     bool alive_ = false;
+    bool trainer_disabled_ = false;
+    bool rollback_pending_ = false;
+    uint64_t rollback_generation_ = 0;
     uint64_t respawns_ = 0;
 
     // POSIX child state (unused on Windows; feature is stubbed there).

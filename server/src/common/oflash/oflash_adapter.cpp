@@ -107,7 +107,7 @@ size_t st_dtype_size(const std::string & d) {
 }
 
 // Convert one tensor's payload to F16 in place-preserving element order.
-bool st_to_f16(const StFile & f, const StTensor & t,
+bool st_to_f16(const StFile & f, const std::string & name, const StTensor & t,
                std::vector<uint16_t> & out, std::string & error) {
     const size_t esz = st_dtype_size(t.dtype);
     if (esz == 0) { error = "unsupported adapter dtype " + t.dtype; return false; }
@@ -121,14 +121,33 @@ bool st_to_f16(const StFile & f, const StTensor & t,
     } else if (t.dtype == "F32") {
         std::vector<float> tmp(n);
         std::memcpy(tmp.data(), src, bytes);
+        if (std::any_of(tmp.begin(), tmp.end(),
+                        [](float v) { return !std::isfinite(v); })) {
+            error = "adapter tensor contains NaN/Inf: " + name;
+            return false;
+        }
         ggml_fp32_to_fp16_row(tmp.data(), (ggml_fp16_t *)out.data(), (int64_t)n);
     } else {  // BF16 → F32 → F16
         std::vector<float> tmp(n);
         for (size_t i = 0; i < n; i++) {
-            uint32_t u = (uint32_t)((const uint16_t *)src)[i] << 16;
+            uint16_t bits = 0;
+            std::memcpy(&bits, src + i * sizeof(bits), sizeof(bits));
+            if ((bits & 0x7f80u) == 0x7f80u) {
+                error = "adapter tensor contains NaN/Inf: " + name;
+                return false;
+            }
+            uint32_t u = (uint32_t)bits << 16;
             std::memcpy(&tmp[i], &u, 4);
         }
         ggml_fp32_to_fp16_row(tmp.data(), (ggml_fp16_t *)out.data(), (int64_t)n);
+    }
+    // This also rejects finite F32/BF16 values that overflow during the F16
+    // conversion. Uploading an infinity is unsafe regardless of its source.
+    if (std::any_of(out.begin(), out.end(), [](uint16_t bits) {
+            return (bits & 0x7c00u) == 0x7c00u;
+        })) {
+        error = "adapter tensor contains NaN/Inf after F16 conversion: " + name;
+        return false;
     }
     return true;
 }
@@ -272,7 +291,7 @@ bool oflash_adapter_load(const std::string & path,
             return false;
         }
         std::vector<uint16_t> data;
-        if (!st_to_f16(f, t, data, error)) return false;
+        if (!st_to_f16(f, s.name, t, data, error)) return false;
         out.tensors.emplace(s.name, std::move(data));
     }
     out.generation = generation;

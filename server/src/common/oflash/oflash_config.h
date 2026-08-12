@@ -16,6 +16,7 @@ struct OFlashConfig {
     // to the sidecar (which scopes itself via HIP_VISIBLE_DEVICES before
     // importing torch); the engine does not interpret it beyond validation.
     std::string device = "1";      // --oflash-device (box: 1 = Strix iGPU)
+    std::string dtype  = "auto";   // --oflash-dtype (auto|fp16|bf16|fp32)
 
     std::string profile = "default";  // --oflash-profile
     int         lora_rank = 16;       // --oflash-lora-rank
@@ -23,9 +24,9 @@ struct OFlashConfig {
     std::string dir;                  // --oflash-dir (default ~/.lucebox/oflash)
 
     // Capture ring sizing + label detail.
-    int ring_mb = 2048;            // --oflash-ring-mb (shm, unified memory)
-    int topk    = 32;              // --oflash-topk (0 = skip top-K capture)
-    int backfill_rows = 512;       // context rows backfilled per request
+    int ring_mb = 512;             // --oflash-ring-mb (shm, unified memory)
+    int topk    = 8;               // --oflash-topk (0 = skip top-K capture)
+    int backfill_rows = 128;       // context rows backfilled per request
 
     // Sidecar launch. Empty = capture-only (M0 telemetry mode): the ring is
     // exposed and a trainer may be attached by hand.

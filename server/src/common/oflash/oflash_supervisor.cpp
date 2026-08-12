@@ -30,8 +30,12 @@ using json = nlohmann::json;
 bool OFlashSupervisor::start(const OFlashSupervisorConfig &) { return false; }
 void OFlashSupervisor::stop() {}
 bool OFlashSupervisor::trainer_alive() const { return false; }
+bool OFlashSupervisor::trainer_disabled() const { return false; }
 uint64_t OFlashSupervisor::respawns() const { return 0; }
 bool OFlashSupervisor::take_pending_swap(OFlashPendingSwap &) { return false; }
+bool OFlashSupervisor::clear_pending_swaps() { return false; }
+void OFlashSupervisor::begin_rollback(uint64_t) {}
+bool OFlashSupervisor::rollback_pending() const { return false; }
 void OFlashSupervisor::send_line(const std::string &) {}
 void OFlashSupervisor::run() {}
 bool OFlashSupervisor::spawn_once(std::string &) { return false; }
@@ -70,8 +74,11 @@ bool OFlashSupervisor::start(const OFlashSupervisorConfig & cfg) {
         cfg_ = cfg;
         stopping_ = false;
         alive_ = false;
+        trainer_disabled_ = false;
         outbox_.clear();
         has_pending_ = false;
+        rollback_pending_ = false;
+        rollback_generation_ = 0;
         respawns_ = 0;
     }
     try {
@@ -98,6 +105,11 @@ bool OFlashSupervisor::trainer_alive() const {
     return alive_;
 }
 
+bool OFlashSupervisor::trainer_disabled() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return trainer_disabled_;
+}
+
 uint64_t OFlashSupervisor::respawns() const {
     std::lock_guard<std::mutex> lock(mu_);
     return respawns_;
@@ -109,6 +121,28 @@ bool OFlashSupervisor::take_pending_swap(OFlashPendingSwap & out) {
     out = pending_;
     has_pending_ = false;
     return true;
+}
+
+bool OFlashSupervisor::clear_pending_swaps() {
+    std::lock_guard<std::mutex> lock(mu_);
+    const bool cleared = has_pending_;
+    pending_ = {};
+    has_pending_ = false;
+    return cleared;
+}
+
+void OFlashSupervisor::begin_rollback(uint64_t generation) {
+    std::lock_guard<std::mutex> lock(mu_);
+    pending_ = {};
+    has_pending_ = false;
+    rollback_pending_ = true;
+    rollback_generation_ = generation;
+    outbox_.push_back("rollback " + std::to_string(generation));
+}
+
+bool OFlashSupervisor::rollback_pending() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return rollback_pending_;
 }
 
 void OFlashSupervisor::send_line(const std::string & line) {
@@ -272,7 +306,14 @@ void OFlashSupervisor::run() {
         {
             std::lock_guard<std::mutex> lock(mu_);
             alive_ = true;
+            trainer_disabled_ = false;
             if (attempts > 0) respawns_++;
+            // A successful pipe write to the old child did not prove that it
+            // processed the rollback. Preserve and resend until acknowledged.
+            if (rollback_pending_) {
+                outbox_.push_back(
+                    "rollback " + std::to_string(rollback_generation_));
+            }
             drain_outbox_locked();
         }
         std::fprintf(stderr, "[oflash] trainer ready (pid=%ld)\n", child_pid_);
@@ -308,9 +349,34 @@ void OFlashSupervisor::run() {
                 const std::string ev = j.value("event", "");
                 if (ev == "swap_ready") {
                     std::lock_guard<std::mutex> lock(mu_);
-                    pending_.path       = j.value("path", "");
-                    pending_.generation = j.value("generation", (uint64_t)0);
-                    has_pending_ = !pending_.path.empty();
+                    if (rollback_pending_) {
+                        std::fprintf(stderr,
+                            "[oflash] discarding adapter announcement during "
+                            "rollback barrier\n");
+                    } else {
+                        pending_.path = j.value("path", "");
+                        pending_.generation =
+                            j.value("generation", (uint64_t)0);
+                        has_pending_ = !pending_.path.empty();
+                    }
+                } else if (ev == "rollback_ack") {
+                    const uint64_t generation =
+                        j.value("generation", (uint64_t)0);
+                    std::lock_guard<std::mutex> lock(mu_);
+                    if (rollback_pending_ &&
+                        generation == rollback_generation_) {
+                        // Stream ordering proves every pre-rollback export was
+                        // parsed (and discarded) before this acknowledgement.
+                        pending_ = {};
+                        has_pending_ = false;
+                        rollback_pending_ = false;
+                    }
+                } else if (ev == "training_disabled") {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    trainer_disabled_ = true;
+                    std::fprintf(stderr,
+                        "[oflash-trainer] training disabled: %s\n",
+                        j.value("reason", "unspecified").c_str());
                 } else if (ev == "log") {
                     std::fprintf(stderr, "[oflash-trainer] %s\n",
                                  j.value("message", "").c_str());

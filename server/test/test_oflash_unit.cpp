@@ -10,9 +10,11 @@
 #include "CppUnitTestFramework.hpp"
 
 #include "common/oflash/oflash_adapter.h"
+#include "common/oflash/oflash_config.h"
 #include "common/oflash/oflash_format.h"
 #include "common/oflash/oflash_guard.h"
 #include "common/oflash/oflash_ring.h"
+#include "common/oflash/oflash_runtime.h"
 #include "common/oflash/oflash_supervisor.h"
 #include "internal.h"
 
@@ -20,6 +22,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -37,6 +40,8 @@ using namespace dflash::common;
 using namespace dflash::common::oflash;
 
 struct OFlashUnitFixture {};
+
+enum class AdapterPayloadPoison { None, NaN, Inf };
 
 // Minimal DraftWeights dims for spec/adapter tests (no tensors needed).
 DraftWeights tiny_drafter() {
@@ -58,7 +63,8 @@ void write_adapter_file(const std::string & path,
                         const std::string & sha,
                         uint64_t generation,
                         bool corrupt_shape = false,
-                        const std::string & alpha = "32") {
+                        const std::string & alpha = "32",
+                        AdapterPayloadPoison poison = AdapterPayloadPoison::None) {
     const auto specs = oflash_lora_expected_tensors(dw, rank);
     nlohmann::json header;
     header["__metadata__"] = {
@@ -81,7 +87,13 @@ void write_adapter_file(const std::string & path,
             {"data_offsets", {offset, offset + bytes}},
         };
         for (int64_t i = 0; i < rows * cols; i++) {
-            data.push_back(0.001f * (float)(data.size() % 97));
+            if (data.empty() && poison == AdapterPayloadPoison::NaN) {
+                data.push_back(std::numeric_limits<float>::quiet_NaN());
+            } else if (data.empty() && poison == AdapterPayloadPoison::Inf) {
+                data.push_back(std::numeric_limits<float>::infinity());
+            } else {
+                data.push_back(0.001f * (float)(data.size() % 97));
+            }
         }
         offset += bytes;
     }
@@ -117,6 +129,38 @@ TEST_CASE(OFlashUnitFixture, hash_from_hex_truncates_big_endian) {
                 (uint64_t)0xabcdef0102030405ull);
     CHECK_EQUAL(oflash_hash_from_hex("shorty"), (uint64_t)0);
     CHECK_EQUAL(oflash_hash_from_hex(nullptr), (uint64_t)0);
+}
+
+TEST_CASE(OFlashUnitFixture, conservative_runtime_defaults) {
+    OFlashConfig cfg;
+    CHECK_EQUAL(cfg.ring_mb, 512);
+    CHECK_EQUAL(cfg.topk, 8);
+    CHECK_EQUAL(cfg.backfill_rows, 128);
+    CHECK_EQUAL(cfg.dtype, std::string("auto"));
+}
+
+TEST_CASE(OFlashUnitFixture, adapter_generations_must_advance_resident_and_pending) {
+    CHECK(oflash_generation_is_newer(8, 7));
+    CHECK(!oflash_generation_is_newer(7, 7));
+    CHECK(!oflash_generation_is_newer(6, 7));
+    CHECK(oflash_generation_is_newer(9, 7, 8));
+    CHECK(!oflash_generation_is_newer(8, 7, 8));
+    // A rollback may lower the resident generation, but must not make a
+    // previously seen/rejected generation eligible again.
+    CHECK(!oflash_generation_is_newer(8, 7, 0, 8));
+    CHECK(oflash_generation_is_newer(9, 7, 0, 8));
+}
+
+TEST_CASE(OFlashUnitFixture, runtime_refuses_incompatible_feature_width_before_gpu_init) {
+    OFlashRuntime runtime;
+    OFlashConfig cfg;
+    DraftWeights dw = tiny_drafter();
+    CHECK(!runtime.init(cfg, "/tmp/target.gguf", "/tmp/draft.gguf",
+                        dw, /*draft_backend=*/nullptr,
+                        /*target_capture_layers=*/dw.n_target_layers + 1,
+                        /*target_hidden=*/dw.n_embd,
+                        /*vocab=*/64));
+    CHECK(dw.oflash == nullptr);
 }
 
 // ── Ring semantics ──────────────────────────────────────────────────
@@ -483,6 +527,28 @@ TEST_CASE(OFlashUnitFixture, adapter_load_accepts_valid_file) {
     std::remove(path.c_str());
 }
 
+TEST_CASE(OFlashUnitFixture, adapter_load_refuses_non_finite_tensor_values) {
+    DraftWeights dw = tiny_drafter();
+    const std::string path =
+        "/tmp/oflash-test-adapter-" + std::to_string((long)getpid()) + "n.st";
+    OFlashAdapterHost host;
+    std::string err;
+
+    write_adapter_file(path, dw, 4, test_sha(), 1,
+                       /*corrupt_shape=*/false, /*alpha=*/"32",
+                       AdapterPayloadPoison::NaN);
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
+    CHECK(err.find("NaN/Inf") != std::string::npos);
+
+    write_adapter_file(path, dw, 4, test_sha(), 1,
+                       /*corrupt_shape=*/false, /*alpha=*/"32",
+                       AdapterPayloadPoison::Inf);
+    err.clear();
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
+    CHECK(err.find("NaN/Inf") != std::string::npos);
+    std::remove(path.c_str());
+}
+
 TEST_CASE(OFlashUnitFixture, adapter_load_refuses_mismatches) {
     DraftWeights dw = tiny_drafter();
     const std::string path =
@@ -557,7 +623,11 @@ TEST_CASE(OFlashUnitFixture, supervisor_spawns_and_relays_swap_events) {
              "printf '%s\\n' "
              "'{\"event\":\"swap_ready\",\"path\":\"/tmp/a.st\","
              "\"generation\":7}' >&$fd\n"
-             "while read line; do [ \"$line\" = quit ] && exit 0; done\n";
+             "while read line; do case \"$line\" in\n"
+             "emit) printf '%s\\n' "
+             "'{\"event\":\"swap_ready\",\"path\":\"/tmp/b.st\","
+             "\"generation\":8}' >&$fd;;\n"
+             "quit) exit 0;; esac; done\n";
     }
     ::chmod(script.c_str(), 0755);
 
@@ -581,8 +651,85 @@ TEST_CASE(OFlashUnitFixture, supervisor_spawns_and_relays_swap_events) {
     CHECK_EQUAL(swap.generation, (uint64_t)7);
     CHECK(sup.trainer_alive());
     sup.send_line("promote 7");
+    sup.send_line("emit");
+    bool cleared = false;
+    for (int i = 0; i < 100 && !cleared; i++) {
+        cleared = sup.clear_pending_swaps();
+        if (!cleared) ::usleep(20 * 1000);
+    }
+    REQUIRE(cleared);
+    CHECK(!sup.take_pending_swap(swap));
     sup.stop();  // graceful: quit → clean child exit → reap
     CHECK(!sup.trainer_alive());
+    std::remove(script.c_str());
+}
+
+TEST_CASE(OFlashUnitFixture, supervisor_rollback_barrier_and_disabled_state) {
+    // Events use one ordered stream. The candidate emitted after receipt of
+    // rollback but before rollback_ack is stale and must be discarded; the
+    // first post-ack candidate is eligible.
+    const std::string script =
+        "/tmp/oflash-barrier-trainer-" +
+        std::to_string((long)getpid()) + ".sh";
+    {
+        std::ofstream f(script);
+        f << "#!/bin/bash\n"
+             "fd=2\n"
+             "for a in \"$@\"; do case \"$a\" in --stream-fd=*) "
+             "fd=${a#--stream-fd=};; esac; done\n"
+             "printf '\\000\\000\\000\\000' >&$fd\n"
+             "while read line; do case \"$line\" in\n"
+             "rollback\\ *) gen=${line#rollback }; "
+             "printf '%s\\n' "
+             "'{\"event\":\"rollback_ack\",\"generation\":6}' >&$fd; "
+             "printf '%s\\n' "
+             "'{\"event\":\"swap_ready\",\"path\":\"/tmp/stale.st\","
+             "\"generation\":8}' >&$fd; "
+             "printf '{\"event\":\"rollback_ack\",\"generation\":%s}\\n' "
+             "\"$gen\" >&$fd; "
+             "printf '%s\\n' "
+             "'{\"event\":\"swap_ready\",\"path\":\"/tmp/fresh.st\","
+             "\"generation\":9}' >&$fd;;\n"
+             "self-disable) printf '%s\\n' "
+             "'{\"event\":\"training_disabled\","
+             "\"reason\":\"synthetic OOM\"}' >&$fd;;\n"
+             "quit) exit 0;; esac; done\n";
+    }
+    ::chmod(script.c_str(), 0755);
+
+    OFlashSupervisor sup;
+    OFlashSupervisorConfig cfg;
+    cfg.trainer_bin = script;
+    cfg.ready_timeout_ms = 5000;
+    REQUIRE(sup.start(cfg));
+    for (int i = 0; i < 100 && !sup.trainer_alive(); i++) {
+        ::usleep(20 * 1000);
+    }
+    REQUIRE(sup.trainer_alive());
+
+    sup.begin_rollback(7);
+    for (int i = 0; i < 100 && sup.rollback_pending(); i++) {
+        ::usleep(20 * 1000);
+    }
+    CHECK(!sup.rollback_pending());
+
+    OFlashPendingSwap swap;
+    bool got = false;
+    for (int i = 0; i < 100 && !(got = sup.take_pending_swap(swap)); i++) {
+        ::usleep(20 * 1000);
+    }
+    REQUIRE(got);
+    CHECK_EQUAL(swap.path, std::string("/tmp/fresh.st"));
+    CHECK_EQUAL(swap.generation, (uint64_t)9);
+    CHECK(!sup.take_pending_swap(swap));
+
+    sup.send_line("self-disable");
+    for (int i = 0; i < 100 && !sup.trainer_disabled(); i++) {
+        ::usleep(20 * 1000);
+    }
+    CHECK(sup.trainer_disabled());
+
+    sup.stop();
     std::remove(script.c_str());
 }
 
