@@ -101,6 +101,14 @@ CLIENTS: dict[str, ClientSpec] = {
         binary="opencode",
         protocol="openai_chat",
     ),
+    "omp": ClientSpec(
+        name="omp",
+        install="omp",
+        package="https://raw.githubusercontent.com/can1357/oh-my-pi/main/scripts/install.sh",
+        binary="omp",
+        protocol="responses",
+        notes="OMP uses a custom openai-responses provider pointed at Lucebox.",
+    ),
     "pi": ClientSpec(
         name="pi",
         install="npm",
@@ -281,6 +289,8 @@ def client_bin(work_dir: Path, spec: ClientSpec) -> Path:
         return pip_venv(work_dir, spec.name) / "bin" / spec.binary
     if spec.install == "hermes":
         return hermes_home(work_dir) / ".local" / "bin" / spec.binary
+    if spec.install == "omp":
+        return work_dir / "clients" / spec.name / "bin" / spec.binary
     raise HarnessError(f"unknown installer {spec.install}")
 
 
@@ -337,6 +347,24 @@ def install_client(work_dir: Path, spec: ClientSpec) -> dict[str, Any]:
             ["bash", str(script_path), "--skip-setup", "--skip-browser"],
             env=env,
             timeout=1800,
+            stream=True,
+        )
+    elif spec.install == "omp":
+        # Install the latest release, matching the repo's unpinned npm/pip
+        # client policy. The --version smoke below records the exact binary
+        # in the install report for reproducibility.
+        root = work_dir / "clients" / spec.name
+        bin_dir = root / "bin"
+        root.mkdir(parents=True, exist_ok=True)
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        script_path = root / "install.sh"
+        urllib.request.urlretrieve(spec.package, script_path)
+        env = os.environ.copy()
+        env["PI_INSTALL_DIR"] = str(bin_dir)
+        result = run_cmd(
+            ["sh", str(script_path), "--binary"],
+            env=env,
+            timeout=900,
             stream=True,
         )
     else:
