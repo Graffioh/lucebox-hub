@@ -1524,6 +1524,18 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_recurrent_snapshot)
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_delta_net_specla.cpp")
+        # GPU parity test: SpecLA topology-masked verify + factor-based state
+        # reconstruction vs the fused sequential gated-delta-net kernel.
+        # Exits 77 (ctest SKIP) when no GPU is present.
+        add_executable(test_delta_net_specla test/test_delta_net_specla.cpp)
+        target_include_directories(test_delta_net_specla PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_delta_net_specla PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_delta_net_specla)
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         set(_server_unit_sources
             test/test_unit_main.cpp
@@ -1536,6 +1548,7 @@ if(DFLASH27B_TESTS)
             test/test_admission.cpp
             test/test_restore_delta.cpp
             test/test_chain_rollback_policy.cpp
+            test/test_ddtree_tau.cpp
             test/test_anchor_transitive.cpp
             test/test_drafter_early_exit_score_range.cpp
             test/test_drafter_tail_capture_guard.cpp
