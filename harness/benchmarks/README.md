@@ -198,6 +198,11 @@ An optional target-only autoregressive report over the identical held-out cases
 can be supplied with `--target-reference`; any adapted/reference mismatch then
 fails as well.
 
+OFlash phases use non-streaming chat responses because that response's
+`usage` object currently carries `accept_rate`; ordinary `bench` runs remain
+streaming for client-observed TTFT. Frozen OFlash reports therefore record
+server prefill/decode timings but leave client TTFT unset.
+
 The 30 short HumanEval/GSM8K/Math500 prompts are suitable for a bounded first
 signal, not a publication-scale conclusion. Use all three folds and report each
 fold separately before pooling. The six agent prompts can be added with

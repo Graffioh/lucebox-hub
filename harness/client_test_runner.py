@@ -1534,14 +1534,64 @@ def _run_bench_case(
     case: dict[str, Any],
     *,
     max_tokens_override: int | None = None,
+    stream_response: bool = True,
 ) -> dict[str, Any]:
-    """Run a single bench case via streaming to capture TTFT and detailed metrics.
+    """Run one bench case, optionally streaming to capture client-observed TTFT.
 
     Always uses streaming to get: walltime, TTFT, prompt_tokens, completion_tokens,
     prefill tok/s, and decode tok/s (excluding prefill).
     """
     messages = case["messages"]
     max_tokens = max_tokens_override or case.get("max_tokens", 256)
+
+    if not stream_response:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "stream": False,
+        }
+        status, response, wall_s = http_json(
+            "POST", base_url + "/v1/chat/completions", payload, timeout=600
+        )
+        if status != 200 or not isinstance(response, dict):
+            return {
+                "id": case["id"], "ok": False, "status": status,
+                "error": response,
+            }
+        choices = response.get("choices") or []
+        message = choices[0].get("message", {}) if choices else {}
+        text = message.get("content") or message.get("reasoning_content") or ""
+        usage = response.get("usage") or {}
+        timings = usage.get("timings") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        prefill_ms = timings.get("prefill_ms")
+        prefilled_tokens = timings.get("prefilled_tokens")
+        prefill_tok_s = None
+        if (isinstance(prefill_ms, (int, float)) and prefill_ms > 0
+                and isinstance(prefilled_tokens, int) and prefilled_tokens > 0):
+            prefill_tok_s = prefilled_tokens / (prefill_ms / 1000.0)
+        output_tok_s = timings.get("decode_tokens_per_sec")
+        return {
+            "id": case["id"],
+            "ok": bool(text.strip()),
+            "text": str(text),
+            "wall_s": round(wall_s, 3),
+            "ttft_s": None,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "prefill_tok_s": round(prefill_tok_s, 1) if prefill_tok_s else None,
+            "output_tok_s": (
+                float(output_tok_s)
+                if isinstance(output_tok_s, (int, float)) else None
+            ),
+            "token_times_s": [],
+            "decode_tok_s_by_window": [],
+            "server_timings": timings or None,
+            "accept_rate": usage.get("accept_rate"),
+        }
 
     payload = {
         "model": model,
@@ -1661,13 +1711,15 @@ def _run_bench_suite(
     n_sample: int | None,
     prompts_dir: Path | None = None,
     max_tokens_override: int | None = None,
+    stream_responses: bool = True,
 ) -> dict[str, Any]:
     """Run all prompts for a given bench suite."""
     cases = _load_bench_prompts(suite, prompts_dir)
     if n_sample is not None and n_sample < len(cases):
         cases = cases[:n_sample]
     prompt_fingerprint = hashlib.sha256(json.dumps(
-        {"cases": cases, "max_tokens_override": max_tokens_override},
+        {"cases": cases, "max_tokens_override": max_tokens_override,
+         "stream_responses": stream_responses},
         sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
 
@@ -1685,6 +1737,7 @@ def _run_bench_suite(
             result = _run_bench_case(
                 base_url, model, case,
                 max_tokens_override=max_tokens_override,
+                stream_response=stream_responses,
             )
         except Exception as exc:
             result = {"id": case["id"], "ok": False, "error": repr(exc)}
@@ -1741,6 +1794,7 @@ def _run_bench_suite(
         "n_ok": len(ok_results),
         "prompt_fingerprint": prompt_fingerprint,
         "max_tokens_override": max_tokens_override,
+        "request_mode": "stream" if stream_responses else "non-stream",
         "results": results,
     }
 
@@ -1906,11 +1960,13 @@ def cmd_bench(args: argparse.Namespace) -> int:
     print(f"[bench] url={base_url}  model={model}  suites={','.join(selected)}", flush=True)
 
     all_suites: dict[str, Any] = {}
+    stream_responses = args.oflash_phase == "none"
     for suite in selected:
         all_suites[suite] = _run_bench_suite(
             suite, base_url, model, n_sample,
             prompts_dir=Path(args.prompts_dir) if args.prompts_dir else None,
             max_tokens_override=args.max_tokens,
+            stream_responses=stream_responses,
         )
 
     payload = {
@@ -1918,6 +1974,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         "url": base_url,
         "model": model,
         "suites": all_suites,
+        "request_mode": "stream" if stream_responses else "non-stream",
         "ok": all(s.get("n_ok", 0) > 0 for s in all_suites.values()),
     }
 

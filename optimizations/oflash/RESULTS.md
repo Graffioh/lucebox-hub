@@ -172,6 +172,24 @@ drops. The generation-20 adapter was 13.1 MB and retained the complete format-v2
 identity. Strix KFD/GTT allocation held around 8.55 GiB, host `MemAvailable` around 98 GiB, and
 swap did not grow. This qualifies execution and export, not the held-out ≥+0.05 α milestone.
 
+The first deterministic held-out fold was run on 2026-08-13 with the official Q4_K_M target and
+draft, 512-token request caps and one fixed 18-prompt adaptation epoch. The trainer produced 45
+exports; the live guard promoted three, rolled back six and selected generation 33. Frozen
+evaluation then restarted from generation 33 with the trainer disabled. Across the 12 held-out
+HumanEval/GSM8K/Math500 cases, mean acceptance changed from 0.4937 to 0.4905
+(`-0.0032`, paired-bootstrap 95% CI `[-0.0129, +0.0094]`), mean decode throughput changed from
+84.10 to 83.45 tok/s (mean per-case speedup `0.995x`, 95% CI `[0.973x, 1.023x]`), and task score
+remained 7/12. Only 8/12 responses were byte-identical, so the comparison correctly failed its
+output-parity gate. This fold therefore does **not** pass the M1 `+0.05` acceptance criterion, and
+the remaining folds should not be presented as confirmatory until the deterministic parity failure
+is understood. The earlier repeated-prompt gain remains a bounded overfit/smoke result.
+
+The run completed without a GPU or host-memory safety event: target allocation was about
+19.3 GiB on the R9700, trainer allocation about 8.6 GiB on Strix Halo, host `MemAvailable` stayed
+near 98 GiB, swap did not grow, the capture backlog drained to zero and `records_dropped` remained
+zero. The bounded trainer settings were `--batch-rows 64 --train-ctx 64 --reservoir-rows 2048
+--export-every 1 --keep-generations 4`; the capture ring was 512 MiB.
+
 ## 3. M2 — within-session AL climb (online loop)
 
 **Bounded fixed-prompt loop passed; domain-shifted and adversarial workloads remain open.**
@@ -254,7 +272,7 @@ steps/s achieved on each device.
 - **Output quality.** Verification is exact-match against the target; the qualification also
   compares deterministic target-only, static-draft and adapted-draft outputs. It does not claim an
   independent quality gain from drafter training.
-- **Other model families.** qwen35 DFlash only; gemma4/laguna drafters are out of scope until the
+- **Other model families.** Qwen3.6 DFlash only; gemma4/laguna drafters are out of scope until the
   capture hook is wired there.
 - **Multi-tenant / batched serving, tensor-parallel targets.** Single-box, single-stream only.
 - **Cross-hardware generality.** All numbers will be from this R9700 + Strix Halo box; other
