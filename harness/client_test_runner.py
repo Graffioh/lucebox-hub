@@ -15,6 +15,7 @@ test machines before project Python dependencies are installed.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import os
@@ -1649,6 +1650,7 @@ def _run_bench_case(
         "token_times_s": token_times_s,
         "decode_tok_s_by_window": decode_tok_s_by_window,
         "server_timings": usage.get("timings") or None,
+        "accept_rate": usage.get("accept_rate"),
     }
 
 
@@ -1658,11 +1660,16 @@ def _run_bench_suite(
     model: str,
     n_sample: int | None,
     prompts_dir: Path | None = None,
+    max_tokens_override: int | None = None,
 ) -> dict[str, Any]:
     """Run all prompts for a given bench suite."""
     cases = _load_bench_prompts(suite, prompts_dir)
     if n_sample is not None and n_sample < len(cases):
         cases = cases[:n_sample]
+    prompt_fingerprint = hashlib.sha256(json.dumps(
+        {"cases": cases, "max_tokens_override": max_tokens_override},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
 
     results = []
     n_correct, n_scored = 0, 0
@@ -1675,7 +1682,10 @@ def _run_bench_suite(
 
     for i, case in enumerate(cases):
         try:
-            result = _run_bench_case(base_url, model, case)
+            result = _run_bench_case(
+                base_url, model, case,
+                max_tokens_override=max_tokens_override,
+            )
         except Exception as exc:
             result = {"id": case["id"], "ok": False, "error": repr(exc)}
             print(f"  {i+1:3d}  {case['id']:<16s}  FAILED: {exc}", flush=True)
@@ -1729,6 +1739,8 @@ def _run_bench_suite(
         "suite": suite,
         "n": len(cases),
         "n_ok": len(ok_results),
+        "prompt_fingerprint": prompt_fingerprint,
+        "max_tokens_override": max_tokens_override,
         "results": results,
     }
 
@@ -1739,6 +1751,11 @@ def _run_bench_suite(
         out_tps_list = [r["output_tok_s"] for r in ok_results if r.get("output_tok_s") is not None]
         out_toks = [r["completion_tokens"] for r in ok_results]
         prompt_toks = [r["prompt_tokens"] for r in ok_results]
+        accept_rates = [
+            float(r["accept_rate"])
+            for r in ok_results
+            if isinstance(r.get("accept_rate"), (int, float))
+        ]
 
         agg["mean_wall_s"] = round(sum(walls) / len(walls), 3)
         agg["mean_ttft_s"] = round(sum(ttfts) / len(ttfts), 4) if ttfts else None
@@ -1746,6 +1763,10 @@ def _run_bench_suite(
         agg["mean_output_tok_s"] = round(sum(out_tps_list) / len(out_tps_list), 2) if out_tps_list else None
         agg["total_output_tokens"] = sum(out_toks)
         agg["total_prompt_tokens"] = sum(prompt_toks)
+        agg["mean_accept_rate"] = (
+            round(sum(accept_rates) / len(accept_rates), 6)
+            if accept_rates else None
+        )
 
         # Per-bucket aggregation for agent suite
         if suite == "agent":
@@ -1783,11 +1804,72 @@ def _run_bench_suite(
         print(f"  prefill={agg['mean_prefill_tok_s']:.2f} tok/s", end="")
     if agg.get("mean_output_tok_s"):
         print(f"  output={agg['mean_output_tok_s']:.2f} tok/s", end="")
+    if agg.get("mean_accept_rate") is not None:
+        print(f"  accept={agg['mean_accept_rate']:.4f}", end="")
     if n_scored > 0:
         print(f"  accuracy={agg['accuracy']} ({agg['accuracy_pct']}%)", end="")
     print(flush=True)
 
     return agg
+
+
+def _validate_oflash_bench_phase(
+    phase: str,
+    props: Any,
+    when: str,
+) -> None:
+    if not isinstance(props, dict) or not props.get("enabled"):
+        raise SystemExit(f"[bench] OFlash must be enabled for {phase} ({when})")
+    generation = props.get("adapter_generation")
+    if not isinstance(generation, int) or generation < 0:
+        raise SystemExit(f"[bench] invalid OFlash adapter generation ({when})")
+
+    if phase == "adapt":
+        if not props.get("trainer_alive"):
+            raise SystemExit(f"[bench] adaptation requires a live trainer ({when})")
+        if props.get("training_disabled"):
+            raise SystemExit(f"[bench] adaptation trainer is disabled ({when})")
+        return
+
+    if props.get("trainer_alive"):
+        raise SystemExit(f"[bench] frozen held-out evaluation forbids a live trainer ({when})")
+    if phase == "heldout-base" and generation != 0:
+        raise SystemExit(
+            f"[bench] heldout-base requires generation 0, got {generation} ({when})"
+        )
+    if phase == "heldout-adapted" and generation <= 0:
+        raise SystemExit(
+            f"[bench] heldout-adapted requires a promoted generation, got {generation} ({when})"
+        )
+
+
+def _validate_oflash_bench_transition(
+    phase: str,
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> None:
+    before_written = int(before.get("records_written", 0))
+    after_written = int(after.get("records_written", 0))
+    if after_written <= before_written:
+        raise SystemExit(
+            f"[bench] {phase} produced no OFlash capture records; "
+            "confirm speculative DDTree is enabled"
+        )
+    before_dropped = int(before.get("records_dropped", 0))
+    after_dropped = int(after.get("records_dropped", 0))
+    if after_dropped != before_dropped:
+        raise SystemExit(
+            f"[bench] {phase} dropped capture records: "
+            f"{before_dropped} -> {after_dropped}"
+        )
+    if phase.startswith("heldout-"):
+        before_generation = int(before.get("adapter_generation", -1))
+        after_generation = int(after.get("adapter_generation", -2))
+        if before_generation != after_generation:
+            raise SystemExit(
+                "[bench] held-out adapter generation changed during evaluation: "
+                f"{before_generation} -> {after_generation}"
+            )
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
@@ -1813,6 +1895,14 @@ def cmd_bench(args: argparse.Namespace) -> int:
     except Exception as exc:
         raise SystemExit(f"[bench] cannot reach server at {base_url}/health: {exc}") from exc
 
+    oflash_before = None
+    if args.oflash_phase != "none":
+        status, props, _elapsed = http_json("GET", base_url + "/props", timeout=10)
+        if status != 200 or not isinstance(props, dict):
+            raise SystemExit(f"[bench] cannot read {base_url}/props for OFlash phase guard")
+        oflash_before = props.get("oflash")
+        _validate_oflash_bench_phase(args.oflash_phase, oflash_before, "before")
+
     print(f"[bench] url={base_url}  model={model}  suites={','.join(selected)}", flush=True)
 
     all_suites: dict[str, Any] = {}
@@ -1820,6 +1910,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         all_suites[suite] = _run_bench_suite(
             suite, base_url, model, n_sample,
             prompts_dir=Path(args.prompts_dir) if args.prompts_dir else None,
+            max_tokens_override=args.max_tokens,
         )
 
     payload = {
@@ -1830,20 +1921,33 @@ def cmd_bench(args: argparse.Namespace) -> int:
         "ok": all(s.get("n_ok", 0) > 0 for s in all_suites.values()),
     }
 
+    if args.oflash_phase != "none":
+        status, props, _elapsed = http_json("GET", base_url + "/props", timeout=10)
+        if status != 200 or not isinstance(props, dict):
+            raise SystemExit(f"[bench] cannot read final {base_url}/props")
+        oflash_after = props.get("oflash")
+        _validate_oflash_bench_phase(args.oflash_phase, oflash_after, "after")
+        _validate_oflash_bench_transition(args.oflash_phase, oflash_before, oflash_after)
+        payload["oflash_phase"] = args.oflash_phase
+        payload["oflash_before"] = oflash_before
+        payload["oflash_after"] = oflash_after
+
     # Final summary
     print("\n[bench] === SUMMARY ===", flush=True)
     print(f"{'Suite':>8s}  {'OK':>5s}  {'Wall':>7s}  {'TTFT':>7s}  {'Pf tok/s':>9s}  "
-          f"{'Out tok/s':>10s}  {'Out tok':>8s}  {'Score':>10s}", flush=True)
+          f"{'Out tok/s':>10s}  {'Accept':>7s}  {'Out tok':>8s}  {'Score':>10s}", flush=True)
     for suite, s in all_suites.items():
         ok_str = f"{s['n_ok']}/{s['n']}"
         wall_str = f"{s.get('mean_wall_s', 0):.2f}s" if s.get("mean_wall_s") else "-"
         ttft_str = f"{s['mean_ttft_s']:.3f}s" if s.get("mean_ttft_s") else "-"
         pf_str = f"{s['mean_prefill_tok_s']:.2f}" if s.get("mean_prefill_tok_s") else "-"
         out_str = f"{s['mean_output_tok_s']:.2f}" if s.get("mean_output_tok_s") else "-"
+        accept_str = f"{s['mean_accept_rate']:.4f}" if s.get("mean_accept_rate") is not None else "-"
         tok_str = str(s.get("total_output_tokens", 0))
         score_str = s.get("accuracy", "-")
         print(f"{suite:>8s}  {ok_str:>5s}  {wall_str:>7s}  {ttft_str:>7s}  "
-              f"{pf_str:>9s}  {out_str:>10s}  {tok_str:>8s}  {score_str:>10s}", flush=True)
+              f"{pf_str:>9s}  {out_str:>10s}  {accept_str:>7s}  "
+              f"{tok_str:>8s}  {score_str:>10s}", flush=True)
 
     write_json(args.json_out, payload)
     return 0 if payload["ok"] else 1
@@ -1901,8 +2005,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--model", default=MODEL, help="Model name")
     p_bench.add_argument("--n-sample", type=int, default=None,
                          help="Max prompts per suite (default: all)")
+    p_bench.add_argument(
+        "--max-tokens", type=int, default=None,
+        help="Override each case's generation cap (default: use the prompt fixture)",
+    )
     p_bench.add_argument("--prompts-dir", default=None,
                          help="Override prompts directory")
+    p_bench.add_argument(
+        "--oflash-phase",
+        choices=("none", "adapt", "heldout-base", "heldout-adapted"),
+        default="none",
+        help=("Validate OFlash server state for an adaptation or frozen held-out run; "
+              "held-out phases reject a live trainer or generation change"),
+    )
     p_bench.add_argument("--json-out", type=Path, default=None)
     p_bench.set_defaults(func=cmd_bench)
 

@@ -156,6 +156,15 @@ optimizations/oflash/bin/oflash-trainer \
 Go/no-go: **≥ +0.05 α** on a held-out slice of the same distribution. Report: α before/after per
 benchmark, adapter generation used, mirror-vs-engine α gap.
 
+Use `harness/benchmarks/oflash_benchmark.py` for this gate. Its default three-fold split uses the
+repository's HumanEval, GSM8K and Math500 fixtures, trains three independent adapters, and ensures
+that every prompt is held out exactly once. Base and adapted evaluation both run capture-only with
+the trainer stopped, so their comparison does not mix adapter benefit with optimizer interference.
+`harness/client_test_runner.py bench --oflash-phase ...` rejects a live trainer or generation change
+during held-out evaluation and records per-request acceptance and server decode timing. Treat this
+30-prompt cross-validation as a bounded signal; follow it with the full 164-task HumanEval+ quality
+gate and larger domain-specific held-out sets before making a general performance claim.
+
 The disposable Strix trainer passed the accelerator preflight, loaded the dense FP16 mirror in
 22.4 seconds and ran 20 optimizer/export steps. Loss EMA moved from 2.5621 at generation 1 to
 1.8563 at generation 20; the final counters were 3,801 rows, 2,341 labels, zero backlog and zero
