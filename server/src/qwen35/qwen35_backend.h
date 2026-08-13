@@ -26,8 +26,8 @@
 #include "kvflash_pager.h"         // bounded KV residency pool
 #include "kvflash_scorer.h"        // chunk-relevance policy interface
 #include "kvflash_qk.h"            // target-QK scorer (pooled keys + query)
-#include "common/oflash/oflash_config.h"
-#include "common/oflash/oflash_runtime.h"
+#include "common/odistill/odistill_config.h"
+#include "common/odistill/odistill_runtime.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -77,8 +77,8 @@ struct Qwen35Config {
     bool         ddtree_chain_seed = true;
     bool         use_feature_mirror = false;
 
-    // OFlash online drafter adaptation (docs/OFLASH.md).
-    oflash::OFlashConfig oflash;
+    // ODistill online drafter adaptation (docs/ODISTILL.md).
+    odistill::ODistillConfig odistill;
 };
 
 // ── Backend class ───────────────────────────────────────────────────────
@@ -133,10 +133,10 @@ public:
     DFlashTarget * dflash_target() override;
     bool supports_remote_draft() const override { return true; }
 
-    bool oflash_props(oflash::OFlashPropsSnapshot & out) const override {
-        std::lock_guard<std::mutex> lock(oflash_mu_);
-        if (!oflash_) return false;
-        out = oflash_->props();
+    bool odistill_props(odistill::ODistillPropsSnapshot & out) const override {
+        std::lock_guard<std::mutex> lock(odistill_mu_);
+        if (!odistill_) return false;
+        out = odistill_->props();
         return true;
     }
 
@@ -258,11 +258,11 @@ private:
     DraftKvState draft_kv_;
     DFlashDraftIpcClient remote_draft_;
 
-    // ── OFlash online drafter adaptation (docs/OFLASH.md) ────────────
-    // Created in init() when cfg_.oflash.enabled (local qwen35 draft only);
+    // ── ODistill online drafter adaptation (docs/ODISTILL.md) ────────────
+    // Created in init() when cfg_.odistill.enabled (local qwen35 draft only);
     // torn down before the draft weights/backend it references.
-    std::unique_ptr<oflash::OFlashRuntime> oflash_;
-    mutable std::mutex oflash_mu_;
+    std::unique_ptr<odistill::ODistillRuntime> odistill_;
+    mutable std::mutex odistill_mu_;
 
     // ── Prefix cache (snapshots) ─────────────────────────────────────
     static constexpr int PREFIX_SLOTS = 64;
@@ -359,15 +359,15 @@ private:
     bool sync_remote_draft_features(int start_pos, int n_tokens);
     bool sync_local_draft_features(int start_pos, int n_tokens);
 
-    // ── OFlash capture helpers (docs/OFLASH.md §4) ───────────────────
+    // ── ODistill capture helpers (docs/ODISTILL.md §4) ───────────────────
     // Copy one bf16 feature row [n_capture_layers*hidden] for absolute
     // position `pos` out of cache_.target_feat. Caller synchronizes the
     // target backend once before a batch of reads.
-    bool oflash_read_feat_row(int pos, uint16_t * dst) const;
+    bool odistill_read_feat_row(int pos, uint16_t * dst) const;
     // Top-K (ids + log-probs, temperature 1) over the first n_rows columns
     // of sg_.logits — valid only between a verify compute and the next
     // graph build/compute. GPU path with CPU fallback.
-    bool oflash_capture_verify_topk(int n_rows, int K,
+    bool odistill_capture_verify_topk(int n_rows, int K,
                                     std::vector<float> & lp,
                                     std::vector<int32_t> & ids);
 

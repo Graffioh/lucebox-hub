@@ -616,7 +616,7 @@ static std::string build_stall_tool_prefix(const json & tools,
 json build_props_body(const ServerConfig & config,
                       const PrefixCache & prefix_cache,
                       const ToolMemory & tool_memory,
-                      const oflash::OFlashPropsSnapshot * oflash) {
+                      const odistill::ODistillPropsSnapshot * odistill) {
     // arch-gated capabilities (mirrors Python _capabilities()).
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
     const bool reasoning_supported = is_qwen;
@@ -810,27 +810,27 @@ json build_props_body(const ServerConfig & config,
             {"current_entries", tms.current_entries},
             {"current_bytes",   tms.current_bytes},
         }},
-        // OFlash online drafter adaptation (docs/OFLASH.md §6.5). Additive
+        // ODistill online drafter adaptation (docs/ODISTILL.md §6.5). Additive
         // section per props-endpoint.md §5.1 — no props_schema bump. Live
         // counters come from the backend snapshot, not the frozen config.
-        {"oflash", oflash && oflash->enabled
+        {"odistill", odistill && odistill->enabled
             ? json{
                 {"enabled",            true},
-                {"profile",            oflash->profile},
-                {"adapter_generation", oflash->adapter_generation},
-                {"swaps",              oflash->swaps},
-                {"promotes",           oflash->promotes},
-                {"rollbacks",          oflash->rollbacks},
-                {"rolling_al",         oflash->rolling_al},
-                {"probation_al",       oflash->in_probation
-                                           ? json(oflash->probation_al)
+                {"profile",            odistill->profile},
+                {"adapter_generation", odistill->adapter_generation},
+                {"swaps",              odistill->swaps},
+                {"promotes",           odistill->promotes},
+                {"rollbacks",          odistill->rollbacks},
+                {"rolling_al",         odistill->rolling_al},
+                {"probation_al",       odistill->in_probation
+                                           ? json(odistill->probation_al)
                                            : json(nullptr)},
-                {"training_disabled",  oflash->training_disabled},
-                {"trainer_alive",      oflash->trainer_alive},
-                {"steps",              oflash->steps},
-                {"records_written",    oflash->records_written},
-                {"records_dropped",    oflash->records_dropped},
-                {"ring_backlog_bytes", oflash->ring_backlog_bytes},
+                {"training_disabled",  odistill->training_disabled},
+                {"trainer_alive",      odistill->trainer_alive},
+                {"steps",              odistill->steps},
+                {"records_written",    odistill->records_written},
+                {"records_dropped",    odistill->records_dropped},
+                {"ring_backlog_bytes", odistill->ring_backlog_bytes},
               }
             : json{{"enabled", false}}},
         // The C++ daemon is linked in-process; if /props is responding,
@@ -1472,10 +1472,10 @@ void HttpServer::handle_client(SocketHandle fd) {
 
     // Introspection: server config + cache stats + arch + capabilities.
     if (hr.method == "GET" && hr.path == "/props") {
-        oflash::OFlashPropsSnapshot oflash_snap;
-        const bool have_oflash = backend_.oflash_props(oflash_snap);
+        odistill::ODistillPropsSnapshot odistill_snap;
+        const bool have_odistill = backend_.odistill_props(odistill_snap);
         json body = build_props_body(config_, prefix_cache_, tool_memory_,
-                                     have_oflash ? &oflash_snap : nullptr);
+                                     have_odistill ? &odistill_snap : nullptr);
         send_response(fd, 200, "application/json", body.dump() + "\n");
         socket_close(fd);
         return;

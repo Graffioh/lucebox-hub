@@ -1,0 +1,264 @@
+// odistill_ring.cpp — SPSC shared-memory capture ring (engine producer).
+
+#include "odistill_ring.h"
+
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#if !defined(_WIN32)
+#include <dirent.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+namespace dflash::common::odistill {
+
+namespace {
+
+// The header lives in shared memory; cursor accesses must be atomic with
+// the right ordering. std::atomic_ref is C++20, so wrap the primitives.
+#if defined(_WIN32)
+// Shared-memory capture is disabled on Windows. Keep the translation unit
+// MSVC-buildable without GCC's __atomic intrinsics; these fallbacks are
+// unreachable while create() returns false.
+inline uint64_t load_acquire(const uint64_t * p) { return *p; }
+inline uint64_t load_relaxed(const uint64_t * p) { return *p; }
+inline void store_release(uint64_t * p, uint64_t v) { *p = v; }
+inline void add_relaxed(uint64_t * p, uint64_t v) { *p += v; }
+#else
+inline uint64_t load_acquire(const uint64_t * p) {
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+inline uint64_t load_relaxed(const uint64_t * p) {
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
+}
+inline void store_release(uint64_t * p, uint64_t v) {
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
+inline void add_relaxed(uint64_t * p, uint64_t v) {
+    __atomic_fetch_add(p, v, __ATOMIC_RELAXED);
+}
+#endif
+
+constexpr size_t align8(size_t n) { return (n + 7) & ~(size_t)7; }
+
+#if !defined(_WIN32)
+void cleanup_stale_segments() {
+    constexpr const char * prefix = "lucebox-odistill-";
+    constexpr size_t prefix_len = sizeof("lucebox-odistill-") - 1;
+    DIR * dir = ::opendir("/dev/shm");
+    if (!dir) return;
+    while (dirent * ent = ::readdir(dir)) {
+        if (std::strncmp(ent->d_name, prefix, prefix_len) != 0) continue;
+        const char * suffix = ent->d_name + prefix_len;
+        char * end = nullptr;
+        errno = 0;
+        const long pid = std::strtol(suffix, &end, 10);
+        if (errno != 0 || pid <= 0 || !end || *end != '\0' ||
+            pid == (long)::getpid()) continue;
+        errno = 0;
+        if (::kill((pid_t)pid, 0) == -1 && errno == ESRCH) {
+            const std::string shm_name = std::string("/") + ent->d_name;
+            if (::shm_unlink(shm_name.c_str()) == 0) {
+                std::fprintf(stderr, "[odistill] removed stale ring %s\n",
+                             shm_name.c_str());
+            }
+        }
+    }
+    ::closedir(dir);
+}
+#endif
+
+}  // namespace
+
+bool ODistillRing::create(const std::string & name,
+                        uint64_t capacity_bytes,
+                        uint64_t drafter_hash,
+                        uint64_t target_hash,
+                        uint64_t drafter_semantics_hash,
+                        uint32_t n_capture_layers,
+                        uint32_t hidden,
+                        uint32_t block_size,
+                        uint32_t topk,
+                        uint32_t vocab) {
+#if defined(_WIN32)
+    (void)name; (void)capacity_bytes; (void)drafter_hash;
+    (void)target_hash; (void)drafter_semantics_hash;
+    (void)n_capture_layers; (void)hidden; (void)block_size;
+    (void)topk; (void)vocab;
+    return false;
+#else
+    close();
+    cleanup_stale_segments();
+    capacity_bytes = align8(capacity_bytes);
+    if (capacity_bytes < (uint64_t)1 << 20) {
+        std::fprintf(stderr, "[odistill] ring capacity too small (%llu)\n",
+                     (unsigned long long)capacity_bytes);
+        return false;
+    }
+    // A stale segment from a crashed run may linger; recreate cleanly.
+    ::shm_unlink(name.c_str());
+    int fd = ::shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) {
+        std::perror("[odistill] shm_open");
+        return false;
+    }
+    const size_t total = sizeof(ODistillRingHeader) + (size_t)capacity_bytes;
+    if (::ftruncate(fd, (off_t)total) != 0) {
+        std::perror("[odistill] ftruncate");
+        ::close(fd);
+        ::shm_unlink(name.c_str());
+        return false;
+    }
+    // Linux tmpfs ftruncate is sparse: without reserving backing store, a ring
+    // can mmap successfully and SIGBUS the decode thread hours later when
+    // writes exhaust /dev/shm. Fail initialization instead; capture is
+    // optional. Other POSIX hosts do not necessarily provide
+    // posix_fallocate(), so retain their previous mmap behavior.
+#if defined(__linux__)
+    const int alloc_rc = ::posix_fallocate(fd, 0, (off_t)total);
+    if (alloc_rc != 0) {
+        errno = alloc_rc;
+        std::perror("[odistill] posix_fallocate");
+        ::close(fd);
+        ::shm_unlink(name.c_str());
+        return false;
+    }
+#endif
+    void * mapped = ::mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (mapped == MAP_FAILED) {
+        std::perror("[odistill] mmap");
+        ::shm_unlink(name.c_str());
+        return false;
+    }
+
+    hdr_       = static_cast<ODistillRingHeader *>(mapped);
+    data_      = reinterpret_cast<uint8_t *>(mapped) + sizeof(ODistillRingHeader);
+    capacity_  = capacity_bytes;
+    map_bytes_ = total;
+    name_      = name;
+
+    std::memset(hdr_, 0, sizeof(*hdr_));
+    hdr_->capacity         = capacity_bytes;
+    hdr_->data_offset      = sizeof(ODistillRingHeader);
+    hdr_->drafter_hash     = drafter_hash;
+    hdr_->target_hash      = target_hash;
+    hdr_->drafter_semantics_hash = drafter_semantics_hash;
+    hdr_->n_capture_layers = n_capture_layers;
+    hdr_->hidden           = hidden;
+    hdr_->block_size       = block_size;
+    hdr_->topk             = topk;
+    hdr_->vocab            = vocab;
+    hdr_->version          = ODISTILL_RING_VERSION;
+    // Magic last: a consumer that maps mid-init sees magic==0 and waits.
+    __atomic_store_n(&hdr_->magic, ODISTILL_RING_MAGIC, __ATOMIC_RELEASE);
+    return true;
+#endif
+}
+
+void ODistillRing::close() {
+#if !defined(_WIN32)
+    if (hdr_) {
+        ::munmap(hdr_, map_bytes_);
+        ::shm_unlink(name_.c_str());
+    }
+#endif
+    hdr_ = nullptr;
+    data_ = nullptr;
+    capacity_ = 0;
+    map_bytes_ = 0;
+    name_.clear();
+}
+
+uint8_t * ODistillRing::slot(uint64_t logical) const {
+    return data_ + (logical % capacity_);
+}
+
+// Reserve `bytes` of contiguous space. On success `write_at` is the
+// logical offset to write at; a PAD record may have been emitted to skip
+// a too-small buffer tail. Fails (drop) when the consumer is too far
+// behind.
+bool ODistillRing::reserve(size_t bytes, uint64_t & write_at) {
+    const uint64_t head = hdr_->head;  // producer-owned, plain load
+    const uint64_t tail = load_acquire(&hdr_->tail);
+    const uint64_t used = head - tail;
+    uint64_t avail = capacity_ - used;
+
+    const uint64_t to_end = capacity_ - (head % capacity_);
+    uint64_t pad = 0;
+    if (bytes > to_end) {
+        pad = to_end;  // wrap: dead space needs a PAD record
+    }
+    if (pad + bytes > avail) return false;
+
+    if (pad) {
+        // The buffer tail is a multiple of 8 but can be SMALLER than a full
+        // record header; a PAD needs only its first 8 bytes (type + size)
+        // to be skippable, so clamp the write to the space that exists.
+        ODistillRecordHeader ph{};
+        ph.type = ODISTILL_REC_PAD;
+        ph.size_bytes = (uint32_t)pad;
+        std::memcpy(slot(head), &ph,
+                    pad < sizeof(ph) ? (size_t)pad : sizeof(ph));
+        // Not published separately — the consumer sees PAD and the next
+        // record together once the real record's head store lands.
+    }
+    write_at = head + pad;
+    return true;
+}
+
+void ODistillRing::publish(uint64_t new_head) {
+    store_release(&hdr_->head, new_head);
+}
+
+bool ODistillRing::push(ODistillRecordHeader header,
+                      const void * payload, size_t payload_bytes) {
+    return push2(header, payload, payload_bytes, nullptr, 0);
+}
+
+bool ODistillRing::push2(ODistillRecordHeader header,
+                       const void * payload_a, size_t a_bytes,
+                       const void * payload_b, size_t b_bytes) {
+    if (!hdr_) return false;
+    const size_t need = align8(sizeof(header) + a_bytes + b_bytes);
+    // A record larger than half the ring is a config error, not load.
+    if (need > capacity_ / 2) {
+        add_relaxed(&hdr_->dropped_records, 1);
+        add_relaxed(&hdr_->dropped_bytes, need);
+        return false;
+    }
+    uint64_t at = 0;
+    if (!reserve(need, at)) {
+        add_relaxed(&hdr_->dropped_records, 1);
+        add_relaxed(&hdr_->dropped_bytes, need);
+        return false;
+    }
+    header.size_bytes = (uint32_t)need;
+    uint8_t * dst = slot(at);
+    std::memcpy(dst, &header, sizeof(header));
+    if (a_bytes) std::memcpy(dst + sizeof(header), payload_a, a_bytes);
+    if (b_bytes) std::memcpy(dst + sizeof(header) + a_bytes, payload_b, b_bytes);
+    const size_t tail_pad = need - sizeof(header) - a_bytes - b_bytes;
+    if (tail_pad) std::memset(dst + need - tail_pad, 0, tail_pad);
+    publish(at + need);
+    records_written_++;
+    return true;
+}
+
+uint64_t ODistillRing::dropped() const {
+    return hdr_ ? load_relaxed(&hdr_->dropped_records) : 0;
+}
+
+uint64_t ODistillRing::backlog() const {
+    if (!hdr_) return 0;
+    return hdr_->head - load_acquire(&hdr_->tail);
+}
+
+}  // namespace dflash::common::odistill

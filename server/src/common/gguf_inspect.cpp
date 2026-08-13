@@ -259,7 +259,7 @@ bool file_fingerprint(const std::string & path, FileFingerprint & out) {
                    int64_t(st.st_ctimespec.tv_nsec);
 #elif defined(_WIN32)
     // MSVC's stat exposes second-resolution timestamps. Device + inode still
-    // reject normal same-size replacements; OFlash deployments are Linux.
+    // reject normal same-size replacements; ODistill deployments are Linux.
     out.mtime_ns = int64_t(st.st_mtime) * INT64_C(1000000000);
     out.ctime_ns = int64_t(st.st_ctime) * INT64_C(1000000000);
 #else

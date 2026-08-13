@@ -270,24 +270,24 @@ bool Qwen35Backend::init() {
         }
     }
 
-    // OFlash online drafter adaptation (docs/OFLASH.md): local qwen35 draft
+    // ODistill online drafter adaptation (docs/ODISTILL.md): local qwen35 draft
     // only; never fatal — a failed init just serves the static drafter.
-    if (cfg_.oflash.enabled) {
+    if (cfg_.odistill.enabled) {
         if (use_remote_draft || !cfg_.draft_path) {
             std::fprintf(stderr,
-                "[oflash] requires a locally loaded --draft model; disabled\n");
+                "[odistill] requires a locally loaded --draft model; disabled\n");
         } else if (tensor_parallel) {
             std::fprintf(stderr,
-                "[oflash] not supported with tensor-parallel targets; disabled\n");
+                "[odistill] not supported with tensor-parallel targets; disabled\n");
         } else {
-            oflash_ = std::make_unique<oflash::OFlashRuntime>();
-            if (!oflash_->init(cfg_.oflash,
+            odistill_ = std::make_unique<odistill::ODistillRuntime>();
+            if (!odistill_->init(cfg_.odistill,
                                cfg_.target_path ? cfg_.target_path : "",
                                cfg_.draft_path,
                                dw_, draft_backend_, w_.n_capture_layers,
                                w_.n_embd, w_.n_vocab)) {
-                oflash_.reset();
-                std::fprintf(stderr, "[oflash] disabled (init failed)\n");
+                odistill_.reset();
+                std::fprintf(stderr, "[odistill] disabled (init failed)\n");
             }
         }
     }
@@ -585,22 +585,22 @@ bool Qwen35Backend::park(ParkTarget target) {
 
     if (want_draft_model && !draft_parked_) {
         {
-            std::lock_guard<std::mutex> lock(oflash_mu_);
-            if (oflash_) {
+            std::lock_guard<std::mutex> lock(odistill_mu_);
+            if (odistill_) {
                 // Adapter tensors live beside the draft weights; suspend
                 // adaptation while the drafter is parked. Persisted state is
                 // restored when unpark recreates the runtime below.
-                oflash_->shutdown();
-                oflash_.reset();
+                odistill_->shutdown();
+                odistill_.reset();
                 std::fprintf(stderr,
-                    "[oflash] suspended while the draft is parked\n");
+                    "[odistill] suspended while the draft is parked\n");
             }
         }
         if (use_remote_draft) {
             remote_draft_.close();
         } else {
             // Persistent draft-kv graphs retain pointers to draft weights and
-            // OFlash LoRA slots; invalidate them before either buffer dies.
+            // ODistill LoRA slots; invalidate them before either buffer dies.
             draft_kv_free(draft_kv_);
             step_graph_destroy(draft_sg_);
             free_draft_weights(dw_);
@@ -665,18 +665,18 @@ bool Qwen35Backend::unpark(ParkTarget target) {
             if (cfg_.draft_swa_window > 0) {
                 apply_draft_swa_override(dw_, cfg_.draft_swa_window);
             }
-            if (cfg_.oflash.enabled) {
-                std::lock_guard<std::mutex> lock(oflash_mu_);
-                oflash_ = std::make_unique<oflash::OFlashRuntime>();
-                if (!oflash_->init(
-                        cfg_.oflash,
+            if (cfg_.odistill.enabled) {
+                std::lock_guard<std::mutex> lock(odistill_mu_);
+                odistill_ = std::make_unique<odistill::ODistillRuntime>();
+                if (!odistill_->init(
+                        cfg_.odistill,
                         cfg_.target_path ? cfg_.target_path : "",
                         cfg_.draft_path, dw_, draft_backend_,
                         w_.n_capture_layers, w_.n_embd,
                         w_.n_vocab)) {
-                    oflash_.reset();
+                    odistill_.reset();
                     std::fprintf(stderr,
-                        "[oflash] disabled after draft unpark "
+                        "[odistill] disabled after draft unpark "
                         "(init failed)\n");
                 }
             }
@@ -1003,12 +1003,12 @@ DFlashTarget * Qwen35Backend::dflash_target() {
 void Qwen35Backend::shutdown() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
     {
-        std::lock_guard<std::mutex> lock(oflash_mu_);
-        if (oflash_) {
+        std::lock_guard<std::mutex> lock(odistill_mu_);
+        if (odistill_) {
             // Must precede draft weight/backend teardown: the adapter buffer
-            // lives on draft_backend_ and dw_.oflash points into the runtime.
-            oflash_->shutdown();
-            oflash_.reset();
+            // lives on draft_backend_ and dw_.odistill points into the runtime.
+            odistill_->shutdown();
+            odistill_.reset();
         }
     }
     end_paged_sequence();
@@ -2164,9 +2164,9 @@ bool Qwen35Backend::sync_local_draft_features(int start_pos, int n_tokens) {
     return false;
 }
 
-// ── OFlash capture helpers ─────────────────────────────────────────────
+// ── ODistill capture helpers ─────────────────────────────────────────────
 
-bool Qwen35Backend::oflash_read_feat_row(int pos, uint16_t * dst) const {
+bool Qwen35Backend::odistill_read_feat_row(int pos, uint16_t * dst) const {
     if (!cache_.target_feat || cache_.target_feat_cap <= 0 ||
         cache_.target_feat->type != GGML_TYPE_BF16 || pos < 0) {
         return false;
@@ -2180,7 +2180,7 @@ bool Qwen35Backend::oflash_read_feat_row(int pos, uint16_t * dst) const {
     return true;
 }
 
-bool Qwen35Backend::oflash_capture_verify_topk(int n_rows, int K,
+bool Qwen35Backend::odistill_capture_verify_topk(int n_rows, int K,
                                                std::vector<float> & lp,
                                                std::vector<int32_t> & ids) {
     if (!sg_.logits || n_rows <= 0 || K <= 0) return false;
@@ -2189,7 +2189,7 @@ bool Qwen35Backend::oflash_capture_verify_topk(int n_rows, int K,
     lp.assign((size_t)n_rows * K, 0.0f);
     ids.assign((size_t)n_rows * K, 0);
 #ifdef DFLASH27B_HAVE_DRAFT_TOPK
-    // OFlash is disabled on tensor-parallel targets, so sg_.logits->data is
+    // ODistill is disabled on tensor-parallel targets, so sg_.logits->data is
     // a single-device pointer here (no meta-tensor branch needed).
     static const bool kGpuTopk = []() {
         const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
@@ -2293,20 +2293,20 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     out_spec_ran = true;
 
-    // OFlash: request-scoped capture. The RAII guard emits SEQ_END on every
+    // ODistill: request-scoped capture. The RAII guard emits SEQ_END on every
     // exit path so the trainer retires the sequence.
-    struct OFlashReqScope {
-        oflash::OFlashRuntime * o = nullptr;
+    struct ODistillReqScope {
+        odistill::ODistillRuntime * o = nullptr;
         const int * committed = nullptr;
-        ~OFlashReqScope() { if (o) o->on_request_end(*committed); }
-    } oflash_scope;
-    auto oflash_feat_reader = [this](int pos, uint16_t * dst) {
-        return oflash_read_feat_row(pos, dst);
+        ~ODistillReqScope() { if (o) o->on_request_end(*committed); }
+    } odistill_scope;
+    auto odistill_feat_reader = [this](int pos, uint16_t * dst) {
+        return odistill_read_feat_row(pos, dst);
     };
-    if (oflash_) {
-        oflash_->on_request_begin();
-        oflash_scope.o = oflash_.get();
-        oflash_scope.committed = &committed;
+    if (odistill_) {
+        odistill_->on_request_begin();
+        odistill_scope.o = odistill_.get();
+        odistill_scope.committed = &committed;
     }
 
     // Sampled-verify: cache_.last_tok is do_prefill's argmax, and the spec
@@ -2418,29 +2418,29 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
-    // OFlash: backfill the prompt-window features once per request so the
+    // ODistill: backfill the prompt-window features once per request so the
     // trainer's shadow feature window matches what the drafter conditions on
     // (prefill already wrote these rows into cache_.target_feat).
-    if (oflash_ && oflash_->want_context() && cache_.target_feat) {
+    if (odistill_ && odistill_->want_context() && cache_.target_feat) {
         const int n_ctx_rows = std::min(committed,
-            std::min(cache_.target_feat_cap, cfg_.oflash.backfill_rows));
+            std::min(cache_.target_feat_cap, cfg_.odistill.backfill_rows));
         if (n_ctx_rows > 0) {
             ggml_backend_synchronize(target_backend_);
-            oflash_->emit_context(committed - n_ctx_rows, n_ctx_rows,
-                                  oflash_feat_reader);
+            odistill_->emit_context(committed - n_ctx_rows, n_ctx_rows,
+                                  odistill_feat_reader);
         }
     }
 
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
 
-        // OFlash: draft-block boundary — the only point where no draft or
+        // ODistill: draft-block boundary — the only point where no draft or
         // verify attribution is in flight. Apply pending adapter swaps and,
         // whenever adapter tensors changed (swap or guard rollback), reset
         // the drafter's ctx-KV ring: cached rows embed the old wk/wv delta.
-        if (oflash_) {
-            oflash_->maybe_apply_swap();
-            if (oflash_->consume_adapter_dirty() && draft_kv_.gf) {
+        if (odistill_) {
+            odistill_->maybe_apply_swap();
+            if (odistill_->consume_adapter_dirty() && draft_kv_.gf) {
                 draft_kv_reset(draft_kv_);
             }
         }
@@ -2671,21 +2671,21 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             profile_add(profile_verify_s, profile_verify_start);
             target_forwards++;
 
-            // OFlash: per-node top-K must be read before any replay reuses
+            // ODistill: per-node top-K must be read before any replay reuses
             // sg_ and clobbers the logits; spine rows are gathered at emit
             // time. The root token is snapshotted now — last_tok is
             // overwritten before the capture points below.
-            std::vector<float>   oflash_tree_lp;
-            std::vector<int32_t> oflash_tree_ids;
-            const int32_t oflash_tree_root_tok = last_tok;
-            if (oflash_ && oflash_->capture_active() && oflash_->topk() > 0 &&
+            std::vector<float>   odistill_tree_lp;
+            std::vector<int32_t> odistill_tree_ids;
+            const int32_t odistill_tree_root_tok = last_tok;
+            if (odistill_ && odistill_->capture_active() && odistill_->topk() > 0 &&
                 !sampled_verify) {
-                if (!oflash_capture_verify_topk(1 + tree.n_nodes,
-                                                oflash_->topk(),
-                                                oflash_tree_lp,
-                                                oflash_tree_ids)) {
-                    oflash_tree_lp.clear();
-                    oflash_tree_ids.clear();
+                if (!odistill_capture_verify_topk(1 + tree.n_nodes,
+                                                odistill_->topk(),
+                                                odistill_tree_lp,
+                                                odistill_tree_ids)) {
+                    odistill_tree_lp.clear();
+                    odistill_tree_ids.clear();
                 }
             }
 
@@ -2742,27 +2742,27 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
             if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
 
-            // OFlash: one STEP record per tree step, shared by the three
+            // ODistill: one STEP record per tree step, shared by the three
             // commit paths below. n_spine labels cover the accepted path;
             // bonus_tok or a short spine carries the following rejection
             // signal for trainer fresh-sample selection. n_rows may
             // additionally include a committed bonus row whose features are
             // final after that path's rollback/replay + mirror sync.
-            auto oflash_emit_tree_step = [&](int n_spine, int n_rows,
+            auto odistill_emit_tree_step = [&](int n_spine, int n_rows,
                                              int32_t bonus) {
-                if (!oflash_) return;
-                oflash::OFlashStepCapture cap;
+                if (!odistill_) return;
+                odistill::ODistillStepCapture cap;
                 cap.accept_len = n_spine;
                 std::vector<int32_t> sp_draft, sp_target;
                 std::vector<uint8_t> sp_flags;
                 std::vector<float>   sp_lp;
                 std::vector<int32_t> sp_ids;
-                if (oflash_->capture_active() && n_spine > 0) {
+                if (odistill_->capture_active() && n_spine > 0) {
                     sp_draft.resize((size_t)n_spine);
                     sp_target.resize((size_t)n_spine);
                     sp_flags.assign((size_t)n_spine, 1);
-                    const int K = oflash_->topk();
-                    const bool have_topk = !oflash_tree_ids.empty();
+                    const int K = odistill_->topk();
+                    const bool have_topk = !odistill_tree_ids.empty();
                     if (have_topk) {
                         sp_lp.resize((size_t)n_spine * K);
                         sp_ids.resize((size_t)n_spine * K);
@@ -2770,17 +2770,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     for (int i = 0; i < n_spine; i++) {
                         const int dfs = accepted[(size_t)i];
                         sp_draft[(size_t)i]  = (dfs == 0)
-                            ? oflash_tree_root_tok
+                            ? odistill_tree_root_tok
                             : tree.token_ids[dfs - 1];
                         sp_target[(size_t)i] = sampled_verify
                             ? sampled_tree_target[(size_t)dfs]
                             : posterior[(size_t)dfs];
                         if (have_topk) {
                             std::memcpy(sp_ids.data() + (size_t)i * K,
-                                        oflash_tree_ids.data() + (size_t)dfs * K,
+                                        odistill_tree_ids.data() + (size_t)dfs * K,
                                         (size_t)K * sizeof(int32_t));
                             std::memcpy(sp_lp.data() + (size_t)i * K,
-                                        oflash_tree_lp.data() + (size_t)dfs * K,
+                                        odistill_tree_lp.data() + (size_t)dfs * K,
                                         (size_t)K * sizeof(float));
                         }
                     }
@@ -2797,7 +2797,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     }
                     ggml_backend_synchronize(target_backend_);
                 }
-                oflash_->emit_step(cap, oflash_feat_reader);
+                odistill_->emit_step(cap, odistill_feat_reader);
             };
 
             if (!sampled_verify) {
@@ -2830,7 +2830,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     }
 
                     // Bonus deferred to the next step's root — not committed.
-                    oflash_emit_tree_step(accepted_emitted, accepted_emitted,
+                    odistill_emit_tree_step(accepted_emitted, accepted_emitted,
                                           /*bonus=*/-1);
 
                     committed   += accepted_emitted;
@@ -2893,7 +2893,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     }
                 }
 
-                oflash_emit_tree_step(accepted_emitted, total_emitted,
+                odistill_emit_tree_step(accepted_emitted, total_emitted,
                                       can_commit_bonus ? next_token : -1);
 
                 committed   += total_emitted;
@@ -2969,7 +2969,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
             // Labels are the sampled-accepted spine (posterior = per-node
             // argmax); no top-K in the sampled tree path.
-            oflash_emit_tree_step(accepted_emitted, total_emitted,
+            odistill_emit_tree_step(accepted_emitted, total_emitted,
                                   can_commit_bonus ? next_token : -1);
 
             committed   += total_emitted;
@@ -3106,16 +3106,16 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             if (commit_n <= accept_n) bonus_tok = -1;
         }
 
-        // OFlash: materialize verify top-K now — sg_.logits is only valid
+        // ODistill: materialize verify top-K now — sg_.logits is only valid
         // until the next graph build/compute (the replay verify below reuses
         // the same step graph).
-        std::vector<float>   oflash_topk_lp;
-        std::vector<int32_t> oflash_topk_ids;
-        if (oflash_ && oflash_->capture_active() && oflash_->topk() > 0) {
-            if (!oflash_capture_verify_topk(q_len, oflash_->topk(),
-                                            oflash_topk_lp, oflash_topk_ids)) {
-                oflash_topk_lp.clear();
-                oflash_topk_ids.clear();
+        std::vector<float>   odistill_topk_lp;
+        std::vector<int32_t> odistill_topk_ids;
+        if (odistill_ && odistill_->capture_active() && odistill_->topk() > 0) {
+            if (!odistill_capture_verify_topk(q_len, odistill_->topk(),
+                                            odistill_topk_lp, odistill_topk_ids)) {
+                odistill_topk_lp.clear();
+                odistill_topk_ids.clear();
             }
         }
 
@@ -3197,34 +3197,34 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // Capture only after the emit phase decides the exact committed
         // prefix. This avoids phantom rows after EOS/cancel and lets policy
         // overrides replay their final features before the ring reads them.
-        auto emit_oflash_chain = [&](int n_rows, bool labels_valid) {
-            if (!oflash_) return;
-            oflash::OFlashStepCapture cap;
+        auto emit_odistill_chain = [&](int n_rows, bool labels_valid) {
+            if (!odistill_) return;
+            odistill::ODistillStepCapture cap;
             cap.pos = step_pos;
             cap.n_rows = n_rows;
             cap.accept_len = std::min(accept_n, n_rows);
-            std::vector<uint8_t> oflash_flags;
-            if (oflash_->capture_active() && labels_valid) {
-                oflash_flags.assign((size_t)q_len, 0);
+            std::vector<uint8_t> odistill_flags;
+            if (odistill_->capture_active() && labels_valid) {
+                odistill_flags.assign((size_t)q_len, 0);
                 for (int i = 0; i < accept_n && i < q_len; i++) {
-                    oflash_flags[(size_t)i] = 1;
+                    odistill_flags[(size_t)i] = 1;
                 }
                 cap.block = q_len;
                 cap.draft_tok = draft_tok.data();
                 cap.target_tok = sampled_verify
                     ? sampled_target_tok.data() : target_tok.data();
-                cap.accept_flags = oflash_flags.data();
+                cap.accept_flags = odistill_flags.data();
                 cap.bonus_tok =
                     bonus_tok >= 0 && n_rows > accept_n &&
                     replay_tok[(size_t)accept_n] == bonus_tok
                         ? bonus_tok : -1;
-                if (!oflash_topk_ids.empty()) {
-                    cap.topk_lp  = oflash_topk_lp.data();
-                    cap.topk_ids = oflash_topk_ids.data();
+                if (!odistill_topk_ids.empty()) {
+                    cap.topk_lp  = odistill_topk_lp.data();
+                    cap.topk_ids = odistill_topk_ids.data();
                 }
                 ggml_backend_synchronize(target_backend_);
             }
-            oflash_->emit_step(cap, oflash_feat_reader);
+            odistill_->emit_step(cap, odistill_feat_reader);
         };
 
         // 8. Emit committed tokens (stop at EOS)
@@ -3371,7 +3371,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         n_draft_steps++;
 
         if (!budget_close_fired) {
-            emit_oflash_chain(emitted, /*labels_valid=*/true);
+            emit_odistill_chain(emitted, /*labels_valid=*/true);
         }
 
         // Notify observer with accepted tokens for this step.
@@ -3425,7 +3425,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
             // The first mirror sync above reflected the pre-policy replay.
             // A forced close token changes that row, so refresh the exact
-            // emitted prefix before OFlash captures its final features.
+            // emitted prefix before ODistill captures its final features.
             if (emitted > 0) {
                 if (use_remote_draft && cache_.target_feat) {
                     if (!sync_remote_draft_features(step_pos, emitted)) {
@@ -3441,7 +3441,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
             committed = step_pos + emitted;
             cache_.cur_pos = committed;
-            emit_oflash_chain(emitted, !budget_token_overridden);
+            emit_odistill_chain(emitted, !budget_token_overridden);
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
             const int total_draft_pos = std::max(1, n_draft_steps * q_len);

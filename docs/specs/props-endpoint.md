@@ -478,10 +478,10 @@ configuration drift between runs is possible.
 - `draft_device` — resolved draft-model device placement, or
   `null` when no draft model is loaded.
 
-### 4.17 `oflash`
+### 4.17 `odistill`
 
 ```json
-"oflash": {
+"odistill": {
   "enabled":            true,
   "profile":            "default",
   "adapter_generation": 4,
@@ -499,8 +499,8 @@ configuration drift between runs is possible.
 }
 ```
 
-Online drafter adaptation (server/docs/OFLASH.md §6.5). `{"enabled":
-false}` (single key) when `--oflash` is off or the backend does not
+Online drafter adaptation (server/docs/ODISTILL.md §6.5). `{"enabled":
+false}` (single key) when `--odistill` is off or the backend does not
 support it. Live counters come from a lock-free backend snapshot, not
 the startup-frozen config: `rolling_al` is the acceptance guard's
 baseline mean accepted length (tokens per verify step, incl. the

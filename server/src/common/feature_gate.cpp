@@ -53,34 +53,34 @@ std::string check_feature_compatibility(
         return "--prefill-compression requires --prefill-drafter";
     }
 
-    // ── OFlash (online drafter adaptation) prerequisites
-    if (features.oflash_aux_options_set && !features.oflash_requested) {
-        return "--oflash-* options require the --oflash master switch";
+    // ── ODistill (online drafter adaptation) prerequisites
+    if (features.odistill_aux_options_set && !features.odistill_requested) {
+        return "--odistill-* options require the --odistill master switch";
     }
-    if (features.oflash_requested) {
+    if (features.odistill_requested) {
         if (arch != "qwen35") {
-            return "--oflash is qwen35-only in this iteration (arch=" +
+            return "--odistill is qwen35-only in this iteration (arch=" +
                    arch + ")";
         }
         if (args.draft_path == nullptr) {
-            return "--oflash requires a --draft model (it adapts the DFlash "
+            return "--odistill requires a --draft model (it adapts the DFlash "
                    "drafter)";
         }
         if (args.remote_draft.enabled()) {
-            return "--oflash requires a locally loaded drafter "
+            return "--odistill requires a locally loaded drafter "
                    "(incompatible with --draft-ipc-bin)";
         }
         if (features.pflash_enabled) {
-            return "--oflash is incompatible with prefill compression: "
+            return "--odistill is incompatible with prefill compression: "
                    "PFlash parks the adapted drafter";
         }
         if (features.request_scoped_draft_residency) {
-            return "--oflash requires persistent draft residency "
+            return "--odistill requires persistent draft residency "
                    "(incompatible with --lazy-draft / request-scoped)";
         }
         if (args.device.is_layer_split() ||
             args.device.split_mode == TargetSplitMode::Tensor) {
-            return "--oflash currently requires single-device target "
+            return "--odistill currently requires single-device target "
                    "placement";
         }
     }

@@ -1616,7 +1616,7 @@ def _run_bench_case(
     status = 0
     # Per-delta arrival times relative to t0. The server emits one SSE chunk
     # per committed visible token, so these recover decode tok/s as a
-    # function of decode-step index / wall-clock (OFLASH.md §10). Timestamp
+    # function of decode-step index / wall-clock (ODISTILL.md §10). Timestamp
     # is taken before json parsing to minimize client-side skew.
     token_times_s: list[float] = []
 
@@ -1678,8 +1678,8 @@ def _run_bench_case(
 
     # Windowed decode speed over visible-token arrivals: tok/s for each
     # consecutive window of 32 deltas — the client-observable curve for
-    # OFlash within-session speedup claims (server-side truth lives in the
-    # capture ring / /props.oflash).
+    # ODistill within-session speedup claims (server-side truth lives in the
+    # capture ring / /props.odistill).
     decode_tok_s_by_window: list[float] = []
     win = 32
     for i in range(win, len(token_times_s), win):
@@ -1867,16 +1867,16 @@ def _run_bench_suite(
     return agg
 
 
-def _validate_oflash_bench_phase(
+def _validate_odistill_bench_phase(
     phase: str,
     props: Any,
     when: str,
 ) -> None:
     if not isinstance(props, dict) or not props.get("enabled"):
-        raise SystemExit(f"[bench] OFlash must be enabled for {phase} ({when})")
+        raise SystemExit(f"[bench] ODistill must be enabled for {phase} ({when})")
     generation = props.get("adapter_generation")
     if not isinstance(generation, int) or generation < 0:
-        raise SystemExit(f"[bench] invalid OFlash adapter generation ({when})")
+        raise SystemExit(f"[bench] invalid ODistill adapter generation ({when})")
 
     if phase == "adapt":
         if not props.get("trainer_alive"):
@@ -1897,7 +1897,7 @@ def _validate_oflash_bench_phase(
         )
 
 
-def _validate_oflash_bench_transition(
+def _validate_odistill_bench_transition(
     phase: str,
     before: dict[str, Any],
     after: dict[str, Any],
@@ -1906,7 +1906,7 @@ def _validate_oflash_bench_transition(
     after_written = int(after.get("records_written", 0))
     if after_written <= before_written:
         raise SystemExit(
-            f"[bench] {phase} produced no OFlash capture records; "
+            f"[bench] {phase} produced no ODistill capture records; "
             "confirm speculative DDTree is enabled"
         )
     before_dropped = int(before.get("records_dropped", 0))
@@ -1949,18 +1949,18 @@ def cmd_bench(args: argparse.Namespace) -> int:
     except Exception as exc:
         raise SystemExit(f"[bench] cannot reach server at {base_url}/health: {exc}") from exc
 
-    oflash_before = None
-    if args.oflash_phase != "none":
+    odistill_before = None
+    if args.odistill_phase != "none":
         status, props, _elapsed = http_json("GET", base_url + "/props", timeout=10)
         if status != 200 or not isinstance(props, dict):
-            raise SystemExit(f"[bench] cannot read {base_url}/props for OFlash phase guard")
-        oflash_before = props.get("oflash")
-        _validate_oflash_bench_phase(args.oflash_phase, oflash_before, "before")
+            raise SystemExit(f"[bench] cannot read {base_url}/props for ODistill phase guard")
+        odistill_before = props.get("odistill")
+        _validate_odistill_bench_phase(args.odistill_phase, odistill_before, "before")
 
     print(f"[bench] url={base_url}  model={model}  suites={','.join(selected)}", flush=True)
 
     all_suites: dict[str, Any] = {}
-    stream_responses = args.oflash_phase == "none"
+    stream_responses = args.odistill_phase == "none"
     for suite in selected:
         all_suites[suite] = _run_bench_suite(
             suite, base_url, model, n_sample,
@@ -1978,16 +1978,16 @@ def cmd_bench(args: argparse.Namespace) -> int:
         "ok": all(s.get("n_ok", 0) > 0 for s in all_suites.values()),
     }
 
-    if args.oflash_phase != "none":
+    if args.odistill_phase != "none":
         status, props, _elapsed = http_json("GET", base_url + "/props", timeout=10)
         if status != 200 or not isinstance(props, dict):
             raise SystemExit(f"[bench] cannot read final {base_url}/props")
-        oflash_after = props.get("oflash")
-        _validate_oflash_bench_phase(args.oflash_phase, oflash_after, "after")
-        _validate_oflash_bench_transition(args.oflash_phase, oflash_before, oflash_after)
-        payload["oflash_phase"] = args.oflash_phase
-        payload["oflash_before"] = oflash_before
-        payload["oflash_after"] = oflash_after
+        odistill_after = props.get("odistill")
+        _validate_odistill_bench_phase(args.odistill_phase, odistill_after, "after")
+        _validate_odistill_bench_transition(args.odistill_phase, odistill_before, odistill_after)
+        payload["odistill_phase"] = args.odistill_phase
+        payload["odistill_before"] = odistill_before
+        payload["odistill_after"] = odistill_after
 
     # Final summary
     print("\n[bench] === SUMMARY ===", flush=True)
@@ -2069,10 +2069,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--prompts-dir", default=None,
                          help="Override prompts directory")
     p_bench.add_argument(
-        "--oflash-phase",
+        "--odistill-phase",
         choices=("none", "adapt", "heldout-base", "heldout-adapted"),
         default="none",
-        help=("Validate OFlash server state for an adaptation or frozen held-out run; "
+        help=("Validate ODistill server state for an adaptation or frozen held-out run; "
               "held-out phases reject a live trainer or generation change"),
     )
     p_bench.add_argument("--json-out", type=Path, default=None)

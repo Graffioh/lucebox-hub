@@ -4666,8 +4666,8 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
 }
 
-TEST_CASE(ServerUnitFixture, test_props_oflash_shape) {
-    // /props.oflash (docs/OFLASH.md §6.5): additive section, so no
+TEST_CASE(ServerUnitFixture, test_props_odistill_shape) {
+    // /props.odistill (docs/ODISTILL.md §6.5): additive section, so no
     // props_schema bump. enabled=false without a snapshot; full counter set
     // when the backend supplies one.
     ServerConfig cfg = make_props_config_with_sidecar(json{
@@ -4681,12 +4681,12 @@ TEST_CASE(ServerUnitFixture, test_props_oflash_shape) {
     ToolMemory   tm;
 
     json body = build_props_body(cfg, pc, tm);
-    TEST_ASSERT(body.contains("oflash"));
-    TEST_ASSERT(body["oflash"]["enabled"].get<bool>() == false);
+    TEST_ASSERT(body.contains("odistill"));
+    TEST_ASSERT(body["odistill"]["enabled"].get<bool>() == false);
     // Additive section: schema stays at 2 (props-endpoint.md §5.1).
     TEST_ASSERT(body["server"]["props_schema"].get<int>() == 2);
 
-    oflash::OFlashPropsSnapshot snap;
+    odistill::ODistillPropsSnapshot snap;
     snap.enabled = true;
     snap.profile = "coding";
     snap.adapter_generation = 4;
@@ -4702,7 +4702,7 @@ TEST_CASE(ServerUnitFixture, test_props_oflash_shape) {
     snap.records_dropped = 3;
     snap.ring_backlog_bytes = 4096;
     body = build_props_body(cfg, pc, tm, &snap);
-    const json & of = body["oflash"];
+    const json & of = body["odistill"];
     TEST_ASSERT(of["enabled"].get<bool>() == true);
     TEST_ASSERT(of["profile"].get<std::string>() == "coding");
     TEST_ASSERT(of["adapter_generation"].get<uint64_t>() == 4);
@@ -4718,8 +4718,8 @@ TEST_CASE(ServerUnitFixture, test_props_oflash_shape) {
     snap.in_probation = true;
     snap.probation_al = 0.0;
     body = build_props_body(cfg, pc, tm, &snap);
-    TEST_ASSERT(body["oflash"]["probation_al"].is_number());
-    TEST_ASSERT(body["oflash"]["probation_al"].get<double>() == 0.0);
+    TEST_ASSERT(body["odistill"]["probation_al"].is_number());
+    TEST_ASSERT(body["odistill"]["probation_al"].get<double>() == 0.0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

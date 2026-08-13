@@ -9,7 +9,7 @@
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
 #include "prefill_attention_mode.h"
-#include "common/oflash/oflash_config.h"
+#include "common/odistill/odistill_config.h"
 
 namespace dflash::common {
 
@@ -21,10 +21,10 @@ struct BackendFeatureConfig {
     bool pflash_enabled = false;
     bool pflash_drafter_configured = false;
 
-    // --oflash online drafter adaptation (qwen35 + local draft only; the
+    // --odistill online drafter adaptation (qwen35 + local draft only; the
     // admission gate rejects unsupported combinations).
-    bool oflash_requested = false;
-    bool oflash_aux_options_set = false;
+    bool odistill_requested = false;
+    bool odistill_aux_options_set = false;
     bool request_scoped_draft_residency = false;
 
     // MoE-only server features. Recorded here so the gate can report them as
@@ -78,8 +78,8 @@ struct BackendArgs {
     int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
 
-    // OFlash online drafter adaptation (docs/OFLASH.md; qwen35 only).
-    oflash::OFlashConfig oflash;
+    // ODistill online drafter adaptation (docs/ODISTILL.md; qwen35 only).
+    odistill::ODistillConfig odistill;
 };
 
 }  // namespace dflash::common

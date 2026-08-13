@@ -106,30 +106,30 @@ checks.
 
 ---
 
-## OFlash online-distillation benchmark
+## ODistill online-distillation benchmark
 
 Do not evaluate an adapter on prompts that were present in its capture stream.
-`oflash_benchmark.py` creates deterministic suite-stratified folds from the
+`odistill_benchmark.py` creates deterministic suite-stratified folds from the
 existing HumanEval, GSM8K and Math500 prompt files. With the default three
 folds, each adapter trains on two-thirds of every suite and is evaluated on the
 unseen third; every prompt is held out exactly once across the three adapters.
 
 ```bash
-python3 harness/benchmarks/oflash_benchmark.py prepare \
-  --out-dir /tmp/oflash-bench/folds --folds 3 --seed oflash-v1
+python3 harness/benchmarks/odistill_benchmark.py prepare \
+  --out-dir /tmp/odistill-bench/folds --folds 3 --seed odistill-v1
 ```
 
-For each fold, use fresh server processes and a unique OFlash store. Disable
+For each fold, use fresh server processes and a unique ODistill store. Disable
 prefix caches in every arm. The three relevant arms are:
 
-1. **Frozen base:** Q4 drafter, OFlash capture enabled, no trainer, generation
-   zero. Run `fold-N/heldout` with `--oflash-phase heldout-base`.
+1. **Frozen base:** Q4 drafter, ODistill capture enabled, no trainer, generation
+   zero. Run `fold-N/heldout` with `--odistill-phase heldout-base`.
 2. **Adaptation:** a different fresh store, trainer enabled. Run only
    `fold-N/adapt`, repeating it as needed until a generation is promoted. Never
    run held-out prompts in this process.
 3. **Frozen adapted:** stop the adaptation server, restart the same store
    without a trainer, and run `fold-N/heldout` with
-   `--oflash-phase heldout-adapted`.
+   `--odistill-phase heldout-adapted`.
 
 The phase guard reads `/props`: adaptation requires a live trainer, while both
 held-out phases reject a live trainer. It also rejects an adapter-generation
@@ -139,56 +139,56 @@ change, missing capture data, or newly dropped capture records. For example:
 # Frozen generation-zero server, using a clean baseline store:
 python3 harness/client_test_runner.py bench \
   --url http://127.0.0.1:18080 --suite he,gsm,math \
-  --prompts-dir /tmp/oflash-bench/folds/fold-0/heldout \
+  --prompts-dir /tmp/odistill-bench/folds/fold-0/heldout \
   --max-tokens 512 \
-  --oflash-phase heldout-base \
-  --json-out /tmp/oflash-bench/fold-0-base.json
+  --odistill-phase heldout-base \
+  --json-out /tmp/odistill-bench/fold-0-base.json
 
 # Trainer-enabled server, using only adaptation prompts. Repeat this command
 # for additional epochs; retain every epoch report.
 python3 harness/client_test_runner.py bench \
   --url http://127.0.0.1:18080 --suite he,gsm,math \
-  --prompts-dir /tmp/oflash-bench/folds/fold-0/adapt \
+  --prompts-dir /tmp/odistill-bench/folds/fold-0/adapt \
   --max-tokens 512 \
-  --oflash-phase adapt \
-  --json-out /tmp/oflash-bench/fold-0-adapt-epoch-1.json
+  --odistill-phase adapt \
+  --json-out /tmp/odistill-bench/fold-0-adapt-epoch-1.json
 
-# Restart the adaptation store without --oflash-trainer-bin, confirm the
+# Restart the adaptation store without --odistill-trainer-bin, confirm the
 # promoted generation warm-started, then evaluate the untouched prompts:
 python3 harness/client_test_runner.py bench \
   --url http://127.0.0.1:18080 --suite he,gsm,math \
-  --prompts-dir /tmp/oflash-bench/folds/fold-0/heldout \
+  --prompts-dir /tmp/odistill-bench/folds/fold-0/heldout \
   --max-tokens 512 \
-  --oflash-phase heldout-adapted \
-  --json-out /tmp/oflash-bench/fold-0-adapted.json
+  --odistill-phase heldout-adapted \
+  --json-out /tmp/odistill-bench/fold-0-adapted.json
 
-python3 harness/benchmarks/oflash_benchmark.py compare \
-  --baseline /tmp/oflash-bench/fold-0-base.json \
-  --candidate /tmp/oflash-bench/fold-0-adapted.json \
-  --json-out /tmp/oflash-bench/fold-0-compare.json \
-  --md-out /tmp/oflash-bench/fold-0-compare.md
+python3 harness/benchmarks/odistill_benchmark.py compare \
+  --baseline /tmp/odistill-bench/fold-0-base.json \
+  --candidate /tmp/odistill-bench/fold-0-adapted.json \
+  --json-out /tmp/odistill-bench/fold-0-compare.json \
+  --md-out /tmp/odistill-bench/fold-0-compare.md
 
 # Repeat each frozen arm once. This gates deterministic output and acceptance
 # while reporting (but not failing on) ordinary timing variation:
-python3 harness/benchmarks/oflash_benchmark.py repeat \
-  --first /tmp/oflash-bench/fold-0-adapted.json \
-  --second /tmp/oflash-bench/fold-0-adapted-repeat.json \
-  --json-out /tmp/oflash-bench/fold-0-adapted-repeat-check.json
+python3 harness/benchmarks/odistill_benchmark.py repeat \
+  --first /tmp/odistill-bench/fold-0-adapted.json \
+  --second /tmp/odistill-bench/fold-0-adapted-repeat.json \
+  --json-out /tmp/odistill-bench/fold-0-adapted-repeat-check.json
 ```
 
 After all three folds, pool the disjoint held-out reports (repeat the paired
 arguments for folds 1 and 2):
 
 ```bash
-python3 harness/benchmarks/oflash_benchmark.py pool \
-  --baseline /tmp/oflash-bench/fold-0-base.json \
-  --candidate /tmp/oflash-bench/fold-0-adapted.json \
-  --baseline /tmp/oflash-bench/fold-1-base.json \
-  --candidate /tmp/oflash-bench/fold-1-adapted.json \
-  --baseline /tmp/oflash-bench/fold-2-base.json \
-  --candidate /tmp/oflash-bench/fold-2-adapted.json \
-  --json-out /tmp/oflash-bench/pooled.json \
-  --md-out /tmp/oflash-bench/pooled.md
+python3 harness/benchmarks/odistill_benchmark.py pool \
+  --baseline /tmp/odistill-bench/fold-0-base.json \
+  --candidate /tmp/odistill-bench/fold-0-adapted.json \
+  --baseline /tmp/odistill-bench/fold-1-base.json \
+  --candidate /tmp/odistill-bench/fold-1-adapted.json \
+  --baseline /tmp/odistill-bench/fold-2-base.json \
+  --candidate /tmp/odistill-bench/fold-2-adapted.json \
+  --json-out /tmp/odistill-bench/pooled.json \
+  --md-out /tmp/odistill-bench/pooled.md
 ```
 
 Pooling rejects duplicate held-out case IDs, which catches accidental fold
@@ -205,9 +205,9 @@ An optional target-only autoregressive report over the identical held-out cases
 can be supplied with `--target-reference`; any adapted/reference mismatch then
 fails as well.
 
-OFlash phases use non-streaming chat responses because that response's
+ODistill phases use non-streaming chat responses because that response's
 `usage` object currently carries `accept_rate`; ordinary `bench` runs remain
-streaming for client-observed TTFT. Frozen OFlash reports therefore record
+streaming for client-observed TTFT. Frozen ODistill reports therefore record
 server prefill/decode timings but leave client TTFT unset.
 
 The 30 short HumanEval/GSM8K/Math500 prompts are suitable for a bounded first

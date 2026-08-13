@@ -40,16 +40,16 @@
 
 namespace dflash::common {
 
-namespace oflash {
+namespace odistill {
 
-// OFlash LoRA delta: y = W@x + scale * B@(A@x). Skipped entirely (identical
-// graph to pre-OFlash builds) when no pair is attached. Declared in
-// common/oflash/oflash_lora.h; lives here so all draft graph construction
+// ODistill LoRA delta: y = W@x + scale * B@(A@x). Skipped entirely (identical
+// graph to pre-ODistill builds) when no pair is attached. Declared in
+// common/odistill/odistill_lora.h; lives here so all draft graph construction
 // stays in this TU.
-ggml_tensor * oflash_lora_mm(ggml_context * ctx,
+ggml_tensor * odistill_lora_mm(ggml_context * ctx,
                              ggml_tensor * w,
                              ggml_tensor * x,
-                             const OFlashLoraPair * pair,
+                             const ODistillLoraPair * pair,
                              float scale) {
     ggml_tensor * y = ggml_mul_mat(ctx, w, x);
     if (!pair || !pair->a || !pair->b) return y;
@@ -57,11 +57,11 @@ ggml_tensor * oflash_lora_mm(ggml_context * ctx,
     return ggml_add(ctx, y, ggml_scale(ctx, delta, scale));
 }
 
-}  // namespace oflash
+}  // namespace odistill
 
-using oflash::oflash_lora_mm;
-using oflash::OFlashLoraLayer;
-using oflash::OFlashLoraPair;
+using odistill::odistill_lora_mm;
+using odistill::ODistillLoraLayer;
+using odistill::ODistillLoraPair;
 
 // Feature fusion shared by the legacy one-shot graph and the cached-KV
 // builders: optional per-capture RMSNorm slices, fc projection, hidden_norm.
@@ -89,8 +89,8 @@ static ggml_tensor * draft_fuse_features(
         }
         thc = aux_cat;
     }
-    ggml_tensor * target_feat = oflash_lora_mm(ctx, w.fc, thc,
-        w.oflash ? &w.oflash->fc : nullptr, w.oflash ? w.oflash->scale : 0.0f);
+    ggml_tensor * target_feat = odistill_lora_mm(ctx, w.fc, thc,
+        w.odistill ? &w.odistill->fc : nullptr, w.odistill ? w.odistill->scale : 0.0f);
     target_feat = ggml_rms_norm(ctx, target_feat, eps);
     target_feat = ggml_mul    (ctx, target_feat, w.hidden_norm);
     return target_feat;
@@ -133,8 +133,8 @@ DraftGraphOutputs build_draft_graph(
 
     for (int il = 0; il < w.n_layer; il++) {
         const DraftLayer & L = w.layers[il];
-        const OFlashLoraLayer * ol = w.oflash ? &w.oflash->layers[il] : nullptr;
-        const float lsc = w.oflash ? w.oflash->scale : 0.0f;
+        const ODistillLoraLayer * ol = w.odistill ? &w.odistill->layers[il] : nullptr;
+        const float lsc = w.odistill ? w.odistill->scale : 0.0f;
         char probe_name[64];
 
         // ── SWA: determine effective context for this layer
@@ -153,7 +153,7 @@ DraftGraphOutputs build_draft_graph(
 
             // ── 2b. Q from noise only, then per-head RMSNorm
             //     wq: [hidden, q_dim=4096]
-            ggml_tensor * Q = oflash_lora_mm(ctx, L.wq, hn,
+            ggml_tensor * Q = odistill_lora_mm(ctx, L.wq, hn,
                 ol ? &ol->wq : nullptr, lsc);  // [q_dim, q_len, 1]
             Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, q_len);  // [head_dim, n_head, q_len]
             Q = ggml_rms_norm(ctx, Q, eps);                        // normalize along head_dim
@@ -176,15 +176,15 @@ DraftGraphOutputs build_draft_graph(
                 tf_kv = ggml_rms_norm(ctx, tf_kv, eps);
                 tf_kv = ggml_mul(ctx, tf_kv, L.attn_norm);
             }
-            // OFlash: the k/v LoRA wraps BOTH activations (ctx features and
+            // ODistill: the k/v LoRA wraps BOTH activations (ctx features and
             // noise) — training sees one wk', drafting must too.
-            ggml_tensor * Kctx = oflash_lora_mm(ctx, L.wk, tf_kv,
+            ggml_tensor * Kctx = odistill_lora_mm(ctx, L.wk, tf_kv,
                 ol ? &ol->wk : nullptr, lsc);  // [kv_dim, eff_ctx, 1]
-            ggml_tensor * Kn   = oflash_lora_mm(ctx, L.wk, hn,
+            ggml_tensor * Kn   = odistill_lora_mm(ctx, L.wk, hn,
                 ol ? &ol->wk : nullptr, lsc);  // [kv_dim, q_len,   1]
-            ggml_tensor * Vctx = oflash_lora_mm(ctx, L.wv, tf_kv,
+            ggml_tensor * Vctx = odistill_lora_mm(ctx, L.wv, tf_kv,
                 ol ? &ol->wv : nullptr, lsc);
-            ggml_tensor * Vn   = oflash_lora_mm(ctx, L.wv, hn,
+            ggml_tensor * Vn   = odistill_lora_mm(ctx, L.wv, hn,
                 ol ? &ol->wv : nullptr, lsc);
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_Kctx", il);
             ggml_set_name(Kctx, probe_name);
@@ -267,7 +267,7 @@ DraftGraphOutputs build_draft_graph(
 
             // ── 2g. Output projection + residual
             //     wo: [q_dim, hidden]  (ne[0]=q_dim, ne[1]=hidden)
-            ggml_tensor * attn_out = oflash_lora_mm(ctx, L.wo, attn,
+            ggml_tensor * attn_out = odistill_lora_mm(ctx, L.wo, attn,
                 ol ? &ol->wo : nullptr, lsc);  // [hidden, q_len]
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_attn_out", il);
             ggml_set_name(attn_out, probe_name);
@@ -286,10 +286,10 @@ DraftGraphOutputs build_draft_graph(
             //     w_down:       [intermediate, hidden]
             ggml_tensor * g  = ggml_mul_mat(ctx, L.w_gate, hf);  // [inter, q_len]
             g = ggml_silu(ctx, g);
-            ggml_tensor * u  = oflash_lora_mm(ctx, L.w_up, hf,
+            ggml_tensor * u  = odistill_lora_mm(ctx, L.w_up, hf,
                 ol ? &ol->w_up : nullptr, lsc);  // [inter, q_len]
             ggml_tensor * gu = ggml_mul(ctx, g, u);
-            ggml_tensor * ffn_out = oflash_lora_mm(ctx, L.w_down, gu,
+            ggml_tensor * ffn_out = odistill_lora_mm(ctx, L.w_down, gu,
                 ol ? &ol->w_down : nullptr, lsc);  // [hidden, q_len]
 
             h = ggml_add(ctx, h, ffn_out);
@@ -330,20 +330,20 @@ static void draft_ctx_kv_rows(
     ggml_context *       ctx,
     const DraftWeights & w,
     const DraftLayer &   L,
-    const OFlashLoraLayer * ol,        // nullptr = no adapter
+    const ODistillLoraLayer * ol,        // nullptr = no adapter
     ggml_tensor *        target_feat,   // [hidden, n]
     ggml_tensor *        positions,     // [n] i32 absolute
     int                  n,
     ggml_tensor **       k_rows_out,
     ggml_tensor **       v_rows_out) {
     const float eps = DFLASH27B_RMS_EPS;
-    const float lsc = w.oflash ? w.oflash->scale : 0.0f;
+    const float lsc = w.odistill ? w.odistill->scale : 0.0f;
     ggml_tensor * tf_kv = target_feat;
     if (w.context_kv_layer_norm) {
         tf_kv = ggml_rms_norm(ctx, tf_kv, eps);
         tf_kv = ggml_mul(ctx, tf_kv, L.attn_norm);
     }
-    ggml_tensor * K = oflash_lora_mm(ctx, L.wk, tf_kv,
+    ggml_tensor * K = odistill_lora_mm(ctx, L.wk, tf_kv,
         ol ? &ol->wk : nullptr, lsc);                          // [kv_dim, n]
     K = ggml_reshape_3d(ctx, K, w.head_dim, w.n_head_kv, n);
     K = ggml_rms_norm(ctx, K, eps);
@@ -356,7 +356,7 @@ static void draft_ctx_kv_rows(
     // rope output is contiguous [head_dim, n_kv, n] → head-major rows view
     *k_rows_out = ggml_view_2d(ctx, K, (int64_t)w.head_dim * w.n_head_kv, n,
                                K->nb[2], 0);
-    *v_rows_out = oflash_lora_mm(ctx, L.wv, tf_kv,
+    *v_rows_out = odistill_lora_mm(ctx, L.wv, tf_kv,
         ol ? &ol->wv : nullptr, lsc);                          // [kv_dim, n]
 }
 
@@ -378,7 +378,7 @@ bool build_draft_kv_append(
         ggml_tensor * Krows = nullptr;
         ggml_tensor * Vrows = nullptr;
         draft_ctx_kv_rows(ctx, w, w.layers[il],
-                          w.oflash ? &w.oflash->layers[il] : nullptr,
+                          w.odistill ? &w.odistill->layers[il] : nullptr,
                           target_feat, in.positions,
                           in.n_rows, &Krows, &Vrows);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache.k[il], Krows, in.rows));
@@ -411,8 +411,8 @@ DraftGraphOutputs build_draft_kv_step(
 
     for (int il = 0; il < w.n_layer; il++) {
         const DraftLayer & L = w.layers[il];
-        const OFlashLoraLayer * ol = w.oflash ? &w.oflash->layers[il] : nullptr;
-        const float lsc = w.oflash ? w.oflash->scale : 0.0f;
+        const ODistillLoraLayer * ol = w.odistill ? &w.odistill->layers[il] : nullptr;
+        const float lsc = w.odistill ? w.odistill->scale : 0.0f;
         const bool layer_is_swa = L.is_swa && !disable_swa;
 
         // ── attention pre-norm
@@ -420,7 +420,7 @@ DraftGraphOutputs build_draft_kv_step(
         hn = ggml_mul(ctx, hn, L.attn_norm);
 
         // ── Q from noise, per-head RMSNorm, RoPE at absolute positions
-        ggml_tensor * Q = oflash_lora_mm(ctx, L.wq, hn,
+        ggml_tensor * Q = odistill_lora_mm(ctx, L.wq, hn,
             ol ? &ol->wq : nullptr, lsc);
         Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, q_len);
         Q = ggml_rms_norm(ctx, Q, eps);
@@ -430,7 +430,7 @@ DraftGraphOutputs build_draft_kv_step(
                           rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
         // ── noise K/V into the scratch cache slots
-        ggml_tensor * Kn = oflash_lora_mm(ctx, L.wk, hn,
+        ggml_tensor * Kn = odistill_lora_mm(ctx, L.wk, hn,
             ol ? &ol->wk : nullptr, lsc);
         Kn = ggml_reshape_3d(ctx, Kn, head_dim, n_kv, q_len);
         Kn = ggml_rms_norm(ctx, Kn, eps);
@@ -440,7 +440,7 @@ DraftGraphOutputs build_draft_kv_step(
                            rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         ggml_tensor * Kn_rows = ggml_view_2d(ctx, Kn,
             (int64_t)head_dim * n_kv, q_len, Kn->nb[2], 0);
-        ggml_tensor * Vn_rows = oflash_lora_mm(ctx, L.wv, hn,
+        ggml_tensor * Vn_rows = odistill_lora_mm(ctx, L.wv, hn,
             ol ? &ol->wv : nullptr, lsc);  // [kv_dim, q_len]
         ggml_build_forward_expand(gf,
             ggml_set_rows(ctx, cache.k[il], Kn_rows, in.noise_rows));
@@ -482,7 +482,7 @@ DraftGraphOutputs build_draft_kv_step(
         }
         attn = ggml_reshape_2d(ctx, attn, head_dim * n_head, q_len);
 
-        ggml_tensor * attn_out = oflash_lora_mm(ctx, L.wo, attn,
+        ggml_tensor * attn_out = odistill_lora_mm(ctx, L.wo, attn,
             ol ? &ol->wo : nullptr, lsc);
         h = ggml_add(ctx, h, attn_out);
 
@@ -491,10 +491,10 @@ DraftGraphOutputs build_draft_kv_step(
         hf = ggml_mul(ctx, hf, L.ffn_norm);
         ggml_tensor * g  = ggml_mul_mat(ctx, L.w_gate, hf);
         g = ggml_silu(ctx, g);
-        ggml_tensor * u  = oflash_lora_mm(ctx, L.w_up, hf,
+        ggml_tensor * u  = odistill_lora_mm(ctx, L.w_up, hf,
             ol ? &ol->w_up : nullptr, lsc);
         ggml_tensor * gu = ggml_mul(ctx, g, u);
-        ggml_tensor * ffn_out = oflash_lora_mm(ctx, L.w_down, gu,
+        ggml_tensor * ffn_out = odistill_lora_mm(ctx, L.w_down, gu,
             ol ? &ol->w_down : nullptr, lsc);
         h = ggml_add(ctx, h, ffn_out);
     }

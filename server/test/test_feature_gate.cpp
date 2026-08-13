@@ -150,18 +150,18 @@ static void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
         args, "qwen35", PlacementBackend::Cuda, features).empty());
 }
 
-static void test_feature_gate_rejects_inert_or_destructive_oflash_modes() {
+static void test_feature_gate_rejects_inert_or_destructive_odistill_modes() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.draft_path = "/nonexistent/draft.gguf";
 
     BackendFeatureConfig features;
-    features.oflash_aux_options_set = true;
+    features.odistill_aux_options_set = true;
     TEST_ASSERT(!gate_result(
         args, "qwen35", PlacementBackend::Cuda, features).empty());
 
-    features.oflash_requested = true;
-    features.oflash_aux_options_set = false;
+    features.odistill_requested = true;
+    features.odistill_aux_options_set = false;
     features.pflash_enabled = true;
     features.pflash_drafter_configured = true;
     TEST_ASSERT(!gate_result(
@@ -600,7 +600,7 @@ int main() {
     RUN_TEST(test_feature_gate_ipc_options_require_ipc_binary);
     RUN_TEST(test_feature_gate_mixed_draft_placement_requires_ipc);
     RUN_TEST(test_feature_gate_pflash_requires_drafter_and_supported_arch);
-    RUN_TEST(test_feature_gate_rejects_inert_or_destructive_oflash_modes);
+    RUN_TEST(test_feature_gate_rejects_inert_or_destructive_odistill_modes);
     RUN_TEST(test_feature_gate_validates_target_split_topology);
     RUN_TEST(test_feature_gate_tensor_parallel_requirements);
     RUN_TEST(test_feature_gate_ds4_prefill_requires_deepseek4);

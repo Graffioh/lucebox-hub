@@ -416,10 +416,10 @@ add_library(dflash_common STATIC
     src/common/target_shard_ipc_daemon.cpp
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp
-    src/common/oflash/oflash_ring.cpp
-    src/common/oflash/oflash_adapter.cpp
-    src/common/oflash/oflash_supervisor.cpp
-    src/common/oflash/oflash_runtime.cpp
+    src/common/odistill/odistill_ring.cpp
+    src/common/odistill/odistill_adapter.cpp
+    src/common/odistill/odistill_supervisor.cpp
+    src/common/odistill/odistill_runtime.cpp
     src/common/dflash_draft_ipc.cpp
     src/common/dflash_draft_ipc_daemon.cpp
     src/common/pflash_drafter_ipc.cpp
@@ -1490,7 +1490,7 @@ if(DFLASH27B_TESTS)
             test/test_qwen35moe_swap_manager.cpp
             test/test_moe_hybrid_storage.cpp
             test/test_qwen35_mrope.cpp
-            test/test_oflash_unit.cpp)
+            test/test_odistill_unit.cpp)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
                 test/test_gpu_sampler_cuda.cpp
