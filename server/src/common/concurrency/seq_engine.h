@@ -202,6 +202,7 @@ public:
         // until retirement and emits one machine-readable proof record.
         uint64_t ddtree_steps = 0;
         uint64_t ddtree_accepted_tokens = 0;
+        uint64_t ddtree_suspensions = 0;
         uint64_t target_forwards = 0;
         uint64_t kvflash_page_ins = 0;
         uint64_t kvflash_page_outs = 0;
@@ -329,6 +330,8 @@ inline std::string validate_step_result(
                 return "failed decode has no diagnostic";
             if (output.token >= 0 || !output.committed_tokens.empty())
                 return "failed decode exposes token payload";
+            if (output.ddtree_suspensions != 0)
+                return "failed decode carries DDTree suspension telemetry";
         } else {
             if (output.token < 0)
                 return "successful decode has no pending token";
@@ -342,6 +345,8 @@ inline std::string validate_step_result(
                     output.committed_tokens.end(),
                     [](int32_t token) { return token < 0; }))
                 return "decode output burst contains an invalid token";
+            if (output.ddtree_suspensions > output.ddtree_steps)
+                return "DDTree suspension has no successful DDTree step";
         }
         decode_seen[(size_t)output.slot] = 1;
     }

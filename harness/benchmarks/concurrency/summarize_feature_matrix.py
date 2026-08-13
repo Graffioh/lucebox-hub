@@ -75,14 +75,18 @@ def run_signature(item: dict) -> tuple[object, ...]:
     report, meta = item["report"], item["meta"]
     max_tokens = report.get("max_tokens")
     ignore_eos = report.get("ignore_eos")
+    temperature = report.get("temperature")
+    seed = report.get("seed")
     model_sha256 = meta.get("model_sha256")
     if (
         type(max_tokens) is not int or max_tokens <= 0
         or not isinstance(ignore_eos, bool)
+        or type(temperature) not in (int, float)
+        or type(seed) is not int
         or not isinstance(model_sha256, str) or not model_sha256
     ):
         raise ValueError("incomplete run metadata")
-    return max_tokens, ignore_eos, model_sha256
+    return max_tokens, ignore_eos, temperature, seed, model_sha256
 
 
 def output_stability(items: list[dict]) -> str:
@@ -117,14 +121,22 @@ def summarize(reports: list[dict]) -> str:
         "proves its requested features executed. Throughput is the median across fresh-process repeats.",
         "",
         "| Workload | C | Variant | N | Output goodput | Output-window | vs AR | "
-        "Effective/wire | DDTree accepted/step | Target forwards | KV in/out | "
-        "PFlash requests | TTFT max s | Stable output |",
-        "| :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
-        ":--- | ---: | ---: | :---: |",
+        "Effective/wire | DDTree accepted/step | DDTree steps/susp. | "
+        "Target forwards | KV in/out | PFlash requests | TTFT max s | "
+        "Stable output |",
+        "| :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | "
+        ":--- | ---: | :--- | ---: | ---: | :---: |",
     ]
     for workload, clients, variant in sorted(grouped):
         items = grouped[(workload, clients, variant)]
-        prompt_hashes = {item["level"]["selected_prompt_set_sha256"] for item in items}
+        prompt_digests = [
+            item["level"].get("selected_prompt_set_sha256") for item in items
+        ]
+        if not all(isinstance(value, str) and value for value in prompt_digests):
+            raise ValueError(
+                f"{workload} C={clients} {variant}: missing selected prompt set hash"
+            )
+        prompt_hashes = set(prompt_digests)
         if len(prompt_hashes) != 1:
             raise ValueError(f"{workload} C={clients} {variant}: prompt sets differ")
         goodput = median([item["level"]["aggregate_tok_s"] for item in items])
@@ -174,6 +186,17 @@ def summarize(reports: list[dict]) -> str:
         steps = sum(a["ddtree_steps"] for a in aggregates)
         accepted = sum(a["ddtree_accepted_tokens"] for a in aggregates)
         accepted_per_step = accepted / steps if steps else None
+        median_steps = median(
+            [a["ddtree_steps"] for a in aggregates]
+        ) if aggregates else None
+        median_suspensions = median(
+            [a["ddtree_suspensions"] for a in aggregates]
+        ) if aggregates else None
+        ddtree_activity = (
+            f"{median_steps:.0f}/{median_suspensions:.0f}"
+            if median_steps is not None and median_suspensions is not None
+            else "n/a"
+        )
         target_forwards = median([a["target_forwards"] for a in aggregates]) if aggregates else None
         page_ins = median([a["kvflash_page_ins"] for a in aggregates]) if aggregates else None
         page_outs = median([a["kvflash_page_outs"] for a in aggregates]) if aggregates else None
@@ -185,8 +208,8 @@ def summarize(reports: list[dict]) -> str:
         lines.append(
             f"| {workload} | {clients} | {variant} | {len(items)} | {goodput:.2f} | "
             f"{fmt(window)} | {vs_ar} | {fmt(ratio, 3)} | {fmt(accepted_per_step)} | "
-            f"{fmt(target_forwards, 0)} | {kv_text} | {fmt(pflash_requests, 0)} | "
-            f"{fmt(ttft, 3)} | {stable} |"
+            f"{ddtree_activity} | {fmt(target_forwards, 0)} | {kv_text} | "
+            f"{fmt(pflash_requests, 0)} | {fmt(ttft, 3)} | {stable} |"
         )
     lines.append("")
     return "\n".join(lines)

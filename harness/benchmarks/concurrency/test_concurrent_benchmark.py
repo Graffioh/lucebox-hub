@@ -126,6 +126,22 @@ class BenchmarkTests(unittest.TestCase):
         }
         self.assertTrue(benchmark.level_failed(level, ignore_eos=True))
 
+    def test_hung_worker_aborts_level_instead_of_overlapping_next(self) -> None:
+        thread = mock.Mock()
+        thread.is_alive.return_value = True
+        args = argparse.Namespace(timeout=1.0)
+        with (
+            mock.patch.object(benchmark.threading, "Thread", return_value=thread),
+            mock.patch.object(
+                benchmark.time, "monotonic", side_effect=(10.0, 50.0),
+            ),
+        ):
+            with self.assertRaisesRegex(TimeoutError, "exceeded the level deadline"):
+                benchmark.run_level(1, args, ["prompt"], 0)
+        thread.start.assert_called_once_with()
+        thread.join.assert_called_once_with(0.0)
+
+
 
 if __name__ == "__main__":
     unittest.main()

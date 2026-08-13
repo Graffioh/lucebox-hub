@@ -118,6 +118,32 @@ class FeatureBenchmarkTests(unittest.TestCase):
             hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
         )
 
+    def test_markdown_reports_prompt_rate_and_ttft_median_max(self) -> None:
+        text = benchmark.markdown({
+            "label": "feature",
+            "levels": [{
+                "clients": 4,
+                "requests_ok": 4,
+                "requests": 4,
+                "aggregate_tok_s": 12.5,
+                "output_window_tok_s": 20.0,
+                "request_decode_tok_s_median": 5.0,
+                "prompt_tokens_per_s_to_first_token": 123.4,
+                "prompt_tokens_min": 100,
+                "prompt_tokens_max": 400,
+                "effective_prompt_tokens_min": 50,
+                "effective_prompt_tokens_max": 200,
+                "effective_to_wire_prompt_ratio": 0.5,
+                "ttft_median_s": 1.25,
+                "ttft_max_s": 2.5,
+            }],
+        })
+        self.assertIn("Prompt tok/s to first", text)
+        self.assertIn("TTFT median/max s", text)
+        self.assertIn("| 4 | 4/4 | 12.50 | 20.00 | 5.00 | 123.40 |", text)
+        self.assertIn("| 0.500 | 1.250/2.500 |", text)
+
+
 
 if __name__ == "__main__":
     unittest.main()

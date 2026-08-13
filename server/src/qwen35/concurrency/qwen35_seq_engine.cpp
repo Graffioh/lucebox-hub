@@ -154,6 +154,7 @@ bool Qwen35SeqEngine::ddtree_eligible(const StepPlan & plan) const {
         if (!in.allow_speculation || in.slot < 0 ||
             in.slot >= slots_.slot_count() ||
             !slots_.slot(in.slot).decoding() ||
+            !slots_.ddtree_speculation_allowed(in.slot) ||
             slots_.slot(in.slot).sampler.needs_logit_processing() ||
             slots_.slot(in.slot).cur_pos < 1 ||
             slots_.slot(in.slot).cur_pos >= slots_.max_context()) {
@@ -234,6 +235,13 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
             GGML_STATUS_SUCCESS) {
             return proposal_fallback();
         }
+        // The draft and target backends own separate HIP streams even when
+        // both are placed on hip:0.  Projection consumes the draft hidden
+        // state on the target stream, so establish the producer/consumer
+        // ordering explicitly before the cross-backend tensor copy.  Without
+        // this barrier the first tree proposal can race stale hidden rows and
+        // collapse acceptance to the one-token fallback.
+        ggml_backend_synchronize(b_.draft_backend_);
         ggml_backend_tensor_copy(
             draft->hidden_states, b_.proj_sg_.hidden_input);
         if (ggml_backend_graph_compute(
@@ -524,18 +532,50 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
             return result;
         }
     }
+
+    uint64_t cohort_emitted = 0;
+    for (const Proposal & p : proposals) {
+        // accepted contains the replay root plus accepted children. The
+        // output emits those children plus one separately computed pending
+        // scalar, so accepted.size() is this request's emitted yield.
+        cohort_emitted += (uint64_t)p.accepted.size();
+    }
+    const bool suspend_cohort =
+        Qwen35SlotManager::ddtree_cohort_should_suspend(
+            cohort_emitted, active);
+    std::vector<bool> newly_suspended((size_t)slots_.slot_count(), false);
+    for (const Proposal & p : proposals) {
+        newly_suspended[(size_t)p.slot] =
+            slots_.record_ddtree_sample(p.slot, suspend_cohort);
+    }
+
     result.decode.reserve((size_t)active);
     for (Proposal & p : proposals) {
         DecodeOutput out;
         out.slot = p.slot;
         out.token = p.bonus;
         out.ddtree_steps = 1;
-        out.ddtree_accepted_tokens = p.accepted.size() - 1;
+        const int accepted_children = (int)p.accepted.size() - 1;
+        out.ddtree_accepted_tokens = (uint64_t)accepted_children;
         out.target_forwards = 2;
         for (size_t i = 1; i < p.accepted.size(); ++i) {
             const int dfs = p.accepted[i];
             out.committed_tokens.push_back(
                 p.tree.token_ids[(size_t)dfs - 1]);
+        }
+        if (newly_suspended[(size_t)p.slot]) {
+            out.ddtree_suspensions = 1;
+            const Qwen35Slot & seq = slots_.slot(p.slot);
+            std::fprintf(stderr,
+                "[parallel-ddtree] adaptive suspend request=%llu slot=%d "
+                "sample=%llu emitted=%d accepted_children=%d "
+                "cohort_emitted=%llu cohort_size=%d target_forwards=2 "
+                "floor=%d\n",
+                (unsigned long long)seq.request_id, p.slot,
+                (unsigned long long)seq.ddtree_sampled_steps,
+                accepted_children + 1, accepted_children,
+                (unsigned long long)cohort_emitted, active,
+                Qwen35SlotManager::kDdtreeMinEmittedTokens);
         }
         attach_residency_telemetry(out);
         result.decode.push_back(std::move(out));

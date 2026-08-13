@@ -212,9 +212,9 @@ struct QwenPagedKvResidencyTransfer::State {
                 }
             }
             if (status != cudaSuccess) {
-                // A callback that returns false is not marked pending by the
-                // residency manager. Drain any prefix already queued here so
-                // its pinned buffer can still be released safely.
+                // Drain any prefix already queued here. The residency manager
+                // also treats a false return as pending, so a failed drain is
+                // quarantined and retried before ownership can be released.
                 (void)cudaGetLastError();
                 if (cudaStreamSynchronize(stream) != cudaSuccess) {
                     stream_may_reference_host = true;

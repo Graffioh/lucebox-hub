@@ -32,10 +32,12 @@ enum class Qwen35SlotPhase {
     free,
     prefill,
     decode,
+    retiring,
 };
 
 struct Qwen35Slot {
     Qwen35SlotPhase phase = Qwen35SlotPhase::free;
+    uint64_t request_id = 0;
     PagedKvSequenceHandle handle;
     // Prompt tokens are the immutable prefix of sample_history. Decode tokens
     // append to the same allocation, avoiding a second full prompt copy.
@@ -64,13 +66,28 @@ struct Qwen35Slot {
             : 0;
     }
 
-    bool active() const { return phase != Qwen35SlotPhase::free; }
+    // Real packed-tree samples are counted per request. A low aggregate-yield
+    // cohort sample suspends every participating request; ordinary AR keeps
+    // every target cache and feature-ring row current.
+    bool ddtree_suspended = false;
+    uint64_t ddtree_sampled_steps = 0;
+
+    bool active() const {
+        return phase == Qwen35SlotPhase::prefill ||
+               phase == Qwen35SlotPhase::decode;
+    }
     bool prefilling() const { return phase == Qwen35SlotPhase::prefill; }
     bool decoding() const { return phase == Qwen35SlotPhase::decode; }
+    bool retiring() const { return phase == Qwen35SlotPhase::retiring; }
 };
 
 class Qwen35SlotManager {
 public:
+    // Packed DDTree pays for verify + accepted-path replay. Requiring six
+    // emitted tokens makes continuation earn at least three tokens per target
+    // forward before accounting for its additional draft/tree work.
+    static constexpr int kDdtreeMinEmittedTokens = 6;
+
     // `max_ctx` is the per-sequence logical bound; slot count comes from the
     // pool's max_sequences. The pool must outlive the manager.
     Qwen35SlotManager(PagedKvPool & pool, int max_ctx,
@@ -138,6 +155,13 @@ public:
     bool reselect_residency(int slot, const std::vector<float> * scores,
                             std::string * error = nullptr);
     void take_residency_telemetry(int slot, SeqEngine::DecodeOutput & out);
+
+    bool ddtree_speculation_allowed(int slot) const;
+    // Compare aggregate emitted yield (accepted children plus one replay
+    // bonus per request) against the cohort continuation floor.
+    static bool ddtree_cohort_should_suspend(uint64_t total_emitted, int active);
+    // Returns true exactly once, when this sample newly suspends the request.
+    bool record_ddtree_sample(int slot, bool suspend_cohort);
 
     // One-token compatibility wrapper used by ordinary autoregressive decode.
     StepAppend append_token(int slot, int32_t fed_token);

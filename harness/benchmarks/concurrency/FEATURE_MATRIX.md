@@ -1,5 +1,8 @@
 # Qwen3.6 concurrent feature matrix
 
+The bounded Strix Halo measurements collected for the draft implementation are
+recorded in [`STRIX_HALO_RESULTS.md`](STRIX_HALO_RESULTS.md).
+
 `run_qwen36_feature_matrix.sh` extends the PR #596 protocol with feature
 ablations for the complete Strix Halo configuration:
 
@@ -19,11 +22,24 @@ Run the default bounded C4 screening repeat (seven applicable fresh-server cases
 
 ```bash
 MODEL=/opt/models/Qwen3.6-27B-Q4_K_M.gguf \
-DRAFT_MODEL=/opt/models/draft/dflash-draft-3.6-q4_k_m.gguf \
+DRAFT_MODEL=/opt/models/draft/dflash-draft-3.6-q8_0.gguf \
 PREFILL_DRAFTER=/opt/models/Qwen3-0.6B-BF16.gguf \
 REPEATS=1 \
 harness/benchmarks/concurrency/run_qwen36_feature_matrix.sh
 ```
+
+For the canonical AMD Strix Halo recipe, use the published Q8_0 3.6 drafter and make the tuning explicit:
+
+```bash
+MODEL=/opt/models/Qwen3.6-27B-Q4_K_M.gguf \
+DRAFT_MODEL=/opt/models/draft/dflash-draft-3.6-q8_0.gguf \
+PREFILL_DRAFTER=/opt/models/Qwen3-0.6B-BF16.gguf \
+DRAFT_SWA=2048 PREFILL_UBATCH=512 DDTREE_ADAPTIVE=0 \
+VARIANTS=ddtree,pflash,kvflash,full CLIENTS=1,4,8,16 REPEATS=5 \
+harness/benchmarks/concurrency/run_qwen36_feature_matrix.sh
+```
+
+`DDTREE_ADAPTIVE=0` matches the blog's continuous DDTree probe policy; leave it at the default `1` when measuring the concurrent engine's adaptive fallback policy. The concurrent path now records a startup `[parallel-ddtree]` marker and per-request `ddtree_steps`; these are the proof that DDTree actually ran.
 
 On a 128 GiB Strix Halo host, budget roughly 45–90 minutes for this smoke run;
 the long-context AR controls dominate and actual time depends on the build.
@@ -77,8 +93,9 @@ The server must write one JSON object per completed request with this prefix:
 ```
 
 Required fields are `effective_prompt_tokens`, `ddtree_steps`,
-`ddtree_accepted_tokens`, `target_forwards`, `kvflash_page_ins`,
-`kvflash_page_outs`, `kvflash_resident_blocks`, `kvflash_reselects`,
+`ddtree_suspensions`, `ddtree_accepted_tokens`, `target_forwards`,
+`kvflash_page_ins`, `kvflash_page_outs`, `kvflash_resident_blocks`,
+`kvflash_reselects`,
 `pflash_applied`, `pflash_input_tokens`, and `pflash_output_tokens`.
 
 The proof tool correlates log objects with measured SSE request IDs and also
@@ -87,6 +104,10 @@ checks the log's effective token count against
 unless:
 
 - DDTree has positive step and target-forward counts. Acceptance may be zero.
+  The required per-request suspension counter must be either zero or one. It
+  records adaptive fallback activation, but does not prove whether AR work ran
+  before or after the suspension; temporal claims require direct ordered-log
+  evidence.
 - PFlash reports `pflash_applied=true`, a smaller output prompt, and (in auto
   mode) an input token count at or above the recorded activation threshold.
 - KVFlash always records an explicit hashed scorer drafter, reports its
@@ -108,6 +129,3 @@ binary/shared-library/target/draft/PFlash-and-KV-scorer hashes, the ordered
 `literal_screenshot_flags` array, all feature values, raw request report,
 server log, and `feature-proof.json`. The summary refuses to
 include a Lucebox row whose proof is missing or invalid.
-
-
-

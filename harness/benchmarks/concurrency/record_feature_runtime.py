@@ -83,7 +83,7 @@ def update_metadata(metadata: dict[str, Any], log_text: str) -> dict[str, Any]:
         raise ValueError(
             "KVFlash metadata is enabled but its physical-pool startup marker is missing"
         )
-    if observed["physical_kv_pool_tokens"] is None:
+    if not observed["proof_sources"]["paged_pool_startup_marker"]:
         raise ValueError("paged physical-pool startup marker is missing")
 
     result = dict(metadata)

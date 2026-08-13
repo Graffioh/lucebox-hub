@@ -50,6 +50,23 @@ class PromptGeneratorTests(unittest.TestCase):
             self.assertEqual(len(row["prompt"].split()), row["target_words"])
 
 
+class RunnerShellTests(unittest.TestCase):
+    def test_runner_guards_case_identity_and_records_launch_environment(self) -> None:
+        runner = (HERE / "run_qwen36_concurrency.sh").read_text(
+            encoding="utf-8",
+        )
+        self.assertIn(
+            'reject_duplicates CLIENTS "${client_list[@]}"', runner,
+        )
+        self.assertIn(
+            'reject_duplicates VARIANTS "${variant_list[@]}"', runner,
+        )
+        self.assertIn('printf \'env \' > "$case_dir/server-command.txt"', runner)
+        self.assertIn('"${launch_env[@]}" "${command[@]}"', runner)
+        self.assertIn("port_is_available || return 1", runner)
+        self.assertIn('wait_health "$model_id"', runner)
+
+
 class SummarizerTests(unittest.TestCase):
     @staticmethod
     def item(
@@ -135,6 +152,37 @@ class SummarizerTests(unittest.TestCase):
         ])
         unstable_row = next(line for line in unstable.splitlines() if "| llama |" in line)
         self.assertEqual(unstable_row.split("|")[10].strip(), "NO")
+
+    def test_unstable_current_variant_suppresses_deltas(self) -> None:
+        reports = [
+            self.item("llama", 10.0, repeat=1),
+            self.item("llama", 10.0, repeat=2),
+            self.item("luce-k8", 20.0, repeat=1, output_hash="first"),
+            self.item("luce-k8", 22.0, repeat=2, output_hash="second"),
+        ]
+        text = summarizer.summarize(reports)
+        row = next(line for line in text.splitlines() if "| luce-k8 |" in line)
+        self.assertEqual(row.split("|")[10].strip(), "NO")
+        self.assertEqual(row.split("|")[11].strip(), "n/a")
+        self.assertEqual(row.split("|")[12].strip(), "n/a")
+
+    def test_unstable_peer_variant_suppresses_deltas(self) -> None:
+        reports = [
+            self.item(
+                "llama", 10.0, repeat=1, output_hash="first",
+            ),
+            self.item(
+                "llama", 10.0, repeat=2, output_hash="second",
+            ),
+            self.item("luce-k8", 20.0, repeat=1),
+            self.item("luce-k8", 22.0, repeat=2),
+        ]
+        text = summarizer.summarize(reports)
+        row = next(line for line in text.splitlines() if "| luce-k8 |" in line)
+        self.assertEqual(row.split("|")[10].strip(), "yes")
+        self.assertEqual(row.split("|")[11].strip(), "n/a")
+        self.assertEqual(row.split("|")[12].strip(), "n/a")
+
 
     def test_missing_output_digest_does_not_claim_stability(self) -> None:
         reports = [

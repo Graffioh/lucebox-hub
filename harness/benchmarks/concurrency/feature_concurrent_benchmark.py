@@ -171,9 +171,9 @@ def markdown(report: dict[str, Any]) -> str:
     lines = [
         f"# Concurrent feature benchmark — {report['label']}", "",
         "| C | Ok | Output goodput tok/s | Output-window tok/s | "
-        "Request decode tok/s | Wire prompt range | Effective prompt range | "
-        "Effective/wire | TTFT max s |",
-        "| ---: | ---: | ---: | ---: | ---: | :--- | :--- | ---: | ---: |",
+        "Request decode tok/s | Prompt tok/s to first | Wire prompt range | "
+        "Effective prompt range | Effective/wire | TTFT median/max s |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- | ---: | :--- |",
     ]
     for level in report["levels"]:
         lines.append(
@@ -181,10 +181,12 @@ def markdown(report: dict[str, Any]) -> str:
             f"{base.fmt(level['aggregate_tok_s'])} | "
             f"{base.fmt(level['output_window_tok_s'])} | "
             f"{base.fmt(level['request_decode_tok_s_median'])} | "
+            f"{base.fmt(level['prompt_tokens_per_s_to_first_token'])} | "
             f"{base.fmt(level['prompt_tokens_min'], '.0f')}–{base.fmt(level['prompt_tokens_max'], '.0f')} | "
             f"{base.fmt(level['effective_prompt_tokens_min'], '.0f')}–"
             f"{base.fmt(level['effective_prompt_tokens_max'], '.0f')} | "
             f"{base.fmt(level['effective_to_wire_prompt_ratio'], '.3f')} | "
+            f"{base.fmt(level['ttft_median_s'], '.3f')}/"
             f"{base.fmt(level['ttft_max_s'], '.3f')} |"
         )
     return "\n".join(lines) + "\n"

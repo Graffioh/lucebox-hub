@@ -60,7 +60,7 @@ struct MockTransfers {
                 pending.push_back({[this, physical, host, bytes] {
                     std::memcpy(host, &device[(size_t)physical * block_bytes], bytes);
                 }});
-                return true;
+                return !fail_copy_out_after_queue;
             },
             [this](PagedKvSequenceHandle, uint32_t, uint32_t physical,
                    const void * host, size_t bytes) {
@@ -68,7 +68,7 @@ struct MockTransfers {
                 pending.push_back({[this, physical, host, bytes] {
                     std::memcpy(&device[(size_t)physical * block_bytes], host, bytes);
                 }});
-                return true;
+                return !fail_copy_in_after_queue;
             },
             [this] {
                 syncs++;
@@ -99,6 +99,8 @@ struct MockTransfers {
     bool fail_alloc = false;
     bool fail_copy_out = false;
     bool fail_copy_in = false;
+    bool fail_copy_out_after_queue = false;
+    bool fail_copy_in_after_queue = false;
     bool fail_sync = false;
 };
 
@@ -251,6 +253,79 @@ TEST_CASE(PagedKvResidencyFixture, allocation_and_copy_failures_are_explicit) {
     CHECK(pager.evict_block(handle, 0, /*allow_protected=*/true) ==
           PagedKvResidencyStatus::TransferFailed);
     CHECK(pager.is_resident(handle, 0));
+}
+
+TEST_CASE(PagedKvResidencyFixture,
+          failed_copy_out_prefix_is_barriered_before_retry) {
+    PagedKvPool pool(/*physical blocks=*/1, /*sequences=*/1, /*block size=*/4);
+    MockTransfers io(1, 16);
+    PagedKvResidencyManager pager(pool, config(16, 1), io.callbacks());
+    const auto handle = acquire(pool, 1);
+    CHECK(pager.register_sequence(handle) == PagedKvResidencyStatus::Ok);
+    CHECK(pager.append(handle, 4));
+    CHECK(pager.commit_pending_writes(handle) == PagedKvResidencyStatus::Ok);
+
+    io.fail_copy_out_after_queue = true;
+    CHECK(pager.evict_block(handle, 0, /*allow_protected=*/true) ==
+          PagedKvResidencyStatus::TransferFailed);
+    CHECK(io.pending.empty());
+    CHECK(pager.is_resident(handle, 0));
+    CHECK(pager.stats().page_outs == 0);
+
+    io.fail_copy_out_after_queue = false;
+    CHECK(pager.evict_block(handle, 0, /*allow_protected=*/true) ==
+          PagedKvResidencyStatus::Ok);
+    CHECK(!pager.is_resident(handle, 0));
+}
+
+TEST_CASE(PagedKvResidencyFixture,
+          rejected_append_remap_is_rolled_back_after_barrier) {
+    PagedKvPool pool(/*physical blocks=*/1, /*sequences=*/1, /*block size=*/4);
+    MockTransfers io(1, 16);
+    PagedKvResidencyManager pager(pool, config(16, 1), io.callbacks());
+    const auto handle = acquire(pool, 1);
+    CHECK(pager.register_sequence(handle) == PagedKvResidencyStatus::Ok);
+    CHECK(pager.append(handle, 2));
+    CHECK(pager.commit_pending_writes(handle) == PagedKvResidencyStatus::Ok);
+    CHECK(pager.evict_block(handle, 0, /*allow_protected=*/true) ==
+          PagedKvResidencyStatus::Ok);
+
+    io.fail_copy_in = true;
+    const auto append = pool.append(handle, 1);
+    CHECK(append.status == PagedKvStatus::Ok);
+    CHECK(append.remapped_cold_blocks.size() == 1);
+    CHECK(pager.observe_append(handle, append) ==
+          PagedKvResidencyStatus::TransferFailed);
+    CHECK(snapshot(pool, handle).block_table[0] == PAGED_KV_COLD_BLOCK);
+    CHECK(pool.free_block_count() == 1);
+    CHECK(pager.stats().page_ins == 0);
+}
+
+TEST_CASE(PagedKvResidencyFixture,
+          failed_copy_in_prefix_quarantines_mapping_until_barrier) {
+    PagedKvPool pool(/*physical blocks=*/1, /*sequences=*/1, /*block size=*/4);
+    MockTransfers io(1, 16);
+    PagedKvResidencyManager pager(pool, config(16, 1), io.callbacks());
+    const auto handle = acquire(pool, 1);
+    CHECK(pager.register_sequence(handle) == PagedKvResidencyStatus::Ok);
+    CHECK(pager.append(handle, 4));
+    CHECK(pager.commit_pending_writes(handle) == PagedKvResidencyStatus::Ok);
+    CHECK(pager.evict_block(handle, 0, /*allow_protected=*/true) ==
+          PagedKvResidencyStatus::Ok);
+
+    io.fail_copy_in_after_queue = true;
+    io.fail_sync = true;
+    CHECK(pager.ensure_resident(handle, {0}) ==
+          PagedKvResidencyStatus::TransferFailed);
+    CHECK(snapshot(pool, handle).block_table[0] != PAGED_KV_COLD_BLOCK);
+    CHECK(pool.free_block_count() == 0);
+    CHECK(io.pending.size() == 1);
+
+    io.fail_sync = false;
+    CHECK(pager.synchronize_before_read() == PagedKvResidencyStatus::Ok);
+    CHECK(snapshot(pool, handle).block_table[0] == PAGED_KV_COLD_BLOCK);
+    CHECK(pool.free_block_count() == 1);
+    CHECK(pager.stats().page_ins == 0);
 }
 
 TEST_CASE(PagedKvResidencyFixture, forget_frees_host_backing_and_stale_is_rejected) {
@@ -534,6 +609,32 @@ TEST_CASE(PagedKvResidencyFixture,
     CHECK(snapshot(pool, second).block_table[0] == PAGED_KV_COLD_BLOCK);
 }
 
+TEST_CASE(PagedKvResidencyFixture,
+          resident_partial_head_stays_within_budget_during_growth) {
+    PagedKvPool pool(/*physical blocks=*/2, /*sequences=*/2, /*block size=*/4);
+    MockTransfers io(2, 16);
+    PagedKvResidencyManager pager(
+        pool, config(16, /*budget=*/2, /*sink=*/0, /*tail=*/0),
+        io.callbacks());
+    const auto first = acquire(pool, 1);
+    const auto second = acquire(pool, 2);
+    CHECK(pager.register_sequence(first) == PagedKvResidencyStatus::Ok);
+    CHECK(pager.register_sequence(second) == PagedKvResidencyStatus::Ok);
+    CHECK(pager.append(first, 2));
+    CHECK(pager.commit_pending_writes(first) == PagedKvResidencyStatus::Ok);
+    const uint32_t append_head = snapshot(pool, first).block_table[0];
+    CHECK(pager.append(second, 4));
+    CHECK(pager.commit_pending_writes(second) == PagedKvResidencyStatus::Ok);
+
+    const auto grown = pager.append(first, 3);
+    CHECK(grown);
+    const auto table = snapshot(pool, first).block_table;
+    CHECK(table.size() == 2);
+    CHECK(table[0] == append_head);
+    CHECK(table[1] != PAGED_KV_COLD_BLOCK);
+    CHECK(snapshot(pool, second).block_table[0] == PAGED_KV_COLD_BLOCK);
+    CHECK(pager.stats().resident_blocks == 2);
+}
 TEST_CASE(PagedKvResidencyFixture,
           requested_restore_set_is_protected_as_one_batch) {
     PagedKvPool pool(/*physical blocks=*/3, /*sequences=*/2, /*block size=*/4);

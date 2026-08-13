@@ -14,6 +14,27 @@ def digest(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def validated_digest(
+    path: pathlib.Path | None,
+    claimed: str | None,
+    label: str,
+    cache: dict[pathlib.Path, str],
+) -> str | None:
+    if path is None:
+        if claimed is not None:
+            raise ValueError(f"{label} SHA-256 supplied without a model file")
+        return None
+    if not isinstance(claimed, str) or not claimed:
+        raise ValueError(f"{label} SHA-256 is required")
+    resolved = path.resolve()
+    if resolved not in cache:
+        cache[resolved] = digest(resolved)
+    actual = cache[resolved]
+    if claimed != actual:
+        raise ValueError(f"{label} SHA-256 does not match {resolved}")
+    return actual
+
+
 def resolved_libraries(binary: pathlib.Path) -> dict[str, str]:
     result = subprocess.run(
         ["ldd", str(binary)], text=True, capture_output=True,
@@ -70,6 +91,7 @@ def main() -> int:
     parser.add_argument("--draft-model", type=pathlib.Path)
     parser.add_argument("--draft-model-sha256")
     parser.add_argument("--ddtree", action="store_true")
+    parser.add_argument("--fast-rollback", action="store_true")
     parser.add_argument("--ddtree-budget", type=int)
     parser.add_argument("--prefill-compression", default="off")
     parser.add_argument("--prefill-threshold", type=int)
@@ -91,6 +113,24 @@ def main() -> int:
             parser.error(f"bad --launch-env {item!r}; expected KEY=VALUE")
         launch_env[key] = value
 
+    digest_cache: dict[pathlib.Path, str] = {}
+    model_sha256 = validated_digest(
+        args.model, args.model_sha256, "target model", digest_cache,
+    )
+    draft_model_sha256 = validated_digest(
+        args.draft_model, args.draft_model_sha256, "draft model", digest_cache,
+    )
+    prefill_drafter_sha256 = validated_digest(
+        args.prefill_drafter, args.prefill_drafter_sha256,
+        "prefill drafter", digest_cache,
+    )
+    kvflash_scorer_drafter_sha256 = validated_digest(
+        args.kvflash_scorer_drafter,
+        args.kvflash_scorer_drafter_sha256,
+        "KVFlash scorer drafter",
+        digest_cache,
+    )
+
     libraries = resolved_libraries(args.binary)
     git_head = repository_head(args.repo)
     literal_flags: list[str] = []
@@ -102,6 +142,8 @@ def main() -> int:
         literal_flags += ["--ddtree"]
     if args.ddtree_budget is not None:
         literal_flags += ["--ddtree-budget", str(args.ddtree_budget)]
+    if args.fast_rollback:
+        literal_flags += ["--fast-rollback"]
     if args.draft_residency:
         literal_flags += ["--draft-residency", args.draft_residency]
     if args.prefill_compression != "off":
@@ -121,7 +163,7 @@ def main() -> int:
         "server_binary": str(args.binary.resolve()),
         "server_binary_sha256": digest(args.binary),
         "model": str(args.model.resolve()),
-        "model_sha256": args.model_sha256,
+        "model_sha256": model_sha256,
         "prompt_file_sha256": digest(args.prompt_file),
         "server_command": args.command_file.read_text(encoding="utf-8").strip(),
         "launch_environment": launch_env,
@@ -134,8 +176,9 @@ def main() -> int:
             "target_device": args.target_device,
             "draft_device": args.draft_device,
             "draft_model": str(args.draft_model.resolve()) if args.draft_model else None,
-            "draft_model_sha256": args.draft_model_sha256,
+            "draft_model_sha256": draft_model_sha256,
             "ddtree": args.ddtree,
+            "fast_rollback": args.fast_rollback,
             "ddtree_budget": args.ddtree_budget,
             "prefill_compression": args.prefill_compression,
             "prefill_threshold": args.prefill_threshold,
@@ -143,7 +186,7 @@ def main() -> int:
             "prefill_drafter": (
                 str(args.prefill_drafter.resolve()) if args.prefill_drafter else None
             ),
-            "prefill_drafter_sha256": args.prefill_drafter_sha256,
+            "prefill_drafter_sha256": prefill_drafter_sha256,
             "draft_residency": args.draft_residency,
             "kvflash": args.kvflash,
             "kvflash_max_pool_tokens": args.kvflash_max_pool_tokens,
@@ -151,9 +194,7 @@ def main() -> int:
                 str(args.kvflash_scorer_drafter.resolve())
                 if args.kvflash_scorer_drafter else None
             ),
-            "kvflash_scorer_drafter_sha256": (
-                args.kvflash_scorer_drafter_sha256
-            ),
+            "kvflash_scorer_drafter_sha256": kvflash_scorer_drafter_sha256,
         },
     }
     args.out.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")

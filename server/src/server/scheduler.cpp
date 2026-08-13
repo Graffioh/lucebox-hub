@@ -41,6 +41,7 @@ struct SchedSlot {
     uint64_t engine_request_id = 0;
     uint64_t ddtree_steps = 0;
     uint64_t ddtree_accepted_tokens = 0;
+    uint64_t ddtree_suspensions = 0;
     uint64_t target_forwards = 0;
     uint64_t kvflash_page_ins = 0;
     uint64_t kvflash_page_outs = 0;
@@ -326,6 +327,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             {"pflash_output_tokens", prompt_tokens},
             {"ddtree_steps", s.ddtree_steps},
             {"ddtree_accepted_tokens", s.ddtree_accepted_tokens},
+            {"ddtree_suspensions", s.ddtree_suspensions},
             {"target_forwards", s.target_forwards},
             {"kvflash_page_ins", s.kvflash_page_ins},
             {"kvflash_page_outs", s.kvflash_page_outs},
@@ -752,6 +754,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
             s.ddtree_steps += out.ddtree_steps;
             s.ddtree_accepted_tokens += out.ddtree_accepted_tokens;
+            s.ddtree_suspensions += out.ddtree_suspensions;
             s.target_forwards += out.target_forwards;
             s.kvflash_page_ins += out.kvflash_page_ins;
             s.kvflash_page_outs += out.kvflash_page_outs;

@@ -43,6 +43,19 @@ def complete_median(values: list[float | None]) -> float | None:
     return median([value for value in values if value is not None])
 
 
+def output_stability(items: list[dict]) -> str:
+    output_digests = [
+        item["level"].get("selected_output_set_sha256") for item in items
+    ]
+    complete = all(isinstance(value, str) and bool(value) for value in output_digests)
+    hashes = {value for value in output_digests if isinstance(value, str)}
+    return (
+        "n/a" if len(items) < 2 or not complete
+        else "yes" if len(hashes) == 1
+        else "NO"
+    )
+
+
 def run_signature(item: dict) -> tuple[object, ...]:
     report, meta = item["report"], item["meta"]
     max_tokens = report.get("max_tokens")
@@ -130,20 +143,7 @@ def summarize(reports: list[dict]) -> str:
         ttft = complete_median([
             item["level"].get("ttft_max_s") for item in items
         ])
-        output_digests = [
-            item["level"].get("selected_output_set_sha256") for item in items
-        ]
-        output_digests_complete = all(
-            isinstance(value, str) and bool(value) for value in output_digests
-        )
-        output_hashes = {
-            value for value in output_digests if isinstance(value, str)
-        }
-        stable = (
-            "n/a" if len(items) < 2 or not output_digests_complete
-            else "yes" if len(output_hashes) == 1
-            else "NO"
-        )
+        stable = output_stability(items)
 
         def delta(other: str, metric: str) -> str:
             peers = grouped.get((workload, clients, other), [])
@@ -164,6 +164,8 @@ def summarize(reports: list[dict]) -> str:
                 raise ValueError(
                     f"{workload} C={clients}: {variant}/{other} repeat sets differ"
                 )
+            if stable == "NO" or output_stability(peers) == "NO":
+                return "n/a"
             ratios = []
             for repeat in sorted(by_repeat):
                 value = by_repeat[repeat]["level"].get(metric)

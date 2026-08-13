@@ -164,11 +164,16 @@ def run_level(
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(clients)]
     for thread in threads:
         thread.start()
+    deadline = time.monotonic() + args.timeout + 30
     for thread in threads:
-        thread.join(args.timeout + 30)
-    completed = [record for record in records if record is not None]
+        thread.join(max(0.0, deadline - time.monotonic()))
     hung = sum(thread.is_alive() for thread in threads)
-    failures = hung + sum(record["error"] is not None for record in completed)
+    if hung:
+        raise TimeoutError(
+            f"{hung} request worker(s) exceeded the level deadline"
+        )
+    completed = [record for record in records if record is not None]
+    failures = sum(record["error"] is not None for record in completed)
     ok = [record for record in completed if record["error"] is None]
     starts = [record["t_start"] for record in completed]
     ends = [record["t_end"] for record in completed]

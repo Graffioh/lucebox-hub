@@ -7,10 +7,13 @@
 
 #include "qwen35/concurrency/qwen35_slot_manager.h"
 #include "host_check.h"
+#include "scoped_env.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
+#include <utility>
 
 using namespace dflash::common;
 
@@ -487,6 +490,117 @@ int main() {
         CHECK(mgr.has_prefill_prompt_at_least(768));
         mgr.retire(long_req.slot);
         CHECK(!mgr.has_prefill_prompt_at_least(768));
+    }
+
+    // Adaptive DDTree judges aggregate cohort yield rather than allowing one
+    // unlucky request to suppress higher-yield peers. Equality at the
+    // six-token average continues; a low average suspends all participants.
+    {
+        const luce_test::ScopedEnvVar adaptive("DFLASH_DDTREE_ADAPTIVE", nullptr);
+        CHECK(Qwen35SlotManager::ddtree_cohort_should_suspend(5, 1));
+        CHECK(!Qwen35SlotManager::ddtree_cohort_should_suspend(6, 1));
+        // Mixed synthetic cohort: one child-less row plus an eleven-token row
+        // exactly meets the continuation floor; one fewer token does not.
+        CHECK(!Qwen35SlotManager::ddtree_cohort_should_suspend(12, 2));
+        CHECK(Qwen35SlotManager::ddtree_cohort_should_suspend(11, 2));
+
+        PagedKvPool pool(8, 2, /*block_size=*/16);
+        Qwen35SlotManager mgr(pool, 64);
+        auto a = admit(mgr, 101, prompt_tokens(4), greedy_sampler());
+        auto b = admit(mgr, 102, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(a));
+        CHECK(is_admitted(b));
+        CHECK(mgr.append_prefill(a.slot, 4).ok);
+        CHECK(mgr.append_prefill(b.slot, 4).ok);
+        mgr.commit_prefill(a.slot);
+        mgr.commit_prefill(b.slot);
+        CHECK(mgr.slot(a.slot).request_id == 101);
+        CHECK(mgr.slot(b.slot).request_id == 102);
+        CHECK(mgr.ddtree_speculation_allowed(a.slot));
+        CHECK(mgr.ddtree_speculation_allowed(b.slot));
+
+        // The keep decision records a real sample without latching either
+        // participant, including the low-yield member.
+        CHECK(!mgr.record_ddtree_sample(a.slot, false));
+        CHECK(!mgr.record_ddtree_sample(b.slot, false));
+        CHECK(mgr.ddtree_speculation_allowed(a.slot));
+        CHECK(mgr.ddtree_speculation_allowed(b.slot));
+        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 1);
+        CHECK(mgr.slot(b.slot).ddtree_sampled_steps == 1);
+
+        // A low cohort decision is applied identically and atomically to both.
+        CHECK(mgr.record_ddtree_sample(a.slot, true));
+        CHECK(mgr.record_ddtree_sample(b.slot, true));
+        CHECK(!mgr.ddtree_speculation_allowed(a.slot));
+        CHECK(!mgr.ddtree_speculation_allowed(b.slot));
+        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 2);
+        CHECK(mgr.slot(b.slot).ddtree_sampled_steps == 2);
+
+        // Suspended requests cannot pay for another bad probe.
+        CHECK(!mgr.record_ddtree_sample(a.slot, true));
+        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 2);
+
+        mgr.retire(a.slot);
+        auto reused = admit(mgr, 103, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(reused) && reused.slot == a.slot);
+        CHECK(mgr.slot(reused.slot).request_id == 103);
+        CHECK(mgr.ddtree_speculation_allowed(reused.slot));
+        CHECK(mgr.slot(reused.slot).ddtree_sampled_steps == 0);
+    }
+
+    // A failed residency barrier quarantines retirement ownership, and a
+    // later admission retries it before considering the slot reusable.
+    {
+        PagedKvPool pool(/*physical_block_count=*/1,
+                         /*max_sequences=*/1, /*block_size=*/4);
+        bool fail_sync = false;
+        PagedKvResidencyTransferOps transfers{
+            [](size_t bytes) -> void * { return new uint8_t[bytes]; },
+            [](void * ptr) { delete[] static_cast<uint8_t *>(ptr); },
+            [](PagedKvSequenceHandle, uint32_t, uint32_t,
+               void *, size_t) { return true; },
+            [](PagedKvSequenceHandle, uint32_t, uint32_t,
+               const void *, size_t) { return true; },
+            [&fail_sync] { return !fail_sync; },
+        };
+        PagedKvResidencyConfig config;
+        config.block_bytes = 16;
+        config.resident_budget_blocks = 1;
+        config.sink_blocks = 0;
+        config.tail_blocks = 0;
+        PagedKvResidencyManager residency(pool, config, std::move(transfers));
+        Qwen35SlotManager mgr(pool, /*max_ctx=*/16,
+                              /*speculative_headroom=*/1, &residency);
+
+        auto first = admit(mgr, 301, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(first));
+        CHECK(mgr.append_prefill(first.slot, 4).ok);
+        CHECK(residency.commit_pending_writes(mgr.slot(first.slot).handle) ==
+              PagedKvResidencyStatus::Ok);
+        mgr.commit_prefill(first.slot);
+
+        fail_sync = true;
+        CHECK(residency.evict_block(
+                  mgr.slot(first.slot).handle, 0,
+                  /*allow_protected=*/true) ==
+              PagedKvResidencyStatus::TransferFailed);
+        mgr.retire(first.slot);
+        CHECK(!mgr.is_active(first.slot));
+        CHECK(mgr.slot(first.slot).retiring());
+        CHECK(pool.active_sequence_count() == 1);
+
+        auto blocked = admit(mgr, 302, prompt_tokens(4), greedy_sampler());
+        CHECK(!is_admitted(blocked));
+        CHECK(is_busy(blocked));
+        CHECK(mgr.slot(first.slot).retiring());
+        CHECK(pool.active_sequence_count() == 1);
+
+        fail_sync = false;
+        auto recovered = admit(mgr, 303, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(recovered));
+        CHECK(recovered.slot == first.slot);
+        CHECK(mgr.is_prefilling(recovered.slot));
+        CHECK(pool.active_sequence_count() == 1);
     }
 
     std::printf("OK test_seq_slot_manager (%d checks)\n", g_checks);

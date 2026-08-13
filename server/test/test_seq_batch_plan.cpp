@@ -131,8 +131,21 @@ int main() {
     burst.decode[0].committed_tokens = {8, 9, 10};
     burst.decode[0].ddtree_steps = 1;
     burst.decode[0].ddtree_accepted_tokens = 3;
+    burst.decode[0].ddtree_suspensions = 1;
     burst.decode[0].target_forwards = 1;
     CHECK(validate_step_result(work, burst, 2).empty());
+
+    SeqEngine::StepResult orphan_suspension = good;
+    orphan_suspension.decode[0].ddtree_suspensions = 1;
+    CHECK(!validate_step_result(work, orphan_suspension, 2).empty());
+
+    SeqEngine::StepResult failed_suspension = good;
+    failed_suspension.decode[0].failed = true;
+    failed_suspension.decode[0].token = -1;
+    failed_suspension.decode[0].error = "decode failed";
+    failed_suspension.decode[0].ddtree_steps = 1;
+    failed_suspension.decode[0].ddtree_suspensions = 1;
+    CHECK(!validate_step_result(work, failed_suspension, 2).empty());
 
     // A scheduler stop in the committed prefix must hide the remaining burst
     // and final pending token. The backend state is discarded at retirement.

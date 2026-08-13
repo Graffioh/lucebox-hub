@@ -55,6 +55,20 @@ MODEL_SHA256="$(sha256sum "$MODEL" | awk '{print $1}')"
 IFS=, read -r -a workload_list <<< "$WORKLOADS"
 IFS=, read -r -a variant_list <<< "$VARIANTS"
 IFS=, read -r -a client_list <<< "$CLIENTS"
+reject_duplicates() {
+  local list_name="$1" value
+  shift
+  local -A seen=()
+  for value in "$@"; do
+    if [[ -n "${seen[$value]+yes}" ]]; then
+      echo "$list_name contains duplicate entry: $value" >&2
+      return 1
+    fi
+    seen["$value"]=1
+  done
+}
+reject_duplicates CLIENTS "${client_list[@]}" || exit 2
+reject_duplicates VARIANTS "${variant_list[@]}" || exit 2
 declare -A prompt_offsets=([1]=0 [4]=1 [8]=5 [16]=13)
 for c in "${client_list[@]}"; do
   [[ -n "${prompt_offsets[$c]+yes}" ]] || { echo "supported CLIENTS are 1,4,8,16" >&2; exit 2; }
@@ -83,14 +97,53 @@ stop_server() {
 }
 trap stop_server EXIT INT TERM
 
+served_model_matches() {
+  python3 - "$PORT" "$1" <<'PY'
+import json
+import sys
+import urllib.request
+
+port, expected = sys.argv[1:]
+with urllib.request.urlopen(
+    f"http://127.0.0.1:{port}/v1/models", timeout=2,
+) as response:
+    payload = json.load(response)
+matches = any(
+    isinstance(row, dict) and row.get("id") == expected
+    for row in payload.get("data", [])
+)
+raise SystemExit(0 if matches else 1)
+PY
+}
+
 wait_health() {
+  local expected_model="$1"
   local deadline=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
   while (( SECONDS < deadline )); do
     kill -0 "$server_pid" 2>/dev/null || return 1
-    curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
+    if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 &&
+       served_model_matches "$expected_model" >/dev/null 2>&1; then
+      return 0
+    fi
     sleep 1
   done
   return 1
+}
+
+port_is_available() {
+  python3 - "$PORT" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("127.0.0.1", port))
+    except OSError as exc:
+        print(f"PORT {port} is unavailable: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+PY
 }
 
 write_metadata() {
@@ -132,12 +185,13 @@ run_case() {
   capacity=$((SLOTS * max_ctx))
   local case_dir="$OUT/$workload/c$clients/r$repeat/$variant"
   mkdir -p "$case_dir"
-  local -a command
+  local -a command launch_env
   if [[ "$variant" == llama ]]; then
     binary="$LLAMA_SERVER_BIN"; model_id=qwen36-llama; max_prefills=0
     command=("$binary" -m "$MODEL" -ngl all --parallel "$SLOTS" -c "$capacity"
       -b 2048 -ub 512 --cont-batching --no-context-shift --no-mmap -fa on
       -ctk q4_0 -ctv q4_0 --no-cache-prompt --host 127.0.0.1 --port "$PORT" --alias "$model_id")
+    launch_env=()
   else
     binary="$LUCE_SERVER_BIN"; model_id=qwen36-luce
     [[ "$variant" == luce-k8 ]] && max_prefills=8 || max_prefills=1
@@ -146,19 +200,27 @@ run_case() {
       --cache-type-k q4_0 --cache-type-v q4_0 --fa-window 0
       --prefix-cache-slots 0 --prefill-cache-slots 0 --admission-coalesce-ms 5
       --host 127.0.0.1 --port "$PORT" --model-name "$model_id")
+    launch_env=("DFLASH_MIN_TOKENS=$WARMUP_TOKENS"
+      "DFLASH_MAX_CONCURRENT_PREFILLS=$max_prefills")
   fi
-  printf '%q ' "${command[@]}" > "$case_dir/server-command.txt"; printf '\n' >> "$case_dir/server-command.txt"
+  if ((${#launch_env[@]})); then
+    printf 'env ' > "$case_dir/server-command.txt"
+    printf '%q ' "${launch_env[@]}" "${command[@]}" >> "$case_dir/server-command.txt"
+  else
+    printf '%q ' "${command[@]}" > "$case_dir/server-command.txt"
+  fi
+  printf '\n' >> "$case_dir/server-command.txt"
   write_metadata "$case_dir/server-metadata.json" "$variant" "$workload" "$clients" "$repeat" "$binary" "$max_prefills" "$case_dir/server-command.txt"
 
   echo "[run] $workload C=$clients repeat=$repeat variant=$variant"
-  if [[ "$variant" == llama ]]; then
-    "${command[@]}" > "$case_dir/server.log" 2>&1 &
+  port_is_available || return 1
+  if ((${#launch_env[@]})); then
+    env "${launch_env[@]}" "${command[@]}" > "$case_dir/server.log" 2>&1 &
   else
-    env DFLASH_MIN_TOKENS="$WARMUP_TOKENS" DFLASH_MAX_CONCURRENT_PREFILLS="$max_prefills" \
-      "${command[@]}" > "$case_dir/server.log" 2>&1 &
+    "${command[@]}" > "$case_dir/server.log" 2>&1 &
   fi
   server_pid=$!
-  if ! wait_health; then tail -n 80 "$case_dir/server.log" >&2 || true; return 1; fi
+  if ! wait_health "$model_id"; then tail -n 80 "$case_dir/server.log" >&2 || true; return 1; fi
 
   local offset="${prompt_offsets[$clients]}" prompts="$OUT/prompts/$workload.jsonl"
   python3 "$CLIENT" --base-url "http://127.0.0.1:$PORT/v1" --model "$model_id" \

@@ -548,6 +548,13 @@ bool Qwen35Backend::init() {
                 max_concurrent_prefills, mixed_prefill_tokens,
                 long_mixed_prefill_tokens, long_prefill_threshold,
                 idle_prefill_tokens, prefill_quantum);
+            if (concurrent_local_ddtree) {
+                const char * adaptive = std::getenv("DFLASH_DDTREE_ADAPTIVE");
+                std::fprintf(stderr,
+                    "[parallel-ddtree] enabled budget=%d width=%d mode=packed-verify-replay adaptive=%s\n",
+                    cfg_.ddtree_budget, tree_width,
+                    adaptive && std::atoi(adaptive) == 0 ? "off" : "on");
+            }
             std::printf("[parallel] %d decode slots, up to %d packed prefills "
                         "(mixed short/long %d/%d at >=%d tokens, "
                         "idle %d, quantum %d), "

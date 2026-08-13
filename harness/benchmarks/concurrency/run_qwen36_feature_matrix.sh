@@ -28,6 +28,9 @@ MAX_TOKENS="${MAX_TOKENS:-64}"
 WARMUP_TOKENS="${WARMUP_TOKENS:-8}"
 SLOTS="${SLOTS:-16}"
 MAX_CONCURRENT_PREFILLS="${MAX_CONCURRENT_PREFILLS:-8}"
+DRAFT_SWA="${DRAFT_SWA:-2048}"
+PREFILL_UBATCH="${PREFILL_UBATCH:-512}"
+DDTREE_ADAPTIVE="${DDTREE_ADAPTIVE:-1}"
 
 # The requested Strix Halo configuration. Every value is serialized into case
 # metadata; no performance-affecting DFLASH variable is inherited implicitly.
@@ -45,13 +48,14 @@ usage() {
   cat <<'EOF'
 Usage:
   MODEL=/path/Qwen3.6-27B-Q4_K_M.gguf \
-  DRAFT_MODEL=/path/dflash-draft-3.6-q4_k_m.gguf \
+  DRAFT_MODEL=/path/dflash-draft-3.6-q8_0.gguf \
   PREFILL_DRAFTER=/path/Qwen3-0.6B-BF16.gguf \
+  DRAFT_SWA=2048 PREFILL_UBATCH=512 \
   harness/benchmarks/concurrency/run_qwen36_feature_matrix.sh
 
 The default is a bounded C4 smoke matrix with independently selectable
 ar, ddtree, pflash, kvflash, and full rows. The full row is the requested
-Strix Halo configuration: target/draft hip:0, DDTree
+Strix Halo configuration: target/draft hip:0, Q8 DFlash SWA=2048, DDTree
 budget 22, persistent PFlash auto, and KVFlash auto. The long-context profiles
 are intended to cross the recorded 32K PFlash and 8K KV-residency thresholds;
 word count is not treated as proof. Per-request wire/log token counts and
@@ -59,6 +63,7 @@ activation telemetry fail the case if an "auto" feature did not execute.
 
 llama is optional: include it explicitly with VARIANTS=ar,ddtree,llama and set
 LLAMA_SERVER_BIN. For publication, set CLIENTS=1,4,8,16 and REPEATS=5.
+For the AMD blog recipe, use the Q8_0 3.6 drafter, DRAFT_SWA=2048, PREFILL_UBATCH=512, and set DDTREE_ADAPTIVE=0 to keep DDTree active for every eligible step.
 OUT must not already exist.
 EOF
 }
@@ -69,13 +74,15 @@ for cmd in python3 curl sha256sum awk; do
   command -v "$cmd" >/dev/null || { echo "missing $cmd" >&2; exit 2; }
 done
 [[ -r "$MODEL" ]] || { echo "set MODEL to a readable target GGUF" >&2; exit 2; }
-[[ -x "$LUCE_SERVER_BIN" ]] || { echo "missing Lucebox server: $LUCE_SERVER_BIN" >&2; exit 2; }
 [[ "$REPEATS" =~ ^[1-9][0-9]*$ ]] || { echo "REPEATS must be positive" >&2; exit 2; }
 [[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] || { echo "SLOTS must be positive" >&2; exit 2; }
 [[ "$MAX_CONCURRENT_PREFILLS" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_CONCURRENT_PREFILLS must be positive" >&2; exit 2; }
 [[ "$DDTREE_BUDGET" =~ ^[1-9][0-9]*$ ]] || { echo "DDTREE_BUDGET must be positive" >&2; exit 2; }
 [[ "$PREFILL_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || { echo "PREFILL_THRESHOLD must be positive" >&2; exit 2; }
 [[ "$KVFLASH_MAX_POOL_TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "KVFLASH_MAX_POOL_TOKENS must be positive" >&2; exit 2; }
+[[ "$DRAFT_SWA" =~ ^[0-9]+$ ]] || { echo "DRAFT_SWA must be a non-negative integer" >&2; exit 2; }
+[[ "$PREFILL_UBATCH" =~ ^[1-9][0-9]*$ ]] || { echo "PREFILL_UBATCH must be positive" >&2; exit 2; }
+[[ "$DDTREE_ADAPTIVE" == 0 || "$DDTREE_ADAPTIVE" == 1 ]] || { echo "DDTREE_ADAPTIVE must be 0 or 1" >&2; exit 2; }
 [[ ! -e "$OUT" ]] || { echo "refusing to overwrite $OUT" >&2; exit 2; }
 
 ambient_tuning="$(env | grep -E '^(GGML_|DFLASH_|LUCE_|HIP_|ROCR_|HSA_|LD_PRELOAD=|LD_LIBRARY_PATH=)' \
@@ -108,12 +115,17 @@ for c in "${client_list[@]}"; do
   [[ -n "${prompt_offsets[$c]+yes}" ]] || { echo "supported CLIENTS are 1,4,8,16" >&2; exit 2; }
   (( c <= SLOTS )) || { echo "CLIENTS=$c exceeds SLOTS=$SLOTS" >&2; exit 2; }
 done
+luce_requested=0
 for v in "${variant_list[@]}"; do
   case "$v" in
-    ar|ddtree|pflash|kvflash|full|llama) ;;
+    llama) ;;
+    ar|ddtree|pflash|kvflash|full) luce_requested=1 ;;
     *) echo "unknown variant $v" >&2; exit 2 ;;
   esac
 done
+if (( luce_requested )); then
+  [[ -x "$LUCE_SERVER_BIN" ]] || { echo "missing Lucebox server: $LUCE_SERVER_BIN" >&2; exit 2; }
+fi
 
 contains_variant() {
   local needle="$1" value
@@ -232,11 +244,16 @@ run_case() {
       --cache-type-k q4_0 --cache-type-v q4_0 --fa-window 0
       --prefix-cache-slots 0 --prefill-cache-slots 0 --admission-coalesce-ms 5
       --host 127.0.0.1 --port "$PORT" --model-name "$model_id")
-    launch_env=("DFLASH_MIN_TOKENS=$WARMUP_TOKENS" "DFLASH_MAX_CONCURRENT_PREFILLS=$max_prefills")
+    launch_env=("DFLASH_MIN_TOKENS=$WARMUP_TOKENS" "DFLASH_MAX_CONCURRENT_PREFILLS=$max_prefills"
+      "DFLASH27B_DRAFT_SWA=$DRAFT_SWA" "DFLASH27B_PREFILL_UBATCH=$PREFILL_UBATCH")
+    if [[ "$DDTREE_ADAPTIVE" == 0 ]]; then
+      launch_env+=("DFLASH_DDTREE_ADAPTIVE=0")
+    fi
     if [[ "$variant" == ddtree || "$variant" == full ]]; then
       command+=(--draft "$DRAFT_MODEL" --draft-device "$DRAFT_DEVICE"
-        --ddtree --ddtree-budget "$DDTREE_BUDGET")
+        --ddtree --ddtree-budget "$DDTREE_BUDGET" --fast-rollback)
       expected+=(--expect ddtree)
+      if [[ "$variant" == ddtree ]]; then command+=(--draft-residency "$DRAFT_RESIDENCY"); fi
     fi
     if [[ "$variant" == pflash || "$variant" == full ]]; then
       if [[ "$variant" == pflash ]]; then command+=(--draft-device "$DRAFT_DEVICE"); fi
@@ -280,7 +297,8 @@ run_case() {
   fi
   if [[ "$variant" == ddtree || "$variant" == full ]]; then
     metadata+=(--draft-device "$DRAFT_DEVICE" --draft-model "$DRAFT_MODEL"
-      --draft-model-sha256 "$DRAFT_MODEL_SHA256" --ddtree --ddtree-budget "$DDTREE_BUDGET")
+      --draft-model-sha256 "$DRAFT_MODEL_SHA256" --ddtree --ddtree-budget "$DDTREE_BUDGET" --fast-rollback)
+    if [[ "$variant" == ddtree ]]; then metadata+=(--draft-residency "$DRAFT_RESIDENCY"); fi
   fi
   if [[ "$variant" == pflash || "$variant" == full ]]; then
     metadata+=(--draft-device "$DRAFT_DEVICE" --prefill-compression "$PREFILL_COMPRESSION"

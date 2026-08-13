@@ -243,10 +243,13 @@ PagedKvResidencyStatus PagedKvResidencyManager::prepare_append(
     }
     if (token_count == 0) return finish_transfers(PagedKvResidencyStatus::Ok);
 
+    BlockState * append_head = nullptr;
     bool restore_partial_head = false;
     uint32_t partial_head = 0;
     if (snapshot.kv_seq_len % pool_.block_size() != 0) {
         partial_head = snapshot.kv_seq_len / pool_.block_size();
+        append_head = &sequences_[handle.slot].blocks[partial_head];
+        append_head->reservation_pending = true;
         restore_partial_head =
             snapshot.block_table[partial_head] == PAGED_KV_COLD_BLOCK;
     }
@@ -265,15 +268,22 @@ PagedKvResidencyStatus PagedKvResidencyManager::prepare_append(
     const auto room = make_room(
         handle, globally_needed + (restore_partial_head ? 1u : 0u),
         additional_blocks + (restore_partial_head ? 1u : 0u));
-    if (room != PagedKvResidencyStatus::Ok) return finish_transfers(room);
+    if (room != PagedKvResidencyStatus::Ok) {
+        if (append_head) append_head->reservation_pending = false;
+        return room;
+    }
     if (restore_partial_head) {
         const auto restored = restore_block_async(
             handle, partial_head);
         if (restored != PagedKvResidencyStatus::Ok) {
-            return finish_transfers(restored);
+            const auto finished = finish_transfers(restored);
+            if (append_head) append_head->reservation_pending = false;
+            return finished;
         }
     }
-    return finish_transfers(PagedKvResidencyStatus::Ok);
+    const auto finished = finish_transfers(PagedKvResidencyStatus::Ok);
+    if (append_head) append_head->reservation_pending = false;
+    return finished;
 }
 
 PagedKvResidentAppendResult PagedKvResidencyManager::append(
@@ -305,18 +315,26 @@ PagedKvResidencyStatus PagedKvResidencyManager::observe_append(
             !state.blocks[remap.logical_block].host_valid) {
             return finish_transfers(PagedKvResidencyStatus::HostCopyMissing);
         }
+        BlockState & block = state.blocks[remap.logical_block];
+        // A callback may reject only after queuing a prefix of a multi-tensor
+        // copy. Quarantine the destination before invoking it either way.
+        transfers_pending_ = true;
+        block.page_in_pending = true;
         bool queued = false;
         try {
             queued = transfers_.copy_in_async(
                 handle, remap.logical_block, remap.physical_block,
-                state.blocks[remap.logical_block].host, config_.block_bytes);
+                block.host, config_.block_bytes);
         } catch (...) {
             queued = false;
         }
-        if (!queued) return finish_transfers(PagedKvResidencyStatus::TransferFailed);
-        transfers_pending_ = true;
-        stats_.page_ins++;
-        stats_.moved_bytes += config_.block_bytes;
+        const PendingTransfer transfer{
+            handle, remap.logical_block, remap.physical_block};
+        if (!queued) {
+            pending_page_in_rollbacks_.push_back(transfer);
+            return finish_transfers(PagedKvResidencyStatus::TransferFailed);
+        }
+        pending_page_ins_.push_back(transfer);
     }
     const auto synced = finish_transfers(PagedKvResidencyStatus::Ok);
     if (synced != PagedKvResidencyStatus::Ok) return synced;
@@ -424,8 +442,34 @@ PagedKvResidencyStatus PagedKvResidencyManager::synchronize_before_read() {
         stats_.page_ins++;
         stats_.moved_bytes += config_.block_bytes;
     }
+    for (const PendingTransfer & transfer : pending_page_in_rollbacks_) {
+        if (validate_registered(transfer.handle) !=
+            PagedKvResidencyStatus::Ok) {
+            result = PagedKvResidencyStatus::InconsistentPoolState;
+            continue;
+        }
+        BlockState & block =
+            sequences_[transfer.handle.slot].blocks[transfer.logical_block];
+        PagedKvSequenceSnapshot snapshot;
+        if (pool_.sequence(transfer.handle, snapshot) != PagedKvStatus::Ok ||
+            transfer.logical_block >= snapshot.block_table.size() ||
+            snapshot.block_table[transfer.logical_block] !=
+                transfer.physical_block) {
+            result = PagedKvResidencyStatus::InconsistentPoolState;
+            continue;
+        }
+        uint32_t released = PAGED_KV_COLD_BLOCK;
+        if (pool_.page_out_block(
+                transfer.handle, transfer.logical_block, released) !=
+                PagedKvStatus::Ok || released != transfer.physical_block) {
+            result = PagedKvResidencyStatus::InconsistentPoolState;
+            continue;
+        }
+        block.page_in_pending = false;
+    }
     pending_page_outs_.clear();
     pending_page_ins_.clear();
+    pending_page_in_rollbacks_.clear();
     if (result != PagedKvResidencyStatus::Ok) return result;
     return PagedKvResidencyStatus::Ok;
 }
@@ -630,6 +674,10 @@ PagedKvResidencyStatus PagedKvResidencyManager::evict_block_async(
 
     const uint32_t physical = snapshot.block_table[logical_block];
     bool queued = false;
+    // False may mean a multi-tensor callback queued only a prefix. Invalidate
+    // the old host image and require a barrier before any later operation.
+    transfers_pending_ = true;
+    block.host_valid = false;
     try {
         queued = transfers_.copy_out_async(
             handle, logical_block, physical, block.host,
@@ -638,8 +686,6 @@ PagedKvResidencyStatus PagedKvResidencyManager::evict_block_async(
         queued = false;
     }
     if (!queued) return PagedKvResidencyStatus::TransferFailed;
-    transfers_pending_ = true;
-    block.host_valid = false;
     block.page_out_pending = true;
     pending_page_outs_.push_back({handle, logical_block, physical});
     return PagedKvResidencyStatus::Ok;
@@ -673,6 +719,8 @@ PagedKvResidencyStatus PagedKvResidencyManager::restore_block_async(
     if (page_status != PagedKvStatus::Ok) return from_pool_status(page_status);
 
     bool queued = false;
+    transfers_pending_ = true;
+    block.page_in_pending = true;
     try {
         queued = transfers_.copy_in_async(
             handle, logical_block, physical, block.host,
@@ -680,17 +728,14 @@ PagedKvResidencyStatus PagedKvResidencyManager::restore_block_async(
     } catch (...) {
         queued = false;
     }
+    const PendingTransfer transfer{handle, logical_block, physical};
     if (!queued) {
-        uint32_t released = PAGED_KV_COLD_BLOCK;
-        if (pool_.page_out_block(handle, logical_block, released) !=
-            PagedKvStatus::Ok) {
-            return PagedKvResidencyStatus::InconsistentPoolState;
-        }
+        // The callback may have queued a prefix. Keep the physical mapping
+        // quarantined until finish_transfers() proves the stream is drained.
+        pending_page_in_rollbacks_.push_back(transfer);
         return PagedKvResidencyStatus::TransferFailed;
     }
-    transfers_pending_ = true;
-    block.page_in_pending = true;
-    pending_page_ins_.push_back({handle, logical_block, physical});
+    pending_page_ins_.push_back(transfer);
     block.last_use = ++clock_;
     return PagedKvResidencyStatus::Ok;
 }

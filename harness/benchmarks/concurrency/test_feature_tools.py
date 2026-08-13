@@ -179,6 +179,17 @@ class FeatureRunnerShellTests(unittest.TestCase):
             self.assertIn("VARIANTS contains duplicate entry: ar", result.stderr)
             self.assertFalse((Path(tmp) / "out").exists())
 
+    def test_llama_only_does_not_require_lucebox_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_invalid_matrix(
+                tmp, VARIANTS="llama", LUCE_SERVER_BIN="/does/not/exist",
+                LLAMA_SERVER_BIN="/bin/true", REPEATS="0",
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("REPEATS must be positive", result.stderr)
+            self.assertNotIn("missing Lucebox server", result.stderr)
+
+
 
 class FeatureProofTests(unittest.TestCase):
     def test_full_below_pool_passes_without_page_traffic(self) -> None:
@@ -450,7 +461,10 @@ class FeatureSummaryTests(unittest.TestCase):
         output_hash: str | None = "same-output",
     ) -> dict:
         return {
-            "report": {"max_tokens": 256, "ignore_eos": True},
+            "report": {
+                "max_tokens": 256, "ignore_eos": True,
+                "temperature": 0.0, "seed": 1,
+            },
             "meta": {
                 "workload": "compression", "variant": variant, "repeat": repeat,
                 "model_sha256": "a" * 64,
@@ -527,6 +541,26 @@ class FeatureSummaryTests(unittest.TestCase):
         feature["meta"]["model_sha256"] = "b" * 64
         with self.assertRaisesRegex(ValueError, "run metadata differs"):
             summary.summarize([ar, feature])
+
+    def test_summary_rejects_sampling_mismatch(self) -> None:
+        for field, value in (("temperature", 0.5), ("seed", 2)):
+            with self.subTest(field=field):
+                ar = self.item("ar", 10.0)
+                feature = self.item("full", 12.0)
+                feature["report"][field] = value
+                with self.assertRaisesRegex(ValueError, "run metadata differs"):
+                    summary.summarize([ar, feature])
+
+    def test_summary_rejects_missing_prompt_hash(self) -> None:
+        for value in (None, ""):
+            with self.subTest(value=value):
+                feature = self.item("full", 12.0)
+                feature["level"]["selected_prompt_set_sha256"] = value
+                with self.assertRaisesRegex(
+                    ValueError, "missing selected prompt set hash",
+                ):
+                    summary.summarize([feature])
+
 
     def test_unstable_feature_row_suppresses_ar_delta(self) -> None:
         reports = [

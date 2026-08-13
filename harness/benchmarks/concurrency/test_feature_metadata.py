@@ -41,6 +41,8 @@ class FeatureMetadataTests(unittest.TestCase):
             target.write_bytes(b"target")
             draft.write_bytes(b"draft")
             prefill.write_bytes(b"prefill")
+            draft_sha = hashlib.sha256(draft.read_bytes()).hexdigest()
+            prefill_sha = hashlib.sha256(prefill.read_bytes()).hexdigest()
             prompts.write_text('{"prompt":"p"}\n', encoding="utf-8")
             command.write_text("server --target-device hip:0\n", encoding="utf-8")
             argv = [
@@ -51,15 +53,15 @@ class FeatureMetadataTests(unittest.TestCase):
                 "--prompt-file", str(prompts), "--command-file", str(command),
                 "--repo", str(HERE.parents[2]), "--max-concurrent-prefills", "8",
                 "--target-device", "hip:0", "--draft-device", "hip:0",
-                "--draft-model", str(draft), "--draft-model-sha256", "draft-sha",
-                "--ddtree", "--ddtree-budget", "22",
+                "--draft-model", str(draft), "--draft-model-sha256", draft_sha,
+                "--ddtree", "--ddtree-budget", "22", "--fast-rollback",
                 "--prefill-compression", "auto", "--prefill-threshold", "32000",
                 "--prefill-keep-ratio", "0.05", "--prefill-drafter", str(prefill),
-                "--prefill-drafter-sha256", "prefill-sha",
+                "--prefill-drafter-sha256", prefill_sha,
                 "--draft-residency", "persistent", "--kvflash", "auto",
                 "--kvflash-max-pool-tokens", "8192",
                 "--kvflash-scorer-drafter", str(prefill),
-                "--kvflash-scorer-drafter-sha256", "prefill-sha",
+                "--kvflash-scorer-drafter-sha256", prefill_sha,
             ]
             with mock.patch.object(sys, "argv", argv):
                 self.assertEqual(metadata.main(), 0)
@@ -67,27 +69,46 @@ class FeatureMetadataTests(unittest.TestCase):
             self.assertEqual(result["model_sha256"], hashlib.sha256(b"target").hexdigest())
             self.assertTrue(result["server_binary_sha256"])
             self.assertTrue(result["git_head"])
-            self.assertEqual(result["feature_config"]["draft_model_sha256"], "draft-sha")
-            self.assertEqual(result["feature_config"]["prefill_drafter_sha256"], "prefill-sha")
+            self.assertEqual(result["feature_config"]["draft_model_sha256"], draft_sha)
+            self.assertEqual(result["feature_config"]["prefill_drafter_sha256"], prefill_sha)
             self.assertEqual(
                 result["feature_config"]["kvflash_scorer_drafter"],
                 str(prefill.resolve()),
             )
             self.assertEqual(
                 result["feature_config"]["kvflash_scorer_drafter_sha256"],
-                "prefill-sha",
+                prefill_sha,
             )
             self.assertEqual(result["literal_screenshot_flags"], [
                 "--target-device", "hip:0",
                 "--draft-device", "hip:0",
                 "--ddtree",
                 "--ddtree-budget", "22",
+                "--fast-rollback",
                 "--draft-residency", "persistent",
                 "--prefill-compression", "auto",
                 "--prefill-drafter", str(prefill.resolve()),
                 "--kvflash", "auto",
             ])
             self.assertIsNone(result["runtime_observed"])
+
+    def test_model_digest_claim_must_match_referenced_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.gguf"
+            model.write_bytes(b"model")
+            expected = hashlib.sha256(b"model").hexdigest()
+            cache: dict[Path, str] = {}
+            self.assertEqual(
+                metadata.validated_digest(model, expected, "model", cache),
+                expected,
+            )
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                metadata.validated_digest(model, "stale", "model", cache)
+            with self.assertRaisesRegex(ValueError, "is required"):
+                metadata.validated_digest(model, None, "model", cache)
+            with self.assertRaisesRegex(ValueError, "without a model file"):
+                metadata.validated_digest(None, expected, "model", cache)
+
 
     def test_ldd_failure_is_fatal(self) -> None:
         failed = mock.Mock(returncode=1, stdout="", stderr="not a dynamic executable")
@@ -147,6 +168,16 @@ class FeatureMetadataTests(unittest.TestCase):
                 "[paged-attention] 512 physical blocks x 16 tokens "
                 "(8192 pool tokens, per-sequence max_ctx 65536)",
             )
+
+    def test_runtime_rejects_kvflash_marker_without_paged_marker(self) -> None:
+        original = {"feature_config": {"kvflash": "auto"}}
+        log = (
+            "[parallel-kvflash] physical resident pool 8192 tokens; "
+            "logical per-slot cap 65536 across 16 slots "
+            "(--kv-pool-tokens does not expand resident VRAM)"
+        )
+        with self.assertRaisesRegex(ValueError, "paged physical-pool"):
+            runtime_metadata.update_metadata(original, log)
 
 
 if __name__ == "__main__":

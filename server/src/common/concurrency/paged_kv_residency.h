@@ -255,6 +255,7 @@ private:
     bool transfer_barrier_failed_ = false;
     std::vector<PendingTransfer> pending_page_outs_;
     std::vector<PendingTransfer> pending_page_ins_;
+    std::vector<PendingTransfer> pending_page_in_rollbacks_;
 };
 
 }  // namespace dflash::common
