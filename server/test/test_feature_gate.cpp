@@ -600,7 +600,6 @@ void test_feature_warnings_report_inert_decode_tunables() {
     vw.verify_width = 8;
     CHECK(!warns_about(warn_result(vw, "laguna"), "--verify-width"));
     CHECK(warns_about(warn_result(vw, "qwen35"), "--verify-width"));
-
     BackendArgs db;
     db.model_path = "/nonexistent/model.gguf";
     db.draft_path = "/nonexistent/draft.gguf";
@@ -677,7 +676,6 @@ void test_model_capability_tables() {
     CHECK(arch_supports_paged_attention("qwen35", false));
     CHECK(!arch_supports_paged_attention("qwen35", true));
     CHECK(!arch_supports_paged_attention("qwen35moe", false));
-
     CHECK(arch_supports_draft_block_size("qwen35", false));
     CHECK(!arch_supports_draft_block_size("qwen35", true));
     CHECK(!arch_supports_draft_block_size("qwen35moe", false));
