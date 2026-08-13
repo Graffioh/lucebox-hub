@@ -4362,6 +4362,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
         const ggml_tensor * silu     = cgraph->nodes[node_idx+1];
 
+        if (ggml_get_op_params_i32(ssm_conv, 0) == 1) {
+            // the Specla ssm_conv kernel applies SiLU itself
+            return false;
+        }
+
         if (ssm_conv->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32) {
             return false;
         }
@@ -6157,6 +6162,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
+            if (ggml_get_op_params_i32(op, 0) == 1) {
+                // Specla layout: x is [d_inner, n_tokens], so d_inner = ne[0]
+                // and the kernel guards the final partial 128-channel block.
+                return true;
+            }
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }

@@ -122,6 +122,8 @@ static void print_usage(const char * prog) {
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
+        "  --ddtree-tau <T>     SpecLA confidence margin on cumulative log-prob\n"
+        "                       (prunes draft-tree candidates below best-T; default off)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
         "                       trimmed per step by drafter confidence; N = fixed base)\n"
         "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
@@ -412,6 +414,8 @@ int main(int argc, char ** argv) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--ddtree-tau") == 0 && i + 1 < argc) {
+            bargs.ddtree_tau = (float)std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--adaptive-experts") == 0) {
             const char * tau = "0.80";
             if (i + 1 < argc && argv[i + 1][0] != '-') {
