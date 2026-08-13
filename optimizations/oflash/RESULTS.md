@@ -209,6 +209,18 @@ faithfully requires a versioned capture-format extension before adding its accep
 KL, rejected-position reverse KL and decay, rather than treating the present rejection weight as
 equivalent.
 
+The next implementation reserves 50% of each microbatch for uniformly selected retired sequences
+once replay history exists, instead of allowing a continuously full fresh queue to starve replay.
+It balances at the sequence level so a single long response cannot dominate, retains overflow fresh
+samples for later steps, and logs the cumulative fresh/replay mix with every export. A fresh fold-0
+run retained all 18 sequences (6,869 rows), drained with zero drops and froze guard-promoted
+generation 5. Two frozen evaluations were identical on all 12 outputs and acceptance values. Mean
+held-out acceptance changed from 0.4937 to 0.4968 (`+0.0031`, paired-bootstrap 95% CI
+`[-0.0102, +0.0180]`); all three suite means were at or above baseline, score remained 7/12, and
+mean per-case throughput was `0.994x` (95% CI `[0.963x, 1.021x]`). This is better than both the
+original `-0.0032` and reservoir-only `+0.0008` variants on this fold, but remains statistically
+uncertain, below the `+0.05` gate, and only 7/12 outputs match the baseline checkpoint.
+
 ## 3. M2 — within-session AL climb (online loop)
 
 **Bounded fixed-prompt loop passed; domain-shifted and adversarial workloads remain open.**

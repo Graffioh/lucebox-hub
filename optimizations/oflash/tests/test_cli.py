@@ -17,6 +17,7 @@ def test_conservative_training_defaults():
     assert args.batch_rows == 128
     assert args.train_ctx == 128
     assert args.reservoir_rows == 10_000
+    assert args.replay_ratio == 0.5
     assert args.seed == 0
     assert args.resolved_rope_theta is None
     assert args.resolved_swa_window is None
@@ -66,6 +67,17 @@ def test_invalid_resolved_engine_metadata_is_rejected(flag):
             "--ring-name=/lucebox-test",
             "--out-dir=/tmp/oflash-test",
             flag,
+        ])
+
+
+@pytest.mark.parametrize("value", ["-0.1", "1", "nan", "inf"])
+def test_invalid_replay_ratio_is_rejected(value):
+    with pytest.raises(SystemExit):
+        parse_args([
+            "draft.gguf",
+            "--ring-name=/lucebox-test",
+            "--out-dir=/tmp/oflash-test",
+            f"--replay-ratio={value}",
         ])
 
 

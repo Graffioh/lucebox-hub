@@ -273,7 +273,8 @@ watch -n 5 'curl -fsS http://127.0.0.1:8080/props | jq .oflash'
 3. **Integrated defaults.** Restart with the online command in Usage. Hold
    `--max-ctx 4096` for ten minutes under the same request stream. Defaults are
    ring 512 MiB, top-K 8, batch 128, train context 128, reservoir 10,000,
-   deterministic replay seed 0 and `auto`/FP16 on Strix. Require
+   50% sequence-balanced replay, deterministic replay seed 0 and `auto`/FP16
+   on Strix. Require
    `/props.oflash.trainer_alive=true`,
    `/props.oflash.training_disabled=false`, increasing `steps`, and bounded
    backlog before accepting a promotion. A self-disabled trainer remains alive

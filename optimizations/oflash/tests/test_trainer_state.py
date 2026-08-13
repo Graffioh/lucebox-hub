@@ -49,6 +49,7 @@ def _trainer(*, out_dir="/tmp/oflash-test-does-not-exist",
         rank=4,
         alpha=32.0,
         reservoir_rows=128,
+        replay_ratio=0.5,
         train_ctx=64,
         seed=0,
     )
@@ -173,6 +174,34 @@ def test_reservoir_replay_sampling_is_seeded_and_reproducible():
 
     assert left_draw == right_draw
     assert len(left_draw) == 8
+
+
+def test_replay_reserves_half_of_busy_microbatch_for_old_sequences():
+    trainer = _trainer()
+    trainer._micro_max = 8
+    fresh_store = SeqStore(seq_id=99, first_pos=0, max_pos=64)
+    for pos in range(64):
+        fresh_store.feat[pos] = np.zeros(2, dtype=np.uint16)
+    trainer._fresh = [
+        (fresh_store, _sample(flags=(1, 0), pos=64)) for _ in range(8)
+    ]
+    trainer._fresh_rows = 16
+
+    for seq_id in range(4):
+        store = SeqStore(seq_id=seq_id, first_pos=0, max_pos=64)
+        for pos in range(64):
+            store.feat[pos] = np.zeros(2, dtype=np.uint16)
+        store.steps = [_sample(flags=(1, 0), pos=64)]
+        trainer._reservoir.append(store)
+
+    batch = trainer._build_batch()
+
+    assert len(batch) == 8
+    assert sum(store.seq_id == 99 for store, _sample_, _start in batch) == 4
+    assert {store.seq_id for store, _sample_, _start in batch
+            if store.seq_id != 99} == {0, 1, 2, 3}
+    assert len(trainer._fresh) == 4
+    assert trainer._last_batch_mix == (4, 4)
 
 
 def test_generation_resumes_above_every_existing_adapter(tmp_path):

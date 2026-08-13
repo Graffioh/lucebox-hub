@@ -270,6 +270,7 @@ are yours to tune (see the matching options in
 | `--export-every <N>` | `8` | training steps between adapter exports |
 | `--train-ctx <N>` | `128` | feature-window length per training sample (minimum: 64) |
 | `--reservoir-rows <N>` | `10000` | replay reservoir size (forgetting knob) |
+| `--replay-ratio <F>` | `0.5` | microbatch share reserved for sequence-balanced replay once history exists |
 | `--keep-generations <N>` | `4` | adapter generations kept on disk per profile |
 | `--seed <N>` | `0` | deterministic replay-sampler seed |
 

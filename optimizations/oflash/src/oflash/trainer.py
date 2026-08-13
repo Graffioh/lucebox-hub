@@ -17,7 +17,6 @@ ring framing exits for a supervisor respawn.
 from __future__ import annotations
 
 import gc
-import math
 import os
 import queue
 import random
@@ -135,6 +134,7 @@ class TrainerConfig:
     export_every: int
     train_ctx: int
     reservoir_rows: int
+    replay_ratio: float
     keep_generations: int
     seed: int
 
@@ -239,6 +239,9 @@ class Trainer:
         self._opt_steps = 0
         self._rows_seen = 0
         self._labels_seen = 0
+        self._fresh_samples_trained = 0
+        self._replay_samples_trained = 0
+        self._last_batch_mix = (0, 0)
         self._loss_ema: float | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────
@@ -695,17 +698,25 @@ class Trainer:
     # ── training ─────────────────────────────────────────────────────
 
     def _build_batch(self) -> list[tuple[SeqStore, StepSample, int]]:
-        """Every fresh rejection-adjacent sample, topped up with
-        recency-biased draws from the reservoir, capped at _micro_max."""
+        """Mix fresh rejection-adjacent samples with sequence-balanced replay.
+
+        Once retired sequences exist, reserve ``replay_ratio`` of the
+        microbatch for them. This makes replay effective even when a dense
+        sequential request stream continually supplies enough fresh samples
+        to fill the whole microbatch.
+        """
         cap = self._micro_max
         batch: list[tuple[SeqStore, StepSample, int]] = []
         remaining: list[tuple[SeqStore, StepSample]] = []
+        replay_slots = (min(cap - 1, int(cap * self.cfg.replay_ratio))
+                        if self._reservoir else 0)
+        fresh_cap = cap - replay_slots
         for store, sample in self._fresh:
             if store.evicted or not sample.has_reject:
                 continue
             start = self._window_start(store, sample)
             if start is not None:
-                if len(batch) < cap:
+                if len(batch) < fresh_cap:
                     batch.append((store, sample, start))
                 else:
                     remaining.append((store, sample))
@@ -714,17 +725,25 @@ class Trainer:
         # forever. The main loop drains remaining batches on later turns.
         self._fresh = remaining
         self._fresh_rows = sum(s.n_labels for _, s in remaining)
-        n_res = len(self._reservoir)
+        fresh_count = len(batch)
+        # Shuffle sequence indices, not a flattened step list: one long
+        # response must not crowd shorter requests out of replay. Cycle only
+        # when the requested replay share exceeds the number of stores.
+        indices = list(range(len(self._reservoir)))
         attempts = 0
-        while len(batch) < cap and n_res > 0 and attempts < 4 * cap:
-            attempts += 1
-            # Density ∝ index: newest retired sequences are drawn most.
-            idx = min(int(math.sqrt(self._rng.random()) * n_res), n_res - 1)
-            store = self._reservoir[idx]
-            sample = self._rng.choice(store.steps)
-            start = self._window_start(store, sample)
-            if start is not None:
-                batch.append((store, sample, start))
+        max_attempts = max(cap * 4, len(indices) * 2)
+        while len(batch) < cap and indices and attempts < max_attempts:
+            self._rng.shuffle(indices)
+            for idx in indices:
+                if len(batch) >= cap or attempts >= max_attempts:
+                    break
+                attempts += 1
+                store = self._reservoir[idx]
+                sample = self._rng.choice(store.steps)
+                start = self._window_start(store, sample)
+                if start is not None:
+                    batch.append((store, sample, start))
+        self._last_batch_mix = (fresh_count, len(batch) - fresh_count)
         return batch
 
     def _train_step(self) -> None:
@@ -772,6 +791,9 @@ class Trainer:
         self._loss_ema = (loss if self._loss_ema is None else
                           EMA_DECAY * self._loss_ema
                           + (1.0 - EMA_DECAY) * loss)
+        fresh_count, replay_count = self._last_batch_mix
+        self._fresh_samples_trained += fresh_count
+        self._replay_samples_trained += replay_count
         self._micro_max = min(MICRO_BATCH_MAX, self._micro_max + 1)
         if self._opt_steps % self.cfg.export_every == 0:
             self._export()
@@ -915,5 +937,7 @@ class Trainer:
             f"labels={self._labels_seen} opt_steps={self._opt_steps} "
             f"loss_ema={ema} backlog={self._ring.backlog()}B "
             f"dropped={self._ring.dropped_records} "
+            f"mix={self._fresh_samples_trained}fresh/"
+            f"{self._replay_samples_trained}replay "
             f"reservoir={self._reservoir_row_count}rows/"
             f"{len(self._reservoir)}seqs")

@@ -52,6 +52,13 @@ def _nonnegative_int(raw: str) -> int:
     return value
 
 
+def _fraction_below_one(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value) or value < 0.0 or value >= 1.0:
+        raise argparse.ArgumentTypeError("must be finite and in [0, 1)")
+    return value
+
+
 def _swa_pattern(raw: str) -> tuple[bool, ...]:
     values = raw.split(",")
     if not values or any(value not in ("0", "1") for value in values):
@@ -106,6 +113,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--export-every", type=int, default=8)
     ap.add_argument("--train-ctx", type=int, default=128)
     ap.add_argument("--reservoir-rows", type=int, default=10_000)
+    ap.add_argument("--replay-ratio", type=_fraction_below_one, default=0.5,
+                    help="fraction of each microbatch reserved for replay "
+                         "once retired sequences exist (default: 0.5)")
     ap.add_argument("--keep-generations", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0,
                     help="deterministic replay-sampler seed (default: 0)")
@@ -311,6 +321,7 @@ def main(argv: list[str] | None = None) -> int:
         export_every=args.export_every,
         train_ctx=args.train_ctx,
         reservoir_rows=args.reservoir_rows,
+        replay_ratio=args.replay_ratio,
         keep_generations=args.keep_generations,
         seed=args.seed,
     )
