@@ -18,19 +18,19 @@
 ---
 
 ```
-Qwen3.6-27B Q4_K_M target · dflash-draft-3.6 Q8_0 drafter
+Qwen3.6-27B Q4_K_M target · Lucebox dflash-draft-3.6 Q4_K_M drafter
 R9700 (gfx1201) serves · Strix Halo iGPU (gfx1151) trains
 
   measurement plan                            acceptance α    decode tok/s
   M0  static drafter (baseline)                 pending         pending
-  M1  + offline replay LoRA (static load)       pending         pending
+  M1  + detached-trainer LoRA (static load)     pending         pending
   M2  + online loop (within-session climb)      pending         pending
 
   No acceptance/speed results yet — this card is the plan, not a claim.
   Hardware qualification evidence and future performance numbers land in
   RESULTS.md first, each with the command that produced it (CONTRIBUTING.md:
   numbers without methodology don't get merged).
-  reproduce: server/build/dflash_server target.gguf --draft drafter.gguf --oflash \
+  reproduce: server/build/dflash_server target.gguf --draft drafter.gguf --draft-swa 2048 --oflash \
                --cache-type-k q4_0 --cache-type-v q4_0   # M0 capture-only
 ```
 
@@ -129,6 +129,26 @@ python -m pip install --no-deps -e .
 cd ../..
 ```
 
+Pin the exact target and official Lucebox Q4_K_M drafter. The drafter is the
+artifact used by Lucebox's published R9700 result; its older GGUF metadata
+requires the explicit 2,048-token SWA override shown below.
+
+```bash
+mkdir -p server/models/oflash
+hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf \
+  --revision e41d24e0e6909d1e15f79445cd9ac27ced27724a \
+  --local-dir server/models/oflash
+hf download Lucebox/Qwen3.6-27B-DFlash-GGUF \
+  dflash-draft-3.6-q4_k_m.gguf \
+  --revision fca10ba135c9d834988e15b7d7f5aee8ebc562a7 \
+  --local-dir server/models/oflash
+
+sha256sum server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf \
+  server/models/oflash/dflash-draft-3.6-q4_k_m.gguf
+# 41ae55b347988dca8352ed4c85f3d8ee3804a23cc89aaea165c071d61ec3cca0  server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf
+# e2500e90165a0f8e7b52c9882c29ed1fa391c60b300ff11b817bf10e31fa092e  server/models/oflash/dflash-draft-3.6-q4_k_m.gguf
+```
+
 Confirm device ordering with `rocm-smi --showproductname`; on the audited box the R9700 is ordinal
 0 and Strix is ordinal 1. Exercise FP16 forward/backward and MIOpen on Strix before a large mirror
 allocation:
@@ -150,8 +170,9 @@ PY
 HIP_VISIBLE_DEVICES=1 optimizations/oflash/.venv/bin/python -m torch.utils.collect_env
 ```
 
-`collect_env` must report ROCm and a MIOpen runtime (3.5.1 for this ROCm 7.2 set). The wheels may
-already provide it. If MIOpen is absent or the convolution fails with a MIOpen link error, install
+`collect_env` must report ROCm and a MIOpen runtime (3.5.1 for this ROCm 7.2 set). The tested wheels
+did not provide the MIOpen shared library on the audited host. If MIOpen is absent or the
+convolution fails with a MIOpen link error, install
 `miopen-hip` from the matching ROCm 7.2 system repository and rerun the test:
 `sudo apt-get install miopen-hip`. That fallback is a host package, not something to pip-install. A
 gfx-specific kernel database is optional and affects warm-up only.
@@ -166,8 +187,8 @@ The first server run must be capture-only, with an intentionally smaller ring an
 
 ```bash
 server/build/dflash_server \
-  /models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft /models/dflash-draft-3.6-q8_0.gguf \
+  server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft server/models/oflash/dflash-draft-3.6-q4_k_m.gguf --draft-swa 2048 \
   --target-device hip:0 --draft-device hip:0 \
   --max-ctx 4096 --cache-type-k q4_0 --cache-type-v q4_0 \
   --oflash --oflash-ring-mb 256 --oflash-topk 8
@@ -179,14 +200,35 @@ trainer test and stop thresholds in
 before enabling the integrated sidecar. The engine passes the target path to an integrated trainer;
 `--target`, `$OFLASH_TARGET_GGUF`, or `trainer.json` is needed only for direct trainer invocation.
 
-Use the published Q8_0 Qwen3.6 drafter on this 32 GiB card. Its
-[model card](https://huggingface.co/spiritbuun/Qwen3.6-27B-DFlash-GGUF)
-reports that Q8_0 preserves F16 acceptance while Q4_K_M loses roughly 17 acceptance points. The
-Q8_0 GGUF already embeds the 2048-token `[S,S,S,S,F]` sliding-window layout, so do not pass
-`--draft-swa`; OFlash refuses a runtime override that would make the engine and trainer disagree.
+Use the official Lucebox Q4_K_M drafter above. Its
+[model card](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) calls Q4_K_M the recommended
+fast draft and Q8_0 the parity/debug option. The legacy file declares RoPE 1,000,000 but no SWA
+pattern; `--draft-swa 2048` resolves it to `[S,S,S,S,F]`, matching the published setup. The engine
+passes those effective values to the trainer and namespaces/validates adapters by both exact GGUF
+hashes plus the resolved RoPE, SWA pattern/window and mask token. Park/unpark preserves the same
+semantics.
 
-Adapters persist under `~/.lucebox/oflash/<drafter-hash>/<profile>/`; the next session warm-starts
-from the promoted generation.
+Keep the published reference configurations separate:
+
+- the [R9700 server README baseline](../../server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) used the
+  Lucebox **Q4_K_M** draft on ROCm 7.1.1: 54.65 tok/s, AL 7.14, 10 HumanEval prompts and
+  `n_gen=256` at DDTree budget 22;
+- the [Strix Halo result](https://www.lucebox.com/blog/amd) used the Lucebox **Q8_0** draft on
+  ROCm 7.2.2 with an explicit 2048 SWA override: 26.85 tok/s, AL 5.58 and 34.9% acceptance over
+  10 prompts with `n_gen=128`;
+- the Q4_K_M file selected here is the R9700 reference artifact. Strix used Q8_0, so its number is
+  capacity/performance evidence rather than an OFlash baseline.
+
+Neither published number is an expected online-training result: both were single-GPU inference
+tests. Q4 saves about 0.78 GB over Lucebox Q8_0 on disk and while serving, but the trainer
+dequantizes either artifact into a dense FP16 mirror, so it does not provide a comparable Strix
+training-memory saving. Measure the quantized-engine/FP16-mirror transfer gap before promotion.
+
+Adapters persist under a semantic namespace such as
+`~/.lucebox/oflash/<drafter-hash>/<profile>-sem-<contract-hash>/`; the next session warm-starts
+only from a promoted generation with the identical draft, target and resolved model contract. The
+server logs the exact directory; the contract hash includes the complete target SHA-256, rank and
+exact float32 alpha.
 
 ## Engine knobs
 
@@ -209,9 +251,10 @@ persistent draft residency, and no PFlash compression; off by default):
 ## Trainer knobs
 
 `bin/oflash-trainer <drafter.gguf> ...` — the engine passes the wiring arguments itself
-(`--ring-name`, `--out-dir`, `--profile`, `--rank`, `--alpha`, `--device`, `--drafter-sha256`,
-`--start-generation`, `--stream-fd`); the training knobs below are yours to tune
-(OFLASH.md §5 defaults):
+(`--ring-name`, `--out-dir`, `--profile`, `--rank`, `--alpha`, `--device`, both model SHA-256
+values, resolved RoPE/SWA/mask semantics, `--start-generation`, `--stream-fd`); the training knobs below
+are yours to tune (see the matching options in
+[`OFLASH.md`](../../server/docs/OFLASH.md#usage)):
 
 | Flag | Default | Purpose |
 |---|---|---|

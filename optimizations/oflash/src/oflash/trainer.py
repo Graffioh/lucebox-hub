@@ -28,10 +28,11 @@ from typing import Protocol
 
 import numpy as np
 import torch
-from safetensors.numpy import load_file
 
-from .adapter_export import adapter_path, export_adapter, gc_generations
+from .adapter_export import (adapter_path, export_adapter, gc_generations,
+                             load_validated_adapter)
 from .mirror import DrafterMirror
+from .identity import fnv1a64, require_sha256
 from .ring_format import (
     REC_CONTEXT,
     REC_SEQ_END,
@@ -118,9 +119,15 @@ class TrainerConfig:
     rank: int
     alpha: float
     drafter_sha256: str
+    target_sha256: str
     start_generation: int
     requested_device: str
     dtype: str
+    resolved_rope_theta: float | None
+    resolved_swa_window: int | None
+    resolved_swa_pattern: tuple[bool, ...] | None
+    resolved_mask_token_id: int | None
+    drafter_semantics: str
     lr: float
     kl_lambda: float
     reject_weight: float
@@ -222,6 +229,8 @@ class Trainer:
         self._generation = max(
             cfg.start_generation, _max_adapter_generation(cfg.out_dir))
         self._promoted_path: str | None = None
+        self._promoted_generation: int | None = None
+        self._drafter_semantics = ""
 
         self._opt_steps = 0
         self._rows_seen = 0
@@ -310,22 +319,40 @@ class Trainer:
                 time.sleep(POLL_SLEEP_S)
 
     def _validate_ring_identity(self) -> bool:
-        """Refuse to train against a ring produced by a different drafter."""
-        sha = self.cfg.drafter_sha256
-        if not sha:
-            self._control.log("no --drafter-sha256 given; skipping ring "
-                              "identity check")
-            return True
-        try:
-            want = int(sha[:16], 16)
-        except ValueError:
-            self._control.log(f"malformed --drafter-sha256 {sha!r}; exiting")
-            return False
-        got = self._ring.info.drafter_hash
+        """Refuse a stream from different model files or draft semantics."""
+        info = self._ring.info
+        checks = (
+            ("drafter", self.cfg.drafter_sha256, info.drafter_hash),
+            ("target", self.cfg.target_sha256, info.target_hash),
+        )
+        for label, sha, got in checks:
+            if not sha:
+                self._control.log(
+                    f"no --{label}-sha256 given; refusing unlabeled ring")
+                return False
+            try:
+                canonical = require_sha256(sha, f"{label} SHA-256")
+                want = int(canonical[:16], 16)
+            except ValueError as exc:
+                self._control.log(f"malformed {label} identity ({exc}); exiting")
+                return False
+            if got != want:
+                self._control.log(
+                    f"ring {label}_hash {got:#018x} != {label} GGUF "
+                    f"{want:#018x} ({canonical[:16]}…); refusing to train — "
+                    "exiting")
+                return False
+        if self.cfg.drafter_semantics:
+            return self._validate_ring_semantics(self.cfg.drafter_semantics)
+        return True
+
+    def _validate_ring_semantics(self, semantics: str) -> bool:
+        want = fnv1a64(semantics)
+        got = self._ring.info.drafter_semantics_hash
         if got != want:
             self._control.log(
-                f"ring drafter_hash {got:#018x} != drafter GGUF "
-                f"{want:#018x} ({sha[:16]}…); refusing to train — exiting")
+                f"ring drafter_semantics_hash {got:#018x} != resolved "
+                f"drafter semantics {want:#018x}; refusing to train")
             return False
         return True
 
@@ -341,14 +368,33 @@ class Trainer:
         t0 = time.monotonic()
         self._mirror = DrafterMirror.from_gguf(
             self.cfg.drafter_gguf, self.cfg.target_gguf, self.cfg.rank,
-            self.cfg.alpha, self._device, self._dtype)
+            self.cfg.alpha, self._device, self._dtype,
+            resolved_rope_theta=self.cfg.resolved_rope_theta,
+            resolved_swa_window=self.cfg.resolved_swa_window,
+            resolved_swa_pattern=self.cfg.resolved_swa_pattern,
+            resolved_mask_token_id=self.cfg.resolved_mask_token_id)
         dt = time.monotonic() - t0
         m = self._mirror
+        from .gguf_reader import drafter_semantics
+        actual_semantics = drafter_semantics(m.meta)
+        if (self.cfg.drafter_semantics
+                and self.cfg.drafter_semantics != actual_semantics):
+            raise ValueError(
+                "resolved drafter semantics disagree with engine: "
+                f"mirror={actual_semantics!r} "
+                f"engine={self.cfg.drafter_semantics!r}")
+        if not self._validate_ring_semantics(actual_semantics):
+            raise ValueError("capture ring has different drafter semantics")
+        self._drafter_semantics = (self.cfg.drafter_semantics
+                                   or actual_semantics)
         self._control.log(
             f"mirror loaded in {dt:.1f}s: device={self._device} "
             f"dtype={self._dtype} layers={m.dims.n_layer} "
             f"hidden={m.dims.hidden} fc_in={m.dims.fc_in} vocab={m.vocab} "
-            f"block={m.block_size} rank={self.cfg.rank}")
+            f"block={m.block_size} rank={self.cfg.rank} "
+            f"rope={m.meta.rope_theta:g} swa={m.meta.swa_window} "
+            f"pattern={m.meta.sliding_window_pattern} "
+            f"mask={m.meta.mask_token_id}")
         self._warm_start()
         self._make_optimizer()
 
@@ -408,10 +454,15 @@ class Trainer:
                               f"{path}; starting from zero LoRA")
             return
         try:
-            self._mirror.load_lora_state_numpy(load_file(path))
+            state = load_validated_adapter(
+                path, self.cfg.drafter_sha256, self.cfg.target_sha256,
+                self._drafter_semantics, self.cfg.rank, self.cfg.alpha,
+                generation=gen, profile=self.cfg.profile)
+            self._mirror.load_lora_state_numpy(state)
             # The engine serves this generation: protect it from GC and make
             # it the rollback target until the first promote arrives.
             self._promoted_path = path
+            self._promoted_generation = gen
             self._control.log(f"warm start: loaded {path}")
         except Exception as e:
             self._mirror.reset_lora()
@@ -427,8 +478,9 @@ class Trainer:
             return False
         if info.block_size != self._mirror.block_size:
             self._control.log(
-                f"warning: ring block_size {info.block_size} != mirror "
-                f"{self._mirror.block_size}; scoring the overlap only")
+                f"ring block_size {info.block_size} != mirror "
+                f"{self._mirror.block_size}; incompatible labels")
+            return False
         if info.vocab != self._mirror.vocab:
             self._control.log(
                 f"ring vocab {info.vocab} != mirror target vocab "
@@ -457,6 +509,7 @@ class Trainer:
             if cmd == "promote":
                 path = os.path.abspath(adapter_path(self.cfg.out_dir, gen))
                 self._promoted_path = path
+                self._promoted_generation = gen
                 self._control.log(f"promote: gen {gen} is now the baseline")
             elif cmd == "rollback":
                 self._rollback(gen)
@@ -476,8 +529,13 @@ class Trainer:
             return
         try:
             if self._promoted_path and os.path.exists(self._promoted_path):
-                self._mirror.load_lora_state_numpy(
-                    load_file(self._promoted_path))
+                state = load_validated_adapter(
+                    self._promoted_path, self.cfg.drafter_sha256,
+                    self.cfg.target_sha256, self._drafter_semantics,
+                    self.cfg.rank, self.cfg.alpha,
+                    generation=self._promoted_generation,
+                    profile=self.cfg.profile)
+                self._mirror.load_lora_state_numpy(state)
                 self._control.log(f"rollback (quarantining gen {gen}): "
                                   f"reloaded {self._promoted_path}")
             else:
@@ -837,7 +895,10 @@ class Trainer:
         try:
             export_adapter(path, self._mirror.lora_state_numpy(),
                            self._mirror.dims, self.cfg.rank, self.cfg.alpha,
-                           self.cfg.drafter_sha256, gen, self.cfg.profile)
+                           self.cfg.drafter_sha256,
+                           self.cfg.target_sha256,
+                           self._drafter_semantics,
+                           gen, self.cfg.profile)
             gc_generations(self.cfg.out_dir, self.cfg.keep_generations,
                            protect=self._promoted_path)
         except Exception as e:

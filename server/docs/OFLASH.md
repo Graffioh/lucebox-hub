@@ -1,8 +1,9 @@
 # OFlash: online drafter adaptation
 
-Status: implemented behind `--oflash`. Capacity analysis says the intended
-R9700 + Strix Halo split is feasible, but simultaneous serving/training and
-its performance still require the staged qualification below.
+Status: implemented behind `--oflash`. Published component results and the
+capacity analysis say the intended R9700 + Strix Halo split is feasible, but
+simultaneous Qwen serving/training and its performance still require the staged
+qualification below.
 
 OFlash teaches the DFlash drafter from the target model's real verification
 results while the server is running. The R9700 keeps serving requests; a
@@ -55,8 +56,9 @@ drafter KV cache, so one block never mixes two adapter generations.
    GPU and FP32 on CPU.
 4. A replay reservoir mixes recent and older examples to reduce forgetting
    when the workload changes.
-5. The sidecar exports a safetensors adapter. The engine validates its model
-   identity, rank and tensor shapes before loading it.
+5. The sidecar exports a safetensors adapter. The engine validates both GGUF
+   hashes, resolved RoPE/SWA/mask semantics, rank and tensor shapes before
+   loading it.
 6. The engine overwrites preallocated, pointer-stable LoRA buffers at a safe
    draft-block boundary. This remains compatible with graph replay.
 7. The acceptance guard promotes the generation or rolls it back.
@@ -93,6 +95,24 @@ GPU-to-CPU fallback. A missing/failed HIP device leaves the sidecar draining
 the ring in capture-only mode; request CPU training explicitly with
 `--oflash-device cpu` and keep the same host-memory guards.
 
+### What Lucebox has already tested
+
+The published evidence is useful, but it covers three different configurations:
+
+- [R9700 Qwen3.6](../README.md#amd-hip-backend-strix-halo-rx-7900-xtx): Q4_K_M target plus the
+  Lucebox Q4_K_M draft, ROCm 7.1.1 and DDTree budget 22. The 10-prompt HumanEval run at
+  `n_gen=256` measured 54.65 tok/s mean and AL 7.14.
+- [Strix Halo Qwen3.6](https://www.lucebox.com/blog/amd): the same target plus the Lucebox Q8_0
+  draft, ROCm 7.2.2, SWA 2048, DDTree budget 22 and fast rollback. The 10-prompt `n_gen=128` run
+  measured 26.85 tok/s, AL 5.58 and 34.9% acceptance.
+- [R9700 + Strix Halo together](https://www.lucebox.com/blog/deepseek-v4-asymmetric-parallelism):
+  ROCm 7.2.4 ran asymmetric DeepSeek-V4 MoE inference concurrently across both GPUs. It explicitly
+  treats 32 GB R9700 memory and 128 GB Strix memory as separate domains, not a flat 160 GB pool.
+
+The Qwen measurements were separate single-GPU runs. The simultaneous test was not Qwen and did
+not run a PyTorch optimizer. Together they are strong component-level feasibility evidence, not a
+measurement of the OFlash split.
+
 ## Trainer environment
 
 Use a dedicated environment with AMD's official Ubuntu 24.04 / Python 3.12
@@ -105,8 +125,10 @@ python3.12 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip wheel
 python -m pip install --no-cache-dir \
-  torch==2.9.1 torchvision==0.24.0 torchaudio==2.9.0 \
-  -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
+  'https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1.lw.gitff65f5bc-cp312-cp312-linux_x86_64.whl' \
+  'https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/torchvision-0.24.0%2Brocm7.2.1.gitb919bd0c-cp312-cp312-linux_x86_64.whl' \
+  'https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/torchaudio-2.9.0%2Brocm7.2.1.gite3c6ee2b-cp312-cp312-linux_x86_64.whl' \
+  'https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/triton-3.5.1%2Brocm7.2.1.gita272dfa8-cp312-cp312-linux_x86_64.whl'
 python -m pip install 'numpy==1.26.4' 'safetensors>=0.4' 'gguf>=0.10'
 python -m pip install --no-deps -e .
 cd ../..
@@ -115,19 +137,37 @@ cd ../..
 The exact AMD wheel URLs and Strix FP16/MIOpen smoke are in the
 [trainer README](../../optimizations/oflash/README.md#quick-start). Require
 `python -m torch.utils.collect_env` to report ROCm and a MIOpen runtime; the
-wheels may already provide it. If it does not, or the MIOpen smoke fails to
-link, install `miopen-hip` from the matching ROCm 7.2 host repository and
+tested wheels did not provide the MIOpen shared library on the audited host.
+If it is absent, or the MIOpen smoke fails to link, install `miopen-hip` from
+the matching ROCm 7.2 host repository and
 retest. That fallback is a host package, not something to pip-install. Its
 architecture-specific kernel database is optional and affects warm-up, not
 correctness.
 
 ## Usage
 
+Download the target and official Q4_K_M drafter at pinned revisions and verify them:
+
+```bash
+mkdir -p server/models/oflash
+hf download unsloth/Qwen3.6-27B-GGUF Qwen3.6-27B-Q4_K_M.gguf \
+  --revision e41d24e0e6909d1e15f79445cd9ac27ced27724a \
+  --local-dir server/models/oflash
+hf download Lucebox/Qwen3.6-27B-DFlash-GGUF \
+  dflash-draft-3.6-q4_k_m.gguf \
+  --revision fca10ba135c9d834988e15b7d7f5aee8ebc562a7 \
+  --local-dir server/models/oflash
+sha256sum server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf \
+  server/models/oflash/dflash-draft-3.6-q4_k_m.gguf
+# 41ae55b347988dca8352ed4c85f3d8ee3804a23cc89aaea165c071d61ec3cca0  server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf
+# e2500e90165a0f8e7b52c9882c29ed1fa391c60b300ff11b817bf10e31fa092e  server/models/oflash/dflash-draft-3.6-q4_k_m.gguf
+```
+
 Capture verification data without starting a trainer:
 
 ```bash
-server/build/dflash_server /models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft /models/dflash-draft-3.6-q8_0.gguf \
+server/build/dflash_server server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft server/models/oflash/dflash-draft-3.6-q4_k_m.gguf --draft-swa 2048 \
   --target-device hip:0 --draft-device hip:0 \
   --max-ctx 4096 --cache-type-k q4_0 --cache-type-v q4_0 \
   --oflash --oflash-ring-mb 256 --oflash-topk 8
@@ -136,8 +176,8 @@ server/build/dflash_server /models/Qwen3.6-27B-Q4_K_M.gguf \
 Run online adaptation on HIP device 1:
 
 ```bash
-server/build/dflash_server /models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft /models/dflash-draft-3.6-q8_0.gguf \
+server/build/dflash_server server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf \
+  --draft server/models/oflash/dflash-draft-3.6-q4_k_m.gguf --draft-swa 2048 \
   --target-device hip:0 --draft-device hip:0 \
   --max-ctx 4096 --cache-type-k q4_0 --cache-type-v q4_0 \
   --oflash \
@@ -150,15 +190,25 @@ The integrated engine passes the target GGUF to the trainer because the mirror
 shares its output head and token embeddings. `OFLASH_TARGET_GGUF`, `--target`,
 or `trainer.json` is only needed for a direct trainer invocation.
 
-Use the Q8_0 drafter shown above: its published model card reports F16-like
-acceptance, whereas Q4_K_M saves less than 1 GiB but loses roughly 17
-acceptance points. This Q8_0 file embeds the 2048-token `[S,S,S,S,F]`
-sliding-window layout. Do not add `--draft-swa`; OFlash rejects an override
-that would make the engine attention layout differ from the Python mirror.
+The commands use the official Lucebox Q4_K_M conversion recommended by its
+[model card](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) and used for the published
+R9700 result. This legacy GGUF declares RoPE 1,000,000 without an embedded SWA pattern, so the
+published 2,048-token `[S,S,S,S,F]` behavior requires `--draft-swa 2048`. OFlash passes the
+post-override values to the Python mirror. It preserves RoPE 1,000,000 across park/unpark rather
+than silently copying the target's 10,000,000 base.
+
+Adapter format v2 binds each file to the exact draft and target GGUF SHA-256 values plus the
+complete resolved RoPE/SWA/mask contract. Engine-only draft debug overrides disable OFlash rather
+than allow the trainer and
+serving graph to diverge. Lucebox Q8_0 remains useful for parity/debug, but Q4 is the selected
+serving artifact here. The trainer dequantizes either one into dense FP16, so Q4's roughly 0.78 GB
+serving/file saving does not materially shrink the Strix training mirror.
 
 Adapters are stored under
-`~/.lucebox/oflash/<drafter-hash>/<profile>/` and the next session starts from
-the last promoted generation.
+`~/.lucebox/oflash/<drafter-hash>/<profile>-sem-<contract-hash>/` and the next session starts from
+the last promoted generation only when both models and the resolved draft contract are identical.
+The contract hash includes the full target hash, rank and exact float32 alpha; the server logs the
+exact profile directory.
 
 ## R9700 and Strix Halo qualification ladder
 
@@ -190,18 +240,27 @@ watch -n 5 'curl -fsS http://127.0.0.1:8080/props | jq .oflash'
    of training without allowing a serving hot-swap:
 
    ```bash
+   OFLASH_RING_NAME=/lucebox-oflash-12345  # paste the name from the server log
    optimizations/oflash/bin/oflash-trainer \
-     /models/dflash-draft-3.6-q8_0.gguf \
-     --ring-name=/lucebox-oflash-<pid> \
-     --target=/models/Qwen3.6-27B-Q4_K_M.gguf \
+     server/models/oflash/dflash-draft-3.6-q4_k_m.gguf \
+     --ring-name="$OFLASH_RING_NAME" \
+     --target=server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf \
      --out-dir=/tmp/oflash-smoke --profile=smoke \
      --device=1 --dtype=auto \
+     --drafter-sha256=e2500e90165a0f8e7b52c9882c29ed1fa391c60b300ff11b817bf10e31fa092e \
+     --target-sha256=41ae55b347988dca8352ed4c85f3d8ee3804a23cc89aaea165c071d61ec3cca0 \
+     --resolved-rope-theta=1000000 \
+     --resolved-swa-window=2048 \
+     --resolved-swa-pattern=1,1,1,1,0 \
+     --resolved-mask-token-id=248070 \
      --batch-rows=64 --train-ctx=64 --reservoir-rows=2048
    ```
 
    Require `accelerator preflight passed`, `mirror loaded`, and no automatic
    `training disabled` message. Stop this direct trainer before continuing;
-   two consumers must never attach to the same ring.
+   two consumers must never attach to the same ring. Direct mode hashes both
+   files before allocating the mirror even when expected digests are supplied;
+   the explicit values make a wrong path fail closed instead of relabeling it.
 3. **Integrated defaults.** Restart with the online command in Usage. Hold
    `--max-ctx 4096` for ten minutes under the same request stream. Defaults are
    ring 512 MiB, top-K 8, batch 128, train context 128, reservoir 10,000 and

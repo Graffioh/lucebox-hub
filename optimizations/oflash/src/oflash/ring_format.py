@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 RING_MAGIC = 0x4F464C31  # "OFL1"
-RING_VERSION = 1
+RING_VERSION = 2
 HEADER_SIZE = 256
 RECORD_HEADER_SIZE = 32
 
@@ -41,6 +41,8 @@ OFF_HIDDEN = 220
 OFF_BLOCK_SIZE = 224
 OFF_TOPK = 228
 OFF_VOCAB = 232
+OFF_TARGET_HASH = 240
+OFF_DRAFTER_SEMANTICS_HASH = 248
 
 REC_PAD = 0
 REC_CONTEXT = 1
@@ -53,6 +55,8 @@ class RingInfo:
     capacity: int
     data_offset: int
     drafter_hash: int
+    target_hash: int
+    drafter_semantics_hash: int
     n_capture_layers: int
     hidden: int
     block_size: int
@@ -113,6 +117,8 @@ class RingReader:
             capacity=self._u64(OFF_CAPACITY),
             data_offset=self._u64(OFF_DATA_OFFSET),
             drafter_hash=self._u64(OFF_DRAFTER_HASH),
+            target_hash=self._u64(OFF_TARGET_HASH),
+            drafter_semantics_hash=self._u64(OFF_DRAFTER_SEMANTICS_HASH),
             n_capture_layers=self._u32(OFF_N_CAPTURE),
             hidden=self._u32(OFF_HIDDEN),
             block_size=self._u32(OFF_BLOCK_SIZE),
@@ -254,6 +260,8 @@ class RingWriter:
     topk: int = 0
     vocab: int = 10
     drafter_hash: int = 0
+    target_hash: int = 0
+    drafter_semantics_hash: int = 0
     _head: int = field(default=0, init=False)
 
     def __post_init__(self):
@@ -265,6 +273,9 @@ class RingWriter:
         struct.pack_into("<Q", self._mm, OFF_CAPACITY, self.capacity)
         struct.pack_into("<Q", self._mm, OFF_DATA_OFFSET, HEADER_SIZE)
         struct.pack_into("<Q", self._mm, OFF_DRAFTER_HASH, self.drafter_hash)
+        struct.pack_into("<Q", self._mm, OFF_TARGET_HASH, self.target_hash)
+        struct.pack_into("<Q", self._mm, OFF_DRAFTER_SEMANTICS_HASH,
+                         self.drafter_semantics_hash)
         struct.pack_into("<I", self._mm, OFF_N_CAPTURE, self.n_capture_layers)
         struct.pack_into("<I", self._mm, OFF_HIDDEN, self.hidden)
         struct.pack_into("<I", self._mm, OFF_BLOCK_SIZE, self.block_size)

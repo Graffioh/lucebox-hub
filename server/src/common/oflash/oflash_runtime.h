@@ -46,6 +46,16 @@ inline constexpr bool oflash_generation_is_newer(uint64_t candidate,
            (high_water == 0 || candidate > high_water);
 }
 
+// Pure cross-language persistence helpers; exposed so C++ and Python can pin
+// the exact same resolved-model identity in CPU-only tests.
+std::string oflash_resolved_drafter_semantics(const DraftWeights & dw);
+std::string oflash_semantics_tag(const std::string & value);
+std::string oflash_adapter_contract(const std::string & drafter_sha256,
+                                    const std::string & target_sha256,
+                                    const std::string & drafter_semantics,
+                                    int rank,
+                                    float alpha);
+
 // pimpl holder so this header need not include oflash_adapter.h.
 struct OFlashAdapterHostHolder;
 
@@ -124,6 +134,8 @@ private:
 
     OFlashConfig cfg_;
     std::string drafter_sha256_;
+    std::string target_sha256_;
+    std::string drafter_semantics_;
     std::string profile_dir_;
     std::string ring_name_;
     DraftWeights * dw_ = nullptr;

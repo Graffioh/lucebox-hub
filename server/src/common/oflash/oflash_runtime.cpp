@@ -7,11 +7,17 @@
 #include "internal.h"               // DraftWeights
 #include "common/gguf_inspect.h"    // read_gguf_metadata (drafter sha256)
 
+#include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <iomanip>
+#include <limits>
 #include <new>
+#include <sstream>
 
 #if !defined(_WIN32)
 #include <sys/stat.h>
@@ -57,7 +63,92 @@ bool make_dirs(const std::string & path) {
 #endif
 }
 
+std::string resolved_swa_pattern(const DraftWeights & dw,
+                                 char separator = ',') {
+    std::string pattern;
+    pattern.reserve((size_t)std::max(0, dw.n_layer) * 2);
+    for (int il = 0; il < dw.n_layer; ++il) {
+        if (il > 0 && separator != '\0') pattern.push_back(separator);
+        pattern.push_back(dw.layers[(size_t)il].is_swa ? '1' : '0');
+    }
+    return pattern;
+}
+
+std::string resolved_drafter_semantics_impl(const DraftWeights & dw) {
+    uint32_t rope_bits = 0;
+    static_assert(sizeof(rope_bits) == sizeof(dw.rope_theta));
+    std::memcpy(&rope_bits, &dw.rope_theta, sizeof(rope_bits));
+    std::ostringstream out;
+    out << "v1;rope=" << std::hex << std::setfill('0') << std::setw(8)
+        << rope_bits << std::dec
+        << ";swa=" << dw.swa_window
+        << ";pattern=" << resolved_swa_pattern(dw, '\0')
+        << ";mask=" << dw.mask_token_id;
+    return out.str();
+}
+
+std::string resolved_float_arg(float value) {
+    std::ostringstream out;
+    out << std::setprecision(std::numeric_limits<float>::max_digits10)
+        << value;
+    return out.str();
+}
+
+std::string semantics_tag_impl(const std::string & value) {
+    // Stable FNV-1a (std::hash is not a persistence contract). The full
+    // semantics string remains in adapter metadata and is checked on load;
+    // this short tag is only a collision-resistant directory namespace.
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (unsigned char c : value) {
+        hash ^= c;
+        hash *= UINT64_C(1099511628211);
+    }
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return out.str();
+}
+
+const char * incompatible_debug_override() {
+    static constexpr const char * names[] = {
+        "DFLASH_DISABLE_DRAFT_AUX_NORMS",
+        "DFLASH_DISABLE_DRAFT_ATTN_GATE",
+        "DFLASH_DISABLE_DRAFT_SWA",
+        "DFLASH_DISABLE_DRAFT_ATTN",
+        "DFLASH_DISABLE_DRAFT_FFN",
+    };
+    for (const char * name : names) {
+        if (std::getenv(name) != nullptr) return name;
+    }
+    return nullptr;
+}
+
 }  // namespace
+
+std::string oflash_resolved_drafter_semantics(const DraftWeights & dw) {
+    return resolved_drafter_semantics_impl(dw);
+}
+
+std::string oflash_semantics_tag(const std::string & value) {
+    return semantics_tag_impl(value);
+}
+
+std::string oflash_adapter_contract(const std::string & drafter_sha256,
+                                    const std::string & target_sha256,
+                                    const std::string & drafter_semantics,
+                                    int rank,
+                                    float alpha) {
+    uint32_t alpha_bits = 0;
+    static_assert(sizeof(alpha_bits) == sizeof(alpha));
+    std::memcpy(&alpha_bits, &alpha, sizeof(alpha_bits));
+    std::ostringstream out;
+    out << "drafter=" << drafter_sha256
+        << ";target=" << target_sha256
+        << ";draft=" << drafter_semantics
+        << ";rank=" << rank
+        << ";alpha=" << std::hex << std::setfill('0') << std::setw(8)
+        << alpha_bits;
+    return out.str();
+}
 
 bool OFlashRuntime::init(const OFlashConfig & cfg,
                          const std::string & target_path,
@@ -68,6 +159,26 @@ bool OFlashRuntime::init(const OFlashConfig & cfg,
                          int target_hidden,
                          int vocab) {
     cfg_ = cfg;
+
+    if (cfg.lora_rank <= 0 || cfg.lora_rank > 256 ||
+        !std::isfinite(cfg.lora_alpha) || cfg.lora_alpha <= 0.0f) {
+        std::fprintf(stderr, "[oflash] invalid LoRA rank/alpha; disabled\n");
+        return false;
+    }
+    if (dw.n_layer <= 0 || dw.layers.size() != (size_t)dw.n_layer ||
+        !std::isfinite(dw.rope_theta) || dw.rope_theta <= 0.0f ||
+        dw.swa_window < 0) {
+        std::fprintf(stderr,
+            "[oflash] invalid resolved drafter metadata; disabled\n");
+        return false;
+    }
+    if (const char * override_name = incompatible_debug_override()) {
+        std::fprintf(stderr,
+            "[oflash] %s changes the served draft graph but is not mirrored "
+            "by the trainer; disabled\n", override_name);
+        return false;
+    }
+    drafter_semantics_ = oflash_resolved_drafter_semantics(dw);
 
     // The capture callback copies target-owned feature rows while record sizing
     // is derived from the drafter's fc input. A mismatch would make that copy
@@ -102,24 +213,40 @@ bool OFlashRuntime::init(const OFlashConfig & cfg,
     }
     dw.oflash = lora_;
 
-    // 2. Drafter identity (sidecar-cached SHA-256 of the GGUF).
-    const GgufMetadata meta = read_gguf_metadata(drafter_path, true);
-    if (!meta.ok || meta.sha256.empty()) {
+    // 2. Model identity (sidecar-cached SHA-256 of each GGUF).
+    const GgufMetadata drafter_meta = read_gguf_metadata(drafter_path, true);
+    if (!drafter_meta.ok || drafter_meta.sha256.empty()) {
         std::fprintf(stderr,
             "[oflash] drafter hash failed for %s; adapters disabled, "
             "capture continues unlabeled\n", drafter_path.c_str());
     } else {
-        drafter_sha256_ = meta.sha256;
+        drafter_sha256_ = drafter_meta.sha256;
+    }
+    const GgufMetadata target_meta = read_gguf_metadata(target_path, true);
+    if (!target_meta.ok || target_meta.sha256.empty()) {
+        std::fprintf(stderr,
+            "[oflash] target hash failed for %s; adapters disabled, "
+            "capture continues unlabeled\n", target_path.c_str());
+    } else {
+        target_sha256_ = target_meta.sha256;
     }
 
     // 3. Profile store + warm start (OFLASH.md §8).
-    if (!drafter_sha256_.empty()) {
+    if (!drafter_sha256_.empty() && !target_sha256_.empty()) {
+        const std::string semantic_profile =
+            cfg.profile + "-sem-" + oflash_semantics_tag(
+                oflash_adapter_contract(drafter_sha256_, target_sha256_,
+                                         drafter_semantics_,
+                                         cfg.lora_rank, cfg.lora_alpha));
         profile_dir_ = oflash_profile_dir(cfg.dir, drafter_sha256_,
-                                          cfg.profile);
+                                          semantic_profile);
         if (!make_dirs(profile_dir_)) {
             std::fprintf(stderr, "[oflash] cannot create %s; persistence off\n",
                          profile_dir_.c_str());
             profile_dir_.clear();
+        } else {
+            std::fprintf(stderr, "[oflash] profile dir %s\n",
+                         profile_dir_.c_str());
         }
         std::string warm_path;
         uint64_t warm_gen = 0;
@@ -139,8 +266,12 @@ bool OFlashRuntime::init(const OFlashConfig & cfg,
     ring_name_ = "/lucebox-oflash-" + std::to_string((long)::getpid());
 #endif
     const uint64_t ring_bytes = (uint64_t)cfg.ring_mb << 20;
+    const std::string drafter_semantics_tag =
+        oflash_semantics_tag(drafter_semantics_);
     if (!ring_.create(ring_name_, ring_bytes,
                       oflash_hash_from_hex(drafter_sha256_.c_str()),
+                      oflash_hash_from_hex(target_sha256_.c_str()),
+                      oflash_hash_from_hex(drafter_semantics_tag.c_str()),
                       (uint32_t)dw.n_target_layers,
                       (uint32_t)dw.n_embd,
                       (uint32_t)dw.block_size,
@@ -154,7 +285,8 @@ bool OFlashRuntime::init(const OFlashConfig & cfg,
 
     // 5. Trainer sidecar (optional — empty bin = M0 capture-only).
     if (!cfg.trainer_bin.empty() && ring_.active() &&
-        !drafter_sha256_.empty() && !profile_dir_.empty()) {
+        !drafter_sha256_.empty() && !target_sha256_.empty() &&
+        !profile_dir_.empty()) {
         OFlashSupervisorConfig scfg;
         scfg.trainer_bin  = cfg.trainer_bin;
         scfg.drafter_path = drafter_path;
@@ -164,10 +296,16 @@ bool OFlashRuntime::init(const OFlashConfig & cfg,
             "--out-dir=" + profile_dir_,
             "--profile=" + cfg.profile,
             "--rank=" + std::to_string(cfg.lora_rank),
-            "--alpha=" + std::to_string(cfg.lora_alpha),
+            "--alpha=" + resolved_float_arg(cfg.lora_alpha),
             "--device=" + cfg.device,
             "--dtype=" + cfg.dtype,
+            "--resolved-rope-theta=" + resolved_float_arg(dw.rope_theta),
+            "--resolved-swa-window=" + std::to_string(dw.swa_window),
+            "--resolved-swa-pattern=" + resolved_swa_pattern(dw),
+            "--resolved-mask-token-id=" + std::to_string(dw.mask_token_id),
+            "--drafter-semantics=" + drafter_semantics_,
             "--drafter-sha256=" + drafter_sha256_,
+            "--target-sha256=" + target_sha256_,
             "--start-generation=" + std::to_string(lora_->generation),
         };
         if (!supervisor_.start(scfg)) {
@@ -394,7 +532,8 @@ bool OFlashRuntime::load_and_upload(const std::string & path,
     OFlashAdapterHost host;
     std::string error;
     if (!oflash_adapter_load(path, *dw_, cfg_.lora_rank, cfg_.lora_alpha,
-                             drafter_sha256_,
+                             drafter_sha256_, target_sha256_,
+                             drafter_semantics_, cfg_.profile,
                              host, error)) {
         std::fprintf(stderr, "[oflash] adapter refused (%s): %s\n",
                      path.c_str(), error.c_str());

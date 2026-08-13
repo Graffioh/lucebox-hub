@@ -43,6 +43,10 @@ struct OFlashUnitFixture {};
 
 enum class AdapterPayloadPoison { None, NaN, Inf };
 
+std::string test_semantics() {
+    return "v1;rope=49742400;swa=2048;pattern=10;mask=248070";
+}
+
 // Minimal DraftWeights dims for spec/adapter tests (no tensors needed).
 DraftWeights tiny_drafter() {
     DraftWeights dw;
@@ -53,6 +57,11 @@ DraftWeights tiny_drafter() {
     dw.n_embd = 16;
     dw.n_ff = 24;
     dw.n_target_layers = 3;  // fc_in=48
+    dw.rope_theta = 1000000.0f;
+    dw.swa_window = 2048;
+    dw.mask_token_id = 248070;
+    dw.layers.resize((size_t)dw.n_layer);
+    dw.layers[0].is_swa = true;
     return dw;
 }
 
@@ -64,12 +73,16 @@ void write_adapter_file(const std::string & path,
                         uint64_t generation,
                         bool corrupt_shape = false,
                         const std::string & alpha = "32",
-                        AdapterPayloadPoison poison = AdapterPayloadPoison::None) {
+                        AdapterPayloadPoison poison = AdapterPayloadPoison::None,
+                        const std::string & semantics = test_semantics(),
+                        const std::string & target_sha = std::string(64, 'c')) {
     const auto specs = oflash_lora_expected_tensors(dw, rank);
     nlohmann::json header;
     header["__metadata__"] = {
-        {"oflash.format", "1"},
+        {"oflash.format", "2"},
         {"oflash.drafter_sha256", sha},
+        {"oflash.target_sha256", target_sha},
+        {"oflash.drafter_semantics", semantics},
         {"oflash.rank", std::to_string(rank)},
         {"oflash.alpha", alpha},
         {"oflash.generation", std::to_string(generation)},
@@ -109,6 +122,10 @@ std::string test_sha() {
     return std::string(64, 'a');  // 64 hex chars
 }
 
+std::string test_target_sha() {
+    return std::string(64, 'c');
+}
+
 }  // namespace
 
 // ── Format invariants ───────────────────────────────────────────────
@@ -119,6 +136,9 @@ TEST_CASE(OFlashUnitFixture, format_header_layout_is_stable) {
     CHECK_EQUAL(offsetof(OFlashRingHeader, tail), (size_t)128);
     CHECK_EQUAL(offsetof(OFlashRingHeader, dropped_records), (size_t)192);
     CHECK_EQUAL(offsetof(OFlashRingHeader, drafter_hash), (size_t)208);
+    CHECK_EQUAL(offsetof(OFlashRingHeader, target_hash), (size_t)240);
+    CHECK_EQUAL(offsetof(OFlashRingHeader, drafter_semantics_hash),
+                (size_t)248);
     CHECK_EQUAL(sizeof(OFlashRecordHeader), (size_t)32);
 }
 
@@ -161,6 +181,29 @@ TEST_CASE(OFlashUnitFixture, runtime_refuses_incompatible_feature_width_before_g
                         /*target_hidden=*/dw.n_embd,
                         /*vocab=*/64));
     CHECK(dw.oflash == nullptr);
+}
+
+TEST_CASE(OFlashUnitFixture, resolved_semantics_match_python_golden) {
+    const DraftWeights dw = tiny_drafter();
+    CHECK_EQUAL(oflash_resolved_drafter_semantics(dw), test_semantics());
+    CHECK_EQUAL(oflash_semantics_tag(test_semantics()),
+                std::string("1ec7f022739c0547"));
+    CHECK_EQUAL(oflash_semantics_tag(test_target_sha() + ";" + test_semantics()),
+                std::string("f234d12ce461a038"));
+    const std::string contract = oflash_adapter_contract(
+        test_sha(), test_target_sha(), test_semantics(), 4, 32.0f);
+    CHECK_EQUAL(contract,
+        "drafter=" + test_sha() + ";target=" + test_target_sha() +
+        ";draft=" + test_semantics() +
+        ";rank=4;alpha=42000000");
+    CHECK_EQUAL(oflash_semantics_tag(contract),
+                std::string("d7562c1f882d7970"));
+    CHECK(oflash_adapter_contract(test_sha(), test_target_sha(), test_semantics(),
+                                  8, 32.0f) != contract);
+    CHECK(oflash_adapter_contract(test_sha(), test_target_sha(), test_semantics(),
+                                  4, 16.0f) != contract);
+    CHECK(oflash_adapter_contract(std::string(64, 'b'), test_target_sha(),
+                                  test_semantics(), 4, 32.0f) != contract);
 }
 
 // ── Ring semantics ──────────────────────────────────────────────────
@@ -211,14 +254,18 @@ TEST_CASE(OFlashUnitFixture, ring_create_publishes_stream_facts) {
     OFlashRing ring;
     const std::string name =
         "/oflash-test-" + std::to_string((long)getpid()) + "-a";
-    REQUIRE(ring.create(name, 1 << 20, 0x1122334455667788ull, 5, 5120, 16,
-                        32, 248320));
+    REQUIRE(ring.create(name, 1 << 20, 0x1122334455667788ull,
+                        0x8877665544332211ull, 0x1ec7f022739c0547ull,
+                        5, 5120, 16, 32, 248320));
     RingView v(ring);
     CHECK_EQUAL(v.hdr->magic, OFLASH_RING_MAGIC);
     CHECK_EQUAL(v.hdr->version, OFLASH_RING_VERSION);
     CHECK_EQUAL(v.hdr->capacity, (uint64_t)(1 << 20));
     CHECK_EQUAL(v.hdr->data_offset, (uint64_t)256);
     CHECK_EQUAL(v.hdr->drafter_hash, (uint64_t)0x1122334455667788ull);
+    CHECK_EQUAL(v.hdr->target_hash, (uint64_t)0x8877665544332211ull);
+    CHECK_EQUAL(v.hdr->drafter_semantics_hash,
+                (uint64_t)0x1ec7f022739c0547ull);
     CHECK_EQUAL(v.hdr->n_capture_layers, (uint32_t)5);
     CHECK_EQUAL(v.hdr->hidden, (uint32_t)5120);
     CHECK_EQUAL(v.hdr->block_size, (uint32_t)16);
@@ -252,7 +299,7 @@ TEST_CASE(OFlashUnitFixture, ring_create_removes_dead_engine_segment) {
     OFlashRing ring;
     const std::string name =
         "/oflash-test-" + std::to_string((long)getpid()) + "-cleanup";
-    REQUIRE(ring.create(name, 1 << 20, 1, 1, 4, 2, 0, 100));
+    REQUIRE(ring.create(name, 1 << 20, 1, 2, 3, 1, 4, 2, 0, 100));
     CHECK(::access(stale_path.c_str(), F_OK) != 0);
     ring.close();
 }
@@ -261,7 +308,7 @@ TEST_CASE(OFlashUnitFixture, ring_push_roundtrips_records) {
     OFlashRing ring;
     const std::string name =
         "/oflash-test-" + std::to_string((long)getpid()) + "-b";
-    REQUIRE(ring.create(name, 1 << 20, 1, 1, 4, 2, 0, 100));
+    REQUIRE(ring.create(name, 1 << 20, 1, 2, 3, 1, 4, 2, 0, 100));
 
     OFlashRecordHeader h{};
     h.type = OFLASH_REC_STEP;
@@ -294,7 +341,7 @@ TEST_CASE(OFlashUnitFixture, ring_drops_when_full_and_pads_at_wrap) {
     const std::string name =
         "/oflash-test-" + std::to_string((long)getpid()) + "-c";
     // Tiny ring: 1 MiB min is enforced, so use 1 MiB and a big record.
-    REQUIRE(ring.create(name, 1 << 20, 1, 1, 4, 2, 0, 100));
+    REQUIRE(ring.create(name, 1 << 20, 1, 2, 3, 1, 4, 2, 0, 100));
 
     std::vector<uint8_t> big((1 << 18) - 32);  // record = 256 KiB exactly
     OFlashRecordHeader h{};
@@ -339,7 +386,7 @@ TEST_CASE(OFlashUnitFixture, ring_pad_record_written_at_wrap) {
     OFlashRing ring;
     const std::string name =
         "/oflash-test-" + std::to_string((long)getpid()) + "-d";
-    REQUIRE(ring.create(name, 1 << 22, 1, 1, 4, 2, 0, 100));  // 4 MiB
+    REQUIRE(ring.create(name, 1 << 22, 1, 2, 3, 1, 4, 2, 0, 100));  // 4 MiB
     OFlashRecordHeader h{};
     h.type = OFLASH_REC_CONTEXT;
     // head → 2.5 MiB, fully drained.
@@ -371,7 +418,9 @@ TEST_CASE(OFlashUnitFixture, ring_step_record_golden_bytes) {
     OFlashRing ring;
     const std::string name =
         "/oflash-test-" + std::to_string((long)getpid()) + "-e";
-    REQUIRE(ring.create(name, 1 << 20, 0x0102030405060708ull, 1, 2, 2, 0, 10));
+    REQUIRE(ring.create(name, 1 << 20, 0x0102030405060708ull,
+                        0x1112131415161718ull, 0x1ec7f022739c0547ull,
+                        1, 2, 2, 0, 10));
     OFlashRecordHeader h{};
     h.type = OFLASH_REC_STEP;
     h.seq_id = 1;
@@ -519,7 +568,9 @@ TEST_CASE(OFlashUnitFixture, adapter_load_accepts_valid_file) {
     write_adapter_file(path, dw, 4, test_sha(), 3);
     OFlashAdapterHost host;
     std::string err;
-    REQUIRE(oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
+    REQUIRE(oflash_adapter_load(path, dw, 4, 32.0f, test_sha(),
+                                test_target_sha(), test_semantics(),
+                                "default", host, err));
     CHECK_EQUAL(host.generation, (uint64_t)3);
     CHECK_EQUAL(host.tensors.size(), (size_t)26);
     // F32 → F16 conversion preserves element count.
@@ -537,14 +588,18 @@ TEST_CASE(OFlashUnitFixture, adapter_load_refuses_non_finite_tensor_values) {
     write_adapter_file(path, dw, 4, test_sha(), 1,
                        /*corrupt_shape=*/false, /*alpha=*/"32",
                        AdapterPayloadPoison::NaN);
-    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(),
+                               test_target_sha(), test_semantics(),
+                               "default", host, err));
     CHECK(err.find("NaN/Inf") != std::string::npos);
 
     write_adapter_file(path, dw, 4, test_sha(), 1,
                        /*corrupt_shape=*/false, /*alpha=*/"32",
                        AdapterPayloadPoison::Inf);
     err.clear();
-    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(),
+                               test_target_sha(), test_semantics(),
+                               "default", host, err));
     CHECK(err.find("NaN/Inf") != std::string::npos);
     std::remove(path.c_str());
 }
@@ -558,23 +613,69 @@ TEST_CASE(OFlashUnitFixture, adapter_load_refuses_mismatches) {
 
     // Wrong drafter hash.
     write_adapter_file(path, dw, 4, std::string(64, 'b'), 1);
-    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(),
+                               test_target_sha(), test_semantics(),
+                               "default", host, err));
     CHECK(err.find("hash") != std::string::npos);
+
+    // Format v2 requires the complete digest, never a convenient prefix.
+    write_adapter_file(path, dw, 4, std::string(16, 'a'), 1);
+    err.clear();
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(),
+                               test_target_sha(), test_semantics(),
+                               "default", host, err));
+    CHECK(err.find("drafter hash") != std::string::npos);
+
+    // Adapters are tied to the target that supplied their supervision.
+    write_adapter_file(path, dw, 4, test_sha(), 1,
+                       /*corrupt_shape=*/false, /*alpha=*/"32",
+                       AdapterPayloadPoison::None, test_semantics(),
+                       std::string(64, 'd'));
+    err.clear();
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(),
+                               test_target_sha(), test_semantics(),
+                               "default", host, err));
+    CHECK(err.find("target hash") != std::string::npos);
+
+    // Same file hash but a different runtime SWA/RoPE contract.
+    write_adapter_file(path, dw, 4, test_sha(), 1,
+                       /*corrupt_shape=*/false, /*alpha=*/"32",
+                       AdapterPayloadPoison::None,
+                       "v1;rope=00000000;swa=2048;pattern=10;mask=0");
+    err.clear();
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(),
+                               test_target_sha(), test_semantics(),
+                               "default", host, err));
+    CHECK(err.find("semantics") != std::string::npos);
+
+    // Profile metadata is part of store isolation in both loaders.
+    write_adapter_file(path, dw, 4, test_sha(), 1);
+    err.clear();
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(),
+                               test_target_sha(), test_semantics(),
+                               "other", host, err));
+    CHECK(err.find("profile") != std::string::npos);
 
     // Wrong rank.
     write_adapter_file(path, dw, 4, test_sha(), 1);
-    CHECK(!oflash_adapter_load(path, dw, 8, 32.0f, test_sha(), host, err));
+    CHECK(!oflash_adapter_load(path, dw, 8, 32.0f, test_sha(),
+                               test_target_sha(), test_semantics(),
+                               "default", host, err));
     CHECK(err.find("rank") != std::string::npos);
 
     // Same rank but incompatible LoRA scale.
     write_adapter_file(path, dw, 4, test_sha(), 1,
                        /*corrupt_shape=*/false, /*alpha=*/"16");
-    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(),
+                               test_target_sha(), test_semantics(),
+                               "default", host, err));
     CHECK(err.find("alpha") != std::string::npos);
 
     // Corrupt tensor shape.
     write_adapter_file(path, dw, 4, test_sha(), 1, /*corrupt_shape=*/true);
-    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(),
+                               test_target_sha(), test_semantics(),
+                               "default", host, err));
     CHECK(err.find("shape") != std::string::npos);
 
     std::remove(path.c_str());
@@ -599,7 +700,9 @@ TEST_CASE(OFlashUnitFixture, adapter_load_refuses_malformed_field_types) {
     DraftWeights dw = tiny_drafter();
     OFlashAdapterHost host;
     std::string err;
-    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(), host, err));
+    CHECK(!oflash_adapter_load(path, dw, 4, 32.0f, test_sha(),
+                               test_target_sha(), test_semantics(),
+                               "default", host, err));
     CHECK(err.find("invalid field types") != std::string::npos);
     std::remove(path.c_str());
 }

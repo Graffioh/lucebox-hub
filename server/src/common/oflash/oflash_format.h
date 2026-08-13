@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace dflash::common::oflash {
 
@@ -36,7 +37,7 @@ namespace dflash::common::oflash {
 // that space first.
 
 inline constexpr uint32_t OFLASH_RING_MAGIC   = 0x4F464C31;  // "OFL1"
-inline constexpr uint32_t OFLASH_RING_VERSION = 1;
+inline constexpr uint32_t OFLASH_RING_VERSION = 2;
 
 // Explicit byte offsets (no alignas tricks — Python mirrors these):
 //   0   magic, 4 version, 8 capacity, 16 data_offset
@@ -44,7 +45,8 @@ inline constexpr uint32_t OFLASH_RING_VERSION = 1;
 //   128 tail   (own cache line, written by trainer only)
 //   192 dropped_records, 200 dropped_bytes
 //   208 drafter_hash, 216 n_capture_layers, 220 hidden, 224 block_size,
-//   228 topk, 232 vocab
+//   228 topk, 232 vocab, 236 reserved, 240 target_hash,
+//   248 drafter_semantics_hash
 //   256 = sizeof (data_offset points here)
 struct OFlashRingHeader {
     uint32_t magic;            // OFLASH_RING_MAGIC
@@ -68,13 +70,18 @@ struct OFlashRingHeader {
     uint32_t block_size;       // draft block q_len (16)
     uint32_t topk;             // K of target_topk rows (0 = not captured)
     uint32_t vocab;            // target vocab size (for id validation)
-    uint8_t  pad3_[20];
+    uint32_t reserved_;
+    uint64_t target_hash;      // first 8 bytes of target GGUF SHA-256
+    uint64_t drafter_semantics_hash; // FNV-1a of resolved semantics string
 };
 static_assert(sizeof(OFlashRingHeader) == 256, "keep layout stable");
 static_assert(offsetof(OFlashRingHeader, head) == 64, "layout");
 static_assert(offsetof(OFlashRingHeader, tail) == 128, "layout");
 static_assert(offsetof(OFlashRingHeader, dropped_records) == 192, "layout");
 static_assert(offsetof(OFlashRingHeader, drafter_hash) == 208, "layout");
+static_assert(offsetof(OFlashRingHeader, target_hash) == 240, "layout");
+static_assert(offsetof(OFlashRingHeader, drafter_semantics_hash) == 248,
+              "layout");
 
 // ── Record framing ──────────────────────────────────────────────────
 //
@@ -165,21 +172,27 @@ static_assert(sizeof(OFlashRecordHeader) == 32, "keep layout stable");
 // dtype: F32 or F16. The forward delta is y += (alpha/rank) * B @ (A @ x).
 //
 // Required __metadata__ keys (all values are strings, per safetensors):
-//   oflash.format        "1"
+//   oflash.format        "2"
 //   oflash.drafter_sha256  full lowercase hex SHA-256 of the drafter GGUF
+//   oflash.target_sha256    full lowercase hex SHA-256 of the target GGUF
+//   oflash.drafter_semantics  resolved model contract, currently
+//                              v1;rope=<f32-bits>;swa=<tokens>;
+//                              pattern=<bits>;mask=<token-id>
 //   oflash.rank          decimal, must equal the engine's --oflash-lora-rank
 //   oflash.alpha         decimal float
 //   oflash.generation    decimal, monotonically increasing per profile
 //   oflash.profile       profile name the trainer ran under
-// The engine refuses adapters whose drafter_sha256 prefix or rank mismatch.
-// Drafter hashing reuses read_gguf_metadata(path, /*compute_sha256=*/true)
-// (common/gguf_inspect.h), which sidecar-caches the digest next to the GGUF.
+// The engine refuses adapters whose draft/target identity, resolved semantics,
+// profile, rank, or alpha mismatch. Format 2 intentionally rejects older adapters
+// that did not distinguish runtime SWA/RoPE overrides.
+// Model hashing reuses read_gguf_metadata(path, /*compute_sha256=*/true)
+// (common/gguf_inspect.h), which sidecar-caches each digest next to its GGUF.
 
 // Truncate a lowercase-hex SHA-256 string to the u64 used in the ring header
 // and in profile directory names (first 16 hex chars, big-endian). Returns 0
 // on malformed input — callers treat 0 as "no hash".
 inline uint64_t oflash_hash_from_hex(const char * hex) {
-    if (!hex) return 0;
+    if (!hex || std::strlen(hex) < 16) return 0;
     uint64_t h = 0;
     for (int i = 0; i < 16; i++) {
         const char c = hex[i];

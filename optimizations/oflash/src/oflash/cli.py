@@ -5,7 +5,8 @@ Process contract (server/src/common/oflash/oflash_supervisor.cpp):
   argv:   oflash-trainer <drafter.gguf>
               --ring-name=/lucebox-oflash-<pid>  --out-dir=<profile dir>
               --profile=<name> --rank=N --alpha=F --device=<cpu|ordinal>
-              --drafter-sha256=<hex> --start-generation=N --stream-fd=N
+              --drafter-sha256=<hex> --target-sha256=<hex>
+              --start-generation=N --stream-fd=N
   ready:  one int32 0 on --stream-fd, sent AFTER attaching the ring but
           BEFORE any heavy import (torch) or model load, so server startup
           never blocks on us. Accelerator/model-load failures after ready
@@ -26,11 +27,44 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
 import struct
 import sys
 import threading
+
+from .identity import (require_sha256, resolved_drafter_semantics,
+                       sha256_file)
+
+
+def _finite_positive_float(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0.0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
+    return value
+
+
+def _nonnegative_int(raw: str) -> int:
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return value
+
+
+def _swa_pattern(raw: str) -> tuple[bool, ...]:
+    values = raw.split(",")
+    if not values or any(value not in ("0", "1") for value in values):
+        raise argparse.ArgumentTypeError(
+            "must be a comma-separated list of 0/1 values")
+    return tuple(value == "1" for value in values)
+
+
+def _sha256(raw: str) -> str:
+    try:
+        return require_sha256(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -40,9 +74,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--profile", default="default")
     ap.add_argument("--rank", type=int, default=16)
-    ap.add_argument("--alpha", type=float, default=32.0)
+    ap.add_argument("--alpha", type=_finite_positive_float, default=32.0)
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--drafter-sha256", default="")
+    ap.add_argument("--drafter-sha256", type=_sha256)
+    ap.add_argument("--target-sha256", type=_sha256)
     ap.add_argument("--start-generation", type=int, default=0)
     ap.add_argument("--stream-fd", type=int, default=-1)
     ap.add_argument("--dtype", choices=("auto", "fp16", "bf16", "fp32"),
@@ -53,6 +88,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                     help="target GGUF for lm_head/token_embd; defaults to "
                          "the value stored in <out-dir>/trainer.json or "
                          "$OFLASH_TARGET_GGUF")
+    # Resolved engine metadata. Integrated launches always pass these after
+    # applying legacy GGUF overrides; direct trainer invocations may omit
+    # them and use the file metadata unchanged.
+    ap.add_argument("--resolved-rope-theta", type=_finite_positive_float)
+    ap.add_argument("--resolved-swa-window", type=_nonnegative_int)
+    ap.add_argument("--resolved-swa-pattern", type=_swa_pattern)
+    ap.add_argument("--resolved-mask-token-id", type=_nonnegative_int)
+    ap.add_argument("--drafter-semantics", default="",
+                    help="engine-computed resolved drafter identity; direct "
+                         "invocations derive it from the resolved metadata")
     # Training knobs (OFLASH.md §5 defaults).
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--kl-lambda", type=float, default=0.5)
@@ -62,7 +107,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--train-ctx", type=int, default=128)
     ap.add_argument("--reservoir-rows", type=int, default=10_000)
     ap.add_argument("--keep-generations", type=int, default=4)
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if ((args.resolved_swa_window is None)
+            != (args.resolved_swa_pattern is None)):
+        ap.error("--resolved-swa-window and --resolved-swa-pattern must be "
+                 "provided together")
+    resolved = (
+        args.resolved_rope_theta,
+        args.resolved_swa_window,
+        args.resolved_swa_pattern,
+        args.resolved_mask_token_id,
+    )
+    if not args.drafter_semantics and all(value is not None
+                                           for value in resolved):
+        try:
+            args.drafter_semantics = resolved_drafter_semantics(*resolved)
+        except ValueError as exc:
+            ap.error(str(exc))
+    return args
 
 
 class Control:
@@ -157,6 +219,13 @@ def main(argv: list[str] | None = None) -> int:
             os.write(args.stream_fd, struct.pack("<i", -1))
         ring.close()
         return 1
+    if not os.path.exists(args.drafter):
+        sys.stderr.write(
+            f"[oflash-trainer] drafter GGUF not found: {args.drafter}\n")
+        if args.stream_fd >= 0:
+            os.write(args.stream_fd, struct.pack("<i", -1))
+        ring.close()
+        return 1
     if args.train_ctx < 64:  # keep in sync with trainer.MIN_WINDOW_ROWS
         sys.stderr.write(
             f"[oflash-trainer] --train-ctx {args.train_ctx} must be >= 64\n")
@@ -173,7 +242,38 @@ def main(argv: list[str] | None = None) -> int:
             os.write(args.stream_fd, struct.pack("<i", -1))
         ring.close()
         return 1
-
+    try:
+        supplied = [
+            ("drafter", args.drafter, args.drafter_sha256),
+            ("target", target, args.target_sha256),
+        ]
+        if args.stream_fd >= 0 and any(
+                digest is None for _, _, digest in supplied):
+            raise ValueError(
+                "engine launch omitted required model SHA-256 identity")
+        # The integrated child trusts the engine, which just fingerprinted the
+        # already-loaded models. Direct mode verifies even supplied hashes so
+        # a mistyped path cannot mislabel training against another target.
+        for label, path, supplied_digest in supplied:
+            if args.stream_fd >= 0:
+                continue
+            sys.stderr.write(
+                f"[oflash-trainer] verifying {label} GGUF for adapter "
+                f"identity: {path}\n")
+            actual_digest = sha256_file(path)
+            if supplied_digest is not None and supplied_digest != actual_digest:
+                raise ValueError(
+                    f"{label} SHA-256 does not match {path}")
+            if label == "drafter":
+                args.drafter_sha256 = actual_digest
+            else:
+                args.target_sha256 = actual_digest
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"[oflash-trainer] model identity failed: {e}\n")
+        if args.stream_fd >= 0:
+            os.write(args.stream_fd, struct.pack("<i", -1))
+        ring.close()
+        return 1
     control = Control(args.stream_fd)
     control.send_ready()
 
@@ -193,9 +293,15 @@ def main(argv: list[str] | None = None) -> int:
         rank=args.rank,
         alpha=args.alpha,
         drafter_sha256=args.drafter_sha256,
+        target_sha256=args.target_sha256,
         start_generation=args.start_generation,
         requested_device=args.device,
         dtype=args.dtype,
+        resolved_rope_theta=args.resolved_rope_theta,
+        resolved_swa_window=args.resolved_swa_window,
+        resolved_swa_pattern=args.resolved_swa_pattern,
+        resolved_mask_token_id=args.resolved_mask_token_id,
+        drafter_semantics=args.drafter_semantics,
         lr=args.lr,
         kl_lambda=args.kl_lambda,
         reject_weight=args.reject_weight,

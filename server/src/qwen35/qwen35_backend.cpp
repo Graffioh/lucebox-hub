@@ -95,15 +95,12 @@ static int dflash_min_tokens_floor() {
     return value;
 }
 
-static bool draft_swa_override_matches_gguf(const DraftWeights & dw,
-                                            int override_window) {
-    if (override_window <= 0) return true;
-    if (dw.swa_window != override_window || dw.n_layer <= 0) return false;
+static void apply_draft_swa_override(DraftWeights & dw, int window) {
+    if (window <= 0) return;
+    dw.swa_window = window;
     for (int il = 0; il < dw.n_layer; ++il) {
-        const bool expected = il < dw.n_layer - 1;
-        if (dw.layers[il].is_swa != expected) return false;
+        dw.layers[(size_t)il].is_swa = il < dw.n_layer - 1;
     }
-    return true;
 }
 
 static FILE * open_dflash_floor_log() {
@@ -192,8 +189,6 @@ bool Qwen35Backend::init() {
     const bool tensor_parallel = cfg_.device.is_tensor_parallel();
     split_gpus_ = !use_remote_draft && cfg_.draft_path &&
                   (tensor_parallel || cfg_.device.gpu != cfg_.draft_gpu);
-    bool oflash_draft_override_changes_model = false;
-
     if (tensor_parallel) {
         tensor_parallel_ = Qwen35TensorParallelContext::create(cfg_.device, w_);
         target_backend_ = tensor_parallel_ ? tensor_parallel_->init_backend() : nullptr;
@@ -268,12 +263,7 @@ bool Qwen35Backend::init() {
         std::printf("[draft]  loaded\n");
 
         if (cfg_.draft_swa_window > 0) {
-            oflash_draft_override_changes_model =
-                !draft_swa_override_matches_gguf(
-                    dw_, cfg_.draft_swa_window);
-            dw_.swa_window = cfg_.draft_swa_window;
-            for (int il = 0; il < dw_.n_layer - 1; il++)
-                dw_.layers[il].is_swa = true;
+            apply_draft_swa_override(dw_, cfg_.draft_swa_window);
             std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
                         dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
         }
@@ -288,10 +278,6 @@ bool Qwen35Backend::init() {
         } else if (tensor_parallel) {
             std::fprintf(stderr,
                 "[oflash] not supported with tensor-parallel targets; disabled\n");
-        } else if (oflash_draft_override_changes_model) {
-            std::fprintf(stderr,
-                "[oflash] --draft-swa changes the GGUF's attention layout, "
-                "but the trainer mirrors GGUF metadata; disabled\n");
         } else {
             oflash_ = std::make_unique<oflash::OFlashRuntime>();
             if (!oflash_->init(cfg_.oflash,
@@ -656,7 +642,6 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 return false;
             }
         } else {
-            bool oflash_draft_override_changes_model = false;
             std::string dp(cfg_.draft_path);
             bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
                 ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
@@ -665,9 +650,9 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
                 return false;
             }
-            // Re-apply rope overrides after reload.
-            if (dw_.rope_theta != w_.rope_theta && w_.rope_theta > 0.0f)
-                dw_.rope_theta = w_.rope_theta;
+            // Re-apply explicit draft overrides after reload. Preserve the
+            // drafter GGUF's RoPE base: the official Lucebox Qwen3.6 draft
+            // was qualified at 1e6 even though the target uses 1e7.
             if (dw_.rope_ext_factor == 0.0f && dw_.n_layer == 8 && dw_.n_embd == 2048) {
                 float yf = cfg_.draft_yarn_factor > 1.0f ? cfg_.draft_yarn_factor : 64.0f;
                 dw_.rope_freq_scale = 1.0f / yf;
@@ -677,32 +662,21 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
             }
             if (cfg_.draft_swa_window > 0) {
-                oflash_draft_override_changes_model =
-                    !draft_swa_override_matches_gguf(
-                        dw_, cfg_.draft_swa_window);
-                dw_.swa_window = cfg_.draft_swa_window;
-                for (int il = 0; il < dw_.n_layer - 1; il++)
-                    dw_.layers[il].is_swa = true;
+                apply_draft_swa_override(dw_, cfg_.draft_swa_window);
             }
             if (cfg_.oflash.enabled) {
                 std::lock_guard<std::mutex> lock(oflash_mu_);
-                if (oflash_draft_override_changes_model) {
+                oflash_ = std::make_unique<oflash::OFlashRuntime>();
+                if (!oflash_->init(
+                        cfg_.oflash,
+                        cfg_.target_path ? cfg_.target_path : "",
+                        cfg_.draft_path, dw_, draft_backend_,
+                        w_.n_capture_layers, w_.n_embd,
+                        w_.n_vocab)) {
+                    oflash_.reset();
                     std::fprintf(stderr,
-                        "[oflash] --draft-swa changes the GGUF's attention "
-                        "layout; disabled after draft unpark\n");
-                } else {
-                    oflash_ = std::make_unique<oflash::OFlashRuntime>();
-                    if (!oflash_->init(
-                            cfg_.oflash,
-                            cfg_.target_path ? cfg_.target_path : "",
-                            cfg_.draft_path, dw_, draft_backend_,
-                            w_.n_capture_layers, w_.n_embd,
-                            w_.n_vocab)) {
-                        oflash_.reset();
-                        std::fprintf(stderr,
-                            "[oflash] disabled after draft unpark "
-                            "(init failed)\n");
-                    }
+                        "[oflash] disabled after draft unpark "
+                        "(init failed)\n");
                 }
             }
         }

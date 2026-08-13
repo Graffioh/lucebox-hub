@@ -52,14 +52,13 @@ struct GgufMetadata {
 // stays empty. The header read is cheap (no weight load).
 //
 // When `compute_sha256` is true and a sidecar file `<path>.sha256` exists,
-// its cached sha256 is trusted only when it carries a `# size=<bytes>` guard
-// matching the current GGUF file size; otherwise (legacy sidecar, size
-// mismatch, or missing guard) the file is rehashed and the sidecar rewritten.
-// This protects against a stale sidecar reporting the wrong identity after
-// the GGUF was edited or replaced in place. After a successful hash, the
-// result is written to the sidecar with the size guard so subsequent
-// restarts skip the rehash. Sidecar I/O failures are non-fatal — the
-// in-memory hash still gets returned.
+// its cached sha256 is trusted only when it carries a complete stat
+// fingerprint (size, nanosecond mtime/ctime, device and inode) matching the
+// current GGUF. Legacy or stale sidecars trigger a rehash. The fingerprint is
+// checked again after reading or hashing so a concurrently changing model is
+// never assigned a cached/partial identity. Sidecar I/O failures are
+// non-fatal; the in-memory hash still gets returned when the file remained
+// stable for the complete read.
 GgufMetadata read_gguf_metadata(const std::string & path,
                                 bool compute_sha256);
 

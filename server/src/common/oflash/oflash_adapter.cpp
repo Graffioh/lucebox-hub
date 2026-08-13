@@ -100,6 +100,13 @@ bool st_open(const std::string & path, StFile & f, std::string & error) {
     return true;
 }
 
+bool is_lower_sha256(const std::string & value) {
+    if (value.size() != 64) return false;
+    return std::all_of(value.begin(), value.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+
 size_t st_dtype_size(const std::string & d) {
     if (d == "F32") return 4;
     if (d == "F16" || d == "BF16") return 2;
@@ -197,6 +204,9 @@ bool oflash_adapter_load(const std::string & path,
                          int rank,
                          float alpha,
                          const std::string & drafter_sha256,
+                         const std::string & target_sha256,
+                         const std::string & drafter_semantics,
+                         const std::string & profile,
                          OFlashAdapterHost & out,
                          std::string & error) {
     StFile f;
@@ -206,17 +216,35 @@ bool oflash_adapter_load(const std::string & path,
         auto it = f.metadata.find(key);
         return it == f.metadata.end() ? std::string() : it->second;
     };
-    if (meta("oflash.format") != "1") {
+    if (meta("oflash.format") != "2") {
         error = "adapter format version mismatch (oflash.format="
               + meta("oflash.format") + ")";
         return false;
     }
     const std::string file_sha = meta("oflash.drafter_sha256");
-    if (file_sha.empty() ||
-        drafter_sha256.compare(0, file_sha.size(), file_sha) != 0 ||
-        file_sha.size() < 16) {
+    if (!is_lower_sha256(file_sha) || !is_lower_sha256(drafter_sha256) ||
+        file_sha != drafter_sha256) {
         error = "adapter drafter hash mismatch (adapter=" + file_sha +
                 " loaded=" + drafter_sha256.substr(0, 16) + "...)";
+        return false;
+    }
+    const std::string file_target_sha = meta("oflash.target_sha256");
+    if (!is_lower_sha256(file_target_sha) ||
+        !is_lower_sha256(target_sha256) ||
+        file_target_sha != target_sha256) {
+        error = "adapter target hash mismatch (adapter=" + file_target_sha +
+                " loaded=" + target_sha256.substr(0, 16) + "...)";
+        return false;
+    }
+    const std::string file_semantics = meta("oflash.drafter_semantics");
+    if (file_semantics.empty() || file_semantics != drafter_semantics) {
+        error = "adapter drafter semantics mismatch (adapter=" +
+                file_semantics + " loaded=" + drafter_semantics + ")";
+        return false;
+    }
+    if (profile.empty() || meta("oflash.profile") != profile) {
+        error = "adapter profile mismatch (adapter=" +
+                meta("oflash.profile") + " loaded=" + profile + ")";
         return false;
     }
     const std::string rank_s = meta("oflash.rank");

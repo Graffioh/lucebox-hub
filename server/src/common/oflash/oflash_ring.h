@@ -34,6 +34,8 @@ public:
     bool create(const std::string & name,
                 uint64_t capacity_bytes,
                 uint64_t drafter_hash,
+                uint64_t target_hash,
+                uint64_t drafter_semantics_hash,
                 uint32_t n_capture_layers,
                 uint32_t hidden,
                 uint32_t block_size,

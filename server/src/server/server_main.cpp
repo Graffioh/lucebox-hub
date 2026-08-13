@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -351,8 +352,10 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--oflash-alpha") == 0 && i + 1 < argc) {
             oflash_aux_options_set = true;
             bargs.oflash.lora_alpha = (float)std::atof(argv[++i]);
-            if (!(bargs.oflash.lora_alpha > 0.0f)) {
-                std::fprintf(stderr, "[server] --oflash-alpha must be > 0\n");
+            if (!std::isfinite(bargs.oflash.lora_alpha) ||
+                !(bargs.oflash.lora_alpha > 0.0f)) {
+                std::fprintf(stderr,
+                    "[server] --oflash-alpha must be finite and > 0\n");
                 return 2;
             }
         } else if (std::strcmp(argv[i], "--oflash-dir") == 0 && i + 1 < argc) {

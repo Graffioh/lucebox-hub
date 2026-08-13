@@ -4,9 +4,9 @@ Contract: server/src/common/oflash/oflash_format.h (names, shapes, metadata
 keys) and oflash_adapter.cpp (refusal rules). Shapes are torch-conventional
 row-major: lora_a is [rank, in_features], lora_b is [out_features, rank] —
 exactly `lora_A.weight` / `lora_B.weight`. dtype F16 (F32/BF16 also accepted
-by the engine). The engine refuses files whose drafter sha or rank mismatch,
-or whose tensor set differs from its expectation in ANY way, so exports are
-all-or-nothing.
+by the engine). The engine refuses files whose draft/target hashes or rank
+mismatch, or whose resolved model semantics or tensor set differs from its
+expectation in ANY way, so exports are all-or-nothing.
 """
 
 from __future__ import annotations
@@ -15,7 +15,10 @@ import os
 from dataclasses import dataclass
 
 import numpy as np
+from safetensors import safe_open
 from safetensors.numpy import save_file
+
+from .identity import require_sha256
 
 # LoRA-targeted projections per OFLASH.md §5: attention q/k/v/o + MLP
 # up/down + the feature-fusion fc. NOT ffn_gate, NOT the (target-owned)
@@ -62,6 +65,8 @@ def export_adapter(path: str,
                    rank: int,
                    alpha: float,
                    drafter_sha256: str,
+                   target_sha256: str,
+                   drafter_semantics: str,
                    generation: int,
                    profile: str) -> None:
     """Validate against the engine's expectation and write atomically.
@@ -72,6 +77,10 @@ def export_adapter(path: str,
     """
     if os.path.exists(path):
         raise FileExistsError(f"adapter generation already exists: {path}")
+    require_sha256(drafter_sha256, "drafter SHA-256")
+    require_sha256(target_sha256, "target SHA-256")
+    if not drafter_semantics:
+        raise ValueError("drafter semantics must not be empty")
     expected = expected_tensor_shapes(dims, rank)
     if set(tensors) != set(expected):
         missing = sorted(set(expected) - set(tensors))
@@ -92,10 +101,14 @@ def export_adapter(path: str,
             raise ValueError(f"{name}: adapter overflows float16 export")
         out[name] = packed
     metadata = {
-        "oflash.format": "1",
+        "oflash.format": "2",
         "oflash.drafter_sha256": drafter_sha256,
+        "oflash.target_sha256": target_sha256,
+        "oflash.drafter_semantics": drafter_semantics,
         "oflash.rank": str(rank),
-        "oflash.alpha": f"{alpha:g}",
+        # The engine's alpha is f32. Nine significant decimal digits round-trip
+        # every f32 value and stay inside the shared validation tolerance.
+        "oflash.alpha": format(float(np.float32(alpha)), ".9g"),
         "oflash.generation": str(generation),
         "oflash.profile": profile,
     }
@@ -110,6 +123,75 @@ def export_adapter(path: str,
             os.remove(tmp)
         except FileNotFoundError:
             pass
+
+
+def _validate_adapter_metadata(metadata: dict[str, str],
+                               drafter_sha256: str,
+                               target_sha256: str,
+                               drafter_semantics: str,
+                               rank: int,
+                               alpha: float,
+                               generation: int | None = None,
+                               profile: str | None = None) -> None:
+    if metadata.get("oflash.format") != "2":
+        raise ValueError("adapter format version mismatch")
+    require_sha256(drafter_sha256, "drafter SHA-256")
+    require_sha256(target_sha256, "target SHA-256")
+    if metadata.get("oflash.drafter_sha256") != drafter_sha256:
+        raise ValueError("adapter drafter hash mismatch")
+    if metadata.get("oflash.target_sha256") != target_sha256:
+        raise ValueError("adapter target hash mismatch")
+    if metadata.get("oflash.drafter_semantics") != drafter_semantics:
+        raise ValueError("adapter drafter semantics mismatch")
+    if metadata.get("oflash.rank") != str(rank):
+        raise ValueError("adapter rank mismatch")
+    try:
+        file_alpha = float(metadata.get("oflash.alpha", ""))
+    except ValueError as exc:
+        raise ValueError("adapter alpha is invalid") from exc
+    if (not np.isfinite(file_alpha)
+            or abs(file_alpha - alpha) > 1e-6 * max(1.0, abs(alpha))):
+        raise ValueError("adapter alpha mismatch")
+    if generation is not None:
+        try:
+            file_generation = int(metadata.get("oflash.generation", ""))
+        except ValueError as exc:
+            raise ValueError("adapter generation is invalid") from exc
+        if file_generation != generation:
+            raise ValueError("adapter generation mismatch")
+    if profile is not None and metadata.get("oflash.profile") != profile:
+        raise ValueError("adapter profile mismatch")
+
+
+def validate_adapter_metadata(path: str,
+                              drafter_sha256: str,
+                              target_sha256: str,
+                              drafter_semantics: str,
+                              rank: int,
+                              alpha: float,
+                              generation: int | None = None,
+                              profile: str | None = None) -> None:
+    """Apply the engine's identity checks before a Python warm start."""
+    with safe_open(path, framework="numpy") as handle:
+        _validate_adapter_metadata(
+            handle.metadata() or {}, drafter_sha256, target_sha256,
+            drafter_semantics, rank, alpha, generation, profile)
+
+
+def load_validated_adapter(path: str,
+                           drafter_sha256: str,
+                           target_sha256: str,
+                           drafter_semantics: str,
+                           rank: int,
+                           alpha: float,
+                           generation: int | None = None,
+                           profile: str | None = None) -> dict[str, np.ndarray]:
+    """Validate metadata and copy tensors through the same open handle."""
+    with safe_open(path, framework="numpy") as handle:
+        _validate_adapter_metadata(
+            handle.metadata() or {}, drafter_sha256, target_sha256,
+            drafter_semantics, rank, alpha, generation, profile)
+        return {name: handle.get_tensor(name) for name in handle.keys()}
 
 
 def gc_generations(profile_dir: str, keep: int = 4,

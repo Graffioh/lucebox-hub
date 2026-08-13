@@ -3,12 +3,14 @@
 // Three concerns, all engine-side:
 //   1. Parse + validate a single-file safetensors adapter produced by the
 //      trainer (tensor names/shapes per oflash_format.h, metadata keys
-//      oflash.*). The engine refuses adapters whose drafter SHA-256 or rank
-//      do not match the loaded drafter GGUF.
+//      oflash.*). The engine refuses adapters whose draft or target SHA-256,
+//      resolved RoPE/SWA/mask semantics, rank, or alpha do not match the
+//      loaded graph.
 //   2. Preallocate the pointer-stable device tensors (OFlashLoraWeights) the
 //      draft graphs reference, zero-filled so "no adapter yet" is bit-exact
 //      with the base drafter.
-//   3. The on-disk profile store <dir>/<hash16>/<profile>/ used for warm
+//   3. The on-disk profile store
+//      <dir>/<hash16>/<profile>-sem-<contract-hash>/ used for warm
 //      start: the engine reads promoted.json to find the adapter to load at
 //      init and rewrites it on promote so the next session warm-starts from
 //      the last promoted generation.
@@ -40,7 +42,9 @@ struct OFlashAdapterHost {
 };
 
 // Load + validate an adapter file against the loaded drafter.
-// `drafter_sha256` is the full lowercase hex of the drafter GGUF.
+// Both model hashes are full lowercase SHA-256 digests;
+// `drafter_semantics` identifies post-load RoPE/SWA overrides and `profile`
+// preserves workload-store isolation.
 // On success fills `out` (F16-converted, ggml element order).
 // Returns false with a "[oflash] ..."-style reason in `error`.
 bool oflash_adapter_load(const std::string & path,
@@ -48,6 +52,9 @@ bool oflash_adapter_load(const std::string & path,
                          int rank,
                          float alpha,
                          const std::string & drafter_sha256,
+                         const std::string & target_sha256,
+                         const std::string & drafter_semantics,
+                         const std::string & profile,
                          OFlashAdapterHost & out,
                          std::string & error);
 
@@ -80,7 +87,7 @@ std::vector<OFlashLoraTensorSpec> oflash_lora_expected_tensors(
 
 // ── Profile store ───────────────────────────────────────────────────
 
-// <dir>/<first 16 hex of drafter sha>/<profile>; created on demand.
+// <dir>/<first 16 hex of drafter sha>/<semantic profile>; created on demand.
 std::string oflash_profile_dir(const std::string & base_dir,
                                const std::string & drafter_sha256,
                                const std::string & profile);

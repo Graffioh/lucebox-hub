@@ -3,26 +3,46 @@
 **No acceptance or throughput result is measured yet.** The 2026-08-12 qualification below covers
 build, model integrity, device execution, and a capture-only server boot; the remaining sections are
 the performance methodology. Every number must arrive with the exact command that produced it
-(CONTRIBUTING.md: numbers without methodology don't get merged). Sections mirror the milestones in
-[`server/docs/OFLASH.md`](../../server/docs/OFLASH.md) §9.
+(CONTRIBUTING.md: numbers without methodology don't get merged). Sections mirror the
+[`R9700 and Strix Halo qualification ladder`](../../server/docs/OFLASH.md#r9700-and-strix-halo-qualification-ladder).
 
-All measurements on one box: **AMD Radeon AI PRO R9700** (gfx1201, 32 GB GDDR6) serving the target,
-**AMD Ryzen AI Max "Strix Halo" iGPU** (gfx1151, 128 GB unified memory) running the trainer.
-Target **Qwen3.6-27B Q4_K_M**; drafter **dflash-draft-3.6 Q8_0** (EAGLE-style DFlash block
-drafter, 16-token blocks). Single-stream decode, same seeds for static-vs-adaptive pairs, same
-power limit, same warmup.
+The planned OFlash measurements use one box: **AMD Radeon AI PRO R9700** (gfx1201, 32 GB GDDR6)
+serving the target and **AMD Ryzen AI Max "Strix Halo" iGPU** (gfx1151, 128 GB unified memory)
+running the trainer. Target: **Qwen3.6-27B Q4_K_M**. Selected drafter for the next qualification
+and M0 run: **Lucebox/dflash-draft-3.6 Q4_K_M** (DFlash block-diffusion drafter, 16-token blocks),
+with the `--draft-swa 2048` CLI equivalent of the published SWA setting. Future
+static-vs-adaptive pairs must use the same seeds, power limit and warmup.
 
 Primary metric: decode tok/s as a function of decode-step index and wall-clock session time,
 static vs adaptive. Secondary: mean accepted length (AL), acceptance rate α per draft position,
 swap/rollback counts, TTFT (must be unchanged), trainer interference on target tok/s, peak memory
 on both devices.
 
+## Published reference configurations
+
+These results establish that the model paths run on each device and that the two AMD devices can
+work concurrently. They are not OFlash measurements and must not be combined into a synthetic
+dual-GPU throughput result.
+
+| Published test | Exact relevant setup | Result |
+|---|---|---|
+| [R9700 Qwen3.6 server README baseline](../../server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) | `gfx1201`, ROCm 7.1.1, Q4_K_M target + **Lucebox Q4_K_M draft**, DDTree 22, HumanEval 10 prompts, `n_gen=256` | 54.65 tok/s mean, AL 7.14, 36.9–93.0 tok/s range |
+| [Strix Halo Qwen3.6](https://www.lucebox.com/blog/amd) | `gfx1151`, ROCm 7.2.2, Q4_K_M target + **Lucebox Q8_0 draft**, SWA 2048, DDTree 22, fast rollback, 10 prompts, `n_gen=128` | 26.85 tok/s, AL 5.58, 34.9% acceptance |
+| [R9700 + Strix Halo](https://www.lucebox.com/blog/deepseek-v4-asymmetric-parallelism) | ROCm 7.2.4, one-process asymmetric DeepSeek-V4 MoE inference | concurrent heterogeneous HIP execution; not Qwen and not training |
+
+The published Qwen tests are two separate single-GPU runs. The R9700 number used the selected
+Lucebox Q4_K_M draft; the Strix number used Lucebox Q8_0 plus the published SWA setting. Neither
+predicts online-training behavior. The
+[Lucebox model card](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) recommends Q4_K_M for
+fast inference and Q8_0 for parity/debug. Q4's smaller serving footprint does not shrink the dense
+FP16 trainer mirror, and its quantized-engine transfer quality remains a measurement.
+
 ## 0. 2026-08-12 hardware qualification
 
 Measured on the intended box with ROCm 7.2.2: R9700 `gfx1201` (31.86 GiB), Strix Halo `gfx1151`
 (96 GiB GPU-accessible KFD heap), and 128 GiB host RAM.
 
-- Pinned target and drafter downloads matched their published SHA-256 values:
+- Pinned target and Spiritbuun drafter downloads matched their published SHA-256 values:
   `41ae55b347988dca8352ed4c85f3d8ee3804a23cc89aaea165c071d61ec3cca0` for the
   16,817,244,064-byte Q4_K_M target and
   `29ba8b816eedea674e8bdabbd29db8da69539117c76da40e40d2207c0fb224db` for the
@@ -52,6 +72,12 @@ DeepSeek-V4 process repeatedly reclaimed both GPUs during the qualification wind
 the documented reserve. An exclusive GPU window is therefore the next prerequisite; the successful
 model boot is a capacity result, not an online-distillation or performance result.
 
+This historical boot predates the selection of the official Lucebox Q4_K_M drafter. It is retained
+as evidence for the machine and code path, not relabeled as a Q4 test. The next M0 run must use the
+pinned 1,055,917,280-byte Lucebox artifact with SHA-256
+`e2500e90165a0f8e7b52c9882c29ed1fa391c60b300ff11b817bf10e31fa092e`, RoPE 1,000,000 and the
+resolved 2,048-token `[S,S,S,S,F]` layout.
+
 ## 1. M0 — acceptance-vs-step baseline curves
 
 **Not yet measured.**
@@ -62,7 +88,7 @@ later claim is measured against.
 
 ```bash
 server/build/dflash_server qwen36-27b-Q4_K_M.gguf \
-    --draft dflash-draft-3.6-q8_0.gguf \
+    --draft dflash-draft-3.6-q4_k_m.gguf --draft-swa 2048 \
     --target-device hip:0 --draft-device hip:0 \
     --oflash                                               # no trainer bin: capture-only
 
@@ -77,24 +103,35 @@ Per-step AL/α come from the engine's rolling stats (`/props` + logs); extending
 to per-step timing output is part of this milestone. Deliverable: acceptance-vs-decode-step curves
 for HumanEval / Math500 / GSM8K and the agentic session, plus the capture-overhead delta.
 
-## 2. M1 — offline replay: does the recipe move α?
+## 2. M1 — detached trainer/static load: does the recipe move α?
 
 **Not yet measured.**
 
-Train the LoRA on M0-captured data offline, then re-run the M0 benchmarks with the adapter loaded
-statically (promoted at startup, trainer off). Proves the loss/rank/λ recipe moves α on our drafter
-before any online machinery is trusted. This is also where the FP16-mirror → Q4_K_M transfer gap is
-quantified: α in the PyTorch mirror vs α on the quantized engine, same adapter.
+Keep the M0 capture-only server running, attach a direct trainer to its live bounded ring, then
+re-run the M0 benchmarks with the resulting adapter loaded statically (promoted at startup, trainer
+off). The ring is not a persisted replay file, and exactly one consumer may attach. This proves the
+loss/rank/λ recipe moves α before any live swap machinery is trusted. It also quantifies the
+FP16-mirror → Q4_K_M transfer gap: α in the PyTorch mirror vs α on the quantized engine, same
+adapter.
 
 ```bash
-# replay the captured ring into the trainer (same args the engine would pass)
-optimizations/oflash/bin/oflash-trainer dflash-draft-3.6-q8_0.gguf \
-    --ring-name /lucebox-oflash-<pid> \
-    --out-dir ~/.lucebox/oflash/<hash16>/default --profile default \
-    --rank 16 --alpha 32 --device 1 --drafter-sha256 <sha256> \
-    --target qwen36-27b-Q4_K_M.gguf
+# Copy the ring name and exact profile directory from the capture-only server log.
+OFLASH_PROFILE_DIR=/path/from/oflash-profile-dir-log
+OFLASH_RING_NAME=/lucebox-oflash-12345
+optimizations/oflash/bin/oflash-trainer \
+    server/models/oflash/dflash-draft-3.6-q4_k_m.gguf \
+    --ring-name "$OFLASH_RING_NAME" \
+    --out-dir "$OFLASH_PROFILE_DIR" --profile default \
+    --rank 16 --alpha 32 --device 1 \
+    --drafter-sha256 e2500e90165a0f8e7b52c9882c29ed1fa391c60b300ff11b817bf10e31fa092e \
+    --target-sha256 41ae55b347988dca8352ed4c85f3d8ee3804a23cc89aaea165c071d61ec3cca0 \
+    --resolved-rope-theta 1000000 --resolved-swa-window 2048 \
+    --resolved-swa-pattern 1,1,1,1,0 --resolved-mask-token-id 248070 \
+    --target server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf
 
-# then re-run the M0 commands with the exported adapter promoted
+# Stop the trainer/server after an export, mark that immutable generation as
+# promoted in "$OFLASH_PROFILE_DIR/promoted.json", then restart the M0 server command.
+# promoted.json: {"adapter":"adapter-gen<N>.safetensors","generation":<N>}
 ```
 
 Go/no-go: **≥ +0.05 α** on a held-out slice of the same distribution. Report: α before/after per
@@ -111,7 +148,7 @@ drafter speed).
 
 ```bash
 server/build/dflash_server qwen36-27b-Q4_K_M.gguf \
-    --draft dflash-draft-3.6-q8_0.gguf \
+    --draft dflash-draft-3.6-q4_k_m.gguf --draft-swa 2048 \
     --target-device hip:0 --draft-device hip:0 \
     --oflash --oflash-trainer-bin optimizations/oflash/bin/oflash-trainer
 # domain-shifted workload through the same per-step harness client as M0
@@ -130,7 +167,7 @@ that a quarantined (rolled-back) generation is never warm-started.
 
 ```bash
 # session 1, then restart the same command; the engine warm-starts from
-# ~/.lucebox/oflash/<hash16>/default/promoted.json
+# ~/.lucebox/oflash/<hash16>/default-sem-<contract-hash>/promoted.json
 ```
 
 Deliverable: session-2 speedup at t=0, adapter store contents before/after GC.

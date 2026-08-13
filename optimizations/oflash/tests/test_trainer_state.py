@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 import torch
 
+import oflash.trainer as trainer_module
+from oflash.identity import fnv1a64
 from oflash.ring_format import REC_CONTEXT, Record
 from oflash.trainer import (
     SeqStore,
@@ -39,11 +41,35 @@ def _trainer(*, out_dir="/tmp/oflash-test-does-not-exist",
         out_dir=out_dir,
         requested_device=device,
         dtype="auto",
+        drafter_sha256="a" * 64,
+        target_sha256="b" * 64,
+        drafter_semantics=(
+            "v1;rope=49742400;swa=2048;pattern=10;mask=248070"),
+        profile="default",
+        rank=4,
+        alpha=32.0,
         reservoir_rows=128,
         train_ctx=64,
     )
-    ring = SimpleNamespace(info=SimpleNamespace(block_size=8))
+    ring = SimpleNamespace(info=SimpleNamespace(
+        block_size=8,
+        drafter_hash=int("a" * 16, 16),
+        target_hash=int("b" * 16, 16),
+        drafter_semantics_hash=fnv1a64(cfg.drafter_semantics),
+    ))
     return Trainer(cfg, ring, _Control())
+
+
+def test_ring_identity_binds_both_models_and_resolved_semantics():
+    trainer = _trainer()
+    assert trainer._validate_ring_identity()
+
+    trainer._ring.info.target_hash ^= 1
+    assert not trainer._validate_ring_identity()
+
+    trainer = _trainer()
+    trainer._ring.info.drafter_semantics_hash ^= 1
+    assert not trainer._validate_ring_identity()
 
 
 def test_newer_sequence_retires_older_live_store_without_seq_end():
@@ -214,6 +240,40 @@ def test_rollback_ack_is_emitted_after_trainer_state_is_restored():
 
     assert trainer._drain_commands() is None
     assert timeline == [("rollback", 17), ("rollback_ack", 17)]
+
+
+def test_rollback_revalidates_promoted_adapter_identity(
+        tmp_path, monkeypatch):
+    trainer = _trainer(out_dir=str(tmp_path))
+    promoted = tmp_path / "adapter-gen3.safetensors"
+    promoted.touch()
+    trainer._promoted_path = str(promoted)
+    trainer._promoted_generation = 3
+    trainer._drafter_semantics = "v1;rope=49742400;swa=2048;pattern=10;mask=248070"
+    loaded = []
+    trainer._mirror = SimpleNamespace(
+        load_lora_state_numpy=lambda state: loaded.append(state),
+        reset_lora=lambda: loaded.append("reset"),
+        lora_parameters=lambda: [],
+    )
+    checked = []
+
+    def load_validated(*args, **kwargs):
+        checked.append((args, kwargs))
+        return {"ok": 1}
+
+    monkeypatch.setattr(
+        trainer_module, "load_validated_adapter", load_validated)
+    trainer._make_optimizer = lambda: None
+
+    trainer._rollback(9)
+
+    assert checked == [(
+        (str(promoted), "a" * 64, "b" * 64,
+         trainer._drafter_semantics, 4, 32.0),
+        {"generation": 3, "profile": "default"},
+    )]
+    assert loaded == [{"ok": 1}]
 
 
 def test_self_disable_emits_engine_visible_state_event():

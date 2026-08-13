@@ -22,11 +22,15 @@ from oflash.adapter_export import (
     expected_tensor_shapes,
     export_adapter,
     gc_generations,
+    load_validated_adapter,
+    validate_adapter_metadata,
 )
 
 DIMS = DrafterDims(n_layer=2, hidden=16, q_dim=32, kv_dim=16, intermediate=24, fc_in=48)
 RANK = 4
 SHA = "a" * 64
+TARGET_SHA = "b" * 64
+SEMANTICS = "v1;rope=49742400;swa=2048;pattern=10;mask=0"
 
 
 def make_tensors(seed: int = 7) -> dict[str, np.ndarray]:
@@ -66,7 +70,9 @@ def test_export_writes_valid_safetensors_and_reloads(tmp_path):
     tensors = make_tensors()
     path = str(tmp_path / "adapter-gen7.safetensors")
     export_adapter(path, tensors, DIMS, RANK, alpha=32.0, drafter_sha256=SHA,
-                   generation=7, profile="default")
+                   target_sha256=TARGET_SHA, drafter_semantics=SEMANTICS,
+                   generation=7,
+                   profile="default")
     assert os.path.exists(path)
     assert not os.path.exists(path + ".tmp")  # atomic: tmp file replaced
 
@@ -83,13 +89,68 @@ def test_export_writes_valid_safetensors_and_reloads(tmp_path):
     with safe_open(path, framework="numpy") as f:
         meta = f.metadata()
     assert meta == {
-        "oflash.format": "1",
+        "oflash.format": "2",
         "oflash.drafter_sha256": SHA,
+        "oflash.target_sha256": TARGET_SHA,
+        "oflash.drafter_semantics": SEMANTICS,
         "oflash.rank": "4",
         "oflash.alpha": "32",
         "oflash.generation": "7",
         "oflash.profile": "default",
     }
+    validate_adapter_metadata(
+        path, SHA, TARGET_SHA, SEMANTICS, RANK, 32.0)
+    assert set(load_validated_adapter(
+        path, SHA, TARGET_SHA, SEMANTICS, RANK, 32.0)) == set(expected)
+    with pytest.raises(ValueError, match="target hash"):
+        validate_adapter_metadata(
+            path, SHA, "c" * 64, SEMANTICS, RANK, 32.0)
+    with pytest.raises(ValueError, match="semantics"):
+        validate_adapter_metadata(
+            path, SHA, TARGET_SHA, SEMANTICS + "-other", RANK, 32.0)
+    with pytest.raises(ValueError, match="rank"):
+        validate_adapter_metadata(
+            path, SHA, TARGET_SHA, SEMANTICS, RANK + 1, 32.0)
+
+
+def test_export_requires_resolved_semantics(tmp_path):
+    with pytest.raises(ValueError, match="semantics"):
+        export_adapter(str(tmp_path / "a.safetensors"), make_tensors(),
+                       DIMS, RANK, alpha=32.0, drafter_sha256=SHA,
+                       target_sha256=TARGET_SHA, drafter_semantics="",
+                       generation=1,
+                       profile="default")
+
+
+@pytest.mark.parametrize("bad_hash", ["", "a" * 16, "A" * 64])
+def test_export_requires_complete_canonical_model_hashes(tmp_path, bad_hash):
+    with pytest.raises(ValueError, match="64 lowercase hex"):
+        export_adapter(str(tmp_path / "a.safetensors"), make_tensors(),
+                       DIMS, RANK, alpha=32.0,
+                       drafter_sha256=bad_hash,
+                       target_sha256=TARGET_SHA,
+                       drafter_semantics=SEMANTICS, generation=1,
+                       profile="default")
+
+
+def test_nonround_alpha_and_store_identity_round_trip(tmp_path):
+    path = str(tmp_path / "adapter-gen9.safetensors")
+    alpha = 1.23456776
+    export_adapter(path, make_tensors(), DIMS, RANK, alpha=alpha,
+                   drafter_sha256=SHA, target_sha256=TARGET_SHA,
+                   drafter_semantics=SEMANTICS, generation=9,
+                   profile="coding")
+    validate_adapter_metadata(
+        path, SHA, TARGET_SHA, SEMANTICS, RANK, alpha,
+        generation=9, profile="coding")
+    with pytest.raises(ValueError, match="generation"):
+        validate_adapter_metadata(
+            path, SHA, TARGET_SHA, SEMANTICS, RANK, alpha,
+            generation=8, profile="coding")
+    with pytest.raises(ValueError, match="profile"):
+        validate_adapter_metadata(
+            path, SHA, TARGET_SHA, SEMANTICS, RANK, alpha,
+            generation=9, profile="other")
 
 
 def test_export_rejects_shape_mismatch(tmp_path):
@@ -97,7 +158,9 @@ def test_export_rejects_shape_mismatch(tmp_path):
     tensors["blk.0.attn_q.lora_a"] = np.zeros((5, 16), dtype=np.float32)  # rank+1
     with pytest.raises(ValueError, match="blk.0.attn_q.lora_a"):
         export_adapter(str(tmp_path / "a.safetensors"), tensors, DIMS, RANK,
-                       alpha=32.0, drafter_sha256=SHA, generation=1,
+                       alpha=32.0, drafter_sha256=SHA,
+                       target_sha256=TARGET_SHA,
+                       drafter_semantics=SEMANTICS, generation=1,
                        profile="default")
     assert not os.listdir(tmp_path)  # nothing written on failure
 
@@ -107,14 +170,18 @@ def test_export_rejects_missing_and_extra_tensors(tmp_path):
     del tensors["blk.1.ffn_down.lora_b"]
     with pytest.raises(ValueError, match="mismatch"):
         export_adapter(str(tmp_path / "a.safetensors"), tensors, DIMS, RANK,
-                       alpha=32.0, drafter_sha256=SHA, generation=1,
+                       alpha=32.0, drafter_sha256=SHA,
+                       target_sha256=TARGET_SHA,
+                       drafter_semantics=SEMANTICS, generation=1,
                        profile="default")
 
     tensors = make_tensors()
     tensors["blk.0.ffn_gate.lora_a"] = np.zeros((4, 16), dtype=np.float32)
     with pytest.raises(ValueError, match="mismatch"):
         export_adapter(str(tmp_path / "a.safetensors"), tensors, DIMS, RANK,
-                       alpha=32.0, drafter_sha256=SHA, generation=1,
+                       alpha=32.0, drafter_sha256=SHA,
+                       target_sha256=TARGET_SHA,
+                       drafter_semantics=SEMANTICS, generation=1,
                        profile="default")
     assert not os.listdir(tmp_path)
 
@@ -122,12 +189,16 @@ def test_export_rejects_missing_and_extra_tensors(tmp_path):
 def test_export_never_overwrites_an_existing_generation(tmp_path):
     path = str(tmp_path / "adapter-gen1.safetensors")
     export_adapter(path, make_tensors(seed=1), DIMS, RANK, alpha=32.0,
-                   drafter_sha256=SHA, generation=1, profile="default")
+                   drafter_sha256=SHA, target_sha256=TARGET_SHA,
+                   drafter_semantics=SEMANTICS,
+                   generation=1, profile="default")
     original = (tmp_path / "adapter-gen1.safetensors").read_bytes()
 
     with pytest.raises(FileExistsError, match="already exists"):
         export_adapter(path, make_tensors(seed=2), DIMS, RANK, alpha=32.0,
-                       drafter_sha256=SHA, generation=1, profile="default")
+                       drafter_sha256=SHA, target_sha256=TARGET_SHA,
+                       drafter_semantics=SEMANTICS,
+                       generation=1, profile="default")
 
     assert (tmp_path / "adapter-gen1.safetensors").read_bytes() == original
     assert not list(tmp_path.glob("*.tmp.*"))
@@ -141,7 +212,9 @@ def test_export_rejects_nonfinite_or_float16_overflow(tmp_path, bad):
 
     with pytest.raises(ValueError, match="NaN|infinity|overflows"):
         export_adapter(path, tensors, DIMS, RANK, alpha=32.0,
-                       drafter_sha256=SHA, generation=1, profile="default")
+                       drafter_sha256=SHA, target_sha256=TARGET_SHA,
+                       drafter_semantics=SEMANTICS,
+                       generation=1, profile="default")
 
     assert not os.listdir(tmp_path)
 

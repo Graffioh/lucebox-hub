@@ -2,6 +2,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -239,16 +240,52 @@ const char * llama_ftype_name(int32_t v) {
     }
 }
 
-// Sidecar layout (extends standard sha256sum format with a validation hint):
-//   line 1: "<64-hex>  <basename>\n"   (sha256sum-compatible)
-//   line 2: "# size=<bytes>\n"         (our extension; required to trust line 1)
-//
-// The size guard is what protects us from a stale sidecar after the GGUF was
-// replaced/edited in place without the sidecar being updated. We deliberately
-// don't trust legacy/external sidecars that lack the size hint — silently
-// reporting the wrong model identity at /props is worse than re-hashing once.
-bool read_sidecar_sha(const std::string & path, int64_t expected_size, std::string & out) {
-    if (expected_size < 0) return false;  // can't validate without a known size
+struct FileFingerprint {
+    int64_t size = -1;
+    int64_t mtime_ns = -1;
+    int64_t ctime_ns = -1;
+    uint64_t device = 0;
+    uint64_t inode = 0;
+};
+
+bool file_fingerprint(const std::string & path, FileFingerprint & out) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) return false;
+    out.size = int64_t(st.st_size);
+#if defined(__APPLE__)
+    out.mtime_ns = int64_t(st.st_mtimespec.tv_sec) * INT64_C(1000000000) +
+                   int64_t(st.st_mtimespec.tv_nsec);
+    out.ctime_ns = int64_t(st.st_ctimespec.tv_sec) * INT64_C(1000000000) +
+                   int64_t(st.st_ctimespec.tv_nsec);
+#elif defined(_WIN32)
+    // MSVC's stat exposes second-resolution timestamps. Device + inode still
+    // reject normal same-size replacements; OFlash deployments are Linux.
+    out.mtime_ns = int64_t(st.st_mtime) * INT64_C(1000000000);
+    out.ctime_ns = int64_t(st.st_ctime) * INT64_C(1000000000);
+#else
+    out.mtime_ns = int64_t(st.st_mtim.tv_sec) * INT64_C(1000000000) +
+                   int64_t(st.st_mtim.tv_nsec);
+    out.ctime_ns = int64_t(st.st_ctim.tv_sec) * INT64_C(1000000000) +
+                   int64_t(st.st_ctim.tv_nsec);
+#endif
+    out.device = uint64_t(st.st_dev);
+    out.inode = uint64_t(st.st_ino);
+    return true;
+}
+
+bool same_fingerprint(const FileFingerprint & a, const FileFingerprint & b) {
+    return a.size == b.size && a.mtime_ns == b.mtime_ns &&
+           a.ctime_ns == b.ctime_ns && a.device == b.device &&
+           a.inode == b.inode;
+}
+
+// Sidecar layout extends sha256sum format with a complete stat fingerprint.
+// All directives are required: size alone cannot detect an in-place rewrite
+// that preserves the byte count.
+bool read_sidecar_sha(const std::string & path,
+                      const FileFingerprint & expected,
+                      std::string & out) {
+    if (expected.size < 0) return false;
     std::ifstream f(path + ".sha256");
     if (!f) return false;
     std::string hex;
@@ -258,44 +295,73 @@ bool read_sidecar_sha(const std::string & path, int64_t expected_size, std::stri
         bool is_hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
         if (!is_hex) return false;
     }
-    // Scan the rest of the file for a `# size=<n>` directive. Refuse to
-    // trust the cached hash if it's missing or doesn't match — that
-    // indicates either a legacy sidecar (pre-validation-guard) or that the
-    // underlying GGUF has been replaced since the hash was written.
+    FileFingerprint cached;
+    bool have_size = false;
+    bool have_mtime = false;
+    bool have_ctime = false;
+    bool have_device = false;
+    bool have_inode = false;
     std::string line;
     std::getline(f, line);  // consume rest of line 1
-    bool size_matches = false;
     while (std::getline(f, line)) {
-        // Strip leading whitespace, then look for "# size=" prefix.
         size_t i = 0;
         while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
-        const std::string prefix = "# size=";
-        if (line.compare(i, prefix.size(), prefix) != 0) continue;
-        const char * num = line.c_str() + i + prefix.size();
-        char * end = nullptr;
-        long long n = std::strtoll(num, &end, 10);
-        if (end == num) continue;
-        if (n == (long long)expected_size) size_matches = true;
-        break;
+        auto parse_i64 = [&](const char * key, int64_t & value,
+                             bool & present) {
+            const std::string prefix = std::string("# ") + key + "=";
+            if (line.compare(i, prefix.size(), prefix) != 0) return;
+            const char * num = line.c_str() + i + prefix.size();
+            char * end = nullptr;
+            errno = 0;
+            const long long parsed = std::strtoll(num, &end, 10);
+            if (end != num && *end == '\0' && errno == 0) {
+                value = int64_t(parsed);
+                present = true;
+            }
+        };
+        auto parse_u64 = [&](const char * key, uint64_t & value,
+                             bool & present) {
+            const std::string prefix = std::string("# ") + key + "=";
+            if (line.compare(i, prefix.size(), prefix) != 0) return;
+            const char * num = line.c_str() + i + prefix.size();
+            char * end = nullptr;
+            errno = 0;
+            const unsigned long long parsed = std::strtoull(num, &end, 10);
+            if (end != num && *end == '\0' && errno == 0) {
+                value = uint64_t(parsed);
+                present = true;
+            }
+        };
+        parse_i64("size", cached.size, have_size);
+        parse_i64("mtime_ns", cached.mtime_ns, have_mtime);
+        parse_i64("ctime_ns", cached.ctime_ns, have_ctime);
+        parse_u64("device", cached.device, have_device);
+        parse_u64("inode", cached.inode, have_inode);
     }
-    if (!size_matches) return false;
+    if (!have_size || !have_mtime || !have_ctime || !have_device ||
+        !have_inode || !same_fingerprint(cached, expected)) return false;
     out = std::move(hex);
     return true;
 }
 
-void write_sidecar_sha(const std::string & path, const std::string & sha, int64_t size_bytes) {
+void write_sidecar_sha(const std::string & path, const std::string & sha,
+                       const FileFingerprint & fingerprint) {
     // Best-effort. If the directory isn't writable (read-only mount, model
     // dir owned by another user), we just skip — the in-memory hash is
     // already what /props will report this run.
     std::ofstream f(path + ".sha256");
     if (!f) return;
-    // Emit sha256sum-compatible line + our size guard. The basename keeps
+    // Emit sha256sum-compatible line + the stat fingerprint. The basename keeps
     // `sha256sum -c` happy if a human ever runs it against the sidecar.
     std::string base = path;
     auto slash = base.find_last_of('/');
     if (slash != std::string::npos) base = base.substr(slash + 1);
     f << sha << "  " << base << "\n";
-    if (size_bytes >= 0) f << "# size=" << size_bytes << "\n";
+    f << "# size=" << fingerprint.size << "\n"
+      << "# mtime_ns=" << fingerprint.mtime_ns << "\n"
+      << "# ctime_ns=" << fingerprint.ctime_ns << "\n"
+      << "# device=" << fingerprint.device << "\n"
+      << "# inode=" << fingerprint.inode << "\n";
 }
 
 }  // namespace
@@ -305,10 +371,9 @@ GgufMetadata read_gguf_metadata(const std::string & path,
     GgufMetadata m;
     m.path = path;
 
-    struct stat st{};
-    if (::stat(path.c_str(), &st) == 0) {
-        m.size_bytes = int64_t(st.st_size);
-    }
+    FileFingerprint fingerprint;
+    const bool have_fingerprint = file_fingerprint(path, fingerprint);
+    if (have_fingerprint) m.size_bytes = fingerprint.size;
 
     gguf_init_params gip{};
     gip.no_alloc = true;
@@ -362,13 +427,19 @@ GgufMetadata read_gguf_metadata(const std::string & path,
 
     if (compute_sha256) {
         std::string cached;
-        if (read_sidecar_sha(path, m.size_bytes, cached)) {
+        FileFingerprint after;
+        if (have_fingerprint &&
+            read_sidecar_sha(path, fingerprint, cached) &&
+            file_fingerprint(path, after) &&
+            same_fingerprint(fingerprint, after)) {
             m.sha256 = std::move(cached);
         } else {
             std::string hash = sha256_of_file(path);
-            if (!hash.empty()) {
+            if (!hash.empty() && have_fingerprint &&
+                file_fingerprint(path, after) &&
+                same_fingerprint(fingerprint, after)) {
                 m.sha256 = hash;
-                write_sidecar_sha(path, hash, m.size_bytes);
+                write_sidecar_sha(path, hash, fingerprint);
             }
         }
     }

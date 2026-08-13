@@ -43,7 +43,10 @@ def test_bf16_bits_to_f32_known_values():
 def test_roundtrip_context_step_seq_end(tmp_path):
     path = str(tmp_path / "ring")
     w = RingWriter(path, capacity=1 << 16, n_capture_layers=2, hidden=4,
-                   block_size=4, topk=3, vocab=100, drafter_hash=0x1122334455667788)
+                   block_size=4, topk=3, vocab=100,
+                   drafter_hash=0x1122334455667788,
+                   target_hash=0x8877665544332211,
+                   drafter_semantics_hash=0x1EC7F022739C0547)
     row = 2 * 4
 
     # CONTEXT: bf16-exact feature values so the bit conversion is lossless.
@@ -75,6 +78,8 @@ def test_roundtrip_context_step_seq_end(tmp_path):
     assert r.info.topk == 3
     assert r.info.vocab == 100
     assert r.info.drafter_hash == 0x1122334455667788
+    assert r.info.target_hash == 0x8877665544332211
+    assert r.info.drafter_semantics_hash == 0x1EC7F022739C0547
     assert r.info.row_elems == row
 
     rec = r.read_next()

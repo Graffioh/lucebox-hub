@@ -79,6 +79,8 @@ void cleanup_stale_segments() {
 bool OFlashRing::create(const std::string & name,
                         uint64_t capacity_bytes,
                         uint64_t drafter_hash,
+                        uint64_t target_hash,
+                        uint64_t drafter_semantics_hash,
                         uint32_t n_capture_layers,
                         uint32_t hidden,
                         uint32_t block_size,
@@ -86,6 +88,7 @@ bool OFlashRing::create(const std::string & name,
                         uint32_t vocab) {
 #if defined(_WIN32)
     (void)name; (void)capacity_bytes; (void)drafter_hash;
+    (void)target_hash; (void)drafter_semantics_hash;
     (void)n_capture_layers; (void)hidden; (void)block_size;
     (void)topk; (void)vocab;
     return false;
@@ -146,6 +149,8 @@ bool OFlashRing::create(const std::string & name,
     hdr_->capacity         = capacity_bytes;
     hdr_->data_offset      = sizeof(OFlashRingHeader);
     hdr_->drafter_hash     = drafter_hash;
+    hdr_->target_hash      = target_hash;
+    hdr_->drafter_semantics_hash = drafter_semantics_hash;
     hdr_->n_capture_layers = n_capture_layers;
     hdr_->hidden           = hidden;
     hdr_->block_size       = block_size;

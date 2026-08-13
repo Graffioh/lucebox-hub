@@ -21,7 +21,8 @@ that).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import struct
 from typing import Any
 
 import numpy as np
@@ -79,6 +80,68 @@ class DrafterMeta:
         if self.sliding_window_pattern is None:
             return False
         return self.sliding_window_pattern[il]
+
+
+def apply_resolved_drafter_meta(
+        meta: DrafterMeta,
+        *,
+        rope_theta: float | None = None,
+        swa_window: int | None = None,
+        sliding_window_pattern: tuple[bool, ...] | None = None,
+        mask_token_id: int | None = None,
+        ) -> DrafterMeta:
+    """Apply the engine's post-load draft metadata to the trainer mirror.
+
+    Older Qwen3.6 GGUFs need a runtime SWA override.  The engine passes the
+    fully resolved values after applying that override so online training
+    cannot silently mirror the stale on-disk attention layout.
+    """
+    resolved_rope = meta.rope_theta if rope_theta is None else float(rope_theta)
+    resolved_window = meta.swa_window if swa_window is None else int(swa_window)
+    resolved_pattern = (meta.sliding_window_pattern
+                        if sliding_window_pattern is None
+                        else tuple(bool(v) for v in sliding_window_pattern))
+    resolved_mask = (meta.mask_token_id if mask_token_id is None
+                     else int(mask_token_id))
+    if not np.isfinite(resolved_rope) or resolved_rope <= 0.0:
+        raise ValueError(f"resolved rope theta must be finite and positive, got "
+                         f"{resolved_rope!r}")
+    if resolved_window < 0:
+        raise ValueError(f"resolved SWA window must be non-negative, got "
+                         f"{resolved_window}")
+    if resolved_pattern is not None and len(resolved_pattern) != meta.n_layer:
+        raise ValueError(
+            f"resolved SWA pattern has {len(resolved_pattern)} layers, expected "
+            f"{meta.n_layer}")
+    if resolved_pattern is not None and any(resolved_pattern) \
+            and resolved_window <= 0:
+        raise ValueError("resolved SWA pattern enables layers with window=0")
+    if resolved_mask < 0:
+        raise ValueError(f"resolved mask token must be non-negative, got "
+                         f"{resolved_mask}")
+    return replace(meta, rope_theta=resolved_rope,
+                   swa_window=resolved_window,
+                   sliding_window_pattern=resolved_pattern,
+                   mask_token_id=resolved_mask)
+
+
+def drafter_semantics(meta: DrafterMeta) -> str:
+    """Canonical identity for runtime-resolved draft behavior.
+
+    The engine writes this into adapter metadata and profile namespaces. RoPE
+    is represented by its exact IEEE-754 f32 bits, avoiding language-specific
+    decimal formatting.
+    """
+    rope = struct.unpack("<I", struct.pack("<f", np.float32(meta.rope_theta)))[0]
+    pattern = meta.sliding_window_pattern
+    if pattern is None:
+        pattern = (False,) * meta.n_layer
+    if len(pattern) != meta.n_layer:
+        raise ValueError(
+            f"SWA pattern has {len(pattern)} layers, expected {meta.n_layer}")
+    bits = "".join("1" if enabled else "0" for enabled in pattern)
+    return (f"v1;rope={rope:08x};swa={meta.swa_window};"
+            f"pattern={bits};mask={meta.mask_token_id}")
 
 
 # ── GGUF access helpers ──────────────────────────────────────────────

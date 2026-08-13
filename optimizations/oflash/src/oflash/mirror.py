@@ -308,17 +308,28 @@ class DrafterMirror(nn.Module):
     def from_gguf(cls, drafter_path: str, target_path: str,
                   rank: int, alpha: float,
                   device: str | torch.device = "cpu",
-                  dtype: torch.dtype = torch.bfloat16) -> DrafterMirror:
+                  dtype: torch.dtype = torch.bfloat16,
+                  resolved_rope_theta: float | None = None,
+                  resolved_swa_window: int | None = None,
+                  resolved_swa_pattern: tuple[bool, ...] | None = None,
+                  resolved_mask_token_id: int | None = None,
+                  ) -> DrafterMirror:
         """Dequantize the drafter + target-head GGUFs and build the mirror.
 
         GPU mirrors stage weights as float16, avoiding the old all-float32
         host copy during startup. bf16 compute still uses float16 staging
         because NumPy has no broadly portable bfloat16 dtype.
         """
-        from .gguf_reader import load_drafter, load_target_head
+        from .gguf_reader import (apply_resolved_drafter_meta, load_drafter,
+                                  load_target_head)
         load_dtype = (np.float16 if dtype in (torch.float16, torch.bfloat16)
                       else np.float32)
         weights, meta = load_drafter(drafter_path, dtype=load_dtype)
+        meta = apply_resolved_drafter_meta(
+            meta, rope_theta=resolved_rope_theta,
+            swa_window=resolved_swa_window,
+            sliding_window_pattern=resolved_swa_pattern,
+            mask_token_id=resolved_mask_token_id)
         lm_head, token_embd, _vocab = load_target_head(
             target_path, dtype=load_dtype)
         mirror = cls(weights, meta, lm_head, token_embd, rank=rank,
