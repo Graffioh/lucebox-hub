@@ -136,6 +136,7 @@ class TrainerConfig:
     train_ctx: int
     reservoir_rows: int
     keep_generations: int
+    seed: int
 
 
 @dataclass
@@ -218,6 +219,9 @@ class Trainer:
         self._seqs: dict[int, SeqStore] = {}
         self._reservoir: deque[SeqStore] = deque()
         self._reservoir_row_count = 0
+        # Keep replay selection reproducible without mutating Python's global
+        # RNG state (the mirror and callers may have their own randomness).
+        self._rng = random.Random(cfg.seed)
 
         # Fresh samples since the last optimizer step, with their stores.
         self._fresh: list[tuple[SeqStore, StepSample]] = []
@@ -715,9 +719,9 @@ class Trainer:
         while len(batch) < cap and n_res > 0 and attempts < 4 * cap:
             attempts += 1
             # Density ∝ index: newest retired sequences are drawn most.
-            idx = min(int(math.sqrt(random.random()) * n_res), n_res - 1)
+            idx = min(int(math.sqrt(self._rng.random()) * n_res), n_res - 1)
             store = self._reservoir[idx]
-            sample = random.choice(store.steps)
+            sample = self._rng.choice(store.steps)
             start = self._window_start(store, sample)
             if start is not None:
                 batch.append((store, sample, start))

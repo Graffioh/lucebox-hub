@@ -17,6 +17,7 @@ def test_conservative_training_defaults():
     assert args.batch_rows == 128
     assert args.train_ctx == 128
     assert args.reservoir_rows == 10_000
+    assert args.seed == 0
     assert args.resolved_rope_theta is None
     assert args.resolved_swa_window is None
     assert args.resolved_swa_pattern is None

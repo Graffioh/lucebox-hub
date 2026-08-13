@@ -272,8 +272,9 @@ watch -n 5 'curl -fsS http://127.0.0.1:8080/props | jq .oflash'
    the explicit values make a wrong path fail closed instead of relabeling it.
 3. **Integrated defaults.** Restart with the online command in Usage. Hold
    `--max-ctx 4096` for ten minutes under the same request stream. Defaults are
-   ring 512 MiB, top-K 8, batch 128, train context 128, reservoir 10,000 and
-   `auto`/FP16 on Strix. Require `/props.oflash.trainer_alive=true`,
+   ring 512 MiB, top-K 8, batch 128, train context 128, reservoir 10,000,
+   deterministic replay seed 0 and `auto`/FP16 on Strix. Require
+   `/props.oflash.trainer_alive=true`,
    `/props.oflash.training_disabled=false`, increasing `steps`, and bounded
    backlog before accepting a promotion. A self-disabled trainer remains alive
    to drain the ring, so `trainer_alive` alone is not a training-health signal.

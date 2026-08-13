@@ -107,6 +107,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--train-ctx", type=int, default=128)
     ap.add_argument("--reservoir-rows", type=int, default=10_000)
     ap.add_argument("--keep-generations", type=int, default=4)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="deterministic replay-sampler seed (default: 0)")
     args = ap.parse_args(argv)
     if ((args.resolved_swa_window is None)
             != (args.resolved_swa_pattern is None)):
@@ -310,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         train_ctx=args.train_ctx,
         reservoir_rows=args.reservoir_rows,
         keep_generations=args.keep_generations,
+        seed=args.seed,
     )
     trainer = Trainer(cfg, ring, control)
     return trainer.run()

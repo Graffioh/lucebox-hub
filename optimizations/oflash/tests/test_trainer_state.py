@@ -50,6 +50,7 @@ def _trainer(*, out_dir="/tmp/oflash-test-does-not-exist",
         alpha=32.0,
         reservoir_rows=128,
         train_ctx=64,
+        seed=0,
     )
     ring = SimpleNamespace(info=SimpleNamespace(
         block_size=8,
@@ -149,6 +150,29 @@ def test_fresh_samples_over_microbatch_cap_are_drained_not_dropped():
     assert [item[1] for item in batch2] == [second]
     assert trainer._fresh == []
     assert trainer._fresh_rows == 0
+
+
+def test_reservoir_replay_sampling_is_seeded_and_reproducible():
+    left = _trainer()
+    right = _trainer()
+    for seq_id in range(4):
+        store = SeqStore(seq_id=seq_id, first_pos=0, max_pos=64)
+        for pos in range(64):
+            store.feat[pos] = np.zeros(2, dtype=np.uint16)
+        store.steps = [_sample(flags=(1, 0), pos=64),
+                       _sample(flags=(1, 1, 0), pos=64)]
+        left._reservoir.append(store)
+        right._reservoir.append(store)
+
+    left._micro_max = 8
+    right._micro_max = 8
+    left_draw = [(store.seq_id, sample.n_labels)
+                 for store, sample, _start in left._build_batch()]
+    right_draw = [(store.seq_id, sample.n_labels)
+                  for store, sample, _start in right._build_batch()]
+
+    assert left_draw == right_draw
+    assert len(left_draw) == 8
 
 
 def test_generation_resumes_above_every_existing_adapter(tmp_path):

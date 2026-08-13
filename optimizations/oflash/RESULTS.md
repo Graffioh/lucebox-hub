@@ -190,6 +190,25 @@ near 98 GiB, swap did not grow, the capture backlog drained to zero and `records
 zero. The bounded trainer settings were `--batch-rows 64 --train-ctx 64 --reservoir-rows 2048
 --export-every 1 --keep-generations 4`; the capture ring was 512 MiB.
 
+A follow-up replay ablation repeated the identical fold with the production `reservoir_rows=10000`
+default and deterministic replay seed 0. The reservoir retained all 18 adaptation sequences (6,980
+rows); the live guard promoted generations 2 and 3, rejected generation 4, and froze generation 3.
+Two frozen evaluations produced byte-identical outputs and acceptance values. Against a duplicate
+frozen baseline, mean acceptance changed from 0.4937 to 0.4944 (`+0.0008`, paired-bootstrap 95% CI
+`[-0.0046, +0.0061]`), task score remained 7/12, and mean per-case throughput was `0.999x` (95% CI
+`[0.976x, 1.018x]`). This removes the small aggregate acceptance regression and supports replay
+truncation/recency as one contributor, but only 6/12 responses were byte-identical to baseline and
+the `+0.05` acceptance gate still fails. Deterministic repetition therefore separates checkpoint
+effects from timing noise without turning this negative fold into a success claim.
+
+OmniDraft suggests interleaved replay and reports gains through LoRA rank 32; both are bounded next
+ablations rather than conclusions from this fold. Draft-OPD's error-position replay is more invasive:
+the current ring intentionally stops valid supervision at the first rejection, while Draft-OPD
+retains the rejected draft suffix and matching target log-probabilities. Implementing that method
+faithfully requires a versioned capture-format extension before adding its accepted-position forward
+KL, rejected-position reverse KL and decay, rather than treating the present rejection weight as
+equivalent.
+
 ## 3. M2 — within-session AL climb (online loop)
 
 **Bounded fixed-prompt loop passed; domain-shifted and adversarial workloads remain open.**

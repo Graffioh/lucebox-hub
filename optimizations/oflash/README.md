@@ -271,6 +271,7 @@ are yours to tune (see the matching options in
 | `--train-ctx <N>` | `128` | feature-window length per training sample (minimum: 64) |
 | `--reservoir-rows <N>` | `10000` | replay reservoir size (forgetting knob) |
 | `--keep-generations <N>` | `4` | adapter generations kept on disk per profile |
+| `--seed <N>` | `0` | deterministic replay-sampler seed |
 
 ## What's ours, what isn't
 
@@ -281,6 +282,9 @@ Online drafter adaptation is established literature; we did not invent the algor
   answers.
 - [**OmniDraft**](https://arxiv.org/abs/2507.02659) (NeurIPS 2025): online cross-vocab drafter
   adaptation with the hybrid CE + KL loss shape we use.
+- [**Draft-OPD**](https://arxiv.org/abs/2605.29343): target-assisted rollouts and error-position
+  replay. OFlash does not yet retain the rejected suffix required to implement its reverse-KL term
+  faithfully; this is a versioned capture-format follow-up, not a label for the current loss.
 - **OnlineSPEC** (ICML 2026): concurrent online-adaptation work.
 
 What's ours is the production engine integration and the hardware split, per

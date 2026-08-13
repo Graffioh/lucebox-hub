@@ -74,6 +74,23 @@ class OFlashBenchmarkTest(unittest.TestCase):
             self.assertAlmostEqual(result["summary"]["mean_speedup"], 1.25)
             self.assertEqual(result["summary"]["exact_output_matches"], 1)
 
+    def test_repeat_separates_determinism_from_timing_jitter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._report("heldout-adapted", 3, "he_1", 0.6, 100)
+            second = self._report("heldout-adapted", 3, "he_1", 0.6, 93)
+            first_path = root / "first.json"
+            second_path = root / "second.json"
+            first_path.write_text(json.dumps(first))
+            second_path.write_text(json.dumps(second))
+
+            result = bench.compare_repeats(first_path, second_path)
+
+            self.assertEqual(result["summary"]["exact_output_matches"], 1)
+            self.assertEqual(result["summary"]["exact_acceptance_matches"], 1)
+            self.assertEqual(result["summary"]["max_abs_acceptance_delta"], 0.0)
+            self.assertAlmostEqual(result["summary"]["mean_decode_speed_ratio"], 0.93)
+
     def test_pool_rejects_duplicate_heldout_cases(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

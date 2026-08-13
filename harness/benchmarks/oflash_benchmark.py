@@ -352,6 +352,77 @@ def compare_reports(
     }
 
 
+def compare_repeats(first_path: Path, second_path: Path) -> dict[str, Any]:
+    """Compare duplicate frozen runs without treating timing jitter as drift."""
+    first_report = _load_report(first_path)
+    second_report = _load_report(second_path)
+    phase = first_report.get("oflash_phase")
+    if phase not in ("heldout-base", "heldout-adapted"):
+        raise ValueError(f"repeat reports must use a frozen held-out phase, got {phase!r}")
+    if second_report.get("oflash_phase") != phase:
+        raise ValueError("repeat reports use different OFlash phases")
+    _require_frozen_phase(first_report, phase, "first repeat")
+    _require_frozen_phase(second_report, phase, "second repeat")
+    first_gen = (first_report.get("oflash_before") or {}).get("adapter_generation")
+    second_gen = (second_report.get("oflash_before") or {}).get("adapter_generation")
+    if first_gen != second_gen:
+        raise ValueError("repeat reports use different adapter generations")
+    if first_report.get("model") != second_report.get("model"):
+        raise ValueError("repeat report model request names differ")
+    if first_report["suites"].keys() != second_report["suites"].keys():
+        raise ValueError("repeat report suite selections differ")
+    for suite in first_report["suites"]:
+        if (first_report["suites"][suite].get("prompt_fingerprint") !=
+                second_report["suites"][suite].get("prompt_fingerprint")):
+            raise ValueError(f"repeat prompt fingerprints differ for {suite}")
+
+    first = _flatten(first_report)
+    second = _flatten(second_report)
+    if first.keys() != second.keys():
+        raise ValueError("repeat reports do not contain identical cases")
+    rows = []
+    for key in sorted(first):
+        left, right = first[key], second[key]
+        left_accept = _number(left, "accept_rate")
+        right_accept = _number(right, "accept_rate")
+        left_tps = _server_decode_tps(left)
+        right_tps = _server_decode_tps(right)
+        rows.append({
+            "key": key,
+            "exact_output_match": left.get("text") == right.get("text"),
+            "exact_acceptance_match": (
+                left_accept is not None and left_accept == right_accept),
+            "acceptance_delta": (
+                right_accept - left_accept
+                if left_accept is not None and right_accept is not None else None
+            ),
+            "decode_speed_ratio": (
+                right_tps / left_tps
+                if left_tps and right_tps is not None else None
+            ),
+        })
+    deltas = [abs(row["acceptance_delta"]) for row in rows
+              if row["acceptance_delta"] is not None]
+    ratios = [row["decode_speed_ratio"] for row in rows
+              if row["decode_speed_ratio"] is not None]
+    return {
+        "schema": 1,
+        "first_report": str(first_path),
+        "second_report": str(second_path),
+        "summary": {
+            "phase": phase,
+            "adapter_generation": first_gen,
+            "cases": len(rows),
+            "exact_output_matches": sum(row["exact_output_match"] for row in rows),
+            "exact_acceptance_matches": sum(
+                row["exact_acceptance_match"] for row in rows),
+            "max_abs_acceptance_delta": max(deltas, default=None),
+            "mean_decode_speed_ratio": _mean(ratios),
+        },
+        "cases": rows,
+    }
+
+
 def _fmt(value: Any, digits: int = 4) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -422,6 +493,25 @@ def cmd_compare(args: argparse.Namespace) -> int:
         parity_ok = parity_ok and summary["target_reference_matches"] == summary["cases"]
     # Target-equivalent output is a hard correctness gate for this comparison.
     return 0 if parity_ok else 1
+
+
+def cmd_repeat(args: argparse.Namespace) -> int:
+    report = compare_repeats(args.first, args.second)
+    args.json_out.parent.mkdir(parents=True, exist_ok=True)
+    args.json_out.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    summary = report["summary"]
+    print(
+        f"[oflash-bench] repeat n={summary['cases']} "
+        f"outputs={summary['exact_output_matches']}/{summary['cases']} "
+        f"acceptance={summary['exact_acceptance_matches']}/{summary['cases']} "
+        f"timing_ratio={_fmt(summary['mean_decode_speed_ratio'], 3)}x"
+    )
+    deterministic = (
+        summary["exact_output_matches"] == summary["cases"]
+        and summary["exact_acceptance_matches"] == summary["cases"]
+    )
+    return 0 if deterministic else 1
 
 
 def cmd_pool(args: argparse.Namespace) -> int:
@@ -538,6 +628,13 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--bootstrap-samples", type=int, default=5000)
     compare.add_argument("--bootstrap-seed", type=int, default=1)
     compare.set_defaults(func=cmd_compare)
+
+    repeat = sub.add_parser(
+        "repeat", help="Check deterministic outputs and acceptance across duplicate frozen runs")
+    repeat.add_argument("--first", type=Path, required=True)
+    repeat.add_argument("--second", type=Path, required=True)
+    repeat.add_argument("--json-out", type=Path, required=True)
+    repeat.set_defaults(func=cmd_repeat)
 
     pool = sub.add_parser("pool", help="Pool disjoint held-out fold comparisons")
     pool.add_argument("--baseline", type=Path, action="append", required=True)

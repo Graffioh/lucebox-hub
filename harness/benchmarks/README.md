@@ -167,6 +167,13 @@ python3 harness/benchmarks/oflash_benchmark.py compare \
   --candidate /tmp/oflash-bench/fold-0-adapted.json \
   --json-out /tmp/oflash-bench/fold-0-compare.json \
   --md-out /tmp/oflash-bench/fold-0-compare.md
+
+# Repeat each frozen arm once. This gates deterministic output and acceptance
+# while reporting (but not failing on) ordinary timing variation:
+python3 harness/benchmarks/oflash_benchmark.py repeat \
+  --first /tmp/oflash-bench/fold-0-adapted.json \
+  --second /tmp/oflash-bench/fold-0-adapted-repeat.json \
+  --json-out /tmp/oflash-bench/fold-0-adapted-repeat-check.json
 ```
 
 After all three folds, pool the disjoint held-out reports (repeat the paired
