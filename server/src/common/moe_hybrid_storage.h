@@ -220,6 +220,9 @@ struct MoeHybridStorage {
     // Per-layer file region metadata for streaming (populated when mmap is active).
     std::vector<LayerExpertRegions> layer_regions;
 
+    // Remove decode-table registrations while their owner tensors are alive.
+    // Safe to call repeatedly, including during failed partial registration.
+    void unregister_mix_tensors();
     bool matches(const MoeHybridConfig & cfg) const;
     bool empty() const;
     bool has_mmap() const { return mmap_data != nullptr && mmap_size > 0; }

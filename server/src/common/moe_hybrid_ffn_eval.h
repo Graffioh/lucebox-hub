@@ -14,6 +14,10 @@
 
 namespace dflash::common {
 
+// Choose the quarter-route main-owner quota that minimizes the slower owner's
+// estimated completion time. Returns zero for invalid inputs.
+int moe_balanced_main_slots_x4(int top_k, double main_to_peer_rate);
+
 // GPU-resident residual combine graph: output = residual + hot_out + cold_correction.
 struct ResidualCombineGraph {
     ggml_context * ctx = nullptr;
@@ -114,11 +118,11 @@ struct MoeHybridFfnTelemetry {
 // map global router IDs to each backend's compact expert stack and mask the
 // slots owned by the other backend without a host-side routing round trip.
 struct MoeHybridGraphInputs {
-    ggml_tensor * router_weights = nullptr;
-    // True only when this graph can safely assign routes dynamically. The LUT
-    // refresh path uses the effective graph decision rather than the raw env
-    // request, which may be disabled for a sparse secondary expert stack.
+    // True only when this graph actually uses batch-wide owner balancing.
+    // The request can fall back to static ownership for unsupported maps or
+    // widths, so consumers must not infer this from the process environment.
     bool dynamic_route_balance = false;
+    ggml_tensor * router_weights = nullptr;
     std::vector<ggml_tensor *> router_nodes;
     // q>1 decomposes the six selected routes into a four-wide head and a
     // padded two-wide tail.  Keep those derived ID/weight tensors on the main
