@@ -13,6 +13,7 @@ TOKENIZER_HARNESS="${TOKENIZER_HARNESS:-$BUILD_DIR/test_tokenizer_harness}"
 TARGET_MODEL="${TARGET_MODEL:?set TARGET_MODEL to the target GGUF path}"
 DRAFT_MODEL="${DRAFT_MODEL:?set DRAFT_MODEL to the DSpark draft GGUF path}"
 HOTNESS_CSV="${HOTNESS_CSV:?set HOTNESS_CSV to the expert hotness CSV path}"
+DECODE_HOTNESS_CSV="${DECODE_HOTNESS_CSV:-}"
 CONTEXT_CLIENT="${CONTEXT_CLIENT:-$CHECKOUT/harness/benchmarks/deepseek4/ds4_context_sweep.py}"
 EXPECTED_SHA256="${EXPECTED_SHA256:-0f785a7ffa406498aafb14553966eaed0f52220fed0f7cc016b66921d104d194}"
 PORT="${PORT:-18109}"
@@ -25,7 +26,14 @@ DIRECT_INDEXER_TOPK="${DIRECT_INDEXER_TOPK:-1}"
 BLOCK_RADIX_TOPK="${BLOCK_RADIX_TOPK:-1}"
 PACK_Q4_INDEXER="${PACK_Q4_INDEXER:-0}"
 Q5_VERIFY="${Q5_VERIFY:-1}"
+case "$Q5_VERIFY" in
+    0|1) ;;
+    *) echo "Q5_VERIFY must be 0 or 1" >&2; exit 2 ;;
+esac
 FP4_Q5_X4_PLUS1="${FP4_Q5_X4_PLUS1:-auto}"
+CRITICAL_PATH_PLACEMENT="${CRITICAL_PATH_PLACEMENT:-0}"
+MAIN_TO_PEER_RATE="${MAIN_TO_PEER_RATE:-3.4}"
+BALANCE_MIN_HOT="${BALANCE_MIN_HOT:-0}"
 EXPERT_BUDGET_MB="${EXPERT_BUDGET_MB:-13200}"
 WARMUP="${WARMUP:-2}"
 RUNS="${RUNS:-3}"
@@ -33,7 +41,14 @@ MAX_TOKENS="${MAX_TOKENS:-128}"
 TARGETS="${TARGETS:-2048 4096 8192 16384 2048}"
 VRAM_MONITOR_SECONDS="${VRAM_MONITOR_SECONDS:-2}"
 HASH_MODELS="${HASH_MODELS:-0}"
-RUN_ID="${RUN_ID:-ds4-q5-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-$(date -u +%Y%m%dT%H%M%SZ)}"
+CUDA_GRAPH_STATS_EVERY="${CUDA_GRAPH_STATS_EVERY:-200}"
+CUDA_DISABLE_GRAPHS_DEVICES="${CUDA_DISABLE_GRAPHS_DEVICES:-}"
+DYNAMIC_ROUTE_BALANCE="${DYNAMIC_ROUTE_BALANCE:-0}"
+DYNAMIC_MAIN_SLOTS="${DYNAMIC_MAIN_SLOTS:-3}"
+DYNAMIC_MAIN_SLOTS_X2="${DYNAMIC_MAIN_SLOTS_X2:-}"
+DYNAMIC_MAIN_SLOTS_X4="${DYNAMIC_MAIN_SLOTS_X4:-}"
+VERIFY_WIDTH=$((4 + Q5_VERIFY))
+RUN_ID="${RUN_ID:-ds4-q${VERIFY_WIDTH}-fr${FORCE_GRAPH_REPLAY}-direct${DIRECT_INDEXER_TOPK}-radix${BLOCK_RADIX_TOPK}-x4p1${FP4_Q5_X4_PLUS1}-cp${CRITICAL_PATH_PLACEMENT}-r${MAIN_TO_PEER_RATE}-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_ROOT="${OUT_ROOT:-$CHECKOUT/results/ds4_q5_context_qualification}"
 OUT_DIR="$OUT_ROOT/$RUN_ID"
 SERVER_LOG="$OUT_DIR/server.log"
@@ -50,6 +65,11 @@ for input in "$TARGET_MODEL" "$DRAFT_MODEL" "$HOTNESS_CSV" "$CONTEXT_CLIENT"; do
         exit 2
     fi
 done
+if [[ -n "$DECODE_HOTNESS_CSV" &&
+      ( ! -f "$DECODE_HOTNESS_CSV" || ! -r "$DECODE_HOTNESS_CSV" ) ]]; then
+    echo "decode hotness profile is missing or unreadable: $DECODE_HOTNESS_CSV" >&2
+    exit 2
+fi
 
 case "$FORCE_GRAPH_REPLAY:$SERIAL_INDEX_SCAN" in
     0:0|0:1|1:0|1:1) ;;
@@ -67,14 +87,46 @@ case "$PACK_Q4_INDEXER" in
     0|1) ;;
     *) echo "PACK_Q4_INDEXER must be 0 or 1" >&2; exit 2 ;;
 esac
-case "$Q5_VERIFY" in
+if [[ "${Q6_VERIFY:-0}" != 0 ]]; then
+    echo "Q6_VERIFY is unsupported; use Q5_VERIFY=1" >&2
+    exit 2
+fi
+case "$DYNAMIC_ROUTE_BALANCE" in
     0|1) ;;
-    *) echo "Q5_VERIFY must be 0 or 1" >&2; exit 2 ;;
+    *) echo "DYNAMIC_ROUTE_BALANCE must be 0 or 1" >&2; exit 2 ;;
+esac
+case "$DYNAMIC_MAIN_SLOTS" in
+    1|2|3|4|5|6) ;;
+    *) echo "DYNAMIC_MAIN_SLOTS must be an integer from 1 through 6" >&2; exit 2 ;;
+esac
+case "$DYNAMIC_MAIN_SLOTS_X2" in
+    ""|2|3|4|5|6|7|8|9|10|11|12) ;;
+    *) echo "DYNAMIC_MAIN_SLOTS_X2 must be empty or an integer from 2 through 12" >&2; exit 2 ;;
+esac
+case "$DYNAMIC_MAIN_SLOTS_X4" in
+    ""|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24) ;;
+    *) echo "DYNAMIC_MAIN_SLOTS_X4 must be empty or an integer from 4 through 24" >&2; exit 2 ;;
 esac
 case "$FP4_Q5_X4_PLUS1" in
     auto|0|1) ;;
     *) echo "FP4_Q5_X4_PLUS1 must be auto, 0, or 1" >&2; exit 2 ;;
 esac
+case "$CRITICAL_PATH_PLACEMENT" in
+    0|1) ;;
+    *) echo "CRITICAL_PATH_PLACEMENT must be 0 or 1" >&2; exit 2 ;;
+esac
+if [[ ! "$MAIN_TO_PEER_RATE" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+   ! awk -v value="$MAIN_TO_PEER_RATE" \
+       'BEGIN { number = value + 0; max = 1.7976931348623157e308; exit !(number > 0 && number <= max) }'; then
+    echo "MAIN_TO_PEER_RATE must be a finite number greater than zero" >&2
+    exit 2
+fi
+if [[ ! "$BALANCE_MIN_HOT" =~ ^[0-9]+$ ]] ||
+   (( ${#BALANCE_MIN_HOT} > 10 )) ||
+   { (( ${#BALANCE_MIN_HOT} == 10 )) && [[ "$BALANCE_MIN_HOT" > "2147483647" ]]; }; then
+    echo "BALANCE_MIN_HOT must be an integer from 0 through 2147483647" >&2
+    exit 2
+fi
 if [[ "$MMVQ_MAX_NCOLS" != auto && ! "$MMVQ_MAX_NCOLS" =~ ^[1-8]$ ]]; then
     echo "MMVQ_MAX_NCOLS must be auto or an integer from 1 through 8" >&2
     exit 2
@@ -93,7 +145,8 @@ case "$RUN_ID" in
         exit 2
         ;;
 esac
-for numeric_setting in PORT MAX_CTX EXPERT_BUDGET_MB WARMUP RUNS MAX_TOKENS VRAM_MONITOR_SECONDS; do
+for numeric_setting in PORT MAX_CTX EXPERT_BUDGET_MB WARMUP RUNS MAX_TOKENS \
+    VRAM_MONITOR_SECONDS CUDA_GRAPH_STATS_EVERY; do
     numeric_value="${!numeric_setting}"
     if [[ ! "$numeric_value" =~ ^(0|[1-9][0-9]{0,8})$ ]]; then
         echo "$numeric_setting must be a non-negative decimal integer with at most 9 digits" >&2
@@ -101,8 +154,8 @@ for numeric_setting in PORT MAX_CTX EXPERT_BUDGET_MB WARMUP RUNS MAX_TOKENS VRAM
     fi
 done
 if (( PORT < 1 || PORT > 65535 || MAX_CTX < 1 || EXPERT_BUDGET_MB < 1 ||
-      RUNS < 1 || MAX_TOKENS < 1 )); then
-    echo "PORT, MAX_CTX, EXPERT_BUDGET_MB, RUNS, and MAX_TOKENS must be positive (PORT <= 65535)" >&2
+      RUNS < 1 || MAX_TOKENS < 1 || CUDA_GRAPH_STATS_EVERY < 1 )); then
+    echo "PORT, MAX_CTX, EXPERT_BUDGET_MB, RUNS, MAX_TOKENS, and CUDA_GRAPH_STATS_EVERY must be positive (PORT <= 65535)" >&2
     exit 2
 fi
 if [[ ! "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
@@ -132,6 +185,13 @@ for visibility_var in HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES; do
     if declare -p "$visibility_var" >/dev/null 2>&1 &&
        [[ "${!visibility_var}" != "0,1" ]]; then
         echo "$visibility_var must be unset or exactly 0,1" >&2
+        exit 2
+    fi
+done
+
+for required_command in flock pgrep python3 rocm-smi sha256sum; do
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+        echo "required command is unavailable: $required_command" >&2
         exit 2
     fi
 done
@@ -217,6 +277,7 @@ server_env=(
     "PATH=$PATH"
     "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
     "GGML_CUDA_GRAPH_STATS=1"
+    "GGML_CUDA_GRAPH_STATS_EVERY=$CUDA_GRAPH_STATS_EVERY"
     "LUCE_CUDA_I32_REPEAT=1"
     "DFLASH_DS4_TOPK=4"
     "DFLASH_DS4_FUSED_VERIFY=1"
@@ -259,7 +320,7 @@ server_env=(
     "DFLASH_DS4_PINNED_ROLLBACK=1"
     "DFLASH_DS4_GPU_ARGMAX_VERIFY=1"
     "DFLASH_DS4_SPEC=1"
-    "DFLASH_DS4_SPEC_Q=$((4 + Q5_VERIFY))"
+    "DFLASH_DS4_SPEC_Q=$VERIFY_WIDTH"
     "DFLASH_DS4_ADAPTIVE_WIDTH=0"
     "DFLASH_DS4_DRAFT=$DRAFT_MODEL"
     "DFLASH_DS4_DRAFT_GPU=0"
@@ -272,6 +333,42 @@ server_env=(
 for visibility_var in HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES; do
     if declare -p "$visibility_var" >/dev/null 2>&1; then
         server_env+=("$visibility_var=${!visibility_var}")
+    fi
+done
+
+if [[ -n "$DECODE_HOTNESS_CSV" ]]; then
+    server_env+=(
+        "DFLASH_DS4_DECODE_HOTNESS_CSV=$DECODE_HOTNESS_CSV"
+    )
+fi
+if [[ "$DYNAMIC_ROUTE_BALANCE" == 1 ]]; then
+    server_env+=(
+        "DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE=1"
+        "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS=$DYNAMIC_MAIN_SLOTS"
+    )
+    if [[ -n "$DYNAMIC_MAIN_SLOTS_X2" ]]; then
+        server_env+=(
+            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS_X2=$DYNAMIC_MAIN_SLOTS_X2"
+        )
+    fi
+    if [[ -n "$DYNAMIC_MAIN_SLOTS_X4" ]]; then
+        server_env+=(
+            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS_X4=$DYNAMIC_MAIN_SLOTS_X4"
+        )
+    fi
+fi
+if [[ -n "$CUDA_DISABLE_GRAPHS_DEVICES" ]]; then
+    server_env+=(
+        "GGML_CUDA_DISABLE_GRAPHS_DEVICES=$CUDA_DISABLE_GRAPHS_DEVICES"
+    )
+fi
+
+# Preserve only the explicit profiler-wrapper controls across env -i. Ordinary
+# qualification runs leave these unset and retain the exact established env.
+for profiler_var in PROFILED_SERVER_BIN ROCPROF_OUTPUT_DIR \
+    ROCPROF_START_SECONDS ROCPROF_DURATION_SECONDS; do
+    if [[ -n "${!profiler_var:-}" ]]; then
+        server_env+=("$profiler_var=${!profiler_var}")
     fi
 done
 
@@ -303,7 +400,13 @@ fi
 if [[ "$FP4_Q5_X4_PLUS1" != auto ]]; then
     server_env+=("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1=$FP4_Q5_X4_PLUS1")
 fi
-
+if [[ "$CRITICAL_PATH_PLACEMENT" == 1 ]]; then
+    server_env+=(
+        "DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT=1"
+        "DFLASH_DS4_TP_MAIN_TO_PEER_RATE=$MAIN_TO_PEER_RATE"
+        "DFLASH_DS4_TP_BALANCE_MIN_HOT=$BALANCE_MIN_HOT"
+    )
+fi
 server_args=(
     "$SERVER_BIN" "$TARGET_MODEL"
     --host 127.0.0.1 --port "$PORT"
@@ -329,7 +432,16 @@ server_args=(
     echo "block_radix_topk=$BLOCK_RADIX_TOPK"
     echo "pack_q4_indexer=$PACK_Q4_INDEXER"
     echo "q5_verify=$Q5_VERIFY"
+    echo "verify_width=$VERIFY_WIDTH"
     echo "fp4_q5_x4_plus1=$FP4_Q5_X4_PLUS1"
+    echo "critical_path_placement=$CRITICAL_PATH_PLACEMENT"
+    echo "main_to_peer_rate=$MAIN_TO_PEER_RATE"
+    echo "balance_min_hot=$BALANCE_MIN_HOT"
+    echo "decode_hotness_csv=$DECODE_HOTNESS_CSV"
+    echo "dynamic_route_balance=$DYNAMIC_ROUTE_BALANCE"
+    echo "dynamic_main_slots=$DYNAMIC_MAIN_SLOTS"
+    echo "dynamic_main_slots_x2=$DYNAMIC_MAIN_SLOTS_X2"
+    echo "dynamic_main_slots_x4=$DYNAMIC_MAIN_SLOTS_X4"
     echo "cache_slots=$CACHE_SLOTS"
     echo "mmvq_max_ncols=$MMVQ_MAX_NCOLS"
     echo "targets=$TARGETS"
@@ -337,6 +449,8 @@ server_args=(
     echo "runs=$RUNS"
     echo "max_tokens=$MAX_TOKENS"
     echo "max_ctx=$MAX_CTX"
+    echo "cuda_graph_stats_every=$CUDA_GRAPH_STATS_EVERY"
+    echo "cuda_disable_graphs_devices=$CUDA_DISABLE_GRAPHS_DEVICES"
     sha256sum -- "$SERVER_BIN"
     stat -c 'target_model=%n bytes=%s mtime=%y' -- "$TARGET_MODEL"
     stat -c 'draft_model=%n bytes=%s mtime=%y' -- "$DRAFT_MODEL"

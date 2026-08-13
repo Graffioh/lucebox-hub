@@ -5,12 +5,14 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <mutex>
 
 namespace dflash::common {
 
@@ -127,6 +129,60 @@ const MoeHybridGraphPolicy & moe_hybrid_graph_policy() {
         return result;
     }();
     return policy;
+}
+
+static int dynamic_route_balance_main_slots_x4() {
+    static const int slots_x4 = [] {
+        const char * enabled = moe_policy_env(
+            "DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE",
+            "DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE");
+        if (!enabled || !*enabled || std::strcmp(enabled, "0") == 0) {
+            return 0;
+        }
+        const char * raw_slots_x4 = moe_policy_env(
+            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4",
+            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS_X4");
+        const char * raw_slots_x2 = moe_policy_env(
+            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X2",
+            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS_X2");
+        const char * raw_slots = moe_policy_env(
+            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS",
+            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS");
+        const char * raw = "3";
+        long minimum = 1;
+        long maximum = 6;
+        int scale = 4;
+        if (raw_slots_x4 && *raw_slots_x4) {
+            raw = raw_slots_x4;
+            minimum = 4;
+            maximum = 24;
+            scale = 1;
+        } else if (raw_slots_x2 && *raw_slots_x2) {
+            raw = raw_slots_x2;
+            minimum = 2;
+            maximum = 12;
+            scale = 2;
+        } else if (raw_slots && *raw_slots) {
+            raw = raw_slots;
+        }
+
+        errno = 0;
+        char * end = nullptr;
+        const long requested = std::strtol(raw, &end, 10);
+        if (errno == ERANGE || end == raw || *end != '\0' ||
+            requested < minimum || requested > maximum) {
+            std::fprintf(stderr,
+                "[moe-hybrid] dynamic route balance disabled: "
+                "main slot quota is malformed or out of range\n");
+            return 0;
+        }
+        const int requested_x4 = (int) requested * scale;
+        std::fprintf(stderr,
+            "[moe-hybrid] dynamic route balance requested: main_slots=%.2f\n",
+            0.25 * (double) requested_x4);
+        return requested_x4;
+    }();
+    return slots_x4;
 }
 
 static void add_hybrid_telemetry(MoeHybridFfnTelemetry & dst,
@@ -756,6 +812,8 @@ static bool build_moe_owner_remap(
         ggml_tensor * global_ids,
         ggml_tensor * router_weights,
         int n_tokens,
+        int dynamic_main_slots_x4,
+        bool main_owner,
         MoeOwnerGraphSpec & owner) {
     if (!owner.local_by_global ||
         (int) owner.local_by_global->size() != cfg.n_expert ||
@@ -784,6 +842,24 @@ static bool build_moe_owner_remap(
         ggml_set_output(*owner.valid_lut);
     }
 
+    if (dynamic_main_slots_x4 > 0) {
+        // The secondary owner must hold every expert because it receives the
+        // exact complement of the capped primary routes.
+        if (!main_owner && std::any_of(
+                owner.local_by_global->begin(), owner.local_by_global->end(),
+                [](int32_t local) { return local < 0; })) {
+            return false;
+        }
+        owner.local_ids = track(ggml_ds4_moe_balanced_owner_ids(
+            ctx, global_ids, router_weights,
+            *owner.local_lut, *owner.valid_lut,
+            dynamic_main_slots_x4, main_owner));
+        // Negative owner IDs suppress non-owned routes exactly in the
+        // dedicated MMVQ kernels, so the canonical route weights can be reused.
+        owner.masked_weights = router_weights;
+        return owner.local_ids != nullptr;
+    }
+
     // Store immutable q-replicated lookup rows as graph inputs instead of
     // running owner-local REPEAT kernels in every layer and verifier step.
     ggml_tensor * mapped = track(ggml_get_rows(
@@ -805,9 +881,12 @@ static bool prepare_moe_owner_branch(
         ggml_tensor * global_ids,
         ggml_tensor * router_weights,
         int n_tokens,
+        int dynamic_main_slots_x4,
+        bool main_owner,
         MoeOwnerGraphSpec & owner) {
     return !owner.available() || build_moe_owner_remap(
-        ctx, cfg, global_ids, router_weights, n_tokens, owner);
+        ctx, cfg, global_ids, router_weights, n_tokens,
+        dynamic_main_slots_x4, main_owner, owner);
 }
 
 static void align_moe_owner_routes(
@@ -982,7 +1061,8 @@ bool build_moe_hybrid_ffn_graph(
     MoeHybridGraphInputs &         out,
     bool                           include_shared,
     bool                           allow_fused_combine,
-    MoeHybridJoinMode              join_mode) {
+    MoeHybridJoinMode              join_mode,
+    MoeHybridRouteBalance          route_balance) {
 
     out.output = nullptr;
     out.main_output = nullptr;
@@ -995,6 +1075,7 @@ bool build_moe_hybrid_ffn_graph(
 
     const bool canonical_route_join =
         join_mode == MoeHybridJoinMode::CanonicalRouteOrder;
+    const int n_used = cfg.n_expert_used;
     // Both owner remaps consume the same normalized top-k route weights.
     // Expose the canonical tensor so the scheduler can keep it on the primary
     // backend rather than discovering it late through the secondary branch.
@@ -1012,12 +1093,49 @@ bool build_moe_hybrid_ffn_graph(
         &out.cold_local_lut, &out.cold_valid_lut,
         &out.cold_remap_nodes, &out.cold_nodes};
 
+    const bool secondary_has_all_experts =
+        secondary_owner.available() && secondary_owner.local_by_global &&
+        (int) secondary_owner.local_by_global->size() == cfg.n_expert &&
+        std::all_of(
+            secondary_owner.local_by_global->begin(),
+            secondary_owner.local_by_global->end(),
+            [](int32_t local) { return local >= 0; });
+    const int requested_main_slots_x4 =
+        route_balance == MoeHybridRouteBalance::Allowed &&
+                primary_owner.available()
+            ? dynamic_route_balance_main_slots_x4()
+            : 0;
+    if (requested_main_slots_x4 > 0 && !secondary_has_all_experts) {
+        static std::once_flag warning_once;
+        std::call_once(warning_once, [] {
+            std::fprintf(stderr,
+                "[moe-hybrid] dynamic route balance disabled: "
+                "the secondary owner does not contain every expert\n");
+        });
+    }
+    if (secondary_has_all_experts &&
+        requested_main_slots_x4 > 4 * n_used) {
+        static std::once_flag warning_once;
+        std::call_once(warning_once, [] {
+            std::fprintf(stderr,
+                "[moe-hybrid] dynamic main slot quota exceeds the route "
+                "width and was clamped\n");
+        });
+    }
+    const int dynamic_main_slots_x4 =
+        secondary_has_all_experts
+            ? std::min(requested_main_slots_x4, 4 * n_used)
+            : 0;
+    out.dynamic_route_balance = dynamic_main_slots_x4 > 0;
+
     // Keep graph construction order stable: both remaps, then both optional ID
     // alignments, then both expert branches.
     if (!prepare_moe_owner_branch(
-            ctx, cfg, global_ids, router_weights, n_tokens, primary_owner) ||
+            ctx, cfg, global_ids, router_weights, n_tokens,
+            dynamic_main_slots_x4, true, primary_owner) ||
         !prepare_moe_owner_branch(
-            ctx, cfg, global_ids, router_weights, n_tokens, secondary_owner)) {
+            ctx, cfg, global_ids, router_weights, n_tokens,
+            dynamic_main_slots_x4, false, secondary_owner)) {
         return false;
     }
     align_moe_owner_routes(ctx, n_tokens, primary_owner);
