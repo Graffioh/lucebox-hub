@@ -1,9 +1,10 @@
 # OFlash: online drafter adaptation
 
-Status: implemented behind `--oflash`. Published component results and the
-capacity analysis say the intended R9700 + Strix Halo split is feasible, but
-simultaneous Qwen serving/training and its performance still require the staged
-qualification below.
+Status: implemented behind `--oflash`. A bounded 2026-08-13 qualification ran
+Qwen3.6-27B Q4_K_M serving on R9700 concurrently with FP16 LoRA training on
+Strix Halo, including export, live swap, promotion and warm start. Sustained,
+multi-workload performance, power and thermal qualification still follow the
+staged ladder below.
 
 OFlash teaches the DFlash drafter from the target model's real verification
 results while the server is running. The R9700 keeps serving requests; a
@@ -33,12 +34,16 @@ The target already computes the supervision OFlash needs. OFlash captures a
 small part of it instead of discarding it, trains only LoRA parameters and
 periodically tries the new adapter in the serving drafter.
 
-## Why output correctness is preserved
+## Correctness contract and validation
 
-The target still verifies every proposed token by exact match. The adapter can
-change which tokens the drafter proposes, but it cannot make an unverified
-token enter the output. A poor adapter can therefore reduce speed, not change
-the target model's accepted output.
+The target verifies every proposed token by exact match. The adapter can change
+which tokens the drafter proposes, but it cannot make an unverified token enter
+the output. Preserving target output also requires target positions and
+recurrent state to be independent of the proposal path. The bounded
+qualification exposed and fixed a token-major M-RoPE layout in multi-token
+prefill/verification, then matched target-only, static-draft and adapted-draft
+output on the fixed prompt. Broader cross-prompt and cross-proposal parity is
+still part of qualification rather than a universal byte-identity claim.
 
 Each adapter first enters a probation window. If mean accepted length gets
 worse, the engine restores the previous adapter and waits longer before the
@@ -74,7 +79,7 @@ The intended setup is:
 - R9700: target model, serving drafter, verification and token generation;
 - Strix Halo: background LoRA training;
 - host shared memory: bounded transfer of captured training records;
-- disk: only promoted adapter generations and metadata.
+- disk: bounded candidate generations plus promoted-generation metadata.
 
 The capture path reads features from discrete R9700 VRAM into the host
 `/dev/shm` ring. Python reads them in host RAM and copies selected windows to
@@ -82,12 +87,14 @@ the Strix allocation. Strix unified memory avoids another discrete VRAM pool;
 it does not eliminate the R9700-to-host PCIe transfer.
 
 On the audited machine the R9700 exposes 31.86 GiB VRAM, the Strix KFD heap is
-96 GiB GPU-accessible, and system RAM is 128 GiB. A conservative upper-bound
-estimate for the current Qwen3.6 draft mirror is about 8 GiB on Strix plus a
-similar temporary host staging peak; 10,000 raw replay rows are about 0.48 GiB
-and the default ring is 0.5 GiB. These are capacity estimates, not a successful
-training result. `rocm-smi` may show only the Strix dedicated segment, so host
-`MemAvailable` and swap are the useful OOM guards.
+96 GiB GPU-accessible, and system RAM is 128 GiB. During the bounded integrated
+run the R9700 allocation was about 19.25 GiB, the Strix trainer's KFD/GTT
+allocation about 8.55 GiB, and host `MemAvailable` stayed near 98 GiB. Swap did
+not grow; there was no OOM, GPU fault/reset or capture drop. A 10,000-row replay
+reservoir is about 0.48 GiB and the default ring is 0.5 GiB. `rocm-smi` may show
+only the Strix dedicated segment, so host `MemAvailable`, KFD/GTT accounting and
+swap are the useful OOM guards. Exact measurements are in
+[`RESULTS.md`](../../optimizations/oflash/RESULTS.md).
 
 Training is asynchronous, but it is not assumed to be free: power, thermal,
 memory-controller and PCIe interference must be measured. There is no silent
@@ -170,6 +177,7 @@ server/build/dflash_server server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf \
   --draft server/models/oflash/dflash-draft-3.6-q4_k_m.gguf --draft-swa 2048 \
   --target-device hip:0 --draft-device hip:0 \
   --max-ctx 4096 --cache-type-k q4_0 --cache-type-v q4_0 \
+  --ddtree --ddtree-budget 22 \
   --oflash --oflash-ring-mb 256 --oflash-topk 8
 ```
 
@@ -180,6 +188,7 @@ server/build/dflash_server server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf \
   --draft server/models/oflash/dflash-draft-3.6-q4_k_m.gguf --draft-swa 2048 \
   --target-device hip:0 --draft-device hip:0 \
   --max-ctx 4096 --cache-type-k q4_0 --cache-type-v q4_0 \
+  --ddtree --ddtree-budget 22 \
   --oflash \
   --oflash-device 1 --oflash-dtype auto \
   --oflash-ring-mb 512 --oflash-topk 8 \
@@ -340,9 +349,10 @@ enabled. Record:
 - power, temperatures and memory use on both devices;
 - whether the FP16-trained LoRA improves the quantized serving drafter.
 
-The first go/no-go result is whether acceptance and decode speed improve
-without meaningful serving interference. Until those measurements exist,
-OFlash is an implemented experiment, not a performance claim.
+The bounded fixed-prompt run improved acceptance and decode speed without OOM,
+GPU fault or capture drops. Held-out workload curves, sustained interference,
+power and thermal measurements still do not exist, so OFlash remains an
+implemented experiment rather than a general performance claim.
 
 ## Implementation map
 

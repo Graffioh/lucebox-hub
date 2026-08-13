@@ -2,6 +2,7 @@
 #include "common/chain_rollback_policy.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
+#include "qwen35_mrope.h"
 #include "graph_builders.h"
 #include "dflash_feature_ring.h"
 #include "dflash_capture.h"
@@ -1511,15 +1512,9 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         ggml_backend_tensor_set(sg_.inp_embed, embed_buf.data(), 0,
                                 sizeof(float) * (size_t)hidden * n_tokens);
 
-        // Positions (M-RoPE)
-        std::vector<int32_t> pos_buf((size_t)4 * n_tokens, 0);
-        for (int i = 0; i < n_tokens; i++) {
-            const int p = kv_pos + i;
-            pos_buf[4 * i + 0] = p;
-            pos_buf[4 * i + 1] = p;
-            pos_buf[4 * i + 2] = p;
-            pos_buf[4 * i + 3] = 0;
-        }
+        // ggml M-RoPE positions are axis-major, not four-token tuples.
+        const std::vector<int32_t> pos_buf =
+            qwen35_text_mrope_positions(kv_pos, n_tokens);
         ggml_backend_tensor_set(sg_.positions, pos_buf.data(), 0,
                                 sizeof(int32_t) * pos_buf.size());
 

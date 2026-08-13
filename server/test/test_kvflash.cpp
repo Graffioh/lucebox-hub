@@ -28,6 +28,7 @@
 #include "attn_masks.h"
 #include "qwen3_drafter.h"
 #include "qwen3_kvflash_scorer.h"
+#include "qwen35/qwen35_mrope.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -303,11 +304,8 @@ struct BatchStepper {
         }
         ggml_backend_tensor_set(inp_embed, embed_buf.data(), 0,
                                 sizeof(float) * embed_buf.size());
-        std::vector<int32_t> p4((size_t)4 * NB);
-        for (int i = 0; i < NB; i++) {
-            p4[4 * i + 0] = p4[4 * i + 1] = p4[4 * i + 2] = pos_base + i;
-            p4[4 * i + 3] = 0;
-        }
+        const std::vector<int32_t> p4 =
+            qwen35_text_mrope_positions(pos_base, NB);
         ggml_backend_tensor_set(positions, p4.data(), 0, sizeof(int32_t) * p4.size());
         // [n_tokens, n_head_kv] ne0-major: (token i, head h) at i + h*NB.
         std::vector<int64_t> rows((size_t)NB * w->n_head_kv);

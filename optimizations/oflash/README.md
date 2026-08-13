@@ -10,8 +10,8 @@
   drafter degrades off-distribution.<br/>
   OFlash captures what the verify step already computes, fine-tunes a LoRA on the idle iGPU, and
   hot-swaps it into the serving drafter.<br/>
-  Correctness-safe by construction: exact-match verification means an adapter can change speed,
-  never output.<br/><br/>
+  Exact-match verification is the correctness contract; target-only, static-draft and
+  adapted-draft outputs matched in the bounded qualification.<br/><br/>
   <a href="https://lucebox.com">lucebox.com</a> · <a href="https://discord.gg/yHfswqZmJQ">Discord</a>
 </p>
 
@@ -21,26 +21,24 @@
 Qwen3.6-27B Q4_K_M target · Lucebox dflash-draft-3.6 Q4_K_M drafter
 R9700 (gfx1201) serves · Strix Halo iGPU (gfx1151) trains
 
-  measurement plan                            acceptance α    decode tok/s
-  M0  static drafter (baseline)                 pending         pending
-  M1  + detached-trainer LoRA (static load)     pending         pending
-  M2  + online loop (within-session climb)      pending         pending
+  bounded code-prompt qualification           acceptance α    decode tok/s
+  M0  static drafter, capture-only                0.505            84.4
+  M2  first promoted online adapter               0.625           104.1
 
-  No acceptance/speed results yet — this card is the plan, not a claim.
-  Hardware qualification evidence and future performance numbers land in
-  RESULTS.md first, each with the command that produced it (CONTRIBUTING.md:
-  numbers without methodology don't get merged).
+  These are three warmed repeats of one deterministic 111-token prompt, not a
+  workload benchmark. Detached training, live swap, promotion and warm start
+  passed; full held-out M0-M4 results remain open. Methodology is in RESULTS.md.
   reproduce: server/build/dflash_server target.gguf --draft drafter.gguf --draft-swa 2048 --oflash \
-               --cache-type-k q4_0 --cache-type-v q4_0   # M0 capture-only
+               --ddtree --ddtree-budget 22 --cache-type-k q4_0 --cache-type-v q4_0
 ```
 
 > Every verify step already computes the exact training data the drafter is missing — target hidden
 > states and target tokens at every draft position — and throws it away. OFlash keeps it: a capture
 > hook streams verify-step records into a lock-free shared-memory ring, a sidecar trains a LoRA on a
 > mirror of the drafter, and the engine swaps the adapter in at draft-block boundaries behind an
-> acceptance guard that auto-rolls-back regressions. Serving/training interference on the shared
-> memory controller, power and thermal budgets remains to be measured; the split is a capacity
-> strategy, not a claim that training is free.
+> acceptance guard that auto-rolls-back acceptance regressions. A bounded simultaneous run passed;
+> sustained serving/training interference, power and thermal budgets remain to be measured. The
+> split is a capacity strategy, not a claim that training is free.
 
 ## What OFlash is
 
@@ -60,8 +58,12 @@ The only contracts between the two are the ring layout and the adapter file form
 [`ring_format.py`](src/oflash/ring_format.py) / [`adapter_export.py`](src/oflash/adapter_export.py),
 cross-checked by golden-bytes tests on both sides.
 
-A bad adapter can only cost speed, never correctness: this engine verifies drafts by exact match
-against the target, and the guard bounds the speed downside at "static drafter".
+An adapter changes draft proposals, while the engine rejects every proposed token that does not
+exactly match target verification. Preserving target output also requires proposal-independent
+target positions and recurrent state. The bounded qualification caught and fixed a multi-token
+M-RoPE layout bug, then matched target-only, static-draft and adapted-draft output on the fixed
+prompt. The guard rejects accepted-length regressions; capture/trainer interference is measured
+separately and remains subject to the documented stop thresholds.
 
 ## How it works
 
@@ -191,6 +193,7 @@ server/build/dflash_server \
   --draft server/models/oflash/dflash-draft-3.6-q4_k_m.gguf --draft-swa 2048 \
   --target-device hip:0 --draft-device hip:0 \
   --max-ctx 4096 --cache-type-k q4_0 --cache-type-v q4_0 \
+  --ddtree --ddtree-budget 22 \
   --oflash --oflash-ring-mb 256 --oflash-topk 8
 ```
 
@@ -302,8 +305,10 @@ What's ours is the production engine integration and the hardware split, per
   not preserve the adapted drafter and its pointer-stable graph today.
 - **Single box, low concurrency.** No multi-tenant or batched-serving concerns, no tensor-parallel
   targets.
-- **Correctness-safe, speed-only risk.** Verification is exact-match against the target, so output
-  is byte-identical with any adapter; the guard bounds the downside at static-drafter speed.
+- **Exact-match verification is the correctness contract.** The bounded target-only/static/adapted
+  parity check passed after the M-RoPE fix; broader cross-prompt and cross-proposal parity remains
+  part of qualification. The guard protects accepted length, while capture and trainer
+  interference must still pass the separate throughput stop thresholds.
 - **FP16-mirror → Q4_K_M transfer must be measured, not assumed.** `auto` uses FP16 for the GPU mirror
   (FP32 on CPU) while the engine serves the quantized base; M1 evaluates the adapter in the engine,
   not only in PyTorch.

@@ -1,8 +1,9 @@
 # OFlash results
 
-**No acceptance or throughput result is measured yet.** The 2026-08-12 qualification below covers
-build, model integrity, device execution, and a capture-only server boot; the remaining sections are
-the performance methodology. Every number must arrive with the exact command that produced it
+**Bounded hardware qualification is measured; workload-scale performance is not.** The
+2026-08-13 run covers official Q4_K_M capture, detached training, live export/swap/promotion and
+warm start on the intended R9700 + Strix Halo pair. M0-M4 still define the larger held-out and
+sustained methodology. Every number must arrive with the exact command that produced it
 (CONTRIBUTING.md: numbers without methodology don't get merged). Sections mirror the
 [`R9700 and Strix Halo qualification ladder`](../../server/docs/OFLASH.md#r9700-and-strix-halo-qualification-ladder).
 
@@ -80,7 +81,7 @@ resolved 2,048-token `[S,S,S,S,F]` layout.
 
 ## 1. M0 — acceptance-vs-step baseline curves
 
-**Not yet measured.**
+**Bounded smoke measured on 2026-08-13; full curves not yet measured.**
 
 Capture-only mode (no trainer): per-step AL and α-per-position over long sessions, plus the capture
 overhead itself (target tok/s with vs without `--oflash`; budget < 1%). This baseline is what every
@@ -90,6 +91,8 @@ later claim is measured against.
 server/build/dflash_server qwen36-27b-Q4_K_M.gguf \
     --draft dflash-draft-3.6-q4_k_m.gguf --draft-swa 2048 \
     --target-device hip:0 --draft-device hip:0 \
+    --max-ctx 4096 --cache-type-k q4_0 --cache-type-v q4_0 \
+    --ddtree --ddtree-budget 22 \
     --oflash                                               # no trainer bin: capture-only
 
 python3 harness/benchmarks/generation_benchmark.py run \
@@ -103,9 +106,23 @@ Per-step AL/α come from the engine's rolling stats (`/props` + logs); extending
 to per-step timing output is part of this milestone. Deliverable: acceptance-vs-decode-step curves
 for HumanEval / Math500 / GSM8K and the agentic session, plus the capture-overhead delta.
 
+The bounded Q4 run used target SHA-256
+`41ae55b347988dca8352ed4c85f3d8ee3804a23cc89aaea165c071d61ec3cca0`
+(16,817,244,064 bytes) and official Lucebox draft SHA-256
+`e2500e90165a0f8e7b52c9882c29ed1fa391c60b300ff11b817bf10e31fa092e`
+(1,055,917,280 bytes). Three fixed temperature-zero prompts produced 8, 25 and 111 tokens with
+acceptance rates 0.15625, 0.31250 and 0.51042. OFlash-off and capture-only outputs were
+byte-identical, `records_dropped=0`, and the R9700 allocation was about 19.25 GiB.
+
+For three warmed repeats of the 111-token code prompt, OFlash-off measured 90.7/90.7/90.7 tok/s
+and capture-only measured 87.8/87.7/87.7 tok/s: a 3.27% capture regression. This misses the
+aspirational <1% M0 budget but remains below the 10% safety stop. The M-RoPE fix discovered during
+M2 changes target prefill/verify numerics, so those pre-fix throughput numbers are retained as
+capture-path evidence, not a final post-fix benchmark baseline.
+
 ## 2. M1 — detached trainer/static load: does the recipe move α?
 
-**Not yet measured.**
+**Detached trainer qualification passed; held-out static-load α gate remains open.**
 
 Keep the M0 capture-only server running, attach a direct trainer to its live bounded ring, then
 re-run the M0 benchmarks with the resulting adapter loaded statically (promoted at startup, trainer
@@ -127,7 +144,9 @@ optimizations/oflash/bin/oflash-trainer \
     --target-sha256 41ae55b347988dca8352ed4c85f3d8ee3804a23cc89aaea165c071d61ec3cca0 \
     --resolved-rope-theta 1000000 --resolved-swa-window 2048 \
     --resolved-swa-pattern 1,1,1,1,0 --resolved-mask-token-id 248070 \
-    --target server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf
+    --target server/models/oflash/Qwen3.6-27B-Q4_K_M.gguf \
+    --batch-rows 64 --train-ctx 64 --reservoir-rows 2048 \
+    --export-every 1 --keep-generations 4
 
 # Stop the trainer/server after an export, mark that immutable generation as
 # promoted in "$OFLASH_PROFILE_DIR/promoted.json", then restart the M0 server command.
@@ -137,25 +156,55 @@ optimizations/oflash/bin/oflash-trainer \
 Go/no-go: **≥ +0.05 α** on a held-out slice of the same distribution. Report: α before/after per
 benchmark, adapter generation used, mirror-vs-engine α gap.
 
+The disposable Strix trainer passed the accelerator preflight, loaded the dense FP16 mirror in
+22.4 seconds and ran 20 optimizer/export steps. Loss EMA moved from 2.5621 at generation 1 to
+1.8563 at generation 20; the final counters were 3,801 rows, 2,341 labels, zero backlog and zero
+drops. The generation-20 adapter was 13.1 MB and retained the complete format-v2 model/semantic
+identity. Strix KFD/GTT allocation held around 8.55 GiB, host `MemAvailable` around 98 GiB, and
+swap did not grow. This qualifies execution and export, not the held-out ≥+0.05 α milestone.
+
 ## 3. M2 — within-session AL climb (online loop)
 
-**Not yet measured.**
+**Bounded fixed-prompt loop passed; domain-shifted and adversarial workloads remain open.**
 
 Full loop: ring → live trainer → swap → guard, on a domain-shifted workload the drafter is weak on
 (non-English prose, or a codebase in an under-represented language). Also the adversarial case:
-rapidly switching domains must show **zero regressions** with the guard on (worst case = static
-drafter speed).
+rapidly switching domains must show no adapter-driven acceptance regression with the guard on.
+Capture and concurrent-training overhead remain separate from the restored static weights.
 
 ```bash
 server/build/dflash_server qwen36-27b-Q4_K_M.gguf \
     --draft dflash-draft-3.6-q4_k_m.gguf --draft-swa 2048 \
     --target-device hip:0 --draft-device hip:0 \
+    --max-ctx 4096 --cache-type-k q4_0 --cache-type-v q4_0 \
+    --ddtree --ddtree-budget 22 \
     --oflash --oflash-trainer-bin optimizations/oflash/bin/oflash-trainer
 # domain-shifted workload through the same per-step harness client as M0
 ```
 
 Deliverable: AL vs decode-step within one session (static vs adaptive, same seeds), swap/rollback
 counts, and the adversarial-switching run.
+
+The first integrated attempt exposed a pre-existing Qwen3.5 target bug: multi-token prefill and
+chain verification supplied text M-RoPE positions token-major even though ggml consumes four
+axis-major rows. A changed draft proposal path could therefore change greedy output. The run was
+stopped at the >10% throughput threshold; no OOM or GPU fault occurred. This PR fixes both dense
+and MoE production writers and adds a CPU layout regression test. It also fixes promotion/rollback
+logs to retain the actual pre-transition AL operands rather than printing cleared windows.
+
+After the fix, target-only AR, zero-adapter DDTree and promoted-adapter DDTree produced the same
+111-token code response. A clean integrated run then exported and hot-swapped generation 1 after
+eight optimizer steps. On three warmed identical repeats, capture-only was
+84.4/84.4/84.5 tok/s at acceptance 0.5052 (AL 9.08); generation 1 was
+103.8/104.1/104.4 tok/s at acceptance 0.6250 and promoted with `AL 9.08 -> 11.06`.
+`records_dropped=0`, backlog returned to zero, R9700 allocation was about 19.25 GiB, host
+`MemAvailable` remained about 98 GiB, and swap did not grow. Two later cycles over smoke, long-list
+and code prompts remained stable. This is encouraging single-prompt adaptation evidence, not the
+held-out/domain-shifted M2 deliverable.
+
+The final patch built the HIP `dflash_server`, `test_server_unit` and `test_kvflash` targets. All
+377 C++ server unit tests and all 66 Python trainer tests passed. The C++ suite was run outside the
+restricted development sandbox because its Unix-socket half-close test requires `shutdown(2)`.
 
 ## 4. M3 — warm start across sessions
 
@@ -193,8 +242,9 @@ steps/s achieved on each device.
 
 ## What this doesn't measure
 
-- **Output quality.** Verification is exact-match against the target, so output is identical by
-  construction with or without an adapter; no quality benchmark is run and none is needed.
+- **Output quality.** Verification is exact-match against the target; the qualification also
+  compares deterministic target-only, static-draft and adapted-draft outputs. It does not claim an
+  independent quality gain from drafter training.
 - **Other model families.** qwen35 DFlash only; gemma4/laguna drafters are out of scope until the
   capture hook is wired there.
 - **Multi-tenant / batched serving, tensor-parallel targets.** Single-box, single-stream only.

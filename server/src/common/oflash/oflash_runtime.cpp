@@ -471,7 +471,8 @@ void OFlashRuntime::apply_guard_action(OFlashGuardAction action) {
             std::fprintf(stderr,
                 "[oflash] promote gen %llu (AL %.2f -> %.2f)\n",
                 (unsigned long long)lora_->generation,
-                guard_.baseline_al(), guard_.probation_al());
+                guard_.decision_baseline_al(),
+                guard_.decision_probation_al());
             if (!profile_dir_.empty() && staging_ &&
                 !staging_->current.path.empty()) {
                 oflash_store_write_promoted(profile_dir_,
@@ -499,7 +500,8 @@ void OFlashRuntime::apply_guard_action(OFlashGuardAction action) {
                 action == OFlashGuardAction::Disable ? "DISABLE after rollback of"
                                                      : "rollback",
                 (unsigned long long)bad_gen,
-                guard_.probation_al(), guard_.baseline_al());
+                guard_.decision_probation_al(),
+                guard_.decision_baseline_al());
             // Restore the previous generation's tensors from host staging.
             if (lora_ && staging_) {
                 std::string err;

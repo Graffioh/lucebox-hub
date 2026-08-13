@@ -479,6 +479,24 @@ TEST_CASE(OFlashUnitFixture, guard_promotes_on_equal_al) {
     CHECK_EQUAL(g.current_generation(), (uint64_t)1);
 }
 
+TEST_CASE(OFlashUnitFixture, guard_retains_promotion_decision_operands) {
+    OFlashGuardConfig cfg;
+    cfg.probation_steps = 4;
+    cfg.min_baseline_steps = 2;
+    cfg.min_steps_between_swaps = 4;
+    cfg.epsilon = 0.15f;
+    OFlashGuard g(cfg);
+    for (int i = 0; i < 4; ++i) g.record_step(5.0f);
+    g.on_swap(1);
+    OFlashGuardAction action = OFlashGuardAction::None;
+    for (int i = 0; i < 4; ++i) action = g.record_step(4.9f);
+    CHECK(action == OFlashGuardAction::Promote);
+    CHECK_CLOSE(g.decision_baseline_al(), 5.0f, 0.001f);
+    CHECK_CLOSE(g.decision_probation_al(), 4.9f, 0.001f);
+    CHECK_CLOSE(g.baseline_al(), 4.9f, 0.001f);
+    CHECK_CLOSE(g.probation_al(), 0.0f, 0.001f);
+}
+
 TEST_CASE(OFlashUnitFixture, guard_rolls_back_on_regression_and_backs_off) {
     OFlashGuardConfig cfg;
     cfg.probation_steps = 4;
@@ -493,6 +511,8 @@ TEST_CASE(OFlashUnitFixture, guard_rolls_back_on_regression_and_backs_off) {
     CHECK(a == OFlashGuardAction::Rollback);
     CHECK_EQUAL(g.rollbacks(), (uint64_t)1);
     CHECK_EQUAL(g.swap_backoff(), backoff0 * 2);
+    CHECK_CLOSE(g.decision_baseline_al(), 6.0f, 0.001f);
+    CHECK_CLOSE(g.decision_probation_al(), 3.0f, 0.001f);
     // Baseline survives the failed probation.
     CHECK(g.baseline_al() > 5.0f);
 }

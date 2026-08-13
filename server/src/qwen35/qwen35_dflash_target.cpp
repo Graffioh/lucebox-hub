@@ -1,6 +1,7 @@
 // Qwen35DFlashTarget — DFlashTarget adapter for qwen35 hybrid models.
 
 #include "qwen35_dflash_target.h"
+#include "qwen35_mrope.h"
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
@@ -302,14 +303,9 @@ bool Qwen35DFlashTarget::verify_batch(
     ggml_backend_tensor_set(sg_.inp_embed, embed.data(), 0,
                             sizeof(float) * embed.size());
 
-    // Qwen35 uses interleaved positions: 4 ints per token.
-    std::vector<int32_t> pos(4 * n_tokens);
-    for (int i = 0; i < n_tokens; i++) {
-        pos[4 * i + 0] = base_pos + i;
-        pos[4 * i + 1] = base_pos + i;
-        pos[4 * i + 2] = base_pos + i;
-        pos[4 * i + 3] = 0;
-    }
+    // ggml M-RoPE positions are axis-major, matching verify_tree().
+    const std::vector<int32_t> pos =
+        qwen35_text_mrope_positions(base_pos, n_tokens);
     ggml_backend_tensor_set(sg_.positions, pos.data(), 0,
                             sizeof(int32_t) * pos.size());
 

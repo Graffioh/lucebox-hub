@@ -12,6 +12,7 @@
 #include "dflash_feature_ring.h"
 #include "graph_builders.h"
 #include "kv_quant.h"
+#include "qwen35/qwen35_mrope.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -945,13 +946,8 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
 
             // Set positions if attention layer
             if (prefill_sg.positions) {
-                std::vector<int32_t> pos_data((size_t)chunk_len * 4);
-                for (int i = 0; i < chunk_len; ++i) {
-                    pos_data[(size_t)i * 4 + 0] = chunk_start + i;
-                    pos_data[(size_t)i * 4 + 1] = chunk_start + i;
-                    pos_data[(size_t)i * 4 + 2] = chunk_start + i;
-                    pos_data[(size_t)i * 4 + 3] = 0;
-                }
+                const std::vector<int32_t> pos_data =
+                    qwen35_text_mrope_positions(chunk_start, chunk_len);
                 ggml_backend_tensor_set(prefill_sg.positions, pos_data.data(), 0, sizeof(int32_t) * pos_data.size());
             }
 
@@ -1767,13 +1763,8 @@ bool Qwen35MoeBackend::hybrid_forward_batch(
 
         // Set positions for attention layers
         if (prefn_sg.positions) {
-            std::vector<int32_t> pos_data((size_t)n_tokens * 4);
-            for (int i = 0; i < n_tokens; ++i) {
-                pos_data[(size_t)i * 4 + 0] = base_pos + i;
-                pos_data[(size_t)i * 4 + 1] = base_pos + i;
-                pos_data[(size_t)i * 4 + 2] = base_pos + i;
-                pos_data[(size_t)i * 4 + 3] = 0;
-            }
+            const std::vector<int32_t> pos_data =
+                qwen35_text_mrope_positions(base_pos, n_tokens);
             ggml_backend_tensor_set(prefn_sg.positions, pos_data.data(), 0,
                                     sizeof(int32_t) * pos_data.size());
         }

@@ -68,6 +68,11 @@ public:
         const bool measurable =
             (int)baseline_snapshot_count_ >= cfg_.min_baseline_steps;
         const float probation_al = mean(probation_);
+        // Retain the exact operands used for this decision. The state
+        // transition below either replaces baseline_ or clears probation_, so
+        // reading the live windows afterwards produces misleading logs.
+        decision_baseline_al_ = baseline_snapshot_al_;
+        decision_probation_al_ = probation_al;
         const bool pass = !measurable ||
             probation_al >= baseline_snapshot_al_ - cfg_.epsilon;
 
@@ -113,6 +118,8 @@ public:
     uint64_t current_generation() const { return current_generation_; }
     float    baseline_al() const { return baseline_.empty() ? 0.0f : mean(baseline_); }
     float    probation_al() const { return probation_.empty() ? 0.0f : mean(probation_); }
+    float    decision_baseline_al() const { return decision_baseline_al_; }
+    float    decision_probation_al() const { return decision_probation_al_; }
     uint64_t swaps() const     { return swaps_; }
     uint64_t promotes() const  { return promotes_; }
     uint64_t rollbacks() const { return rollbacks_; }
@@ -134,6 +141,8 @@ private:
     std::vector<float> probation_;
     float    baseline_snapshot_al_ = 0.0f;
     size_t   baseline_snapshot_count_ = 0;
+    float    decision_baseline_al_ = 0.0f;
+    float    decision_probation_al_ = 0.0f;
     int      swap_backoff_ = 0;
     uint64_t steps_total_ = 0;
     uint64_t last_swap_step_ = 0;
