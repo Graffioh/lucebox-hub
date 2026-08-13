@@ -1,4 +1,4 @@
-// ─── Fused whole-model graph (n_tokens = q in [1,4]) ────────────────────
+// ─── Fused whole-model graph (n_tokens = q in [1,5]) ────────────────────
 // One whole-model graph per (q, flush, padded-comp) shape: batched attention
 // (causal mask input) + batched MoE, per-token fused HC chains, in-graph
 // optional drafter-feature capture and q-wide logits. The spec loop guarantees a
@@ -287,7 +287,15 @@ static void ds4_fused_consume_route_diagnostics(
 static size_t ds4_fused_verify_hybrid_slot_limit() {
     static const size_t limit = []() {
         const char * raw = std::getenv("DFLASH_DS4_TP_FUSED_CACHE_SLOTS");
-        const long requested = raw ? std::strtol(raw, nullptr, 10) : 2;
+        // q=5 advances through four ratio-4 phases and crosses a ratio-128
+        // boundary in the 128-token qualification request. With two slots the
+        // nine recurring shapes rebuild on every step. Nine slots were
+        // model-qualified at 28.5 GiB peak on the 31.9 GiB R9700. q<=4 keeps
+        // the conservative two-slot default.
+        const long default_slots =
+            ds4_env_flag("DFLASH_DS4_Q5_VERIFY") ? 9 : 2;
+        const long requested = raw ? std::strtol(raw, nullptr, 10)
+                                   : default_slots;
         return (size_t) std::max<long>(
             1, std::min<long>(requested,
                               (long) Ds4FusedVerifyCache::kSlotCount));
@@ -386,11 +394,11 @@ static bool ds4_build_fused_verify_graph(
     ex.ape128 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q); ggml_set_input(ex.ape128);
     ex.st4 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.st4);
     ex.st128 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.st128);
-    // comp emission scalars per layer: i32 {ape_row(unused batched), comp_pos},
-    // i64 {comp_row}; reuse the decode-style bundles (2 i32 + 1 i64 per layer).
+    // Up to two compressor emissions per layer. q<=4 uses at most one; q=5
+    // can touch two ratio-4 boundaries when it starts at position mod 4 == 3.
     fg.i32_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * (int64_t) w.n_layer);
     ggml_set_input(fg.i32_bundle);
-    fg.i64_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 1 * (int64_t) w.n_layer);
+    fg.i64_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 2 * (int64_t) w.n_layer);
     ggml_set_input(fg.i64_bundle);
 
     // Mask bundle: q>1 preserves the q ring rows that the batch overwrites,
@@ -460,20 +468,36 @@ static bool ds4_build_fused_verify_graph(
         ain.neg_pos = ex.neg_q;
         ain.raw_kv_rows = ex.rawrows;
         if (ratio > 0) {
+            int n_flush = 0;
+            for (int t = 0; t < lane_q; ++t) {
+                if (((lane_kv_start + t + 1) % ratio) == 0) ++n_flush;
+            }
+            const int n_comp_inputs = std::max(1, n_flush);
             ggml_tensor * ape_all = (ratio == 4) ? ex.ape4 : ex.ape128;
             ggml_tensor * state_all = (ratio == 4) ? ex.st4 : ex.st128;
             ain.attn_ape_row = ape_all;
             ain.attn_state_rows = state_all;
-            ain.attn_comp_pos = ggml_view_1d(ctx, fg.i32_bundle, 1, ((size_t) il * 2 + 1) * sizeof(int32_t));
-            ain.attn_comp_rows = ggml_view_2d(ctx, fg.i64_bundle, 1, 1, sizeof(int64_t),
-                                              (size_t) il * sizeof(int64_t));
+            ain.attn_comp_pos = ggml_view_1d(
+                ctx, fg.i32_bundle, n_comp_inputs,
+                (size_t) il * 2 * sizeof(int32_t));
+            ain.attn_comp_rows = ggml_view_1d(
+                ctx, fg.i64_bundle, n_comp_inputs,
+                (size_t) il * 2 * sizeof(int64_t));
         }
         if (ratio == 4) {
+            int n_flush = 0;
+            for (int t = 0; t < lane_q; ++t) {
+                if (((lane_kv_start + t + 1) % ratio) == 0) ++n_flush;
+            }
+            const int n_comp_inputs = std::max(1, n_flush);
             ain.index_ape_row = ex.ape4;
             ain.index_state_rows = ex.st4;
-            ain.index_comp_pos = ggml_view_1d(ctx, fg.i32_bundle, 1, ((size_t) il * 2 + 1) * sizeof(int32_t));
-            ain.index_comp_rows = ggml_view_2d(ctx, fg.i64_bundle, 1, 1, sizeof(int64_t),
-                                               (size_t) il * sizeof(int64_t));
+            ain.index_comp_pos = ggml_view_1d(
+                ctx, fg.i32_bundle, n_comp_inputs,
+                (size_t) il * 2 * sizeof(int32_t));
+            ain.index_comp_rows = ggml_view_1d(
+                ctx, fg.i64_bundle, n_comp_inputs,
+                (size_t) il * 2 * sizeof(int64_t));
         }
         int padded = 0;
         if (ratio > 0 && lc.comp_kv) {
@@ -1167,17 +1191,27 @@ static int ds4_try_fused_verify_step(
     ds4_fv_set(ex->st128, lv.data(), sizeof(int64_t) * q);
 
     std::vector<int32_t> i32v((size_t) w.n_layer * 2, 0);
-    std::vector<int64_t> i64v((size_t) w.n_layer * 1, 0);
+    std::vector<int64_t> i64v((size_t) w.n_layer * 2, 0);
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) w.compress_ratios[il];
         if (ratio > 0) {
-            int pos_b = -1;   // boundary position inside the batch (if any)
+            int n_flush = 0;
             for (int t = 0; t < q; ++t) {
-                if (((kv_start + t + 1) % ratio) == 0) { pos_b = kv_start + t; break; }
+                if (((kv_start + t + 1) % ratio) != 0) continue;
+                GGML_ASSERT(n_flush < 2);
+                const int pos_b = kv_start + t;
+                i32v[(size_t) il * 2 + (size_t) n_flush] =
+                    pos_b + 1 - ratio;
+                i64v[(size_t) il * 2 + (size_t) n_flush] =
+                    pos_b / ratio;
+                ++n_flush;
             }
-            i32v[(size_t) il * 2 + 0] = token_pos % ratio;
-            i32v[(size_t) il * 2 + 1] = (pos_b >= 0 ? pos_b : token_pos) + 1 - ratio;
-            i64v[(size_t) il] = (pos_b >= 0 ? pos_b : token_pos) / ratio;
+            if (n_flush == 0) {
+                // The graph does not consume these values in a no-flush shape,
+                // but initialize them deterministically for diagnostics.
+                i32v[(size_t) il * 2] = token_pos + 1 - ratio;
+                i64v[(size_t) il * 2] = token_pos / ratio;
+            }
         }
     }
     ds4_fv_set(fg->i32_bundle, i32v.data(), sizeof(int32_t) * i32v.size());
@@ -1275,7 +1309,7 @@ static int ds4_try_fused_verify_step(
     // nodes is correct in eager mode but its HIP graph replay faults against
     // unified-memory expert mappings. Keep the proven width-3 ceiling only
     // while q=1 capture graphs are evaluated/captured. q>=2 verification uses
-    // the process ceiling (LUCE_MMVQ_MAX_NCOLS=4 in the optimized launch).
+    // the process ceiling (LUCE_MMVQ_MAX_NCOLS=5 for q=5 verification).
     const bool capture_eager = capture_cache &&
         ds4_env_flag("DFLASH_DS4_TP_CAPTURE_EAGER");
     // q>=2 verifier graph slots own fixed tensor storage. Position, mask,

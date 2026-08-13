@@ -44,17 +44,66 @@ static bool env_flag_enabled(const char * name) {
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
-static void configure_gfx1151_dspark_mmvq_default(int gpu) {
+static bool configure_dspark_mmvq_defaults(int gpu) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-    if (!env_flag_enabled("DFLASH_DS4_SPEC") ||
-        std::getenv("LUCE_MMVQ_MAX_NCOLS") != nullptr) {
-        return;
+    if (!env_flag_enabled("DFLASH_DS4_SPEC")) {
+        return true;
+    }
+
+    // q=5 is an explicit AMD-only experiment and needs the plain quantized
+    // verifier matmuls to stay on MMVQ. The process-wide crossover applies to
+    // both owners in the heterogeneous graph, so set it before inspecting the
+    // target device (which is gfx1201 in the R9700 + gfx1151 launch).
+    if (env_flag_enabled("DFLASH_DS4_Q5_VERIFY")) {
+        if (std::getenv("LUCE_MMVQ_MAX_NCOLS") == nullptr &&
+            ::setenv("LUCE_MMVQ_MAX_NCOLS", "5", 0) != 0) {
+            std::fprintf(stderr,
+                         "[deepseek4] failed to set LUCE_MMVQ_MAX_NCOLS=5\n");
+            return false;
+        }
+        if (std::strcmp(std::getenv("LUCE_MMVQ_MAX_NCOLS"), "5") == 0) {
+            std::fprintf(stderr,
+                         "[deepseek4] AMD DSpark q5: defaulting "
+                         "LUCE_MMVQ_MAX_NCOLS=5\n");
+        }
+
+        const char * fp4_x4 = std::getenv("DFLASH_CUDA_MMVQ_FP4_X4");
+        if (!fp4_x4 && ::setenv("DFLASH_CUDA_MMVQ_FP4_X4", "1", 0) != 0) {
+            std::fprintf(stderr,
+                         "[deepseek4] failed to enable ROCmFP4 x4 MMVQ\n");
+            return false;
+        }
+        fp4_x4 = std::getenv("DFLASH_CUDA_MMVQ_FP4_X4");
+        // Zero deliberately selects the generic five-column MMVQ fallback.
+        if (!fp4_x4 ||
+            (std::strcmp(fp4_x4, "0") != 0 &&
+             std::strcmp(fp4_x4, "1") != 0)) {
+            std::fprintf(stderr,
+                         "[deepseek4] DFLASH_CUDA_MMVQ_FP4_X4 must be 0 or 1\n");
+            return false;
+        }
+
+        cudaDeviceProp prop{};
+        if (std::strcmp(fp4_x4, "1") == 0 &&
+            std::getenv("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1") == nullptr &&
+            cudaGetDeviceProperties(&prop, gpu) == cudaSuccess &&
+            std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0 &&
+            ::setenv("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1", "1", 0) == 0) {
+            std::fprintf(stderr,
+                         "[deepseek4] gfx1201 DSpark q5: defaulting "
+                         "ROCmFP4 x4+1 MMVQ\n");
+        }
+        return true;
+    }
+
+    if (std::getenv("LUCE_MMVQ_MAX_NCOLS") != nullptr) {
+        return true;
     }
 
     cudaDeviceProp prop{};
     if (cudaGetDeviceProperties(&prop, gpu) != cudaSuccess ||
         std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0) {
-        return;
+        return true;
     }
 
     if (::setenv("LUCE_MMVQ_MAX_NCOLS", "4", 0) == 0) {
@@ -65,6 +114,7 @@ static void configure_gfx1151_dspark_mmvq_default(int gpu) {
 #else
     (void) gpu;
 #endif
+    return true;
 }
 
 static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
@@ -829,7 +879,9 @@ bool DeepSeek4Backend::init() {
     // The shared MMVQ/MMQ crossover defaults to q=3 for NVIDIA. On gfx1151,
     // DSpark q=4 is faster through MMVQ. Keep AR and other devices unchanged,
     // and preserve LUCE_MMVQ_MAX_NCOLS as an explicit override.
-    configure_gfx1151_dspark_mmvq_default(cfg_.device.gpu);
+    if (!configure_dspark_mmvq_defaults(cfg_.device.gpu)) {
+        return false;
+    }
     configure_gfx1201_hybrid_sub_batch_default(cfg_.device.gpu);
 
     backend_ = ggml_backend_cuda_init(cfg_.device.gpu);

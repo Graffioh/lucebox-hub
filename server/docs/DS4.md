@@ -282,7 +282,9 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
 | `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
 | `GGML_BATCH_PEER_COPIES` | Batch peer-runtime copies and unlike-runtime pinned-host staging with one source wait per split. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. |
-| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of heterogeneous verifier graph slots. Defaults to `2`; each slot retains scheduler scratch on both GPUs. |
+| `DFLASH_DS4_Q5_VERIFY` | Opt in to the AMD q=5 fused verifier. This also selects the qualified MMVQ width and verifier-cache defaults when they are not explicitly overridden. |
+| `DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1` | Select the q=5 ROCmFP4 dense verifier kernel that reuses the existing x4 dot product for columns 0-3 and the exact scalar path for column 4. Defaults to `1` for q=5 on `gfx1201`; set `0` to force the generic five-column kernel. |
+| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of heterogeneous verifier graph slots. Defaults to `2` for q<=4 and `9` for the opt-in q=5 verifier; each slot retains scheduler scratch on both GPUs. |
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | Skip the expensive property scan only for a warmed verifier graph. Rebuilt scheduler generations are always validated. Leave unset for the conservative production profile. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | Restore the serial compressed-row mask scan for an indexed-attention A/B. By default, HIP scans contexts above 512 compressed rows in parallel. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Long-prefill arena kill switch; set `0` to restore per-layer owner allocation. |
@@ -388,6 +390,56 @@ The required burn-in sequence is repeated requests at 2K, 4K, 8K, and 16K in
 one process, followed by another 2K request to force additional eviction. Run
 with `DFLASH_DS4_TP_FUSED_CACHE_SLOTS=2`; first qualify with forced replay
 unset, then repeat with it enabled as a separate performance A/B.
+
+### Experimental AMD q=5 verifier
+
+`DFLASH_DS4_Q5_VERIFY=1` enables a five-row fused verifier on HIP. It handles
+the shape that crosses two ratio-4 compressor boundaries, preserves five raw
+SWA rows for rollback, and restores plus replays only the accepted prefix after
+a partial rejection. q<=4 behavior is unchanged when the flag is absent.
+
+On the qualified R9700 + Strix Halo profile, leaving the related controls
+unset selects `LUCE_MMVQ_MAX_NCOLS=5`, nine heterogeneous verifier slots, and
+the ROCmFP4 x4+1 dense kernel on `gfx1201`.
+The wider MMVQ ceiling avoids the slow small-matrix crossover, while nine slots
+hold the recurring compressor phases without steady graph rebuilds. The x4+1
+kernel decodes shared weights through the existing four-column vector path and
+retains the original scalar accumulation for the fifth verifier column.
+Explicit environment values still take priority. The hot-36 full sweep peaked
+at 30.561 GiB on the reported 31.86 GiB R9700 and must be requalified on
+smaller devices.
+
+The exact qualification launch used:
+
+```bash
+export DFLASH_DS4_Q5_VERIFY=1
+export DFLASH_DS4_SPEC_Q=5
+export DFLASH_EXPERT_BUDGET_MB=13200 # 36 hot experts/layer on this profile
+export DFLASH_DS4_HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv
+```
+
+The checked-in wrapper reproduces the full exact-context protocol and records
+the manifest, response hashes, server log, ROCm state, and a two-second VRAM
+trace:
+
+```bash
+TARGET_MODEL=/path/to/target.gguf \
+DRAFT_MODEL=/path/to/dspark-draft.gguf \
+HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv \
+harness/qualification/deepseek4/qualify_ds4_q5_amd.sh
+```
+
+Its q=5 MMVQ width, verifier slots, and x4+1 controls default to `auto`, so the
+run also verifies the platform defaults. `EXPECTED_SHA256` can override the
+qualified deterministic-workload hash when intentionally testing another
+compatible artifact.
+
+At temperature zero, all 25 requests in the 2K -> 4K -> 8K -> 16K -> 2K
+burn-in produced the same expected response hash. With the automatic q=5
+MMVQ/cache/kernel defaults and the explicit hot-36 hardware profile, measured
+medians were 67.957, 65.927, 62.544, 56.335, and 67.458 tok/s. Treat these as
+workload-specific burn-in measurements, not as a portable default for unrelated
+AMD memory layouts.
 
 On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
 the variable is unset. This keeps the four-row verifier on MMVQ. On a 128 GiB
