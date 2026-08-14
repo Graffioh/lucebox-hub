@@ -89,7 +89,10 @@ TEST_CASE(MoeHybridStorageFixture, fractional_route_quota_rounds_over_the_batch)
         ctx, ids, weights, local_lut, candidate_lut,
         /*main_slots_x4=*/18, /*main_owner=*/true);
     REQUIRE(owner_ids != nullptr);
-    const int32_t main_quota = owner_ids->op_params[1];
+    int32_t main_quota = 0;
+    std::memcpy(&main_quota,
+                owner_ids->op_params + 1,
+                sizeof(main_quota));
     REQUIRE(main_quota == 23);
 
     ggml_free(ctx);
