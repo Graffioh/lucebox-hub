@@ -40,7 +40,9 @@ if [[ $# -ne 0 ]]; then usage >&2; exit 2; fi
 for cmd in python3 curl sha256sum; do command -v "$cmd" >/dev/null || { echo "missing $cmd" >&2; exit 2; }; done
 [[ -r "$MODEL" ]] || { echo "set MODEL to a readable GGUF" >&2; exit 2; }
 [[ -x "$LUCE_SERVER_BIN" ]] || { echo "missing Lucebox server: $LUCE_SERVER_BIN" >&2; exit 2; }
-[[ -x "$LLAMA_SERVER_BIN" ]] || { echo "missing llama.cpp server: $LLAMA_SERVER_BIN" >&2; exit 2; }
+if [[ ",$VARIANTS," == *,llama,* ]]; then
+  [[ -x "$LLAMA_SERVER_BIN" ]] || { echo "missing llama.cpp server: $LLAMA_SERVER_BIN" >&2; exit 2; }
+fi
 [[ "$REPEATS" =~ ^[1-9][0-9]*$ ]] || { echo "REPEATS must be positive" >&2; exit 2; }
 [[ ! -e "$OUT" ]] || { echo "refusing to overwrite $OUT" >&2; exit 2; }
 ambient_tuning="$(env | grep -E '^(GGML_|DFLASH_|LUCE_|HIP_|ROCR_|HSA_|LD_PRELOAD=|LD_LIBRARY_PATH=)' \
@@ -74,7 +76,9 @@ for c in "${client_list[@]}"; do
   [[ -n "${prompt_offsets[$c]+yes}" ]] || { echo "supported CLIENTS are 1,4,8,16" >&2; exit 2; }
 done
 for v in "${variant_list[@]}"; do
-  [[ "$v" == luce-k8 || "$v" == luce-k1 || "$v" == llama ]] || { echo "unknown variant $v" >&2; exit 2; }
+  [[ "$v" == luce-k8 || "$v" == luce-k1 || "$v" == luce-k16-b2 ||
+     "$v" == luce-k16-b4 || "$v" == luce-k16-dyn ||
+     "$v" == llama ]] || { echo "unknown variant $v" >&2; exit 2; }
 done
 
 mkdir -p "$OUT/prompts"
@@ -95,7 +99,8 @@ stop_server() {
   fi
   server_pid=""
 }
-trap stop_server EXIT INT TERM
+trap stop_server EXIT
+trap 'exit 130' INT TERM
 
 served_model_matches() {
   python3 - "$PORT" "$1" <<'PY'
@@ -147,9 +152,9 @@ PY
 }
 
 write_metadata() {
-  local path="$1" variant="$2" workload="$3" clients="$4" repeat="$5" binary="$6" max_prefills="$7" command_file="$8"
+  local path="$1" variant="$2" workload="$3" clients="$4" repeat="$5" binary="$6" max_prefills="$7" mixed_budget="$8" idle_budget="$9" quantum="${10}" command_file="${11}"
   python3 -c 'import hashlib,json,pathlib,subprocess,sys
-p,variant,workload,clients,repeat,binary,max_prefills,cmd_file,model_sha,prompts,repo=sys.argv[1:]
+p,variant,workload,clients,repeat,binary,max_prefills,mixed,idle,quantum,cmd_file,model_sha,prompts,repo=sys.argv[1:]
 digest=lambda x: hashlib.sha256(pathlib.Path(x).read_bytes()).hexdigest()
 libs={}
 for line in subprocess.run(["ldd",binary],text=True,capture_output=True).stdout.splitlines():
@@ -165,18 +170,20 @@ if variant == "llama":
         raise RuntimeError(f"cannot identify llama.cpp source version from {binary} --version")
 obj={"variant":variant,"workload":workload,"clients":int(clients),"repeat":int(repeat),
      "max_concurrent_prefills":int(max_prefills),"server_binary":str(pathlib.Path(binary).resolve()),
+     "mixed_prefill_tokens":int(mixed),"idle_prefill_tokens":int(idle),
+     "prefill_allocation_quantum":int(quantum),
      "server_binary_sha256":digest(binary),"model_sha256":model_sha,
      "prompt_file_sha256":digest(prompts),"server_command":pathlib.Path(cmd_file).read_text().strip(),
      "resolved_shared_library_sha256":libs,
      "lucebox_git_head":lucebox_git_head if variant != "llama" else None,
      "server_version":server_version}
 pathlib.Path(p).write_text(json.dumps(obj,indent=2,sort_keys=True)+"\n")' \
-    "$path" "$variant" "$workload" "$clients" "$repeat" "$binary" "$max_prefills" "$command_file" "$MODEL_SHA256" "$OUT/prompts/$workload.jsonl" "$REPO"
+    "$path" "$variant" "$workload" "$clients" "$repeat" "$binary" "$max_prefills" "$mixed_budget" "$idle_budget" "$quantum" "$command_file" "$MODEL_SHA256" "$OUT/prompts/$workload.jsonl" "$REPO"
 }
 
 run_case() {
   local repeat="$1" workload="$2" clients="$3" variant="$4"
-  local max_ctx timeout capacity max_prefills binary model_id
+  local max_ctx timeout capacity max_prefills mixed_budget idle_budget quantum binary model_id
   if [[ "$workload" == long ]]; then
     max_ctx=8192; timeout=1800
   else
@@ -188,20 +195,30 @@ run_case() {
   local -a command launch_env
   if [[ "$variant" == llama ]]; then
     binary="$LLAMA_SERVER_BIN"; model_id=qwen36-llama; max_prefills=0
+    mixed_budget=0; idle_budget=0; quantum=0
     command=("$binary" -m "$MODEL" -ngl all --parallel "$SLOTS" -c "$capacity"
       -b 2048 -ub 512 --cont-batching --no-context-shift --no-mmap -fa on
       -ctk q4_0 -ctv q4_0 --no-cache-prompt --host 127.0.0.1 --port "$PORT" --alias "$model_id")
     launch_env=()
   else
     binary="$LUCE_SERVER_BIN"; model_id=qwen36-luce
-    [[ "$variant" == luce-k8 ]] && max_prefills=8 || max_prefills=1
+    case "$variant" in
+      luce-k8) max_prefills=8; mixed_budget=2048; idle_budget=4096; quantum=512 ;;
+      luce-k16-b2) max_prefills=16; mixed_budget=2048; idle_budget=2048; quantum=128 ;;
+      luce-k16-b4) max_prefills=16; mixed_budget=4096; idle_budget=4096; quantum=256 ;;
+      luce-k16-dyn) max_prefills=16; mixed_budget=2048; idle_budget=4096; quantum=256 ;;
+      *) max_prefills=1; mixed_budget=2048; idle_budget=4096; quantum=512 ;;
+    esac
     command=("$binary" "$MODEL" --target-device hip:0 --paged-attention
       --max-concurrency "$SLOTS" --kv-pool-tokens "$capacity" --max-ctx "$max_ctx"
       --cache-type-k q4_0 --cache-type-v q4_0 --fa-window 0
       --prefix-cache-slots 0 --prefill-cache-slots 0 --admission-coalesce-ms 5
       --host 127.0.0.1 --port "$PORT" --model-name "$model_id")
     launch_env=("DFLASH_MIN_TOKENS=$WARMUP_TOKENS"
-      "DFLASH_MAX_CONCURRENT_PREFILLS=$max_prefills")
+      "DFLASH_MAX_CONCURRENT_PREFILLS=$max_prefills"
+      "DFLASH_MIXED_PREFILL_TOKENS=$mixed_budget"
+      "DFLASH_IDLE_PREFILL_TOKENS=$idle_budget"
+      "DFLASH_PREFILL_ALLOCATION_QUANTUM=$quantum")
   fi
   if ((${#launch_env[@]})); then
     printf 'env ' > "$case_dir/server-command.txt"
@@ -210,7 +227,7 @@ run_case() {
     printf '%q ' "${command[@]}" > "$case_dir/server-command.txt"
   fi
   printf '\n' >> "$case_dir/server-command.txt"
-  write_metadata "$case_dir/server-metadata.json" "$variant" "$workload" "$clients" "$repeat" "$binary" "$max_prefills" "$case_dir/server-command.txt"
+  write_metadata "$case_dir/server-metadata.json" "$variant" "$workload" "$clients" "$repeat" "$binary" "$max_prefills" "$mixed_budget" "$idle_budget" "$quantum" "$case_dir/server-command.txt"
 
   echo "[run] $workload C=$clients repeat=$repeat variant=$variant"
   port_is_available || return 1
@@ -228,6 +245,7 @@ run_case() {
     --require-distinct-prompts --max-tokens "$WARMUP_TOKENS" --temperature 0 \
     --ignore-eos --timeout "$timeout" --cooldown 0 --out "$case_dir/warmup.json" \
     --label "$variant $workload C=$clients warmup" > "$case_dir/warmup.txt"
+  sleep 1
   python3 "$CLIENT" --base-url "http://127.0.0.1:$PORT/v1" --model "$model_id" \
     --clients "$clients" --prompt-file "$prompts" --prompt-offset "$offset" \
     --require-distinct-prompts --max-tokens "$MAX_TOKENS" --temperature 0 \

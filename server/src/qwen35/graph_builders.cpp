@@ -417,6 +417,12 @@ bool build_target_step(
             n_prefill_segments, graph_capacity)) {
         return false;
     }
+    // Experimental adaptive prefill: node count depends on aggregate width,
+    // ragged layout, and fused decode rows. Use the already-supported maximum
+    // capacity so the benchmark does not rely on an incomplete shape proxy.
+    if (n_prefill_tokens > 0) {
+        graph_capacity = std::max<size_t>(graph_capacity, 131072);
+    }
 
     // Persistent thread_local arena: rebuilt step graphs land at identical
     // addresses, keeping the ggml-cuda CUDA-graph cache key (nodes[0]) and

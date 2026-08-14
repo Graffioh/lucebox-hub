@@ -390,7 +390,7 @@ bool Qwen35Backend::init() {
     const int max_concurrent_prefills = n_slots > 1
         ? std::clamp(
               env_int_or_default("DFLASH_MAX_CONCURRENT_PREFILLS", 8),
-              1, std::min(n_slots, 8))
+              1, n_slots)
         : 1;
     const int mixed_prefill_tokens = std::max(
         1, env_int_or_default("DFLASH_MIXED_PREFILL_TOKENS", 2048));

@@ -10,6 +10,7 @@ from typing import Callable, Mapping
 
 
 PROFILES = {
+    "tiny": (64, 96, 128, 160),
     "short": (250, 350, 450, 550),
     "medium": (650, 850, 1150, 1350),
     "long": (2000, 2600, 3400, 4000),
