@@ -1,9 +1,9 @@
 # Qwen3.6 concurrency benchmark
 
 This protocol measures the serving behavior targeted by packed continuous
-prefill and concurrent decode. It is intentionally small: one streaming client,
-one fresh-process runner, one deterministic prompt generator, and one summary
-script.
+prefill and concurrent decode. It has two user-facing runners that share the
+streaming client, deterministic prompt generation, and summary tooling:
+the paired ragged workload runner and the canonical-suite runner.
 
 ## Canonical and blog workloads
 
@@ -13,6 +13,8 @@ runner:
 
 ```bash
 MODEL=/path/to/Qwen3.6-27B-Q4_K_M.gguf \
+GPU_DEVICE=1 \
+EXPECTED_GPU_ARCH=gfx1151 \
 REPEATS=3 \
 harness/benchmarks/concurrency/run_qwen36_canonical_concurrency.sh
 ```
@@ -129,6 +131,8 @@ Run a quick screening repeat:
 
 ```bash
 MODEL=/path/to/Qwen3.6-27B-Q4_K_M.gguf \
+GPU_DEVICE=1 \
+EXPECTED_GPU_ARCH=gfx1151 \
 LUCE_SERVER_BIN=server/build-hip/dflash_server \
 LLAMA_SERVER_BIN=/path/to/llama-server \
 harness/benchmarks/concurrency/run_qwen36_concurrency.sh
@@ -138,6 +142,8 @@ Run a decode-heavy comparison with the same harness:
 
 ```bash
 MODEL=/path/to/Qwen3.6-27B-Q4_K_M.gguf \
+GPU_DEVICE=1 \
+EXPECTED_GPU_ARCH=gfx1151 \
 LUCE_SERVER_BIN=server/build-hip/dflash_server \
 LLAMA_SERVER_BIN=/path/to/llama-server \
 WORKLOADS=short MAX_TOKENS=256 VARIANTS=luce-k8,llama REPEATS=3 \
@@ -151,13 +157,73 @@ discarded warmup at the same concurrency. The variants are:
 
 - `luce-k8`: packed prefill with up to eight concurrent prefills.
 - `luce-k1`: the same binary/configuration with packing width limited to one.
-- `llama`: llama.cpp continuous batching with fixed `-b 2048 -ub 512`.
+- `llama`: llama.cpp continuous batching with fixed `-b 2048 -ub 512` and
+  `--reasoning off --reasoning-format none`, matching Luce's non-thinking mode
+  and preserving raw immediate streaming for the fixed-token protocol.
 
-The 29 generated prompts are disjoint cohorts for C1/C4/C8/C16. C4 and above
-contain four substantial length strata while holding the mean target length
-constant. The default short, medium, and long profiles target approximately
-400, 1,000, and 3,000 input tokens per request. The client refuses to wrap or
-reuse a prompt; reports retain the exact server-observed token counts.
+Set `PREFILL_FIRST_BURST_STEPS=N` to benchmark the opt-in Lucebox TTFT policy.
+The runner records the resolved value in both the server command and metadata.
+`0` preserves continuous decode; positive `N` permits at most `N` consecutive
+prefill-only traversals before a mandatory decode traversal. Screen `N=1` and
+`N=2` against `N=0` before choosing a latency/active-decode tradeoff.
+
+`IDLE_PREFILL_TOKENS` exposes Luce's existing prefill-only traversal budget.
+It defaults to the runtime's neutral value of 4096 and accepts 1 through 16384.
+The upper bound is the largest currently effective K8 pure-prefill batch:
+eight packed lanes times the 2048-token per-sequence cap. Both runners inject
+the resolved value into Luce AR/DDTree launches and record it in metadata;
+synthetic llama metadata records `null`, and llama never receives the
+`DFLASH_IDLE_PREFILL_TOKENS` environment variable.
+
+Values above 4096 pair with a positive `PREFILL_FIRST_BURST_STEPS`: the burst
+creates prefill-only traversal opportunities while the larger idle budget
+allows those traversals to carry more than 4096 real prompt tokens. Mixed
+decode+prefill traversals retain their separate mixed-token budgets.
+
+The default 30 generated prompts are disjoint cohorts for C2/C4/C8/C16. C2
+uses the shortest and longest strata; C4 and above contain all four substantial
+length strata. Every cohort has the same mean target length. The default short,
+medium, and long profiles target approximately 400, 1,000, and 3,000 input
+tokens per request. Cohort IDs, local indices, and cumulative offsets are
+recorded in the prompt manifest. The client refuses to wrap or reuse a prompt;
+reports retain the exact prompt indices, prompt hashes, and server-observed
+token counts.
+
+`CLIENTS` accepts any distinct positive levels. The generator appends a
+deterministic, disjoint, mean-matched cohort for each requested level, while
+leaving earlier cohorts unchanged. `SLOTS` stays at 16 for smaller screens and
+automatically grows to the largest level, so this extends the matrix without
+source changes:
+
+```bash
+CLIENTS=2,4,8,16,32 GPU_DEVICE=1 EXPECTED_GPU_ARCH=gfx1151 \
+harness/benchmarks/concurrency/run_qwen36_concurrency.sh
+```
+
+Both runners default to physical ROCr `GPU_DEVICE=0`, expose only that device
+to their server processes, and then address it as `hip:0`. On the dual-GPU
+benchmark host, every Strix Halo comparison must set both `GPU_DEVICE=1` and
+`EXPECTED_GPU_ARCH=gfx1151`, as in the commands above. Ambient GPU/backend
+tuning variables are refused.
+
+The paired synthetic runner uses independent preflight and running-process
+proofs, and aborts before warmup when any required proof is missing:
+
+- `gpu-identity.txt` is the matching line from `rocminfo` executed under the
+  isolated `ROCR_VISIBLE_DEVICES` value. This catches physical-index reorder.
+- For llama.cpp, `llama-list-devices-command.txt` records the isolated command
+  and `llama-list-devices.txt` stores its raw output. The exact binary whose
+  path, hash, and version are in metadata must expose a `ROCmN:` device.
+- After health, `server-gpu-proof.txt` comes from the actual server log. A
+  Lucebox case must report `gfx1151`. A llama.cpp case must report a positive
+  full offload in its revision-4cb22cd form, `offloaded N/N layers to GPU`;
+  partial offload, `0/0`, or CPU fallback fails the case. The llama server uses
+  `-lv 4` because that revision omits these startup lines at its default log
+  level; this changes logging verbosity, not the inference configuration.
+
+Keep all four evidence files with published llama.cpp result artifacts. Lucebox
+cases do not produce the two `llama-list-devices*` files. Each server command
+and metadata JSON also records the resolved isolation and expected architecture.
 
 The headline metric is aggregate output goodput: exact server-reported
 completion tokens divided by level wall time. It includes queueing, prefill,
@@ -176,6 +242,26 @@ decode throughput.
 the latest first-token arrival; it is a useful prefill-facing metric but still
 includes admission, queueing, and transport. Report TTFT median/max alongside
 all throughput metrics.
+
+Lucebox also supplies `usage.timings.prefilled_tokens` and
+`usage.timings.prefill_ms` in the terminal streaming usage event. The client
+copies those exact values into each request as
+`server_native_prefilled_tokens` and `server_native_prefill_ms`, plus their
+direct per-request rate. It never substitutes `usage.prompt_tokens` or client
+TTFT when either native field is absent.
+
+For one concurrent ragged level, the native prefill window is
+`max(start_offset_ms + server_native_prefill_ms)`. The level rate divides
+`server_native_prefilled_tokens_total` by that common-origin window, avoiding
+double-counting overlapping request intervals. Canonical suites run sequential
+waves, so their top-level rate divides total native-prefilled tokens by the sum
+of those per-wave windows. The report records the formula in
+`server_native_prefill_metric` and exposes completeness flags. The summarizer
+requires native telemetry on every repeat or none; partial repeats fail closed.
+
+Servers that do not expose both Luce timing fields, including the paired
+llama.cpp baseline, display `n/a` for native metrics. The existing end-to-end
+`Prompt tok/s to first` remains available and unchanged for both servers.
 
 The K8-vs-K1 comparison is the causal packing ablation. The K8-vs-llama
 comparison is the product comparison. Five paired repeats, the exact command

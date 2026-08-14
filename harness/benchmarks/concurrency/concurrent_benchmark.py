@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import statistics
 import sys
 import threading
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 PromptInput = str | list[dict[str, str]]
+DEFAULT_CLIENT_LEVELS = (2, 4, 8, 16)
 
 
 def sha256_text(text: str) -> str:
@@ -84,6 +86,27 @@ def prompt_input_sha256(prompt: PromptInput) -> str:
     return sha256_text(json.dumps(prompt, ensure_ascii=False, separators=(",", ":")))
 
 
+def native_prefill_values(usage: Any) -> tuple[int | None, float | None]:
+    """Return exact Luce usage.timings fields, without protocol fallbacks."""
+    if not isinstance(usage, dict):
+        return None, None
+    timings = usage.get("timings")
+    if not isinstance(timings, dict):
+        return None, None
+    tokens = timings.get("prefilled_tokens")
+    prefill_ms = timings.get("prefill_ms")
+    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+        tokens = None
+    if (
+        isinstance(prefill_ms, bool)
+        or not isinstance(prefill_ms, (int, float))
+        or not math.isfinite(prefill_ms)
+        or prefill_ms < 0
+    ):
+        prefill_ms = None
+    return tokens, float(prefill_ms) if prefill_ms is not None else None
+
+
 def stream_request(args: argparse.Namespace, prompt: PromptInput) -> dict[str, Any]:
     started = time.perf_counter()
     first = None
@@ -91,6 +114,8 @@ def stream_request(args: argparse.Namespace, prompt: PromptInput) -> dict[str, A
     reasoning: list[str] = []
     completion_tokens = None
     prompt_tokens = None
+    server_native_prefilled_tokens = None
+    server_native_prefill_ms = None
     finish_reason = None
     done_received = False
     response_id = None
@@ -127,6 +152,11 @@ def stream_request(args: argparse.Namespace, prompt: PromptInput) -> dict[str, A
                     completion_tokens = usage["completion_tokens"]
                 if isinstance(usage.get("prompt_tokens"), int):
                     prompt_tokens = usage["prompt_tokens"]
+                native_tokens, native_ms = native_prefill_values(usage)
+                if native_tokens is not None:
+                    server_native_prefilled_tokens = native_tokens
+                if native_ms is not None:
+                    server_native_prefill_ms = native_ms
                 for choice in event.get("choices") or []:
                     if choice.get("finish_reason") is not None:
                         finish_reason = choice["finish_reason"]
@@ -154,12 +184,21 @@ def stream_request(args: argparse.Namespace, prompt: PromptInput) -> dict[str, A
         if isinstance(completion_tokens, int) and completion_tokens > 0
         and decode_duration is not None else None
     )
+    server_native_prefill_tokens_per_s = (
+        server_native_prefilled_tokens * 1000.0 / server_native_prefill_ms
+        if server_native_prefilled_tokens is not None
+        and server_native_prefill_ms is not None
+        and server_native_prefill_ms > 0 else None
+    )
     return {
         "t_start": started, "t_first": first, "t_end": ended,
         "duration_s": ended - started,
         "ttft_s": first - started if first is not None else None,
         "decode_duration_s": decode_duration,
         "completion_tokens": completion_tokens, "prompt_tokens": prompt_tokens,
+        "server_native_prefilled_tokens": server_native_prefilled_tokens,
+        "server_native_prefill_ms": server_native_prefill_ms,
+        "server_native_prefill_tokens_per_s": server_native_prefill_tokens_per_s,
         "finish_reason": finish_reason, "done_received": done_received, "error": error,
         "response_id": response_id,
         "content_sha256": sha256_text(output),
@@ -221,9 +260,33 @@ def run_level(
         r["request_decode_tok_s"] for r in ok
         if r.get("request_decode_tok_s") is not None
     ]
+    native_prefilled_counts = [
+        r.get("server_native_prefilled_tokens") for r in ok
+    ]
+    native_prefill_ms_values = [r.get("server_native_prefill_ms") for r in ok]
+    native_token_count_complete = bool(ok) and all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in native_prefilled_counts
+    )
+    native_timing_complete = bool(ok) and all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        and math.isfinite(value) and value >= 0
+        for value in native_prefill_ms_values
+    )
+    native_prefilled_tokens_total = (
+        sum(native_prefilled_counts) if native_token_count_complete else None
+    )
+    native_prefill_ms_max = (
+        max(native_prefill_ms_values) if native_timing_complete else None
+    )
+    native_prefill_window_ms = (
+        max(r["start_offset_s"] * 1000.0 + r["server_native_prefill_ms"] for r in ok)
+        if native_timing_complete else None
+    )
     fixed_valid = (
         failures == 0 and len(ok) == clients
         and completion_complete
+        and prompt_complete
         and all(v == args.max_tokens for v in completion_counts)
     ) if args.ignore_eos else None
     prompt_hashes = [r["prompt_sha256"] for r in ok]
@@ -263,6 +326,20 @@ def run_level(
             sum(prompt_counts) / first_window
             if prompt_complete and first_window is not None and first_window > 0 else None
         ),
+        "server_native_prefilled_tokens_total": native_prefilled_tokens_total,
+        "server_native_prefill_ms_max": native_prefill_ms_max,
+        "server_native_prefill_window_ms": native_prefill_window_ms,
+        "server_native_prefill_token_count_complete": native_token_count_complete,
+        "server_native_prefill_timing_complete": native_timing_complete,
+        "server_native_prefill_tokens_per_s": (
+            native_prefilled_tokens_total * 1000.0 / native_prefill_window_ms
+            if native_prefilled_tokens_total is not None
+            and native_prefill_window_ms is not None
+            and native_prefill_window_ms > 0 else None
+        ),
+        "server_native_prefill_metric": (
+            "sum_prefilled_tokens_per_common_origin_prefill_window_second"
+        ),
         "ttft_median_s": statistics.median(ttfts) if ttfts else None,
         "ttft_max_s": max(ttfts) if ttfts else None,
         "selected_prompt_set_sha256": digest(prompt_hashes),
@@ -279,9 +356,10 @@ def markdown(report: dict[str, Any]) -> str:
     lines = [
         f"# Concurrent benchmark — {report['label']}", "",
         "| C | Ok | Output goodput tok/s | Output-window tok/s | "
-        "Request decode tok/s | Prompt tok/s to first | Prompt range | "
-        "TTFT median s | TTFT max s | Wall s |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | :--- | ---: | ---: | ---: |",
+        "Request decode tok/s | Prompt tok/s to first | Native prefill tok/s | "
+        "Native prefill window ms | Prompt range | TTFT median s | TTFT max s | Wall s |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | "
+        "---: | ---: | ---: |",
     ]
     for level in report["levels"]:
         lines.append(
@@ -290,6 +368,8 @@ def markdown(report: dict[str, Any]) -> str:
             f"{fmt(level['output_window_tok_s'])} | "
             f"{fmt(level['request_decode_tok_s_median'])} | "
             f"{fmt(level['prompt_tokens_per_s_to_first_token'])} | "
+            f"{fmt(level.get('server_native_prefill_tokens_per_s'))} | "
+            f"{fmt(level.get('server_native_prefill_window_ms'), '.1f')} | "
             f"{fmt(level['prompt_tokens_min'], '.0f')}–{fmt(level['prompt_tokens_max'], '.0f')} | "
             f"{fmt(level['ttft_median_s'], '.3f')} | {fmt(level['ttft_max_s'], '.3f')} | "
             f"{fmt(level['wall_s'])} |"
@@ -329,9 +409,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
-    levels = args.client_levels or [1, 4, 8, 16]
+    levels = args.client_levels or list(DEFAULT_CLIENT_LEVELS)
     if any(level < 1 for level in levels):
         raise ValueError("--clients must be positive")
+    if len(set(levels)) != len(levels):
+        raise ValueError("--clients levels must be distinct")
     if args.prompt_offset < 0 or args.max_tokens < 1 or args.timeout <= 0:
         raise ValueError("invalid offset, max-tokens, or timeout")
     prompts = load_prompts(args.prompt_file)
@@ -352,6 +434,7 @@ def run(args: argparse.Namespace) -> int:
         "model": args.model, "max_tokens": args.max_tokens,
         "temperature": args.temperature, "seed": args.seed,
         "ignore_eos": args.ignore_eos, "prompt_offset": args.prompt_offset,
+        "client_levels": levels,
         "prompt_file_sha256": hashlib.sha256(args.prompt_file.read_bytes()).hexdigest(),
         "server_metadata": metadata, "levels": results,
     }
