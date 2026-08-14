@@ -15,6 +15,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+PromptInput = str | list[dict[str, str]]
+
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -63,7 +65,26 @@ def iter_sse_data(lines: Iterable[bytes]) -> Iterable[str]:
         yield "\n".join(data)
 
 
-def stream_request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
+def prompt_messages(prompt: PromptInput) -> list[dict[str, str]]:
+    if isinstance(prompt, str):
+        return [{"role": "user", "content": prompt}]
+    if not isinstance(prompt, list) or not prompt or any(
+        not isinstance(message, dict)
+        or not isinstance(message.get("role"), str)
+        or not isinstance(message.get("content"), str)
+        for message in prompt
+    ):
+        raise ValueError("messages must contain role/content strings")
+    return prompt
+
+
+def prompt_input_sha256(prompt: PromptInput) -> str:
+    if isinstance(prompt, str):
+        return sha256_text(prompt)
+    return sha256_text(json.dumps(prompt, ensure_ascii=False, separators=(",", ":")))
+
+
+def stream_request(args: argparse.Namespace, prompt: PromptInput) -> dict[str, Any]:
     started = time.perf_counter()
     first = None
     content: list[str] = []
@@ -72,10 +93,11 @@ def stream_request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
     prompt_tokens = None
     finish_reason = None
     done_received = False
+    response_id = None
     error = None
     payload = {
         "model": args.model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": prompt_messages(prompt),
         "stream": True,
         "stream_options": {"include_usage": True},
         "max_tokens": args.max_tokens,
@@ -98,6 +120,8 @@ def stream_request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
                     done_received = True
                     break
                 event = json.loads(data)
+                if isinstance(event.get("id"), str):
+                    response_id = event["id"]
                 usage = event.get("usage") or {}
                 if isinstance(usage.get("completion_tokens"), int):
                     completion_tokens = usage["completion_tokens"]
@@ -137,6 +161,7 @@ def stream_request(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
         "decode_duration_s": decode_duration,
         "completion_tokens": completion_tokens, "prompt_tokens": prompt_tokens,
         "finish_reason": finish_reason, "done_received": done_received, "error": error,
+        "response_id": response_id,
         "content_sha256": sha256_text(output),
         "reasoning_content_sha256": sha256_text(reasoning_output),
         "content_chars": len(output), "reasoning_content_chars": len(reasoning_output),
@@ -159,7 +184,7 @@ def run_level(
         barrier.wait()
         record = stream_request(args, selected[index])
         record["prompt_index"] = offset + index
-        record["prompt_sha256"] = sha256_text(selected[index])
+        record["prompt_sha256"] = prompt_input_sha256(selected[index])
         records[index] = record
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(clients)]

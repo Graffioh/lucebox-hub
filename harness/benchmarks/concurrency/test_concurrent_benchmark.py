@@ -33,6 +33,10 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "refusing to reuse"):
             benchmark.request_prompts(["a", "b"], 2, 1)
 
+    def test_prompt_messages_rejects_non_array(self) -> None:
+        with self.assertRaisesRegex(ValueError, "messages must contain"):
+            benchmark.prompt_messages({"role": "user"})
+
     def test_level_uses_exact_usage_and_first_token_window(self) -> None:
         prompt_counts = iter((10, 30))
 
@@ -89,6 +93,34 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIsNone(record["error"])
         self.assertIsNotNone(record["request_decode_tok_s"])
         self.assertEqual(record["content_sha256"], benchmark.sha256_text("one chunk"))
+
+    def test_stream_request_preserves_canonical_message_roles(self) -> None:
+        captured = {}
+
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self):
+                return iter([
+                    b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":1}}\n',
+                    b"\n", b"data: [DONE]\n", b"\n",
+                ])
+
+        def fake_open(request, timeout):
+            captured["payload"] = __import__("json").loads(request.data)
+            return Response()
+
+        args = argparse.Namespace(
+            model="m", max_tokens=1, temperature=0.0, seed=1, ignore_eos=True,
+            api_key="", base_url="http://localhost/v1", timeout=2.0,
+        )
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "user"},
+        ]
+        with mock.patch.object(benchmark.urllib.request, "urlopen", side_effect=fake_open):
+            benchmark.stream_request(args, messages)
+        self.assertEqual(captured["payload"]["messages"], messages)
 
     def test_stream_request_rejects_clean_eof_without_done(self) -> None:
         class Response:
