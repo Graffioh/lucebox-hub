@@ -422,6 +422,23 @@ int main() {
         CHECK(!mgr.slot(0).sampler.needs_logit_processing());
     }
 
+    // Long-prefill policy follows active request length and clears on retire.
+    {
+        PagedKvPool pool(128, 2, /*block_size=*/16);
+        Qwen35SlotManager mgr(pool, 2048);
+        CHECK(!mgr.has_prefill_prompt_at_least(768));
+        auto short_req =
+            admit(mgr, 201, prompt_tokens(512), greedy_sampler());
+        CHECK(is_admitted(short_req));
+        CHECK(!mgr.has_prefill_prompt_at_least(768));
+        auto long_req =
+            admit(mgr, 202, prompt_tokens(800), greedy_sampler());
+        CHECK(is_admitted(long_req));
+        CHECK(mgr.has_prefill_prompt_at_least(768));
+        mgr.retire(long_req.slot);
+        CHECK(!mgr.has_prefill_prompt_at_least(768));
+    }
+
     std::printf("OK test_seq_slot_manager (%d checks)\n", g_checks);
     return 0;
 }

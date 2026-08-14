@@ -40,8 +40,18 @@ public:
     // `max_prefills` bounds scheduler-selected prompt slices per traversal.
     Qwen35SeqEngine(Qwen35Backend & backend, PagedKvPool & pool,
                     int max_ctx, int64_t scratch_row,
-                    int max_prefills = 8)
-        : max_prefills_(std::max(1, max_prefills)), b_(backend),
+                    int max_prefills = 8,
+                    int mixed_prefill_tokens = 2048,
+                    int long_mixed_prefill_tokens = 4096,
+                    int long_prefill_threshold = 768,
+                    int idle_prefill_tokens = 4096,
+                    int prefill_quantum = 512)
+        : max_prefills_(std::max(1, max_prefills)),
+          mixed_prefill_tokens_(std::max(1, mixed_prefill_tokens)),
+          long_mixed_prefill_tokens_(std::max(1, long_mixed_prefill_tokens)),
+          long_prefill_threshold_(std::max(1, long_prefill_threshold)),
+          idle_prefill_tokens_(std::max(1, idle_prefill_tokens)),
+          prefill_quantum_(std::max(1, prefill_quantum)), b_(backend),
           slots_(pool, max_ctx), scratch_row_(scratch_row) {}
 
     int slot_count() const override { return slots_.slot_count(); }
@@ -55,12 +65,18 @@ public:
     StepPlanLimits step_plan_limits(int decode_rows) const override {
         const bool mixed = decode_rows > 0;
         const int per_sequence = mixed ? 512 : 2048;
-        const int total_cap = mixed ? 2048 : 4096;
+        int total_cap = idle_prefill_tokens_;
+        if (mixed) {
+            total_cap = mixed_prefill_tokens_;
+            if (slots_.has_prefill_prompt_at_least(long_prefill_threshold_)) {
+                total_cap = std::max(total_cap, long_mixed_prefill_tokens_);
+            }
+        }
         return {
             max_prefills_,
             per_sequence,
             std::min(max_prefills_ * per_sequence, total_cap),
-            512,
+            prefill_quantum_,
         };
     }
 
@@ -80,6 +96,11 @@ private:
     };
 
     int max_prefills_;
+    int mixed_prefill_tokens_;
+    int long_mixed_prefill_tokens_;
+    int long_prefill_threshold_;
+    int idle_prefill_tokens_;
+    int prefill_quantum_;
 
     bool upload_block_table_delta(int slot, int first_block,
                                   const int32_t * blocks, size_t count);

@@ -381,6 +381,16 @@ bool Qwen35Backend::init() {
               env_int_or_default("DFLASH_MAX_CONCURRENT_PREFILLS", 8),
               1, std::min(n_slots, 8))
         : 1;
+    const int mixed_prefill_tokens = std::max(
+        1, env_int_or_default("DFLASH_MIXED_PREFILL_TOKENS", 2048));
+    const int long_mixed_prefill_tokens = std::max(
+        1, env_int_or_default("DFLASH_LONG_MIXED_PREFILL_TOKENS", 4096));
+    const int long_prefill_threshold = std::max(
+        1, env_int_or_default("DFLASH_LONG_PREFILL_THRESHOLD", 768));
+    const int idle_prefill_tokens = std::max(
+        1, env_int_or_default("DFLASH_IDLE_PREFILL_TOKENS", 4096));
+    const int prefill_quantum = std::max(
+        1, env_int_or_default("DFLASH_PREFILL_ALLOCATION_QUANTUM", 512));
     if (n_slots > 1 && !cfg_.paged_attention) {
         set_last_error("--max-concurrency requires --paged-attention");
         return false;
@@ -475,11 +485,17 @@ bool Qwen35Backend::init() {
             seq_engine_ = std::make_unique<Qwen35SeqEngine>(
                 *this, *paged_kv_pool_, cfg_.device.max_ctx,
                 /*scratch_row=*/pool_tokens,
-                max_concurrent_prefills);
-            std::printf("[parallel] %d decode slots, up to %d packed prefills, "
+                max_concurrent_prefills, mixed_prefill_tokens,
+                long_mixed_prefill_tokens, long_prefill_threshold,
+                idle_prefill_tokens, prefill_quantum);
+            std::printf("[parallel] %d decode slots, up to %d packed prefills "
+                        "(mixed short/long %d/%d at >=%d tokens, "
+                        "idle %d, quantum %d), "
                         "pool %u blocks x %u tokens"
                         " (%lld shared tokens, per-seq max_ctx %d)\n",
                         n_slots, max_concurrent_prefills,
+                        mixed_prefill_tokens, long_mixed_prefill_tokens,
+                        long_prefill_threshold, idle_prefill_tokens, prefill_quantum,
                         paged_kv_pool_->physical_block_count(),
                         paged_kv_pool_->block_size(),
                         (long long)pool_tokens, cfg_.device.max_ctx);

@@ -115,6 +115,7 @@ public:
     int decoding_count() const;
     bool is_active(int slot) const;
     bool is_prefilling(int slot) const;
+    bool has_prefill_prompt_at_least(int tokens) const;
     Qwen35Slot & slot(int i) { return slots_[(size_t)i]; }
     const Qwen35Slot & slot(int i) const { return slots_[(size_t)i]; }
 
