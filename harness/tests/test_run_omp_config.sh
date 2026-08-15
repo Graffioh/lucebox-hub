@@ -92,6 +92,35 @@ grep -Fxq 'OMP_PROFILE=' "$ARGS_CAPTURE"
 grep -Fxq 'PI_PROFILE=' "$ARGS_CAPTURE"
 grep -Fxq '3600s' "$TIMEOUT_CAPTURE"
 
+INTERACTIVE_ARGS_CAPTURE="$TMP_DIR/omp-interactive-args"
+env -u OMP_TOOLS \
+  PATH="$FAKE_BIN:$PATH" \
+  CLIENT_WORK_DIR="$TMP_DIR/client-work" \
+  RUN_DIR="$TMP_DIR/runs" \
+  STAMP=omp-interactive-contract \
+  TARGET="$FAKE_TARGET" \
+  DRAFT="$FAKE_DRAFT" \
+  FA_WINDOW=1 \
+  DFLASH_SERVER_BIN="$FAKE_SERVER" \
+  OMP_BIN="$FAKE_OMP" \
+  AUTO_INSTALL_CLIENTS=0 \
+  OMP_ARGS_CAPTURE="$INTERACTIVE_ARGS_CAPTURE" \
+  OMP_INTERACTIVE=1 \
+  OMP_INITIAL_PROMPT=interactive-contract-prompt \
+  MODEL_ID=omp-test-model \
+  MAX_CTX=32768 \
+  MAX_TOKENS=768 \
+  bash "$RUN_OMP" >/dev/null
+
+grep -Fq -- '--model lucebox/omp-test-model' "$INTERACTIVE_ARGS_CAPTURE"
+grep -Fq -- 'interactive-contract-prompt' "$INTERACTIVE_ARGS_CAPTURE"
+grep -Fq "PI_CODING_AGENT_DIR=$TMP_DIR/client-work/omp-home/agent" "$INTERACTIVE_ARGS_CAPTURE"
+if grep -Eq -- '(^| )--print( |$)|(^| )--mode json( |$)|(^| )--no-session( |$)|(^| )--tools( |$)' \
+  "$INTERACTIVE_ARGS_CAPTURE"; then
+  echo "interactive OMP must keep the TUI/session and default tool set" >&2
+  exit 1
+fi
+
 if [[ -n "${REAL_OMP_BIN:-}" ]]; then
   real_models="$(
     env \
@@ -127,6 +156,19 @@ set -e
 if [[ "$invalid_rc" -ne 2 ]] ||
    ! grep -Fq 'OMP_TIMEOUT must be a non-negative integer (seconds; 0 disables it)' <<<"$invalid_output"; then
   echo "invalid OMP_TIMEOUT must fail with a useful error before startup" >&2
+  exit 1
+fi
+
+set +e
+invalid_output="$(
+  OMP_BIN="$FAKE_OMP" OMP_INTERACTIVE=invalid \
+    AUTO_INSTALL_CLIENTS=0 bash "$RUN_OMP" 2>&1
+)"
+invalid_rc=$?
+set -e
+if [[ "$invalid_rc" -ne 2 ]] ||
+   ! grep -Fq 'OMP_INTERACTIVE must be 0 or 1' <<<"$invalid_output"; then
+  echo "invalid OMP_INTERACTIVE must fail with a useful error before startup" >&2
   exit 1
 fi
 

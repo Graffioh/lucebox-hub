@@ -63,6 +63,8 @@ LLAMA_CACHE_TYPE_K="${LLAMA_CACHE_TYPE_K:-${CACHE_TYPE_K:-q8_0}}"
 LLAMA_CACHE_TYPE_V="${LLAMA_CACHE_TYPE_V:-${CACHE_TYPE_V:-q8_0}}"
 MAX_TOKENS="${MAX_TOKENS:-2048}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
+TARGET_DEVICE="${TARGET_DEVICE:-}"
+DRAFT_DEVICE="${DRAFT_DEVICE:-${TARGET_DEVICE:-}}"
 
 MODEL_ID="${MODEL_ID:-luce-dflash}"
 API_KEY="${API_KEY:-sk-lucebox}"
@@ -80,6 +82,17 @@ LOG_DIR="$RUN_DIR/$STAMP"
 SERVER_LOG="$LOG_DIR/server.log"
 
 mkdir -p "$LOG_DIR"
+
+# Keep progress messages attached to the launcher's original stderr even when a
+# client invocation redirects its stdout/stderr to a per-client log file.
+exec 3>&2
+HARNESS_PROGRESS="${HARNESS_PROGRESS:-1}"
+
+progress() {
+  if [[ "$HARNESS_PROGRESS" != "0" ]]; then
+    printf '[harness] %s\n' "$*" >&3
+  fi
+}
 
 require_client_binary() {
   local label="$1"
@@ -118,11 +131,45 @@ run_with_timeout() {
     echo "client timeout must be a non-negative integer (seconds; 0 disables it)" >&2
     return 2
   fi
+  local command_name
+  command_name="$(basename "$1")"
+  if [[ "$command_name" == "env" ]]; then
+    local arg
+    for arg in "${@:2}"; do
+      if [[ "$arg" != *=* ]]; then
+        command_name="$(basename "$arg")"
+        break
+      fi
+    done
+  fi
+  local timeout_label="${timeout_seconds}s"
+  if [[ "$timeout_seconds" == "0" ]]; then
+    timeout_label="disabled"
+  fi
+  progress "running $command_name (timeout: $timeout_label; logs: $LOG_DIR)"
+
+  local started_at heartbeat_pid rc elapsed
+  started_at="$(date +%s)"
+  (
+    while sleep 10; do
+      elapsed=$(( $(date +%s) - started_at ))
+      progress "$command_name still running (${elapsed}s elapsed)"
+    done
+  ) &
+  heartbeat_pid=$!
+
   if [[ "$timeout_seconds" == "0" ]]; then
     "$@"
+    rc=$?
   else
     timeout "${timeout_seconds}s" "$@"
+    rc=$?
   fi
+  kill "$heartbeat_pid" 2>/dev/null || true
+  wait "$heartbeat_pid" 2>/dev/null || true
+  elapsed=$(( $(date +%s) - started_at ))
+  progress "$command_name finished (rc=$rc, ${elapsed}s elapsed)"
+  return "$rc"
 }
 
 draft_enabled() {
@@ -130,6 +177,7 @@ draft_enabled() {
 }
 
 start_lucebox_server() {
+  progress "starting $MODEL_SERVER server (log: $SERVER_LOG)"
   if [[ "$MODEL_SERVER" == "llamacpp" ]]; then
     start_llamacpp_server
     return
@@ -177,10 +225,18 @@ start_dflash_native_server() {
   if [[ -n "$FA_WINDOW" ]] && [[ "$FA_WINDOW" != "0" ]]; then
     fa_args=(--fa-window "$FA_WINDOW")
   fi
+  local device_args=()
+  if [[ -n "$TARGET_DEVICE" ]]; then
+    device_args+=(--target-device "$TARGET_DEVICE")
+  fi
+  if [[ -n "$DRAFT_DEVICE" ]]; then
+    device_args+=(--draft-device "$DRAFT_DEVICE")
+  fi
   # Export KV cache type env vars for the C++ server to pick up (only when
   # explicitly requested: the per-axis envs override family defaults).
   if [[ -n "$CACHE_TYPE_K" ]]; then export DFLASH27B_KV_K="$CACHE_TYPE_K"; fi
   if [[ -n "$CACHE_TYPE_V" ]]; then export DFLASH27B_KV_V="$CACHE_TYPE_V"; fi
+  progress "server placement: target=${TARGET_DEVICE:-auto:0} draft=${DRAFT_DEVICE:-auto:0} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-unset}"
   "$DFLASH_SERVER_BIN" "$TARGET" \
     "${draft_args[@]}" \
     --host "$HOST" \
@@ -188,6 +244,7 @@ start_dflash_native_server() {
     --max-ctx "$MAX_CTX" \
     --max-tokens "$MAX_TOKENS" \
     --model-name "$MODEL_ID" \
+    "${device_args[@]}" \
     "${ddtree_args[@]}" \
     "${fa_args[@]}" \
     "${extra_args[@]}" \
@@ -264,9 +321,14 @@ start_llamacpp_server() {
 }
 
 wait_lucebox_server() {
-  for _ in $(seq 1 300); do
+  progress "waiting for server health at $BASE_URL/health"
+  for attempt in $(seq 1 300); do
     if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
+      progress "server is healthy"
       return 0
+    fi
+    if (( attempt % 10 == 0 )); then
+      progress "server still starting (${attempt}s elapsed; log: $SERVER_LOG)"
     fi
     sleep 1
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -304,5 +366,24 @@ finish_report() {
   echo "--- server tail ---"
   tail -n 120 "$SERVER_LOG" || true
   echo "--- gpu ---"
-  nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader || true
+  local resolved_backend="${TARGET_DEVICE%%:*}"
+  if [[ -z "$TARGET_DEVICE" ]] && grep -Eq 'target_device[[:space:]]*=[[:space:]]*hip:' "$SERVER_LOG"; then
+    resolved_backend="hip"
+  elif [[ -z "$TARGET_DEVICE" ]] && grep -Eq 'target_device[[:space:]]*=[[:space:]]*cuda:' "$SERVER_LOG"; then
+    resolved_backend="cuda"
+  fi
+  if [[ "$resolved_backend" == "hip" ]]; then
+    if command -v rocm-smi >/dev/null 2>&1; then
+      local rocm_device_args=()
+      if [[ "${HIP_VISIBLE_DEVICES:-}" =~ ^[0-9]+$ ]]; then
+        rocm_device_args=(--device "$HIP_VISIBLE_DEVICES")
+      fi
+      rocm-smi "${rocm_device_args[@]}" --showproductname --showuse --showmeminfo vram 2>/dev/null || true
+    else
+      echo "rocm-smi not found"
+    fi
+  else
+    nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null || \
+      echo "nvidia-smi unavailable"
+  fi
 }

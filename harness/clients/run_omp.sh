@@ -6,9 +6,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${BUDGET:=22}"
 : "${VERIFY_MODE:=ddtree}"
 : "${EXTRA_SERVER_ARGS:=--lazy-draft}"
-: "${OMP_TOOLS:=read,grep,glob}"
 : "${OMP_TIMEOUT:=3600}"
 : "${OMP_STREAM_IDLE_TIMEOUT_MS:=3600000}"
+: "${OMP_INTERACTIVE:=0}"
+if [[ -z "${OMP_TOOLS+x}" ]]; then
+  if [[ "$OMP_INTERACTIVE" == "1" ]]; then
+    OMP_TOOLS=""
+  else
+    OMP_TOOLS="read,grep,glob"
+  fi
+fi
 if [[ ! "$OMP_TIMEOUT" =~ ^[0-9]+$ ]]; then
   echo "OMP_TIMEOUT must be a non-negative integer (seconds; 0 disables it)" >&2
   exit 2
@@ -17,12 +24,20 @@ if [[ ! "$OMP_STREAM_IDLE_TIMEOUT_MS" =~ ^[0-9]+$ ]]; then
   echo "OMP_STREAM_IDLE_TIMEOUT_MS must be a non-negative integer (0 disables OMP's stream watchdog)" >&2
   exit 2
 fi
+if [[ "$OMP_INTERACTIVE" != "0" && "$OMP_INTERACTIVE" != "1" ]]; then
+  echo "OMP_INTERACTIVE must be 0 or 1" >&2
+  exit 2
+fi
 source "$SCRIPT_DIR/common.sh"
 
 CLIENT_OUT="$LOG_DIR/omp.out"
 OMP_BIN="${OMP_BIN:-$CLIENT_WORK_DIR/clients/omp/bin/omp}"
 require_client_binary "OMP" "$OMP_BIN" "omp" "OMP_BIN"
-HOME_DIR="$LOG_DIR/omp-home"
+if [[ "$OMP_INTERACTIVE" == "1" ]]; then
+  HOME_DIR="${OMP_HOME_DIR:-$CLIENT_WORK_DIR/omp-home}"
+else
+  HOME_DIR="$LOG_DIR/omp-home"
+fi
 AGENT_DIR="$HOME_DIR/agent"
 mkdir -p "$AGENT_DIR" "$HOME_DIR/sessions"
 
@@ -68,21 +83,34 @@ omp_env=(
 omp_cmd=(
   "$OMP_BIN"
   --model "lucebox/$MODEL_ID"
-  --print
-  --mode json
-  --tools "$OMP_TOOLS"
-  --no-session
-  --no-extensions
-  --no-skills
-  --no-rules
-  --no-title
-  "$PROMPT"
 )
+if [[ "$OMP_INTERACTIVE" == "0" ]]; then
+  omp_cmd+=(--print --mode json)
+fi
+if [[ -n "$OMP_TOOLS" ]]; then
+  omp_cmd+=(--tools "$OMP_TOOLS")
+fi
+if [[ "$OMP_INTERACTIVE" == "0" ]]; then
+  omp_cmd+=(--no-session)
+fi
+omp_cmd+=(--no-extensions --no-skills --no-rules --no-title)
+if [[ "$OMP_INTERACTIVE" == "0" ]]; then
+  omp_cmd+=("$PROMPT")
+elif [[ -n "${OMP_INITIAL_PROMPT:-}" ]]; then
+  omp_cmd+=("$OMP_INITIAL_PROMPT")
+fi
 
 set +e
-run_with_timeout "$OMP_TIMEOUT" env "${omp_env[@]}" "${omp_cmd[@]}" \
-  < /dev/null > "$CLIENT_OUT" 2>&1
-RC=$?
+if [[ "$OMP_INTERACTIVE" == "1" ]]; then
+  progress "opening interactive OMP; exit OMP to stop the server"
+  env "${omp_env[@]}" "${omp_cmd[@]}"
+  RC=$?
+  printf 'Interactive OMP terminal output was not captured.\n' > "$CLIENT_OUT"
+else
+  run_with_timeout "$OMP_TIMEOUT" env "${omp_env[@]}" "${omp_cmd[@]}" \
+    < /dev/null > "$CLIENT_OUT" 2>&1
+  RC=$?
+fi
 set -e
 
 finish_report "$CLIENT_OUT" "$RC"

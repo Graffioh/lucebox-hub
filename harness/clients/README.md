@@ -50,6 +50,45 @@ MAX_CTX=32768 MAX_TOKENS=512 \
 harness/clients/run_codex.sh
 ```
 
+## GPU selection
+
+All launchers inherit the standard runtime visibility variables and accept the
+server's explicit placement names through `TARGET_DEVICE` and `DRAFT_DEVICE`.
+When `DRAFT_DEVICE` is omitted, it follows `TARGET_DEVICE`. Device numbers are
+in the runtime-visible namespace, so pinning one physical GPU makes it device
+zero inside the server:
+
+```bash
+# NVIDIA GPU 0, using a CUDA-built server.
+CUDA_VISIBLE_DEVICES=0 \
+DFLASH_SERVER_BIN=server/build-cuda/dflash_server \
+TARGET_DEVICE=cuda:0 \
+harness/clients/run_omp.sh
+
+# Physical HIP GPU 1, exposed as hip:0 inside a dual-architecture HIP build.
+HIP_VISIBLE_DEVICES=1 \
+DFLASH_SERVER_BIN=server/build-hip/dflash_server \
+TARGET_DEVICE=hip:0 \
+harness/clients/run_omp.sh
+```
+
+CUDA and HIP servers are different build artifacts. On a host with Strix Halo
+(`gfx1151`) and an R9700 (`gfx1201`), one HIP build can contain code objects for
+both architectures:
+
+```bash
+cmake -S server -B server/build-hip \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES='gfx1151;gfx1201' \
+  -DDFLASH27B_HIP_SM80_EQUIV=ON
+cmake --build server/build-hip --target dflash_server -j"$(nproc)"
+```
+
+Use `rocm-smi --showproductname` to confirm physical HIP indices. Avoid setting
+both CUDA and HIP visibility variables for a single-backend run; select the
+matching server binary and visibility variable together.
+
 The C++ server is expected to handle the same client protocol shapes covered by
 these launchers and probes: OpenAI Chat Completions, streaming chunks, tool
 metadata, OpenAI Responses for Codex and OMP, Anthropic Messages for Claude
@@ -91,6 +130,22 @@ disable that watchdog. Override either when needed:
 OMP_TIMEOUT=0 OMP_STREAM_IDLE_TIMEOUT_MS=7200000 \
   harness/clients/run_omp.sh
 ```
+
+The default is a non-interactive compatibility test. For a normal interactive
+OMP session backed by a launcher-managed Lucebox server, set
+`OMP_INTERACTIVE=1`. The TUI remains attached to the terminal, session state is
+stored under `.harness-work/omp-home`, and exiting OMP stops the server. An
+optional `OMP_INITIAL_PROMPT` starts the conversation with a message. Interactive
+mode enables OMP's normal tool set by default; set `OMP_TOOLS` to restrict it:
+
+```bash
+OMP_INTERACTIVE=1 harness/clients/run_omp.sh
+OMP_INTERACTIVE=1 OMP_INITIAL_PROMPT='Explain this repository' \
+  harness/clients/run_omp.sh
+```
+
+`OMP_TIMEOUT` applies only to non-interactive test mode; an interactive session
+runs until you exit OMP or press Ctrl+C.
 
 `PI_TIMEOUT` is Pi's total wall-clock limit in seconds. Its one-hour default
 allows long-context prefill and long generations to finish; set
