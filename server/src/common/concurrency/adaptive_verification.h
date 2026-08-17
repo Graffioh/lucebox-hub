@@ -24,6 +24,9 @@ struct AdaptiveVerificationCandidate {
     double expected_tokens = 1.0;
     double maximum_tokens = 1.0;
     bool calibrated = false;
+    // Cheap request prior used only to order otherwise-unknown candidates.
+    // Measured expected tokens replace it after the first verification.
+    double routing_prior = 0.0;
 };
 
 struct AdaptiveVerificationDecision {
@@ -148,7 +151,10 @@ public:
             int active_requests,
             const std::vector<AdaptiveVerificationCandidate> & candidates,
             int max_speculative_requests =
-                std::numeric_limits<int>::max()) const {
+                std::numeric_limits<int>::max(),
+            bool probe_uncalibrated_with_verifier = false,
+            bool project_cost_from_higher_occupancy = false,
+            bool evaluate_nonconvex_prefixes = false) const {
         AdaptiveVerificationDecision out;
         if (active_requests <= 0 || candidates.empty() ||
             !has_autoregressive_cost(active_requests)) {
@@ -184,6 +190,9 @@ public:
         std::stable_sort(unknown.begin(), unknown.end(),
             [](const AdaptiveVerificationCandidate & a,
                const AdaptiveVerificationCandidate & b) {
+                if (a.routing_prior != b.routing_prior) {
+                    return a.routing_prior > b.routing_prior;
+                }
                 if (a.maximum_tokens != b.maximum_tokens) {
                     return a.maximum_tokens > b.maximum_tokens;
                 }
@@ -205,32 +214,52 @@ public:
         double expected_total = static_cast<double>(active_requests);
         const int prefix_limit = std::max(0, std::min(
             active_requests, max_speculative_requests));
+        auto effective_route_cost = [&](int speculative_requests) {
+            if (has_route_cost(active_requests, speculative_requests)) {
+                return route_cost_us(
+                    active_requests, speculative_requests);
+            }
+            return project_cost_from_higher_occupancy
+                ? projected_route_cost_us(
+                      active_requests, speculative_requests)
+                : std::numeric_limits<double>::infinity();
+        };
+        bool measured_route = false;
         for (int k = 1; k <= static_cast<int>(known.size()) &&
                         k <= prefix_limit; ++k) {
             expected_total += known[(size_t)k - 1].expected_tokens - 1.0;
-            if (!has_route_cost(active_requests, k)) {
-                missing_cost_prefix = k;
-                break;
+            const double route_us = effective_route_cost(k);
+            if (!std::isfinite(route_us)) {
+                if (missing_cost_prefix == 0) missing_cost_prefix = k;
+                if (!evaluate_nonconvex_prefixes) break;
+                continue;
             }
-            const double route_us = route_cost_us(active_requests, k);
+            measured_route = true;
             const double throughput = expected_total / route_us;
-            // DSpark's greedy policy stops at the first non-improving
-            // candidate because candidates are already ranked by survival.
-            if (throughput <= best) break;
-            best = throughput;
-            if (throughput >= required) {
-                admitted_prefix = k;
-                admitted_goodput = throughput;
+            // Request-level route costs can be non-convex: on wide GPUs a
+            // k=3 compact bundle may win even when k=1 and k=2 do not.
+            if (!evaluate_nonconvex_prefixes && throughput <= best) break;
+            if (throughput > best) {
+                best = throughput;
+                if (throughput >= required) {
+                    admitted_prefix = k;
+                    admitted_goodput = throughput;
+                }
             }
         }
 
-        // Uncalibrated requests are never sent through an expensive target
-        // verification merely to discover their value. calibration_request
-        // asks the concrete adapter for its cheap confidence signal instead.
+        // By default, calibration_request asks the concrete adapter for a
+        // cheap confidence signal. Verifier-side calibration is opt-in below
+        // for adapters whose separate confidence pass would duplicate work.
 
         // A calibrated route shape without a hardware sample gets one bounded
-        // probe. Larger prefixes are not explored after a measured decline.
-        if (missing_cost_prefix > 0) {
+        // probe. Grow a measured winning prefix by one, but do not walk every
+        // smaller shape after another measured width has already lost.
+        const bool probe_missing = missing_cost_prefix > 0 &&
+            (!measured_route ||
+             (admitted_prefix > 0 &&
+              missing_cost_prefix == admitted_prefix + 1));
+        if (probe_missing) {
             out.requests.reserve((size_t)missing_cost_prefix);
             for (int i = 0; i < missing_cost_prefix; ++i) {
                 out.requests.push_back(known[(size_t)i].request);
@@ -246,10 +275,74 @@ public:
             }
             out.predicted_gain = admitted_goodput / baseline;
         }
+        // A speculator without a cheap calibrated confidence head can turn a
+        // bounded verification bundle into useful decoding and calibration.
+        // Prefer the executor's widest compact bundle because request-level
+        // route costs can be non-convex. Once sampled, its observed accepted
+        // yield gates later unknown bundles; perfect-acceptance optimism is
+        // used only before a yield sample exists. DDTree uses this at high
+        // occupancy, while DSpark can keep using its confidence head.
+        if (probe_uncalibrated_with_verifier && !unknown.empty() &&
+            !out.exploring &&
+            static_cast<int>(out.requests.size()) < prefix_limit) {
+            const int probe_count = std::min(
+                static_cast<int>(unknown.size()),
+                prefix_limit - static_cast<int>(out.requests.size()));
+            const int probe_prefix =
+                static_cast<int>(out.requests.size()) + probe_count;
+            double optimistic_total =
+                static_cast<double>(active_requests);
+            for (int request : out.requests) {
+                const auto candidate = std::find_if(
+                    known.begin(), known.end(),
+                    [request](const AdaptiveVerificationCandidate & item) {
+                        return item.request == request;
+                    });
+                if (candidate != known.end()) {
+                    optimistic_total += candidate->expected_tokens - 1.0;
+                }
+            }
+            for (int i = 0; i < probe_count; ++i) {
+                optimistic_total +=
+                    unknown[(size_t)i].maximum_tokens - 1.0;
+            }
+            const double probe_route_us =
+                effective_route_cost(probe_prefix);
+            const bool unseen_shape = !std::isfinite(probe_route_us);
+            const bool can_win = unseen_shape ||
+                optimistic_total / probe_route_us >= required;
+            if (can_win) {
+                for (int i = 0; i < probe_count; ++i) {
+                    out.requests.push_back(unknown[(size_t)i].request);
+                }
+                out.calibration_request = -1;
+                out.exploring = true;
+            }
+        }
         return out;
     }
 
 private:
+    double projected_route_cost_us(
+            int active_requests, int speculative_requests) const {
+        if (!has_autoregressive_cost(active_requests)) {
+            return std::numeric_limits<double>::infinity();
+        }
+        for (int higher = active_requests + 1;
+             static_cast<size_t>(higher) < route_cost_known_.size();
+             ++higher) {
+            if (!has_autoregressive_cost(higher) ||
+                !has_route_cost(higher, speculative_requests)) {
+                continue;
+            }
+            const double relative_cost =
+                route_cost_us(higher, speculative_requests) /
+                autoregressive_cost_us(higher);
+            return relative_cost * autoregressive_cost_us(active_requests);
+        }
+        return std::numeric_limits<double>::infinity();
+    }
+
     static AdaptiveVerificationConfig sanitize(
             AdaptiveVerificationConfig config) {
         config.minimum_gain = std::max(1.0, config.minimum_gain);

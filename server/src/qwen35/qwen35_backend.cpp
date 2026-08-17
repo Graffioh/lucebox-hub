@@ -574,7 +574,7 @@ bool Qwen35Backend::init() {
                 std::fprintf(stderr,
                     "[parallel-ddtree] enabled budget=%d width=%d "
                     "mode=one-pass-tree-ar+bounded-replay adaptive=%s "
-                    "policy=ranked-goodput scope=all-concurrency\n",
+                    "policy=ranked-goodput scope=occupancy-aware\n",
                     cfg_.ddtree_budget, tree_width,
                     adaptive && std::atoi(adaptive) == 0 ? "off" : "on");
             }

@@ -122,12 +122,13 @@ private:
     bool ddtree_available(const StepPlan & plan) const;
     bool ddtree_input_eligible(const StepInput & input) const;
     std::optional<double> estimate_ddtree_expected_tokens(
-        const StepInput & input);
+        const StepInput & input, int tree_budget);
     StepResult step_regular(const StepPlan & plan);
     // nullopt means proposal setup failed before target/cache mutation and the
     // caller may safely use the ordinary packed AR path for this iteration.
     std::optional<StepResult> step_ddtree(
-        const StepPlan & speculative_plan, const StepPlan & ar_plan);
+        const StepPlan & speculative_plan, const StepPlan & ar_plan,
+        int tree_budget);
 
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
@@ -137,7 +138,9 @@ private:
     int             tree_scratch_stride_ = 0;
     bool            capture_features_ = false;
     AdaptiveVerificationRanker adaptive_verification_;
+    AdaptiveVerificationRanker compact_adaptive_verification_;
     int             adaptive_calibration_cooldown_ = 0;
+    std::vector<uint8_t> compact_tree_cohort_;
     ggml_context *  feature_view_ctx_ = nullptr;
     std::vector<DraftFeatureMirror> slot_feature_mirrors_;
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;

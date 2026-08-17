@@ -414,8 +414,9 @@ struct TargetCache {
     std::vector<ggml_tensor *> conv_input_cache;    // size = n_delta (48)
 
     // Bounded concurrent-tree checkpoint domain. A packed tree row is
-    // sequence-major, so recurrent checkpoint t for compact tree lane s lives
-    // at s*tree_capture_width+t. Keeping this lane count independent from the
+    // sequence-major. The allocation reserves tree_capture_width rows per
+    // lane, while a runtime width T <= tree_capture_width writes the active
+    // packed prefix at s*T+t. Keeping this lane count independent from the
     // physical serving-slot count lets an all-C adaptive route directly commit
     // a small profitable subset without reserving T*C recurrent states.
     int tree_capture_width = 0;

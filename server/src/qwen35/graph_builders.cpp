@@ -753,7 +753,7 @@ bool build_target_step_paged_tree(
         return false;
     }
     if (capture_direct_commit &&
-        (cache.tree_capture_width != tree_width ||
+        (cache.tree_capture_width < tree_width ||
          cache.tree_capture_lanes < n_tree_seqs ||
          cache.target_feat_tree_scratch_base <= 0 ||
          cache.ssm_intermediate.empty() ||

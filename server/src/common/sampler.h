@@ -25,6 +25,10 @@ struct SamplerCfg {
     float    rep_pen    = 1.0f;     // multiplicative repetition penalty (HF-style)
     int      rep_window = 256;
     uint64_t seed       = 0;
+    // Cold-start speculation prior: -1 conversational/creative, 0 neutral,
+    // +1 structured/code. It affects admission only; measured goodput remains
+    // authoritative. Non-HTTP callers naturally retain the neutral default.
+    int8_t   speculation_prompt_hint = 0;
 
     // OpenAI-style additive penalties (applied per-token to logits before softmax).
     // frequency_penalty: subtract freq_pen * count(token_in_history) from logit.

@@ -1,5 +1,6 @@
 #include "common/concurrency/adaptive_verification.h"
 #include "common/concurrency/speculation_goodput.h"
+#include "common/concurrency/speculation_prompt_prior.h"
 #include "host_check.h"
 
 #include <cstdio>
@@ -9,6 +10,17 @@ using namespace dflash::common;
 static int g_checks = 0;
 
 int main() {
+    // The cold-start prior separates obvious structured/code requests from
+    // conversational writing while leaving ambiguous requests neutral.
+    {
+        CHECK(speculation_prompt_hint(
+                  "Complete this Python function:\n\ndef solve(values):") == 1);
+        CHECK(speculation_prompt_hint(
+                  "Chatting casually, write a story and avoid code.") == -1);
+        CHECK(speculation_prompt_hint(
+                  "What happened during the Apollo 11 mission?") == 0);
+    }
+
     // Cold start measures one real speculative step and one neighboring AR
     // step, then keeps the route with higher useful-token goodput.
     {
@@ -182,6 +194,84 @@ int main() {
             ranker.select(16, candidates);
         CHECK(decision.requests.empty());
         CHECK(decision.calibration_request == 1);
+    }
+
+    // A concrete adapter may calibrate a bounded compact bundle inside useful
+    // verification. The first unseen route probes up to executor capacity,
+    // never the whole unknown cohort.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(8, 100.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {5, 1.0, 9.0, false, 1.0},
+            {2, 1.0, 9.0, false, -1.0},
+        };
+        const AdaptiveVerificationDecision probe =
+            ranker.select(8, candidates, 3,
+                          /*probe_uncalibrated_with_verifier=*/true);
+        CHECK(probe.exploring);
+        CHECK(probe.requests.size() == 2);
+        CHECK(probe.requests[0] == 5);
+        CHECK(probe.requests[1] == 2);
+        CHECK(probe.calibration_request == -1);
+    }
+
+    // A losing route ratio suppresses repeated probes as occupancy falls.
+    // Even perfect acceptance cannot make this projected route beat AR.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(16, 100.0);
+        ranker.observe_route(16, 1, 200.0);
+        ranker.observe_autoregressive(15, 95.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {7, 1.0, 9.0, false},
+        };
+        const AdaptiveVerificationDecision decision =
+            ranker.select(15, candidates, 3,
+                          /*probe_uncalibrated_with_verifier=*/true,
+                          /*project_cost_from_higher_occupancy=*/true);
+        CHECK(!decision.exploring);
+        CHECK(decision.requests.empty());
+        CHECK(decision.calibration_request == 7);
+    }
+    // A profitable measured route ratio can rank calibrated requests after
+    // occupancy drops, without spending a fresh hardware probe.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(8, 100.0);
+        ranker.observe_route(8, 1, 80.0);
+        ranker.observe_autoregressive(7, 90.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {12, 4.0, 9.0, true},
+        };
+        const AdaptiveVerificationDecision decision =
+            ranker.select(7, candidates, 3,
+                          /*probe_uncalibrated_with_verifier=*/false,
+                          /*project_cost_from_higher_occupancy=*/true);
+        CHECK(!decision.exploring);
+        CHECK(decision.requests.size() == 1);
+        CHECK(decision.requests[0] == 12);
+    }
+
+    // Prefix widths are compared independently because hardware occupancy can
+    // make k=3 profitable even when the measured k=1 route loses.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(8, 100.0);
+        ranker.observe_route(8, 1, 120.0);
+        ranker.observe_route(8, 3, 80.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {1, 4.0, 9.0, true},
+            {2, 4.0, 9.0, true},
+            {3, 4.0, 9.0, true},
+        };
+        const AdaptiveVerificationDecision decision =
+            ranker.select(8, candidates, 3,
+                          /*probe_uncalibrated_with_verifier=*/false,
+                          /*project_cost_from_higher_occupancy=*/false,
+                          /*evaluate_nonconvex_prefixes=*/true);
+        CHECK(!decision.exploring);
+        CHECK(decision.requests.size() == 3);
     }
 
     // There is no concurrency cutoff: when one request pays for the route at
