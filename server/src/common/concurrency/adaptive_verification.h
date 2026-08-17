@@ -72,6 +72,11 @@ struct AdaptiveVerificationConfig {
     // Shared evidence ranks a new request after the minimum above, but its
     // yield magnitude is shrunk toward AR until this many outcomes exist.
     std::size_t routing_prior_full_weight_samples = 8;
+    // A continuous-backlog scheduler may optimize aggregate output after a
+    // routing-prior bucket has accumulated this many target-verified outcomes.
+    // This is deliberately stronger than cold ordering, but does not count as
+    // request-local proof for closed-cohort AR-peer protection.
+    std::size_t routing_prior_peer_guard_samples = 6;
     double cost_ewma_alpha = 0.35;
 };
 
@@ -80,6 +85,13 @@ inline bool adaptive_verification_can_relax_peer_guard(
     return active_requests > 0 && verifier_request_lanes > 0 &&
         static_cast<std::int64_t>(active_requests) <=
             2 * static_cast<std::int64_t>(verifier_request_lanes) + 1;
+}
+
+inline bool adaptive_verification_can_extend_stable_cohort(
+        int active_requests, int verifier_request_lanes) {
+    return active_requests > 0 && verifier_request_lanes > 0 &&
+        static_cast<std::int64_t>(active_requests) <=
+            3 * static_cast<std::int64_t>(verifier_request_lanes);
 }
 
 // Convert conditional survival confidence into expected useful tokens:
@@ -109,6 +121,7 @@ public:
     void reset() {
         route_cost_us_.clear();
         route_cost_known_.clear();
+        route_cost_samples_.clear();
         request_yield_.clear();
         routing_prior_yield_.clear();
     }
@@ -189,8 +202,36 @@ public:
         return it == routing_prior_yield_.end() ? 0 : it->second.samples;
     }
 
+    bool has_stable_routing_prior_yield(double routing_prior) const {
+        if (!std::isfinite(routing_prior)) return false;
+        const auto it = routing_prior_yield_.find(routing_prior);
+        return it != routing_prior_yield_.end() &&
+            it->second.samples >=
+                config_.routing_prior_peer_guard_samples &&
+            has_useful_yield(it->second.expected_tokens);
+    }
+
+    bool forms_stable_routing_prior_cohort(
+            const std::vector<AdaptiveVerificationCandidate> & candidates)
+            const {
+        if (candidates.empty()) return false;
+        double minimum = std::numeric_limits<double>::infinity();
+        double maximum = 1.0;
+        for (const AdaptiveVerificationCandidate & candidate : candidates) {
+            if (!has_stable_routing_prior_yield(candidate.routing_prior)) {
+                return false;
+            }
+            const auto it = routing_prior_yield_.find(candidate.routing_prior);
+            minimum = std::min(minimum, it->second.expected_tokens);
+            maximum = std::max(maximum, it->second.expected_tokens);
+        }
+        return minimum >=
+            config_.homogeneous_minimum_relative_yield * maximum;
+    }
+
     std::optional<AdaptiveVerificationYieldEstimate> estimate_request_yield(
-            std::uint64_t request, double routing_prior) const {
+            std::uint64_t request, double routing_prior,
+            bool trust_stable_routing_prior = false) const {
         const auto request_it = request_yield_.find(request);
         const auto prior_it = std::isfinite(routing_prior)
             ? routing_prior_yield_.find(routing_prior)
@@ -201,10 +242,16 @@ public:
         if (!has_request && !has_prior) return std::nullopt;
 
         AdaptiveVerificationYieldEstimate out;
-        const double prior_weight = std::min(
-            1.0, static_cast<double>(prior_it->second.samples) /
-                static_cast<double>(
-                    config_.routing_prior_full_weight_samples));
+        const bool stable_backlog_prior =
+            trust_stable_routing_prior &&
+            prior_it->second.samples >=
+                config_.routing_prior_peer_guard_samples;
+        const double prior_weight = stable_backlog_prior
+            ? 1.0
+            : std::min(
+                  1.0, static_cast<double>(prior_it->second.samples) /
+                      static_cast<double>(
+                          config_.routing_prior_full_weight_samples));
         const double trusted_prior = 1.0 + prior_weight *
             (prior_it->second.expected_tokens - 1.0);
         if (!has_request) {
@@ -245,7 +292,8 @@ public:
     }
 
     void observe_route(int active_requests, int speculative_requests,
-                       double elapsed_us) {
+                       double elapsed_us,
+                       bool discard_first_sample = false) {
         if (active_requests <= 0 || speculative_requests < 0 ||
             speculative_requests > active_requests ||
             !std::isfinite(elapsed_us) || elapsed_us <= 0.0) {
@@ -254,22 +302,41 @@ public:
         const size_t rows = static_cast<size_t>(active_requests) + 1;
         if (route_cost_us_.size() < rows) route_cost_us_.resize(rows);
         if (route_cost_known_.size() < rows) route_cost_known_.resize(rows);
+        if (route_cost_samples_.size() < rows) route_cost_samples_.resize(rows);
         std::vector<double> & costs =
             route_cost_us_[(size_t)active_requests];
         std::vector<bool> & known =
             route_cost_known_[(size_t)active_requests];
+        std::vector<std::size_t> & samples =
+            route_cost_samples_[(size_t)active_requests];
         const size_t cols = static_cast<size_t>(speculative_requests) + 1;
         if (costs.size() < cols) costs.resize(cols, 0.0);
         if (known.size() < cols) known.resize(cols, false);
+        if (samples.size() < cols) samples.resize(cols, 0);
         if (!known[(size_t)speculative_requests]) {
             costs[(size_t)speculative_requests] = elapsed_us;
             known[(size_t)speculative_requests] = true;
+            samples[(size_t)speculative_requests] = 1;
+            return;
+        }
+        if (discard_first_sample &&
+            samples[(size_t)speculative_requests] == 1) {
+            // The first execution of a new graph shape includes capture and
+            // allocator warmup. Replace it with the first replay before using
+            // the normal EWMA, rather than permanently teaching the policy
+            // that a profitable steady route is cold-start slow.
+            costs[(size_t)speculative_requests] = elapsed_us;
+            samples[(size_t)speculative_requests] = 2;
             return;
         }
         costs[(size_t)speculative_requests] =
             config_.cost_ewma_alpha * elapsed_us +
             (1.0 - config_.cost_ewma_alpha) *
                 costs[(size_t)speculative_requests];
+        if (samples[(size_t)speculative_requests] <
+            std::numeric_limits<std::size_t>::max()) {
+            ++samples[(size_t)speculative_requests];
+        }
     }
 
     bool has_autoregressive_cost(int batch_size) const {
@@ -308,13 +375,29 @@ public:
             : std::numeric_limits<double>::infinity();
     }
 
+    std::size_t route_cost_samples(int active_requests,
+                                   int speculative_requests) const {
+        return has_route_cost(active_requests, speculative_requests) &&
+                static_cast<std::size_t>(active_requests) <
+                    route_cost_samples_.size() &&
+                static_cast<std::size_t>(speculative_requests) <
+                    route_cost_samples_[(size_t)active_requests].size()
+            ? route_cost_samples_[(size_t)active_requests]
+                                 [(size_t)speculative_requests]
+            : 0;
+    }
+
     bool has_exact_profile(int active_requests,
-                           int max_speculative_requests) const {
+                           int max_speculative_requests,
+                           std::size_t minimum_route_samples = 1) const {
         if (!has_autoregressive_cost(active_requests)) return false;
+        const std::size_t required_samples =
+            std::max<std::size_t>(1, minimum_route_samples);
         const int limit = std::max(0, std::min(
             active_requests, max_speculative_requests));
         for (int k = 1; k <= limit; ++k) {
-            if (!has_route_cost(active_requests, k)) return false;
+            if (route_cost_samples(active_requests, k) <
+                required_samples) return false;
         }
         return true;
     }
@@ -336,7 +419,8 @@ public:
                 std::numeric_limits<int>::max(),
             bool probe_uncalibrated_with_verifier = false,
             bool probe_missing_routes = true,
-            bool enforce_ar_peer_guard = true) const {
+            bool enforce_ar_peer_guard = true,
+            std::size_t minimum_speculative_route_samples = 1) const {
         AdaptiveVerificationDecision out;
         if (active_requests <= 0 || candidates.empty() ||
             !has_autoregressive_cost(active_requests)) {
@@ -460,6 +544,9 @@ public:
             static_cast<double>(active_requests) /
             autoregressive_cost_us(active_requests);
         const double required = baseline * config_.minimum_gain;
+        const std::size_t required_route_samples =
+            std::max<std::size_t>(
+                1, minimum_speculative_route_samples);
         int admitted_prefix = 0;
         double best = baseline;
         double admitted_goodput = baseline;
@@ -471,7 +558,8 @@ public:
         for (int k = 1; k <= static_cast<int>(known.size()) &&
                         k <= prefix_limit; ++k) {
             expected_total += known[(size_t)k - 1].expected_tokens - 1.0;
-            if (!has_route_cost(active_requests, k)) continue;
+            if (route_cost_samples(active_requests, k) <
+                required_route_samples) continue;
             const double route_us = route_cost_us(active_requests, k);
             const double throughput = expected_total / route_us;
             const bool protects_ar_peers = !enforce_ar_peer_guard ||
@@ -502,7 +590,8 @@ public:
         int missing_width = 0;
         for (int k = 1; probe_missing_routes &&
                         k <= probe_candidates; ++k) {
-            if (has_route_cost(active_requests, k)) continue;
+            if (route_cost_samples(active_requests, k) >=
+                required_route_samples) continue;
             missing_width = k;
             break;
         }
@@ -539,7 +628,8 @@ public:
                     known_total +=
                         known[(size_t)k - 2].expected_tokens - 1.0;
                 }
-                if (!has_route_cost(active_requests, k)) continue;
+                if (route_cost_samples(active_requests, k) <
+                    required_route_samples) continue;
                 const double route_us = route_cost_us(active_requests, k);
                 // This is one bounded evidence-gathering step, not a steady
                 // route. It may cross the steady AR-peer guard so an otherwise
@@ -591,6 +681,9 @@ private:
         config.routing_prior_full_weight_samples =
             std::max(config.routing_prior_minimum_samples,
                      config.routing_prior_full_weight_samples);
+        config.routing_prior_peer_guard_samples =
+            std::max(config.routing_prior_minimum_samples,
+                     config.routing_prior_peer_guard_samples);
         config.cost_ewma_alpha =
             std::clamp(config.cost_ewma_alpha, 0.0, 1.0);
         return config;
@@ -599,6 +692,7 @@ private:
     AdaptiveVerificationConfig config_;
     std::vector<std::vector<double>> route_cost_us_;
     std::vector<std::vector<bool>> route_cost_known_;
+    std::vector<std::vector<std::size_t>> route_cost_samples_;
     struct YieldEstimate {
         double expected_tokens = 1.0;
         std::size_t samples = 0;

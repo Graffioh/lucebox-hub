@@ -1393,7 +1393,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     // head while reusing the same selection policy.
     std::vector<AdaptiveVerificationCandidate> candidates;
     candidates.reserve(inputs.size());
-    auto collect_candidates = [&]() {
+    auto collect_candidates = [&](bool trust_stable_routing_prior = false) {
         candidates.clear();
         for (const StepInput & in : inputs) {
             if (!ddtree_input_eligible(in)) continue;
@@ -1401,7 +1401,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             const int prompt_hint = seq.sampler.speculation_prompt_hint;
             const std::optional<AdaptiveVerificationYieldEstimate> estimate =
                 route_ranker.estimate_request_yield(
-                    seq.request_id, static_cast<double>(prompt_hint));
+                    seq.request_id, static_cast<double>(prompt_hint),
+                    trust_stable_routing_prior);
             candidates.push_back({
                 in.slot,
                 estimate ? estimate->expected_tokens : 1.0,
@@ -1425,15 +1426,21 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
               direct_speculation_limit,
               compact_short_shape ? 2 : direct_speculation_limit)
         : static_cast<int>(inputs.size());
-    // Relax peer protection for continuous batching only when the one-pass
-    // verifier can cover roughly half the live cohort. This derives the
-    // boundary from executor capacity rather than a fixed C: a wider DSpark
-    // adapter automatically expands the eligible concurrency range.
-    const bool relax_ar_peer_guard =
-        plan.has_refill_backlog && compact_tree_route &&
+    const int active_requests = static_cast<int>(inputs.size());
+    const bool broad_verifier_coverage =
         adaptive_verification_can_relax_peer_guard(
-            static_cast<int>(inputs.size()), adaptive_speculation_limit);
-    const bool enforce_ar_peer_guard = !relax_ar_peer_guard;
+            active_requests, adaptive_speculation_limit);
+    const bool bounded_stable_cohort_extension =
+        adaptive_verification_can_extend_stable_cohort(
+            active_requests, adaptive_speculation_limit);
+    const bool use_stable_cohort_extension =
+        plan.has_refill_backlog && compact_tree_route &&
+        !broad_verifier_coverage && bounded_stable_cohort_extension;
+    if (use_stable_cohort_extension) {
+        collect_candidates(/*trust_stable_routing_prior=*/true);
+    }
+    bool enforce_ar_peer_guard = true;
+    std::size_t minimum_route_samples = 1;
     if (oracle.forces_selection()) {
         const int force_limit = std::min(
             adaptive_speculation_limit,
@@ -1456,13 +1463,46 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         const int exact_profile_width = std::min(
             adaptive_speculation_limit,
             static_cast<int>(candidates.size()));
+        // Replay a cold graph shape only in the narrow capacity extension that
+        // can plausibly become steady. This avoids doubling rejected probes at
+        // occupancies such as Strix C=16 and leaves established low-C profiles
+        // unchanged.
+        minimum_route_samples =
+            use_stable_cohort_extension &&
+                positive_prompt_candidates == active_requests
+            ? 2 : 1;
         int & calibration_cooldown = compact_tree_route
             ? (compact_short_shape
                   ? compact_short_adaptive_calibration_cooldown_
                   : compact_adaptive_calibration_cooldown_)
             : adaptive_calibration_cooldown_;
         const bool exact_profile_ready = route_ranker.has_exact_profile(
-            static_cast<int>(inputs.size()), exact_profile_width);
+            static_cast<int>(inputs.size()), exact_profile_width,
+            minimum_route_samples);
+        // A closed cohort keeps request-local AR-peer protection. Continuous
+        // backlog may instead optimize aggregate output once either verifier
+        // coverage is broad enough or target-verified outcomes have made a
+        // useful routing-prior bucket stable. Exact route costs still decide
+        // whether speculation wins, so the same evidence can unlock C=8 while
+        // an unprofitable C=16 profile remains AR. A future speculator supplies
+        // its own work-bucket ranker and inherits the same rule.
+        const bool has_stable_backlog_cohort =
+            plan.has_refill_backlog && exact_profile_ready &&
+            route_ranker.forms_stable_routing_prior_cohort(candidates);
+        const bool has_stable_backlog_candidate =
+            plan.has_refill_backlog && exact_profile_ready &&
+            std::any_of(
+                candidates.begin(), candidates.end(),
+                [&](const AdaptiveVerificationCandidate & candidate) {
+                    return route_ranker.has_stable_routing_prior_yield(
+                        candidate.routing_prior);
+                });
+        const bool relax_ar_peer_guard =
+            plan.has_refill_backlog && compact_tree_route &&
+            (broad_verifier_coverage ||
+             (bounded_stable_cohort_extension &&
+              has_stable_backlog_cohort));
+        enforce_ar_peer_guard = !relax_ar_peer_guard;
         const bool exact_profile_started =
             route_ranker.has_speculative_profile_sample(
                 static_cast<int>(inputs.size()), exact_profile_width);
@@ -1482,6 +1522,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         const bool prompt_prior_marks_mixed =
             positive_prompt_candidates > 0 &&
             positive_prompt_candidates < static_cast<int>(inputs.size());
+        const bool suppress_uncovered_mixed_calibration =
+            exact_profile_ready && prompt_prior_marks_mixed &&
+            !broad_verifier_coverage && has_stable_backlog_candidate;
         if (!exact_profile_ready || inputs.size() <= 3) {
             calibration_cooldown = 0;
         } else if (calibration_cooldown > 0) {
@@ -1494,6 +1537,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         // existing all-speculative exception.
         const bool verifier_side_calibration =
             compact_tree_route && probe_missing_routes &&
+            !suppress_uncovered_mixed_calibration &&
             (!exact_profile_ready ||
              (calibration_cooldown == 0 &&
               (plan.has_refill_backlog || !prompt_prior_marks_mixed)));
@@ -1525,7 +1569,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             static_cast<int>(inputs.size()), *decision_candidates,
             adaptive_speculation_limit, verifier_side_calibration,
             probe_missing_routes,
-            enforce_ar_peer_guard);
+            enforce_ar_peer_guard, minimum_route_samples);
         if (compact_tree_route && exact_profile_ready &&
             verifier_side_calibration && decision.exploring) {
             calibration_cooldown =
@@ -1559,7 +1603,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                             adaptive_speculation_limit,
                             /*probe_uncalibrated_with_verifier=*/false,
                             /*probe_missing_routes=*/false,
-                            enforce_ar_peer_guard);
+                            enforce_ar_peer_guard,
+                            minimum_route_samples);
                     if (inputs.size() > 3 && exact_profile_ready &&
                         static_cast<int>(steady_after.requests.size()) >=
                             exact_profile_width) {
@@ -1575,7 +1620,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                         adaptive_speculation_limit,
                         verifier_side_calibration,
                         probe_missing_routes,
-                        enforce_ar_peer_guard);
+                        enforce_ar_peer_guard,
+                        minimum_route_samples);
                 }
             }
         }
@@ -1640,7 +1686,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
 
     if (adaptive_enabled && !oracle.forces_selection()) {
         route_ranker.observe_route(
-            static_cast<int>(inputs.size()), speculative_count, route_us);
+            static_cast<int>(inputs.size()), speculative_count, route_us,
+            /*discard_first_sample=*/
+                speculative_count > 0 && minimum_route_samples > 1);
     }
     if (decision.exploring && !speculative_plan.decode.empty()) {
         std::fprintf(stderr,

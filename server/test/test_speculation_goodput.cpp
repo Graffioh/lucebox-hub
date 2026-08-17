@@ -319,6 +319,12 @@ int main() {
         CHECK(!adaptive_verification_can_relax_peer_guard(8, 3));
         CHECK(adaptive_verification_can_relax_peer_guard(16, 8));
         CHECK(!adaptive_verification_can_relax_peer_guard(1, 0));
+        CHECK(adaptive_verification_can_extend_stable_cohort(8, 3));
+        CHECK(adaptive_verification_can_extend_stable_cohort(9, 3));
+        CHECK(!adaptive_verification_can_extend_stable_cohort(10, 3));
+        CHECK(!adaptive_verification_can_extend_stable_cohort(16, 3));
+        CHECK(adaptive_verification_can_extend_stable_cohort(16, 6));
+        CHECK(!adaptive_verification_can_extend_stable_cohort(1, 0));
     }
 
     // Timings from a neighboring occupancy never stand in for the exact-C
@@ -335,6 +341,28 @@ int main() {
         CHECK(decision.requests.empty());
         CHECK(!decision.exploring);
         CHECK(!ranker.has_exact_profile(7, 1));
+    }
+
+    // The first graph-shape execution is a capture sample. A backlog profile
+    // can require a second replay, which replaces that cold timing before the
+    // normal EWMA begins.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(8, 100.0);
+        ranker.observe_route(8, 1, 250.0);
+        CHECK(ranker.route_cost_samples(8, 1) == 1);
+        CHECK(ranker.route_cost_us(8, 1) == 250.0);
+        CHECK(ranker.has_exact_profile(8, 1));
+        CHECK(!ranker.has_exact_profile(8, 2, 0));
+        CHECK(!ranker.has_exact_profile(8, 1, 2));
+        ranker.observe_route(
+            8, 1, 100.0, /*discard_first_sample=*/true);
+        CHECK(ranker.route_cost_samples(8, 1) == 2);
+        CHECK(ranker.route_cost_us(8, 1) == 100.0);
+        CHECK(ranker.has_exact_profile(8, 1, 2));
+        ranker.observe_route(8, 1, 200.0);
+        CHECK(ranker.route_cost_samples(8, 1) == 3);
+        CHECK(std::abs(ranker.route_cost_us(8, 1) - 135.0) < 1e-9);
     }
 
     // Proven high-yield peers rotate scarce verifier lanes toward the request
@@ -401,7 +429,9 @@ int main() {
         ranker.observe_routing_prior_yield(1.0, 6.0);
         CHECK(ranker.routing_prior_expected_tokens(1.0).value() == 5.0);
         CHECK(ranker.routing_prior_yield_samples(1.0) == 4);
+        CHECK(!ranker.has_stable_routing_prior_yield(1.0));
         CHECK(!ranker.routing_prior_expected_tokens(-1.0).has_value());
+        CHECK(!ranker.has_stable_routing_prior_yield(-1.0));
 
         // Shared yield magnitude itself starts conservatively shrunk toward
         // AR; four local samples still make the request authoritative.
@@ -418,6 +448,32 @@ int main() {
         const auto local = ranker.estimate_request_yield(98, 1.0);
         CHECK(local.has_value());
         CHECK(local->expected_tokens == 1.0);
+
+        ranker.observe_routing_prior_yield(1.0, 4.0);
+        CHECK(!ranker.has_stable_routing_prior_yield(1.0));
+        ranker.observe_routing_prior_yield(1.0, 6.0);
+        CHECK(ranker.has_stable_routing_prior_yield(1.0));
+        const auto closed_prior =
+            ranker.estimate_request_yield(100, 1.0);
+        const auto backlog_prior =
+            ranker.estimate_request_yield(
+                100, 1.0, /*trust_stable_routing_prior=*/true);
+        CHECK(closed_prior.has_value());
+        CHECK(backlog_prior.has_value());
+        CHECK(closed_prior->expected_tokens == 4.0);
+        CHECK(backlog_prior->expected_tokens == 5.0);
+        for (int i = 0; i < 6; ++i) {
+            ranker.observe_routing_prior_yield(-1.0, 1.25);
+        }
+        CHECK(!ranker.has_stable_routing_prior_yield(-1.0));
+        CHECK(ranker.forms_stable_routing_prior_cohort({
+            {101, 5.0, 9.0, true, 1.0},
+            {102, 5.0, 9.0, true, 1.0},
+        }));
+        CHECK(!ranker.forms_stable_routing_prior_cohort({
+            {101, 5.0, 9.0, true, 1.0},
+            {103, 1.25, 9.0, true, -1.0},
+        }));
 
         // Per-request evidence is local to one proposal-shape ranker and is
         // explicitly forgotten at request retirement.
