@@ -91,6 +91,35 @@ static int env_int_or_default(const char * name, int fallback) {
     return fallback;
 }
 
+static void configure_concurrent_hipblaslt_default(
+        const Qwen35Config & cfg) {
+#if (defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)) && !defined(_WIN32)
+    if (!cfg.paged_attention || cfg.max_concurrency <= 1 ||
+        std::getenv("ROCBLAS_USE_HIPBLASLT") != nullptr) {
+        return;
+    }
+
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, cfg.device.gpu) != cudaSuccess ||
+        std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0) {
+        return;
+    }
+
+    // The concurrent Qwen workload spends most of its time in wide Q4_K
+    // dequantize + GEMM steps. ROCm 7.2's hipBLASLt route is consistently
+    // faster for those gfx1151 shapes. Preserve an explicit environment value
+    // so ROCBLAS_USE_HIPBLASLT=0 remains an opt-out.
+    if (::setenv("ROCBLAS_USE_HIPBLASLT", "1", 0) == 0) {
+        std::fprintf(
+            stderr,
+            "[qwen35] gfx1151 concurrent mode: enabled rocBLAS hipBLASLt "
+            "(set ROCBLAS_USE_HIPBLASLT=0 to disable)\n");
+    }
+#else
+    (void)cfg;
+#endif
+}
+
 static int dflash_min_tokens_floor() {
     static const int value = env_int_or_default("DFLASH_MIN_TOKENS", 0);
     return value;
@@ -138,12 +167,13 @@ static FILE * open_dflash_floor_log() {
 }
 
 // Persistent concurrent-cache bytes that do not scale with the physical
-// paged pool. The estimate mirrors create_target_cache_partial(): one
-// max-context staging K/V, recurrent state for N slots plus one staging slot,
-// target features, paged metadata, Q capture, and the dead-row scratch block.
+// paged pool. The estimate mirrors create_target_cache_partial(): recurrent
+// state for N slots, target features, paged metadata, Q capture, and the
+// dead-row scratch block. Prefill reads the pool directly, so there is no
+// staging K/V or staging recurrent slab to reserve.
 static int64_t concurrent_fixed_cache_bytes(
         const TargetWeights & w, int max_ctx, int n_slots,
-        int64_t kv_bytes_per_token, int max_concurrent_prefills = 1) {
+        int64_t kv_bytes_per_token) {
     const int64_t n_full_attn =
         w.n_layer / w.full_attention_interval;
     const int64_t n_delta = w.n_layer - n_full_attn;
@@ -154,13 +184,8 @@ static int64_t concurrent_fixed_cache_bytes(
         (head_v_dim * head_v_dim * w.ssm_dt_rank +
          (int64_t)(w.ssm_d_conv - 1) * conv_ch) *
         (int64_t)sizeof(float);
-    const int64_t staging_state =
-        state_per_layer * n_delta * (int64_t)(max_concurrent_prefills - 1);
     const int64_t recurrent =
-        state_per_layer * n_delta * (n_slots + 1LL);
-    const int64_t staging_kv =
-        kv_bytes_per_token * paged_token_capacity(max_ctx) *
-        (int64_t)max_concurrent_prefills;
+        state_per_layer * n_delta * (int64_t)n_slots;
     const int64_t target_feat =
         (int64_t)w.n_capture_layers * w.n_embd *
         std::min(max_ctx, 4096) * (int64_t)sizeof(uint16_t);
@@ -172,8 +197,8 @@ static int64_t concurrent_fixed_cache_bytes(
         (int64_t)sizeof(int32_t);
     const int64_t scratch =
         kv_bytes_per_token * PAGED_BLOCK_SIZE;
-    return recurrent + staging_state + staging_kv + target_feat +
-           q_capture + paged_metadata + scratch;
+    return recurrent + target_feat + q_capture +
+           paged_metadata + scratch;
 }
 }  // namespace
 
@@ -217,6 +242,8 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
 // ── init() ──────────────────────────────────────────────────────────────
 
 bool Qwen35Backend::init() {
+    configure_concurrent_hipblaslt_default(cfg_);
+
     const bool use_remote_draft = cfg_.remote_draft.enabled();
     const bool tensor_parallel = cfg_.device.is_tensor_parallel();
     split_gpus_ = !use_remote_draft && cfg_.draft_path &&
@@ -351,9 +378,19 @@ bool Qwen35Backend::init() {
     const int n_slots = concurrent_slots();
     const int max_concurrent_prefills = n_slots > 1
         ? std::clamp(
-              env_int_or_default("DFLASH_MAX_CONCURRENT_PREFILLS", 2),
-              1, 2)
+              env_int_or_default("DFLASH_MAX_CONCURRENT_PREFILLS", 8),
+              1, std::min(n_slots, 8))
         : 1;
+    const int mixed_prefill_tokens = std::max(
+        1, env_int_or_default("DFLASH_MIXED_PREFILL_TOKENS", 2048));
+    const int long_mixed_prefill_tokens = std::max(
+        1, env_int_or_default("DFLASH_LONG_MIXED_PREFILL_TOKENS", 4096));
+    const int long_prefill_threshold = std::max(
+        1, env_int_or_default("DFLASH_LONG_PREFILL_THRESHOLD", 768));
+    const int idle_prefill_tokens = std::max(
+        1, env_int_or_default("DFLASH_IDLE_PREFILL_TOKENS", 4096));
+    const int prefill_quantum = std::max(
+        1, env_int_or_default("DFLASH_PREFILL_ALLOCATION_QUANTUM", 512));
     if (n_slots > 1 && !cfg_.paged_attention) {
         set_last_error("--max-concurrency requires --paged-attention");
         return false;
@@ -379,8 +416,7 @@ bool Qwen35Backend::init() {
             budget.bytes_per_token = kvf_budget.bytes_per_token;
             budget.reserve_bytes = kvf_budget.reserve_bytes;
             budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
-                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
-                max_concurrent_prefills);
+                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token);
             pool_tokens = paged_kv_auto_pool_tokens(
                 cfg_.device.max_ctx, n_slots, budget);
             const int64_t one_context =
@@ -414,8 +450,7 @@ bool Qwen35Backend::init() {
                : kvflash_tokens_);
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
-                             cfg_.paged_attention, n_slots,
-                             max_concurrent_prefills)) {
+                             cfg_.paged_attention, n_slots)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
     }
@@ -450,12 +485,17 @@ bool Qwen35Backend::init() {
             seq_engine_ = std::make_unique<Qwen35SeqEngine>(
                 *this, *paged_kv_pool_, cfg_.device.max_ctx,
                 /*scratch_row=*/pool_tokens,
-                max_concurrent_prefills);  // first row of the scratch block
-            std::printf("[parallel] %d decode slots, %d prefill staging set%s, "
+                max_concurrent_prefills, mixed_prefill_tokens,
+                long_mixed_prefill_tokens, long_prefill_threshold,
+                idle_prefill_tokens, prefill_quantum);
+            std::printf("[parallel] %d decode slots, up to %d packed prefills "
+                        "(mixed short/long %d/%d at >=%d tokens, "
+                        "idle %d, quantum %d), "
                         "pool %u blocks x %u tokens"
                         " (%lld shared tokens, per-seq max_ctx %d)\n",
                         n_slots, max_concurrent_prefills,
-                        max_concurrent_prefills == 1 ? "" : "s",
+                        mixed_prefill_tokens, long_mixed_prefill_tokens,
+                        long_prefill_threshold, idle_prefill_tokens, prefill_quantum,
                         paged_kv_pool_->physical_block_count(),
                         paged_kv_pool_->block_size(),
                         (long long)pool_tokens, cfg_.device.max_ctx);
@@ -692,7 +732,13 @@ int32_t Qwen35Backend::apply_min_tokens_floor(int32_t tok, int generated,
         if (IS_EOS_TOK(v, w_)) continue;
         if (buf[(size_t)v] > best) { best = buf[(size_t)v]; alt = v; }
     }
-    return alt >= 0 ? alt : tok;
+    if (alt < 0) return tok;
+    FILE * log = open_dflash_floor_log();
+    if (log) {
+        std::fprintf(log, "[floor] eos@%d -> alt=%d\n", generated, alt);
+        std::fclose(log);
+    }
+    return alt;
 }
 
 SeqEngine * Qwen35Backend::seq_engine() {

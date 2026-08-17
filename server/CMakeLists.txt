@@ -397,6 +397,7 @@ add_library(dflash_common STATIC
     src/errors.cpp
     src/qwen35/gguf_target_loader.cpp
     src/qwen35/qwen35_target_graph.cpp
+    src/qwen35/qwen35_roctx.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
@@ -1077,6 +1078,19 @@ if(DFLASH27B_TESTS)
         endif()
         target_link_libraries(test_deepseek4_roctx PRIVATE ${CMAKE_DL_LIBS})
         list(APPEND _raw_unit_test_targets test_deepseek4_roctx)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35_roctx.cpp")
+        add_executable(test_qwen35_roctx
+            test/test_qwen35_roctx.cpp
+            src/qwen35/qwen35_roctx.cpp)
+        target_include_directories(test_qwen35_roctx PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_qwen35_roctx PRIVATE
+                DFLASH27B_BACKEND_HIP=1)
+        endif()
+        target_link_libraries(test_qwen35_roctx PRIVATE ${CMAKE_DL_LIBS})
+        list(APPEND _raw_unit_test_targets test_qwen35_roctx)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ggml_rmsnorm_batch.cpp")
         add_executable(test_ggml_rmsnorm_batch test/test_ggml_rmsnorm_batch.cpp)
@@ -1880,6 +1894,16 @@ if(DFLASH27B_TESTS)
         add_test(NAME batched_gdn_cpu COMMAND test_batched_gdn --cpu)
         if(TARGET check)
             add_dependencies(check test_batched_gdn)
+        endif()
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_concat_transpose.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_concat_transpose test/test_concat_transpose.cpp)
+        add_test(NAME concat_transpose COMMAND test_concat_transpose)
+        if(TARGET check)
+            add_dependencies(check test_concat_transpose)
         endif()
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR

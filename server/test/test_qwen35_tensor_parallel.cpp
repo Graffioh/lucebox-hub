@@ -12,7 +12,6 @@ using namespace CppUnitTestFramework;
 namespace {
 struct Qwen35TensorParallelFixture : CommonFixture {
     using CommonFixture::CommonFixture;
-    void expect_staging_cache_lifecycle(ggml_context * ctx);
 };
 }
 
@@ -32,38 +31,12 @@ static bool expect_split(const TargetWeights & weights,
         (state.ne[0] + state.ne[1]) * state.nr[0] == tensor->ne[axis];
 }
 
-void Qwen35TensorParallelFixture::expect_staging_cache_lifecycle(
-        ggml_context * ctx) {
-    ggml_tensor * primary =
-        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    ggml_tensor * extra =
-        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-
-    TargetCache cache;
-    cache.prefill_staging.resize(2);
-    cache.prefill_staging[0] = {{primary}, {primary}, {primary}, {primary}};
-    cache.prefill_staging[1] = {{extra}, {extra}, {extra}, {extra}};
-
-    CHECK(staging_k_for(cache, 0).at(0) == primary);
-    CHECK(staging_k_for(cache, 1).at(0) == extra);
-    CHECK(staging_k_for(cache, -1).empty());
-    CHECK(staging_k_for(cache, 2).empty());
-    CHECK(staging_v_for(cache, -1).empty());
-    CHECK(staging_ssm_for(cache, 2).empty());
-    CHECK(staging_conv_for(cache, 2).empty());
-
-    free_target_cache(cache);
-    CHECK(cache.prefill_staging.empty());
-}
-
 TEST_CASE(Qwen35TensorParallelFixture, tensor_parallel_split_state) {
     ggml_init_params params{};
     params.mem_size = 32 * ggml_tensor_overhead();
     params.no_alloc = true;
     ggml_context * ctx = ggml_init(params);
     REQUIRE(ctx != nullptr);
-
-    expect_staging_cache_lifecycle(ctx);
 
     TargetWeights weights;
 

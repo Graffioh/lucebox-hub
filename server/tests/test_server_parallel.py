@@ -35,19 +35,21 @@ import urllib.error
 
 
 def make_math_prompts(count: int):
-    """Deterministic arithmetic prompts with distinct 3-digit answers.
+    """Deterministic arithmetic prompts for up to 64 isolated streams.
 
-    Sums start at 111 and step by 3 so that no answer is within +/-2 of
-    another (greedy reasoning that decomposes a sum won't casually emit a
-    neighboring stream's answer), and for small counts the operands stay
-    2-digit while every answer is 3-digit, so an answer never collides with
-    an operand echoed from another prompt.
+    Answers occupy the 3-digit range 100..163 while operands occupy the
+    disjoint 2-digit range 50..82.  This matters because the isolation test
+    inspects reasoning as well as final content: a model may echo an operand
+    while working, and that must not look like another stream's answer.
     """
+    if not 0 <= count <= 64:
+        raise ValueError(f"prompt count must be in [0, 64], got {count}")
+
     prompts = []
     for i in range(count):
-        s = 111 + 3 * i
-        a = s // 2
-        b = s - a
+        s = 100 + i
+        a = 50 + i // 2
+        b = 50 + (i + 1) // 2
         prompts.append((f"What is {a}+{b}? Answer with just the number.", str(s)))
     return prompts
 
@@ -170,13 +172,14 @@ class ParallelTestSuite:
                           timeout: float = 600.0):
         """Run one non-streaming chat completion."""
         r = {"ok": False, "error": None, "content": "", "reasoning": "",
-             "usage": {}}
+             "usage": {}, "started_t": None, "finish_t": None}
         results[idx] = r
         try:
             if barrier is not None:
                 barrier.wait(timeout=60)
             if start_delay > 0:
                 time.sleep(start_delay)
+            r["started_t"] = time.monotonic()
             resp = self._req("POST", "/v1/chat/completions",
                              self._chat_body(prompt, max_tokens, stream=False),
                              timeout=timeout)
@@ -184,6 +187,7 @@ class ParallelTestSuite:
             r["content"] = msg.get("content") or ""
             r["reasoning"] = msg.get("reasoning_content") or ""
             r["usage"] = resp.get("usage", {})
+            r["finish_t"] = time.monotonic()
             r["ok"] = True
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")
@@ -314,19 +318,20 @@ class ParallelTestSuite:
 
         answers = [ans for _, ans in prompts]
         for i, r in enumerate(results):
+            combined = self._combined(r)
             # Positive: own answer somewhere in reasoning+content.
             self._check(f"stream {i+1} contains its own answer {answers[i]}",
-                        contains_number(self._combined(r), answers[i]),
+                        contains_number(combined, answers[i]),
                         f"content={r['content']!r} "
                         f"reasoning={r['reasoning'][:200]!r}")
-            # Negative: no other stream's answer in the final content
-            # (content only — reasoning legitimately echoes this prompt's
-            # operands and intermediate sums, content is just the number).
-            leaked = [answers[j] for j in range(n)
-                      if j != i and contains_number(r["content"], answers[j])]
-            self._check(f"stream {i+1} contains no other stream's answer",
-                        not leaked,
-                        f"leaked answers {leaked} in content={r['content']!r}")
+            for j, answer in enumerate(answers):
+                if i == j:
+                    continue
+                self._check(
+                    f"stream {i+1} excludes stream {j+1}'s answer {answer}",
+                    not contains_number(combined, answer),
+                    f"content={r['content']!r} "
+                    f"reasoning={r['reasoning'][:200]!r}")
 
     def test_parallel_nonstream(self):
         """A prompt answered correctly alone must still be answered correctly
@@ -401,13 +406,13 @@ class ParallelTestSuite:
                         f"reasoning={r['reasoning'][:200]!r}")
         print(f"    → {count} requests completed in {elapsed:.1f}s")
 
-    def test_unequal_prefill_staging_leases(self):
-        """A multi-chunk prefill must keep its staging identity after an
+    def test_unequal_packed_prefills(self):
+        """A multi-chunk prefill must keep its slot-local state after an
         earlier short prefill commits and leaves the FIFO head."""
-        print("\n[PAR-5] Unequal prefills retain isolated staging state")
+        print("\n[PAR-5] Unequal prefills retain isolated paged state")
         if self.parallel < 2:
-            self._skip("unequal prefill staging lease",
-                       "--max-concurrency 1: multiple staging sets unavailable")
+            self._skip("unequal packed prefill",
+                       "--max-concurrency 1: packed prefill is unavailable")
             return
 
         short_prompt = "What is 55+56? Answer with just the number."
@@ -418,9 +423,9 @@ class ParallelTestSuite:
             f"Read and then ignore these padding records:\n{filler}\n"
             "What is 4500+4501? Answer with just the number.")
 
-        # Launch both requests close together, with the short request first in
-        # FIFO order. It should finish first while the long request retains
-        # staging set 1.
+        # Bias the short request toward the FIFO head, then assert the observed
+        # completion order below so this test cannot silently cover the reverse
+        # scenario when host scheduling delays either client thread.
         kwargs = [
             {"prompt": short_prompt, "max_tokens": 512,
              "start_delay": 0.0},
@@ -431,6 +436,11 @@ class ParallelTestSuite:
             self._nonstream_worker, 2, kwargs, join_timeout=1800.0)
         if not self._all_completed(results, "unequal-prefill"):
             return
+        self._check(
+            "short prefill commits before the long prefill",
+            results[0]["finish_t"] < results[1]["finish_t"],
+            f"short_finish={results[0]['finish_t']} "
+            f"long_finish={results[1]['finish_t']}")
 
         self._check(
             "short prefill answers 111",
@@ -498,6 +508,18 @@ class ParallelTestSuite:
         b_thread.join(timeout=900)
         a_thread.join(timeout=900)
 
+        if b_thread.is_alive():
+            self._check("stream B completes", False, "worker timed out")
+            return
+        ra = a_res[0]
+        if a_thread.is_alive() or ra is None or not ra["ok"]:
+            self._check(
+                "stream A completes", False,
+                "worker timed out" if a_thread.is_alive() else
+                ("no result" if ra is None else str(ra["error"])))
+            return
+        self._check("stream A completes", True)
+
         rb = b_res[0]
         if rb is None or not rb["ok"] or rb["first_chunk_t"] is None:
             self._check("stream B completes", False,
@@ -515,7 +537,6 @@ class ParallelTestSuite:
         with timeline_lock:
             a_early = [t for t, idx in timeline
                        if idx == 0 and b_started <= t <= early_end]
-        ra = a_res[0]
         if ra["finish_t"] is not None and ra["finish_t"] < early_end:
             self._skip("A kept emitting during B's prefill",
                        "stream A finished before B's window closed")
@@ -538,7 +559,7 @@ class ParallelTestSuite:
         self.test_parallel_isolation()
         self.test_parallel_nonstream()
         self.test_parallel_more_than_slots()
-        self.test_unequal_prefill_staging_leases()
+        self.test_unequal_packed_prefills()
         self.test_parallel_prefill_no_pause()
 
         print("\n" + "=" * 60)

@@ -5705,6 +5705,7 @@ struct ggml_tensor * ggml_paged_attn_ext(
         struct ggml_tensor  * block_table,
         struct ggml_tensor  * kv_seq_lens,
         struct ggml_tensor  * active_slot_ids,
+        struct ggml_tensor  * query_positions,
         float                 scale,
         int                   block_size,
         int                   max_kv_seq_len) {
@@ -5714,6 +5715,10 @@ struct ggml_tensor * ggml_paged_attn_ext(
     GGML_ASSERT(block_table->type == GGML_TYPE_I32);
     GGML_ASSERT(kv_seq_lens->type == GGML_TYPE_I32);
     GGML_ASSERT(active_slot_ids == NULL || active_slot_ids->type == GGML_TYPE_I32);
+    // Ragged causal positions only make sense for compact batches that carry
+    // an explicit row -> block-table-column mapping.
+    GGML_ASSERT(query_positions == NULL || active_slot_ids != NULL);
+    GGML_ASSERT(query_positions == NULL || query_positions->type == GGML_TYPE_I32);
 
     GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0]);
     GGML_ASSERT(k->ne[1] == v->ne[1]);
@@ -5728,8 +5733,15 @@ struct ggml_tensor * ggml_paged_attn_ext(
     GGML_ASSERT(kv_seq_lens->ne[1] == 1 && kv_seq_lens->ne[2] == 1 && kv_seq_lens->ne[3] == 1);
     if (active_slot_ids) {
         GGML_ASSERT(ggml_is_contiguous(active_slot_ids));
+        // Compact/ragged batches: n_query stays decoupled from the number of
+        // physical block-table columns (block_table->ne[1]).
         GGML_ASSERT(active_slot_ids->ne[0] == q->ne[1]);
         GGML_ASSERT(active_slot_ids->ne[1] == 1 && active_slot_ids->ne[2] == 1 && active_slot_ids->ne[3] == 1);
+        if (query_positions) {
+            GGML_ASSERT(ggml_is_contiguous(query_positions));
+            GGML_ASSERT(query_positions->ne[0] == q->ne[1]);
+            GGML_ASSERT(query_positions->ne[1] == 1 && query_positions->ne[2] == 1 && query_positions->ne[3] == 1);
+        }
     } else {
         GGML_ASSERT(block_table->ne[1] == q->ne[1]);
     }
@@ -5752,6 +5764,7 @@ struct ggml_tensor * ggml_paged_attn_ext(
     result->src[3] = block_table;
     result->src[4] = kv_seq_lens;
     result->src[5] = active_slot_ids;
+    result->src[6] = query_positions;
 
     return result;
 }
@@ -6588,7 +6601,6 @@ static struct ggml_tensor * ggml_gated_delta_net_impl(
 
     GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H);
     if (active_slot_ids) {
-        GGML_ASSERT(ggml_is_contiguous(active_slot_ids));
         GGML_ASSERT(active_slot_ids->ne[0] == n_seqs);
         GGML_ASSERT(active_slot_ids->ne[1] == 1 && active_slot_ids->ne[2] == 1 && active_slot_ids->ne[3] == 1);
     } else {
