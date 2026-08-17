@@ -234,6 +234,11 @@ public:
     struct StepPlan {
         std::vector<StepInput>    decode;
         std::vector<PrefillSlice> prefills;
+        // True when completing a live request can immediately admit queued
+        // work. Engines may then optimize sustained goodput rather than the
+        // makespan of the current finite cohort, using measured total output
+        // rate for any mixed route.
+        bool has_refill_backlog = false;
     };
 
     struct StepResult {

@@ -66,9 +66,21 @@ struct AdaptiveVerificationConfig {
     // otherwise scarce verifier lanes create a low-yield AR tail.
     double homogeneous_minimum_relative_yield = 0.60;
     std::size_t homogeneous_minimum_samples = 4;
-    std::size_t routing_prior_minimum_samples = 4;
+    // A complete two-lane verifier profile observes k=1 then k=2, yielding
+    // three request outcomes before any steady route is selected.
+    std::size_t routing_prior_minimum_samples = 3;
+    // Shared evidence ranks a new request after the minimum above, but its
+    // yield magnitude is shrunk toward AR until this many outcomes exist.
+    std::size_t routing_prior_full_weight_samples = 8;
     double cost_ewma_alpha = 0.35;
 };
+
+inline bool adaptive_verification_can_relax_peer_guard(
+        int active_requests, int verifier_request_lanes) {
+    return active_requests > 0 && verifier_request_lanes > 0 &&
+        static_cast<std::int64_t>(active_requests) <=
+            2 * static_cast<std::int64_t>(verifier_request_lanes) + 1;
+}
 
 // Convert conditional survival confidence into expected useful tokens:
 // 1 AR token plus the probability of reaching every speculative prefix.
@@ -189,8 +201,14 @@ public:
         if (!has_request && !has_prior) return std::nullopt;
 
         AdaptiveVerificationYieldEstimate out;
+        const double prior_weight = std::min(
+            1.0, static_cast<double>(prior_it->second.samples) /
+                static_cast<double>(
+                    config_.routing_prior_full_weight_samples));
+        const double trusted_prior = 1.0 + prior_weight *
+            (prior_it->second.expected_tokens - 1.0);
         if (!has_request) {
-            out.expected_tokens = prior_it->second.expected_tokens;
+            out.expected_tokens = trusted_prior;
             out.evidence_samples = 0;
             return out;
         }
@@ -200,7 +218,6 @@ public:
         out.evidence_samples = request_estimate.samples;
         if (!has_prior) return out;
 
-        const YieldEstimate & prior_estimate = prior_it->second;
         if (request_estimate.samples < config_.homogeneous_minimum_samples) {
             // Shrink the first few noisy request observations toward a stable
             // cohort mean. Once request-local evidence is stable, its measured
@@ -210,9 +227,9 @@ public:
                 static_cast<double>(request_estimate.samples) /
                     static_cast<double>(
                         config_.homogeneous_minimum_samples));
-            out.expected_tokens = prior_estimate.expected_tokens +
+            out.expected_tokens = trusted_prior +
                 local_weight * (request_estimate.expected_tokens -
-                                prior_estimate.expected_tokens);
+                                trusted_prior);
         }
         return out;
     }
@@ -318,7 +335,8 @@ public:
             int max_speculative_requests =
                 std::numeric_limits<int>::max(),
             bool probe_uncalibrated_with_verifier = false,
-            bool probe_missing_routes = true) const {
+            bool probe_missing_routes = true,
+            bool enforce_ar_peer_guard = true) const {
         AdaptiveVerificationDecision out;
         if (active_requests <= 0 || candidates.empty() ||
             !has_autoregressive_cost(active_requests)) {
@@ -456,7 +474,8 @@ public:
             if (!has_route_cost(active_requests, k)) continue;
             const double route_us = route_cost_us(active_requests, k);
             const double throughput = expected_total / route_us;
-            const bool protects_ar_peers = k == active_requests ||
+            const bool protects_ar_peers = !enforce_ar_peer_guard ||
+                k == active_requests ||
                 homogeneous_speculative_cohort ||
                 route_us <= config_.maximum_ar_peer_slowdown *
                     autoregressive_cost_us(active_requests);
@@ -569,6 +588,9 @@ private:
             std::max<std::size_t>(1, config.homogeneous_minimum_samples);
         config.routing_prior_minimum_samples =
             std::max<std::size_t>(1, config.routing_prior_minimum_samples);
+        config.routing_prior_full_weight_samples =
+            std::max(config.routing_prior_minimum_samples,
+                     config.routing_prior_full_weight_samples);
         config.cost_ewma_alpha =
             std::clamp(config.cost_ewma_alpha, 0.0, 1.0);
         return config;

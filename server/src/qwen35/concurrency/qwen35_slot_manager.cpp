@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 
 namespace dflash::common {
 
@@ -13,8 +12,6 @@ Qwen35SlotManager::Qwen35SlotManager(
       headroom_tokens_(std::max<int>(pool.block_size(), speculative_headroom)),
       residency_(residency) {
     slots_.assign(pool.max_sequences(), Qwen35Slot{});
-    const char * adaptive = std::getenv("DFLASH_DDTREE_ADAPTIVE");
-    speculation_adaptive_ = !(adaptive && std::atoi(adaptive) == 0);
 }
 
 int Qwen35SlotManager::decoding_count() const {
@@ -207,8 +204,6 @@ SeqEngine::AdmitResult Qwen35SlotManager::admit(
     Qwen35Slot & s = slots_[(size_t)slot];
     s.phase = Qwen35SlotPhase::prefill;
     s.request_id = request_id;
-    s.ddtree_sampled_steps = 0;
-    s.speculation.reset(speculation_adaptive_);
     s.handle = handle;
     s.cur_pos = 0;
     s.prompt_len = prompt_len;
@@ -225,26 +220,6 @@ SeqEngine::AdmitResult Qwen35SlotManager::admit(
     r.status = AdmitStatus::admitted;
     r.slot = slot;
     return r;
-}
-
-bool Qwen35SlotManager::ddtree_speculation_allowed(int slot) const {
-    return is_active(slot) &&
-        slots_[(size_t)slot].speculation.wants_speculation();
-}
-
-SpeculationGoodputTransition Qwen35SlotManager::record_speculation_sample(
-        int slot, double emitted_tokens, double elapsed_us) {
-    if (!is_active(slot)) return SpeculationGoodputTransition::none;
-    Qwen35Slot & s = slots_[(size_t)slot];
-    ++s.ddtree_sampled_steps;
-    return s.speculation.observe_speculation(emitted_tokens, elapsed_us);
-}
-
-SpeculationGoodputTransition Qwen35SlotManager::record_ar_sample(
-        int slot, double elapsed_us) {
-    if (!is_active(slot)) return SpeculationGoodputTransition::none;
-    Qwen35Slot & s = slots_[(size_t)slot];
-    return s.speculation.observe_autoregressive(elapsed_us);
 }
 
 Qwen35SlotManager::PrefillChunk Qwen35SlotManager::append_prefill(

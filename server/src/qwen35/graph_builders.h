@@ -25,6 +25,12 @@ namespace dflash::common {
 
 namespace detail {
 
+// Stable tree-sequence buckets shared by graph validation and the concurrent
+// engine. The direct-request limit rounds capture capacity down so every
+// admitted width stays on the one-pass state-capture path.
+int target_paged_tree_bucket_width(int requested_sequences);
+int target_paged_tree_direct_request_limit(int capture_lanes);
+
 // Qwen's recurrent graph duplicates one small subgraph per ragged sequence.
 // Return a graph capacity that covers every supported concurrent bucket while
 // keeping the legacy allocation for the common <= 8-sequence case.

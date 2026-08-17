@@ -138,9 +138,13 @@ private:
     int             tree_scratch_stride_ = 0;
     bool            capture_features_ = false;
     AdaptiveVerificationRanker adaptive_verification_;
+    AdaptiveVerificationRanker compact_short_adaptive_verification_;
     AdaptiveVerificationRanker compact_adaptive_verification_;
     int             adaptive_calibration_cooldown_ = 0;
+    int             compact_short_adaptive_calibration_cooldown_ = 0;
     int             compact_adaptive_calibration_cooldown_ = 0;
+    // Zero means no sticky compact cohort. Non-zero entries store the exact
+    // DDTree work-shape budget so short and wide observations never mix.
     std::vector<uint8_t> compact_tree_cohort_;
     ggml_context *  feature_view_ctx_ = nullptr;
     std::vector<DraftFeatureMirror> slot_feature_mirrors_;

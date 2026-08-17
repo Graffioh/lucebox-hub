@@ -18,7 +18,6 @@
 
 #include "common/concurrency/paged_kv_pool.h"
 #include "common/concurrency/paged_kv_residency.h"
-#include "common/concurrency/speculation_goodput.h"
 #include "common/sampler.h"
 #include "common/concurrency/seq_engine.h"
 
@@ -66,12 +65,6 @@ struct Qwen35Slot {
             ? (int)(sample_history.size() - (size_t)prompt_len)
             : 0;
     }
-
-    // Route each request from measured useful-token goodput, independently of
-    // the concrete speculator. DDTree records observations today; DSpark can
-    // use the same controller later.
-    SpeculationGoodputController speculation;
-    uint64_t ddtree_sampled_steps = 0;
 
     bool active() const {
         return phase == Qwen35SlotPhase::prefill ||
@@ -153,11 +146,6 @@ public:
                             std::string * error = nullptr);
     void take_residency_telemetry(int slot, SeqEngine::DecodeOutput & out);
 
-    bool ddtree_speculation_allowed(int slot) const;
-    SpeculationGoodputTransition record_speculation_sample(
-        int slot, double emitted_tokens, double elapsed_us);
-    SpeculationGoodputTransition record_ar_sample(int slot, double elapsed_us);
-
     // One-token compatibility wrapper used by ordinary autoregressive decode.
     StepAppend append_token(int slot, int32_t fed_token);
 
@@ -193,7 +181,6 @@ private:
     int max_ctx_ = 0;
     int headroom_tokens_;
     PagedKvResidencyManager * residency_ = nullptr;
-    bool speculation_adaptive_ = true;
     std::vector<Qwen35Slot> slots_;
 };
 

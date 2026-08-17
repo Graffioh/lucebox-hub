@@ -285,6 +285,42 @@ int main() {
         CHECK(ranker.select(5, mixed, 2).requests.size() == 2);
     }
 
+    // A continuous-batching scheduler may optimize total goodput when a
+    // completed request immediately refills its slot. Closed cohorts keep the
+    // AR-peer guard; backlog mode may select the measured goodput winner.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(5, 100.0);
+        ranker.observe_route(5, 2, 140.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {86, 5.0, 5.0, true},
+            {87, 5.0, 5.0, true},
+        };
+        CHECK(ranker.select(
+                  5, candidates, 2,
+                  /*probe_uncalibrated_with_verifier=*/false,
+                  /*probe_missing_routes=*/false)
+                  .requests.empty());
+        const AdaptiveVerificationDecision backlog = ranker.select(
+            5, candidates, 2,
+            /*probe_uncalibrated_with_verifier=*/false,
+            /*probe_missing_routes=*/false,
+            /*enforce_ar_peer_guard=*/false);
+        CHECK(backlog.requests.size() == 2);
+    }
+
+    // Peer-guard relaxation follows verifier capacity rather than a hard-coded
+    // concurrency cutoff. Two lanes cover C=5 but not C=6; a wider executor
+    // raises the boundary automatically.
+    {
+        CHECK(adaptive_verification_can_relax_peer_guard(5, 2));
+        CHECK(!adaptive_verification_can_relax_peer_guard(6, 2));
+        CHECK(adaptive_verification_can_relax_peer_guard(7, 3));
+        CHECK(!adaptive_verification_can_relax_peer_guard(8, 3));
+        CHECK(adaptive_verification_can_relax_peer_guard(16, 8));
+        CHECK(!adaptive_verification_can_relax_peer_guard(1, 0));
+    }
+
     // Timings from a neighboring occupancy never stand in for the exact-C
     // baseline or route profile.
     {
@@ -358,21 +394,24 @@ int main() {
         ranker.observe_routing_prior_yield(1.0, 4.0);
         ranker.observe_routing_prior_yield(1.0, 6.0);
         ranker.observe_routing_prior_yield(1.0, 4.0);
-        CHECK(!ranker.routing_prior_expected_tokens(1.0).has_value());
+        CHECK(std::abs(
+                  ranker.routing_prior_expected_tokens(1.0).value() -
+                  14.0 / 3.0) < 1e-9);
         CHECK(ranker.routing_prior_yield_samples(1.0) == 3);
         ranker.observe_routing_prior_yield(1.0, 6.0);
         CHECK(ranker.routing_prior_expected_tokens(1.0).value() == 5.0);
         CHECK(ranker.routing_prior_yield_samples(1.0) == 4);
         CHECK(!ranker.routing_prior_expected_tokens(-1.0).has_value());
 
-        // Early request observations are shrunk toward the stable cohort, but
-        // four local samples make the request's own magnitude authoritative.
+        // Shared yield magnitude itself starts conservatively shrunk toward
+        // AR; four local samples still make the request authoritative.
+        const double expected[] = {2.5, 2.0, 1.5, 1.0};
         for (int sample = 1; sample <= 4; ++sample) {
             ranker.observe_request_yield(98, 1.0);
             const auto estimate =
                 ranker.estimate_request_yield(98, 1.0);
             CHECK(estimate.has_value());
-            CHECK(estimate->expected_tokens == 5.0 - sample);
+            CHECK(estimate->expected_tokens == expected[sample - 1]);
             CHECK(estimate->evidence_samples ==
                   static_cast<std::size_t>(sample));
         }

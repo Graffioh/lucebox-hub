@@ -55,6 +55,21 @@ TEST_CASE(RecurrentSnapshotFixture, hardens_feature_smoke_paths) {
               23, 16, graph_capacity) && graph_capacity == 32768);
     CHECK(!dflash::common::detail::target_paged_tree_graph_capacity(
                257, 16, graph_capacity));
+    for (int lanes = 0; lanes <= 16; ++lanes) {
+        const int limit =
+            dflash::common::detail::target_paged_tree_direct_request_limit(
+                lanes);
+        CHECK(limit >= 0);
+        CHECK(limit <= lanes);
+        if (limit > 0) {
+            CHECK(dflash::common::detail::target_paged_tree_bucket_width(
+                      limit) <= lanes);
+        }
+        if (limit < lanes) {
+            CHECK(dflash::common::detail::target_paged_tree_bucket_width(
+                      limit + 1) > lanes);
+        }
+    }
 
     // Mapped-tree active_slot_ids is a topology marker and can legitimately
     // be left without gallocr storage. Required state/query/write metadata

@@ -7,11 +7,9 @@
 
 #include "qwen35/concurrency/qwen35_slot_manager.h"
 #include "host_check.h"
-#include "scoped_env.h"
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <type_traits>
 #include <utility>
 
@@ -490,76 +488,6 @@ int main() {
         CHECK(mgr.has_prefill_prompt_at_least(768));
         mgr.retire(long_req.slot);
         CHECK(!mgr.has_prefill_prompt_at_least(768));
-    }
-
-    // The legacy per-slot controller remains a tested primitive. Production
-    // concurrency routing uses the shared exact-C ranker so one authority owns
-    // request selection and mixed-route cost.
-    {
-        const luce_test::ScopedEnvVar adaptive(
-            "DFLASH_DDTREE_ADAPTIVE", nullptr);
-        PagedKvPool pool(8, 2, /*block_size=*/16);
-        Qwen35SlotManager mgr(pool, 64);
-        auto code = admit(mgr, 101, prompt_tokens(4), greedy_sampler());
-        auto chat = admit(mgr, 102, prompt_tokens(4), greedy_sampler());
-        CHECK(is_admitted(code));
-        CHECK(is_admitted(chat));
-        CHECK(mgr.append_prefill(code.slot, 4).ok);
-        CHECK(mgr.append_prefill(chat.slot, 4).ok);
-        mgr.commit_prefill(code.slot);
-        mgr.commit_prefill(chat.slot);
-        CHECK(mgr.ddtree_speculation_allowed(code.slot));
-        CHECK(mgr.ddtree_speculation_allowed(chat.slot));
-
-        CHECK(mgr.record_speculation_sample(
-                  code.slot, /*emitted_tokens=*/8, /*elapsed_us=*/2000.0) ==
-              SpeculationGoodputTransition::none);
-        CHECK(mgr.record_speculation_sample(
-                  chat.slot, /*emitted_tokens=*/1, /*elapsed_us=*/2000.0) ==
-              SpeculationGoodputTransition::none);
-        // Both requests take one neighboring AR calibration step.
-        CHECK(!mgr.ddtree_speculation_allowed(code.slot));
-        CHECK(!mgr.ddtree_speculation_allowed(chat.slot));
-        CHECK(mgr.record_ar_sample(code.slot, /*elapsed_us=*/1000.0) ==
-              SpeculationGoodputTransition::none);
-        CHECK(mgr.record_ar_sample(chat.slot, /*elapsed_us=*/1000.0) ==
-              SpeculationGoodputTransition::disabled);
-        CHECK(mgr.ddtree_speculation_allowed(code.slot));
-        CHECK(!mgr.ddtree_speculation_allowed(chat.slot));
-        CHECK(mgr.slot(code.slot).ddtree_sampled_steps == 1);
-        CHECK(mgr.slot(chat.slot).ddtree_sampled_steps == 1);
-
-        // Its default still makes one bounded decision per request; explicit
-        // controller users may opt into periodic re-probing.
-        for (int i = 0; i < 32; ++i) {
-            CHECK(mgr.record_ar_sample(chat.slot, 1000.0) ==
-                  SpeculationGoodputTransition::none);
-            CHECK(!mgr.ddtree_speculation_allowed(chat.slot));
-        }
-
-        mgr.retire(code.slot);
-        auto reused = admit(mgr, 103, prompt_tokens(4), greedy_sampler());
-        CHECK(is_admitted(reused) && reused.slot == code.slot);
-        CHECK(mgr.slot(reused.slot).request_id == 103);
-        CHECK(mgr.ddtree_speculation_allowed(reused.slot));
-        CHECK(mgr.slot(reused.slot).ddtree_sampled_steps == 0);
-    }
-
-    // The existing burn-in switch preserves fixed speculation.
-    {
-        const luce_test::ScopedEnvVar adaptive("DFLASH_DDTREE_ADAPTIVE", "0");
-        PagedKvPool pool(4, 1, /*block_size=*/16);
-        Qwen35SlotManager mgr(pool, 64);
-        auto admitted = admit(mgr, 201, prompt_tokens(4), greedy_sampler());
-        CHECK(is_admitted(admitted));
-        CHECK(mgr.append_prefill(admitted.slot, 4).ok);
-        mgr.commit_prefill(admitted.slot);
-        CHECK(mgr.ddtree_speculation_allowed(admitted.slot));
-        CHECK(mgr.record_speculation_sample(admitted.slot, 1, 2000.0) ==
-              SpeculationGoodputTransition::none);
-        CHECK(mgr.record_ar_sample(admitted.slot, 1000.0) ==
-              SpeculationGoodputTransition::none);
-        CHECK(mgr.ddtree_speculation_allowed(admitted.slot));
     }
 
     // A failed residency barrier quarantines retirement ownership, and a

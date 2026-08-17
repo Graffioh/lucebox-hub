@@ -10,6 +10,31 @@
 
 namespace dflash::common {
 
+namespace {
+
+constexpr int kTreeSequenceBuckets[] = {
+    1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,
+};
+
+}  // namespace
+
+int detail::target_paged_tree_bucket_width(int requested_sequences) {
+    if (requested_sequences <= 0) return 0;
+    for (int bucket : kTreeSequenceBuckets) {
+        if (bucket >= requested_sequences) return bucket;
+    }
+    return 0;
+}
+
+int detail::target_paged_tree_direct_request_limit(int capture_lanes) {
+    for (int requested = std::min(capture_lanes, 64);
+         requested > 0; --requested) {
+        const int bucket = target_paged_tree_bucket_width(requested);
+        if (bucket > 0 && bucket <= capture_lanes) return requested;
+    }
+    return 0;
+}
+
 bool detail::target_graph_capacity_for_parallel_segments(
         int n_parallel_segments,
         size_t & capacity) {
@@ -42,12 +67,8 @@ bool detail::target_paged_tree_graph_capacity(
         int tree_width,
         int n_tree_seqs,
         size_t & capacity) {
-    static constexpr int tree_buckets[] = {
-        1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64,
-    };
     if (tree_width < 1 || tree_width > 256 ||
-        std::find(std::begin(tree_buckets), std::end(tree_buckets),
-                  n_tree_seqs) == std::end(tree_buckets) ||
+        target_paged_tree_bucket_width(n_tree_seqs) != n_tree_seqs ||
         (int64_t)tree_width * n_tree_seqs > INT32_MAX) {
         return false;
     }

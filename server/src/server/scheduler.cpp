@@ -744,6 +744,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             engine.step_plan_limits((int)step_plan.decode.size());
         step_plan.prefills = plan_prefill_slices(
             prefill_candidates, step_limits, prefill_round_robin_start);
+        step_plan.has_refill_backlog =
+            deferred != nullptr || has_queued_job();
         if (!prefill_candidates.empty()) {
             ++prefill_round_robin_start;
         }

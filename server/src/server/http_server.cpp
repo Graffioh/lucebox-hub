@@ -4006,6 +4006,11 @@ ServerJob * HttpServer::try_dequeue() {
     return job;
 }
 
+bool HttpServer::has_queued_job() {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    return queue_head_ != nullptr;
+}
+
 ServerJob * HttpServer::dequeue_for(
         std::chrono::steady_clock::duration timeout) {
     std::unique_lock<std::mutex> lk(queue_mu_);

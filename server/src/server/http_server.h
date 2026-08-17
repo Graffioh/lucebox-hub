@@ -479,6 +479,7 @@ private:
 
     // Non-blocking dequeue used for admission polling between decode steps.
     ServerJob * try_dequeue();
+    bool has_queued_job();
     // Bounded wait used only during an idle-to-busy admission window.
     ServerJob * dequeue_for(
         std::chrono::steady_clock::duration timeout);
