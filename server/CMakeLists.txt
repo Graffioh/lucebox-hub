@@ -1425,6 +1425,15 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_seq_slot_manager)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_speculation_goodput.cpp")
+        # Model-neutral online AR/speculation policy: no model or GPU.
+        add_executable(test_speculation_goodput
+            test/test_speculation_goodput.cpp)
+        target_include_directories(test_speculation_goodput PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_speculation_goodput)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_engine_contract.cpp")
         # SeqEngine conformance checker + the fakes that prove it bites: no GPU.
         add_executable(test_seq_engine_contract test/test_seq_engine_contract.cpp)
