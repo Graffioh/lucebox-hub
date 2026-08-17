@@ -173,7 +173,8 @@ static FILE * open_dflash_floor_log() {
 // staging K/V or staging recurrent slab to reserve.
 static int64_t concurrent_fixed_cache_bytes(
         const TargetWeights & w, int max_ctx, int n_slots,
-        int64_t kv_bytes_per_token, int64_t scratch_tokens) {
+        int64_t kv_bytes_per_token, int64_t scratch_tokens,
+        int tree_width, int tree_capture_lanes) {
     const int64_t n_full_attn =
         w.n_layer / w.full_attention_interval;
     const int64_t n_delta = w.n_layer - n_full_attn;
@@ -186,9 +187,18 @@ static int64_t concurrent_fixed_cache_bytes(
         (int64_t)sizeof(float);
     const int64_t recurrent =
         state_per_layer * n_delta * (int64_t)n_slots;
+    const int64_t tree_checkpoint =
+        tree_capture_lanes > 0
+            ? n_delta * tree_capture_lanes *
+                  ((head_v_dim * head_v_dim * w.ssm_dt_rank *
+                        (int64_t)tree_width * (int64_t)sizeof(uint16_t)) +
+                   (((int64_t)w.ssm_d_conv - 1 + tree_width) * conv_ch *
+                        (int64_t)sizeof(float)))
+            : 0;
     const int64_t target_feat =
         (int64_t)w.n_capture_layers * w.n_embd *
-        ((int64_t)std::min(max_ctx, 4096) * n_slots + 1) *
+        ((int64_t)std::min(max_ctx, 4096) * n_slots + 1 +
+         (int64_t)tree_width * tree_capture_lanes) *
         (int64_t)sizeof(uint16_t);
     const int64_t q_capture =
         (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
@@ -198,7 +208,7 @@ static int64_t concurrent_fixed_cache_bytes(
         (int64_t)sizeof(int32_t);
     const int64_t scratch =
         kv_bytes_per_token * scratch_tokens;
-    return recurrent + target_feat + q_capture +
+    return recurrent + tree_checkpoint + target_feat + q_capture +
            paged_metadata + scratch;
 }
 }  // namespace
@@ -412,6 +422,15 @@ bool Qwen35Backend::init() {
         target_backend_ == draft_backend_;
     const int tree_width = concurrent_local_ddtree
         ? cfg_.ddtree_budget + 1 : 0;
+    const int tree_capture_lanes = concurrent_local_ddtree
+        ? std::clamp(
+              env_int_or_default(
+                  "DFLASH_DDTREE_DIRECT_COMMIT_MAX_REQUESTS", 3),
+              0, n_slots)
+        : 0;
+    if (tree_capture_lanes > 0) {
+        std::fprintf(stderr, "[parallel-ddtree] direct commit lanes=%d\n", tree_capture_lanes);
+    }
     const int tree_stride = concurrent_local_ddtree
         ? paged_token_capacity(tree_width) : 0;
     const int64_t concurrent_scratch_tokens =
@@ -446,7 +465,8 @@ bool Qwen35Backend::init() {
             budget.reserve_bytes = kvf_budget.reserve_bytes;
             budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
                 w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
-                concurrent_scratch_tokens);
+                concurrent_scratch_tokens, tree_width,
+                tree_capture_lanes);
             pool_tokens = paged_kv_auto_pool_tokens(
                 cfg_.device.max_ctx, n_slots, budget);
             const int64_t one_context =
@@ -480,7 +500,8 @@ bool Qwen35Backend::init() {
                : kvflash_tokens_);
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
-                             cfg_.paged_attention, n_slots, concurrent_local_ddtree)) {
+                             cfg_.paged_attention, n_slots, concurrent_local_ddtree,
+                             tree_capture_lanes)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
     }
@@ -552,7 +573,7 @@ bool Qwen35Backend::init() {
                 const char * adaptive = std::getenv("DFLASH_DDTREE_ADAPTIVE");
                 std::fprintf(stderr,
                     "[parallel-ddtree] enabled budget=%d width=%d "
-                    "mode=packed-verify-mixed-replay adaptive=%s "
+                    "mode=bounded-direct-commit+mixed-replay adaptive=%s "
                     "policy=ranked-goodput scope=all-concurrency\n",
                     cfg_.ddtree_budget, tree_width,
                     adaptive && std::atoi(adaptive) == 0 ? "off" : "on");

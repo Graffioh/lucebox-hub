@@ -220,7 +220,8 @@ bool build_target_step_paged_tree(
     int paged_max_kv_len,
     int tree_scratch_base,
     int tree_scratch_stride,
-    int kq_stride_pad = KQ_MASK_PAD);
+    int kq_stride_pad = KQ_MASK_PAD,
+    bool capture_direct_commit = false);
 
 // LM-head projection: project draft hidden states through the target output matrix.
 bool build_lm_head_projection_step(

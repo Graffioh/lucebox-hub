@@ -740,13 +740,24 @@ bool build_target_step_paged_tree(
     int paged_max_kv_len,
     int tree_scratch_base,
     int tree_scratch_stride,
-    int kq_stride_pad) {
+    int kq_stride_pad,
+    bool capture_direct_commit) {
     (void)kq_stride_pad;
     step_graph_free(sg);
 
     if (!detail::validate_target_paged_tree_layout(
             cache, tree_width, n_tree_seqs, paged_max_kv_len,
             tree_scratch_base, tree_scratch_stride)) {
+        return false;
+    }
+    if (capture_direct_commit &&
+        (cache.tree_capture_width != tree_width ||
+         cache.tree_capture_lanes < n_tree_seqs ||
+         cache.target_feat_tree_scratch_base <= 0 ||
+         cache.ssm_intermediate.empty() ||
+         cache.conv_input_cache.empty() ||
+         !cache.ssm_intermediate.front() ||
+         !cache.conv_input_cache.front())) {
         return false;
     }
     size_t graph_capacity = 0;
@@ -787,6 +798,10 @@ bool build_target_step_paged_tree(
         ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
     sg.kv_write_rows = ggml_new_tensor_2d(
         sg.ctx, GGML_TYPE_I64, n_tokens, w.n_head_kv);
+    if (capture_direct_commit) {
+        sg.target_feat_rows =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    }
 
     const struct NamedInput {
         ggml_tensor * tensor;
@@ -805,6 +820,10 @@ bool build_target_step_paged_tree(
         ggml_set_name(input.tensor, input.name);
         ggml_set_input(input.tensor);
     }
+    if (sg.target_feat_rows) {
+        ggml_set_name(sg.target_feat_rows, "target_feat_rows");
+        ggml_set_input(sg.target_feat_rows);
+    }
 
     sg.gf = ggml_new_graph_custom(sg.ctx, graph_capacity, false);
     QwenGraphInputs gi{};
@@ -812,8 +831,8 @@ bool build_target_step_paged_tree(
     gi.positions = sg.positions;
     gi.n_tokens = n_tokens;
     gi.kv_start = 0;
-    gi.capture_layers = false;
-    gi.capture_delta_intermediate = false;
+    gi.capture_layers = capture_direct_commit;
+    gi.capture_delta_intermediate = capture_direct_commit;
     gi.parent_ids = sg.parent_ids;
     gi.tree_sizes = sg.tree_sizes;
     gi.kv_write_rows = sg.kv_write_rows;
@@ -823,6 +842,7 @@ bool build_target_step_paged_tree(
     gi.state_slot_ids = sg.state_slot_ids;
     gi.paged_query_seq_ids = sg.paged_query_seq_ids;
     gi.n_seqs = n_tree_seqs;
+    gi.target_feat_rows = sg.target_feat_rows;
     gi.paged_max_kv_len = paged_max_kv_len;
     gi.tree_width = tree_width;
     gi.tree_scratch_base = tree_scratch_base;
@@ -832,6 +852,7 @@ bool build_target_step_paged_tree(
     if (!go.logits) return false;
     sg.logits = go.logits;
     ggml_set_output(sg.logits);
+    sg.delta_captures = std::move(go.delta_captures);
     sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
     ggml_set_name(sg.argmax_tokens, "paged_tree_verify_argmax");
     ggml_set_output(sg.argmax_tokens);

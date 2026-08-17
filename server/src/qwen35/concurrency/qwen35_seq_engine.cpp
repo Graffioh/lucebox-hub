@@ -15,6 +15,8 @@
 #include "common/ddtree.h"
 #include "common/geometric_draft_topk_cuda.h"
 #include "internal.h"
+#include "common/gpu_runtime_compat.h"
+#include "ggml-backend-impl.h"
 
 #include <algorithm>
 #include <chrono>
@@ -23,6 +25,9 @@
 #include <cstdlib>
 #include <utility>
 #include <vector>
+using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
+extern "C++" to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
+
 
 namespace dflash::common {
 
@@ -355,6 +360,15 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         proposals.push_back(std::move(p));
     }
 
+    const bool target_is_meta = b_.cache_.ssm_state.empty() ||
+        !b_.cache_.ssm_state.front() ||
+        ggml_backend_buft_is_meta(ggml_backend_buffer_get_type(
+            b_.cache_.ssm_state.front()->buffer));
+    const bool direct_commit =
+        !target_is_meta && bucket <= b_.cache_.tree_capture_lanes &&
+        T == b_.cache_.tree_capture_width &&
+        b_.cache_.target_feat_tree_scratch_base > 0;
+
     StepGraph & tree_sg = b_.sg_;
     int max_prefix = 1;
     for (const Proposal & p : proposals) {
@@ -363,12 +377,20 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
     if (!build_target_step_paged_tree(
             tree_sg, b_.w_, b_.cache_, b_.target_backend_, T, bucket,
             max_prefix, tree_scratch_base_, tree_scratch_stride_,
-            b_.cfg_.kq_stride_pad)) {
+            b_.cfg_.kq_stride_pad, direct_commit)) {
         result.error = "packed DDTree verify graph build failed";
         return result;
     }
 
     const int total_tree = T * bucket;
+    std::vector<int32_t> tree_feature_rows;
+    if (direct_commit) {
+        tree_feature_rows.resize((size_t)total_tree);
+        for (int row = 0; row < total_tree; ++row) {
+            tree_feature_rows[(size_t)row] =
+                b_.cache_.target_feat_tree_scratch_base + row;
+        }
+    }
     std::vector<int32_t> flat_tokens((size_t)total_tree, 0);
     std::vector<int32_t> parents((size_t)total_tree, -1);
     std::vector<int32_t> sizes((size_t)bucket, 0);
@@ -438,6 +460,11 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
                             sizeof(int32_t) * query_slots.size());
     ggml_backend_tensor_set(tree_sg.kv_write_rows, tree_rows.data(), 0,
                             sizeof(int64_t) * tree_rows.size());
+    if (direct_commit) {
+        ggml_backend_tensor_set(
+            tree_sg.target_feat_rows, tree_feature_rows.data(), 0,
+            sizeof(int32_t) * tree_feature_rows.size());
+    }
     ggml_backend_tensor_set(b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
                             sizeof(int32_t) * seq_lens_.size());
     if (ggml_backend_graph_compute(b_.target_backend_, tree_sg.gf) !=
@@ -463,6 +490,258 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
             return result;
         }
         replay_total += (int)p.accepted.size();
+    }
+    if (direct_commit) {
+        struct DirectAppend {
+            Qwen35SlotManager::StepAppend append;
+            std::vector<int32_t> tokens;
+        };
+        std::vector<DirectAppend> appends((size_t)active);
+        std::vector<int> write_slots;
+        write_slots.reserve((size_t)active);
+
+        for (int s = 0; s < active; ++s) {
+            Proposal & p = proposals[(size_t)s];
+            DirectAppend & staged = appends[(size_t)s];
+            staged.tokens.reserve(p.accepted.size());
+            for (int dfs : p.accepted) {
+                staged.tokens.push_back(dfs == 0 ? p.root :
+                    p.tree.token_ids[(size_t)dfs - 1]);
+            }
+            staged.append = slots_.append_tokens(
+                p.slot, staged.tokens.data(), (int)staged.tokens.size());
+            const bool table_ok = staged.append.ok &&
+                (slots_.residency_active() ||
+                 upload_block_table_delta(
+                     p.slot, staged.append.first_new_block,
+                     staged.append.new_blocks.data(),
+                     staged.append.new_blocks.size()));
+            if (!table_ok ||
+                staged.append.physical_rows.size() != staged.tokens.size()) {
+                result.error = staged.append.busy
+                    ? "paged KV pool exhausted during DDTree direct commit"
+                    : "DDTree direct commit K/V append failed";
+                return result;
+            }
+            write_slots.push_back(p.slot);
+        }
+
+        const size_t n_delta = b_.cache_.ssm_state.size();
+        if (tree_sg.delta_captures.size() != n_delta ||
+            b_.cache_.conv_state.size() != n_delta) {
+            result.error = "DDTree direct commit capture count mismatch";
+            return result;
+        }
+        const auto to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+        if (!to_fp32) {
+            result.error = "DDTree direct commit has no F16 state converter";
+            return result;
+        }
+
+        cudaStream_t stream = nullptr;
+        auto copy_2d = [&](void * dst, size_t dst_pitch,
+                           const void * src, size_t src_pitch,
+                           size_t width, size_t height) {
+            return cudaMemcpy2DAsync(
+                       dst, dst_pitch, src, src_pitch, width, height,
+                       cudaMemcpyDeviceToDevice, stream) == cudaSuccess;
+        };
+        auto copy_row = [&](ggml_tensor * tensor, int64_t src_row,
+                            int64_t dst_row) {
+            if (!tensor || src_row < 0 || dst_row < 0 ||
+                src_row >= tensor->ne[1] || dst_row >= tensor->ne[1]) {
+                return false;
+            }
+            const size_t row_bytes = tensor->nb[1];
+            for (int h = 0; h < (int)tensor->ne[2]; ++h) {
+                const char * src = (const char *)tensor->data +
+                    (size_t)h * tensor->nb[2] +
+                    (size_t)src_row * tensor->nb[1];
+                char * dst = (char *)tensor->data +
+                    (size_t)h * tensor->nb[2] +
+                    (size_t)dst_row * tensor->nb[1];
+                if (cudaMemcpyAsync(
+                        dst, src, row_bytes, cudaMemcpyDeviceToDevice,
+                        stream) != cudaSuccess) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const int conv_kernel = b_.w_.ssm_d_conv;
+        if (conv_kernel < 2) {
+            result.error = "DDTree direct commit has invalid conv kernel";
+            return result;
+        }
+        for (size_t il = 0; il < n_delta; ++il) {
+            const DeltaNetCapture & cap = tree_sg.delta_captures[il];
+            ggml_tensor * state = b_.cache_.ssm_state[il];
+            ggml_tensor * conv = b_.cache_.conv_state[il];
+            if (!cap.ssm_intermediate_states || !cap.conv_input ||
+                !state || !conv ||
+                cap.ssm_intermediate_states->type != GGML_TYPE_F16 ||
+                cap.ssm_intermediate_states->ne[3] < T * bucket ||
+                cap.conv_input->ne[2] < bucket) {
+                result.error = "DDTree direct commit capture layout mismatch";
+                return result;
+            }
+            const int64_t state_elems =
+                state->ne[0] * state->ne[1] * state->ne[2];
+            for (int s = 0; s < active; ++s) {
+                const Proposal & p = proposals[(size_t)s];
+                const int deepest = p.accepted.back();
+                const int capture_row = s * T + deepest;
+                const char * state_src =
+                    (const char *)cap.ssm_intermediate_states->data +
+                    (size_t)capture_row *
+                        cap.ssm_intermediate_states->nb[3];
+                float * state_dst = (float *)((char *)state->data +
+                    (size_t)p.slot * state->nb[3]);
+                to_fp32(state_src, state_dst, state_elems, stream);
+                if (cudaPeekAtLastError() != cudaSuccess) {
+                    result.error = "DDTree direct commit SSM conversion failed";
+                    return result;
+                }
+
+                std::vector<int> ancestry((size_t)conv_kernel - 1);
+                ancestry.back() = deepest;
+                for (int k = conv_kernel - 3; k >= 0; --k) {
+                    const int next = ancestry[(size_t)k + 1];
+                    ancestry[(size_t)k] =
+                        next >= 0 ? p.tree.parents[(size_t)next] : next - 1;
+                }
+                for (int k = 0; k < conv_kernel - 1; ++k) {
+                    const int source_col =
+                        conv_kernel - 1 + ancestry[(size_t)k];
+                    if (source_col < 0 ||
+                        source_col >= cap.conv_input->ne[0]) {
+                        result.error =
+                            "DDTree direct commit conv ancestry is invalid";
+                        return result;
+                    }
+                    const char * conv_src =
+                        (const char *)cap.conv_input->data +
+                        (size_t)s * cap.conv_input->nb[2] +
+                        (size_t)source_col *
+                            ggml_element_size(cap.conv_input);
+                    char * conv_dst = (char *)conv->data +
+                        (size_t)p.slot * conv->nb[2] +
+                        (size_t)k * ggml_element_size(conv);
+                    if (!copy_2d(
+                            conv_dst, conv->nb[1], conv_src,
+                            cap.conv_input->nb[1],
+                            ggml_element_size(conv), conv->ne[1])) {
+                        result.error =
+                            "DDTree direct commit conv state copy failed";
+                        return result;
+                    }
+                }
+            }
+        }
+
+        for (int s = 0; s < active; ++s) {
+            const Proposal & p = proposals[(size_t)s];
+            const DirectAppend & staged = appends[(size_t)s];
+            for (size_t d = 0; d < p.accepted.size(); ++d) {
+                const int dfs = p.accepted[d];
+                const int64_t src_row =
+                    (int64_t)tree_scratch_base_ +
+                    (int64_t)p.slot * tree_scratch_stride_ + dfs;
+                const int64_t dst_row = staged.append.physical_rows[d];
+                for (size_t il = 0; il < b_.cache_.attn_k.size(); ++il) {
+                    if (!copy_row(b_.cache_.attn_k[il], src_row, dst_row) ||
+                        !copy_row(b_.cache_.attn_v[il], src_row, dst_row)) {
+                        result.error =
+                            "DDTree direct commit paged K/V copy failed";
+                        return result;
+                    }
+                }
+
+                ggml_tensor * feat = b_.cache_.target_feat;
+                const int src_feat =
+                    b_.cache_.target_feat_tree_scratch_base + s * T + dfs;
+                const int dst_feat = p.slot * b_.cache_.target_feat_cap +
+                    (staged.append.position + (int)d) %
+                        b_.cache_.target_feat_cap;
+                if (!feat || src_feat < 0 || dst_feat < 0 ||
+                    src_feat >= feat->ne[1] || dst_feat >= feat->ne[1] ||
+                    cudaMemcpyAsync(
+                        (char *)feat->data +
+                            (size_t)dst_feat * feat->nb[1],
+                        (const char *)feat->data +
+                            (size_t)src_feat * feat->nb[1],
+                        feat->nb[1], cudaMemcpyDeviceToDevice,
+                        stream) != cudaSuccess) {
+                    result.error =
+                        "DDTree direct commit target feature copy failed";
+                    return result;
+                }
+            }
+        }
+
+        if (cudaStreamSynchronize(stream) != cudaSuccess) {
+            result.error = "DDTree direct commit synchronization failed";
+            return result;
+        }
+        if (!commit_residency_writes(write_slots)) {
+            result.error = "DDTree direct commit residency write failed";
+            return result;
+        }
+        for (int slot : write_slots) slots_.commit_step(slot);
+        if (!upload_all_active_block_tables()) {
+            result.error = "DDTree direct commit block-table refresh failed";
+            return result;
+        }
+
+        StepResult ar_result;
+        if (!ar_plan.decode.empty()) {
+            ar_result = step_regular(ar_plan);
+            if (!ar_result.ok()) return ar_result;
+        }
+
+        for (int slot : write_slots) {
+            std::string reselect_error;
+            if (!maybe_reselect_residency(slot, reselect_error)) {
+                result.error = reselect_error.empty()
+                    ? "KVFlash reselect failed" : reselect_error;
+                return result;
+            }
+        }
+
+        result.decode.reserve((size_t)total_active);
+        for (Proposal & p : proposals) {
+            if (p.bonus < 0 || p.bonus >= b_.w_.n_vocab) {
+                result.error =
+                    "DDTree direct commit produced an invalid pending token";
+                return result;
+            }
+            DecodeOutput out;
+            out.slot = p.slot;
+            out.token = p.bonus;
+            out.ddtree_steps = 1;
+            out.ddtree_accepted_tokens =
+                (uint64_t)((int)p.accepted.size() - 1);
+            out.target_forwards = 1;
+            for (size_t i = 1; i < p.accepted.size(); ++i) {
+                const int dfs = p.accepted[i];
+                out.committed_tokens.push_back(
+                    p.tree.token_ids[(size_t)dfs - 1]);
+            }
+            attach_residency_telemetry(out);
+            result.decode.push_back(std::move(out));
+        }
+        for (DecodeOutput & out : ar_result.decode) {
+            result.decode.push_back(std::move(out));
+        }
+        static const bool direct_commit_diag =
+            std::getenv("DFLASH_DDTREE_DIRECT_COMMIT_DIAG") != nullptr;
+        if (direct_commit_diag) {
+            std::fprintf(stderr,
+                "[parallel-ddtree] mode=direct-tree-commit speculative=%d ar=%zu\n",
+                active, ar_plan.decode.size());
+        }
+        return result;
     }
     replay_total += (int)ar_plan.decode.size();
 

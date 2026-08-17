@@ -81,13 +81,15 @@ bool create_target_cache(const TargetWeights & w,
                          int ctx_alloc,
                          bool paged_attention,
                          int n_seq_slots,
-                         bool concurrent_tree) {
+                         bool concurrent_tree,
+                         int concurrent_tree_capture_lanes) {
     return create_target_cache_partial(w, max_ctx, max_verify_tokens, backend,
                                        out, prefill_only,
                                        0, w.n_layer, true, ctx_alloc,
                                        /*f32_ssm_intermediates=*/false,
                                        paged_attention, n_seq_slots,
-                                       concurrent_tree);
+                                       concurrent_tree,
+                                       concurrent_tree_capture_lanes);
 }
 
 // concurrent_fixed_cache_bytes() in qwen35_backend.cpp mirrors this
@@ -106,7 +108,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool f32_ssm_intermediates,
                                  bool paged_attention,
                                  int n_seq_slots,
-                                 bool concurrent_tree) {
+                                 bool concurrent_tree,
+                                 int concurrent_tree_capture_lanes) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
     if (layer_begin > layer_end) {
@@ -123,6 +126,9 @@ bool create_target_cache_partial(const TargetWeights & w,
             "concurrent tree cache requires paged multi-slot serving");
         return false;
     }
+    if (!concurrent_tree) concurrent_tree_capture_lanes = 0;
+    concurrent_tree_capture_lanes = std::clamp(
+        concurrent_tree_capture_lanes, 0, n_seq_slots);
     out.backend = backend;
     out.max_ctx = max_ctx;
     out.cur_pos = 0;
@@ -130,6 +136,10 @@ bool create_target_cache_partial(const TargetWeights & w,
     if (max_verify_tokens <= 0) {
         max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
     }
+
+    out.tree_capture_width = concurrent_tree_capture_lanes > 0
+        ? max_verify_tokens : 0;
+    out.tree_capture_lanes = concurrent_tree_capture_lanes;
 
     const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
     const int n_delta     = w.n_layer - n_full_attn;               // 48
@@ -236,11 +246,16 @@ bool create_target_cache_partial(const TargetWeights & w,
         if (allocate_target_feat) {
             const int fc_in = w.n_capture_layers * w.n_embd;
             // Concurrent slots own disjoint feature rings. The final row is
-            // dead scratch for padded bucket rows because set_rows does not
-            // accept negative destination indices.
-            const int feat_rows = multi_slot
+            // dead scratch for padded bucket rows. Direct-tree candidates use
+            // a separate compact scratch domain after the durable rings.
+            const int durable_feat_rows = multi_slot
                 ? out.target_feat_cap * n_seq_slots + 1
                 : out.target_feat_cap;
+            const int tree_scratch_rows =
+                out.tree_capture_width * out.tree_capture_lanes;
+            const int feat_rows = durable_feat_rows + tree_scratch_rows;
+            out.target_feat_tree_scratch_base = tree_scratch_rows > 0
+                ? durable_feat_rows : 0;
             out.target_feat = ggml_new_tensor_2d(
                 out.base_ctx, GGML_TYPE_BF16, fc_in, feat_rows);
             ggml_set_name(out.target_feat, "target_feat");
@@ -281,12 +296,13 @@ bool create_target_cache_partial(const TargetWeights & w,
     }
 
     // ── Rollback context: snapshots + intermediates ───────────────────
-    // Multi-slot caches skip these entirely. Packed tree verification gathers
-    // the selected slots' base state without mutating it, then a bounded
-    // replay commits accepted paths. T*S recurrent captures would be tens of
-    // GiB at useful Strix concurrency and are intentionally not allocated.
-    if (!prefill_only && !multi_slot) {
-        const int rb_tensors = 4 * n_delta;
+    // Concurrent trees reserve only a bounded compact set of F16 captures;
+    // physical serving slots that are not selected consume no checkpoint
+    // memory, and routes wider than the bound use accepted-path replay.
+    const bool concurrent_capture = multi_slot &&
+        out.tree_capture_lanes > 0 && out.tree_capture_width > 0;
+    if ((!prefill_only && !multi_slot) || concurrent_capture) {
+        const int rb_tensors = (multi_slot ? 2 : 4) * n_delta;
         ggml_init_params ip{};
         ip.mem_size   = (size_t)(rb_tensors + 16) * ggml_tensor_overhead();
         ip.mem_buffer = nullptr;
@@ -299,26 +315,32 @@ bool create_target_cache_partial(const TargetWeights & w,
             if (((il + 1) % w.full_attention_interval) != 0) {
                 const bool owns_layer = il >= layer_begin && il < layer_end;
                 if (!owns_layer) { dn_idx++; continue; }
-                ggml_tensor * Sn = ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
-                                                       head_v_dim, head_v_dim, w.ssm_dt_rank);
-                ggml_tensor * Cn = ggml_new_tensor_2d(out.rollback_ctx, GGML_TYPE_F32,
-                                                       w.ssm_d_conv - 1, conv_ch);
+                ggml_tensor * Sn = multi_slot ? nullptr :
+                    ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
+                                       head_v_dim, head_v_dim, w.ssm_dt_rank);
+                ggml_tensor * Cn = multi_slot ? nullptr :
+                    ggml_new_tensor_2d(out.rollback_ctx, GGML_TYPE_F32,
+                                       w.ssm_d_conv - 1, conv_ch);
                 // I0 domain: ne[3] is the root-inclusive flat verify-token
                 // domain. Tree capture writes t=0 synthetic root through the
                 // final/padded flat slot directly into slot t.
-                const ggml_type ssm_intermediate_type = f32_ssm_intermediates
-                    ? GGML_TYPE_F32 : GGML_TYPE_Q8_0;
+                const ggml_type ssm_intermediate_type = multi_slot
+                    ? GGML_TYPE_F16
+                    : (f32_ssm_intermediates ? GGML_TYPE_F32 : GGML_TYPE_Q8_0);
                 ggml_tensor * Si = ggml_new_tensor_4d(out.rollback_ctx, ssm_intermediate_type,
                                                        head_v_dim, head_v_dim,
-                                                       w.ssm_dt_rank, max_verify_tokens);
+                                                       w.ssm_dt_rank,
+                                                       max_verify_tokens *
+                                                           (multi_slot ? out.tree_capture_lanes : 1));
                 // I0 domain: ne[0] is [K_conv-1 prefix rows |
                 // root-inclusive verify rows].
                 ggml_tensor * Ci = ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
                                                        (w.ssm_d_conv - 1) + max_verify_tokens,
-                                                       conv_ch, 1);
+                                                       conv_ch,
+                                                       multi_slot ? out.tree_capture_lanes : 1);
                 char name[64];
-                std::snprintf(name, sizeof(name), "ssm_state_snap_%d", il);  ggml_set_name(Sn, name);
-                std::snprintf(name, sizeof(name), "conv_state_snap_%d", il); ggml_set_name(Cn, name);
+                if (Sn) { std::snprintf(name, sizeof(name), "ssm_state_snap_%d", il);  ggml_set_name(Sn, name); }
+                if (Cn) { std::snprintf(name, sizeof(name), "conv_state_snap_%d", il); ggml_set_name(Cn, name); }
                 std::snprintf(name, sizeof(name), "ssm_intermediate_%d", il); ggml_set_name(Si, name);
                 std::snprintf(name, sizeof(name), "conv_input_cache_%d", il); ggml_set_name(Ci, name);
                 out.ssm_state_snap[dn_idx]  = Sn;
@@ -401,6 +423,9 @@ void free_target_cache(TargetCache & c) {
     c.ssm_intermediate.clear();
     c.conv_input_cache.clear();
     c.target_feat = nullptr;
+    c.tree_capture_width = 0;
+    c.tree_capture_lanes = 0;
+    c.target_feat_tree_scratch_base = 0;
     c.q_cap = nullptr;
     c.cur_pos = 0;
 }
@@ -1095,7 +1120,7 @@ static ggml_tensor * build_delta_net_block(
     }
     GGML_ASSERT((active_slot_ids == nullptr) == (state_slot_ids == nullptr));
     const bool mapped_tree = active_slot_ids && parent_ids;
-    GGML_ASSERT(!active_slot_ids || !cap);
+    GGML_ASSERT(!cap || !active_slot_ids || mapped_tree);
     GGML_ASSERT(!active_slot_ids ||
                 (mapped_tree
                      ? (!ragged && prefill_total == 0 &&
@@ -1239,11 +1264,12 @@ static ggml_tensor * build_delta_net_block(
         // Copy into a matching-sized view of the cache destination.
         const int64_t ci_len = conv_input->ne[0];
         ggml_tensor * dst;
-        if (ci_len == cap->conv_input->ne[0]) {
+        if (ci_len == cap->conv_input->ne[0] &&
+            seg_seqs == cap->conv_input->ne[2]) {
             dst = cap->conv_input;
         } else {
             dst = ggml_view_3d(ctx, cap->conv_input,
-                ci_len, cap->conv_input->ne[1], cap->conv_input->ne[2],
+                ci_len, cap->conv_input->ne[1], seg_seqs,
                 cap->conv_input->nb[1], cap->conv_input->nb[2], 0);
         }
         GGML_ASSERT(ggml_nelements(conv_input) == ggml_nelements(dst));
