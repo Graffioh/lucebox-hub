@@ -92,6 +92,12 @@ TEST_CASE(RecurrentSnapshotFixture, hardens_feature_smoke_paths) {
                 ggml_new_tensor_1d(live_ctx, GGML_TYPE_I32, 4);
             tree.kv_write_rows =
                 ggml_new_tensor_2d(live_ctx, GGML_TYPE_I64, 4, 1);
+            tree.ar_active_slot_ids =
+                ggml_new_tensor_1d(live_ctx, GGML_TYPE_I32, 1);
+            tree.ar_state_slot_ids =
+                ggml_new_tensor_1d(live_ctx, GGML_TYPE_I32, 1);
+            tree.paged_query_positions =
+                ggml_new_tensor_1d(live_ctx, GGML_TYPE_I32, 5);
             ggml_backend_buffer_t live_buffer =
                 ggml_backend_alloc_ctx_tensors(live_ctx, tree_backend);
             CHECK(live_buffer != nullptr);

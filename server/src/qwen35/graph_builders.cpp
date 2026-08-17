@@ -741,13 +741,15 @@ bool build_target_step_paged_tree(
     int tree_scratch_base,
     int tree_scratch_stride,
     int kq_stride_pad,
-    bool capture_direct_commit) {
+    bool capture_direct_commit,
+    int n_ar_seqs) {
     (void)kq_stride_pad;
     step_graph_free(sg);
 
     if (!detail::validate_target_paged_tree_layout(
             cache, tree_width, n_tree_seqs, paged_max_kv_len,
-            tree_scratch_base, tree_scratch_stride)) {
+            tree_scratch_base, tree_scratch_stride) ||
+        n_ar_seqs < 0 || n_ar_seqs > cache.n_seq_slots) {
         return false;
     }
     if (capture_direct_commit &&
@@ -762,10 +764,12 @@ bool build_target_step_paged_tree(
     }
     size_t graph_capacity = 0;
     if (!detail::target_paged_tree_graph_capacity(
-            tree_width, n_tree_seqs, graph_capacity)) {
+            tree_width, n_tree_seqs, graph_capacity) ||
+        !detail::target_graph_capacity_for_parallel_segments(
+            n_tree_seqs + n_ar_seqs, graph_capacity)) {
         return false;
     }
-    const int n_tokens = tree_width * n_tree_seqs;
+    const int n_tokens = tree_width * n_tree_seqs + n_ar_seqs;
 
     ggml_init_params ip{};
     ip.mem_size = 512 * 1024 * 1024;
@@ -778,7 +782,7 @@ bool build_target_step_paged_tree(
 
     // Salt graph addresses by the stable bucket shape so captured graphs for
     // different T/S buckets never alias in ggml-cuda's topology cache.
-    for (int i = 0; i < tree_width + n_tree_seqs; ++i) {
+    for (int i = 0; i < tree_width + n_tree_seqs + n_ar_seqs; ++i) {
         (void)ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
     }
 
@@ -794,6 +798,14 @@ bool build_target_step_paged_tree(
         ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tree_seqs);
     sg.state_slot_ids =
         ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tree_seqs);
+    if (n_ar_seqs > 0) {
+        sg.ar_active_slot_ids =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_ar_seqs);
+        sg.ar_state_slot_ids =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_ar_seqs);
+        sg.paged_query_positions =
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    }
     sg.paged_query_seq_ids =
         ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
     sg.kv_write_rows = ggml_new_tensor_2d(
@@ -820,6 +832,15 @@ bool build_target_step_paged_tree(
         ggml_set_name(input.tensor, input.name);
         ggml_set_input(input.tensor);
     }
+    if (n_ar_seqs > 0) {
+        ggml_set_name(sg.ar_active_slot_ids, "ar_active_slot_ids");
+        ggml_set_input(sg.ar_active_slot_ids);
+        ggml_set_name(sg.ar_state_slot_ids, "ar_state_slot_ids");
+        ggml_set_input(sg.ar_state_slot_ids);
+        ggml_set_name(
+            sg.paged_query_positions, "paged_query_positions");
+        ggml_set_input(sg.paged_query_positions);
+    }
     if (sg.target_feat_rows) {
         ggml_set_name(sg.target_feat_rows, "target_feat_rows");
         ggml_set_input(sg.target_feat_rows);
@@ -840,7 +861,11 @@ bool build_target_step_paged_tree(
     gi.paged_kv_seq_lens = cache.paged_kv_seq_lens;
     gi.active_slot_ids = sg.active_slot_ids;
     gi.state_slot_ids = sg.state_slot_ids;
+    gi.ar_active_slot_ids = sg.ar_active_slot_ids;
+    gi.ar_state_slot_ids = sg.ar_state_slot_ids;
+    gi.n_ar_seqs = n_ar_seqs;
     gi.paged_query_seq_ids = sg.paged_query_seq_ids;
+    gi.paged_query_positions = sg.paged_query_positions;
     gi.n_seqs = n_tree_seqs;
     gi.target_feat_rows = sg.target_feat_rows;
     gi.paged_max_kv_len = paged_max_kv_len;

@@ -201,6 +201,27 @@ int main() {
         CHECK(decision.requests[0] == 21);
     }
 
+    // Executor capacity bounds the ranked prefix. This keeps every adaptive
+    // route on the one-pass implementation even when more requests rank well.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(16, 160.0);
+        ranker.observe_route(16, 1, 145.0);
+        ranker.observe_route(16, 2, 150.0);
+        ranker.observe_route(16, 3, 155.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {41, 8.0, 8.0, true},
+            {42, 7.0, 8.0, true},
+            {43, 6.0, 8.0, true},
+        };
+        const AdaptiveVerificationDecision decision =
+            ranker.select(16, candidates, /*max_speculative_requests=*/2);
+        CHECK(!decision.exploring);
+        CHECK(decision.requests.size() == 2);
+        CHECK(decision.requests[0] == 41);
+        CHECK(decision.requests[1] == 42);
+    }
+
     // A promising calibrated prefix gets one bounded hardware-cost probe when
     // that subbatch shape has not been observed yet.
     {

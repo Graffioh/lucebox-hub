@@ -146,8 +146,9 @@ public:
 
     AdaptiveVerificationDecision select(
             int active_requests,
-            const std::vector<AdaptiveVerificationCandidate> & candidates)
-            const {
+            const std::vector<AdaptiveVerificationCandidate> & candidates,
+            int max_speculative_requests =
+                std::numeric_limits<int>::max()) const {
         AdaptiveVerificationDecision out;
         if (active_requests <= 0 || candidates.empty() ||
             !has_autoregressive_cost(active_requests)) {
@@ -202,8 +203,10 @@ public:
         double best = baseline;
         double admitted_goodput = baseline;
         double expected_total = static_cast<double>(active_requests);
+        const int prefix_limit = std::max(0, std::min(
+            active_requests, max_speculative_requests));
         for (int k = 1; k <= static_cast<int>(known.size()) &&
-                        k <= active_requests; ++k) {
+                        k <= prefix_limit; ++k) {
             expected_total += known[(size_t)k - 1].expected_tokens - 1.0;
             if (!has_route_cost(active_requests, k)) {
                 missing_cost_prefix = k;

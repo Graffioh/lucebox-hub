@@ -60,7 +60,11 @@ inline bool target_paged_tree_uploads_ready(const StepGraph & sg) {
     const auto allocated = [](const ggml_tensor * tensor) {
         return tensor && tensor->buffer;
     };
-    return sg.active_slot_ids &&
+    const bool ar_ready = !sg.ar_active_slot_ids ||
+        (allocated(sg.ar_active_slot_ids) &&
+         allocated(sg.ar_state_slot_ids) &&
+         allocated(sg.paged_query_positions));
+    return ar_ready && sg.active_slot_ids &&
            allocated(sg.inp_embed) && allocated(sg.positions) &&
            allocated(sg.parent_ids) && allocated(sg.tree_sizes) &&
            allocated(sg.state_slot_ids) &&
@@ -202,14 +206,14 @@ bool build_target_step_tree(
     int fa_window = 0,
     int kq_stride_pad = KQ_MASK_PAD);
 
-// Packed concurrent DDTree verify over a paged multi-slot cache. Tokens are
-// flattened sequence-major as [tree_width*n_tree_seqs]. n_tree_seqs is a
-// stable graph-bucket width; inactive trees use tree_size=0 and dead/safe row
-// mappings. In particular state_slot_ids padding must map to a valid harmless
-// slot (normally 0), while active/paged sequence IDs may use -1. The graph
-// writes candidate K/V into per-slot scratch slabs but
-// does not mutate persistent recurrent state or target features. Accepted
-// paths are committed by a later row-indexed replay through build_target_step.
+// Packed concurrent DDTree verify over a paged multi-slot cache. Tree tokens
+// are flattened sequence-major as [tree_width*n_tree_seqs]. An optional
+// compact [n_ar_seqs] suffix advances ordinary AR requests in the same model
+// graph. Inactive trees use tree_size=0 and dead/safe row mappings. Tree rows
+// write candidate K/V and features into scratch and do not mutate recurrent
+// state; AR rows update their mapped recurrent/KV/feature state in place.
+// Accepted tree paths are copied from the captured scratch rows after the
+// shared forward completes.
 bool build_target_step_paged_tree(
     StepGraph & sg,
     const TargetWeights & w,
@@ -221,7 +225,8 @@ bool build_target_step_paged_tree(
     int tree_scratch_base,
     int tree_scratch_stride,
     int kq_stride_pad = KQ_MASK_PAD,
-    bool capture_direct_commit = false);
+    bool capture_direct_commit = false,
+    int n_ar_seqs = 0);
 
 // LM-head projection: project draft hidden states through the target output matrix.
 bool build_lm_head_projection_step(

@@ -698,6 +698,12 @@ struct QwenGraphInputs {
     // each row's KV extent to position+1, which IS the causal mask. -1 on
     // padding rows.
     ggml_tensor * paged_query_positions = nullptr;
+    // Mixed packed-tree verification may append compact one-token AR rows
+    // after the sequence-major tree rows. These mappings name the physical
+    // recurrent slabs for that AR suffix; tree rows keep using
+    // active_slot_ids/state_slot_ids above.
+    ggml_tensor * ar_active_slot_ids = nullptr;
+    ggml_tensor * ar_state_slot_ids = nullptr;
     // Optional [n_rows] i32 gather of final-norm rows before the LM head:
     // multi-prompt steps sample scattered rows (each committing segment's
     // last row plus the decode rows), which a tail view cannot express.
@@ -738,6 +744,9 @@ struct QwenGraphInputs {
     // Packed steps use logits_row_indices for scattered committing rows and
     // compact decode rows; logits_tail_rows remains the dense-path fallback.
     int  n_seqs = 1;
+    // Number of compact one-token AR rows appended after a packed tree.
+    // Zero preserves the established pure-tree/prefill/decode layouts.
+    int  n_ar_seqs = 0;
     int  seq_slot = 0;
     int  paged_max_kv_len = 0;
     int  n_prefill_tokens = 0;
