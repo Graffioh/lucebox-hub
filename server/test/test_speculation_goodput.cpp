@@ -135,12 +135,11 @@ int main() {
     }
 
     // A measured request is admitted at C=5 only when its expected useful
-    // tokens overcome both the speculative and remaining AR subbatch costs.
+    // tokens overcome the measured cost of that exact fused route shape.
     {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(5, 100.0);
-        ranker.observe_autoregressive(4, 80.0);
-        ranker.observe_speculation(1, 40.0);
+        ranker.observe_route(5, 1, 80.0);
         std::vector<AdaptiveVerificationCandidate> candidates = {
             {11, 4.0, 8.0, true},
         };
@@ -157,10 +156,8 @@ int main() {
     {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(5, 100.0);
-        ranker.observe_autoregressive(4, 80.0);
-        ranker.observe_autoregressive(3, 70.0);
-        ranker.observe_speculation(1, 40.0);
-        ranker.observe_speculation(2, 70.0);
+        ranker.observe_route(5, 1, 80.0);
+        ranker.observe_route(5, 2, 95.0);
         std::vector<AdaptiveVerificationCandidate> candidates = {
             {2, 1.5, 8.0, true},
             {9, 4.0, 8.0, true},
@@ -177,8 +174,6 @@ int main() {
     {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(16, 100.0);
-        ranker.observe_autoregressive(15, 95.0);
-        ranker.observe_speculation(1, 100.0);
         std::vector<AdaptiveVerificationCandidate> candidates = {
             {1, 1.0, 8.0, false},
             {2, 1.0, 8.0, false},
@@ -194,10 +189,8 @@ int main() {
     {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(16, 160.0);
-        ranker.observe_autoregressive(15, 150.0);
-        ranker.observe_autoregressive(14, 140.0);
-        ranker.observe_speculation(1, 20.0);
-        ranker.observe_speculation(2, 80.0);
+        ranker.observe_route(16, 1, 150.0);
+        ranker.observe_route(16, 2, 220.0);
         std::vector<AdaptiveVerificationCandidate> candidates = {
             {21, 8.0, 8.0, true},
             {22, 2.0, 8.0, true},

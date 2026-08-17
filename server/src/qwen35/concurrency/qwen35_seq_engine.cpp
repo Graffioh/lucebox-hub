@@ -244,9 +244,10 @@ std::optional<double> Qwen35SeqEngine::estimate_ddtree_expected_tokens(
 }
 
 std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
-        const StepPlan & plan) {
+        const StepPlan & speculative_plan, const StepPlan & ar_plan) {
     StepResult result;
-    const int active = (int)plan.decode.size();
+    const int active = (int)speculative_plan.decode.size();
+    const int total_active = active + (int)ar_plan.decode.size();
     const int bucket = decode_bucket_width(active);
     const int T = tree_width_;
     const int q_len = b_.dw_.block_size;
@@ -276,7 +277,7 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         // A failed proposal graph may therefore leave only part of that
         // cache valid. Reset all participating draft rings so a later
         // speculative round rebuilds them from committed target features.
-        for (const StepInput & in : plan.decode) {
+        for (const StepInput & in : speculative_plan.decode) {
             if (in.slot >= 0 && in.slot < (int)slot_draft_kv_.size() &&
                 slot_draft_kv_[(size_t)in.slot]) {
                 draft_kv_reset(*slot_draft_kv_[(size_t)in.slot]);
@@ -292,7 +293,7 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
 
     // Proposal is sequential by slot: immutable draft weights are shared,
     // while each slot owns an independent persistent context-KV ring.
-    for (const StepInput & in : plan.decode) {
+    for (const StepInput & in : speculative_plan.decode) {
         DraftKvState * draft = ensure_slot_draft_kv(in.slot);
         DraftFeatureMirror * mirror = slot_feature_mirror(in.slot);
         if (!draft || !mirror) return proposal_fallback();
@@ -463,6 +464,7 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         }
         replay_total += (int)p.accepted.size();
     }
+    replay_total += (int)ar_plan.decode.size();
 
     std::vector<QwenPrefillSegment> replay_segments;
     std::vector<int32_t> replay_tokens;
@@ -470,12 +472,12 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
     std::vector<int32_t> replay_positions;
     std::vector<int64_t> replay_rows;
     std::vector<int32_t> replay_logits_rows;
-    replay_segments.reserve((size_t)active);
+    replay_segments.reserve((size_t)total_active);
     replay_tokens.reserve((size_t)replay_total);
     replay_slots.reserve((size_t)replay_total);
     replay_positions.reserve((size_t)replay_total);
     replay_rows.assign((size_t)replay_total * n_head_kv, scratch_row_);
-    replay_logits_rows.reserve((size_t)active);
+    replay_logits_rows.reserve((size_t)total_active);
     seq_lens_.assign((size_t)n_slots, 0);
 
     int replay_offset = 0;
@@ -513,6 +515,36 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         replay_logits_rows.push_back(replay_offset - 1);
         seq_lens_[(size_t)p.slot] = app.position + (int)path.size();
     }
+    for (const StepInput & in : ar_plan.decode) {
+        const Qwen35SlotManager::StepAppend app = slots_.append_tokens(
+            in.slot, &in.token, 1);
+        const bool table_ok = slots_.residency_active() ||
+            upload_block_table_delta(in.slot, app.first_new_block,
+                app.new_blocks.data(), app.new_blocks.size());
+        if (!app.ok || app.physical_rows.size() != 1 || !table_ok) {
+            result.error = app.busy
+                ? "paged KV pool exhausted during mixed DDTree/AR replay"
+                : "mixed DDTree/AR replay K/V append failed";
+            return result;
+        }
+        replay_segments.push_back({replay_offset, 1, in.slot});
+        replay_tokens.push_back(in.token);
+        replay_slots.push_back(in.slot);
+        replay_positions.push_back(app.position);
+        for (int h = 0; h < n_head_kv; ++h) {
+            replay_rows[(size_t)h * replay_total + replay_offset] =
+                app.physical_rows[0];
+        }
+        ++replay_offset;
+        replay_logits_rows.push_back(replay_offset - 1);
+        seq_lens_[(size_t)in.slot] = app.position + 1;
+    }
+    if (replay_offset != replay_total ||
+        (int)replay_segments.size() != total_active ||
+        (int)replay_logits_rows.size() != total_active) {
+        result.error = "mixed DDTree/AR replay staging mismatch";
+        return result;
+    }
 
     if (!upload_all_active_block_tables()) {
         result.error = "DDTree replay block-table refresh failed";
@@ -526,7 +558,7 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
             b_.cfg_.kq_stride_pad, false, false, false, true,
             1, 0, *std::max_element(seq_lens_.begin(), seq_lens_.end()),
             replay_total, replay_segments.data(),
-            (int)replay_segments.size(), active, false) ||
+            (int)replay_segments.size(), total_active, false) ||
         !replay_sg.target_feat_rows || !replay_sg.paged_query_seq_ids ||
         !replay_sg.paged_query_positions || !replay_sg.logits_row_indices ||
         !replay_sg.argmax_tokens) {
@@ -576,18 +608,20 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         return result;
     }
     std::vector<int> replay_write_slots;
-    replay_write_slots.reserve(proposals.size());
+    replay_write_slots.reserve((size_t)total_active);
     for (const Proposal & p : proposals) replay_write_slots.push_back(p.slot);
+    for (const StepInput & in : ar_plan.decode) {
+        replay_write_slots.push_back(in.slot);
+    }
     if (!commit_residency_writes(replay_write_slots)) {
-        result.error = "DDTree replay KV write commit failed";
+        result.error = "mixed DDTree/AR replay KV write commit failed";
         return result;
     }
+    for (int slot : replay_write_slots) slots_.commit_step(slot);
 
-    // The replay is the durable target forward: its recurrent/KV/feature
-    // state is what the next step consumes. Use its posterior rather than
-    // the tree-verify posterior so the pending scalar remains exact even if
-    // the two graph shapes differ numerically.
-    std::vector<int32_t> replay_next((size_t)active, -1);
+    // The replay is the one durable target forward for both routes. Its
+    // recurrent/KV/feature state is what the next step consumes.
+    std::vector<int32_t> replay_next((size_t)total_active, -1);
     ggml_backend_tensor_get(
         replay_sg.argmax_tokens, replay_next.data(), 0,
         sizeof(int32_t) * replay_next.size());
@@ -598,19 +632,28 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         }
         proposals[(size_t)s].bonus = replay_next[(size_t)s];
     }
+    std::vector<int32_t> ar_next(ar_plan.decode.size(), -1);
+    for (size_t i = 0; i < ar_plan.decode.size(); ++i) {
+        const int logits_row = active + (int)i;
+        ar_next[i] = sample_graph_row(
+            ar_plan.decode[i].slot, logits_row,
+            &replay_next[(size_t)logits_row], &logits_buf_);
+        if (ar_next[i] < 0) {
+            result.error = "mixed replay produced an invalid AR token";
+            return result;
+        }
+    }
 
-    for (Proposal & p : proposals) {
-        slots_.commit_step(p.slot);
+    for (int slot : replay_write_slots) {
         std::string reselect_error;
-        if (!maybe_reselect_residency(p.slot, reselect_error)) {
+        if (!maybe_reselect_residency(slot, reselect_error)) {
             result.error = reselect_error.empty()
                 ? "KVFlash reselect failed" : reselect_error;
             return result;
         }
     }
 
-
-    result.decode.reserve((size_t)active);
+    result.decode.reserve((size_t)total_active);
     for (Proposal & p : proposals) {
         DecodeOutput out;
         out.slot = p.slot;
@@ -624,6 +667,14 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
             out.committed_tokens.push_back(
                 p.tree.token_ids[(size_t)dfs - 1]);
         }
+        attach_residency_telemetry(out);
+        result.decode.push_back(std::move(out));
+    }
+    for (size_t i = 0; i < ar_plan.decode.size(); ++i) {
+        DecodeOutput out;
+        out.slot = ar_plan.decode[i].slot;
+        out.token = ar_next[i];
+        out.target_forwards = 1;
         attach_residency_telemetry(out);
         result.decode.push_back(std::move(out));
     }
@@ -985,47 +1036,32 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     }
 
     using Clock = std::chrono::steady_clock;
-    StepResult speculative_result;
-    StepResult ar_result;
-    double speculative_us = 0.0;
-    double ar_us = 0.0;
-
-    if (!speculative_plan.decode.empty()) {
-        const auto started = Clock::now();
-        std::optional<StepResult> speculative =
-            step_ddtree(speculative_plan);
-        speculative_us = std::max(
-            1.0, std::chrono::duration<double, std::micro>(
-                     Clock::now() - started).count());
-        if (!speculative) {
+    StepResult routed_result;
+    const int speculative_count =
+        static_cast<int>(speculative_plan.decode.size());
+    const auto started = Clock::now();
+    if (speculative_count > 0) {
+        std::optional<StepResult> mixed =
+            step_ddtree(speculative_plan, ar_plan);
+        if (!mixed) {
             // Proposal setup failed before target/cache mutation. Preserve
             // service with one ordinary packed step and retry speculation on a
-            // later iteration.
+            // later iteration. Do not learn from this contaminated timing.
             return step_regular(plan);
         }
-        if (!speculative->ok()) return std::move(*speculative);
-        speculative_result = std::move(*speculative);
+        if (!mixed->ok()) return std::move(*mixed);
+        routed_result = std::move(*mixed);
+    } else {
+        routed_result = step_regular(ar_plan);
+        if (!routed_result.ok()) return routed_result;
     }
-
-    if (!ar_plan.decode.empty()) {
-        const auto started = Clock::now();
-        ar_result = step_regular(ar_plan);
-        ar_us = std::max(
-            1.0, std::chrono::duration<double, std::micro>(
-                     Clock::now() - started).count());
-        if (!ar_result.ok()) return ar_result;
-    }
+    const double route_us = std::max(
+        1.0, std::chrono::duration<double, std::micro>(
+                 Clock::now() - started).count());
 
     if (adaptive_enabled) {
-        if (!speculative_plan.decode.empty()) {
-            adaptive_verification_.observe_speculation(
-                static_cast<int>(speculative_plan.decode.size()),
-                speculative_us);
-        }
-        if (!ar_plan.decode.empty()) {
-            adaptive_verification_.observe_autoregressive(
-                static_cast<int>(ar_plan.decode.size()), ar_us);
-        }
+        adaptive_verification_.observe_route(
+            static_cast<int>(inputs.size()), speculative_count, route_us);
     }
     if (decision.exploring && !speculative_plan.decode.empty()) {
         std::fprintf(stderr,
@@ -1057,27 +1093,24 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             elapsed_us, spec_tps, ar_tps);
     };
 
-    for (DecodeOutput & out : speculative_result.decode) {
+    for (DecodeOutput & out : routed_result.decode) {
         if (out.failed || out.slot < 0 || out.slot >= n_slots) continue;
-        const double emitted =
-            static_cast<double>(out.ddtree_accepted_tokens + 1);
-        const SpeculationGoodputTransition transition =
-            slots_.record_speculation_sample(
-                out.slot, emitted, speculative_us);
-        if (transition == SpeculationGoodputTransition::disabled) {
-            out.ddtree_suspensions = 1;
+        if (selected[(size_t)out.slot]) {
+            const double emitted =
+                static_cast<double>(out.ddtree_accepted_tokens + 1);
+            const SpeculationGoodputTransition transition =
+                slots_.record_speculation_sample(
+                    out.slot, emitted, route_us);
+            if (transition == SpeculationGoodputTransition::disabled) {
+                out.ddtree_suspensions = 1;
+            }
+            log_transition(
+                out.slot, transition, "speculation", emitted, route_us);
+        } else if (observe_ar[(size_t)out.slot]) {
+            const SpeculationGoodputTransition transition =
+                slots_.record_ar_sample(out.slot, route_us);
+            log_transition(out.slot, transition, "ar", 1.0, route_us);
         }
-        log_transition(
-            out.slot, transition, "speculation", emitted, speculative_us);
-    }
-    for (DecodeOutput & out : ar_result.decode) {
-        if (out.failed || out.slot < 0 || out.slot >= n_slots ||
-            !observe_ar[(size_t)out.slot]) {
-            continue;
-        }
-        const SpeculationGoodputTransition transition =
-            slots_.record_ar_sample(out.slot, ar_us);
-        log_transition(out.slot, transition, "ar", 1.0, ar_us);
     }
 
     std::vector<DecodeOutput> by_slot((size_t)n_slots);
@@ -1093,7 +1126,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         }
         return true;
     };
-    if (!collect(speculative_result.decode) || !collect(ar_result.decode)) {
+    if (!collect(routed_result.decode)) {
         return fail_step("adaptive decode produced duplicate slot output");
     }
     result.decode.reserve(inputs.size());

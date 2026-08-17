@@ -5,9 +5,10 @@
 // DSpark's scheduler ranks candidate tokens by cumulative survival probability
 // and grows the verification batch while expected throughput improves. This
 // helper applies the same policy at request granularity. The concrete
-// speculator supplies expected useful tokens; the engine supplies observed AR
-// and speculative subbatch costs. DDTree can learn value from accepted paths,
-// while DSpark can use its calibrated confidence head directly.
+// speculator supplies expected useful tokens; the engine supplies the observed
+// cost of each mixed route shape (active requests, speculative requests).
+// DDTree can learn value from accepted paths, while DSpark can use its
+// calibrated confidence head directly.
 
 #include <algorithm>
 #include <cmath>
@@ -65,34 +66,82 @@ public:
         : config_(sanitize(config)) {}
 
     void reset() {
-        ar_cost_us_.clear();
-        spec_cost_us_.clear();
-        ar_cost_known_.clear();
-        spec_cost_known_.clear();
+        route_cost_us_.clear();
+        route_cost_known_.clear();
     }
 
     void observe_autoregressive(int batch_size, double elapsed_us) {
-        observe_cost(ar_cost_us_, ar_cost_known_, batch_size, elapsed_us);
+        observe_route(batch_size, /*speculative_requests=*/0, elapsed_us);
     }
 
+    // Compatibility helper for engines whose whole batch takes one
+    // speculative route. Mixed executors should call observe_route directly.
     void observe_speculation(int batch_size, double elapsed_us) {
-        observe_cost(spec_cost_us_, spec_cost_known_, batch_size, elapsed_us);
+        observe_route(batch_size, batch_size, elapsed_us);
+    }
+
+    void observe_route(int active_requests, int speculative_requests,
+                       double elapsed_us) {
+        if (active_requests <= 0 || speculative_requests < 0 ||
+            speculative_requests > active_requests ||
+            !std::isfinite(elapsed_us) || elapsed_us <= 0.0) {
+            return;
+        }
+        const size_t rows = static_cast<size_t>(active_requests) + 1;
+        if (route_cost_us_.size() < rows) route_cost_us_.resize(rows);
+        if (route_cost_known_.size() < rows) route_cost_known_.resize(rows);
+        std::vector<double> & costs =
+            route_cost_us_[(size_t)active_requests];
+        std::vector<bool> & known =
+            route_cost_known_[(size_t)active_requests];
+        const size_t cols = static_cast<size_t>(speculative_requests) + 1;
+        if (costs.size() < cols) costs.resize(cols, 0.0);
+        if (known.size() < cols) known.resize(cols, false);
+        if (!known[(size_t)speculative_requests]) {
+            costs[(size_t)speculative_requests] = elapsed_us;
+            known[(size_t)speculative_requests] = true;
+            return;
+        }
+        costs[(size_t)speculative_requests] =
+            config_.cost_ewma_alpha * elapsed_us +
+            (1.0 - config_.cost_ewma_alpha) *
+                costs[(size_t)speculative_requests];
     }
 
     bool has_autoregressive_cost(int batch_size) const {
-        return has_cost(ar_cost_known_, batch_size);
+        return has_route_cost(batch_size, /*speculative_requests=*/0);
     }
 
     bool has_speculation_cost(int batch_size) const {
-        return has_cost(spec_cost_known_, batch_size);
+        return has_route_cost(batch_size, batch_size);
     }
 
     double autoregressive_cost_us(int batch_size) const {
-        return cost(ar_cost_us_, ar_cost_known_, batch_size);
+        return route_cost_us(batch_size, /*speculative_requests=*/0);
     }
 
     double speculation_cost_us(int batch_size) const {
-        return cost(spec_cost_us_, spec_cost_known_, batch_size);
+        return route_cost_us(batch_size, batch_size);
+    }
+
+    bool has_route_cost(int active_requests,
+                        int speculative_requests) const {
+        return active_requests > 0 && speculative_requests >= 0 &&
+            speculative_requests <= active_requests &&
+            static_cast<size_t>(active_requests) <
+                route_cost_known_.size() &&
+            static_cast<size_t>(speculative_requests) <
+                route_cost_known_[(size_t)active_requests].size() &&
+            route_cost_known_[(size_t)active_requests]
+                             [(size_t)speculative_requests];
+    }
+
+    double route_cost_us(int active_requests,
+                         int speculative_requests) const {
+        return has_route_cost(active_requests, speculative_requests)
+            ? route_cost_us_[(size_t)active_requests]
+                            [(size_t)speculative_requests]
+            : std::numeric_limits<double>::infinity();
     }
 
     AdaptiveVerificationDecision select(
@@ -156,11 +205,11 @@ public:
         for (int k = 1; k <= static_cast<int>(known.size()) &&
                         k <= active_requests; ++k) {
             expected_total += known[(size_t)k - 1].expected_tokens - 1.0;
-            double route_us = 0.0;
-            if (!combined_cost(active_requests, k, route_us)) {
+            if (!has_route_cost(active_requests, k)) {
                 missing_cost_prefix = k;
                 break;
             }
+            const double route_us = route_cost_us(active_requests, k);
             const double throughput = expected_total / route_us;
             // DSpark's greedy policy stops at the first non-improving
             // candidate because candidates are already ranked by survival.
@@ -206,59 +255,9 @@ private:
         return config;
     }
 
-    void observe_cost(std::vector<double> & costs,
-                      std::vector<bool> & known,
-                      int batch_size, double elapsed_us) {
-        if (batch_size <= 0 || !std::isfinite(elapsed_us) ||
-            elapsed_us <= 0.0) {
-            return;
-        }
-        const size_t needed = static_cast<size_t>(batch_size) + 1;
-        if (costs.size() < needed) costs.resize(needed, 0.0);
-        if (known.size() < needed) known.resize(needed, false);
-        if (!known[(size_t)batch_size]) {
-            costs[(size_t)batch_size] = elapsed_us;
-            known[(size_t)batch_size] = true;
-            return;
-        }
-        costs[(size_t)batch_size] =
-            config_.cost_ewma_alpha * elapsed_us +
-            (1.0 - config_.cost_ewma_alpha) *
-                costs[(size_t)batch_size];
-    }
-
-    static bool has_cost(const std::vector<bool> & known, int batch_size) {
-        return batch_size == 0 ||
-            (batch_size > 0 && static_cast<size_t>(batch_size) < known.size() &&
-             known[(size_t)batch_size]);
-    }
-
-    static double cost(const std::vector<double> & costs,
-                       const std::vector<bool> & known, int batch_size) {
-        if (batch_size == 0) return 0.0;
-        return has_cost(known, batch_size)
-            ? costs[(size_t)batch_size]
-            : std::numeric_limits<double>::infinity();
-    }
-
-    bool combined_cost(int active_requests, int speculative_requests,
-                       double & elapsed_us) const {
-        const int ar_requests = active_requests - speculative_requests;
-        if (speculative_requests <= 0 || ar_requests < 0 ||
-            !has_speculation_cost(speculative_requests) ||
-            !has_autoregressive_cost(ar_requests)) {
-            return false;
-        }
-        elapsed_us = speculation_cost_us(speculative_requests) +
-                     autoregressive_cost_us(ar_requests);
-        return std::isfinite(elapsed_us) && elapsed_us > 0.0;
-    }
-
     AdaptiveVerificationConfig config_;
-    std::vector<double> ar_cost_us_;
-    std::vector<double> spec_cost_us_;
-    std::vector<bool> ar_cost_known_;
-    std::vector<bool> spec_cost_known_;
+    std::vector<std::vector<double>> route_cost_us_;
+    std::vector<std::vector<bool>> route_cost_known_;
 };
 
 }  // namespace dflash::common

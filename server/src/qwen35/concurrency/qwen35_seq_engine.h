@@ -126,7 +126,8 @@ private:
     StepResult step_regular(const StepPlan & plan);
     // nullopt means proposal setup failed before target/cache mutation and the
     // caller may safely use the ordinary packed AR path for this iteration.
-    std::optional<StepResult> step_ddtree(const StepPlan & plan);
+    std::optional<StepResult> step_ddtree(
+        const StepPlan & speculative_plan, const StepPlan & ar_plan);
 
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
