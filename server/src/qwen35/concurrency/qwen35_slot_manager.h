@@ -18,6 +18,7 @@
 
 #include "common/concurrency/paged_kv_pool.h"
 #include "common/concurrency/paged_kv_residency.h"
+#include "common/concurrency/speculation_goodput.h"
 #include "common/sampler.h"
 #include "common/concurrency/seq_engine.h"
 
@@ -66,10 +67,10 @@ struct Qwen35Slot {
             : 0;
     }
 
-    // Real packed-tree samples are counted per request. A low aggregate-yield
-    // cohort sample suspends every participating request; ordinary AR keeps
-    // every target cache and feature-ring row current.
-    bool ddtree_suspended = false;
+    // Route each request from measured useful-token goodput, independently of
+    // the concrete speculator. DDTree records observations today; DSpark can
+    // use the same controller later.
+    SpeculationGoodputController speculation;
     uint64_t ddtree_sampled_steps = 0;
 
     bool active() const {
@@ -83,10 +84,6 @@ struct Qwen35Slot {
 
 class Qwen35SlotManager {
 public:
-    // Packed DDTree pays for verify + accepted-path replay. Requiring six
-    // emitted tokens makes continuation earn at least three tokens per target
-    // forward before accounting for its additional draft/tree work.
-    static constexpr int kDdtreeMinEmittedTokens = 6;
 
     // `max_ctx` is the per-sequence logical bound; slot count comes from the
     // pool's max_sequences. The pool must outlive the manager.
@@ -157,11 +154,9 @@ public:
     void take_residency_telemetry(int slot, SeqEngine::DecodeOutput & out);
 
     bool ddtree_speculation_allowed(int slot) const;
-    // Compare aggregate emitted yield (accepted children plus one replay
-    // bonus per request) against the cohort continuation floor.
-    static bool ddtree_cohort_should_suspend(uint64_t total_emitted, int active);
-    // Returns true exactly once, when this sample newly suspends the request.
-    bool record_ddtree_sample(int slot, bool suspend_cohort);
+    SpeculationGoodputTransition record_speculation_sample(
+        int slot, double emitted_tokens, double elapsed_us);
+    SpeculationGoodputTransition record_ar_sample(int slot, double elapsed_us);
 
     // One-token compatibility wrapper used by ordinary autoregressive decode.
     StepAppend append_token(int slot, int32_t fed_token);
@@ -198,6 +193,7 @@ private:
     int max_ctx_ = 0;
     int headroom_tokens_;
     PagedKvResidencyManager * residency_ = nullptr;
+    bool speculation_adaptive_ = true;
     std::vector<Qwen35Slot> slots_;
 };
 

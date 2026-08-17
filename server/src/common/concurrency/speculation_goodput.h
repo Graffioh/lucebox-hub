@@ -25,10 +25,11 @@ struct SpeculationGoodputConfig {
     double ewma_alpha = 0.5;
     // Do not abandon a profitable route after one unlucky verification.
     int bad_speculation_steps = 2;
-    // AR requests periodically earn one new speculative probe so a response
-    // can recover when its continuation becomes predictable again.  Zero
-    // disables re-probing.
-    int ar_reprobe_steps = 16;
+    // Optional re-probing after the initial route decision. This is disabled
+    // by default because one speculative tree probe can be much more expensive
+    // than an AR step at high occupancy. Callers may opt in when the speculator
+    // has a sufficiently cheap proposal path.
+    int ar_reprobe_steps = 0;
 };
 
 class SpeculationGoodputController {

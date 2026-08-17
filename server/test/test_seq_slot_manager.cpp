@@ -492,60 +492,75 @@ int main() {
         CHECK(!mgr.has_prefill_prompt_at_least(768));
     }
 
-    // Adaptive DDTree judges aggregate cohort yield rather than allowing one
-    // unlucky request to suppress higher-yield peers. Equality at the
-    // six-token average continues; a low average suspends all participants.
+    // Requests in one concurrent cohort make independent routing decisions
+    // from their measured useful-token goodput. A predictable request can keep
+    // DDTree while a low-yield chat-like peer switches to packed AR.
     {
-        const luce_test::ScopedEnvVar adaptive("DFLASH_DDTREE_ADAPTIVE", nullptr);
-        CHECK(Qwen35SlotManager::ddtree_cohort_should_suspend(5, 1));
-        CHECK(!Qwen35SlotManager::ddtree_cohort_should_suspend(6, 1));
-        // Mixed synthetic cohort: one child-less row plus an eleven-token row
-        // exactly meets the continuation floor; one fewer token does not.
-        CHECK(!Qwen35SlotManager::ddtree_cohort_should_suspend(12, 2));
-        CHECK(Qwen35SlotManager::ddtree_cohort_should_suspend(11, 2));
-
+        const luce_test::ScopedEnvVar adaptive(
+            "DFLASH_DDTREE_ADAPTIVE", nullptr);
         PagedKvPool pool(8, 2, /*block_size=*/16);
         Qwen35SlotManager mgr(pool, 64);
-        auto a = admit(mgr, 101, prompt_tokens(4), greedy_sampler());
-        auto b = admit(mgr, 102, prompt_tokens(4), greedy_sampler());
-        CHECK(is_admitted(a));
-        CHECK(is_admitted(b));
-        CHECK(mgr.append_prefill(a.slot, 4).ok);
-        CHECK(mgr.append_prefill(b.slot, 4).ok);
-        mgr.commit_prefill(a.slot);
-        mgr.commit_prefill(b.slot);
-        CHECK(mgr.slot(a.slot).request_id == 101);
-        CHECK(mgr.slot(b.slot).request_id == 102);
-        CHECK(mgr.ddtree_speculation_allowed(a.slot));
-        CHECK(mgr.ddtree_speculation_allowed(b.slot));
+        auto code = admit(mgr, 101, prompt_tokens(4), greedy_sampler());
+        auto chat = admit(mgr, 102, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(code));
+        CHECK(is_admitted(chat));
+        CHECK(mgr.append_prefill(code.slot, 4).ok);
+        CHECK(mgr.append_prefill(chat.slot, 4).ok);
+        mgr.commit_prefill(code.slot);
+        mgr.commit_prefill(chat.slot);
+        CHECK(mgr.ddtree_speculation_allowed(code.slot));
+        CHECK(mgr.ddtree_speculation_allowed(chat.slot));
 
-        // The keep decision records a real sample without latching either
-        // participant, including the low-yield member.
-        CHECK(!mgr.record_ddtree_sample(a.slot, false));
-        CHECK(!mgr.record_ddtree_sample(b.slot, false));
-        CHECK(mgr.ddtree_speculation_allowed(a.slot));
-        CHECK(mgr.ddtree_speculation_allowed(b.slot));
-        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 1);
-        CHECK(mgr.slot(b.slot).ddtree_sampled_steps == 1);
+        CHECK(mgr.record_speculation_sample(
+                  code.slot, /*emitted_tokens=*/8, /*elapsed_us=*/2000.0) ==
+              SpeculationGoodputTransition::none);
+        CHECK(mgr.record_speculation_sample(
+                  chat.slot, /*emitted_tokens=*/1, /*elapsed_us=*/2000.0) ==
+              SpeculationGoodputTransition::none);
+        // Both requests take one neighboring AR calibration step.
+        CHECK(!mgr.ddtree_speculation_allowed(code.slot));
+        CHECK(!mgr.ddtree_speculation_allowed(chat.slot));
+        CHECK(mgr.record_ar_sample(code.slot, /*elapsed_us=*/1000.0) ==
+              SpeculationGoodputTransition::none);
+        CHECK(mgr.record_ar_sample(chat.slot, /*elapsed_us=*/1000.0) ==
+              SpeculationGoodputTransition::disabled);
+        CHECK(mgr.ddtree_speculation_allowed(code.slot));
+        CHECK(!mgr.ddtree_speculation_allowed(chat.slot));
+        CHECK(mgr.slot(code.slot).ddtree_sampled_steps == 1);
+        CHECK(mgr.slot(chat.slot).ddtree_sampled_steps == 1);
 
-        // A low cohort decision is applied identically and atomically to both.
-        CHECK(mgr.record_ddtree_sample(a.slot, true));
-        CHECK(mgr.record_ddtree_sample(b.slot, true));
-        CHECK(!mgr.ddtree_speculation_allowed(a.slot));
-        CHECK(!mgr.ddtree_speculation_allowed(b.slot));
-        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 2);
-        CHECK(mgr.slot(b.slot).ddtree_sampled_steps == 2);
+        // The production default makes one bounded decision per request; an
+        // expensive speculator does not periodically interrupt a winning AR
+        // route. Re-probing remains available through controller config.
+        for (int i = 0; i < 32; ++i) {
+            CHECK(mgr.record_ar_sample(chat.slot, 1000.0) ==
+                  SpeculationGoodputTransition::none);
+            CHECK(!mgr.ddtree_speculation_allowed(chat.slot));
+        }
 
-        // Suspended requests cannot pay for another bad probe.
-        CHECK(!mgr.record_ddtree_sample(a.slot, true));
-        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 2);
-
-        mgr.retire(a.slot);
+        mgr.retire(code.slot);
         auto reused = admit(mgr, 103, prompt_tokens(4), greedy_sampler());
-        CHECK(is_admitted(reused) && reused.slot == a.slot);
+        CHECK(is_admitted(reused) && reused.slot == code.slot);
         CHECK(mgr.slot(reused.slot).request_id == 103);
         CHECK(mgr.ddtree_speculation_allowed(reused.slot));
         CHECK(mgr.slot(reused.slot).ddtree_sampled_steps == 0);
+    }
+
+    // The existing burn-in switch preserves fixed speculation.
+    {
+        const luce_test::ScopedEnvVar adaptive("DFLASH_DDTREE_ADAPTIVE", "0");
+        PagedKvPool pool(4, 1, /*block_size=*/16);
+        Qwen35SlotManager mgr(pool, 64);
+        auto admitted = admit(mgr, 201, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(admitted));
+        CHECK(mgr.append_prefill(admitted.slot, 4).ok);
+        mgr.commit_prefill(admitted.slot);
+        CHECK(mgr.ddtree_speculation_allowed(admitted.slot));
+        CHECK(mgr.record_speculation_sample(admitted.slot, 1, 2000.0) ==
+              SpeculationGoodputTransition::none);
+        CHECK(mgr.record_ar_sample(admitted.slot, 1000.0) ==
+              SpeculationGoodputTransition::none);
+        CHECK(mgr.ddtree_speculation_allowed(admitted.slot));
     }
 
     // A failed residency barrier quarantines retirement ownership, and a

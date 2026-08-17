@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include "common/concurrency/adaptive_verification.h"
 #include "common/concurrency/seq_engine.h"
 #include "common/dflash_draft_kv.h"
 #include "common/dflash_feature_ring.h"
@@ -118,7 +119,11 @@ private:
                              std::vector<float> * logits_scratch = nullptr);
     DraftFeatureMirror * slot_feature_mirror(int slot);
     DraftKvState * ensure_slot_draft_kv(int slot);
-    bool ddtree_eligible(const StepPlan & plan) const;
+    bool ddtree_available(const StepPlan & plan) const;
+    bool ddtree_input_eligible(const StepInput & input) const;
+    std::optional<double> estimate_ddtree_expected_tokens(
+        const StepInput & input);
+    StepResult step_regular(const StepPlan & plan);
     // nullopt means proposal setup failed before target/cache mutation and the
     // caller may safely use the ordinary packed AR path for this iteration.
     std::optional<StepResult> step_ddtree(const StepPlan & plan);
@@ -130,6 +135,8 @@ private:
     int             tree_scratch_base_ = 0;
     int             tree_scratch_stride_ = 0;
     bool            capture_features_ = false;
+    AdaptiveVerificationRanker adaptive_verification_;
+    int             adaptive_calibration_cooldown_ = 0;
     ggml_context *  feature_view_ctx_ = nullptr;
     std::vector<DraftFeatureMirror> slot_feature_mirrors_;
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;

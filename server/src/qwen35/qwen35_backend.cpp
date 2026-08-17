@@ -551,7 +551,9 @@ bool Qwen35Backend::init() {
             if (concurrent_local_ddtree) {
                 const char * adaptive = std::getenv("DFLASH_DDTREE_ADAPTIVE");
                 std::fprintf(stderr,
-                    "[parallel-ddtree] enabled budget=%d width=%d mode=packed-verify-replay adaptive=%s\n",
+                    "[parallel-ddtree] enabled budget=%d width=%d "
+                    "mode=packed-verify-replay adaptive=%s "
+                    "policy=ranked-goodput scope=all-concurrency\n",
                     cfg_.ddtree_budget, tree_width,
                     adaptive && std::atoi(adaptive) == 0 ? "off" : "on");
             }

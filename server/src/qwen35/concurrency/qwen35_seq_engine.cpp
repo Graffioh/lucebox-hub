@@ -17,6 +17,8 @@
 #include "internal.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -140,31 +142,105 @@ DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
     return state.get();
 }
 
-bool Qwen35SeqEngine::ddtree_eligible(const StepPlan & plan) const {
-    if (tree_width_ <= 1 || !capture_features_ || !plan.prefills.empty() ||
-        plan.decode.empty() || b_.dw_.block_size <= 1 ||
-        b_.cfg_.ddtree_budget + 1 != tree_width_) {
+bool Qwen35SeqEngine::ddtree_available(const StepPlan & plan) const {
+    return tree_width_ > 1 && capture_features_ && plan.prefills.empty() &&
+        !plan.decode.empty() && b_.dw_.block_size > 1 &&
+        b_.cfg_.ddtree_budget + 1 == tree_width_;
+}
+
+bool Qwen35SeqEngine::ddtree_input_eligible(const StepInput & in) const {
+    if (!in.allow_speculation || in.slot < 0 ||
+        in.slot >= slots_.slot_count() ||
+        !slots_.slot(in.slot).decoding() ||
+        slots_.slot(in.slot).sampler.needs_logit_processing() ||
+        slots_.slot(in.slot).cur_pos < 1 ||
+        slots_.slot(in.slot).cur_pos >= slots_.max_context()) {
         return false;
     }
     const int min_floor = []() {
         const char * value = std::getenv("DFLASH_MIN_TOKENS");
         return value ? std::max(0, std::atoi(value)) : 0;
     }();
-    for (const StepInput & in : plan.decode) {
-        if (!in.allow_speculation || in.slot < 0 ||
-            in.slot >= slots_.slot_count() ||
-            !slots_.slot(in.slot).decoding() ||
-            !slots_.ddtree_speculation_allowed(in.slot) ||
-            slots_.slot(in.slot).sampler.needs_logit_processing() ||
-            slots_.slot(in.slot).cur_pos < 1 ||
-            slots_.slot(in.slot).cur_pos >= slots_.max_context()) {
-            return false;
-        }
-        const Qwen35Slot & seq = slots_.slot(in.slot);
-        const int generated = seq.generated_tokens();
-        if (generated < min_floor) return false;
+    return slots_.slot(in.slot).generated_tokens() >= min_floor;
+}
+
+std::optional<double> Qwen35SeqEngine::estimate_ddtree_expected_tokens(
+        const StepInput & in) {
+    const int q_len = b_.dw_.block_size;
+    const int hidden = b_.w_.n_embd;
+    if (q_len <= 1 || !build_lm_head_projection_step(
+            b_.proj_sg_, b_.w_, b_.target_backend_, q_len)) {
+        return std::nullopt;
     }
-    return true;
+
+    DraftKvState * draft = ensure_slot_draft_kv(in.slot);
+    DraftFeatureMirror * mirror = slot_feature_mirror(in.slot);
+    if (!draft || !mirror) return std::nullopt;
+
+    auto fail = [&]() -> std::optional<double> {
+        // begin_step advances only host cache bookkeeping, but a failed graph
+        // can leave the appended rows incomplete. Rebuild from committed
+        // target features on the next proposal.
+        draft_kv_reset(*draft);
+        return std::nullopt;
+    };
+
+    std::vector<int32_t> noise((size_t)q_len, b_.w_.mask_token_id);
+    noise[0] = in.token;
+    std::vector<float> noise_embed((size_t)hidden * q_len);
+    if (!b_.w_.embedder.embed(
+            noise.data(), q_len, noise_embed.data()) ||
+        !draft_kv_begin_step(*draft, b_.dw_, b_.draft_backend_,
+                             *mirror, slots_.slot(in.slot).cur_pos)) {
+        return fail();
+    }
+    ggml_backend_tensor_set(
+        draft->inp_embed, noise_embed.data(), 0,
+        sizeof(float) * noise_embed.size());
+    if (ggml_backend_graph_compute(b_.draft_backend_, draft->gf) !=
+        GGML_STATUS_SUCCESS) {
+        return fail();
+    }
+    ggml_backend_synchronize(b_.draft_backend_);
+    ggml_backend_tensor_copy(
+        draft->hidden_states, b_.proj_sg_.hidden_input);
+    if (ggml_backend_graph_compute(
+            b_.target_backend_, b_.proj_sg_.gf) != GGML_STATUS_SUCCESS) {
+        return fail();
+    }
+
+    std::vector<float> top_lp((size_t)q_len);
+    std::vector<int32_t> top_ids((size_t)q_len);
+    bool topk_ready = false;
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK
+    topk_ready = geometric_extract_draft_topk_cuda(
+        b_.proj_sg_.logits->data, q_len, b_.w_.n_vocab, 1,
+        top_lp.data(), top_ids.data(), b_.cfg_.ddtree_temp);
+#endif
+    if (!topk_ready) {
+        std::vector<float> logits(
+            (size_t)b_.w_.n_vocab * q_len);
+        ggml_backend_tensor_get(
+            b_.proj_sg_.logits, logits.data(), 0,
+            sizeof(float) * logits.size());
+        extract_draft_topk(
+            logits.data(), q_len, b_.w_.n_vocab, 1,
+            top_lp.data(), top_ids.data(), b_.cfg_.ddtree_temp);
+    }
+
+    // Training-free SVIP-style confidence: the top-1 draft probability at
+    // each position estimates conditional survival, so the cumulative product
+    // estimates reaching that prefix. DSpark can replace this adapter with its
+    // calibrated confidence-head probabilities without changing the ranker.
+    std::vector<float> confidence((size_t)q_len - 1);
+    for (int pos = 1; pos < q_len; ++pos) {
+        confidence[(size_t)pos - 1] = static_cast<float>(
+            std::clamp(std::exp(static_cast<double>(
+                           top_lp[(size_t)pos])),
+                       0.0, 1.0));
+    }
+    return expected_tokens_from_conditional_confidence(
+        confidence.data(), static_cast<int>(confidence.size()));
 }
 
 std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
@@ -533,21 +609,6 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         }
     }
 
-    uint64_t cohort_emitted = 0;
-    for (const Proposal & p : proposals) {
-        // accepted contains the replay root plus accepted children. The
-        // output emits those children plus one separately computed pending
-        // scalar, so accepted.size() is this request's emitted yield.
-        cohort_emitted += (uint64_t)p.accepted.size();
-    }
-    const bool suspend_cohort =
-        Qwen35SlotManager::ddtree_cohort_should_suspend(
-            cohort_emitted, active);
-    std::vector<bool> newly_suspended((size_t)slots_.slot_count(), false);
-    for (const Proposal & p : proposals) {
-        newly_suspended[(size_t)p.slot] =
-            slots_.record_ddtree_sample(p.slot, suspend_cohort);
-    }
 
     result.decode.reserve((size_t)active);
     for (Proposal & p : proposals) {
@@ -562,20 +623,6 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
             const int dfs = p.accepted[i];
             out.committed_tokens.push_back(
                 p.tree.token_ids[(size_t)dfs - 1]);
-        }
-        if (newly_suspended[(size_t)p.slot]) {
-            out.ddtree_suspensions = 1;
-            const Qwen35Slot & seq = slots_.slot(p.slot);
-            std::fprintf(stderr,
-                "[parallel-ddtree] adaptive suspend request=%llu slot=%d "
-                "sample=%llu emitted=%d accepted_children=%d "
-                "cohort_emitted=%llu cohort_size=%d target_forwards=2 "
-                "floor=%d\n",
-                (unsigned long long)seq.request_id, p.slot,
-                (unsigned long long)seq.ddtree_sampled_steps,
-                accepted_children + 1, accepted_children,
-                (unsigned long long)cohort_emitted, active,
-                Qwen35SlotManager::kDdtreeMinEmittedTokens);
         }
         attach_residency_telemetry(out);
         result.decode.push_back(std::move(out));
@@ -787,8 +834,6 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
 
 SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     StepResult result;
-    std::vector<DecodeOutput> & decode_outputs = result.decode;
-    std::vector<PrefillOutput> & prefill_outputs = result.prefills;
     const std::vector<StepInput> & inputs = plan.decode;
     const int n_slots = slots_.slot_count();
 
@@ -835,13 +880,245 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     }
     if (inputs.empty() && plan.prefills.empty()) return result;
 
-    if (ddtree_eligible(plan)) {
-        std::optional<StepResult> speculative = step_ddtree(plan);
-        if (speculative) return std::move(*speculative);
-        // Proposal setup failed before target/cache mutation. Preserve service
-        // by taking the existing packed AR path for this iteration.
+    if (!ddtree_available(plan)) return step_regular(plan);
+
+    const char * adaptive = std::getenv("DFLASH_DDTREE_ADAPTIVE");
+    const bool adaptive_enabled = !(adaptive && std::atoi(adaptive) == 0);
+
+    // Keep the scheduler independent of the concrete speculation algorithm.
+    // DDTree contributes either a cheap draft-confidence estimate or an EWMA
+    // of target-accepted useful tokens. A future DSpark adapter can contribute
+    // calibrated prefix survival from its confidence head.
+    std::vector<AdaptiveVerificationCandidate> candidates;
+    candidates.reserve(inputs.size());
+    auto collect_candidates = [&]() {
+        candidates.clear();
+        for (const StepInput & in : inputs) {
+            if (!ddtree_input_eligible(in) ||
+                !slots_.ddtree_speculation_allowed(in.slot)) {
+                continue;
+            }
+            const SpeculationGoodputController & policy =
+                slots_.slot(in.slot).speculation;
+            candidates.push_back({
+                in.slot,
+                policy.expected_emitted_tokens(),
+                static_cast<double>(b_.dw_.block_size),
+                policy.has_expected_emitted_tokens(),
+            });
+        }
+    };
+    collect_candidates();
+
+    AdaptiveVerificationDecision decision;
+    if (adaptive_enabled) {
+        decision = adaptive_verification_.select(
+            static_cast<int>(inputs.size()), candidates);
+        if (inputs.size() <= 3) {
+            adaptive_calibration_cooldown_ = 0;
+        } else if (adaptive_calibration_cooldown_ > 0) {
+            --adaptive_calibration_cooldown_;
+        }
+        if (decision.calibration_request >= 0 &&
+            adaptive_calibration_cooldown_ == 0) {
+            const auto input = std::find_if(
+                inputs.begin(), inputs.end(),
+                [&](const StepInput & in) {
+                    return in.slot == decision.calibration_request;
+                });
+            if (input != inputs.end()) {
+                const std::optional<double> expected =
+                    estimate_ddtree_expected_tokens(*input);
+                if (expected) {
+                    slots_.slot(input->slot).speculation
+                        .observe_expected_tokens(*expected);
+                    // Drafter confidence is cheap relative to target
+                    // verification but not free on the current sequential
+                    // per-slot DDTree path. At high occupancy, amortize cold
+                    // calibration across decode steps; already-ranked requests
+                    // remain independently selectable on every step.
+                    if (inputs.size() > 3) {
+                        static const int interval = []() {
+                            const char * value = std::getenv(
+                                "DFLASH_ADAPTIVE_VERIFY_CALIBRATION_STEPS");
+                            return value ? std::max(1, std::atoi(value)) : 64;
+                        }();
+                        adaptive_calibration_cooldown_ = interval;
+                    }
+                    std::fprintf(stderr,
+                        "[parallel-ddtree] confidence request=%llu slot=%d "
+                        "expected_tokens=%.3f\n",
+                        (unsigned long long)
+                            slots_.slot(input->slot).request_id,
+                        input->slot, *expected);
+                    collect_candidates();
+                    decision = adaptive_verification_.select(
+                        static_cast<int>(inputs.size()), candidates);
+                }
+            }
+        }
+    } else {
+        decision.requests.reserve(candidates.size());
+        for (const AdaptiveVerificationCandidate & candidate : candidates) {
+            decision.requests.push_back(candidate.request);
+        }
     }
 
+    std::vector<uint8_t> selected((size_t)n_slots, 0);
+    for (int slot : decision.requests) {
+        if (slot >= 0 && slot < n_slots) selected[(size_t)slot] = 1;
+    }
+
+    StepPlan speculative_plan;
+    StepPlan ar_plan;
+    speculative_plan.decode.reserve(decision.requests.size());
+    ar_plan.decode.reserve(inputs.size() - decision.requests.size());
+    std::vector<uint8_t> observe_ar((size_t)n_slots, 0);
+    for (const StepInput & in : inputs) {
+        const bool eligible = ddtree_input_eligible(in);
+        if (eligible && selected[(size_t)in.slot]) {
+            speculative_plan.decode.push_back(in);
+        } else {
+            ar_plan.decode.push_back(in);
+            if (eligible) observe_ar[(size_t)in.slot] = 1;
+        }
+    }
+
+    using Clock = std::chrono::steady_clock;
+    StepResult speculative_result;
+    StepResult ar_result;
+    double speculative_us = 0.0;
+    double ar_us = 0.0;
+
+    if (!speculative_plan.decode.empty()) {
+        const auto started = Clock::now();
+        std::optional<StepResult> speculative =
+            step_ddtree(speculative_plan);
+        speculative_us = std::max(
+            1.0, std::chrono::duration<double, std::micro>(
+                     Clock::now() - started).count());
+        if (!speculative) {
+            // Proposal setup failed before target/cache mutation. Preserve
+            // service with one ordinary packed step and retry speculation on a
+            // later iteration.
+            return step_regular(plan);
+        }
+        if (!speculative->ok()) return std::move(*speculative);
+        speculative_result = std::move(*speculative);
+    }
+
+    if (!ar_plan.decode.empty()) {
+        const auto started = Clock::now();
+        ar_result = step_regular(ar_plan);
+        ar_us = std::max(
+            1.0, std::chrono::duration<double, std::micro>(
+                     Clock::now() - started).count());
+        if (!ar_result.ok()) return ar_result;
+    }
+
+    if (adaptive_enabled) {
+        if (!speculative_plan.decode.empty()) {
+            adaptive_verification_.observe_speculation(
+                static_cast<int>(speculative_plan.decode.size()),
+                speculative_us);
+        }
+        if (!ar_plan.decode.empty()) {
+            adaptive_verification_.observe_autoregressive(
+                static_cast<int>(ar_plan.decode.size()), ar_us);
+        }
+    }
+    if (decision.exploring && !speculative_plan.decode.empty()) {
+        std::fprintf(stderr,
+            "[parallel-ddtree] adaptive verification probe active=%zu "
+            "speculative=%zu ar=%zu\n",
+            inputs.size(), speculative_plan.decode.size(),
+            ar_plan.decode.size());
+    }
+
+    auto log_transition = [&](int slot,
+                              SpeculationGoodputTransition transition,
+                              const char * observed_route,
+                              double emitted_tokens,
+                              double elapsed_us) {
+        if (transition == SpeculationGoodputTransition::none) return;
+        const Qwen35Slot & seq = slots_.slot(slot);
+        const SpeculationGoodputController & policy = seq.speculation;
+        const char * action =
+            transition == SpeculationGoodputTransition::enabled
+                ? "enable" : "disable";
+        const double spec_tps = policy.speculative_goodput() * 1.0e6;
+        const double ar_tps = policy.ar_goodput() * 1.0e6;
+        std::fprintf(stderr,
+            "[parallel-ddtree] adaptive route request=%llu slot=%d "
+            "action=%s observed=%s sample=%llu emitted=%.0f "
+            "elapsed_us=%.0f spec_tok_s=%.2f ar_tok_s=%.2f\n",
+            (unsigned long long)seq.request_id, slot, action, observed_route,
+            (unsigned long long)seq.ddtree_sampled_steps, emitted_tokens,
+            elapsed_us, spec_tps, ar_tps);
+    };
+
+    for (DecodeOutput & out : speculative_result.decode) {
+        if (out.failed || out.slot < 0 || out.slot >= n_slots) continue;
+        const double emitted =
+            static_cast<double>(out.ddtree_accepted_tokens + 1);
+        const SpeculationGoodputTransition transition =
+            slots_.record_speculation_sample(
+                out.slot, emitted, speculative_us);
+        if (transition == SpeculationGoodputTransition::disabled) {
+            out.ddtree_suspensions = 1;
+        }
+        log_transition(
+            out.slot, transition, "speculation", emitted, speculative_us);
+    }
+    for (DecodeOutput & out : ar_result.decode) {
+        if (out.failed || out.slot < 0 || out.slot >= n_slots ||
+            !observe_ar[(size_t)out.slot]) {
+            continue;
+        }
+        const SpeculationGoodputTransition transition =
+            slots_.record_ar_sample(out.slot, ar_us);
+        log_transition(out.slot, transition, "ar", 1.0, ar_us);
+    }
+
+    std::vector<DecodeOutput> by_slot((size_t)n_slots);
+    std::vector<uint8_t> present((size_t)n_slots, 0);
+    auto collect = [&](std::vector<DecodeOutput> & outputs) {
+        for (DecodeOutput & out : outputs) {
+            if (out.slot < 0 || out.slot >= n_slots ||
+                present[(size_t)out.slot]) {
+                return false;
+            }
+            present[(size_t)out.slot] = 1;
+            by_slot[(size_t)out.slot] = std::move(out);
+        }
+        return true;
+    };
+    if (!collect(speculative_result.decode) || !collect(ar_result.decode)) {
+        return fail_step("adaptive decode produced duplicate slot output");
+    }
+    result.decode.reserve(inputs.size());
+    for (const StepInput & in : inputs) {
+        if (!present[(size_t)in.slot]) {
+            return fail_step("adaptive decode omitted a live slot output");
+        }
+        result.decode.push_back(std::move(by_slot[(size_t)in.slot]));
+    }
+    return result;
+}
+
+SeqEngine::StepResult Qwen35SeqEngine::step_regular(const StepPlan & plan) {
+    StepResult result;
+    std::vector<DecodeOutput> & decode_outputs = result.decode;
+    std::vector<PrefillOutput> & prefill_outputs = result.prefills;
+    const std::vector<StepInput> & inputs = plan.decode;
+    const int n_slots = slots_.slot_count();
+
+    auto fail_step = [&](const std::string & error) {
+        result.decode.clear();
+        result.prefills.clear();
+        result.error = error;
+        return std::move(result);
+    };
     const TargetWeights & w = b_.w_;
     StepGraph & sg = b_.sg_;
     const int hidden = w.n_embd;

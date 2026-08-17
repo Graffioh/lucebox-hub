@@ -39,7 +39,7 @@ VARIANTS=ddtree,pflash,kvflash,full CLIENTS=1,4,8,16 REPEATS=5 \
 harness/benchmarks/concurrency/run_qwen36_feature_matrix.sh
 ```
 
-`DDTREE_ADAPTIVE=0` matches the blog's continuous DDTree probe policy; leave it at the default `1` when measuring the concurrent engine's adaptive fallback policy. The concurrent path now records a startup `[parallel-ddtree]` marker and per-request `ddtree_steps`; these are the proof that DDTree actually ran.
+`DDTREE_ADAPTIVE=0` matches the blog's continuous DDTree probe policy; leave it at the default `1` when measuring adaptive verification. The default policy ranks requests independently at every concurrency from expected useful tokens and measured AR/speculation subbatch costs. DDTree calibrates cold requests from cumulative top-1 draft confidence; at C>3 these calibration passes are spaced by 64 decode steps by default (`DFLASH_ADAPTIVE_VERIFY_CALIBRATION_STEPS` overrides the interval). The speculator-neutral ranker also accepts calibrated DSpark confidence directly. The concurrent path records a startup `[parallel-ddtree]` marker and per-request `ddtree_steps`; these are the proof that DDTree actually ran.
 
 On a 128 GiB Strix Halo host, budget roughly 45–90 minutes for this smoke run;
 the long-context AR controls dominate and actual time depends on the build.
