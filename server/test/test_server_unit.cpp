@@ -44,6 +44,7 @@
 
 #include <filesystem>
 #include <cmath>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -98,6 +99,13 @@ struct ServerUnitFixture {};
     } \
 } while (0)
 
+TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {
+    CHECK(std::string(api_format_name(ApiFormat::OPENAI_CHAT)) == "chat");
+    CHECK(std::string(api_format_name(ApiFormat::ANTHROPIC)) == "anthropic");
+    CHECK(std::string(api_format_name(ApiFormat::RESPONSES)) == "responses");
+    CHECK(std::string(api_format_name(ApiFormat::COMPLETIONS)) == "completions");
+}
+
 TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
     bool cancel = false;
     DaemonIO io;
@@ -141,6 +149,47 @@ TEST_CASE(ServerUnitFixture, test_http_peer_socket_probe_preserves_half_close) {
     sockets[0] = -1;
     TEST_ASSERT(http_detail::inspect_peer_socket(closed_fd) ==
                 http_detail::PeerSocketState::Disconnected);
+    close(sockets[1]);
+}
+
+TEST_CASE(ServerUnitFixture, test_http_heartbeat_never_waits_for_stalled_peer) {
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    TEST_ASSERT(fcntl(sockets[0], F_SETFL, O_NONBLOCK) == 0);
+    const int sndbuf = 4096;
+    TEST_ASSERT(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF,
+                           &sndbuf, sizeof(sndbuf)) == 0);
+
+    const std::string fill(4096, 'x');
+    ssize_t sent = 0;
+    do {
+        sent = send(sockets[0], fill.data(), fill.size(), MSG_NOSIGNAL);
+    } while (sent > 0);
+    TEST_ASSERT(sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+
+    const auto started = std::chrono::steady_clock::now();
+    size_t heartbeat_offset = 0;
+    TEST_ASSERT(http_detail::try_send_sse_heartbeat(
+                    sockets[0], heartbeat_offset) ==
+                http_detail::HeartbeatSendResult::Retry);
+    TEST_ASSERT(heartbeat_offset < sizeof(": keep-alive\n\n") - 1);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    TEST_ASSERT(elapsed < std::chrono::milliseconds(100));
+
+    // Once the peer drains, retrying completes the same heartbeat rather than
+    // treating temporary backpressure as a disconnect.
+    char drained[8192];
+    while (recv(sockets[1], drained, sizeof(drained), MSG_DONTWAIT) > 0) {}
+    TEST_ASSERT(http_detail::try_send_sse_heartbeat(
+                    sockets[0], heartbeat_offset) ==
+                http_detail::HeartbeatSendResult::Complete);
+    TEST_ASSERT(heartbeat_offset == 0);
+    const std::string expected = ": keep-alive\n\n";
+    TEST_ASSERT(recv(sockets[1], drained, sizeof(drained), 0) ==
+                (ssize_t)expected.size());
+    TEST_ASSERT(std::memcmp(drained, expected.data(), expected.size()) == 0);
+
+    close(sockets[0]);
     close(sockets[1]);
 }
 #endif
@@ -2245,6 +2294,38 @@ TEST_CASE(ServerUnitFixture, test_pflash_config_defaults) {
     TEST_ASSERT(cfg.pflash_drafter_path.empty());
     TEST_ASSERT(!cfg.pflash_skip_park);
     TEST_ASSERT(cfg.draft_residency == DraftResidencyPolicy::Auto);
+}
+
+TEST_CASE(ServerUnitFixture, test_concurrent_status_is_aggregate_only) {
+    ServerStatus status;
+    ServerStatus::RequestInfo info;
+    info.model = "classic-model";
+    status.set_running("classic prompt", 12, true, info);
+    json snapshot = status.to_json();
+    TEST_ASSERT(snapshot["active_requests"] == 0);
+    TEST_ASSERT(snapshot["current"]["model"] == "classic-model");
+
+    status.set_concurrent_requests(2, 2);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "prefill");
+    TEST_ASSERT(snapshot["active_requests"] == 2);
+    TEST_ASSERT(snapshot["current"].is_null());
+
+    status.set_concurrent_requests(2, 1);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "mixed");
+    TEST_ASSERT(snapshot["active_requests"] == 2);
+
+    status.set_concurrent_requests(2, 0);
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "decode");
+    TEST_ASSERT(snapshot["active_requests"] == 2);
+
+    status.set_idle();
+    snapshot = status.to_json();
+    TEST_ASSERT(snapshot["phase"] == "idle");
+    TEST_ASSERT(snapshot["active_requests"] == 0);
+    TEST_ASSERT(snapshot["current"].is_null());
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
@@ -4633,7 +4714,6 @@ TEST_CASE(ServerUnitFixture, test_props_model_card_wholesale_sidecar) {
     PrefixCache  pc(0, tok);
     ToolMemory   tm;
     json body = build_props_body(cfg, pc, tm);
-
     TEST_ASSERT(body.contains("model_card"));
     TEST_ASSERT(!body["model_card"].is_null());
     // `source` is the upstream URL, NOT the filepath. The filepath label
@@ -4746,6 +4826,7 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     cfg.chunk           = 512;
     cfg.target_device   = "auto:0";
     cfg.draft_device    = "auto:0";
+    TEST_ASSERT(cfg.admission_coalesce_ms == 20);
 
     Tokenizer    tok;
     PrefixCache  pc(0, tok);
@@ -4764,12 +4845,17 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
     TEST_ASSERT(rt["target_device"].get<std::string>()   == "auto:0");
     TEST_ASSERT(rt["draft_device"].get<std::string>()    == "auto:0");
+    TEST_ASSERT(rt["continuous_batching"]["admission_coalesce_ms"]
+                    .get<int>() == 20);
     TEST_ASSERT(body["pflash"]["draft_residency"].get<std::string>() == "persistent");
 
     // draft_device is null when no draft model is loaded.
     cfg.draft_device.clear();
+    cfg.admission_coalesce_ms = 7;
     body = build_props_body(cfg, pc, tm);
     TEST_ASSERT(body["runtime"]["draft_device"].is_null());
+    TEST_ASSERT(body["runtime"]["continuous_batching"]
+                    ["admission_coalesce_ms"].get<int>() == 7);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
