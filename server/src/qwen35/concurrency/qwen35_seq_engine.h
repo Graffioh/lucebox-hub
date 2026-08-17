@@ -140,6 +140,7 @@ private:
     AdaptiveVerificationRanker adaptive_verification_;
     AdaptiveVerificationRanker compact_adaptive_verification_;
     int             adaptive_calibration_cooldown_ = 0;
+    int             compact_adaptive_calibration_cooldown_ = 0;
     std::vector<uint8_t> compact_tree_cohort_;
     ggml_context *  feature_view_ctx_ = nullptr;
     std::vector<DraftFeatureMirror> slot_feature_mirrors_;

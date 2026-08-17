@@ -65,6 +65,15 @@ const AdaptiveVerificationOracle & adaptive_verification_oracle() {
     return oracle;
 }
 
+int adaptive_calibration_interval() {
+    static const int interval = []() {
+        const char * value = std::getenv(
+            "DFLASH_ADAPTIVE_VERIFY_CALIBRATION_STEPS");
+        return value ? std::max(1, std::atoi(value)) : 64;
+    }();
+    return interval;
+}
+
 } // namespace
 
 Qwen35SeqEngine::Qwen35SeqEngine(
@@ -1081,6 +1090,8 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
         const SamplerCfg & sampler) {
     AdmitResult result = slots_.admit(request_id, prompt, sampler);
     if (result.status == AdmitResult::Status::admitted) {
+        adaptive_verification_.forget_request(request_id);
+        compact_adaptive_verification_.forget_request(request_id);
         compact_tree_cohort_[(size_t)result.slot] = 0;
         reset_recurrent_slot(b_.cache_, result.slot);
         if (slots_.residency_active()) {
@@ -1328,10 +1339,16 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     const bool adaptive_enabled = !(adaptive && std::atoi(adaptive) == 0);
     const AdaptiveVerificationOracle & oracle =
         adaptive_verification_oracle();
-    const bool inherited_compact_tree = std::any_of(
+    const bool has_compact_cohort_member = std::any_of(
         inputs.begin(), inputs.end(), [&](const StepInput & in) {
             return compact_tree_cohort_[(size_t)in.slot] != 0;
         });
+    const bool inherited_compact_tree =
+        !inputs.empty() && std::all_of(
+            inputs.begin(), inputs.end(), [&](const StepInput & in) {
+                return compact_tree_cohort_[(size_t)in.slot] != 0;
+            });
+    const bool starts_compact_cohort = !has_compact_cohort_member;
     // Full DDTree depth wins in the low-occupancy regime. Once target AR is
     // well batched, a compact proposal lowers the marginal verification cost
     // enough for a small profitable request subset. Keep that compact shape
@@ -1339,14 +1356,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     // still gets the established full-depth path.
     constexpr int kFullTreeMaxConcurrency = 4;
     constexpr int kCompactTreeBudget = 8;
-    constexpr uint64_t kVerifierCalibrationSamples = 16;
     const bool compact_tree_route =
         inputs.size() > kFullTreeMaxConcurrency || inherited_compact_tree;
-    const bool structured_compact_cohort =
-        !compact_tree_route || std::all_of(
-            inputs.begin(), inputs.end(), [&](const StepInput & in) {
-                return slots_.slot(in.slot).sampler.speculation_prompt_hint > 0;
-            });
     const int adaptive_tree_budget =
         compact_tree_route
             ? std::min(b_.cfg_.ddtree_budget, kCompactTreeBudget)
@@ -1359,9 +1370,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         ? compact_adaptive_verification_ : adaptive_verification_;
 
     // Keep the scheduler independent of the concrete speculation algorithm.
-    // DDTree contributes either a cheap draft-confidence estimate or an EWMA
-    // of target-accepted useful tokens. A future DSpark adapter can contribute
-    // calibrated prefix survival from its confidence head.
+    // DDTree contributes either a cheap draft-confidence estimate or a
+    // profile-local mean of target-accepted useful tokens. A future DSpark
+    // adapter can contribute calibrated prefix survival from its confidence
+    // head while reusing the same selection policy.
     std::vector<AdaptiveVerificationCandidate> candidates;
     candidates.reserve(inputs.size());
     auto collect_candidates = [&]() {
@@ -1370,39 +1382,27 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             if (!ddtree_input_eligible(in)) continue;
             const Qwen35Slot & seq = slots_.slot(in.slot);
             const int prompt_hint = seq.sampler.speculation_prompt_hint;
-            const bool structured_warmup =
-                adaptive_enabled && !oracle.forces_selection() &&
-                compact_tree_route && structured_compact_cohort &&
-                prompt_hint > 0 &&
-                seq.ddtree_sampled_steps < kVerifierCalibrationSamples;
-            if (!oracle.forces_selection() &&
-                !slots_.ddtree_speculation_allowed(in.slot) &&
-                !structured_warmup) {
-                continue;
-            }
-            if (adaptive_enabled && !oracle.forces_selection() &&
-                compact_tree_route && prompt_hint <= 0) {
-                continue;
-            }
-            const SpeculationGoodputController & policy =
-                seq.speculation;
+            const std::optional<AdaptiveVerificationYieldEstimate> estimate =
+                route_ranker.estimate_request_yield(
+                    seq.request_id, static_cast<double>(prompt_hint));
             candidates.push_back({
                 in.slot,
-                policy.expected_emitted_tokens(),
+                estimate ? estimate->expected_tokens : 1.0,
                 static_cast<double>(compact_tree_route
                     ? tree_budget + 1 : b_.dw_.block_size),
-                policy.has_expected_emitted_tokens(),
+                estimate.has_value(),
                 static_cast<double>(prompt_hint),
+                estimate ? estimate->evidence_samples : 0,
+                seq.generated_tokens(),
             });
         }
     };
     collect_candidates();
 
     AdaptiveVerificationDecision decision;
-    const int adaptive_speculation_limit =
-        b_.cache_.tree_capture_lanes > 0
-            ? b_.cache_.tree_capture_lanes
-            : static_cast<int>(inputs.size());
+    const int adaptive_speculation_limit = compact_tree_route
+        ? std::max(0, b_.cache_.tree_capture_lanes)
+        : static_cast<int>(inputs.size());
     if (oracle.forces_selection()) {
         const int force_limit = std::min(
             adaptive_speculation_limit,
@@ -1422,36 +1422,85 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             logged = true;
         }
     } else if (adaptive_enabled) {
-        const bool drafter_side_calibration = !compact_tree_route;
-        // The compact verifier has three directly captured lanes on Strix
-        // Halo. Oracle sweeps show that a bundle remains worthwhile while
-        // those lanes cover at least one third of the active cohort.
-        constexpr int kCompactActiveRequestsPerLane = 3;
-        const int compact_calibration_limit =
-            kCompactActiveRequestsPerLane * adaptive_speculation_limit;
+        const int exact_profile_width = std::min(
+            adaptive_speculation_limit,
+            static_cast<int>(candidates.size()));
+        const AdaptiveVerificationDecision steady_decision =
+            route_ranker.select(
+                static_cast<int>(inputs.size()), candidates,
+                adaptive_speculation_limit,
+                /*probe_uncalibrated_with_verifier=*/false,
+                /*probe_missing_routes=*/false);
+        const bool request_frontier_ready =
+            static_cast<int>(steady_decision.requests.size()) >=
+                exact_profile_width;
+        int & calibration_cooldown = compact_tree_route
+            ? compact_adaptive_calibration_cooldown_
+            : adaptive_calibration_cooldown_;
+        const bool exact_profile_ready = route_ranker.has_exact_profile(
+            static_cast<int>(inputs.size()), exact_profile_width);
+        const bool exact_profile_started =
+            route_ranker.has_speculative_profile_sample(
+                static_cast<int>(inputs.size()), exact_profile_width);
+        // Finish a profile already started at this occupancy, but do not make
+        // a shrinking compact cohort pay for brand-new C-tail exploration.
+        // A fresh batch at that same C still profiles normally, and a prior
+        // exact profile remains reusable.
+        const bool probe_missing_routes =
+            !compact_tree_route || !inherited_compact_tree ||
+            exact_profile_started;
+        // Full DDTree uses its drafter-side confidence adapter. Compact DDTree
+        // avoids a duplicate draft pass and calibrates one unknown request in
+        // useful verification instead. DSpark can take the former path with
+        // its calibrated confidence head.
+        const bool drafter_side_calibration =
+            !compact_tree_route && probe_missing_routes;
+        if (!exact_profile_ready || !request_frontier_ready ||
+            inputs.size() <= 3) {
+            calibration_cooldown = 0;
+        } else if (calibration_cooldown > 0) {
+            --calibration_cooldown;
+        }
         const bool verifier_side_calibration =
-            compact_tree_route && structured_compact_cohort &&
-            static_cast<int>(inputs.size()) <= compact_calibration_limit;
-        const int ranked_speculation_limit =
-            !compact_tree_route
-                ? adaptive_speculation_limit
-                : (structured_compact_cohort &&
-                   static_cast<int>(inputs.size()) <=
-                       compact_calibration_limit
-                    ? adaptive_speculation_limit : 0);
+            compact_tree_route && probe_missing_routes &&
+            (!exact_profile_ready ||
+             calibration_cooldown == 0);
+        std::vector<AdaptiveVerificationCandidate> verifier_candidates;
+        const std::vector<AdaptiveVerificationCandidate> * decision_candidates =
+            &candidates;
+        const bool potentially_homogeneous =
+            route_ranker.forms_homogeneous_cohort(
+                candidates, /*require_stable_local_evidence=*/false);
+        if (verifier_side_calibration) {
+            verifier_candidates = candidates;
+            for (AdaptiveVerificationCandidate & candidate :
+                    verifier_candidates) {
+                if (candidate.calibrated &&
+                    potentially_homogeneous &&
+                    !route_ranker.has_stable_evidence(
+                        candidate.evidence_samples) &&
+                    route_ranker.has_useful_yield(
+                        candidate.expected_tokens)) {
+                    // A slow route may earn the homogeneous exception only
+                    // when every active request still looks useful. Stable
+                    // low-yield peers make further local proof pure overhead.
+                    candidate.calibrated = false;
+                }
+            }
+            decision_candidates = &verifier_candidates;
+        }
         decision = route_ranker.select(
-            static_cast<int>(inputs.size()), candidates,
-            ranked_speculation_limit, verifier_side_calibration,
-            verifier_side_calibration,
-            /*evaluate_nonconvex_prefixes=*/compact_tree_route);
-        if (inputs.size() <= 3) {
-            adaptive_calibration_cooldown_ = 0;
-        } else if (adaptive_calibration_cooldown_ > 0) {
-            --adaptive_calibration_cooldown_;
+            static_cast<int>(inputs.size()), *decision_candidates,
+            adaptive_speculation_limit, verifier_side_calibration,
+            probe_missing_routes);
+        if (compact_tree_route && exact_profile_ready &&
+            verifier_side_calibration && decision.exploring) {
+            calibration_cooldown =
+                adaptive_calibration_interval();
         }
         if (drafter_side_calibration &&
             decision.calibration_request >= 0 &&
-            adaptive_calibration_cooldown_ == 0) {
+            calibration_cooldown == 0) {
             const auto input = std::find_if(
                 inputs.begin(), inputs.end(),
                 [&](const StepInput & in) {
@@ -1461,21 +1510,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                 const std::optional<double> expected =
                     estimate_ddtree_expected_tokens(*input, tree_budget);
                 if (expected) {
-                    slots_.slot(input->slot).speculation
-                        .observe_expected_tokens(*expected);
-                    // Drafter confidence is cheap relative to target
-                    // verification but not free on the current sequential
-                    // per-slot DDTree path. At high occupancy, amortize cold
-                    // calibration across decode steps; already-ranked requests
-                    // remain independently selectable on every step.
-                    if (inputs.size() > 3) {
-                        static const int interval = []() {
-                            const char * value = std::getenv(
-                                "DFLASH_ADAPTIVE_VERIFY_CALIBRATION_STEPS");
-                            return value ? std::max(1, std::atoi(value)) : 64;
-                        }();
-                        adaptive_calibration_cooldown_ = interval;
-                    }
+                    route_ranker.observe_request_yield(
+                        slots_.slot(input->slot).request_id, *expected);
                     std::fprintf(stderr,
                         "[parallel-ddtree] confidence request=%llu slot=%d "
                         "expected_tokens=%.3f\n",
@@ -1483,9 +1519,26 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                             slots_.slot(input->slot).request_id,
                         input->slot, *expected);
                     collect_candidates();
+                    const AdaptiveVerificationDecision steady_after =
+                        route_ranker.select(
+                            static_cast<int>(inputs.size()), candidates,
+                            adaptive_speculation_limit,
+                            /*probe_uncalibrated_with_verifier=*/false,
+                            /*probe_missing_routes=*/false);
+                    if (inputs.size() > 3 && exact_profile_ready &&
+                        static_cast<int>(steady_after.requests.size()) >=
+                            exact_profile_width) {
+                        // Drafter confidence is not free on the sequential
+                        // per-slot DDTree path. Fill the executor frontier
+                        // immediately, then amortize lower-priority newcomers.
+                        calibration_cooldown =
+                            adaptive_calibration_interval();
+                    }
                     decision = route_ranker.select(
                         static_cast<int>(inputs.size()), candidates,
-                        adaptive_speculation_limit);
+                        adaptive_speculation_limit,
+                        verifier_side_calibration,
+                        probe_missing_routes);
                 }
             }
         }
@@ -1505,14 +1558,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     StepPlan ar_plan;
     speculative_plan.decode.reserve(decision.requests.size());
     ar_plan.decode.reserve(inputs.size() - decision.requests.size());
-    std::vector<uint8_t> observe_ar((size_t)n_slots, 0);
     for (const StepInput & in : inputs) {
         const bool eligible = ddtree_input_eligible(in);
         if (eligible && selected[(size_t)in.slot]) {
             speculative_plan.decode.push_back(in);
         } else {
             ar_plan.decode.push_back(in);
-            if (eligible) observe_ar[(size_t)in.slot] = 1;
         }
     }
 
@@ -1533,7 +1584,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         if (!mixed->ok()) return std::move(*mixed);
         routed_result = std::move(*mixed);
         if (adaptive_enabled && !oracle.forces_selection() &&
-            compact_tree_route) {
+            compact_tree_route && starts_compact_cohort) {
             for (const StepInput & in : inputs) {
                 compact_tree_cohort_[(size_t)in.slot] = 1;
             }
@@ -1558,68 +1609,20 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             ar_plan.decode.size());
     }
 
-    const bool use_route_ar_baseline =
-        adaptive_enabled && !oracle.forces_selection() &&
-        compact_tree_route && decision.exploring &&
-        route_ranker.has_autoregressive_cost(
-            static_cast<int>(inputs.size()));
-    const double route_ar_us = use_route_ar_baseline
-        ? route_ranker.autoregressive_cost_us(
-              static_cast<int>(inputs.size())) : 0.0;
-    auto log_transition = [&](int slot,
-                              SpeculationGoodputTransition transition,
-                              const char * observed_route,
-                              double emitted_tokens,
-                              double elapsed_us) {
-        if (transition == SpeculationGoodputTransition::none) return;
-        const Qwen35Slot & seq = slots_.slot(slot);
-        const SpeculationGoodputController & policy = seq.speculation;
-        const char * action =
-            transition == SpeculationGoodputTransition::enabled
-                ? "enable" : "disable";
-        const double spec_tps = policy.speculative_goodput() * 1.0e6;
-        const double ar_tps = policy.ar_goodput() * 1.0e6;
-        std::fprintf(stderr,
-            "[parallel-ddtree] adaptive route request=%llu slot=%d "
-            "action=%s observed=%s sample=%llu emitted=%.0f "
-            "elapsed_us=%.0f spec_tok_s=%.2f ar_tok_s=%.2f\n",
-            (unsigned long long)seq.request_id, slot, action, observed_route,
-            (unsigned long long)seq.ddtree_sampled_steps, emitted_tokens,
-            elapsed_us, spec_tps, ar_tps);
-    };
-
     for (DecodeOutput & out : routed_result.decode) {
         if (oracle.forces_selection()) break;
         if (out.failed || out.slot < 0 || out.slot >= n_slots) continue;
         if (selected[(size_t)out.slot]) {
             const double emitted =
                 static_cast<double>(out.ddtree_accepted_tokens + 1);
-            SpeculationGoodputTransition transition =
-                slots_.record_speculation_sample(
-                    out.slot, emitted, route_us);
-            bool seeded_route_ar = false;
-            const Qwen35Slot & observed_seq = slots_.slot(out.slot);
-            const bool warmup_complete =
-                observed_seq.sampler.speculation_prompt_hint <= 0 ||
-                observed_seq.ddtree_sampled_steps >=
-                    kVerifierCalibrationSamples;
-            if (use_route_ar_baseline && warmup_complete &&
-                !observed_seq.speculation.has_ar_goodput()) {
-                transition = slots_.record_ar_sample(
-                    out.slot, route_ar_us);
-                seeded_route_ar = true;
-            }
-            if (transition == SpeculationGoodputTransition::disabled) {
-                out.ddtree_suspensions = 1;
-            }
-            log_transition(
-                out.slot, transition,
-                seeded_route_ar ? "speculation-vs-route-ar" : "speculation",
-                emitted, route_us);
-        } else if (observe_ar[(size_t)out.slot]) {
-            const SpeculationGoodputTransition transition =
-                slots_.record_ar_sample(out.slot, route_us);
-            log_transition(out.slot, transition, "ar", 1.0, route_us);
+            Qwen35Slot & observed_seq = slots_.slot(out.slot);
+            ++observed_seq.ddtree_sampled_steps;
+            route_ranker.observe_request_yield(
+                observed_seq.request_id, emitted);
+            route_ranker.observe_routing_prior_yield(
+                static_cast<double>(
+                    observed_seq.sampler.speculation_prompt_hint),
+                emitted);
         }
     }
 
@@ -2042,6 +2045,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step_regular(const StepPlan & plan) {
 
 void Qwen35SeqEngine::retire(int slot) {
     if (!slots_.is_active(slot)) return;
+    const std::uint64_t request_id = slots_.slot(slot).request_id;
+    adaptive_verification_.forget_request(request_id);
+    compact_adaptive_verification_.forget_request(request_id);
     slots_.retire(slot);
     compact_tree_cohort_[(size_t)slot] = 0;
 }

@@ -492,9 +492,9 @@ int main() {
         CHECK(!mgr.has_prefill_prompt_at_least(768));
     }
 
-    // Requests in one concurrent cohort make independent routing decisions
-    // from their measured useful-token goodput. A predictable request can keep
-    // DDTree while a low-yield chat-like peer switches to packed AR.
+    // The legacy per-slot controller remains a tested primitive. Production
+    // concurrency routing uses the shared exact-C ranker so one authority owns
+    // request selection and mixed-route cost.
     {
         const luce_test::ScopedEnvVar adaptive(
             "DFLASH_DDTREE_ADAPTIVE", nullptr);
@@ -529,9 +529,8 @@ int main() {
         CHECK(mgr.slot(code.slot).ddtree_sampled_steps == 1);
         CHECK(mgr.slot(chat.slot).ddtree_sampled_steps == 1);
 
-        // The production default makes one bounded decision per request; an
-        // expensive speculator does not periodically interrupt a winning AR
-        // route. Re-probing remains available through controller config.
+        // Its default still makes one bounded decision per request; explicit
+        // controller users may opt into periodic re-probing.
         for (int i = 0; i < 32; ++i) {
             CHECK(mgr.record_ar_sample(chat.slot, 1000.0) ==
                   SpeculationGoodputTransition::none);

@@ -2,11 +2,12 @@
 
 // Training-free request prior for cold-start speculative routing.
 //
-// This is deliberately a weak prior, not the final decision: obvious
-// structured/code prompts are ranked ahead of neutral prompts, obvious
-// conversational/creative prompts stay on AR, and measured verifier goodput
-// remains authoritative after admission. The policy is model-neutral and can
-// be replaced by a learned prompt ranker without changing the verifier.
+// This is deliberately a weak prior, not an eligibility decision: obvious
+// structured/code prompts are sampled before neutral or conversational ones
+// during cold start. A bucket is reused only after several measured verifier
+// outcomes, and request-local evidence takes over as it stabilizes. The policy
+// is model-neutral and can be replaced by a learned prompt ranker without
+// changing the verifier.
 
 #include <algorithm>
 #include <cctype>

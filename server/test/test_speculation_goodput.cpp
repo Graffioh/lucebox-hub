@@ -163,8 +163,8 @@ int main() {
         CHECK(decision.predicted_gain > 1.05);
     }
 
-    // Candidates are ranked by expected value. Greedy growth stops at the
-    // first prefix that would reduce whole-batch throughput.
+    // Candidates are ranked by expected value and every measured width is
+    // compared against the whole-batch AR baseline.
     {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(5, 100.0);
@@ -176,7 +176,7 @@ int main() {
             {4, 1.2, 8.0, true},
         };
         const AdaptiveVerificationDecision decision =
-            ranker.select(5, candidates);
+            ranker.select(5, candidates, /*max_speculative_requests=*/2);
         CHECK(decision.requests.size() == 1);
         CHECK(decision.requests[0] == 9);
     }
@@ -196,82 +196,295 @@ int main() {
         CHECK(decision.calibration_request == 1);
     }
 
-    // A concrete adapter may calibrate a bounded compact bundle inside useful
-    // verification. The first unseen route probes up to executor capacity,
-    // never the whole unknown cohort.
+    // Compact verifier calibration discovers every exact route width in order,
+    // even when k=1 and k=2 lose. The prompt prior orders unknown requests but
+    // never filters them, and the globally best non-convex k=3 route wins.
     {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(8, 100.0);
         std::vector<AdaptiveVerificationCandidate> candidates = {
             {5, 1.0, 9.0, false, 1.0},
             {2, 1.0, 9.0, false, -1.0},
+            {9, 1.0, 9.0, false, 0.0},
         };
-        const AdaptiveVerificationDecision probe =
+        AdaptiveVerificationDecision probe =
             ranker.select(8, candidates, 3,
                           /*probe_uncalibrated_with_verifier=*/true);
         CHECK(probe.exploring);
+        CHECK(probe.requests.size() == 1);
+        CHECK(probe.requests[0] == 5);
+        CHECK(probe.calibration_request == -1);
+        ranker.observe_route(8, 1, 160.0);
+        candidates[0] = {5, 4.0, 9.0, true, 1.0};
+
+        probe = ranker.select(8, candidates, 3,
+                              /*probe_uncalibrated_with_verifier=*/true);
+        CHECK(probe.exploring);
         CHECK(probe.requests.size() == 2);
         CHECK(probe.requests[0] == 5);
-        CHECK(probe.requests[1] == 2);
-        CHECK(probe.calibration_request == -1);
+        CHECK(probe.requests[1] == 9);
+        ranker.observe_route(8, 2, 170.0);
+        candidates[2] = {9, 4.0, 9.0, true, 0.0};
+
+        probe = ranker.select(8, candidates, 3,
+                              /*probe_uncalibrated_with_verifier=*/true);
+        CHECK(probe.exploring);
+        CHECK(probe.requests.size() == 3);
+        CHECK(probe.requests[0] == 5);
+        CHECK(probe.requests[1] == 9);
+        CHECK(probe.requests[2] == 2);
+        ranker.observe_route(8, 3, 105.0);
+        candidates[1] = {2, 4.0, 9.0, true, -1.0};
+
+        const AdaptiveVerificationDecision decision =
+            ranker.select(8, candidates, 3,
+                          /*probe_uncalibrated_with_verifier=*/true);
+        CHECK(!decision.exploring);
+        CHECK(decision.requests.size() == 3);
+        CHECK(ranker.has_exact_profile(8, 3));
     }
 
-    // A losing route ratio suppresses repeated probes as occupancy falls.
-    // Even perfect acceptance cannot make this projected route beat AR.
+    // A profitable token-count estimate cannot strand slow AR peers. The same
+    // route is allowed only after every active request has enough supporting
+    // evidence; one cache hit or lucky accepted path is insufficient.
     {
         AdaptiveVerificationRanker ranker;
-        ranker.observe_autoregressive(16, 100.0);
-        ranker.observe_route(16, 1, 200.0);
-        ranker.observe_autoregressive(15, 95.0);
-        std::vector<AdaptiveVerificationCandidate> candidates = {
-            {7, 1.0, 9.0, false},
+        ranker.observe_autoregressive(5, 100.0);
+        ranker.observe_route(5, 1, 150.0);
+        ranker.observe_route(5, 2, 150.0);
+        std::vector<AdaptiveVerificationCandidate> mixed = {
+            {81, 8.0, 8.0, true},
+            {82, 8.0, 8.0, true},
+            {83, 1.0, 8.0, true},
+            {84, 1.0, 8.0, true},
+            {85, 1.0, 8.0, true},
         };
-        const AdaptiveVerificationDecision decision =
-            ranker.select(15, candidates, 3,
-                          /*probe_uncalibrated_with_verifier=*/true,
-                          /*project_cost_from_higher_occupancy=*/true);
-        CHECK(!decision.exploring);
-        CHECK(decision.requests.empty());
-        CHECK(decision.calibration_request == 7);
+        CHECK(ranker.select(5, mixed, 2).requests.empty());
+
+        for (AdaptiveVerificationCandidate & candidate : mixed) {
+            candidate.expected_tokens = 8.0;
+        }
+        CHECK(ranker.select(5, mixed, 2).requests.empty());
+
+        // Even individually useful requests cannot waive the peer guard when
+        // their measured yields are too dissimilar; that creates a slow tail.
+        for (AdaptiveVerificationCandidate & candidate : mixed) {
+            candidate.expected_tokens = 3.0;
+            candidate.evidence_samples = 4;
+        }
+        mixed[0].expected_tokens = 8.0;
+        mixed[1].expected_tokens = 8.0;
+        CHECK(ranker.select(5, mixed, 2).requests.empty());
+
+        // A genuinely proven, comparable high-yield cohort may amortize the
+        // slower mixed step because its remaining requests take verifier lanes
+        // as the first requests retire.
+        for (AdaptiveVerificationCandidate & candidate : mixed) {
+            candidate.expected_tokens = 8.0;
+        }
+        CHECK(ranker.select(5, mixed, 2).requests.size() == 2);
     }
-    // A profitable measured route ratio can rank calibrated requests after
-    // occupancy drops, without spending a fresh hardware probe.
+
+    // Timings from a neighboring occupancy never stand in for the exact-C
+    // baseline or route profile.
     {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(8, 100.0);
         ranker.observe_route(8, 1, 80.0);
-        ranker.observe_autoregressive(7, 90.0);
         std::vector<AdaptiveVerificationCandidate> candidates = {
             {12, 4.0, 9.0, true},
         };
         const AdaptiveVerificationDecision decision =
-            ranker.select(7, candidates, 3,
-                          /*probe_uncalibrated_with_verifier=*/false,
-                          /*project_cost_from_higher_occupancy=*/true);
+            ranker.select(7, candidates, 3);
+        CHECK(decision.requests.empty());
         CHECK(!decision.exploring);
-        CHECK(decision.requests.size() == 1);
-        CHECK(decision.requests[0] == 12);
+        CHECK(!ranker.has_exact_profile(7, 1));
     }
 
-    // Prefix widths are compared independently because hardware occupancy can
-    // make k=3 profitable even when the measured k=1 route loses.
+    // Proven high-yield peers rotate scarce verifier lanes toward the request
+    // with less generated progress, preventing a homogeneous cohort tail.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(2, 100.0);
+        ranker.observe_route(2, 1, 150.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {91, 8.0, 8.0, true, 1.0, 4, 10},
+            {92, 8.0, 8.0, true, 1.0, 4, 2},
+        };
+        const AdaptiveVerificationDecision decision =
+            ranker.select(2, candidates, 1);
+        CHECK(decision.requests.size() == 1);
+        CHECK(decision.requests[0] == 92);
+    }
+
+    // A losing higher-C route never suppresses a fresh exact lower-C
+    // measurement: GPU occupancy boundaries are non-convex.
     {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(8, 100.0);
-        ranker.observe_route(8, 1, 120.0);
-        ranker.observe_route(8, 3, 80.0);
+        ranker.observe_route(8, 1, 200.0);
+        ranker.observe_autoregressive(7, 95.0);
+
+        const AdaptiveVerificationDecision decision = ranker.select(
+            7, {{13, 1.0, 9.0, true}}, 1);
+        CHECK(decision.exploring);
+        CHECK(decision.requests.size() == 1);
+        CHECK(decision.requests[0] == 13);
+    }
+
+    // A prior affects cold-start order only. Once calibrated, the high-yield
+    // conversational-prior request ranks ahead of a low-yield code prior.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(2, 100.0);
+        ranker.observe_route(2, 1, 100.0);
+        ranker.observe_route(2, 2, 1000.0);
         std::vector<AdaptiveVerificationCandidate> candidates = {
-            {1, 4.0, 9.0, true},
-            {2, 4.0, 9.0, true},
-            {3, 4.0, 9.0, true},
+            {1, 1.0, 8.0, true, 1.0},
+            {2, 8.0, 8.0, true, -1.0},
         };
         const AdaptiveVerificationDecision decision =
-            ranker.select(8, candidates, 3,
-                          /*probe_uncalibrated_with_verifier=*/false,
-                          /*project_cost_from_higher_occupancy=*/false,
-                          /*evaluate_nonconvex_prefixes=*/true);
-        CHECK(!decision.exploring);
-        CHECK(decision.requests.size() == 3);
+            ranker.select(2, candidates, 2);
+        CHECK(decision.requests.size() == 1);
+        CHECK(decision.requests[0] == 2);
+    }
+
+    // Verified yield can seed later requests in the same coarse routing-prior
+    // bucket. The cache belongs to this speculator/profile ranker and resets
+    // with it; no model-specific table is required.
+    {
+        AdaptiveVerificationRanker ranker;
+        CHECK(!ranker.routing_prior_expected_tokens(1.0).has_value());
+        ranker.observe_routing_prior_yield(1.0, 4.0);
+        ranker.observe_routing_prior_yield(1.0, 6.0);
+        ranker.observe_routing_prior_yield(1.0, 4.0);
+        CHECK(!ranker.routing_prior_expected_tokens(1.0).has_value());
+        CHECK(ranker.routing_prior_yield_samples(1.0) == 3);
+        ranker.observe_routing_prior_yield(1.0, 6.0);
+        CHECK(ranker.routing_prior_expected_tokens(1.0).value() == 5.0);
+        CHECK(ranker.routing_prior_yield_samples(1.0) == 4);
+        CHECK(!ranker.routing_prior_expected_tokens(-1.0).has_value());
+
+        // Early request observations are shrunk toward the stable cohort, but
+        // four local samples make the request's own magnitude authoritative.
+        for (int sample = 1; sample <= 4; ++sample) {
+            ranker.observe_request_yield(98, 1.0);
+            const auto estimate =
+                ranker.estimate_request_yield(98, 1.0);
+            CHECK(estimate.has_value());
+            CHECK(estimate->expected_tokens == 5.0 - sample);
+            CHECK(estimate->evidence_samples ==
+                  static_cast<std::size_t>(sample));
+        }
+        const auto local = ranker.estimate_request_yield(98, 1.0);
+        CHECK(local.has_value());
+        CHECK(local->expected_tokens == 1.0);
+
+        // Per-request evidence is local to one proposal-shape ranker and is
+        // explicitly forgotten at request retirement.
+        AdaptiveVerificationRanker compact;
+        ranker.observe_request_yield(99, 7.0);
+        CHECK(ranker.request_expected_tokens(99).value() == 7.0);
+        CHECK(ranker.request_yield_samples(99) == 1);
+        CHECK(!compact.request_expected_tokens(99).has_value());
+        ranker.forget_request(99);
+        CHECK(!ranker.request_expected_tokens(99).has_value());
+        ranker.reset();
+        CHECK(!ranker.routing_prior_expected_tokens(1.0).has_value());
+    }
+
+    // Shared cohort evidence can rank a new request, but it cannot unlock the
+    // slow-route homogeneous exception. A bounded verifier probe may cross the
+    // steady peer guard to gather the missing request-local evidence.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(5, 100.0);
+        ranker.observe_route(5, 1, 150.0);
+        std::vector<AdaptiveVerificationCandidate> prior_backed;
+        for (int request = 1; request <= 5; ++request) {
+            prior_backed.push_back(
+                {request, 8.0, 8.0, true, 1.0, 0});
+        }
+        CHECK(ranker.select(5, prior_backed, 1).requests.empty());
+
+        std::vector<AdaptiveVerificationCandidate> probe = prior_backed;
+        for (AdaptiveVerificationCandidate & candidate : probe) {
+            candidate.calibrated = false;
+        }
+        const AdaptiveVerificationDecision exploring = ranker.select(
+            5, probe, 1,
+            /*probe_uncalibrated_with_verifier=*/true);
+        CHECK(exploring.exploring);
+        CHECK(exploring.requests.size() == 1);
+
+        for (AdaptiveVerificationCandidate & candidate : prior_backed) {
+            candidate.evidence_samples = 4;
+        }
+        CHECK(ranker.select(5, prior_backed, 1).requests.size() == 1);
+        prior_backed.back().expected_tokens = 1.0;
+        CHECK(ranker.select(5, prior_backed, 1).requests.empty());
+    }
+
+    // With route costs already profiled, a no-confidence adapter calibrates
+    // exactly one unknown request in the best optimistic measured width.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(5, 100.0);
+        ranker.observe_route(5, 1, 80.0);
+        ranker.observe_route(5, 2, 95.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {14, 4.0, 8.0, true, 1.0},
+            {15, 1.0, 8.0, false, -1.0},
+            {16, 1.0, 8.0, false, 0.0},
+        };
+        const AdaptiveVerificationDecision decision = ranker.select(
+            5, candidates, 2,
+            /*probe_uncalibrated_with_verifier=*/true);
+        CHECK(decision.exploring);
+        CHECK(decision.requests.size() == 2);
+        CHECK(decision.requests[0] == 14);
+        CHECK(decision.requests[1] == 16);
+    }
+
+    // A promising newcomer can replace one incumbent even when every executor
+    // lane is occupied; calibration remains one bounded K-wide step.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(5, 100.0);
+        ranker.observe_route(5, 1, 80.0);
+        ranker.observe_route(5, 2, 90.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {17, 4.0, 8.0, true},
+            {18, 4.0, 8.0, true},
+            {19, 1.0, 8.0, false, 1.0},
+        };
+        const AdaptiveVerificationDecision decision = ranker.select(
+            5, candidates, 2,
+            /*probe_uncalibrated_with_verifier=*/true);
+        CHECK(decision.exploring);
+        CHECK(decision.requests.size() == 2);
+        CHECK(decision.requests[0] == 17);
+        CHECK(decision.requests[1] == 19);
+    }
+
+    // Selection is tied to request value, not to a lane count. When the
+    // profitable request retires, speculation does not migrate to chat.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(2, 100.0);
+        ranker.observe_route(2, 1, 100.0);
+        std::vector<AdaptiveVerificationCandidate> code_and_chat = {
+            {21, 8.0, 8.0, true, 1.0},
+            {22, 1.0, 8.0, true, -1.0},
+        };
+        AdaptiveVerificationDecision decision =
+            ranker.select(2, code_and_chat, 1);
+        CHECK(decision.requests.size() == 1);
+        CHECK(decision.requests[0] == 21);
+        ranker.observe_autoregressive(1, 60.0);
+        ranker.observe_route(1, 1, 100.0);
+        decision = ranker.select(1, {code_and_chat[1]}, 1);
+        CHECK(decision.requests.empty());
     }
 
     // There is no concurrency cutoff: when one request pays for the route at
@@ -289,6 +502,60 @@ int main() {
             ranker.select(16, candidates);
         CHECK(decision.requests.size() == 1);
         CHECK(decision.requests[0] == 21);
+    }
+
+    // Executor capacity is independent of C, and only eligible candidates
+    // consume speculative lanes. Three non-candidates remain ordinary AR.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(5, 100.0);
+        ranker.observe_route(5, 1, 160.0);
+        ranker.observe_route(5, 2, 100.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {51, 4.0, 8.0, true},
+            {52, 4.0, 8.0, true},
+        };
+        const AdaptiveVerificationDecision decision =
+            ranker.select(5, candidates, 3);
+        CHECK(ranker.has_exact_profile(5, 2));
+        CHECK(!ranker.has_exact_profile(5, 3));
+        CHECK(decision.requests.size() == 2);
+    }
+
+    // The safety margin rejects a noisy 4% estimate and admits a 6% gain.
+    {
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {61, 1.0, 1.0, true},
+        };
+        AdaptiveVerificationRanker below_margin;
+        below_margin.observe_autoregressive(1, 100.0);
+        below_margin.observe_route(1, 1, 96.0);
+        CHECK(below_margin.select(1, candidates).requests.empty());
+
+        AdaptiveVerificationRanker above_margin;
+        above_margin.observe_autoregressive(1, 100.0);
+        above_margin.observe_route(1, 1, 94.0);
+        CHECK(above_margin.select(1, candidates).requests.size() == 1);
+    }
+
+    // DDTree accepted-path yield and DSpark conditional survival use the same
+    // model-neutral expected-token contract and therefore make the same choice.
+    {
+        const float confidence[] = {0.8f, 0.5f};
+        const double dspark_expected =
+            expected_tokens_from_conditional_confidence(confidence, 2);
+        AdaptiveVerificationRanker ddtree;
+        AdaptiveVerificationRanker dspark;
+        for (AdaptiveVerificationRanker * ranker : {&ddtree, &dspark}) {
+            ranker->observe_autoregressive(4, 100.0);
+            ranker->observe_route(4, 1, 80.0);
+        }
+        const auto ddtree_decision = ddtree.select(
+            4, {{71, 2.2, 3.0, true}}, 1);
+        const auto dspark_decision = dspark.select(
+            4, {{71, dspark_expected, 3.0, true}}, 1);
+        CHECK(ddtree_decision.requests == dspark_decision.requests);
+        CHECK(ddtree_decision.requests.size() == 1);
     }
 
     // Executor capacity bounds the ranked prefix. This keeps every adaptive
@@ -312,6 +579,33 @@ int main() {
         CHECK(decision.requests[1] == 42);
     }
 
+    // Exact profiling and executor bounds are independent of C. Every fresh
+    // occupancy from 1 through 16 discovers k=1..min(C, 3), including widths
+    // whose smaller neighbors lose.
+    {
+        for (int concurrency = 1; concurrency <= 16; ++concurrency) {
+            AdaptiveVerificationRanker ranker;
+            ranker.observe_autoregressive(concurrency, 100.0);
+            const int limit = std::min(concurrency, 3);
+            std::vector<AdaptiveVerificationCandidate> candidates;
+            for (int i = 0; i < limit; ++i) {
+                candidates.push_back({
+                    concurrency * 10 + i, 4.0, 8.0, true});
+            }
+            for (int width = 1; width <= limit; ++width) {
+                const AdaptiveVerificationDecision probe = ranker.select(
+                    concurrency, candidates, limit);
+                CHECK(probe.exploring);
+                CHECK(static_cast<int>(probe.requests.size()) == width);
+                ranker.observe_route(
+                    concurrency, width, 150.0 - 20.0 * width);
+            }
+            CHECK(ranker.has_exact_profile(concurrency, limit));
+            CHECK(ranker.select(concurrency, candidates, 0)
+                      .requests.empty());
+        }
+    }
+
     // A promising calibrated prefix gets one bounded hardware-cost probe when
     // that subbatch shape has not been observed yet.
     {
@@ -325,6 +619,31 @@ int main() {
         CHECK(probe.exploring);
         CHECK(probe.requests.size() == 1);
         CHECK(probe.requests[0] == 31);
+    }
+
+    // A shrinking cohort may suppress a brand-new tail profile without
+    // disabling a route that was already measured at that exact occupancy.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(3, 90.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {32, 6.0, 8.0, true},
+        };
+        AdaptiveVerificationDecision decision = ranker.select(
+            3, candidates, 1,
+            /*probe_uncalibrated_with_verifier=*/false,
+            /*probe_missing_routes=*/false);
+        CHECK(decision.requests.empty());
+        CHECK(!decision.exploring);
+        CHECK(!ranker.has_speculative_profile_sample(3, 1));
+
+        ranker.observe_route(3, 1, 70.0);
+        decision = ranker.select(
+            3, candidates, 1,
+            /*probe_uncalibrated_with_verifier=*/false,
+            /*probe_missing_routes=*/false);
+        CHECK(decision.requests.size() == 1);
+        CHECK(ranker.has_speculative_profile_sample(3, 1));
     }
 
     // Kill-switch mode retains fixed speculation and ignores observations.
