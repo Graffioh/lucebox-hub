@@ -89,14 +89,6 @@ bool Qwen35SlotManager::is_prefilling(int slot) const {
     return is_active(slot) && slots_[(size_t)slot].prefilling();
 }
 
-bool Qwen35SlotManager::has_prefill_prompt_at_least(int tokens) const {
-    if (tokens <= 0) return true;
-    return std::any_of(slots_.begin(), slots_.end(),
-        [tokens](const Qwen35Slot & slot) {
-            return slot.prefilling() && slot.prompt_len >= tokens;
-        });
-}
-
 void Qwen35SlotManager::accumulate_residency_delta(
         Qwen35Slot & slot, const PagedKvResidencyStats & before) {
     if (!residency_) return;

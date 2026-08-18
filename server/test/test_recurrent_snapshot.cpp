@@ -158,6 +158,7 @@ TEST_CASE(RecurrentSnapshotFixture, snapshot_and_restore_recurrent_state) {
     // C16 x width-23 selects a 32K graph. Prove that graph traversal and
     // gallocr can cross the old 16K hard ceiling without asserting.
     {
+        size_t graph_capacity = 0;
         CHECK(dflash::common::detail::target_paged_tree_graph_capacity(
             23, 16, graph_capacity));
         ggml_init_params graph_params{};
