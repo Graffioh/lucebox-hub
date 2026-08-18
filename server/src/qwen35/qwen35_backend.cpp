@@ -2178,6 +2178,22 @@ static bool qwen35_dspark_enabled() {
     return kEnabled;
 }
 
+// Confidence-gate threshold for adaptive block length (0 = gate off, verify
+// the full drafted block). The drafter's AcceptRatePredictor scores each
+// draft position; the chain is truncated at the first position below the
+// threshold and only the confident prefix is verified.
+static float qwen35_dspark_confidence_threshold() {
+    static const float kThreshold = []() {
+        const char * e = std::getenv("DFLASH_QWEN35_DSPARK_CONFIDENCE_THRESHOLD");
+        if (!e) return 0.0f;
+        float threshold = (float)std::atof(e);
+        if (threshold < 0.0f) threshold = 0.0f;
+        if (threshold > 1.0f) threshold = 1.0f;
+        return threshold;
+    }();
+    return kThreshold;
+}
+
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
@@ -2540,6 +2556,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
             !use_remote_draft && q_len > 1 && tree_special_inactive;
 
+        // Chain-verify length for this step. The DSpark confidence gate may
+        // truncate the drafted block (adaptive block length); q_len stays the
+        // buffer-sizing upper bound.
+        int v_len = q_len;
         // DDTree consumes top-K rows directly. Avoid projecting the same
         // hidden block once for argmax and again for top-K on every step.
         if (!use_tree_verify) {
@@ -2561,23 +2581,23 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     return !(e && e[0] == '0' && e[1] == '\0');
                 }();
                 bool ds_ok = false;
-                if (fused_dspark) {
+                if (fused_dspark && qwen35_dspark_confidence_threshold() <= 0.0f) {
                     ds_ok = dspark_markov_correct_greedy_chain_fused(
                         dw_, draft_backend_, target->lm_head_tensor(),
                         local_hidden.data(), q_len, last_tok, draft_tok);
                 }
                 if (!ds_ok) {
-                    // threshold 0 = confidence gate off: q_len sizes the
-                    // step buffers for the whole request, so the truncated
-                    // chain the gate produces cannot be verified here yet.
                     ds_ok = dspark_markov_correct_greedy_chain(dw_, draft_backend_, *target,
                                                        local_hidden.data(), q_len,
                                                        last_tok,
-                                                       /*confidence_threshold=*/0.0f,
+                                                       qwen35_dspark_confidence_threshold(),
                                                        draft_tok);
                 }
                 if (ds_ok) {
                     used_dspark = true;
+                    // Confidence gate truncates the drafted chain: verify
+                    // only the confident prefix this step.
+                    v_len = std::max(1, (int)draft_tok.size());
                 } else {
                     static std::atomic<bool> s_dspark_warned{false};
                     if (!s_dspark_warned.exchange(true)) {
@@ -2885,7 +2905,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         int hint_fill = 0;
         if (hint_tokens && n_generated < (int)hint_tokens->size()) {
             const int hint_avail = (int)hint_tokens->size() - n_generated;
-            hint_fill = std::min(hint_avail, q_len - 1);
+            hint_fill = std::min(hint_avail, v_len - 1);
             for (int i = 0; i < hint_fill; i++) {
                 draft_tok[1 + i] = (*hint_tokens)[n_generated + i];
             }
@@ -2920,13 +2940,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         int accept_n = 1;
         int bonus_tok = -1;
         if (sampled_verify) {
-            if (!target->read_verify_logits(q_len, verify_logits)) {
+            if (!target->read_verify_logits(v_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
                 target->restore_kv();
                 step_graph_destroy(draft_sg);
                 return false;
             }
-            const int vocab_v = (int)(verify_logits.size() / (size_t)q_len);
+            const int vocab_v = (int)(verify_logits.size() / (size_t)v_len);
             static const bool kSvDebug = []() {
                 const char * e = std::getenv("DFLASH_SV_DEBUG");
                 return e != nullptr && std::string(e) == "1";
@@ -2935,7 +2955,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 // Row-alignment check: CPU argmax over each bulk-read row must
                 // equal the GPU argmax (target_tok). Divergence = misaligned
                 // or stale bulk read.
-                for (int i = 0; i < q_len; i++) {
+                for (int i = 0; i < v_len; i++) {
                     const float * row = verify_logits.data() + (size_t)i * vocab_v;
                     int am = 0; float best = row[0];
                     for (int v = 1; v < vocab_v; v++)
@@ -2960,7 +2980,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             verify_history = out_tokens;
             verify_history.push_back(draft_tok[0]);
             bool mismatched = false;
-            for (int i = 0; i < q_len - 1; i++) {
+            for (int i = 0; i < v_len - 1; i++) {
                 const int s = sample_logits(
                     verify_logits.data() + (size_t)i * vocab_v, vocab_v,
                     sampler_, verify_history, sampler_rng_);
@@ -2981,11 +3001,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
             (void)mismatched;
         } else {
-            for (int i = 0; i < q_len - 1; i++) {
+            for (int i = 0; i < v_len - 1; i++) {
                 if (draft_tok[i + 1] == target_tok[i]) accept_n++;
                 else break;
             }
-            bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
+            bonus_tok = (accept_n < v_len) ? target_tok[accept_n - 1] : -1;
         }
         // Track hint acceptance telemetry.
         if (hint_fill > 0) {
