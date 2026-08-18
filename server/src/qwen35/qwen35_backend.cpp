@@ -2203,7 +2203,9 @@ static float qwen35_dspark_confidence_threshold() {
 // then probes with one spec step. Set DFLASH_QWEN35_SPEC_STEP_RATIO=0 to
 // disable the policy.
 struct Qwen35AdaptiveSpecPolicy {
-    float step_ratio = 1.7f;   // spec step cost / plain step cost (measured, gfx1201 IQ4_XS w8)
+    float step_ratio = 1.7f;   // spec/plain step cost; the measured 1.9 (54 vs 28.6 ms) is deliberately
+                               // under-stated: a higher threshold costs more on bursty code/mixed streams than
+                               // it saves on prose (measured 45.6/40.4/32.4 vs 42.5/36.4/32.3 tok/s)
     int   burst      = 40;     // plain-decode steps per burst (each burst ends with one spec probe step)
     float ema_alpha  = 0.1f;   // slow EMA: ~10-step memory so bursty acceptance does not flap
     bool  enabled() const { return step_ratio > 1.0f && burst > 0; }
@@ -2418,11 +2420,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // Adaptive speculation state (see Qwen35AdaptiveSpecPolicy).
     const Qwen35AdaptiveSpecPolicy adaptive = qwen35_adaptive_spec_policy();
     // Start well above the burst threshold so an unlucky opening does not
-    // park a predictable stream in plain decode; low-acceptance text still
-    // settles into bursts within a couple of dozen steps.
+    // park a predictable stream in plain decode. The probe step that ends a
+    // burst updates the EMA with a fast alpha (see below) so a stream that
+    // turned predictable leaves plain decode quickly.
     float accepted_ema = 2.0f * adaptive.accept_threshold();
     int   ar_burst_left = 0;
     int   n_ar_burst_steps = 0;
+    bool  probe_step = false;   // first spec step after a burst
 
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
@@ -2433,6 +2437,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (ar_step) {
             ar_burst_left--;
             n_ar_burst_steps++;
+            probe_step = (ar_burst_left == 0);
         }
 
         // Budget hook: no tail-off here. The close-token injection fires
@@ -3338,8 +3343,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // of plain-decode steps, the step after the burst is a spec probe.
         if (adaptive.enabled() && !ar_step) {
             const float accepted_drafts = (float)std::max(0, accept_n - 1);
-            accepted_ema = (1.0f - adaptive.ema_alpha) * accepted_ema +
-                           adaptive.ema_alpha * accepted_drafts;
+            // A probe (first spec step after a burst) weighs its result
+            // heavily: it is the only evidence about the current text.
+            const float alpha = probe_step ? 0.5f : adaptive.ema_alpha;
+            accepted_ema = (1.0f - alpha) * accepted_ema + alpha * accepted_drafts;
+            probe_step = false;
             if (accepted_ema < adaptive.accept_threshold()) {
                 ar_burst_left = adaptive.burst;
             }
