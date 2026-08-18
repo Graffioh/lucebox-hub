@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -586,6 +587,10 @@ void run_factorized_conv_commit_case(ggml_backend_t backend) {
 }
 
 float max_abs_diff(const std::vector<float> & a, const std::vector<float> & b) {
+    if (a.size() != b.size()) {
+        CHECK_MSG(false, "max_abs_diff size mismatch: %zu != %zu", a.size(), b.size());
+        return std::numeric_limits<float>::infinity();
+    }
     float m = 0.0f;
     for (size_t i = 0; i < a.size(); i++) m = std::max(m, std::fabs(a[i] - b[i]));
     return m;

@@ -28,6 +28,7 @@
 #include "qwen3_drafter.h"
 #include "gpu_runtime_compat.h"
 #include "chain_rollback_policy.h"
+#include "platform_env.h"
 #include "laguna_daemon.h"  // arch dispatch - laguna targets are served by
                             // dflash::common::run_laguna_daemon() instead of the
                             // qwen35 + DFlash + DDTree pipeline below.
@@ -760,6 +761,10 @@ int main(int argc, char ** argv) {
     float ddtree_temp   = 1.0f;   // softmax temperature for top-K extract
     bool  ddtree_chain_seed = true;  // pre-seed full chain (vs paper's pure best-first)
     float ddtree_tau    = std::numeric_limits<float>::infinity();  // SpecLA confidence margin
+    bool  ddtree_tau_set = false;
+    bool  specla_mode   = false;
+    bool  specla_top_k_set = false;
+    int   specla_top_k  = 4;
     bool  profile_scaling = false;  // microbench: time target forward at varying N
     bool  time_breakdown  = false;  // one-token time breakdown: prefill/decode/verify × ctx size
     bool  hybrid_bench_only = false; // skip monolithic scenarios, run only hybrid/pipelined
@@ -811,6 +816,22 @@ int main(int argc, char ** argv) {
         if      (std::strcmp(argv[i], "--daemon") == 0)        daemon_mode = true;
         else if (std::strcmp(argv[i], "--seq-verify") == 0)    seq_verify = true;
         else if (std::strcmp(argv[i], "--fast-rollback") == 0) fast_rollback = true;
+        else if (std::strcmp(argv[i], "--specla") == 0) {
+            specla_mode = true;
+            ddtree_mode = true;
+            fast_rollback = true;
+        }
+        else if (std::strncmp(argv[i], "--specla-top-k=", 15) == 0) {
+            const char * value = argv[i] + 15;
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
+                std::fprintf(stderr, "bad --specla-top-k value: %s\n", value);
+                return 2;
+            }
+            specla_top_k = (int)parsed;
+            specla_top_k_set = true;
+        }
         else if (std::strcmp(argv[i], "--ddtree") == 0)        { ddtree_mode = true; fast_rollback = true; }
         else if (std::strncmp(argv[i], "--ddtree-budget=", 16) == 0) {
             ddtree_budget = std::atoi(argv[i] + 16);
@@ -829,6 +850,7 @@ int main(int argc, char ** argv) {
                 ddtree_tau = std::numeric_limits<float>::infinity();
             } else {
                 ddtree_tau = tau;
+                ddtree_tau_set = true;
             }
         }
         else if (std::strncmp(argv[i], "--ddtree-temp=", 14) == 0) {
@@ -1067,8 +1089,23 @@ int main(int argc, char ** argv) {
         (void)n;
 #endif
     };
+    if (specla_mode && seq_verify) {
+        std::fprintf(stderr, "--specla and --seq-verify are mutually exclusive\n");
+        return 2;
+    }
     if (fast_rollback && seq_verify && !ddtree_mode) {
         std::fprintf(stderr, "--fast-rollback and --seq-verify are mutually exclusive\n");
+        return 2;
+    }
+    if (specla_mode) {
+        if (!ddtree_tau_set) ddtree_tau = 6.0f;
+        set_environment_variable("DFLASH_SPECLA", "1", true);
+        if (specla_top_k_set) {
+            set_environment_variable(
+                "DFLASH_SPECLA_TOPK", std::to_string(specla_top_k).c_str(), true);
+        }
+    } else if (specla_top_k_set) {
+        std::fprintf(stderr, "--specla-top-k requires --specla\n");
         return 2;
     }
     if (target_split_dflash) target_split_load_draft = true;
@@ -3281,7 +3318,9 @@ int main(int argc, char ** argv) {
         // Match the SpecLA paper's tree route (top-k=4) when factor-buffered
         // state is active; retain the historical top-8 baseline otherwise.
         const int ddtree_K = (ddtree_budget > q_len - 1)
-            ? (!cache.factor_k.empty() ? dflash::common::specla_tree_topk() : 8)
+            ? (!cache.factor_k.empty()
+                ? std::min(dflash::common::specla_tree_topk(), vocab)
+                : 8)
             : 1;
 
         if (draft_hidden_bridge) {
