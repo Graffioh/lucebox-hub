@@ -69,7 +69,9 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       sb3,
                                      const uint3   neqk1_magic,
                                      const uint3   rq3_magic,
-                                     float         scale) {
+                                     float         scale,
+                                     const float * gate_bias,   // raw-gate mode: dt_bias[H], else nullptr
+                                     const float * gate_A) {    // raw-gate mode: A[H]
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -164,7 +166,9 @@ gated_delta_net_cuda(const float * q,
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        const float beta_val = *beta_t;
+        // raw-gate mode: beta = sigmoid(beta_raw); g = softplus(alpha_raw + bias) * A
+        const bool  raw_gates = gate_bias != nullptr;
+        const float beta_val  = raw_gates ? 1.0f / (1.0f + expf(-(*beta_t))) : *beta_t;
 
         // Cache k and q in registers
         float k_reg[rows_per_lane];
@@ -177,7 +181,12 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            float g_log = *g_t;
+            if (raw_gates) {
+                const float a = g_log + gate_bias[h_idx];
+                g_log = ((a > 20.0f) ? a : logf(1.0f + expf(a))) * gate_A[h_idx];
+            }
+            const float g_val = expf(g_log);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -284,7 +293,9 @@ gated_delta_net_cuda_grouped_cols(const float * q,
                                   int64_t       sb3,
                                   const uint3   neqk1_magic,
                                   const uint3   rq3_magic,
-                                  float         scale) {
+                                  float         scale,
+                                  const float * gate_bias,   // raw-gate mode: dt_bias[H], else nullptr
+                                  const float * gate_A) {    // raw-gate mode: A[H]
     static_assert(S_v == 128, "grouped GDN kernel is specialized for S_v=128");
     static_assert(WIDTH == 16, "grouped GDN kernel expects 16-lane subgroups");
     static_assert(COLS == 4, "grouped GDN kernel expects 4 columns per subgroup");
@@ -347,8 +358,16 @@ gated_delta_net_cuda_grouped_cols(const float * q,
         float g_val = 0.0f;
         float beta_val = 0.0f;
         if (threadIdx.x == 0) {
-            g_val = expf(g[gb_offset]);
-            beta_val = beta[gb_offset];
+            if (gate_bias != nullptr) {
+                // raw-gate mode: g = exp(softplus(alpha_raw + bias) * A), beta = sigmoid(beta_raw)
+                const float a  = g[gb_offset] + gate_bias[h_idx];
+                const float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
+                g_val    = expf(sp * gate_A[h_idx]);
+                beta_val = 1.0f / (1.0f + expf(-beta[gb_offset]));
+            } else {
+                g_val = expf(g[gb_offset]);
+                beta_val = beta[gb_offset];
+            }
         }
         g_val = __shfl_sync(0xffffffffU, g_val, 0);
         beta_val = __shfl_sync(0xffffffffU, beta_val, 0);
@@ -455,7 +474,8 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, cudaStream_t stream) {
+        float scale, cudaStream_t stream,
+        const float * gate_bias = nullptr, const float * gate_A = nullptr) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -479,19 +499,19 @@ static void launch_gated_delta_net(
             gated_delta_net_cuda<16, KDA, TREE_MODE, WRITE_INTER, InterT><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
             break;
         case 32:
             gated_delta_net_cuda<32, KDA, TREE_MODE, WRITE_INTER, InterT><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
             break;
         case 64: {
             gated_delta_net_cuda<64, KDA, TREE_MODE, WRITE_INTER, InterT><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
             break;
         }
         case 128: {
@@ -510,7 +530,7 @@ static void launch_gated_delta_net(
                         gated_delta_net_cuda_grouped_cols<128, cols, width, 32, WRITE_INTER, InterT><<<grouped_grid_dims, grouped_block_dims, 0, stream>>>(
                             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, persist_inter_d, H,
                             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
                     } else if (warp_size == 64) {
                         constexpr int groups_per_warp = 64 / width;
                         dim3 grouped_grid_dims(H, n_seqs, (groups + column_groups_per_block * groups_per_warp - 1) / (column_groups_per_block * groups_per_warp));
@@ -518,24 +538,24 @@ static void launch_gated_delta_net(
                         gated_delta_net_cuda_grouped_cols<128, cols, width, 64, WRITE_INTER, InterT><<<grouped_grid_dims, grouped_block_dims, 0, stream>>>(
                             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, persist_inter_d, H,
                             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
                     } else {
                         gated_delta_net_cuda<128, KDA, TREE_MODE, WRITE_INTER, InterT><<<grid_dims, block_dims, 0, stream>>>(
                             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
                             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
                     }
                 } else {
                     gated_delta_net_cuda<128, KDA, TREE_MODE, WRITE_INTER, InterT><<<grid_dims, block_dims, 0, stream>>>(
                         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
                         n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
                 }
             } else {
                 gated_delta_net_cuda<128, KDA, TREE_MODE, WRITE_INTER, InterT><<<grid_dims, block_dims, 0, stream>>>(
                     q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_inter_d, H,
                     n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, gate_bias, gate_A);
             }
             break;
         }
@@ -637,6 +657,17 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     const bool tree_mode = (parent_ids_d != nullptr);
     const bool skip_intermediate = ggml_get_op_params_i32(dst, 0) != 0;
+    // dflash raw-gate mode: src[8] = dt_bias[H], src[9] = A[H]; the kernel
+    // applies sigmoid / softplus+bias / A itself (see ggml_gated_delta_net_set_raw_gates).
+    const bool raw_gates = ggml_get_op_params_i32(dst, 2) != 0;
+    const float * gate_bias_d = nullptr;
+    const float * gate_A_d    = nullptr;
+    if (raw_gates) {
+        GGML_ASSERT(dst->src[8] && dst->src[9]);
+        GGML_ASSERT(!kda && !tree_mode);
+        gate_bias_d = (const float *) dst->src[8]->data;
+        gate_A_d    = (const float *) dst->src[9]->data;
+    }
     const bool write_intermediate = tree_mode || !skip_intermediate || persist_inter_d != nullptr;
 
     // Macro to expand KDA × TREE_MODE × WRITE_INTER for a given InterT.
@@ -649,34 +680,34 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
                     launch_gated_delta_net<true, true, true, INTER_T>(                          \
                         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_typed, \
                         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d);                              \
                 } else if (write_intermediate) {                                                \
                     launch_gated_delta_net<true, false, true, INTER_T>(                         \
                         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, nullptr, persist_typed, \
                         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d);                              \
                 } else {                                                                        \
                     launch_gated_delta_net<true, false, false, INTER_T>(                        \
                         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, nullptr, persist_typed, \
                         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d);                              \
                 }                                                                               \
             } else {                                                                            \
                 if (tree_mode) {                                                                \
                     launch_gated_delta_net<false, true, true, INTER_T>(                         \
                         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, parent_ids_d, persist_typed, \
                         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d);                              \
                 } else if (write_intermediate) {                                                \
                     launch_gated_delta_net<false, false, true, INTER_T>(                        \
                         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, nullptr, persist_typed, \
                         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d);                              \
                 } else {                                                                        \
                     launch_gated_delta_net<false, false, false, INTER_T>(                       \
                         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_out_d, nullptr, persist_typed, \
                         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                 \
-                        sb1, sb2, sb3, neqk1, rq3, scale, stream);                              \
+                        sb1, sb2, sb3, neqk1, rq3, scale, stream, gate_bias_d, gate_A_d);                              \
                 }                                                                               \
             }                                                                                   \
         } while (0)

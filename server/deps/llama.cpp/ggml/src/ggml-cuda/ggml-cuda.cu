@@ -473,7 +473,11 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
-    static const int MAX_BUFFERS = 256;
+    // 1024 (upstream 256): LUCE_Q8_MEMO keeps one pooled q8_1 activation
+    // buffer per quantized matmul alive across a whole graph evaluation
+    // (~300 on a 64-layer hybrid), and a full pool falls back to freeing
+    // in-flight buffers with cudaFree.
+    static const int MAX_BUFFERS = 1024;
 
     int device;
     struct ggml_cuda_buffer {
@@ -4308,6 +4312,49 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    // dflash: residual ADD + RMS_NORM + MUL. The add output stays live (it is
+    // the next residual), so this is a subgraph fusion with two outputs.
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM &&
+        ops.begin()[2] == GGML_OP_MUL) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx, node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * add = cgraph->nodes[node_idx];
+        const ggml_tensor * rms = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul = cgraph->nodes[node_idx + 2];
+        if (rms->src[0] != add) {
+            return false;
+        }
+        const ggml_tensor * w = nullptr;
+        if (mul->src[0] == rms) {
+            w = mul->src[1];
+        } else if (mul->src[1] == rms) {
+            w = mul->src[0];
+        } else {
+            return false;
+        }
+        const ggml_tensor * a = add->src[0];
+        const ggml_tensor * b = add->src[1];
+        if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+            add->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(w) ||
+            !ggml_is_contiguous(add) || !ggml_is_contiguous(mul)) {
+            return false;
+        }
+        if (!ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, add) || !ggml_are_same_shape(a, mul)) {
+            return false;
+        }
+        if (w->ne[0] != a->ne[0] || ggml_nelements(w) != a->ne[0]) {
+            return false;
+        }
+        if (ggml_backend_buft_is_cuda_split(a->buffer->buft) || ggml_backend_buft_is_cuda_split(b->buffer->buft)) {
+            return false;
+        }
+        return true;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4904,6 +4951,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                     if (fused_mul_mat_vec) {
                         i += fused_node_count - 1;
+                        continue;
+                    }
+
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+                        ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+                        i += 2;
                         continue;
                     }
 
@@ -6148,6 +6201,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
+            // dflash fused step mode handles any channel count
+            if (ggml_get_op_params_i32(op, 0) == 1) {
+                return true;
+            }
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }

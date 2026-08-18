@@ -5859,6 +5859,53 @@ struct ggml_tensor * ggml_ssm_conv_tree(
     return result;
 }
 
+// dflash: fused conv step. Same op id as ggml_ssm_conv; op_params[0] = 1
+// marks step mode, srcs are (x, c, conv_state, conv_input_out).
+struct ggml_tensor * ggml_ssm_conv_step(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * conv_state,
+        struct ggml_tensor  * conv_input_out) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_F32);
+    GGML_ASSERT(conv_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+    GGML_ASSERT(x->ne[3] == 1);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[1];
+    const int64_t n_s     = x->ne[2];
+
+    GGML_ASSERT(x->ne[0] == d_inner);
+    GGML_ASSERT(conv_state->ne[0] == d_conv - 1);
+    GGML_ASSERT(conv_state->ne[1] == d_inner);
+    GGML_ASSERT(conv_state->ne[2] == n_s);
+    GGML_ASSERT(conv_state->nb[0] == sizeof(float));
+    GGML_ASSERT(conv_state->nb[1] == (size_t)(d_conv - 1) * sizeof(float));
+    if (conv_input_out) {
+        GGML_ASSERT(conv_input_out->type == GGML_TYPE_F32);
+        GGML_ASSERT(conv_input_out->ne[0] >= d_conv - 1 + n_t);
+        GGML_ASSERT(conv_input_out->ne[1] == d_inner);
+        GGML_ASSERT(conv_input_out->ne[2] == n_s);
+        GGML_ASSERT(conv_input_out->nb[0] == sizeof(float));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+    ggml_set_op_params_i32(result, 0, 1);   // step mode
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = conv_state;
+    result->src[3] = conv_input_out;
+
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
@@ -6627,6 +6674,28 @@ void ggml_gated_delta_net_set_skip_intermediate(
     }
     tensor->nb[2] = tensor->nb[1]*tensor->ne[1];
     tensor->nb[3] = tensor->nb[2]*tensor->ne[2];
+}
+
+// dflash: raw-gate mode (see ggml.h). dt_bias -> src[8], A -> src[9],
+// op_params[2] = 1.
+void ggml_gated_delta_net_set_raw_gates(
+        struct ggml_tensor * tensor,
+        struct ggml_tensor * dt_bias,
+        struct ggml_tensor * A) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(dt_bias != NULL && A != NULL);
+    GGML_ASSERT(dt_bias->type == GGML_TYPE_F32 && A->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dt_bias) && ggml_is_contiguous(A));
+    const struct ggml_tensor * v = tensor->src[2];
+    GGML_ASSERT(ggml_nelements(dt_bias) == v->ne[1]);
+    GGML_ASSERT(ggml_nelements(A) == v->ne[1]);
+    // scalar gate only (no KDA), no tree mode
+    GGML_ASSERT(tensor->src[3]->ne[0] == 1);
+    GGML_ASSERT(tensor->src[6] == NULL);
+    tensor->src[8] = dt_bias;
+    tensor->src[9] = A;
+    ggml_set_op_params_i32(tensor, 2, 1);
 }
 
 // dflash: tree-mode variant. Same op, with parent_ids plumbed into

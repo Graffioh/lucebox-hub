@@ -2721,6 +2721,25 @@ extern "C" {
             struct ggml_tensor  * c,
             struct ggml_tensor  * parent_ids);
 
+    // dflash extension: fused causal-conv step for recurrent decode/verify.
+    // Replaces transpose + concat(state, x) + ssm_conv + silu + state
+    // write-back with one kernel.
+    //   x:              [C, T, S] f32, rows contiguous (token stride may be
+    //                   larger than C, e.g. a row-slice of a stacked GEMV)
+    //   c:              [K, C]    f32 depthwise conv weights
+    //   conv_state:     [K-1, C, S] f32 history; READ, then OVERWRITTEN in
+    //                   place with the last K-1 conv inputs
+    //   conv_input_out: optional [>= K-1+T, C, S] f32; receives the full
+    //                   conv window (history rows then x rows) per channel,
+    //                   for speculative-decode rollback. May be a view.
+    // Returns silu(conv(x)) as [C, T, S]. CUDA/HIP only.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_step(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * conv_state,
+            struct ggml_tensor  * conv_input_out);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2853,6 +2872,17 @@ extern "C" {
     GGML_API void ggml_gated_delta_net_set_skip_intermediate(
             struct ggml_tensor * tensor,
             bool                 skip_intermediate);
+
+    // dflash extension: let the kernel derive the gates from the raw
+    // projections instead of graph-side sigmoid/softplus ops:
+    //   beta_val = sigmoid(beta_raw)
+    //   g_val    = exp(softplus(alpha_raw + dt_bias[h]) * A[h])
+    // `g` then carries alpha_raw and `beta` carries beta_raw (both [1,H,T,S]);
+    // dt_bias and A are [H] f32. Only for the non-tree, non-KDA CUDA/HIP path.
+    GGML_API void ggml_gated_delta_net_set_raw_gates(
+            struct ggml_tensor * tensor,
+            struct ggml_tensor * dt_bias,
+            struct ggml_tensor * A);
 
     // dflash extension: tree-mode gated delta net for DDTree-style
     // speculative decoding verify. `parent_ids` is an int32 tensor of shape
