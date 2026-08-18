@@ -236,6 +236,7 @@ def tokenize_prompt(prompt: str, out_path: Path, tokenizer) -> int:
 
 
 def run_test_dflash(prompt_path: Path, n_gen: int, fast_rollback: bool,
+                    specla: bool = False,
                     ddtree_budget: int | None = None,
                     ddtree_temp: float | None = None,
                     ddtree_tau: float | None = None,
@@ -248,6 +249,8 @@ def run_test_dflash(prompt_path: Path, n_gen: int, fast_rollback: bool,
     ]
     if fast_rollback:
         cmd.append("--fast-rollback")
+    if specla:
+        cmd.append("--specla")
     if ddtree_budget is not None:
         cmd.append("--ddtree")
         cmd.append(f"--ddtree-budget={ddtree_budget}")
@@ -318,6 +321,8 @@ def main():
     ap.add_argument("--skip-tokenize", action="store_true")
     ap.add_argument("--ddtree-budget", type=int, default=None,
                     help="Enable DDTree mode with this node budget (e.g. 15, 32, 64)")
+    ap.add_argument("--specla", action="store_true",
+                    help="Enable SpecLA with its tested defaults")
     ap.add_argument("--ddtree-temp", type=float, default=None,
                     help="Sharpen draft logits with this temperature (T<1 widens top-1/top-2 gap)")
     ap.add_argument("--ddtree-tau", type=float, default=None,
@@ -428,6 +433,7 @@ def main():
         try:
             r = run_test_dflash(path, args.n_gen,
                                 fast_rollback=(args.mode == "fast" and not args.target_split_dflash),
+                                specla=args.specla,
                                 ddtree_budget=args.ddtree_budget,
                                 ddtree_temp=args.ddtree_temp,
                                 ddtree_tau=args.ddtree_tau,

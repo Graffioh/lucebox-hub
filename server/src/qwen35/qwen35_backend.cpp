@@ -2713,7 +2713,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             // spends projection and scheduling work on low-ranked siblings;
             // keep the legacy width only outside SpecLA.
             const int K = (cfg_.ddtree_budget > L)
-                ? (target->exact_fast_rollback() ? specla_tree_topk() : 8)
+                ? (target->exact_fast_rollback()
+                    ? std::min(specla_tree_topk(), w_.n_vocab)
+                    : 8)
                 : 1;
             DDTree tree;
             if (target->exact_fast_rollback() && K > 1 &&

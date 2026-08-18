@@ -77,6 +77,7 @@ struct BackendArgs {
     int             draft_ctx_max    = 4096;
     bool            fast_rollback    = true;
     bool            seq_verify       = false;
+    bool            specla_mode      = false;
     bool            ddtree_mode      = false;
     int             ddtree_budget    = 22;
     float           ddtree_temp      = 1.0f;
