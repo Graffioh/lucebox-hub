@@ -8643,6 +8643,32 @@ bool deepseek4_should_attempt_fused_verify(
            fused_verify_enabled;
 }
 
+bool deepseek4_should_attempt_wide_fused_verify(
+        int n_tokens,
+        const Ds4VerifyHooks * verify_hooks,
+        bool q5_enabled,
+        bool owner_topology_supported,
+        bool full_layer_range,
+        bool has_output_storage,
+        bool gpu_backend,
+        bool fused_verify_enabled) {
+    return n_tokens == DS4_Q5_VERIFY_TOKENS && q5_enabled &&
+           verify_hooks && verify_hooks->allow_fused_verify &&
+           owner_topology_supported && full_layer_range &&
+           has_output_storage && gpu_backend && fused_verify_enabled;
+}
+
+bool deepseek4_should_warn_fused_verify_inactive(
+        int n_tokens,
+        const Ds4VerifyHooks * verify_hooks,
+        bool full_layer_range,
+        bool fused_verify_enabled,
+        bool fused_verify_candidate) {
+    return fused_verify_enabled && !fused_verify_candidate &&
+           n_tokens >= 2 && full_layer_range && verify_hooks &&
+           verify_hooks->allow_fused_verify;
+}
+
 DeepSeek4RecursiveOutputIntent deepseek4_recursive_output_intent(
         PrefillAttentionMode mode,
         bool parent_execute_output_path,
@@ -8720,38 +8746,49 @@ bool deepseek4_step_layer_range(
         moe_hybrid->materialized_cold_experts &&
         moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
         moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
-    const bool wide_verify_candidate =
-        n_tokens == DS4_Q5_VERIFY_TOKENS &&
-        ds4_env_flag("DFLASH_DS4_Q5_VERIFY");
+    const bool owner_topology_supported =
+        !moe_hybrid || fused_hybrid_ready;
+    const bool full_layer_range = layer_begin == 0 && is_last_shard;
+    const bool gpu_backend = ds4_backend_is_gpu(backend);
+    const bool fused_verify_enabled = ds4_fused_verify_enabled();
+    const bool conservative_verify_candidate =
+        deepseek4_should_attempt_fused_verify(
+            n_tokens, verify_hooks, owner_topology_supported,
+            full_layer_range, execute_output_path, gpu_backend,
+            fused_verify_enabled);
+    const bool q5_verify_enabled = ds4_env_flag("DFLASH_DS4_Q5_VERIFY");
     const bool fused_verify_candidate =
-        (!moe_hybrid || fused_hybrid_ready) &&
-        n_tokens >= 2 &&
-        (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
-         wide_verify_candidate) && verify_hooks &&
-        verify_hooks->allow_fused_verify &&
-        layer_begin == 0 && is_last_shard && execute_output_path &&
-        ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
+        conservative_verify_candidate ||
+        deepseek4_should_attempt_wide_fused_verify(
+            n_tokens, verify_hooks, q5_verify_enabled,
+            owner_topology_supported, full_layer_range,
+            out_logits != nullptr, gpu_backend, fused_verify_enabled);
     // Fused verify has many preconditions and declining any of them is
     // invisible: the request still decodes, still reports a healthy acceptance
     // rate, and only the throughput differs. Name the failed condition once so
     // a slow DSpark run can be attributed from the log instead of guessed at.
     // (No run has yet tripped this on gfx1151 — it is here so that the next
     // "spec decode is slow" report starts from evidence.)
-    if (ds4_fused_verify_enabled() && !fused_verify_candidate &&
-        n_tokens >= 2 && layer_begin == 0 && is_last_shard) {
+    if (deepseek4_should_warn_fused_verify_inactive(
+            n_tokens, verify_hooks, full_layer_range,
+            fused_verify_enabled, fused_verify_candidate)) {
         static bool warned = false;
         if (!warned) {
             warned = true;
             std::fprintf(stderr,
                 "[deepseek4] DFLASH_DS4_FUSED_VERIFY=1 but fused verify is "
-                "inactive: n_tokens=%d (cap %d) verify_hooks=%d out_logits=%d "
+                "inactive: n_tokens=%d (cap %d) verify_hooks=%d "
+                "allow_fused_verify=%d execute_output_path=%d out_logits=%d "
+                "q5_enabled=%d "
                 "backend_gpu=%d moe_hybrid=%d expert_runtime=%d "
                 "materialized_cold=%d cold_backend_kind_gpu=%d "
                 "cold_backend_distinct=%d; verify falls back to the dense "
                 "full-expert path\n",
                 n_tokens, GGML_CUDA_DS4_FUSED_VERIFY_MAX_TOKENS,
-                verify_hooks ? 1 : 0, out_logits ? 1 : 0,
-                ds4_backend_is_gpu(backend) ? 1 : 0,
+                verify_hooks ? 1 : 0,
+                verify_hooks && verify_hooks->allow_fused_verify ? 1 : 0,
+                execute_output_path ? 1 : 0, out_logits ? 1 : 0,
+                q5_verify_enabled ? 1 : 0, gpu_backend ? 1 : 0,
                 moe_hybrid ? 1 : 0, expert_runtime ? 1 : 0,
                 moe_hybrid && moe_hybrid->materialized_cold_experts ? 1 : 0,
                 moe_hybrid && moe_hybrid->cold_backend_kind ==

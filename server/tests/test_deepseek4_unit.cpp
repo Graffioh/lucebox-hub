@@ -2182,7 +2182,54 @@ static void test_prefill_readout_lifecycle_and_fused_exclusion() {
     TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
         /*n_tokens=*/1, &verifier_hooks, true, true, true, true, true));
     TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
-        /*n_tokens=*/5, &verifier_hooks, true, true, true, true, true));
+        /*n_tokens=*/DS4_Q5_VERIFY_TOKENS,
+        &verifier_hooks, true, true, true, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_fused_verify(
+        /*n_tokens=*/DS4_Q5_VERIFY_TOKENS + 1,
+        &verifier_hooks, true, true, true, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_wide_fused_verify(
+        DS4_Q5_VERIFY_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/false, true, true, true, true, true));
+    TEST_ASSERT(deepseek4_should_attempt_wide_fused_verify(
+        DS4_Q5_VERIFY_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/true, true, true, true, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_wide_fused_verify(
+        DS4_Q5_VERIFY_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/true, true, true,
+        /*has_output_storage=*/false, true, true));
+    TEST_ASSERT(!deepseek4_should_attempt_wide_fused_verify(
+        DS4_CONSERVATIVE_VERIFY_MAX_TOKENS, &verifier_hooks,
+        /*q5_enabled=*/true, true, true, true, true, true));
+    TEST_ASSERT(deepseek4_should_warn_fused_verify_inactive(
+        /*n_tokens=*/4, &verifier_hooks,
+        /*full_layer_range=*/true,
+        /*fused_verify_enabled=*/true,
+        /*fused_verify_candidate=*/false));
+    TEST_ASSERT(!deepseek4_should_warn_fused_verify_inactive(
+        /*n_tokens=*/4, /*verify_hooks=*/nullptr,
+        /*full_layer_range=*/true,
+        /*fused_verify_enabled=*/true,
+        /*fused_verify_candidate=*/false));
+    TEST_ASSERT(!deepseek4_should_warn_fused_verify_inactive(
+        /*n_tokens=*/4, &verifier_hooks,
+        /*full_layer_range=*/true,
+        /*fused_verify_enabled=*/true,
+        /*fused_verify_candidate=*/true));
+    TEST_ASSERT(!deepseek4_should_warn_fused_verify_inactive(
+        /*n_tokens=*/1, &verifier_hooks,
+        /*full_layer_range=*/true,
+        /*fused_verify_enabled=*/true,
+        /*fused_verify_candidate=*/false));
+    TEST_ASSERT(!deepseek4_should_warn_fused_verify_inactive(
+        /*n_tokens=*/4, &verifier_hooks,
+        /*full_layer_range=*/false,
+        /*fused_verify_enabled=*/true,
+        /*fused_verify_candidate=*/false));
+    TEST_ASSERT(!deepseek4_should_warn_fused_verify_inactive(
+        /*n_tokens=*/4, &verifier_hooks,
+        /*full_layer_range=*/true,
+        /*fused_verify_enabled=*/false,
+        /*fused_verify_candidate=*/false));
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 static void test_dspark_park_all_releases_drafter() {
