@@ -182,7 +182,8 @@ bool Qwen35SeqEngine::ddtree_available(const StepPlan & plan) const {
 }
 
 bool Qwen35SeqEngine::ddtree_input_eligible(const StepInput & in) const {
-    if (!in.allow_speculation || in.slot < 0 ||
+    if (!in.allow_speculation ||
+        in.speculation_policy == SpeculationPolicy::Never || in.slot < 0 ||
         in.slot >= slots_.slot_count() ||
         !slots_.slot(in.slot).decoding() ||
         slots_.slot(in.slot).sampler.needs_logit_processing() ||
@@ -1412,6 +1413,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                 static_cast<double>(prompt_hint),
                 estimate ? estimate->evidence_samples : 0,
                 seq.generated_tokens(),
+                in.speculation_policy == SpeculationPolicy::Always,
             });
         }
     };

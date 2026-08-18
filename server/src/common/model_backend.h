@@ -170,6 +170,10 @@ struct GenerateRequest {
     std::vector<int32_t>       prompt;
     int                        n_gen       = 0;
     SamplerCfg                 sampler;
+    // Public decode policy. Concurrent engines consume it per request;
+    // sequential backends currently map Never to their established AR path.
+    SpeculationPolicy          speculation_policy =
+        SpeculationPolicy::Adaptive;
     bool                       do_sample   = false;
     bool                       stream      = false;  // emit tokens to stream_fd
     // Optional inline-snap: snapshot at this position after prefill.

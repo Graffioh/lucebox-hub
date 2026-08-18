@@ -56,6 +56,7 @@
 #include <vector>
 
 #include "common/sampler.h"
+#include "common/speculation_policy.h"
 
 namespace dflash::common {
 
@@ -182,6 +183,11 @@ public:
     struct StepInput {
         int     slot  = -1;
         int32_t token = -1;   // token to commit at this slot's next position
+        // User policy for this request. `Always` is mandatory speculation,
+        // `Never` is AR, and `Adaptive` delegates to the engine's measured
+        // policy. The mechanism is deliberately independent of DDTree/DSpark.
+        SpeculationPolicy speculation_policy =
+            SpeculationPolicy::Adaptive;
         // False when scheduler-side policy may replace the sampled token
         // before it is committed (currently the thinking-budget close hook).
         bool allow_speculation = true;
@@ -311,7 +317,9 @@ inline std::string validate_step_result(
             return "decode plan contains a duplicate slot";
         decode_planned[(size_t)input.slot] = 1;
         speculation_allowed[(size_t)input.slot] =
-            input.allow_speculation ? 1 : 0;
+            input.allow_speculation &&
+                input.speculation_policy != SpeculationPolicy::Never
+            ? 1 : 0;
     }
     for (const PrefillSlice & slice : plan.prefills) {
         if (slice.slot < 0 || slice.slot >= slot_count ||

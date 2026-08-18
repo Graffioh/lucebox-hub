@@ -1,6 +1,7 @@
 #include "common/concurrency/adaptive_verification.h"
 #include "common/concurrency/speculation_goodput.h"
 #include "common/concurrency/speculation_prompt_prior.h"
+#include "common/speculation_policy.h"
 #include "host_check.h"
 
 #include <cstdio>
@@ -10,6 +11,19 @@ using namespace dflash::common;
 static int g_checks = 0;
 
 int main() {
+    // The public policy vocabulary is intentionally small and stable across
+    // DDTree, DSpark, and later speculators.
+    {
+        CHECK(parse_decode_mode("adaptive") ==
+              SpeculationPolicy::Adaptive);
+        CHECK(parse_decode_mode("speculation") ==
+              SpeculationPolicy::Always);
+        CHECK(parse_decode_mode("ar") ==
+              SpeculationPolicy::Never);
+        CHECK(!parse_decode_mode("always"));
+        CHECK(decode_mode_name(SpeculationPolicy::Never) == "ar");
+    }
+
     // The cold-start prior separates obvious structured/code requests from
     // conversational writing while leaving ambiguous requests neutral.
     {
@@ -161,6 +175,56 @@ int main() {
         CHECK(decision.requests.size() == 1);
         CHECK(decision.requests[0] == 11);
         CHECK(decision.predicted_gain > 1.05);
+    }
+
+    // User-forced speculation does not wait for an AR baseline and remains
+    // selected even when its measured route is slower than AR.
+    {
+        AdaptiveVerificationRanker ranker;
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {41, 1.0, 8.0, false, 0.0, 0, 0, true},
+        };
+        AdaptiveVerificationDecision decision =
+            ranker.select(2, candidates, 1);
+        CHECK(decision.requests.size() == 1);
+        CHECK(decision.requests[0] == 41);
+
+        ranker.observe_autoregressive(2, 100.0);
+        ranker.observe_route(2, 1, 200.0);
+        decision = ranker.select(2, candidates, 1);
+        CHECK(decision.requests.size() == 1);
+        CHECK(decision.requests[0] == 41);
+    }
+
+    // Mandatory requests form the prefix. Adaptive peers may join only when
+    // the exact combined width is profitable, and a user override can exceed
+    // the normal efficient-lane limit without being silently ignored.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(2, 100.0);
+        ranker.observe_route(2, 1, 200.0);
+        ranker.observe_route(2, 2, 100.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {51, 4.0, 8.0, true},
+            {52, 1.0, 8.0, true, 0.0, 0, 0, true},
+        };
+        const AdaptiveVerificationDecision decision =
+            ranker.select(2, candidates, 2);
+        CHECK(decision.requests.size() == 2);
+        CHECK(decision.requests[0] == 52);
+        CHECK(decision.requests[1] == 51);
+    }
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(4, 100.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {61, 1.0, 8.0, false, 0.0, 0, 0, true},
+            {62, 1.0, 8.0, false, 0.0, 0, 0, true},
+        };
+        const AdaptiveVerificationDecision decision =
+            ranker.select(4, candidates, /*max_speculative_requests=*/1);
+        CHECK(decision.requests.size() == 2);
+        CHECK(decision.exploring);
     }
 
     // Candidates are ranked by expected value and every measured width is

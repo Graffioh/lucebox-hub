@@ -170,6 +170,30 @@ Run it directly:
   --model-name luce-dflash
 ```
 
+With a decode drafter configured (`--draft`), the server default is adaptive
+routing. The operator can choose a different default without unloading the
+draft model; DDTree is shown here, but the control is not DDTree-specific:
+
+```bash
+--ddtree --decode-mode adaptive    # measured request-level routing
+--ddtree --decode-mode speculation # force speculation when eligible
+--ddtree --decode-mode ar          # force autoregressive decode
+```
+
+Every generation endpoint also accepts a top-level per-request override:
+
+```json
+{
+  "model": "luce-dflash",
+  "messages": [{"role": "user", "content": "Implement a Python parser"}],
+  "decode_mode": "adaptive"
+}
+```
+
+The accepted values are `adaptive`, `ar`, and `speculation`. `speculation`
+requires the server to have speculative decode enabled. The mode is speculator-neutral:
+DDTree consumes it today, and DSpark or a later verifier can use the same API.
+
 ### Compression proxy mode
 
 `dflash_server` can run as a **PFlash compression proxy** in front of any

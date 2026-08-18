@@ -38,6 +38,10 @@ struct AdaptiveVerificationCandidate {
     // Generated output already committed for this request. Proven-useful peers
     // with less progress receive compact lanes first to avoid cohort stragglers.
     int progress_tokens = 0;
+    // A user-forced request is always present in the selected prefix. Its
+    // observed yield still contributes to deciding whether adaptive peers
+    // should share the same verifier pass.
+    bool required = false;
 };
 
 struct AdaptiveVerificationYieldEstimate {
@@ -422,14 +426,12 @@ public:
             bool enforce_ar_peer_guard = true,
             std::size_t minimum_speculative_route_samples = 1) const {
         AdaptiveVerificationDecision out;
-        if (active_requests <= 0 || candidates.empty() ||
-            !has_autoregressive_cost(active_requests)) {
-            // First observe the exact all-AR baseline for this occupancy.
-            return out;
-        }
+        if (active_requests <= 0 || candidates.empty()) return out;
 
+        std::vector<AdaptiveVerificationCandidate> required_candidates;
         std::vector<AdaptiveVerificationCandidate> known;
         std::vector<AdaptiveVerificationCandidate> unknown;
+        required_candidates.reserve(candidates.size());
         known.reserve(candidates.size());
         unknown.reserve(candidates.size());
         for (AdaptiveVerificationCandidate candidate : candidates) {
@@ -444,9 +446,37 @@ public:
             if (!std::isfinite(candidate.routing_prior)) {
                 candidate.routing_prior = 0.0;
             }
-            (candidate.calibrated ? known : unknown).push_back(candidate);
+            if (candidate.required) {
+                required_candidates.push_back(candidate);
+            } else {
+                (candidate.calibrated ? known : unknown).push_back(candidate);
+            }
         }
-        if (known.empty() && unknown.empty()) return out;
+        if (required_candidates.empty() && known.empty() && unknown.empty()) {
+            return out;
+        }
+
+        std::stable_sort(
+            required_candidates.begin(), required_candidates.end(),
+            [](const AdaptiveVerificationCandidate & a,
+               const AdaptiveVerificationCandidate & b) {
+                return a.request < b.request;
+            });
+        auto select_required = [&]() {
+            out.requests.clear();
+            out.requests.reserve(required_candidates.size());
+            for (const AdaptiveVerificationCandidate & candidate :
+                    required_candidates) {
+                out.requests.push_back(candidate.request);
+            }
+        };
+        if (!has_autoregressive_cost(active_requests)) {
+            // Adaptive-only cohorts first observe the exact AR baseline. User
+            // overrides are stronger: an Always request must not be delayed
+            // by profiling, and its route timing is learned from this step.
+            select_required();
+            return out;
+        }
 
         auto has_stable_useful_yield =
             [&](const AdaptiveVerificationCandidate & candidate) {
@@ -540,6 +570,16 @@ public:
             out.calibration_request = unknown.front().request;
         }
 
+        std::vector<AdaptiveVerificationCandidate> ordered_known;
+        ordered_known.reserve(required_candidates.size() + known.size());
+        ordered_known.insert(
+            ordered_known.end(), required_candidates.begin(),
+            required_candidates.end());
+        ordered_known.insert(
+            ordered_known.end(), known.begin(), known.end());
+        const int required_count =
+            static_cast<int>(required_candidates.size());
+
         const double baseline =
             static_cast<double>(active_requests) /
             autoregressive_cost_us(active_requests);
@@ -547,17 +587,21 @@ public:
         const std::size_t required_route_samples =
             std::max<std::size_t>(
                 1, minimum_speculative_route_samples);
-        int admitted_prefix = 0;
+        int admitted_prefix = required_count;
         double best = baseline;
         double admitted_goodput = baseline;
         double expected_total = static_cast<double>(active_requests);
-        const int prefix_limit = std::max(0, std::min(
-            active_requests, max_speculative_requests));
+        const int prefix_limit = std::max(
+            required_count,
+            std::max(0, std::min(
+                active_requests, max_speculative_requests)));
         // Evaluate every measured width independently. GPU occupancy makes
         // these costs non-convex: k=3 may win even when k=1 and k=2 lose.
-        for (int k = 1; k <= static_cast<int>(known.size()) &&
+        for (int k = 1; k <= static_cast<int>(ordered_known.size()) &&
                         k <= prefix_limit; ++k) {
-            expected_total += known[(size_t)k - 1].expected_tokens - 1.0;
+            expected_total +=
+                ordered_known[(size_t)k - 1].expected_tokens - 1.0;
+            if (k < required_count) continue;
             if (route_cost_samples(active_requests, k) <
                 required_route_samples) continue;
             const double route_us = route_cost_us(active_requests, k);
@@ -584,11 +628,11 @@ public:
         // bounded prefix and learn their yield from accepted output.
         const int probe_candidates = std::min(
             prefix_limit,
-            static_cast<int>(known.size()) +
+            static_cast<int>(ordered_known.size()) +
                 (probe_uncalibrated_with_verifier
                     ? static_cast<int>(unknown.size()) : 0));
         int missing_width = 0;
-        for (int k = 1; probe_missing_routes &&
+        for (int k = std::max(1, required_count); probe_missing_routes &&
                         k <= probe_candidates; ++k) {
             if (route_cost_samples(active_requests, k) >=
                 required_route_samples) continue;
@@ -598,9 +642,10 @@ public:
         if (missing_width > 0) {
             out.requests.reserve((size_t)missing_width);
             const int known_count = std::min(
-                missing_width, static_cast<int>(known.size()));
+                missing_width, static_cast<int>(ordered_known.size()));
             for (int i = 0; i < known_count; ++i) {
-                out.requests.push_back(known[(size_t)i].request);
+                out.requests.push_back(
+                    ordered_known[(size_t)i].request);
             }
             for (int i = 0;
                  static_cast<int>(out.requests.size()) < missing_width;
@@ -621,13 +666,14 @@ public:
             int calibration_width = 0;
             double calibration_goodput = required;
             const int calibration_limit = std::min(
-                prefix_limit, static_cast<int>(known.size()) + 1);
+                prefix_limit, static_cast<int>(ordered_known.size()) + 1);
             double known_total = static_cast<double>(active_requests);
             for (int k = 1; k <= calibration_limit; ++k) {
                 if (k > 1) {
                     known_total +=
-                        known[(size_t)k - 2].expected_tokens - 1.0;
+                        ordered_known[(size_t)k - 2].expected_tokens - 1.0;
                 }
+                if (k <= required_count) continue;
                 if (route_cost_samples(active_requests, k) <
                     required_route_samples) continue;
                 const double route_us = route_cost_us(active_requests, k);
@@ -645,7 +691,8 @@ public:
             if (calibration_width > 0) {
                 out.requests.reserve((size_t)calibration_width);
                 for (int i = 0; i < calibration_width - 1; ++i) {
-                    out.requests.push_back(known[(size_t)i].request);
+                    out.requests.push_back(
+                        ordered_known[(size_t)i].request);
                 }
                 out.requests.push_back(unknown.front().request);
                 out.calibration_request = -1;
@@ -657,9 +704,12 @@ public:
         if (admitted_prefix > 0) {
             out.requests.reserve((size_t)admitted_prefix);
             for (int i = 0; i < admitted_prefix; ++i) {
-                out.requests.push_back(known[(size_t)i].request);
+                out.requests.push_back(
+                    ordered_known[(size_t)i].request);
             }
-            out.predicted_gain = admitted_goodput / baseline;
+            if (admitted_prefix > required_count) {
+                out.predicted_gain = admitted_goodput / baseline;
+            }
         }
         return out;
     }

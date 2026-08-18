@@ -176,6 +176,7 @@ struct ServerConfig {
     int         fa_window           = 0;
     int         ddtree_budget       = 0;
     bool        speculative_enabled = false;
+    SpeculationPolicy decode_mode = SpeculationPolicy::Adaptive;
     bool        target_sharding     = false;
     // Prefill chunk size (bargs.chunk). Exposed at /props.runtime.chunk so
     // bench/snapshot tooling can capture the full server config — needed
@@ -302,6 +303,10 @@ struct ParsedRequest {
     int                       max_output   = 4096;
     bool                      stream       = true;
     SamplerCfg                sampler;
+    // Defaults to the server policy and may be overridden by the top-level
+    // `decode_mode` request field.
+    SpeculationPolicy         decode_mode =
+        SpeculationPolicy::Adaptive;
     std::string               model;
     // Tool definitions (stored as JSON for response formatting)
     json                      tools;
