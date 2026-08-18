@@ -209,6 +209,14 @@ bool load_draft_gguf(const std::string & path,
     if (target) {
         out.mask_token_id = target->mask_token_id;
     }
+    // The drafter's own MASK id wins over the family default: newer drafters
+    // (e.g. the Qwen3.8 DSpark release) are trained with a different mask
+    // token than the target-side default, and drafting with the wrong mask
+    // embedding silently destroys acceptance.
+    {
+        const uint32_t mask_meta = read_u32("dflash.mask_token_id", 0);
+        if (mask_meta != 0) out.mask_token_id = (int32_t)mask_meta;
+    }
 
     // Upper bounds on hparams. Guards against malformed/hostile GGUFs that
     // would otherwise trigger huge allocations or signed-int overflow when
@@ -244,6 +252,24 @@ bool load_draft_gguf(const std::string & path,
     out.rope_theta = read_f32("rope.freq_base", 0.0f);
     if (out.rope_theta == 0.0f) {
         fprintf(stderr, "[draft-gguf] WARNING: rope.freq_base not found in GGUF, draft RoPE will be wrong\n");
+    }
+    // YaRN rope scaling (optional). Drafters trained with YaRN (e.g. Qwen3.8
+    // DSpark: factor 32, orig ctx 8192) apply it at every position; plain
+    // RoPE at inference silently degrades acceptance.
+    {
+        const float yarn_factor = read_f32("rope.scaling.factor", 0.0f);
+        if (yarn_factor > 1.0f) {
+            out.rope_freq_scale  = 1.0f / yarn_factor;
+            out.rope_ext_factor  = 1.0f;
+            out.rope_attn_factor = read_f32("rope.scaling.attn_factor", 1.0f);
+            out.rope_beta_fast   = read_f32("rope.scaling.beta_fast", 32.0f);
+            out.rope_beta_slow   = read_f32("rope.scaling.beta_slow", 1.0f);
+            out.rope_n_ctx_orig  = (int)read_u32("rope.scaling.original_context_length", 0);
+            fprintf(stderr,
+                "[draft-gguf] YaRN rope: factor=%.1f orig_ctx=%d beta=%.1f/%.1f\n",
+                yarn_factor, out.rope_n_ctx_orig,
+                out.rope_beta_fast, out.rope_beta_slow);
+        }
     }
     out.layers.assign((size_t)n_layer, DraftLayer{});
 

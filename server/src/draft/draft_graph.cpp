@@ -40,6 +40,19 @@
 
 namespace dflash::common {
 
+// RoPE with the drafter's scaling config. YaRN-trained drafters (e.g. the
+// Qwen3.8 DSpark release: factor 32, orig ctx 8192) apply the scaled rotary
+// at every position, so plain-RoPE inference silently degrades acceptance.
+static ggml_tensor * draft_rope(ggml_context * ctx, ggml_tensor * t,
+                                ggml_tensor * positions,
+                                const DraftWeights & w) {
+    return ggml_rope_ext(ctx, t, positions, /*freq_factors=*/nullptr,
+                         w.head_dim, GGML_ROPE_TYPE_NEOX, w.rope_n_ctx_orig,
+                         w.rope_theta, w.rope_freq_scale,
+                         w.rope_ext_factor, w.rope_attn_factor,
+                         w.rope_beta_fast, w.rope_beta_slow);
+}
+
 // Feature fusion shared by the legacy one-shot graph and the cached-KV
 // builders: optional per-capture RMSNorm slices, fc projection, hidden_norm.
 // Row-independent, so it is bit-identical whether run over the full window
@@ -83,7 +96,6 @@ DraftGraphOutputs build_draft_graph(
     const int n_kv     = w.n_head_kv;
     const int head_dim = w.head_dim;
     const float eps    = DFLASH27B_RMS_EPS;
-    const float rope_base = w.rope_theta;
 
     // ── 1. Feature fusion: target_feat = rms_norm(fc @ target_hidden_cat, hidden_norm)
     //    fc:                [5*hidden, hidden]  (ggml: ne[0]=5*hidden, ne[1]=hidden)
@@ -185,14 +197,8 @@ DraftGraphOutputs build_draft_graph(
                 pk = ggml_view_1d(ctx, in.positions_k, eff_total_k,
                                   ctx_offset * ggml_element_size(in.positions_k));
             }
-            Q = ggml_rope_ext(ctx, Q, in.positions_q, /*freq_factors=*/nullptr,
-                              head_dim, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
-                              rope_base, /*freq_scale=*/1.0f,
-                              /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
-                              /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
-            K = ggml_rope_ext(ctx, K, pk, nullptr,
-                              head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                              rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            Q = draft_rope(ctx, Q, in.positions_q, w);
+            K = draft_rope(ctx, K, pk, w);
 
             // ── 2e. Permute into the layout flash_attn_ext wants
             //   q: [n_embd_k=head_dim, n_batch=q_len, n_head,   ne3]
@@ -309,11 +315,7 @@ static void draft_ctx_kv_rows(
     K = ggml_reshape_3d(ctx, K, w.head_dim, w.n_head_kv, n);
     K = ggml_rms_norm(ctx, K, eps);
     K = ggml_mul     (ctx, K, L.k_norm);
-    K = ggml_rope_ext(ctx, K, positions, /*freq_factors=*/nullptr,
-                      w.head_dim, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig=*/0,
-                      w.rope_theta, /*freq_scale=*/1.0f,
-                      /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
-                      /*beta_fast=*/0.0f, /*beta_slow=*/0.0f);
+    K = draft_rope(ctx, K, positions, w);
     // rope output is contiguous [head_dim, n_kv, n] → head-major rows view
     *k_rows_out = ggml_view_2d(ctx, K, (int64_t)w.head_dim * w.n_head_kv, n,
                                K->nb[2], 0);
@@ -356,7 +358,6 @@ DraftGraphOutputs build_draft_kv_step(
     const int n_kv     = w.n_head_kv;
     const int head_dim = w.head_dim;
     const float eps    = DFLASH27B_RMS_EPS;
-    const float rope_base = w.rope_theta;
     const int kv_total = cache.kv_total;
 
     static const bool disable_attn_gate =
@@ -380,18 +381,14 @@ DraftGraphOutputs build_draft_kv_step(
         Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, q_len);
         Q = ggml_rms_norm(ctx, Q, eps);
         Q = ggml_mul     (ctx, Q, L.q_norm);
-        Q = ggml_rope_ext(ctx, Q, in.positions_q, nullptr,
-                          head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                          rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        Q = draft_rope(ctx, Q, in.positions_q, w);
 
         // ── noise K/V into the scratch cache slots
         ggml_tensor * Kn = ggml_mul_mat(ctx, L.wk, hn);
         Kn = ggml_reshape_3d(ctx, Kn, head_dim, n_kv, q_len);
         Kn = ggml_rms_norm(ctx, Kn, eps);
         Kn = ggml_mul     (ctx, Kn, L.k_norm);
-        Kn = ggml_rope_ext(ctx, Kn, in.positions_q, nullptr,
-                           head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                           rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        Kn = draft_rope(ctx, Kn, in.positions_q, w);
         ggml_tensor * Kn_rows = ggml_view_2d(ctx, Kn,
             (int64_t)head_dim * n_kv, q_len, Kn->nb[2], 0);
         ggml_tensor * Vn_rows = ggml_mul_mat(ctx, L.wv, hn);  // [kv_dim, q_len]

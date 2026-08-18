@@ -13,6 +13,7 @@
 #include "common/geometric_sampler_cuda.h"
 #include <random>
 #endif
+#include "common/dspark_head.h"
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
 #include "qwen35_tensor_parallel.h"
@@ -25,6 +26,7 @@
 #include "flashprefill.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -149,6 +151,33 @@ static bool qwen35_empty_visible_output(const std::vector<int32_t> & tokens,
     return true;
 }
 
+// Drafters trained on explicit target layers (GGUF dflash.target_layer_ids)
+// override the evenly-spaced derivation: capturing different layers than the
+// drafter was trained on silently destroys acceptance.
+static void apply_drafter_capture_layer_ids(const DraftWeights & dw, TargetWeights & w) {
+    if (dw.capture_layer_ids.empty()) return;
+    const int n = (int)dw.capture_layer_ids.size();
+    bool ok = (n == w.n_capture_layers);
+    for (int k = 0; ok && k < n; k++)
+        ok = dw.capture_layer_ids[k] >= 0 && dw.capture_layer_ids[k] < w.n_layer;
+    if (!ok) {
+        std::fprintf(stderr,
+            "[draft]  drafter target_layer_ids invalid (n=%d, slots=%d); "
+            "keeping derived capture layers\n", n, w.n_capture_layers);
+        return;
+    }
+    bool changed = false;
+    for (int k = 0; k < n; k++) {
+        changed |= w.capture_layer_ids[k] != dw.capture_layer_ids[k];
+        w.capture_layer_ids[k] = dw.capture_layer_ids[k];
+    }
+    if (changed) {
+        std::printf("[draft]  target capture layers from drafter GGUF:");
+        for (int k = 0; k < n; k++) std::printf(" %d", w.capture_layer_ids[k]);
+        std::printf("\n");
+    }
+}
+
 // ── Construction / destruction ──────────────────────────────────────────
 
 Qwen35Backend::Qwen35Backend(const Qwen35Config & cfg) : cfg_(cfg) {}
@@ -253,6 +282,7 @@ bool Qwen35Backend::init() {
             return false;
         }
         std::printf("[draft]  loaded\n");
+        apply_drafter_capture_layer_ids(dw_, w_);
 
         if (cfg_.draft_swa_window > 0) {
             dw_.swa_window = cfg_.draft_swa_window;
@@ -607,6 +637,7 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
                 return false;
             }
+            apply_drafter_capture_layer_ids(dw_, w_);
             // Re-apply rope overrides after reload.
             if (dw_.rope_theta != w_.rope_theta && w_.rope_theta > 0.0f)
                 dw_.rope_theta = w_.rope_theta;
@@ -2139,6 +2170,14 @@ bool Qwen35Backend::sync_local_draft_features(int start_pos, int n_tokens) {
 
 // ── DFlash speculative decode loop ─────────────────────────────────────
 
+static bool qwen35_dspark_enabled() {
+    static const bool kEnabled = []() {
+        const char * e = std::getenv("DFLASH_QWEN35_DSPARK");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    return kEnabled;
+}
+
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
@@ -2504,12 +2543,58 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // DDTree consumes top-K rows directly. Avoid projecting the same
         // hidden block once for argmax and again for top-K on every step.
         if (!use_tree_verify) {
-            if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
-                std::fprintf(stderr, "spec-decode: projection failed\n");
-                step_graph_destroy(draft_sg);
-                return false;
+            // DSpark heads (markov bigram correction + optional confidence
+            // gate) when the drafter ships them; mirrors the laguna hook.
+            bool used_dspark = false;
+            if (qwen35_dspark_enabled() && dw_.dspark.enabled &&
+                q_len > 1 && !sampled_verify && !use_remote_draft) {
+                static std::atomic<bool> s_dspark_logged{false};
+                if (!s_dspark_logged.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[qwen35-spec] DSpark Markov head active for greedy chain decode "
+                        "(rank=%d vocab=%d confidence_dim=%d)\n",
+                        dw_.dspark.markov_rank, dw_.dspark.vocab_size,
+                        dw_.dspark.confidence_dim);
+                }
+                static const bool fused_dspark = []() {
+                    const char * e = std::getenv("DFLASH_QWEN35_FUSED_DSPARK");
+                    return !(e && e[0] == '0' && e[1] == '\0');
+                }();
+                bool ds_ok = false;
+                if (fused_dspark) {
+                    ds_ok = dspark_markov_correct_greedy_chain_fused(
+                        dw_, draft_backend_, target->lm_head_tensor(),
+                        local_hidden.data(), q_len, last_tok, draft_tok);
+                }
+                if (!ds_ok) {
+                    // threshold 0 = confidence gate off: q_len sizes the
+                    // step buffers for the whole request, so the truncated
+                    // chain the gate produces cannot be verified here yet.
+                    ds_ok = dspark_markov_correct_greedy_chain(dw_, draft_backend_, *target,
+                                                       local_hidden.data(), q_len,
+                                                       last_tok,
+                                                       /*confidence_threshold=*/0.0f,
+                                                       draft_tok);
+                }
+                if (ds_ok) {
+                    used_dspark = true;
+                } else {
+                    static std::atomic<bool> s_dspark_warned{false};
+                    if (!s_dspark_warned.exchange(true)) {
+                        std::fprintf(stderr,
+                            "[qwen35-spec] DSpark Markov head failed; falling back to "
+                            "base DFlash projection\n");
+                    }
+                }
             }
-            draft_tok[0] = last_tok;
+            if (!used_dspark) {
+                if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
+                    std::fprintf(stderr, "spec-decode: projection failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                draft_tok[0] = last_tok;
+            }
         }
 
         if (use_tree_verify) {
@@ -2518,7 +2603,25 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             std::vector<float>   top_lp;
             std::vector<int32_t> top_ids;
             const auto profile_project_start = profile_start();
-            if (!target->project_hidden_to_topk(local_hidden.data(), q_len, K,
+            static const bool dspark_tree = []() {
+                const char * e = std::getenv("DFLASH_QWEN35_DSPARK_TREE");
+                return !(e && e[0] == '0' && e[1] == '\0');
+            }();
+            bool topk_ok = false;
+            if (dspark_tree && qwen35_dspark_enabled() && dw_.dspark.enabled) {
+                static std::atomic<bool> s_dstree_logged{false};
+                if (!s_dstree_logged.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[qwen35-spec] DSpark Markov head active for DDTree candidates\n");
+                }
+                topk_ok = dspark_markov_project_topk(dw_, draft_backend_,
+                                                     target->lm_head_tensor(),
+                                                     local_hidden.data(), q_len, K,
+                                                     cfg_.ddtree_temp, last_tok,
+                                                     top_lp, top_ids);
+            }
+            if (!topk_ok &&
+                !target->project_hidden_to_topk(local_hidden.data(), q_len, K,
                                                 cfg_.ddtree_temp, top_lp, top_ids)) {
                 std::fprintf(stderr, "spec-decode: ddtree topk projection failed\n");
                 step_graph_destroy(draft_sg);

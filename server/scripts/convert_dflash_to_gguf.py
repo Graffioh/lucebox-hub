@@ -110,6 +110,20 @@ def load_arch(safetensors: Path, header: dict) -> dict:
                 or c.get("aux_hidden_state_layer_ids"))
         if _tli:
             a["capture_layer_ids"] = [int(x) for x in _tli]
+        # Newer HF configs (transformers >= 5.x, e.g. the Qwen3.8 DSpark
+        # drafter) nest rope_theta / YaRN under rope_parameters and
+        # mask_token_id under dflash_config instead of top-level.
+        rp = c.get("rope_parameters") or c.get("rope_scaling") or {}
+        if isinstance(rp, dict):
+            if rp.get("rope_theta") is not None:
+                a["rope_theta"] = float(rp["rope_theta"])
+            if str(rp.get("rope_type", "")).lower() == "yarn":
+                a["yarn_factor"]    = float(rp.get("factor", 0.0))
+                a["yarn_orig_ctx"]  = int(rp.get("original_max_position_embeddings", 0))
+                a["yarn_beta_fast"] = float(rp.get("beta_fast", 32.0))
+                a["yarn_beta_slow"] = float(rp.get("beta_slow", 1.0))
+        if dfc.get("mask_token_id") is not None:
+            a["mask_token_id"] = int(dfc["mask_token_id"])
         print(f"[info] read arch from {cfg_path}")
     else:
         print(f"[warn] no config.json next to safetensors; using 27B defaults")
@@ -248,18 +262,30 @@ DOMINO_TENSOR_MAP = {
 }
 
 
+# Alias sets per head tensor: SpecForge sidecar names, DS4 MTP-shard names,
+# and single-file releases (e.g. RadixArk Qwen3.8-27B-DSpark) that carry the
+# heads inline in the main model.safetensors.
+DSPARK_MARKOV_W1_KEYS = ("dspark_markov_head.markov_w1.weight",
+                         "mtp.2.markov_head.markov_w1.weight",
+                         "markov_head.markov_w1.weight")
+DSPARK_MARKOV_W2_KEYS = ("dspark_markov_head.markov_w2.weight",
+                         "mtp.2.markov_head.markov_w2.weight",
+                         "markov_head.markov_w2.weight")
+DSPARK_CONF_W_KEYS    = ("dspark_confidence_head.weight",
+                         "mtp.2.confidence_head.proj.weight",
+                         "confidence_head.proj.weight")
+DSPARK_CONF_B_KEYS    = ("dspark_confidence_head.bias",
+                         "mtp.2.confidence_head.proj.bias",
+                         "confidence_head.proj.bias")
+
 DSPARK_TENSOR_MAP = {
-    ("dspark_markov_head.markov_w1.weight",
-     "mtp.2.markov_head.markov_w1.weight"): ("dflash.dspark.markov.w1", gguf.GGMLQuantizationType.F16),
-    ("dspark_markov_head.markov_w2.weight",
-     "mtp.2.markov_head.markov_w2.weight"): ("dflash.dspark.markov.w2", gguf.GGMLQuantizationType.F16),
+    DSPARK_MARKOV_W1_KEYS: ("dflash.dspark.markov.w1", gguf.GGMLQuantizationType.F16),
+    DSPARK_MARKOV_W2_KEYS: ("dflash.dspark.markov.w2", gguf.GGMLQuantizationType.F16),
 }
 
 DSPARK_CONFIDENCE_TENSOR_MAP = {
-    ("dspark_confidence_head.weight",
-     "mtp.2.confidence_head.proj.weight"): ("dflash.dspark.confidence.weight", gguf.GGMLQuantizationType.F16),
-    ("dspark_confidence_head.bias",
-     "mtp.2.confidence_head.proj.bias"): ("dflash.dspark.confidence.bias", gguf.GGMLQuantizationType.F32),
+    DSPARK_CONF_W_KEYS: ("dflash.dspark.confidence.weight", gguf.GGMLQuantizationType.F16),
+    DSPARK_CONF_B_KEYS: ("dflash.dspark.confidence.bias", gguf.GGMLQuantizationType.F32),
 }
 
 
@@ -372,8 +398,8 @@ def add_dspark_aux_heads(writer, arch: str, aux_path: Path | None):
         return
 
     print(f"[info] reading DSpark aux heads from {aux_path}")
-    w1 = resolved[("dspark_markov_head.markov_w1.weight", "mtp.2.markov_head.markov_w1.weight")][1]
-    w2 = resolved[("dspark_markov_head.markov_w2.weight", "mtp.2.markov_head.markov_w2.weight")][1]
+    w1 = resolved[DSPARK_MARKOV_W1_KEYS][1]
+    w2 = resolved[DSPARK_MARKOV_W2_KEYS][1]
     vocab = int(w1.shape[0])
     rank = int(w1.shape[1])
     if tuple(w2.shape) != (vocab, rank):
@@ -397,8 +423,8 @@ def add_dspark_aux_heads(writer, arch: str, aux_path: Path | None):
             conf_missing.append(names)
             continue
         conf_resolved[names] = (found_name, tensor, spec)
-    weight_names = ("dspark_confidence_head.weight", "mtp.2.confidence_head.proj.weight")
-    bias_names = ("dspark_confidence_head.bias", "mtp.2.confidence_head.proj.bias")
+    weight_names = DSPARK_CONF_W_KEYS
+    bias_names = DSPARK_CONF_B_KEYS
     if weight_names not in conf_resolved:
         if conf_missing:
             print("[warn] incomplete DSpark confidence head; Markov head will still load")
@@ -470,6 +496,12 @@ def main():
     writer.add_uint32(f"{ARCH}.vocab_size",              a["vocab"])
     writer.add_float32(f"{ARCH}.attention.layer_norm_rms_epsilon", a["rms_eps"])
     writer.add_float32(f"{ARCH}.rope.freq_base",         a["rope_theta"])
+    if a.get("yarn_factor", 0.0) > 1.0:
+        writer.add_string(f"{ARCH}.rope.scaling.type", "yarn")
+        writer.add_float32(f"{ARCH}.rope.scaling.factor", a["yarn_factor"])
+        writer.add_uint32(f"{ARCH}.rope.scaling.original_context_length", a["yarn_orig_ctx"])
+        writer.add_float32(f"{ARCH}.rope.scaling.beta_fast", a["yarn_beta_fast"])
+        writer.add_float32(f"{ARCH}.rope.scaling.beta_slow", a["yarn_beta_slow"])
 
     # DFlash-specific hyperparameters
     writer.add_uint32(f"{ARCH}.dflash.n_target_layers", a["n_target_layers"])
@@ -534,7 +566,13 @@ def main():
     if not args.no_aux_heads:
         aux_path = args.aux_heads if args.aux_heads is not None else args.safetensors.parent / "dflash_aux_heads.pt"
     add_domino_aux_heads(writer, ARCH, aux_path)
-    add_dspark_aux_heads(writer, ARCH, aux_path)
+    # DSpark heads may live in a sidecar (.pt / .safetensors) or inline in
+    # the main safetensors (single-file releases like RadixArk
+    # Qwen3.8-27B-DSpark). Fall back to the main file when no sidecar exists.
+    dspark_aux = aux_path
+    if dspark_aux is not None and not dspark_aux.exists():
+        dspark_aux = args.safetensors
+    add_dspark_aux_heads(writer, ARCH, dspark_aux)
 
     print(f"[info] writing {args.out_gguf}")
     writer.write_header_to_file()
