@@ -13,7 +13,6 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
-#include <utility>
 #include <vector>
 
 namespace dflash::common {
@@ -23,7 +22,6 @@ struct SpecGateConfig {
     double cost_ewma_alpha = 0.35;
     int probe_rounds        = 2;
     int max_probers         = 2;
-    int bad_rounds          = 2;
     int reprobe_tokens      = 64;
     double margin           = 1.05;
     double slack            = 1.10;
@@ -35,6 +33,12 @@ struct SpecCandidate {
     SpeculationPolicy policy = SpeculationPolicy::Adaptive;
     bool eligible = false;
     double prior_accept = std::numeric_limits<double>::quiet_NaN();
+    int generated_tokens = 0;
+};
+
+struct SpecObservation {
+    std::uint64_t request_id = 0;
+    int emitted_tokens = 0;
     int generated_tokens = 0;
 };
 
@@ -56,8 +60,6 @@ public:
         struct Ranked {
             const SpecCandidate * candidate = nullptr;
             double score = 1.0;
-            bool probing = false;
-            bool reprobe = false;
         };
         std::vector<Ranked> forced;
         std::vector<Ranked> steady;
@@ -69,28 +71,22 @@ public:
                 continue;
             }
             RequestState & state = requests_[candidate.request_id];
-            state.request_id = candidate.request_id;
             if (candidate.policy == SpeculationPolicy::Always) {
-                forced.push_back({&candidate,
-                                  score_for(state, candidate), false, false});
-                continue;
-            }
-            if (state.mode == Mode::spec) {
-                steady.push_back(
-                    {&candidate, state.ema_yield, false, false});
-                continue;
-            }
-            if (state.mode == Mode::probing) {
-                probers.push_back(
-                    {&candidate, probe_score(candidate), true, false});
+                forced.push_back({&candidate, state.rounds > 0
+                    ? measured_score(state) : optimistic_score(candidate)});
                 continue;
             }
             const long long generated = candidate.generated_tokens;
             const long long last = state.tokens_at_last_spec;
-            if (generated - last >= cfg_.reprobe_tokens) {
-                probers.push_back(
-                    {&candidate, probe_score(candidate), true, true});
-            }
+            const bool stale =
+                generated - last >= cfg_.reprobe_tokens;
+            const bool optimistic =
+                state.rounds < cfg_.probe_rounds || stale;
+            (optimistic ? probers : steady).push_back({
+                &candidate,
+                optimistic ? optimistic_score(candidate)
+                           : measured_score(state),
+            });
         }
 
         // In particular, an all-Never/ineligible cohort must not allocate
@@ -114,45 +110,46 @@ public:
         const int capacity = std::max(0, std::min(C, k_cap));
         if (costs_[(size_t)C].ar.samples > 0 &&
             (int)forced.size() <= capacity) {
-            double surplus = 0.0;
-            for (const Ranked & item : forced) surplus += item.score - 1.0;
             const double ar_us = costs_[(size_t)C].ar.value;
+            std::vector<double> estimated_us((size_t)capacity + 1, ar_us);
+            for (int k = 1; k <= capacity; ++k) {
+                const double raw = estimated_spec_us(C, k);
+                estimated_us[(size_t)k] = valid_positive(raw)
+                    ? std::max(estimated_us[(size_t)k - 1], raw)
+                    : estimated_us[(size_t)k - 1];
+            }
+
+            double emitted = C;
+            for (const Ranked & item : forced) emitted += item.score - 1.0;
+            int current_k = (int)forced.size();
+            double current_goodput =
+                emitted / estimated_us[(size_t)current_k];
+            const double ar_goodput = C / ar_us;
             for (const Ranked & item : steady) {
-                const int next_k = (int)selected.size() + 1;
+                const int next_k = current_k + 1;
                 if (next_k > capacity) break;
-                const double next_surplus = surplus + item.score - 1.0;
-                const double spec_us = estimated_spec_us(C, next_k);
-                const bool goodput = valid_positive(spec_us) &&
-                    (C + next_surplus) / spec_us >=
-                        cfg_.margin * C / ar_us;
+                const double next_emitted = emitted + item.score - 1.0;
+                const double next_us = estimated_us[(size_t)next_k];
+                const double next_goodput = next_emitted / next_us;
+                const bool marginal = next_goodput > current_goodput;
+                const bool overall =
+                    next_goodput >= cfg_.margin * ar_goodput;
                 const bool peers_ok = next_k == C ||
-                    spec_us <= cfg_.slack * ar_us;
-                if (!goodput || !peers_ok) break;
+                    next_us <= cfg_.slack * ar_us;
+                if (!marginal || !overall || !peers_ok) break;
                 selected.push_back(item);
-                surplus = next_surplus;
+                current_k = next_k;
+                emitted = next_emitted;
+                current_goodput = next_goodput;
             }
         }
 
         std::vector<int> slots;
         slots.reserve(selected.size());
-        std::vector<RequestState *> reprobed;
         for (const Ranked & item : selected) {
-            const SpecCandidate & candidate = *item.candidate;
-            RequestState & state = requests_[candidate.request_id];
-            state.pending_generated_tokens = candidate.generated_tokens;
-            state.pending_forced =
-                candidate.policy == SpeculationPolicy::Always;
-            if (item.reprobe && state.mode == Mode::ar) {
-                state.mode = Mode::probing;
-                state.bad_rounds = 0;
-                reprobed.push_back(&state);
-            }
-            slots.push_back(candidate.slot);
+            slots.push_back(item.candidate->slot);
         }
-        for (RequestState * state : reprobed) {
-            log_transition(state->request_id, Mode::ar, Mode::probing,
-                           state->ema_yield, C, (int)selected.size());
-        }
+        trace_plan(C, capacity, slots);
         return slots;
     }
 
@@ -176,45 +173,17 @@ public:
                 (step_us - cost.ar.value) / k, cfg_.cost_ewma_alpha);
         }
 
-        for (const std::pair<std::uint64_t, int> & sample : accepted) {
-            if (sample.second < 1) continue;
-            RequestState & state = requests_[sample.first];
-            state.request_id = sample.first;
+        for (const SpecObservation & sample : accepted) {
+            if (sample.emitted_tokens < 1) continue;
+            RequestState & state = requests_[sample.request_id];
             const double emitted = std::min(
-                max_accept_, static_cast<double>(sample.second));
+                max_accept_, static_cast<double>(sample.emitted_tokens));
             if (state.rounds == 0) state.ema_yield = emitted;
             else state.ema_yield = cfg_.ema_alpha * emitted +
                 (1.0 - cfg_.ema_alpha) * state.ema_yield;
             ++state.rounds;
-            if (state.pending_generated_tokens >= 0) {
-                state.tokens_at_last_spec =
-                    state.pending_generated_tokens;
-            }
-            state.pending_generated_tokens = -1;
-            const bool forced = state.pending_forced;
-            state.pending_forced = false;
-            if (forced || cost.ar.samples == 0) continue;
-
-            const double marginal_us =
-                estimated_spec_us(C, k) - estimated_spec_us(C, k - 1);
-            const bool pays = state.ema_yield - 1.0 >=
-                C * marginal_us / cost.ar.value;
-            const Mode before = state.mode;
-            if (state.mode == Mode::probing &&
-                state.rounds >= cfg_.probe_rounds) {
-                state.mode = pays ? Mode::spec : Mode::ar;
-                state.bad_rounds = 0;
-            } else if (state.mode == Mode::spec) {
-                state.bad_rounds = pays ? 0 : state.bad_rounds + 1;
-                if (state.bad_rounds >= cfg_.bad_rounds) {
-                    state.mode = Mode::ar;
-                    state.bad_rounds = 0;
-                }
-            }
-            if (before != state.mode) {
-                log_transition(sample.first, before, state.mode,
-                               state.ema_yield, C, k);
-            }
+            state.tokens_at_last_spec =
+                std::max(0, sample.generated_tokens);
         }
         trace(C, k);
     }
@@ -222,8 +191,6 @@ public:
     void forget(std::uint64_t request_id) { requests_.erase(request_id); }
 
 private:
-    enum class Mode { probing, spec, ar };
-
     struct Ewma {
         double value = 0.0;
         int samples = 0;
@@ -236,14 +203,9 @@ private:
     };
 
     struct RequestState {
-        std::uint64_t request_id = 0;
-        Mode mode = Mode::probing;
         double ema_yield = 1.0;
         int rounds = 0;
-        int bad_rounds = 0;
         int tokens_at_last_spec = 0;
-        int pending_generated_tokens = -1;
-        bool pending_forced = false;
     };
 
     struct CostState {
@@ -267,7 +229,6 @@ private:
             ? std::clamp(cfg.cost_ewma_alpha, 0.0, 1.0) : 0.35;
         cfg.probe_rounds = std::max(1, cfg.probe_rounds);
         cfg.max_probers = std::max(0, cfg.max_probers);
-        cfg.bad_rounds = std::max(1, cfg.bad_rounds);
         cfg.reprobe_tokens = std::max(0, cfg.reprobe_tokens);
         if (!valid_positive(cfg.margin)) cfg.margin = 1.05;
         if (!valid_positive(cfg.slack)) cfg.slack = 1.10;
@@ -278,17 +239,14 @@ private:
         if ((int)costs_.size() <= C) costs_.resize((size_t)C + 1);
     }
 
-    double probe_score(const SpecCandidate & candidate) const {
+    double optimistic_score(const SpecCandidate & candidate) const {
         return std::isfinite(candidate.prior_accept)
             ? std::clamp(candidate.prior_accept, 1.0, max_accept_)
             : max_accept_;
     }
 
-    double score_for(const RequestState & state,
-                     const SpecCandidate & candidate) const {
-        return state.rounds > 0
-            ? std::clamp(state.ema_yield, 1.0, max_accept_)
-            : probe_score(candidate);
+    double measured_score(const RequestState & state) const {
+        return std::clamp(state.ema_yield, 1.0, max_accept_);
     }
 
     double nearest_delta(int C) const {
@@ -317,22 +275,16 @@ private:
         return cost.ar.value + k * delta;
     }
 
-    static const char * mode_name(Mode mode) {
-        switch (mode) {
-        case Mode::probing: return "probing";
-        case Mode::spec:    return "spec";
-        case Mode::ar:      return "ar";
-        }
-        return "unknown";
-    }
-
-    static void log_transition(std::uint64_t request_id, Mode before,
-                               Mode after, double ema_yield, int C, int k) {
+    static void trace_plan(int C, int capacity,
+                           const std::vector<int> & slots) {
+        if (std::getenv("DFLASH_SPECULATION_GATE_TRACE") == nullptr) return;
         std::fprintf(stderr,
-            "[speculation-gate] request=%llu mode=%s->%s "
-            "ema_yield=%.3f C=%d k=%d\n",
-            (unsigned long long)request_id, mode_name(before),
-            mode_name(after), ema_yield, C, k);
+            "[speculation-gate] plan C=%d capacity=%d selected=%zu slots=",
+            C, capacity, slots.size());
+        for (size_t i = 0; i < slots.size(); ++i) {
+            std::fprintf(stderr, "%s%d", i == 0 ? "" : ",", slots[i]);
+        }
+        std::fputc('\n', stderr);
     }
 
     void trace(int C, int k) const {
@@ -354,10 +306,10 @@ private:
         for (const auto & entry : requests_) {
             const RequestState & state = entry.second;
             std::fprintf(stderr,
-                "[speculation-gate] request=%llu mode=%s ema_yield=%.3f "
-                "rounds=%d bad_rounds=%d\n",
-                (unsigned long long)entry.first, mode_name(state.mode),
-                state.ema_yield, state.rounds, state.bad_rounds);
+                "[speculation-gate] request=%llu ema_yield=%.3f "
+                "rounds=%d tokens_at_last_spec=%d\n",
+                (unsigned long long)entry.first, state.ema_yield,
+                state.rounds, state.tokens_at_last_spec);
         }
     }
 

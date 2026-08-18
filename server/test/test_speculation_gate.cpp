@@ -1,10 +1,8 @@
 #include "common/concurrency/speculation_gate.h"
 #include "host_check.h"
 
-#include <cmath>
 #include <cstdio>
 #include <limits>
-#include <utility>
 #include <vector>
 
 using namespace dflash::common;
@@ -22,8 +20,13 @@ SpecCandidate candidate(
     return {slot, request_id, policy, eligible, prior, generated};
 }
 
-std::vector<std::pair<std::uint64_t, int>> accepted(
-        std::initializer_list<std::pair<std::uint64_t, int>> values) {
+std::vector<SpecObservation> observed(
+        std::initializer_list<SpecObservation> values) {
+    return values;
+}
+
+std::vector<SpecCandidate> batch(
+        std::initializer_list<SpecCandidate> values) {
     return values;
 }
 
@@ -44,8 +47,8 @@ SpecGateConfig permissive_config() {
 }  // namespace
 
 int main() {
-    // Cold start is one general all-AR baseline step. The following step
-    // admits at most max_probers, ordered by score then stable request id.
+    // Cold start seeds one AR baseline, then admits only the best bounded
+    // optimistic cohort. Equal scores are ordered by stable request id.
     {
         SpecGateConfig cfg = permissive_config();
         cfg.max_probers = 2;
@@ -58,8 +61,8 @@ int main() {
         CHECK(equal_slots(gate.plan(3, candidates, 3), {1, 2}));
     }
 
-    // Priors rank cold requests but probation still performs the real
-    // measurement. Equal priors use request_id rather than reusable slot id.
+    // Adapter priors rank cold requests; measured acceptance remains the
+    // production signal after probation.
     {
         SpecGateConfig cfg = permissive_config();
         cfg.max_probers = 2;
@@ -73,8 +76,9 @@ int main() {
         CHECK(equal_slots(gate.plan(4, candidates, 4), {2, 3}));
     }
 
-    // Never and ineligible requests do not create request state. Always is
-    // returned before a baseline and remains exempt from profitability.
+    // Never and ineligible requests stay AR. Always is returned before a
+    // baseline and remains exempt from profitability. Capacity overflow is
+    // returned intact so the engine can report the configuration error.
     {
         SpeculationGate gate(permissive_config(), 8);
         std::vector<SpecCandidate> never = {
@@ -89,71 +93,95 @@ int main() {
             candidate(4, 2, SpeculationPolicy::Always, false),
         };
         CHECK(equal_slots(gate.plan(2, policies, 2), {1, 0}));
-        gate.observe_spec(2, 2, 1000.0, accepted({{3, 1}, {1, 1}}));
-        std::vector<SpecCandidate> forced = {
-            candidate(3, 1, SpeculationPolicy::Always),
-        };
-        CHECK(equal_slots(gate.plan(2, forced, 1), {1}));
-    }
+        gate.observe_spec(2, 1, 1000.0, observed({{3, 1, 1}}));
+        CHECK(equal_slots(gate.plan(2, batch({
+            candidate(3, 1, SpeculationPolicy::Always)}), 1), {1}));
 
-    // Forced requests beyond executor capacity are returned intact so the
-    // engine can surface the configuration error instead of silently routing
-    // a user-forced request through AR.
-    {
-        SpeculationGate gate(permissive_config(), 8);
         std::vector<SpecCandidate> forced = {
-            candidate(1, 0, SpeculationPolicy::Always),
-            candidate(2, 1, SpeculationPolicy::Always),
+            candidate(5, 0, SpeculationPolicy::Always),
+            candidate(6, 1, SpeculationPolicy::Always),
         };
         CHECK(equal_slots(gate.plan(2, forced, 1), {0, 1}));
     }
 
-    // C=1 covers probation, the break-even transition, two-round bad-yield
-    // hysteresis, AR token-cadence re-probing, and one-round re-admission.
+    // C=1: one bad first sample cannot end probation. After two low samples
+    // the measured score loses the cut; 64 AR tokens make it optimistic for
+    // one re-probe. EMA smoothing alone keeps one later rejection from
+    // immediately removing a productive request.
     {
         SpecGateConfig cfg = permissive_config();
+        cfg.ema_alpha = 0.4;
         cfg.probe_rounds = 2;
-        cfg.bad_rounds = 2;
         cfg.reprobe_tokens = 64;
         SpeculationGate gate(cfg, 8);
         gate.observe_ar(1, 100.0);
 
         std::vector<SpecCandidate> one = {candidate(11, 0)};
         CHECK(equal_slots(gate.plan(1, one, 1), {0}));
-        gate.observe_spec(1, 1, 100.0, accepted({{11, 4}}));
+        gate.observe_spec(1, 1, 200.0, observed({{11, 1, 1}}));
         CHECK(equal_slots(gate.plan(1, one, 1), {0}));
-        gate.observe_spec(1, 1, 100.0, accepted({{11, 4}}));
-
-        CHECK(equal_slots(gate.plan(1, one, 1), {0}));
-        gate.observe_spec(1, 1, 400.0, accepted({{11, 1}}));
+        gate.observe_spec(1, 1, 200.0, observed({{11, 1, 2}}));
         CHECK(gate.plan(1, one, 1).empty());
-        gate.observe_ar(1, 500.0);
-        CHECK(equal_slots(gate.plan(1, one, 1), {0}));
-        gate.observe_spec(1, 1, 1000.0, accepted({{11, 1}}));
 
-        one[0].generated_tokens = 63;
+        one[0].generated_tokens = 65;
         CHECK(gate.plan(1, one, 1).empty());
-        one[0].generated_tokens = 64;
+        one[0].generated_tokens = 66;
         CHECK(equal_slots(gate.plan(1, one, 1), {0}));
-        gate.observe_spec(1, 1, 100.0, accepted({{11, 8}}));
+        gate.observe_spec(1, 1, 120.0, observed({{11, 8, 67}}));
+        one[0].generated_tokens = 67;
+        CHECK(equal_slots(gate.plan(1, one, 1), {0}));
+        gate.observe_spec(1, 1, 120.0, observed({{11, 1, 68}}));
+        one[0].generated_tokens = 68;
         CHECK(equal_slots(gate.plan(1, one, 1), {0}));
     }
 
-    // Synthetic marginal timings, rather than a universal acceptance
-    // threshold, decide whether probation converges to speculation or AR.
+    // The marginal cut rejects a zero-surplus freeloader even though two
+    // high-yield requests keep the aggregate route far above the AR baseline.
+    {
+        SpeculationGate gate(permissive_config(), 8);
+        gate.observe_ar(6, 100.0);
+        gate.observe_spec(6, 2, 106.0,
+            observed({{21, 4, 1}, {22, 4, 1}}));
+        gate.observe_spec(6, 2, 106.0,
+            observed({{21, 4, 2}, {22, 4, 2}}));
+        gate.observe_spec(6, 1, 103.0, observed({{23, 1, 1}}));
+        gate.observe_spec(6, 1, 103.0, observed({{23, 1, 2}}));
+        std::vector<SpecCandidate> cohort = {
+            candidate(21, 0, SpeculationPolicy::Adaptive, true,
+                      std::numeric_limits<double>::quiet_NaN(), 2),
+            candidate(22, 1, SpeculationPolicy::Adaptive, true,
+                      std::numeric_limits<double>::quiet_NaN(), 2),
+            candidate(23, 2, SpeculationPolicy::Adaptive, true,
+                      std::numeric_limits<double>::quiet_NaN(), 2),
+        };
+        CHECK(equal_slots(gate.plan(6, cohort, 6), {0, 1}));
+    }
+
+    // Marginal improvement alone is insufficient: the route must also clear
+    // the global 5% margin and the AR-peer latency bound.
     {
         SpecGateConfig cfg = permissive_config();
+        cfg.margin = 1.05;
         cfg.probe_rounds = 1;
-        SpeculationGate gate(cfg, 8);
-        gate.observe_ar(2, 100.0);
-        std::vector<SpecCandidate> one = {candidate(21, 0)};
-        CHECK(equal_slots(gate.plan(2, one, 1), {0}));
-        gate.observe_spec(2, 1, 200.0, accepted({{21, 2}}));
-        CHECK(gate.plan(2, one, 1).empty());
+        SpeculationGate margin_gate(cfg, 8);
+        margin_gate.observe_ar(1, 100.0);
+        margin_gate.observe_spec(1, 1, 195.0, observed({{31, 2, 1}}));
+        CHECK(margin_gate.plan(1, batch({candidate(
+            31, 0, SpeculationPolicy::Adaptive, true,
+            std::numeric_limits<double>::quiet_NaN(), 1)}), 1).empty());
+
+        cfg.margin = 1.0;
+        cfg.slack = 1.10;
+        SpeculationGate slack_gate(cfg, 8);
+        slack_gate.observe_ar(2, 100.0);
+        slack_gate.observe_spec(2, 1, 111.0, observed({{32, 8, 1}}));
+        CHECK(slack_gate.plan(2, batch({candidate(
+            32, 0, SpeculationPolicy::Adaptive, true,
+            std::numeric_limits<double>::quiet_NaN(), 1)}), 1).empty());
     }
 
-    // Once an observed shape is hopeless even under max_accept, new cold
-    // requests stay AR without running more speculative probes.
+    // Once an observed shape is hopeless even with max_accept, later cold
+    // requests cost arithmetic only and run no speculative probe.
     {
         SpecGateConfig cfg = permissive_config();
         cfg.probe_rounds = 1;
@@ -161,100 +189,113 @@ int main() {
         cfg.margin = 1.05;
         SpeculationGate gate(cfg, 4);
         gate.observe_ar(8, 100.0);
-        std::vector<SpecCandidate> first = {candidate(31, 0)};
-        CHECK(equal_slots(gate.plan(8, first, 8), {0}));
-        gate.observe_spec(8, 1, 1000.0, accepted({{31, 1}}));
-        std::vector<SpecCandidate> next = {candidate(32, 1)};
-        CHECK(gate.plan(8, next, 8).empty());
-        CHECK(gate.plan(8, next, 8).empty());
+        CHECK(equal_slots(gate.plan(8, batch({candidate(41, 0)}), 8), {0}));
+        gate.observe_spec(8, 1, 1000.0, observed({{41, 1, 1}}));
+        CHECK(gate.plan(8, batch({candidate(42, 1)}), 8).empty());
+        CHECK(gate.plan(8, batch({candidate(42, 1)}), 8).empty());
     }
 
-    // A missing (C,k) cost uses the nearest concurrency's per-lane affine
-    // increment, then the first real measurement corrects that estimate.
+    // Missing shapes use the nearest concurrency's affine increment until a
+    // real measurement corrects them.
     {
         SpecGateConfig cfg = permissive_config();
         cfg.probe_rounds = 1;
         SpeculationGate gate(cfg, 8);
         gate.observe_ar(2, 100.0);
-        std::vector<SpecCandidate> at_two = {candidate(41, 0)};
-        CHECK(equal_slots(gate.plan(2, at_two, 1), {0}));
-        gate.observe_spec(2, 1, 120.0, accepted({{41, 8}}));
+        gate.observe_spec(2, 1, 120.0, observed({{51, 8, 1}}));
 
         gate.observe_ar(3, 150.0);
-        std::vector<SpecCandidate> at_three = {candidate(42, 1)};
-        CHECK(equal_slots(gate.plan(3, at_three, 1), {1}));
-        gate.observe_spec(3, 1, 1000.0, accepted({{42, 1}}));
-        std::vector<SpecCandidate> corrected = {candidate(43, 2)};
-        CHECK(gate.plan(3, corrected, 1).empty());
+        CHECK(equal_slots(gate.plan(3, batch({candidate(52, 1)}), 1), {1}));
+        gate.observe_spec(3, 1, 1000.0, observed({{52, 1, 1}}));
+        CHECK(gate.plan(3, batch({candidate(53, 2)}), 1).empty());
     }
 
-    // Cost EWMAs accept valid samples and invalid observations never poison
-    // either the hardware profile or request state.
+    // Noisy exact width samples are made nondecreasing before the cut. A
+    // lower measured T(2) therefore cannot make a zero-yield second lane look
+    // profitable after T(1).
+    {
+        SpecGateConfig cfg = permissive_config();
+        cfg.probe_rounds = 1;
+        SpeculationGate gate(cfg, 8);
+        gate.observe_ar(2, 100.0);
+        gate.observe_spec(2, 1, 130.0, observed({{61, 4, 1}}));
+        gate.observe_spec(2, 2, 120.0,
+            observed({{61, 4, 2}, {62, 1, 1}}));
+        std::vector<SpecCandidate> candidates = {
+            candidate(61, 0, SpeculationPolicy::Adaptive, true,
+                      std::numeric_limits<double>::quiet_NaN(), 2),
+            candidate(62, 1, SpeculationPolicy::Adaptive, true,
+                      std::numeric_limits<double>::quiet_NaN(), 1),
+        };
+        CHECK(equal_slots(gate.plan(2, candidates, 2), {0}));
+    }
+
+    // Invalid observations never poison costs or consume probation.
     {
         SpecGateConfig cfg = permissive_config();
         cfg.cost_ewma_alpha = 0.5;
         cfg.probe_rounds = 1;
-        SpeculationGate gate(cfg, 2);
+        SpeculationGate gate(cfg, 8);
         gate.observe_ar(1, 100.0);
         gate.observe_ar(1, 200.0);  // T_ar = 150
         gate.observe_ar(1, 0.0);
         gate.observe_ar(1, std::numeric_limits<double>::quiet_NaN());
-        std::vector<SpecCandidate> one = {candidate(51, 0)};
+        std::vector<SpecCandidate> one = {candidate(71, 0)};
         CHECK(equal_slots(gate.plan(1, one, 1), {0}));
         gate.observe_spec(1, 1,
-            std::numeric_limits<double>::quiet_NaN(), accepted({{51, 1}}));
+            std::numeric_limits<double>::quiet_NaN(),
+            observed({{71, 1, 1}}));
         CHECK(equal_slots(gate.plan(1, one, 1), {0}));
-        gate.observe_spec(1, 1, 300.0, accepted({{51, 2}}));
-        CHECK(equal_slots(gate.plan(1, one, 1), {0}));
-        gate.observe_ar(1, 100.0);  // T_ar = 125
+        gate.observe_spec(1, 1, 300.0, observed({{71, 2, 1}}));
+        one[0].generated_tokens = 1;
         CHECK(gate.plan(1, one, 1).empty());
     }
 
-    // Eligibility may disappear for a step without discarding learned state.
-    // forget() removes it on finish, and a new request reusing the same slot
-    // receives independent cold probation.
+    // Eligibility can disappear without discarding measurements. forget()
+    // removes state, so a new request reusing the slot starts cold.
     {
         SpecGateConfig cfg = permissive_config();
         cfg.probe_rounds = 1;
         SpeculationGate gate(cfg, 8);
         gate.observe_ar(1, 100.0);
-        std::vector<SpecCandidate> one = {candidate(61, 0)};
+        std::vector<SpecCandidate> one = {candidate(81, 0)};
         CHECK(equal_slots(gate.plan(1, one, 1), {0}));
-        gate.observe_spec(1, 1, 100.0, accepted({{61, 8}}));
+        gate.observe_spec(1, 1, 100.0, observed({{81, 8, 1}}));
+        one[0].generated_tokens = 1;
         one[0].eligible = false;
         CHECK(gate.plan(1, one, 1).empty());
         one[0].eligible = true;
         CHECK(equal_slots(gate.plan(1, one, 1), {0}));
 
-        gate.forget(61);
-        std::vector<SpecCandidate> reused = {candidate(62, 0)};
-        CHECK(equal_slots(gate.plan(1, reused, 1), {0}));
-        gate.forget(62);  // finishing during probation leaves no residue
-        std::vector<SpecCandidate> reused_again = {candidate(63, 0)};
-        CHECK(equal_slots(gate.plan(1, reused_again, 1), {0}));
+        gate.forget(81);
+        CHECK(equal_slots(gate.plan(1, batch({candidate(82, 0)}), 1), {0}));
+        gate.forget(82);
+        CHECK(equal_slots(gate.plan(1, batch({candidate(83, 0)}), 1), {0}));
     }
 
-    // A profitable cold C=2 cohort converges to all-spec within the bounded
-    // probation window, using the same mechanism as every other occupancy.
+    // A profitable C=2 cohort converges through the same probation rule used
+    // at every occupancy.
     {
         SpecGateConfig cfg = permissive_config();
         cfg.probe_rounds = 2;
         SpeculationGate gate(cfg, 8);
         std::vector<SpecCandidate> cohort = {
-            candidate(71, 0), candidate(72, 1),
+            candidate(91, 0), candidate(92, 1),
         };
         CHECK(gate.plan(2, cohort, 2).empty());
         gate.observe_ar(2, 100.0);
         for (int round = 0; round < cfg.probe_rounds; ++round) {
             CHECK(equal_slots(gate.plan(2, cohort, 2), {0, 1}));
-            gate.observe_spec(
-                2, 2, 100.0, accepted({{71, 4}, {72, 4}}));
+            gate.observe_spec(2, 2, 100.0,
+                observed({{91, 4, round + 1}, {92, 4, round + 1}}));
+            cohort[0].generated_tokens = round + 1;
+            cohort[1].generated_tokens = round + 1;
         }
         CHECK(equal_slots(gate.plan(2, cohort, 2), {0, 1}));
     }
 
-    // At C=8 one expensive probation measurement makes the optimistic
-    // hopeless check reject all later probes; steady state is pure AR.
+    // At C=8 one expensive probation round makes even optimistic requests
+    // fail the cut, so steady state is pure AR.
     {
         SpecGateConfig cfg = permissive_config();
         cfg.probe_rounds = 2;
@@ -262,11 +303,12 @@ int main() {
         cfg.margin = 1.05;
         SpeculationGate gate(cfg, 8);
         std::vector<SpecCandidate> cohort;
-        for (int i = 0; i < 8; ++i) cohort.push_back(candidate(80 + i, i));
+        for (int i = 0; i < 8; ++i) cohort.push_back(candidate(100 + i, i));
         CHECK(gate.plan(8, cohort, 8).empty());
         gate.observe_ar(8, 100.0);
         CHECK(equal_slots(gate.plan(8, cohort, 8), {0, 1}));
-        gate.observe_spec(8, 2, 1000.0, accepted({{80, 1}, {81, 1}}));
+        gate.observe_spec(8, 2, 1000.0,
+            observed({{100, 1, 1}, {101, 1, 1}}));
         CHECK(gate.plan(8, cohort, 8).empty());
         CHECK(gate.plan(8, cohort, 8).empty());
     }

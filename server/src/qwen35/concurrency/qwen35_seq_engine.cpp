@@ -1336,16 +1336,17 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         if (speculative_count == 0) {
             speculation_gate_.observe_ar(C, route_us);
         } else {
-            std::vector<std::pair<std::uint64_t, int>> accepted_yields;
+            std::vector<SpecObservation> accepted_yields;
             accepted_yields.reserve((size_t)speculative_count);
             for (const DecodeOutput & out : routed_result.decode) {
                 if (out.failed || out.slot < 0 || out.slot >= n_slots ||
                     !selected[(size_t)out.slot]) {
                     continue;
                 }
-                accepted_yields.emplace_back(
+                accepted_yields.push_back({
                     slots_.slot(out.slot).request_id,
-                    static_cast<int>(out.ddtree_accepted_tokens + 1));
+                    static_cast<int>(out.ddtree_accepted_tokens + 1),
+                    slots_.slot(out.slot).generated_tokens()});
             }
             speculation_gate_.observe_spec(
                 C, speculative_count, route_us, accepted_yields);
