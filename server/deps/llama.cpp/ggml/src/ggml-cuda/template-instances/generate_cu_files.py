@@ -102,8 +102,16 @@ for type in TYPES_MMQ:
             "GGML_TYPE_Q2_1_ROCMFP2_MIX",
             "GGML_TYPE_Q3_0_ROCMFPX",
             "GGML_TYPE_Q3_1_ROCMFP3_MIX",
+            # Dense hybrid (Qwen3.5/3.8) verify widths N<=16 on gfx1201: the
+            # 128-row tile leaves a 5120-row projection with only 40 blocks;
+            # 64x64/4-warp tiles measured +12-23% on those shapes (mmq_probe).
+            "GGML_TYPE_IQ4_XS",
+            "GGML_TYPE_Q4_K",
+            "GGML_TYPE_Q5_K",
+            "GGML_TYPE_Q6_K",
+            "GGML_TYPE_Q8_0",
         }:
-            guard = "#define GGML_CUDA_ROCMFPX_MMQ_TILE 1\n"
+            guard = "#define GGML_CUDA_MMQ_SMALL_TILE 1\n"
         f.write(SOURCE_MMQ.format(type=type, guard=guard))
 
 for type in range(1, 17):
