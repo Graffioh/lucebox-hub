@@ -71,8 +71,48 @@ int adaptive_calibration_interval(int active_requests) {
 
 int adaptive_confidence_refresh_interval(int active_requests) {
     // Revisit AR-routed requests without turning confidence estimation into a
-    // per-token tax. Wider batches amortize a rejected probe for longer.
-    return 64 * std::max(1, (active_requests + 3) / 4);
+    // per-token tax. One request-local estimate covers an ordinary 96-token
+    // completion; longer continuations are revisited as their regime changes.
+    return 128 * std::max(1, (active_requests + 3) / 4);
+}
+
+// Adapter-stable topology identifiers. Work depth remains a separate key so
+// measurements for a four-token chain, an eight-token chain, and the full
+// branching tree can never contaminate one another.
+constexpr std::uint32_t kDDTreeChainWorkShape = 1;
+constexpr std::uint32_t kDDTreeBranchingWorkShape = 2;
+constexpr std::uint32_t kDDTreeTop1ScoutShape = 1;
+constexpr std::uint32_t kDDTreeTop8ScoutShape = 2;
+
+int ddtree_top_k_for_budget(int budget, int draft_block_size) {
+    return budget > draft_block_size - 1 ? 8 : 1;
+}
+
+VerifierWorkKey ddtree_work_key(int budget, int draft_block_size) {
+    return {
+        SpeculatorKind::DDTree,
+        ddtree_top_k_for_budget(budget, draft_block_size) == 1
+            ? kDDTreeChainWorkShape : kDDTreeBranchingWorkShape,
+        budget,
+        budget + 1,
+    };
+}
+
+ConfidenceScoutWorkKey ddtree_scout_work_key(
+        int budget, int draft_block_size) {
+    const int top_k = ddtree_top_k_for_budget(budget, draft_block_size);
+    return {
+        SpeculatorKind::DDTree,
+        top_k == 1 ? kDDTreeTop1ScoutShape : kDDTreeTop8ScoutShape,
+        std::max(1, draft_block_size - 1),
+    };
+}
+
+int ddtree_scout_top_k(const ConfidenceScoutWorkKey & work) {
+    if (work.speculator != SpeculatorKind::DDTree) return 0;
+    if (work.shape_id == kDDTreeTop1ScoutShape) return 1;
+    if (work.shape_id == kDDTreeTop8ScoutShape) return 8;
+    return 0;
 }
 
 } // namespace
@@ -97,7 +137,6 @@ Qwen35SeqEngine::Qwen35SeqEngine(
       tree_scratch_stride_(tree_scratch_stride) {
     const int n_slots = slots_.slot_count();
     slot_draft_kv_.resize((size_t)n_slots);
-    compact_tree_cohort_.resize((size_t)n_slots, 0);
 
     // The concurrent DDTree stack is gated to a local same-device drafter.
     // Build metadata-only BF16 views over each slot's disjoint target feature
@@ -204,11 +243,23 @@ bool Qwen35SeqEngine::ddtree_input_eligible(const StepInput & in) const {
     return slots_.slot(in.slot).generated_tokens() >= min_floor;
 }
 
-std::optional<SpeculationConfidenceEstimate>
-Qwen35SeqEngine::estimate_ddtree_confidence(
-        const StepInput & in) {
+std::optional<Qwen35SeqEngine::DDTreeConfidenceScout>
+Qwen35SeqEngine::scout_ddtree_confidence(
+        const ConfidenceScoutRequest & request) {
     const int q_len = b_.dw_.block_size;
     const int hidden = b_.w_.n_embd;
+    const int K = ddtree_scout_top_k(request.work);
+    const SpeculationRequestView & view = request.request;
+    if (K <= 0 || !request.valid() || view.slot < 0 ||
+        view.slot >= slots_.slot_count() || !slots_.is_active(view.slot) ||
+        slots_.slot(view.slot).request_id != view.request_id) {
+        return std::nullopt;
+    }
+    StepInput in;
+    in.slot = view.slot;
+    in.token = view.seed_token;
+    in.allow_speculation = true;
+    if (!ddtree_input_eligible(in)) return std::nullopt;
     if (q_len <= 1 || !build_lm_head_projection_step(
             b_.proj_sg_, b_.w_, b_.target_backend_, q_len)) {
         return std::nullopt;
@@ -218,8 +269,7 @@ Qwen35SeqEngine::estimate_ddtree_confidence(
     DraftFeatureMirror * mirror = slot_feature_mirror(in.slot);
     if (!draft || !mirror) return std::nullopt;
 
-    auto fail = [&]() ->
-            std::optional<SpeculationConfidenceEstimate> {
+    auto fail = [&]() -> std::optional<DDTreeConfidenceScout> {
         // begin_step advances only host cache bookkeeping, but a failed graph
         // can leave the appended rows incomplete. Rebuild from committed
         // target features on the next proposal.
@@ -251,12 +301,12 @@ Qwen35SeqEngine::estimate_ddtree_confidence(
         return fail();
     }
 
-    std::vector<float> top_lp((size_t)q_len);
-    std::vector<int32_t> top_ids((size_t)q_len);
+    std::vector<float> top_lp((size_t)q_len * K);
+    std::vector<int32_t> top_ids((size_t)q_len * K);
     bool topk_ready = false;
 #ifdef DFLASH27B_HAVE_DRAFT_TOPK
     topk_ready = geometric_extract_draft_topk_cuda(
-        b_.proj_sg_.logits->data, q_len, b_.w_.n_vocab, 1,
+        b_.proj_sg_.logits->data, q_len, b_.w_.n_vocab, K,
         top_lp.data(), top_ids.data(), b_.cfg_.ddtree_temp);
 #endif
     if (!topk_ready) {
@@ -266,7 +316,7 @@ Qwen35SeqEngine::estimate_ddtree_confidence(
             b_.proj_sg_.logits, logits.data(), 0,
             sizeof(float) * logits.size());
         extract_draft_topk(
-            logits.data(), q_len, b_.w_.n_vocab, 1,
+            logits.data(), q_len, b_.w_.n_vocab, K,
             top_lp.data(), top_ids.data(), b_.cfg_.ddtree_temp);
     }
 
@@ -279,14 +329,81 @@ Qwen35SeqEngine::estimate_ddtree_confidence(
     for (int pos = 1; pos <= confidence_tokens; ++pos) {
         confidence[(size_t)pos - 1] = static_cast<float>(
             std::clamp(std::exp(static_cast<double>(
-                           top_lp[(size_t)pos])),
+                           top_lp[(size_t)pos * K])),
                        0.0, 1.0));
     }
-    return make_speculation_confidence_estimate(
+    DDTreeConfidenceScout out;
+    out.request_id = view.request_id;
+    out.slot = in.slot;
+    out.seed_token = in.token;
+    out.committed_tokens = slots_.slot(in.slot).cur_pos;
+    out.top_k = K;
+    out.top_log_probs = std::move(top_lp);
+    out.top_token_ids = std::move(top_ids);
+    out.confidence = make_speculation_confidence_estimate(
         SpeculatorKind::DDTree, confidence.data(),
         static_cast<int>(confidence.size()),
         SpeculationConfidenceCost::ExtraDraftPass,
         /*posthoc_calibrated=*/false);
+    return out;
+}
+
+ConfidenceScoutBatchResult
+Qwen35SeqEngine::scout_ddtree_confidence_batch(
+        const std::vector<ConfidenceScoutRequest> & requests,
+        std::vector<DDTreeConfidenceScout> & prepared) {
+    using Clock = std::chrono::steady_clock;
+    const auto started = Clock::now();
+    ConfidenceScoutBatchResult batch;
+    batch.requests.reserve(requests.size());
+    prepared.reserve(prepared.size() + requests.size());
+    // This adapter batches association and accounting, but proposal execution
+    // remains serial because each slot owns a distinct persistent draft-KV
+    // ring. A future DSpark adapter may implement the same contract with one
+    // fused confidence-head graph.
+    for (const ConfidenceScoutRequest & request : requests) {
+        const auto request_started = Clock::now();
+        ConfidenceScoutResult result;
+        result.request_id = request.request.request_id;
+        StepInput current;
+        current.slot = request.request.slot;
+        current.token = request.request.seed_token;
+        current.allow_speculation = true;
+        const bool associated = current.slot >= 0 &&
+            current.slot < slots_.slot_count() &&
+            slots_.is_active(current.slot) &&
+            slots_.slot(current.slot).request_id == result.request_id;
+        if (!associated || !request.valid() ||
+            ddtree_scout_top_k(request.work) <= 0 ||
+            !ddtree_input_eligible(current)) {
+            result.status = ConfidenceScoutStatus::Ineligible;
+            result.elapsed_us = std::max(
+                1.0, std::chrono::duration<double, std::micro>(
+                         Clock::now() - request_started).count());
+            batch.requests.push_back(std::move(result));
+            continue;
+        }
+        std::optional<DDTreeConfidenceScout> scout =
+            scout_ddtree_confidence(request);
+        result.elapsed_us = std::max(
+            1.0, std::chrono::duration<double, std::micro>(
+                     Clock::now() - request_started).count());
+        if (!scout || !scout->confidence.available()) {
+            result.status = ConfidenceScoutStatus::RetryableFailure;
+            batch.requests.push_back(std::move(result));
+            continue;
+        }
+        result.status = ConfidenceScoutStatus::Ready;
+        result.confidence = scout->confidence.limited_to(
+            request.max_candidate_tokens);
+        scout->elapsed_us = result.elapsed_us;
+        prepared.push_back(std::move(*scout));
+        batch.requests.push_back(std::move(result));
+    }
+    batch.elapsed_us = std::max(
+        1.0, std::chrono::duration<double, std::micro>(
+                 Clock::now() - started).count());
+    return batch;
 }
 
 void Qwen35SeqEngine::remember_ddtree_confidence(
@@ -294,26 +411,16 @@ void Qwen35SeqEngine::remember_ddtree_confidence(
         const SpeculationConfidenceEstimate & estimate,
         int progress_tokens) {
     if (!estimate.available()) return;
-    const auto current = ddtree_confidence_.find(request_id);
-    if (current != ddtree_confidence_.end() &&
-        current->second.available()) {
-        const SpeculationConfidenceProfile old_profile =
-            speculation_confidence_profile(current->second);
-        const SpeculationConfidenceProfile new_profile =
-            speculation_confidence_profile(estimate);
-        if (old_profile.speculator != new_profile.speculator ||
-            std::abs(old_profile.expected_half_tokens -
-                     new_profile.expected_half_tokens) >= 2) {
-            ddtree_target_yield_.erase(request_id);
-        }
-    }
     ddtree_confidence_[request_id] = estimate;
     ddtree_confidence_progress_[request_id] = progress_tokens;
 }
 
 std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         const StepPlan & speculative_plan, const StepPlan & ar_plan,
-        int tree_budget) {
+        int tree_budget,
+        const std::vector<DDTreeConfidenceScout> * prepared,
+        int * reused_scouts) {
+    if (reused_scouts) *reused_scouts = 0;
     StepResult result;
     const int active = (int)speculative_plan.decode.size();
     const int total_active = active + (int)ar_plan.decode.size();
@@ -364,50 +471,72 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
     // Proposal is sequential by slot: immutable draft weights are shared,
     // while each slot owns an independent persistent context-KV ring.
     for (const StepInput & in : speculative_plan.decode) {
-        DraftKvState * draft = ensure_slot_draft_kv(in.slot);
-        DraftFeatureMirror * mirror = slot_feature_mirror(in.slot);
-        if (!draft || !mirror) return proposal_fallback();
-        noise[0] = in.token;
-        std::fill(noise.begin() + 1, noise.end(), b_.w_.mask_token_id);
-        if (!b_.w_.embedder.embed(
-                noise.data(), q_len, noise_embed.data()) ||
-            !draft_kv_begin_step(*draft, b_.dw_, b_.draft_backend_,
-                                 *mirror, slots_.slot(in.slot).cur_pos)) {
-            return proposal_fallback();
+        const DDTreeConfidenceScout * scouted = nullptr;
+        if (prepared) {
+            const auto found = std::find_if(
+                prepared->begin(), prepared->end(),
+                [&](const DDTreeConfidenceScout & candidate) {
+                    return candidate.request_id ==
+                            slots_.slot(in.slot).request_id &&
+                        candidate.slot == in.slot &&
+                        candidate.seed_token == in.token &&
+                        candidate.committed_tokens ==
+                            slots_.slot(in.slot).cur_pos &&
+                        candidate.top_k == K &&
+                        candidate.top_log_probs.size() ==
+                            static_cast<size_t>(q_len * K) &&
+                        candidate.top_token_ids.size() ==
+                            static_cast<size_t>(q_len * K);
+                });
+            if (found != prepared->end()) scouted = &*found;
         }
-        ggml_backend_tensor_set(
-            draft->inp_embed, noise_embed.data(), 0,
-            sizeof(float) * noise_embed.size());
-        if (ggml_backend_graph_compute(b_.draft_backend_, draft->gf) !=
-            GGML_STATUS_SUCCESS) {
-            return proposal_fallback();
-        }
-        // The draft and target backends own separate HIP streams even when
-        // both are placed on hip:0.  Projection consumes the draft hidden
-        // state on the target stream, so establish the producer/consumer
-        // ordering explicitly before the cross-backend tensor copy.  Without
-        // this barrier the first tree proposal can race stale hidden rows and
-        // collapse acceptance to the one-token fallback.
-        ggml_backend_synchronize(b_.draft_backend_);
-        ggml_backend_tensor_copy(
-            draft->hidden_states, b_.proj_sg_.hidden_input);
-        if (ggml_backend_graph_compute(
-                b_.target_backend_, b_.proj_sg_.gf) != GGML_STATUS_SUCCESS) {
-            return proposal_fallback();
-        }
-        bool topk_ready = false;
+        if (scouted) {
+            top_lp = scouted->top_log_probs;
+            top_ids = scouted->top_token_ids;
+            if (reused_scouts) ++*reused_scouts;
+        } else {
+            DraftKvState * draft = ensure_slot_draft_kv(in.slot);
+            DraftFeatureMirror * mirror = slot_feature_mirror(in.slot);
+            if (!draft || !mirror) return proposal_fallback();
+            noise[0] = in.token;
+            std::fill(noise.begin() + 1, noise.end(), b_.w_.mask_token_id);
+            if (!b_.w_.embedder.embed(
+                    noise.data(), q_len, noise_embed.data()) ||
+                !draft_kv_begin_step(*draft, b_.dw_, b_.draft_backend_,
+                                     *mirror, slots_.slot(in.slot).cur_pos)) {
+                return proposal_fallback();
+            }
+            ggml_backend_tensor_set(
+                draft->inp_embed, noise_embed.data(), 0,
+                sizeof(float) * noise_embed.size());
+            if (ggml_backend_graph_compute(b_.draft_backend_, draft->gf) !=
+                GGML_STATUS_SUCCESS) {
+                return proposal_fallback();
+            }
+            // Projection consumes the draft hidden state on another backend
+            // stream. Establish producer/consumer ordering before the copy.
+            ggml_backend_synchronize(b_.draft_backend_);
+            ggml_backend_tensor_copy(
+                draft->hidden_states, b_.proj_sg_.hidden_input);
+            if (ggml_backend_graph_compute(
+                    b_.target_backend_, b_.proj_sg_.gf) !=
+                GGML_STATUS_SUCCESS) {
+                return proposal_fallback();
+            }
+            bool topk_ready = false;
 #ifdef DFLASH27B_HAVE_DRAFT_TOPK
-        topk_ready = geometric_extract_draft_topk_cuda(
-            b_.proj_sg_.logits->data, q_len, b_.w_.n_vocab, K,
-            top_lp.data(), top_ids.data(), b_.cfg_.ddtree_temp);
-#endif
-        if (!topk_ready) {
-            ggml_backend_tensor_get(
-                b_.proj_sg_.logits, logits.data(), 0,
-                sizeof(float) * logits.size());
-            extract_draft_topk(
-                logits.data(), q_len, b_.w_.n_vocab, K,
+            topk_ready = geometric_extract_draft_topk_cuda(
+                b_.proj_sg_.logits->data, q_len, b_.w_.n_vocab, K,
                 top_lp.data(), top_ids.data(), b_.cfg_.ddtree_temp);
+#endif
+            if (!topk_ready) {
+                ggml_backend_tensor_get(
+                    b_.proj_sg_.logits, logits.data(), 0,
+                    sizeof(float) * logits.size());
+                extract_draft_topk(
+                    logits.data(), q_len, b_.w_.n_vocab, K,
+                    top_lp.data(), top_ids.data(), b_.cfg_.ddtree_temp);
+            }
         }
 
         Proposal p;
@@ -1135,32 +1264,25 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
         uint64_t request_id,
         const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler) {
+    bool was_idle = true;
+    for (int slot = 0; slot < slots_.slot_count(); ++slot) {
+        if (slots_.is_active(slot)) {
+            was_idle = false;
+            break;
+        }
+    }
     AdmitResult result = slots_.admit(request_id, prompt, sampler);
     if (result.status == AdmitResult::Status::admitted) {
-        std::uint8_t inherited_compact_budget = 0;
-        bool has_active_peer = false;
-        bool compact_peers_agree = true;
-        for (int slot = 0; slot < slots_.slot_count(); ++slot) {
-            if (slot == result.slot || !slots_.is_active(slot)) continue;
-            const std::uint8_t peer_budget =
-                compact_tree_cohort_[(size_t)slot];
-            if (!has_active_peer) {
-                inherited_compact_budget = peer_budget;
-                has_active_peer = true;
-            } else if (peer_budget != inherited_compact_budget) {
-                compact_peers_agree = false;
-            }
-            if (peer_budget == 0) compact_peers_agree = false;
+        if (was_idle) {
+            previous_decode_requests_.clear();
+            stable_decode_cohort_steps_ = 0;
+            draining_decode_cohort_ = false;
+            adaptive_calibration_cooldowns_.clear();
+            adaptive_scout_failure_cooldowns_.clear();
         }
-        adaptive_verification_.forget_request(request_id);
-        compact_short_adaptive_verification_.forget_request(request_id);
-        compact_adaptive_verification_.forget_request(request_id);
+        adaptive_verification_profiles_.forget_request(request_id);
         ddtree_confidence_.erase(request_id);
         ddtree_confidence_progress_.erase(request_id);
-        ddtree_target_yield_.erase(request_id);
-        compact_tree_cohort_[(size_t)result.slot] =
-            has_active_peer && compact_peers_agree
-            ? inherited_compact_budget : 0;
         reset_recurrent_slot(b_.cache_, result.slot);
         if (slots_.residency_active()) {
             slots_.slot(result.slot).kvflash_last_reselect_generated =
@@ -1401,6 +1523,39 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     }
     if (inputs.empty() && plan.prefills.empty()) return result;
 
+    const int active_requests = static_cast<int>(inputs.size());
+    std::vector<std::uint64_t> current_decode_requests;
+    current_decode_requests.reserve(inputs.size());
+    for (const StepInput & in : inputs) {
+        current_decode_requests.push_back(
+            slots_.slot(in.slot).request_id);
+    }
+    std::sort(
+        current_decode_requests.begin(), current_decode_requests.end());
+    if (current_decode_requests == previous_decode_requests_) {
+        if (stable_decode_cohort_steps_ <
+            std::numeric_limits<int>::max()) {
+            ++stable_decode_cohort_steps_;
+        }
+    } else {
+        draining_decode_cohort_ =
+            !previous_decode_requests_.empty() &&
+            current_decode_requests.size() <
+                previous_decode_requests_.size() &&
+            std::includes(
+                previous_decode_requests_.begin(),
+                previous_decode_requests_.end(),
+                current_decode_requests.begin(),
+                current_decode_requests.end());
+        if (!draining_decode_cohort_) {
+            // Hardware profiles survive cohort turnover, but a new/refilled
+            // request set must get one bounded chance to expose confidence.
+            adaptive_calibration_cooldowns_.clear();
+        }
+        previous_decode_requests_ = std::move(current_decode_requests);
+        stable_decode_cohort_steps_ = 0;
+    }
+
     if (!ddtree_available(plan)) return step_regular(plan);
 
     const char * adaptive = std::getenv("DFLASH_DDTREE_ADAPTIVE");
@@ -1423,170 +1578,166 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             // Confidence is a decode-regime signal, not a permanent prompt
             // label. Periodically forget it so an AR-routed request can be
             // re-probed after its continuation changes character.
-            adaptive_verification_.forget_request(seq.request_id);
-            compact_short_adaptive_verification_.forget_request(
-                seq.request_id);
-            compact_adaptive_verification_.forget_request(seq.request_id);
+            adaptive_verification_profiles_.forget_request(seq.request_id);
             ddtree_confidence_.erase(seq.request_id);
             ddtree_confidence_progress_.erase(observed);
-            ddtree_target_yield_.erase(seq.request_id);
         }
     }
-    const int inherited_compact_budget = inputs.empty()
-        ? 0 : compact_tree_cohort_[(size_t)inputs.front().slot];
-    const bool inherited_compact_tree =
-        inherited_compact_budget > 0 &&
-        std::all_of(
-            inputs.begin(), inputs.end(), [&](const StepInput & in) {
-                return compact_tree_cohort_[(size_t)in.slot] ==
-                    inherited_compact_budget;
-            });
-    int confidence_candidates = 0;
-    int useful_confidence_candidates = 0;
-    int eligible_candidates = 0;
-    for (const StepInput & in : inputs) {
-        if (!ddtree_input_eligible(in)) continue;
-        ++eligible_candidates;
-        const Qwen35Slot & seq = slots_.slot(in.slot);
-        const auto estimate = ddtree_confidence_.find(seq.request_id);
-        if (estimate == ddtree_confidence_.end() ||
-            !estimate->second.available()) {
-            continue;
-        }
-        ++confidence_candidates;
-        double expected_tokens = estimate->second.expected_tokens();
-        const auto target = ddtree_target_yield_.find(seq.request_id);
-        if (target != ddtree_target_yield_.end() && target->second.samples > 0) {
-            // Raw confidence orders cold requests. Target-accepted output
-            // progressively corrects that estimate, independent of which
-            // proposal shape produced the observation.
-            const double target_weight = std::min(
-                1.0, static_cast<double>(target->second.samples) / 4.0);
-            expected_tokens += target_weight *
-                (target->second.expected_tokens - expected_tokens);
-        }
-        if (expected_tokens >= 1.5) {
-            ++useful_confidence_candidates;
-        }
-    }
-    const bool confidence_cohort_ready = eligible_candidates > 0 &&
-        confidence_candidates == eligible_candidates;
-    const bool mixed_confidence_cohort = confidence_cohort_ready &&
-        useful_confidence_candidates > 0 &&
-        useful_confidence_candidates < static_cast<int>(inputs.size());
-    // Full DDTree depth remains the neutral low-occupancy shape. Once the
-    // concrete speculator has estimated the whole eligible cohort, a mixed C=4
-    // backlog can use a compact proposal for its small useful subset. No prompt
-    // category or model-specific task table participates in this decision.
     constexpr int kFullTreeMaxConcurrency = 4;
     constexpr int kCompactShortTreeBudget = 4;
     constexpr int kCompactTreeBudget = 8;
-    const bool starts_short_backlog_shape =
-        plan.has_refill_backlog && inputs.size() == kFullTreeMaxConcurrency &&
-        confidence_cohort_ready && useful_confidence_candidates > 0 &&
-        useful_confidence_candidates <= 2 && mixed_confidence_cohort;
-    const bool retains_compact_mixed_cohort =
-        inherited_compact_tree &&
-        (!confidence_cohort_ready || mixed_confidence_cohort);
-    const bool compact_tree_route =
-        inputs.size() > kFullTreeMaxConcurrency ||
-        retains_compact_mixed_cohort || starts_short_backlog_shape;
-    const int selected_compact_budget =
-        inherited_compact_tree &&
-            (!plan.has_refill_backlog || !confidence_cohort_ready)
-        ? inherited_compact_budget
-        : (confidence_cohort_ready &&
-           useful_confidence_candidates > 0 &&
-           useful_confidence_candidates <= 2
-              ? kCompactShortTreeBudget
-              : kCompactTreeBudget);
-    const int adaptive_tree_budget =
-        compact_tree_route
-            ? std::min(b_.cfg_.ddtree_budget, selected_compact_budget)
-            : b_.cfg_.ddtree_budget;
-    const int tree_budget = std::clamp(
-        oracle.tree_budget > 0 ? oracle.tree_budget
-                               : adaptive_tree_budget,
-        1, b_.cfg_.ddtree_budget);
-    const bool compact_short_shape =
-        compact_tree_route && tree_budget <= kCompactShortTreeBudget;
-    AdaptiveVerificationRanker & route_ranker = compact_tree_route
-        ? (compact_short_shape
-              ? compact_short_adaptive_verification_
-              : compact_adaptive_verification_)
-        : adaptive_verification_;
+    constexpr int kDrainingTailExplorationDelay = 8;
+    const bool suppress_draining_tail_exploration =
+        adaptive_enabled && !oracle.forces_selection() &&
+        draining_decode_cohort_ &&
+        stable_decode_cohort_steps_ < kDrainingTailExplorationDelay;
+    const int draft_block_size = b_.dw_.block_size;
+    const int direct_speculation_limit = std::max(
+        1, detail::target_paged_tree_direct_request_limit(
+               b_.cache_.tree_capture_lanes));
 
-    // Keep the scheduler independent of the concrete speculation algorithm.
-    // DDTree contributes either a cheap draft-confidence estimate or a
-    // profile-local mean of target-accepted useful tokens. A future DSpark
-    // adapter can contribute calibrated prefix survival from its confidence
-    // head while reusing the same selection policy.
-    std::vector<AdaptiveVerificationCandidate> candidates;
-    candidates.reserve(inputs.size());
-    auto collect_candidates = [&](bool trust_stable_confidence = false) {
-        candidates.clear();
+    struct DDTreeWorkSpec {
+        VerifierWorkKey work;
+        int adaptive_request_limit = 1;
+        std::uint32_t priority = 0;
+        bool preferred_for_forced_mode = false;
+    };
+    std::vector<DDTreeWorkSpec> offered_work;
+    auto offer_work = [&](int requested_budget, int adaptive_limit,
+                          std::uint32_t priority, bool preferred) {
+        const int budget = std::clamp(
+            requested_budget, 1, b_.cfg_.ddtree_budget);
+        const VerifierWorkKey work =
+            ddtree_work_key(budget, draft_block_size);
+        const auto existing = std::find_if(
+            offered_work.begin(), offered_work.end(),
+            [&](const DDTreeWorkSpec & candidate) {
+                return candidate.work == work;
+            });
+        if (existing != offered_work.end()) {
+            existing->preferred_for_forced_mode |= preferred;
+            existing->priority = std::min(existing->priority, priority);
+            return;
+        }
+        offered_work.push_back({
+            work,
+            std::max(1, std::min(active_requests, adaptive_limit)),
+            priority,
+            preferred,
+        });
+    };
+
+    if (oracle.tree_budget > 0) {
+        offer_work(oracle.tree_budget, active_requests, 0, true);
+    } else if (!adaptive_enabled || active_requests <= 3) {
+        // Keep the proven C<=3 executor shape intact; adaptation changes only
+        // which requests use it. Disabling adaptation restores fixed full
+        // DDTree at every occupancy.
+        offer_work(b_.cfg_.ddtree_budget, active_requests, 0, true);
+    } else if (active_requests == kFullTreeMaxConcurrency) {
+        // Profile the established full tree first. Only a measured losing
+        // full shape can advance C=4 to the cheaper compact verifier.
+        offer_work(b_.cfg_.ddtree_budget, active_requests, 0, true);
+        offer_work(
+            kCompactShortTreeBudget,
+            std::min(2, direct_speculation_limit), 1, false);
+    } else {
+        // Above C=4, start with bounded verifier work. The shared selector
+        // advances to eight nodes only after the exact short profile loses;
+        // raw confidence orders requests but never chooses the work shape.
+        offer_work(
+            kCompactShortTreeBudget,
+            std::min(2, direct_speculation_limit), 0, false);
+        offer_work(
+            kCompactTreeBudget, direct_speculation_limit, 1, true);
+    }
+
+    auto make_work_menus = [&]() {
+        std::vector<RequestVerifierWorkMenu> menus;
+        menus.reserve(inputs.size());
+        for (const StepInput & in : inputs) {
+            const Qwen35Slot & seq = slots_.slot(in.slot);
+            RequestVerifierWorkMenu menu;
+            menu.request.request_id = seq.request_id;
+            menu.request.slot = in.slot;
+            menu.request.seed_token = in.token;
+            menu.request.progress_tokens = seq.generated_tokens();
+            const bool eligible = ddtree_input_eligible(in);
+            menu.request.required = eligible &&
+                in.speculation_policy == SpeculationPolicy::Always;
+            if (eligible) {
+                const auto confidence =
+                    ddtree_confidence_.find(seq.request_id);
+                for (const DDTreeWorkSpec & offered : offered_work) {
+                    VerifierWorkPlan work_plan;
+                    work_plan.work = offered.work;
+                    const bool chain = offered.work.shape_id ==
+                        kDDTreeChainWorkShape;
+                    work_plan.maximum_emitted_tokens = chain
+                        ? static_cast<double>(
+                              offered.work.proposal_nodes + 1)
+                        : static_cast<double>(draft_block_size);
+                    if (confidence != ddtree_confidence_.end() &&
+                        confidence->second.available()) {
+                        work_plan.confidence_expected_tokens =
+                            confidence->second.limited_to(std::min(
+                                offered.work.proposal_nodes,
+                                draft_block_size - 1)).expected_tokens();
+                    }
+                    work_plan.preferred_for_forced_mode =
+                        offered.preferred_for_forced_mode;
+                    work_plan.max_parallel_requests = active_requests;
+                    work_plan.adaptive_request_limit =
+                        offered.adaptive_request_limit;
+                    work_plan.exploration_priority = offered.priority;
+                    menu.speculative.push_back(std::move(work_plan));
+                }
+            }
+            menus.push_back(std::move(menu));
+        }
+        return menus;
+    };
+
+    std::vector<RequestVerifierWorkMenu> work_menus = make_work_menus();
+    std::vector<DDTreeConfidenceScout> prepared_scouts;
+    AdaptiveVerificationDecision decision;
+    std::optional<VerifierWorkKey> route_work;
+    AdaptiveVerificationRanker * route_ranker = nullptr;
+    int tree_budget = offered_work.front().work.proposal_nodes;
+    // Cold graph/allocation work affects short-request goodput too. Keep the
+    // established one-sample policy rather than doubling every C<=4 width;
+    // selected steady routes continue updating their EWMA after the probe.
+    const std::size_t minimum_route_samples = 1;
+    // Closed cohorts always protect AR peers. A continuous refill may relax
+    // that guard only inside the generic selector when this exact work shape
+    // has broad verifier coverage or a stable target-verified cohort.
+    const bool allow_safe_peer_guard_relaxation =
+        plan.has_refill_backlog;
+    AdaptiveVerificationWorkDecision work_selection;
+
+    auto bind_selected_work = [&]() {
+        route_work = work_selection.work;
+        route_ranker = nullptr;
+        if (!route_work) return;
+        tree_budget = route_work->proposal_nodes;
+        route_ranker = &adaptive_verification_profiles_.profile(*route_work);
+    };
+
+    if (oracle.forces_selection()) {
+        route_work = offered_work.front().work;
+        tree_budget = route_work->proposal_nodes;
+        const int force_limit = std::min(
+            oracle.speculative_requests,
+            static_cast<int>(std::count_if(
+                inputs.begin(), inputs.end(),
+                [&](const StepInput & in) {
+                    return ddtree_input_eligible(in);
+                })));
+        decision.requests.reserve((size_t)force_limit);
         for (const StepInput & in : inputs) {
             if (!ddtree_input_eligible(in)) continue;
-            const Qwen35Slot & seq = slots_.slot(in.slot);
-            const auto confidence = ddtree_confidence_.find(seq.request_id);
-            if (confidence != ddtree_confidence_.end() &&
-                confidence->second.available()) {
-                route_ranker.observe_request_estimate(
-                    seq.request_id,
-                    confidence->second.limited_to(tree_budget));
-            }
-            const std::optional<AdaptiveVerificationYieldEstimate> estimate =
-                route_ranker.estimate_request_yield(
-                    seq.request_id, trust_stable_confidence);
-            candidates.push_back({
-                in.slot,
-                estimate ? estimate->expected_tokens : 1.0,
-                static_cast<double>(compact_tree_route
-                    ? tree_budget + 1 : b_.dw_.block_size),
-                estimate.has_value(),
-                estimate ? estimate->confidence_expected_tokens
-                         : std::numeric_limits<double>::quiet_NaN(),
-                estimate ? estimate->evidence_samples : 0,
-                seq.generated_tokens(),
-                in.speculation_policy == SpeculationPolicy::Always,
-                SpeculatorKind::DDTree,
-            });
-        }
-    };
-    collect_candidates();
-
-    AdaptiveVerificationDecision decision;
-    const int direct_speculation_limit =
-        detail::target_paged_tree_direct_request_limit(
-            b_.cache_.tree_capture_lanes);
-    const int adaptive_speculation_limit = compact_tree_route
-        ? std::min(
-              direct_speculation_limit,
-              compact_short_shape ? 2 : direct_speculation_limit)
-        : static_cast<int>(inputs.size());
-    const int active_requests = static_cast<int>(inputs.size());
-    const bool broad_verifier_coverage =
-        adaptive_verification_can_relax_peer_guard(
-            active_requests, adaptive_speculation_limit);
-    const bool bounded_stable_cohort_extension =
-        adaptive_verification_can_extend_stable_cohort(
-            active_requests, adaptive_speculation_limit);
-    const bool use_stable_cohort_extension =
-        plan.has_refill_backlog && compact_tree_route &&
-        !broad_verifier_coverage && bounded_stable_cohort_extension;
-    if (use_stable_cohort_extension) {
-        collect_candidates(/*trust_stable_confidence=*/true);
-    }
-    bool enforce_ar_peer_guard = true;
-    std::size_t minimum_route_samples = 1;
-    if (oracle.forces_selection()) {
-        const int force_limit = std::min(
-            adaptive_speculation_limit,
-            oracle.speculative_requests);
-        decision.requests.reserve((size_t)force_limit);
-        for (const AdaptiveVerificationCandidate & candidate : candidates) {
             if ((int)decision.requests.size() >= force_limit) break;
-            decision.requests.push_back(candidate.request);
+            decision.requests.push_back(in.slot);
         }
         static bool logged = false;
         if (!logged) {
@@ -1594,190 +1745,214 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
                 "[parallel-ddtree] oracle force_speculative=%d "
                 "tree_budget=%d direct_limit=%d\n",
                 oracle.speculative_requests, tree_budget,
-                adaptive_speculation_limit);
+                direct_speculation_limit);
             logged = true;
         }
-    } else if (adaptive_enabled) {
-        const int mandatory_speculative_requests =
-            static_cast<int>(std::count_if(
-                candidates.begin(), candidates.end(),
-                [](const AdaptiveVerificationCandidate & candidate) {
-                    return candidate.required;
-                }));
-        const int exact_profile_width = std::max(
-            mandatory_speculative_requests,
-            std::min(adaptive_speculation_limit,
-                     static_cast<int>(candidates.size())));
-        // Replay a cold graph shape only in the narrow capacity extension that
-        // can plausibly become steady. This avoids doubling rejected probes at
-        // occupancies such as Strix C=16 and leaves established low-C profiles
-        // unchanged.
-        minimum_route_samples =
-            use_stable_cohort_extension &&
-                confidence_cohort_ready &&
-                useful_confidence_candidates == active_requests
-            ? 2 : 1;
-        int & calibration_cooldown = compact_tree_route
-            ? (compact_short_shape
-                  ? compact_short_adaptive_calibration_cooldown_
-                  : compact_adaptive_calibration_cooldown_)
-            : adaptive_calibration_cooldown_;
-        const bool exact_profile_ready = route_ranker.has_exact_profile(
-            static_cast<int>(inputs.size()), exact_profile_width,
-            minimum_route_samples, mandatory_speculative_requests);
-        // A closed cohort keeps request-local AR-peer protection. Continuous
-        // backlog may instead optimize aggregate output once either verifier
-        // coverage is broad enough or target-verified outcomes have made a
-        // useful confidence bucket stable. Exact route costs still decide
-        // whether speculation wins, so the same evidence can unlock C=8 while
-        // an unprofitable C=16 profile remains AR. A future speculator supplies
-        // its own work-bucket ranker and inherits the same rule.
-        const bool has_stable_backlog_cohort =
-            plan.has_refill_backlog && exact_profile_ready &&
-            route_ranker.forms_stable_confidence_cohort(candidates);
-        const bool has_stable_backlog_candidate =
-            plan.has_refill_backlog && exact_profile_ready &&
-            std::any_of(
-                candidates.begin(), candidates.end(),
-                [&](const AdaptiveVerificationCandidate & candidate) {
-                    return route_ranker.has_stable_confidence_yield(
-                        candidate.speculator,
-                        candidate.confidence_expected_tokens);
-                });
-        const bool relax_ar_peer_guard =
-            plan.has_refill_backlog && compact_tree_route &&
-            (broad_verifier_coverage ||
-             (bounded_stable_cohort_extension &&
-              has_stable_backlog_cohort));
-        enforce_ar_peer_guard = !relax_ar_peer_guard;
-        const bool exact_profile_started =
-            route_ranker.has_speculative_profile_sample(
-                static_cast<int>(inputs.size()), exact_profile_width);
-        // Finish a profile already started at this occupancy, but do not make
-        // a shrinking compact cohort pay for brand-new C-tail exploration.
-        // A fresh batch at that same C still profiles normally, and a prior
-        // exact profile remains reusable.
-        const bool probe_missing_routes =
-            !compact_tree_route || !inherited_compact_tree ||
-            exact_profile_started;
-        // Full DDTree uses its drafter-side confidence adapter. Compact DDTree
-        // avoids a duplicate draft pass and calibrates one unknown request in
-        // useful verification instead. DSpark can take the former path with
-        // its confidence head; target outcomes calibrate both adapters.
-        const bool drafter_side_calibration =
-            !compact_tree_route && probe_missing_routes;
-        const bool suppress_uncovered_mixed_calibration =
-            exact_profile_ready && mixed_confidence_cohort &&
-            !broad_verifier_coverage && has_stable_backlog_candidate;
-        if (!exact_profile_ready || inputs.size() <= 3) {
-            calibration_cooldown = 0;
-        } else if (calibration_cooldown > 0) {
-            --calibration_cooldown;
-        }
-        // Once a closed mixed cohort has measured every exact width, probing
-        // each remaining low-priority request cannot remove its AR critical
-        // path. A refill backlog changes that objective, so keep calibrating
-        // newcomers there; homogeneous/unknown cohorts can still prove the
-        // existing all-speculative exception.
-        const bool verifier_side_calibration =
-            compact_tree_route && probe_missing_routes &&
-            !suppress_uncovered_mixed_calibration &&
-            (!exact_profile_ready ||
-             (calibration_cooldown == 0 &&
-              (plan.has_refill_backlog || !mixed_confidence_cohort)));
-        std::vector<AdaptiveVerificationCandidate> verifier_candidates;
-        const std::vector<AdaptiveVerificationCandidate> * decision_candidates =
-            &candidates;
-        const bool potentially_homogeneous =
-            route_ranker.forms_homogeneous_cohort(
-                candidates, /*require_stable_local_evidence=*/false);
-        if (verifier_side_calibration) {
-            verifier_candidates = candidates;
-            for (AdaptiveVerificationCandidate & candidate :
-                    verifier_candidates) {
-                if (candidate.calibrated &&
-                    potentially_homogeneous &&
-                    !route_ranker.has_stable_evidence(
-                        candidate.evidence_samples) &&
-                    route_ranker.has_useful_yield(
-                        candidate.expected_tokens)) {
-                    // A slow route may earn the homogeneous exception only
-                    // when every active request still looks useful. Stable
-                    // low-yield peers make further local proof pure overhead.
-                    candidate.calibrated = false;
-                }
-            }
-            decision_candidates = &verifier_candidates;
-        }
-        decision = route_ranker.select(
-            static_cast<int>(inputs.size()), *decision_candidates,
-            adaptive_speculation_limit, verifier_side_calibration,
-            probe_missing_routes,
-            enforce_ar_peer_guard, minimum_route_samples);
-        if (compact_tree_route && exact_profile_ready &&
-            verifier_side_calibration && decision.exploring) {
-            calibration_cooldown =
-                adaptive_calibration_interval(
-                    static_cast<int>(inputs.size()));
-        }
-        if (drafter_side_calibration &&
-            decision.calibration_request >= 0 &&
-            calibration_cooldown == 0) {
-            const auto input = std::find_if(
-                inputs.begin(), inputs.end(),
-                [&](const StepInput & in) {
-                    return in.slot == decision.calibration_request;
-                });
-            if (input != inputs.end()) {
-                const std::optional<SpeculationConfidenceEstimate>
-                    confidence =
-                        estimate_ddtree_confidence(*input);
-                if (confidence) {
-                    const std::uint64_t request_id =
-                        slots_.slot(input->slot).request_id;
-                    remember_ddtree_confidence(
-                        request_id, *confidence,
-                        slots_.slot(input->slot).generated_tokens());
-                    route_ranker.observe_request_estimate(
-                        request_id, confidence->limited_to(tree_budget));
-                    std::fprintf(stderr,
-                        "[parallel-ddtree] confidence request=%llu slot=%d "
-                        "expected_tokens=%.3f\n",
-                        (unsigned long long)request_id,
-                        input->slot, confidence->expected_tokens());
-                    collect_candidates();
-                    const AdaptiveVerificationDecision steady_after =
-                        route_ranker.select(
-                            static_cast<int>(inputs.size()), candidates,
-                            adaptive_speculation_limit,
-                            /*probe_uncalibrated_with_verifier=*/false,
-                            /*probe_missing_routes=*/false,
-                            enforce_ar_peer_guard,
-                            minimum_route_samples);
-                    if (inputs.size() > 3 && exact_profile_ready &&
-                        static_cast<int>(steady_after.requests.size()) >=
-                            exact_profile_width) {
-                        // Drafter confidence is not free on the sequential
-                        // per-slot DDTree path. Fill the executor frontier
-                        // immediately, then amortize lower-priority newcomers.
-                        calibration_cooldown =
-                            adaptive_calibration_interval(
-                                static_cast<int>(inputs.size()));
-                    }
-                    decision = route_ranker.select(
-                        static_cast<int>(inputs.size()), candidates,
-                        adaptive_speculation_limit,
-                        verifier_side_calibration,
-                        probe_missing_routes,
-                        enforce_ar_peer_guard,
-                        minimum_route_samples);
-                }
-            }
+    } else if (!adaptive_enabled) {
+        route_work = offered_work.front().work;
+        tree_budget = route_work->proposal_nodes;
+        for (const StepInput & in : inputs) {
+            if (ddtree_input_eligible(in)) decision.requests.push_back(in.slot);
         }
     } else {
-        decision.requests.reserve(candidates.size());
-        for (const AdaptiveVerificationCandidate & candidate : candidates) {
-            decision.requests.push_back(candidate.request);
+        work_selection = adaptive_verification_profiles_.select_work(
+            active_requests, work_menus,
+            /*probe_uncalibrated_with_verifier=*/false,
+            /*enforce_ar_peer_guard=*/true, minimum_route_samples,
+            /*trust_stable_confidence=*/plan.has_refill_backlog,
+            allow_safe_peer_guard_relaxation);
+        if (work_selection.status ==
+                AdaptiveVerificationWorkStatus::InvalidMenu) {
+            return fail_step("adaptive speculation produced an invalid work menu");
+        }
+        if (work_selection.status ==
+                AdaptiveVerificationWorkStatus::RequiredUnavailable) {
+            return fail_step(
+                "required speculation has no common executable verifier work");
+        }
+        const bool has_required_request = std::any_of(
+            work_menus.begin(), work_menus.end(),
+            [](const RequestVerifierWorkMenu & menu) {
+                return menu.request.required;
+            });
+        if (suppress_draining_tail_exploration &&
+            !has_required_request &&
+            (work_selection.status ==
+                 AdaptiveVerificationWorkStatus::Calibration ||
+             work_selection.decision.exploring)) {
+            work_selection = AdaptiveVerificationWorkDecision{};
+        }
+        decision = work_selection.decision;
+        bind_selected_work();
+
+        if (route_work) {
+            int & cooldown = adaptive_calibration_cooldowns_[
+                {*route_work, active_requests}];
+            if (cooldown > 0) --cooldown;
+            const ConfidenceScoutWorkKey scout_work =
+                ddtree_scout_work_key(tree_budget, draft_block_size);
+            int & scout_failure_cooldown =
+                adaptive_scout_failure_cooldowns_[
+                    {scout_work, active_requests}];
+            if (scout_failure_cooldown > 0) {
+                --scout_failure_cooldown;
+            }
+            const bool may_scout = decision.calibration_request >= 0 &&
+                scout_failure_cooldown == 0 &&
+                (active_requests <= kFullTreeMaxConcurrency ||
+                 cooldown == 0);
+            if (may_scout) {
+                int scout_limit =
+                    ddtree_scout_top_k(scout_work) == 1 ? 2 : 1;
+                if (scout_limit > 1 &&
+                    adaptive_verification_profiles_.has_autoregressive_cost(
+                        active_requests) &&
+                    adaptive_verification_profiles_.has_scout_cost(
+                        scout_work, 2) &&
+                    adaptive_verification_profiles_.scout_cost_us(
+                        scout_work, 2) >
+                        0.5 * adaptive_verification_profiles_.
+                            autoregressive_cost_us(active_requests)) {
+                    scout_limit = 1;
+                }
+
+                const int required_count = static_cast<int>(std::count_if(
+                    work_menus.begin(), work_menus.end(),
+                    [](const RequestVerifierWorkMenu & menu) {
+                        return menu.request.required;
+                    }));
+                int adaptive_limit = 1;
+                for (const DDTreeWorkSpec & offered : offered_work) {
+                    if (offered.work == *route_work) {
+                        adaptive_limit = offered.adaptive_request_limit;
+                        break;
+                    }
+                }
+                const int exact_width = std::max(
+                    required_count,
+                    std::min(adaptive_limit, static_cast<int>(std::count_if(
+                        work_menus.begin(), work_menus.end(),
+                        [](const RequestVerifierWorkMenu & menu) {
+                            return !menu.speculative.empty();
+                        }))));
+                const bool exact_profile_before =
+                    route_ranker && route_ranker->has_exact_profile(
+                        active_requests, exact_width,
+                        minimum_route_samples, required_count);
+
+                std::vector<ConfidenceScoutRequest> scout_requests;
+                scout_requests.reserve((size_t)scout_limit);
+                auto add_scout = [&](int slot) {
+                    if ((int)scout_requests.size() >= scout_limit ||
+                        std::any_of(
+                            scout_requests.begin(), scout_requests.end(),
+                            [&](const ConfidenceScoutRequest & request) {
+                                return request.request.slot == slot;
+                            })) {
+                        return;
+                    }
+                    const auto menu = std::find_if(
+                        work_menus.begin(), work_menus.end(),
+                        [&](const RequestVerifierWorkMenu & candidate) {
+                            return candidate.request.slot == slot &&
+                                !candidate.speculative.empty();
+                        });
+                    if (menu == work_menus.end()) return;
+                    ConfidenceScoutRequest request;
+                    request.request = menu->request;
+                    request.work = scout_work;
+                    request.max_candidate_tokens = std::min(
+                        tree_budget, scout_work.candidate_tokens);
+                    if (request.valid()) {
+                        scout_requests.push_back(std::move(request));
+                    }
+                };
+                add_scout(decision.calibration_request);
+                for (const RequestVerifierWorkMenu & menu : work_menus) {
+                    if ((int)scout_requests.size() >= scout_limit) break;
+                    const auto known =
+                        ddtree_confidence_.find(menu.request.request_id);
+                    if (!menu.speculative.empty() &&
+                        (known == ddtree_confidence_.end() ||
+                         !known->second.available())) {
+                        add_scout(menu.request.slot);
+                    }
+                }
+
+                if (!scout_requests.empty()) {
+                    const std::size_t prepared_before =
+                        prepared_scouts.size();
+                    ConfidenceScoutBatchResult scout =
+                        scout_ddtree_confidence_batch(
+                            scout_requests, prepared_scouts);
+                    adaptive_verification_profiles_.observe_scout(
+                        scout_work,
+                        static_cast<int>(scout_requests.size()),
+                        scout.elapsed_us);
+                    const std::size_t ready =
+                        prepared_scouts.size() - prepared_before;
+                    for (std::size_t i = prepared_before;
+                         i < prepared_scouts.size(); ++i) {
+                        const DDTreeConfidenceScout & prepared =
+                            prepared_scouts[i];
+                        remember_ddtree_confidence(
+                            prepared.request_id, prepared.confidence,
+                            slots_.slot(prepared.slot).generated_tokens());
+                        std::fprintf(stderr,
+                            "[parallel-ddtree] confidence request=%llu "
+                            "slot=%d expected_tokens=%.3f work_nodes=%d\n",
+                            (unsigned long long)prepared.request_id,
+                            prepared.slot,
+                            prepared.confidence.expected_tokens(),
+                            tree_budget);
+                    }
+                    std::fprintf(stderr,
+                        "[parallel-ddtree] confidence scout requested=%zu "
+                        "ready=%zu elapsed_us=%.1f\n",
+                        scout_requests.size(), ready, scout.elapsed_us);
+                    scout_failure_cooldown = ready == 0
+                        ? adaptive_calibration_interval(active_requests)
+                        : 0;
+                    if (active_requests > kFullTreeMaxConcurrency &&
+                        (exact_profile_before || ready == 0)) {
+                        cooldown = adaptive_calibration_interval(
+                            active_requests);
+                    }
+
+                    work_menus = make_work_menus();
+                    work_selection =
+                        adaptive_verification_profiles_.select_work(
+                            active_requests, work_menus,
+                            /*probe_uncalibrated_with_verifier=*/false,
+                            /*enforce_ar_peer_guard=*/true,
+                            minimum_route_samples,
+                            /*trust_stable_confidence=*/
+                                plan.has_refill_backlog,
+                            allow_safe_peer_guard_relaxation);
+                    if (work_selection.status ==
+                            AdaptiveVerificationWorkStatus::InvalidMenu) {
+                        return fail_step(
+                            "adaptive speculation produced an invalid work menu");
+                    }
+                    if (work_selection.status ==
+                            AdaptiveVerificationWorkStatus::
+                                RequiredUnavailable) {
+                        return fail_step(
+                            "required speculation has no common executable "
+                            "verifier work");
+                    }
+                    if (suppress_draining_tail_exploration &&
+                        !has_required_request &&
+                        (work_selection.status ==
+                             AdaptiveVerificationWorkStatus::Calibration ||
+                         work_selection.decision.exploring)) {
+                        work_selection =
+                            AdaptiveVerificationWorkDecision{};
+                    }
+                    decision = work_selection.decision;
+                    bind_selected_work();
+                }
+            }
         }
     }
 
@@ -1798,25 +1973,42 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             ar_plan.decode.push_back(in);
         }
     }
-    if (adaptive_enabled && !oracle.forces_selection() &&
-        compact_tree_route) {
-        // This is work-shape metadata, not a decision to speculate. Propagate
-        // it on AR steps too so newly refilled slots cannot make a draining
-        // cohort rediscover C-tail graph costs.
-        for (const StepInput & in : inputs) {
-            compact_tree_cohort_[(size_t)in.slot] =
-                static_cast<uint8_t>(tree_budget);
-        }
-    }
 
     using Clock = std::chrono::steady_clock;
     StepResult routed_result;
     const int speculative_count =
         static_cast<int>(speculative_plan.decode.size());
+    if (speculative_count > 0 && !route_work) {
+        return fail_step("adaptive speculation selected no verifier work");
+    }
+    const int proposal_top_k =
+        ddtree_top_k_for_budget(tree_budget, draft_block_size);
+    int expected_reused_scouts = 0;
+    double reused_scout_us = 0.0;
+    for (const StepInput & in : speculative_plan.decode) {
+        const auto prepared = std::find_if(
+            prepared_scouts.begin(), prepared_scouts.end(),
+            [&](const DDTreeConfidenceScout & candidate) {
+                return candidate.request_id ==
+                        slots_.slot(in.slot).request_id &&
+                    candidate.slot == in.slot &&
+                    candidate.seed_token == in.token &&
+                    candidate.committed_tokens ==
+                        slots_.slot(in.slot).cur_pos &&
+                    candidate.top_k == proposal_top_k;
+            });
+        if (prepared != prepared_scouts.end()) {
+            ++expected_reused_scouts;
+            reused_scout_us += prepared->elapsed_us;
+        }
+    }
+    int reused_scouts = 0;
     const auto started = Clock::now();
     if (speculative_count > 0) {
         std::optional<StepResult> mixed =
-            step_ddtree(speculative_plan, ar_plan, tree_budget);
+            step_ddtree(
+                speculative_plan, ar_plan, tree_budget,
+                &prepared_scouts, &reused_scouts);
         if (!mixed) {
             // Proposal setup failed before target/cache mutation. Preserve
             // service with one ordinary packed step and retry speculation on a
@@ -1829,65 +2021,52 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         routed_result = step_regular(ar_plan);
         if (!routed_result.ok()) return routed_result;
     }
-    const double route_us = std::max(
+    const double execution_us = std::max(
         1.0, std::chrono::duration<double, std::micro>(
                  Clock::now() - started).count());
+    // Only request-local artifacts actually consumed by this route contribute
+    // scouting time. Failed and unselected sequential scouts remain separate
+    // calibration cost and cannot poison the verifier profile.
+    const bool route_timing_valid =
+        expected_reused_scouts == reused_scouts;
+    const double route_us = execution_us + reused_scout_us;
 
     if (adaptive_enabled && !oracle.forces_selection()) {
-        route_ranker.observe_route(
-            static_cast<int>(inputs.size()), speculative_count, route_us,
-            /*discard_first_sample=*/
-                speculative_count > 0 && minimum_route_samples > 1);
         if (speculative_count == 0) {
-            // AR has the same work shape for every proposal profile. Sharing
-            // this exact (C,0) timing avoids re-running the baseline merely
-            // because confidence moves a cohort from full to compact DDTree.
-            for (AdaptiveVerificationRanker * ranker : {
-                     &adaptive_verification_,
-                     &compact_short_adaptive_verification_,
-                     &compact_adaptive_verification_}) {
-                if (ranker != &route_ranker) {
-                    ranker->observe_route(
-                        static_cast<int>(inputs.size()), 0, route_us);
-                }
-            }
+            adaptive_verification_profiles_.observe_autoregressive(
+                static_cast<int>(inputs.size()), route_us);
+        } else if (route_work && route_timing_valid) {
+            adaptive_verification_profiles_.observe_route(
+                *route_work, static_cast<int>(inputs.size()),
+                speculative_count, route_us,
+                /*discard_first_sample=*/minimum_route_samples > 1);
         }
     }
     if (decision.exploring && !speculative_plan.decode.empty()) {
         std::fprintf(stderr,
             "[parallel-ddtree] adaptive verification probe active=%zu "
-            "speculative=%zu ar=%zu\n",
+            "speculative=%zu ar=%zu work_nodes=%d reused_scouts=%d\n",
             inputs.size(), speculative_plan.decode.size(),
-            ar_plan.decode.size());
+            ar_plan.decode.size(), tree_budget, reused_scouts);
     }
 
     for (DecodeOutput & out : routed_result.decode) {
-        if (oracle.forces_selection()) break;
+        if (!adaptive_enabled || oracle.forces_selection()) break;
         if (out.failed || out.slot < 0 || out.slot >= n_slots) continue;
-        if (selected[(size_t)out.slot]) {
+        if (selected[(size_t)out.slot] && route_work) {
             const double emitted =
                 static_cast<double>(out.ddtree_accepted_tokens + 1);
             Qwen35Slot & observed_seq = slots_.slot(out.slot);
             const auto confidence =
                 ddtree_confidence_.find(observed_seq.request_id);
             if (confidence != ddtree_confidence_.end()) {
-                route_ranker.observe_request_estimate(
+                adaptive_verification_profiles_.observe_request_estimate(
+                    *route_work,
                     observed_seq.request_id,
                     confidence->second.limited_to(tree_budget));
             }
-            route_ranker.observe_request_yield(
-                observed_seq.request_id, emitted);
-            RequestTargetYield & target =
-                ddtree_target_yield_[observed_seq.request_id];
-            if (target.samples == 0) {
-                target.expected_tokens = emitted;
-            } else {
-                constexpr double kTargetYieldAlpha = 0.35;
-                target.expected_tokens += kTargetYieldAlpha *
-                    (emitted - target.expected_tokens);
-            }
-            target.samples = std::min<std::size_t>(
-                target.samples + 1, 64);
+            adaptive_verification_profiles_.observe_request_yield(
+                *route_work, observed_seq.request_id, emitted);
         }
     }
 
@@ -2312,14 +2491,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step_regular(const StepPlan & plan) {
 void Qwen35SeqEngine::retire(int slot) {
     if (!slots_.is_active(slot)) return;
     const std::uint64_t request_id = slots_.slot(slot).request_id;
-    adaptive_verification_.forget_request(request_id);
-    compact_short_adaptive_verification_.forget_request(request_id);
-    compact_adaptive_verification_.forget_request(request_id);
+    adaptive_verification_profiles_.forget_request(request_id);
     ddtree_confidence_.erase(request_id);
     ddtree_confidence_progress_.erase(request_id);
-    ddtree_target_yield_.erase(request_id);
     slots_.retire(slot);
-    compact_tree_cohort_[(size_t)slot] = 0;
 }
 
 }  // namespace dflash::common

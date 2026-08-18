@@ -622,6 +622,658 @@ int main() {
                   SpeculatorKind::DDTree, 2.2).has_value());
     }
 
+    // Equal-value peers outside a bounded verifier prefix receive service once
+    // one member has proven the bucket useful. A materially lower-value peer
+    // remains in its own bucket and cannot displace them merely for fairness.
+    {
+        AdaptiveVerificationRanker ranker;
+        ranker.observe_autoregressive(8, 100.0);
+        ranker.observe_route(8, 1, 80.0);
+        ranker.observe_route(8, 2, 80.0);
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {1, 4.0, 5.0, true,
+             std::numeric_limits<double>::quiet_NaN(), 4, 12},
+            {2, 4.0, 5.0, true,
+             std::numeric_limits<double>::quiet_NaN(), 4, 12},
+            {3, 4.0, 5.0, true,
+             std::numeric_limits<double>::quiet_NaN(), 0, 4},
+            {4, 4.0, 5.0, true,
+             std::numeric_limits<double>::quiet_NaN(), 0, 4},
+            {5, 2.0, 5.0, true,
+             std::numeric_limits<double>::quiet_NaN(), 0, 0},
+        };
+        const AdaptiveVerificationDecision rotated = ranker.select(
+            8, candidates, /*max_speculative_requests=*/2);
+        CHECK(rotated.requests.size() == 2);
+        CHECK(rotated.requests[0] == 3);
+        CHECK(rotated.requests[1] == 4);
+        CHECK(std::find(rotated.requests.begin(), rotated.requests.end(), 5) ==
+              rotated.requests.end());
+    }
+
+    // Scouting and verifier menus carry only model-neutral request, confidence,
+    // and structural work metadata. AR remains implicit, and a branching
+    // verifier's row count does not pretend to be its maximum emitted path.
+    {
+        SpeculationRequestView request;
+        request.request_id = 700;
+        request.slot = 3;
+        request.seed_token = 42;
+        request.progress_tokens = 9;
+
+        ConfidenceScoutRequest scout;
+        scout.request = request;
+        scout.work = {SpeculatorKind::DDTree, 7, 4};
+        scout.max_candidate_tokens = 4;
+        CHECK(scout.request.request_id == 700);
+        CHECK(scout.work.valid());
+        CHECK(scout.valid());
+        CHECK(scout.max_candidate_tokens == 4);
+        scout.max_candidate_tokens = 5;
+        CHECK(!scout.valid());
+        scout.max_candidate_tokens = 0;
+        CHECK(!scout.valid());
+        scout.max_candidate_tokens = 4;
+
+        const float confidence_values[] = {0.8f, 0.5f};
+        ConfidenceScoutResult ready;
+        ready.request_id = request.request_id;
+        ready.status = ConfidenceScoutStatus::Ready;
+        ready.confidence = make_speculation_confidence_estimate(
+            SpeculatorKind::DDTree, confidence_values, 2,
+            SpeculationConfidenceCost::ExtraDraftPass);
+        ready.elapsed_us = 12.0;
+        CHECK(ready.ready());
+        CHECK(ready.elapsed_us == 12.0);
+        ready.status = ConfidenceScoutStatus::ProposalRequired;
+        CHECK(!ready.ready());
+
+        ConfidenceScoutBatchResult batch;
+        batch.requests.push_back(ready);
+        batch.elapsed_us = 25.0;
+        CHECK(batch.requests.size() == 1);
+        CHECK(batch.elapsed_us == 25.0);
+
+        const VerifierWorkKey tree_work{
+            SpeculatorKind::DDTree, 1, 32, 33};
+        const VerifierWorkKey compact_work{
+            SpeculatorKind::DDTree, 2, 4, 5};
+        const VerifierWorkKey dspark_work{
+            SpeculatorKind::DSpark, 1, 3, 4};
+        CHECK(tree_work.valid());
+        CHECK(tree_work != compact_work);
+        CHECK(compact_work < tree_work || tree_work < compact_work);
+        CHECK(tree_work < dspark_work);
+
+        VerifierWorkPlan plan;
+        plan.work = tree_work;
+        plan.maximum_emitted_tokens = 16.0;
+        plan.confidence_expected_tokens = 2.2;
+        plan.preferred_for_forced_mode = true;
+        plan.max_parallel_requests = 3;
+        plan.adaptive_request_limit = 2;
+        plan.exploration_priority = 2;
+        CHECK(plan.valid());
+        CHECK(plan.has_confidence());
+        CHECK(plan.work.verifier_rows == 33);
+        CHECK(plan.maximum_emitted_tokens == 16.0);
+        CHECK(plan.max_parallel_requests == 3);
+        CHECK(plan.adaptive_request_limit == 2);
+        CHECK(plan.exploration_priority == 2);
+
+        RequestVerifierWorkMenu menu;
+        menu.request = request;
+        menu.speculative.push_back(plan);
+        CHECK(menu.request.slot == 3);
+        CHECK(menu.speculative.size() == 1);
+        CHECK(menu.speculative[0].preferred_for_forced_mode);
+    }
+
+    // Work profiles isolate speculative shapes while sharing the exact AR
+    // baseline. Extra scouting cost has its own EWMA and cannot create or
+    // mutate a verifier profile.
+    {
+        AdaptiveVerificationConfig config;
+        config.cost_ewma_alpha = 0.5;
+        AdaptiveVerificationProfileBank bank(config);
+        const VerifierWorkKey short_tree{
+            SpeculatorKind::DDTree, 1, 4, 5};
+        const VerifierWorkKey wide_tree{
+            SpeculatorKind::DDTree, 2, 8, 9};
+        const VerifierWorkKey dspark_linear{
+            SpeculatorKind::DSpark, 1, 3, 4};
+
+        // An AR observation made before a profile exists is replayed when that
+        // work key is first requested.
+        bank.observe_autoregressive(5, 100.0);
+        AdaptiveVerificationRanker & short_ranker = bank.profile(short_tree);
+        CHECK(short_ranker.has_autoregressive_cost(5));
+        CHECK(short_ranker.autoregressive_cost_us(5) == 100.0);
+        bank.observe_route(short_tree, 5, 1, 80.0);
+        CHECK(short_ranker.has_route_cost(5, 1));
+
+        AdaptiveVerificationRanker & wide_ranker = bank.profile(wide_tree);
+        CHECK(wide_ranker.has_autoregressive_cost(5));
+        CHECK(!wide_ranker.has_route_cost(5, 1));
+        CHECK(bank.profile_count() == 2);
+
+        bank.observe_autoregressive(5, 120.0);
+        CHECK(bank.autoregressive_cost_us(5) == 110.0);
+        CHECK(bank.autoregressive_cost_samples(5) == 2);
+        CHECK(short_ranker.autoregressive_cost_us(5) == 110.0);
+        CHECK(wide_ranker.autoregressive_cost_us(5) == 110.0);
+
+        const ConfidenceScoutWorkKey short_scout{
+            SpeculatorKind::DDTree, 1, 4};
+        const ConfidenceScoutWorkKey wide_scout{
+            SpeculatorKind::DDTree, 2, 8};
+        const ConfidenceScoutWorkKey dspark_scout{
+            SpeculatorKind::DSpark, 1, 4};
+        bank.observe_scout(short_scout, 2, 50.0);
+        bank.observe_scout(short_scout, 2, 70.0);
+        bank.observe_scout(wide_scout, 2, 90.0);
+        bank.observe_scout(dspark_scout, 2, 110.0);
+        bank.observe_scout(short_scout, 1, 20.0);
+        CHECK(bank.profile_count() == 2);
+        CHECK(bank.scout_cost_us(short_scout, 2) == 60.0);
+        CHECK(bank.scout_cost_samples(short_scout, 2) == 2);
+        CHECK(bank.scout_cost_us(wide_scout, 2) == 90.0);
+        CHECK(bank.scout_cost_us(dspark_scout, 2) == 110.0);
+        CHECK(bank.scout_cost_us(short_scout, 1) == 20.0);
+        CHECK(short_ranker.autoregressive_cost_us(5) == 110.0);
+        CHECK(short_ranker.route_cost_us(5, 1) == 80.0);
+
+        bank.observe_request_yield(short_tree, 900, 4.0);
+        bank.observe_request_yield(wide_tree, 900, 3.0);
+        CHECK(short_ranker.request_expected_tokens(900).has_value());
+        CHECK(wide_ranker.request_expected_tokens(900).has_value());
+        bank.forget_request(900);
+        CHECK(!short_ranker.request_expected_tokens(900).has_value());
+        CHECK(!wide_ranker.request_expected_tokens(900).has_value());
+
+        // A k=0 route is shared AR work and does not manufacture the referenced
+        // speculative profile. It is inherited if that profile appears later.
+        bank.observe_route(dspark_linear, 4, 0, 90.0);
+        CHECK(bank.profile_count() == 2);
+        CHECK(bank.profile(dspark_linear).autoregressive_cost_us(4) == 90.0);
+        CHECK(bank.profile_count() == 3);
+
+        bank.reset();
+        CHECK(bank.profile_count() == 0);
+        CHECK(!bank.has_autoregressive_cost(5));
+        CHECK(!bank.has_scout_cost(short_scout, 2));
+    }
+
+    // Work-menu exploration is ordered by adapter priority. A measured
+    // profitable short route suppresses a fresh wide probe, while a complete
+    // losing short profile advances to the wider shape.
+    {
+        const VerifierWorkKey short_work{
+            SpeculatorKind::DDTree, 101, 4, 5};
+        const VerifierWorkKey wide_work{
+            SpeculatorKind::DDTree, 102, 8, 9};
+        auto menus = [&]() {
+            std::vector<RequestVerifierWorkMenu> out;
+            for (int slot = 0; slot < 2; ++slot) {
+                RequestVerifierWorkMenu menu;
+                menu.request.request_id =
+                    static_cast<std::uint64_t>(1000 + slot);
+                menu.request.slot = slot;
+                menu.request.progress_tokens = slot;
+                VerifierWorkPlan short_plan;
+                short_plan.work = short_work;
+                short_plan.maximum_emitted_tokens = 5.0;
+                short_plan.confidence_expected_tokens =
+                    slot == 0 ? 4.0 : 2.0;
+                short_plan.max_parallel_requests = 1;
+                short_plan.adaptive_request_limit = 1;
+                short_plan.exploration_priority = 0;
+                VerifierWorkPlan wide_plan;
+                wide_plan.work = wide_work;
+                wide_plan.maximum_emitted_tokens = 9.0;
+                wide_plan.confidence_expected_tokens =
+                    short_plan.confidence_expected_tokens;
+                wide_plan.max_parallel_requests = 1;
+                wide_plan.adaptive_request_limit = 1;
+                wide_plan.exploration_priority = 1;
+                menu.speculative = {short_plan, wide_plan};
+                out.push_back(std::move(menu));
+            }
+            return out;
+        }();
+
+        AdaptiveVerificationProfileBank profitable;
+        profitable.observe_autoregressive(2, 100.0);
+        AdaptiveVerificationWorkDecision selected =
+            profitable.select_work(2, menus);
+        CHECK(selected.has_work());
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::Verification);
+        CHECK(selected.work.value() == short_work);
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::Verification);
+        CHECK(selected.decision.exploring);
+        CHECK(selected.decision.requests.size() == 1);
+
+        profitable.observe_route(short_work, 2, 1, 70.0);
+        selected = profitable.select_work(2, menus);
+        CHECK(selected.work.value() == short_work);
+        CHECK(!selected.decision.exploring);
+        CHECK(selected.decision.requests.size() == 1);
+        CHECK(!profitable.profile(wide_work).has_route_cost(2, 1));
+
+        AdaptiveVerificationProfileBank losing;
+        losing.observe_autoregressive(2, 100.0);
+        losing.observe_route(short_work, 2, 1, 300.0);
+        selected = losing.select_work(2, menus);
+        CHECK(selected.has_work());
+        CHECK(selected.work.value() == wide_work);
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::Verification);
+        CHECK(selected.decision.exploring);
+        CHECK(selected.decision.requests.size() == 1);
+    }
+
+    // Refill relaxation is scoped to each exact work shape's executable
+    // coverage. Two lanes may optimize aggregate C=5 goodput, while a
+    // one-lane C=16 route still protects its fifteen AR peers even when its
+    // aggregate token estimate looks attractive.
+    {
+        auto make_menus = [](
+                int active, int eligible, const VerifierWorkKey & work,
+                int adaptive_limit, double confidence) {
+            std::vector<RequestVerifierWorkMenu> menus;
+            menus.reserve((size_t)active);
+            for (int slot = 0; slot < active; ++slot) {
+                RequestVerifierWorkMenu menu;
+                menu.request.request_id =
+                    static_cast<std::uint64_t>(9000 + slot);
+                menu.request.slot = slot;
+                if (slot < eligible) {
+                    VerifierWorkPlan plan;
+                    plan.work = work;
+                    plan.maximum_emitted_tokens = confidence;
+                    plan.confidence_expected_tokens = confidence;
+                    plan.max_parallel_requests = active;
+                    plan.adaptive_request_limit = adaptive_limit;
+                    menu.speculative = {plan};
+                }
+                menus.push_back(std::move(menu));
+            }
+            return menus;
+        };
+
+        const VerifierWorkKey broad_work{
+            SpeculatorKind::DDTree, 901, 4, 5};
+        AdaptiveVerificationProfileBank broad;
+        broad.observe_autoregressive(5, 100.0);
+        broad.observe_route(broad_work, 5, 1, 130.0);
+        broad.observe_route(broad_work, 5, 2, 120.0);
+        const auto broad_menus = make_menus(
+            5, 2, broad_work, 2, 4.0);
+        CHECK(broad.select_work(5, broad_menus).decision.requests.empty());
+        const AdaptiveVerificationWorkDecision refill_broad =
+            broad.select_work(
+                5, broad_menus,
+                /*probe_uncalibrated_with_verifier=*/false,
+                /*enforce_ar_peer_guard=*/true,
+                /*minimum_speculative_route_samples=*/1,
+                /*trust_stable_confidence=*/true,
+                /*allow_safe_peer_guard_relaxation=*/true);
+        CHECK(refill_broad.decision.requests.size() == 2);
+
+        const VerifierWorkKey narrow_work{
+            SpeculatorKind::DDTree, 902, 4, 5};
+        AdaptiveVerificationProfileBank narrow;
+        narrow.observe_autoregressive(16, 100.0);
+        narrow.observe_route(narrow_work, 16, 1, 120.0);
+        const auto narrow_menus = make_menus(
+            16, 1, narrow_work, 1, 21.0);
+        const AdaptiveVerificationWorkDecision refill_narrow =
+            narrow.select_work(
+                16, narrow_menus,
+                /*probe_uncalibrated_with_verifier=*/false,
+                /*enforce_ar_peer_guard=*/true,
+                /*minimum_speculative_route_samples=*/1,
+                /*trust_stable_confidence=*/true,
+                /*allow_safe_peer_guard_relaxation=*/true);
+        CHECK(refill_narrow.status ==
+              AdaptiveVerificationWorkStatus::Autoregressive);
+        CHECK(refill_narrow.decision.requests.empty());
+        CHECK(narrow.select_work(
+                  16, narrow_menus,
+                  /*probe_uncalibrated_with_verifier=*/false,
+                  /*enforce_ar_peer_guard=*/false)
+                  .decision.requests.size() == 1);
+    }
+
+    // Target-verified yield is local to each exact work shape and replaces raw
+    // confidence once stable. The wider route wins despite its lower raw score
+    // because only its target outcomes are useful.
+    {
+        const VerifierWorkKey short_work{
+            SpeculatorKind::DDTree, 201, 4, 5};
+        const VerifierWorkKey wide_work{
+            SpeculatorKind::DDTree, 202, 8, 9};
+        AdaptiveVerificationProfileBank bank;
+        bank.observe_autoregressive(1, 100.0);
+        bank.observe_route(short_work, 1, 1, 100.0);
+        bank.observe_route(wide_work, 1, 1, 100.0);
+        bank.observe_request_estimate(
+            short_work, 2000, SpeculatorKind::DDTree, 8.0);
+        bank.observe_request_estimate(
+            wide_work, 2000, SpeculatorKind::DDTree, 2.0);
+        for (int sample = 0; sample < 4; ++sample) {
+            bank.observe_request_yield(short_work, 2000, 1.0);
+            bank.observe_request_yield(wide_work, 2000, 4.0);
+        }
+
+        RequestVerifierWorkMenu menu;
+        menu.request.request_id = 2000;
+        menu.request.slot = 7;
+        VerifierWorkPlan short_plan;
+        short_plan.work = short_work;
+        short_plan.maximum_emitted_tokens = 8.0;
+        short_plan.confidence_expected_tokens = 8.0;
+        short_plan.max_parallel_requests = 1;
+        short_plan.adaptive_request_limit = 1;
+        short_plan.exploration_priority = 0;
+        VerifierWorkPlan wide_plan;
+        wide_plan.work = wide_work;
+        wide_plan.maximum_emitted_tokens = 8.0;
+        wide_plan.confidence_expected_tokens = 2.0;
+        wide_plan.max_parallel_requests = 1;
+        wide_plan.adaptive_request_limit = 1;
+        wide_plan.exploration_priority = 1;
+        menu.speculative = {short_plan, wide_plan};
+
+        const AdaptiveVerificationWorkDecision selected =
+            bank.select_work(1, {menu});
+        CHECK(selected.has_work());
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::Verification);
+        CHECK(selected.work.value() == wide_work);
+        CHECK(selected.decision.requests == std::vector<int>{7});
+        CHECK(!selected.decision.exploring);
+    }
+
+    // Always requests cannot disappear into AR. The adapter's preferred plan
+    // wins at cold start; without one, lower exploration priority is the
+    // deterministic forced-mode fallback.
+    {
+        const VerifierWorkKey short_work{
+            SpeculatorKind::DDTree, 301, 4, 5};
+        const VerifierWorkKey wide_work{
+            SpeculatorKind::DDTree, 302, 8, 9};
+        RequestVerifierWorkMenu menu;
+        menu.request.request_id = 3000;
+        menu.request.slot = 5;
+        menu.request.required = true;
+        VerifierWorkPlan short_plan;
+        short_plan.work = short_work;
+        short_plan.maximum_emitted_tokens = 5.0;
+        short_plan.max_parallel_requests = 1;
+        short_plan.adaptive_request_limit = 1;
+        short_plan.exploration_priority = 0;
+        VerifierWorkPlan wide_plan;
+        wide_plan.work = wide_work;
+        wide_plan.maximum_emitted_tokens = 9.0;
+        wide_plan.preferred_for_forced_mode = true;
+        wide_plan.max_parallel_requests = 1;
+        wide_plan.adaptive_request_limit = 1;
+        wide_plan.exploration_priority = 4;
+        menu.speculative = {short_plan, wide_plan};
+
+        AdaptiveVerificationProfileBank preferred_bank;
+        AdaptiveVerificationWorkDecision selected =
+            preferred_bank.select_work(1, {menu});
+        CHECK(selected.work.value() == wide_work);
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::Verification);
+        CHECK(selected.decision.requests == std::vector<int>{5});
+
+        menu.speculative[1].preferred_for_forced_mode = false;
+        AdaptiveVerificationProfileBank priority_bank;
+        selected = priority_bank.select_work(1, {menu});
+        CHECK(selected.work.value() == short_work);
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::Verification);
+        CHECK(selected.decision.requests == std::vector<int>{5});
+    }
+
+    // Work decisions distinguish normal AR, confidence calibration, malformed
+    // adapter input, and a forced request that has no executable common shape.
+    {
+        const VerifierWorkKey work{
+            SpeculatorKind::DDTree, 401, 4, 5};
+        VerifierWorkPlan plan;
+        plan.work = work;
+        plan.maximum_emitted_tokens = 5.0;
+        plan.max_parallel_requests = 2;
+        plan.adaptive_request_limit = 1;
+
+        RequestVerifierWorkMenu empty;
+        empty.request.request_id = 4000;
+        empty.request.slot = 0;
+        AdaptiveVerificationProfileBank ar_bank;
+        AdaptiveVerificationWorkDecision selected =
+            ar_bank.select_work(1, {empty});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::Autoregressive);
+        CHECK(!selected.has_work());
+
+        RequestVerifierWorkMenu unknown = empty;
+        unknown.speculative = {plan};
+        AdaptiveVerificationProfileBank calibration_bank;
+        calibration_bank.observe_autoregressive(1, 100.0);
+        selected = calibration_bank.select_work(1, {unknown});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::Calibration);
+        CHECK(selected.work.value() == work);
+        CHECK(selected.decision.calibration_request == 0);
+
+        selected = calibration_bank.select_work(2, {unknown});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::InvalidMenu);
+        CHECK(!selected.has_work());
+
+        RequestVerifierWorkMenu duplicate_slot = empty;
+        duplicate_slot.request.request_id = 4001;
+        selected = ar_bank.select_work(2, {empty, duplicate_slot});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::InvalidMenu);
+
+        RequestVerifierWorkMenu duplicate_request = empty;
+        duplicate_request.request.slot = 1;
+        selected = ar_bank.select_work(2, {empty, duplicate_request});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::InvalidMenu);
+
+        RequestVerifierWorkMenu inconsistent_a = unknown;
+        RequestVerifierWorkMenu inconsistent_b = unknown;
+        inconsistent_b.request.request_id = 4001;
+        inconsistent_b.request.slot = 1;
+        inconsistent_b.speculative[0].exploration_priority = 1;
+        selected = ar_bank.select_work(
+            2, {inconsistent_a, inconsistent_b});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::InvalidMenu);
+
+        RequestVerifierWorkMenu duplicate_work = unknown;
+        duplicate_work.speculative.push_back(plan);
+        selected = ar_bank.select_work(1, {duplicate_work});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::InvalidMenu);
+
+        RequestVerifierWorkMenu mixed_speculators = unknown;
+        VerifierWorkPlan dspark_plan = plan;
+        dspark_plan.work = {
+            SpeculatorKind::DSpark, 403, 4, 5};
+        mixed_speculators.speculative.push_back(dspark_plan);
+        selected = ar_bank.select_work(1, {mixed_speculators});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::InvalidMenu);
+
+        RequestVerifierWorkMenu required_empty = empty;
+        required_empty.request.required = true;
+        selected = ar_bank.select_work(1, {required_empty});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::RequiredUnavailable);
+
+        const VerifierWorkKey other_work{
+            SpeculatorKind::DDTree, 402, 8, 9};
+        RequestVerifierWorkMenu required_a = unknown;
+        required_a.request.required = true;
+        RequestVerifierWorkMenu required_b = unknown;
+        required_b.request.request_id = 4001;
+        required_b.request.slot = 1;
+        required_b.request.required = true;
+        required_b.speculative[0].work = other_work;
+        selected = ar_bank.select_work(2, {required_a, required_b});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::RequiredUnavailable);
+    }
+
+    // The adaptive limit bounds optional profiling, while required/Always
+    // requests may cross it only when the hard executor capacity permits all.
+    {
+        const VerifierWorkKey work{
+            SpeculatorKind::DDTree, 501, 4, 5};
+        VerifierWorkPlan plan;
+        plan.work = work;
+        plan.maximum_emitted_tokens = 5.0;
+        plan.preferred_for_forced_mode = true;
+        plan.max_parallel_requests = 2;
+        plan.adaptive_request_limit = 1;
+        std::vector<RequestVerifierWorkMenu> required;
+        for (int slot = 0; slot < 2; ++slot) {
+            RequestVerifierWorkMenu menu;
+            menu.request.request_id =
+                static_cast<std::uint64_t>(5000 + slot);
+            menu.request.slot = slot;
+            menu.request.required = true;
+            menu.speculative = {plan};
+            required.push_back(std::move(menu));
+        }
+        AdaptiveVerificationProfileBank bank;
+        AdaptiveVerificationWorkDecision selected =
+            bank.select_work(2, required);
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::Verification);
+        CHECK(selected.decision.requests.size() == 2);
+
+        for (RequestVerifierWorkMenu & menu : required) {
+            menu.speculative[0].max_parallel_requests = 1;
+        }
+        selected = bank.select_work(2, required);
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::RequiredUnavailable);
+    }
+
+    // Once required routes are measured, absolute goodput overrides the cold
+    // forced-mode preference. Relative gain is one for both required baselines.
+    {
+        const VerifierWorkKey preferred_work{
+            SpeculatorKind::DDTree, 601, 4, 5};
+        const VerifierWorkKey faster_work{
+            SpeculatorKind::DDTree, 602, 8, 9};
+        RequestVerifierWorkMenu menu;
+        menu.request.request_id = 6000;
+        menu.request.slot = 0;
+        menu.request.required = true;
+        VerifierWorkPlan preferred;
+        preferred.work = preferred_work;
+        preferred.maximum_emitted_tokens = 4.0;
+        preferred.confidence_expected_tokens = 2.0;
+        preferred.preferred_for_forced_mode = true;
+        preferred.max_parallel_requests = 1;
+        preferred.adaptive_request_limit = 1;
+        VerifierWorkPlan faster = preferred;
+        faster.work = faster_work;
+        faster.preferred_for_forced_mode = false;
+        menu.speculative = {preferred, faster};
+
+        AdaptiveVerificationProfileBank bank;
+        bank.observe_route(preferred_work, 1, 1, 200.0);
+        bank.observe_route(faster_work, 1, 1, 100.0);
+        const AdaptiveVerificationWorkDecision selected =
+            bank.select_work(1, {menu});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::Verification);
+        CHECK(selected.work.value() == faster_work);
+        CHECK(std::abs(
+            selected.decision.predicted_goodput - 0.02) < 1e-12);
+        CHECK(selected.decision.predicted_gain == 1.0);
+    }
+
+    // Adapter confidence cannot claim more useful output than the selected
+    // work shape can emit; both calibration storage and goodput use the clamp.
+    {
+        const VerifierWorkKey work{
+            SpeculatorKind::DSpark, 701, 1, 2};
+        RequestVerifierWorkMenu menu;
+        menu.request.request_id = 7000;
+        menu.request.slot = 0;
+        VerifierWorkPlan plan;
+        plan.work = work;
+        plan.maximum_emitted_tokens = 2.0;
+        plan.confidence_expected_tokens = 100.0;
+        plan.max_parallel_requests = 1;
+        plan.adaptive_request_limit = 1;
+        CHECK(plan.bounded_confidence_expected_tokens() == 2.0);
+        menu.speculative = {plan};
+
+        AdaptiveVerificationProfileBank bank;
+        bank.observe_autoregressive(1, 100.0);
+        bank.observe_route(work, 1, 1, 100.0);
+        const AdaptiveVerificationWorkDecision selected =
+            bank.select_work(1, {menu});
+        CHECK(selected.work.value() == work);
+        CHECK(std::abs(
+            selected.decision.predicted_goodput - 0.02) < 1e-12);
+        const auto estimate =
+            bank.profile(work).estimate_request_yield(7000);
+        CHECK(estimate.has_value());
+        CHECK(estimate->expected_tokens == 2.0);
+        CHECK(estimate->confidence_expected_tokens == 2.0);
+    }
+
+    // An exact losing short profile's fallback calibration cannot indefinitely
+    // block bounded exploration of the next wider work shape.
+    {
+        const VerifierWorkKey short_work{
+            SpeculatorKind::DDTree, 801, 4, 5};
+        const VerifierWorkKey wide_work{
+            SpeculatorKind::DDTree, 802, 8, 9};
+        RequestVerifierWorkMenu menu;
+        menu.request.request_id = 8000;
+        menu.request.slot = 0;
+        VerifierWorkPlan short_plan;
+        short_plan.work = short_work;
+        short_plan.maximum_emitted_tokens = 5.0;
+        short_plan.max_parallel_requests = 1;
+        short_plan.adaptive_request_limit = 1;
+        short_plan.exploration_priority = 0;
+        VerifierWorkPlan wide_plan;
+        wide_plan.work = wide_work;
+        wide_plan.maximum_emitted_tokens = 9.0;
+        wide_plan.confidence_expected_tokens = 4.0;
+        wide_plan.max_parallel_requests = 1;
+        wide_plan.adaptive_request_limit = 1;
+        wide_plan.exploration_priority = 1;
+        menu.speculative = {short_plan, wide_plan};
+
+        AdaptiveVerificationProfileBank bank;
+        bank.observe_autoregressive(1, 100.0);
+        bank.observe_route(short_work, 1, 1, 300.0);
+        const AdaptiveVerificationWorkDecision selected =
+            bank.select_work(1, {menu});
+        CHECK(selected.status ==
+              AdaptiveVerificationWorkStatus::Verification);
+        CHECK(selected.work.value() == wide_work);
+        CHECK(selected.decision.exploring);
+    }
+
     // Shared cohort evidence can rank a new request, but it cannot unlock the
     // slow-route homogeneous exception. A bounded verifier probe may cross the
     // steady peer guard to gather the missing request-local evidence.

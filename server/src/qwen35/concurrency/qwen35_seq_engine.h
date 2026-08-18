@@ -33,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace dflash::common {
@@ -122,8 +123,22 @@ private:
     DraftKvState * ensure_slot_draft_kv(int slot);
     bool ddtree_available(const StepPlan & plan) const;
     bool ddtree_input_eligible(const StepInput & input) const;
-    std::optional<SpeculationConfidenceEstimate> estimate_ddtree_confidence(
-        const StepInput & input);
+    struct DDTreeConfidenceScout {
+        std::uint64_t request_id = 0;
+        int slot = -1;
+        int32_t seed_token = -1;
+        int committed_tokens = 0;
+        int top_k = 0;
+        double elapsed_us = 0.0;
+        std::vector<float> top_log_probs;
+        std::vector<int32_t> top_token_ids;
+        SpeculationConfidenceEstimate confidence;
+    };
+    std::optional<DDTreeConfidenceScout> scout_ddtree_confidence(
+        const ConfidenceScoutRequest & request);
+    ConfidenceScoutBatchResult scout_ddtree_confidence_batch(
+        const std::vector<ConfidenceScoutRequest> & requests,
+        std::vector<DDTreeConfidenceScout> & prepared);
     void remember_ddtree_confidence(
         std::uint64_t request_id,
         const SpeculationConfidenceEstimate & estimate,
@@ -133,7 +148,9 @@ private:
     // caller may safely use the ordinary packed AR path for this iteration.
     std::optional<StepResult> step_ddtree(
         const StepPlan & speculative_plan, const StepPlan & ar_plan,
-        int tree_budget);
+        int tree_budget,
+        const std::vector<DDTreeConfidenceScout> * prepared = nullptr,
+        int * reused_scouts = nullptr);
 
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
@@ -142,27 +159,28 @@ private:
     int             tree_scratch_base_ = 0;
     int             tree_scratch_stride_ = 0;
     bool            capture_features_ = false;
-    AdaptiveVerificationRanker adaptive_verification_;
-    AdaptiveVerificationRanker compact_short_adaptive_verification_;
-    AdaptiveVerificationRanker compact_adaptive_verification_;
+    AdaptiveVerificationProfileBank adaptive_verification_profiles_;
     // Latest drafter confidence is request-owned and can be projected onto
     // the current full/compact work budget without looking at prompt text.
     std::map<std::uint64_t, SpeculationConfidenceEstimate>
         ddtree_confidence_;
     std::map<std::uint64_t, int> ddtree_confidence_progress_;
-    struct RequestTargetYield {
-        double expected_tokens = 1.0;
-        std::size_t samples = 0;
-    };
-    // Shape choice uses target outcomes when available; this map deliberately
-    // spans full/compact rankers while their hardware route costs stay split.
-    std::map<std::uint64_t, RequestTargetYield> ddtree_target_yield_;
-    int             adaptive_calibration_cooldown_ = 0;
-    int             compact_short_adaptive_calibration_cooldown_ = 0;
-    int             compact_adaptive_calibration_cooldown_ = 0;
-    // Zero means no sticky compact cohort. Non-zero entries store the exact
-    // DDTree work-shape budget so short and wide observations never mix.
-    std::vector<uint8_t> compact_tree_cohort_;
+    // Calibration cadence is both work- and occupancy-local. A losing C=8
+    // DDTree profile must not delay a C=4 request or a later DSpark adapter.
+    std::map<std::pair<VerifierWorkKey, int>, int>
+        adaptive_calibration_cooldowns_;
+    // Transient scout failures are adapter-shape-local. Backoff prevents a
+    // broken confidence path from taxing every AR token, including at low C.
+    std::map<std::pair<ConfidenceScoutWorkKey, int>, int>
+        adaptive_scout_failure_cooldowns_;
+    // A draining closed batch should reuse measured work, but it should not
+    // pay immediately to discover every transient lower-C tail. If occupancy
+    // and request identity remain stable, exploration is re-enabled after a
+    // short bounded delay. Identity prevents a new cohort from inheriting an
+    // unrelated predecessor's draining state.
+    std::vector<std::uint64_t> previous_decode_requests_;
+    int stable_decode_cohort_steps_ = 0;
+    bool draining_decode_cohort_ = false;
     ggml_context *  feature_view_ctx_ = nullptr;
     std::vector<DraftFeatureMirror> slot_feature_mirrors_;
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;

@@ -14,6 +14,7 @@
 // keep separate rankers for distinct work buckets.
 
 #include "speculation_confidence.h"
+#include "speculation_planning.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -66,6 +67,32 @@ struct AdaptiveVerificationDecision {
     int calibration_request = -1;
     bool exploring = false;
     double predicted_gain = 1.0;
+    // Absolute useful-token goodput for a measured steady decision. This is
+    // comparable across exact work profiles; zero means the selected action
+    // is cold/unmeasured.
+    double predicted_goodput = 0.0;
+};
+
+enum class AdaptiveVerificationWorkStatus : std::uint8_t {
+    Autoregressive,
+    Calibration,
+    Verification,
+    RequiredUnavailable,
+    InvalidMenu,
+};
+
+struct AdaptiveVerificationWorkDecision {
+    AdaptiveVerificationWorkStatus status =
+        AdaptiveVerificationWorkStatus::Autoregressive;
+    // A work key is returned for calibration and verification actions.
+    std::optional<VerifierWorkKey> work;
+    AdaptiveVerificationDecision decision;
+
+    bool has_work() const {
+        return work.has_value() &&
+            (status == AdaptiveVerificationWorkStatus::Calibration ||
+             status == AdaptiveVerificationWorkStatus::Verification);
+    }
 };
 
 struct AdaptiveVerificationConfig {
@@ -135,13 +162,22 @@ public:
             std::uint64_t request,
             const SpeculationConfidenceEstimate & estimate) {
         if (!estimate.available()) return;
+        observe_request_estimate(
+            request, estimate.speculator, estimate.expected_tokens());
+    }
+
+    void observe_request_estimate(
+            std::uint64_t request, SpeculatorKind speculator,
+            double expected_tokens) {
+        if (!std::isfinite(expected_tokens) || expected_tokens < 1.0) return;
         const auto current = request_confidence_.find(request);
-        if (current != request_confidence_.end() &&
-            current->second.available()) {
+        if (current != request_confidence_.end()) {
             const SpeculationConfidenceProfile old_profile =
-                speculation_confidence_profile(current->second);
+                speculation_confidence_profile(
+                    current->second.speculator,
+                    current->second.expected_tokens);
             const SpeculationConfidenceProfile new_profile =
-                speculation_confidence_profile(estimate);
+                speculation_confidence_profile(speculator, expected_tokens);
             if (old_profile.speculator != new_profile.speculator ||
                 std::abs(old_profile.expected_half_tokens -
                          new_profile.expected_half_tokens) >= 2) {
@@ -151,7 +187,7 @@ public:
                 request_yield_.erase(request);
             }
         }
-        request_confidence_[request] = estimate;
+        request_confidence_[request] = {speculator, expected_tokens};
     }
 
     void observe_request_yield(std::uint64_t request,
@@ -159,11 +195,11 @@ public:
         if (!valid_yield(emitted_tokens)) return;
         update_yield(request_yield_[request], emitted_tokens);
         const auto confidence = request_confidence_.find(request);
-        if (confidence != request_confidence_.end() &&
-            confidence->second.available()) {
+        if (confidence != request_confidence_.end()) {
             update_yield(
                 confidence_yield_[speculation_confidence_profile(
-                    confidence->second)], emitted_tokens);
+                    confidence->second.speculator,
+                    confidence->second.expected_tokens)], emitted_tokens);
         }
     }
 
@@ -282,12 +318,13 @@ public:
         const auto confidence_it = request_confidence_.find(request);
         const bool has_request = request_it != request_yield_.end();
         const bool has_confidence =
-            confidence_it != request_confidence_.end() &&
-            confidence_it->second.available();
+            confidence_it != request_confidence_.end();
         auto profile_it = confidence_yield_.end();
         if (has_confidence) {
             profile_it = confidence_yield_.find(
-                speculation_confidence_profile(confidence_it->second));
+                speculation_confidence_profile(
+                    confidence_it->second.speculator,
+                    confidence_it->second.expected_tokens));
         }
         const bool has_profile = profile_it != confidence_yield_.end() &&
             profile_it->second.samples >=
@@ -299,11 +336,11 @@ public:
         AdaptiveVerificationYieldEstimate out;
         if (has_confidence) {
             out.confidence_expected_tokens =
-                confidence_it->second.expected_tokens();
+                confidence_it->second.expected_tokens;
             out.speculator = confidence_it->second.speculator;
         }
         double trusted_confidence = has_confidence
-            ? confidence_it->second.expected_tokens() : 1.0;
+            ? confidence_it->second.expected_tokens : 1.0;
         if (has_profile) {
             const bool stable_backlog_confidence =
                 trust_stable_confidence &&
@@ -601,13 +638,17 @@ public:
                     fair_group_positions) {
                 (void)yield_bucket;
                 if (positions.size() < 2 ||
-                    !std::all_of(
+                    !std::any_of(
                         positions.begin(), positions.end(),
                         [&](std::size_t position) {
                             return has_stable_useful_yield(known[position]);
                         })) {
                     continue;
                 }
+                // One proven-useful member is enough to rotate peers in the
+                // same narrow value bucket. Requiring every member to be
+                // stable permanently starves raw-confidence peers that never
+                // enter the bounded verifier prefix in the first place.
                 std::vector<AdaptiveVerificationCandidate> members;
                 members.reserve(positions.size());
                 for (std::size_t position : positions) {
@@ -794,6 +835,9 @@ public:
             if (admitted_prefix > required_count) {
                 out.predicted_gain = admitted_goodput / baseline;
             }
+            out.predicted_goodput = admitted_goodput;
+        } else {
+            out.predicted_goodput = baseline;
         }
         return out;
     }
@@ -856,9 +900,532 @@ private:
     // Capped running means represent the complete request/profile while still
     // adapting gradually if a model or speculator changes behavior.
     std::map<std::uint64_t, YieldEstimate> request_yield_;
-    std::map<std::uint64_t, SpeculationConfidenceEstimate>
-        request_confidence_;
+    struct StoredConfidenceEstimate {
+        SpeculatorKind speculator = SpeculatorKind::DDTree;
+        double expected_tokens = 1.0;
+    };
+    std::map<std::uint64_t, StoredConfidenceEstimate> request_confidence_;
     std::map<SpeculationConfidenceProfile, YieldEstimate> confidence_yield_;
+};
+
+// Owns one adaptive ranker per concrete verifier work shape. Speculative route
+// timings and confidence calibration remain isolated by VerifierWorkKey, while
+// the exact all-AR baseline is shared because it is independent of the
+// speculator. Extra confidence-scout time has a separate profile and never
+// contaminates either route cost.
+class AdaptiveVerificationProfileBank {
+public:
+    AdaptiveVerificationProfileBank() = default;
+    explicit AdaptiveVerificationProfileBank(
+            AdaptiveVerificationConfig config)
+        : config_(config), cost_ewma_alpha_(std::clamp(
+              config.cost_ewma_alpha, 0.0, 1.0)) {}
+
+    AdaptiveVerificationRanker & profile(
+            const VerifierWorkKey & work) {
+        auto [it, inserted] = profiles_.try_emplace(work, config_);
+        if (inserted) {
+            // One replay of the current EWMA is sufficient: rankers use the AR
+            // sample as a baseline value, not as confidence evidence.
+            for (const auto & [active_requests, cost] : ar_cost_us_) {
+                it->second.observe_autoregressive(
+                    active_requests, cost.elapsed_us);
+            }
+        }
+        return it->second;
+    }
+
+    const AdaptiveVerificationRanker * find_profile(
+            const VerifierWorkKey & work) const {
+        const auto it = profiles_.find(work);
+        return it == profiles_.end() ? nullptr : &it->second;
+    }
+
+    std::size_t profile_count() const { return profiles_.size(); }
+
+    void observe_autoregressive(int active_requests, double elapsed_us) {
+        if (active_requests <= 0 || !valid_cost(elapsed_us)) return;
+        update_cost(ar_cost_us_[active_requests], elapsed_us);
+        for (auto & [work, ranker] : profiles_) {
+            (void)work;
+            ranker.observe_autoregressive(active_requests, elapsed_us);
+        }
+    }
+
+    void observe_route(const VerifierWorkKey & work,
+                       int active_requests, int speculative_requests,
+                       double elapsed_us,
+                       bool discard_first_sample = false) {
+        if (speculative_requests == 0) {
+            observe_autoregressive(active_requests, elapsed_us);
+            return;
+        }
+        profile(work).observe_route(
+            active_requests, speculative_requests, elapsed_us,
+            discard_first_sample);
+    }
+
+    void observe_request_estimate(
+            const VerifierWorkKey & work, std::uint64_t request,
+            const SpeculationConfidenceEstimate & estimate) {
+        profile(work).observe_request_estimate(request, estimate);
+    }
+
+    void observe_request_estimate(
+            const VerifierWorkKey & work, std::uint64_t request,
+            SpeculatorKind speculator, double expected_tokens) {
+        profile(work).observe_request_estimate(
+            request, speculator, expected_tokens);
+    }
+
+    void observe_request_yield(const VerifierWorkKey & work,
+                               std::uint64_t request,
+                               double emitted_tokens) {
+        profile(work).observe_request_yield(request, emitted_tokens);
+    }
+
+    void forget_request(std::uint64_t request) {
+        for (auto & [work, ranker] : profiles_) {
+            (void)work;
+            ranker.forget_request(request);
+        }
+    }
+
+    // Select one exact verifier work shape from adapter-provided per-request
+    // menus for one configured speculator. DDTree, DSpark, and future adapters
+    // reuse this contract independently; simultaneous cross-speculator racing
+    // requires a separate portfolio policy. A measured profitable steady
+    // route wins over any new profiling. Otherwise only the lowest
+    // exploration_priority action is returned, so adapters can profile
+    // short/cheap shapes before wider alternatives.
+    AdaptiveVerificationWorkDecision select_work(
+            int active_requests,
+            const std::vector<RequestVerifierWorkMenu> & menus,
+            bool probe_uncalibrated_with_verifier = false,
+            bool enforce_ar_peer_guard = true,
+            std::size_t minimum_speculative_route_samples = 1,
+            bool trust_stable_confidence = false,
+            bool allow_safe_peer_guard_relaxation = false) {
+        AdaptiveVerificationWorkDecision out;
+        if (active_requests <= 0 ||
+            menus.size() != static_cast<std::size_t>(active_requests)) {
+            out.status = AdaptiveVerificationWorkStatus::InvalidMenu;
+            return out;
+        }
+
+        struct WorkOption {
+            const SpeculationRequestView * request = nullptr;
+            const VerifierWorkPlan * plan = nullptr;
+        };
+        struct WorkGroup {
+            std::vector<WorkOption> options;
+            bool traits_initialized = false;
+            int max_parallel_requests = std::numeric_limits<int>::max();
+            int adaptive_request_limit = std::numeric_limits<int>::max();
+            std::uint32_t exploration_priority = 0;
+            bool preferred_for_forced_mode = false;
+        };
+        std::map<VerifierWorkKey, WorkGroup> groups;
+        std::map<int, bool> seen_slots;
+        std::map<std::uint64_t, bool> seen_requests;
+        std::optional<SpeculatorKind> configured_speculator;
+        std::size_t required_requests = 0;
+        bool required_without_plan = false;
+
+        for (const RequestVerifierWorkMenu & menu : menus) {
+            if (menu.request.slot < 0 ||
+                !seen_slots.emplace(menu.request.slot, true).second ||
+                !seen_requests.emplace(
+                    menu.request.request_id, true).second) {
+                out.status = AdaptiveVerificationWorkStatus::InvalidMenu;
+                return out;
+            }
+            if (menu.request.required) ++required_requests;
+            if (menu.speculative.empty()) {
+                if (menu.request.required) required_without_plan = true;
+                continue;
+            }
+
+            std::map<VerifierWorkKey, bool> menu_work;
+            for (const VerifierWorkPlan & plan : menu.speculative) {
+                if (!plan.valid() ||
+                    (configured_speculator &&
+                     *configured_speculator != plan.work.speculator) ||
+                    !menu_work.emplace(plan.work, true).second) {
+                    out.status = AdaptiveVerificationWorkStatus::InvalidMenu;
+                    return out;
+                }
+                configured_speculator = plan.work.speculator;
+                WorkGroup & group = groups[plan.work];
+                if (!group.traits_initialized) {
+                    group.traits_initialized = true;
+                    group.max_parallel_requests =
+                        plan.max_parallel_requests;
+                    group.adaptive_request_limit =
+                        plan.adaptive_request_limit;
+                    group.exploration_priority =
+                        plan.exploration_priority;
+                    group.preferred_for_forced_mode =
+                        plan.preferred_for_forced_mode;
+                } else if (
+                    group.max_parallel_requests !=
+                        plan.max_parallel_requests ||
+                    group.adaptive_request_limit !=
+                        plan.adaptive_request_limit ||
+                    group.exploration_priority !=
+                        plan.exploration_priority ||
+                    group.preferred_for_forced_mode !=
+                        plan.preferred_for_forced_mode) {
+                    out.status = AdaptiveVerificationWorkStatus::InvalidMenu;
+                    return out;
+                }
+                group.options.push_back({&menu.request, &plan});
+            }
+        }
+        if (required_without_plan) {
+            out.status =
+                AdaptiveVerificationWorkStatus::RequiredUnavailable;
+            return out;
+        }
+        if (groups.empty()) return out;
+
+        struct Evaluation {
+            VerifierWorkKey work;
+            AdaptiveVerificationDecision decision;
+            std::uint32_t exploration_priority = 0;
+            std::size_t required_count = 0;
+            bool preferred_for_forced_mode = false;
+            bool exact_profile = false;
+        };
+        std::vector<Evaluation> evaluations;
+        evaluations.reserve(groups.size());
+
+        for (const auto & [work, group] : groups) {
+            Evaluation evaluation;
+            evaluation.work = work;
+            evaluation.exploration_priority =
+                group.exploration_priority;
+            evaluation.preferred_for_forced_mode =
+                group.preferred_for_forced_mode;
+            std::vector<AdaptiveVerificationCandidate> candidates;
+            candidates.reserve(group.options.size());
+            for (const WorkOption & option : group.options) {
+                const SpeculationRequestView & request = *option.request;
+                const VerifierWorkPlan & plan = *option.plan;
+
+                AdaptiveVerificationRanker & ranker = profile(work);
+                const double confidence =
+                    plan.bounded_confidence_expected_tokens();
+                if (plan.has_confidence()) {
+                    ranker.observe_request_estimate(
+                        request.request_id, work.speculator,
+                        confidence);
+                }
+
+                AdaptiveVerificationCandidate candidate;
+                candidate.request = request.slot;
+                candidate.maximum_tokens = plan.maximum_emitted_tokens;
+                candidate.confidence_expected_tokens = confidence;
+                candidate.progress_tokens = request.progress_tokens;
+                candidate.required = request.required;
+                candidate.speculator = work.speculator;
+
+                if (plan.has_confidence()) {
+                    const auto estimate = ranker.estimate_request_yield(
+                        request.request_id, trust_stable_confidence);
+                    candidate.expected_tokens = std::clamp(
+                        estimate ? estimate->expected_tokens : confidence,
+                        1.0, plan.maximum_emitted_tokens);
+                    candidate.evidence_samples = estimate
+                        ? estimate->evidence_samples : 0;
+                    candidate.calibrated = true;
+                } else {
+                    const auto target =
+                        ranker.request_expected_tokens(request.request_id);
+                    if (target) {
+                        candidate.expected_tokens = std::clamp(
+                            *target, 1.0,
+                            plan.maximum_emitted_tokens);
+                        candidate.evidence_samples =
+                            ranker.request_yield_samples(request.request_id);
+                        candidate.calibrated = true;
+                    }
+                }
+                candidates.push_back(candidate);
+
+                if (request.required) {
+                    ++evaluation.required_count;
+                }
+            }
+            // One executor shape must be able to carry every Always request.
+            if (evaluation.required_count != required_requests ||
+                evaluation.required_count >
+                    static_cast<std::size_t>(
+                        group.max_parallel_requests) ||
+                candidates.empty()) {
+                continue;
+            }
+
+            AdaptiveVerificationRanker & ranker = profile(work);
+            const int profile_limit = std::max(
+                static_cast<int>(evaluation.required_count),
+                std::min({
+                    active_requests,
+                    group.adaptive_request_limit,
+                    static_cast<int>(candidates.size())}));
+            evaluation.exact_profile = ranker.has_exact_profile(
+                active_requests, profile_limit,
+                minimum_speculative_route_samples,
+                static_cast<int>(evaluation.required_count));
+            const int executable_lanes = std::max(
+                static_cast<int>(evaluation.required_count),
+                std::min(
+                    group.adaptive_request_limit,
+                    static_cast<int>(candidates.size())));
+            const bool broad_verifier_coverage =
+                adaptive_verification_can_relax_peer_guard(
+                    active_requests, executable_lanes);
+            const bool stable_bounded_cohort =
+                evaluation.exact_profile &&
+                candidates.size() ==
+                    static_cast<std::size_t>(active_requests) &&
+                adaptive_verification_can_extend_stable_cohort(
+                    active_requests, executable_lanes) &&
+                ranker.forms_stable_confidence_cohort(candidates);
+            const bool relax_peer_guard =
+                allow_safe_peer_guard_relaxation &&
+                (broad_verifier_coverage || stable_bounded_cohort);
+            evaluation.decision = ranker.select(
+                active_requests, candidates,
+                group.adaptive_request_limit,
+                probe_uncalibrated_with_verifier,
+                /*probe_missing_routes=*/true,
+                enforce_ar_peer_guard && !relax_peer_guard,
+                minimum_speculative_route_samples);
+            evaluations.push_back(std::move(evaluation));
+        }
+        if (evaluations.empty()) {
+            if (required_requests > 0) {
+                out.status =
+                    AdaptiveVerificationWorkStatus::RequiredUnavailable;
+            }
+            return out;
+        }
+
+        auto choose = [&](const Evaluation & evaluation) {
+            out.work = evaluation.work;
+            out.decision = evaluation.decision;
+            out.status = evaluation.decision.requests.empty()
+                ? AdaptiveVerificationWorkStatus::Calibration
+                : AdaptiveVerificationWorkStatus::Verification;
+        };
+
+        // Compare measured work alternatives by absolute useful-token
+        // goodput. Relative gain is profile-local and cannot rank two shapes
+        // whose required baselines have different costs.
+        const Evaluation * measured = nullptr;
+        for (const Evaluation & evaluation : evaluations) {
+            if (evaluation.decision.exploring ||
+                evaluation.decision.requests.empty() ||
+                evaluation.decision.predicted_goodput <= 0.0) {
+                continue;
+            }
+            if (!measured ||
+                evaluation.decision.predicted_goodput >
+                    measured->decision.predicted_goodput ||
+                (evaluation.decision.predicted_goodput ==
+                     measured->decision.predicted_goodput &&
+                 evaluation.work < measured->work)) {
+                measured = &evaluation;
+            }
+        }
+        if (measured) {
+            choose(*measured);
+            return out;
+        }
+
+        // Forced requests cannot fall back to AR. Adapter preference and
+        // exploration priority are used only while every executable shape is
+        // cold/unmeasured.
+        if (required_requests > 0) {
+            const Evaluation * forced = nullptr;
+            for (const Evaluation & evaluation : evaluations) {
+                if (evaluation.decision.requests.size() < required_requests) {
+                    continue;
+                }
+                if (!forced ||
+                    (evaluation.preferred_for_forced_mode &&
+                     !forced->preferred_for_forced_mode) ||
+                    (evaluation.preferred_for_forced_mode ==
+                         forced->preferred_for_forced_mode &&
+                     evaluation.exploration_priority <
+                         forced->exploration_priority) ||
+                    (evaluation.preferred_for_forced_mode ==
+                         forced->preferred_for_forced_mode &&
+                     evaluation.exploration_priority ==
+                         forced->exploration_priority &&
+                     evaluation.work < forced->work)) {
+                    forced = &evaluation;
+                }
+            }
+            if (forced) choose(*forced);
+            return out;
+        }
+
+        // Missing verifier widths and confidence needed to begin an incomplete
+        // profile are primary bounded exploration. A pure calibration request
+        // on a complete losing profile is deferred until every other work
+        // option has had its exploration opportunity.
+        const Evaluation * exploration = nullptr;
+        for (const Evaluation & evaluation : evaluations) {
+            const bool calibration =
+                evaluation.decision.requests.empty() &&
+                evaluation.decision.calibration_request >= 0;
+            if (!evaluation.decision.exploring &&
+                (!calibration || evaluation.exact_profile)) {
+                continue;
+            }
+            if (!exploration ||
+                evaluation.exploration_priority <
+                    exploration->exploration_priority ||
+                (evaluation.exploration_priority ==
+                     exploration->exploration_priority &&
+                 evaluation.work < exploration->work)) {
+                exploration = &evaluation;
+            }
+        }
+        if (exploration) {
+            choose(*exploration);
+            return out;
+        }
+
+        const Evaluation * fallback_calibration = nullptr;
+        for (const Evaluation & evaluation : evaluations) {
+            if (!evaluation.decision.requests.empty() ||
+                evaluation.decision.calibration_request < 0) {
+                continue;
+            }
+            if (!fallback_calibration ||
+                evaluation.exploration_priority <
+                    fallback_calibration->exploration_priority ||
+                (evaluation.exploration_priority ==
+                     fallback_calibration->exploration_priority &&
+                 evaluation.work < fallback_calibration->work)) {
+                fallback_calibration = &evaluation;
+            }
+        }
+        if (fallback_calibration) choose(*fallback_calibration);
+        return out;
+    }
+
+    bool has_autoregressive_cost(int active_requests) const {
+        return ar_cost_us_.find(active_requests) != ar_cost_us_.end();
+    }
+
+    double autoregressive_cost_us(int active_requests) const {
+        const auto it = ar_cost_us_.find(active_requests);
+        return it == ar_cost_us_.end()
+            ? std::numeric_limits<double>::infinity()
+            : it->second.elapsed_us;
+    }
+
+    std::size_t autoregressive_cost_samples(int active_requests) const {
+        const auto it = ar_cost_us_.find(active_requests);
+        return it == ar_cost_us_.end() ? 0 : it->second.samples;
+    }
+
+    void observe_scout(const ConfidenceScoutWorkKey & work,
+                       int request_count, double elapsed_us) {
+        if (request_count <= 0 || !valid_cost(elapsed_us)) return;
+        update_cost(scout_cost_us_[{work, request_count}], elapsed_us);
+    }
+
+    bool has_scout_cost(const ConfidenceScoutWorkKey & work,
+                        int request_count) const {
+        return scout_cost_us_.find({work, request_count}) !=
+            scout_cost_us_.end();
+    }
+
+    double scout_cost_us(const ConfidenceScoutWorkKey & work,
+                         int request_count) const {
+        const auto it = scout_cost_us_.find({work, request_count});
+        return it == scout_cost_us_.end()
+            ? std::numeric_limits<double>::infinity()
+            : it->second.elapsed_us;
+    }
+
+    std::size_t scout_cost_samples(const ConfidenceScoutWorkKey & work,
+                                   int request_count) const {
+        const auto it = scout_cost_us_.find({work, request_count});
+        return it == scout_cost_us_.end() ? 0 : it->second.samples;
+    }
+
+    // Compatibility for adapters not yet assigning stable scout shape IDs.
+    // New integrations should use ConfidenceScoutWorkKey so depths and
+    // executor paths cannot contaminate one another.
+    void observe_scout(SpeculatorKind speculator, int request_count,
+                       double elapsed_us) {
+        observe_scout({speculator, 0, 0}, request_count, elapsed_us);
+    }
+
+    bool has_scout_cost(SpeculatorKind speculator,
+                        int request_count) const {
+        return has_scout_cost({speculator, 0, 0}, request_count);
+    }
+
+    double scout_cost_us(SpeculatorKind speculator,
+                         int request_count) const {
+        return scout_cost_us({speculator, 0, 0}, request_count);
+    }
+
+    std::size_t scout_cost_samples(SpeculatorKind speculator,
+                                   int request_count) const {
+        return scout_cost_samples({speculator, 0, 0}, request_count);
+    }
+
+    void reset() {
+        profiles_.clear();
+        ar_cost_us_.clear();
+        scout_cost_us_.clear();
+    }
+
+private:
+    struct CostEstimate {
+        double elapsed_us = 0.0;
+        std::size_t samples = 0;
+    };
+
+    struct ScoutCostKey {
+        ConfidenceScoutWorkKey work;
+        int request_count = 0;
+
+        bool operator<(const ScoutCostKey & other) const {
+            if (work != other.work) return work < other.work;
+            return request_count < other.request_count;
+        }
+    };
+
+    static bool valid_cost(double elapsed_us) {
+        return std::isfinite(elapsed_us) && elapsed_us > 0.0;
+    }
+
+    void update_cost(CostEstimate & estimate, double elapsed_us) {
+        if (estimate.samples == 0) {
+            estimate.elapsed_us = elapsed_us;
+        } else {
+            estimate.elapsed_us = cost_ewma_alpha_ * elapsed_us +
+                (1.0 - cost_ewma_alpha_) * estimate.elapsed_us;
+        }
+        if (estimate.samples < std::numeric_limits<std::size_t>::max()) {
+            ++estimate.samples;
+        }
+    }
+
+    AdaptiveVerificationConfig config_;
+    double cost_ewma_alpha_ = 0.35;
+    std::map<VerifierWorkKey, AdaptiveVerificationRanker> profiles_;
+    std::map<int, CostEstimate> ar_cost_us_;
+    std::map<ScoutCostKey, CostEstimate> scout_cost_us_;
 };
 
 }  // namespace dflash::common
