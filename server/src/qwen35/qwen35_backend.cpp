@@ -2203,14 +2203,15 @@ static float qwen35_dspark_confidence_threshold() {
 // then probes with one spec step. Set DFLASH_QWEN35_SPEC_STEP_RATIO=0 to
 // disable the policy.
 struct Qwen35AdaptiveSpecPolicy {
-    float step_ratio = 1.7f;   // spec/plain step cost; the measured 1.9 (54 vs 28.6 ms) is deliberately
-                               // under-stated: a higher threshold costs more on bursty code/mixed streams than
-                               // it saves on prose (measured 45.6/40.4/32.4 vs 42.5/36.4/32.3 tok/s)
+    float step_ratio = 1.9f;   // spec/plain step cost used until both step kinds have been timed
+                               // (measured 54-55 vs 28.6 ms on gfx1201 for width-8 and width-16 verify)
     int   burst      = 40;     // plain-decode steps per burst (each burst ends with one spec probe step)
     float ema_alpha  = 0.1f;   // slow EMA: ~10-step memory so bursty acceptance does not flap
     bool  enabled() const { return step_ratio > 1.0f && burst > 0; }
     // Enter a burst only clearly below break-even (hysteresis against noise).
-    float accept_threshold() const { return 0.8f * (step_ratio - 1.0f); }
+    // `ratio` is the live spec/plain step-time ratio once measured.
+    float accept_threshold(float ratio) const { return 0.8f * (ratio - 1.0f); }
+    float accept_threshold() const { return accept_threshold(step_ratio); }
 };
 
 static Qwen35AdaptiveSpecPolicy qwen35_adaptive_spec_policy() {
@@ -2427,6 +2428,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int   ar_burst_left = 0;
     int   n_ar_burst_steps = 0;
     bool  probe_step = false;   // first spec step after a burst
+    // Live step-time EMAs (seconds) for the break-even ratio; 0 = not yet measured.
+    double t_spec_step_ema = 0.0;
+    double t_ar_step_ema   = 0.0;
+    auto live_step_ratio = [&]() {
+        return (t_spec_step_ema > 0.0 && t_ar_step_ema > 0.0)
+            ? (float)(t_spec_step_ema / t_ar_step_ema) : adaptive.step_ratio;
+    };
 
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
@@ -2439,6 +2447,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             n_ar_burst_steps++;
             probe_step = (ar_burst_left == 0);
         }
+        const auto t_step_start = std::chrono::steady_clock::now();
 
         // Budget hook: no tail-off here. The close-token injection fires
         // during the emit phase (step 8) after acceptance+replay, mirroring
@@ -3341,6 +3350,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // Adaptive policy update on real spec steps: EMA of accepted draft
         // tokens (the seed is always accepted); a low EMA schedules a burst
         // of plain-decode steps, the step after the burst is a spec probe.
+        if (adaptive.enabled()) {
+            const double t_step = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_step_start).count();
+            double & t_ema = ar_step ? t_ar_step_ema : t_spec_step_ema;
+            t_ema = (t_ema > 0.0) ? 0.9 * t_ema + 0.1 * t_step : t_step;
+        }
         if (adaptive.enabled() && !ar_step) {
             const float accepted_drafts = (float)std::max(0, accept_n - 1);
             // A probe (first spec step after a burst) weighs its result
@@ -3348,7 +3363,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             const float alpha = probe_step ? 0.5f : adaptive.ema_alpha;
             accepted_ema = (1.0f - alpha) * accepted_ema + alpha * accepted_drafts;
             probe_step = false;
-            if (accepted_ema < adaptive.accept_threshold()) {
+            if (accepted_ema < adaptive.accept_threshold(live_step_ratio())) {
                 ar_burst_left = adaptive.burst;
             }
         }
@@ -3441,8 +3456,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
     if (n_ar_burst_steps > 0) {
         std::fprintf(stderr, "[spec-decode] adaptive: %d of %d steps ran as plain decode "
-                             "(accept threshold %.2f drafts/step, burst %d)\n",
-                     n_ar_burst_steps, n_draft_steps, adaptive.accept_threshold(), adaptive.burst);
+                             "(step ratio %.2f, accept threshold %.2f drafts/step, burst %d)\n",
+                     n_ar_burst_steps, n_draft_steps, live_step_ratio(),
+                     adaptive.accept_threshold(live_step_ratio()), adaptive.burst);
     }
     if (tp_profile) {
         std::fprintf(stderr,
