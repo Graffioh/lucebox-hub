@@ -76,6 +76,13 @@ struct TargetLayer {
     ggml_tensor * ssm_dt_bias    = nullptr;  // [dt_rank] per-head alpha bias
     ggml_tensor * ssm_norm       = nullptr;  // [head_v_dim]
     ggml_tensor * ssm_out        = nullptr;  // output projection after delta-net
+    // Zero-copy stacked projections (set by the loader when the two source
+    // tensors share a type and were placed back to back in the weight buffer):
+    //   wqkv_z: rows [0, n_z) = wqkv_gate (z), rows [n_z, ...) = wqkv
+    //   ssm_ba: rows [0, dt_rank) = ssm_beta, rows [dt_rank, ...) = ssm_alpha
+    // One GEMV each instead of two; nullptr when stacking was not possible.
+    ggml_tensor * wqkv_z         = nullptr;
+    ggml_tensor * ssm_ba         = nullptr;
 
     // MoE FFN (qwen35moe only; nullptr on dense qwen35)
     ggml_tensor * ffn_gate_inp       = nullptr;  // [hidden, n_expert] router
@@ -147,6 +154,7 @@ struct CpuEmbedder {
 
 struct TargetWeights {
     ggml_context *        ctx     = nullptr;
+    ggml_context *        stack_ctx = nullptr;  // owns the stacked alias tensors
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
 

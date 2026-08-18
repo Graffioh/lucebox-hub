@@ -137,7 +137,13 @@ bool create_target_cache_partial(const TargetWeights & w,
     // Graph-level FWHT K-rotation (TurboQuant-style outlier spreading with
     // standard quant types that keep fast FA kernel paths on all arches).
     // Skip for TQ3_0 K cache — that type already applies WHT during quantization.
-    out.kv_k_rotated = (kv_k_type != GGML_TYPE_TQ3_0);
+    // DFLASH_KV_ROTATE=0 turns it off (two fewer launches per attention layer;
+    // with q8_0/f16 caches the rotation is precision-neutral).
+    static const bool kv_rotate_env = []() {
+        const char * e = std::getenv("DFLASH_KV_ROTATE");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    out.kv_k_rotated = (kv_k_type != GGML_TYPE_TQ3_0) && kv_rotate_env;
 
     const bool needs_256_stride =
         kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0;
@@ -639,10 +645,19 @@ bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
 
 static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       const TargetLayer & L) {
-    ggml_tensor * gate = apply_scale2(ctx, ggml_mul_mat(ctx, L.w_gate, cur), L.w_gate_s);   // [inter, n_tokens]
-    gate = ggml_silu(ctx, gate);
-    ggml_tensor * up = apply_scale2(ctx, ggml_mul_mat(ctx, L.w_up, cur), L.w_up_s);
-    ggml_tensor * gu = ggml_mul(ctx, gate, up);
+    ggml_tensor * gate = ggml_mul_mat(ctx, L.w_gate, cur);   // [inter, n_tokens]
+    ggml_tensor * up   = ggml_mul_mat(ctx, L.w_up, cur);
+    ggml_tensor * gu;
+    if (L.w_gate_s == 1.0f && L.w_up_s == 1.0f) {
+        // GLU node right after the two matmuls: the CUDA/HIP backend fuses
+        // mul_mat(gate) + mul_mat(up) + swiglu into a single vector kernel
+        // for single-token decode.
+        gu = ggml_swiglu_split(ctx, gate, up);
+    } else {
+        gate = ggml_silu(ctx, apply_scale2(ctx, gate, L.w_gate_s));
+        up   = apply_scale2(ctx, up, L.w_up_s);
+        gu   = ggml_mul(ctx, gate, up);
+    }
     return apply_scale2(ctx, ggml_mul_mat(ctx, L.w_down, gu), L.w_down_s);                  // [hidden, n_tokens]
 }
 
@@ -915,82 +930,148 @@ static ggml_tensor * build_delta_net_block(
     const int n_seq_tokens = n_tokens;
     const bool can_skip_gdn_intermediate = skip_gdn_intermediate && !parent_ids && !cap;
 
+    // Row-slices of a stacked projection are only contiguous for a single
+    // token; wider batches (verify/prefill) need a copy before reshape/unary.
+    auto contig = [&](ggml_tensor * t) {
+        return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
+    };
+
     // ── qkv_mixed = wqkv @ cur         [10240, n_tokens]
-    ggml_tensor * qkv_mixed = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv, cur), L.wqkv_s);
-    qkv_mixed = ggml_reshape_3d(ctx, qkv_mixed, conv_channels, n_seq_tokens, n_seqs);
+    // ── z         = wqkv_gate @ cur    [inner, n_tokens]
+    // One GEMV over the stacked (z | qkv) alias when the loader built it.
+    ggml_tensor * qkv_mixed = nullptr;
+    ggml_tensor * z = nullptr;
+    const bool stacked_qkv_z = L.wqkv_z && L.wqkv_s == 1.0f && L.wqkv_gate_s == 1.0f;
+    if (stacked_qkv_z) {
+        const int64_t n_z = L.wqkv_gate->ne[1];
+        ggml_tensor * qkvz = ggml_mul_mat(ctx, L.wqkv_z, cur);   // [n_z + conv_channels, n_tokens]
+        const size_t e = ggml_element_size(qkvz);
+        z = ggml_view_2d(ctx, qkvz, n_z, n_tokens, qkvz->nb[1], 0);
+        qkv_mixed = ggml_view_3d(ctx, qkvz, conv_channels, n_seq_tokens, n_seqs,
+                                 qkvz->nb[1], qkvz->nb[1] * n_seq_tokens, (size_t)n_z * e);
+    } else {
+        qkv_mixed = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv, cur), L.wqkv_s);
+        qkv_mixed = ggml_reshape_3d(ctx, qkv_mixed, conv_channels, n_seq_tokens, n_seqs);
+        z = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv_gate, cur), L.wqkv_gate_s);
+    }
 
-    // ── z = wqkv_gate @ cur            [inner, n_tokens]
-    ggml_tensor * z = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv_gate, cur), L.wqkv_gate_s);
-
-    // ── beta = ssm_beta @ cur          [dt_rank, n_tokens]
-    ggml_tensor * beta = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_beta, cur), L.ssm_beta_s);
-    beta = ggml_reshape_4d(ctx, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
-    beta = ggml_sigmoid(ctx, beta);
-
+    // ── beta  = ssm_beta @ cur         [dt_rank, n_tokens]
     // ── alpha = ssm_alpha @ cur        [dt_rank, n_tokens]
-    //    alpha = alpha + ssm_dt_bias          (per-head bias)
-    //    alpha = softplus(alpha)
-    //    g     = alpha * ssm_a                (-A_log.exp() * softplus)
-    ggml_tensor * alpha = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_alpha, cur), L.ssm_alpha_s);
+    // One GEMV over the stacked (beta | alpha) alias when available.
+    ggml_tensor * beta = nullptr;
+    ggml_tensor * alpha = nullptr;
+    const bool stacked_ba = L.ssm_ba && L.ssm_beta_s == 1.0f && L.ssm_alpha_s == 1.0f;
+    if (stacked_ba) {
+        ggml_tensor * ba = ggml_mul_mat(ctx, L.ssm_ba, cur);     // [2 * dt_rank, n_tokens]
+        const size_t e = ggml_element_size(ba);
+        beta  = contig(ggml_view_2d(ctx, ba, num_v_heads, n_tokens, ba->nb[1], 0));
+        alpha = contig(ggml_view_2d(ctx, ba, num_v_heads, n_tokens, ba->nb[1], (size_t)num_v_heads * e));
+    } else {
+        beta  = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_beta, cur), L.ssm_beta_s);
+        alpha = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_alpha, cur), L.ssm_alpha_s);
+    }
+    // Chunked delta-net path (opt-in, chain-only, no capture): decided here
+    // because the fused-kernel choices below depend on it.
+    bool use_chunked = false;
+    if (can_skip_gdn_intermediate && n_seq_tokens > 1) {
+        if (const char * s_env = std::getenv("DFLASH27B_CHUNKED")) {
+            use_chunked = (std::atoi(s_env) != 0);
+        }
+    }
+    // Fused kernels (chain path only): the conv step and the gate prep are
+    // folded into the ssm_conv_step / gated_delta_net kernels instead of
+    // 6-8 tiny graph ops per layer. DFLASH_QWEN35_NO_FUSED_KERNELS=1 keeps
+    // the op-by-op graph for A/B checks.
+    static const bool fused_kernels_env = std::getenv("DFLASH_QWEN35_NO_FUSED_KERNELS") == nullptr;
+    const bool fused_conv  = fused_kernels_env && !parent_ids;
+    const bool raw_gates   = fused_kernels_env && !parent_ids && !use_chunked;
+
+    beta = ggml_reshape_4d(ctx, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     alpha = ggml_reshape_3d(ctx, alpha, num_v_heads, n_seq_tokens, n_seqs);
-    alpha = ggml_add(ctx, alpha, L.ssm_dt_bias);
-    alpha = ggml_softplus(ctx, alpha);
-    ggml_tensor * g_tensor = ggml_mul(ctx, alpha, L.ssm_a);
-    g_tensor = ggml_reshape_4d(ctx, g_tensor, 1, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * g_tensor = nullptr;
+    if (raw_gates) {
+        // The kernel applies sigmoid(beta) and softplus(alpha + dt_bias) * A.
+        g_tensor = ggml_reshape_4d(ctx, alpha, 1, num_v_heads, n_seq_tokens, n_seqs);
+    } else {
+        beta = ggml_sigmoid(ctx, beta);
+        //    alpha = alpha + ssm_dt_bias          (per-head bias)
+        //    alpha = softplus(alpha)
+        //    g     = alpha * ssm_a                (-A_log.exp() * softplus)
+        alpha = ggml_add(ctx, alpha, L.ssm_dt_bias);
+        alpha = ggml_softplus(ctx, alpha);
+        g_tensor = ggml_mul(ctx, alpha, L.ssm_a);
+        g_tensor = ggml_reshape_4d(ctx, g_tensor, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
 
     // ── Fetch conv state [kernel-1, conv_channels] and prepend to qkv_mixed
     //    along the token axis to form the convolution input.
     ggml_tensor * conv_states_r = ggml_reshape_3d(ctx, conv_state,
         w.ssm_d_conv - 1, conv_channels, n_seqs);
 
-    // qkv_mixed currently is [conv_channels, n_tokens, n_seqs]; we need
-    // [n_tokens, conv_channels, n_seqs] to concat on dim 0.
-    ggml_tensor * qkv_T = ggml_transpose(ctx, qkv_mixed);
-
-    ggml_tensor * conv_input = ggml_concat(ctx, conv_states_r, qkv_T, 0);
-    // I0 domain: [0,K_conv-2] are prefix-history rows; tree token flat slot t
-    // (root-inclusive, including synthetic root t=0) is stored at
-    // conv_input row (K_conv-1)+t.
-    // conv_input: [kernel-1 + n_tokens, conv_channels, n_seqs]
-
-    // For spec-decode rollback: copy the full conv_input into the persistent
-    // cache buffer via an in-graph ggml_cpy. This avoids marking conv_input as
-    // a graph output (which would force the gallocr to preserve its memory
-    // past graph_compute). After graph_compute, the cache buffer's data is
-    // always valid; the rollback code slices it at commit_n.
-    if (cap && cap->conv_input) {
-        // conv_input may be shorter than the pre-allocated cache
-        // (e.g. during prefill when n_tokens < max_verify_tokens).
-        // Copy into a matching-sized view of the cache destination.
-        const int64_t ci_len = conv_input->ne[0];
-        ggml_tensor * dst;
-        if (ci_len == cap->conv_input->ne[0]) {
-            dst = cap->conv_input;
-        } else {
-            dst = ggml_view_3d(ctx, cap->conv_input,
-                ci_len, cap->conv_input->ne[1], cap->conv_input->ne[2],
-                cap->conv_input->nb[1], cap->conv_input->nb[2], 0);
+    ggml_tensor * conv_out = nullptr;
+    if (fused_conv) {
+        // One kernel: window = [conv_state | x], silu(conv), history
+        // write-back, and (when capturing) the rollback window copy.
+        ggml_tensor * ci_dst = nullptr;
+        if (cap && cap->conv_input) {
+            const int64_t ci_len = (w.ssm_d_conv - 1) + n_tokens;
+            ci_dst = (ci_len == cap->conv_input->ne[0])
+                ? cap->conv_input
+                : ggml_view_3d(ctx, cap->conv_input,
+                      ci_len, cap->conv_input->ne[1], cap->conv_input->ne[2],
+                      cap->conv_input->nb[1], cap->conv_input->nb[2], 0);
         }
-        GGML_ASSERT(ggml_nelements(conv_input) == ggml_nelements(dst));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, dst));
+        conv_out = ggml_ssm_conv_step(ctx, qkv_mixed, L.ssm_conv1d, conv_states_r, ci_dst);
+    } else {
+        // qkv_mixed currently is [conv_channels, n_tokens, n_seqs]; we need
+        // [n_tokens, conv_channels, n_seqs] to concat on dim 0.
+        ggml_tensor * qkv_T = ggml_transpose(ctx, qkv_mixed);
+
+        ggml_tensor * conv_input = ggml_concat(ctx, conv_states_r, qkv_T, 0);
+        // I0 domain: [0,K_conv-2] are prefix-history rows; tree token flat slot t
+        // (root-inclusive, including synthetic root t=0) is stored at
+        // conv_input row (K_conv-1)+t.
+        // conv_input: [kernel-1 + n_tokens, conv_channels, n_seqs]
+
+        // For spec-decode rollback: copy the full conv_input into the persistent
+        // cache buffer via an in-graph ggml_cpy. This avoids marking conv_input as
+        // a graph output (which would force the gallocr to preserve its memory
+        // past graph_compute). After graph_compute, the cache buffer's data is
+        // always valid; the rollback code slices it at commit_n.
+        if (cap && cap->conv_input) {
+            // conv_input may be shorter than the pre-allocated cache
+            // (e.g. during prefill when n_tokens < max_verify_tokens).
+            // Copy into a matching-sized view of the cache destination.
+            const int64_t ci_len = conv_input->ne[0];
+            ggml_tensor * dst;
+            if (ci_len == cap->conv_input->ne[0]) {
+                dst = cap->conv_input;
+            } else {
+                dst = ggml_view_3d(ctx, cap->conv_input,
+                    ci_len, cap->conv_input->ne[1], cap->conv_input->ne[2],
+                    cap->conv_input->nb[1], cap->conv_input->nb[2], 0);
+            }
+            GGML_ASSERT(ggml_nelements(conv_input) == ggml_nelements(dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, dst));
+        }
+
+        // ── Save the last (kernel-1) steps back to conv_state
+        ggml_tensor * last_conv = ggml_view_3d(ctx, conv_input,
+            w.ssm_d_conv - 1, conv_channels, n_seqs,
+            conv_input->nb[1], conv_input->nb[2],
+            (conv_input->ne[0] - (w.ssm_d_conv - 1)) * ggml_element_size(conv_input));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, last_conv, conv_state));
+
+        // ── 1D conv + silu
+        //    Tree mode: use the parent-chain-aware variant so sibling nodes gather
+        //    their conv window from their actual tree parent instead of the DFS
+        //    predecessor. Without this, siblings get garbage logits (the conv
+        //    output would mix unrelated branches).
+        conv_out = parent_ids
+            ? ggml_ssm_conv_tree(ctx, conv_input, L.ssm_conv1d, parent_ids)
+            : ggml_ssm_conv     (ctx, conv_input, L.ssm_conv1d);
+        conv_out = ggml_silu(ctx, conv_out);
     }
-
-    // ── Save the last (kernel-1) steps back to conv_state
-    ggml_tensor * last_conv = ggml_view_3d(ctx, conv_input,
-        w.ssm_d_conv - 1, conv_channels, n_seqs,
-        conv_input->nb[1], conv_input->nb[2],
-        (conv_input->ne[0] - (w.ssm_d_conv - 1)) * ggml_element_size(conv_input));
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, last_conv, conv_state));
-
-    // ── 1D conv + silu
-    //    Tree mode: use the parent-chain-aware variant so sibling nodes gather
-    //    their conv window from their actual tree parent instead of the DFS
-    //    predecessor. Without this, siblings get garbage logits (the conv
-    //    output would mix unrelated branches).
-    ggml_tensor * conv_out = parent_ids
-        ? ggml_ssm_conv_tree(ctx, conv_input, L.ssm_conv1d, parent_ids)
-        : ggml_ssm_conv     (ctx, conv_input, L.ssm_conv1d);
-    conv_out = ggml_silu(ctx, conv_out);
 
     // conv_out: [conv_channels, n_tokens, n_seqs]
     const int64_t q_offset = 0;
@@ -1019,13 +1100,29 @@ static ggml_tensor * build_delta_net_block(
         row_size * n_seq_tokens,
         v_offset * elt);
 
-    // L2 norm on Q and K
-    q_c = ggml_l2_norm(ctx, q_c, w.rms_eps);
-    k_c = ggml_l2_norm(ctx, k_c, w.rms_eps);
+    // L2 norm on Q and K: q and k heads are adjacent in conv_out, so one
+    // launch over the [head_k_dim, 2*num_k_heads] slab normalizes both.
+    {
+        ggml_tensor * qk_c = ggml_view_4d(ctx, conv_out,
+            head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+            head_k_dim * elt,
+            row_size,
+            row_size * n_seq_tokens,
+            q_offset * elt);
+        ggml_tensor * qk_n = ggml_l2_norm(ctx, qk_c, w.rms_eps);   // contiguous [hd, 2*Hk, T, S]
+        const size_t ne_ = ggml_element_size(qk_n);
+        q_c = ggml_view_4d(ctx, qk_n, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                           qk_n->nb[1], qk_n->nb[2], qk_n->nb[3], 0);
+        k_c = ggml_view_4d(ctx, qk_n, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                           qk_n->nb[1], qk_n->nb[2], qk_n->nb[3],
+                           (size_t)num_k_heads * head_k_dim * ne_);
+    }
 
-    // Repeat Q and K from num_k_heads to num_v_heads so they match V's layout
-    // (only needed if not using the fused op's broadcast support).
-    if (num_k_heads != num_v_heads) {
+    // Repeat Q and K from num_k_heads to num_v_heads so they match V's layout.
+    // The fused gated_delta_net kernels broadcast heads themselves (v head h
+    // reads q/k head h % num_k_heads, the same tiling ggml_repeat produces),
+    // so only the chunked path needs the materialized copies.
+    if (num_k_heads != num_v_heads && use_chunked) {
         q_c = ggml_repeat_4d(ctx, q_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
         k_c = ggml_repeat_4d(ctx, k_c, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
     }
@@ -1067,13 +1164,6 @@ static ggml_tensor * build_delta_net_block(
     // default — port produces correct shape but slightly wrong final state,
     // causing AL degradation and loopy output. Set DFLASH27B_CHUNKED=1 to
     // opt in for A/B testing while debugging.
-    bool use_chunked = false;
-    if (can_skip_gdn_intermediate && n_seq_tokens > 1) {
-        if (const char * s_env = std::getenv("DFLASH27B_CHUNKED")) {
-            use_chunked = (std::atoi(s_env) != 0);
-        }
-    }
-
     ggml_tensor * output = nullptr;
     ggml_tensor * new_state = nullptr;
 
@@ -1096,9 +1186,15 @@ static ggml_tensor * build_delta_net_block(
         // cache buffer — same mechanism as _tree_persist, but without tree
         // parent_ids. Avoids the legacy result-region cpy (and the OOB it
         // could cause if the result tensor has no embedded intermediate region).
-        result = ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        // In-place final state: the kernel writes the new recurrent state
+        // straight into `s` (a view of the persistent ssm_state), so no
+        // separate 3 MB copy per layer is needed. Tree mode keeps the copy.
+        result = ggml_gated_delta_net_inplace(ctx, q_c, k_c, v_c, g_tensor, beta, s);
         if (persist_inter) {
             result->src[7] = persist_inter;
+        }
+        if (raw_gates) {
+            ggml_gated_delta_net_set_raw_gates(result, L.ssm_dt_bias, L.ssm_a);
         }
     }
     if (can_skip_gdn_intermediate) {
@@ -1123,8 +1219,10 @@ static ggml_tensor * build_delta_net_block(
         S_v * S_v * H_v * r_elt,
         S_v * H_v * n_seq_tokens * n_seqs * r_elt);
 
-    // Persist new_state back to cache
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, ssm_state));
+    // Persist new_state back to cache (chain mode already wrote it in place)
+    if (parent_ids) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, ssm_state));
+    }
 
     // Expose per-step intermediate states for spec-decode rollback. The patched
     // ggml_gated_delta_net kernel appends an intermediate-states region to the
@@ -1164,7 +1262,7 @@ after_delta_net:
     }
 
     // ── Gated output norm: rms_norm(output) * silu(z_4d)
-    ggml_tensor * z_4d = ggml_reshape_4d(ctx, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * z_4d = ggml_reshape_4d(ctx, contig(z), head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
     ggml_tensor * output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
     output_n = ggml_mul(ctx, output_n, L.ssm_norm);
     ggml_tensor * z_silu  = ggml_silu(ctx, z_4d);
