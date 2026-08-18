@@ -413,6 +413,14 @@ struct TargetCache {
     std::vector<ggml_tensor *> ssm_intermediate;    // size = n_delta (48)
     std::vector<ggml_tensor *> conv_input_cache;    // size = n_delta (48)
 
+    // Bounded concurrent-tree checkpoint domain. A packed tree row is
+    // sequence-major, so recurrent checkpoint t for compact tree lane s lives
+    // at s*tree_capture_width+t. Keeping this lane count independent from the
+    // physical serving-slot count lets an all-C adaptive route directly commit
+    // a small profitable subset without reserving T*C recurrent states.
+    int tree_capture_width = 0;
+    int tree_capture_lanes = 0;
+
     // Rolling target layer features captured during target forward passes.
     // Single-sequence shape: [5 * hidden, target_feat_cap] bf16. A multi-slot
     // cache owns one ring per physical sequence slot and one final dead row:
@@ -422,6 +430,10 @@ struct TargetCache {
     // target_feat_cap remains the per-sequence ring width.
     ggml_tensor * target_feat = nullptr;
     int target_feat_cap = 0;
+    // Extra rows after the per-slot rings and dead row. Direct concurrent-tree
+    // verification writes candidate features here, then copies only the
+    // accepted spine into the owning slot's durable ring.
+    int target_feat_tree_scratch_base = 0;
 
     // KVFlash target-QK scorer: last token's post-RoPE (and post-FWHT when
     // kv_k_rotated) query per full-attention layer, written by the graph
@@ -559,9 +571,9 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
 // n_seq_slots > 1 the attention K/V tensors are sized by ctx_alloc (the shared
 // pool capacity plus one scratch block) rather than one sequence's max_ctx.
 // `concurrent_tree` declares that a paged multi-slot caller will build packed
-// DDTree verification graphs. Those graphs are deliberately side-effect-free
-// for recurrent state and commit accepted paths through a later replay, so no
-// rollback snapshots/intermediates are allocated.
+// DDTree verification graphs. `concurrent_tree_capture_lanes` reserves a
+// bounded number of compact F16 recurrent checkpoint lanes for direct accepted
+// path commit; routes wider than that retain the replay fallback.
 bool create_target_cache(const TargetWeights & w,
                          int max_ctx,
                          int max_verify_tokens,
@@ -571,7 +583,8 @@ bool create_target_cache(const TargetWeights & w,
                          int ctx_alloc = 0,
                          bool paged_attention = false,
                          int n_seq_slots = 1,
-                         bool concurrent_tree = false);
+                         bool concurrent_tree = false,
+                         int concurrent_tree_capture_lanes = 0);
 
 // `f32_ssm_intermediates` enables exact per-token checkpoints for the opt-in
 // layer-split fast rollback path. The default preserves the established Q8_0
@@ -589,7 +602,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool f32_ssm_intermediates = false,
                                  bool paged_attention = false,
                                  int n_seq_slots = 1,
-                                 bool concurrent_tree = false);
+                                 bool concurrent_tree = false,
+                                 int concurrent_tree_capture_lanes = 0);
 
 void free_target_cache(TargetCache & c);
 
@@ -684,6 +698,12 @@ struct QwenGraphInputs {
     // each row's KV extent to position+1, which IS the causal mask. -1 on
     // padding rows.
     ggml_tensor * paged_query_positions = nullptr;
+    // Mixed packed-tree verification may append compact one-token AR rows
+    // after the sequence-major tree rows. These mappings name the physical
+    // recurrent slabs for that AR suffix; tree rows keep using
+    // active_slot_ids/state_slot_ids above.
+    ggml_tensor * ar_active_slot_ids = nullptr;
+    ggml_tensor * ar_state_slot_ids = nullptr;
     // Optional [n_rows] i32 gather of final-norm rows before the LM head:
     // multi-prompt steps sample scattered rows (each committing segment's
     // last row plus the decode rows), which a tail view cannot express.
@@ -724,6 +744,9 @@ struct QwenGraphInputs {
     // Packed steps use logits_row_indices for scattered committing rows and
     // compact decode rows; logits_tail_rows remains the dense-path fallback.
     int  n_seqs = 1;
+    // Number of compact one-token AR rows appended after a packed tree.
+    // Zero preserves the established pure-tree/prefill/decode layouts.
+    int  n_ar_seqs = 0;
     int  seq_slot = 0;
     int  paged_max_kv_len = 0;
     int  n_prefill_tokens = 0;

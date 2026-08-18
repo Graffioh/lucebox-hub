@@ -22,6 +22,7 @@
 #pragma once
 
 #include "common/concurrency/seq_engine.h"
+#include "common/concurrency/speculation_gate.h"
 #include "common/dflash_draft_kv.h"
 #include "common/dflash_feature_ring.h"
 #include "common/ddtree.h"
@@ -118,13 +119,17 @@ private:
                              std::vector<float> * logits_scratch = nullptr);
     DraftFeatureMirror * slot_feature_mirror(int slot);
     DraftKvState * ensure_slot_draft_kv(int slot);
-    bool ddtree_eligible(const StepPlan & plan) const;
+    bool ddtree_available(const StepPlan & plan) const;
+    bool ddtree_input_eligible(const StepInput & input) const;
+    StepResult step_regular(const StepPlan & plan);
     // nullopt means proposal setup failed before target/cache mutation and the
     // caller may safely use the ordinary packed AR path for this iteration.
-    std::optional<StepResult> step_ddtree(const StepPlan & plan);
+    std::optional<StepResult> step_ddtree(
+        const StepPlan & speculative_plan, const StepPlan & ar_plan);
 
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
+    SpeculationGate speculation_gate_;
     int64_t         scratch_row_ = 0;
     int             tree_width_ = 0;
     int             tree_scratch_base_ = 0;

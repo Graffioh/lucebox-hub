@@ -122,6 +122,9 @@ static void print_usage(const char * prog) {
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
+        "  --decode-mode <adaptive|ar|speculation>\n"
+        "                       Default decode policy; requests may override it\n"
+        "                       with the decode_mode field (default: adaptive)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
         "                       trimmed per step by drafter confidence; N = fixed base)\n"
         "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
@@ -412,6 +415,14 @@ int main(int argc, char ** argv) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--decode-mode") == 0 && i + 1 < argc) {
+            const auto policy = parse_decode_mode(argv[++i]);
+            if (!policy) {
+                std::fprintf(stderr,
+                    "--decode-mode must be adaptive, ar, or speculation\n");
+                return 2;
+            }
+            sconfig.decode_mode = *policy;
         } else if (std::strcmp(argv[i], "--adaptive-experts") == 0) {
             const char * tau = "0.80";
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -680,6 +691,18 @@ int main(int argc, char ** argv) {
                 BackendPreparationError::FeatureCompatibility
             ? 2
             : 1;
+    }
+    const bool speculative_decode_enabled =
+        bargs.draft_path != nullptr &&
+        arch_supports_decode_draft(
+            backend_preparation.plan.arch(),
+            bargs.device.is_layer_split());
+    if (sconfig.decode_mode == SpeculationPolicy::Always &&
+        !speculative_decode_enabled) {
+        std::fprintf(stderr,
+            "[server] --decode-mode=speculation requires a supported "
+            "decode drafter (--draft)\n");
+        return 2;
     }
     // Options that parsed cleanly but do nothing on this model. Reported up
     // front so they are visible before the backend's own startup chatter.
@@ -1108,6 +1131,10 @@ int main(int argc, char ** argv) {
                              "[server] │     Use --fa-window 0 for tool-call workloads.\n");
     }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  decode_mode     = %.*s\n",
+                 static_cast<int>(decode_mode_name(
+                     sconfig.decode_mode).size()),
+                 decode_mode_name(sconfig.decode_mode).data());
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
     if (bargs.device.is_layer_split()) {
         std::fprintf(stderr, "[server] │  split_rollback  = %s\n",
@@ -1157,8 +1184,8 @@ int main(int argc, char ** argv) {
     sconfig.model_path   = bargs.model_path ? bargs.model_path : "";
     sconfig.draft_path   = bargs.draft_path ? bargs.draft_path : "";
     sconfig.fa_window    = bargs.fa_window;
-    sconfig.ddtree_budget = bargs.ddtree_budget;
-    sconfig.speculative_enabled = bargs.ddtree_mode;
+    sconfig.ddtree_budget = bargs.ddtree_mode ? bargs.ddtree_budget : 0;
+    sconfig.speculative_enabled = speculative_decode_enabled;
     sconfig.target_sharding     = bargs.device.is_layer_split();
     // KV type: report the operator's choice if set, else the family default
     // the backend resolves (the tq3_0 auto policy was removed; laguna uses

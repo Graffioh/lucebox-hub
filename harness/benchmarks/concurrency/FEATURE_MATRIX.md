@@ -39,7 +39,7 @@ VARIANTS=ddtree,pflash,kvflash,full CLIENTS=1,4,8,16 REPEATS=5 \
 harness/benchmarks/concurrency/run_qwen36_feature_matrix.sh
 ```
 
-`DDTREE_ADAPTIVE=0` matches the blog's continuous DDTree probe policy; leave it at the default `1` when measuring the concurrent engine's adaptive fallback policy. The concurrent path now records a startup `[parallel-ddtree]` marker and per-request `ddtree_steps`; these are the proof that DDTree actually ran.
+`DDTREE_ADAPTIVE=0` matches the blog-aligned continuous DDTree policy; leave it at the default `1` when measuring acceptance-gated speculation. The default policy gives cold requests bounded probation through ordinary speculative rounds, then ranks each request from its measured accepted-token EMA and the measured cost of the exact `(active requests, speculative requests)` route shape. No scout or prompt classifier runs. Selected DDTree paths and unselected AR roots share one packed target pass, with accepted paths committed directly when capture capacity permits and through fused replay otherwise. The concurrent path records a startup `[parallel-ddtree]` marker and per-request `ddtree_steps`; these are the proof that DDTree actually ran.
 
 On a 128 GiB Strix Halo host, budget roughly 45–90 minutes for this smoke run;
 the long-context AR controls dominate and actual time depends on the build.

@@ -2557,6 +2557,27 @@ TEST_CASE(ServerUnitFixture, test_pflash_raw_body_preserved) {
     TEST_ASSERT(req.raw_body["temperature"].get<float>() > 0.6f);
 }
 
+TEST_CASE(ServerUnitFixture, test_decode_mode_defaults_and_props) {
+    ParsedRequest req;
+    TEST_ASSERT(req.decode_mode == SpeculationPolicy::Adaptive);
+    TEST_ASSERT(parse_decode_mode("ar") == SpeculationPolicy::Never);
+    TEST_ASSERT(parse_decode_mode("speculation") == SpeculationPolicy::Always);
+    TEST_ASSERT(!parse_decode_mode("sometimes"));
+
+    ServerConfig cfg;
+    cfg.arch = "qwen35";
+    cfg.speculative_enabled = true;
+    cfg.decode_mode = SpeculationPolicy::Always;
+    Tokenizer tok;
+    PrefixCache pc(0, tok);
+    ToolMemory tm;
+    const json body = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(body["speculative"]["enabled"].get<bool>());
+    TEST_ASSERT(body["decode_mode"].get<std::string>() == "speculation");
+    TEST_ASSERT(body["speculative"]["decode_mode"].get<std::string>() ==
+                "speculation");
+}
+
 TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_overrides) {
     SamplingDefaults defaults;
     defaults.has_temperature = true;

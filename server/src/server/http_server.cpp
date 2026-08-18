@@ -764,6 +764,7 @@ json build_props_body(const ServerConfig & config,
         {"build_info",  std::string(kServerName) + " v" DFLASH_SERVER_VERSION
                         " props_schema=" + std::to_string(kPropsSchema)},
         {"speculative_mode", speculative_mode},
+        {"decode_mode", std::string(decode_mode_name(config.decode_mode))},
         {"server", server},
         {"model", {
             {"arch",         config.arch},
@@ -824,7 +825,9 @@ json build_props_body(const ServerConfig & config,
         }},
         {"speculative", {
             {"enabled",       config.speculative_enabled},
-            {"ddtree_budget", config.speculative_enabled
+            {"decode_mode",   std::string(decode_mode_name(
+                                  config.decode_mode))},
+            {"ddtree_budget", config.ddtree_budget > 0
                                 ? json(config.ddtree_budget) : json(nullptr)},
         }},
         {"sampling", {
@@ -1661,6 +1664,29 @@ bool HttpServer::parse_common_request_fields(
     req.stream = body.value("stream", false);
     req.model = body.value("model", config_.model_name);
     req.disk_cache_policy = config_.disk_cache_policy;
+    req.decode_mode = config_.decode_mode;
+
+    if (body.contains("decode_mode")) {
+        if (!body["decode_mode"].is_string()) {
+            send_error(fd, 400,
+                "decode_mode must be adaptive, ar, or speculation");
+            return false;
+        }
+        const auto parsed = parse_decode_mode(
+            body["decode_mode"].get<std::string>());
+        if (!parsed) {
+            send_error(fd, 400,
+                "decode_mode must be adaptive, ar, or speculation");
+            return false;
+        }
+        if (*parsed == SpeculationPolicy::Always &&
+            !config_.speculative_enabled) {
+            send_error(fd, 400,
+                "decode_mode=speculation requires speculative decode to be enabled");
+            return false;
+        }
+        req.decode_mode = *parsed;
+    }
 
     // Accept the output-token names used by each supported API dialect.
     // Default when the client omits all three: --default-max-tokens, so
@@ -1975,13 +2001,16 @@ bool HttpServer::validate_request_context(
 void HttpServer::log_parsed_request(const ParsedRequest & req) const {
     std::fprintf(stderr,
         "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
-        "max_tokens=%d max_ctx=%d thinking=%s started_in_thinking=%s stops=%zu model=%s\n",
+        "max_tokens=%d max_ctx=%d thinking=%s started_in_thinking=%s "
+        "decode_mode=%.*s stops=%zu model=%s\n",
         req.response_id.c_str(), api_format_name(req.format),
         req.stream ? "true" : "false",
         json_array_size(req.messages), json_array_size(req.tools),
         req.prompt_tokens.size(), req.max_output, config_.max_ctx,
         req.thinking_enabled ? "true" : "false",
         req.started_in_thinking ? "true" : "false",
+        static_cast<int>(decode_mode_name(req.decode_mode).size()),
+        decode_mode_name(req.decode_mode).data(),
         req.stop_sequences.size(), req.model.c_str());
 }
 
@@ -3475,6 +3504,9 @@ void HttpServer::prepare_generation_inputs(
     inputs.request.prompt = prepared.tokens;
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
+    inputs.request.speculation_policy = req.decode_mode;
+    inputs.request.force_ar_decode =
+        req.decode_mode == SpeculationPolicy::Never;
     inputs.request.do_sample = req.sampler.needs_logit_processing();
     // Tokens are delivered through DaemonIO so all API formats share the
     // same disconnect and streaming state machine.

@@ -702,8 +702,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 SeqEngine::StepInput input;
                 input.slot = i;
                 input.token = slots[(size_t)i].pending_tok;
+                input.speculation_policy =
+                    slots[(size_t)i].job->req.decode_mode;
                 input.allow_speculation =
-                    slots[(size_t)i].hook.close_token_ids.empty();
+                    slots[(size_t)i].hook.close_token_ids.empty() &&
+                    input.speculation_policy != SpeculationPolicy::Never;
                 step_plan.decode.push_back(input);
             } else if (slots[(size_t)i].job) {
                 prefill_candidates.push_back(

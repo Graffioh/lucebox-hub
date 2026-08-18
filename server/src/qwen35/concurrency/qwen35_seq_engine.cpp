@@ -15,12 +15,19 @@
 #include "common/ddtree.h"
 #include "common/geometric_draft_topk_cuda.h"
 #include "internal.h"
+#include "common/gpu_runtime_compat.h"
+#include "ggml-backend-impl.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <utility>
 #include <vector>
+using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
+extern "C++" to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
+
 
 namespace dflash::common {
 
@@ -33,6 +40,15 @@ int decode_bucket_width(int live_count) {
     for (int b : buckets)
         if (b >= live_count) return b;
     return 64;
+}
+
+int forced_speculative_requests() {
+    static const int forced = []() {
+        const char * value = std::getenv(
+            "DFLASH_ADAPTIVE_VERIFY_FORCE_SPECULATIVE_REQUESTS");
+        return value ? std::max(0, std::atoi(value)) : -1;
+    }();
+    return forced;
 }
 
 } // namespace
@@ -52,6 +68,7 @@ Qwen35SeqEngine::Qwen35SeqEngine(
       prefill_quantum_(std::max(1, prefill_quantum)), b_(backend),
       slots_(pool, max_ctx, std::max(1, tree_width),
              backend.paged_kv_residency_.get()),
+      speculation_gate_(SpecGateConfig{}, std::max(1, tree_width)),
       scratch_row_(scratch_row), tree_width_(tree_width),
       tree_scratch_base_(tree_scratch_base),
       tree_scratch_stride_(tree_scratch_stride) {
@@ -140,37 +157,33 @@ DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
     return state.get();
 }
 
-bool Qwen35SeqEngine::ddtree_eligible(const StepPlan & plan) const {
-    if (tree_width_ <= 1 || !capture_features_ || !plan.prefills.empty() ||
-        plan.decode.empty() || b_.dw_.block_size <= 1 ||
-        b_.cfg_.ddtree_budget + 1 != tree_width_) {
+bool Qwen35SeqEngine::ddtree_available(const StepPlan & plan) const {
+    return tree_width_ > 1 && capture_features_ && plan.prefills.empty() &&
+        !plan.decode.empty() && b_.dw_.block_size > 1 &&
+        b_.cfg_.ddtree_budget + 1 == tree_width_;
+}
+
+bool Qwen35SeqEngine::ddtree_input_eligible(const StepInput & in) const {
+    if (!in.allow_speculation || in.slot < 0 ||
+        in.slot >= slots_.slot_count() ||
+        !slots_.slot(in.slot).decoding() ||
+        slots_.slot(in.slot).sampler.needs_logit_processing() ||
+        slots_.slot(in.slot).cur_pos < 1 ||
+        slots_.slot(in.slot).cur_pos >= slots_.max_context()) {
         return false;
     }
     const int min_floor = []() {
         const char * value = std::getenv("DFLASH_MIN_TOKENS");
         return value ? std::max(0, std::atoi(value)) : 0;
     }();
-    for (const StepInput & in : plan.decode) {
-        if (!in.allow_speculation || in.slot < 0 ||
-            in.slot >= slots_.slot_count() ||
-            !slots_.slot(in.slot).decoding() ||
-            !slots_.ddtree_speculation_allowed(in.slot) ||
-            slots_.slot(in.slot).sampler.needs_logit_processing() ||
-            slots_.slot(in.slot).cur_pos < 1 ||
-            slots_.slot(in.slot).cur_pos >= slots_.max_context()) {
-            return false;
-        }
-        const Qwen35Slot & seq = slots_.slot(in.slot);
-        const int generated = seq.generated_tokens();
-        if (generated < min_floor) return false;
-    }
-    return true;
+    return slots_.slot(in.slot).generated_tokens() >= min_floor;
 }
 
 std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
-        const StepPlan & plan) {
+        const StepPlan & speculative_plan, const StepPlan & ar_plan) {
     StepResult result;
-    const int active = (int)plan.decode.size();
+    const int active = (int)speculative_plan.decode.size();
+    const int total_active = active + (int)ar_plan.decode.size();
     const int bucket = decode_bucket_width(active);
     const int T = tree_width_;
     const int q_len = b_.dw_.block_size;
@@ -200,7 +213,7 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         // A failed proposal graph may therefore leave only part of that
         // cache valid. Reset all participating draft rings so a later
         // speculative round rebuilds them from committed target features.
-        for (const StepInput & in : plan.decode) {
+        for (const StepInput & in : speculative_plan.decode) {
             if (in.slot >= 0 && in.slot < (int)slot_draft_kv_.size() &&
                 slot_draft_kv_[(size_t)in.slot]) {
                 draft_kv_reset(*slot_draft_kv_[(size_t)in.slot]);
@@ -216,7 +229,7 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
 
     // Proposal is sequential by slot: immutable draft weights are shared,
     // while each slot owns an independent persistent context-KV ring.
-    for (const StepInput & in : plan.decode) {
+    for (const StepInput & in : speculative_plan.decode) {
         DraftKvState * draft = ensure_slot_draft_kv(in.slot);
         DraftFeatureMirror * mirror = slot_feature_mirror(in.slot);
         if (!draft || !mirror) return proposal_fallback();
@@ -278,21 +291,72 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         proposals.push_back(std::move(p));
     }
 
+    const bool target_is_meta = b_.cache_.ssm_state.empty() ||
+        !b_.cache_.ssm_state.front() ||
+        ggml_backend_buft_is_meta(ggml_backend_buffer_get_type(
+            b_.cache_.ssm_state.front()->buffer));
+    const bool direct_commit =
+        !target_is_meta && bucket <= b_.cache_.tree_capture_lanes &&
+        T == b_.cache_.tree_capture_width &&
+        b_.cache_.target_feat_tree_scratch_base > 0;
+    struct DirectArStage {
+        Qwen35SlotManager::StepAppend append;
+    };
+    std::vector<DirectArStage> direct_ar;
+    if (direct_commit) {
+        direct_ar.resize(ar_plan.decode.size());
+        for (size_t i = 0; i < ar_plan.decode.size(); ++i) {
+            const StepInput & in = ar_plan.decode[i];
+            DirectArStage & staged = direct_ar[i];
+            staged.append = slots_.append_token(in.slot, in.token);
+            const bool table_ok = staged.append.ok &&
+                (slots_.residency_active() ||
+                 upload_block_table_delta(
+                     in.slot, staged.append.first_new_block,
+                     staged.append.new_blocks.data(),
+                     staged.append.new_blocks.size()));
+            if (!table_ok || staged.append.physical_rows.size() != 1) {
+                result.error = staged.append.busy
+                    ? "paged KV pool exhausted during mixed DDTree/AR step"
+                    : "mixed DDTree/AR append failed";
+                return result;
+            }
+        }
+        if (!direct_ar.empty() && !upload_all_active_block_tables()) {
+            result.error =
+                "mixed DDTree/AR block-table refresh failed";
+            return result;
+        }
+    }
+
     StepGraph & tree_sg = b_.sg_;
     int max_prefix = 1;
     for (const Proposal & p : proposals) {
         max_prefix = std::max(max_prefix, slots_.slot(p.slot).cur_pos);
     }
+    for (const DirectArStage & staged : direct_ar) {
+        max_prefix = std::max(max_prefix, staged.append.position + 1);
+    }
+    const int n_ar = (int)direct_ar.size();
     if (!build_target_step_paged_tree(
             tree_sg, b_.w_, b_.cache_, b_.target_backend_, T, bucket,
             max_prefix, tree_scratch_base_, tree_scratch_stride_,
-            b_.cfg_.kq_stride_pad)) {
+            b_.cfg_.kq_stride_pad, direct_commit, n_ar)) {
         result.error = "packed DDTree verify graph build failed";
         return result;
     }
 
     const int total_tree = T * bucket;
-    std::vector<int32_t> flat_tokens((size_t)total_tree, 0);
+    const int total_packed = total_tree + n_ar;
+    std::vector<int32_t> tree_feature_rows;
+    if (direct_commit) {
+        tree_feature_rows.resize((size_t)total_packed);
+        for (int row = 0; row < total_tree; ++row) {
+            tree_feature_rows[(size_t)row] =
+                b_.cache_.target_feat_tree_scratch_base + row;
+        }
+    }
+    std::vector<int32_t> flat_tokens((size_t)total_packed, 0);
     std::vector<int32_t> parents((size_t)total_tree, -1);
     std::vector<int32_t> sizes((size_t)bucket, 0);
     // Negative active IDs identify bucket padding. Recurrent gathers cannot
@@ -301,11 +365,14 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
     // their attention/output rows inactive and tree mode never persists it.
     std::vector<int32_t> tree_slots((size_t)bucket, -1);
     std::vector<int32_t> tree_state_slots((size_t)bucket, 0);
-    std::vector<int32_t> query_slots((size_t)total_tree, -1);
+    std::vector<int32_t> ar_slots((size_t)n_ar, -1);
+    std::vector<int32_t> ar_state_slots((size_t)n_ar, 0);
+    std::vector<int32_t> query_slots((size_t)total_packed, -1);
+    std::vector<int32_t> query_positions((size_t)total_packed, -1);
     std::vector<int64_t> tree_rows(
-        (size_t)total_tree * n_head_kv, scratch_row_);
-    std::vector<int32_t> tree_pos((size_t)4 * total_tree, 0);
-    std::vector<float> tree_embed((size_t)hidden * total_tree, 0.0f);
+        (size_t)total_packed * n_head_kv, scratch_row_);
+    std::vector<int32_t> tree_pos((size_t)4 * total_packed, 0);
+    std::vector<float> tree_embed((size_t)hidden * total_packed, 0.0f);
     seq_lens_.assign((size_t)n_slots, 0);
 
     for (int s = 0; s < active; ++s) {
@@ -324,18 +391,40 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
             const int depth = node == 0 ? 0 :
                 p.tree.depths[(size_t)node - 1];
             const int pos = slots_.slot(p.slot).cur_pos + depth;
-            tree_pos[(size_t)0 * total_tree + row] = pos;
-            tree_pos[(size_t)1 * total_tree + row] = pos;
-            tree_pos[(size_t)2 * total_tree + row] = pos;
+            tree_pos[(size_t)0 * total_packed + row] = pos;
+            tree_pos[(size_t)1 * total_packed + row] = pos;
+            tree_pos[(size_t)2 * total_packed + row] = pos;
             for (int h = 0; h < n_head_kv; ++h) {
-                tree_rows[(size_t)h * total_tree + row] =
+                tree_rows[(size_t)h * total_packed + row] =
                     (int64_t)tree_scratch_base_ +
                     (int64_t)p.slot * tree_scratch_stride_ + node;
             }
         }
     }
+    const int feature_cap = b_.cache_.target_feat_cap;
+    for (int i = 0; i < n_ar; ++i) {
+        const StepInput & in = ar_plan.decode[(size_t)i];
+        const Qwen35SlotManager::StepAppend & app =
+            direct_ar[(size_t)i].append;
+        const int row = total_tree + i;
+        flat_tokens[(size_t)row] = in.token;
+        ar_slots[(size_t)i] = in.slot;
+        ar_state_slots[(size_t)i] = in.slot;
+        query_slots[(size_t)row] = in.slot;
+        query_positions[(size_t)row] = app.position;
+        seq_lens_[(size_t)in.slot] = app.position + 1;
+        tree_pos[(size_t)0 * total_packed + row] = app.position;
+        tree_pos[(size_t)1 * total_packed + row] = app.position;
+        tree_pos[(size_t)2 * total_packed + row] = app.position;
+        tree_feature_rows[(size_t)row] =
+            in.slot * feature_cap + app.position % feature_cap;
+        for (int h = 0; h < n_head_kv; ++h) {
+            tree_rows[(size_t)h * total_packed + row] =
+                app.physical_rows[0];
+        }
+    }
     if (!b_.w_.embedder.embed(
-            flat_tokens.data(), total_tree, tree_embed.data())) {
+            flat_tokens.data(), total_packed, tree_embed.data())) {
         result.error = "packed DDTree embedding failed";
         return result;
     }
@@ -357,10 +446,26 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
     }
     ggml_backend_tensor_set(tree_sg.state_slot_ids, tree_state_slots.data(), 0,
                             sizeof(int32_t) * tree_state_slots.size());
+    if (n_ar > 0) {
+        ggml_backend_tensor_set(
+            tree_sg.ar_active_slot_ids, ar_slots.data(), 0,
+            sizeof(int32_t) * ar_slots.size());
+        ggml_backend_tensor_set(
+            tree_sg.ar_state_slot_ids, ar_state_slots.data(), 0,
+            sizeof(int32_t) * ar_state_slots.size());
+        ggml_backend_tensor_set(
+            tree_sg.paged_query_positions, query_positions.data(), 0,
+            sizeof(int32_t) * query_positions.size());
+    }
     ggml_backend_tensor_set(tree_sg.paged_query_seq_ids, query_slots.data(), 0,
                             sizeof(int32_t) * query_slots.size());
     ggml_backend_tensor_set(tree_sg.kv_write_rows, tree_rows.data(), 0,
                             sizeof(int64_t) * tree_rows.size());
+    if (direct_commit) {
+        ggml_backend_tensor_set(
+            tree_sg.target_feat_rows, tree_feature_rows.data(), 0,
+            sizeof(int32_t) * tree_feature_rows.size());
+    }
     ggml_backend_tensor_set(b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
                             sizeof(int32_t) * seq_lens_.size());
     if (ggml_backend_graph_compute(b_.target_backend_, tree_sg.gf) !=
@@ -368,9 +473,21 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         result.error = "packed DDTree verify compute failed";
         return result;
     }
-    std::vector<int32_t> posterior((size_t)total_tree, -1);
+    std::vector<int32_t> posterior((size_t)total_packed, -1);
     ggml_backend_tensor_get(tree_sg.argmax_tokens, posterior.data(), 0,
                             sizeof(int32_t) * posterior.size());
+    std::vector<int32_t> direct_ar_next((size_t)n_ar, -1);
+    for (int i = 0; i < n_ar; ++i) {
+        const int row = total_tree + i;
+        direct_ar_next[(size_t)i] = sample_graph_row(
+            ar_plan.decode[(size_t)i].slot, row,
+            &posterior[(size_t)row], &logits_buf_);
+        if (direct_ar_next[(size_t)i] < 0) {
+            result.error =
+                "mixed DDTree/AR graph produced an invalid AR token";
+            return result;
+        }
+    }
 
     int replay_total = 0;
     for (int s = 0; s < active; ++s) {
@@ -387,6 +504,262 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         }
         replay_total += (int)p.accepted.size();
     }
+    if (direct_commit) {
+        struct DirectAppend {
+            Qwen35SlotManager::StepAppend append;
+            std::vector<int32_t> tokens;
+        };
+        std::vector<DirectAppend> appends((size_t)active);
+        std::vector<int> write_slots;
+        write_slots.reserve((size_t)total_active);
+        for (const StepInput & in : ar_plan.decode) {
+            write_slots.push_back(in.slot);
+        }
+
+        for (int s = 0; s < active; ++s) {
+            Proposal & p = proposals[(size_t)s];
+            DirectAppend & staged = appends[(size_t)s];
+            staged.tokens.reserve(p.accepted.size());
+            for (int dfs : p.accepted) {
+                staged.tokens.push_back(dfs == 0 ? p.root :
+                    p.tree.token_ids[(size_t)dfs - 1]);
+            }
+            staged.append = slots_.append_tokens(
+                p.slot, staged.tokens.data(), (int)staged.tokens.size());
+            const bool table_ok = staged.append.ok &&
+                (slots_.residency_active() ||
+                 upload_block_table_delta(
+                     p.slot, staged.append.first_new_block,
+                     staged.append.new_blocks.data(),
+                     staged.append.new_blocks.size()));
+            if (!table_ok ||
+                staged.append.physical_rows.size() != staged.tokens.size()) {
+                result.error = staged.append.busy
+                    ? "paged KV pool exhausted during DDTree direct commit"
+                    : "DDTree direct commit K/V append failed";
+                return result;
+            }
+            write_slots.push_back(p.slot);
+        }
+
+        const size_t n_delta = b_.cache_.ssm_state.size();
+        if (tree_sg.delta_captures.size() != n_delta ||
+            b_.cache_.conv_state.size() != n_delta) {
+            result.error = "DDTree direct commit capture count mismatch";
+            return result;
+        }
+        const auto to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+        if (!to_fp32) {
+            result.error = "DDTree direct commit has no F16 state converter";
+            return result;
+        }
+
+        cudaStream_t stream = nullptr;
+        auto copy_2d = [&](void * dst, size_t dst_pitch,
+                           const void * src, size_t src_pitch,
+                           size_t width, size_t height) {
+            return cudaMemcpy2DAsync(
+                       dst, dst_pitch, src, src_pitch, width, height,
+                       cudaMemcpyDeviceToDevice, stream) == cudaSuccess;
+        };
+        auto copy_row = [&](ggml_tensor * tensor, int64_t src_row,
+                            int64_t dst_row) {
+            if (!tensor || src_row < 0 || dst_row < 0 ||
+                src_row >= tensor->ne[1] || dst_row >= tensor->ne[1]) {
+                return false;
+            }
+            const size_t row_bytes = tensor->nb[1];
+            for (int h = 0; h < (int)tensor->ne[2]; ++h) {
+                const char * src = (const char *)tensor->data +
+                    (size_t)h * tensor->nb[2] +
+                    (size_t)src_row * tensor->nb[1];
+                char * dst = (char *)tensor->data +
+                    (size_t)h * tensor->nb[2] +
+                    (size_t)dst_row * tensor->nb[1];
+                if (cudaMemcpyAsync(
+                        dst, src, row_bytes, cudaMemcpyDeviceToDevice,
+                        stream) != cudaSuccess) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const int conv_kernel = b_.w_.ssm_d_conv;
+        if (conv_kernel < 2) {
+            result.error = "DDTree direct commit has invalid conv kernel";
+            return result;
+        }
+        for (size_t il = 0; il < n_delta; ++il) {
+            const DeltaNetCapture & cap = tree_sg.delta_captures[il];
+            ggml_tensor * state = b_.cache_.ssm_state[il];
+            ggml_tensor * conv = b_.cache_.conv_state[il];
+            if (!cap.ssm_intermediate_states || !cap.conv_input ||
+                !state || !conv ||
+                cap.ssm_intermediate_states->type != GGML_TYPE_F16 ||
+                cap.ssm_intermediate_states->ne[3] < T * bucket ||
+                cap.conv_input->ne[2] < bucket) {
+                result.error = "DDTree direct commit capture layout mismatch";
+                return result;
+            }
+            const int64_t state_elems =
+                state->ne[0] * state->ne[1] * state->ne[2];
+            for (int s = 0; s < active; ++s) {
+                const Proposal & p = proposals[(size_t)s];
+                const int deepest = p.accepted.back();
+                const int capture_row = s * T + deepest;
+                const char * state_src =
+                    (const char *)cap.ssm_intermediate_states->data +
+                    (size_t)capture_row *
+                        cap.ssm_intermediate_states->nb[3];
+                float * state_dst = (float *)((char *)state->data +
+                    (size_t)p.slot * state->nb[3]);
+                to_fp32(state_src, state_dst, state_elems, stream);
+                if (cudaPeekAtLastError() != cudaSuccess) {
+                    result.error = "DDTree direct commit SSM conversion failed";
+                    return result;
+                }
+
+                std::vector<int> ancestry((size_t)conv_kernel - 1);
+                ancestry.back() = deepest;
+                for (int k = conv_kernel - 3; k >= 0; --k) {
+                    const int next = ancestry[(size_t)k + 1];
+                    ancestry[(size_t)k] =
+                        next >= 0 ? p.tree.parents[(size_t)next] : next - 1;
+                }
+                for (int k = 0; k < conv_kernel - 1; ++k) {
+                    const int source_col =
+                        conv_kernel - 1 + ancestry[(size_t)k];
+                    if (source_col < 0 ||
+                        source_col >= cap.conv_input->ne[0]) {
+                        result.error =
+                            "DDTree direct commit conv ancestry is invalid";
+                        return result;
+                    }
+                    const char * conv_src =
+                        (const char *)cap.conv_input->data +
+                        (size_t)s * cap.conv_input->nb[2] +
+                        (size_t)source_col *
+                            ggml_element_size(cap.conv_input);
+                    char * conv_dst = (char *)conv->data +
+                        (size_t)p.slot * conv->nb[2] +
+                        (size_t)k * ggml_element_size(conv);
+                    if (!copy_2d(
+                            conv_dst, conv->nb[1], conv_src,
+                            cap.conv_input->nb[1],
+                            ggml_element_size(conv), conv->ne[1])) {
+                        result.error =
+                            "DDTree direct commit conv state copy failed";
+                        return result;
+                    }
+                }
+            }
+        }
+
+        for (int s = 0; s < active; ++s) {
+            const Proposal & p = proposals[(size_t)s];
+            const DirectAppend & staged = appends[(size_t)s];
+            for (size_t d = 0; d < p.accepted.size(); ++d) {
+                const int dfs = p.accepted[d];
+                const int64_t src_row =
+                    (int64_t)tree_scratch_base_ +
+                    (int64_t)p.slot * tree_scratch_stride_ + dfs;
+                const int64_t dst_row = staged.append.physical_rows[d];
+                for (size_t il = 0; il < b_.cache_.attn_k.size(); ++il) {
+                    if (!copy_row(b_.cache_.attn_k[il], src_row, dst_row) ||
+                        !copy_row(b_.cache_.attn_v[il], src_row, dst_row)) {
+                        result.error =
+                            "DDTree direct commit paged K/V copy failed";
+                        return result;
+                    }
+                }
+
+                ggml_tensor * feat = b_.cache_.target_feat;
+                const int src_feat =
+                    b_.cache_.target_feat_tree_scratch_base + s * T + dfs;
+                const int dst_feat = p.slot * b_.cache_.target_feat_cap +
+                    (staged.append.position + (int)d) %
+                        b_.cache_.target_feat_cap;
+                if (!feat || src_feat < 0 || dst_feat < 0 ||
+                    src_feat >= feat->ne[1] || dst_feat >= feat->ne[1] ||
+                    cudaMemcpyAsync(
+                        (char *)feat->data +
+                            (size_t)dst_feat * feat->nb[1],
+                        (const char *)feat->data +
+                            (size_t)src_feat * feat->nb[1],
+                        feat->nb[1], cudaMemcpyDeviceToDevice,
+                        stream) != cudaSuccess) {
+                    result.error =
+                        "DDTree direct commit target feature copy failed";
+                    return result;
+                }
+            }
+        }
+
+        if (cudaStreamSynchronize(stream) != cudaSuccess) {
+            result.error = "DDTree direct commit synchronization failed";
+            return result;
+        }
+        if (!commit_residency_writes(write_slots)) {
+            result.error = "DDTree direct commit residency write failed";
+            return result;
+        }
+        for (int slot : write_slots) slots_.commit_step(slot);
+        if (!upload_all_active_block_tables()) {
+            result.error = "DDTree direct commit block-table refresh failed";
+            return result;
+        }
+
+
+        for (int slot : write_slots) {
+            std::string reselect_error;
+            if (!maybe_reselect_residency(slot, reselect_error)) {
+                result.error = reselect_error.empty()
+                    ? "KVFlash reselect failed" : reselect_error;
+                return result;
+            }
+        }
+
+        result.decode.reserve((size_t)total_active);
+        for (Proposal & p : proposals) {
+            if (p.bonus < 0 || p.bonus >= b_.w_.n_vocab) {
+                result.error =
+                    "DDTree direct commit produced an invalid pending token";
+                return result;
+            }
+            DecodeOutput out;
+            out.slot = p.slot;
+            out.token = p.bonus;
+            out.ddtree_steps = 1;
+            out.ddtree_accepted_tokens =
+                (uint64_t)((int)p.accepted.size() - 1);
+            out.target_forwards = 1;
+            for (size_t i = 1; i < p.accepted.size(); ++i) {
+                const int dfs = p.accepted[i];
+                out.committed_tokens.push_back(
+                    p.tree.token_ids[(size_t)dfs - 1]);
+            }
+            attach_residency_telemetry(out);
+            result.decode.push_back(std::move(out));
+        }
+        for (size_t i = 0; i < ar_plan.decode.size(); ++i) {
+            DecodeOutput out;
+            out.slot = ar_plan.decode[i].slot;
+            out.token = direct_ar_next[i];
+            out.target_forwards = 1;
+            attach_residency_telemetry(out);
+            result.decode.push_back(std::move(out));
+        }
+        static const bool direct_commit_diag =
+            std::getenv("DFLASH_DDTREE_DIRECT_COMMIT_DIAG") != nullptr;
+        if (direct_commit_diag) {
+            std::fprintf(stderr,
+                "[parallel-ddtree] mode=one-pass-tree-ar speculative=%d ar=%zu\n",
+                active, ar_plan.decode.size());
+        }
+        return result;
+    }
+    replay_total += (int)ar_plan.decode.size();
 
     std::vector<QwenPrefillSegment> replay_segments;
     std::vector<int32_t> replay_tokens;
@@ -394,12 +767,12 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
     std::vector<int32_t> replay_positions;
     std::vector<int64_t> replay_rows;
     std::vector<int32_t> replay_logits_rows;
-    replay_segments.reserve((size_t)active);
+    replay_segments.reserve((size_t)total_active);
     replay_tokens.reserve((size_t)replay_total);
     replay_slots.reserve((size_t)replay_total);
     replay_positions.reserve((size_t)replay_total);
     replay_rows.assign((size_t)replay_total * n_head_kv, scratch_row_);
-    replay_logits_rows.reserve((size_t)active);
+    replay_logits_rows.reserve((size_t)total_active);
     seq_lens_.assign((size_t)n_slots, 0);
 
     int replay_offset = 0;
@@ -437,6 +810,36 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         replay_logits_rows.push_back(replay_offset - 1);
         seq_lens_[(size_t)p.slot] = app.position + (int)path.size();
     }
+    for (const StepInput & in : ar_plan.decode) {
+        const Qwen35SlotManager::StepAppend app = slots_.append_tokens(
+            in.slot, &in.token, 1);
+        const bool table_ok = slots_.residency_active() ||
+            upload_block_table_delta(in.slot, app.first_new_block,
+                app.new_blocks.data(), app.new_blocks.size());
+        if (!app.ok || app.physical_rows.size() != 1 || !table_ok) {
+            result.error = app.busy
+                ? "paged KV pool exhausted during mixed DDTree/AR replay"
+                : "mixed DDTree/AR replay K/V append failed";
+            return result;
+        }
+        replay_segments.push_back({replay_offset, 1, in.slot});
+        replay_tokens.push_back(in.token);
+        replay_slots.push_back(in.slot);
+        replay_positions.push_back(app.position);
+        for (int h = 0; h < n_head_kv; ++h) {
+            replay_rows[(size_t)h * replay_total + replay_offset] =
+                app.physical_rows[0];
+        }
+        ++replay_offset;
+        replay_logits_rows.push_back(replay_offset - 1);
+        seq_lens_[(size_t)in.slot] = app.position + 1;
+    }
+    if (replay_offset != replay_total ||
+        (int)replay_segments.size() != total_active ||
+        (int)replay_logits_rows.size() != total_active) {
+        result.error = "mixed DDTree/AR replay staging mismatch";
+        return result;
+    }
 
     if (!upload_all_active_block_tables()) {
         result.error = "DDTree replay block-table refresh failed";
@@ -450,7 +853,7 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
             b_.cfg_.kq_stride_pad, false, false, false, true,
             1, 0, *std::max_element(seq_lens_.begin(), seq_lens_.end()),
             replay_total, replay_segments.data(),
-            (int)replay_segments.size(), active, false) ||
+            (int)replay_segments.size(), total_active, false) ||
         !replay_sg.target_feat_rows || !replay_sg.paged_query_seq_ids ||
         !replay_sg.paged_query_positions || !replay_sg.logits_row_indices ||
         !replay_sg.argmax_tokens) {
@@ -500,18 +903,20 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         return result;
     }
     std::vector<int> replay_write_slots;
-    replay_write_slots.reserve(proposals.size());
+    replay_write_slots.reserve((size_t)total_active);
     for (const Proposal & p : proposals) replay_write_slots.push_back(p.slot);
+    for (const StepInput & in : ar_plan.decode) {
+        replay_write_slots.push_back(in.slot);
+    }
     if (!commit_residency_writes(replay_write_slots)) {
-        result.error = "DDTree replay KV write commit failed";
+        result.error = "mixed DDTree/AR replay KV write commit failed";
         return result;
     }
+    for (int slot : replay_write_slots) slots_.commit_step(slot);
 
-    // The replay is the durable target forward: its recurrent/KV/feature
-    // state is what the next step consumes. Use its posterior rather than
-    // the tree-verify posterior so the pending scalar remains exact even if
-    // the two graph shapes differ numerically.
-    std::vector<int32_t> replay_next((size_t)active, -1);
+    // The replay is the one durable target forward for both routes. Its
+    // recurrent/KV/feature state is what the next step consumes.
+    std::vector<int32_t> replay_next((size_t)total_active, -1);
     ggml_backend_tensor_get(
         replay_sg.argmax_tokens, replay_next.data(), 0,
         sizeof(int32_t) * replay_next.size());
@@ -522,34 +927,28 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
         }
         proposals[(size_t)s].bonus = replay_next[(size_t)s];
     }
+    std::vector<int32_t> ar_next(ar_plan.decode.size(), -1);
+    for (size_t i = 0; i < ar_plan.decode.size(); ++i) {
+        const int logits_row = active + (int)i;
+        ar_next[i] = sample_graph_row(
+            ar_plan.decode[i].slot, logits_row,
+            &replay_next[(size_t)logits_row], &logits_buf_);
+        if (ar_next[i] < 0) {
+            result.error = "mixed replay produced an invalid AR token";
+            return result;
+        }
+    }
 
-    for (Proposal & p : proposals) {
-        slots_.commit_step(p.slot);
+    for (int slot : replay_write_slots) {
         std::string reselect_error;
-        if (!maybe_reselect_residency(p.slot, reselect_error)) {
+        if (!maybe_reselect_residency(slot, reselect_error)) {
             result.error = reselect_error.empty()
                 ? "KVFlash reselect failed" : reselect_error;
             return result;
         }
     }
 
-    uint64_t cohort_emitted = 0;
-    for (const Proposal & p : proposals) {
-        // accepted contains the replay root plus accepted children. The
-        // output emits those children plus one separately computed pending
-        // scalar, so accepted.size() is this request's emitted yield.
-        cohort_emitted += (uint64_t)p.accepted.size();
-    }
-    const bool suspend_cohort =
-        Qwen35SlotManager::ddtree_cohort_should_suspend(
-            cohort_emitted, active);
-    std::vector<bool> newly_suspended((size_t)slots_.slot_count(), false);
-    for (const Proposal & p : proposals) {
-        newly_suspended[(size_t)p.slot] =
-            slots_.record_ddtree_sample(p.slot, suspend_cohort);
-    }
-
-    result.decode.reserve((size_t)active);
+    result.decode.reserve((size_t)total_active);
     for (Proposal & p : proposals) {
         DecodeOutput out;
         out.slot = p.slot;
@@ -563,20 +962,14 @@ std::optional<SeqEngine::StepResult> Qwen35SeqEngine::step_ddtree(
             out.committed_tokens.push_back(
                 p.tree.token_ids[(size_t)dfs - 1]);
         }
-        if (newly_suspended[(size_t)p.slot]) {
-            out.ddtree_suspensions = 1;
-            const Qwen35Slot & seq = slots_.slot(p.slot);
-            std::fprintf(stderr,
-                "[parallel-ddtree] adaptive suspend request=%llu slot=%d "
-                "sample=%llu emitted=%d accepted_children=%d "
-                "cohort_emitted=%llu cohort_size=%d target_forwards=2 "
-                "floor=%d\n",
-                (unsigned long long)seq.request_id, p.slot,
-                (unsigned long long)seq.ddtree_sampled_steps,
-                accepted_children + 1, accepted_children,
-                (unsigned long long)cohort_emitted, active,
-                Qwen35SlotManager::kDdtreeMinEmittedTokens);
-        }
+        attach_residency_telemetry(out);
+        result.decode.push_back(std::move(out));
+    }
+    for (size_t i = 0; i < ar_plan.decode.size(); ++i) {
+        DecodeOutput out;
+        out.slot = ar_plan.decode[i].slot;
+        out.token = ar_next[i];
+        out.target_forwards = 1;
         attach_residency_telemetry(out);
         result.decode.push_back(std::move(out));
     }
@@ -787,8 +1180,6 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
 
 SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     StepResult result;
-    std::vector<DecodeOutput> & decode_outputs = result.decode;
-    std::vector<PrefillOutput> & prefill_outputs = result.prefills;
     const std::vector<StepInput> & inputs = plan.decode;
     const int n_slots = slots_.slot_count();
 
@@ -835,13 +1226,171 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     }
     if (inputs.empty() && plan.prefills.empty()) return result;
 
-    if (ddtree_eligible(plan)) {
-        std::optional<StepResult> speculative = step_ddtree(plan);
-        if (speculative) return std::move(*speculative);
-        // Proposal setup failed before target/cache mutation. Preserve service
-        // by taking the existing packed AR path for this iteration.
+    if (!ddtree_available(plan)) return step_regular(plan);
+
+    const char * adaptive = std::getenv("DFLASH_DDTREE_ADAPTIVE");
+    const bool adaptive_enabled = !(adaptive && std::atoi(adaptive) == 0);
+    const int C = static_cast<int>(inputs.size());
+    const int k_cap = std::min(
+        C, std::max(0, b_.cache_.tree_capture_lanes));
+
+    // DDTree's adapter has no cold prior: normal speculative rounds provide
+    // both accepted yield and the hardware cost. DSpark can later populate
+    // prior_accept from its calibrated confidence head without gate changes.
+    std::vector<SpecCandidate> candidates;
+    candidates.reserve(inputs.size());
+    for (const StepInput & in : inputs) {
+        const Qwen35Slot & seq = slots_.slot(in.slot);
+        candidates.push_back({
+            in.slot,
+            seq.request_id,
+            in.speculation_policy,
+            ddtree_input_eligible(in),
+            std::numeric_limits<double>::quiet_NaN(),
+            seq.generated_tokens(),
+        });
     }
 
+    const int oracle_limit = forced_speculative_requests();
+    const bool gate_active = adaptive_enabled && oracle_limit < 0;
+    std::vector<int> spec_slots;
+    if (gate_active) {
+        spec_slots = speculation_gate_.plan(C, candidates, k_cap);
+    } else if (oracle_limit >= 0) {
+        // Explicit Always requests remain mandatory even when the benchmark
+        // oracle asks for a smaller synthetic speculative subbatch.
+        for (const SpecCandidate & candidate : candidates) {
+            if (candidate.eligible &&
+                candidate.policy == SpeculationPolicy::Always) {
+                spec_slots.push_back(candidate.slot);
+            }
+        }
+        const int target = std::max(
+            oracle_limit, static_cast<int>(spec_slots.size()));
+        for (const SpecCandidate & candidate : candidates) {
+            if ((int)spec_slots.size() >= target) break;
+            if (!candidate.eligible ||
+                candidate.policy != SpeculationPolicy::Adaptive) {
+                continue;
+            }
+            spec_slots.push_back(candidate.slot);
+        }
+    } else {
+        // Burn-in/parity mode: preserve fixed speculation for every eligible
+        // request except an explicit per-request Never override.
+        for (const SpecCandidate & candidate : candidates) {
+            if (candidate.eligible &&
+                candidate.policy != SpeculationPolicy::Never) {
+                spec_slots.push_back(candidate.slot);
+            }
+        }
+    }
+    if (gate_active && (int)spec_slots.size() > k_cap) {
+        return fail_step(
+            "forced speculation requests exceed DDTree executor capacity");
+    }
+
+    std::vector<uint8_t> selected((size_t)n_slots, 0);
+    for (int slot : spec_slots) {
+        if (slot >= 0 && slot < n_slots) selected[(size_t)slot] = 1;
+    }
+
+    StepPlan speculative_plan;
+    StepPlan ar_plan;
+    speculative_plan.decode.reserve(spec_slots.size());
+    ar_plan.decode.reserve(inputs.size() - spec_slots.size());
+    for (const StepInput & in : inputs) {
+        const bool eligible = ddtree_input_eligible(in);
+        if (eligible && selected[(size_t)in.slot]) {
+            speculative_plan.decode.push_back(in);
+        } else {
+            ar_plan.decode.push_back(in);
+        }
+    }
+
+    using Clock = std::chrono::steady_clock;
+    StepResult routed_result;
+    const int speculative_count =
+        static_cast<int>(speculative_plan.decode.size());
+    const auto started = Clock::now();
+    if (speculative_count > 0) {
+        std::optional<StepResult> mixed =
+            step_ddtree(speculative_plan, ar_plan);
+        if (!mixed) {
+            // Proposal setup failed before target/cache mutation. Preserve
+            // service with one ordinary packed step and retry speculation on a
+            // later iteration. Do not learn from this contaminated timing.
+            return step_regular(plan);
+        }
+        if (!mixed->ok()) return std::move(*mixed);
+        routed_result = std::move(*mixed);
+    } else {
+        routed_result = step_regular(ar_plan);
+        if (!routed_result.ok()) return routed_result;
+    }
+    const double route_us = std::max(
+        1.0, std::chrono::duration<double, std::micro>(
+                 Clock::now() - started).count());
+
+    if (gate_active) {
+        if (speculative_count == 0) {
+            speculation_gate_.observe_ar(C, route_us);
+        } else {
+            std::vector<std::pair<std::uint64_t, int>> accepted_yields;
+            accepted_yields.reserve((size_t)speculative_count);
+            for (const DecodeOutput & out : routed_result.decode) {
+                if (out.failed || out.slot < 0 || out.slot >= n_slots ||
+                    !selected[(size_t)out.slot]) {
+                    continue;
+                }
+                accepted_yields.emplace_back(
+                    slots_.slot(out.slot).request_id,
+                    static_cast<int>(out.ddtree_accepted_tokens + 1));
+            }
+            speculation_gate_.observe_spec(
+                C, speculative_count, route_us, accepted_yields);
+        }
+    }
+
+    std::vector<DecodeOutput> by_slot((size_t)n_slots);
+    std::vector<uint8_t> present((size_t)n_slots, 0);
+    auto collect = [&](std::vector<DecodeOutput> & outputs) {
+        for (DecodeOutput & out : outputs) {
+            if (out.slot < 0 || out.slot >= n_slots ||
+                present[(size_t)out.slot]) {
+                return false;
+            }
+            present[(size_t)out.slot] = 1;
+            by_slot[(size_t)out.slot] = std::move(out);
+        }
+        return true;
+    };
+    if (!collect(routed_result.decode)) {
+        return fail_step("adaptive decode produced duplicate slot output");
+    }
+    result.decode.reserve(inputs.size());
+    for (const StepInput & in : inputs) {
+        if (!present[(size_t)in.slot]) {
+            return fail_step("adaptive decode omitted a live slot output");
+        }
+        result.decode.push_back(std::move(by_slot[(size_t)in.slot]));
+    }
+    return result;
+}
+
+SeqEngine::StepResult Qwen35SeqEngine::step_regular(const StepPlan & plan) {
+    StepResult result;
+    std::vector<DecodeOutput> & decode_outputs = result.decode;
+    std::vector<PrefillOutput> & prefill_outputs = result.prefills;
+    const std::vector<StepInput> & inputs = plan.decode;
+    const int n_slots = slots_.slot_count();
+
+    auto fail_step = [&](const std::string & error) {
+        result.decode.clear();
+        result.prefills.clear();
+        result.error = error;
+        return std::move(result);
+    };
     const TargetWeights & w = b_.w_;
     StepGraph & sg = b_.sg_;
     const int hidden = w.n_embd;
@@ -1222,6 +1771,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
 
 void Qwen35SeqEngine::retire(int slot) {
     if (!slots_.is_active(slot)) return;
+    speculation_gate_.forget(slots_.slot(slot).request_id);
     slots_.retire(slot);
 }
 

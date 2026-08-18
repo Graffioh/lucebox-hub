@@ -59,6 +59,12 @@ struct StepGraph {
     // Recurrent gather rows. Unlike active/paged IDs, padding must name a
     // valid harmless slot (normally 0): ggml_get_rows does not mask -1.
     ggml_tensor *   state_slot_ids = nullptr;
+    // Mixed DDTree+AR target graph: compact AR rows use their own recurrent
+    // mapping after the tree rows. Keeping these separate lets the graph
+    // share projections/FFN while the small conv/GDN cores retain their
+    // proven uniform [timesteps,sequences] layouts.
+    ggml_tensor *   ar_active_slot_ids = nullptr;
+    ggml_tensor *   ar_state_slot_ids = nullptr;
     // Ragged paged read (concurrent prefill): per-row block-table column and
     // inclusive causal position, [n_tokens] i32 each. Padding rows carry -1.
     ggml_tensor *   paged_query_seq_ids = nullptr;
@@ -102,6 +108,8 @@ inline void step_graph_free(StepGraph & sg) {
     sg.kv_write_rows = nullptr;
     sg.active_slot_ids = nullptr;
     sg.state_slot_ids = nullptr;
+    sg.ar_active_slot_ids = nullptr;
+    sg.ar_state_slot_ids = nullptr;
     sg.paged_query_seq_ids = nullptr;
     sg.paged_query_positions = nullptr;
     sg.target_feat_rows = nullptr;

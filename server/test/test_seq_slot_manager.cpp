@@ -492,62 +492,6 @@ int main() {
         CHECK(!mgr.has_prefill_prompt_at_least(768));
     }
 
-    // Adaptive DDTree judges aggregate cohort yield rather than allowing one
-    // unlucky request to suppress higher-yield peers. Equality at the
-    // six-token average continues; a low average suspends all participants.
-    {
-        const luce_test::ScopedEnvVar adaptive("DFLASH_DDTREE_ADAPTIVE", nullptr);
-        CHECK(Qwen35SlotManager::ddtree_cohort_should_suspend(5, 1));
-        CHECK(!Qwen35SlotManager::ddtree_cohort_should_suspend(6, 1));
-        // Mixed synthetic cohort: one child-less row plus an eleven-token row
-        // exactly meets the continuation floor; one fewer token does not.
-        CHECK(!Qwen35SlotManager::ddtree_cohort_should_suspend(12, 2));
-        CHECK(Qwen35SlotManager::ddtree_cohort_should_suspend(11, 2));
-
-        PagedKvPool pool(8, 2, /*block_size=*/16);
-        Qwen35SlotManager mgr(pool, 64);
-        auto a = admit(mgr, 101, prompt_tokens(4), greedy_sampler());
-        auto b = admit(mgr, 102, prompt_tokens(4), greedy_sampler());
-        CHECK(is_admitted(a));
-        CHECK(is_admitted(b));
-        CHECK(mgr.append_prefill(a.slot, 4).ok);
-        CHECK(mgr.append_prefill(b.slot, 4).ok);
-        mgr.commit_prefill(a.slot);
-        mgr.commit_prefill(b.slot);
-        CHECK(mgr.slot(a.slot).request_id == 101);
-        CHECK(mgr.slot(b.slot).request_id == 102);
-        CHECK(mgr.ddtree_speculation_allowed(a.slot));
-        CHECK(mgr.ddtree_speculation_allowed(b.slot));
-
-        // The keep decision records a real sample without latching either
-        // participant, including the low-yield member.
-        CHECK(!mgr.record_ddtree_sample(a.slot, false));
-        CHECK(!mgr.record_ddtree_sample(b.slot, false));
-        CHECK(mgr.ddtree_speculation_allowed(a.slot));
-        CHECK(mgr.ddtree_speculation_allowed(b.slot));
-        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 1);
-        CHECK(mgr.slot(b.slot).ddtree_sampled_steps == 1);
-
-        // A low cohort decision is applied identically and atomically to both.
-        CHECK(mgr.record_ddtree_sample(a.slot, true));
-        CHECK(mgr.record_ddtree_sample(b.slot, true));
-        CHECK(!mgr.ddtree_speculation_allowed(a.slot));
-        CHECK(!mgr.ddtree_speculation_allowed(b.slot));
-        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 2);
-        CHECK(mgr.slot(b.slot).ddtree_sampled_steps == 2);
-
-        // Suspended requests cannot pay for another bad probe.
-        CHECK(!mgr.record_ddtree_sample(a.slot, true));
-        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 2);
-
-        mgr.retire(a.slot);
-        auto reused = admit(mgr, 103, prompt_tokens(4), greedy_sampler());
-        CHECK(is_admitted(reused) && reused.slot == a.slot);
-        CHECK(mgr.slot(reused.slot).request_id == 103);
-        CHECK(mgr.ddtree_speculation_allowed(reused.slot));
-        CHECK(mgr.slot(reused.slot).ddtree_sampled_steps == 0);
-    }
-
     // A failed residency barrier quarantines retirement ownership, and a
     // later admission retries it before considering the slot reusable.
     {

@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 
 namespace dflash::common {
 
@@ -205,8 +204,6 @@ SeqEngine::AdmitResult Qwen35SlotManager::admit(
     Qwen35Slot & s = slots_[(size_t)slot];
     s.phase = Qwen35SlotPhase::prefill;
     s.request_id = request_id;
-    s.ddtree_suspended = false;
-    s.ddtree_sampled_steps = 0;
     s.handle = handle;
     s.cur_pos = 0;
     s.prompt_len = prompt_len;
@@ -223,33 +220,6 @@ SeqEngine::AdmitResult Qwen35SlotManager::admit(
     r.status = AdmitStatus::admitted;
     r.slot = slot;
     return r;
-}
-
-bool Qwen35SlotManager::ddtree_speculation_allowed(int slot) const {
-    return is_active(slot) && !slots_[(size_t)slot].ddtree_suspended;
-}
-
-bool Qwen35SlotManager::ddtree_cohort_should_suspend(
-        uint64_t total_emitted, int active) {
-    const char * adaptive = std::getenv("DFLASH_DDTREE_ADAPTIVE");
-    if (adaptive && std::atoi(adaptive) == 0) {
-        return false;
-    }
-    if (active <= 0) return false;
-    return total_emitted <
-        (uint64_t)active * (uint64_t)kDdtreeMinEmittedTokens;
-}
-
-bool Qwen35SlotManager::record_ddtree_sample(
-        int slot, bool suspend_cohort) {
-    if (!is_active(slot)) return false;
-    Qwen35Slot & s = slots_[(size_t)slot];
-    // A suspended request must never pay for another probe.
-    if (s.ddtree_suspended) return false;
-    ++s.ddtree_sampled_steps;
-    if (!suspend_cohort) return false;
-    s.ddtree_suspended = true;
-    return true;
 }
 
 Qwen35SlotManager::PrefillChunk Qwen35SlotManager::append_prefill(
