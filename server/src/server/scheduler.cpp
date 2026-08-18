@@ -10,7 +10,6 @@
 
 #include "http_server.h"
 #include "common/concurrency/seq_engine.h"
-#include "common/concurrency/speculation_prompt_prior.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,32 +20,6 @@
 namespace dflash::common {
 
 namespace {
-
-std::string last_user_prompt_text(const json & messages) {
-    if (!messages.is_array()) return {};
-    for (int i = static_cast<int>(messages.size()) - 1; i >= 0; --i) {
-        const json & message = messages[(size_t)i];
-        if (!message.is_object() ||
-            message.value("role", "") != "user" ||
-            !message.contains("content")) {
-            continue;
-        }
-        const json & content = message["content"];
-        if (content.is_string()) return content.get<std::string>();
-        if (!content.is_array()) return {};
-        std::string text;
-        for (const json & part : content) {
-            if (!part.is_object() || !part.contains("text") ||
-                !part["text"].is_string()) {
-                continue;
-            }
-            if (!text.empty()) text.push_back('\n');
-            text += part["text"].get<std::string>();
-        }
-        return text;
-    }
-    return {};
-}
 
 // Per-slot request state for the iteration-level scheduler. Indexed by the
 // engine slot id returned from admit(), so scheduler and engine agree on
@@ -550,11 +523,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // Admission only claims the slot and queues the prompt. Prefill
         // advances one chunk per engine step alongside live decode.
         const uint64_t engine_request_id = next_request_id;
-        SamplerCfg sampler = req.sampler;
-        sampler.speculation_prompt_hint =
-            speculation_prompt_hint(last_user_prompt_text(req.messages));
         auto ar = engine.admit(engine_request_id, effective_prompt,
-                               sampler);
+                               req.sampler);
         if (ar.status == SeqEngine::AdmitResult::Status::busy)
             return AdmissionDisposition::Deferred;
         if (ar.status != SeqEngine::AdmitResult::Status::admitted) {

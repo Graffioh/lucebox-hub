@@ -25,6 +25,7 @@
 #include "deepseek4_internal.h"
 #include "deepseek4_roctx.h"
 #include "internal.h"
+#include "common/concurrency/speculation_confidence.h"
 #include "common/dspark_head.h"
 
 #include "ggml.h"
@@ -930,10 +931,16 @@ bool run_deepseek4_dspark_spec_decode(
         // traces and keep q=4 for high-confidence prefixes while avoiding its
         // extra verify cost on low-acceptance prompts.
         if (use_confidence_width && draft_confidence.size() >= 2 && draft_tok.size() >= 3) {
-            const float confidence_p2 = draft_confidence[0] * draft_confidence[1];
+            const SpeculationConfidenceView confidence =
+                make_speculation_confidence_view(
+                    SpeculatorKind::DSpark, draft_confidence.data(),
+                    static_cast<int>(draft_confidence.size()),
+                    SpeculationConfidenceCost::PiggybacksOnProposal,
+                    /*posthoc_calibrated=*/false);
+            const double confidence_p2 = confidence.prefix_survival(2);
             int selected_q = confidence_p2 >= kConfidenceQ3Threshold ? 3 : 2;
             if (selected_q == 3 && draft_confidence.size() >= 3 && draft_tok.size() >= 4) {
-                const float confidence_p3 = confidence_p2 * draft_confidence[2];
+                const double confidence_p3 = confidence.prefix_survival(3);
                 if (confidence_p3 >= kConfidenceQ4Threshold) selected_q = 4;
             }
             if ((int) draft_tok.size() > selected_q) draft_tok.resize((size_t) selected_q);

@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -121,8 +122,12 @@ private:
     DraftKvState * ensure_slot_draft_kv(int slot);
     bool ddtree_available(const StepPlan & plan) const;
     bool ddtree_input_eligible(const StepInput & input) const;
-    std::optional<double> estimate_ddtree_expected_tokens(
-        const StepInput & input, int tree_budget);
+    std::optional<SpeculationConfidenceEstimate> estimate_ddtree_confidence(
+        const StepInput & input);
+    void remember_ddtree_confidence(
+        std::uint64_t request_id,
+        const SpeculationConfidenceEstimate & estimate,
+        int progress_tokens);
     StepResult step_regular(const StepPlan & plan);
     // nullopt means proposal setup failed before target/cache mutation and the
     // caller may safely use the ordinary packed AR path for this iteration.
@@ -140,6 +145,18 @@ private:
     AdaptiveVerificationRanker adaptive_verification_;
     AdaptiveVerificationRanker compact_short_adaptive_verification_;
     AdaptiveVerificationRanker compact_adaptive_verification_;
+    // Latest drafter confidence is request-owned and can be projected onto
+    // the current full/compact work budget without looking at prompt text.
+    std::map<std::uint64_t, SpeculationConfidenceEstimate>
+        ddtree_confidence_;
+    std::map<std::uint64_t, int> ddtree_confidence_progress_;
+    struct RequestTargetYield {
+        double expected_tokens = 1.0;
+        std::size_t samples = 0;
+    };
+    // Shape choice uses target outcomes when available; this map deliberately
+    // spans full/compact rankers while their hardware route costs stay split.
+    std::map<std::uint64_t, RequestTargetYield> ddtree_target_yield_;
     int             adaptive_calibration_cooldown_ = 0;
     int             compact_short_adaptive_calibration_cooldown_ = 0;
     int             compact_adaptive_calibration_cooldown_ = 0;

@@ -7,10 +7,13 @@
 // helper applies the same policy at request granularity. The concrete
 // speculator supplies expected useful tokens; the engine supplies the observed
 // cost of each exact mixed route shape (active requests, speculative requests).
-// DDTree can learn value from accepted paths, while DSpark can use its
-// calibrated confidence head directly. One ranker instance represents one
+// DDTree and DSpark expose the same conditional-survival contract. Raw model
+// confidence orders cold probes while target-verified accepted paths calibrate
+// it online. One ranker instance represents one
 // fixed speculator/proposal shape; adapters with ragged verification work must
 // keep separate rankers for distinct work buckets.
+
+#include "speculation_confidence.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -28,10 +31,13 @@ struct AdaptiveVerificationCandidate {
     // Includes the one token that ordinary AR would emit.
     double expected_tokens = 1.0;
     double maximum_tokens = 1.0;
+    // True when either the concrete speculator or target outcomes provide an
+    // estimate. This does not mean the raw confidence was post-hoc calibrated.
     bool calibrated = false;
-    // Cheap request prior used only to order otherwise-unknown candidates.
-    // Request-local measurements smoothly replace it during warmup.
-    double routing_prior = 0.0;
+    // Raw speculator estimate used to find a target-calibrated confidence
+    // profile. Prompt semantics never enter this value.
+    double confidence_expected_tokens =
+        std::numeric_limits<double>::quiet_NaN();
     // Number of request-local observations supporting the estimate. Shared
     // cohort evidence must never relax AR-peer protection for a new request.
     std::size_t evidence_samples = 0;
@@ -42,11 +48,15 @@ struct AdaptiveVerificationCandidate {
     // observed yield still contributes to deciding whether adaptive peers
     // should share the same verifier pass.
     bool required = false;
+    SpeculatorKind speculator = SpeculatorKind::DDTree;
 };
 
 struct AdaptiveVerificationYieldEstimate {
     double expected_tokens = 1.0;
     std::size_t evidence_samples = 0;
+    double confidence_expected_tokens =
+        std::numeric_limits<double>::quiet_NaN();
+    SpeculatorKind speculator = SpeculatorKind::DDTree;
 };
 
 struct AdaptiveVerificationDecision {
@@ -72,15 +82,15 @@ struct AdaptiveVerificationConfig {
     std::size_t homogeneous_minimum_samples = 4;
     // A complete two-lane verifier profile observes k=1 then k=2, yielding
     // three request outcomes before any steady route is selected.
-    std::size_t routing_prior_minimum_samples = 3;
+    std::size_t confidence_profile_minimum_samples = 3;
     // Shared evidence ranks a new request after the minimum above, but its
     // yield magnitude is shrunk toward AR until this many outcomes exist.
-    std::size_t routing_prior_full_weight_samples = 8;
+    std::size_t confidence_profile_full_weight_samples = 8;
     // A continuous-backlog scheduler may optimize aggregate output after a
-    // routing-prior bucket has accumulated this many target-verified outcomes.
+    // confidence bucket has accumulated this many target-verified outcomes.
     // This is deliberately stronger than cold ordering, but does not count as
     // request-local proof for closed-cohort AR-peer protection.
-    std::size_t routing_prior_peer_guard_samples = 6;
+    std::size_t confidence_profile_peer_guard_samples = 6;
     double cost_ewma_alpha = 0.35;
 };
 
@@ -98,22 +108,12 @@ inline bool adaptive_verification_can_extend_stable_cohort(
             3 * static_cast<std::int64_t>(verifier_request_lanes);
 }
 
-// Convert conditional survival confidence into expected useful tokens:
-// 1 AR token plus the probability of reaching every speculative prefix.
-// DSpark supplies calibrated confidence-head values directly.
-inline double expected_tokens_from_conditional_confidence(
-        const float * confidence, int count) {
-    double expected = 1.0;
-    double survival = 1.0;
-    for (int i = 0; confidence && i < count; ++i) {
-        const double conditional = std::clamp(
-            std::isfinite(confidence[i])
-                ? static_cast<double>(confidence[i]) : 0.0,
-            0.0, 1.0);
-        survival *= conditional;
-        expected += survival;
-    }
-    return expected;
+inline bool adaptive_verification_confidence_is_stale(
+        int current_progress, int observed_progress,
+        int refresh_interval) {
+    return refresh_interval > 0 && current_progress >= observed_progress &&
+        static_cast<std::int64_t>(current_progress) - observed_progress >=
+            refresh_interval;
 }
 
 class AdaptiveVerificationRanker {
@@ -127,17 +127,49 @@ public:
         route_cost_known_.clear();
         route_cost_samples_.clear();
         request_yield_.clear();
-        routing_prior_yield_.clear();
+        request_confidence_.clear();
+        confidence_yield_.clear();
+    }
+
+    void observe_request_estimate(
+            std::uint64_t request,
+            const SpeculationConfidenceEstimate & estimate) {
+        if (!estimate.available()) return;
+        const auto current = request_confidence_.find(request);
+        if (current != request_confidence_.end() &&
+            current->second.available()) {
+            const SpeculationConfidenceProfile old_profile =
+                speculation_confidence_profile(current->second);
+            const SpeculationConfidenceProfile new_profile =
+                speculation_confidence_profile(estimate);
+            if (old_profile.speculator != new_profile.speculator ||
+                std::abs(old_profile.expected_half_tokens -
+                         new_profile.expected_half_tokens) >= 2) {
+                // A materially different drafter regime invalidates the local
+                // running target mean. Profile-level target outcomes stay
+                // isolated in their original buckets.
+                request_yield_.erase(request);
+            }
+        }
+        request_confidence_[request] = estimate;
     }
 
     void observe_request_yield(std::uint64_t request,
                                double emitted_tokens) {
         if (!valid_yield(emitted_tokens)) return;
         update_yield(request_yield_[request], emitted_tokens);
+        const auto confidence = request_confidence_.find(request);
+        if (confidence != request_confidence_.end() &&
+            confidence->second.available()) {
+            update_yield(
+                confidence_yield_[speculation_confidence_profile(
+                    confidence->second)], emitted_tokens);
+        }
     }
 
     void forget_request(std::uint64_t request) {
         request_yield_.erase(request);
+        request_confidence_.erase(request);
     }
 
     std::optional<double> request_expected_tokens(
@@ -183,49 +215,59 @@ public:
             config_.homogeneous_minimum_relative_yield * maximum;
     }
 
-    void observe_routing_prior_yield(double routing_prior,
-                                     double emitted_tokens) {
-        if (!std::isfinite(routing_prior) || !valid_yield(emitted_tokens)) {
-            return;
-        }
-        update_yield(routing_prior_yield_[routing_prior], emitted_tokens);
+    std::optional<double> confidence_profile_expected_tokens(
+            SpeculatorKind speculator,
+            double confidence_expected_tokens) const {
+        if (!std::isfinite(confidence_expected_tokens)) return std::nullopt;
+        const auto profile = speculation_confidence_profile(
+            speculator, confidence_expected_tokens);
+        const auto it = confidence_yield_.find(profile);
+        return it == confidence_yield_.end() ||
+                it->second.samples <
+                    config_.confidence_profile_minimum_samples
+            ? std::nullopt
+            : std::optional<double>(it->second.expected_tokens);
     }
 
-    std::optional<double> routing_prior_expected_tokens(
-            double routing_prior) const {
-        if (!std::isfinite(routing_prior)) return std::nullopt;
-        const auto it = routing_prior_yield_.find(routing_prior);
-        return it == routing_prior_yield_.end() ||
-                it->second.samples < config_.routing_prior_minimum_samples
-            ? std::nullopt : std::optional<double>(it->second.expected_tokens);
+    std::size_t confidence_profile_yield_samples(
+            SpeculatorKind speculator,
+            double confidence_expected_tokens) const {
+        if (!std::isfinite(confidence_expected_tokens)) return 0;
+        const auto it = confidence_yield_.find(
+            speculation_confidence_profile(
+                speculator, confidence_expected_tokens));
+        return it == confidence_yield_.end() ? 0 : it->second.samples;
     }
 
-    std::size_t routing_prior_yield_samples(double routing_prior) const {
-        if (!std::isfinite(routing_prior)) return 0;
-        const auto it = routing_prior_yield_.find(routing_prior);
-        return it == routing_prior_yield_.end() ? 0 : it->second.samples;
-    }
-
-    bool has_stable_routing_prior_yield(double routing_prior) const {
-        if (!std::isfinite(routing_prior)) return false;
-        const auto it = routing_prior_yield_.find(routing_prior);
-        return it != routing_prior_yield_.end() &&
+    bool has_stable_confidence_yield(
+            SpeculatorKind speculator,
+            double confidence_expected_tokens) const {
+        if (!std::isfinite(confidence_expected_tokens)) return false;
+        const auto it = confidence_yield_.find(
+            speculation_confidence_profile(
+                speculator, confidence_expected_tokens));
+        return it != confidence_yield_.end() &&
             it->second.samples >=
-                config_.routing_prior_peer_guard_samples &&
+                config_.confidence_profile_peer_guard_samples &&
             has_useful_yield(it->second.expected_tokens);
     }
 
-    bool forms_stable_routing_prior_cohort(
+    bool forms_stable_confidence_cohort(
             const std::vector<AdaptiveVerificationCandidate> & candidates)
             const {
         if (candidates.empty()) return false;
         double minimum = std::numeric_limits<double>::infinity();
         double maximum = 1.0;
         for (const AdaptiveVerificationCandidate & candidate : candidates) {
-            if (!has_stable_routing_prior_yield(candidate.routing_prior)) {
+            if (!has_stable_confidence_yield(
+                    candidate.speculator,
+                    candidate.confidence_expected_tokens)) {
                 return false;
             }
-            const auto it = routing_prior_yield_.find(candidate.routing_prior);
+            const auto it = confidence_yield_.find(
+                speculation_confidence_profile(
+                    candidate.speculator,
+                    candidate.confidence_expected_tokens));
             minimum = std::min(minimum, it->second.expected_tokens);
             maximum = std::max(maximum, it->second.expected_tokens);
         }
@@ -234,32 +276,51 @@ public:
     }
 
     std::optional<AdaptiveVerificationYieldEstimate> estimate_request_yield(
-            std::uint64_t request, double routing_prior,
-            bool trust_stable_routing_prior = false) const {
+            std::uint64_t request,
+            bool trust_stable_confidence = false) const {
         const auto request_it = request_yield_.find(request);
-        const auto prior_it = std::isfinite(routing_prior)
-            ? routing_prior_yield_.find(routing_prior)
-            : routing_prior_yield_.end();
+        const auto confidence_it = request_confidence_.find(request);
         const bool has_request = request_it != request_yield_.end();
-        const bool has_prior = prior_it != routing_prior_yield_.end() &&
-            prior_it->second.samples >= config_.routing_prior_minimum_samples;
-        if (!has_request && !has_prior) return std::nullopt;
+        const bool has_confidence =
+            confidence_it != request_confidence_.end() &&
+            confidence_it->second.available();
+        auto profile_it = confidence_yield_.end();
+        if (has_confidence) {
+            profile_it = confidence_yield_.find(
+                speculation_confidence_profile(confidence_it->second));
+        }
+        const bool has_profile = profile_it != confidence_yield_.end() &&
+            profile_it->second.samples >=
+                config_.confidence_profile_minimum_samples;
+        if (!has_request && !has_confidence && !has_profile) {
+            return std::nullopt;
+        }
 
         AdaptiveVerificationYieldEstimate out;
-        const bool stable_backlog_prior =
-            trust_stable_routing_prior &&
-            prior_it->second.samples >=
-                config_.routing_prior_peer_guard_samples;
-        const double prior_weight = stable_backlog_prior
-            ? 1.0
-            : std::min(
-                  1.0, static_cast<double>(prior_it->second.samples) /
-                      static_cast<double>(
-                          config_.routing_prior_full_weight_samples));
-        const double trusted_prior = 1.0 + prior_weight *
-            (prior_it->second.expected_tokens - 1.0);
+        if (has_confidence) {
+            out.confidence_expected_tokens =
+                confidence_it->second.expected_tokens();
+            out.speculator = confidence_it->second.speculator;
+        }
+        double trusted_confidence = has_confidence
+            ? confidence_it->second.expected_tokens() : 1.0;
+        if (has_profile) {
+            const bool stable_backlog_confidence =
+                trust_stable_confidence &&
+                profile_it->second.samples >=
+                    config_.confidence_profile_peer_guard_samples;
+            const double profile_weight = stable_backlog_confidence
+                ? 1.0
+                : std::min(
+                      1.0,
+                      static_cast<double>(profile_it->second.samples) /
+                          static_cast<double>(
+                              config_.confidence_profile_full_weight_samples));
+            trusted_confidence += profile_weight *
+                (profile_it->second.expected_tokens - trusted_confidence);
+        }
         if (!has_request) {
-            out.expected_tokens = trusted_prior;
+            out.expected_tokens = trusted_confidence;
             out.evidence_samples = 0;
             return out;
         }
@@ -267,20 +328,20 @@ public:
         const YieldEstimate & request_estimate = request_it->second;
         out.expected_tokens = request_estimate.expected_tokens;
         out.evidence_samples = request_estimate.samples;
-        if (!has_prior) return out;
-
-        if (request_estimate.samples < config_.homogeneous_minimum_samples) {
-            // Shrink the first few noisy request observations toward a stable
-            // cohort mean. Once request-local evidence is stable, its measured
-            // magnitude fully replaces the prior for goodput decisions.
+        if (has_confidence &&
+            request_estimate.samples <
+                config_.homogeneous_minimum_samples) {
+            // Blend the first few noisy target observations with the concrete
+            // speculator estimate (and any profile calibration). Once local
+            // evidence is stable, measured target yield fully replaces it.
             const double local_weight = std::min(
                 1.0,
                 static_cast<double>(request_estimate.samples) /
                     static_cast<double>(
                         config_.homogeneous_minimum_samples));
-            out.expected_tokens = trusted_prior +
+            out.expected_tokens = trusted_confidence +
                 local_weight * (request_estimate.expected_tokens -
-                                trusted_prior);
+                                trusted_confidence);
         }
         return out;
     }
@@ -393,13 +454,27 @@ public:
 
     bool has_exact_profile(int active_requests,
                            int max_speculative_requests,
-                           std::size_t minimum_route_samples = 1) const {
-        if (!has_autoregressive_cost(active_requests)) return false;
+                           std::size_t minimum_route_samples = 1,
+                           int baseline_speculative_requests = 0) const {
+        if (baseline_speculative_requests < 0 ||
+            baseline_speculative_requests > active_requests) {
+            return false;
+        }
         const std::size_t required_samples =
             std::max<std::size_t>(1, minimum_route_samples);
-        const int limit = std::max(0, std::min(
-            active_requests, max_speculative_requests));
-        for (int k = 1; k <= limit; ++k) {
+        const std::size_t baseline_samples =
+            baseline_speculative_requests == 0 ? 1 : required_samples;
+        if (route_cost_samples(
+                active_requests, baseline_speculative_requests) <
+            baseline_samples) {
+            return false;
+        }
+        const int limit = std::max(
+            baseline_speculative_requests,
+            std::max(0, std::min(
+                active_requests, max_speculative_requests)));
+        for (int k = baseline_speculative_requests + 1;
+             k <= limit; ++k) {
             if (route_cost_samples(active_requests, k) <
                 required_samples) return false;
         }
@@ -443,9 +518,6 @@ public:
                 std::isfinite(candidate.expected_tokens)
                     ? candidate.expected_tokens : 1.0,
                 1.0, candidate.maximum_tokens);
-            if (!std::isfinite(candidate.routing_prior)) {
-                candidate.routing_prior = 0.0;
-            }
             if (candidate.required) {
                 required_candidates.push_back(candidate);
             } else {
@@ -470,10 +542,13 @@ public:
                 out.requests.push_back(candidate.request);
             }
         };
-        if (!has_autoregressive_cost(active_requests)) {
-            // Adaptive-only cohorts first observe the exact AR baseline. User
-            // overrides are stronger: an Always request must not be delayed
-            // by profiling, and its route timing is learned from this step.
+        const int required_count =
+            static_cast<int>(required_candidates.size());
+        const int baseline_width = required_count;
+        if (!has_route_cost(active_requests, baseline_width)) {
+            // Adaptive-only cohorts first observe all-AR. With user-forced
+            // requests, all-AR is unattainable, so their mandatory mixed route
+            // is the baseline from which optional adaptive peers are judged.
             select_required();
             return out;
         }
@@ -515,7 +590,7 @@ public:
         } else {
             // For mixed cohorts, rotate only within contiguous half-token
             // request-value buckets. This preserves ordering across materially
-            // different expected yields and never uses the raw prompt hint.
+            // different expected yields without inspecting prompt semantics.
             std::map<int, std::vector<std::size_t>> fair_group_positions;
             for (std::size_t i = 0; i < known.size(); ++i) {
                 const int yield_bucket = static_cast<int>(
@@ -558,11 +633,11 @@ public:
         std::stable_sort(unknown.begin(), unknown.end(),
             [](const AdaptiveVerificationCandidate & a,
                const AdaptiveVerificationCandidate & b) {
-                if (a.routing_prior != b.routing_prior) {
-                    return a.routing_prior > b.routing_prior;
-                }
                 if (a.maximum_tokens != b.maximum_tokens) {
                     return a.maximum_tokens > b.maximum_tokens;
+                }
+                if (a.progress_tokens != b.progress_tokens) {
+                    return a.progress_tokens < b.progress_tokens;
                 }
                 return a.request < b.request;
             });
@@ -577,16 +652,24 @@ public:
             required_candidates.end());
         ordered_known.insert(
             ordered_known.end(), known.begin(), known.end());
-        const int required_count =
-            static_cast<int>(required_candidates.size());
-
-        const double baseline =
-            static_cast<double>(active_requests) /
-            autoregressive_cost_us(active_requests);
-        const double required = baseline * config_.minimum_gain;
         const std::size_t required_route_samples =
             std::max<std::size_t>(
                 1, minimum_speculative_route_samples);
+        if (route_cost_samples(active_requests, baseline_width) <
+            required_route_samples) {
+            select_required();
+            return out;
+        }
+        double baseline_expected_total =
+            static_cast<double>(active_requests);
+        for (const AdaptiveVerificationCandidate & candidate :
+                required_candidates) {
+            baseline_expected_total += candidate.expected_tokens - 1.0;
+        }
+        const double baseline_cost =
+            route_cost_us(active_requests, baseline_width);
+        const double baseline = baseline_expected_total / baseline_cost;
+        const double required = baseline * config_.minimum_gain;
         int admitted_prefix = required_count;
         double best = baseline;
         double admitted_goodput = baseline;
@@ -610,7 +693,7 @@ public:
                 k == active_requests ||
                 homogeneous_speculative_cohort ||
                 route_us <= config_.maximum_ar_peer_slowdown *
-                    autoregressive_cost_us(active_requests);
+                    baseline_cost;
             if (!protects_ar_peers) continue;
             if (throughput > best) {
                 best = throughput;
@@ -632,7 +715,8 @@ public:
                 (probe_uncalibrated_with_verifier
                     ? static_cast<int>(unknown.size()) : 0));
         int missing_width = 0;
-        for (int k = std::max(1, required_count); probe_missing_routes &&
+        for (int k = std::max(1, required_count + 1);
+                        probe_missing_routes &&
                         k <= probe_candidates; ++k) {
             if (route_cost_samples(active_requests, k) >=
                 required_route_samples) continue;
@@ -726,14 +810,15 @@ private:
             config.homogeneous_minimum_relative_yield, 0.0, 1.0);
         config.homogeneous_minimum_samples =
             std::max<std::size_t>(1, config.homogeneous_minimum_samples);
-        config.routing_prior_minimum_samples =
-            std::max<std::size_t>(1, config.routing_prior_minimum_samples);
-        config.routing_prior_full_weight_samples =
-            std::max(config.routing_prior_minimum_samples,
-                     config.routing_prior_full_weight_samples);
-        config.routing_prior_peer_guard_samples =
-            std::max(config.routing_prior_minimum_samples,
-                     config.routing_prior_peer_guard_samples);
+        config.confidence_profile_minimum_samples =
+            std::max<std::size_t>(
+                1, config.confidence_profile_minimum_samples);
+        config.confidence_profile_full_weight_samples =
+            std::max(config.confidence_profile_minimum_samples,
+                     config.confidence_profile_full_weight_samples);
+        config.confidence_profile_peer_guard_samples =
+            std::max(config.confidence_profile_minimum_samples,
+                     config.confidence_profile_peer_guard_samples);
         config.cost_ewma_alpha =
             std::clamp(config.cost_ewma_alpha, 0.0, 1.0);
         return config;
@@ -771,7 +856,9 @@ private:
     // Capped running means represent the complete request/profile while still
     // adapting gradually if a model or speculator changes behavior.
     std::map<std::uint64_t, YieldEstimate> request_yield_;
-    std::map<double, YieldEstimate> routing_prior_yield_;
+    std::map<std::uint64_t, SpeculationConfidenceEstimate>
+        request_confidence_;
+    std::map<SpeculationConfidenceProfile, YieldEstimate> confidence_yield_;
 };
 
 }  // namespace dflash::common

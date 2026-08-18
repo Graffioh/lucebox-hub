@@ -1,6 +1,5 @@
 #include "common/concurrency/adaptive_verification.h"
 #include "common/concurrency/speculation_goodput.h"
-#include "common/concurrency/speculation_prompt_prior.h"
 #include "common/speculation_policy.h"
 #include "host_check.h"
 
@@ -24,17 +23,6 @@ int main() {
         CHECK(decode_mode_name(SpeculationPolicy::Never) == "ar");
     }
 
-    // The cold-start prior separates obvious structured/code requests from
-    // conversational writing while leaving ambiguous requests neutral.
-    {
-        CHECK(speculation_prompt_hint(
-                  "Complete this Python function:\n\ndef solve(values):") == 1);
-        CHECK(speculation_prompt_hint(
-                  "Chatting casually, write a story and avoid code.") == -1);
-        CHECK(speculation_prompt_hint(
-                  "What happened during the Apollo 11 mission?") == 0);
-    }
-
     // Cold start measures one real speculative step and one neighboring AR
     // step, then keeps the route with higher useful-token goodput.
     {
@@ -53,7 +41,7 @@ int main() {
         CHECK(policy.expected_emitted_tokens() == 4.0);
     }
 
-    // A chat-like low-yield probe loses to AR and is disabled per request.
+    // A low-yield probe loses to AR and is disabled per request.
     {
         SpeculationGoodputController policy;
         CHECK(policy.observe_speculation(/*emitted_tokens=*/1,
@@ -224,7 +212,37 @@ int main() {
         const AdaptiveVerificationDecision decision =
             ranker.select(4, candidates, /*max_speculative_requests=*/1);
         CHECK(decision.requests.size() == 2);
+        CHECK(!decision.exploring);
+    }
+
+    // A forced request makes (C,r), not the impossible all-AR route, the cold
+    // baseline. Optional adaptive peers can therefore be profiled and joined.
+    {
+        AdaptiveVerificationRanker ranker;
+        std::vector<AdaptiveVerificationCandidate> candidates = {
+            {71, 4.0, 8.0, true, 4.0, 0, 0, true},
+            {72, 4.0, 8.0, true, 4.0},
+        };
+        AdaptiveVerificationDecision decision =
+            ranker.select(2, candidates, 2);
+        CHECK(decision.requests == std::vector<int>{71});
+        CHECK(!ranker.has_exact_profile(
+            2, 2, /*minimum_route_samples=*/1,
+            /*baseline_speculative_requests=*/1));
+        ranker.observe_route(2, 1, 100.0);
+        decision = ranker.select(2, candidates, 2);
         CHECK(decision.exploring);
+        CHECK(decision.requests == std::vector<int>({71, 72}));
+        CHECK(!ranker.has_exact_profile(
+            2, 2, /*minimum_route_samples=*/1,
+            /*baseline_speculative_requests=*/1));
+        ranker.observe_route(2, 2, 80.0);
+        decision = ranker.select(2, candidates, 2);
+        CHECK(!decision.exploring);
+        CHECK(decision.requests == std::vector<int>({71, 72}));
+        CHECK(ranker.has_exact_profile(
+            2, 2, /*minimum_route_samples=*/1,
+            /*baseline_speculative_requests=*/1));
     }
 
     // Candidates are ranked by expected value and every measured width is
@@ -261,44 +279,44 @@ int main() {
     }
 
     // Compact verifier calibration discovers every exact route width in order,
-    // even when k=1 and k=2 lose. The prompt prior orders unknown requests but
-    // never filters them, and the globally best non-convex k=3 route wins.
+    // even when k=1 and k=2 lose. Unknown requests use deterministic neutral
+    // ordering, and the globally best non-convex k=3 route wins.
     {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(8, 100.0);
         std::vector<AdaptiveVerificationCandidate> candidates = {
-            {5, 1.0, 9.0, false, 1.0},
-            {2, 1.0, 9.0, false, -1.0},
-            {9, 1.0, 9.0, false, 0.0},
+            {5, 1.0, 9.0, false},
+            {2, 1.0, 9.0, false},
+            {9, 1.0, 9.0, false},
         };
         AdaptiveVerificationDecision probe =
             ranker.select(8, candidates, 3,
                           /*probe_uncalibrated_with_verifier=*/true);
         CHECK(probe.exploring);
         CHECK(probe.requests.size() == 1);
-        CHECK(probe.requests[0] == 5);
+        CHECK(probe.requests[0] == 2);
         CHECK(probe.calibration_request == -1);
         ranker.observe_route(8, 1, 160.0);
-        candidates[0] = {5, 4.0, 9.0, true, 1.0};
+        candidates[1] = {2, 4.0, 9.0, true};
 
         probe = ranker.select(8, candidates, 3,
                               /*probe_uncalibrated_with_verifier=*/true);
         CHECK(probe.exploring);
         CHECK(probe.requests.size() == 2);
-        CHECK(probe.requests[0] == 5);
-        CHECK(probe.requests[1] == 9);
+        CHECK(probe.requests[0] == 2);
+        CHECK(probe.requests[1] == 5);
         ranker.observe_route(8, 2, 170.0);
-        candidates[2] = {9, 4.0, 9.0, true, 0.0};
+        candidates[0] = {5, 4.0, 9.0, true};
 
         probe = ranker.select(8, candidates, 3,
                               /*probe_uncalibrated_with_verifier=*/true);
         CHECK(probe.exploring);
         CHECK(probe.requests.size() == 3);
-        CHECK(probe.requests[0] == 5);
-        CHECK(probe.requests[1] == 9);
-        CHECK(probe.requests[2] == 2);
+        CHECK(probe.requests[0] == 2);
+        CHECK(probe.requests[1] == 5);
+        CHECK(probe.requests[2] == 9);
         ranker.observe_route(8, 3, 105.0);
-        candidates[1] = {2, 4.0, 9.0, true, -1.0};
+        candidates[2] = {9, 4.0, 9.0, true};
 
         const AdaptiveVerificationDecision decision =
             ranker.select(8, candidates, 3,
@@ -389,6 +407,12 @@ int main() {
         CHECK(!adaptive_verification_can_extend_stable_cohort(16, 3));
         CHECK(adaptive_verification_can_extend_stable_cohort(16, 6));
         CHECK(!adaptive_verification_can_extend_stable_cohort(1, 0));
+
+        CHECK(!adaptive_verification_confidence_is_stale(63, 0, 64));
+        CHECK(adaptive_verification_confidence_is_stale(64, 0, 64));
+        CHECK(adaptive_verification_confidence_is_stale(192, 64, 128));
+        CHECK(!adaptive_verification_confidence_is_stale(63, 64, 64));
+        CHECK(!adaptive_verification_confidence_is_stale(128, 0, 0));
     }
 
     // Timings from a neighboring occupancy never stand in for the exact-C
@@ -460,8 +484,7 @@ int main() {
         CHECK(decision.requests[0] == 13);
     }
 
-    // A prior affects cold-start order only. Once calibrated, the high-yield
-    // conversational-prior request ranks ahead of a low-yield code prior.
+    // Expected target yield, rather than a prompt category, determines order.
     {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(2, 100.0);
@@ -477,79 +500,126 @@ int main() {
         CHECK(decision.requests[0] == 2);
     }
 
-    // Verified yield can seed later requests in the same coarse routing-prior
-    // bucket. The cache belongs to this speculator/profile ranker and resets
-    // with it; no model-specific table is required.
+    // DDTree softmax and DSpark confidence-head output use one sanitized
+    // conditional-survival contract. Raw estimates are explicitly distinct
+    // from target-verified calibration evidence.
     {
+        const float confidence[] = {0.8f, 0.5f};
+        const SpeculationConfidenceEstimate ddtree_confidence =
+            make_speculation_confidence_estimate(
+                SpeculatorKind::DDTree, confidence, 2,
+                SpeculationConfidenceCost::ExtraDraftPass);
+        const SpeculationConfidenceEstimate dspark_confidence =
+            make_speculation_confidence_estimate(
+                SpeculatorKind::DSpark, confidence, 2,
+                SpeculationConfidenceCost::PiggybacksOnProposal);
+        CHECK(ddtree_confidence.available());
+        CHECK(dspark_confidence.available());
+        CHECK(!ddtree_confidence.posthoc_calibrated);
+        CHECK(!dspark_confidence.posthoc_calibrated);
+        CHECK(std::abs(ddtree_confidence.expected_tokens() - 2.2) < 1e-6);
+        CHECK(std::abs(dspark_confidence.expected_tokens() - 2.2) < 1e-6);
+        CHECK(std::abs(conditional_prefix_survival(confidence, 2) - 0.4) <
+              1e-6);
+        const SpeculationConfidenceEstimate limited =
+            ddtree_confidence.limited_to(1);
+        CHECK(limited.maximum_tokens() == 2.0);
+        CHECK(ddtree_confidence.maximum_tokens() == 3.0);
+        CHECK(std::abs(ddtree_confidence.expected_tokens() - 2.2) < 1e-6);
+
+        const float invalid[] = {
+            2.0f, -1.0f, std::numeric_limits<float>::quiet_NaN()};
+        const auto sanitized = make_speculation_confidence_estimate(
+            SpeculatorKind::DDTree, invalid, 3,
+            SpeculationConfidenceCost::PiggybacksOnProposal);
+        CHECK(sanitized.expected_tokens() == 2.0);
+        const auto unavailable = make_speculation_confidence_estimate(
+            SpeculatorKind::DSpark, nullptr, 0,
+            SpeculationConfidenceCost::PiggybacksOnProposal);
+        CHECK(!unavailable.available());
+        CHECK(unavailable.expected_tokens() == 1.0);
+
         AdaptiveVerificationRanker ranker;
-        CHECK(!ranker.routing_prior_expected_tokens(1.0).has_value());
-        ranker.observe_routing_prior_yield(1.0, 4.0);
-        ranker.observe_routing_prior_yield(1.0, 6.0);
-        ranker.observe_routing_prior_yield(1.0, 4.0);
-        CHECK(std::abs(
-                  ranker.routing_prior_expected_tokens(1.0).value() -
-                  14.0 / 3.0) < 1e-9);
-        CHECK(ranker.routing_prior_yield_samples(1.0) == 3);
-        ranker.observe_routing_prior_yield(1.0, 6.0);
-        CHECK(ranker.routing_prior_expected_tokens(1.0).value() == 5.0);
-        CHECK(ranker.routing_prior_yield_samples(1.0) == 4);
-        CHECK(!ranker.has_stable_routing_prior_yield(1.0));
-        CHECK(!ranker.routing_prior_expected_tokens(-1.0).has_value());
-        CHECK(!ranker.has_stable_routing_prior_yield(-1.0));
+        ranker.observe_request_estimate(98, ddtree_confidence);
+        auto estimate = ranker.estimate_request_yield(98);
+        CHECK(estimate.has_value());
+        CHECK(std::abs(estimate->expected_tokens - 2.2) < 1e-6);
+        CHECK(estimate->evidence_samples == 0);
+        CHECK(ranker.request_yield_samples(98) == 0);
+        CHECK(!ranker.confidence_profile_expected_tokens(
+                  SpeculatorKind::DDTree, 2.2).has_value());
 
-        // Shared yield magnitude itself starts conservatively shrunk toward
-        // AR; four local samples still make the request authoritative.
-        const double expected[] = {2.5, 2.0, 1.5, 1.0};
-        for (int sample = 1; sample <= 4; ++sample) {
+        // Early target outcomes smoothly correct an optimistic raw estimate;
+        // drafter confidence never counts as manufactured target evidence.
+        ranker.observe_request_yield(98, 1.0);
+        estimate = ranker.estimate_request_yield(98);
+        CHECK(estimate.has_value());
+        CHECK(std::abs(estimate->expected_tokens - 1.9) < 1e-6);
+        CHECK(estimate->evidence_samples == 1);
+        CHECK(ranker.confidence_profile_yield_samples(
+                  SpeculatorKind::DDTree, 2.2) == 1);
+        for (int sample = 1; sample < 4; ++sample) {
             ranker.observe_request_yield(98, 1.0);
-            const auto estimate =
-                ranker.estimate_request_yield(98, 1.0);
-            CHECK(estimate.has_value());
-            CHECK(estimate->expected_tokens == expected[sample - 1]);
-            CHECK(estimate->evidence_samples ==
-                  static_cast<std::size_t>(sample));
         }
-        const auto local = ranker.estimate_request_yield(98, 1.0);
-        CHECK(local.has_value());
-        CHECK(local->expected_tokens == 1.0);
+        estimate = ranker.estimate_request_yield(98);
+        CHECK(estimate.has_value());
+        CHECK(std::abs(estimate->expected_tokens - 1.0) < 1e-6);
+        CHECK(estimate->evidence_samples == 4);
 
-        ranker.observe_routing_prior_yield(1.0, 4.0);
-        CHECK(!ranker.has_stable_routing_prior_yield(1.0));
-        ranker.observe_routing_prior_yield(1.0, 6.0);
-        CHECK(ranker.has_stable_routing_prior_yield(1.0));
-        const auto closed_prior =
-            ranker.estimate_request_yield(100, 1.0);
-        const auto backlog_prior =
-            ranker.estimate_request_yield(
-                100, 1.0, /*trust_stable_routing_prior=*/true);
-        CHECK(closed_prior.has_value());
-        CHECK(backlog_prior.has_value());
-        CHECK(closed_prior->expected_tokens == 4.0);
-        CHECK(backlog_prior->expected_tokens == 5.0);
-        for (int i = 0; i < 6; ++i) {
-            ranker.observe_routing_prior_yield(-1.0, 1.25);
+        // A material confidence-regime change invalidates local target history
+        // rather than treating the request as a permanent semantic category.
+        const float low_confidence_values[] = {0.1f, 0.1f};
+        const SpeculationConfidenceEstimate low_confidence =
+            make_speculation_confidence_estimate(
+                SpeculatorKind::DDTree, low_confidence_values, 2,
+                SpeculationConfidenceCost::PiggybacksOnProposal);
+        AdaptiveVerificationRanker changing;
+        changing.observe_request_estimate(197, ddtree_confidence);
+        for (int sample = 0; sample < 4; ++sample) {
+            changing.observe_request_yield(197, 4.0);
         }
-        CHECK(!ranker.has_stable_routing_prior_yield(-1.0));
-        CHECK(ranker.forms_stable_routing_prior_cohort({
-            {101, 5.0, 9.0, true, 1.0},
-            {102, 5.0, 9.0, true, 1.0},
+        CHECK(changing.request_yield_samples(197) == 4);
+        changing.observe_request_estimate(197, low_confidence);
+        CHECK(changing.request_yield_samples(197) == 0);
+        const auto changed = changing.estimate_request_yield(197);
+        CHECK(changed.has_value());
+        CHECK(std::abs(
+            changed->expected_tokens - low_confidence.expected_tokens()) <
+              1e-6);
+
+        for (std::uint64_t request = 99; request <= 103; ++request) {
+            ranker.observe_request_estimate(request, ddtree_confidence);
+            ranker.observe_request_yield(request, 5.0);
+        }
+        CHECK(ranker.has_stable_confidence_yield(
+            SpeculatorKind::DDTree, 2.2));
+        CHECK(!ranker.has_stable_confidence_yield(
+            SpeculatorKind::DSpark, 2.2));
+        CHECK(ranker.forms_stable_confidence_cohort({
+            {101, 5.0, 9.0, true, 2.2, 0, 0, false,
+             SpeculatorKind::DDTree},
+            {102, 5.0, 9.0, true, 2.2, 0, 0, false,
+             SpeculatorKind::DDTree},
         }));
-        CHECK(!ranker.forms_stable_routing_prior_cohort({
-            {101, 5.0, 9.0, true, 1.0},
-            {103, 1.25, 9.0, true, -1.0},
+        CHECK(!ranker.forms_stable_confidence_cohort({
+            {101, 5.0, 9.0, true, 2.2, 0, 0, false,
+             SpeculatorKind::DDTree},
+            {104, 5.0, 9.0, true, 2.2, 0, 0, false,
+             SpeculatorKind::DSpark},
         }));
 
         // Per-request evidence is local to one proposal-shape ranker and is
         // explicitly forgotten at request retirement.
         AdaptiveVerificationRanker compact;
-        ranker.observe_request_yield(99, 7.0);
-        CHECK(ranker.request_expected_tokens(99).value() == 7.0);
-        CHECK(ranker.request_yield_samples(99) == 1);
-        CHECK(!compact.request_expected_tokens(99).has_value());
-        ranker.forget_request(99);
-        CHECK(!ranker.request_expected_tokens(99).has_value());
+        ranker.observe_request_yield(199, 7.0);
+        CHECK(ranker.request_expected_tokens(199).value() == 7.0);
+        CHECK(ranker.request_yield_samples(199) == 1);
+        CHECK(!compact.request_expected_tokens(199).has_value());
+        ranker.forget_request(199);
+        CHECK(!ranker.request_expected_tokens(199).has_value());
         ranker.reset();
-        CHECK(!ranker.routing_prior_expected_tokens(1.0).has_value());
+        CHECK(!ranker.confidence_profile_expected_tokens(
+                  SpeculatorKind::DDTree, 2.2).has_value());
     }
 
     // Shared cohort evidence can rank a new request, but it cannot unlock the
@@ -559,14 +629,14 @@ int main() {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(5, 100.0);
         ranker.observe_route(5, 1, 150.0);
-        std::vector<AdaptiveVerificationCandidate> prior_backed;
+        std::vector<AdaptiveVerificationCandidate> confidence_backed;
         for (int request = 1; request <= 5; ++request) {
-            prior_backed.push_back(
-                {request, 8.0, 8.0, true, 1.0, 0});
+            confidence_backed.push_back(
+                {request, 8.0, 8.0, true, 8.0, 0});
         }
-        CHECK(ranker.select(5, prior_backed, 1).requests.empty());
+        CHECK(ranker.select(5, confidence_backed, 1).requests.empty());
 
-        std::vector<AdaptiveVerificationCandidate> probe = prior_backed;
+        std::vector<AdaptiveVerificationCandidate> probe = confidence_backed;
         for (AdaptiveVerificationCandidate & candidate : probe) {
             candidate.calibrated = false;
         }
@@ -576,12 +646,12 @@ int main() {
         CHECK(exploring.exploring);
         CHECK(exploring.requests.size() == 1);
 
-        for (AdaptiveVerificationCandidate & candidate : prior_backed) {
+        for (AdaptiveVerificationCandidate & candidate : confidence_backed) {
             candidate.evidence_samples = 4;
         }
-        CHECK(ranker.select(5, prior_backed, 1).requests.size() == 1);
-        prior_backed.back().expected_tokens = 1.0;
-        CHECK(ranker.select(5, prior_backed, 1).requests.empty());
+        CHECK(ranker.select(5, confidence_backed, 1).requests.size() == 1);
+        confidence_backed.back().expected_tokens = 1.0;
+        CHECK(ranker.select(5, confidence_backed, 1).requests.empty());
     }
 
     // With route costs already profiled, a no-confidence adapter calibrates
@@ -593,8 +663,8 @@ int main() {
         ranker.observe_route(5, 2, 95.0);
         std::vector<AdaptiveVerificationCandidate> candidates = {
             {14, 4.0, 8.0, true, 1.0},
-            {15, 1.0, 8.0, false, -1.0},
-            {16, 1.0, 8.0, false, 0.0},
+            {15, 1.0, 8.0, false},
+            {16, 1.0, 8.0, false},
         };
         const AdaptiveVerificationDecision decision = ranker.select(
             5, candidates, 2,
@@ -602,7 +672,7 @@ int main() {
         CHECK(decision.exploring);
         CHECK(decision.requests.size() == 2);
         CHECK(decision.requests[0] == 14);
-        CHECK(decision.requests[1] == 16);
+        CHECK(decision.requests[1] == 15);
     }
 
     // A promising newcomer can replace one incumbent even when every executor
@@ -627,22 +697,23 @@ int main() {
     }
 
     // Selection is tied to request value, not to a lane count. When the
-    // profitable request retires, speculation does not migrate to chat.
+    // profitable request retires, speculation does not migrate to a low-yield
+    // peer.
     {
         AdaptiveVerificationRanker ranker;
         ranker.observe_autoregressive(2, 100.0);
         ranker.observe_route(2, 1, 100.0);
-        std::vector<AdaptiveVerificationCandidate> code_and_chat = {
+        std::vector<AdaptiveVerificationCandidate> mixed_yield = {
             {21, 8.0, 8.0, true, 1.0},
             {22, 1.0, 8.0, true, -1.0},
         };
         AdaptiveVerificationDecision decision =
-            ranker.select(2, code_and_chat, 1);
+            ranker.select(2, mixed_yield, 1);
         CHECK(decision.requests.size() == 1);
         CHECK(decision.requests[0] == 21);
         ranker.observe_autoregressive(1, 60.0);
         ranker.observe_route(1, 1, 100.0);
-        decision = ranker.select(1, {code_and_chat[1]}, 1);
+        decision = ranker.select(1, {mixed_yield[1]}, 1);
         CHECK(decision.requests.empty());
     }
 
@@ -762,6 +833,32 @@ int main() {
             CHECK(ranker.has_exact_profile(concurrency, limit));
             CHECK(ranker.select(concurrency, candidates, 0)
                       .requests.empty());
+        }
+    }
+
+    // With exact route costs known, request-granular selection has no C
+    // cutoff: one or two useful requests remain speculative at every
+    // occupancy through the supported C=16 while low-yield peers stay AR.
+    {
+        for (int concurrency = 1; concurrency <= 16; ++concurrency) {
+            AdaptiveVerificationRanker ranker;
+            ranker.observe_autoregressive(concurrency, 100.0);
+            for (int width = 1; width <= concurrency; ++width) {
+                ranker.observe_route(concurrency, width, 100.0);
+            }
+            std::vector<AdaptiveVerificationCandidate> one_useful;
+            std::vector<AdaptiveVerificationCandidate> two_useful;
+            for (int request = 0; request < concurrency; ++request) {
+                one_useful.push_back({
+                    request, request == 0 ? 4.0 : 1.0, 4.0, true});
+                two_useful.push_back({
+                    request, request < 2 ? 4.0 : 1.0, 4.0, true});
+            }
+            CHECK(ranker.select(concurrency, one_useful, concurrency)
+                      .requests.size() == 1);
+            CHECK(ranker.select(concurrency, two_useful, concurrency)
+                      .requests.size() ==
+                  static_cast<std::size_t>(std::min(2, concurrency)));
         }
     }
 
