@@ -4782,6 +4782,14 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
         if (mmq_x % granularity != 0 || mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {
             continue;
         }
+#if defined(GGML_CUDA_MMQ_SMALL_TILE)
+        // The 64-row/4-warp tile is pathological at mmq_x == 32 on gfx1201
+        // (17408x5120 IQ4_XS: N=16 443 GB/s, N=24..32 180 GB/s, N=48 315 GB/s
+        // in mmq_probe); a wider tile with more padding is still faster.
+        if (LUCEBOX_RDNA_TILE_HOST(cc) && mmq_x == 32) {
+            continue;
+        }
+#endif
 
         const int ntiles_x = (args.ncols_max + mmq_x - 1) / mmq_x;
 
