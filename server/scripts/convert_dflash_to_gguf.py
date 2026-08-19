@@ -124,6 +124,23 @@ def load_arch(safetensors: Path, header: dict) -> dict:
                 a["yarn_beta_slow"] = float(rp.get("beta_slow", 1.0))
         if dfc.get("mask_token_id") is not None:
             a["mask_token_id"] = int(dfc["mask_token_id"])
+        if dfc.get("block_size") is not None:
+            a["block_size"] = int(dfc["block_size"])
+        # DFlash 2 (z-lab/inco): grouped dynamic convs + candidate selector.
+        if dfc.get("conv_kernel_size") is not None:
+            a["conv_kernel_size"] = int(dfc["conv_kernel_size"])
+            a["conv_group_size"]  = int(dfc.get("conv_group_size", 16))
+        if dfc.get("selector_rank") is not None:
+            a["selector_rank"]  = int(dfc["selector_rank"])
+            a["selector_top_k"] = int(dfc.get("selector_top_k", 16))
+        # Per-layer sliding-window / causal attention (Qwen3.6-style drafters
+        # and DFlash 2). HF: layer_types + sliding_window; a top-level
+        # is_causal=false (DFlash 2) makes every layer bidirectional, which is
+        # our default (no SWA pattern emitted).
+        lt = c.get("layer_types")
+        if lt and c.get("sliding_window") and c.get("is_causal", None) is not False:
+            a["swa_window"]  = int(c["sliding_window"])
+            a["swa_pattern"] = [str(x) == "sliding_attention" for x in lt]
         print(f"[info] read arch from {cfg_path}")
     else:
         print(f"[warn] no config.json next to safetensors; using 27B defaults")
@@ -196,8 +213,17 @@ def map_name(name: str) -> str | None:
             "mlp.gate_proj.weight":            f"blk.{i}.ffn_gate.weight",
             "mlp.up_proj.weight":              f"blk.{i}.ffn_up.weight",
             "mlp.down_proj.weight":            f"blk.{i}.ffn_down.weight",
+            # DFlash 2 grouped dynamic convs
+            "attention_conv.base_kernel":            f"blk.{i}.attn_conv.base",
+            "attention_conv.kernel_projection.weight": f"blk.{i}.attn_conv.proj.weight",
+            "mlp_conv.base_kernel":                  f"blk.{i}.ffn_conv.base",
+            "mlp_conv.kernel_projection.weight":     f"blk.{i}.ffn_conv.proj.weight",
         }
         return layer_map.get(rest)
+    # DFlash 2 candidate selector
+    if name == "candidate_selector.hidden_projection.weight": return "dflash.selector.hproj.weight"
+    if name == "candidate_selector.predecessor_codebook":     return "dflash.selector.pred_cb"
+    if name == "candidate_selector.successor_codebook":       return "dflash.selector.succ_cb"
     return None
 
 
@@ -516,6 +542,15 @@ def main():
     elif _cap_ids:
         print(f"[warn] capture_layer_ids len {len(_cap_ids)} != n_target_layers "
               f"{a['n_target_layers']}; not embedding ids", file=sys.stderr)
+    if a.get("swa_pattern"):
+        writer.add_uint32(f"{ARCH}.attention.sliding_window", a["swa_window"])
+        writer.add_array(f"{ARCH}.attention.sliding_window_pattern", [bool(x) for x in a["swa_pattern"]])
+    if a.get("conv_kernel_size"):
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.conv_kernel_size", a["conv_kernel_size"])
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.conv_group_size",  a["conv_group_size"])
+    if a.get("selector_rank"):
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.selector_rank",  a["selector_rank"])
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.selector_top_k", a["selector_top_k"])
 
     # Walk + add tensors. Sort: dflash.* singletons first, then output_*,
     # then per-layer in numeric order — keeps the on-disk layout stable.
@@ -554,7 +589,8 @@ def main():
         is_norm = (
             gguf_name.endswith("_norm.weight") or
             gguf_name == "output_norm.weight" or
-            gguf_name == "dflash.hidden_norm.weight"
+            gguf_name == "dflash.hidden_norm.weight" or
+            gguf_name.endswith("_conv.base")   # DFlash 2 conv base kernels [2, K, hidden]
         )
         if is_norm:
             arr = arr.astype("<f4")

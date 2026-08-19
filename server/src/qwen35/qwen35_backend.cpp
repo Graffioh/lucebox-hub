@@ -14,6 +14,7 @@
 #include <random>
 #endif
 #include "common/dspark_head.h"
+#include "common/dflash2_head.h"
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
 #include "qwen35_tensor_parallel.h"
@@ -2631,10 +2632,32 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             v_len = 1;
         } else if (!use_tree_verify) {
             const auto profile_project_start = profile_start();
+            // DFlash 2 selector (top-k candidates + low-rank path score) when
+            // the drafter ships it.
+            bool used_dspark = false;
+            if (dw_.selector.enabled && q_len > 1 && !sampled_verify && !use_remote_draft) {
+                static std::atomic<bool> s_sel_logged{false};
+                if (!s_sel_logged.exchange(true)) {
+                    std::fprintf(stderr,
+                        "[qwen35-spec] DFlash 2 selector active for greedy chain decode "
+                        "(rank=%d top_k=%d)\n", dw_.selector.rank, dw_.selector.top_k);
+                }
+                if (dflash2_select_chain(dw_, draft_backend_, *target,
+                                         local_hidden.data(), q_len, last_tok, draft_tok)) {
+                    used_dspark = true;
+                    v_len = std::max(1, (int)draft_tok.size());
+                } else {
+                    static std::atomic<bool> s_sel_warned{false};
+                    if (!s_sel_warned.exchange(true)) {
+                        std::fprintf(stderr,
+                            "[qwen35-spec] DFlash 2 selector failed; falling back to "
+                            "base DFlash projection\n");
+                    }
+                }
+            }
             // DSpark heads (markov bigram correction + optional confidence
             // gate) when the drafter ships them; mirrors the laguna hook.
-            bool used_dspark = false;
-            if (qwen35_dspark_enabled() && dw_.dspark.enabled &&
+            if (!used_dspark && qwen35_dspark_enabled() && dw_.dspark.enabled &&
                 q_len > 1 && !sampled_verify && !use_remote_draft) {
                 static std::atomic<bool> s_dspark_logged{false};
                 if (!s_dspark_logged.exchange(true)) {
