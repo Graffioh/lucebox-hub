@@ -2544,6 +2544,18 @@ TEST_CASE(ServerUnitFixture, test_max_output_alias_precedence_ignores_shadowed_i
     TEST_ASSERT(
         resolve_max_output_tokens({{"max_output_tokens", 200}}, 400) == 200);
     TEST_ASSERT(resolve_max_output_tokens(json::object(), 400) == 400);
+    // "Unlimited" sentinels from clients such as PocketPal must fall back
+    // to the default rather than yielding a zero-token budget.
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_completion_tokens", -1}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_completion_tokens", 0}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_tokens", -1}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_output_tokens", -1}}, 400) == 400);
+    TEST_ASSERT(
+        resolve_max_output_tokens({{"max_completion_tokens", 8}}, 400) == 8);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_placement_same_backend_local) {
@@ -5112,7 +5124,7 @@ TEST_CASE(ServerUnitFixture, test_model_backend_retries_empty_visible_spec_resto
     TEST_ASSERT(backend.restore_saw_force_ar);
 }
 
-// GenerateResult.accept_rate plumbing tests (Day 1 of bandit MVP)
+// GenerateResult speculative telemetry plumbing tests (Day 1 of bandit MVP)
 // ═══════════════════════════════════════════════════════════════════════
 
 TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_defaults_to_zero) {
@@ -5141,6 +5153,7 @@ TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_openai) {
     result.succeed();
     result.tokens = {1, 2, 3};
     result.accept_rate = 0.75f;
+    result.spec_decode_ran = true;
 
     std::vector<int32_t> prompt_tokens = {10, 20};
 
@@ -5150,12 +5163,14 @@ TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_openai) {
             {"prompt_tokens", (int)prompt_tokens.size()},
             {"completion_tokens", (int)result.tokens.size()},
             {"total_tokens", (int)(prompt_tokens.size() + result.tokens.size())},
-            {"accept_rate", result.accept_rate}
+            {"accept_rate", result.accept_rate},
+            {"spec_decode_ran", result.spec_decode_ran}
         }}
     };
 
     TEST_ASSERT(resp["usage"].contains("accept_rate"));
     TEST_ASSERT(std::abs(resp["usage"]["accept_rate"].get<float>() - 0.75f) < 1e-6f);
+    TEST_ASSERT(resp["usage"]["spec_decode_ran"].get<bool>());
 }
 
 TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_anthropic) {
@@ -5163,6 +5178,7 @@ TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_anthropic
     result.succeed();
     result.tokens = {1, 2};
     result.accept_rate = 0.60f;
+    result.spec_decode_ran = true;
 
     std::vector<int32_t> prompt_tokens = {5};
 
@@ -5170,20 +5186,23 @@ TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_in_usage_anthropic
         {"usage", {
             {"input_tokens", (int)prompt_tokens.size()},
             {"output_tokens", (int)result.tokens.size()},
-            {"accept_rate", result.accept_rate}
+            {"accept_rate", result.accept_rate},
+            {"spec_decode_ran", result.spec_decode_ran}
         }}
     };
 
     TEST_ASSERT(resp["usage"].contains("accept_rate"));
     TEST_ASSERT(std::abs(resp["usage"]["accept_rate"].get<float>() - 0.60f) < 1e-6f);
+    TEST_ASSERT(resp["usage"]["spec_decode_ran"].get<bool>());
 }
 
 TEST_CASE(ServerUnitFixture, test_generate_result_accept_rate_zero_when_no_spec_decode) {
     // When spec decode doesn't run (no draft model), accept_rate stays 0.
     GenerateResult r;
     r.succeed();
-    // accept_rate not set → must be 0.0f
+    // Telemetry not set → accept_rate is zero and speculative decode is false.
     TEST_ASSERT(r.accept_rate == 0.0f);
+    TEST_ASSERT(!r.spec_decode_ran);
 }
 
 TEST_CASE(ServerUnitFixture, test_generate_result_error_state_is_consistent) {

@@ -511,14 +511,22 @@ static size_t json_array_size(const json & value) {
 }
 
 int resolve_max_output_tokens(const json & body, int default_max_tokens) {
+    // OpenAI-compatible clients (e.g. PocketPal's "Unlimited") send
+    // max_completion_tokens: -1 to mean "no explicit limit"; 0 is also
+    // invalid as a budget. Treat non-positive values as unset so they
+    // fall back to the server default instead of yielding zero tokens.
+    auto field_or_default = [&](const char * key) {
+        const int value = body.at(key).get<int>();
+        return value > 0 ? value : default_max_tokens;
+    };
     if (body.contains("max_tokens")) {
-        return body.at("max_tokens").get<int>();
+        return field_or_default("max_tokens");
     }
     if (body.contains("max_output_tokens")) {
-        return body.at("max_output_tokens").get<int>();
+        return field_or_default("max_output_tokens");
     }
     if (body.contains("max_completion_tokens")) {
-        return body.at("max_completion_tokens").get<int>();
+        return field_or_default("max_completion_tokens");
     }
     return default_max_tokens;
 }
@@ -2245,8 +2253,9 @@ json build_openai_completion_response(
     // usage.completion_tokens_details.reasoning_tokens — OpenAI o1/o3
     // standard location; kept in sync with finish_details.thinking_tokens.
     // usage.timings — per-request prefill/decode wall clock, additive to
-    // the OpenAI shape (ignored by clients that don't recognize it). See
-    // docs/specs/thinking-budget.md §6.3.
+    // the OpenAI shape (ignored by clients that don't recognize it).
+    // spec_decode_ran disambiguates a real zero-acceptance speculative run
+    // from an autoregressive fallback. See docs/specs/thinking-budget.md §6.3.
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const json usage = {
         {"prompt_tokens", prompt_tokens},
@@ -2257,6 +2266,7 @@ json build_openai_completion_response(
         }},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},
@@ -2324,6 +2334,7 @@ json build_anthropic_response(
         {"output_tokens", counts.total},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},
@@ -2373,6 +2384,7 @@ json build_responses_api_response(
         {"total_tokens", prompt_tokens + counts.total},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},
