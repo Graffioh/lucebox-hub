@@ -1016,6 +1016,62 @@ bool load_target_gguf_partial(const std::string & path,
         return false;
     }
 
+    // ── Fused raw-gate GDN parameters: per DeltaNet layer one f32 [2*H]
+    //    tensor holding [dt_bias | A] so the kernel can apply
+    //    sigmoid/softplus itself (src[9] of the GDN op). Skipped for
+    //    metadata-only / meta (TP) loads.
+    if (!plan.metadata_only && !ggml_backend_buft_is_meta(buft)) {
+        int n_gate = 0;
+        for (int il = 0; il < (int)n_layer; il++) {
+            const TargetLayer & L = out.layers[il];
+            if (L.ssm_dt_bias && L.ssm_a && L.ssm_dt_bias->data && L.ssm_a->data &&
+                L.ssm_dt_bias->type == GGML_TYPE_F32 && L.ssm_a->type == GGML_TYPE_F32 &&
+                ggml_nelements(L.ssm_dt_bias) == ggml_nelements(L.ssm_a)) {
+                n_gate++;
+            }
+        }
+        if (n_gate > 0) {
+            ggml_init_params gip{};
+            gip.mem_size   = (n_gate + 2) * ggml_tensor_overhead();
+            gip.mem_buffer = nullptr;
+            gip.no_alloc   = true;
+            out.gate_ctx = ggml_init(gip);
+            if (out.gate_ctx) {
+                for (int il = 0; il < (int)n_layer; il++) {
+                    TargetLayer & L = out.layers[il];
+                    if (!(L.ssm_dt_bias && L.ssm_a && L.ssm_dt_bias->data && L.ssm_a->data &&
+                          L.ssm_dt_bias->type == GGML_TYPE_F32 && L.ssm_a->type == GGML_TYPE_F32 &&
+                          ggml_nelements(L.ssm_dt_bias) == ggml_nelements(L.ssm_a))) {
+                        continue;
+                    }
+                    const int64_t h = ggml_nelements(L.ssm_a);
+                    L.ssm_gate_ba = ggml_new_tensor_1d(out.gate_ctx, GGML_TYPE_F32, 2*h);
+                    char nm[96];
+                    std::snprintf(nm, sizeof(nm), "blk.%d.ssm_gate_ba", il);
+                    ggml_set_name(L.ssm_gate_ba, nm);
+                }
+                out.gate_buf = ggml_backend_alloc_ctx_tensors(out.gate_ctx, backend);
+                if (out.gate_buf) {
+                    ggml_backend_buffer_set_usage(out.gate_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    std::vector<float> tmp;
+                    for (int il = 0; il < (int)n_layer; il++) {
+                        TargetLayer & L = out.layers[il];
+                        if (!L.ssm_gate_ba) continue;
+                        const int64_t h = ggml_nelements(L.ssm_a);
+                        tmp.resize((size_t)2*h);
+                        ggml_backend_tensor_get(L.ssm_dt_bias, tmp.data(), 0, (size_t)h*sizeof(float));
+                        ggml_backend_tensor_get(L.ssm_a, tmp.data() + h, 0, (size_t)h*sizeof(float));
+                        ggml_backend_tensor_set(L.ssm_gate_ba, tmp.data(), 0, (size_t)2*h*sizeof(float));
+                    }
+                } else {
+                    for (int il = 0; il < (int)n_layer; il++) out.layers[il].ssm_gate_ba = nullptr;
+                    ggml_free(out.gate_ctx);
+                    out.gate_ctx = nullptr;
+                }
+            }
+        }
+    }
+
     if (tok_embd_off == 0 || tok_embd_type == GGML_TYPE_COUNT) {
         set_last_error("token_embd.weight not found or invalid type");
         release_out_buffer();
@@ -1055,6 +1111,8 @@ void free_target_weights(TargetWeights & w) {
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
     if (w.stack_ctx) { ggml_free(w.stack_ctx);    w.stack_ctx = nullptr; }
+    if (w.gate_buf)  { ggml_backend_buffer_free(w.gate_buf); w.gate_buf = nullptr; }
+    if (w.gate_ctx)  { ggml_free(w.gate_ctx);     w.gate_ctx = nullptr; }
     // CpuEmbedder destructor handles the mmap automatically.
     w.moe_hybrid.reset();
     w.layers.clear();

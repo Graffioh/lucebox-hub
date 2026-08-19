@@ -99,6 +99,7 @@ namespace dflash::common {
 namespace {
 constexpr auto kClientMonitorInterval = std::chrono::milliseconds(250);
 constexpr auto kSseHeartbeatInterval = std::chrono::seconds(15);
+constexpr auto kReadClosedProbeInterval = std::chrono::seconds(1);
 constexpr char kSseHeartbeat[] = ": keep-alive\n\n";
 }
 
@@ -155,6 +156,33 @@ bool sse_chunk_has_done(
         }
     }
     return found;
+}
+
+HeartbeatSendResult try_send_sse_heartbeat(
+        SocketHandle fd, size_t & offset) {
+    constexpr size_t heartbeat_size = sizeof(kSseHeartbeat) - 1;
+    if (offset > heartbeat_size) {
+        offset = 0;
+        return HeartbeatSendResult::Disconnected;
+    }
+    while (offset < heartbeat_size) {
+        const ssize_t n = send(
+            fd, kSseHeartbeat + offset, heartbeat_size - offset,
+            MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n > 0) {
+            offset += (size_t)n;
+            continue;
+        }
+        if (n < 0) {
+            const int error = sock_errno();
+            if (sock_is_eintr(error)) continue;
+            if (sock_is_eagain(error)) return HeartbeatSendResult::Retry;
+        }
+        offset = 0;
+        return HeartbeatSendResult::Disconnected;
+    }
+    offset = 0;
+    return HeartbeatSendResult::Complete;
 }
 
 }  // namespace http_detail
@@ -478,31 +506,27 @@ static std::string generate_id(const char * prefix) {
     return buf;
 }
 
-// Logging helpers shared by route_request() / worker_loop(). Kept static
-// (file-scope) so they don't leak into the public ABI; the chat lifecycle
-// logs that use them are part of #270's request-tracing instrumentation.
-static const char * api_format_name(ApiFormat format) {
-    switch (format) {
-    case ApiFormat::OPENAI_CHAT: return "chat";
-    case ApiFormat::ANTHROPIC:   return "anthropic";
-    case ApiFormat::RESPONSES:   return "responses";
-    default:                     return "unknown";
-    }
-}
-
 static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
 }
 
 int resolve_max_output_tokens(const json & body, int default_max_tokens) {
+    // OpenAI-compatible clients (e.g. PocketPal's "Unlimited") send
+    // max_completion_tokens: -1 to mean "no explicit limit"; 0 is also
+    // invalid as a budget. Treat non-positive values as unset so they
+    // fall back to the server default instead of yielding zero tokens.
+    auto field_or_default = [&](const char * key) {
+        const int value = body.at(key).get<int>();
+        return value > 0 ? value : default_max_tokens;
+    };
     if (body.contains("max_tokens")) {
-        return body.at("max_tokens").get<int>();
+        return field_or_default("max_tokens");
     }
     if (body.contains("max_output_tokens")) {
-        return body.at("max_output_tokens").get<int>();
+        return field_or_default("max_output_tokens");
     }
     if (body.contains("max_completion_tokens")) {
-        return body.at("max_completion_tokens").get<int>();
+        return field_or_default("max_completion_tokens");
     }
     return default_max_tokens;
 }
@@ -649,7 +673,7 @@ json build_props_body(const ServerConfig & config,
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
     const bool reasoning_supported = is_qwen;
     const bool speculative_supported = is_qwen;
-    const bool tools_supported = is_qwen;
+    const bool tools_supported = is_qwen || config.arch == "deepseek4";
 
     auto pcs  = prefix_cache.stats();
     auto pcfs = prefix_cache.full_stats();
@@ -768,6 +792,9 @@ json build_props_body(const ServerConfig & config,
             // (dflash/scripts/bench_http_capability.py) read
             // /props.runtime wholesale into result.json.server_info.
             {"chunk",           config.chunk},
+            {"continuous_batching", {
+                {"admission_coalesce_ms", config.admission_coalesce_ms},
+            }},
             // Device placement strings (e.g. "auto:0", "cuda:0"). Empty
             // string when no draft model is loaded.
             {"target_device",   config.target_device},
@@ -1361,8 +1388,16 @@ int HttpServer::run() {
     std::fprintf(stderr, "[server] listening on http://%s:%d\n",
                  config_.host.c_str(), config_.port);
 
-    // Start worker thread.
-    worker_thread_ = std::thread([this]() { worker_loop(); });
+    // A backend-provided sequence engine replaces the one-request worker
+    // with the concurrent scheduler. Upstream forwarding stays on the
+    // classic path even when the local backend exposes an engine.
+    if (SeqEngine * engine = backend_.seq_engine();
+        engine && config_.pflash_upstream_base.empty()) {
+        worker_thread_ =
+            std::thread([this, engine]() { scheduler_loop(*engine); });
+    } else {
+        worker_thread_ = std::thread([this]() { worker_loop(); });
+    }
 
     // Accept loop.
     while (!stopping_.load()) {
@@ -1945,8 +1980,7 @@ void HttpServer::log_parsed_request(const ParsedRequest & req) const {
 
 void HttpServer::enqueue_request_and_wait(SocketHandle fd, ParsedRequest req) {
     // Set socket non-blocking for send() stall detection during streaming.
-    const int flags = sock_get_flags(fd);
-    if (flags >= 0) sock_set_nonblock(fd);
+    sock_set_nonblock(fd);
 
     ServerJob job;
     job.fd = fd;
@@ -2219,8 +2253,9 @@ json build_openai_completion_response(
     // usage.completion_tokens_details.reasoning_tokens — OpenAI o1/o3
     // standard location; kept in sync with finish_details.thinking_tokens.
     // usage.timings — per-request prefill/decode wall clock, additive to
-    // the OpenAI shape (ignored by clients that don't recognize it). See
-    // docs/specs/thinking-budget.md §6.3.
+    // the OpenAI shape (ignored by clients that don't recognize it).
+    // spec_decode_ran disambiguates a real zero-acceptance speculative run
+    // from an autoregressive fallback. See docs/specs/thinking-budget.md §6.3.
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const json usage = {
         {"prompt_tokens", prompt_tokens},
@@ -2231,6 +2266,7 @@ json build_openai_completion_response(
         }},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},
@@ -2298,6 +2334,7 @@ json build_anthropic_response(
         {"output_tokens", counts.total},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},
@@ -2347,6 +2384,7 @@ json build_responses_api_response(
         {"total_tokens", prompt_tokens + counts.total},
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
+        {"spec_decode_ran", result.spec_decode_ran},
     };
     return {
         {"id", req.response_id},
@@ -2360,10 +2398,8 @@ json build_responses_api_response(
 
 json build_non_streaming_response(
         const ParsedRequest & req, const GenerateResult & result,
-        int generation_cap, const GenTimings & timings, Tokenizer & tokenizer,
-        SseEmitter & emitter) {
-    const CompletionTokenCounts counts = feed_non_streaming_tokens(
-        result.tokens, tokenizer, emitter);
+        int generation_cap, const GenTimings & timings,
+        const CompletionTokenCounts & counts, SseEmitter & emitter) {
     switch (req.format) {
     case ApiFormat::OPENAI_CHAT:
         return build_openai_completion_response(
@@ -2377,6 +2413,16 @@ json build_non_streaming_response(
     default:
         return {{"text", emitter.accumulated_text()}};
     }
+}
+
+json build_non_streaming_response(
+        const ParsedRequest & req, const GenerateResult & result,
+        int generation_cap, const GenTimings & timings, Tokenizer & tokenizer,
+        SseEmitter & emitter) {
+    const CompletionTokenCounts counts = feed_non_streaming_tokens(
+        result.tokens, tokenizer, emitter);
+    return build_non_streaming_response(
+        req, result, generation_cap, timings, counts, emitter);
 }
 
 // Prompt preparation applies exactly one compression policy: FlowKV for
@@ -3535,6 +3581,74 @@ void HttpServer::configure_generation_io(
     };
 }
 
+bool HttpServer::deliver_generation_token(
+        ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
+        int32_t token, int & completion_tokens,
+        ClientSendBuffer & send_buffer) {
+    ++completion_tokens;
+
+    std::string text;
+    const TokenDelivery delivery =
+        classify_generated_token(tokenizer_, token, text);
+    if (delivery == TokenDelivery::kSkip) return true;
+
+    // Non-stream replay counts every non-skipped token, including tokens
+    // whose decoded text is empty. Keep concurrent usage accounting aligned;
+    // streaming still has no frame to send for an empty string.
+    if (text.empty() && req.stream) return true;
+
+    const auto chunks = emitter.emit_token(text);
+    if (req.stream && !chunks.empty()) {
+        // Disable silent-prefill heartbeats only once there is a real frame
+        // to buffer. Complete a partial comment ahead of that frame.
+        stop_job_stream(job, &send_buffer);
+        for (const auto & chunk : chunks) {
+            send_buffer.append(chunk);
+        }
+    }
+    return delivery == TokenDelivery::kThinkTag || !emitter.stop_hit();
+}
+
+void HttpServer::send_nonstream_response(
+        const ParsedRequest & req, SocketHandle fd, SseEmitter & emitter,
+        const std::vector<int32_t> & gen_tokens, int n_gen_cap,
+        bool budget_forced_close, bool degenerate_decode_close,
+        const GenTimings & gen_timings,
+        ClientSendBuffer * send_buffer) {
+    CompletionTokenCounts counts;
+    counts.total = (int) gen_tokens.size();
+    emitter.emit_finish(counts.total);
+    const int first_content = emitter.first_content_token_index();
+    const int emitted = emitter.emit_token_count();
+    counts.reasoning = first_content < 0 ? emitted : first_content;
+    counts.content = first_content < 0 ? 0 : emitted - first_content;
+
+    GenerateResult result;
+    result.tokens = gen_tokens;
+    result.budget_forced_close = budget_forced_close;
+    result.degenerate_decode_close = degenerate_decode_close;
+
+    const json response = build_non_streaming_response(
+        req, result, n_gen_cap, gen_timings, counts, emitter);
+
+    const std::string body = response.dump() + "\n";
+    if (send_buffer) {
+        send_buffer->append(
+            format_http_response(200, "application/json", body));
+    } else {
+        send_response(fd, 200, "application/json", body);
+    }
+}
+
+std::array<std::string, 2> HttpServer::sse_error_close_chunks(
+        const std::string & message) {
+    const json err = {{"error", {
+        {"message", message},
+        {"type", "server_error"},
+    }}};
+    return {"data: " + err.dump() + "\n\n", "data: [DONE]\n\n"};
+}
+
 void HttpServer::worker_loop() {
     while (true) {
         ServerJob * job = dequeue();
@@ -3590,11 +3704,9 @@ void HttpServer::process_job(ServerJob * job) {
         std::fprintf(stderr, "[server] request failed: %s\n", message.c_str());
         if (req.stream) {
             stop_job_stream(job);
-            json err = {{"error", {{"message", message}, {"type", "server_error"}}}};
-            const std::string chunk = "data: " + err.dump() + "\n\n";
-            send_job_bytes(job, chunk.data(), chunk.size());
-            const char done[] = "data: [DONE]\n\n";
-            send_job_bytes(job, done, sizeof(done) - 1);
+            for (const std::string & chunk : sse_error_close_chunks(message)) {
+                send_job_bytes(job, chunk.data(), chunk.size());
+            }
         } else {
             send_error(fd, status, message);
         }
@@ -3796,8 +3908,7 @@ void HttpServer::process_job(ServerJob * job) {
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
         // Streaming uses non-blocking sends; restore blocking mode before
         // writing a complete JSON response on this shared socket path.
-        const int flags = sock_get_flags(fd);
-        if (flags >= 0) sock_set_block(fd);
+        sock_set_block(fd);
         send_response(fd, 200, "application/json",
                       response.dump() + "\n");
     }
@@ -3880,6 +3991,33 @@ ServerJob * HttpServer::dequeue() {
     if (!queue_head_) queue_tail_ = nullptr;
     j->next = nullptr;
     return j;
+}
+
+ServerJob * HttpServer::try_dequeue() {
+    std::lock_guard<std::mutex> lk(queue_mu_);
+    if (!queue_head_) return nullptr;
+    ServerJob * job = queue_head_;
+    queue_head_ = job->next;
+    if (!queue_head_) queue_tail_ = nullptr;
+    job->next = nullptr;
+    return job;
+}
+
+ServerJob * HttpServer::dequeue_for(
+        std::chrono::steady_clock::duration timeout) {
+    std::unique_lock<std::mutex> lk(queue_mu_);
+    if (!queue_head_ && !stopping_.load() &&
+        timeout > std::chrono::steady_clock::duration::zero()) {
+        queue_cv_.wait_for(lk, timeout, [&] {
+            return queue_head_ != nullptr || stopping_.load();
+        });
+    }
+    if (!queue_head_) return nullptr;
+    ServerJob * job = queue_head_;
+    queue_head_ = job->next;
+    if (!queue_head_) queue_tail_ = nullptr;
+    job->next = nullptr;
+    return job;
 }
 
 // ─── HTTP I/O ───────────────────────────────────────────────────────────
@@ -4024,6 +4162,19 @@ bool HttpServer::send_job_bytes(
     if (job->client_disconnected.load(std::memory_order_acquire)) {
         return false;
     }
+    // A heartbeat may have made a short write on the previous monitor tick.
+    // Finish that comment before writing an SSE data frame so their bytes
+    // cannot be interleaved on the stream.
+    if (job->heartbeat_offset > 0) {
+        constexpr size_t heartbeat_size = sizeof(kSseHeartbeat) - 1;
+        if (!send_all(job->fd, kSseHeartbeat + job->heartbeat_offset,
+                      heartbeat_size - job->heartbeat_offset)) {
+            job->heartbeat_offset = 0;
+            job->client_disconnected.store(true, std::memory_order_release);
+            return false;
+        }
+        job->heartbeat_offset = 0;
+    }
     if (!send_all(job->fd, data, len)) {
         job->client_disconnected.store(true, std::memory_order_release);
         return false;
@@ -4036,13 +4187,21 @@ void HttpServer::start_job_stream(ServerJob * job) {
     std::lock_guard<std::mutex> lock(job->write_mu);
     if (job->client_disconnected.load(std::memory_order_acquire)) return;
     job->stream_ready = true;
-    job->read_close_probe_sent = false;
+    job->heartbeat_offset = 0;
     job->last_stream_write = std::chrono::steady_clock::now();
 }
 
-void HttpServer::stop_job_stream(ServerJob * job) {
+void HttpServer::stop_job_stream(
+        ServerJob * job, ClientSendBuffer * pending_output) {
     std::lock_guard<std::mutex> lock(job->write_mu);
     job->stream_ready = false;
+    if (pending_output && job->heartbeat_offset > 0) {
+        constexpr size_t heartbeat_size = sizeof(kSseHeartbeat) - 1;
+        pending_output->append(std::string_view(
+            kSseHeartbeat + job->heartbeat_offset,
+            heartbeat_size - job->heartbeat_offset));
+        job->heartbeat_offset = 0;
+    }
 }
 
 void HttpServer::maybe_send_job_heartbeat(
@@ -4053,24 +4212,28 @@ void HttpServer::maybe_send_job_heartbeat(
         return;
     }
     const auto now = std::chrono::steady_clock::now();
-    const bool probe_read_close =
-        peer_read_closed && !job->read_close_probe_sent;
-    if (!probe_read_close &&
-        now - job->last_stream_write < kSseHeartbeatInterval) {
+    const auto heartbeat_interval =
+        peer_read_closed ? kReadClosedProbeInterval : kSseHeartbeatInterval;
+    if (now - job->last_stream_write < heartbeat_interval) {
         return;
     }
 
-    if (!send_all(job->fd, kSseHeartbeat, sizeof(kSseHeartbeat) - 1)) {
+    // The scheduler also takes write_mu when it switches from prefill
+    // heartbeats to buffered token output.  Never hold that shared mutex
+    // across send_all()'s 30-second stall window.
+    const auto result = http_detail::try_send_sse_heartbeat(
+        job->fd, job->heartbeat_offset);
+    if (result == http_detail::HeartbeatSendResult::Disconnected) {
         job->client_disconnected.store(true, std::memory_order_release);
         return;
     }
-    if (probe_read_close) job->read_close_probe_sent = true;
+    if (result == http_detail::HeartbeatSendResult::Retry) return;
     job->last_stream_write = now;
 }
 
-bool HttpServer::send_response(
-        SocketHandle fd, int status, const std::string & content_type,
-                               const std::string & body) {
+std::string HttpServer::format_http_response(
+        int status, const std::string & content_type,
+        const std::string & body) {
     const char * reason = "OK";
     switch (status) {
         case 200: reason = "OK"; break;
@@ -4094,7 +4257,15 @@ bool HttpServer::send_response(
     header += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     header += "Connection: close\r\n\r\n";
     header += body;
-    return send_all(fd, header.data(), header.size());
+    return header;
+}
+
+bool HttpServer::send_response(
+        SocketHandle fd, int status, const std::string & content_type,
+        const std::string & body) {
+    const std::string payload =
+        format_http_response(status, content_type, body);
+    return send_all(fd, payload.data(), payload.size());
 }
 
 bool HttpServer::send_error(

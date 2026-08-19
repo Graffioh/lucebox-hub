@@ -147,6 +147,7 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     endif()
     set(GGML_HIP  ON  CACHE BOOL "" FORCE)
     set(GGML_HIP_RCCL OFF CACHE BOOL "" FORCE)
+    set(GGML_HIP_GRAPHS OFF CACHE BOOL "Enable experimental HIP graph replay")
     set(DFLASH27B_GGML_BACKEND_TARGET ggml-hip)
     set(DFLASH27B_HIP_ARCHITECTURES "" CACHE STRING "HIP GPU targets, e.g. gfx906;gfx1100")
     set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
@@ -175,6 +176,16 @@ endif()
 # the spec_prefill demo (target_gen path uses standard quant pairs).
 option(DFLASH27B_FA_ALL_QUANTS "Compile ggml-cuda fattn kernels for all KV-quant pairs" ON)
 set(GGML_CUDA_FA_ALL_QUANTS ${DFLASH27B_FA_ALL_QUANTS} CACHE BOOL "" FORCE)
+
+# Some third-party qtype-107 GGUFs encode one affine (scale, offset) pair per
+# 32-weight block instead of the original two-scale layout. This is a wire
+# format choice, so keep it explicit and build-wide.
+option(DFLASH27B_ROCMFP2_AFFINE
+    "Interpret qtype-107 ROCmFP2 blocks as affine code*scale-offset weights"
+    OFF)
+if(DFLASH27B_ROCMFP2_AFFINE)
+    add_compile_definitions(ROCMFP2_AFFINE=1)
+endif()
 
 # HIP Phase 2 — opt-in rocWMMA flashprefill kernels (Strix Halo / gfx1151).
 # Default OFF (Phase 1 = ggml q8 fallback). Set ON for the 1.7-2.7× compress
@@ -356,6 +367,10 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
     )
     target_include_directories(ggml-hip BEFORE PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/hip_compat)
+    # HIP's clang driver otherwise finds Ubuntu's older libamdhip64 before the
+    # configured ROCm runtime when it expands --hip-link.
+    get_filename_component(_dflash_hip_runtime_dir "${hip_DIR}/../.." ABSOLUTE)
+    add_link_options("-L${_dflash_hip_runtime_dir}")
 endif()
 
 if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
@@ -396,6 +411,7 @@ add_library(dflash_common STATIC
     src/errors.cpp
     src/qwen35/gguf_target_loader.cpp
     src/qwen35/qwen35_target_graph.cpp
+    src/qwen35/qwen35_roctx.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
     src/draft/draft_graph.cpp
@@ -426,6 +442,7 @@ add_library(dflash_common STATIC
     src/kv_cache.cpp
     src/kv_quant.cpp
     src/delta_net_chunked.cpp
+    src/delta_net_specla.cpp
     # Laguna-XS.2 (Poolside) target arch
     src/laguna/laguna_target_loader.cpp
     src/laguna/laguna_target_graph.cpp
@@ -448,7 +465,8 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_graph.cpp
     src/common/dflash_draft_kv.cpp
     src/common/dflash_spec_decode.cpp
-    src/common/paged_kv_pool.cpp
+    src/common/concurrency/paged_kv_pool.cpp
+    src/qwen35/concurrency/qwen35_slot_manager.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -474,6 +492,7 @@ add_library(dflash_common STATIC
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
     src/qwen35/qwen35_tensor_parallel.cpp
+    src/qwen35/concurrency/qwen35_seq_engine.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
     src/qwen35/qwen35_dflash_target.cpp
     src/qwen35/qwen35_layer_split_dflash_target.cpp
@@ -589,6 +608,10 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     target_sources(dflash_common PRIVATE src/common/geometric_draft_topk_cuda.cu)
     set_source_files_properties(src/common/geometric_draft_topk_cuda.cu
         PROPERTIES LANGUAGE HIP)
+    # Fused SpecLA accepted-state commit (one launch for all delta layers).
+    target_sources(dflash_common PRIVATE src/common/specla_commit_cuda.cu)
+    set_source_files_properties(src/common/specla_commit_cuda.cu
+        PROPERTIES LANGUAGE HIP)
     # PUBLIC so test consumers (test_dflash / test_draft_topk_cuda) also take the
     # GPU draft top-K path instead of the CPU fallback.
     target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_DRAFT_TOPK=1)
@@ -623,7 +646,8 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_sources(dflash_common PRIVATE
         src/flashprefill_select.cpp
         src/flashprefill.cpp
-        src/common/geometric_draft_topk_cuda.cu)
+        src/common/geometric_draft_topk_cuda.cu
+        src/common/specla_commit_cuda.cu)
     # PUBLIC so consumers (e.g. the test_dflash executable) also see the macro
     # and take the GPU draft top-K path instead of the CPU fallback. Same macro
     # name as the HIP branch above (backend-neutral).
@@ -986,6 +1010,11 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE CUDA::cudart)
         endif()
+        # The grouped test includes rocmfpx.h unconditionally; expose it to both
+        # backends (previously only HIP resolved it, so the default CUDA build
+        # could not compile this target).
+        target_include_directories(test_deepseek4_mmid_grouped_cuda PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
         target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE
             ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_deepseek4_mmid_grouped_cuda)
@@ -1075,6 +1104,19 @@ if(DFLASH27B_TESTS)
         endif()
         target_link_libraries(test_deepseek4_roctx PRIVATE ${CMAKE_DL_LIBS})
         list(APPEND _raw_unit_test_targets test_deepseek4_roctx)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen35_roctx.cpp")
+        add_executable(test_qwen35_roctx
+            test/test_qwen35_roctx.cpp
+            src/qwen35/qwen35_roctx.cpp)
+        target_include_directories(test_qwen35_roctx PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_qwen35_roctx PRIVATE
+                DFLASH27B_BACKEND_HIP=1)
+        endif()
+        target_link_libraries(test_qwen35_roctx PRIVATE ${CMAKE_DL_LIBS})
+        list(APPEND _raw_unit_test_targets test_qwen35_roctx)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ggml_rmsnorm_batch.cpp")
         add_executable(test_ggml_rmsnorm_batch test/test_ggml_rmsnorm_batch.cpp)
@@ -1348,7 +1390,9 @@ if(DFLASH27B_TESTS)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_generate.cpp")
         add_executable(test_generate test/test_generate.cpp)
-        target_include_directories(test_generate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_include_directories(test_generate PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
         target_link_libraries(test_generate PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash.cpp")
@@ -1368,10 +1412,43 @@ if(DFLASH27B_TESTS)
         # Pure host-side allocator test: no model, ggml, or GPU is required.
         add_executable(test_paged_kv_pool
             test/test_paged_kv_pool.cpp
-            src/common/paged_kv_pool.cpp)
+            src/common/concurrency/paged_kv_pool.cpp)
         target_include_directories(test_paged_kv_pool PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_slot_manager.cpp")
+        # Host-side slot bookkeeping test (concurrent serving): no GPU.
+        add_executable(test_seq_slot_manager
+            test/test_seq_slot_manager.cpp
+            src/qwen35/concurrency/qwen35_slot_manager.cpp
+            src/common/concurrency/paged_kv_pool.cpp)
+        target_include_directories(test_seq_slot_manager PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_seq_slot_manager)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_engine_contract.cpp")
+        # SeqEngine conformance checker + the fakes that prove it bites: no GPU.
+        add_executable(test_seq_engine_contract test/test_seq_engine_contract.cpp)
+        target_include_directories(test_seq_engine_contract PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_seq_engine_contract)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_batch_plan.cpp")
+        # Pure-host tests for model-neutral token-budget/FIFO planning.
+        add_executable(test_seq_batch_plan test/test_seq_batch_plan.cpp)
+        target_include_directories(test_seq_batch_plan PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_seq_batch_plan)
+    endif()
+    if(UNIX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_client_send_buffer.cpp")
+        # Buffered non-blocking client writer test (socketpair): no GPU.
+        add_executable(test_client_send_buffer test/test_client_send_buffer.cpp)
+        target_include_directories(test_client_send_buffer PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_client_send_buffer)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash.cpp")
         add_executable(test_dflash test/test_dflash.cpp)
@@ -1467,6 +1544,18 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_recurrent_snapshot)
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_delta_net_specla.cpp")
+        # GPU parity test: SpecLA topology-masked verify + factor-based state
+        # reconstruction vs the fused sequential gated-delta-net kernel.
+        # Exits 77 (ctest SKIP) when no GPU is present.
+        add_executable(test_delta_net_specla test/test_delta_net_specla.cpp)
+        target_include_directories(test_delta_net_specla PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(test_delta_net_specla PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        list(APPEND _raw_unit_test_targets test_delta_net_specla)
+    endif()
+
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
         set(_server_unit_sources
             test/test_unit_main.cpp
@@ -1479,6 +1568,7 @@ if(DFLASH27B_TESTS)
             test/test_admission.cpp
             test/test_restore_delta.cpp
             test/test_chain_rollback_policy.cpp
+            test/test_ddtree_tau.cpp
             test/test_anchor_transitive.cpp
             test/test_drafter_early_exit_score_range.cpp
             test/test_drafter_tail_capture_guard.cpp
@@ -1503,6 +1593,7 @@ if(DFLASH27B_TESTS)
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
+            src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
             src/qwen3/anchor_scan.cpp)
@@ -1819,20 +1910,46 @@ if(DFLASH27B_TESTS)
     endif()
     endif()
 
+    function(dflash_add_ggml_gpu_executable target source)
+        add_executable(${target} ${source})
+        target_link_libraries(${target} PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            target_link_libraries(${target} PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(${target} PRIVATE hip::host)
+        endif()
+        target_include_directories(${target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+    endfunction()
+
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_batched_gdn.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_batched_gdn test/test_batched_gdn.cpp)
+        add_test(NAME batched_gdn COMMAND test_batched_gdn)
+        add_test(NAME batched_gdn_cpu COMMAND test_batched_gdn --cpu)
+        if(TARGET check)
+            add_dependencies(check test_batched_gdn)
+        endif()
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_concat_transpose.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_concat_transpose test/test_concat_transpose.cpp)
+        add_test(NAME concat_transpose COMMAND test_concat_transpose)
+        if(TARGET check)
+            add_dependencies(check test_concat_transpose)
+        endif()
+    endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_paged_attention.cpp")
-        add_executable(bench_paged_attention test/bench_paged_attention.cpp)
-        target_link_libraries(bench_paged_attention PRIVATE
-            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            target_link_libraries(bench_paged_attention PRIVATE CUDA::cudart)
-        else()
-            target_link_libraries(bench_paged_attention PRIVATE hip::host)
-        endif()
-        target_include_directories(bench_paged_attention PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        dflash_add_ggml_gpu_executable(
+            bench_paged_attention test/bench_paged_attention.cpp)
     endif()
 endif()
 
@@ -1847,6 +1964,7 @@ if(DFLASH27B_SERVER)
         add_executable(dflash_server
             src/server/server_main.cpp
             src/server/http_server.cpp
+            src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
         )
