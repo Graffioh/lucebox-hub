@@ -5809,3 +5809,139 @@ TEST_CASE(ServerUnitFixture, test_qwen35_embedded_mtp_target_layer_count) {
         "laguna", 65, 1, target_layers, error));
     TEST_ASSERT(target_layers == 65);
 }
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_xml) {
+    const std::string text =
+        "Reading configuration:\n"
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  <param name=\"path\">server.go</param>\n"
+        "  <param name=\"offset\">10</param>\n"
+        "  <param name=\"limit\">50</param>\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "server.go");
+        TEST_ASSERT(args["offset"] == 10);
+        TEST_ASSERT(args["limit"] == 50);
+    }
+    TEST_ASSERT(result.cleaned_text == "Reading configuration:");
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_invoke_json) {
+    const std::string text =
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  {\"path\": \"app.py\", \"offset\": \"5\"}\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, read_tools());
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "app.py");
+        TEST_ASSERT(args["offset"] == 5);
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_inside_reasoning) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    auto c1 = em.emit_token("<think>Analyzing build files.\n");
+    auto c2 = em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">CMakeLists.txt</param>\n  </invoke>\n</function_calls>\n</think>");
+    auto fin = em.emit_finish(2);
+
+    std::string all = concat(c1) + concat(c2) + concat(fin);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.reasoning_text().find("Analyzing build files.") != std::string::npos);
+    TEST_ASSERT(all.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_calls_anthropic_input_schema) {
+    json anthropic_tools = json::array({
+        {
+            {"name", "read"},
+            {"description", "Read a file"},
+            {"input_schema", {
+                {"type", "object"},
+                {"properties", {
+                    {"path", {{"type", "string"}}},
+                    {"offset", {{"type", "integer"}}}
+                }}
+            }}
+        }
+    });
+
+    const std::string text =
+        "<function_calls>\n"
+        "<invoke name=\"read\">\n"
+        "  <param name=\"path\">main.cpp</param>\n"
+        "  <param name=\"offset\">42</param>\n"
+        "</invoke>\n"
+        "</function_calls>";
+
+    auto result = parse_tool_calls(text, anthropic_tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "main.cpp");
+        TEST_ASSERT(args["offset"] == 42);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_unclosed_think_flushes_reasoning) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    auto c1 = em.emit_token("<think>Analyzing build files without closing tag.\n");
+    auto c2 = em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">CMakeLists.txt</param>\n  </invoke>\n</function_calls>");
+    auto fin = em.emit_finish(2);
+
+    std::string all = concat(c1) + concat(c2) + concat(fin);
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.reasoning_text().find("Analyzing build files without closing tag.") != std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("Analyzing build files") == std::string::npos);
+    TEST_ASSERT(all.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_content_tokens_accounting) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    // Token 0: reasoning
+    em.emit_token("<think>Analyzing build configuration.\n");
+    // Token 1: function_calls
+    em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">CMakeLists.txt</param>\n  </invoke>\n</function_calls>\n");
+    // Token 2: close think
+    em.emit_token("</think>\n");
+    // Token 3: content
+    em.emit_token("Here is the build summary.");
+    em.emit_finish(4);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.first_content_token_index() == 3);
+    TEST_ASSERT(em.emit_token_count() == 4);
+    TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_function_calls_param_with_literal_think_close) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    // Token 0: reasoning
+    em.emit_token("<think>Searching for tag.\n");
+    // Token 1: parameter with literal </think> inside
+    em.emit_token("<function_calls>\n  <invoke name=\"read\">\n    <param name=\"path\">test_</think>.cpp</param>\n  </invoke>\n</function_calls>\n");
+    // Token 2: real close think + trailing content in same token
+    em.emit_token("</think> Found file.");
+    em.emit_finish(3);
+
+    TEST_ASSERT(em.tool_calls().size() == 1);
+    TEST_ASSERT(em.first_content_token_index() == 2);
+    TEST_ASSERT(em.emit_token_count() == 3);
+    TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 1);
+}
+
+
+
