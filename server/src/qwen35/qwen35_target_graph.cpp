@@ -1499,16 +1499,25 @@ static ggml_tensor * build_delta_net_block(
     // keeps the op-by-op graph for A/B checks. The chunked delta-net path
     // (opt-in) needs the materialized gates, so it is decided here too.
     static const bool fused_kernels_env = std::getenv("DFLASH_QWEN35_NO_FUSED_KERNELS") == nullptr;
-    bool chunked_env = false;
-    if (can_skip_gdn_intermediate && n_tokens > 1) {
-        if (const char * s_env = std::getenv("DFLASH27B_CHUNKED")) {
-            chunked_env = (std::atoi(s_env) != 0);
-        }
-    }
+    // Chunked delta-net (llama.cpp build_delta_net_chunking port, verified
+    // ~1e-6 vs the sequential kernel): re-expresses the recurrence as
+    // chunk-parallel matmuls. Prefill-shaped calls only; decode, verify
+    // (rollback capture), tree, ragged and SpecLA paths always keep the
+    // sequential fused kernel. OFF by default: on gfx1201 the sequential
+    // kernel wins at a 512-token ubatch (514 ms vs 667 ms per forward; the
+    // ~20k-node chunk graph costs more in launches than it saves in GDN
+    // serialization). DFLASH27B_CHUNKED=1 opts in for A/B on other
+    // hardware.
+    static const bool chunked_env_on = []() {
+        const char * s_env = std::getenv("DFLASH27B_CHUNKED");
+        return s_env && std::atoi(s_env) == 1;
+    }();
+    const bool chunked_call = chunked_env_on && can_skip_gdn_intermediate && !ragged &&
+        !active_slot_ids && !use_specla_factorized && !use_specla_hld && n_tokens > 1;
     const bool fused_plain = fused_kernels_env && !parent_ids && !ragged && !active_slot_ids &&
                              !use_specla_factorized && !use_specla_hld;
     const bool fused_conv  = fused_plain;
-    const bool raw_gates   = fused_plain && !chunked_env && L.ssm_gate_ba != nullptr;
+    const bool raw_gates   = fused_plain && !chunked_call && L.ssm_gate_ba != nullptr;
 
     // beta = sigmoid(beta); g = softplus(alpha + ssm_dt_bias) * ssm_a
     // (-A_log.exp() * softplus). In raw-gate mode the GDN kernel applies both
@@ -1777,7 +1786,7 @@ static ggml_tensor * build_delta_net_block(
     // produces); the chunked, compact-decode and SpecLA paths take the
     // materialized copies.
     if (num_k_heads != num_v_heads &&
-        (chunked_env || seg_active || use_specla_factorized || use_specla_hld)) {
+        (chunked_call || seg_active || use_specla_factorized || use_specla_hld)) {
         q_c = ggml_repeat_4d(ctx, q_c, head_k_dim, num_v_heads, n_seq_tokens, seg_seqs);
         k_c = ggml_repeat_4d(ctx, k_c, head_k_dim, num_v_heads, n_seq_tokens, seg_seqs);
     }
@@ -1824,7 +1833,7 @@ static ggml_tensor * build_delta_net_block(
     // Chunked delta-net path (opt-in via DFLASH27B_CHUNKED, chain-only, no
     // capture): decided whole-batch above; a segment only qualifies with
     // more than one timestep.
-    const bool use_chunked = chunked_env && n_seq_tokens > 1;
+    const bool use_chunked = chunked_call && n_seq_tokens > 1;
 
     ggml_tensor * output = nullptr;
 

@@ -1691,6 +1691,8 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         // positions encode the complete context — critical for tool
         // definitions at prompt start to propagate into KV values that
         // decode-time windowed attention will later read.
+        static const bool prefill_timing = std::getenv("DFLASH_PREFILL_TIMING") != nullptr;
+        const auto t_build0 = std::chrono::steady_clock::now();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/kv_pos, /*n_tokens=*/n_tokens,
                                with_mask, /*capture=*/true,
@@ -1767,7 +1769,17 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
 
         // Compute
+        const auto t_comp0 = std::chrono::steady_clock::now();
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
+        if (prefill_timing) {
+            ggml_backend_synchronize(target_backend_);
+            const auto t_comp1 = std::chrono::steady_clock::now();
+            std::fprintf(stderr,
+                "[prefill-timing] tokens=%d nodes=%d build+alloc=%.1fms compute=%.1fms\n",
+                n_tokens, ggml_graph_n_nodes(sg_.gf),
+                std::chrono::duration<double, std::milli>(t_comp0 - t_build0).count(),
+                std::chrono::duration<double, std::milli>(t_comp1 - t_comp0).count());
+        }
         if (st != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "prefill compute @%d failed\n", kv_pos);
             return -1;
