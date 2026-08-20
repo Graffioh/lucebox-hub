@@ -412,11 +412,16 @@ static void ggml_cuda_mul_mat_q_impl(
         ne03, ne13, s03, s13, s3,
         use_stream_k, ncols_max};
 
+    // Negative expert IDs represent masked owner routes. The compact MMID
+    // kernels intentionally do not write those destination columns, so clear
+    // the output before dispatch to make their contribution exactly zero.
+    CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
     if (src0_pair) {
         mmq_args pair_args = args;
         pair_args.x = (const char *) src0_pair->data;
         pair_args.dst = (float *) dst_pair->data;
+        CUDA_CHECK(cudaMemsetAsync(pair_args.dst, 0, ggml_nbytes(dst_pair), stream));
         if (src0_pair->type == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
             const void * pair_codebooks = nullptr;
             const uint8_t * pair_modes = nullptr;

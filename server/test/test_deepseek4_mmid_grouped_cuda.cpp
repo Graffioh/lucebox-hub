@@ -105,7 +105,11 @@ static bool run_case(
     std::vector<int32_t> ids_h((size_t) top_k * width);
     for (int token = 0; token < width; ++token) {
         for (int slot = 0; slot < top_k; ++slot) {
-            ids_h[(size_t) token * top_k + slot] = (token * 3 + slot * 5) % n_experts;
+            // Exercise the owner-split contract as well as dense routing:
+            // negative IDs are masked routes and their output lanes must be
+            // exactly zero rather than stale allocator contents.
+            ids_h[(size_t) token * top_k + slot] =
+                (token + slot) % 5 == 0 ? -1 : (token * 3 + slot * 5) % n_experts;
         }
     }
 
