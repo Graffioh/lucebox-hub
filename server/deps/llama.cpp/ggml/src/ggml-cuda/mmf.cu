@@ -96,13 +96,6 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         ids_info_ptr = &ids_info;
     }
 
-    // Compact MUL_MAT_ID skips negative (owner-masked) routes. Initialize the
-    // corresponding destination lanes so later zero weighting cannot turn
-    // stale NaN/Inf values into a poisoned route reduction.
-    if (ids_info_ptr) {
-        CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), ctx.stream()));
-    }
-
     const int device    = ggml_cuda_get_device();
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int rows_per_block = mmf_get_rows_per_block(cc);

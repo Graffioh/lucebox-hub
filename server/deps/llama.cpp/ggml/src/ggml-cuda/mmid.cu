@@ -149,8 +149,8 @@ static __global__ void mm_ids_helper_fast(
     __syncthreads();
 
     // 2. Cooperative parallel histogram
-    const int total_items = n_tokens * n_expert_used;
-    for (int idx = tid; idx < total_items; idx += 256) {
+    const int64_t total_items = (int64_t) n_tokens * n_expert_used;
+    for (int64_t idx = tid; idx < total_items; idx += 256) {
         const int it = idx / n_expert_used;
         const int iex = idx % n_expert_used;
         const int exp_id = ids[it * si1 + iex];
@@ -197,6 +197,8 @@ static void launch_mm_ids_helper(
         const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
     GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
+    GGML_ASSERT((int64_t) n_tokens * n_expert_used_var <= 0x7FFFFFFFLL &&
+                "MUL_MAT_ID route count exceeds compact int32 indexing");
 
     if (n_experts <= 256) {
         mm_ids_helper_fast<n_expert_used_template><<<1, 256, 0, stream>>>

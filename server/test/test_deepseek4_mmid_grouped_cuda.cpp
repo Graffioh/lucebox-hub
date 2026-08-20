@@ -166,17 +166,18 @@ static bool run_case(
 
 static int run_child(const char * mode, const char * output_path) {
     const bool grouped = std::strcmp(mode, "grouped") == 0;
-    if (!grouped && std::strcmp(mode, "legacy") != 0) {
+    const bool masked_fused = std::strcmp(mode, "masked-fused") == 0;
+    if (!grouped && !masked_fused && std::strcmp(mode, "legacy") != 0) {
         return 2;
     }
 #if defined(_WIN32)
-    if (!grouped) {
+    if (!grouped && !masked_fused) {
         _putenv_s("GGML_CUDA_DISABLE_FUSION", "1");
     } else {
         _putenv_s("GGML_CUDA_DISABLE_FUSION", "");
     }
 #else
-    if (!grouped) {
+    if (!grouped && !masked_fused) {
         setenv("GGML_CUDA_DISABLE_FUSION", "1", 1);
     } else {
         unsetenv("GGML_CUDA_DISABLE_FUSION");
@@ -190,6 +191,13 @@ static int run_child(const char * mode, const char * output_path) {
     }
 
     std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+    if (masked_fused) {
+        const bool ok = output.good() && run_case(
+            backend, GGML_TYPE_Q2_0_ROCMFP2, 32, true, true, output);
+        output.close();
+        ggml_backend_free(backend);
+        return ok ? 0 : 1;
+    }
     const ggml_type types[] = {
         GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
         GGML_TYPE_Q5_K, GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
@@ -363,7 +371,9 @@ int main(int argc, char ** argv) {
         return run_child(argv[2], argv[3]);
     }
     if (argc != 1) {
-        std::fprintf(stderr, "usage: %s [--child legacy|grouped OUTPUT]\n", argv[0]);
+        std::fprintf(stderr,
+                     "usage: %s [--child legacy|grouped|masked-fused OUTPUT]\n",
+                     argv[0]);
         return 2;
     }
 
@@ -382,16 +392,22 @@ int main(int argc, char ** argv) {
     const std::string grouped_path = prefix + "_enabled.bin";
     const std::string legacy_log_path = prefix + "_legacy.log";
     const std::string grouped_log_path = prefix + "_enabled.log";
+    const std::string masked_fused_path = prefix + "_masked_fused.bin";
+    const std::string masked_fused_log_path = prefix + "_masked_fused.log";
     const std::string executable = argv[0];
     const std::string legacy_cmd =
         child_command(executable, "legacy", legacy_path, legacy_log_path);
     const std::string grouped_cmd =
         child_command(executable, "grouped", grouped_path, grouped_log_path);
+    const std::string masked_fused_cmd = child_command(
+        executable, "masked-fused", masked_fused_path, masked_fused_log_path);
 
     const int legacy_status = std::system(legacy_cmd.c_str());
     const int grouped_status = std::system(grouped_cmd.c_str());
+    const int masked_fused_status = std::system(masked_fused_cmd.c_str());
     const std::vector<char> legacy = read_file(legacy_path.c_str());
     const std::vector<char> grouped = read_file(grouped_path.c_str());
+    const std::vector<char> masked_fused = read_file(masked_fused_path.c_str());
     const std::vector<char> legacy_log = read_file(legacy_log_path.c_str());
     const std::vector<char> grouped_log = read_file(grouped_log_path.c_str());
     const size_t legacy_grouped = count_records(legacy_log, "variant=grouped");
@@ -446,20 +462,26 @@ int main(int argc, char ** argv) {
         }
     }
     output_parity = output_parity && offset == legacy.size() && compared_cases == 72;
+    const size_t masked_case_bytes = (size_t) 128 * 8 * 32 * sizeof(float);
+    const bool masked_fused_zero = masked_fused.size() == masked_case_bytes;
     const bool pass = legacy_status == 0 && grouped_status == 0 &&
+        masked_fused_status == 0 && masked_fused_zero &&
         output_parity && grouped_dispatch && legacy_grouped == 0 && grouped_grouped == 105;
     if (pass) {
         std::remove(legacy_path.c_str());
         std::remove(grouped_path.c_str());
         std::remove(legacy_log_path.c_str());
         std::remove(grouped_log_path.c_str());
+        std::remove(masked_fused_path.c_str());
+        std::remove(masked_fused_log_path.c_str());
     }
     std::printf("[mmid-grouped-test] legacy_status=%d grouped_status=%d bytes=%zu "
                 "compared_cases=%d exact_cases=%d tolerant_cases=%d compared_bytes=%zu "
-                "legacy_grouped=%zu grouped_grouped=%zu "
+                "legacy_grouped=%zu grouped_grouped=%zu masked_fused_zero=%s "
                 "parity=%s\n",
                 legacy_status, grouped_status, legacy.size(), compared_cases, exact_cases,
                 tolerant_cases, compared_bytes, legacy_grouped, grouped_grouped,
+                masked_fused_zero ? "PASS" : "FAIL",
                 pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
