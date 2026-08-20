@@ -118,11 +118,119 @@ static __global__ void mm_ids_helper(
 }
 
 template <int n_expert_used_template>
+__launch_bounds__(256, 1)
+static __global__ void mm_ids_helper_fast(
+        const int32_t * __restrict__ ids,
+        int32_t * __restrict__ ids_src1,
+        int32_t * __restrict__ ids_dst,
+        int32_t * __restrict__ expert_bounds,
+        const int n_experts,
+        const int n_tokens,
+        const int n_expert_used_var,
+        const int nchannels_y,
+        const int si1,
+        const int sis1) {
+
+    const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    __shared__ int smem_hist[256];
+    __shared__ int smem_offsets[256];
+    __shared__ int smem_curr[256];
+    __shared__ int warp_totals[32];
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid / warp_size;
+    const int lane_id = tid % warp_size;
+    const int nwarps = 256 / warp_size;
+
+    // 1. Initialize LDS
+    if (tid < n_experts) {
+        smem_hist[tid] = 0;
+    }
+    __syncthreads();
+
+    // 2. Cooperative parallel histogram
+    const int total_items = n_tokens * n_expert_used;
+    for (int idx = tid; idx < total_items; idx += 256) {
+        const int it = idx / n_expert_used;
+        const int iex = idx % n_expert_used;
+        const int exp_id = ids[it * si1 + iex];
+        if (exp_id >= 0 && exp_id < n_experts) {
+            atomicAdd(&smem_hist[exp_id], 1);
+        }
+    }
+    __syncthreads();
+
+    // 3. Exclusive prefix sum over smem_hist[0..n_experts-1]
+    const int val = tid < n_experts ? smem_hist[tid] : 0;
+    int warp_sum = val;
+#pragma unroll
+    for (int offset = 1; offset < warp_size; offset *= 2) {
+        const int n = __shfl_up_sync(0xFFFFFFFF, warp_sum, offset, warp_size);
+        if (lane_id >= offset) warp_sum += n;
+    }
+
+    if (lane_id == warp_size - 1) {
+        warp_totals[warp_id] = warp_sum;
+    }
+    __syncthreads();
+
+    if (warp_id == 0 && lane_id < nwarps) {
+        int w_val = warp_totals[lane_id];
+#pragma unroll
+        for (int offset = 1; offset < nwarps; offset *= 2) {
+            const int n = __shfl_up_sync(0xFFFFFFFF, w_val, offset, warp_size);
+            if (lane_id >= offset) w_val += n;
+        }
+        warp_totals[lane_id] = w_val;
+    }
+    __syncthreads();
+
+    const int block_offset = (warp_id > 0) ? warp_totals[warp_id - 1] : 0;
+    const int inclusive_prefix = warp_sum + block_offset;
+    const int exclusive_prefix = inclusive_prefix - val;
+
+    if (tid < n_experts) {
+        smem_offsets[tid] = exclusive_prefix;
+        smem_curr[tid]    = exclusive_prefix;
+        expert_bounds[tid] = exclusive_prefix;
+    }
+    if (tid == 0) {
+        const int total_valid = warp_totals[nwarps - 1];
+        expert_bounds[n_experts] = total_valid;
+    }
+    __syncthreads();
+
+    // 4. Deterministic token scatter in token order
+    for (int it0 = 0; it0 < n_tokens; it0 += nwarps) {
+        const int it = it0 + warp_id;
+        if (it < n_tokens) {
+            for (int iex = lane_id; iex < n_expert_used; iex += warp_size) {
+                const int exp_id = ids[it * si1 + iex];
+                if (exp_id >= 0 && exp_id < n_experts) {
+                    const int pos = atomicAdd(&smem_curr[exp_id], 1);
+                    ids_src1[pos] = it * sis1 + (iex % nchannels_y);
+                    ids_dst[pos]  = it * n_expert_used + iex;
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <int n_expert_used_template>
 static void launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
     GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
+
+    if (n_experts <= 256) {
+        mm_ids_helper_fast<n_expert_used_template><<<1, 256, 0, stream>>>
+            (ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used_var, nchannels_y, si1, sis1);
+        return;
+    }
 
     const int id = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
