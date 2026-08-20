@@ -2769,7 +2769,14 @@ static bool eval_moe_owner_expert_major_batched(
         return true;
     }
 
-    const bool use_grouped_mmid = []() {
+    const bool grouped_mmid_types =
+        ((gate_tensor && up_tensor &&
+          gate_tensor->type == GGML_TYPE_Q2_0_ROCMFP2 &&
+          up_tensor->type == GGML_TYPE_Q2_0_ROCMFP2) ||
+         (gate_up_tensor &&
+          gate_up_tensor->type == GGML_TYPE_Q2_0_ROCMFP2)) &&
+        down_tensor->type == GGML_TYPE_Q3_0_ROCMFPX;
+    const bool use_grouped_mmid = grouped_mmid_types && []() {
         const char * raw = std::getenv("DFLASH_MOE_GROUPED_MMID_PREFILL");
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
     }() && n_tokens >= 32 && backend_is_gpu(backend);

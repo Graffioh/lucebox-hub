@@ -103,13 +103,16 @@ static bool run_case(
     }
 
     std::vector<int32_t> ids_h((size_t) top_k * width);
+    const bool masked_owner_routes =
+        width >= 32 &&
+        (type == GGML_TYPE_Q2_0_ROCMFP2 || type == GGML_TYPE_Q3_0_ROCMFPX);
     for (int token = 0; token < width; ++token) {
         for (int slot = 0; slot < top_k; ++slot) {
             // Exercise the owner-split contract as well as dense routing:
             // negative IDs are masked routes and their output lanes must be
             // exactly zero rather than stale allocator contents.
             ids_h[(size_t) token * top_k + slot] =
-                width >= 32 && (token + slot) % 5 == 0
+                masked_owner_routes && (token + slot) % 5 == 0
                     ? -1
                     : (token * 3 + slot * 5) % n_experts;
         }
