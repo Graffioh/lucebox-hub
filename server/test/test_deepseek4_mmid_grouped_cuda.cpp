@@ -109,7 +109,9 @@ static bool run_case(
             // negative IDs are masked routes and their output lanes must be
             // exactly zero rather than stale allocator contents.
             ids_h[(size_t) token * top_k + slot] =
-                (token + slot) % 5 == 0 ? -1 : (token * 3 + slot * 5) % n_experts;
+                width >= 32 && (token + slot) % 5 == 0
+                    ? -1
+                    : (token * 3 + slot * 5) % n_experts;
         }
     }
 
@@ -126,6 +128,25 @@ static bool run_case(
     if (status == GGML_STATUS_SUCCESS) {
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_get(result, result_h.data(), 0, result_h.size() * sizeof(float));
+        for (int token = 0; token < width; ++token) {
+            for (int slot = 0; slot < top_k; ++slot) {
+                if (ids_h[(size_t) token * top_k + slot] >= 0) {
+                    continue;
+                }
+                for (int row = 0; row < n_rows; ++row) {
+                    const size_t index =
+                        ((size_t) token * top_k + slot) * n_rows + row;
+                    if (result_h[index] != 0.0f || std::signbit(result_h[index])) {
+                        std::fprintf(stderr,
+                                     "masked route is not +0 token=%d slot=%d row=%d value=%g\n",
+                                     token, slot, row, result_h[index]);
+                        ggml_gallocr_free(alloc);
+                        ggml_free(ctx);
+                        return false;
+                    }
+                }
+            }
+        }
         if (write_output) {
             output.write(reinterpret_cast<const char *>(result_h.data()),
                          (std::streamsize) (result_h.size() * sizeof(float)));
@@ -170,7 +191,7 @@ static int run_child(const char * mode, const char * output_path) {
         GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
         GGML_TYPE_Q5_K, GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
     };
-    const int widths[] = {2, 4, 8, 9, 16};
+    const int widths[] = {2, 4, 8, 9, 16, 32};
     bool ok = output.good();
     for (ggml_type type : types) {
         for (int width : widths) {
@@ -370,7 +391,7 @@ int main(int argc, char ** argv) {
         GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
         GGML_TYPE_Q5_K, GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
     };
-    const int widths[] = {2, 4, 8, 9, 16};
+    const int widths[] = {2, 4, 8, 9, 16, 32};
     size_t offset = 0;
     size_t compared_bytes = 0;
     int compared_cases = 0;
@@ -384,8 +405,10 @@ int main(int argc, char ** argv) {
             for (bool fused_ds4 : {false, true}) {
                 const size_t case_bytes = (size_t) 128 * 8 * width * sizeof(float);
                 const bool require_exact = legacy_mmvq && !fused_ds4;
-                grouped_dispatch =
-                    has_mmvq_record(grouped_log, type, width, "grouped") && grouped_dispatch;
+                if (width <= 16) {
+                    grouped_dispatch =
+                        has_mmvq_record(grouped_log, type, width, "grouped") && grouped_dispatch;
+                }
                 if (output_parity) {
                     output_parity = compare_case_outputs(
                         legacy, grouped, offset, case_bytes, require_exact);
@@ -404,7 +427,7 @@ int main(int argc, char ** argv) {
             }
         }
     }
-    output_parity = output_parity && offset == legacy.size() && compared_cases == 70;
+    output_parity = output_parity && offset == legacy.size() && compared_cases == 84;
     const bool pass = legacy_status == 0 && grouped_status == 0 &&
         output_parity && grouped_dispatch && legacy_grouped == 0 && grouped_grouped == 105;
     if (pass) {
