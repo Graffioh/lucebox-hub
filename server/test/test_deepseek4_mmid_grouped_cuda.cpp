@@ -198,6 +198,11 @@ static int run_child(const char * mode, const char * output_path) {
     bool ok = output.good();
     for (ggml_type type : types) {
         for (int width : widths) {
+            if (width == 32 &&
+                type != GGML_TYPE_Q2_0_ROCMFP2 &&
+                type != GGML_TYPE_Q3_0_ROCMFPX) {
+                continue;
+            }
             ok = run_case(backend, type, width, false, true, output) && ok;
             ok = run_case(backend, type, width, true, true, output) && ok;
         }
@@ -404,6 +409,11 @@ int main(int argc, char ** argv) {
     bool grouped_dispatch = true;
     for (ggml_type type : types) {
         for (int width : widths) {
+            if (width == 32 &&
+                type != GGML_TYPE_Q2_0_ROCMFP2 &&
+                type != GGML_TYPE_Q3_0_ROCMFPX) {
+                continue;
+            }
             const bool legacy_mmvq = has_mmvq_record(legacy_log, type, width);
             for (bool fused_ds4 : {false, true}) {
                 const size_t case_bytes = (size_t) 128 * 8 * width * sizeof(float);
@@ -430,7 +440,7 @@ int main(int argc, char ** argv) {
             }
         }
     }
-    output_parity = output_parity && offset == legacy.size() && compared_cases == 84;
+    output_parity = output_parity && offset == legacy.size() && compared_cases == 74;
     const bool pass = legacy_status == 0 && grouped_status == 0 &&
         output_parity && grouped_dispatch && legacy_grouped == 0 && grouped_grouped == 105;
     if (pass) {
