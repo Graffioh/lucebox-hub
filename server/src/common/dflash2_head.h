@@ -26,4 +26,31 @@ bool dflash2_select_chain(const DraftWeights & dw,
                           int32_t last_tok,
                           std::vector<int32_t> & draft_tok);
 
+// Selector-scored candidates for DDTree construction (DARTree-style): the
+// same per-position top-k + selector projections as the chain path, kept on
+// the host so the tree builder can ask for branch-conditioned scores.
+struct Dflash2TreeScores {
+    int n_cand = 0, K = 0, rank = 0;
+    int32_t seed = 0;
+    std::vector<float>   lp;     // [n_cand*K]
+    std::vector<int32_t> ids;    // [n_cand*K]
+    std::vector<float>   hproj;  // [rank*n_cand]
+    std::vector<float>   succ;   // [rank*n_cand*K]
+    std::vector<float>   pred;   // [rank*(1+n_cand*K)]
+
+    // K selector-adjusted scores for position `depth-1`, conditioned on the
+    // prefix'/s last token. Sorted descending; false if depth out of range.
+    bool topk(const std::vector<int32_t> & prefix, int next_depth,
+              std::vector<float> & out_lp, std::vector<int32_t> & out_ids) const;
+};
+
+bool dflash2_score_candidates(const DraftWeights & dw,
+                              ggml_backend_t backend,
+                              DFlashTarget & target,
+                              const float * local_hidden,
+                              int q_len,
+                              int32_t last_tok,
+                              float temperature,
+                              Dflash2TreeScores & out);
+
 }  // namespace dflash::common

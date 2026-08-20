@@ -3017,6 +3017,41 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     return false;
                 }
             } else {
+                // DFlash2 selector-scored tree (DARTree-style): branch scores
+                // are logp + selector compatibility with the branch's actual
+                // parent, so the tree at worst degenerates to the selector
+                // chain. DFLASH_QWEN35_DFLASH2_TREE=0 falls back to raw top-k.
+                static const bool dflash2_tree = []() {
+                    const char * e = std::getenv("DFLASH_QWEN35_DFLASH2_TREE");
+                    return !(e && e[0] == '0' && e[1] == '\0');
+                }();
+                bool selector_tree_ok = false;
+                if (dflash2_tree && dw_.selector.enabled && !use_remote_draft) {
+                    Dflash2TreeScores sc;
+                    const auto profile_project_start = profile_start();
+                    if (dflash2_score_candidates(dw_, draft_backend_, *target,
+                                                 local_hidden.data(), q_len, last_tok,
+                                                 cfg_.ddtree_temp, sc)) {
+                        static std::atomic<bool> s_seltree_logged{false};
+                        if (!s_seltree_logged.exchange(true)) {
+                            std::fprintf(stderr,
+                                "[qwen35-spec] DFlash2 selector scores active for DDTree candidates\n");
+                        }
+                        DDTreeConditionalTopK selector_topk =
+                            [&](const std::vector<int32_t> & prefix, int next_depth,
+                                std::vector<float> & lp, std::vector<int32_t> & ids) -> bool {
+                            if (!sc.topk(prefix, next_depth, lp, ids)) return false;
+                            if ((int)lp.size() > K) { lp.resize((size_t)K); ids.resize((size_t)K); }
+                            return true;
+                        };
+                        tree = build_ddtree_conditional(
+                            selector_topk, L, K, cfg_.ddtree_budget,
+                            cfg_.ddtree_chain_seed, cfg_.ddtree_tau);
+                        selector_tree_ok = tree.n_nodes > 0;
+                    }
+                    profile_add(profile_project_s, profile_project_start);
+                }
+                if (!selector_tree_ok) {
                 std::vector<float>   top_lp;
                 std::vector<int32_t> top_ids;
                 const auto profile_project_start = profile_start();
@@ -3052,6 +3087,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                     top_ids.data() + (size_t)K,
                     L, K, cfg_.ddtree_budget, cfg_.ddtree_chain_seed,
                     cfg_.ddtree_tau);
+                }
             }
             // SpecLA schedules the retained topology directly. Never execute
             // fake padding nodes: confidence pruning must reduce target work,
