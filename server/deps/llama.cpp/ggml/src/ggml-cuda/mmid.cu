@@ -135,9 +135,7 @@ static __global__ void mm_ids_helper_fast(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     __shared__ int smem_hist[256];
-    __shared__ int smem_offsets[256];
     __shared__ int smem_curr[256];
-    __shared__ int warp_totals[32];
 
     const int tid = threadIdx.x;
     const int warp_id = tid / warp_size;
@@ -162,43 +160,17 @@ static __global__ void mm_ids_helper_fast(
     }
     __syncthreads();
 
-    // 3. Exclusive prefix sum over smem_hist[0..n_experts-1]
-    const int val = tid < n_experts ? smem_hist[tid] : 0;
-    int warp_sum = val;
-#pragma unroll
-    for (int offset = 1; offset < warp_size; offset *= 2) {
-        const int n = __shfl_up_sync(0xFFFFFFFF, warp_sum, offset, warp_size);
-        if (lane_id >= offset) warp_sum += n;
-    }
-
-    if (lane_id == warp_size - 1) {
-        warp_totals[warp_id] = warp_sum;
-    }
-    __syncthreads();
-
-    if (warp_id == 0 && lane_id < nwarps) {
-        int w_val = warp_totals[lane_id];
-#pragma unroll
-        for (int offset = 1; offset < nwarps; offset *= 2) {
-            const int n = __shfl_up_sync(0xFFFFFFFF, w_val, offset, warp_size);
-            if (lane_id >= offset) w_val += n;
-        }
-        warp_totals[lane_id] = w_val;
-    }
-    __syncthreads();
-
-    const int block_offset = (warp_id > 0) ? warp_totals[warp_id - 1] : 0;
-    const int inclusive_prefix = warp_sum + block_offset;
-    const int exclusive_prefix = inclusive_prefix - val;
-
-    if (tid < n_experts) {
-        smem_offsets[tid] = exclusive_prefix;
-        smem_curr[tid]    = exclusive_prefix;
-        expert_bounds[tid] = exclusive_prefix;
-    }
+    // 3. Exclusive prefix sum over at most 256 experts. A short serial scan
+    // avoids partial-warp shuffle masks and is negligible next to route
+    // histogram/scatter and the following matrix multiplies.
     if (tid == 0) {
-        const int total_valid = warp_totals[nwarps - 1];
-        expert_bounds[n_experts] = total_valid;
+        int offset = 0;
+        for (int expert = 0; expert < n_experts; ++expert) {
+            smem_curr[expert] = offset;
+            expert_bounds[expert] = offset;
+            offset += smem_hist[expert];
+        }
+        expert_bounds[n_experts] = offset;
     }
     __syncthreads();
 
