@@ -119,3 +119,14 @@ Adaptive averaged 0.878 times AR goodput. The adaptive runs accepted 1,288 and
 981 speculative tokens over 537 and 401 speculative steps. This is a stable
 baseline for the next profiling pass. It is not a performance acceptance gate
 for the refactor.
+
+The throughput artifacts in
+`.harness-runs/pr626-qwen38-measurement-739cf84a/` were produced before the
+profile-context marker was added. Use them for the two-replicate throughput and
+route-count evidence above. Before this docs-only disclosure, the same server
+and harness tree was smoke-tested at `cc6b7a7d` in
+`.harness-runs/pr626-qwen38-final-stack-smoke-lint/`, where adaptive and forced
+speculation logs both record
+`context_method=synthetic-zero-kv-zero-features-v1`. Re-run the measurement
+with the current scripts before treating profile-context enforcement as part of
+a full throughput run.
