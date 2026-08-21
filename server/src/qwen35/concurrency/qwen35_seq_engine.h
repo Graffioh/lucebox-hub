@@ -22,6 +22,7 @@
 #pragma once
 
 #include "common/concurrency/seq_engine.h"
+#include "common/concurrency/chain_spec_shapes.h"
 #include "common/dflash_draft_kv.h"
 #include "common/dflash_feature_ring.h"
 #include "qwen35_slot_manager.h"
@@ -29,6 +30,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -95,9 +97,84 @@ private:
         std::vector<float> embeddings;
     };
 
+    enum class DraftFailureReason {
+        none,
+        prefill_service_round,
+        sampler_incompatible,
+        context_room_insufficient,
+        close_token_hook_active,
+        draft_feature_unavailable,
+        target_row_budget,
+        slot_draft_kv_init_failed,
+        draft_kv_begin_failed,
+        draft_embedding_failed,
+        draft_bucket_unavailable,
+        draft_backbone_failed,
+        selector_failed,
+        invalid_proposal,
+        prepared_root_stale,
+    };
+
+    struct DraftPreparationResult {
+        std::vector<uint8_t> ready;
+        std::vector<DraftFailureReason> failures;
+        bool fatal = false;
+        std::string fatal_error;
+        double draft_append_ms = 0.0;
+        double draft_backbone_ms = 0.0;
+        double lm_head_topk_ms = 0.0;
+        double selector_ms = 0.0;
+    };
+
+    struct RoundTelemetry {
+        bool enabled = false;
+        uint64_t round = 0;
+        int decode_lanes = 0;
+        int eligible_speculative_lanes = 0;
+        int speculative_lanes = 0;
+        int ar_lanes = 0;
+        int tree_width = 0;
+        int tree_bucket = 0;
+        int ar_bucket = 0;
+        int tree_padding_rows = 0;
+        int padded_rows = 0;
+        int target_rows = 0;
+        int prefill_suppressed_spec_rounds = 0;
+        bool graph_cache_hit = false;
+        bool graph_cache_miss = false;
+        size_t graph_cache_bytes = 0;
+        double draft_append_ms = 0.0;
+        double draft_backbone_ms = 0.0;
+        double lm_head_topk_ms = 0.0;
+        double selector_ms = 0.0;
+        double target_graph_build_ms = 0.0;
+        double target_forward_ms = 0.0;
+        double commit_ms = 0.0;
+        std::vector<int> accepted_tokens_per_lane;
+        std::vector<int> fallback_slots;
+        std::vector<DraftFailureReason> fallback_reasons;
+
+        ~RoundTelemetry();
+    };
+
+    struct TargetGraphKey {
+        int tree_width = 0;
+        int tree_bucket = 0;
+        int ar_bucket = 0;
+        int context_bucket = 0;
+
+        bool operator==(const TargetGraphKey & other) const {
+            return tree_width == other.tree_width &&
+                tree_bucket == other.tree_bucket &&
+                ar_bucket == other.ar_bucket &&
+                context_bucket == other.context_bucket;
+        }
+    };
+
     struct PromptServiceRound {};
     struct SpeculativeDecodeRound {
         std::vector<uint8_t> chain_lanes;
+        SpecBatchPlan plan;
     };
     using FixedServiceRound =
         std::variant<PromptServiceRound, SpeculativeDecodeRound>;
@@ -127,15 +204,17 @@ private:
                              const int32_t * cached_argmax = nullptr,
                              std::vector<float> * logits_scratch = nullptr);
     FixedServiceRound make_fixed_service_round(
-        const StepPlan & plan) const;
-    bool chain_spec_input_capable(const StepInput & input) const;
+        const StepPlan & plan);
+    DraftFailureReason chain_spec_input_failure(
+        const StepInput & input) const;
     DraftFeatureMirror * slot_feature_mirror(int slot);
     DraftKvState * ensure_slot_draft_kv(int slot);
-    bool prepare_chain_drafts(
+    DraftPreparationResult prepare_chain_drafts(
         const std::vector<StepInput> & inputs,
         const std::vector<uint8_t> & selected);
     StepResult step_chain_spec(
-        const StepPlan & plan, const std::vector<uint8_t> & selected);
+        const StepPlan & plan, const std::vector<uint8_t> & selected,
+        const SpecBatchPlan & batch_plan, RoundTelemetry & telemetry);
 
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
@@ -150,6 +229,13 @@ private:
     std::vector<std::unique_ptr<DraftKvState>> dummy_draft_kv_;
     DraftKvBatchGraph batch_draft_graph_;
     std::vector<PreparedChainDraft> prepared_chain_drafts_;
+
+    int max_target_rows_ = 0;
+    size_t spec_round_robin_start_ = 0;
+    uint64_t telemetry_round_ = 0;
+    int prefill_suppressed_spec_rounds_ = 0;
+    bool target_graph_key_valid_ = false;
+    TargetGraphKey target_graph_key_;
 
     // Hoisted per-step buffers (reused across step() calls).
     std::vector<int>         output_rows_;

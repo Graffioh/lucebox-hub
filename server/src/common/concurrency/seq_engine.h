@@ -78,6 +78,55 @@ struct StepPlanLimits {
     int prefill_allocation_quantum = 512;
 };
 
+// Mixed prompt/decode traffic alternates between decode-only islands and
+// prompt service rounds. Decode-only rounds let engines use fixed speculative
+// graphs; prompt rounds bound the time-to-first-token cost of new arrivals.
+struct ServicePolicy {
+    int max_decode_only_rounds = 4;
+    int max_prefill_wait_rounds = 2;
+};
+
+struct ServiceRoundState {
+    int decode_only_rounds = 0;
+    int prefill_wait_rounds = 0;
+};
+
+enum class ServiceRoundKind {
+    idle,
+    decode_only,
+    prompt,
+};
+
+inline ServiceRoundKind choose_service_round(
+        bool has_decode, bool has_prefill, const ServicePolicy & policy,
+        ServiceRoundState & state) {
+    if (!has_decode && !has_prefill) {
+        state = {};
+        return ServiceRoundKind::idle;
+    }
+    if (!has_prefill) {
+        state.prefill_wait_rounds = 0;
+        ++state.decode_only_rounds;
+        return ServiceRoundKind::decode_only;
+    }
+    if (!has_decode) {
+        state = {};
+        return ServiceRoundKind::prompt;
+    }
+
+    const int max_decode = std::max(0, policy.max_decode_only_rounds);
+    const int max_wait = std::max(0, policy.max_prefill_wait_rounds);
+    if (state.decode_only_rounds >= max_decode ||
+        state.prefill_wait_rounds >= max_wait) {
+        state = {};
+        return ServiceRoundKind::prompt;
+    }
+
+    ++state.decode_only_rounds;
+    ++state.prefill_wait_rounds;
+    return ServiceRoundKind::decode_only;
+}
+
 // Select the oldest eligible sequences, then distribute the step's token
 // capacity in engine-owned quanta. Strict FIFO determines cohort membership;
 // a rotating cursor prevents the oldest member from always winning a partial

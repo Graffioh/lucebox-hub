@@ -105,6 +105,32 @@ int main() {
         pending, idle_limits).empty());
     CHECK(plan_prefill_slices({}, idle_limits).empty());
 
+    ServiceRoundState service;
+    const ServicePolicy policy{/*max decode-only=*/4,
+                               /*max prefill wait=*/2};
+    CHECK(choose_service_round(false, false, policy, service) ==
+          ServiceRoundKind::idle);
+    CHECK(choose_service_round(true, true, policy, service) ==
+          ServiceRoundKind::decode_only);
+    CHECK(choose_service_round(true, true, policy, service) ==
+          ServiceRoundKind::decode_only);
+    CHECK(choose_service_round(true, true, policy, service) ==
+          ServiceRoundKind::prompt);
+    CHECK(service.decode_only_rounds == 0);
+    CHECK(service.prefill_wait_rounds == 0);
+    CHECK(choose_service_round(true, false, policy, service) ==
+          ServiceRoundKind::decode_only);
+    CHECK(choose_service_round(false, true, policy, service) ==
+          ServiceRoundKind::prompt);
+
+    ServiceRoundState decode_bound;
+    const ServicePolicy decode_policy{/*max decode-only=*/1,
+                                      /*max prefill wait=*/8};
+    CHECK(choose_service_round(true, true, decode_policy, decode_bound) ==
+          ServiceRoundKind::decode_only);
+    CHECK(choose_service_round(true, true, decode_policy, decode_bound) ==
+          ServiceRoundKind::prompt);
+
     StepPlanLimits large_limits{/*max sequences=*/2,
                                 /*per sequence=*/std::numeric_limits<int>::max(),
                                 /*total=*/std::numeric_limits<int>::max(),

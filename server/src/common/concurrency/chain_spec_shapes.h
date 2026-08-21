@@ -58,6 +58,65 @@ struct ChainLaunchShape {
     int commit_rows = 0;
 };
 
+struct SpecBatchPlan {
+    std::vector<int> speculative_slots;
+    std::vector<int> autoregressive_slots;
+    int tree_bucket = 0;
+    int ar_bucket = 0;
+    int target_rows = 0;
+    int padded_rows = 0;
+};
+
+inline int chain_context_bucket(int max_prefix) {
+    int bucket = 128;
+    const int required = std::max(1, max_prefix);
+    while (bucket < required && bucket <= (1 << 29)) bucket *= 2;
+    return bucket;
+}
+
+// Select the largest speculative cohort that fits the target-row budget.
+// Eligible lanes outside this round's cohort still run as AR, so every decode
+// slot makes progress. Rotating the eligible order prevents the same tail
+// lanes from losing speculation on every constrained round.
+inline SpecBatchPlan plan_spec_batch(
+        const std::vector<int> & eligible_speculative_slots,
+        const std::vector<int> & mandatory_ar_slots,
+        int tree_width, int max_target_rows,
+        size_t round_robin_start = 0) {
+    SpecBatchPlan plan;
+    const int width = std::max(1, tree_width);
+    const int eligible = static_cast<int>(eligible_speculative_slots.size());
+    int selected = 0;
+    for (int candidate = eligible; candidate >= 0; --candidate) {
+        const int ar_count = static_cast<int>(mandatory_ar_slots.size()) +
+            eligible - candidate;
+        const int tree_bucket = chain_decode_bucket_width(candidate);
+        const int ar_bucket = chain_decode_bucket_width(ar_count);
+        const int rows = width * tree_bucket + ar_bucket;
+        if (rows <= max_target_rows || candidate == 0) {
+            selected = candidate;
+            plan.tree_bucket = tree_bucket;
+            plan.ar_bucket = ar_bucket;
+            plan.target_rows = rows;
+            plan.padded_rows = width * (tree_bucket - candidate) +
+                ar_bucket - ar_count;
+            break;
+        }
+    }
+
+    plan.autoregressive_slots = mandatory_ar_slots;
+    if (eligible == 0) return plan;
+    const size_t start = round_robin_start % static_cast<size_t>(eligible);
+    for (int i = 0; i < eligible; ++i) {
+        const int slot = eligible_speculative_slots[
+            (start + static_cast<size_t>(i)) %
+            static_cast<size_t>(eligible)];
+        if (i < selected) plan.speculative_slots.push_back(slot);
+        else plan.autoregressive_slots.push_back(slot);
+    }
+    return plan;
+}
+
 inline ChainLaunchShape chain_launch_shape(
         const std::vector<uint8_t> & admitted,
         const std::vector<int> & accepted_lengths,

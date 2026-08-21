@@ -19,6 +19,7 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -39,6 +40,84 @@ int decode_bucket_width(int live_count) {
 
 } // namespace
 
+Qwen35SeqEngine::RoundTelemetry::~RoundTelemetry() {
+    if (!enabled) return;
+    const auto reason_name = [](DraftFailureReason reason) {
+        switch (reason) {
+        case DraftFailureReason::none: return "none";
+        case DraftFailureReason::prefill_service_round:
+            return "prefill_service_round";
+        case DraftFailureReason::sampler_incompatible:
+            return "sampler_incompatible";
+        case DraftFailureReason::context_room_insufficient:
+            return "context_room_insufficient";
+        case DraftFailureReason::close_token_hook_active:
+            return "close_token_hook_active";
+        case DraftFailureReason::draft_feature_unavailable:
+            return "draft_feature_unavailable";
+        case DraftFailureReason::target_row_budget:
+            return "target_row_budget";
+        case DraftFailureReason::slot_draft_kv_init_failed:
+            return "slot_draft_kv_init_failed";
+        case DraftFailureReason::draft_kv_begin_failed:
+            return "draft_kv_begin_failed";
+        case DraftFailureReason::draft_embedding_failed:
+            return "draft_embedding_failed";
+        case DraftFailureReason::draft_bucket_unavailable:
+            return "draft_bucket_unavailable";
+        case DraftFailureReason::draft_backbone_failed:
+            return "draft_backbone_failed";
+        case DraftFailureReason::selector_failed:
+            return "selector_failed";
+        case DraftFailureReason::invalid_proposal:
+            return "invalid_proposal";
+        case DraftFailureReason::prepared_root_stale:
+            return "prepared_root_stale";
+        }
+        return "unknown";
+    };
+    int accepted = 0;
+    for (int lane : accepted_tokens_per_lane) accepted += lane;
+    const double useful_verify_ratio = target_rows > 0
+        ? static_cast<double>(accepted) / target_rows : 0.0;
+    const double spec_ready_fraction = eligible_speculative_lanes > 0
+        ? static_cast<double>(speculative_lanes) /
+            eligible_speculative_lanes : 0.0;
+    const double padding_ratio = target_rows > 0
+        ? static_cast<double>(padded_rows) / target_rows : 0.0;
+    std::fprintf(stderr,
+        "[parallel-chain-telemetry] {\"round\":%llu,\"decode_lanes\":%d,"
+        "\"eligible_speculative_lanes\":%d,\"speculative_lanes\":%d,"
+        "\"ar_lanes\":%d,\"tree_width\":%d,\"tree_bucket\":%d,"
+        "\"ar_bucket\":%d,\"tree_padding_rows\":%d,\"padded_rows\":%d,"
+        "\"target_rows\":%d,\"draft_append_ms\":%.3f,"
+        "\"draft_backbone_ms\":%.3f,\"lm_head_topk_ms\":%.3f,"
+        "\"selector_ms\":%.3f,\"target_graph_build_ms\":%.3f,"
+        "\"target_forward_ms\":%.3f,\"commit_ms\":%.3f,"
+        "\"graph_cache\":\"%s\",\"graph_cache_bytes\":%zu,"
+        "\"prefill_suppressed_spec_rounds\":%d,\"accepted_tokens\":[",
+        static_cast<unsigned long long>(round), decode_lanes,
+        eligible_speculative_lanes, speculative_lanes, ar_lanes, tree_width,
+        tree_bucket, ar_bucket, tree_padding_rows, padded_rows, target_rows,
+        draft_append_ms, draft_backbone_ms, lm_head_topk_ms, selector_ms,
+        target_graph_build_ms, target_forward_ms, commit_ms,
+        graph_cache_hit ? "hit" : (graph_cache_miss ? "miss" : "unused"),
+        graph_cache_bytes, prefill_suppressed_spec_rounds);
+    for (size_t i = 0; i < accepted_tokens_per_lane.size(); ++i) {
+        std::fprintf(stderr, "%s%d", i ? "," : "",
+                     accepted_tokens_per_lane[i]);
+    }
+    std::fprintf(stderr, "],\"fallbacks\":[");
+    for (size_t i = 0; i < fallback_reasons.size(); ++i) {
+        std::fprintf(stderr, "%s{\"slot\":%d,\"reason\":\"%s\"}",
+            i ? "," : "", fallback_slots[i], reason_name(fallback_reasons[i]));
+    }
+    std::fprintf(stderr,
+        "],\"useful_verify_ratio\":%.6f,\"spec_ready_fraction\":%.6f,"
+        "\"padding_ratio\":%.6f}\n", useful_verify_ratio,
+        spec_ready_fraction, padding_ratio);
+}
+
 Qwen35SeqEngine::Qwen35SeqEngine(
         Qwen35Backend & backend, PagedKvPool & pool, int max_ctx,
         int64_t scratch_row, int tree_width, int tree_scratch_base,
@@ -58,6 +137,16 @@ Qwen35SeqEngine::Qwen35SeqEngine(
     const int n_slots = slots_.slot_count();
     slot_draft_kv_.resize(static_cast<size_t>(n_slots));
     prepared_chain_drafts_.resize(static_cast<size_t>(n_slots));
+    max_target_rows_ = std::max(
+        chain_decode_bucket_width(n_slots),
+        tree_width_ * chain_decode_bucket_width(n_slots));
+    if (const char * value = std::getenv("DFLASH_MAX_TARGET_ROWS")) {
+        const int configured = std::atoi(value);
+        if (configured > 0) {
+            max_target_rows_ = std::max(
+                configured, chain_decode_bucket_width(n_slots));
+        }
+    }
 
     capture_features_ = tree_width_ > 1 && tree_width_ <= 16 &&
         tree_width_ == b_.dw_.block_size && b_.dw_.selector.enabled &&
@@ -150,39 +239,75 @@ DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
     return state.get();
 }
 
-bool Qwen35SeqEngine::chain_spec_input_capable(
+Qwen35SeqEngine::DraftFailureReason
+Qwen35SeqEngine::chain_spec_input_failure(
         const StepInput & input) const {
-    if (!capture_features_ || !input.allow_speculation ||
-        input.slot < 0 || input.slot >= slots_.slot_count()) {
-        return false;
+    if (!capture_features_ || input.slot < 0 ||
+        input.slot >= slots_.slot_count()) {
+        return DraftFailureReason::draft_feature_unavailable;
+    }
+    if (!input.allow_speculation) {
+        return DraftFailureReason::close_token_hook_active;
     }
     const Qwen35Slot & slot = slots_.slot(input.slot);
-    return slot.decoding() && !slot.sampler.needs_logit_processing() &&
-           slot.cur_pos >= 1 &&
-           slot.cur_pos + tree_width_ <= slots_.max_context();
+    if (!slot.decoding() || slot.cur_pos < 1) {
+        return DraftFailureReason::draft_feature_unavailable;
+    }
+    if (slot.sampler.needs_logit_processing()) {
+        return DraftFailureReason::sampler_incompatible;
+    }
+    if (slot.cur_pos + tree_width_ > slots_.max_context()) {
+        return DraftFailureReason::context_room_insufficient;
+    }
+    return DraftFailureReason::none;
 }
 
 Qwen35SeqEngine::FixedServiceRound
-Qwen35SeqEngine::make_fixed_service_round(const StepPlan & plan) const {
+Qwen35SeqEngine::make_fixed_service_round(const StepPlan & plan) {
     if (!plan.prefills.empty()) return PromptServiceRound{};
     SpeculativeDecodeRound round;
     round.chain_lanes.resize(plan.decode.size(), 0);
+    std::vector<int> eligible;
+    std::vector<int> mandatory_ar;
     for (size_t i = 0; i < plan.decode.size(); ++i) {
-        round.chain_lanes[i] =
-            chain_spec_input_capable(plan.decode[i]) ? 1 : 0;
+        const StepInput & input = plan.decode[i];
+        if (chain_spec_input_failure(input) == DraftFailureReason::none) {
+            eligible.push_back(input.slot);
+        } else {
+            mandatory_ar.push_back(input.slot);
+        }
+    }
+    round.plan = plan_spec_batch(
+        eligible, mandatory_ar, tree_width_, max_target_rows_,
+        spec_round_robin_start_++);
+    for (int slot : round.plan.speculative_slots) {
+        const auto found = std::find_if(
+            plan.decode.begin(), plan.decode.end(),
+            [slot](const StepInput & input) { return input.slot == slot; });
+        if (found != plan.decode.end()) {
+            round.chain_lanes[static_cast<size_t>(
+                std::distance(plan.decode.begin(), found))] = 1;
+        }
     }
     return round;
 }
 
-bool Qwen35SeqEngine::prepare_chain_drafts(
+Qwen35SeqEngine::DraftPreparationResult
+Qwen35SeqEngine::prepare_chain_drafts(
         const std::vector<StepInput> & inputs,
         const std::vector<uint8_t> & selected) {
+    DraftPreparationResult result;
+    result.ready.assign(inputs.size(), 0);
+    result.failures.assign(inputs.size(), DraftFailureReason::none);
     if (selected.size() != inputs.size() || !capture_features_ ||
         tree_width_ <= 1 || tree_width_ != b_.dw_.block_size) {
-        return false;
+        result.fatal = true;
+        result.fatal_error = "invalid fixed-chain draft preparation";
+        return result;
     }
 
     struct Lane {
+        size_t input_index = 0;
         int slot = -1;
         int32_t root = -1;
         DraftKvState * state = nullptr;
@@ -196,9 +321,11 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
     std::vector<float> noise_embed(
         static_cast<size_t>(hidden) * tree_width_);
 
-    auto reset_lanes = [&]() {
+    auto reset_lanes = [&](DraftFailureReason reason) {
         for (const Lane & lane : lanes) {
             if (lane.state) draft_kv_reset(*lane.state);
+            result.ready[lane.input_index] = 0;
+            result.failures[lane.input_index] = reason;
             if (lane.slot >= 0 &&
                 lane.slot < static_cast<int>(prepared_chain_drafts_.size())) {
                 prepared_chain_drafts_[static_cast<size_t>(lane.slot)] = {};
@@ -209,41 +336,53 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
         }
     };
 
+    const auto append_started = std::chrono::steady_clock::now();
     for (size_t i = 0; i < inputs.size(); ++i) {
         if (!selected[i]) continue;
         const StepInput & input = inputs[i];
-        if (!chain_spec_input_capable(input)) {
-            reset_lanes();
-            return false;
+        const DraftFailureReason capability =
+            chain_spec_input_failure(input);
+        if (capability != DraftFailureReason::none) {
+            result.failures[i] = capability;
+            continue;
         }
         prepared_chain_drafts_[static_cast<size_t>(input.slot)] = {};
         DraftKvState * state = ensure_slot_draft_kv(input.slot);
         DraftFeatureMirror * mirror = slot_feature_mirror(input.slot);
         if (!state || !mirror) {
             if (state) draft_kv_reset(*state);
-            reset_lanes();
-            return false;
+            result.failures[i] = mirror
+                ? DraftFailureReason::slot_draft_kv_init_failed
+                : DraftFailureReason::draft_feature_unavailable;
+            continue;
         }
-        lanes.push_back({input.slot, input.token, state, mirror});
+        lanes.push_back({i, input.slot, input.token, state, mirror});
         if (!draft_kv_begin_step(
                 *state, b_.dw_, b_.draft_backend_, *mirror,
                 slots_.slot(input.slot).cur_pos)) {
-            reset_lanes();
-            return false;
+            draft_kv_reset(*state);
+            result.failures[i] = DraftFailureReason::draft_kv_begin_failed;
+            lanes.pop_back();
+            continue;
         }
         noise[0] = input.token;
         std::fill(
             noise.begin() + 1, noise.end(), b_.w_.mask_token_id);
         if (!b_.w_.embedder.embed(
                 noise.data(), tree_width_, noise_embed.data())) {
-            reset_lanes();
-            return false;
+            draft_kv_reset(*state);
+            result.failures[i] = DraftFailureReason::draft_embedding_failed;
+            lanes.pop_back();
+            continue;
         }
         ggml_backend_tensor_set(
             state->inp_embed, noise_embed.data(), 0,
             sizeof(float) * noise_embed.size());
     }
-    if (lanes.empty()) return true;
+    result.draft_append_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - append_started).count();
+    if (lanes.empty()) return result;
 
     const int bucket = chain_decode_bucket_width(
         static_cast<int>(lanes.size()));
@@ -265,8 +404,8 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
         if (!draft_kv_init(
                 *dummy, b_.dw_, b_.draft_backend_, cap, nullptr)) {
             draft_kv_free(*dummy);
-            reset_lanes();
-            return false;
+            reset_lanes(DraftFailureReason::draft_bucket_unavailable);
+            return result;
         }
         dummy_draft_kv_.push_back(std::move(dummy));
     }
@@ -274,8 +413,8 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
     std::fill(noise.begin() + 1, noise.end(), b_.w_.mask_token_id);
     if (!b_.w_.embedder.embed(
             noise.data(), tree_width_, noise_embed.data())) {
-        reset_lanes();
-        return false;
+        reset_lanes(DraftFailureReason::draft_bucket_unavailable);
+        return result;
     }
     for (int i = 0; i < dummy_count; ++i) {
         DraftKvState * dummy =
@@ -283,8 +422,8 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
         if (!draft_kv_begin_step(
                 *dummy, b_.dw_, b_.draft_backend_,
                 *lanes.front().mirror, 1)) {
-            reset_lanes();
-            return false;
+            reset_lanes(DraftFailureReason::draft_bucket_unavailable);
+            return result;
         }
         ggml_backend_tensor_set(
             dummy->inp_embed, noise_embed.data(), 0,
@@ -295,33 +434,46 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
 
     std::vector<std::vector<float>> hidden_blocks;
     std::vector<std::vector<int32_t>> proposals;
+    const auto backbone_started = std::chrono::steady_clock::now();
     if (!draft_kv_batch_compute(
             batch_draft_graph_, b_.dw_, b_.draft_backend_,
             batch_states, hidden_blocks) ||
         hidden_blocks.size() != batch_states.size()) {
-        reset_lanes();
-        return false;
+        result.draft_backbone_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - backbone_started).count();
+        reset_lanes(DraftFailureReason::draft_backbone_failed);
+        return result;
     }
+    result.draft_backbone_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - backbone_started).count();
     std::vector<const float *> hidden_by_lane;
     hidden_by_lane.reserve(hidden_blocks.size());
     for (const std::vector<float> & block : hidden_blocks) {
         hidden_by_lane.push_back(block.data());
     }
+    DFlash2BatchTimings selector_timings;
     if (!dflash2_select_chains_batched(
             b_.dw_, b_.draft_backend_, b_.w_.output, hidden_by_lane,
-            tree_width_, roots, proposals) ||
+            tree_width_, roots, proposals, &selector_timings) ||
         proposals.size() != batch_states.size()) {
-        reset_lanes();
-        return false;
+        result.lm_head_topk_ms = selector_timings.lm_head_topk_ms;
+        result.selector_ms = selector_timings.selector_ms;
+        reset_lanes(DraftFailureReason::selector_failed);
+        return result;
     }
+    result.lm_head_topk_ms = selector_timings.lm_head_topk_ms;
+    result.selector_ms = selector_timings.selector_ms;
 
     for (size_t lane_index = 0; lane_index < lanes.size(); ++lane_index) {
         const Lane & lane = lanes[lane_index];
         std::vector<int32_t> & tokens = proposals[lane_index];
         if (tokens.size() != static_cast<size_t>(tree_width_) ||
             tokens.front() != lane.root) {
-            reset_lanes();
-            return false;
+            draft_kv_reset(*lane.state);
+            result.failures[lane.input_index] =
+                DraftFailureReason::invalid_proposal;
+            continue;
         }
         PreparedChainDraft & prepared =
             prepared_chain_drafts_[static_cast<size_t>(lane.slot)];
@@ -329,8 +481,9 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
         prepared.generated = slots_.slot(lane.slot).generated_tokens();
         prepared.root = lane.root;
         prepared.tokens = std::move(tokens);
+        result.ready[lane.input_index] = 1;
     }
-    return true;
+    return result;
 }
 
 bool Qwen35SeqEngine::token_is_eos(int32_t token) const {
@@ -465,10 +618,12 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
 }
 
 SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
-        const StepPlan & plan, const std::vector<uint8_t> & selected) {
+        const StepPlan & plan, const std::vector<uint8_t> & selected,
+        const SpecBatchPlan & batch_plan, RoundTelemetry & telemetry) {
     StepResult result;
     const std::vector<StepInput> & inputs = plan.decode;
-    if (!plan.prefills.empty() || selected.size() != inputs.size()) {
+    if (!plan.prefills.empty() || selected.size() != inputs.size() ||
+        batch_plan.speculative_slots.empty()) {
         result.error = "invalid fixed chain round";
         return result;
     }
@@ -572,9 +727,23 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
 
     const int spec_count = static_cast<int>(proposals.size());
     const int ar_count = static_cast<int>(ar_lanes.size());
-    const int tree_bucket = chain_decode_bucket_width(spec_count);
+    const int tree_bucket = batch_plan.tree_bucket;
+    const int ar_bucket = batch_plan.ar_bucket;
+    if (tree_bucket < chain_decode_bucket_width(spec_count) ||
+        ar_bucket < chain_decode_bucket_width(ar_count)) {
+        result.error = "fixed chain batch plan is too small";
+        return result;
+    }
     const int tree_rows_count = tree_width * tree_bucket;
-    const int total_rows = ar_count + tree_rows_count;
+    const int total_rows = ar_bucket + tree_rows_count;
+    telemetry.speculative_lanes = spec_count;
+    telemetry.ar_lanes = ar_count;
+    telemetry.tree_bucket = tree_bucket;
+    telemetry.ar_bucket = ar_bucket;
+    telemetry.tree_padding_rows = tree_width * (tree_bucket - spec_count);
+    telemetry.padded_rows = telemetry.tree_padding_rows +
+        ar_bucket - ar_count;
+    telemetry.target_rows = total_rows;
 
     int max_prefix = 1;
     for (const Proposal & proposal : proposals) {
@@ -586,13 +755,34 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     }
 
     StepGraph & graph = b_.sg_;
-    if (!build_target_step_paged_tree(
-            graph, b_.w_, b_.cache_, b_.target_backend_,
-            tree_width, tree_bucket, max_prefix,
-            tree_scratch_base_, tree_scratch_stride_,
-            b_.cfg_.kq_stride_pad, ar_count)) {
-        result.error = "fixed chain target graph build failed";
-        return result;
+    const int context_bucket = chain_context_bucket(max_prefix);
+    const TargetGraphKey graph_key{
+        tree_width, tree_bucket, ar_bucket, context_bucket};
+    if (target_graph_key_valid_ && target_graph_key_ == graph_key &&
+        graph.gf) {
+        telemetry.graph_cache_hit = true;
+    } else {
+        telemetry.graph_cache_miss = true;
+        const auto graph_build_started = std::chrono::steady_clock::now();
+        if (!build_target_step_paged_tree(
+                graph, b_.w_, b_.cache_, b_.target_backend_,
+                tree_width, tree_bucket, context_bucket,
+                tree_scratch_base_, tree_scratch_stride_,
+                b_.cfg_.kq_stride_pad, ar_bucket)) {
+            target_graph_key_valid_ = false;
+            result.error = "fixed chain target graph build failed";
+            return result;
+        }
+        telemetry.target_graph_build_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() -
+                graph_build_started).count();
+        target_graph_key_ = graph_key;
+        target_graph_key_valid_ = true;
+    }
+    if (graph.alloc) {
+        telemetry.graph_cache_bytes =
+            ggml_gallocr_get_buffer_size(graph.alloc, 0);
     }
 
     std::vector<int32_t> tokens(static_cast<size_t>(total_rows), 0);
@@ -601,9 +791,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     std::vector<int32_t> tree_sizes(
         static_cast<size_t>(tree_bucket), 0);
     std::vector<int32_t> mapped_slots(
-        static_cast<size_t>(ar_count + tree_bucket), -1);
+        static_cast<size_t>(ar_bucket + tree_bucket), -1);
     std::vector<int32_t> state_slots(
-        static_cast<size_t>(ar_count + tree_bucket), 0);
+        static_cast<size_t>(ar_bucket + tree_bucket), 0);
     std::vector<int32_t> query_slots(
         static_cast<size_t>(total_rows), -1);
     std::vector<int32_t> query_positions(
@@ -638,8 +828,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         const Proposal & proposal =
             proposals[static_cast<size_t>(lane_index)];
         const int tree_base = lane_index * tree_width;
-        const int row_base = ar_count + tree_base;
-        const int mapped_lane = ar_count + lane_index;
+        const int row_base = ar_bucket + tree_base;
+        const int mapped_lane = ar_bucket + lane_index;
         tree_sizes[static_cast<size_t>(lane_index)] = tree_width;
         mapped_slots[static_cast<size_t>(mapped_lane)] = proposal.slot;
         state_slots[static_cast<size_t>(mapped_lane)] = proposal.slot;
@@ -711,12 +901,19 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     ggml_backend_tensor_set(
         b_.cache_.paged_kv_seq_lens, seq_lens_.data(), 0,
         sizeof(int32_t) * seq_lens_.size());
+    const auto target_forward_started = std::chrono::steady_clock::now();
     if (ggml_backend_graph_compute(b_.target_backend_, graph.gf) !=
         GGML_STATUS_SUCCESS) {
         result.error = "fixed chain target compute failed";
+        telemetry.target_forward_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - target_forward_started).count();
         return result;
     }
 
+    telemetry.target_forward_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - target_forward_started).count();
     std::vector<int32_t> posterior(
         static_cast<size_t>(total_rows), -1);
     ggml_backend_tensor_get(
@@ -725,7 +922,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
 
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
-        const int row_base = ar_count + lane_index * tree_width;
+        const int row_base = ar_bucket + lane_index * tree_width;
         const int32_t * lane_posterior =
             posterior.data() + static_cast<size_t>(row_base);
         int32_t ignored_bonus = -1;
@@ -759,6 +956,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         }
     }
 
+    telemetry.accepted_tokens_per_lane.assign(inputs.size(), 0);
+    for (const Proposal & proposal : proposals) {
+        telemetry.accepted_tokens_per_lane[proposal.input_index] =
+            static_cast<int>(proposal.path.size());
+    }
+    const auto commit_started = std::chrono::steady_clock::now();
     std::vector<int32_t> accepted_prefixes(
         static_cast<size_t>(tree_bucket), 0);
     std::vector<int32_t> commit_slots(
@@ -804,7 +1007,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
                 return result;
             }
             const int flat = lane_index * tree_width + node;
-            const int graph_row = ar_count + flat;
+            const int graph_row = ar_bucket + flat;
             commit_rows[static_cast<size_t>(flat)] =
                 append.physical_rows[depth];
             feature_commit_rows[static_cast<size_t>(graph_row)] =
@@ -898,9 +1101,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     for (const StepInput & input : inputs) {
         slots_.commit_step(input.slot);
     }
+    telemetry.commit_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - commit_started).count();
+
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
-        const int graph_row = ar_count + lane_index * tree_width +
+        const int graph_row = ar_bucket + lane_index * tree_width +
             proposal.accepted.back();
         proposal.pending = sample_graph_row(
             proposal.slot, graph_row,
@@ -990,6 +1196,20 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     }
     if (inputs.empty() && plan.prefills.empty()) return result;
 
+    static const bool telemetry_enabled =
+        std::getenv("DFLASH_CONCURRENCY_TELEMETRY") != nullptr;
+    RoundTelemetry telemetry;
+    telemetry.enabled = telemetry_enabled;
+    telemetry.round = ++telemetry_round_;
+    telemetry.decode_lanes = static_cast<int>(inputs.size());
+    telemetry.tree_width = tree_width_;
+    telemetry.accepted_tokens_per_lane.assign(inputs.size(), 0);
+    for (const StepInput & input : inputs) {
+        if (chain_spec_input_failure(input) == DraftFailureReason::none) {
+            ++telemetry.eligible_speculative_lanes;
+        }
+    }
+
     FixedServiceRound service_round = make_fixed_service_round(plan);
     if (auto * decode_round =
             std::get_if<SpeculativeDecodeRound>(&service_round)) {
@@ -997,11 +1217,91 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             decode_round->chain_lanes.begin(),
             decode_round->chain_lanes.end(),
             [](uint8_t selected) { return selected != 0; });
-        if (has_chain_lane &&
-            prepare_chain_drafts(inputs, decode_round->chain_lanes)) {
-            return step_chain_spec(plan, decode_round->chain_lanes);
+        if (has_chain_lane) {
+            DraftPreparationResult preparation =
+                prepare_chain_drafts(inputs, decode_round->chain_lanes);
+            telemetry.draft_append_ms = preparation.draft_append_ms;
+            telemetry.draft_backbone_ms = preparation.draft_backbone_ms;
+            telemetry.lm_head_topk_ms = preparation.lm_head_topk_ms;
+            telemetry.selector_ms = preparation.selector_ms;
+            if (preparation.fatal) {
+                return fail_step(preparation.fatal_error);
+            }
+
+            std::vector<int> ready_slots;
+            std::vector<int> mandatory_ar;
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                if (preparation.ready[i]) ready_slots.push_back(inputs[i].slot);
+                else mandatory_ar.push_back(inputs[i].slot);
+            }
+            SpecBatchPlan final_plan = plan_spec_batch(
+                ready_slots, mandatory_ar, tree_width_, max_target_rows_,
+                spec_round_robin_start_);
+            std::vector<uint8_t> final_selected(inputs.size(), 0);
+            for (int slot : final_plan.speculative_slots) {
+                const auto found = std::find_if(
+                    inputs.begin(), inputs.end(),
+                    [slot](const StepInput & input) {
+                        return input.slot == slot;
+                    });
+                if (found != inputs.end()) {
+                    final_selected[static_cast<size_t>(
+                        std::distance(inputs.begin(), found))] = 1;
+                }
+            }
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                DraftFailureReason reason = chain_spec_input_failure(inputs[i]);
+                if (reason == DraftFailureReason::none &&
+                    !decode_round->chain_lanes[i]) {
+                    reason = DraftFailureReason::target_row_budget;
+                } else if (reason == DraftFailureReason::none &&
+                           !preparation.ready[i]) {
+                    reason = preparation.failures[i];
+                } else if (reason == DraftFailureReason::none &&
+                           !final_selected[i]) {
+                    reason = DraftFailureReason::target_row_budget;
+                    prepared_chain_drafts_[
+                        static_cast<size_t>(inputs[i].slot)] = {};
+                }
+                if (reason != DraftFailureReason::none) {
+                    telemetry.fallback_slots.push_back(inputs[i].slot);
+                    telemetry.fallback_reasons.push_back(reason);
+                }
+            }
+            if (!final_plan.speculative_slots.empty()) {
+                prefill_suppressed_spec_rounds_ = 0;
+                return step_chain_spec(
+                    plan, final_selected, final_plan, telemetry);
+            }
+        }
+    } else {
+        if (telemetry.eligible_speculative_lanes > 0) {
+            ++prefill_suppressed_spec_rounds_;
+        }
+        telemetry.prefill_suppressed_spec_rounds =
+            prefill_suppressed_spec_rounds_;
+        for (const StepInput & input : inputs) {
+            DraftFailureReason reason = chain_spec_input_failure(input);
+            if (reason == DraftFailureReason::none) {
+                reason = DraftFailureReason::prefill_service_round;
+            }
+            telemetry.fallback_slots.push_back(input.slot);
+            telemetry.fallback_reasons.push_back(reason);
         }
     }
+    if (telemetry.fallback_slots.empty()) {
+        for (const StepInput & input : inputs) {
+            DraftFailureReason reason = chain_spec_input_failure(input);
+            if (reason == DraftFailureReason::none) {
+                reason = DraftFailureReason::target_row_budget;
+            }
+            telemetry.fallback_slots.push_back(input.slot);
+            telemetry.fallback_reasons.push_back(reason);
+        }
+    }
+
+
+    telemetry.ar_lanes = static_cast<int>(inputs.size());
 
     const TargetWeights & w = b_.w_;
     StepGraph & sg = b_.sg_;
@@ -1111,6 +1411,11 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     }
     const bool with_prefill = n_prefill > 0;
     const int n_total = n_prefill + decode_bucket;
+    telemetry.ar_bucket = decode_bucket;
+    telemetry.target_rows = n_total;
+    telemetry.padded_rows = decode_bucket - live_count;
+    target_graph_key_valid_ = false;
+    const auto graph_build_started = std::chrono::steady_clock::now();
     const Qwen35RoctxMetadata roctx_metadata{
         live_count, decode_bucket, n_prefill, (int)segments.size(),
         n_total, max_kv_len};
@@ -1160,6 +1465,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             /*n_logits_rows=*/0,
             /*compact_slots=*/true);
     }
+    telemetry.target_graph_build_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - graph_build_started).count();
+
     if (!built || !sg.kv_write_rows ||
         (capture_features_ && !sg.target_feat_rows) ||
         (with_prefill &&
@@ -1309,12 +1618,16 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         b_.target_backend_, b_.cache_.paged_kv_seq_lens,
         seq_lens_.data(), 0, sizeof(int32_t) * seq_lens_.size());
 
+    const auto target_forward_started = std::chrono::steady_clock::now();
     ggml_status st = GGML_STATUS_FAILED;
     {
         const Qwen35RoctxRange roctx_compute(
             "qwen35.graph_compute", roctx_metadata);
         st = ggml_backend_graph_compute(b_.target_backend_, sg.gf);
     }
+    telemetry.target_forward_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - target_forward_started).count();
     if (st != GGML_STATUS_SUCCESS) {
         return fail_step("packed prefill/decode compute failed");
     }
@@ -1331,6 +1644,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         ggml_backend_synchronize(b_.target_backend_);
     }
 
+    const auto commit_started = std::chrono::steady_clock::now();
     for (size_t oi = 0; oi < inputs.size(); ++oi) {
         DecodeOutput & out = decode_outputs[oi];
         if (out.failed) continue;
@@ -1355,6 +1669,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         }
         prefill_outputs.push_back(std::move(out));
     }
+    telemetry.commit_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - commit_started).count();
+
     return result;
 }
 

@@ -26,6 +26,44 @@ int main() {
         CHECK(chain_decode_bucket_width(bucket_inputs[i]) ==
               bucket_expected[i]);
     }
+    CHECK(chain_context_bucket(1) == 128);
+    CHECK(chain_context_bucket(128) == 128);
+    CHECK(chain_context_bucket(129) == 256);
+    CHECK(chain_context_bucket(4097) == 8192);
+
+    const SpecBatchPlan unconstrained = plan_spec_batch(
+        {0, 1, 2, 3, 4, 5}, {}, 8, 48);
+    CHECK((unconstrained.speculative_slots ==
+           std::vector<int>{0, 1, 2, 3, 4, 5}));
+    CHECK(unconstrained.autoregressive_slots.empty());
+    CHECK(unconstrained.tree_bucket == 6);
+    CHECK(unconstrained.ar_bucket == 0);
+    CHECK(unconstrained.target_rows == 48);
+    CHECK(unconstrained.padded_rows == 0);
+
+    const SpecBatchPlan one_mandatory_ar = plan_spec_batch(
+        {0, 1, 2, 3, 4}, {5}, 8, 48);
+    CHECK((one_mandatory_ar.speculative_slots ==
+           std::vector<int>{0, 1, 2, 3}));
+    CHECK((one_mandatory_ar.autoregressive_slots ==
+           std::vector<int>{5, 4}));
+    CHECK(one_mandatory_ar.tree_bucket == 4);
+    CHECK(one_mandatory_ar.ar_bucket == 2);
+    CHECK(one_mandatory_ar.target_rows == 34);
+
+    const SpecBatchPlan rotated = plan_spec_batch(
+        {0, 1, 2, 3, 4}, {5}, 8, 48, 2);
+    CHECK((rotated.speculative_slots ==
+           std::vector<int>{2, 3, 4, 0}));
+    CHECK((rotated.autoregressive_slots ==
+           std::vector<int>{5, 1}));
+
+    const SpecBatchPlan ar_only = plan_spec_batch(
+        {}, {0, 1, 2, 3, 4}, 8, 4);
+    CHECK(ar_only.speculative_slots.empty());
+    CHECK(ar_only.ar_bucket == 6);
+    CHECK(ar_only.target_rows == 6);
+    CHECK(ar_only.padded_rows == 1);
 
     int pending = -1;
     const int32_t full_posterior[] = {11, 12, 13, 14};

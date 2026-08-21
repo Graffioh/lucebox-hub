@@ -806,7 +806,10 @@ bool build_target_step_paged_tree(
     (void)kq_stride_pad;
     step_graph_free(sg);
 
-    if (mapped_ar_seqs < 0 || mapped_ar_seqs > cache.n_seq_slots) {
+    // The mapped AR dimension is bucketed. Padding rows carry active slot -1,
+    // query position -1, and safe recurrent state slot 0, so the graph shape
+    // may be wider than the physical live-slot count.
+    if (mapped_ar_seqs < 0 || mapped_ar_seqs > 64) {
         return false;
     }
     if (!detail::validate_target_paged_tree_layout(

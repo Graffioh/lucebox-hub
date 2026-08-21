@@ -26,6 +26,12 @@ bool dflash2_select_chain(const DraftWeights & dw,
                           int32_t last_tok,
                           std::vector<int32_t> & draft_tok);
 
+struct DFlash2BatchTimings {
+    double lm_head_topk_ms = 0.0;
+    double selector_ms = 0.0;
+};
+
+
 // Same selector, batched over host-resident drafter hidden blocks and using a
 // local target lm_head tensor. The expensive lm_head projection covers every
 // (lane, depth) in one graph, GPU top-K is invoked once, and selector
@@ -37,7 +43,8 @@ bool dflash2_select_chains_batched(
     const std::vector<const float *> & hidden_by_lane,
     int q_len,
     const std::vector<int32_t> & last_tokens,
-    std::vector<std::vector<int32_t>> & draft_tokens);
+    std::vector<std::vector<int32_t>> & draft_tokens,
+    DFlash2BatchTimings * timings = nullptr);
 
 // Selector-scored candidates for DDTree construction (DARTree-style): the
 // same per-position top-k + selector projections as the chain path, kept on

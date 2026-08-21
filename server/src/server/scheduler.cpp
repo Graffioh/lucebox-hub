@@ -512,6 +512,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     std::vector<PrefillCandidate> prefill_candidates;
     prefill_candidates.reserve((size_t)n_slots);
     size_t prefill_round_robin_start = 0;
+    const ServicePolicy service_policy{};
+    ServiceRoundState service_state;
 
     while (true) {
         // Phase 1 — Admission: deferred job first (FIFO), then the queue.
@@ -625,12 +627,18 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     {i, slots[(size_t)i].admission_order});
             }
         }
-        const StepPlanLimits step_limits =
-            engine.step_plan_limits((int)step_plan.decode.size());
-        step_plan.prefills = plan_prefill_slices(
-            prefill_candidates, step_limits, prefill_round_robin_start);
-        if (!prefill_candidates.empty()) {
-            ++prefill_round_robin_start;
+        step_plan.prefills.clear();
+        const ServiceRoundKind service_round = choose_service_round(
+            !step_plan.decode.empty(), !prefill_candidates.empty(),
+            service_policy, service_state);
+        if (service_round == ServiceRoundKind::prompt) {
+            const StepPlanLimits step_limits =
+                engine.step_plan_limits((int)step_plan.decode.size());
+            step_plan.prefills = plan_prefill_slices(
+                prefill_candidates, step_limits, prefill_round_robin_start);
+            if (!prefill_candidates.empty()) {
+                ++prefill_round_robin_start;
+            }
         }
 
         SeqEngine::StepResult step_result = engine.step(step_plan);

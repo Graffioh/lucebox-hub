@@ -6,6 +6,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -200,7 +201,10 @@ bool dflash2_select_chains_batched(
         const std::vector<const float *> & hidden_by_lane,
         int q_len,
         const std::vector<int32_t> & last_tokens,
-        std::vector<std::vector<int32_t>> & draft_tokens) {
+        std::vector<std::vector<int32_t>> & draft_tokens,
+        DFlash2BatchTimings * timings) {
+    using Clock = std::chrono::steady_clock;
+    if (timings) *timings = {};
     draft_tokens.clear();
     const DraftSelectorWeights & selector = dw.selector;
     const int n_lanes = static_cast<int>(hidden_by_lane.size());
@@ -249,6 +253,7 @@ bool dflash2_select_chains_batched(
         }
     }
 
+    const auto lm_head_started = Clock::now();
     ProjectionGraph & projection = projection_graph();
     if (!ensure_projection_graph(
             projection, dw, backend, lm_head, n_positions)) {
@@ -287,7 +292,13 @@ bool dflash2_select_chains_batched(
             logits.data(), n_positions, vocab, K,
             candidate_log_probs.data(), candidate_ids.data(), 1.0f);
     }
+    if (timings) {
+        timings->lm_head_topk_ms = std::chrono::duration<double, std::milli>(
+            Clock::now() - lm_head_started).count();
+    }
 
+
+    const auto selector_started = Clock::now();
     BatchedSelectorGraph & graph = batched_selector_graph();
     if (!ensure_selector_graph(
             graph, dw, backend, n_lanes, n_cand, K)) {
@@ -369,6 +380,10 @@ bool dflash2_select_chains_batched(
                 candidate_ids[(size_t) selected_row];
             predecessor_row = n_lanes + selected_row;
         }
+    }
+    if (timings) {
+        timings->selector_ms = std::chrono::duration<double, std::milli>(
+            Clock::now() - selector_started).count();
     }
     return true;
 }
