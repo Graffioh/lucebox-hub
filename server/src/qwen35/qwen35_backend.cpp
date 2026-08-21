@@ -362,6 +362,22 @@ bool Qwen35Backend::init() {
             std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
                         dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
         }
+
+        // DFlash weights are sequence-length agnostic; the GGUF block size is
+        // the training/default verify width, not a tensor dimension. A wider
+        // runtime block can trade a larger target batch for fewer verification
+        // steps without rewriting the model file.
+        if (cfg_.draft_block_size != 0) {
+            if (cfg_.draft_block_size < 2 || cfg_.draft_block_size > 32) {
+                std::fprintf(stderr,
+                    "[draft] --draft-block-size must be in [2, 32], got %d\n",
+                    cfg_.draft_block_size);
+                return false;
+            }
+            std::printf("[draft]  block size override: %d -> %d\n",
+                        dw_.block_size, cfg_.draft_block_size);
+            dw_.block_size = cfg_.draft_block_size;
+        }
     }
 
     // Create KV cache
