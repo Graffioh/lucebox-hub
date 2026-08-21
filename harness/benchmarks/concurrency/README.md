@@ -1,5 +1,26 @@
 # Qwen3.6 concurrency benchmark
 
+## Qwen3.8 DFlash2 measurement
+
+PR #626 uses a separate fixed-work measurement suite over the updated PR #625
+Qwen3.8 target and DFlash2 drafter:
+
+```bash
+MODEL=/path/Qwen3.8-27B-PR625-IQ4_XS.gguf \
+DRAFT_MODEL=/path/dflash2-q8_0.gguf \
+SERVER_BIN=/path/build-gfx1201/dflash_server \
+OUT_ROOT=/path/results/qwen38-measurement \
+harness/benchmarks/concurrency/run_qwen38_dflash2_measurement.sh
+```
+
+It runs three order-rotated replicates of AR, forced speculation, and adaptive
+mode. Each case has a fresh server, one-request decode smoke, C29 warmup, C29 x
+256-token measured backlog, binary/GPU identity proof, hashes, runtime pool
+proof, and request-level scheduler telemetry. The suite validates the
+measurement independently of whether adaptive mode wins. See
+`harness/benchmarks/QWEN38_DSPARK_ADAPTIVE_SELECTION.md` for the protocol and
+report interpretation.
+
 This protocol measures the serving behavior targeted by packed continuous
 prefill and concurrent decode. It has two user-facing runners that share the
 streaming client, deterministic prompt generation, and summary tooling:
