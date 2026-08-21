@@ -5913,6 +5913,9 @@ struct ggml_tensor * ggml_ssm_conv_step(
     const int64_t n_s     = x->ne[2];
 
     GGML_ASSERT(x->ne[0] == d_inner);
+    // The CUDA/HIP step kernel instantiates K in {3, 4, 5, 9}; other tap
+    // counts would load fine and abort on the first decode.
+    GGML_ASSERT(d_conv == 3 || d_conv == 4 || d_conv == 5 || d_conv == 9);
     GGML_ASSERT(conv_state->ne[0] == d_conv - 1);
     GGML_ASSERT(conv_state->ne[1] == d_inner);
     GGML_ASSERT(conv_state->ne[2] == n_s);
