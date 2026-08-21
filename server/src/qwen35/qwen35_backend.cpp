@@ -1,6 +1,7 @@
 #include "qwen35_backend.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "common/chain_rollback_policy.h"
+#include "common/draft_block_size.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -363,19 +364,22 @@ bool Qwen35Backend::init() {
                         dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
         }
 
-        // DFlash weights are sequence-length agnostic; the GGUF block size is
-        // the training/default verify width, not a tensor dimension. A wider
-        // runtime block can trade a larger target batch for fewer verification
-        // steps without rewriting the model file.
+        // The checkpoint metadata is the drafter's trained/published proposal
+        // horizon. Shorter blocks are safe runtime tuning; longer blocks are
+        // out of distribution even when the tensor shapes happen to allow it.
         if (cfg_.draft_block_size != 0) {
-            if (cfg_.draft_block_size < 2 || cfg_.draft_block_size > 32) {
+            const int checkpoint_block_size = dw_.block_size;
+            if (!draft_block_size_override_supported(
+                    cfg_.draft_block_size, checkpoint_block_size)) {
                 std::fprintf(stderr,
-                    "[draft] --draft-block-size must be in [2, 32], got %d\n",
-                    cfg_.draft_block_size);
+                    "[draft] --draft-block-size must be in [2, %d] for this "
+                    "drafter (checkpoint metadata is the supported horizon); "
+                    "got %d\n",
+                    checkpoint_block_size, cfg_.draft_block_size);
                 return false;
             }
             std::printf("[draft]  block size override: %d -> %d\n",
-                        dw_.block_size, cfg_.draft_block_size);
+                        checkpoint_block_size, cfg_.draft_block_size);
             dw_.block_size = cfg_.draft_block_size;
         }
     }
