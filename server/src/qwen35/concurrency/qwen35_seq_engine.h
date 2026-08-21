@@ -22,10 +22,20 @@
 #pragma once
 
 #include "common/concurrency/seq_engine.h"
+#include "common/speculation/speculator.h"
+#include "common/speculation/speculation_gate.h"
+#include "common/dflash_draft_kv.h"
+#include "common/dflash_feature_ring.h"
+#include "common/ddtree.h"
 #include "qwen35_slot_manager.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace dflash::common {
@@ -34,25 +44,28 @@ class Qwen35Backend;
 
 class Qwen35SeqEngine final : public SeqEngine {
 public:
+    enum class SpecMode {
+        none,
+        ddtree,
+        chain,
+    };
+
     // `pool` and `backend` must outlive the engine. `scratch_row` is the
     // first row of the block appended past the pool's index space, used as
     // the K/V write destination of graph-bucket padding rows.
     // `max_prefills` bounds scheduler-selected prompt slices per traversal.
     Qwen35SeqEngine(Qwen35Backend & backend, PagedKvPool & pool,
                     int max_ctx, int64_t scratch_row,
+                    int tree_width = 0, int tree_scratch_base = 0,
+                    int tree_scratch_stride = 0,
+                    SpecMode spec_mode = SpecMode::none,
                     int max_prefills = 8,
                     int mixed_prefill_tokens = 2048,
                     int long_mixed_prefill_tokens = 4096,
                     int long_prefill_threshold = 768,
                     int idle_prefill_tokens = 4096,
-                    int prefill_quantum = 512)
-        : max_prefills_(std::max(1, max_prefills)),
-          mixed_prefill_tokens_(std::max(1, mixed_prefill_tokens)),
-          long_mixed_prefill_tokens_(std::max(1, long_mixed_prefill_tokens)),
-          long_prefill_threshold_(std::max(1, long_prefill_threshold)),
-          idle_prefill_tokens_(std::max(1, idle_prefill_tokens)),
-          prefill_quantum_(std::max(1, prefill_quantum)), b_(backend),
-          slots_(pool, max_ctx), scratch_row_(scratch_row) {}
+                    int prefill_quantum = 512);
+    ~Qwen35SeqEngine() override;
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
@@ -62,6 +75,13 @@ public:
                       const SamplerCfg & sampler) override;
 
     StepResult step(const StepPlan & plan) override;
+    // Fabricate a steady-state paged context and profile the three launch
+    // series used by the activation gate. Called once from backend init.
+    bool profile_spec_costs(int context_tokens);
+    // True only when the registered speculator adapter can produce a
+    // first-request activation score. A configured chain
+    // may still accept Adaptive requests and serve AR fallback when this is false.
+    bool activation_scoring_available() const;
     StepPlanLimits step_plan_limits(int decode_rows) const override {
         const bool mixed = decode_rows > 0;
         const int per_sequence = mixed ? 512 : 2048;
@@ -104,6 +124,10 @@ private:
 
     bool upload_block_table_delta(int slot, int first_block,
                                   const int32_t * blocks, size_t count);
+    bool upload_all_active_block_tables();
+    bool commit_residency_writes(const std::vector<int> & slots);
+    bool maybe_reselect_residency(int slot, std::string & error);
+    void attach_residency_telemetry(DecodeOutput & out);
     void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
                               const char * log_message,
                               const char * client_message);
@@ -112,11 +136,79 @@ private:
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
                              std::vector<float> * logits_scratch = nullptr);
+    DraftFeatureMirror * slot_feature_mirror(int slot);
+    DraftKvState * ensure_slot_draft_kv(int slot);
+    bool ddtree_eligible(const StepPlan & plan) const;
+    bool chain_proposal_input_capable(const StepInput & input) const;
+    bool chain_activation_input_scoreable(const StepInput & input) const;
+    bool chain_spec_request_capable(const StepInput & input) const;
+    bool chain_spec_input_eligible(const StepInput & input) const;
+    bool spec_gate_debug_enabled() const;
+    struct PreparedChainDraft {
+        bool valid = false;
+        int generated = -1;
+        int32_t root = -1;
+        std::vector<int32_t> tokens;
+        ActivationEstimate estimate;
+        std::vector<std::string> debug_depth_fields;
+    };
+    bool prepare_chain_drafts(
+        const std::vector<StepInput> & inputs,
+        const std::vector<uint8_t> & selected,
+        bool force_serial = false,
+        bool fail_fast_batch = false);
+    bool batched_drafting_enabled() const;
+    bool activation_scoring_enabled() const;
+    std::string chain_activation_score_kind() const;
+    // Verification depth may vary between rounds while the cohort route stays
+    // fixed; every returned depth must stay in [2, tree_width_].
+    int chain_verify_depth_for_round() const {
+        return chain_verify_depth_;
+    }
+    // DFLASH_STEP_TIMING=1 emits one [step-timing] JSON line per decode
+    // round attributing wall time to draft, verify, readback, CPU commit,
+    // replay, and packed-AR phases. Diagnostic only; off by default.
+    static bool step_timing_enabled();
+    // DDTree preserves its legacy best-effort AR fallback. Chain
+    // proposal failures are instead returned as lane-local DecodeOutput
+    // failures so an epoch-selected speculation lane never silently executes as AR.
+    std::optional<StepResult> step_ddtree(const StepPlan & plan);
+    StepResult step_chain_spec(
+        const StepPlan & plan, const std::vector<uint8_t> & admitted,
+        std::chrono::steady_clock::time_point round_started);
 
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
     int64_t         scratch_row_ = 0;
+    int             tree_width_ = 0;
+    // Root-inclusive verification depth. The drafter still produces
+    // tree_width_ tokens; this common cohort depth may vary between 2 and
+    // tree_width_ without changing the current cohort plan.
+    int             chain_verify_depth_ = 0;
+    int             tree_scratch_base_ = 0;
+    int             tree_scratch_stride_ = 0;
+    bool            capture_features_ = false;
+    SpecMode        spec_mode_ = SpecMode::none;
+    ggml_context *  feature_view_ctx_ = nullptr;
+    std::vector<DraftFeatureMirror> slot_feature_mirrors_;
+    std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;
 
+    DraftKvBatchGraph batch_draft_graph_;
+    std::vector<std::unique_ptr<DraftKvState>> dummy_draft_kv_;
+    std::vector<PreparedChainDraft> prepared_chain_drafts_;
+    std::unique_ptr<SpeculationGate> speculation_gate_;
+    std::optional<SpecCohortEpoch> spec_cohort_epoch_;
+    uint64_t next_spec_cohort_epoch_id_ = 1;
+    std::unique_ptr<Speculator> speculator_;
+    // Startup profile/adapter failure is a request-local AR outcome, never an
+    // admission or step error for a configured chain.
+    std::string adaptive_fallback_reason_ = "cost_profile_unavailable";
+    std::vector<uint8_t> adaptive_fallback_ar_;
+    std::vector<ActivationEstimate> last_activation_estimate_;
+    // Per-round draft cost accumulator for [step-timing]; reset at the top
+    // of each chain-speculation round, accumulated by prepare_chain_drafts.
+    double round_draft_us_ = 0.0;
+    int    round_draft_lanes_ = 0;
     // Hoisted per-step buffers (reused across step() calls).
     std::vector<int>         output_rows_;
     std::vector<int32_t>     live_tokens_;
@@ -131,6 +223,7 @@ private:
     std::vector<int32_t>     query_slot_ids_;
     std::vector<int32_t>     query_positions_;
     std::vector<int32_t>     logits_rows_;
+    std::vector<int32_t>     feature_rows_;
     std::vector<float>       embed_buf_;
     std::vector<int32_t>     pos_buf_;
     std::vector<int64_t>     rows_buf_;

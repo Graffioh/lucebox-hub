@@ -414,10 +414,68 @@ void test_feature_gate_paged_attention_requires_plain_ar_decode() {
     BackendArgs draft = base;
     draft.draft_path = "/nonexistent/draft.gguf";
     CHECK(!gate_result(draft, "qwen35", PlacementBackend::Cuda).empty());
+    BackendArgs concurrent_chain = draft;
+    concurrent_chain.max_concurrency = 16;
+    CHECK(gate_result(
+        concurrent_chain, "qwen35", PlacementBackend::Cuda).empty());
+    CHECK(gate_result(
+        concurrent_chain, "qwen35", PlacementBackend::Hip).empty());
+
+    BackendArgs forced_ar = draft;
+    forced_ar.speculation_policy = SpeculationPolicy::Never;
+    CHECK(gate_result(
+        forced_ar, "qwen35", PlacementBackend::Cuda).empty());
 
     BackendArgs ddtree = base;
     ddtree.ddtree_mode = true;
     CHECK(!gate_result(ddtree, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs concurrent_ddtree = base;
+    concurrent_ddtree.max_concurrency = 16;
+    concurrent_ddtree.draft_path = "/nonexistent/draft.gguf";
+    concurrent_ddtree.ddtree_mode = true;
+    concurrent_ddtree.ddtree_budget = 22;
+    CHECK(gate_result(
+        concurrent_ddtree, "qwen35", PlacementBackend::Cuda).empty());
+    CHECK(gate_result(
+        concurrent_ddtree, "qwen35", PlacementBackend::Hip).empty());
+
+    BackendArgs tensor_ddtree = concurrent_ddtree;
+    CHECK(parse_placement_device_list(
+        "cuda:0,cuda:1", tensor_ddtree.device));
+    tensor_ddtree.device.split_mode = TargetSplitMode::Tensor;
+    CHECK(!gate_result(
+        tensor_ddtree, "qwen35", PlacementBackend::Cuda).empty());
+
+
+    BackendFeatureConfig concurrent_pflash;
+    concurrent_pflash.pflash_enabled = true;
+    concurrent_pflash.pflash_drafter_configured = true;
+    CHECK(gate_result(concurrent_ddtree, "qwen35",
+                      PlacementBackend::Hip, concurrent_pflash).empty());
+
+    BackendArgs concurrent_plain = base;
+    concurrent_plain.max_concurrency = 16;
+    CHECK(gate_result(concurrent_plain, "qwen35",
+                      PlacementBackend::Hip, concurrent_pflash).empty());
+    BackendFeatureConfig concurrent_kvflash;
+    concurrent_kvflash.kvflash_enabled = true;
+    CHECK(gate_result(concurrent_plain, "qwen35",
+                      PlacementBackend::Hip, concurrent_kvflash).empty());
+
+    BackendArgs bad_budget = concurrent_ddtree;
+    for (int value : {0, -1, 256, INT_MAX}) {
+        bad_budget.ddtree_budget = value;
+        CHECK(!gate_result(
+            bad_budget, "qwen35", PlacementBackend::Hip).empty());
+    }
+
+    BackendArgs remote_ddtree = concurrent_ddtree;
+    remote_ddtree.remote_draft.ipc_bin = "/usr/bin/draft-ipc";
+    remote_ddtree.draft_device.backend = PlacementBackend::Cuda;
+    remote_ddtree.device.backend = PlacementBackend::Hip;
+    CHECK(!gate_result(
+        remote_ddtree, "qwen35", PlacementBackend::Hip).empty());
 
     BackendArgs windowed = base;
     windowed.fa_window = 4096;
@@ -518,6 +576,38 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     CHECK(!gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
     pool.kv_pool_tokens = max_pool_tokens;
     CHECK(gate_result(pool, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs tree_pool = paged;
+    tree_pool.max_concurrency = 16;
+    tree_pool.draft_path = "/nonexistent/draft.gguf";
+    tree_pool.ddtree_mode = true;
+    tree_pool.ddtree_budget = 22;
+    const long long tree_scratch =
+        (long long)tree_pool.max_concurrency *
+        paged_token_capacity(tree_pool.ddtree_budget + 1);
+    const long long max_tree_pool_tokens =
+        ((long long)INT_MAX - PAGED_BLOCK_SIZE - tree_scratch) /
+        PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
+    tree_pool.kv_pool_tokens = max_tree_pool_tokens;
+    CHECK(gate_result(
+        tree_pool, "qwen35", PlacementBackend::Cuda).empty());
+    tree_pool.kv_pool_tokens = max_tree_pool_tokens + PAGED_BLOCK_SIZE;
+    CHECK(!gate_result(
+        tree_pool, "qwen35", PlacementBackend::Cuda).empty());
+    BackendArgs chain_pool = paged;
+    chain_pool.max_concurrency = 16;
+    chain_pool.draft_path = "/nonexistent/draft.gguf";
+    const long long chain_scratch =
+        (long long)chain_pool.max_concurrency * paged_token_capacity(16);
+    const long long max_chain_pool_tokens =
+        ((long long)INT_MAX - PAGED_BLOCK_SIZE - chain_scratch) /
+        PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
+    chain_pool.kv_pool_tokens = max_chain_pool_tokens;
+    CHECK(gate_result(
+        chain_pool, "qwen35", PlacementBackend::Hip).empty());
+    chain_pool.kv_pool_tokens = max_chain_pool_tokens + PAGED_BLOCK_SIZE;
+    CHECK(!gate_result(
+        chain_pool, "qwen35", PlacementBackend::Hip).empty());
 
     // The automatic pool is memory-derived, so a logical slot/context product
     // larger than the physical tensor address space is legal.

@@ -64,6 +64,7 @@ struct DraftKvState {
     ggml_context *  g_ctx  = nullptr;
     ggml_cgraph *   gf     = nullptr;
     ggml_gallocr_t  galloc = nullptr;
+    ggml_tensor *   hidden_prenorm = nullptr;
     ggml_tensor *   hidden_states = nullptr;
     ggml_tensor *   logits        = nullptr;  // iff lm_head passed at init
 
@@ -98,5 +99,38 @@ bool draft_kv_begin_step(DraftKvState & st,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
                          int committed);
+
+struct DraftKvBatchGraph {
+    DraftKvBatchGraph() = default;
+    DraftKvBatchGraph(const DraftKvBatchGraph &) = delete;
+    DraftKvBatchGraph & operator=(const DraftKvBatchGraph &) = delete;
+
+    int n_lanes = 0;
+    int q_len = 0;
+    bool outputs_prenorm = false;
+    const void * built_for = nullptr;
+    std::vector<DraftKvState *> lane_states;
+
+    std::vector<uint8_t> meta_arena;
+    ggml_context * g_ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    std::vector<ggml_tensor *> hidden_by_lane;
+    std::vector<ggml_tensor *> prenorm_by_lane;
+};
+
+void draft_kv_batch_free(DraftKvBatchGraph & batch);
+
+// All lane states must already have draft_kv_begin_step() inputs and
+// inp_embed uploaded. The packed graph only computes the shared backbone;
+// adapters consume the returned per-lane host views.
+bool draft_kv_batch_compute(
+    DraftKvBatchGraph & batch,
+    const DraftWeights & dw,
+    ggml_backend_t backend,
+    const std::vector<DraftKvState *> & lane_states,
+    bool need_prenorm,
+    std::vector<std::vector<float>> & hidden_by_lane,
+    std::vector<std::vector<float>> & prenorm_by_lane);
 
 }  // namespace dflash::common

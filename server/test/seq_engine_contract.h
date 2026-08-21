@@ -151,7 +151,7 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
                 require(remaining[(size_t)output.slot] > 1,
                         "prefill reported advanced for its final token");
                 --remaining[(size_t)output.slot];
-            } else {
+            } else if (output.status == PrefillStatus::completed) {
                 require(remaining[(size_t)output.slot] == 1,
                         "prefill reported completion before its final token");
                 remaining[(size_t)output.slot] = 0;
@@ -254,6 +254,16 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
     require(decode_plan.decode.size() == 2,
             "both completed admissions must enter decode");
     if (!execute(decode_plan)) {
+        retire_all();
+        return violations;
+    }
+
+    SeqEngine::StepPlan no_speculation;
+    no_speculation.decode = decode_inputs();
+    for (SeqEngine::StepInput & input : no_speculation.decode) {
+        input.allow_speculation = false;
+    }
+    if (!execute(no_speculation)) {
         retire_all();
         return violations;
     }

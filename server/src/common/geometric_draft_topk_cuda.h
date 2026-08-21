@@ -25,6 +25,15 @@
 
 namespace dflash::common {
 
+// Keep the public capability predicate in lockstep with the template
+// instantiations dispatched by geometric_draft_topk_cuda.cu. Callers use this
+// to choose the CPU fallback without entering CUDA, and loader validation uses
+// it to reject selector metadata that cannot be executed consistently across
+// the host and device paths.
+inline constexpr bool geometric_draft_topk_cuda_supports_k(int K) noexcept {
+    return (K >= 1 && K <= 8) || K == 12 || K == 16;
+}
+
 // d_logits: device pointer to row-major [n_positions][vocab] f32 logits (the
 //           position stride is `vocab` floats — pass an offset pointer to skip
 //           leading positions). out_* are HOST buffers of size n_positions*K.

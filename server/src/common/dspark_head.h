@@ -36,6 +36,31 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               std::vector<float> * confidence_out = nullptr,
                                               const float * confidence_hidden = nullptr);
 
+// Outputs embedded in a caller-owned graph for a lane-batched DSpark chain.
+// Each depth tensor is shaped [n_lanes], with confidence in [1, n_lanes].
+struct DSparkBatchedChainOutputs {
+    int n_lanes = 0;
+    int q_len = 0;
+    std::vector<ggml_tensor *> tokens;
+    std::vector<ggml_tensor *> confidence;
+};
+
+// Append a depth-major, multi-lane Markov chain to an existing draft graph.
+// The lane backbones remain independent; their hidden tensors stay on-device.
+// One lm_head matmul covers every (depth, lane), then each depth performs a
+// batched Markov lookup, correction, argmax, and calibrated confidence head.
+bool build_dspark_markov_batched_chain(
+    ggml_context * ctx,
+    ggml_cgraph * gf,
+    const DraftWeights & dw,
+    ggml_tensor * lm_head,
+    const std::vector<ggml_tensor *> & hidden_by_lane,
+    const std::vector<ggml_tensor *> & prenorm_by_lane,
+    ggml_tensor * seed_tokens,
+    int q_len,
+    bool want_confidence,
+    DSparkBatchedChainOutputs & out);
+
 // DDTree candidate generation with the Markov correction: base logits for
 // all n_tokens positions in ONE lm_head matmul; rows 1..n-1 get the low-rank
 // previous-token bias chained along the main (argmax) path; top-K extracted

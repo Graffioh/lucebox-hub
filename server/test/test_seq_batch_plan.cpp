@@ -119,17 +119,105 @@ int main() {
     SeqEngine::StepPlan work;
     work.decode = {{0, 7}};
     work.prefills = {{1, 4}};
+    CHECK(work.decode[0].allow_speculation);
 
     SeqEngine::StepResult good;
     good.decode.push_back({0, 11, false, {}});
     good.prefills.push_back({
         1, SeqEngine::PrefillOutput::Status::advanced, -1, {}});
     CHECK(validate_step_result(work, good, 2).empty());
+    CHECK(prefill_result_made_progress(good));
+
+    SeqEngine::StepResult burst = good;
+    burst.decode[0].committed_tokens = {8, 9, 10};
+    burst.decode[0].ddtree_steps = 1;
+    burst.decode[0].ddtree_accepted_tokens = 3;
+    burst.decode[0].ddtree_suspensions = 1;
+    burst.decode[0].target_forwards = 1;
+    CHECK(validate_step_result(work, burst, 2).empty());
+
+    SeqEngine::StepResult chain_burst = good;
+    chain_burst.decode[0].committed_tokens = {8, 9};
+    chain_burst.decode[0].spec_steps = 1;
+    chain_burst.decode[0].spec_accepted_tokens = 2;
+    chain_burst.decode[0].target_forwards = 2;
+    CHECK(validate_step_result(work, chain_burst, 2).empty());
+
+    SeqEngine::StepResult chain_service = good;
+    chain_service.decode[0].spec_service_ar_steps = 1;
+    chain_service.decode[0].target_forwards = 1;
+    CHECK(validate_step_result(work, chain_service, 2).empty());
+
+    SeqEngine::StepResult mixed_chain_paths = chain_burst;
+    mixed_chain_paths.decode[0].spec_service_ar_steps = 1;
+    CHECK(!validate_step_result(work, mixed_chain_paths, 2).empty());
+
+    SeqEngine::StepResult orphan_chain_service = good;
+    orphan_chain_service.decode[0].spec_service_ar_steps = 1;
+    CHECK(!validate_step_result(work, orphan_chain_service, 2).empty());
+
+    SeqEngine::StepResult orphan_chain_acceptance = good;
+    orphan_chain_acceptance.decode[0].spec_accepted_tokens = 1;
+    CHECK(!validate_step_result(work, orphan_chain_acceptance, 2).empty());
+
+    SeqEngine::StepResult failed_chain = good;
+    failed_chain.decode[0] = {0, -1, true, "decode failed"};
+    failed_chain.decode[0].spec_steps = 1;
+    CHECK(!validate_step_result(work, failed_chain, 2).empty());
+
+    SeqEngine::StepResult orphan_suspension = good;
+    orphan_suspension.decode[0].ddtree_suspensions = 1;
+    CHECK(!validate_step_result(work, orphan_suspension, 2).empty());
+
+    SeqEngine::StepResult failed_suspension = good;
+    failed_suspension.decode[0].failed = true;
+    failed_suspension.decode[0].token = -1;
+    failed_suspension.decode[0].error = "decode failed";
+    failed_suspension.decode[0].ddtree_steps = 1;
+    failed_suspension.decode[0].ddtree_suspensions = 1;
+    CHECK(!validate_step_result(work, failed_suspension, 2).empty());
+
+    std::vector<int32_t> delivered;
+    const bool delivered_all = consume_decode_output_tokens(
+        burst.decode[0], [&](int32_t token) {
+            delivered.push_back(token);
+            return token != 9;
+        });
+    CHECK(!delivered_all);
+    CHECK((delivered == std::vector<int32_t>{8, 9}));
+
+    SeqEngine::StepResult malformed_burst = burst;
+    malformed_burst.decode[0].committed_tokens = {8, -1};
+    CHECK(!validate_step_result(work, malformed_burst, 2).empty());
+
+    SeqEngine::StepPlan speculation_disabled = work;
+    speculation_disabled.decode[0].allow_speculation = false;
+    CHECK(!validate_step_result(
+        speculation_disabled, burst, 2).empty());
+    CHECK(validate_step_result(
+        speculation_disabled, good, 2).empty());
 
     SeqEngine::StepResult complete = good;
     complete.prefills[0] = {
         1, SeqEngine::PrefillOutput::Status::completed, 12, {}};
     CHECK(validate_step_result(work, complete, 2).empty());
+    CHECK(prefill_result_made_progress(complete));
+
+    SeqEngine::StepResult deferred = good;
+    deferred.prefills[0] = {
+        1, SeqEngine::PrefillOutput::Status::deferred, -1, {}};
+    CHECK(validate_step_result(work, deferred, 2).empty());
+    CHECK(!prefill_result_made_progress(deferred));
+    deferred.prefills[0].token = 12;
+    CHECK(!validate_step_result(work, deferred, 2).empty());
+    deferred.prefills[0].token = -1;
+    deferred.prefills[0].error = "not an error";
+    CHECK(!validate_step_result(work, deferred, 2).empty());
+    SeqEngine::StepPlan idle_prefill = work;
+    idle_prefill.decode.clear();
+    deferred.prefills[0].error.clear();
+    deferred.decode.clear();
+    CHECK(!validate_step_result(idle_prefill, deferred, 2).empty());
 
     SeqEngine::StepResult missing_decode = good;
     missing_decode.decode.clear();
@@ -149,6 +237,7 @@ int main() {
     prefill_failure.prefills[0] = {
         1, SeqEngine::PrefillOutput::Status::failed, -1, "prefill failed"};
     CHECK(validate_step_result(work, prefill_failure, 2).empty());
+    CHECK(!prefill_result_made_progress(prefill_failure));
 
     SeqEngine::StepResult bad_row_failure = prefill_failure;
     bad_row_failure.prefills.back().error.clear();
@@ -170,6 +259,13 @@ int main() {
     SeqEngine::StepResult success_with_error = good;
     success_with_error.decode[0].error = "contradictory diagnostic";
     CHECK(!validate_step_result(work, success_with_error, 2).empty());
+
+    SeqEngine::StepResult failed_burst = good;
+    failed_burst.decode[0].failed = true;
+    failed_burst.decode[0].token = -1;
+    failed_burst.decode[0].error = "decode failed";
+    failed_burst.decode[0].committed_tokens = {8};
+    CHECK(!validate_step_result(work, failed_burst, 2).empty());
 
     SeqEngine::StepResult failed;
     failed.error = "device compute failed";

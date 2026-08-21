@@ -773,6 +773,7 @@ json build_props_body(const ServerConfig & config,
         {"build_info",  std::string(kServerName) + " v" DFLASH_SERVER_VERSION
                         " props_schema=" + std::to_string(kPropsSchema)},
         {"speculative_mode", speculative_mode},
+        {"decode_mode", speculation_policy_name(config.decode_mode)},
         {"server", server},
         {"model", {
             {"arch",         config.arch},
@@ -786,6 +787,7 @@ json build_props_body(const ServerConfig & config,
             {"kv_cache_v",      config.kv_cache_v},
             {"lazy_draft",      config.lazy_draft},
             {"draft_residency", draft_residency_policy_name(config.draft_residency)},
+            {"decode_mode",      speculation_policy_name(config.decode_mode)},
             {"target_sharding", config.target_sharding},
             // Prefill chunk size (bargs.chunk). Surfaced so snapshot
             // tooling captures the full config — bench consumers
@@ -1388,11 +1390,27 @@ int HttpServer::run() {
     std::fprintf(stderr, "[server] listening on http://%s:%d\n",
                  config_.host.c_str(), config_.port);
 
-    // A backend-provided sequence engine replaces the one-request worker
-    // with the concurrent scheduler. Upstream forwarding stays on the
-    // classic path even when the local backend exposes an engine.
-    if (SeqEngine * engine = backend_.seq_engine();
-        engine && config_.pflash_upstream_base.empty()) {
+    // A backend-provided sequence engine replaces the one-request worker.
+    // Local PFlash stays on this path too: scheduler admission prepares each
+    // prompt exactly once, then admits the effective tokens. Persistent
+    // residency is the explicit safety contract that lets compression run
+    // without parking model state owned by other live slots.
+    SeqEngine * engine = backend_.seq_engine();
+    if (engine && config_.pflash_upstream_base.empty()) {
+        const ConcurrentPflashPlan pflash_plan =
+            resolve_concurrent_pflash_plan(config_, drafter_tokenizer_ != nullptr);
+        if (!pflash_plan.ok()) {
+            std::fprintf(stderr, "[server] %s\n", pflash_plan.error.c_str());
+            socket_close(listen_fd_);
+            listen_fd_ = kInvalidSocket;
+            return 2;
+        }
+        if (pflash_plan.force_skip_park && !config_.pflash_skip_park) {
+            config_.pflash_skip_park = true;
+            std::fprintf(stderr,
+                "[server] concurrent PFlash: persistent residency enables "
+                "skip-park for live sequence safety\n");
+        }
         worker_thread_ =
             std::thread([this, engine]() { scheduler_loop(*engine); });
     } else {
@@ -1654,6 +1672,21 @@ bool HttpServer::parse_common_request_fields(
     req.stream = body.value("stream", false);
     req.model = body.value("model", config_.model_name);
     req.disk_cache_policy = config_.disk_cache_policy;
+    if (body.contains("decode_mode")) {
+        if (!body["decode_mode"].is_string()) {
+            send_error(fd, 400,
+                       "decode_mode must be ar, speculation, or adaptive");
+            return false;
+        }
+        SpeculationPolicy policy;
+        if (!parse_speculation_policy(
+                body["decode_mode"].get<std::string>(), policy)) {
+            send_error(fd, 400,
+                       "decode_mode must be ar, speculation, or adaptive");
+            return false;
+        }
+        req.decode_mode = policy;
+    }
 
     // Accept the output-token names used by each supported API dialect.
     // Default when the client omits all three: --default-max-tokens, so
@@ -4241,6 +4274,7 @@ std::string HttpServer::format_http_response(
         case 400: reason = "Bad Request"; break;
         case 404: reason = "Not Found"; break;
         case 405: reason = "Method Not Allowed"; break;
+        case 409: reason = "Conflict"; break;
         case 413: reason = "Payload Too Large"; break;
         case 500: reason = "Internal Server Error"; break;
         case 503: reason = "Service Unavailable"; break;

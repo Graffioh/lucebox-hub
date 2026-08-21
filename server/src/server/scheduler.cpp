@@ -36,6 +36,20 @@ struct SchedSlot {
     double prefill_s = 0.0;
     int n_gen_cap = 0;
     int completion_tokens = 0;
+    int effective_prompt_tokens = 0;
+    bool prompt_compressed = false;
+    uint64_t engine_request_id = 0;
+    uint64_t ddtree_steps = 0;
+    uint64_t ddtree_accepted_tokens = 0;
+    uint64_t ddtree_suspensions = 0;
+    uint64_t spec_steps = 0;
+    uint64_t spec_accepted_tokens = 0;
+    uint64_t spec_service_ar_steps = 0;
+    uint64_t target_forwards = 0;
+    uint64_t kvflash_page_ins = 0;
+    uint64_t kvflash_page_outs = 0;
+    uint64_t kvflash_resident_blocks = 0;
+    uint64_t kvflash_reselects = 0;
     bool client_disconnected = false;
     bool failed = false;
     std::string error;
@@ -244,7 +258,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         stop_job_stream(s.job, &s.send_buffer);
         const double decode_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - s.decode_started_at).count();
-        const int prompt_tokens = (int)req.prompt_tokens.size();
+        const int prompt_tokens = s.effective_prompt_tokens;
         GenTimings gen_timings{
             s.prefill_s,
             decode_s,
@@ -259,9 +273,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             perf.prompt_tokens = (int)req.prompt_tokens.size();
             perf.completion_tokens = s.completion_tokens;
             perf.prefill_tok_s = s.prefill_s > 0.0
-                ? (double)req.prompt_tokens.size() / s.prefill_s : 0.0;
+                ? (double)prompt_tokens / s.prefill_s : 0.0;
             perf.decode_tok_s = decode_s > 0.0
                 ? (double)s.completion_tokens / decode_s : 0.0;
+            perf.pflash = s.prompt_compressed;
             status_.record_perf(perf);
         }
 
@@ -298,16 +313,41 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             std::chrono::steady_clock::now() - s.started_at).count();
         const int out_tokens = (int)s.gen_tokens.size();
         std::fprintf(stderr,
-            "[server] chat DONE %s ok=%s in=%zu out=%d %.1fs %.1f tok/s "
+            "[server] chat DONE %s ok=%s in=%zu effective_in=%d out=%d %.1fs %.1f tok/s "
             "finish=%s slot=%d prefill=%.1fs decode=%.1fs(%.1ftok/s) parallel\n",
             req.response_id.c_str(),
             (!s.failed && backend_ok) ? "true" : "false",
-            req.prompt_tokens.size(), out_tokens, elapsed_s,
+            req.prompt_tokens.size(), prompt_tokens, out_tokens, elapsed_s,
             elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0,
             s.client_disconnected ? "client_disconnect"
                                   : s.emitter->finish_reason().c_str(),
             idx, s.prefill_s, decode_s,
             decode_s > 0.0 ? out_tokens / decode_s : 0.0);
+
+        const json concurrency_metrics = {
+            {"request_id", req.response_id},
+            {"response_id", req.response_id},
+            {"engine_request_id", s.engine_request_id},
+            {"raw_prompt_tokens", req.prompt_tokens.size()},
+            {"effective_prompt_tokens", prompt_tokens},
+            {"output_tokens", out_tokens},
+            {"pflash_applied", s.prompt_compressed},
+            {"pflash_input_tokens", req.prompt_tokens.size()},
+            {"pflash_output_tokens", prompt_tokens},
+            {"ddtree_steps", s.ddtree_steps},
+            {"ddtree_accepted_tokens", s.ddtree_accepted_tokens},
+            {"ddtree_suspensions", s.ddtree_suspensions},
+            {"spec_steps", s.spec_steps},
+            {"spec_accepted_tokens", s.spec_accepted_tokens},
+            {"spec_service_ar_steps", s.spec_service_ar_steps},
+            {"target_forwards", s.target_forwards},
+            {"kvflash_page_ins", s.kvflash_page_ins},
+            {"kvflash_page_outs", s.kvflash_page_outs},
+            {"kvflash_resident_blocks", s.kvflash_resident_blocks},
+            {"kvflash_reselects", s.kvflash_reselects},
+        };
+        std::fprintf(stderr, "[concurrency-metrics] %s\n",
+                     concurrency_metrics.dump().c_str());
 
         engine.retire(idx);
         // A retirement may have released the blocks the head job needs.
@@ -403,6 +443,24 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             return AdmissionDisposition::Retired;
         }
 
+        const SpeculationPolicy decode_mode = resolve_speculation_policy(
+            config_.decode_mode, req.decode_mode);
+        const ConcurrentDecodeCapabilities decode_capabilities =
+            backend_.concurrent_decode_capabilities();
+        if (!decode_capabilities.supports(decode_mode)) {
+            const std::string message =
+                std::string("decode_mode=") +
+                speculation_policy_name(decode_mode) +
+                " is unavailable for this server's concurrent decode "
+                "configuration";
+            std::fprintf(stderr,
+                "[server] concurrent admission rejected %s: %s\n",
+                req.response_id.c_str(), message.c_str());
+            send_error(job->fd, 409, message);
+            finish_job(job);
+            return AdmissionDisposition::Retired;
+        }
+
         if (!job->announced) {
             job->announced = true;
             std::fprintf(stderr,
@@ -442,9 +500,65 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             start_job_stream(job);
         }
 
+        // Apply the same FlowKV/PFlash precedence and overflow checks as the
+        // classic worker. Keep the prepared prompt on the job because an
+        // atomically-busy admission is retried at the FIFO head later.
+        if (!job->parallel_prompt_prepared) {
+            PreparedPrompt prepared = prepare_prompt(req);
+            if (prepared.error_status != 0) {
+                const std::string message = prepared.error.empty()
+                    ? "prompt preparation failed"
+                    : prepared.error;
+                std::fprintf(stderr,
+                    "[server] concurrent prompt preparation failed: %s\n",
+                    message.c_str());
+                if (req.stream && job->sse_started) {
+                    stop_job_stream(job);
+                    for (const std::string & chunk :
+                         sse_error_close_chunks(message)) {
+                        send_job_bytes(job, chunk.data(), chunk.size());
+                    }
+                } else {
+                    send_error(job->fd, prepared.error_status, message);
+                }
+                finish_job(job);
+                return AdmissionDisposition::Retired;
+            }
+            // Paged sequence engines cannot restore the classic snapshot
+            // format. Startup normally disables those caches; keep this
+            // check as a hard guard for embedded/non-CLI callers.
+            if (prepared.full_cache_hit_slot >= 0 ||
+                prepared.full_cache_served_tokens >= 0) {
+                const std::string message =
+                    "concurrent paged serving cannot restore a prefix snapshot";
+                if (req.stream && job->sse_started) {
+                    stop_job_stream(job);
+                    for (const std::string & chunk :
+                         sse_error_close_chunks(message)) {
+                        send_job_bytes(job, chunk.data(), chunk.size());
+                    }
+                } else {
+                    send_error(job->fd, 409, message);
+                }
+                finish_job(job);
+                return AdmissionDisposition::Retired;
+            }
+            job->parallel_prompt_tokens = std::move(prepared.tokens);
+            job->parallel_prompt_compressed = prepared.compressed;
+            job->parallel_prompt_prepared = true;
+            std::fprintf(stderr,
+                "[server] concurrent prompt READY %s raw=%zu effective=%zu "
+                "pflash=%s\n",
+                req.response_id.c_str(), req.prompt_tokens.size(),
+                job->parallel_prompt_tokens.size(),
+                prepared.compressed ? "true" : "false");
+        }
+        const auto & effective_prompt = job->parallel_prompt_tokens;
+
         // Admission only claims the slot and queues the prompt. Prefill
         // advances one chunk per engine step alongside live decode.
-        auto ar = engine.admit(next_request_id, req.prompt_tokens,
+        const uint64_t engine_request_id = next_request_id;
+        auto ar = engine.admit(engine_request_id, effective_prompt,
                                req.sampler);
         if (ar.status == SeqEngine::AdmitResult::Status::busy)
             return AdmissionDisposition::Deferred;
@@ -475,9 +589,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.admission_order = next_admission_order++;
         s.started_at = started_at;
         s.decode_started_at = started_at;  // sane on prefill failure
+        s.effective_prompt_tokens = (int)effective_prompt.size();
+        s.prompt_compressed = job->parallel_prompt_compressed;
+        s.engine_request_id = engine_request_id;
         s.n_gen_cap = std::min(
             n_gen_cap,
-            engine.max_context() - (int)req.prompt_tokens.size() + 1);
+            engine.max_context() - s.effective_prompt_tokens + 1);
         s.emitter = std::move(job->emitter);
         s.send_buffer.mark_progress(std::chrono::steady_clock::now());
         if (budget_active && !config_.think_close_token_ids.empty() &&
@@ -617,8 +734,15 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         prefill_candidates.clear();
         for (int i = 0; i < n_slots; i++) {
             if (slots[(size_t)i].job && !slots[(size_t)i].prefilling) {
-                step_plan.decode.push_back(
-                    {i, slots[(size_t)i].pending_tok});
+                SeqEngine::StepInput input;
+                input.slot = i;
+                input.token = slots[(size_t)i].pending_tok;
+                input.allow_speculation =
+                    slots[(size_t)i].hook.close_token_ids.empty();
+                input.speculation_policy = resolve_speculation_policy(
+                    config_.decode_mode,
+                    slots[(size_t)i].job->req.decode_mode);
+                step_plan.decode.push_back(input);
             } else if (slots[(size_t)i].job) {
                 prefill_candidates.push_back(
                     {i, slots[(size_t)i].admission_order});
@@ -628,9 +752,6 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             engine.step_plan_limits((int)step_plan.decode.size());
         step_plan.prefills = plan_prefill_slices(
             prefill_candidates, step_limits, prefill_round_robin_start);
-        if (!prefill_candidates.empty()) {
-            ++prefill_round_robin_start;
-        }
 
         SeqEngine::StepResult step_result = engine.step(step_plan);
         const std::string protocol_error =
@@ -666,9 +787,26 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 s.finished = true;
                 continue;
             }
-            advance_slot(s, out.token);
+            s.ddtree_steps += out.ddtree_steps;
+            s.ddtree_accepted_tokens += out.ddtree_accepted_tokens;
+            s.ddtree_suspensions += out.ddtree_suspensions;
+            s.spec_steps += out.spec_steps;
+            s.spec_accepted_tokens += out.spec_accepted_tokens;
+            s.spec_service_ar_steps += out.spec_service_ar_steps;
+            s.target_forwards += out.target_forwards;
+            s.kvflash_page_ins += out.kvflash_page_ins;
+            s.kvflash_page_outs += out.kvflash_page_outs;
+            s.kvflash_resident_blocks = std::max(
+                s.kvflash_resident_blocks, out.kvflash_resident_blocks);
+            s.kvflash_reselects += out.kvflash_reselects;
+            consume_decode_output_tokens(out, [&](int32_t token) {
+                advance_slot(s, token);
+                return !s.finished;
+            });
         }
         using PrefillStatus = SeqEngine::PrefillOutput::Status;
+        const bool prefill_progressed =
+            prefill_result_made_progress(step_result);
         for (const auto & out : step_result.prefills) {
             if (out.slot < 0 || out.slot >= n_slots) continue;
             SchedSlot & s = slots[(size_t)out.slot];
@@ -677,6 +815,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 s.failed = true;
                 s.error = out.error;
                 s.finished = true;
+                continue;
+            }
+            if (out.status == PrefillStatus::deferred) {
+                // The exclusive decode graph made no prompt progress. Leave
+                // the slot untouched so normal FIFO planning retries it after
+                // the current decode wave drains.
                 continue;
             }
             if (out.status == PrefillStatus::completed) {
@@ -692,6 +836,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 continue;
             }
         }
+        // Deferred means the engine intentionally left the selected slices
+        // untouched. Keep allocation fairness stable across such rounds.
+        if (prefill_progressed) ++prefill_round_robin_start;
         // Phase 4 — Non-blocking flush of every live slot's chunks. Progress
         // resets the stall clock; a reader that makes no progress for 30 s
         // or lets the buffer hit the cap is dropped (its slot retires).

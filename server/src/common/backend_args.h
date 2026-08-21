@@ -12,6 +12,7 @@
 #include "placement/remote_target_shard_config.h"
 #include "prefill_attention_mode.h"
 
+#include "speculation_policy.h"
 namespace dflash::common {
 
 // Server-owned features that participate in backend admission even though
@@ -87,6 +88,7 @@ struct BackendArgs {
     float           ddtree_tau       = std::numeric_limits<float>::infinity();
     int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
+    SpeculationPolicy speculation_policy = SpeculationPolicy::Adaptive;
 };
 
 }  // namespace dflash::common

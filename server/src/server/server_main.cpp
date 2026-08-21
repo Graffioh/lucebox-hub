@@ -132,6 +132,8 @@ static void print_usage(const char * prog) {
         "  --specla-top-k <K>  SpecLA draft-tree width (default: 4)\n"
         "  --ddtree             Enable DDTree speculative decode\n"
         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
+        "  --decode-mode <mode> Speculative decode policy: ar, speculation,\n"
+        "                       or adaptive (default: adaptive)\n"
         "  --ddtree-tau <T>     Confidence margin on cumulative log-prob\n"
         "                       (default: 6 with --specla; otherwise off)\n"
         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
@@ -455,6 +457,15 @@ int main(int argc, char ** argv) {
             bargs.fast_rollback = true;
         } else if (std::strcmp(argv[i], "--ddtree-budget") == 0 && i + 1 < argc) {
             bargs.ddtree_budget = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--decode-mode") == 0 && i + 1 < argc) {
+            SpeculationPolicy policy;
+            if (!parse_speculation_policy(argv[++i], policy)) {
+                std::fprintf(stderr,
+                    "[server] --decode-mode expects ar, speculation, or adaptive\n");
+                return 2;
+            }
+            bargs.speculation_policy = policy;
+            sconfig.decode_mode = policy;
         } else if (std::strcmp(argv[i], "--ddtree-tau") == 0 && i + 1 < argc) {
             const char * value = argv[++i];
             char * end = nullptr;
@@ -1237,6 +1248,8 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
+    std::fprintf(stderr, "[server] │  decode_mode     = %s\n",
+                 speculation_policy_name(bargs.speculation_policy));
     std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
@@ -1280,7 +1293,11 @@ int main(int argc, char ** argv) {
     sconfig.draft_path   = bargs.draft_path ? bargs.draft_path : "";
     sconfig.fa_window    = bargs.fa_window;
     sconfig.ddtree_budget = bargs.ddtree_budget;
-    sconfig.speculative_enabled = bargs.ddtree_mode;
+    sconfig.speculative_enabled =
+        bargs.speculation_policy != SpeculationPolicy::Never &&
+        (bargs.ddtree_mode ||
+         (bargs.paged_attention && bargs.max_concurrency > 1 &&
+          bargs.draft_path != nullptr));
     sconfig.target_sharding     = bargs.device.is_layer_split();
     // KV type: report the operator's choice if set, else the family default
     // the backend resolves (the tq3_0 auto policy was removed; laguna uses

@@ -21,6 +21,7 @@
 #include "server/http_server.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
+#include "common/concurrency/seq_engine.h"
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
 #include "common/moe_hybrid_ffn_eval.h"
@@ -2022,6 +2023,31 @@ TEST_CASE(ServerUnitFixture, test_stop_sequence_holdback_extends) {
     TEST_ASSERT(em.accumulated_text().find("suffix") == std::string::npos);
 }
 
+TEST_CASE(ServerUnitFixture,
+          test_concurrent_scheduler_burst_stops_at_eos) {
+    SeqEngine::DecodeOutput burst;
+    burst.slot = 0;
+    burst.committed_tokens = {101, 2, 103};
+    burst.token = 104;
+
+    std::vector<int32_t> emitted;
+    int completion_tokens = 0;
+    const bool consumed_all = consume_decode_output_tokens(
+        burst, [&](int32_t token) {
+            emitted.push_back(token);
+            ++completion_tokens;
+            return token != 2;
+        });
+
+    TEST_ASSERT(!consumed_all);
+    TEST_ASSERT((emitted == std::vector<int32_t>{101, 2}));
+    TEST_ASSERT(completion_tokens == 2);
+    TEST_ASSERT(std::find(emitted.begin(), emitted.end(), 103) ==
+                emitted.end());
+    TEST_ASSERT(std::find(emitted.begin(), emitted.end(), 104) ==
+                emitted.end());
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Prefix cache hash tests (model-free)
 // ═══════════════════════════════════════════════════════════════════════
@@ -2444,6 +2470,48 @@ TEST_CASE(ServerUnitFixture, test_pflash_config_modes) {
     TEST_ASSERT(cfg.pflash_mode != ServerConfig::PflashMode::AUTO);
 }
 
+TEST_CASE(ServerUnitFixture, test_concurrent_pflash_persistent_forces_skip_park) {
+    ServerConfig cfg;
+    cfg.pflash_mode = ServerConfig::PflashMode::AUTO;
+    cfg.draft_residency = DraftResidencyPolicy::Persistent;
+    cfg.prefix_cache_cap = 0;
+
+    const auto plan = resolve_concurrent_pflash_plan(
+        cfg, /*drafter_tokenizer_available=*/true);
+    TEST_ASSERT(plan.ok());
+    TEST_ASSERT(plan.enabled);
+    TEST_ASSERT(plan.force_skip_park);
+}
+
+TEST_CASE(ServerUnitFixture, test_concurrent_pflash_rejects_unsafe_residency) {
+    ServerConfig cfg;
+    cfg.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    cfg.draft_residency = DraftResidencyPolicy::Auto;
+    cfg.prefix_cache_cap = 0;
+
+    auto plan = resolve_concurrent_pflash_plan(
+        cfg, /*drafter_tokenizer_available=*/true);
+    TEST_ASSERT(!plan.ok());
+    TEST_ASSERT(plan.error.find("--draft-residency persistent") !=
+                std::string::npos);
+
+    cfg.draft_residency = DraftResidencyPolicy::Persistent;
+    plan = resolve_concurrent_pflash_plan(
+        cfg, /*drafter_tokenizer_available=*/false);
+    TEST_ASSERT(!plan.ok());
+    TEST_ASSERT(plan.error.find("--prefill-drafter") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_concurrent_pflash_rejects_snapshot_caches) {
+    ServerConfig cfg;
+    cfg.pflash_mode = ServerConfig::PflashMode::AUTO;
+    cfg.draft_residency = DraftResidencyPolicy::Persistent;
+    const auto plan = resolve_concurrent_pflash_plan(
+        cfg, /*drafter_tokenizer_available=*/true);
+    TEST_ASSERT(!plan.ok());
+    TEST_ASSERT(plan.error.find("snapshots") != std::string::npos);
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_compress_request_struct) {
     ModelBackend::CompressRequest req;
     req.input_ids = {1, 2, 3, 4, 5};
@@ -2583,6 +2651,46 @@ TEST_CASE(ServerUnitFixture, test_parse_request_sampler_applies_defaults_and_ove
     TEST_ASSERT(sampler.seed == 42);
     TEST_ASSERT(std::fabs(sampler.pres_pen - 0.3f) < 0.001f);
     TEST_ASSERT(std::fabs(sampler.rep_pen - 1.1f) < 0.001f);
+}
+TEST_CASE(ServerUnitFixture, test_speculation_policy_parse_name_and_fold) {
+    SpeculationPolicy policy = SpeculationPolicy::Adaptive;
+    TEST_ASSERT(parse_speculation_policy("ar", policy));
+    TEST_ASSERT(policy == SpeculationPolicy::Never);
+    TEST_ASSERT(std::string(speculation_policy_name(policy)) == "ar");
+
+    TEST_ASSERT(parse_speculation_policy("speculation", policy));
+    TEST_ASSERT(policy == SpeculationPolicy::Always);
+    TEST_ASSERT(std::string(speculation_policy_name(policy)) == "speculation");
+
+    TEST_ASSERT(parse_speculation_policy("adaptive", policy));
+    TEST_ASSERT(policy == SpeculationPolicy::Adaptive);
+    TEST_ASSERT(!parse_speculation_policy("always", policy));
+
+    TEST_ASSERT(resolve_speculation_policy(
+        SpeculationPolicy::Always, std::nullopt) == SpeculationPolicy::Always);
+    TEST_ASSERT(resolve_speculation_policy(
+        SpeculationPolicy::Always, SpeculationPolicy::Never) ==
+        SpeculationPolicy::Never);
+
+    const ConcurrentDecodeCapabilities ar_only{};
+    TEST_ASSERT(ar_only.supports(SpeculationPolicy::Never));
+    TEST_ASSERT(!ar_only.supports(SpeculationPolicy::Always));
+    TEST_ASSERT(!ar_only.supports(SpeculationPolicy::Adaptive));
+
+    const ConcurrentDecodeCapabilities forced_only{
+        /*forced_speculation=*/true,
+        /*adaptive=*/false,
+    };
+    TEST_ASSERT(forced_only.supports(SpeculationPolicy::Never));
+    TEST_ASSERT(forced_only.supports(SpeculationPolicy::Always));
+    TEST_ASSERT(!forced_only.supports(SpeculationPolicy::Adaptive));
+
+    const ConcurrentDecodeCapabilities adaptive{
+        /*forced_speculation=*/true,
+        /*adaptive=*/true,
+    };
+    TEST_ASSERT(adaptive.supports(SpeculationPolicy::Always));
+    TEST_ASSERT(adaptive.supports(SpeculationPolicy::Adaptive));
 }
 
 TEST_CASE(ServerUnitFixture, test_require_messages_array_rejects_invalid) {
@@ -4955,6 +5063,7 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     cfg.chunk           = 512;
     cfg.target_device   = "auto:0";
     cfg.draft_device    = "auto:0";
+    cfg.decode_mode     = SpeculationPolicy::Always;
     TEST_ASSERT(cfg.admission_coalesce_ms == 20);
 
     Tokenizer    tok;
@@ -4970,6 +5079,8 @@ TEST_CASE(ServerUnitFixture, test_props_runtime_shape) {
     TEST_ASSERT(rt["kv_cache_v"].get<std::string>()      == "tq3_0");
     TEST_ASSERT(rt["lazy_draft"].get<bool>()             == false);
     TEST_ASSERT(rt["draft_residency"].get<std::string>() == "persistent");
+    TEST_ASSERT(rt["decode_mode"].get<std::string>()      == "speculation");
+    TEST_ASSERT(body["decode_mode"].get<std::string>()    == "speculation");
     TEST_ASSERT(rt["target_sharding"].get<bool>()        == false);
     TEST_ASSERT(rt["chunk"].get<int>()                   == 512);
     TEST_ASSERT(rt["target_device"].get<std::string>()   == "auto:0");
@@ -5942,6 +6053,5 @@ TEST_CASE(ServerUnitFixture, test_emitter_function_calls_param_with_literal_thin
     TEST_ASSERT(em.emit_token_count() == 3);
     TEST_ASSERT(em.emit_token_count() - em.first_content_token_index() == 1);
 }
-
 
 

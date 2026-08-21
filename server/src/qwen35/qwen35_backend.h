@@ -18,6 +18,7 @@
 #include "placement/remote_draft_config.h"
 #include "step_graph.h"
 #include "ddtree.h"
+#include "common/speculation_policy.h"
 
 #include <limits>
 #include "dflash_feature_ring.h"
@@ -26,7 +27,9 @@
 #include "concurrency/qwen35_seq_engine.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
-#include "kvflash_pager.h"         // bounded KV residency pool
+#include "kvflash_pager.h"
+#include "common/concurrency/paged_kv_residency.h"
+#include "common/concurrency/qwen_paged_kv_transfer.h"
 #include "kvflash_scorer.h"        // chunk-relevance policy interface
 #include "kvflash_qk.h"            // target-QK scorer (pooled keys + query)
 
@@ -89,6 +92,7 @@ struct Qwen35Config {
     // SpecLA confidence margin on cumulative path log-prob (off when inf).
     float        ddtree_tau      = std::numeric_limits<float>::infinity();
     bool         use_feature_mirror = false;
+    SpeculationPolicy speculation_policy = SpeculationPolicy::Adaptive;
 };
 
 // ── Backend class ───────────────────────────────────────────────────────
@@ -150,6 +154,10 @@ public:
     // attention); null otherwise, which is what tells the server to serve
     // one request at a time through generate().
     SeqEngine * seq_engine() override;
+    ConcurrentDecodeCapabilities concurrent_decode_capabilities()
+            const override {
+        return concurrent_decode_capabilities_;
+    }
 
     // EOS identity of the loaded weights. Model-level, so it stays on the
     // backend and is shared by the AR decode path and the engine.
@@ -300,6 +308,8 @@ private:
     // Page size comes from PAGED_BLOCK_SIZE (paged_attention_config.h),
     // shared with the graph builder and the cache's block-aligned sizing.
     std::unique_ptr<PagedKvPool> paged_kv_pool_;
+    std::unique_ptr<QwenPagedKvResidencyTransfer> paged_kv_transfer_;
+    std::unique_ptr<PagedKvResidencyManager> paged_kv_residency_;
     std::optional<PagedKvSequenceHandle> paged_sequence_;
     PagedKvRequestId paged_request_id_ = 0;
 
@@ -317,6 +327,7 @@ private:
     // hence the friendship — and owns everything else concurrent serving
     // needs (Qwen35SlotManager, slot prefill, the batched decode step).
     std::unique_ptr<Qwen35SeqEngine> seq_engine_;
+    ConcurrentDecodeCapabilities concurrent_decode_capabilities_;
     friend class Qwen35SeqEngine;
 
     // DFLASH_MIN_TOKENS floor for the slot paths (mirrors do_ar_decode's

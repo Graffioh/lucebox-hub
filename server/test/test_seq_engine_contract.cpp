@@ -22,7 +22,9 @@ struct Faults {
     bool lose_other_pending = false;
     bool overconsume_prefill = false;
     bool drop_second_completion = false;
+    bool defer_first_mixed_prefill = false;
     bool retire_leaks = false;
+    bool burst_when_speculation_disabled = false;
 };
 
 struct FakeCapabilities {
@@ -111,6 +113,10 @@ public:
                 100 + input.slot + (int32_t)slot.fed.size(),
                 false, {},
             });
+            if (faults_.burst_when_speculation_disabled &&
+                !input.allow_speculation) {
+                result.decode.back().committed_tokens.push_back(91);
+            }
         }
 
         std::vector<int> completed_this_step;
@@ -120,6 +126,14 @@ public:
             if (slice.slot < 0 || slice.slot >= slot_count()) continue;
             Slot & slot = slots_[(size_t)slice.slot];
             if (!slot.active || !slot.prefilling || slot.remaining <= 0) {
+                continue;
+            }
+            if (faults_.defer_first_mixed_prefill &&
+                !plan.decode.empty() && !deferred_mixed_prefill_) {
+                deferred_mixed_prefill_ = true;
+                result.prefills.push_back({
+                    slice.slot, PrefillOutput::Status::deferred, -1, {},
+                });
                 continue;
             }
             int consumed = std::min(slice.max_tokens, slot.remaining);
@@ -231,6 +245,7 @@ private:
     std::vector<Slot> slots_;
     Faults faults_;
     FakeCapabilities capabilities_;
+    bool deferred_mixed_prefill_ = false;
 };
 
 static void print_violations(const char * label,
@@ -279,6 +294,17 @@ int main() {
         CHECK(violations.empty());
     }
 
+    {
+        Faults faults;
+        faults.defer_first_mixed_prefill = true;
+        FakeSeqEngine engine(2, faults);
+        const auto violations = check_seq_engine_contract(engine);
+        if (!violations.empty()) {
+            print_violations("conforming-deferred-prefill", violations);
+        }
+        CHECK(violations.empty());
+    }
+
     struct Case {
         const char * label;
         bool Faults::*fault;
@@ -302,6 +328,9 @@ int main() {
          "omitted an output"},
         {"retire-leak", &Faults::retire_leaks,
          "succeed while a slot is free"},
+        {"ignore-speculation-gate",
+         &Faults::burst_when_speculation_disabled,
+         "disabled speculation"},
     };
 
     for (const Case & test : cases) {

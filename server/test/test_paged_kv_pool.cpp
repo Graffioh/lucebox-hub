@@ -401,6 +401,81 @@ TEST_CASE(PagedKvPoolFixture, invalid_arguments) {
     }));
 }
 
+
+TEST_CASE(PagedKvPoolFixture, cold_block_roundtrip_and_release) {
+    PagedKvPool pool(/*physical_block_count=*/4,
+                     /*max_sequences=*/2, /*block_size=*/16);
+    const auto first = acquire(pool, 1);
+    CHECK(pool.append(first, 33).status == PagedKvStatus::Ok);
+    CHECK(equals(sequence(pool, first).block_table, {0, 1, 2}));
+    CHECK(pool.free_block_count() == 1);
+
+    uint32_t released = 99;
+    CHECK(pool.page_out_block(first, 1, released) == PagedKvStatus::Ok);
+    CHECK(released == 1);
+    CHECK(pool.free_block_count() == 2);
+    CHECK(sequence(pool, first).block_table[1] == PAGED_KV_COLD_BLOCK);
+    uint32_t resident = 0;
+    uint32_t owned = 0;
+    CHECK(pool.resident_block_count(first, resident) == PagedKvStatus::Ok);
+    CHECK(resident == 2);
+    CHECK(pool.owned_block_count(first, owned) == PagedKvStatus::Ok);
+    CHECK(owned == 3);  // logical appended capacity includes the cold block
+
+    uint32_t unchanged = 123;
+    CHECK(pool.page_out_block(first, 1, unchanged) ==
+          PagedKvStatus::BlockNotResident);
+    CHECK(unchanged == 123);
+    CHECK(pool.page_in_block(first, 99, unchanged) ==
+          PagedKvStatus::LogicalBlockOutOfRange);
+    CHECK(unchanged == 123);
+
+    uint32_t restored = 99;
+    CHECK(pool.page_in_block(first, 1, restored) == PagedKvStatus::Ok);
+    CHECK(restored == 1);
+    CHECK(equals(sequence(pool, first).block_table, {0, 1, 2}));
+    CHECK(pool.page_in_block(first, 1, unchanged) ==
+          PagedKvStatus::BlockAlreadyResident);
+
+    CHECK(pool.page_out_block(first, 1, released) == PagedKvStatus::Ok);
+    CHECK(pool.release(first) == PagedKvStatus::Ok);
+    CHECK(pool.free_block_count() == 4);
+}
+
+TEST_CASE(PagedKvPoolFixture, append_remaps_cold_partial_head_atomically) {
+    PagedKvPool pool(/*physical_block_count=*/2,
+                     /*max_sequences=*/2, /*block_size=*/16);
+    const auto first = acquire(pool, 1);
+    const auto second = acquire(pool, 2);
+    CHECK(pool.append(first, 8).status == PagedKvStatus::Ok);
+    CHECK(pool.append(second, 16).status == PagedKvStatus::Ok);
+    CHECK(pool.free_block_count() == 0);
+
+    uint32_t released = 99;
+    CHECK(pool.page_out_block(first, 0, released) == PagedKvStatus::Ok);
+    CHECK(released == 0);
+    auto appended = pool.append(first, 4);
+    CHECK(appended.status == PagedKvStatus::Ok);
+    CHECK(appended.remapped_cold_blocks.size() == 1);
+    CHECK(appended.remapped_cold_blocks[0].logical_block == 0);
+    CHECK(appended.remapped_cold_blocks[0].physical_block == 0);
+    CHECK(appended.write_slots.front().physical_block == 0);
+    CHECK(appended.write_slots.front().logical_position == 8);
+
+    CHECK(pool.page_out_block(first, 0, released) == PagedKvStatus::Ok);
+    const auto before = sequence(pool, first);
+    appended = pool.append(first, 8);  // positions 12..19
+    CHECK(appended.status == PagedKvStatus::BlocksExhausted);
+    const auto after = sequence(pool, first);
+    CHECK(after.kv_seq_len == before.kv_seq_len);
+    CHECK(after.block_table == before.block_table);
+    CHECK(after.block_table[0] == PAGED_KV_COLD_BLOCK);
+    CHECK(appended.remapped_cold_blocks.empty());
+
+    pool.reset();
+    CHECK(pool.free_block_count() == 2);
+}
+
 TEST_CASE(PagedKvPoolFixture, auto_pool_sizing) {
     PagedKvAutoBudget budget;
     budget.free_bytes = 10'000;

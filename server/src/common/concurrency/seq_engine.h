@@ -6,11 +6,15 @@
 // paged KV cache and execute a batched decode step. Any additional
 // per-sequence model state is owned by the concrete engine, not by this
 // interface. admit() claims a slot and queues its prompt without compute.
-// Each step() then advances a scheduler-selected cohort of prompt slices
-// alongside the complete live decode batch. Once a prefill completes, the
-// scheduler advances that slot one token per step(), feeding each sampled
-// token back as the next step's input — which is what lets it override a token
-// (thinking-budget force-close) before it is committed to the cache.
+// Each step() advances the complete live decode batch and may also advance a
+// scheduler-selected cohort of prompt slices. A decode graph that cannot mix
+// with prefill reports those slices as deferred and leaves their prompt state
+// unchanged; the scheduler selects them again after the exclusive decode wave.
+// Once a prefill completes, the scheduler feeds the final sampled token back as
+// the next step's input. An engine may also return speculative children it
+// already committed before that final pending token. The scheduler can disable
+// that burst path per slot when it must preserve authority to substitute a
+// thinking-budget close token.
 //
 // The split of duties is deliberate and is the reason this interface exists
 // apart from ModelBackend:
@@ -47,6 +51,7 @@
 // engine through it before wiring it up.
 
 #pragma once
+#include "common/speculation_policy.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -181,20 +186,52 @@ public:
     struct StepInput {
         int     slot  = -1;
         int32_t token = -1;   // token to commit at this slot's next position
+        // False when scheduler-side policy may replace the sampled token
+        // before it is committed (currently the thinking-budget close hook).
+        bool allow_speculation = true;
+        // Effective server default + per-request override. The hard safety
+        // check above always wins over this policy.
+        SpeculationPolicy speculation_policy = SpeculationPolicy::Adaptive;
     };
     struct DecodeOutput {
         int     slot   = -1;
-        int32_t token  = -1;  // newly sampled token (pending until next step)
+        // Final newly sampled token, pending until the scheduler feeds it into
+        // the next step. `committed_tokens`, when non-empty, precede this token
+        // and are already present in backend state.
+        int32_t token  = -1;
         bool    failed = false;
         // Present when failed=true so the scheduler can report an honest
         // per-request error instead of silently truncating generation.
         std::string error;
+        std::vector<int32_t> committed_tokens;
+
+        // Per-slot deltas for this engine step. The scheduler aggregates them
+        // until retirement and emits one machine-readable proof record.
+        uint64_t ddtree_steps = 0;
+        uint64_t ddtree_accepted_tokens = 0;
+        uint64_t ddtree_suspensions = 0;
+        uint64_t spec_steps = 0;
+        uint64_t spec_accepted_tokens = 0;
+        // Sticky-SPEC lane advances performed by an explicit packed
+        // AR+prefill service round. These are scheduling suspensions, not a
+        // routing-mode change, and are reported separately from spec_steps.
+        uint64_t spec_service_ar_steps = 0;
+        uint64_t target_forwards = 0;
+        uint64_t kvflash_page_ins = 0;
+        uint64_t kvflash_page_outs = 0;
+        uint64_t kvflash_resident_blocks = 0;
+        uint64_t kvflash_reselects = 0;
     };
 
     struct PrefillOutput {
         enum class Status {
             advanced,
             completed,
+            // Selected work intentionally made no progress because the same
+            // engine call executed an incompatible decode graph. No prompt
+            // state changed; the scheduler keeps it pending and selects it
+            // again after the exclusive decode wave.
+            deferred,
             failed,
         };
 
@@ -237,8 +274,9 @@ public:
     virtual StepPlanLimits step_plan_limits(int decode_rows) const = 0;
 
     // A successful result returns one decode output for every decode input and
-    // one explicit advanced/completed/failed result for every selected
-    // prefill. Invalid plans return a fatal error without advancing state.
+    // one explicit advanced/completed/deferred/failed result for every
+    // selected prefill. Invalid plans return a fatal error without advancing
+    // state.
     // Runtime failures are terminal for the live cohort and may follow partial
     // backend mutation, but expose no consumable payload.
     virtual StepResult step(const StepPlan & plan) = 0;
@@ -249,6 +287,33 @@ public:
     // EOS check for scheduler-side stop decisions.
     virtual bool token_is_eos(int32_t token) const = 0;
 };
+
+// Scheduler fairness advances only when selected prompt work actually moved.
+// A deferred or failed slice remains non-progress even though both are valid,
+// explicit answers for the selected row.
+inline bool prefill_result_made_progress(
+        const SeqEngine::StepResult & result) {
+    using Status = SeqEngine::PrefillOutput::Status;
+    return std::any_of(
+        result.prefills.begin(), result.prefills.end(),
+        [](const SeqEngine::PrefillOutput & output) {
+            return output.status == Status::advanced ||
+                   output.status == Status::completed;
+        });
+}
+
+// Deliver a successful decode result in wire order. The visitor returns false
+// after a stop/EOS/output-cap decision; in that case later committed children
+// and the final pending token are intentionally hidden and the slot is retired.
+template <typename Advance>
+inline bool consume_decode_output_tokens(
+        const SeqEngine::DecodeOutput & output, Advance advance) {
+    if (output.failed) return false;
+    for (int32_t token : output.committed_tokens) {
+        if (!advance(token)) return false;
+    }
+    return advance(output.token);
+}
 
 // Validate the model-neutral step protocol before the scheduler consumes any
 // output. Malformed row ownership is fatal because re-feeding a token after an
@@ -265,6 +330,7 @@ inline std::string validate_step_result(
     }
 
     std::vector<uint8_t> decode_planned((size_t)slot_count, 0);
+    std::vector<uint8_t> speculation_allowed((size_t)slot_count, 0);
     std::vector<uint8_t> prefill_planned((size_t)slot_count, 0);
     for (const SeqEngine::StepInput & input : plan.decode) {
         if (input.slot < 0 || input.slot >= slot_count || input.token < 0)
@@ -272,6 +338,8 @@ inline std::string validate_step_result(
         if (decode_planned[(size_t)input.slot])
             return "decode plan contains a duplicate slot";
         decode_planned[(size_t)input.slot] = 1;
+        speculation_allowed[(size_t)input.slot] =
+            input.allow_speculation ? 1 : 0;
     }
     for (const PrefillSlice & slice : plan.prefills) {
         if (slice.slot < 0 || slice.slot >= slot_count ||
@@ -290,10 +358,39 @@ inline std::string validate_step_result(
             return "decode output names an unplanned slot";
         if (decode_seen[(size_t)output.slot])
             return "step returned duplicate decode outputs";
-        if (output.failed && (output.token >= 0 || output.error.empty()))
-            return "failed decode has invalid payload";
-        if (!output.failed && (output.token < 0 || !output.error.empty()))
-            return "successful decode has invalid payload";
+        if (output.failed) {
+            if (output.error.empty())
+                return "failed decode has no diagnostic";
+            if (output.token >= 0 || !output.committed_tokens.empty())
+                return "failed decode exposes token payload";
+            if (output.ddtree_suspensions != 0)
+                return "failed decode carries DDTree suspension telemetry";
+            if (output.spec_steps != 0 || output.spec_accepted_tokens != 0)
+                return "failed decode carries chain speculation telemetry";
+            if (output.spec_service_ar_steps != 0)
+                return "failed decode carries chain service telemetry";
+        } else {
+            if (output.token < 0)
+                return "successful decode has no pending token";
+            if (!output.error.empty())
+                return "successful decode carries an error diagnostic";
+            if (!speculation_allowed[(size_t)output.slot] &&
+                !output.committed_tokens.empty())
+                return "decode output burst violates disabled speculation";
+            if (std::any_of(
+                    output.committed_tokens.begin(),
+                    output.committed_tokens.end(),
+                    [](int32_t token) { return token < 0; }))
+                return "decode output burst contains an invalid token";
+            if (output.ddtree_suspensions > output.ddtree_steps)
+                return "DDTree suspension has no successful DDTree step";
+            if (output.spec_accepted_tokens != 0 && output.spec_steps == 0)
+                return "chain acceptance has no successful speculation step";
+            if (output.spec_service_ar_steps > output.target_forwards)
+                return "chain service steps exceed target forwards";
+            if (output.spec_service_ar_steps != 0 && output.spec_steps != 0)
+                return "step mixes chain speculation and AR service";
+        }
         decode_seen[(size_t)output.slot] = 1;
     }
 
@@ -307,6 +404,7 @@ inline std::string validate_step_result(
             return "step returned duplicate prefill outputs";
         if (output.status != PrefillStatus::advanced &&
             output.status != PrefillStatus::completed &&
+            output.status != PrefillStatus::deferred &&
             output.status != PrefillStatus::failed)
             return "prefill output has an unknown status";
         if (output.status == PrefillStatus::advanced &&
@@ -315,6 +413,10 @@ inline std::string validate_step_result(
         if (output.status == PrefillStatus::completed &&
             (output.token < 0 || !output.error.empty()))
             return "completed prefill has invalid payload";
+        if (output.status == PrefillStatus::deferred &&
+            (plan.decode.empty() || output.token >= 0 ||
+             !output.error.empty()))
+            return "deferred prefill has invalid payload or no decode peer";
         if (output.status == PrefillStatus::failed &&
             (output.token >= 0 || output.error.empty()))
             return "failed prefill has invalid payload";

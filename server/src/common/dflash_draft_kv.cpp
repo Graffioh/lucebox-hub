@@ -96,9 +96,12 @@ bool draft_kv_init(DraftKvState & st,
     si.mask_swa    = st.mask_swa;
     si.lm_head     = lm_head;
     DraftGraphOutputs go = build_draft_kv_step(st.g_ctx, st.gf, dw, st.cache, si);
-    if (!go.hidden_states) return false;
+    if (!go.hidden_prenorm || !go.hidden_states) return false;
+    st.hidden_prenorm = go.hidden_prenorm;
     st.hidden_states = go.hidden_states;
     st.logits        = go.logits;
+    ggml_set_output(st.hidden_prenorm);
+    ggml_build_forward_expand(st.gf, st.hidden_prenorm);
     ggml_set_output(st.hidden_states);
     ggml_build_forward_expand(st.gf, st.hidden_states);
     if (st.logits) {
@@ -142,7 +145,7 @@ void draft_kv_free(DraftKvState & st) {
     if (st.mem_ctx) { ggml_free(st.mem_ctx); st.mem_ctx = nullptr; }
     st.meta_arena.clear();
     st.meta_arena.shrink_to_fit();
-    st.hidden_states = st.logits = nullptr;
+    st.hidden_prenorm = st.hidden_states = st.logits = nullptr;
     st.cache.k.clear();
     st.cache.v.clear();
     st.slot_pos.clear();
@@ -315,6 +318,175 @@ bool draft_kv_begin_step(DraftKvState & st,
         ggml_backend_tensor_set(st.mask_swa, st.mask_hbuf.data(), 0,
                                 sizeof(uint16_t) * mask_elems);
     }
+    return true;
+}
+
+void draft_kv_batch_free(DraftKvBatchGraph & batch) {
+    if (batch.galloc) {
+        ggml_gallocr_free(batch.galloc);
+        batch.galloc = nullptr;
+    }
+    if (batch.g_ctx) {
+        ggml_free(batch.g_ctx);
+        batch.g_ctx = nullptr;
+    }
+    batch.gf = nullptr;
+    batch.hidden_by_lane.clear();
+    batch.prenorm_by_lane.clear();
+    batch.lane_states.clear();
+    batch.meta_arena.clear();
+    batch.n_lanes = 0;
+    batch.q_len = 0;
+    batch.outputs_prenorm = false;
+    batch.built_for = nullptr;
+}
+
+static bool draft_kv_batch_build(
+        DraftKvBatchGraph & batch,
+        const DraftWeights & dw,
+        ggml_backend_t backend,
+        const std::vector<DraftKvState *> & lane_states,
+        bool need_prenorm) {
+    if (!backend || lane_states.empty() || dw.block_size <= 1) {
+        return false;
+    }
+    for (DraftKvState * state : lane_states) {
+        if (!state || !state->mem_buf || state->q_len != dw.block_size ||
+            state->built_for != static_cast<const void *>(&dw)) {
+            return false;
+        }
+    }
+
+    draft_kv_batch_free(batch);
+    const int n_lanes = static_cast<int>(lane_states.size());
+    const size_t arena_size =
+        (32u + 16u * static_cast<size_t>(n_lanes)) * 1024u * 1024u;
+    batch.meta_arena.resize(arena_size);
+    ggml_init_params params{};
+    params.mem_size = batch.meta_arena.size();
+    params.mem_buffer = batch.meta_arena.data();
+    params.no_alloc = true;
+    batch.g_ctx = ggml_init(params);
+    if (!batch.g_ctx) {
+        draft_kv_batch_free(batch);
+        return false;
+    }
+    batch.gf = ggml_new_graph_custom(
+        batch.g_ctx, 4096 * n_lanes + 2048, false);
+
+    batch.hidden_by_lane.reserve(static_cast<size_t>(n_lanes));
+    if (need_prenorm) {
+        batch.prenorm_by_lane.reserve(static_cast<size_t>(n_lanes));
+    }
+    for (DraftKvState * state : lane_states) {
+        DraftKvAppendInputs append{};
+        append.n_rows = state->a_step;
+        append.feat = state->ap_feat;
+        append.positions = state->ap_pos;
+        append.rows = state->ap_rows;
+        if (!build_draft_kv_append(
+                batch.g_ctx, batch.gf, dw, state->cache, append)) {
+            draft_kv_batch_free(batch);
+            return false;
+        }
+
+        DraftKvStepInputs step{};
+        step.noise_embed = state->inp_embed;
+        step.positions_q = state->pos_q;
+        step.noise_rows = state->noise_rows;
+        step.mask_full = state->mask_full;
+        step.mask_swa = state->mask_swa;
+        DraftGraphOutputs output = build_draft_kv_step(
+            batch.g_ctx, batch.gf, dw, state->cache, step);
+        if (!output.hidden_states ||
+            (need_prenorm && !output.hidden_prenorm)) {
+            draft_kv_batch_free(batch);
+            return false;
+        }
+        ggml_set_output(output.hidden_states);
+        ggml_build_forward_expand(batch.gf, output.hidden_states);
+        batch.hidden_by_lane.push_back(output.hidden_states);
+        if (need_prenorm) {
+            ggml_set_output(output.hidden_prenorm);
+            ggml_build_forward_expand(batch.gf, output.hidden_prenorm);
+            batch.prenorm_by_lane.push_back(output.hidden_prenorm);
+        }
+    }
+
+    batch.galloc =
+        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!batch.galloc ||
+        !ggml_gallocr_alloc_graph(batch.galloc, batch.gf)) {
+        std::fprintf(stderr,
+            "[draft-kv-batch] graph alloc failed lanes=%d\n", n_lanes);
+        draft_kv_batch_free(batch);
+        return false;
+    }
+
+    batch.n_lanes = n_lanes;
+    batch.q_len = dw.block_size;
+    batch.outputs_prenorm = need_prenorm;
+    batch.built_for = &dw;
+    batch.lane_states = lane_states;
+    std::fprintf(stderr,
+        "[draft-kv-batch] packed backbone ready lanes=%d q_len=%d "
+        "prenorm=%s\n",
+        n_lanes, dw.block_size, need_prenorm ? "on" : "off");
+    return true;
+}
+
+bool draft_kv_batch_compute(
+        DraftKvBatchGraph & batch,
+        const DraftWeights & dw,
+        ggml_backend_t backend,
+        const std::vector<DraftKvState *> & lane_states,
+        bool need_prenorm,
+        std::vector<std::vector<float>> & hidden_by_lane,
+        std::vector<std::vector<float>> & prenorm_by_lane) {
+    hidden_by_lane.clear();
+    prenorm_by_lane.clear();
+    if (lane_states.empty()) return false;
+
+    const bool reusable =
+        batch.gf && batch.built_for == static_cast<const void *>(&dw) &&
+        batch.lane_states == lane_states &&
+        batch.outputs_prenorm == need_prenorm;
+    if (!reusable &&
+        !draft_kv_batch_build(
+            batch, dw, backend, lane_states, need_prenorm)) {
+        return false;
+    }
+    if (ggml_backend_graph_compute(backend, batch.gf) !=
+        GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr,
+            "[draft-kv-batch] graph compute failed lanes=%d\n",
+            batch.n_lanes);
+        return false;
+    }
+
+    const size_t elements =
+        static_cast<size_t>(dw.n_embd) * static_cast<size_t>(batch.q_len);
+    hidden_by_lane.assign(
+        static_cast<size_t>(batch.n_lanes),
+        std::vector<float>(elements));
+    if (need_prenorm) {
+        prenorm_by_lane.assign(
+            static_cast<size_t>(batch.n_lanes),
+            std::vector<float>(elements));
+    }
+    for (int lane = 0; lane < batch.n_lanes; ++lane) {
+        ggml_backend_tensor_get_async(
+            backend, batch.hidden_by_lane[static_cast<size_t>(lane)],
+            hidden_by_lane[static_cast<size_t>(lane)].data(), 0,
+            sizeof(float) * elements);
+        if (need_prenorm) {
+            ggml_backend_tensor_get_async(
+                backend, batch.prenorm_by_lane[static_cast<size_t>(lane)],
+                prenorm_by_lane[static_cast<size_t>(lane)].data(), 0,
+                sizeof(float) * elements);
+        }
+    }
+    ggml_backend_synchronize(backend);
     return true;
 }
 

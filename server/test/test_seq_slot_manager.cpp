@@ -7,9 +7,13 @@
 
 #include "qwen35/concurrency/qwen35_slot_manager.h"
 #include "host_check.h"
+#include "scoped_env.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
+#include <utility>
 
 using namespace dflash::common;
 
@@ -85,18 +89,20 @@ int main() {
         mgr.commit_prefill(0);
         CHECK(mgr.slot(0).cur_pos == 20);
 
-        // Decode appends: row allocation + sample_history; cur_pos advances
-        // separately after the step's compute.
         auto st = mgr.append_token(0, /*fed_token=*/42);
         CHECK(st.ok);
         CHECK(st.position == 20);
         CHECK(st.physical_row == 20);     // tail of the prompt's last block
         CHECK(st.new_block < 0 && st.new_block_index < 0);
         CHECK(mgr.slot(0).cur_pos == 20);
-        CHECK(mgr.slot(0).sample_history.size() == 21 &&
-              mgr.slot(0).sample_history.back() == 42);
+        CHECK(mgr.slot(0).sample_history.size() == 20);
+        CHECK(mgr.slot(0).staged_tokens.size() == 1 &&
+              mgr.slot(0).staged_tokens.back() == 42);
         mgr.commit_step(0);
         CHECK(mgr.slot(0).cur_pos == 21);
+        CHECK(mgr.slot(0).sample_history.size() == 21 &&
+              mgr.slot(0).sample_history.back() == 42);
+        CHECK(mgr.slot(0).staged_tokens.empty());
 
         // Second admission lands in slot 1 with non-identity rows.
         auto b = admit(mgr, 2, prompt_tokens(20), greedy_sampler());
@@ -333,6 +339,47 @@ int main() {
         CHECK(pool.free_block_count() == 0);
     }
 
+    {
+        PagedKvPool pool(8, 1, /*block_size=*/4);
+        Qwen35SlotManager mgr(pool, /*max_ctx=*/32,
+                              /*speculative_headroom=*/7);
+        auto a = admit(mgr, 1, prompt_tokens(3), greedy_sampler());
+        CHECK(is_admitted(a));
+        CHECK(mgr.append_prefill(a.slot, 3).ok);
+        mgr.commit_prefill(a.slot);
+
+        const int32_t accepted[] = {41, 42, 43, 44, 45, 46};
+        auto staged = mgr.append_tokens(a.slot, accepted, 6);
+        CHECK(staged.ok && !staged.busy && staged.count == 6);
+        CHECK(staged.position == 3 && staged.physical_rows.size() == 6);
+        CHECK(staged.first_new_block == 1);
+        CHECK(staged.new_blocks.size() == 2);
+        CHECK(mgr.slot(a.slot).cur_pos == 3);
+        CHECK(mgr.slot(a.slot).sample_history.size() == 3);
+        CHECK(mgr.slot(a.slot).staged_tokens ==
+              std::vector<int32_t>(accepted, accepted + 6));
+        CHECK(!mgr.append_token(a.slot, 99).ok);
+
+        const uint32_t free_while_staged = pool.free_block_count();
+        mgr.retire(a.slot);
+        CHECK(!mgr.is_active(a.slot));
+        CHECK(pool.free_block_count() > free_while_staged);
+
+        a = admit(mgr, 2, prompt_tokens(3), greedy_sampler());
+        CHECK(is_admitted(a));
+        CHECK(mgr.append_prefill(a.slot, 3).ok);
+        mgr.commit_prefill(a.slot);
+        staged = mgr.append_tokens(a.slot, accepted, 6);
+        CHECK(staged.ok);
+
+        mgr.commit_step(a.slot);
+        CHECK(mgr.slot(a.slot).cur_pos == 9);
+        CHECK(mgr.slot(a.slot).staged_tokens.empty());
+        CHECK(mgr.slot(a.slot).sample_history.size() == 9);
+        CHECK(std::equal(accepted, accepted + 6,
+                         mgr.slot(a.slot).sample_history.end() - 6));
+    }
+
     // Context exhaustion: append_token refuses past max_ctx.
     {
         PagedKvPool pool(4, 1, /*block_size=*/16);
@@ -423,6 +470,122 @@ int main() {
     }
 
     // Long-prefill policy follows active request length and clears on retire.
+    {
+        PagedKvPool pool(128, 2, /*block_size=*/16);
+        Qwen35SlotManager mgr(pool, 2048);
+        CHECK(!mgr.has_prefill_prompt_at_least(768));
+        auto short_req =
+            admit(mgr, 201, prompt_tokens(512), greedy_sampler());
+        CHECK(is_admitted(short_req));
+        CHECK(!mgr.has_prefill_prompt_at_least(768));
+        auto long_req =
+            admit(mgr, 202, prompt_tokens(800), greedy_sampler());
+        CHECK(is_admitted(long_req));
+        CHECK(mgr.has_prefill_prompt_at_least(768));
+        mgr.retire(long_req.slot);
+        CHECK(!mgr.has_prefill_prompt_at_least(768));
+    }
+
+    {
+        const luce_test::ScopedEnvVar adaptive("DFLASH_DDTREE_ADAPTIVE", nullptr);
+        CHECK(Qwen35SlotManager::ddtree_cohort_should_suspend(5, 1));
+        CHECK(!Qwen35SlotManager::ddtree_cohort_should_suspend(6, 1));
+        CHECK(!Qwen35SlotManager::ddtree_cohort_should_suspend(12, 2));
+        CHECK(Qwen35SlotManager::ddtree_cohort_should_suspend(11, 2));
+
+        PagedKvPool pool(8, 2, /*block_size=*/16);
+        Qwen35SlotManager mgr(pool, 64);
+        auto a = admit(mgr, 101, prompt_tokens(4), greedy_sampler());
+        auto b = admit(mgr, 102, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(a));
+        CHECK(is_admitted(b));
+        CHECK(mgr.append_prefill(a.slot, 4).ok);
+        CHECK(mgr.append_prefill(b.slot, 4).ok);
+        mgr.commit_prefill(a.slot);
+        mgr.commit_prefill(b.slot);
+        CHECK(mgr.slot(a.slot).request_id == 101);
+        CHECK(mgr.slot(b.slot).request_id == 102);
+        CHECK(mgr.ddtree_speculation_allowed(a.slot));
+        CHECK(mgr.ddtree_speculation_allowed(b.slot));
+
+        CHECK(!mgr.record_ddtree_sample(a.slot, false));
+        CHECK(!mgr.record_ddtree_sample(b.slot, false));
+        CHECK(mgr.ddtree_speculation_allowed(a.slot));
+        CHECK(mgr.ddtree_speculation_allowed(b.slot));
+        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 1);
+        CHECK(mgr.slot(b.slot).ddtree_sampled_steps == 1);
+
+        CHECK(mgr.record_ddtree_sample(a.slot, true));
+        CHECK(mgr.record_ddtree_sample(b.slot, true));
+        CHECK(!mgr.ddtree_speculation_allowed(a.slot));
+        CHECK(!mgr.ddtree_speculation_allowed(b.slot));
+        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 2);
+        CHECK(mgr.slot(b.slot).ddtree_sampled_steps == 2);
+
+        CHECK(!mgr.record_ddtree_sample(a.slot, true));
+        CHECK(mgr.slot(a.slot).ddtree_sampled_steps == 2);
+
+        mgr.retire(a.slot);
+        auto reused = admit(mgr, 103, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(reused) && reused.slot == a.slot);
+        CHECK(mgr.slot(reused.slot).request_id == 103);
+        CHECK(mgr.ddtree_speculation_allowed(reused.slot));
+        CHECK(mgr.slot(reused.slot).ddtree_sampled_steps == 0);
+    }
+
+    {
+        PagedKvPool pool(/*physical_block_count=*/1,
+                         /*max_sequences=*/1, /*block_size=*/4);
+        bool fail_sync = false;
+        PagedKvResidencyTransferOps transfers{
+            [](size_t bytes) -> void * { return new uint8_t[bytes]; },
+            [](void * ptr) { delete[] static_cast<uint8_t *>(ptr); },
+            [](PagedKvSequenceHandle, uint32_t, uint32_t,
+               void *, size_t) { return true; },
+            [](PagedKvSequenceHandle, uint32_t, uint32_t,
+               const void *, size_t) { return true; },
+            [&fail_sync] { return !fail_sync; },
+        };
+        PagedKvResidencyConfig config;
+        config.block_bytes = 16;
+        config.resident_budget_blocks = 1;
+        config.sink_blocks = 0;
+        config.tail_blocks = 0;
+        PagedKvResidencyManager residency(pool, config, std::move(transfers));
+        Qwen35SlotManager mgr(pool, /*max_ctx=*/16,
+                              /*speculative_headroom=*/1, &residency);
+
+        auto first = admit(mgr, 301, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(first));
+        CHECK(mgr.append_prefill(first.slot, 4).ok);
+        CHECK(residency.commit_pending_writes(mgr.slot(first.slot).handle) ==
+              PagedKvResidencyStatus::Ok);
+        mgr.commit_prefill(first.slot);
+
+        fail_sync = true;
+        CHECK(residency.evict_block(
+                  mgr.slot(first.slot).handle, 0,
+                  /*allow_protected=*/true) ==
+              PagedKvResidencyStatus::TransferFailed);
+        mgr.retire(first.slot);
+        CHECK(!mgr.is_active(first.slot));
+        CHECK(mgr.slot(first.slot).retiring());
+        CHECK(pool.active_sequence_count() == 1);
+
+        auto blocked = admit(mgr, 302, prompt_tokens(4), greedy_sampler());
+        CHECK(!is_admitted(blocked));
+        CHECK(is_busy(blocked));
+        CHECK(mgr.slot(first.slot).retiring());
+        CHECK(pool.active_sequence_count() == 1);
+
+        fail_sync = false;
+        auto recovered = admit(mgr, 303, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(recovered));
+        CHECK(recovered.slot == first.slot);
+        CHECK(mgr.is_prefilling(recovered.slot));
+        CHECK(pool.active_sequence_count() == 1);
+    }
+
     {
         PagedKvPool pool(128, 2, /*block_size=*/16);
         Qwen35SlotManager mgr(pool, 2048);

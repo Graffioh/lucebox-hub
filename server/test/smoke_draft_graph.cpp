@@ -20,6 +20,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include <algorithm>
 
 #include <cinttypes>
 #include <cmath>
@@ -103,11 +104,22 @@ int main(int argc, char ** argv) {
     gi.positions_k       = pos_k;
 
     DraftGraphOutputs go = build_draft_graph(gctx, w, gi);
-    if (!go.hidden_states) { std::fprintf(stderr, "build_draft_graph returned null\n"); return 1; }
+    if (!go.hidden_prenorm || !go.hidden_states) {
+        std::fprintf(stderr, "build_draft_graph returned null output\n");
+        return 1;
+    }
+    ggml_tensor * rebuilt_hidden = ggml_rms_norm(
+        gctx, go.hidden_prenorm, DFLASH27B_RMS_EPS);
+    rebuilt_hidden = ggml_mul(gctx, rebuilt_hidden, w.out_norm);
+    ggml_set_name(rebuilt_hidden, "rebuilt_draft_hidden_out");
+    ggml_set_output(go.hidden_prenorm);
     ggml_set_output(go.hidden_states);
+    ggml_set_output(rebuilt_hidden);
 
     ggml_cgraph * gf = ggml_new_graph(gctx);
+    ggml_build_forward_expand(gf, go.hidden_prenorm);
     ggml_build_forward_expand(gf, go.hidden_states);
+    ggml_build_forward_expand(gf, rebuilt_hidden);
     std::printf("graph built: n_nodes=%d\n", ggml_graph_n_nodes(gf));
 
     // ── 5. Allocate graph + all input tensors on the backend
@@ -158,6 +170,29 @@ int main(int argc, char ** argv) {
     }
     std::vector<float> out(n_out_elems);
     ggml_backend_tensor_get(go.hidden_states, out.data(), 0, sizeof(float) * out.size());
+    std::vector<float> prenorm(n_out_elems);
+    std::vector<float> rebuilt(n_out_elems);
+    ggml_backend_tensor_get(go.hidden_prenorm, prenorm.data(), 0,
+                            sizeof(float) * prenorm.size());
+    ggml_backend_tensor_get(rebuilt_hidden, rebuilt.data(), 0,
+                            sizeof(float) * rebuilt.size());
+
+    double max_prenorm_delta = 0.0;
+    double max_rebuild_error = 0.0;
+    for (size_t i = 0; i < out.size(); ++i) {
+        max_prenorm_delta = std::max(
+            max_prenorm_delta, std::fabs((double)prenorm[i] - out[i]));
+        max_rebuild_error = std::max(
+            max_rebuild_error, std::fabs((double)rebuilt[i] - out[i]));
+    }
+    if (max_prenorm_delta < 1e-5 || max_rebuild_error > 1e-5) {
+        std::fprintf(stderr,
+            "FAIL: pre-norm calibration output delta=%.8g rebuild_error=%.8g\n",
+            max_prenorm_delta, max_rebuild_error);
+        return 1;
+    }
+    std::printf("pre-norm export OK: delta=%.6g rebuild_error=%.6g\n",
+                max_prenorm_delta, max_rebuild_error);
 
     int n_nan = 0, n_inf = 0;
     double sum = 0.0, sumsq = 0.0;

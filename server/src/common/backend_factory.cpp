@@ -287,6 +287,7 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.ddtree_tau         = args.ddtree_tau;
         cfg.use_feature_mirror = args.use_feature_mirror;
 
+        cfg.speculation_policy = args.speculation_policy;
         auto backend = std::make_unique<Qwen35Backend>(cfg);
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] Qwen35Backend init failed\n");
@@ -314,6 +315,7 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.ddtree_tau         = args.ddtree_tau;
         cfg.use_feature_mirror = args.use_feature_mirror;
 
+        cfg.speculation_policy = args.speculation_policy;
         auto backend = std::make_unique<Qwen35MoeBackend>(cfg);
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] Qwen35MoeBackend init failed\n");

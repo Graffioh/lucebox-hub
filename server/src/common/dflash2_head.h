@@ -8,6 +8,26 @@
 
 namespace dflash::common {
 
+// Raw selector diagnostics for one proposed depth. These are deliberately
+// not called confidence: the DFlash2 selector is trained to rank its top-K
+// candidates, not to emit calibrated target-acceptance probabilities. An
+// offline, model-specific adapter may later map these values to survival
+// probabilities for the adaptive gate.
+struct DFlash2DepthSignal {
+    float selected_log_prob = 0.0f;
+    float lm_top2_margin = 0.0f;
+    float top_k_mass = 0.0f;
+    int selected_rank = 0;
+    bool agrees_with_lm_top1 = false;
+    float selector_margin = 0.0f;
+    float selector_winner_mass = 0.0f;
+    float selector_entropy = 0.0f;
+};
+
+struct DFlash2SelectorTrace {
+    std::vector<DFlash2DepthSignal> depths;
+};
+
 // DFlash 2 candidate selector for greedy chain drafting.
 //
 // For every drafted block position the target lm_head logits are reduced to
@@ -24,7 +44,23 @@ bool dflash2_select_chain(const DraftWeights & dw,
                           const float * local_hidden,
                           int q_len,
                           int32_t last_tok,
-                          std::vector<int32_t> & draft_tok);
+                          std::vector<int32_t> & draft_tok,
+                          DFlash2SelectorTrace * trace = nullptr);
+
+// Same selector, batched over host-resident drafter hidden blocks and using a
+// local target lm_head tensor. The expensive lm_head projection covers every
+// (lane, depth) in one graph, GPU top-K is invoked once, and selector
+// projections/readback are shared across the cohort. This is the concurrent
+// paged-engine entry point; no non-paged DFlashTarget adapter is required.
+bool dflash2_select_chains_batched(
+    const DraftWeights & dw,
+    ggml_backend_t backend,
+    ggml_tensor * lm_head,
+    const std::vector<const float *> & hidden_by_lane,
+    int q_len,
+    const std::vector<int32_t> & last_tokens,
+    std::vector<std::vector<int32_t>> & draft_tokens,
+    std::vector<DFlash2SelectorTrace> * traces = nullptr);
 
 // Selector-scored candidates for DDTree construction (DARTree-style): the
 // same per-position top-k + selector projections as the chain path, kept on
@@ -39,7 +75,7 @@ struct Dflash2TreeScores {
     std::vector<float>   pred;   // [rank*(1+n_cand*K)]
 
     // K selector-adjusted scores for position `depth-1`, conditioned on the
-    // prefix'/s last token. Sorted descending; false if depth out of range.
+    // prefix's last token. Sorted descending; false if depth out of range.
     bool topk(const std::vector<int32_t> & prefix, int next_depth,
               std::vector<float> & out_lp, std::vector<int32_t> & out_ids) const;
 };

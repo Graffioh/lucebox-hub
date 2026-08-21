@@ -174,6 +174,30 @@ std::string check_feature_compatibility(
         }
     }
 
+    const bool concurrent_paged_qwen =
+        arch == "qwen35" && args.paged_attention &&
+        args.max_concurrency > 1 &&
+        !args.device.is_layer_split() &&
+        !args.remote_target_shard.enabled() &&
+        args.fa_window == 0;
+    const bool concurrent_local_paged_qwen =
+        concurrent_paged_qwen && !args.remote_draft.enabled() &&
+        target_backend == draft_backend &&
+        args.device.gpu == args.draft_device.gpu &&
+        !args.device.is_tensor_parallel();
+    const bool concurrent_local_ddtree =
+        concurrent_local_paged_qwen && args.draft_path != nullptr &&
+        args.ddtree_mode;
+    const bool concurrent_local_chain =
+        concurrent_local_paged_qwen && args.draft_path != nullptr &&
+        !args.ddtree_mode &&
+        args.speculation_policy != SpeculationPolicy::Never;
+
+    if (args.ddtree_mode &&
+        (args.ddtree_budget < 1 || args.ddtree_budget > 255)) {
+        return "--ddtree-budget must be in [1, 255]";
+    }
+
     // ── --paged-attention × architecture, placement, and decode features
     // Paged decode swaps the contiguous K/V cache for a block table owned by
     // the monolithic qwen35 backend, so every rule below is about reaching
@@ -191,20 +215,30 @@ std::string check_feature_compatibility(
             args.remote_target_shard.enabled()) {
             return "--paged-attention requires one local target device";
         }
-        if (args.draft_path != nullptr || args.remote_draft.enabled() ||
-            args.ddtree_mode) {
-            return "--paged-attention requires autoregressive decode without a "
-                   "draft or DDTree";
+        if (args.remote_draft.enabled() &&
+            args.speculation_policy != SpeculationPolicy::Never) {
+            return "concurrent paged DDTree requires a local draft on the target device";
+        }
+        if (args.ddtree_mode && !concurrent_local_ddtree) {
+            return "paged DDTree requires concurrent local target/draft execution "
+                   "on one device";
+        }
+        if (args.draft_path != nullptr && !args.ddtree_mode &&
+            args.speculation_policy != SpeculationPolicy::Never &&
+            !concurrent_local_chain) {
+            return "paged chain speculation requires concurrent local target/draft "
+                   "execution on one device";
         }
         if (args.fa_window != 0) {
             return "--paged-attention requires full attention (--fa-window 0)";
         }
-        if (features.pflash_enabled) {
-            return "--paged-attention cannot be combined with PFlash prefill "
-                   "compression";
+        if (features.pflash_enabled && !concurrent_local_paged_qwen) {
+            return "paged PFlash prefill compression requires concurrent local "
+                   "Qwen3.5/Qwen3.6 serving on one target/draft device";
         }
-        if (features.kvflash_enabled) {
-            return "--paged-attention cannot be combined with KVFlash";
+        if (features.kvflash_enabled && !concurrent_paged_qwen) {
+            return "paged KVFlash requires concurrent local Qwen3.5/Qwen3.6 "
+                   "serving with full attention";
         }
         // The pool rounds max_ctx up to a whole number of blocks, so the top
         // of the range is what can be rounded without overflowing int.
@@ -243,10 +277,18 @@ std::string check_feature_compatibility(
         if (args.max_concurrency <= 1) {
             return "--kv-pool-tokens requires --max-concurrency greater than 1";
         }
-        // The cache appends one scratch block after the physical pool, and
-        // the requested pool itself is rounded up to a whole block. Cap the
-        // request at the largest aligned pool that leaves room for scratch.
-        const int64_t max_pool_tokens = paged_kv_address_cap();
+        // Reserve the dead-row block plus one rounded DDTree candidate slab
+        // per slot, exactly matching Qwen35Backend's cache allocation.
+        const int64_t tree_scratch = concurrent_local_ddtree
+            ? (int64_t)args.max_concurrency *
+                paged_token_capacity(args.ddtree_budget + 1)
+            : concurrent_local_chain
+                ? (int64_t)args.max_concurrency * paged_token_capacity(16)
+                : 0;
+        const int64_t scratch_tokens = PAGED_BLOCK_SIZE + tree_scratch;
+        const int64_t max_pool_tokens =
+            ((int64_t)INT32_MAX - scratch_tokens) / PAGED_BLOCK_SIZE *
+            PAGED_BLOCK_SIZE;
         if (args.kv_pool_tokens < PAGED_BLOCK_SIZE ||
             args.kv_pool_tokens > max_pool_tokens) {
             return "--kv-pool-tokens must be in [" +

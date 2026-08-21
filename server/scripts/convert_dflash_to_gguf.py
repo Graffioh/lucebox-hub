@@ -492,6 +492,9 @@ def main():
                     help="optional Domino/DSpark aux-head .pt or DS4 MTP .safetensors file; defaults to dflash_aux_heads.pt next to the safetensors")
     ap.add_argument("--no-aux-heads", action="store_true",
                     help="do not auto-embed Domino/DSpark aux-head tensors")
+    ap.add_argument("--no-yarn", action="store_true",
+                    help="omit YaRN scaling metadata while retaining rope_theta; "
+                         "this matches the PR #625 short-context Qwen3.8 DSpark artifact")
     args = ap.parse_args()
 
     if not args.safetensors.exists():
@@ -504,6 +507,9 @@ def main():
     print(f"[info]   {n_entries} tensor entries")
 
     a = load_arch(args.safetensors, header)
+    if args.no_yarn:
+        for key in ("yarn_factor", "yarn_orig_ctx", "yarn_beta_fast", "yarn_beta_slow"):
+            a.pop(key, None)
 
     writer = gguf.GGUFWriter(args.out_gguf, ARCH)
 

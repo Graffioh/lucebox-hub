@@ -131,6 +131,7 @@ static int dflash_min_tokens_floor() {
     return value;
 }
 
+
 static FILE * open_dflash_floor_log() {
 #if defined(_WIN32)
     // Simple append-mode log on Windows (no file size check).
@@ -179,7 +180,7 @@ static FILE * open_dflash_floor_log() {
 // staging K/V or staging recurrent slab to reserve.
 static int64_t concurrent_fixed_cache_bytes(
         const TargetWeights & w, int max_ctx, int n_slots,
-        int64_t kv_bytes_per_token) {
+        int64_t kv_bytes_per_token, int64_t scratch_tokens) {
     const int64_t n_full_attn =
         w.n_layer / w.full_attention_interval;
     const int64_t n_delta = w.n_layer - n_full_attn;
@@ -194,7 +195,8 @@ static int64_t concurrent_fixed_cache_bytes(
         state_per_layer * n_delta * (int64_t)n_slots;
     const int64_t target_feat =
         (int64_t)w.n_capture_layers * w.n_embd *
-        std::min(max_ctx, 4096) * (int64_t)sizeof(uint16_t);
+        ((int64_t)std::min(max_ctx, 4096) * n_slots + 1) *
+        (int64_t)sizeof(uint16_t);
     const int64_t q_capture =
         (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
         (int64_t)sizeof(float);
@@ -202,11 +204,13 @@ static int64_t concurrent_fixed_cache_bytes(
         ((int64_t)paged_block_count(max_ctx) * n_slots + n_slots) *
         (int64_t)sizeof(int32_t);
     const int64_t scratch =
-        kv_bytes_per_token * PAGED_BLOCK_SIZE;
+        kv_bytes_per_token * scratch_tokens;
     return recurrent + target_feat + q_capture +
            paged_metadata + scratch;
 }
 }  // namespace
+
+static bool qwen35_dspark_enabled();
 
 #define IS_EOS_TOK(tok, w)                                         \
     ( ((w).eos_chat_id >= 0 && (tok) == (w).eos_chat_id)                  \
@@ -276,6 +280,7 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
 
 bool Qwen35Backend::init() {
     configure_concurrent_hipblaslt_default(cfg_);
+    concurrent_decode_capabilities_ = {};
 
     const bool use_remote_draft = cfg_.remote_draft.enabled();
     const bool tensor_parallel = cfg_.device.is_tensor_parallel();
@@ -384,10 +389,20 @@ bool Qwen35Backend::init() {
         }
     }
 
+    // Feature-gate validation normally catches this before construction, but
+    // keep backend arithmetic safe for direct/test callers too.
+    if (cfg_.ddtree_mode &&
+        (cfg_.ddtree_budget < 1 || cfg_.ddtree_budget > 255)) {
+        set_last_error("--ddtree-budget must be in [1, 255]");
+        return false;
+    }
+
     // Create KV cache
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
+    const int n_slots = concurrent_slots();
+
     // kvflash (bounded residency): pool size from the env, rounded/floored/
     // clamped by the shared reader (256-stride keeps FA vec-kernel
     // eligibility; the floor keeps eviction from deadlocking).
@@ -419,20 +434,20 @@ bool Qwen35Backend::init() {
     if (!post_kvflash_init_gate()) return false;
     // KVFlash is resolved from env at init; this is the authoritative
     // paged×KVFlash compatibility check.
-    if (cfg_.paged_attention && kvflash_active()) {
+    if (cfg_.paged_attention && kvflash_active() && n_slots <= 1) {
         std::fprintf(stderr,
-            "[paged-attention] cannot be combined with KVFlash "
-            "(resident pool %d tokens)\n", kvflash_tokens_);
-        set_last_error("paged attention cannot be combined with KVFlash");
+            "[paged-attention] single-sequence paged decode cannot be combined "
+            "with KVFlash (resident pool %d tokens)\n", kvflash_tokens_);
+        set_last_error(
+            "paged KVFlash requires --max-concurrency greater than 1");
         return false;
     }
     // Paged mode sizes the KV cache to whole blocks; otherwise KVFlash
     // decides the allocation (0 = full max_ctx).
-    const int n_slots = concurrent_slots();
     const int max_concurrent_prefills = n_slots > 1
         ? std::clamp(
               env_int_or_default("DFLASH_MAX_CONCURRENT_PREFILLS", 8),
-              1, std::min(n_slots, 8))
+              1, n_slots)
         : 1;
     const int mixed_prefill_tokens = std::max(
         1, env_int_or_default("DFLASH_MIXED_PREFILL_TOKENS", 2048));
@@ -448,6 +463,32 @@ bool Qwen35Backend::init() {
         set_last_error("--max-concurrency requires --paged-attention");
         return false;
     }
+    const bool concurrent_local_draft =
+        n_slots > 1 && cfg_.draft_path &&
+        !use_remote_draft && !tensor_parallel && !split_gpus_ &&
+        target_backend_ == draft_backend_;
+    const bool concurrent_local_ddtree =
+        concurrent_local_draft && cfg_.ddtree_mode;
+    const bool concurrent_local_chain =
+        concurrent_local_draft && !cfg_.ddtree_mode &&
+        (dw_.selector.enabled ||
+         (dw_.dspark.enabled && qwen35_dspark_enabled())) &&
+        cfg_.speculation_policy != SpeculationPolicy::Never;
+    const bool concurrent_spec_tree =
+        concurrent_local_ddtree || concurrent_local_chain;
+    const Qwen35SeqEngine::SpecMode spec_mode = concurrent_local_ddtree
+        ? Qwen35SeqEngine::SpecMode::ddtree
+        : concurrent_local_chain
+            ? Qwen35SeqEngine::SpecMode::chain
+            : Qwen35SeqEngine::SpecMode::none;
+    const int tree_width = concurrent_local_ddtree
+        ? cfg_.ddtree_budget + 1
+        : concurrent_local_chain ? dw_.block_size : 0;
+    const int tree_stride = concurrent_spec_tree
+        ? paged_token_capacity(tree_width) : 0;
+    const int64_t concurrent_scratch_tokens =
+        (int64_t)n_slots * tree_stride + PAGED_BLOCK_SIZE;
+
     // Concurrent slots share one physical pool. An explicit
     // --kv-pool-tokens is rounded up to a whole block; otherwise capacity is
     // derived from device-free memory after subtracting fixed concurrent cache
@@ -457,10 +498,17 @@ bool Qwen35Backend::init() {
     // pool's index space) as the write target of dead decode-batch rows.
     int64_t pool_tokens = 0;
     if (n_slots > 1) {
-        if (cfg_.kv_pool_tokens > 0) {
+        if (kvflash_active()) {
+            pool_tokens = paged_token_capacity(kvflash_tokens_);
+            std::fprintf(stderr,
+                "[parallel-kvflash] physical resident pool %lld tokens; "
+                "logical per-slot cap %d across %d slots "
+                "(--kv-pool-tokens does not expand resident VRAM)\n",
+                (long long)pool_tokens, cfg_.device.max_ctx, n_slots);
+        } else if (cfg_.kv_pool_tokens > 0) {
             pool_tokens = (int64_t)paged_token_capacity(
                 (int)std::min<int64_t>(
-                    cfg_.kv_pool_tokens, INT32_MAX - PAGED_BLOCK_SIZE));
+                    cfg_.kv_pool_tokens, INT32_MAX - concurrent_scratch_tokens));
         } else {
             PagedKvAutoBudget budget;
             // TODO: Size tensor-parallel pools from each device's free memory
@@ -469,7 +517,8 @@ bool Qwen35Backend::init() {
             budget.bytes_per_token = kvf_budget.bytes_per_token;
             budget.reserve_bytes = kvf_budget.reserve_bytes;
             budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
-                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token);
+                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
+                concurrent_scratch_tokens);
             pool_tokens = paged_kv_auto_pool_tokens(
                 cfg_.device.max_ctx, n_slots, budget);
             const int64_t one_context =
@@ -491,19 +540,19 @@ bool Qwen35Backend::init() {
                 return false;
             }
         }
-        if (pool_tokens + PAGED_BLOCK_SIZE > INT32_MAX) {
+        if (pool_tokens + concurrent_scratch_tokens > INT32_MAX) {
             set_last_error("paged KV pool exceeds INT32_MAX tokens");
             return false;
         }
     }
     const int ctx_alloc = n_slots > 1
-        ? (int)(pool_tokens + PAGED_BLOCK_SIZE)
+        ? (int)(pool_tokens + concurrent_scratch_tokens)
         : (cfg_.paged_attention
                ? paged_token_capacity(cfg_.device.max_ctx)
                : kvflash_tokens_);
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
-                             cfg_.paged_attention, n_slots)) {
+                             cfg_.paged_attention, n_slots, concurrent_spec_tree)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
     }
@@ -534,13 +583,107 @@ bool Qwen35Backend::init() {
                          e.what());
             return false;
         }
+        if (n_slots > 1 && kvflash_active()) {
+            std::string transfer_error;
+            paged_kv_transfer_ = QwenPagedKvResidencyTransfer::create(
+                cache_, target_backend_, cfg_.device.gpu, PAGED_BLOCK_SIZE,
+                &transfer_error);
+            if (!paged_kv_transfer_) {
+                set_last_error("concurrent KVFlash transfer init failed: " +
+                               transfer_error);
+                return false;
+            }
+            PagedKvResidencyConfig residency_cfg;
+            residency_cfg.block_bytes = paged_kv_transfer_->block_bytes();
+            residency_cfg.resident_budget_blocks =
+                paged_kv_pool_->physical_block_count();
+            residency_cfg.sink_blocks = 1;
+            residency_cfg.tail_blocks = 4;
+            try {
+                paged_kv_residency_ =
+                    std::make_unique<PagedKvResidencyManager>(
+                        *paged_kv_pool_, residency_cfg,
+                        paged_kv_transfer_->callbacks());
+            } catch (const std::exception & e) {
+                set_last_error(std::string(
+                    "concurrent KVFlash residency init failed: ") + e.what());
+                return false;
+            }
+        }
         if (n_slots > 1) {
+            const int tree_scratch_base = (int)pool_tokens;
+            const int64_t dead_scratch_row =
+                pool_tokens + (int64_t)n_slots * tree_stride;
             seq_engine_ = std::make_unique<Qwen35SeqEngine>(
                 *this, *paged_kv_pool_, cfg_.device.max_ctx,
-                /*scratch_row=*/pool_tokens,
+                dead_scratch_row, tree_width, tree_scratch_base, tree_stride,
+                spec_mode,
                 max_concurrent_prefills, mixed_prefill_tokens,
                 long_mixed_prefill_tokens, long_prefill_threshold,
                 idle_prefill_tokens, prefill_quantum);
+            concurrent_decode_capabilities_.forced_speculation =
+                concurrent_local_ddtree || concurrent_local_chain;
+            concurrent_decode_capabilities_.adaptive =
+                concurrent_local_ddtree || concurrent_local_chain;
+            // Per-request decode_mode may select Adaptive even when the
+            // server default is forced speculation. A configured chain always
+            // accepts Adaptive: if activation scoring or startup profiling is
+            // unavailable, the engine uses an AR fallback instead of rejecting
+            // the request or failing its peers.
+            bool adaptive_scored = false;
+            if (concurrent_local_chain &&
+                seq_engine_->activation_scoring_available()) {
+                int profile_ctx = 4096;
+                if (const char * value =
+                        std::getenv("DFLASH_SPEC_PROFILE_CONTEXT")) {
+                    profile_ctx = std::max(1, std::atoi(value));
+                }
+                const bool profile_ready =
+                    seq_engine_->profile_spec_costs(profile_ctx);
+                adaptive_scored = profile_ready;
+                if (!profile_ready) {
+                    std::fprintf(stderr,
+                        "[parallel-chain] adaptive scoring unavailable: "
+                        "cost profile failed; adaptive requests will use "
+                        "AR fallback (forced speculation remains "
+                        "available)\n");
+                }
+            } else if (concurrent_local_chain) {
+                std::fprintf(stderr,
+                    "[parallel-chain] adaptive activation unavailable: "
+                    "drafter has no compatible request-benefit adapter; "
+                    "adaptive requests will use AR fallback "
+                    "(forced speculation remains available)\n");
+            }
+            if (concurrent_local_ddtree) {
+                const char * adaptive = std::getenv("DFLASH_DDTREE_ADAPTIVE");
+                std::fprintf(stderr,
+                    "[parallel-ddtree] enabled budget=%d width=%d mode=packed-verify-replay adaptive=%s\n",
+                    cfg_.ddtree_budget, tree_width,
+                    adaptive && std::atoi(adaptive) == 0 ? "off" : "on");
+            }
+            if (concurrent_local_chain) {
+                std::fprintf(stderr,
+                    "[parallel-chain] enabled producer=%s width=%d "
+                    "mode=packed-chain-verify decode_mode=%s adaptive=%s\n",
+                    dw_.selector.enabled ? "dflash2" : "dspark",
+                    tree_width,
+                    speculation_policy_name(cfg_.speculation_policy),
+                    adaptive_scored ? "scored" : "fallback-ar");
+            } else if (!cfg_.ddtree_mode &&
+                       cfg_.speculation_policy != SpeculationPolicy::Never) {
+                std::fprintf(stderr,
+                    "[parallel-chain] unavailable for this concurrent "
+                    "configuration; speculation/adaptive requests will be "
+                    "rejected at admission\n");
+            } else if (!cfg_.ddtree_mode && concurrent_local_draft &&
+                       (dw_.selector.enabled ||
+                        (dw_.dspark.enabled && qwen35_dspark_enabled()))) {
+                std::fprintf(stderr,
+                    "[parallel-chain] disabled by decode_mode=ar; "
+                    "per-request speculation/adaptive overrides will be "
+                    "rejected at admission\n");
+            }
             std::printf("[parallel] %d decode slots, up to %d packed prefills "
                         "(mixed short/long %d/%d at >=%d tokens, "
                         "idle %d, quantum %d), "
@@ -562,7 +705,7 @@ bool Qwen35Backend::init() {
                     cfg_.device.max_ctx);
         std::fflush(stdout);
     }
-    if (kvflash_active()) {
+    if (kvflash_active() && !(cfg_.paged_attention && n_slots > 1)) {
         KvFlashConfig pc;
         pc.pool_tokens = kvflash_tokens_;
         if (!kvflash_pager_.attach(pc, cache_.attn_k, cache_.attn_v)) {
@@ -593,7 +736,8 @@ bool Qwen35Backend::init() {
 
     // Init feature mirror when draft model is available (needed for spec decode).
     // On single-GPU, this is an F32 conversion buffer; on split-GPU, a cross-device mirror.
-    if (cfg_.draft_path && !use_remote_draft) {
+    if (cfg_.draft_path && !use_remote_draft &&
+        !(n_slots > 1 && concurrent_local_ddtree)) {
         const int mirror_cap = std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
                                          cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
@@ -1238,7 +1382,12 @@ DFlashTarget * Qwen35Backend::dflash_target() {
 
 void Qwen35Backend::shutdown() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
+    concurrent_decode_capabilities_ = {};
+    seq_engine_.reset();
     end_paged_sequence();
+    paged_kv_residency_.reset();
+    paged_kv_transfer_.reset();
+    paged_kv_pool_.reset();
     free_drafter();
     step_graph_destroy(sg_);
     step_graph_destroy(draft_sg_);
@@ -2714,6 +2863,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
         // 2. Draft compute (skipped on plain-decode burst steps)
         constexpr int DRAFT_CTX_MAX_DEFAULT = 2048;
+        // True when this step drafted through the ring-cached drafter-KV
+        // graph rather than the rebuilt draft step graph (SpecLA conditional
+        // drafting reads the matching input/hidden tensors).
         bool used_draft_kv = false;
         if (!ar_step) {
             const int ring_cap = use_remote_draft ? remote_draft_.ring_cap() : feature_mirror_.cap;

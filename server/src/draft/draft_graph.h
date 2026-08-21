@@ -30,6 +30,7 @@ struct DraftGraphInputs {
 };
 
 struct DraftGraphOutputs {
+    ggml_tensor * hidden_prenorm;   // [hidden, q_len, 1] before final RMSNorm
     ggml_tensor * hidden_states;    // [hidden, q_len, 1]  (always set)
     ggml_tensor * logits;           // [vocab, q_len, 1]   (non-null iff lm_head was provided)
 };

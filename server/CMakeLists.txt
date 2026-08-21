@@ -454,7 +454,11 @@ add_library(dflash_common STATIC
     src/common/dynamic_backend.cpp
     src/common/domino_head.cpp
     src/common/dspark_head.cpp
+    src/common/dflash2_benefit.cpp
+    src/common/speculation/spec_cost_profile.cpp
+    src/common/speculation/adapters/dflash2_speculator.cpp
     src/common/dflash2_head.cpp
+    src/common/dflash2_batch.cpp
     src/common/target_shard_ipc.cpp
     src/common/target_shard_ipc_daemon.cpp
     src/common/dflash_feature_ring.cpp
@@ -466,6 +470,9 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_kv.cpp
     src/common/dflash_spec_decode.cpp
     src/common/concurrency/paged_kv_pool.cpp
+    src/common/concurrency/paged_kv_residency.cpp
+    src/common/concurrency/qwen_paged_kv_transfer_layout.cpp
+    src/common/concurrency/qwen_paged_kv_transfer.cpp
     src/qwen35/concurrency/qwen35_slot_manager.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
@@ -1417,12 +1424,33 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_paged_kv_residency.cpp")
+        # Pure host-side multi-sequence residency policy + mock DMA test.
+        add_executable(test_paged_kv_residency
+            test/test_paged_kv_residency.cpp
+            src/common/concurrency/paged_kv_pool.cpp
+            src/common/concurrency/paged_kv_residency.cpp)
+        target_include_directories(test_paged_kv_residency PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_paged_kv_residency)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_qwen_paged_kv_transfer_layout.cpp")
+        # Pure host-side validation of packed K/V block byte/stride math.
+        add_executable(test_qwen_paged_kv_transfer_layout
+            test/test_qwen_paged_kv_transfer_layout.cpp
+            src/common/concurrency/qwen_paged_kv_transfer_layout.cpp)
+        target_include_directories(test_qwen_paged_kv_transfer_layout PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        list(APPEND _raw_unit_test_targets test_qwen_paged_kv_transfer_layout)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_slot_manager.cpp")
         # Host-side slot bookkeeping test (concurrent serving): no GPU.
         add_executable(test_seq_slot_manager
             test/test_seq_slot_manager.cpp
             src/qwen35/concurrency/qwen35_slot_manager.cpp
-            src/common/concurrency/paged_kv_pool.cpp)
+            src/common/concurrency/paged_kv_pool.cpp
+            src/common/concurrency/paged_kv_residency.cpp)
         target_include_directories(test_seq_slot_manager PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_seq_slot_manager)
@@ -1434,6 +1462,84 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/test)
         list(APPEND _raw_unit_test_targets test_seq_engine_contract)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ddtree_path.cpp")
+        # Pure host-side accepted-path/pending-token contract tests.
+        add_executable(test_ddtree_path
+            test/test_ddtree_path.cpp
+            src/common/ddtree.cpp)
+        target_include_directories(test_ddtree_path PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_ddtree_path)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_chain_spec_shapes.cpp")
+        # Pure host-side DSpark chain topology and mixed-launch arithmetic.
+        add_executable(test_chain_spec_shapes
+            test/test_chain_spec_shapes.cpp
+            src/common/ddtree.cpp)
+        target_include_directories(test_chain_spec_shapes PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_chain_spec_shapes)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash2_selector_validation.cpp")
+        # Pure host-side selector metadata/layout validation: no GPU.
+        add_executable(test_dflash2_selector_validation
+            test/test_dflash2_selector_validation.cpp)
+        target_include_directories(test_dflash2_selector_validation PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_dflash2_selector_validation)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash2_benefit.cpp")
+        # Pure host-side, versioned selector-to-benefit adapter: no GPU.
+        add_executable(test_dflash2_benefit
+            test/test_dflash2_benefit.cpp
+            src/common/dflash2_benefit.cpp)
+        target_include_directories(test_dflash2_benefit PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/test
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        list(APPEND _raw_unit_test_targets test_dflash2_benefit)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_delta_transition_journal.cpp")
+        # Pure host-side proof for replay-free DeltaNet transition commits.
+        add_executable(test_delta_transition_journal
+            test/test_delta_transition_journal.cpp
+            src/qwen35/delta_transition_journal.cpp)
+        target_include_directories(test_delta_transition_journal PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_delta_transition_journal)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dspark_batched_head.cpp")
+        add_executable(test_dspark_batched_head
+            test/test_dspark_batched_head.cpp)
+        target_include_directories(test_dspark_batched_head PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        target_link_libraries(test_dspark_batched_head PRIVATE
+            dflash_common ggml ggml-cpu
+            ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        list(APPEND _raw_unit_test_targets test_dspark_batched_head)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_speculation_gate.cpp")
+        add_executable(test_speculation_gate
+            test/test_speculation_gate.cpp)
+        target_include_directories(test_speculation_gate PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_speculation_gate)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_spec_cost_profile.cpp")
+        add_executable(test_spec_cost_profile
+            test/test_spec_cost_profile.cpp
+            src/common/speculation/spec_cost_profile.cpp)
+        target_include_directories(test_spec_cost_profile PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_spec_cost_profile)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_batch_plan.cpp")
         # Pure-host tests for model-neutral token-budget/FIFO planning.
@@ -1830,6 +1936,8 @@ if(DFLASH27B_TESTS)
                     set(_unit_ctest_name recurrent_snapshot)
                 elseif(_unit_target STREQUAL "test_paged_kv_pool")
                     set(_unit_ctest_name paged_kv_pool)
+                elseif(_unit_target STREQUAL "test_paged_kv_residency")
+                    set(_unit_ctest_name paged_kv_residency)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
                 set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
@@ -1933,6 +2041,17 @@ if(DFLASH27B_TESTS)
         add_test(NAME batched_gdn_cpu COMMAND test_batched_gdn --cpu)
         if(TARGET check)
             add_dependencies(check test_batched_gdn)
+        endif()
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gdn_transition_journal.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_gdn_transition_journal
+            test/test_gdn_transition_journal.cpp)
+        add_test(NAME gdn_transition_journal COMMAND test_gdn_transition_journal)
+        if(TARGET check)
+            add_dependencies(check test_gdn_transition_journal)
         endif()
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR

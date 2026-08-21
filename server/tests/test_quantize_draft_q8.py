@@ -29,6 +29,15 @@ class RecordingWriter:
     def add_array(self, key, value):
         self.calls.append(("array", key, value))
 
+    def add_string(self, key, value):
+        self.calls.append(("string", key, value))
+
+    def add_float32(self, key, value):
+        self.calls.append(("float32", key, value))
+
+    def add_quantization_version(self, value):
+        self.calls.append(("quantization_version", value))
+
 
 class Qwen36SwaMetadataTest(unittest.TestCase):
     @staticmethod
@@ -107,6 +116,51 @@ class Qwen36SwaMetadataTest(unittest.TestCase):
                     else:
                         self.assertIsNone(window)
                         self.assertIsNone(pattern)
+
+    def test_dflash2_tensor_mapping_is_complete(self):
+        expected = {
+            "layers.0.attention_conv.base_kernel": "blk.0.attn_conv.base",
+            "layers.0.attention_conv.kernel_projection.weight": "blk.0.attn_conv.proj.weight",
+            "layers.0.mlp_conv.base_kernel": "blk.0.ffn_conv.base",
+            "layers.0.mlp_conv.kernel_projection.weight": "blk.0.ffn_conv.proj.weight",
+            "candidate_selector.hidden_projection.weight": "dflash.selector.hproj.weight",
+            "candidate_selector.predecessor_codebook": "dflash.selector.pred_cb",
+            "candidate_selector.successor_codebook": "dflash.selector.succ_cb",
+        }
+        for source, output in expected.items():
+            self.assertEqual(MODULE.map_name(source), output)
+        self.assertTrue(MODULE.is_norm_tensor("blk.0.attn_conv.base"))
+
+    def test_dflash2_metadata_is_emitted_from_resolved_profile(self):
+        profile = dict(
+            hidden=32,
+            n_layer=1,
+            n_head=2,
+            n_head_kv=1,
+            head_dim=16,
+            intermediate=64,
+            vocab=64,
+            n_target_layers=1,
+            rope_theta=10_000_000.0,
+            rms_eps=1e-6,
+            mask_token_id=63,
+            block_size=8,
+            ctx_len=4096,
+            capture_layer_ids=[7],
+            conv_kernel_size=2,
+            conv_group_size=16,
+            selector_rank=32,
+            selector_top_k=16,
+        )
+        writer = RecordingWriter()
+        MODULE.add_arch_metadata(writer, profile)
+        prefix = "qwen35-dflash-draft.dflash."
+        self.assertIn(("array", prefix + "target_layer_ids", [7]), writer.calls)
+        self.assertIn(("uint32", prefix + "block_size", 8), writer.calls)
+        self.assertIn(("uint32", prefix + "dflash2.conv_kernel_size", 2), writer.calls)
+        self.assertIn(("uint32", prefix + "dflash2.conv_group_size", 16), writer.calls)
+        self.assertIn(("uint32", prefix + "dflash2.selector_rank", 32), writer.calls)
+        self.assertIn(("uint32", prefix + "dflash2.selector_top_k", 16), writer.calls)
 
     def test_gguf_round_trip_preserves_types_and_values(self):
         with tempfile.TemporaryDirectory() as tmp:

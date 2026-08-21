@@ -1,11 +1,13 @@
 #include "dflash2_head.h"
 
+#include "dflash2_selector_validation.h"
 #include "ggml-alloc.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace dflash::common {
@@ -44,6 +46,90 @@ void selector_graph_free(SelectorGraph & g) {
     g.K = 0;
 }
 
+DFlash2DepthSignal make_depth_signal(
+        const float * log_probs, const std::vector<float> & scores,
+        int K, int selected) {
+    DFlash2DepthSignal signal;
+    if (!log_probs || K <= 0 || selected < 0 || selected >= K ||
+        static_cast<int>(scores.size()) != K) {
+        return signal;
+    }
+    signal.selected_log_prob = log_probs[selected];
+    signal.lm_top2_margin = K > 1 ? log_probs[0] - log_probs[1]
+                                  : std::numeric_limits<float>::infinity();
+    float top_k_mass = 0.0f;
+    for (int k = 0; k < K; ++k) top_k_mass += std::exp(log_probs[k]);
+    signal.top_k_mass = std::clamp(top_k_mass, 0.0f, 1.0f);
+    signal.selected_rank = selected;
+    signal.agrees_with_lm_top1 = selected == 0;
+
+    float runner_up = -INFINITY;
+    for (int k = 0; k < K; ++k) {
+        if (k != selected) runner_up = std::max(runner_up, scores[(size_t)k]);
+    }
+    signal.selector_margin = K > 1
+        ? scores[(size_t)selected] - runner_up
+        : std::numeric_limits<float>::infinity();
+
+    const float max_score = *std::max_element(scores.begin(), scores.end());
+    float z = 0.0f;
+    for (float score : scores) z += std::exp(score - max_score);
+    if (z > 0.0f && std::isfinite(z)) {
+        signal.selector_winner_mass =
+            std::exp(scores[(size_t)selected] - max_score) / z;
+        float entropy = 0.0f;
+        for (float score : scores) {
+            const float p = std::exp(score - max_score) / z;
+            if (p > 0.0f) entropy -= p * std::log(p);
+        }
+        signal.selector_entropy = entropy;
+    }
+    return signal;
+}
+
+bool score_depth(const Dflash2TreeScores & scores,
+                 const std::vector<int32_t> & prefix,
+                 int next_depth,
+                 std::vector<float> & out_scores) {
+    const int position = next_depth - 1;
+    if (position < 0 || position >= scores.n_cand ||
+        static_cast<int>(prefix.size()) != position) {
+        return false;
+    }
+
+    int predecessor_row = 0;
+    if (position > 0) {
+        predecessor_row = -1;
+        const int32_t parent_token = prefix.back();
+        for (int candidate = 0; candidate < scores.K; ++candidate) {
+            if (scores.ids[(size_t)(position - 1) * scores.K + candidate] ==
+                parent_token) {
+                predecessor_row = 1 + (position - 1) * scores.K + candidate;
+                break;
+            }
+        }
+        if (predecessor_row < 0) predecessor_row = 0;
+    }
+
+    const float * predecessor =
+        scores.pred.data() + (size_t)predecessor_row * scores.rank;
+    const float * projected_hidden =
+        scores.hproj.data() + (size_t)position * scores.rank;
+    out_scores.resize((size_t)scores.K);
+    for (int candidate = 0; candidate < scores.K; ++candidate) {
+        const float * successor = scores.succ.data() +
+            ((size_t)position * scores.K + candidate) * scores.rank;
+        float correction = 0.0f;
+        for (int component = 0; component < scores.rank; ++component) {
+            correction += predecessor[component] * projected_hidden[component] *
+                          successor[component];
+        }
+        out_scores[(size_t)candidate] =
+            scores.lp[(size_t)position * scores.K + candidate] + correction;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool dflash2_score_candidates(const DraftWeights & dw,
@@ -62,6 +148,21 @@ bool dflash2_score_candidates(const DraftWeights & dw,
     const int K      = sel.top_k;
     const int n_cand = q_len - 1;
     if (hdim <= 0 || rank <= 0 || K <= 0) return false;
+    DFlash2SelectorLayout selector_layout;
+    selector_layout.rank = rank;
+    selector_layout.top_k = K;
+    selector_layout.hproj_rank = sel.hproj->ne[1];
+    selector_layout.pred_rank = sel.pred_cb->ne[0];
+    selector_layout.pred_vocab = sel.pred_cb->ne[1];
+    selector_layout.succ_rank = sel.succ_cb->ne[0];
+    selector_layout.succ_vocab = sel.succ_cb->ne[1];
+    std::string selector_error;
+    if (!validate_dflash2_selector_layout(
+            selector_layout, selector_error)) {
+        std::fprintf(stderr, "dflash2_score_candidates: %s\n",
+                     selector_error.c_str());
+        return false;
+    }
 
     // 1. Top-k candidates (log-probs) per block position through the target
     //    lm_head. Position 0 of local_hidden is the seed slot; candidates are
@@ -135,26 +236,15 @@ bool dflash2_score_candidates(const DraftWeights & dw,
 
 bool Dflash2TreeScores::topk(const std::vector<int32_t> & prefix, int next_depth,
                              std::vector<float> & out_lp, std::vector<int32_t> & out_ids) const {
-    const int i = next_depth - 1;   // candidate position
-    if (i < 0 || i >= n_cand || (int)prefix.size() != i) return false;
-    // predecessor row: 0 = seed, 1 + (i-1)*K + j = candidate j of position i-1
-    int prev_row = 0;
-    if (i > 0) {
-        const int32_t parent_tok = prefix.back();
-        prev_row = -1;
-        for (int j = 0; j < K; ++j) {
-            if (ids[(size_t)(i - 1) * K + j] == parent_tok) { prev_row = 1 + (i - 1) * K + j; break; }
-        }
-        if (prev_row < 0) prev_row = 0;   // unknown parent: fall back to raw log-probs via seed row? no — zero compat
-    }
-    const float * pr = pred.data() + (size_t)prev_row * rank;
-    const float * hp = hproj.data() + (size_t)i * rank;
+    const int position = next_depth - 1;
+    std::vector<float> scores;
+    if (!score_depth(*this, prefix, next_depth, scores)) return false;
+
     std::vector<std::pair<float, int>> scored((size_t)K);
-    for (int k = 0; k < K; ++k) {
-        const float * sc = succ.data() + ((size_t)i * K + k) * rank;
-        float dot = 0.0f;
-        for (int r = 0; r < rank; ++r) dot += pr[r] * hp[r] * sc[r];
-        scored[(size_t)k] = { lp[(size_t)i * K + k] + dot, k };
+    for (int candidate = 0; candidate < K; ++candidate) {
+        scored[(size_t)candidate] = {
+            scores[(size_t)candidate], candidate
+        };
     }
     std::sort(scored.begin(), scored.end(),
               [](const std::pair<float,int> & a, const std::pair<float,int> & b) { return a.first > b.first; });
@@ -169,7 +259,8 @@ bool Dflash2TreeScores::topk(const std::vector<int32_t> & prefix, int next_depth
     out_ids.resize((size_t)K);
     for (int k = 0; k < K; ++k) {
         out_lp[(size_t)k]  = scored[(size_t)k].first - lse;
-        out_ids[(size_t)k] = ids[(size_t)i * K + scored[(size_t)k].second];
+        out_ids[(size_t)k] =
+            ids[(size_t)position * K + scored[(size_t)k].second];
     }
     return true;
 }
@@ -180,7 +271,8 @@ bool dflash2_select_chain(const DraftWeights & dw,
                           const float * local_hidden,
                           int q_len,
                           int32_t last_tok,
-                          std::vector<int32_t> & draft_tok) {
+                          std::vector<int32_t> & draft_tok,
+                          DFlash2SelectorTrace * trace) {
     Dflash2TreeScores sc;
     if (!dflash2_score_candidates(dw, backend, target, local_hidden, q_len, last_tok,
                                   /*temperature=*/1.0f, sc)) {
@@ -191,9 +283,28 @@ bool dflash2_select_chain(const DraftWeights & dw,
     std::vector<int32_t> prefix;
     std::vector<float>   top_lp;
     std::vector<int32_t> top_ids;
+    if (trace) {
+        trace->depths.clear();
+        trace->depths.reserve((size_t)sc.n_cand);
+    }
     for (int i = 0; i < sc.n_cand; ++i) {
         if (!sc.topk(prefix, i + 1, top_lp, top_ids)) return false;
         draft_tok[(size_t)i + 1] = top_ids[0];
+        if (trace) {
+            int selected = -1;
+            for (int candidate = 0; candidate < sc.K; ++candidate) {
+                if (sc.ids[(size_t)i * sc.K + candidate] == top_ids[0]) {
+                    selected = candidate;
+                    break;
+                }
+            }
+            std::vector<float> scores;
+            if (selected < 0 || !score_depth(sc, prefix, i + 1, scores)) {
+                return false;
+            }
+            trace->depths.push_back(make_depth_signal(
+                sc.lp.data() + (size_t)i * sc.K, scores, sc.K, selected));
+        }
         prefix.push_back(top_ids[0]);
     }
     return true;

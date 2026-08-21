@@ -350,12 +350,15 @@ DraftGraphOutputs build_draft_graph(
         }
     }
 
-    // ── 3. Final norm
+    // ── 3. Final norm. DSpark's confidence head is calibrated on h before
+    // this normalization, so retain both tensors as distinct graph outputs.
+    ggml_set_name(h, "draft_hidden_prenorm");
     ggml_tensor * out = ggml_rms_norm(ctx, h, eps);
     out = ggml_mul(ctx, out, w.out_norm);
     ggml_set_name(out, "draft_hidden_out");
 
     DraftGraphOutputs og{};
+    og.hidden_prenorm = h;
     og.hidden_states = out;
     og.logits = nullptr;
 
@@ -546,10 +549,12 @@ DraftGraphOutputs build_draft_kv_step(
     }
 
     ggml_tensor * out = ggml_rms_norm(ctx, h, eps);
+    ggml_set_name(h, "draft_kv_hidden_prenorm");
     out = ggml_mul(ctx, out, w.out_norm);
     ggml_set_name(out, "draft_kv_hidden_out");
 
     DraftGraphOutputs og{};
+    og.hidden_prenorm = h;
     og.hidden_states = out;
     og.logits = nullptr;
     if (in.lm_head) {

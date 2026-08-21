@@ -307,6 +307,120 @@ bool build_markov_chain_graph(const DraftWeights & dw,
 
 }  // namespace
 
+bool build_dspark_markov_batched_chain(
+        ggml_context * ctx,
+        ggml_cgraph * gf,
+        const DraftWeights & dw,
+        ggml_tensor * lm_head,
+        const std::vector<ggml_tensor *> & hidden_by_lane,
+        const std::vector<ggml_tensor *> & prenorm_by_lane,
+        ggml_tensor * seed_tokens,
+        int q_len,
+        bool want_confidence,
+        DSparkBatchedChainOutputs & out) {
+    out = {};
+    const int n_lanes = static_cast<int>(hidden_by_lane.size());
+    const int hdim = dw.n_embd;
+    if (!ctx || !gf || !lm_head || !seed_tokens || n_lanes <= 0 ||
+        q_len <= 1 || hdim <= 0 || !dw.dspark.enabled ||
+        !dw.dspark.markov_w1 || !dw.dspark.markov_w2 ||
+        seed_tokens->ne[0] != n_lanes ||
+        prenorm_by_lane.size() != hidden_by_lane.size()) {
+        return false;
+    }
+    const int vocab = static_cast<int>(lm_head->ne[1]);
+    if (vocab <= 0 ||
+        (dw.dspark.vocab_size > 0 && vocab != dw.dspark.vocab_size)) {
+        return false;
+    }
+    for (int lane = 0; lane < n_lanes; ++lane) {
+        ggml_tensor * hidden = hidden_by_lane[(size_t)lane];
+        ggml_tensor * prenorm = prenorm_by_lane[(size_t)lane];
+        if (!hidden || hidden->ne[0] != hdim || hidden->ne[1] < q_len ||
+            !prenorm || prenorm->ne[0] != hdim || prenorm->ne[1] < q_len) {
+            return false;
+        }
+    }
+
+    const bool have_confidence = want_confidence &&
+        dw.dspark.confidence_w && dw.dspark.confidence_b &&
+        (dw.dspark.confidence_dim == hdim ||
+         dw.dspark.confidence_dim == hdim + dw.dspark.markov_rank);
+    const int n_depths = q_len - 1;
+    std::vector<ggml_tensor *> hidden_by_depth((size_t)n_depths);
+    std::vector<ggml_tensor *> confidence_by_depth((size_t)n_depths);
+
+    auto concat_lane_column = [&](const std::vector<ggml_tensor *> & sources,
+                                  int column) -> ggml_tensor * {
+        ggml_tensor * packed = nullptr;
+        for (ggml_tensor * source : sources) {
+            ggml_tensor * lane = ggml_view_2d(
+                ctx, source, hdim, 1, source->nb[1],
+                (size_t)column * source->nb[1]);
+            packed = packed ? ggml_concat(ctx, packed, lane, 1) : lane;
+        }
+        return packed;
+    };
+
+    ggml_tensor * all_hidden = nullptr;
+    for (int depth = 0; depth < n_depths; ++depth) {
+        hidden_by_depth[(size_t)depth] =
+            concat_lane_column(hidden_by_lane, depth + 1);
+        confidence_by_depth[(size_t)depth] =
+            concat_lane_column(prenorm_by_lane, depth + 1);
+        if (!hidden_by_depth[(size_t)depth] ||
+            !confidence_by_depth[(size_t)depth]) {
+            return false;
+        }
+        all_hidden = all_hidden
+            ? ggml_concat(ctx, all_hidden, hidden_by_depth[(size_t)depth], 1)
+            : hidden_by_depth[(size_t)depth];
+    }
+
+    // Depth-major layout makes each Markov step a contiguous [vocab, lanes]
+    // view while retaining one lm_head projection for the whole cohort.
+    ggml_tensor * base = ggml_mul_mat(ctx, lm_head, all_hidden);
+    ggml_tensor * prev_ids = seed_tokens;
+    out.n_lanes = n_lanes;
+    out.q_len = q_len;
+    out.tokens.assign((size_t)n_depths, nullptr);
+    out.confidence.assign((size_t)n_depths, nullptr);
+
+    for (int depth = 0; depth < n_depths; ++depth) {
+        ggml_tensor * prev_emb =
+            ggml_get_rows(ctx, dw.dspark.markov_w1, prev_ids);
+        ggml_tensor * bias =
+            ggml_mul_mat(ctx, dw.dspark.markov_w2, prev_emb);
+        ggml_tensor * base_depth = ggml_view_2d(
+            ctx, base, vocab, n_lanes, base->nb[1],
+            (size_t)depth * (size_t)n_lanes * base->nb[1]);
+        ggml_tensor * corrected = ggml_add(ctx, base_depth, bias);
+        ggml_tensor * tok = ggml_argmax(ctx, corrected);
+        ggml_set_output(tok);
+        ggml_build_forward_expand(gf, tok);
+        out.tokens[(size_t)depth] = tok;
+
+        if (have_confidence) {
+            ggml_tensor * conf_in = confidence_by_depth[(size_t)depth];
+            if (dw.dspark.confidence_dim ==
+                hdim + dw.dspark.markov_rank) {
+                conf_in = ggml_concat(ctx, conf_in, prev_emb, 0);
+            }
+            ggml_tensor * conf =
+                ggml_mul_mat(ctx, dw.dspark.confidence_w, conf_in);
+            conf = ggml_add(
+                ctx, conf,
+                ggml_reshape_2d(ctx, dw.dspark.confidence_b, 1, 1));
+            conf = ggml_sigmoid(ctx, conf);
+            ggml_set_output(conf);
+            ggml_build_forward_expand(gf, conf);
+            out.confidence[(size_t)depth] = conf;
+        }
+        prev_ids = tok;
+    }
+    return true;
+}
+
 bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               ggml_backend_t backend,
                                               ggml_tensor * lm_head,

@@ -335,6 +335,14 @@ struct ModelBackend {
     // and stays valid until shutdown().
     virtual SeqEngine * seq_engine() { return nullptr; }
 
+    // Request-level decode_mode is consumed by the concurrent scheduler.
+    // Report only capabilities whose resources were actually initialized;
+    // the scheduler rejects unsupported non-AR modes before claiming a slot.
+    virtual ConcurrentDecodeCapabilities concurrent_decode_capabilities()
+            const {
+        return {};
+    }
+
     // ── Snapshots ────────────────────────────────────────────────────
     // With right-sized CPU-resident snapshots, each slot costs only
     // ~(cur_pos × 5 KB) of system RAM, so we can afford many slots.

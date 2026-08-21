@@ -19,35 +19,22 @@ draft sliding-window architecture metadata required by the server.
 """
 
 import argparse
-import json
-import struct
 import sys
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deps" / "llama.cpp" / "gguf-py"))
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR.parent / "deps" / "llama.cpp" / "gguf-py"))
+sys.path.insert(0, str(SCRIPT_DIR))
 
 import gguf
+import convert_dflash_to_gguf as canonical
 
 # ──────────────────────────────────────────────────────────────────────
-# DFlash 27B draft architecture constants (must match dflash27b.h)
 # ──────────────────────────────────────────────────────────────────────
 
-ARCH                = "qwen35-dflash-draft"
-HIDDEN              = 5120
-N_LAYER             = 5
-N_HEAD              = 32
-N_HEAD_KV           = 8
-HEAD_DIM            = 128
-INTERMEDIATE        = 17408
-VOCAB               = 248320
-N_TARGET_LAYERS     = 5
-ROPE_THETA          = 1_000_000.0
-RMS_EPS             = 1e-6
-MASK_TOKEN_ID       = 248070
-BLOCK_SIZE          = 16
-CTX_LEN             = 32768
+ARCH                = canonical.ARCH
 
 Q8_0_BLOCK_SIZE     = 32   # elements per Q8_0 block
 
@@ -67,66 +54,70 @@ def add_qwen36_swa_metadata(writer, enabled: bool) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Tensor name mapping  —  DFlash safetensors -> llama.cpp GGUF
-# (Identical to convert_dflash_to_gguf.py)
 # ──────────────────────────────────────────────────────────────────────
 
 def map_name(name: str) -> str | None:
-    if name == "fc.weight":          return "dflash.fc.weight"
-    if name == "hidden_norm.weight": return "dflash.hidden_norm.weight"
-    if name == "norm.weight":        return "output_norm.weight"
-    if name.startswith("layers."):
-        parts = name.split(".", 2)
-        if len(parts) < 3: return None
-        i = int(parts[1])
-        rest = parts[2]
-        layer_map = {
-            "input_layernorm.weight":          f"blk.{i}.attn_norm.weight",
-            "post_attention_layernorm.weight": f"blk.{i}.ffn_norm.weight",
-            "self_attn.q_proj.weight":         f"blk.{i}.attn_q.weight",
-            "self_attn.k_proj.weight":         f"blk.{i}.attn_k.weight",
-            "self_attn.v_proj.weight":         f"blk.{i}.attn_v.weight",
-            "self_attn.o_proj.weight":         f"blk.{i}.attn_output.weight",
-            "self_attn.q_norm.weight":         f"blk.{i}.attn_q_norm.weight",
-            "self_attn.k_norm.weight":         f"blk.{i}.attn_k_norm.weight",
-            "mlp.gate_proj.weight":            f"blk.{i}.ffn_gate.weight",
-            "mlp.up_proj.weight":              f"blk.{i}.ffn_up.weight",
-            "mlp.down_proj.weight":            f"blk.{i}.ffn_down.weight",
-        }
-        return layer_map.get(rest)
-    return None
+    return canonical.map_name(name)
 
 
 def is_norm_tensor(gguf_name: str) -> bool:
     return (
         gguf_name.endswith("_norm.weight") or
         gguf_name == "output_norm.weight" or
-        gguf_name == "dflash.hidden_norm.weight"
+        gguf_name == "dflash.hidden_norm.weight" or
+        gguf_name.endswith("_conv.base")
     )
 
 
 # ──────────────────────────────────────────────────────────────────────
-# safetensors reader
 # ──────────────────────────────────────────────────────────────────────
 
-def load_safetensors_header(path: Path):
-    with open(path, "rb") as f:
-        header_size = struct.unpack("<Q", f.read(8))[0]
-        header_json = f.read(header_size).decode("utf-8")
-        return header_size, json.loads(header_json)
-
-
-def read_tensor_bytes(path: Path, header_size: int, info: dict) -> bytes:
-    start, end = info["data_offsets"]
-    with open(path, "rb") as f:
-        f.seek(8 + header_size + start)
-        return f.read(end - start)
+load_safetensors_header = canonical.load_safetensors_header
+read_tensor_bytes = canonical.read_tensor_bytes
 
 
 def bf16_bytes_to_f32(raw: bytes, shape: list[int]) -> np.ndarray:
     u16 = np.frombuffer(raw, dtype=np.uint16).reshape(shape)
     u32 = (u16.astype(np.uint32) << 16)
     return u32.view("<f4").reshape(shape)
+
+def add_arch_metadata(writer, a: dict, qwen36_swa: bool = False) -> None:
+    """Write the same resolved architecture profile as the F16 converter."""
+    writer.add_string("general.name", f"DFlash-Draft-{a['hidden']}h-{a['n_layer']}L-Q8_0")
+    writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
+    writer.add_uint32(f"{ARCH}.context_length", a["ctx_len"])
+    writer.add_uint32(f"{ARCH}.embedding_length", a["hidden"])
+    writer.add_uint32(f"{ARCH}.block_count", a["n_layer"])
+    writer.add_uint32(f"{ARCH}.feed_forward_length", a["intermediate"])
+    writer.add_uint32(f"{ARCH}.attention.head_count", a["n_head"])
+    writer.add_uint32(f"{ARCH}.attention.head_count_kv", a["n_head_kv"])
+    writer.add_uint32(f"{ARCH}.attention.key_length", a["head_dim"])
+    writer.add_uint32(f"{ARCH}.attention.value_length", a["head_dim"])
+    writer.add_uint32(f"{ARCH}.vocab_size", a["vocab"])
+    writer.add_float32(f"{ARCH}.attention.layer_norm_rms_epsilon", a["rms_eps"])
+    writer.add_float32(f"{ARCH}.rope.freq_base", a["rope_theta"])
+
+    if qwen36_swa:
+        add_qwen36_swa_metadata(writer, True)
+    elif a.get("swa_pattern"):
+        writer.add_uint32(f"{ARCH}.attention.sliding_window", a["swa_window"])
+        writer.add_array(f"{ARCH}.attention.sliding_window_pattern", [bool(x) for x in a["swa_pattern"]])
+
+    writer.add_uint32(f"{ARCH}.dflash.n_target_layers", a["n_target_layers"])
+    writer.add_uint32(f"{ARCH}.dflash.block_size", a["block_size"])
+    writer.add_uint32(f"{ARCH}.dflash.mask_token_id", a["mask_token_id"])
+    capture_ids = a.get("capture_layer_ids")
+    if capture_ids and len(capture_ids) == a["n_target_layers"]:
+        writer.add_array(f"{ARCH}.dflash.target_layer_ids", [int(x) for x in capture_ids])
+    elif capture_ids:
+        print(f"[warn] capture_layer_ids len {len(capture_ids)} != n_target_layers {a['n_target_layers']}; not embedding ids", file=sys.stderr)
+
+    if a.get("conv_kernel_size"):
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.conv_kernel_size", a["conv_kernel_size"])
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.conv_group_size", a["conv_group_size"])
+    if a.get("selector_rank"):
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.selector_rank", a["selector_rank"])
+        writer.add_uint32(f"{ARCH}.dflash.dflash2.selector_top_k", a["selector_top_k"])
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -160,31 +151,13 @@ def main():
     header_size, header = load_safetensors_header(args.safetensors)
     n_entries = sum(1 for k in header if k != "__metadata__")
     print(f"[info]   {n_entries} tensor entries")
+    arch = canonical.load_arch(args.safetensors, header)
 
     writer = gguf.GGUFWriter(args.out_gguf, ARCH)
 
-    # Architecture metadata (identical to convert_dflash_to_gguf.py)
-    writer.add_string("general.name", "Qwen3.5-27B-DFlash-Draft-Q8_0")
-    writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
-    writer.add_uint32(f"{ARCH}.context_length",          CTX_LEN)
-    writer.add_uint32(f"{ARCH}.embedding_length",        HIDDEN)
-    writer.add_uint32(f"{ARCH}.block_count",             N_LAYER)
-    writer.add_uint32(f"{ARCH}.feed_forward_length",     INTERMEDIATE)
-    writer.add_uint32(f"{ARCH}.attention.head_count",    N_HEAD)
-    writer.add_uint32(f"{ARCH}.attention.head_count_kv", N_HEAD_KV)
-    writer.add_uint32(f"{ARCH}.attention.key_length",    HEAD_DIM)
-    writer.add_uint32(f"{ARCH}.attention.value_length",  HEAD_DIM)
-    writer.add_uint32(f"{ARCH}.vocab_size",              VOCAB)
-    writer.add_float32(f"{ARCH}.attention.layer_norm_rms_epsilon", RMS_EPS)
-    writer.add_float32(f"{ARCH}.rope.freq_base",         ROPE_THETA)
-    add_qwen36_swa_metadata(writer, args.qwen36_swa)
+    add_arch_metadata(writer, arch, args.qwen36_swa)
     if args.qwen36_swa:
         print("[info] Qwen3.6 draft SWA: layers 0-3 window=2048; layer 4 full attention")
-
-    # DFlash-specific hyperparameters
-    writer.add_uint32(f"{ARCH}.dflash.n_target_layers", N_TARGET_LAYERS)
-    writer.add_uint32(f"{ARCH}.dflash.block_size",      BLOCK_SIZE)
-    writer.add_uint32(f"{ARCH}.dflash.mask_token_id",   MASK_TOKEN_ID)
 
     # Collect and sort tensors (same order as convert_dflash_to_gguf.py)
     pending = []
