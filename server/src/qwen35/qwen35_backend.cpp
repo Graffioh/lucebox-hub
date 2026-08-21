@@ -364,22 +364,27 @@ bool Qwen35Backend::init() {
                         dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
         }
 
-        // The checkpoint metadata is the drafter's trained/published proposal
-        // horizon. Shorter blocks are safe runtime tuning; longer blocks are
-        // out of distribution even when the tensor shapes happen to allow it.
+        // The checkpoint metadata is the drafter's published proposal
+        // horizon. Greedy chain verification keeps output byte-identical to
+        // plain decode at any width, so widening only risks acceptance
+        // depth; it is allowed up to 2x the horizon (measured on Qwen3.8
+        // DFlash2: byte-identical completions across widths 8-24, commits
+        // grow through 16, step time cliffs past 16 with no commit gain).
         if (cfg_.draft_block_size != 0) {
             const int checkpoint_block_size = dw_.block_size;
             if (!draft_block_size_override_supported(
                     cfg_.draft_block_size, checkpoint_block_size)) {
                 std::fprintf(stderr,
                     "[draft] --draft-block-size must be in [2, %d] for this "
-                    "drafter (checkpoint metadata is the supported horizon); "
-                    "got %d\n",
-                    checkpoint_block_size, cfg_.draft_block_size);
+                    "drafter (up to 2x the checkpoint horizon); got %d\n",
+                    2 * checkpoint_block_size, cfg_.draft_block_size);
                 return false;
             }
-            std::printf("[draft]  block size override: %d -> %d\n",
-                        checkpoint_block_size, cfg_.draft_block_size);
+            std::printf("[draft]  block size override: %d -> %d%s\n",
+                        checkpoint_block_size, cfg_.draft_block_size,
+                        cfg_.draft_block_size > checkpoint_block_size
+                            ? " (beyond the published horizon; exact greedy verify)"
+                            : "");
             dw_.block_size = cfg_.draft_block_size;
         }
     }

@@ -136,8 +136,13 @@ void test_draft_block_size_override_respects_checkpoint_horizon() {
     CHECK(draft_block_size_override_supported(2, 8));
     CHECK(draft_block_size_override_supported(7, 8));
     CHECK(draft_block_size_override_supported(8, 8));
+    // Greedy verify keeps output exact at any width, so widening is allowed
+    // up to 2x the checkpoint horizon (measured: acceptance extrapolates to
+    // 16 on Qwen3.8 DFlash2, step time cliffs past it).
+    CHECK(draft_block_size_override_supported(12, 8));
+    CHECK(draft_block_size_override_supported(16, 8));
     CHECK(!draft_block_size_override_supported(1, 8));
-    CHECK(!draft_block_size_override_supported(9, 8));
+    CHECK(!draft_block_size_override_supported(17, 8));
     CHECK(!draft_block_size_override_supported(32, 8));
 }
 
