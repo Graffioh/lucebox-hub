@@ -5938,6 +5938,44 @@ struct ggml_tensor * ggml_ssm_conv_step(
     return result;
 }
 
+struct ggml_tensor * ggml_dflash_dyn_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * base,
+        struct ggml_tensor  * dyn,
+        int                   site,
+        int                   kernel,
+        int                   group_size) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(dyn->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dyn));
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(group_size > 0 && x->ne[0] % group_size == 0);
+    GGML_ASSERT(kernel > 0 && site >= 0);
+    GGML_ASSERT(dyn->ne[1] == x->ne[1]);
+    GGML_ASSERT(dyn->ne[0] >= (int64_t)(site + 1) * kernel * (x->ne[0] / group_size));
+    // base is [hidden, K, 2] (per-tap rows, then site planes); contiguity
+    // makes flat row (site*K + k) valid with stride nb[1].
+    GGML_ASSERT(ggml_is_contiguous(base));
+    GGML_ASSERT(base->ne[0] == x->ne[0]);
+    GGML_ASSERT(base->ne[1] * base->ne[2] >= (int64_t)(site + 1) * kernel);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1]);
+    ggml_set_op_params_i32(result, 0, 3);   // dflash2 grouped dyn-conv mode
+    ggml_set_op_params_i32(result, 1, site);
+    ggml_set_op_params_i32(result, 2, kernel);
+    ggml_set_op_params_i32(result, 3, group_size);
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = base;
+    result->src[2] = dyn;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_ssm_conv_specla(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
