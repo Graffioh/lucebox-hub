@@ -364,6 +364,18 @@ bool Qwen35Backend::init() {
                         dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
         }
 
+        // Legacy 8-layer drafter YaRN from config flags. Applied here AND in
+        // unpark() so the rotary encoding cannot flip mid-process (it used
+        // to switch from plain RoPE to YaRN on the first park/unpark).
+        if (dw_.rope_ext_factor == 0.0f && dw_.n_layer == 8 && dw_.n_embd == 2048) {
+            float yf = cfg_.draft_yarn_factor > 1.0f ? cfg_.draft_yarn_factor : 64.0f;
+            dw_.rope_freq_scale = 1.0f / yf;
+            dw_.rope_ext_factor = 1.0f; dw_.rope_attn_factor = 1.0f;
+            dw_.rope_beta_fast = cfg_.draft_yarn_beta_fast;
+            dw_.rope_beta_slow = cfg_.draft_yarn_beta_slow;
+            dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
+        }
+
         // The checkpoint metadata is the drafter's published proposal
         // horizon. Greedy chain verification keeps output byte-identical to
         // plain decode at any width, so widening only risks acceptance
@@ -887,6 +899,15 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.swa_window = cfg_.draft_swa_window;
                 for (int il = 0; il < dw_.n_layer - 1; il++)
                     dw_.layers[il].is_swa = true;
+            }
+            // Re-apply the runtime block-size override: without this a
+            // park/unpark cycle silently reverts to checkpoint metadata
+            // (out-of-bounds rollback windows when narrowing, a silent
+            // no-op when widening).
+            if (cfg_.draft_block_size != 0 &&
+                draft_block_size_override_supported(cfg_.draft_block_size,
+                                                    dw_.block_size)) {
+                dw_.block_size = cfg_.draft_block_size;
             }
         }
         draft_parked_ = false;
@@ -2656,6 +2677,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     float accepted_ema = 2.0f * adaptive.accept_threshold();
     int   ar_burst_left = 0;
     int   n_ar_burst_steps = 0;
+    int   n_spec_steps = 0;      // steps that actually proposed q_len drafts
     bool  probe_step = false;   // first spec step after a burst
     // Live step-time EMAs (seconds) for the break-even ratio; 0 = not yet measured.
     double t_spec_step_ema = 0.0;
@@ -2670,7 +2692,14 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // Plain-decode step inside the spec loop: no drafter forward, verify
         // the seed token only. Features are still captured, so the drafter
         // resumes cleanly on the next probe step.
-        const bool ar_step = adaptive.enabled() && ar_burst_left > 0;
+        bool ar_step = adaptive.enabled() && ar_burst_left > 0;
+        // Pending tool-call hints verify at near-100% acceptance; a plain
+        // decode burst would ignore them for up to `burst` tokens, so end
+        // the burst as soon as hints are available.
+        if (ar_step && hint_tokens && n_generated < (int)hint_tokens->size()) {
+            ar_burst_left = 0;
+            ar_step = false;
+        }
         if (ar_step) {
             ar_burst_left--;
             n_ar_burst_steps++;
@@ -2707,9 +2736,15 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             return ok;
         }
 
-        // 1. Build noise input for draft
+        // 1. Build noise input for draft. The drafter GGUF's own MASK id
+        // wins over the target-side default (the loader resolved the
+        // precedence into dw_); remote drafters keep the target default
+        // because dw_ is not populated for them.
+        const int32_t noise_mask_id =
+            (!use_remote_draft && dw_.mask_token_id >= 0)
+                ? dw_.mask_token_id : target->mask_token_id();
         noise_ids[0] = last_tok;
-        for (int i = 1; i < q_len; i++) noise_ids[i] = target->mask_token_id();
+        for (int i = 1; i < q_len; i++) noise_ids[i] = noise_mask_id;
         if (!target->embed_tokens(noise_ids.data(), q_len, noise_embed.data())) {
             std::fprintf(stderr, "spec-decode: noise embed failed (last_tok=%d mask=%d q_len=%d)\n",
                          last_tok, target->mask_token_id(), q_len);
@@ -3004,7 +3039,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                         for (int i = 1; i < q_len; ++i) {
                             noise_ids[(size_t)i] = i <= (int)prefix.size()
                                 ? prefix[(size_t)i - 1]
-                                : target->mask_token_id();
+                                : noise_mask_id;
                         }
                         if (!target->embed_tokens(noise_ids.data(), q_len,
                                                   noise_embed.data())) {
@@ -3422,7 +3457,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok,
                                    /*capture_ssm_intermediates=*/true)) {
             std::fprintf(stderr, "spec-decode: verify failed\n");
-            target->restore_kv();
+            // Plain-decode steps skipped the snapshot; restoring would copy
+            // back state up to a whole burst stale.
+            if (!ar_step) target->restore_kv();
             step_graph_destroy(draft_sg);
             return false;
         }
@@ -3439,7 +3476,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (sampled_verify) {
             if (!target->read_verify_logits(v_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
-                target->restore_kv();
+                if (!ar_step) target->restore_kv();
                 step_graph_destroy(draft_sg);
                 return false;
             }
@@ -3746,7 +3783,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         cache_.cur_pos = committed;
         n_generated += emitted + injected;
-        n_accept_sum += std::min(accept_n, emitted);
+        // Only steps that proposed a full draft block enter the accept-rate
+        // accounting; 1-token burst steps would otherwise dilute the rate
+        // that steers the PFlash residency bandit.
+        if (!ar_step) {
+            n_accept_sum += std::min(accept_n, emitted);
+            n_spec_steps++;
+        }
         n_draft_steps++;
 
         // Adaptive policy update on real spec steps: EMA of accepted draft
@@ -3765,7 +3808,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             const float alpha = probe_step ? 0.5f : adaptive.ema_alpha;
             accepted_ema = (1.0f - alpha) * accepted_ema + alpha * accepted_drafts;
             probe_step = false;
-            if (accepted_ema < adaptive.accept_threshold(live_step_ratio())) {
+            // A plain-decode burst commits greedy argmax tokens without
+            // passing through the sampler chain, so bursts stay off under
+            // sampled-verify to keep its output-distribution guarantee.
+            if (!sampled_verify &&
+                accepted_ema < adaptive.accept_threshold(live_step_ratio())) {
                 ar_burst_left = adaptive.burst;
             }
         }
@@ -3779,7 +3826,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (floor_to_ar) {
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+            const int total_draft_pos = std::max(1, n_spec_steps * q_len);
             out_accept_rate =
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
@@ -3824,7 +3871,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.cur_pos = committed;
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+            const int total_draft_pos = std::max(1, n_spec_steps * q_len);
             out_accept_rate =
                 (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
@@ -3855,7 +3902,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+    const int total_draft_pos = std::max(1, n_spec_steps * q_len);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "
