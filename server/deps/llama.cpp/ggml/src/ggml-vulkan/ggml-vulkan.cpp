@@ -15782,7 +15782,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             {
                 // The Vulkan kernel addresses state by compact sequence row
                 // and does not consume the physical-slot mapping in src[8].
-                if (op->src[8] != nullptr) {
+                if (op->src[8] != nullptr || op->src[11] != nullptr ||
+                    ggml_get_op_params_i32(op, 10) == 1) {
                     return false;
                 }
                 const uint32_t S_v = op->src[2]->ne[0];
