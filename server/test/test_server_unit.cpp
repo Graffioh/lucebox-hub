@@ -21,6 +21,7 @@
 #include "server/http_server.h"
 #include "server/chat_template.h"
 #include "common/sampler.h"
+#include "common/concurrency/seq_engine.h"
 #include "common/backend_precision.h"
 #include "common/backend_ipc.h"
 #include "common/moe_hybrid_ffn_eval.h"
@@ -6602,4 +6603,22 @@ TEST_CASE(ServerUnitFixture, test_emitter_suppresses_malformed_multiline_tool_bu
     TEST_ASSERT(em.accumulated_text().empty());
     TEST_ASSERT(captured.find("[server] tool_call parse failed; suppressing buffered tool text") != std::string::npos);
     TEST_ASSERT(captured.find("text='<function_call>\\n  <invoke name=\"read\">\\n    malformed prose body with\\nnew lines and \\t tabs\\n'") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture,
+          test_concurrent_scheduler_burst_stops_at_eos) {
+    SeqEngine::DecodeOutput burst;
+    burst.slot = 0;
+    burst.committed_tokens = {101, 2, 103};
+    burst.token = 104;
+
+    std::vector<int32_t> emitted;
+    const bool consumed_all = consume_decode_output_tokens(
+        burst, [&](int32_t token) {
+            emitted.push_back(token);
+            return token != 2;
+        });
+
+    TEST_ASSERT(!consumed_all);
+    TEST_ASSERT((emitted == std::vector<int32_t>{101, 2}));
 }
