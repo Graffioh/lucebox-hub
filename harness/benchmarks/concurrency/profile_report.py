@@ -197,7 +197,9 @@ def build_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
             "rounds": len(steps),
             "requests": len(requests),
             "failed_requests": sum(
-                not bool(request.get("ok")) for request in requests
+                int(request.get("completed_ns", 0)) != 0
+                and request.get("ok") is False
+                for request in requests
             ),
             "dropped_steps": int(footer.get("dropped_steps", 0)),
             "dropped_requests": int(footer.get("dropped_requests", 0)),
@@ -240,8 +242,7 @@ def build_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def build_markdown(records: list[dict[str, Any]]) -> str:
-    summary = build_summary(records)
+def build_markdown(summary: dict[str, Any]) -> str:
     run = summary["run"]
     capture = summary["capture"]
     latency = summary["latency_ms"]
@@ -359,54 +360,29 @@ def build_markdown(records: list[dict[str, Any]]) -> str:
             f"{percent(ratio(nanoseconds, phase_total))} |"
         )
 
-    eligible = speculation["spec_eligible_lanes"]
-    attempted = speculation["spec_attempted_lanes"]
-    proposed = speculation["spec_proposed_draft_tokens"]
     accepted = speculation["spec_accepted_draft_tokens"]
     durable = speculation["spec_durable_draft_tokens"]
-    queue_p95 = latency["queue"]["p95"]
-    ttft_p95 = latency["ttft"]["p95"]
-    signals: list[str] = []
+    warnings: list[str] = []
     if capture["failed_requests"]:
-        signals.append(
+        warnings.append(
             f"{capture['failed_requests']}/{capture['requests']} captured "
             "requests failed. Inspect the first incomplete funnel or phase "
             "boundary."
         )
     if accepted != durable:
-        signals.append(
+        warnings.append(
             "Accepted and durable draft token counts differ. Inspect state "
             "promotion or commit before tuning proposal quality."
         )
-    if (padding["target_padding_ratio"] is not None and
-            padding["target_padding_ratio"] > 0.20):
-        signals.append(
-            "Target graph padding exceeds 20%. Inspect cohort bucket shapes."
-        )
-    if proposed and ratio(accepted, proposed) < 0.35:
-        signals.append(
-            "Draft acceptance is below 35%. Inspect proposal quality before "
-            "increasing speculative width."
-        )
-    if eligible and ratio(attempted, eligible) < 0.75:
-        signals.append(
-            "Fewer than 75% of eligible lanes reach an attempt. Inspect "
-            "suppression reasons and prompt mixing."
-        )
-    if (capture["requests"] and queue_p95 is not None and
-            ttft_p95 is not None and queue_p95 > ttft_p95 * 0.40):
-        signals.append(
-            "Queueing accounts for a large part of p95 TTFT. Inspect "
-            "admission and KV pressure."
-        )
-    if not signals:
-        signals.append(
-            "No default threshold fired. Use the cohort and phase tables to "
-            "choose the next experiment."
-        )
-
-    lines.extend(["", "## Signals", ""])
-    lines.extend(f"- {signal}" for signal in signals)
+    if not capture["complete"]:
+        warnings.append("Capture is incomplete.")
+    dropped = (
+        capture["dropped_steps"]
+        + capture["dropped_requests"]
+        + capture["dropped_token_bursts"]
+    )
+    if dropped:
+        warnings.append(f"Capture dropped {dropped} records.")
     paths = ", ".join(
         f"{name}={count}" for name, count in capture["paths"].items()
     ) or "none"
@@ -419,8 +395,11 @@ def build_markdown(records: list[dict[str, Any]]) -> str:
         f"- Dropped steps: {capture['dropped_steps']}",
         f"- Dropped requests: {capture['dropped_requests']}",
         f"- Dropped token bursts: {capture['dropped_token_bursts']}",
-        "",
     ])
+    if warnings:
+        lines.extend(["", "### Warnings", ""])
+        lines.extend(f"- {warning}" for warning in warnings)
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -492,7 +471,8 @@ def main() -> int:
     args = parser.parse_args()
 
     records = load_records(args.profile)
-    markdown = build_markdown(records)
+    summary = build_summary(records)
+    markdown = build_markdown(summary)
     if args.markdown:
         args.markdown.write_text(markdown, encoding="utf-8")
     else:
@@ -504,7 +484,7 @@ def main() -> int:
         )
     if args.json_summary:
         args.json_summary.write_text(
-            json.dumps(build_summary(records), indent=2, sort_keys=True) + "\n",
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
     return 0

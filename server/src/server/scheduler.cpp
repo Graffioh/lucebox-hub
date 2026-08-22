@@ -476,10 +476,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             return AdmissionDisposition::Retired;
         }
         next_request_id++;
-        job->profile_request_id = request_id;
-        if (observability_.enabled()) {
-            job->profile_admitted_ns = observability::steady_time_ns();
-        }
+        const uint64_t profile_admitted_ns = observability_.enabled()
+            ? observability::steady_time_ns() : 0;
 
         SchedSlot & s = slots[(size_t)ar.slot];
         s = SchedSlot{};
@@ -505,7 +503,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             observability_.record_request_admitted(
                 request_id, req.response_id,
                 static_cast<uint32_t>(req.prompt_tokens.size()),
-                job->profile_queued_ns, job->profile_admitted_ns);
+                job->profile_queued_ns, profile_admitted_ns);
         }
         publish_live_count();
         return AdmissionDisposition::Admitted;

@@ -63,7 +63,7 @@ public:
 
     StepResult step(
         const StepPlan & plan,
-        observability::StepProfile * profile = nullptr) override;
+        observability::StepProfile * profile) override;
     StepPlanLimits step_plan_limits(int decode_rows) const override {
         const bool mixed = decode_rows > 0;
         const int per_sequence = mixed ? 512 : 2048;

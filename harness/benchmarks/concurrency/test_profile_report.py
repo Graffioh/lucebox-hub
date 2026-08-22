@@ -46,7 +46,8 @@ class ProfileReportTest(unittest.TestCase):
 
     def test_markdown_and_perfetto_share_the_records(self):
         records = self.records()
-        markdown = profile_report.build_markdown(records)
+        markdown = profile_report.build_markdown(
+            profile_report.build_summary(records))
         self.assertIn("## Speculation funnel", markdown)
         self.assertIn("| 4 | 1 | 2.00 ms | 20.0% | 66.7%", markdown)
         trace = profile_report.build_perfetto(records)
@@ -79,10 +80,24 @@ class ProfileReportTest(unittest.TestCase):
         records[1]["spec_durable_draft_tokens"] = 0
         records[2]["ok"] = False
 
-        markdown = profile_report.build_markdown(records)
+        markdown = profile_report.build_markdown(
+            profile_report.build_summary(records))
 
         self.assertIn("1/1 captured requests failed", markdown)
         self.assertIn("Accepted and durable draft token counts differ", markdown)
+
+    def test_incomplete_request_is_not_failed(self):
+        records = self.records()
+        records.insert(-1, {
+            "type": "request", "request_id": 10, "ok": None,
+            "queued_ns": 1000, "admitted_ns": 1100,
+            "completed_ns": 0,
+        })
+
+        summary = profile_report.build_summary(records)
+
+        self.assertEqual(summary["capture"]["requests"], 2)
+        self.assertEqual(summary["capture"]["failed_requests"], 0)
 
 
 if __name__ == "__main__":

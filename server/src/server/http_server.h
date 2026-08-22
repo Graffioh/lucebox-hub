@@ -609,9 +609,7 @@ struct ServerJob {
     // First concurrent-scheduler attempt; retained across busy deferrals so
     // server-side prefill/elapsed telemetry does not erase queueing delay.
     std::chrono::steady_clock::time_point parallel_started_at{};
-    uint64_t      profile_request_id = 0;
     uint64_t      profile_queued_ns = 0;
-    uint64_t      profile_admitted_ns = 0;
     std::unique_ptr<SseEmitter> emitter;
 };
 

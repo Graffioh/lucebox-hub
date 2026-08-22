@@ -1,6 +1,7 @@
 #include "server/observability.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -17,6 +18,18 @@ using namespace dflash::common::observability;
 } while (false)
 
 int main() {
+#if defined(_WIN32)
+    _putenv_s("DFLASH_PROF_MAX_ROUNDS", "-1");
+#else
+    setenv("DFLASH_PROF_MAX_ROUNDS", "-1", 1);
+#endif
+    CHECK(ObservabilityConfig::from_env().max_rounds == 10000);
+#if defined(_WIN32)
+    _putenv_s("DFLASH_PROF_MAX_ROUNDS", "");
+#else
+    unsetenv("DFLASH_PROF_MAX_ROUNDS");
+#endif
+
     ObservabilityState disabled({});
     CHECK(disabled.job_queued() == 0);
     CHECK(disabled.queue_depth() == 0);
@@ -65,6 +78,9 @@ int main() {
     step->spec_attempted_lanes = 4;
     step->spec_proposed_draft_tokens = 12;
     step->spec_accepted_draft_tokens = 8;
+    step->spec_tree_width = 3;
+    step->proposed_by_position[1] = 2;
+    step->accepted_by_position[1] = 1;
     step->kv_blocks_total = 100;
     step->kv_blocks_free_after = 80;
     LaneProfile lane;
@@ -75,7 +91,6 @@ int main() {
     step->add_phase({Phase::TargetCompute, 1, 20});
     state.record_prefill_completed(7, queued_ns + 20);
     state.record_token_burst(7, step->round_id, queued_ns + 30, 3);
-    state.record_request_finished(7, true, 3, queued_ns + 40);
     state.commit_step(step);
     {
         std::ifstream checkpoint_input(output);
@@ -89,7 +104,13 @@ int main() {
               std::string::npos);
         CHECK(checkpoint.find("\"DFLASH_DRAFT_KV\":\"1\"") !=
               std::string::npos);
+        CHECK(checkpoint.find("\"ok\":null") != std::string::npos);
+        CHECK(checkpoint.find(
+                  "\"proposed_by_position\":[0,2],"
+                  "\"accepted_by_position\":[0,1]") !=
+              std::string::npos);
     }
+    state.record_request_finished(7, true, 3, queued_ns + 40);
 
     StepProfile * dropped = state.begin_step(4);
     dropped->kv_blocks_total = 100;
@@ -110,6 +131,7 @@ int main() {
           std::string::npos);
     CHECK(jsonl.find("\"type\":\"request\"") != std::string::npos);
     CHECK(jsonl.find("\"type\":\"token_burst\"") != std::string::npos);
+    CHECK(jsonl.find("\"ok\":true") != std::string::npos);
     CHECK(jsonl.find("\"dropped_steps\":1") != std::string::npos);
     CHECK(jsonl.find("\"complete\":true") != std::string::npos);
     std::filesystem::remove(output);

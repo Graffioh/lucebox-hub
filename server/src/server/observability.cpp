@@ -3,6 +3,7 @@
 #include "common/prof_env.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -20,9 +21,13 @@ namespace {
 uint64_t env_u64(const char * name, uint64_t fallback) {
     const char * raw = std::getenv(name);
     if (!raw || !*raw) return fallback;
-    char * end = nullptr;
-    const unsigned long long value = std::strtoull(raw, &end, 10);
-    return end && *end == '\0' ? static_cast<uint64_t>(value) : fallback;
+    const std::string_view text(raw);
+    uint64_t value = 0;
+    const auto parsed = std::from_chars(
+        text.data(), text.data() + text.size(), value);
+    return parsed.ec == std::errc{} &&
+            parsed.ptr == text.data() + text.size()
+        ? value : fallback;
 }
 
 size_t bounded_size_env(const char * name, size_t fallback) {
@@ -66,9 +71,10 @@ std::string json_escape(std::string_view value) {
 
 void write_u32_array(
         std::ostream & out,
-        const std::array<uint32_t, kMaxSpecPositions> & values) {
+        const std::array<uint32_t, kMaxSpecPositions> & values,
+        size_t count) {
     out << '[';
-    for (size_t i = 0; i < values.size(); ++i) {
+    for (size_t i = 0; i < count; ++i) {
         if (i) out << ',';
         out << values[i];
     }
@@ -76,6 +82,14 @@ void write_u32_array(
 }
 
 void write_step_json(std::ostream & out, const StepProfile & step) {
+    size_t position_count = 0;
+    for (size_t i = kMaxSpecPositions; i > 0; --i) {
+        if (step.proposed_by_position[i - 1] != 0 ||
+            step.accepted_by_position[i - 1] != 0) {
+            position_count = i;
+            break;
+        }
+    }
     out << "{\"type\":\"step\",\"schema_version\":"
         << step.schema_version
         << ",\"round_id\":" << step.round_id
@@ -122,9 +136,9 @@ void write_step_json(std::ostream & out, const StepProfile & step) {
         << ",\"dropped_lanes\":" << step.dropped_lanes
         << ",\"dropped_phases\":" << step.dropped_phases
         << ",\"proposed_by_position\":";
-    write_u32_array(out, step.proposed_by_position);
+    write_u32_array(out, step.proposed_by_position, position_count);
     out << ",\"accepted_by_position\":";
-    write_u32_array(out, step.accepted_by_position);
+    write_u32_array(out, step.accepted_by_position, position_count);
     out << ",\"lanes\":[";
     for (uint32_t i = 0; i < step.lane_count; ++i) {
         if (i) out << ',';
@@ -471,8 +485,10 @@ bool ObservabilityState::write_capture(bool complete) {
         out << "{\"type\":\"request\",\"request_id\":"
             << request.request_id
             << ",\"response_id\":\"" << json_escape(request.response_id)
-            << "\",\"ok\":" << (request.ok ? "true" : "false")
-            << ",\"prompt_tokens\":" << request.prompt_tokens
+            << "\",\"ok\":";
+        if (request.completed_ns == 0) out << "null";
+        else out << (request.ok ? "true" : "false");
+        out << ",\"prompt_tokens\":" << request.prompt_tokens
             << ",\"output_tokens\":" << request.output_tokens
             << ",\"queued_ns\":" << request.queued_ns
             << ",\"admitted_ns\":" << request.admitted_ns

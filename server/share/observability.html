@@ -199,28 +199,12 @@ th {
   padding: 14px;
 }
 
-.span-3 {
-  grid-column: span 3;
-}
-
-.span-4 {
-  grid-column: span 4;
-}
-
 .span-5 {
   grid-column: span 5;
 }
 
-.span-6 {
-  grid-column: span 6;
-}
-
 .span-7 {
   grid-column: span 7;
-}
-
-.span-8 {
-  grid-column: span 8;
 }
 
 .span-12 {
@@ -229,7 +213,7 @@ th {
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -311,10 +295,6 @@ th {
 
 .bar-fill.danger {
   background: linear-gradient(90deg, #ff4962, var(--danger));
-}
-
-.bar-fill.muted {
-  background: linear-gradient(90deg, #5d7293, #9db2d0);
 }
 
 .bar-value {
@@ -400,30 +380,6 @@ th {
   content: "";
 }
 
-.mono-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.mono-table th,
-.mono-table td {
-  padding: 8px 6px;
-  border-bottom: 1px solid rgba(157, 178, 208, 0.12);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-  font-size: 0.78rem;
-  text-align: left;
-  vertical-align: top;
-}
-
-.mono-table th {
-  color: var(--muted);
-  font-weight: 600;
-}
-
-.mono-table td {
-  color: var(--text);
-}
-
 .notice {
   min-height: 42px;
   padding: 11px 12px;
@@ -439,12 +395,8 @@ th {
 }
 
 @media (max-width: 1100px) {
-  .span-3,
-  .span-4,
   .span-5,
-  .span-6,
-  .span-7,
-  .span-8 {
+  .span-7 {
     grid-column: span 6;
   }
 
@@ -467,12 +419,8 @@ th {
     justify-content: flex-start;
   }
 
-  .span-3,
-  .span-4,
   .span-5,
-  .span-6,
   .span-7,
-  .span-8,
   .span-12 {
     grid-column: span 12;
   }
@@ -533,6 +481,14 @@ th {
         <div class="metric">
           <div class="metric-label">Decode lanes</div>
           <div class="metric-value" id="decode-lanes">0</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Last path</div>
+          <div class="metric-value" id="last-path">unknown</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Last round time</div>
+          <div class="metric-value" id="last-duration">unknown</div>
         </div>
       </div>
     </article>
@@ -642,34 +598,6 @@ th {
       </div>
     </article>
 
-    <article class="panel span-12">
-      <div class="panel-header">
-        <h2>Last step</h2>
-        <div class="label" id="last-step-duration">duration unknown</div>
-      </div>
-      <div class="panel-body">
-        <table class="mono-table">
-          <thead>
-            <tr>
-              <th>Round</th>
-              <th>Path</th>
-              <th>Duration</th>
-              <th>Live slots</th>
-              <th>Queue</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td id="last-round">unknown</td>
-              <td id="last-path">unknown</td>
-              <td id="last-duration">unknown</td>
-              <td id="last-live-slots">0</td>
-              <td id="last-queue-depth">0</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </article>
   </section>
 </main>
 
@@ -948,12 +876,8 @@ th {
     const path = lastStep.path || data.path || "unknown";
     const duration = Number(lastStep.duration_ns || 0);
     setText("last-step-label", "round " + roundId);
-    setText("last-step-duration", fmtDuration(duration));
-    setText("last-round", String(roundId));
     setText("last-path", String(path));
     setText("last-duration", fmtDuration(duration));
-    setText("last-live-slots", fmt(n(lastStep, "live_slots", liveSlots)));
-    setText("last-queue-depth", fmt(n(lastStep, "queue_depth", queueDepth)));
 
     renderPhases(data);
     renderFunnel(data);
