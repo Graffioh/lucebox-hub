@@ -88,6 +88,97 @@ class PromptGeneratorTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_rocprof_wrapper_exports_capture_contract(self) -> None:
+        wrapper = HERE / "rocprof_server_wrapper.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "capture"
+            invocation = root / "invocation.json"
+            fake_rocprof = root / "rocprofv3"
+            fake_server = root / "dflash_server"
+            fake_rocprof.write_text(
+                """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+payload = {
+    "argv": sys.argv[1:],
+    "env": {
+        name: os.environ.get(name)
+        for name in (
+            "DFLASH_PROF",
+            "DFLASH_PROF_OUT",
+            "DFLASH_QWEN35_ROCTX",
+        )
+    },
+}
+with open(os.environ["FAKE_ROCPROF_INVOCATION"], "w", encoding="utf-8") as out:
+    json.dump(payload, out)
+""",
+                encoding="utf-8",
+            )
+            fake_server.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+            fake_rocprof.chmod(0o755)
+            fake_server.chmod(0o755)
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "PROFILED_SERVER_BIN": str(fake_server),
+                "ROCPROF_OUTPUT_DIR": str(output),
+                "ROCPROF_BIN": str(fake_rocprof),
+                "ROCPROF_START_SECONDS": "7",
+                "ROCPROF_DURATION_SECONDS": "11",
+                "FAKE_ROCPROF_INVOCATION": str(invocation),
+            }
+
+            result = subprocess.run(
+                [str(wrapper), "--model", "qwen"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(output.is_dir())
+            payload = json.loads(invocation.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["env"],
+                {
+                    "DFLASH_PROF": "concurrency",
+                    "DFLASH_PROF_OUT": str(output / "profile.jsonl"),
+                    "DFLASH_QWEN35_ROCTX": "1",
+                },
+            )
+            self.assertEqual(
+                payload["argv"],
+                [
+                    "--marker-trace",
+                    "--kernel-trace",
+                    "--memory-copy-trace",
+                    "--hip-runtime-trace",
+                    "--group-by-queue",
+                    "true",
+                    "--stats",
+                    "--summary",
+                    "--summary-output-file",
+                    str(output / "summary.txt"),
+                    "--collection-period",
+                    "7:11:1",
+                    "--output-format",
+                    "csv",
+                    "pftrace",
+                    "--output-directory",
+                    str(output),
+                    "--output-file",
+                    "trace",
+                    "--",
+                    str(fake_server),
+                    "--model",
+                    "qwen",
+                ],
+            )
+
     def test_runners_isolate_and_record_selected_gpu(self) -> None:
         for script_name in (
             "run_qwen36_concurrency.sh",

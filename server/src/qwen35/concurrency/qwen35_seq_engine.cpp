@@ -657,6 +657,19 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     for (const ArLane & lane : ar_lanes) {
         max_prefix = std::max(max_prefix, lane.position + 1);
     }
+    const Qwen35RoctxMetadata roctx_metadata{
+        profile ? profile->round_id : 0,
+        "speculative",
+        tree_width,
+        static_cast<int>(inputs.size()),
+        tree_bucket,
+        0,
+        0,
+        total_rows,
+        max_prefix,
+    };
+    const Qwen35RoctxRange roctx_step(
+        "qwen35.concurrent_step", roctx_metadata);
 
     StepGraph & graph = b_.sg_;
     bool graph_built = false;
@@ -798,6 +811,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     {
         observability::PhaseScope phase(
             profile, observability::Phase::TargetCompute);
+        const Qwen35RoctxRange roctx_compute(
+            "qwen35.graph_compute", roctx_metadata);
         target_status = ggml_backend_graph_compute(
             b_.target_backend_, graph.gf);
     }
@@ -811,6 +826,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     {
         observability::PhaseScope phase(
             profile, observability::Phase::ReadbackSync);
+        const Qwen35RoctxRange roctx_sync(
+            "qwen35.argmax_readback", roctx_metadata);
         ggml_backend_tensor_get(
             graph.argmax_tokens, posterior.data(), 0,
             sizeof(int32_t) * posterior.size());
@@ -1351,8 +1368,16 @@ SeqEngine::StepResult Qwen35SeqEngine::step(
         profile->target_forwards = 1;
     }
     const Qwen35RoctxMetadata roctx_metadata{
-        live_count, decode_bucket, n_prefill, (int)segments.size(),
-        n_total, max_kv_len};
+        profile ? profile->round_id : 0,
+        "packed",
+        tree_width_,
+        live_count,
+        decode_bucket,
+        n_prefill,
+        static_cast<int>(segments.size()),
+        n_total,
+        max_kv_len,
+    };
     const Qwen35RoctxRange roctx_step("qwen35.concurrent_step", roctx_metadata);
     const int gather_rows = with_prefill
         ? (with_decode ? n_commits + decode_bucket

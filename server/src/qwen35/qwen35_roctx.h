@@ -1,13 +1,18 @@
 #pragma once
 
+#include <cstdint>
+
 namespace dflash::common {
 
 struct Qwen35RoctxMetadata {
-    int live = -1;
-    int bucket = -1;
+    uint64_t round_id = 0;
+    const char * path = nullptr;
+    int spec_tree_width = -1;
+    int live_slots = -1;
+    int decode_bucket = -1;
     int prefill_tokens = -1;
     int prefill_segments = -1;
-    int total_rows = -1;
+    int target_rows = -1;
     int max_kv_len = -1;
 };
 

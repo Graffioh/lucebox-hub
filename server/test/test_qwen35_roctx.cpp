@@ -27,12 +27,26 @@ int main() {
 
     {
         Qwen35RoctxRange range(
-            "qwen35.graph_compute", {9, 12, 64, 2, 76, 511}, true,
+            "qwen35.graph_compute",
+            {42, "speculative", 8, 9, 12, 64, 2, 76, 511}, true,
             {push, pop});
         CHECK(events.size() == 1);
-        CHECK(events[0] == "qwen35.graph_compute live=9 bucket=12 "
-                           "prefill_tokens=64 prefill_segments=2 total_rows=76 "
+        CHECK(events[0] == "qwen35.graph_compute round_id=42 path=speculative "
+                           "spec_tree_width=8 live_slots=9 decode_bucket=12 "
+                           "prefill_tokens=64 prefill_segments=2 target_rows=76 "
                            "max_kv_len=511");
+    }
+    CHECK(events.size() == 2 && events[1] == "pop");
+
+    events.clear();
+    {
+        Qwen35RoctxRange range(
+            "qwen35.graph_compute", {0, nullptr, 8, 4, 4, 0, 0, 4, 128}, true,
+            {push, pop});
+        CHECK(events.size() == 1);
+        CHECK(events[0] == "qwen35.graph_compute spec_tree_width=8 live_slots=4 "
+                           "decode_bucket=4 prefill_tokens=0 prefill_segments=0 "
+                           "target_rows=4 max_kv_len=128");
     }
     CHECK(events.size() == 2 && events[1] == "pop");
 

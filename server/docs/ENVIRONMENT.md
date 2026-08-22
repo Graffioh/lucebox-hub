@@ -49,7 +49,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | 2 | BURN-IN: number of heterogeneous verifier schedulers retained; higher values retain substantially more scratch on both GPUs. |
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
 | `DFLASH_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
-| `DFLASH_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
+| `DFLASH_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. With `DFLASH_PROF=concurrency`, markers also carry the matching high-level round ID and packed/speculative path. See [CONCURRENCY_OBSERVABILITY.md](CONCURRENCY_OBSERVABILITY.md#drill-into-one-target-round). |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | unset | DEBUG/A-B: restore the serial indexed-attention mask scan instead of the long-context HIP parallel scan. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
 | `DFLASH_MOE_TP_*` / `DFLASH_MOE_HYBRID_PREFILL_EAGER` | unset | BURN-IN: model-neutral names for common heterogeneous-MoE scheduling and kernel policy. Existing `DFLASH_DS4_*` names remain compatibility aliases. |

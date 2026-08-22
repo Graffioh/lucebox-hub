@@ -5,6 +5,10 @@ prefill and concurrent decode. It has two user-facing runners that share the
 streaming client, deterministic prompt generation, and summary tooling:
 the paired ragged workload runner and the canonical-suite runner.
 
+To drill from a slow high-level service round into kernels, launches, copies,
+graph replay/capture, or device idle gaps, use the local rocprof workflow in
+[Concurrency observability](../../../server/docs/CONCURRENCY_OBSERVABILITY.md#drill-into-one-target-round).
+
 ## Canonical and blog workloads
 
 The synthetic ragged profiles below isolate serving mechanics. To measure how

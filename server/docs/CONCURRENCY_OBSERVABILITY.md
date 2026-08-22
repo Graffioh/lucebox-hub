@@ -102,9 +102,99 @@ Instrumentation does not add device synchronization. A target compute or
 readback span therefore reflects the synchronization behavior already present
 in that code path.
 
-Use the built-in profile to choose the next experiment. Use ROCTX and rocprof
-afterward when the question becomes kernel scheduling, memory bandwidth, or a
-specific device operation.
+`target_compute` measures the host call that submits a graph. Device work can
+continue after that scope and finish while the host is in `argmax_readback`.
+Do not treat the host span as GPU busy time. The kernel, queue, and memory-copy
+tracks in a native rocprof trace are authoritative for device timing and idle
+gaps.
+
+## Drill into one target round
+
+Use the built-in profile to find an expensive service round, then use its
+`round_id` to locate the same Qwen graph submission in a native rocprof trace.
+For example, start a local C=4 server under the repository wrapper:
+
+```bash
+PROFILED_SERVER_BIN=/absolute/path/to/dflash_server \
+ROCPROF_OUTPUT_DIR=/tmp/lucebox-c4-rocprof \
+ROCPROF_START_SECONDS=180 \
+ROCPROF_DURATION_SECONDS=60 \
+harness/benchmarks/concurrency/rocprof_server_wrapper.sh \
+  <normal server arguments, including --max-concurrency 4>
+```
+
+In another terminal, wait for the server to become healthy and run the normal
+C=4 workload during the collection window. Adjust the start delay to cover
+model loading and warmup on the target machine. The wrapper enables the
+high-level concurrency capture and Qwen ROCTX markers, and writes local
+artifacts under `ROCPROF_OUTPUT_DIR`.
+
+Build the high-level report after stopping the server normally:
+
+```bash
+python3 harness/benchmarks/concurrency/profile_report.py \
+  /tmp/lucebox-c4-rocprof/profile.jsonl \
+  --markdown /tmp/lucebox-c4-rocprof/profile.md \
+  --perfetto /tmp/lucebox-c4-rocprof/profile.perfetto.json \
+  --json-summary /tmp/lucebox-c4-rocprof/profile.summary.json
+```
+
+Choose a `round_id` whose `target_compute` phase or cohort is interesting.
+Open the generated `.pftrace` artifact at
+[ui.perfetto.dev](https://ui.perfetto.dev), then search for
+`qwen35.graph_compute round_id=<round_id>`. The marker also carries the packed
+or speculative path and the relevant live, bucket, row, prefill, and KV-length
+shape.
+
+Use the native tracks to answer the device-level question:
+
+- Raw kernel names and durations provide evidence about which operations
+  dominate. Names are backend implementation details, not a stable
+  attention/GDN/expert classification.
+- HIP runtime calls beside dispatches expose host launch overhead and launch
+  queues.
+- Kernel tracks inside and between round markers show real device busy and
+  idle gaps.
+- Memory-copy tracks show transfers on the critical path.
+- Graph launch, capture, instantiate, and update APIs distinguish replay from
+  capture for that traced round.
+
+The built-in `profile.perfetto.json` and rocprof `.pftrace` artifact remain
+separate by design. The former explains serving policy and request lifecycle;
+the latter owns the device timeline. `round_id` joins them without translating
+independent clocks or importing profiler-version-specific CSV schemas.
+
+`GGML_CUDA_GRAPH_STATS=1` is an optional aggregate cross-check. Set it before
+the wrapper, and optionally set `GGML_CUDA_GRAPH_STATS_EVERY=1` for a short
+diagnostic run. The counters are cumulative per graph key and cannot identify
+an exact round; use the HIP graph APIs in the native trace for that. Stats are
+emitted only by a graph-enabled build when the exercised path has a graph key.
+The wrapper does not force graph stats on.
+
+Kernel tracing does not measure occupancy or memory bandwidth. Counter names
+and compatible groups depend on the target GPU, so discover and validate them
+there instead of hard-coding a repository default:
+
+```bash
+rocprofv3-avail --device 0 list --pmc
+rocprofv3-avail --device 0 pmc-check <counter-name> [<counter-name> ...]
+```
+
+Run a separate pass with the validated counters and write it to a different
+local output directory:
+
+```bash
+rocprofv3 \
+  --pmc <validated-counter-names> \
+  --output-format csv \
+  --output-directory /tmp/lucebox-c4-pmc \
+  --output-file counters \
+  -- <same server command>
+```
+
+Do not combine this counter pass with the timing trace. Hardware counters and
+full tracing can each perturb execution; use these runs to diagnose a chosen
+operation, not as throughput benchmark results.
 
 ## Extend another model
 
