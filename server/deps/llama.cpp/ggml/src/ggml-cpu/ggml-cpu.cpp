@@ -478,10 +478,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             // implements the original mode and asserts if one reaches it.
             return ggml_get_op_params_i32(op, 0) == 0;
         case GGML_OP_GATED_DELTA_NET:
-            // Stateful SpecLA, raw gates and transition journals are
-            // CUDA/HIP-only extensions.
+            // The CPU kernel supports in-place and active-slot recurrence,
+            // but not tree parents, persistent intermediate storage, raw
+            // gates, transition journals, or SpecLA state.
             return ggml_get_op_params_i32(op, 2) != 1 &&
                    ggml_get_op_params_i32(op, 10) == 0 &&
+                   op->src[6] == nullptr && op->src[7] == nullptr &&
                    op->src[9] == nullptr &&
                    op->src[11] == nullptr;
         case GGML_OP_OUT_PROD:
