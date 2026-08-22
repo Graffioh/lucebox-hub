@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <limits>
 #include <mutex>
@@ -2697,6 +2698,14 @@ static bool full_cold_parallel_enabled() {
     return enabled;
 }
 
+static bool cold_input_first_enabled() {
+    static const bool enabled = []() {
+        const char * raw = std::getenv("DFLASH_MOE_COLD_INPUT_FIRST");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
 static bool eval_moe_owner_expert_major_batched(
     ggml_backend_t                  backend,
     const MoeHybridConfig &         cfg,
@@ -2717,7 +2726,8 @@ static bool eval_moe_owner_expert_major_batched(
     ggml_backend_t                  cur_backend_owner = nullptr,
     ggml_tensor *                   device_output = nullptr,
     ggml_backend_t                  device_output_owner = nullptr,
-    ggml_gallocr_t *                p_alloc = nullptr) {
+    ggml_gallocr_t *                p_alloc = nullptr,
+    const std::function<void()> &   input_ready = {}) {
     const int n_embd = cfg.n_embd;
     const int n_used = cfg.n_expert_used;
     const int n_ff = cfg.n_ff_exp;
@@ -2912,6 +2922,10 @@ static bool eval_moe_owner_expert_major_batched(
         } else {
             ggml_backend_tensor_set(inp, cur_host, 0,
                                     sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
+        }
+        if (input_ready) {
+            ggml_backend_synchronize(backend);
+            input_ready();
         }
 
         ggml_backend_tensor_set(local_ids_tensor, local_ids_vec.data(), 0,
@@ -3164,6 +3178,10 @@ static bool eval_moe_owner_expert_major_batched(
         } else {
             ggml_backend_tensor_copy(cur_backend, owner_input);
         }
+    }
+    if (input_ready) {
+        ggml_backend_synchronize(backend);
+        input_ready();
     }
     if (packed_token_ids) {
         ggml_backend_tensor_set(packed_token_ids, packed_tokens.data(), 0,
@@ -3523,19 +3541,41 @@ bool eval_moe_hybrid_ffn_batched(
         std::string hot_err;
         std::string cold_err;
         const auto cold_t0 = HybridClock::now();
+        const bool wait_for_cold_input =
+            cur_backend && cold_input_first_enabled();
+        std::promise<void> cold_input_promise;
+        std::future<void> cold_input_future;
+        bool cold_input_signaled = false;
+        std::function<void()> signal_cold_input;
+        if (wait_for_cold_input) {
+            cold_input_future = cold_input_promise.get_future();
+            signal_cold_input = [&]() {
+                if (!cold_input_signaled) {
+                    cold_input_signaled = true;
+                    cold_input_promise.set_value();
+                }
+            };
+        }
         auto cold_future = std::async(std::launch::async, [&]() {
             ScopedCudaGraphOverrides graph_scope(
                 heterogeneous_prefill_eager_enabled(
                     p_cold_alloc != nullptr));
-            return eval_moe_owner_expert_major_batched(
+            const bool ok = eval_moe_owner_expert_major_batched(
                 storage.cold_backend, cfg, desc,
                 storage.gate_cold, storage.up_cold, storage.down_cold,
                 storage.gate_up_cold, storage.cold_local_by_global,
                 cur_host, selected_ids, selected_weights, n_tokens,
                 /*include_shared=*/false, cold_partial, &cold_err,
                 cur_backend, gpu_backend, nullptr, nullptr,
-                p_cold_alloc);
+                p_cold_alloc, signal_cold_input);
+            if (signal_cold_input) {
+                signal_cold_input();
+            }
+            return ok;
         });
+        if (wait_for_cold_input) {
+            cold_input_future.wait();
+        }
         const auto hot_t0 = HybridClock::now();
         const bool hot_ok = eval_moe_owner_expert_major_batched(
             gpu_backend, cfg, desc,
