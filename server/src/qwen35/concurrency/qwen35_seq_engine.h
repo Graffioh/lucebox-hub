@@ -61,7 +61,9 @@ public:
                       const std::vector<int32_t> & prompt,
                       const SamplerCfg & sampler) override;
 
-    StepResult step(const StepPlan & plan) override;
+    StepResult step(
+        const StepPlan & plan,
+        observability::StepProfile * profile = nullptr) override;
     StepPlanLimits step_plan_limits(int decode_rows) const override {
         const bool mixed = decode_rows > 0;
         const int per_sequence = mixed ? 512 : 2048;
@@ -128,15 +130,20 @@ private:
                              std::vector<float> * logits_scratch = nullptr);
     FixedServiceRound make_fixed_service_round(
         const StepPlan & plan) const;
+    observability::SpecDecision chain_spec_decision(
+        const StepInput & input) const;
     bool chain_spec_input_capable(const StepInput & input) const;
     DraftFeatureMirror * slot_feature_mirror(int slot);
     DraftKvState * ensure_slot_draft_kv(int slot);
     bool prepare_chain_drafts(
         const std::vector<StepInput> & inputs,
-        const std::vector<uint8_t> & selected);
+        const std::vector<uint8_t> & selected,
+        observability::StepProfile * profile);
     StepResult step_chain_spec(
-        const StepPlan & plan, const std::vector<uint8_t> & selected);
+        const StepPlan & plan, const std::vector<uint8_t> & selected,
+        observability::StepProfile * profile);
 
+    PagedKvPool & pool_;
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
     int64_t         scratch_row_ = 0;

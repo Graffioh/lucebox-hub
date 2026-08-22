@@ -31,6 +31,7 @@ struct SchedSlot {
     std::unique_ptr<SseEmitter> emitter;
     bool prefilling = false;
     uint64_t admission_order = 0;
+    uint64_t request_id = 0;
     std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
     double prefill_s = 0.0;
@@ -103,6 +104,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             prefilling == published_prefill_count) return;
         published_live_count = live_slots;
         published_prefill_count = prefilling;
+        observability_.set_live_slots(static_cast<uint32_t>(live_slots));
         if (live_slots > 0) {
             status_.set_concurrent_requests(live_slots, prefilling);
         } else status_.set_idle();
@@ -309,6 +311,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             idx, s.prefill_s, decode_s,
             decode_s > 0.0 ? out_tokens / decode_s : 0.0);
 
+        if (observability_.enabled()) {
+            observability_.record_request_finished(
+                s.request_id, !s.failed && backend_ok,
+                static_cast<uint32_t>(out_tokens),
+                observability::steady_time_ns());
+        }
+
         engine.retire(idx);
         // A retirement may have released the blocks the head job needs.
         deferred_retry_at = {};
@@ -444,7 +453,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
         // Admission only claims the slot and queues the prompt. Prefill
         // advances one chunk per engine step alongside live decode.
-        auto ar = engine.admit(next_request_id, req.prompt_tokens,
+        const uint64_t request_id = next_request_id;
+        auto ar = engine.admit(request_id, req.prompt_tokens,
                                req.sampler);
         if (ar.status == SeqEngine::AdmitResult::Status::busy)
             return AdmissionDisposition::Deferred;
@@ -466,6 +476,10 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             return AdmissionDisposition::Retired;
         }
         next_request_id++;
+        job->profile_request_id = request_id;
+        if (observability_.enabled()) {
+            job->profile_admitted_ns = observability::steady_time_ns();
+        }
 
         SchedSlot & s = slots[(size_t)ar.slot];
         s = SchedSlot{};
@@ -473,6 +487,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.fd = job->fd;
         s.prefilling = true;
         s.admission_order = next_admission_order++;
+        s.request_id = request_id;
         s.started_at = started_at;
         s.decode_started_at = started_at;  // sane on prefill failure
         s.n_gen_cap = std::min(
@@ -486,6 +501,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             s.hook.hard_limit_remaining = eff_reply_for_n_gen;
         }
         live_slots++;
+        if (observability_.enabled()) {
+            observability_.record_request_admitted(
+                request_id, req.response_id,
+                static_cast<uint32_t>(req.prompt_tokens.size()),
+                job->profile_queued_ns, job->profile_admitted_ns);
+        }
         publish_live_count();
         return AdmissionDisposition::Admitted;
     };
@@ -613,27 +634,56 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // Phase 3 — Build one model-neutral batch plan: every decode row plus
         // a FIFO, engine-bounded subset of pending prompt work. The engine
         // lowers this plan into whatever graph/state representation it owns.
-        step_plan.decode.clear();
-        prefill_candidates.clear();
-        for (int i = 0; i < n_slots; i++) {
-            if (slots[(size_t)i].job && !slots[(size_t)i].prefilling) {
-                step_plan.decode.push_back(
-                    {i, slots[(size_t)i].pending_tok,
-                     slots[(size_t)i].hook.close_token_ids.empty()});
-            } else if (slots[(size_t)i].job) {
-                prefill_candidates.push_back(
-                    {i, slots[(size_t)i].admission_order});
+        observability::StepProfile * profile =
+            observability_.begin_step(static_cast<uint32_t>(live_slots));
+        {
+            observability::PhaseScope phase(
+                profile, observability::Phase::SchedulerPlan);
+            step_plan.decode.clear();
+            prefill_candidates.clear();
+            for (int i = 0; i < n_slots; i++) {
+                if (slots[(size_t)i].job && !slots[(size_t)i].prefilling) {
+                    step_plan.decode.push_back(
+                        {i, slots[(size_t)i].pending_tok,
+                         slots[(size_t)i].hook.close_token_ids.empty()});
+                } else if (slots[(size_t)i].job) {
+                    prefill_candidates.push_back(
+                        {i, slots[(size_t)i].admission_order});
+                }
+            }
+            const StepPlanLimits step_limits =
+                engine.step_plan_limits((int)step_plan.decode.size());
+            step_plan.prefills = plan_prefill_slices(
+                prefill_candidates, step_limits, prefill_round_robin_start);
+            if (!prefill_candidates.empty()) ++prefill_round_robin_start;
+        }
+        if (profile) {
+            profile->planned_decode_lanes =
+                static_cast<uint32_t>(step_plan.decode.size());
+            profile->planned_prefill_lanes =
+                static_cast<uint32_t>(step_plan.prefills.size());
+            for (const auto & input : step_plan.decode) {
+                const SchedSlot & slot = slots[(size_t)input.slot];
+                profile->add_lane({
+                    slot.request_id, input.slot,
+                    observability::LaneKind::Decode,
+                });
+            }
+            for (const auto & slice : step_plan.prefills) {
+                const SchedSlot & slot = slots[(size_t)slice.slot];
+                observability::LaneProfile lane;
+                lane.request_id = slot.request_id;
+                lane.slot = slice.slot;
+                lane.kind = observability::LaneKind::Prefill;
+                lane.requested_prefill_tokens =
+                    static_cast<uint32_t>(slice.max_tokens);
+                profile->planned_prefill_tokens +=
+                    lane.requested_prefill_tokens;
+                profile->add_lane(lane);
             }
         }
-        const StepPlanLimits step_limits =
-            engine.step_plan_limits((int)step_plan.decode.size());
-        step_plan.prefills = plan_prefill_slices(
-            prefill_candidates, step_limits, prefill_round_robin_start);
-        if (!prefill_candidates.empty()) {
-            ++prefill_round_robin_start;
-        }
 
-        SeqEngine::StepResult step_result = engine.step(step_plan);
+        SeqEngine::StepResult step_result = engine.step(step_plan, profile);
         const std::string protocol_error =
             validate_step_result(step_plan, step_result, n_slots);
         if (!protocol_error.empty()) {
@@ -644,6 +694,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
 
         if (!step_result.ok()) {
+            if (profile) profile->ok = false;
+            observability_.commit_step(profile);
             const std::string & error = step_result.error;
             std::fprintf(stderr,
                 "[parallel] engine step failed: %s — "
@@ -657,6 +709,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             }
             continue;
         }
+        {
+        observability::PhaseScope output_phase(
+            profile, observability::Phase::OutputProcessing);
         for (const auto & out : step_result.decode) {
             if (out.slot < 0 || out.slot >= n_slots) continue;
             SchedSlot & s = slots[(size_t)out.slot];
@@ -667,11 +722,32 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 s.finished = true;
                 continue;
             }
-            consume_decode_output_tokens(out, [&](int32_t token) {
-                if (s.finished) return false;
+            uint32_t consumed = 0;
+            uint32_t committed_consumed = 0;
+            for (int32_t token : out.committed_tokens) {
+                if (s.finished) break;
                 advance_slot(s, token);
-                return !s.finished;
-            });
+                ++consumed;
+                ++committed_consumed;
+            }
+            bool pending_consumed = false;
+            if (!s.finished) {
+                advance_slot(s, out.token);
+                ++consumed;
+                pending_consumed = true;
+            }
+            if (profile) {
+                if (auto * lane = profile->find_lane(
+                        out.slot, observability::LaneKind::Decode)) {
+                    lane->scheduler_consumed_tokens = consumed;
+                    lane->pending_token_consumed = pending_consumed;
+                    profile->spec_scheduler_consumed_tokens += std::min(
+                        committed_consumed, lane->durable_draft_tokens);
+                }
+                observability_.record_token_burst(
+                    s.request_id, profile->round_id,
+                    observability::steady_time_ns(), consumed);
+            }
         }
         using PrefillStatus = SeqEngine::PrefillOutput::Status;
         for (const auto & out : step_result.prefills) {
@@ -694,13 +770,28 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 s.prefill_s = std::chrono::duration<double>(
                     s.decode_started_at - s.started_at).count();
                 advance_slot(s, out.token);
+                if (profile) {
+                    const uint64_t now_ns = observability::steady_time_ns();
+                    observability_.record_prefill_completed(
+                        s.request_id, now_ns);
+                    observability_.record_token_burst(
+                        s.request_id, profile->round_id, now_ns, 1);
+                    if (auto * lane = profile->find_lane(
+                            out.slot, observability::LaneKind::Prefill)) {
+                        lane->scheduler_consumed_tokens = 1;
+                        lane->pending_token_consumed = true;
+                    }
+                }
                 continue;
             }
+        }
         }
         // Phase 4 — Non-blocking flush of every live slot's chunks. Progress
         // resets the stall clock; a reader that makes no progress for 30 s
         // or lets the buffer hit the cap is dropped (its slot retires).
         {
+            observability::PhaseScope flush_phase(
+                profile, observability::Phase::ClientFlush);
             const auto now = std::chrono::steady_clock::now();
             for (int i = 0; i < n_slots; i++) {
                 SchedSlot & s = slots[(size_t)i];
@@ -724,6 +815,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 }
             }
         }
+        observability_.commit_step(profile);
         // Phase 5 — Reap: finish the drains, then hand back the blocks of
         // every slot that ended this iteration so the next admit can use them.
         service_drains();
@@ -768,6 +860,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         send_error(queued->fd, 503, "server shutting down");
         finish_job(queued);
     }
+    observability_.flush();
 }
 
 

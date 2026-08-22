@@ -82,7 +82,9 @@ public:
         return result;
     }
 
-    StepResult step(const StepPlan & plan) override {
+    StepResult step(
+            const StepPlan & plan,
+            observability::StepProfile * = nullptr) override {
         StepResult result;
         std::string validation_error;
         if (!valid_decode(plan, validation_error) &&

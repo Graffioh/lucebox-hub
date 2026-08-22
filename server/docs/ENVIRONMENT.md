@@ -18,7 +18,12 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 |---|---|---|
 | `DFLASH_DRAFT_KV` | 1 | KILL SWITCH (remove after burn-in): =0 restores the legacy per-step drafter window recompute instead of the ring cache. |
 | `DFLASH_LAGUNA_SWA_RING` | 1 | KILL SWITCH (remove after burn-in): =0 keeps SWA layers on pool-sized caches under KVFlash. |
-| `DFLASH_PROF` | unset | DEBUG: comma list of profilers (step,verify,prefill). Replaces DFLASH_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
+| `DFLASH_PROF` | unset | DEBUG: comma list of profilers (`step`, `verify`, `prefill`, `concurrency`). Replaces DFLASH_LAGUNA_{STEP,VERIFY,PREFILL}_PROF. |
+| `DFLASH_PROF_OUT` | `concurrency-profile.jsonl` | Output path for the bounded concurrency profile when `DFLASH_PROF=concurrency`. |
+| `DFLASH_PROF_WARMUP_ROUNDS` | `0` | Concurrency rounds to omit from the offline capture. Live totals still include them. |
+| `DFLASH_PROF_MAX_ROUNDS` | `10000` | Maximum concurrency round records retained for shutdown export. |
+| `DFLASH_PROF_MAX_REQUESTS` | `4096` | Maximum request lifecycle records retained for shutdown export. |
+| `DFLASH_PROF_MAX_TOKEN_BURSTS` | `200000` | Maximum scheduler token-burst records retained for shutdown export. |
 | `GGML_CUDA_GRAPH_STATS` | unset | DEBUG: per-graph CUDA-graph replay/capture/eager counters. |
 | `GGML_CUDA_GRAPH_STATS_EVERY` | 200 | DEBUG: print period for the stats above (clamped to >=1). |
 | `DFLASH_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |

@@ -30,6 +30,7 @@
 #include "adaptive_keep_ratio.h"
 #include "server_status.h"
 #include "sse_emitter.h"
+#include "server/observability.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -536,6 +537,8 @@ private:
     // Resolve and cache path to share/status.html.
     std::string status_html_path_;
     std::string resolve_status_html();
+    std::string observability_html_path_;
+    std::string resolve_share_html(const char * filename);
 
     // Track prompt tokens for each snapshot slot (for shutdown save).
     std::unordered_map<int, std::vector<int32_t>> slot_tokens_;
@@ -568,6 +571,7 @@ private:
     std::condition_variable         queue_cv_;
     ServerJob *                     queue_head_ = nullptr;
     ServerJob *                     queue_tail_ = nullptr;
+    observability::ObservabilityState observability_;
     std::atomic<bool>               stopping_{false};
 
     // Active client thread tracking.
@@ -603,6 +607,9 @@ struct ServerJob {
     // First concurrent-scheduler attempt; retained across busy deferrals so
     // server-side prefill/elapsed telemetry does not erase queueing delay.
     std::chrono::steady_clock::time_point parallel_started_at{};
+    uint64_t      profile_request_id = 0;
+    uint64_t      profile_queued_ns = 0;
+    uint64_t      profile_admitted_ns = 0;
     std::unique_ptr<SseEmitter> emitter;
 };
 

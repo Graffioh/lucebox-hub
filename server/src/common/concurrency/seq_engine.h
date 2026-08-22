@@ -55,6 +55,7 @@
 #include <vector>
 
 #include "common/sampler.h"
+#include "common/observability/inference_profile.h"
 
 namespace dflash::common {
 
@@ -247,7 +248,9 @@ public:
     // prefill. Invalid plans return a fatal error without advancing state.
     // Runtime failures are terminal for the live cohort and may follow partial
     // backend mutation, but expose no consumable payload.
-    virtual StepResult step(const StepPlan & plan) = 0;
+    virtual StepResult step(
+        const StepPlan & plan,
+        observability::StepProfile * profile = nullptr) = 0;
 
     // Release a slot's KV blocks and mark it free. Safe on failed slots.
     virtual void retire(int slot) = 0;
