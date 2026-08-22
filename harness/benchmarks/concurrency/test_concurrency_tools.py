@@ -83,6 +83,7 @@ class PromptGeneratorTests(unittest.TestCase):
 
     def test_client_level_parser_rejects_reuse(self) -> None:
         self.assertEqual(generator.CLIENT_MATRICES["legacy"], (2, 4, 8, 16))
+        self.assertEqual(generator.CLIENT_MATRICES["lucegraph"], (1, 2, 3, 4, 5))
         self.assertEqual(generator.parse_client_levels("2,4,8,16,32"), (2, 4, 8, 16, 32))
         with self.assertRaisesRegex(ValueError, "distinct"):
             generator.parse_client_levels("2,4,2")

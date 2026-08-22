@@ -1,4 +1,5 @@
 .harness-work/
 results/
 *.json
+!benchmarks/concurrency/device_specs.json
 __pycache__/

@@ -19,10 +19,10 @@ RAGGED_PROFILES = {
 }
 
 CLIENT_MATRICES = {
-    "profile-view": (1, 2, 3, 4, 5),
+    "lucegraph": (1, 2, 3, 4, 5),
     "legacy": (2, 4, 8, 16),
 }
-DEFAULT_CLIENT_LEVELS = CLIENT_MATRICES["profile-view"]
+DEFAULT_CLIENT_LEVELS = CLIENT_MATRICES["lucegraph"]
 
 WORD_BANK = (
     "systems engineers compare latency throughput scheduling memory kernels queues "
@@ -134,7 +134,7 @@ def main() -> int:
         help="comma-separated, distinct concurrency levels for disjoint cohorts",
     )
     parser.add_argument(
-        "--matrix", choices=sorted(CLIENT_MATRICES), default="profile-view",
+        "--matrix", choices=sorted(CLIENT_MATRICES), default="lucegraph",
         help="named cohort matrix used when --clients is omitted",
     )
     parser.add_argument("--out", type=Path, required=True)

@@ -6,10 +6,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import statistics
-from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+from profile_payload import (
+    build_folded,
+    build_summary,
+    format_folded_weight,
+    step_phase_buckets,
+)
+from profile_view import build_html, load_device_specs
 
 FOLDED_DIMENSIONS = frozenset(("path", "cohort", "phase"))
 DEFAULT_FOLDED_STACK = ("path", "cohort", "phase")
@@ -39,210 +45,6 @@ def ratio(numerator: float, denominator: float) -> float:
 
 def percent(value: float) -> str:
     return "n/a" if math.isnan(value) else f"{100.0 * value:.1f}%"
-
-
-def percentile(values: Iterable[float], quantile: float) -> float:
-    ordered = sorted(values)
-    if not ordered:
-        return math.nan
-    index = (len(ordered) - 1) * quantile
-    low = math.floor(index)
-    high = math.ceil(index)
-    if low == high:
-        return ordered[low]
-    return ordered[low] * (high - index) + ordered[high] * (index - low)
-
-
-def duration_ms(end: int, start: int) -> float:
-    return (end - start) / 1_000_000 if end and start and end >= start else math.nan
-
-
-def sum_field(records: Iterable[dict[str, Any]], key: str) -> int:
-    return sum(int(record.get(key, 0)) for record in records)
-
-
-def optional_number(value: float) -> float | None:
-    return None if math.isnan(value) else value
-
-
-def percentile_pair(values: Iterable[float]) -> dict[str, float | None]:
-    finite = [value for value in values if not math.isnan(value)]
-    return {
-        "p50": optional_number(percentile(finite, 0.50)),
-        "p95": optional_number(percentile(finite, 0.95)),
-    }
-
-
-def build_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
-    metadata = next(
-        (record for record in records if record["type"] == "metadata"),
-        {},
-    )
-    footer = next(
-        (record for record in reversed(records) if record["type"] == "footer"),
-        {},
-    )
-    steps = [record for record in records if record["type"] == "step"]
-    requests = [record for record in records if record["type"] == "request"]
-    bursts = [record for record in records if record["type"] == "token_burst"]
-
-    phases: Counter[str] = Counter()
-    decisions: Counter[str] = Counter()
-    paths: Counter[str] = Counter()
-    cohorts: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    proposed_by_position: list[int] = []
-    accepted_by_position: list[int] = []
-    for step in steps:
-        live_slots = int(step.get("live_slots", 0))
-        cohorts[live_slots].append(step)
-        paths[str(step.get("path", "unknown"))] += 1
-        for span in step.get("phases", []):
-            phases[str(span.get("phase", "unknown"))] += int(
-                span.get("duration_ns", 0)
-            )
-        for lane in step.get("lanes", []):
-            if lane.get("kind") == "decode":
-                decisions[str(lane.get("spec", "none"))] += 1
-        for source, target in (
-            (step.get("proposed_by_position", []), proposed_by_position),
-            (step.get("accepted_by_position", []), accepted_by_position),
-        ):
-            if len(target) < len(source):
-                target.extend([0] * (len(source) - len(target)))
-            for index, value in enumerate(source):
-                target[index] += int(value)
-
-    queue_ms = [
-        duration_ms(int(request.get("admitted_ns", 0)),
-                    int(request.get("queued_ns", 0)))
-        for request in requests
-    ]
-    ttft_ms = [
-        duration_ms(int(request.get("first_token_ns", 0)),
-                    int(request.get("queued_ns", 0)))
-        for request in requests
-    ]
-    e2e_ms = [
-        duration_ms(int(request.get("completed_ns", 0)),
-                    int(request.get("queued_ns", 0)))
-        for request in requests
-    ]
-    burst_times: dict[int, list[tuple[int, int]]] = defaultdict(list)
-    for burst in bursts:
-        burst_times[int(burst["request_id"])].append(
-            (int(burst["ready_ns"]), int(burst.get("token_count", 0)))
-        )
-    inter_burst_ms: list[float] = []
-    for request_bursts in burst_times.values():
-        request_bursts.sort()
-        for previous, current in zip(request_bursts, request_bursts[1:]):
-            inter_burst_ms.append(
-                (current[0] - previous[0]) /
-                1_000_000 / max(1, current[1])
-            )
-
-    funnel_keys = (
-        "spec_eligible_lanes",
-        "spec_reserved_lanes",
-        "spec_attempted_lanes",
-        "spec_proposed_draft_tokens",
-        "spec_verified_draft_tokens",
-        "spec_accepted_draft_tokens",
-        "spec_durable_draft_tokens",
-        "spec_scheduler_consumed_tokens",
-    )
-    funnel = {key: sum_field(steps, key) for key in funnel_keys}
-    acceptance_by_position = [
-        optional_number(ratio(accepted, proposed))
-        for proposed, accepted in zip(
-            proposed_by_position, accepted_by_position)
-    ]
-
-    cohort_summary: dict[str, Any] = {}
-    for live_slots, cohort in sorted(cohorts.items()):
-        target_rows = sum_field(cohort, "target_rows")
-        target_padding = sum_field(cohort, "target_padding_rows")
-        draft_rows = sum_field(cohort, "draft_rows")
-        draft_padding = sum_field(cohort, "draft_padding_rows")
-        proposed = sum_field(cohort, "spec_proposed_draft_tokens")
-        accepted = sum_field(cohort, "spec_accepted_draft_tokens")
-        cohort_summary[str(live_slots)] = {
-            "rounds": len(cohort),
-            "mean_round_ms": statistics.fmean(
-                int(step.get("duration_ns", 0)) for step in cohort
-            ) / 1_000_000,
-            "target_padding_ratio": optional_number(
-                ratio(target_padding, target_rows)
-            ),
-            "draft_padding_ratio": optional_number(
-                ratio(draft_padding, draft_rows)
-            ),
-            "draft_acceptance_ratio": optional_number(
-                ratio(accepted, proposed)
-            ),
-            "paths": dict(sorted(Counter(
-                str(step.get("path", "unknown")) for step in cohort
-            ).items())),
-        }
-
-    target_rows = sum_field(steps, "target_rows")
-    target_padding = sum_field(steps, "target_padding_rows")
-    draft_rows = sum_field(steps, "draft_rows")
-    draft_padding = sum_field(steps, "draft_padding_rows")
-    return {
-        "schema": "lucebox.concurrency.summary.v1",
-        "run": {
-            key: value for key, value in metadata.items()
-            if key not in {"type", "schema"}
-        },
-        "capture": {
-            "complete": bool(footer.get("complete", False)),
-            "rounds": len(steps),
-            "requests": len(requests),
-            "failed_requests": sum(
-                int(request.get("completed_ns", 0)) != 0
-                and request.get("ok") is False
-                for request in requests
-            ),
-            "dropped_steps": int(footer.get("dropped_steps", 0)),
-            "dropped_requests": int(footer.get("dropped_requests", 0)),
-            "dropped_token_bursts": int(
-                footer.get("dropped_token_bursts", 0)
-            ),
-            "paths": dict(sorted(paths.items())),
-        },
-        "latency_ms": {
-            "queue": percentile_pair(queue_ms),
-            "ttft": percentile_pair(ttft_ms),
-            "end_to_end": percentile_pair(e2e_ms),
-            "inter_burst_per_token": percentile_pair(inter_burst_ms),
-        },
-        "speculation": {
-            **funnel,
-            "tree_widths": sorted({
-                int(step.get("spec_tree_width", 0)) for step in steps
-                if int(step.get("spec_tree_width", 0)) > 0
-            }),
-            "decisions": dict(sorted(decisions.items())),
-            "proposed_by_position": proposed_by_position,
-            "accepted_by_position": accepted_by_position,
-            "acceptance_by_position": acceptance_by_position,
-        },
-        "padding": {
-            "target_rows": target_rows,
-            "target_padding_rows": target_padding,
-            "target_padding_ratio": optional_number(
-                ratio(target_padding, target_rows)
-            ),
-            "draft_rows": draft_rows,
-            "draft_padding_rows": draft_padding,
-            "draft_padding_ratio": optional_number(
-                ratio(draft_padding, draft_rows)
-            ),
-        },
-        "cohorts": cohort_summary,
-        "phase_ns": dict(phases.most_common()),
-    }
 
 
 def build_markdown(summary: dict[str, Any]) -> str:
@@ -474,118 +276,6 @@ def parse_folded_stack(value: str) -> tuple[str, ...]:
     return dimensions
 
 
-def folded_atom(value: Any) -> str:
-    atom = str(value)
-    if not atom or ";" in atom or any(character.isspace() for character in atom):
-        raise ValueError(f"invalid folded-stack frame: {atom!r}")
-    return atom
-
-
-def step_phase_buckets(step: dict[str, Any]) -> Counter[str]:
-    duration_ns = max(0, int(step.get("duration_ns", 0)))
-    events: dict[int, Counter[str]] = defaultdict(Counter)
-    for span in step.get("phases", []):
-        phase = folded_atom(span.get("phase", "unknown"))
-        raw_start = int(span.get("start_offset_ns", 0))
-        raw_end = raw_start + max(0, int(span.get("duration_ns", 0)))
-        start = min(duration_ns, max(0, raw_start))
-        end = min(duration_ns, max(0, raw_end))
-        if end <= start:
-            continue
-        events[start][phase] += 1
-        events[end][phase] -= 1
-
-    buckets: Counter[str] = Counter()
-    active: Counter[str] = Counter()
-    previous = 0
-    for offset in sorted({0, duration_ns, *events}):
-        if offset > previous:
-            phases = sorted(
-                phase for phase, count in active.items() if count > 0
-            )
-            if not phases:
-                label = "unattributed"
-            elif len(phases) == 1:
-                label = phases[0]
-            else:
-                label = f"overlap({'+'.join(phases)})"
-            buckets[label] += offset - previous
-        active.update(events[offset])
-        previous = offset
-    return buckets
-
-
-def format_folded_weight(duration_ns: int, tokens: int | None) -> str:
-    if tokens is None or duration_ns % tokens == 0:
-        return str(duration_ns if tokens is None else duration_ns // tokens)
-    return f"{duration_ns / tokens:.6f}".rstrip("0").rstrip(".")
-
-
-def build_folded(
-    records: list[dict[str, Any]],
-    *,
-    stack: tuple[str, ...] = DEFAULT_FOLDED_STACK,
-    per_token: bool = False,
-) -> str:
-    if len(stack) != 3 or set(stack) != FOLDED_DIMENSIONS:
-        raise ValueError("stack must be a permutation of path,cohort,phase")
-
-    durations: Counter[tuple[str, int, str]] = Counter()
-    tokens: Counter[tuple[str, int]] = Counter()
-    steps = [record for record in records if record["type"] == "step"]
-    for step in steps:
-        path = folded_atom(step.get("path", "unknown"))
-        cohort = max(0, int(step.get("live_slots", 0)))
-        group = (path, cohort)
-        tokens[group] += sum(
-            max(0, int(lane.get("scheduler_consumed_tokens", 0)))
-            for lane in step.get("lanes", [])
-            if lane.get("kind") == "decode"
-        )
-        for phase, duration_ns in step_phase_buckets(step).items():
-            durations[path, cohort, phase] += duration_ns
-
-    lines: list[str] = []
-    for (path, cohort, phase), duration_ns in durations.items():
-        denominator = tokens[path, cohort] if per_token else None
-        if per_token and denominator == 0:
-            continue
-        frames = {
-            "path": path,
-            "cohort": f"C={cohort}",
-            "phase": phase,
-        }
-        folded_stack = ";".join(frames[dimension] for dimension in stack)
-        lines.append(
-            f"{folded_stack} {format_folded_weight(duration_ns, denominator)}"
-        )
-
-    if not per_token and len(steps) > 1:
-        inter_round_ns = 0
-        ordered_steps = sorted(
-            steps,
-            key=lambda step: (
-                int(step.get("started_ns", 0)),
-                int(step.get("round_id", 0)),
-            ),
-        )
-        previous_end = (
-            int(ordered_steps[0].get("started_ns", 0))
-            + max(0, int(ordered_steps[0].get("duration_ns", 0)))
-        )
-        for step in ordered_steps[1:]:
-            started_ns = int(step.get("started_ns", 0))
-            inter_round_ns += max(0, started_ns - previous_end)
-            previous_end = max(
-                previous_end,
-                started_ns + max(0, int(step.get("duration_ns", 0))),
-            )
-        if inter_round_ns:
-            lines.append(f"idle;inter_round {inter_round_ns}")
-
-    return "" if not lines else "\n".join(sorted(lines)) + "\n"
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile", type=Path)
@@ -594,11 +284,26 @@ def main() -> int:
     parser.add_argument("--json-summary", type=Path)
     parser.add_argument("--folded", type=Path)
     parser.add_argument("--folded-per-token", type=Path)
+    parser.add_argument("--html", type=Path)
+    parser.add_argument("--baseline", type=Path)
+    parser.add_argument(
+        "--device",
+        help="device_specs.json key used for analytic boundness coloring",
+    )
+    parser.add_argument(
+        "--baseline-device",
+        help="device key for the baseline capture; defaults to --device",
+    )
     parser.add_argument(
         "--stack", type=parse_folded_stack, default=DEFAULT_FOLDED_STACK,
         metavar="path,cohort,phase",
     )
     args = parser.parse_args()
+
+    if args.baseline and not args.html:
+        parser.error("--baseline requires --html")
+    if args.baseline_device and not args.baseline:
+        parser.error("--baseline-device requires --baseline")
 
     records = load_records(args.profile)
     summary = build_summary(records)
@@ -624,6 +329,17 @@ def main() -> int:
     if args.folded_per_token:
         args.folded_per_token.write_text(
             build_folded(records, stack=args.stack, per_token=True),
+            encoding="utf-8",
+        )
+    if args.html:
+        device_specs = load_device_specs()
+        if args.device:
+            device_specs["selected_device"] = args.device
+        if args.baseline_device:
+            device_specs["baseline_device"] = args.baseline_device
+        baseline_records = load_records(args.baseline) if args.baseline else None
+        args.html.write_text(
+            build_html(records, baseline_records, device_specs),
             encoding="utf-8",
         )
     return 0

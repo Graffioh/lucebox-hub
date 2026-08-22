@@ -91,6 +91,50 @@ decode tokens that the scheduler consumed for that group. The report omits a
 group when it has no durable decode tokens. Inter-round gaps have no honest
 path or cohort owner, so the per-token file omits them.
 
+### Build a LuceGraph report
+
+Write one self-contained HTML file that opens from `file://`.
+
+```bash
+python3 harness/benchmarks/concurrency/profile_report.py \
+  /tmp/lucebox-profile.jsonl \
+  --html /tmp/lucegraph.html \
+  --device gfx1201
+```
+
+The LuceGraph report contains three linked views. The phase-budget wall
+compares
+concurrency cohorts with per-token, per-round, and wall-share normalization.
+The request waterfall separates queue, prefill, first-decode, and decode time.
+The speculation strip shows the funnel and acceptance by draft position.
+
+The wall uses the exclusive buckets from `step_phase_buckets`. It includes
+unattributed time, overlapping spans, and inter-round host gaps. Select a wall
+segment to inspect its zero-inclusive per-round p50 and p95 values. The report
+embeds aggregates instead of raw step records.
+
+A capture with several observed `live_slots` values shows a mixed-run badge.
+Admission and tail drain can create these cohorts even when the configured
+concurrency is fixed. Use separate fixed-C captures for cohort comparisons
+that exclude this bias.
+
+Pass `--baseline` to compare two captures.
+
+```bash
+python3 harness/benchmarks/concurrency/profile_report.py \
+  current.jsonl --html lucegraph-diff.html --device gfx1201 \
+  --baseline baseline.jsonl --baseline-device gfx1151
+```
+
+`device_specs.json` is the source of device and model facts. The capture's
+`arch` field names the model adapter, not the GPU architecture, so the
+report never infers a device from capture metadata. Omit `--device` or pass
+an unknown key to render neutral segments with a visible notice.
+
+The analytic roofline classifier applies only to `target_compute` and
+`draft_compute`. Segment details show arithmetic intensity, machine
+balance, and headroom. Recheck any fact whose note starts with `VERIFY`.
+
 The v1 capture does not contain model FLOP counts, weight bytes, or device
 machine balance. Folded stacks also have no portable color metadata. Use a
 separate device profile for compute-bound or bandwidth-bound classification.

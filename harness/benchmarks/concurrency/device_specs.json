@@ -1,0 +1,35 @@
+{
+  "devices": {
+    "gfx1151": {
+      "name": "Strix Halo",
+      "mem_bw_gbps": 256,
+      "fp16_tflops": 60,
+      "note": "Published peak FP16 vector throughput and shared-memory bandwidth. Bandwidth is shared with the CPU.",
+      "source_urls": [
+        "https://www.amd.com/en/products/processors/desktops/ryzen/ryzen-ai-halo/ryzen-ai-max-plus-395.html",
+        "https://ir.amd.com/news-events/press-releases/detail/1270/amd-expands-ai-leadership-across-client-graphics-and-software-with-new-ryzen-ryzen-ai-and-amd-rocm-announcements-at-ces-2026"
+      ]
+    },
+    "gfx1201": {
+      "name": "R9700",
+      "mem_bw_gbps": 640,
+      "fp16_tflops": 95.7,
+      "note": "Published peak FP16 vector throughput and memory bandwidth.",
+      "source_urls": [
+        "https://www.amd.com/content/dam/amd/en/documents/partner-hub/radeon-pro/radeon-ai-pro-r9700-datasheet.pdf"
+      ]
+    }
+  },
+  "models": {
+    "Qwen3.6-27B-Q4_K_M.gguf": {
+      "weight_bytes": 16800000000,
+      "active_params": 27000000000,
+      "kv_bytes_per_token_per_seq": 18432,
+      "note": "VERIFY weight_bytes against the deployed GGUF file. KV bytes are derived from the Q4_0 cache layout and must be rechecked if the cache type changes.",
+      "source_urls": [
+        "https://huggingface.co/Qwen/Qwen3.6-27B/blob/main/README.md",
+        "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/blob/main/Qwen3.6-27B-Q4_K_M.gguf"
+      ]
+    }
+  }
+}

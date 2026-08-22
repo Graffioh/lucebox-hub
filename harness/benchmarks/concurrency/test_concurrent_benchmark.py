@@ -28,7 +28,7 @@ class BenchmarkTests(unittest.TestCase):
             ['{"choices":[{"delta":{"content":"hi"}}]}', "[DONE]"],
         )
 
-    def test_default_matrix_matches_profile_view_range(self) -> None:
+    def test_default_matrix_matches_lucegraph_range(self) -> None:
         self.assertEqual(benchmark.DEFAULT_CLIENT_LEVELS, (1, 2, 3, 4, 5))
 
     def test_run_rejects_duplicate_client_levels(self) -> None:
