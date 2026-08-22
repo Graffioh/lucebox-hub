@@ -26,7 +26,8 @@ class ProfileReportTest(unittest.TestCase):
                 "spec_accepted_draft_tokens": 8,
                 "spec_durable_draft_tokens": 8,
                 "spec_scheduler_consumed_tokens": 7,
-                "lanes": [{"kind": "decode", "spec": "selected"}],
+                "lanes": [{"kind": "decode", "spec": "selected",
+                           "scheduler_consumed_tokens": 2}],
                 "phases": [{"phase": "target_compute",
                             "start_offset_ns": 100, "duration_ns": 1000}],
             },
@@ -98,6 +99,79 @@ class ProfileReportTest(unittest.TestCase):
 
         self.assertEqual(summary["capture"]["requests"], 2)
         self.assertEqual(summary["capture"]["failed_requests"], 0)
+
+    def test_folded_views_merge_frames_and_normalize_by_group(self):
+        records = self.records()
+        records.insert(2, {
+            "type": "step", "round_id": 2, "started_ns": 4_000_000,
+            "duration_ns": 1_000, "path": "speculative",
+            "live_slots": 4,
+            "lanes": [{"kind": "decode", "scheduler_consumed_tokens": 3}],
+            "phases": [{"phase": "target_compute",
+                        "start_offset_ns": 0, "duration_ns": 1_000}],
+        })
+
+        wall = profile_report.build_folded(records)
+        per_token = profile_report.build_folded(records, per_token=True)
+
+        self.assertIn("speculative;C=4;target_compute 2000\n", wall)
+        self.assertIn("speculative;C=4;unattributed 1999000\n", wall)
+        self.assertIn("idle;inter_round 1000000\n", wall)
+        self.assertEqual(
+            per_token,
+            "speculative;C=4;target_compute 400\n"
+            "speculative;C=4;unattributed 399800\n",
+        )
+
+    def test_folded_coverage_partitions_overlap(self):
+        step = {
+            "type": "step", "duration_ns": 100, "path": "packed",
+            "live_slots": 2,
+            "phases": [
+                {"phase": "a", "start_offset_ns": 10, "duration_ns": 50},
+                {"phase": "b", "start_offset_ns": 40, "duration_ns": 40},
+            ],
+        }
+
+        buckets = profile_report.step_phase_buckets(step)
+
+        self.assertEqual(buckets, {
+            "unattributed": 30,
+            "a": 30,
+            "overlap(a+b)": 20,
+            "b": 20,
+        })
+        self.assertEqual(sum(buckets.values()), step["duration_ns"])
+
+        step["phases"] = [
+            {"phase": "a", "start_offset_ns": -10, "duration_ns": 60},
+            {"phase": "a", "start_offset_ns": 40, "duration_ns": 80},
+        ]
+        self.assertEqual(
+            profile_report.step_phase_buckets(step), {"a": 100}
+        )
+
+    def test_folded_stack_order_is_validated(self):
+        stack = profile_report.parse_folded_stack("cohort,path,phase")
+        folded = profile_report.build_folded(self.records(), stack=stack)
+        self.assertIn("C=4;speculative;target_compute 1000\n", folded)
+
+        with self.assertRaisesRegex(ValueError, "permutation"):
+            profile_report.build_folded(
+                self.records(), stack=("path", "path", "phase")
+            )
+        with self.assertRaisesRegex(Exception, "permutation"):
+            profile_report.parse_folded_stack("path,cohort,kind")
+
+    def test_folded_per_token_omits_groups_without_decode_tokens(self):
+        records = self.records()
+        records[1]["lanes"] = [
+            {"kind": "prefill", "scheduler_consumed_tokens": 1}
+        ]
+
+        self.assertEqual(
+            profile_report.build_folded(records, per_token=True), ""
+        )
 
 
 if __name__ == "__main__":

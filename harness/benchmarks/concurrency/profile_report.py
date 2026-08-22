@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize a Lucebox concurrency profile and emit a Perfetto trace."""
+"""Build reports from a Lucebox concurrency profile."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
+
+FOLDED_DIMENSIONS = frozenset(("path", "cohort", "phase"))
+DEFAULT_FOLDED_STACK = ("path", "cohort", "phase")
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
@@ -462,12 +465,139 @@ def build_perfetto(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {"displayTimeUnit": "ms", "traceEvents": events}
 
 
+def parse_folded_stack(value: str) -> tuple[str, ...]:
+    dimensions = tuple(value.split(","))
+    if len(dimensions) != 3 or set(dimensions) != FOLDED_DIMENSIONS:
+        raise argparse.ArgumentTypeError(
+            "stack must be a permutation of path,cohort,phase"
+        )
+    return dimensions
+
+
+def folded_atom(value: Any) -> str:
+    atom = str(value)
+    if not atom or ";" in atom or any(character.isspace() for character in atom):
+        raise ValueError(f"invalid folded-stack frame: {atom!r}")
+    return atom
+
+
+def step_phase_buckets(step: dict[str, Any]) -> Counter[str]:
+    duration_ns = max(0, int(step.get("duration_ns", 0)))
+    events: dict[int, Counter[str]] = defaultdict(Counter)
+    for span in step.get("phases", []):
+        phase = folded_atom(span.get("phase", "unknown"))
+        raw_start = int(span.get("start_offset_ns", 0))
+        raw_end = raw_start + max(0, int(span.get("duration_ns", 0)))
+        start = min(duration_ns, max(0, raw_start))
+        end = min(duration_ns, max(0, raw_end))
+        if end <= start:
+            continue
+        events[start][phase] += 1
+        events[end][phase] -= 1
+
+    buckets: Counter[str] = Counter()
+    active: Counter[str] = Counter()
+    previous = 0
+    for offset in sorted({0, duration_ns, *events}):
+        if offset > previous:
+            phases = sorted(
+                phase for phase, count in active.items() if count > 0
+            )
+            if not phases:
+                label = "unattributed"
+            elif len(phases) == 1:
+                label = phases[0]
+            else:
+                label = f"overlap({'+'.join(phases)})"
+            buckets[label] += offset - previous
+        active.update(events[offset])
+        previous = offset
+    return buckets
+
+
+def format_folded_weight(duration_ns: int, tokens: int | None) -> str:
+    if tokens is None or duration_ns % tokens == 0:
+        return str(duration_ns if tokens is None else duration_ns // tokens)
+    return f"{duration_ns / tokens:.6f}".rstrip("0").rstrip(".")
+
+
+def build_folded(
+    records: list[dict[str, Any]],
+    *,
+    stack: tuple[str, ...] = DEFAULT_FOLDED_STACK,
+    per_token: bool = False,
+) -> str:
+    if len(stack) != 3 or set(stack) != FOLDED_DIMENSIONS:
+        raise ValueError("stack must be a permutation of path,cohort,phase")
+
+    durations: Counter[tuple[str, int, str]] = Counter()
+    tokens: Counter[tuple[str, int]] = Counter()
+    steps = [record for record in records if record["type"] == "step"]
+    for step in steps:
+        path = folded_atom(step.get("path", "unknown"))
+        cohort = max(0, int(step.get("live_slots", 0)))
+        group = (path, cohort)
+        tokens[group] += sum(
+            max(0, int(lane.get("scheduler_consumed_tokens", 0)))
+            for lane in step.get("lanes", [])
+            if lane.get("kind") == "decode"
+        )
+        for phase, duration_ns in step_phase_buckets(step).items():
+            durations[path, cohort, phase] += duration_ns
+
+    lines: list[str] = []
+    for (path, cohort, phase), duration_ns in durations.items():
+        denominator = tokens[path, cohort] if per_token else None
+        if per_token and denominator == 0:
+            continue
+        frames = {
+            "path": path,
+            "cohort": f"C={cohort}",
+            "phase": phase,
+        }
+        folded_stack = ";".join(frames[dimension] for dimension in stack)
+        lines.append(
+            f"{folded_stack} {format_folded_weight(duration_ns, denominator)}"
+        )
+
+    if not per_token and len(steps) > 1:
+        inter_round_ns = 0
+        ordered_steps = sorted(
+            steps,
+            key=lambda step: (
+                int(step.get("started_ns", 0)),
+                int(step.get("round_id", 0)),
+            ),
+        )
+        previous_end = (
+            int(ordered_steps[0].get("started_ns", 0))
+            + max(0, int(ordered_steps[0].get("duration_ns", 0)))
+        )
+        for step in ordered_steps[1:]:
+            started_ns = int(step.get("started_ns", 0))
+            inter_round_ns += max(0, started_ns - previous_end)
+            previous_end = max(
+                previous_end,
+                started_ns + max(0, int(step.get("duration_ns", 0))),
+            )
+        if inter_round_ns:
+            lines.append(f"idle;inter_round {inter_round_ns}")
+
+    return "" if not lines else "\n".join(sorted(lines)) + "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile", type=Path)
     parser.add_argument("--markdown", type=Path)
     parser.add_argument("--perfetto", type=Path)
     parser.add_argument("--json-summary", type=Path)
+    parser.add_argument("--folded", type=Path)
+    parser.add_argument("--folded-per-token", type=Path)
+    parser.add_argument(
+        "--stack", type=parse_folded_stack, default=DEFAULT_FOLDED_STACK,
+        metavar="path,cohort,phase",
+    )
     args = parser.parse_args()
 
     records = load_records(args.profile)
@@ -485,6 +615,15 @@ def main() -> int:
     if args.json_summary:
         args.json_summary.write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    if args.folded:
+        args.folded.write_text(
+            build_folded(records, stack=args.stack), encoding="utf-8"
+        )
+    if args.folded_per_token:
+        args.folded_per_token.write_text(
+            build_folded(records, stack=args.stack, per_token=True),
             encoding="utf-8",
         )
     return 0

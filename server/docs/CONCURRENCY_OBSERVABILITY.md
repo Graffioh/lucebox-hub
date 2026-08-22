@@ -65,7 +65,9 @@ python3 harness/benchmarks/concurrency/profile_report.py \
   /tmp/lucebox-profile.jsonl \
   --markdown /tmp/lucebox-profile.md \
   --perfetto /tmp/lucebox-profile.perfetto.json \
-  --json-summary /tmp/lucebox-profile.summary.json
+  --json-summary /tmp/lucebox-profile.summary.json \
+  --folded /tmp/lucebox-profile.folded \
+  --folded-per-token /tmp/lucebox-profile.per-token.folded
 ```
 
 Open the Perfetto JSON at [ui.perfetto.dev](https://ui.perfetto.dev). It shows
@@ -73,6 +75,25 @@ round phase spans, request queue/prefill/decode spans, and token-ready bursts.
 The JSON summary has a versioned schema for benchmark diffs. It includes run
 context, latency percentiles, phase totals, padding ratios, concurrency
 cohorts, suppression decisions, and acceptance by speculative position.
+
+The folded files use `path;C=<live slots>;phase` stacks. Identical stacks
+merge across rounds. Pass `--stack cohort,path,phase` to put the concurrency
+cohort first. The flag accepts any permutation of `path`, `cohort`, and
+`phase`.
+
+`--folded` writes host wall nanoseconds. The `unattributed` phase covers time
+inside a round that has no phase span. The `idle;inter_round` stack covers
+positive host-clock gaps between retained rounds. Neither value proves that
+the device was idle.
+
+`--folded-per-token` divides each path and cohort's phase totals by the durable
+decode tokens that the scheduler consumed for that group. The report omits a
+group when it has no durable decode tokens. Inter-round gaps have no honest
+path or cohort owner, so the per-token file omits them.
+
+The v1 capture does not contain model FLOP counts, weight bytes, or device
+machine balance. Folded stacks also have no portable color metadata. Use a
+separate device profile for compute-bound or bandwidth-bound classification.
 
 ## Read the speculation funnel
 
