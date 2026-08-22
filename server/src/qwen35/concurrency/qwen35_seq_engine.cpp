@@ -164,7 +164,7 @@ observability::SpecDecision Qwen35SeqEngine::chain_spec_decision(
     }
     if (!input.allow_speculation) return Decision::CallerDisallowed;
     if (input.slot < 0 || input.slot >= slots_.slot_count()) {
-        return Decision::InsufficientContext;
+        return Decision::InvalidSlot;
     }
     const Qwen35Slot & slot = slots_.slot(input.slot);
     if (!slot.decoding() || slot.cur_pos < 1 ||
@@ -1099,10 +1099,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step(
         profile->kv_blocks_free_before = pool_.free_block_count();
         profile->kv_blocks_free_after = profile->kv_blocks_free_before;
         profile->active_sequences = pool_.active_sequence_count();
-        profile->planned_decode_lanes =
-            static_cast<uint32_t>(plan.decode.size());
-        profile->planned_prefill_lanes =
-            static_cast<uint32_t>(plan.prefills.size());
+        profile->spec_tree_width = static_cast<uint32_t>(
+            std::max(0, tree_width_));
     }
 
     auto fail_step = [&](const std::string & error) {
@@ -1153,11 +1151,6 @@ SeqEngine::StepResult Qwen35SeqEngine::step(
     if (inputs.empty() && plan.prefills.empty()) return result;
 
     if (profile) {
-        profile->planned_prefill_tokens = 0;
-        for (const PrefillSlice & slice : plan.prefills) {
-            profile->planned_prefill_tokens +=
-                static_cast<uint32_t>(slice.max_tokens);
-        }
         for (const StepInput & input : inputs) {
             const auto decision = chain_spec_decision(input);
             auto * lane = profile->find_lane(

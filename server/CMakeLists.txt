@@ -2028,6 +2028,30 @@ if(DFLASH27B_SERVER)
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
         )
+        execute_process(
+            COMMAND git rev-parse --verify HEAD
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+            RESULT_VARIABLE _dflash_git_result
+            OUTPUT_VARIABLE _dflash_git_sha
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(NOT _dflash_git_result EQUAL 0 OR NOT _dflash_git_sha)
+            set(_dflash_git_sha "unknown")
+        else()
+            execute_process(
+                COMMAND git diff --quiet --ignore-submodules --
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+                RESULT_VARIABLE _dflash_git_dirty
+                ERROR_QUIET)
+            if(_dflash_git_dirty EQUAL 1)
+                string(APPEND _dflash_git_sha "-dirty")
+            endif()
+        endif()
+        target_compile_definitions(dflash_server PRIVATE
+            DFLASH_GIT_SHA="${_dflash_git_sha}")
+        unset(_dflash_git_result)
+        unset(_dflash_git_dirty)
+        unset(_dflash_git_sha)
         target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)

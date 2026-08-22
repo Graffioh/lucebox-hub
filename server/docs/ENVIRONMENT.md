@@ -24,6 +24,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_PROF_MAX_ROUNDS` | `10000` | Maximum concurrency round records retained for shutdown export. |
 | `DFLASH_PROF_MAX_REQUESTS` | `4096` | Maximum request lifecycle records retained for shutdown export. |
 | `DFLASH_PROF_MAX_TOKEN_BURSTS` | `200000` | Maximum scheduler token-burst records retained for shutdown export. |
+| `DFLASH_PROF_CHECKPOINT_EVERY` | `0` | Write an atomic in-progress JSONL snapshot after this many service rounds. `0` writes only on clean shutdown. |
 | `GGML_CUDA_GRAPH_STATS` | unset | DEBUG: per-graph CUDA-graph replay/capture/eager counters. |
 | `GGML_CUDA_GRAPH_STATS_EVERY` | 200 | DEBUG: print period for the stats above (clamped to >=1). |
 | `DFLASH_ADAPTIVE_K_TAU` | 0 = off | Prefer the CLI: --adaptive-experts [tau]. Cumulative combine-weight threshold for per-token expert gating. |

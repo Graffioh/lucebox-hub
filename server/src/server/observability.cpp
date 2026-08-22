@@ -3,7 +3,9 @@
 #include "common/prof_env.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -26,6 +28,16 @@ uint64_t env_u64(const char * name, uint64_t fallback) {
 size_t bounded_size_env(const char * name, size_t fallback) {
     return static_cast<size_t>(std::min<uint64_t>(
         env_u64(name, fallback), std::numeric_limits<size_t>::max()));
+}
+
+void capture_env(
+        ObservabilityConfig & config,
+        std::initializer_list<const char *> names) {
+    for (const char * name : names) {
+        if (const char * value = std::getenv(name)) {
+            config.run_env.emplace_back(name, value);
+        }
+    }
 }
 
 std::string json_escape(std::string_view value) {
@@ -99,6 +111,7 @@ void write_step_json(std::ostream & out, const StepProfile & step) {
         << ",\"draft_padding_rows\":" << step.draft_padding_rows
         << ",\"decode_bucket\":" << step.decode_bucket
         << ",\"draft_bucket\":" << step.draft_bucket
+        << ",\"spec_tree_width\":" << step.spec_tree_width
         << ",\"max_kv_len\":" << step.max_kv_len
         << ",\"kv_blocks_total\":" << step.kv_blocks_total
         << ",\"kv_blocks_free_before\":" << step.kv_blocks_free_before
@@ -164,6 +177,18 @@ ObservabilityConfig ObservabilityConfig::from_env() {
     config.max_requests = bounded_size_env("DFLASH_PROF_MAX_REQUESTS", 4096);
     config.max_token_bursts = bounded_size_env(
         "DFLASH_PROF_MAX_TOKEN_BURSTS", 200000);
+    config.checkpoint_every_rounds = env_u64(
+        "DFLASH_PROF_CHECKPOINT_EVERY", 0);
+    capture_env(config, {
+        "DFLASH_QWEN35_DFLASH2_TREE",
+        "DFLASH_QWEN35_DSPARK_TREE",
+        "DFLASH_QWEN35_SPEC_STEP_RATIO",
+        "DFLASH_DRAFT_KV",
+        "DFLASH_DISABLE_DRAFT_SWA",
+        "DFLASH_QWEN35_NO_KVPAD",
+        "DFLASH27B_PREFILL_UBATCH",
+        "DFLASH_KVFLASH",
+    });
     return config;
 }
 
@@ -171,6 +196,10 @@ ObservabilityState::ObservabilityState(ObservabilityConfig config)
     : config_(std::move(config)) {
     live_.enabled = config_.enabled;
     if (!config_.enabled) return;
+    started_unix_ns_ = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    started_steady_ns_ = steady_time_ns();
     steps_.reserve(config_.max_rounds);
     requests_.reserve(config_.max_requests);
     token_bursts_.reserve(config_.max_token_bursts);
@@ -277,6 +306,12 @@ void ObservabilityState::commit_step(StepProfile * profile) {
     } else {
         std::lock_guard<std::mutex> lock(live_mu_);
         ++live_.dropped_steps;
+    }
+    if (config_.checkpoint_every_rounds != 0 &&
+        profile->round_id - last_checkpoint_round_ >=
+            config_.checkpoint_every_rounds &&
+        write_capture(false)) {
+        last_checkpoint_round_ = profile->round_id;
     }
 }
 
@@ -396,16 +431,41 @@ std::string ObservabilityState::snapshot_json() const {
     return out.str();
 }
 
-void ObservabilityState::flush() {
-    if (!config_.enabled || config_.output_path.empty() || flushed_) return;
-    flushed_ = true;
-    std::ofstream out(config_.output_path);
+bool ObservabilityState::write_capture(bool complete) {
+    if (!config_.enabled || config_.output_path.empty()) return false;
+    const std::string temporary_path = config_.output_path + ".tmp";
+    std::ofstream out(temporary_path);
     if (!out) {
         std::cerr << "[observability] failed to write "
-                  << config_.output_path << '\n';
-        return;
+                  << temporary_path << '\n';
+        return false;
     }
-    out << "{\"type\":\"metadata\",\"schema\":\"lucebox.concurrency.v1\"}\n";
+    out << "{\"type\":\"metadata\",\"schema\":\"lucebox.concurrency.v1\""
+        << ",\"schema_version\":" << kProfileSchemaVersion
+        << ",\"git_sha\":\"" << json_escape(config_.git_sha) << "\""
+        << ",\"model_name\":\"" << json_escape(config_.model_name) << "\""
+        << ",\"model_path\":\"" << json_escape(config_.model_path) << "\""
+        << ",\"draft_path\":\"" << json_escape(config_.draft_path) << "\""
+        << ",\"arch\":\"" << json_escape(config_.arch) << "\""
+        << ",\"runtime_backend\":\""
+        << json_escape(config_.runtime_backend) << "\""
+        << ",\"max_concurrency\":" << config_.max_concurrency
+        << ",\"ddtree_budget\":" << config_.ddtree_budget
+        << ",\"draft_block_size\":" << config_.draft_block_size
+        << ",\"started_unix_ns\":" << started_unix_ns_
+        << ",\"started_steady_ns\":" << started_steady_ns_
+        << ",\"round_retention\":\"keep_first\""
+        << ",\"max_rounds\":" << config_.max_rounds
+        << ",\"step_record_bytes\":" << sizeof(StepProfile)
+        << ",\"checkpoint_every_rounds\":"
+        << config_.checkpoint_every_rounds
+        << ",\"env\":{";
+    for (size_t i = 0; i < config_.run_env.size(); ++i) {
+        if (i) out << ',';
+        out << '\"' << json_escape(config_.run_env[i].first) << "\":\""
+            << json_escape(config_.run_env[i].second) << '\"';
+    }
+    out << "}}\n";
     for (const StepProfile & step : steps_) write_step_json(out, step);
     for (const RequestRecord & request : requests_) {
         out << "{\"type\":\"request\",\"request_id\":"
@@ -431,7 +491,41 @@ void ObservabilityState::flush() {
     out << "{\"type\":\"footer\",\"dropped_steps\":"
         << s.dropped_steps << ",\"dropped_requests\":"
         << s.dropped_requests << ",\"dropped_token_bursts\":"
-        << s.dropped_token_bursts << "}\n";
+        << s.dropped_token_bursts << ",\"complete\":"
+        << (complete ? "true" : "false") << "}\n";
+    out.close();
+    if (!out) {
+        std::cerr << "[observability] failed to finish "
+                  << temporary_path << '\n';
+        std::error_code ignored;
+        std::filesystem::remove(temporary_path, ignored);
+        return false;
+    }
+
+    std::error_code error;
+    std::filesystem::rename(
+        temporary_path, config_.output_path, error);
+#if defined(_WIN32)
+    if (error) {
+        std::filesystem::remove(config_.output_path, error);
+        error.clear();
+        std::filesystem::rename(
+            temporary_path, config_.output_path, error);
+    }
+#endif
+    if (error) {
+        std::cerr << "[observability] failed to publish "
+                  << config_.output_path << ": " << error.message() << '\n';
+        std::error_code ignored;
+        std::filesystem::remove(temporary_path, ignored);
+        return false;
+    }
+    return true;
+}
+
+void ObservabilityState::flush() {
+    if (!config_.enabled || config_.output_path.empty() || flushed_) return;
+    if (write_capture(true)) flushed_ = true;
 }
 
 }

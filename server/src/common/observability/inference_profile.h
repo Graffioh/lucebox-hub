@@ -25,6 +25,7 @@ enum class LaneKind : uint8_t {
 enum class SpecDecision : uint8_t {
     None,
     Selected,
+    InvalidSlot,
     PromptWorkPresent,
     CallerDisallowed,
     FeatureUnavailable,
@@ -109,6 +110,7 @@ struct StepProfile {
     uint32_t draft_padding_rows = 0;
     uint32_t decode_bucket = 0;
     uint32_t draft_bucket = 0;
+    uint32_t spec_tree_width = 0;
     uint32_t max_kv_len = 0;
     uint32_t kv_blocks_total = 0;
     uint32_t kv_blocks_free_before = 0;

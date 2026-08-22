@@ -33,6 +33,17 @@ int main() {
     config.max_rounds = 1;
     config.max_requests = 1;
     config.max_token_bursts = 1;
+    config.checkpoint_every_rounds = 1;
+    config.git_sha = "0123456789abcdef";
+    config.model_name = "qwen38";
+    config.model_path = "/models/target.gguf";
+    config.draft_path = "/models/draft.gguf";
+    config.arch = "qwen35";
+    config.runtime_backend = "hip";
+    config.max_concurrency = 4;
+    config.ddtree_budget = 8;
+    config.draft_block_size = 8;
+    config.run_env.emplace_back("DFLASH_DRAFT_KV", "1");
     ObservabilityState state(config);
 
     const uint64_t queued_ns = state.job_queued();
@@ -66,6 +77,19 @@ int main() {
     state.record_token_burst(7, step->round_id, queued_ns + 30, 3);
     state.record_request_finished(7, true, 3, queued_ns + 40);
     state.commit_step(step);
+    {
+        std::ifstream checkpoint_input(output);
+        const std::string checkpoint{
+            std::istreambuf_iterator<char>(checkpoint_input),
+            std::istreambuf_iterator<char>()};
+        CHECK(checkpoint.find("\"complete\":false") != std::string::npos);
+        CHECK(checkpoint.find("\"git_sha\":\"0123456789abcdef\"") !=
+              std::string::npos);
+        CHECK(checkpoint.find("\"max_concurrency\":4") !=
+              std::string::npos);
+        CHECK(checkpoint.find("\"DFLASH_DRAFT_KV\":\"1\"") !=
+              std::string::npos);
+    }
 
     StepProfile * dropped = state.begin_step(4);
     dropped->kv_blocks_total = 100;
@@ -82,11 +106,12 @@ int main() {
     const std::string jsonl{
         std::istreambuf_iterator<char>(input),
         std::istreambuf_iterator<char>()};
-    CHECK(jsonl.find("lucebox.concurrency.v1\"}\n{\"type\":\"step\"") !=
+    CHECK(jsonl.find("lucebox.concurrency.v1") !=
           std::string::npos);
     CHECK(jsonl.find("\"type\":\"request\"") != std::string::npos);
     CHECK(jsonl.find("\"type\":\"token_burst\"") != std::string::npos);
     CHECK(jsonl.find("\"dropped_steps\":1") != std::string::npos);
+    CHECK(jsonl.find("\"complete\":true") != std::string::npos);
     std::filesystem::remove(output);
 
     std::printf("test_observability: passed\n");

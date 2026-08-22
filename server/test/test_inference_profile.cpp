@@ -67,6 +67,8 @@ int main() {
     CHECK(std::string_view(spec_decision_name(
               SpecDecision::PromptWorkPresent)) ==
           "prompt_work_present");
+    CHECK(std::string_view(spec_decision_name(SpecDecision::InvalidSlot)) ==
+          "invalid_slot");
     CHECK(std::string_view(phase_name(Phase::ClientFlush)) ==
           "client_flush");
 

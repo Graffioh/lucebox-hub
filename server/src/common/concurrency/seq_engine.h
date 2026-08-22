@@ -250,7 +250,7 @@ public:
     // backend mutation, but expose no consumable payload.
     virtual StepResult step(
         const StepPlan & plan,
-        observability::StepProfile * profile = nullptr) = 0;
+        observability::StepProfile * profile) = 0;
 
     // Release a slot's KV blocks and mark it free. Safe on failed slots.
     virtual void retire(int slot) = 0;
@@ -258,16 +258,6 @@ public:
     // EOS check for scheduler-side stop decisions.
     virtual bool token_is_eos(int32_t token) const = 0;
 };
-
-template <typename Advance>
-inline bool consume_decode_output_tokens(
-        const SeqEngine::DecodeOutput & output, Advance advance) {
-    if (output.failed) return false;
-    for (int32_t token : output.committed_tokens) {
-        if (!advance(token)) return false;
-    }
-    return advance(output.token);
-}
 
 // Validate the model-neutral step protocol before the scheduler consumes any
 // output. Malformed row ownership is fatal because re-feeding a token after an

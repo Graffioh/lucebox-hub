@@ -19,6 +19,28 @@ Stop the server normally to write the JSONL file. Capture is bounded by the
 [ENVIRONMENT.md](ENVIRONMENT.md). The footer reports dropped records when a
 bound is reached.
 
+Set `DFLASH_PROF_CHECKPOINT_EVERY` to preserve an in-progress capture if the
+server later crashes or hangs. Each checkpoint replaces the prior JSONL file
+atomically and ends with `"complete": false`. Clean shutdown replaces it with
+the final capture and `"complete": true`. Checkpoint writing runs on the
+scheduler thread, so leave it disabled for overhead measurements. A signal
+handler does not attempt to flush C++ streams because that is not
+async-signal-safe.
+
+The metadata record includes the configured Git SHA, model and draft paths,
+architecture, backend, maximum concurrency, DDTree budget, draft block-size
+override, selected Qwen concurrency environment values, and both wall-clock
+and steady-clock anchors. The anchors correlate service-round timestamps with
+benchmark logs and external traces. Each Qwen step also records the effective
+speculative tree width resolved from the drafter.
+
+Round retention is keep-first. Once `DFLASH_PROF_MAX_ROUNDS` is reached, later
+rounds increment `dropped_steps`. The metadata record reports the retention
+policy, `max_rounds`, and `step_record_bytes`, so the reserved memory and any
+early-run bias are visible in every capture. Raise the limit for long benchmark
+runs. Periodic checkpoints protect in-progress data but do not change the
+retention policy.
+
 ## Inspect a live server
 
 The server exposes two read-only routes:
@@ -42,11 +64,15 @@ Generate a Markdown summary and a Perfetto trace from the same JSONL capture.
 python3 harness/benchmarks/concurrency/profile_report.py \
   /tmp/lucebox-profile.jsonl \
   --markdown /tmp/lucebox-profile.md \
-  --perfetto /tmp/lucebox-profile.perfetto.json
+  --perfetto /tmp/lucebox-profile.perfetto.json \
+  --json-summary /tmp/lucebox-profile.summary.json
 ```
 
 Open the Perfetto JSON at [ui.perfetto.dev](https://ui.perfetto.dev). It shows
 round phase spans, request queue/prefill/decode spans, and token-ready bursts.
+The JSON summary has a versioned schema for benchmark diffs. It includes run
+context, latency percentiles, phase totals, padding ratios, concurrency
+cohorts, suppression decisions, and acceptance by speculative position.
 
 ## Read the speculation funnel
 
@@ -90,3 +116,9 @@ pressure, and speculation progress.
 The contract is model-neutral and fixed-capacity. A future non-batched C=1
 adapter can populate the same record without changing the report, metrics, or
 dashboard.
+
+The detailed engine instrumentation currently lives in the Qwen35-family
+adapter used by Qwen3.8. Another sequence engine can accept the optional
+profile pointer and leave it untouched, but its capture will contain only the
+scheduler-owned lifecycle and planning fields until that adapter records its
+own execution facts.

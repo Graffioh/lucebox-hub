@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace dflash::common::observability {
@@ -20,6 +21,17 @@ struct ObservabilityConfig {
     size_t max_rounds = 10000;
     size_t max_requests = 4096;
     size_t max_token_bursts = 200000;
+    uint64_t checkpoint_every_rounds = 0;
+    std::string git_sha = "unknown";
+    std::string model_name;
+    std::string model_path;
+    std::string draft_path;
+    std::string arch;
+    std::string runtime_backend;
+    int max_concurrency = 1;
+    int ddtree_budget = 0;
+    int draft_block_size = 0;
+    std::vector<std::pair<std::string, std::string>> run_env;
 
     static ObservabilityConfig from_env();
 };
@@ -129,7 +141,12 @@ private:
     std::vector<RequestRecord> requests_;
     std::vector<TokenBurst> token_bursts_;
     std::unordered_map<uint64_t, size_t> active_requests_;
+    uint64_t started_unix_ns_ = 0;
+    uint64_t started_steady_ns_ = 0;
+    uint64_t last_checkpoint_round_ = 0;
     bool flushed_ = false;
+
+    bool write_capture(bool complete);
 };
 
 }

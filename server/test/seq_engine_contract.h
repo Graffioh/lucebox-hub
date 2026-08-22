@@ -179,7 +179,7 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
     };
 
     auto execute = [&](const SeqEngine::StepPlan & plan) {
-        return apply_progress(plan, engine.step(plan));
+        return apply_progress(plan, engine.step(plan, nullptr));
     };
 
     auto decode_inputs = [&]() {
@@ -270,7 +270,7 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
     // terminal plan-validation failure and must not partially advance state.
     auto require_failed = [&](const SeqEngine::StepPlan & invalid,
                               const char * message) {
-        const SeqEngine::StepResult result = engine.step(invalid);
+        const SeqEngine::StepResult result = engine.step(invalid, nullptr);
         require(!result.ok(), message);
         require(!result.error.empty(),
                 "failed step must explain the validation error");
@@ -333,7 +333,7 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
     }
 
     retire_all();
-    const SeqEngine::StepResult idle = engine.step({});
+    const SeqEngine::StepResult idle = engine.step({}, nullptr);
     require(idle.ok(), "step() with no work must succeed");
     require(idle.decode.empty() && idle.prefills.empty() &&
                 idle.error.empty(),

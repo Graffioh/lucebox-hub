@@ -51,6 +51,7 @@ const char * spec_decision_name(SpecDecision decision) noexcept {
     switch (decision) {
     case SpecDecision::None: return "none";
     case SpecDecision::Selected: return "selected";
+    case SpecDecision::InvalidSlot: return "invalid_slot";
     case SpecDecision::PromptWorkPresent: return "prompt_work_present";
     case SpecDecision::CallerDisallowed: return "caller_disallowed";
     case SpecDecision::FeatureUnavailable: return "feature_unavailable";

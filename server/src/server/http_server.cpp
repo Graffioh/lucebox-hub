@@ -46,6 +46,10 @@
 
 using dflash::common::SocketHandle;
 
+#ifndef DFLASH_GIT_SHA
+#define DFLASH_GIT_SHA "unknown"
+#endif
+
 #if defined(_WIN32)
 #include <io.h>
 #include <sys/stat.h>
@@ -1067,6 +1071,26 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
 
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
+namespace {
+
+observability::ObservabilityConfig make_observability_config(
+        const ServerConfig & server) {
+    observability::ObservabilityConfig config =
+        observability::ObservabilityConfig::from_env();
+    config.git_sha = DFLASH_GIT_SHA;
+    config.model_name = server.model_name;
+    config.model_path = server.model_path;
+    config.draft_path = server.draft_path;
+    config.arch = server.arch;
+    config.runtime_backend = server.runtime_backend;
+    config.max_concurrency = server.max_concurrency;
+    config.ddtree_budget = server.ddtree_budget;
+    config.draft_block_size = server.draft_block_size;
+    return config;
+}
+
+}
+
 HttpServer::HttpServer(ModelBackend & backend,
                        Tokenizer & tokenizer,
                        const ServerConfig & config)
@@ -1080,7 +1104,7 @@ HttpServer::HttpServer(ModelBackend & backend,
                    config.disk_cache_min_tokens,
                    config.disk_cache_continued_interval,
                    config.disk_cache_cold_max_tokens}, backend)
-    , observability_(observability::ObservabilityConfig::from_env())
+    , observability_(make_observability_config(config))
 {
     #ifdef DFLASH_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
