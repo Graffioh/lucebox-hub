@@ -266,6 +266,7 @@ def _group_payload(
     metadata: dict[str, Any],
     catalog: dict[str, Any],
     device_key: str | None,
+    classification_resolver: Any = None,
 ) -> dict[str, Any]:
     per_round = [step_phase_buckets(step) for step in steps]
     phase_names = sorted(
@@ -274,22 +275,32 @@ def _group_payload(
     )
     round_count = len(steps)
     token_count = sum(_decode_tokens(step) for step in steps)
+    prefill_tokens = sum_field(steps, "executed_prefill_tokens")
+    serviced_tokens = token_count + prefill_tokens
     total_ns = sum(max(0, int(step.get("duration_ns", 0))) for step in steps)
     phases = []
     for phase in phase_names:
         values = [int(buckets.get(phase, 0)) for buckets in per_round]
         phase_total = sum(values)
+        classification = (
+            classification_resolver(phase) if classification_resolver else None
+        )
+        if classification is None:
+            classification = _classification(
+                phase, steps, metadata, catalog, device_key
+            )
         phases.append({
             "phase": phase,
             "total_ns": phase_total,
             "ns_per_round": phase_total / round_count if round_count else None,
             "ns_per_token": phase_total / token_count if token_count else None,
+            "ns_per_serviced_token": (
+                phase_total / serviced_tokens if serviced_tokens else None
+            ),
             "wall_share": phase_total / total_ns if total_ns else None,
             "p50_ns": optional_number(percentile(values, 0.50)),
             "p95_ns": optional_number(percentile(values, 0.95)),
-            "classification": _classification(
-                phase, steps, metadata, catalog, device_key
-            ),
+            "classification": classification,
         })
     return {
         "path": path,
@@ -297,12 +308,71 @@ def _group_payload(
         "label": f"C={cohort}",
         "rounds": round_count,
         "durable_tokens": token_count,
+        "executed_prefill_tokens": prefill_tokens,
+        "serviced_tokens": serviced_tokens,
         "total_ns": total_ns,
         "mean_target_rows": sum_field(steps, "target_rows") / round_count,
         "mean_draft_rows": sum_field(steps, "draft_rows") / round_count,
         "mean_max_kv_len": sum_field(steps, "max_kv_len") / round_count,
         "phases": phases,
     }
+
+
+def _inherited_classification_resolver(
+    paths_payload: dict[str, list[dict[str, Any]]],
+) -> Any:
+    """Resolve merged-group boundness from per-path rooflines.
+
+    A merged "all" group blends packed and speculative row shapes that never
+    executed together, so its roofline must come from the per-path groups
+    rather than a blended mean.
+    """
+    by_cohort_phase: dict[tuple[int, str], dict[str, dict[str, Any]]] = {}
+    for path, groups in paths_payload.items():
+        for group in groups:
+            for phase in group["phases"]:
+                by_cohort_phase.setdefault(
+                    (group["cohort"], phase["phase"]), {}
+                )[path] = phase["classification"]
+
+    def resolver_for(cohort: int) -> Any:
+        def resolve(phase_name: str) -> dict[str, Any] | None:
+            if phase_name not in {"target_compute", "draft_compute"}:
+                return None
+            by_path = by_cohort_phase.get((cohort, phase_name))
+            if not by_path:
+                return None
+            if len(by_path) == 1:
+                path, classification = next(iter(by_path.items()))
+                return {**classification, "inherited_from": path}
+            per_path = {
+                path: {
+                    "class": classification["class"],
+                    "arithmetic_intensity_flops_per_byte": classification.get(
+                        "arithmetic_intensity_flops_per_byte"
+                    ),
+                    "headroom": classification.get("headroom"),
+                }
+                for path, classification in sorted(by_path.items())
+            }
+            classes = {c["class"] for c in per_path.values()}
+            if len(classes) == 1:
+                return {
+                    "class": classes.pop(),
+                    "reason": "inherited: consistent across paths",
+                    "per_path": per_path,
+                }
+            return {
+                "class": "mixed",
+                "reason": "paths disagree: " + ", ".join(
+                    f"{path}={c['class']}"
+                    for path, c in sorted(per_path.items())
+                ),
+                "per_path": per_path,
+            }
+        return resolve
+
+    return resolver_for
 
 
 def build_phase_groups(
@@ -323,19 +393,24 @@ def build_phase_groups(
         cohort = max(0, int(step.get("live_slots", 0)))
         all_groups[cohort].append(step)
         path_groups[path, cohort].append(step)
+    paths_payload = {
+        path: [
+            _group_payload(group, path, cohort, metadata, catalog, device_key)
+            for (group_path, cohort), group in sorted(path_groups.items())
+            if group_path == path
+        ]
+        for path in sorted({path for path, _ in path_groups})
+    }
+    resolver_for = _inherited_classification_resolver(paths_payload)
     return {
         "all": [
-            _group_payload(group, "all", cohort, metadata, catalog, device_key)
+            _group_payload(
+                group, "all", cohort, metadata, catalog, device_key,
+                classification_resolver=resolver_for(cohort),
+            )
             for cohort, group in sorted(all_groups.items())
         ],
-        "paths": {
-            path: [
-                _group_payload(group, path, cohort, metadata, catalog, device_key)
-                for (group_path, cohort), group in sorted(path_groups.items())
-                if group_path == path
-            ]
-            for path in sorted({path for path, _ in path_groups})
-        },
+        "paths": paths_payload,
         "inter_round_idle": inter_round_idle(steps),
     }
 
@@ -697,12 +772,12 @@ def build_run_payload(
 
 
 def _group_index(run: ReportPayload) -> dict[tuple[str, int, str], dict[str, Any]]:
-    groups = list(run["phase_groups"]["all"])
-    for path_groups in run["phase_groups"]["paths"].values():
-        groups.extend(path_groups)
+    # Per-path groups only: an "all" row would repeat every per-path row's
+    # time and double-count the table.
     return {
         (group["path"], group["cohort"], phase["phase"]): phase
-        for group in groups
+        for path_groups in run["phase_groups"]["paths"].values()
+        for group in path_groups
         for phase in group["phases"]
     }
 
@@ -751,6 +826,10 @@ def _diff_payload(current: ReportPayload, baseline: ReportPayload) -> dict[str, 
             "delta_ns_per_token": delta,
             "delta_percent": delta_percent,
         })
+    rows.sort(key=lambda row: (
+        row["delta_ns_per_token"] is None,
+        -abs(row["delta_ns_per_token"] or 0.0),
+    ))
     return {"warnings": warnings, "rows": rows}
 
 

@@ -112,11 +112,17 @@ h2 { font-size: 1rem; }
 .wall-card h3 { margin-bottom: 8px; font-size: .78rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
 svg { display: block; width: 100%; overflow: visible; }
 .wall-svg { min-height: 350px; }
-.axis, .bar-label, .segment-label { fill: var(--muted); font: 11px "JetBrains Mono", ui-monospace, monospace; }
+.axis, .bar-label { fill: var(--muted); font: 11px "JetBrains Mono", ui-monospace, monospace; }
+.bar-label.anchor-note { fill: var(--accent-bright); }
+.segment-label { fill: rgba(1, 11, 38, .92); font: 700 9px "JetBrains Mono", ui-monospace, monospace; pointer-events: none; }
 .gridline { stroke: var(--line); stroke-width: 1; }
 .segment { stroke: rgba(234, 242, 255, .18); stroke-width: 1; cursor: pointer; }
 .segment:focus { outline: none; stroke: var(--accent-bright); stroke-width: 3; }
-.anchor { stroke: var(--accent-bright); stroke-width: 2; }
+.anchor { stroke: var(--accent-bright); stroke-width: 3; stroke-linecap: round; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; margin: 0 0 10px; color: var(--muted); font: 11px "JetBrains Mono", ui-monospace, monospace; }
+.legend svg { display: inline-block; width: 12px; height: 12px; vertical-align: -2px; margin-right: 5px; border: 1px solid var(--line); border-radius: 2px; }
+.legend .sw { display: inline-block; width: 12px; height: 12px; vertical-align: -2px; margin-right: 5px; border: 1px solid var(--line); border-radius: 2px; }
+.strip { margin: 0 0 10px; color: var(--muted); font: 12px "JetBrains Mono", ui-monospace, monospace; }
 select, button { min-height: 34px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg-deep); color: var(--text); }
 button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-bright); }
 .notice { margin-bottom: 8px; padding: 9px 11px; border: 1px solid rgba(255,195,74,.4); border-radius: 6px; background: rgba(255,195,74,.07); color: var(--warn); }
@@ -161,6 +167,7 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
         <label>Normalize
           <select id="normalization">
             <option value="ns_per_token">ns / durable token</option>
+            <option value="ns_per_serviced_token">ns / serviced token</option>
             <option value="ns_per_round">ns / round</option>
             <option value="wall_share">share of wall</option>
           </select>
@@ -171,6 +178,7 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
     </div>
     <div class="panel-body">
       <div id="notices"></div>
+      <div class="legend" id="wall-legend"></div>
       <div class="walls" id="walls"></div>
       <div class="idle-strip" id="idle"></div>
       <div class="detail" id="detail">Focus or select a segment to inspect its percentiles and roofline facts.</div>
@@ -178,24 +186,27 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
   </section>
 
   <section class="panel">
-    <div class="panel-head"><h2>Request waterfall</h2><span class="muted mono" id="request-note"></span></div>
-    <div class="panel-body waterfall"><svg id="waterfall" aria-label="Request timing waterfall"></svg></div>
+    <div class="panel-head"><h2>Request waterfall</h2><span class="muted mono" id="latency"></span><span class="muted mono" id="request-note"></span></div>
+    <div class="panel-body waterfall"><div class="legend" id="wf-legend"></div><svg id="waterfall" aria-label="Request timing waterfall"></svg></div>
   </section>
 
   <section class="panel">
     <div class="panel-head"><h2>Speculation funnel</h2></div>
-    <div class="panel-body two-col">
-      <div class="funnel" id="funnel"></div>
-      <svg id="acceptance" aria-label="Acceptance by speculative position"></svg>
+    <div class="panel-body">
+      <div class="strip" id="decisions"></div>
+      <div class="two-col">
+        <div class="funnel" id="funnel"></div>
+        <svg id="acceptance" aria-label="Acceptance by speculative position"></svg>
+      </div>
     </div>
   </section>
 
   <section class="panel" id="diff-panel" hidden>
-    <div class="panel-head"><h2>Baseline delta</h2></div>
+    <div class="panel-head"><h2>Baseline delta</h2><button type="button" id="delta-expand" hidden></button></div>
     <div class="panel-body">
       <div id="diff-warnings"></div>
       <div style="overflow:auto"><table>
-        <thead><tr><th>Path</th><th>Cohort / phase</th><th>Baseline ns/token</th><th>Current ns/token</th><th>Δ ns/token</th><th>Δ %</th></tr></thead>
+        <thead><tr><th>Path</th><th>Cohort / phase</th><th>Baseline / durable token</th><th>Current / durable token</th><th>Δ / durable token</th><th>Δ %</th></tr></thead>
         <tbody id="delta-rows"></tbody>
       </table></div>
     </div>
@@ -214,11 +225,27 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
   const data = JSON.parse(document.getElementById("data").textContent);
   const current = data.current;
   const baseline = data.baseline;
-  const state = { normalization: "ns_per_token", path: "all", split: false };
+  const state = { normalization: "ns_per_token", path: "all", split: false, diffExpanded: false };
   const ns = ["http:", "", "www.w3.org", "2000", "svg"].join("/");
   const $ = (id) => document.getElementById(id);
   const fmt = (value, digits = 2) => value == null ? "n/a" : Number(value).toLocaleString(undefined, { maximumFractionDigits: digits });
   const pct = (value) => value == null ? "n/a" : `${fmt(value * 100, 1)}%`;
+  const fmtNs = (value, digits = 2) => {
+    if (value == null) return "n/a";
+    const abs = Math.abs(value);
+    if (abs >= 1e9) return `${fmt(value / 1e9, digits)} s`;
+    if (abs >= 1e6) return `${fmt(value / 1e6, digits)} ms`;
+    if (abs >= 1e3) return `${fmt(value / 1e3, digits)} µs`;
+    return `${fmt(value, 0)} ns`;
+  };
+  const PHASE_ABBR = {
+    scheduler_plan: "plan", input_staging: "stage", draft_prepare: "d-prep",
+    draft_compute: "draft", proposal_select: "select", target_graph_build: "build",
+    metadata_upload: "upload", target_compute: "target", readback_sync: "readback",
+    acceptance: "accept", state_promotion: "promote", sampling_commit: "sample",
+    output_processing: "output", client_flush: "flush", unattributed: "unattr",
+  };
+  const abbrFor = (phase) => PHASE_ABBR[phase] || (phase.startsWith("overlap(") ? "overlap" : phase.slice(0, 8));
   const runLabel = (run) => `${run.run.model_name || "unknown model"} · ${run.device.name} · ${run.run.git_sha || "unknown SHA"}`;
   const isoStart = (run) => {
     const unixNs = Number(run.run.started_unix_ns);
@@ -247,6 +274,13 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
       [`configured C=${current.run.max_concurrency ?? "unknown"}`, ""],
       [`started ${isoStart(current)}`, ""],
     ];
+    const treeWidths = current.speculation.tree_widths || [];
+    if (treeWidths.length) values.push([`tree width ${treeWidths.join("/")}`, ""]);
+    const durableTokens = current.phase_groups.all.reduce((sum, group) => sum + group.durable_tokens, 0);
+    const boundsNs = current.capture_bounds.duration_ns;
+    if (durableTokens && boundsNs) {
+      values.push([`${fmt(durableTokens / (boundsNs / 1e9), 0)} durable tok/s overall`, "good"]);
+    }
     if (current.mixed_run_cohorts) values.push(["mixed-run cohorts", "warn"]);
     if (baseline) values.push(["baseline comparison", "good"]);
     if (data.diff && data.diff.warnings.length) values.push([`${data.diff.warnings.length} mismatch warning${data.diff.warnings.length === 1 ? "" : "s"}`, "bad"]);
@@ -295,7 +329,10 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
     const idle = element("pattern", { id: `${prefix}-idle`, width: 7, height: 7, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" });
     idle.append(element("rect", { width: 7, height: 7, fill: "#571f3a" }));
     idle.append(element("line", { x1: 0, y1: 0, x2: 0, y2: 7, stroke: "#ff5c70", "stroke-width": 2 }));
-    defs.append(compute, idle);
+    const mixed = element("pattern", { id: `${prefix}-mixed`, width: 8, height: 8, patternUnits: "userSpaceOnUse", patternTransform: "rotate(-35)" });
+    mixed.append(element("rect", { width: 8, height: 8, fill: "#5aa9e6" }));
+    mixed.append(element("line", { x1: 0, y1: 0, x2: 0, y2: 8, stroke: "#f8a903", "stroke-width": 3 }));
+    defs.append(compute, idle, mixed);
     svg.append(defs);
   }
 
@@ -305,6 +342,7 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
       compute: `url(#${prefix}-compute)`,
       overhead: "#5d7293",
       idle: `url(#${prefix}-idle)`,
+      mixed: `url(#${prefix}-mixed)`,
       neutral: "#9db2d0",
     }[classification.class] || "#9db2d0";
   }
@@ -313,15 +351,20 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
     const facts = phase.classification;
     const parts = [
       `${group.label} · ${group.path} · ${phase.phase}`,
-      `${fmt(phase.total_ns, 0)} ns total`,
-      `${fmt(phase.ns_per_round)} ns/round`,
-      `${fmt(phase.ns_per_token)} ns/token`,
+      `${fmtNs(phase.total_ns)} total · ${fmtNs(phase.ns_per_round)}/round`,
+      `${fmtNs(phase.ns_per_token)}/durable token · ${fmtNs(phase.ns_per_serviced_token)}/serviced token`,
       `${pct(phase.wall_share)} of cohort wall`,
-      `${group.rounds} rounds · ${group.durable_tokens} durable tokens`,
-      `class ${facts.class}`,
+      `${group.rounds} rounds · ${group.durable_tokens} durable + ${group.executed_prefill_tokens} prefill tokens`,
+      `class ${facts.class}${facts.inherited_from ? ` (from ${facts.inherited_from})` : ""}`,
     ];
     if (facts.arithmetic_intensity_flops_per_byte != null) {
       parts.push(`AI ${fmt(facts.arithmetic_intensity_flops_per_byte)} FLOP/B · machine balance ${fmt(facts.machine_balance_flops_per_byte)} FLOP/B · headroom ${fmt(facts.headroom)}×`);
+    }
+    if (facts.per_path) {
+      Object.entries(facts.per_path).forEach(([path, entry]) => {
+        const intensity = entry.arithmetic_intensity_flops_per_byte;
+        parts.push(`${path}: ${entry.class}${intensity != null ? ` · AI ${fmt(intensity)} FLOP/B` : ""}`);
+      });
     }
     if (facts.padding_note) parts.push(facts.padding_note);
     return parts.join("\n");
@@ -346,7 +389,7 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
     const detail = $("detail");
     const heading = document.createElement("strong");
     heading.textContent = `${group.label} · ${group.path} · ${phase.phase}`;
-    const distribution = `Zero-inclusive round distribution. p50 ${fmt(phase.p50_ns)} ns. p95 ${fmt(phase.p95_ns)} ns.`;
+    const distribution = `Zero-inclusive round distribution. p50 ${fmtNs(phase.p50_ns)}. p95 ${fmtNs(phase.p95_ns)}.`;
     const rooflineText = `${roofline}${facts.padding_note ? ` ${facts.padding_note}.` : ""}`;
     detail.replaceChildren(
       heading, document.createElement("br"), document.createTextNode(distribution),
@@ -357,15 +400,15 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
   function wallSvg(run, title, prefix, scale) {
     const groups = groupsFor(run);
     const width = Math.max(460, groups.length * 92 + 90);
-    const height = 350;
-    const plot = { left: 58, top: 18, width: width - 74, height: 275 };
+    const height = 368;
+    const plot = { left: 64, top: 18, width: width - 80, height: 275 };
     const svg = element("svg", { viewBox: `0 0 ${width} ${height}`, class: "wall-svg", role: "img", "aria-label": `${title} phase budget` });
     patternDefs(svg, prefix);
     for (let tick = 0; tick <= 4; tick += 1) {
       const y = plot.top + plot.height - plot.height * tick / 4;
       svg.append(element("line", { x1: plot.left, y1: y, x2: plot.left + plot.width, y2: y, class: "gridline" }));
       const value = scale * tick / 4;
-      svg.append(element("text", { x: plot.left - 6, y: y + 4, "text-anchor": "end", class: "axis" }, state.normalization === "wall_share" ? pct(value) : fmt(value, 0)));
+      svg.append(element("text", { x: plot.left - 6, y: y + 4, "text-anchor": "end", class: "axis" }, state.normalization === "wall_share" ? pct(value) : fmtNs(value, 1)));
     }
     const slot = plot.width / Math.max(1, groups.length);
     const barWidth = Math.min(58, slot * .68);
@@ -381,7 +424,7 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
         const rect = element("rect", {
           x, y, width: barWidth, height: Math.max(.8, segmentHeight),
           fill: fillFor(phase.classification, prefix),
-          class: `segment ${group.cohort === 1 ? "anchor" : ""}`,
+          class: "segment",
           tabindex: 0, role: "button", "aria-label": label.replaceAll("\n", ". "),
         });
         rect.append(element("title", {}, label));
@@ -395,13 +438,49 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
           if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); }
         });
         svg.append(rect);
+        if (segmentHeight >= 13) {
+          svg.append(element("text", {
+            x: x + barWidth / 2, y: y + segmentHeight / 2 + 3.5,
+            "text-anchor": "middle", class: "segment-label",
+          }, abbrFor(phase.phase)));
+        }
       });
-      const groupLabel = group.path === "all" ? group.label : `${group.label}\n${group.path}`;
-      groupLabel.split("\n").forEach((line, lineIndex) => {
-        svg.append(element("text", { x: x + barWidth / 2, y: plot.top + plot.height + 20 + lineIndex * 13, "text-anchor": "middle", class: "bar-label" }, line));
+      const baselineY = plot.top + plot.height;
+      if (group.cohort === 1) {
+        svg.append(element("line", { x1: x, y1: baselineY + 6, x2: x + barWidth, y2: baselineY + 6, class: "anchor" }));
+      }
+      const tokRate = group.total_ns > 0 && group.durable_tokens > 0
+        ? `${fmt(group.durable_tokens / (group.total_ns / 1e9), 0)} t/s`
+        : "0 t/s";
+      const lines = [group.label];
+      if (group.path !== "all") lines.push(group.path);
+      lines.push(`n=${group.rounds}`, tokRate);
+      lines.forEach((line, lineIndex) => {
+        svg.append(element("text", {
+          x: x + barWidth / 2, y: baselineY + 22 + lineIndex * 13,
+          "text-anchor": "middle",
+          class: `bar-label ${group.cohort === 1 && lineIndex === 0 ? "anchor-note" : ""}`,
+        }, line));
       });
     });
     return svg;
+  }
+
+  function renderWallLegend() {
+    const host = $("wall-legend");
+    const entries = [
+      ["bandwidth-bound", "bandwidth"], ["compute-bound", "compute"],
+      ["host overhead", "overhead"], ["idle / unattributed", "idle"],
+      ["mixed paths", "mixed"], ["no device spec", "neutral"],
+    ];
+    host.replaceChildren(...entries.map(([label, cls], index) => {
+      const item = document.createElement("span");
+      const swatch = element("svg", { viewBox: "0 0 12 12" });
+      patternDefs(swatch, `lg${index}`);
+      swatch.append(element("rect", { width: 12, height: 12, fill: fillFor({ class: cls }, `lg${index}`) }));
+      item.append(swatch, document.createTextNode(label));
+      return item;
+    }));
   }
 
   function renderWalls() {
@@ -418,7 +497,7 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
     });
     $("walls").replaceChildren(...cards);
     const idle = current.phase_groups.inter_round_idle;
-    $("idle").textContent = `Inter-round idle · ${fmt(idle.total_ns, 0)} ns total · p50 ${fmt(idle.p50_ns)} ns · p95 ${fmt(idle.p95_ns)} ns. ${idle.note}`;
+    $("idle").textContent = `Inter-round idle · ${fmtNs(idle.total_ns)} total · p50 ${fmtNs(idle.p50_ns)} · p95 ${fmtNs(idle.p95_ns)}. ${idle.note}`;
   }
 
   function renderNotices() {
@@ -441,21 +520,35 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
     const width = 1180;
     const rowHeight = 18;
     const labelWidth = 90;
+    const axisHeight = 22;
+    const plotWidth = width - labelWidth - 12;
     const duration = Math.max(1, requests.end_ns - requests.origin_ns);
     const svg = $("waterfall");
-    svg.setAttribute("viewBox", `0 0 ${width} ${Math.max(44, rows.length * rowHeight + 28)}`);
+    svg.setAttribute("viewBox", `0 0 ${width} ${Math.max(60, rows.length * rowHeight + axisHeight + 12)}`);
     svg.replaceChildren();
     const colors = { queue_ns: "#5d7293", prefill_ns: "#5aa9e6", first_decode_ns: "#ffc34a", decode_ns: "#48d597" };
+    const segmentNames = { queue_ns: "queue", prefill_ns: "prefill", first_decode_ns: "first token", decode_ns: "decode" };
+    const bottom = axisHeight + rows.length * rowHeight;
+    for (let tick = 0; tick <= 4; tick += 1) {
+      const tickX = labelWidth + plotWidth * tick / 4;
+      svg.append(element("line", { x1: tickX, y1: axisHeight - 6, x2: tickX, y2: bottom, class: "gridline" }));
+      svg.append(element("text", { x: tickX, y: 10, "text-anchor": tick === 0 ? "start" : "middle", class: "axis" }, `${fmt(duration * tick / 4 / 1e9, 1)} s`));
+    }
     rows.forEach((row, index) => {
       const group = element("g", { class: `request ${row.ok === false ? "failed" : ""} ${row.open_ended ? "incomplete" : ""}` });
-      const y = 8 + index * rowHeight;
+      const y = axisHeight + index * rowHeight;
+      const status = row.ok === false ? "failed" : row.open_ended ? "incomplete" : "ok";
+      const spans = Object.keys(colors)
+        .map((key) => `${segmentNames[key]} ${fmtNs(row[key])}`)
+        .join(" · ");
+      group.append(element("title", {}, `#${row.request_id} · ${status} · prompt ${row.prompt_tokens} tokens · output ${row.output_tokens} tokens\n${spans}`));
       group.append(element("text", { x: 0, y: y + 11, class: "axis" }, `#${row.request_id}`));
       let cursor = row.start_offset_ns;
       Object.keys(colors).forEach((key) => {
         const value = row[key];
         if (value == null) return;
-        const x = labelWidth + (width - labelWidth - 12) * cursor / duration;
-        const w = Math.max(1, (width - labelWidth - 12) * value / duration);
+        const x = labelWidth + plotWidth * cursor / duration;
+        const w = Math.max(1, plotWidth * value / duration);
         group.append(element("rect", { x, y, width: w, height: 12, rx: 2, fill: colors[key] }));
         cursor += value;
       });
@@ -463,6 +556,22 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
     });
     const shown = Math.min(rows.length, requests.display_limit);
     $("request-note").textContent = `showing first ${shown} of ${requests.total}${requests.embedded < requests.total ? ` · ${requests.embedded} embedded` : ""}`;
+    const legendNote = document.createElement("span");
+    legendNote.textContent = "red outline = failed · dashed = incomplete";
+    $("wf-legend").replaceChildren(...Object.keys(colors).map((key) => {
+      const item = document.createElement("span");
+      const swatch = document.createElement("span");
+      swatch.className = "sw";
+      swatch.style.background = colors[key];
+      item.append(swatch, document.createTextNode(segmentNames[key]));
+      return item;
+    }), legendNote);
+  }
+
+  function renderLatency() {
+    const latency = current.latency_ms;
+    const pair = (values) => `${fmt(values.p50)}/${fmt(values.p95)}`;
+    $("latency").textContent = `ms p50/p95 — queue ${pair(latency.queue)} · TTFT ${pair(latency.ttft)} · e2e ${pair(latency.end_to_end)} · inter-token ${pair(latency.inter_burst_per_token)}`;
   }
 
   function renderFunnel() {
@@ -491,8 +600,13 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
         return step;
       }));
     }
+    const decisions = Object.entries(speculation.decisions || {}).sort((a, b) => b[1] - a[1]);
+    $("decisions").textContent = decisions.length
+      ? `decode-lane speculation decisions: ${decisions.map(([name, count]) => `${name} ${fmt(count, 0)}`).join(" · ")}`
+      : "";
     const svg = $("acceptance");
-    const values = speculation.acceptance_by_position || [];
+    // Index 0 is the draft root; real speculative positions start at 1.
+    const values = (speculation.acceptance_by_position || []).slice(1);
     const width = 360;
     const height = 150;
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
@@ -515,12 +629,14 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
       node.textContent = message;
       return node;
     }));
-    $("delta-rows").replaceChildren(...data.diff.rows.map((row) => {
+    const rows = data.diff.rows;
+    const visible = state.diffExpanded ? rows : rows.slice(0, 20);
+    $("delta-rows").replaceChildren(...visible.map((row) => {
       const tr = document.createElement("tr");
       const values = [
         row.path, `C=${row.cohort} · ${row.phase}`,
-        fmt(row.baseline_ns_per_token), fmt(row.current_ns_per_token),
-        fmt(row.delta_ns_per_token), pct(row.delta_percent),
+        fmtNs(row.baseline_ns_per_token), fmtNs(row.current_ns_per_token),
+        fmtNs(row.delta_ns_per_token), pct(row.delta_percent),
       ];
       values.forEach((value, index) => {
         const td = document.createElement("td");
@@ -530,6 +646,13 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
       });
       return tr;
     }));
+    const expand = $("delta-expand");
+    if (rows.length > 20) {
+      expand.hidden = false;
+      expand.textContent = state.diffExpanded ? "Show top 20" : `Show all ${rows.length}`;
+    } else {
+      expand.hidden = true;
+    }
   }
 
   function footer() {
@@ -538,7 +661,7 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
       const bounds = run.capture_bounds;
       const earliest = bounds.earliest_steady_ns == null ? "unknown" : `${fmt(bounds.earliest_steady_ns, 0)} ns`;
       const latest = bounds.latest_steady_ns == null ? "unknown" : `${fmt(bounds.latest_steady_ns, 0)} ns`;
-      const duration = bounds.duration_ns == null ? "unknown" : `${fmt(bounds.duration_ns, 0)} ns`;
+      const duration = bounds.duration_ns == null ? "unknown" : fmtNs(bounds.duration_ns);
       return `${label} steady bounds ${earliest} to ${latest}. Duration ${duration}.`;
     };
     const boundsText = baseline
@@ -554,12 +677,18 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
     event.currentTarget.setAttribute("aria-pressed", String(state.split));
     renderWalls();
   });
+  $("delta-expand").addEventListener("click", () => {
+    state.diffExpanded = !state.diffExpanded;
+    renderDiff();
+  });
 
   chips();
   pathOptions();
   renderNotices();
+  renderWallLegend();
   renderWalls();
   renderWaterfall();
+  renderLatency();
   renderFunnel();
   renderDiff();
   footer();

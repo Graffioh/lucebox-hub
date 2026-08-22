@@ -103,10 +103,19 @@ python3 harness/benchmarks/concurrency/profile_report.py \
 ```
 
 The LuceGraph report contains three linked views. The phase-budget wall
-compares
-concurrency cohorts with per-token, per-round, and wall-share normalization.
-The request waterfall separates queue, prefill, first-decode, and decode time.
-The speculation strip shows the funnel and acceptance by draft position.
+compares concurrency cohorts with per-durable-token, per-serviced-token,
+per-round, and wall-share normalization. The request waterfall separates
+queue, prefill, first-decode, and decode time on a labeled time axis, with
+queue, TTFT, end-to-end, and inter-token p50/p95 in the panel head. The
+speculation strip shows the funnel, per-lane suppression decisions, and
+acceptance by draft position starting at position 1 (position 0 is the root).
+
+Durable-token normalization bills every phase to committed decode tokens, so
+prefill-heavy packed rounds look expensive per token. Serviced-token
+normalization divides by durable plus executed prefill tokens and is the
+honest view when prompt work dominates. Each cohort label shows its round
+count and in-round durable tok/s; the header chip shows aggregate durable
+tok/s over the whole capture window.
 
 The wall uses the exclusive buckets from `step_phase_buckets`. It includes
 unattributed time, overlapping spans, and inter-round host gaps. Select a wall
@@ -134,6 +143,13 @@ an unknown key to render neutral segments with a visible notice.
 The analytic roofline classifier applies only to `target_compute` and
 `draft_compute`. Segment details show arithmetic intensity, machine
 balance, and headroom. Recheck any fact whose note starts with `VERIFY`.
+
+Merged "all" cohorts never recompute the roofline on a blended row shape.
+They inherit the per-path classification; when packed and speculative
+disagree, the segment renders as `mixed paths` and the tooltip lists both
+per-path classes. The baseline delta table contains per-path rows only,
+sorted by absolute per-durable-token delta, and shows the top 20 movers with
+an expand control.
 
 The v1 capture does not contain model FLOP counts, weight bytes, or device
 machine balance. Folded stacks also have no portable color metadata. Use a

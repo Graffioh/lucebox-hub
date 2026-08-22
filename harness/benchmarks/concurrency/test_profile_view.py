@@ -207,11 +207,20 @@ class ProfileViewTest(unittest.TestCase):
         phases = {phase["phase"]: phase for phase in c1["phases"]}
         self.assertEqual(c1["rounds"], 1)
         self.assertEqual(c1["durable_tokens"], 2)
+        self.assertEqual(c1["serviced_tokens"], 2)
         self.assertEqual(phases["target_compute"]["total_ns"], 30)
         self.assertEqual(phases["target_compute"]["ns_per_token"], 15)
+        self.assertEqual(phases["target_compute"]["ns_per_serviced_token"], 15)
         self.assertEqual(phases["target_compute"]["ns_per_round"], 30)
         self.assertEqual(phases["target_compute"]["wall_share"], 0.3)
         self.assertEqual(phases["target_compute"]["p50_ns"], 30)
+        self.assertIn('value="ns_per_serviced_token"', html)
+        self.assertIn('id="wall-legend"', html)
+        self.assertIn('id="wf-legend"', html)
+        self.assertIn('id="latency"', html)
+        self.assertIn('id="decisions"', html)
+        # Position 0 is the draft root; the histogram must start at position 1.
+        self.assertIn("acceptance_by_position || []).slice(1)", html)
         self.assertEqual(phases["overlap(readback_sync+target_compute)"]["total_ns"], 20)
         self.assertEqual(phases["unattributed"]["total_ns"], 30)
         self.assertEqual(
@@ -277,6 +286,34 @@ class ProfileViewTest(unittest.TestCase):
         self.assertIn("No device spec", unknown["notices"][0]["message"])
         self.assertEqual(target_class(bandwidth)["arithmetic_intensity_flops_per_byte"], 20)
         self.assertEqual(target_class(bandwidth)["machine_balance_flops_per_byte"], 100)
+        # The merged C=1 group has only packed rounds, so its roofline is the
+        # packed group's, inherited rather than recomputed on a blended shape.
+        self.assertEqual(target_class(bandwidth)["inherited_from"], "packed")
+
+    def test_merged_groups_mark_disagreeing_paths_as_mixed(self) -> None:
+        records = self.records()
+        # Same cohort, both paths: packed rows stay bandwidth-bound while the
+        # speculative rows cross the fixture roofline into compute-bound.
+        speculative = copy.deepcopy(records[1])
+        speculative["round_id"] = 3
+        speculative["started_ns"] = 1_500
+        speculative["path"] = "speculative"
+        speculative["target_rows"] = 100
+        records.insert(3, speculative)
+        payload = profile_payload.build_run_payload(
+            records, device_specs=self.specs(), device_key="bandwidth"
+        )
+
+        c1 = payload["phase_groups"]["all"][0]
+        target = next(
+            phase for phase in c1["phases"]
+            if phase["phase"] == "target_compute"
+        )
+        self.assertEqual(target["classification"]["class"], "mixed")
+        per_path = target["classification"]["per_path"]
+        self.assertEqual(set(per_path), {"packed", "speculative"})
+        self.assertEqual(per_path["packed"]["class"], "bandwidth")
+        self.assertEqual(per_path["speculative"]["class"], "compute")
 
     def test_diff_reports_mismatch_and_numeric_delta(self) -> None:
         current = self.records()
@@ -298,9 +335,10 @@ class ProfileViewTest(unittest.TestCase):
         self.assertIn(
             "Baseline ${runLabel(baseline)} · Current ${runLabel(current)}", html
         )
+        rows = payload["diff"]["rows"]
         target = next(
-            row for row in payload["diff"]["rows"]
-            if row["path"] == "all"
+            row for row in rows
+            if row["path"] == "packed"
             and row["cohort"] == 1
             and row["phase"] == "target_compute"
         )
@@ -308,6 +346,12 @@ class ProfileViewTest(unittest.TestCase):
         self.assertEqual(target["current_ns_per_token"], 15)
         self.assertEqual(target["delta_ns_per_token"], 5)
         self.assertEqual(target["delta_percent"], 0.5)
+        # Per-path rows only — an "all" row would double-count them — sorted
+        # with the largest absolute mover first and unmatched rows last.
+        self.assertTrue(all(row["path"] != "all" for row in rows))
+        self.assertEqual(rows[0]["phase"], "readback_sync")
+        self.assertEqual(rows[0]["delta_ns_per_token"], -10)
+        self.assertIsNone(rows[-1]["delta_ns_per_token"])
 
     @unittest.skipUnless(shutil.which("node"), "node is required for JavaScript syntax checks")
     def test_generated_javascript_is_valid(self) -> None:
