@@ -1915,25 +1915,17 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         }
 
         t_replay_build_end = timing_clock::now();
-        if (!ggml_backend_cuda_tree_cache_commit_many(
+        if (!ggml_backend_cuda_tree_commit_transaction(
                 cache_tensors.data(),
                 static_cast<int>(cache_tensors.size()),
-                tree_sg.commit_rows, tree_sg.commit_slot_ids,
-                tree_scratch_base_, tree_scratch_stride_)) {
-            result.error = "direct commit K/V promotion failed";
-            return result;
-        }
-        if (!ggml_backend_cuda_tree_feature_commit(
                 tree_sg.tree_features, b_.cache_.target_feat,
-                tree_sg.feature_commit_rows)) {
-            result.error = "direct commit target-feature promotion failed";
-            return result;
-        }
-        if (!ggml_backend_cuda_gdn_transition_journal_commit_many(
+                tree_sg.feature_commit_rows,
                 journals.data(), states.data(), conv_inputs.data(),
                 conv_states.data(), static_cast<int>(n_delta),
-                tree_sg.accepted_prefixes, tree_sg.commit_slot_ids)) {
-            result.error = "direct commit recurrent-state promotion failed";
+                tree_sg.commit_rows, tree_sg.accepted_prefixes,
+                tree_sg.commit_slot_ids,
+                tree_scratch_base_, tree_scratch_stride_)) {
+            result.error = "direct commit preflight failed";
             return result;
         }
         ggml_backend_tensor_set(

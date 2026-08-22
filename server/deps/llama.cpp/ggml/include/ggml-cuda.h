@@ -100,7 +100,7 @@ GGML_BACKEND_API bool ggml_backend_cuda_topk_rows(const struct ggml_tensor * log
                                                   float * probs_out, int32_t * ids_out);
 
 // Apply compact GDN journal prefixes to persistent F32 state. The journal is
-// [J,H,T,B] (see ggml_gated_delta_net_set_transition_journal); accepted and
+// [J,H,T,B] (see ggml_gated_delta_net_capture_transition_journal); accepted and
 // active slots are contiguous I32 [B]. Negative/out-of-range slots are
 // padding. Phase 1 is synchronous, single-device, and requires unique slots.
 // Each live state slot must still contain the same base state from which its
@@ -135,6 +135,26 @@ GGML_BACKEND_API bool ggml_backend_cuda_tree_cache_commit_many(
 GGML_BACKEND_API bool ggml_backend_cuda_tree_feature_commit(
         const struct ggml_tensor * source, struct ggml_tensor * destination,
         const struct ggml_tensor * destination_rows);
+
+// Validate every packed-tree destination before changing any cache. Once the
+// first kernel launches, a device failure is fatal because fallback cannot
+// recover from a partially committed state.
+GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction(
+        struct ggml_tensor * const * caches,
+        int n_caches,
+        const struct ggml_tensor * feature_source,
+        struct ggml_tensor * feature_destination,
+        const struct ggml_tensor * feature_destination_rows,
+        const struct ggml_tensor * const * journals,
+        struct ggml_tensor * const * states,
+        const struct ggml_tensor * const * conv_inputs,
+        struct ggml_tensor * const * conv_states,
+        int n_layers,
+        const struct ggml_tensor * commit_rows,
+        const struct ggml_tensor * accepted_prefixes,
+        const struct ggml_tensor * active_slot_ids,
+        int tree_scratch_base,
+        int tree_scratch_stride);
 
 // Attach learned per-expert decode tables to a mixed-precision tensor. The
 // host variants copy the tables to the device that owns `base`. Call the
