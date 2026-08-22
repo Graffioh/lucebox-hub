@@ -18,7 +18,11 @@ RAGGED_PROFILES = {
     "long": (2000, 2600, 3400, 4000),
 }
 
-DEFAULT_CLIENT_LEVELS = (2, 4, 8, 16)
+CLIENT_MATRICES = {
+    "profile-view": (1, 2, 3, 4, 5),
+    "legacy": (2, 4, 8, 16),
+}
+DEFAULT_CLIENT_LEVELS = CLIENT_MATRICES["profile-view"]
 
 WORD_BANK = (
     "systems engineers compare latency throughput scheduling memory kernels queues "
@@ -126,8 +130,12 @@ def main() -> int:
         "--profile", choices=["he-raw", *sorted(RAGGED_PROFILES)], required=True
     )
     parser.add_argument(
-        "--clients", default=",".join(map(str, DEFAULT_CLIENT_LEVELS)),
+        "--clients",
         help="comma-separated, distinct concurrency levels for disjoint cohorts",
+    )
+    parser.add_argument(
+        "--matrix", choices=sorted(CLIENT_MATRICES), default="profile-view",
+        help="named cohort matrix used when --clients is omitted",
     )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -135,7 +143,8 @@ def main() -> int:
         parser.error(f"refusing to overwrite {args.out}")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     try:
-        client_levels = parse_client_levels(args.clients)
+        raw_levels = args.clients or ",".join(map(str, CLIENT_MATRICES[args.matrix]))
+        client_levels = parse_client_levels(raw_levels)
     except ValueError as exc:
         parser.error(str(exc))
     records = build_records(args.profile, client_levels)

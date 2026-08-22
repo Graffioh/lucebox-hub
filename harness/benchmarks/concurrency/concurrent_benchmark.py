@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 PromptInput = str | list[dict[str, str]]
-DEFAULT_CLIENT_LEVELS = (2, 4, 8, 16)
+DEFAULT_CLIENT_LEVELS = (1, 2, 3, 4, 5)
 
 
 def sha256_text(text: str) -> str:

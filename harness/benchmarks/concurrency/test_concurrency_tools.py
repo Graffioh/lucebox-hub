@@ -30,15 +30,15 @@ summarizer = load("summarize_concurrency")
 class PromptGeneratorTests(unittest.TestCase):
     def test_cohorts_are_disjoint_ragged_and_mean_matched(self) -> None:
         records = generator.build_records("short")
-        self.assertEqual(len(records), 30)
+        self.assertEqual(len(records), 15)
         self.assertEqual(
             [row["cohort"] for row in records],
-            ["c2"] * 2 + ["c4"] * 4 + ["c8"] * 8 + ["c16"] * 16,
+            ["c1"] + ["c2"] * 2 + ["c3"] * 3 + ["c4"] * 4 + ["c5"] * 5,
         )
-        self.assertEqual(len({row["prompt"] for row in records}), 30)
+        self.assertEqual(len({row["prompt"] for row in records}), 15)
         by_cohort = {
             cohort: [row for row in records if row["cohort"] == cohort]
-            for cohort in ("c2", "c4", "c8", "c16")
+            for cohort in ("c1", "c2", "c3", "c4", "c5")
         }
         means = {
             cohort: sum(row["target_words"] for row in rows) / len(rows)
@@ -47,13 +47,15 @@ class PromptGeneratorTests(unittest.TestCase):
         self.assertEqual(len(set(means.values())), 1)
         self.assertEqual(
             {cohort: rows[0]["cohort_offset"] for cohort, rows in by_cohort.items()},
-            {"c2": 0, "c4": 2, "c8": 6, "c16": 14},
+            {"c1": 0, "c2": 1, "c3": 3, "c4": 6, "c5": 10},
         )
         self.assertEqual(
             {row["target_words"] for row in by_cohort["c2"]}, {250, 550}
         )
-        for cohort in ("c4", "c8", "c16"):
-            self.assertEqual(len({row["target_words"] for row in by_cohort[cohort]}), 4)
+        self.assertEqual({row["target_words"] for row in by_cohort["c1"]}, {400})
+        self.assertEqual(len({row["target_words"] for row in by_cohort["c3"]}), 3)
+        self.assertEqual(len({row["target_words"] for row in by_cohort["c4"]}), 4)
+        self.assertEqual(len({row["target_words"] for row in by_cohort["c5"]}), 5)
         for row in records:
             self.assertEqual(len(row["prompt"].split()), row["target_words"])
 
@@ -80,6 +82,7 @@ class PromptGeneratorTests(unittest.TestCase):
             offset += clients
 
     def test_client_level_parser_rejects_reuse(self) -> None:
+        self.assertEqual(generator.CLIENT_MATRICES["legacy"], (2, 4, 8, 16))
         self.assertEqual(generator.parse_client_levels("2,4,8,16,32"), (2, 4, 8, 16, 32))
         with self.assertRaisesRegex(ValueError, "distinct"):
             generator.parse_client_levels("2,4,2")
@@ -191,7 +194,7 @@ with open(os.environ["FAKE_ROCPROF_INVOCATION"], "w", encoding="utf-8") as out:
 
     def test_ragged_runner_derives_offsets_from_requested_matrix(self) -> None:
         text = (HERE / "run_qwen36_concurrency.sh").read_text(encoding="utf-8")
-        self.assertIn('CLIENTS="${CLIENTS:-2,4,8,16}"', text)
+        self.assertIn('CLIENTS="${CLIENTS:-1,2,3,4,5}"', text)
         self.assertIn('prompt_offsets[$c]="$next_prompt_offset"', text)
         self.assertIn('--clients "$CLIENTS"', text)
         self.assertNotIn("prompt_offsets=([", text)

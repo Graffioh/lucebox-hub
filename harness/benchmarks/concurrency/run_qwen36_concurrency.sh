@@ -15,7 +15,7 @@ OUT="${OUT:-$REPO/.harness-runs/qwen36-concurrency-$(date -u +%Y%m%dT%H%M%SZ)}"
 REPEATS="${REPEATS:-1}"
 WORKLOADS="${WORKLOADS:-short,medium,long}"
 VARIANTS="${VARIANTS:-luce-k8,luce-k1,llama}"
-CLIENTS="${CLIENTS:-2,4,8,16}"
+CLIENTS="${CLIENTS:-1,2,3,4,5}"
 SLOTS="${SLOTS:-}"
 GPU_DEVICE="${GPU_DEVICE:-0}"
 EXPECTED_GPU_ARCH="${EXPECTED_GPU_ARCH:-}"
@@ -32,7 +32,7 @@ usage() {
 Usage: MODEL=/path/model.gguf [REPEATS=5] run_qwen36_concurrency.sh
 
 Runs fresh-server, same-concurrency warmup + measurement cases for luce-k8,
-luce-k1, and llama at C=2/4/8/16. Defaults to one repeat for screening; use at
+luce-k1, and llama at C=1/2/3/4/5. Defaults to one repeat for screening; use at
 least five paired repeats for publication. For a decode-heavy comparison, set
 WORKLOADS=short MAX_TOKENS=256 VARIANTS=luce-k8,llama. OUT must not already
 exist. GPU_DEVICE is the physical ROCr device exposed exclusively to both
