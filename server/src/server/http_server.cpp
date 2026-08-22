@@ -252,6 +252,35 @@ bool should_clamp_flowkv_disk_cache(
     return flowkv && policy.compress;
 }
 
+bool canonical_turn_matches_checkpoint(
+        const std::vector<int32_t> & prompt,
+        const std::vector<int32_t> & completed_turn,
+        int checkpoint) {
+    return checkpoint > 0 && checkpoint <= (int) prompt.size() &&
+           checkpoint < (int) completed_turn.size() &&
+           std::equal(prompt.begin(), prompt.begin() + checkpoint,
+                      completed_turn.begin());
+}
+
+bool canonical_assistant_content(
+        const std::string & generation_prompt,
+        const std::string & sentinel_rendered,
+        const std::string & sentinel,
+        const std::string & generated_text,
+        std::string & content) {
+    const size_t pos = sentinel_rendered.find(sentinel);
+    if (pos == std::string::npos ||
+        sentinel_rendered.find(sentinel, pos + 1) != std::string::npos) {
+        return false;
+    }
+    const std::string assistant_head = sentinel_rendered.substr(0, pos);
+    if (generation_prompt.compare(0, assistant_head.size(), assistant_head) != 0) {
+        return false;
+    }
+    content = generation_prompt.substr(assistant_head.size()) + generated_text;
+    return true;
+}
+
 }  // namespace http_detail
 
 // ─── curl helpers for upstream proxy ─────────────────────────────────────
@@ -850,6 +879,7 @@ json build_props_body(const ServerConfig & config,
             {"capacity",      pcs.capacity},
             {"in_use",        pcs.in_use},
             {"lifetime_hits", pcs.lifetime_hits},
+            {"agent_turn_enabled", config.agent_turn_cache},
         }},
         {"full_cache", {
             {"enabled",       pcfs.enabled},
@@ -935,6 +965,18 @@ std::vector<ChatMessage> normalize_chat_messages(
     ToolMemory & tool_memory) {
     std::vector<ChatMessage> chat_msgs;
     std::vector<std::string> system_parts;
+    std::vector<std::string> response_call_ids;
+    std::string response_call_fallback;
+
+    auto flush_response_calls = [&]() {
+        if (response_call_fallback.empty()) return;
+        std::string raw = response_call_ids.empty()
+            ? std::string() : tool_memory.lookup(response_call_ids);
+        chat_msgs.push_back({"assistant",
+                             raw.empty() ? response_call_fallback : raw});
+        response_call_ids.clear();
+        response_call_fallback.clear();
+    };
 
     if (messages.is_array()) {
         for (const auto & m : messages) {
@@ -942,17 +984,12 @@ std::vector<ChatMessage> normalize_chat_messages(
                 std::string item_type = m.value("type", "message");
                 if (item_type == "function_call") {
                     std::string call_id = m.value("call_id", m.value("id", ""));
-                    std::string raw;
-                    if (!call_id.empty()) {
-                        raw = tool_memory.lookup({call_id});
-                    }
-                    if (raw.empty()) {
-                        raw = render_tool_call_xml(m.value("name", ""),
-                                                   parse_responses_arguments(m));
-                    }
-                    chat_msgs.push_back({"assistant", raw});
+                    if (!call_id.empty()) response_call_ids.push_back(call_id);
+                    response_call_fallback += render_tool_call_xml(
+                        m.value("name", ""), parse_responses_arguments(m));
                     continue;
                 }
+                flush_response_calls();
                 if (item_type == "function_call_output") {
                     std::string output;
                     if (m.contains("output") && m["output"].is_string()) {
@@ -965,6 +1002,7 @@ std::vector<ChatMessage> normalize_chat_messages(
                     continue;
                 }
             }
+            if (format == ApiFormat::RESPONSES) flush_response_calls();
 
             ChatMessage cm;
             cm.role = m.value("role", "user");
@@ -1005,6 +1043,7 @@ std::vector<ChatMessage> normalize_chat_messages(
                 chat_msgs.push_back(std::move(cm));
             }
         }
+        flush_response_calls();
     } else if (messages.is_string()) {
         chat_msgs.push_back({"user", messages.get<std::string>()});
     }
@@ -1900,16 +1939,15 @@ void HttpServer::apply_request_reasoning(
     // reply reserve falls back to --hard-limit-reply-budget.)
 }
 
-// Render messages to prompt text and tokenize into req.prompt_tokens.
-bool HttpServer::render_and_tokenize_request(
-        SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
-        ParsedRequest & req) {
+bool HttpServer::render_messages_to_text(
+        const std::vector<ChatMessage> & chat_messages,
+        const ParsedRequest & req, bool add_generation_prompt,
+        std::string & rendered, std::string & error) {
     std::string tools_json;
     if (req.tools.is_array() && !req.tools.empty()) {
         tools_json = req.tools.dump();
     }
 
-    std::string rendered;
     if (!config_.chat_template_src.empty()) {
         // Jinja path: --chat-template-file overrides the hardcoded
         // QWEN3/LAGUNA renderer. Used for tool-using agents that need the
@@ -1927,21 +1965,34 @@ bool HttpServer::render_and_tokenize_request(
         try {
             rendered = render_chat_template_jinja(
                 config_.chat_template_src, chat_messages, bos, eos,
-                /*add_generation_prompt=*/true,
+                add_generation_prompt,
                 req.thinking_enabled, tools_json);
         } catch (const std::exception & e) {
-            send_error(fd, 500,
-                std::string("chat template (jinja) render failed: ") + e.what());
+            error = std::string("chat template (jinja) render failed: ") + e.what();
             return false;
         }
     } else {
         rendered = render_chat_template(
-            chat_messages, chat_format_, /*add_generation_prompt=*/true,
+            chat_messages, chat_format_, add_generation_prompt,
             req.thinking_enabled, tools_json);
     }
 
-    req.started_in_thinking = prompt_ends_in_open_think(rendered);
-    req.prompt_tokens = tokenizer_.encode(rendered);
+    return true;
+}
+
+// Render messages to prompt text and tokenize into req.prompt_tokens.
+bool HttpServer::render_and_tokenize_request(
+        SocketHandle fd, const std::vector<ChatMessage> & chat_messages,
+        ParsedRequest & req) {
+    std::string error;
+    if (!render_messages_to_text(chat_messages, req,
+                                 /*add_generation_prompt=*/true,
+                                 req.rendered_prompt, error)) {
+        send_error(fd, 500, error);
+        return false;
+    }
+    req.started_in_thinking = prompt_ends_in_open_think(req.rendered_prompt);
+    req.prompt_tokens = tokenizer_.encode(req.rendered_prompt);
     return true;
 }
 
@@ -2086,10 +2137,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
 
 namespace {
 
-// Staging slot for disk-cache loads: the last ModelBackend slot, reserved
-// so it never collides with PrefixCache slots (inline uses 0..cap-1, full
-// uses cap..cap+full_cap-1 — safe as long as total cache slots stay below
-// kMaxSlots - 1).
+// Disk-cache staging lives above both PrefixCache pools.
 constexpr int kDiskStagingSlot = ModelBackend::kMaxSlots - 1;
 
 struct CompletionTokenCounts {
@@ -3218,6 +3266,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
                 // must not remain discoverable on every later request.
                 // Inline and full caches use disjoint slot ranges, so
                 // invalidating both ownership tables is unambiguous.
+                forget_inline_slot_metadata(cache.cache_slot);
                 backend_.snapshot_free(cache.cache_slot);
                 prefix_cache_.abort_inline_snap(cache.cache_slot);
                 prefix_cache_.abort_full_snap(cache.cache_slot);
@@ -3323,6 +3372,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     }
     cache.snap_prepared = cache.snap_slot >= 0;
     if (cache.snap_prepared) {
+        forget_inline_slot_metadata(cache.snap_slot);
         backend_.snapshot_free(cache.snap_slot);
         generate_request.snap_slot = cache.snap_slot;
         generate_request.snap_pos = cache.snap_cut;
@@ -3450,6 +3500,138 @@ void HttpServer::finalize_generation_cache(
     static constexpr size_t kMaxRecentDiskPrompts = 256;
     if (recent_disk_prompts_.size() > kMaxRecentDiskPrompts) {
         recent_disk_prompts_.resize(kMaxRecentDiskPrompts);
+    }
+}
+
+void HttpServer::forget_inline_slot_metadata(int slot) {
+    if (slot < 0) return;
+    agent_turn_cache_slots_.erase(slot);
+    slot_tokens_.erase(slot);
+}
+
+void HttpServer::remember_agent_turn(
+        const ParsedRequest & req, const PreparedPrompt & prepared,
+        const GenerationCacheState & cache, const GenerateResult & result,
+        const SseEmitter & emitter, int completion_tokens,
+        bool visible_output_seen, bool client_disconnected,
+        bool replay_cache) {
+    const bool supported_format = req.format == ApiFormat::OPENAI_CHAT ||
+        req.format == ApiFormat::RESPONSES;
+    const bool valid_tool_turn = result.ok() && completion_tokens > 0 &&
+        visible_output_seen && !client_disconnected && !req.tools.empty() &&
+        !emitter.tool_calls().empty() && !emitter.accumulated_raw().empty();
+    if (!supported_format || !valid_tool_turn) return;
+
+    std::vector<ChatMessage> messages =
+        normalize_chat_messages(req.messages, req.format, tool_memory_);
+    static constexpr const char * kSentinel =
+        "__DFLASH_AGENT_TURN_CONTENT_7A21D9__";
+    messages.push_back({"assistant", kSentinel});
+
+    std::string sentinel_rendered;
+    std::string render_error;
+    if (!render_messages_to_text(
+            messages, req, /*add_generation_prompt=*/false,
+            sentinel_rendered, render_error)) {
+        std::fprintf(stderr, "[agent-turn-cache] render skipped: %s\n",
+                     render_error.c_str());
+        return;
+    }
+    // Preserve template-injected generation text (for example Qwen's
+    // <think> prefix) in tool memory so the next stateless request renders the
+    // same token stream as the checkpointed generation.
+    std::string assistant_content;
+    if (!http_detail::canonical_assistant_content(
+            req.rendered_prompt, sentinel_rendered, kSentinel,
+            emitter.accumulated_raw(), assistant_content)) {
+        return;
+    }
+    messages.back().content = assistant_content;
+
+    // Stateless tool APIs send structured calls back on the next request.
+    // Retain the exact generated text so normalization recreates the same
+    // assistant turn, even when no compatible KV checkpoint is available.
+    std::vector<std::string> call_ids;
+    for (const auto & call : emitter.tool_calls()) call_ids.push_back(call.id);
+    tool_memory_.remember(call_ids, assistant_content);
+
+    if (!replay_cache) return;
+    if (!config_.agent_turn_cache || prefix_cache_.disabled()) return;
+    // Cache only stateless-equivalent prompts. Compression and token rewrites
+    // need a separate replay contract.
+    if (prepared.compressed || prepared.tokens != req.prompt_tokens) return;
+
+    std::string canonical_rendered;
+    if (!render_messages_to_text(
+            messages, req, /*add_generation_prompt=*/false,
+            canonical_rendered, render_error)) {
+        return;
+    }
+    std::vector<int32_t> canonical_tokens = tokenizer_.encode(canonical_rendered);
+    if (has_pending_jobs()) return;
+
+    // Reuse the deepest checkpoint ordinary prefix caching already produced.
+    // Matching at the checkpoint, instead of at the prompt end, tolerates the
+    // BPE boundary change caused by appending the generated assistant turn.
+    int source_slot = -1;
+    int source_pos = 0;
+    auto consider_source = [&](int slot) {
+        if (slot < 0 || !backend_.snapshot_used(slot)) return;
+        const int pos = backend_.snapshot_cur_pos(slot);
+        if (pos <= source_pos ||
+            !http_detail::canonical_turn_matches_checkpoint(
+                prepared.tokens, canonical_tokens, pos)) {
+            return;
+        }
+        source_slot = slot;
+        source_pos = pos;
+    };
+    if (cache.using_restore) consider_source(cache.cache_slot);
+    if (cache.snap_prepared) consider_source(cache.snap_slot);
+    if (source_slot < 0) {
+        std::fprintf(stderr,
+            "[agent-turn-cache] no compatible prefix checkpoint; skipped\n");
+        return;
+    }
+
+    const int canonical_end = (int) canonical_tokens.size();
+    const auto pending = prefix_cache_.prepare_inline_snap(
+        canonical_tokens, source_pos, false, canonical_end);
+    if (pending.first < 0 || pending.second != canonical_end) return;
+
+    const int slot = pending.first;
+    if (slot == source_slot) {
+        prefix_cache_.cancel_inline_snap(slot);
+        return;
+    }
+    forget_inline_slot_metadata(slot);
+    backend_.snapshot_free(slot);
+
+    GenerateRequest replay;
+    replay.prompt = canonical_tokens;
+    replay.n_gen = 0;
+    replay.snap_slot = slot;
+    replay.snap_pos = canonical_end;
+    DaemonIO replay_io;
+    replay_io.should_cancel = [this]() { return has_pending_jobs(); };
+    const GenerateResult replay_result = backend_.restore_and_generate(
+        source_slot, replay, replay_io);
+    backend_.release_scratch();
+    const int saved_pos = replay_result.ok() && backend_.snapshot_used(slot)
+        ? backend_.snapshot_cur_pos(slot) : 0;
+    if (saved_pos > source_pos && saved_pos <= canonical_end) {
+        prefix_cache_.confirm_inline_snap(slot, saved_pos, canonical_tokens);
+        canonical_tokens.resize((size_t) saved_pos);
+        slot_tokens_[slot] = std::move(canonical_tokens);
+        agent_turn_cache_slots_.insert(slot);
+        std::fprintf(stderr,
+            "[agent-turn-cache] saved slot=%d prefix=%d source=%d:%d "
+            "replayed=%d\n",
+            slot, saved_pos, source_slot, source_pos,
+            canonical_end - source_pos);
+    } else {
+        backend_.snapshot_free(slot);
+        prefix_cache_.abort_inline_snap(slot);
     }
 }
 
@@ -3853,16 +4035,21 @@ void HttpServer::process_job(ServerJob * job) {
     // message_delta usage, Responses response.completed usage).
     // See docs/specs/thinking-budget.md §6.3.
     const int effective_prompt_tokens = (int) effective_prompt.size();
-    const int cached_prefix_tokens = using_restore
-        ? (std::clamp)(prefix_len, 0, effective_prompt_tokens)
+    const int cached_prefix_tokens = result.ok()
+        ? (std::clamp)(result.restored_prefix_tokens, 0,
+                      effective_prompt_tokens)
         : 0;
+    const bool cache_hit = cached_prefix_tokens > 0;
+    const bool agent_turn_cache_hit = cache_hit &&
+        agent_turn_cache_slots_.count(cache_slot) != 0;
     GenTimings gen_timings{
         result.prefill_s,
         result.decode_s,
-        using_restore,
+        cache_hit,
         cached_prefix_tokens,
         effective_prompt_tokens - cached_prefix_tokens,
         effective_prompt_tokens,
+        agent_turn_cache_hit,
     };
 
     // Record performance for /status page.
@@ -3873,15 +4060,14 @@ void HttpServer::process_job(ServerJob * job) {
         // Use actual prefilled token count: on cache hit the backend only
         // prefills the delta beyond the cached prefix, so dividing the full
         // prompt size by delta time would be wrong.
-        const int prefill_tokens = using_restore
-            ? (std::max)(0, (int)effective_prompt.size() - prefix_len)
-            : (int)effective_prompt.size();
+        const int prefill_tokens =
+            (std::max)(0, effective_prompt_tokens - cached_prefix_tokens);
         perf.prefill_tok_s = (result.prefill_s > 0.0)
             ? (double)prefill_tokens / result.prefill_s : 0.0;
         perf.decode_tok_s = (result.decode_s > 0.0)
             ? (double)completion_tokens / result.decode_s : 0.0;
         perf.accept_rate = result.accept_rate;
-        perf.cache_hit = using_restore;
+        perf.cache_hit = cache_hit;
         perf.pflash = pflash_compressed;
         perf.spec_decode = result.spec_decode_ran;
         perf.timestamp = std::chrono::steady_clock::now();
@@ -3897,6 +4083,10 @@ void HttpServer::process_job(ServerJob * job) {
     }
     if (req.stream && !client_disconnected) {
         auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings);
+        remember_agent_turn(
+            req, prepared, cache, result, emitter, completion_tokens,
+            visible_output_seen, client_disconnected,
+            /*replay_cache=*/false);
         for (const auto & chunk : final_chunks) {
             if (!send_job_bytes(job, chunk.data(), chunk.size())) {
                 client_disconnected = true;
@@ -3906,12 +4096,21 @@ void HttpServer::process_job(ServerJob * job) {
     } else if (!req.stream && !client_disconnected) {
         const json response = build_non_streaming_response(
             req, result, n_gen_cap, gen_timings, tokenizer_, emitter);
+        remember_agent_turn(
+            req, prepared, cache, result, emitter, completion_tokens,
+            visible_output_seen, client_disconnected,
+            /*replay_cache=*/false);
         // Streaming uses non-blocking sends; restore blocking mode before
         // writing a complete JSON response on this shared socket path.
         sock_set_block(fd);
         send_response(fd, 200, "application/json",
                       response.dump() + "\n");
     }
+
+    remember_agent_turn(
+        req, prepared, cache, result, emitter, completion_tokens,
+        visible_output_seen, client_disconnected,
+        /*replay_cache=*/true);
 
     if (client_disconnected) {
         std::fprintf(stderr, "[server] client disconnected — generation aborted "
@@ -3972,6 +4171,11 @@ void HttpServer::enqueue(ServerJob * job) {
     else queue_head_ = job;
     queue_tail_ = job;
     queue_cv_.notify_one();
+}
+
+bool HttpServer::has_pending_jobs() {
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    return queue_head_ != nullptr;
 }
 
 ServerJob * HttpServer::dequeue() {

@@ -46,6 +46,7 @@ struct GenTimings {
     int    cached_prefix_tokens = 0;
     int    prefilled_tokens     = 0;
     int    effective_prompt_tokens = 0;
+    bool   agent_turn_cache_hit = false;
 };
 
 // Build the `timings` sub-object emitted under `usage`.
@@ -97,6 +98,9 @@ public:
 
     // Get accumulated content (for non-streaming).
     const std::string & accumulated_text() const { return accumulated_content_; }
+
+    // Exact model text before structured tool-call normalization.
+    const std::string & accumulated_raw() const { return accumulated_raw_; }
 
     // Get the parsed tool calls (after emit_finish).
     const std::vector<ToolCall> & tool_calls() const { return tool_calls_; }
