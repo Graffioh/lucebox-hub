@@ -2662,7 +2662,7 @@ bool moe_expert_major_prefill_enabled(int n_tokens) {
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
     }();
     static const int min_tokens =
-        env_int_or_default("DFLASH_MOE_EXPERT_MAJOR_MIN_TOKENS", 32);
+        env_int_or_default("DFLASH_MOE_EXPERT_MAJOR_MIN_TOKENS", 64);
     return enabled && n_tokens >= min_tokens;
 }
 
@@ -2926,7 +2926,8 @@ static bool eval_moe_owner_expert_major_batched(
                                     sizeof(float) * (size_t)n_embd * (size_t)n_tokens);
         }
         if (input_ready) {
-            ggml_backend_synchronize(backend);
+            // The async peer copy records a source event and queues a destination
+            // wait, so later cold work is ordered without blocking the host.
             input_ready();
         }
 
