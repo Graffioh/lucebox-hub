@@ -441,135 +441,203 @@ bool build_draft_kv_append(
     return true;
 }
 
-DraftGraphOutputs build_draft_kv_step(
-    ggml_context *            ctx,
-    ggml_cgraph *             gf,
-    const DraftWeights &      w,
-    const DraftKvCacheRefs &  cache,
-    const DraftKvStepInputs & in) {
-    const int q_len    = w.block_size;
-    const int n_head   = w.n_head;
-    const int n_kv     = w.n_head_kv;
-    const int head_dim = w.head_dim;
-    const float eps    = DFLASH27B_RMS_EPS;
-    const int kv_total = cache.kv_total;
+static ggml_tensor * draft_pack_columns(
+        ggml_context * ctx,
+        const std::vector<ggml_tensor *> & lanes) {
+    ggml_tensor * packed = lanes.front();
+    for (size_t lane = 1; lane < lanes.size(); ++lane) {
+        packed = ggml_concat(ctx, packed, lanes[lane], 1);
+    }
+    return packed;
+}
 
+static ggml_tensor * draft_lane_columns(
+        ggml_context * ctx, ggml_tensor * packed,
+        int q_len, size_t lane) {
+    return ggml_view_2d(
+        ctx, packed, packed->ne[0], q_len, packed->nb[1],
+        lane * static_cast<size_t>(q_len) * packed->nb[1]);
+}
+
+std::vector<DraftGraphOutputs> build_draft_kv_steps(
+        ggml_context *                         ctx,
+        ggml_cgraph *                          gf,
+        const DraftWeights &                   w,
+        const std::vector<DraftKvLaneInputs> & lanes) {
+    const size_t n_lanes = lanes.size();
+    if (!ctx || !gf || n_lanes == 0) {
+        return {};
+    }
+
+    const int q_len = w.block_size;
+    const int n_head = w.n_head;
+    const int n_kv = w.n_head_kv;
+    const int head_dim = w.head_dim;
+    const int64_t q_dim = static_cast<int64_t>(head_dim) * n_head;
+    const int64_t kv_dim = static_cast<int64_t>(head_dim) * n_kv;
+    const float eps = DFLASH27B_RMS_EPS;
     static const bool disable_attn_gate =
         std::getenv("DFLASH_DISABLE_DRAFT_ATTN_GATE") != nullptr;
     static const bool disable_swa =
         std::getenv("DFLASH_DISABLE_DRAFT_SWA") != nullptr;
 
-    ggml_tensor * h = in.noise_embed;  // [hidden, q_len]
-    char probe_name[64];
-
-    for (int il = 0; il < w.n_layer; il++) {
-        const DraftLayer & L = w.layers[il];
-        const bool layer_is_swa = L.is_swa && !disable_swa;
-        const bool dyn_conv = w.conv_kernel_size > 0 && L.attn_conv.present() && L.mlp_conv.present();
-
-        // ── attention pre-norm (+ DFlash 2 dynamic conv "prepare")
-        ggml_tensor * hn = ggml_rms_norm(ctx, h, eps);
-        hn = ggml_mul(ctx, hn, L.attn_norm);
-        DraftDynConv attn_dc;
-        if (dyn_conv) {
-            attn_dc = draft_dyn_conv_kernel(ctx, L.attn_conv, hn);
-            hn = draft_dyn_conv_apply(ctx, w, L.attn_conv, attn_dc, 0, hn);
+    for (const DraftKvLaneInputs & lane : lanes) {
+        const DraftKvCacheRefs * cache = lane.cache;
+        const DraftKvStepInputs & in = lane.inputs;
+        if (!cache || !in.noise_embed || !in.positions_q || !in.noise_rows ||
+            cache->kv_total <= 0 ||
+            cache->k.size() != static_cast<size_t>(w.n_layer) ||
+            cache->v.size() != static_cast<size_t>(w.n_layer)) {
+            return {};
         }
+    }
 
-        // ── Q from noise, per-head RMSNorm, RoPE at absolute positions
-        ggml_tensor * Q = ggml_mul_mat(ctx, L.wq, hn);
-        Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, q_len);
-        Q = ggml_rms_norm(ctx, Q, eps);
-        Q = ggml_mul     (ctx, Q, L.q_norm);
-        Q = draft_rope(ctx, Q, in.positions_q, w);
+    std::vector<ggml_tensor *> h(n_lanes);
+    for (size_t lane = 0; lane < n_lanes; ++lane) {
+        h[lane] = lanes[lane].inputs.noise_embed;
+    }
 
-        // ── noise K/V into the scratch cache slots
-        ggml_tensor * Kn = ggml_mul_mat(ctx, L.wk, hn);
-        Kn = ggml_reshape_3d(ctx, Kn, head_dim, n_kv, q_len);
-        Kn = ggml_rms_norm(ctx, Kn, eps);
-        Kn = ggml_mul     (ctx, Kn, L.k_norm);
-        Kn = draft_rope(ctx, Kn, in.positions_q, w);
-        ggml_tensor * Kn_rows = ggml_view_2d(ctx, Kn,
-            (int64_t)head_dim * n_kv, q_len, Kn->nb[2], 0);
-        ggml_tensor * Vn_rows = ggml_mul_mat(ctx, L.wv, hn);  // [kv_dim, q_len]
-        ggml_build_forward_expand(gf,
-            ggml_set_rows(ctx, cache.k[il], Kn_rows, in.noise_rows));
-        ggml_build_forward_expand(gf,
-            ggml_set_rows(ctx, cache.v[il], Vn_rows, in.noise_rows));
+    for (int il = 0; il < w.n_layer; ++il) {
+        const DraftLayer & layer = w.layers[il];
+        const bool layer_is_swa = layer.is_swa && !disable_swa;
+        const bool dyn_conv = w.conv_kernel_size > 0 &&
+            layer.attn_conv.present() && layer.mlp_conv.present();
 
-        // ── flash attention over the full cache span (masks gate validity).
-        // The set_rows nodes were expanded above, so graph order guarantees
-        // the scratch slots hold this step's noise K/V before the FA reads.
-        ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);  // [hd, q_len, n_head]
-        Qfa = ggml_cont(ctx, Qfa);
-        ggml_tensor * Kview = ggml_view_3d(ctx, cache.k[il],
-            head_dim, n_kv, kv_total,
-            ggml_row_size(cache.k[il]->type, head_dim), cache.k[il]->nb[1], 0);
-        ggml_tensor * Vview = ggml_view_3d(ctx, cache.v[il],
-            head_dim, n_kv, kv_total,
-            ggml_row_size(cache.v[il]->type, head_dim), cache.v[il]->nb[1], 0);
-        ggml_tensor * Kfa = ggml_permute(ctx, Kview, 0, 2, 1, 3);  // [hd, kv_total, n_kv]
-        ggml_tensor * Vfa = ggml_permute(ctx, Vview, 0, 2, 1, 3);
-
-        const float scale = 1.0f / std::sqrt((float)head_dim);
-        ggml_tensor * mask = layer_is_swa ? in.mask_swa : in.mask_full;
-        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, mask,
-                                                 scale, /*max_bias=*/0.0f,
-                                                 /*logit_softcap=*/0.0f);
-        std::snprintf(probe_name, sizeof(probe_name), "draft_kv_l%d_attn", il);
-        ggml_set_name(attn, probe_name);
-
-        if (!disable_attn_gate && L.attn_gate) {
-            ggml_tensor * gate = ggml_mul_mat(ctx, L.attn_gate, hn);
-            gate = ggml_softplus(ctx, gate);
-            if (L.attn_gate_per_head) {
-                gate = ggml_reshape_3d(ctx, gate, 1, n_head, q_len);
-            } else {
-                gate = ggml_reshape_3d(ctx, gate, head_dim, n_head, q_len);
+        std::vector<ggml_tensor *> hn(n_lanes);
+        std::vector<DraftDynConv> attn_dc(n_lanes);
+        for (size_t lane = 0; lane < n_lanes; ++lane) {
+            hn[lane] = ggml_rms_norm(ctx, h[lane], eps);
+            hn[lane] = ggml_mul(ctx, hn[lane], layer.attn_norm);
+            if (dyn_conv) {
+                attn_dc[lane] = draft_dyn_conv_kernel(
+                    ctx, layer.attn_conv, hn[lane]);
+                hn[lane] = draft_dyn_conv_apply(
+                    ctx, w, layer.attn_conv, attn_dc[lane], 0, hn[lane]);
             }
-            gate = ggml_cast(ctx, gate, attn->type);
-            attn = ggml_mul(ctx, attn, gate);
         }
-        attn = ggml_reshape_2d(ctx, attn, head_dim * n_head, q_len);
 
-        ggml_tensor * attn_out = ggml_mul_mat(ctx, L.wo, attn);
-        if (dyn_conv) {
-            attn_out = draft_dyn_conv_apply(ctx, w, L.attn_conv, attn_dc, 1, attn_out);
+        ggml_tensor * hn_packed = draft_pack_columns(ctx, hn);
+        ggml_tensor * q_packed = ggml_mul_mat(ctx, layer.wq, hn_packed);
+        ggml_tensor * k_packed = ggml_mul_mat(ctx, layer.wk, hn_packed);
+        ggml_tensor * v_packed = ggml_mul_mat(ctx, layer.wv, hn_packed);
+        ggml_tensor * gate_packed = nullptr;
+        if (!disable_attn_gate && layer.attn_gate) {
+            gate_packed = ggml_mul_mat(ctx, layer.attn_gate, hn_packed);
+            gate_packed = ggml_softplus(ctx, gate_packed);
         }
-        h = ggml_add(ctx, h, attn_out);
 
-        // ── FFN (+ DFlash 2 dynamic conv prepare/finish)
-        ggml_tensor * hf = ggml_rms_norm(ctx, h, eps);
-        hf = ggml_mul(ctx, hf, L.ffn_norm);
-        DraftDynConv mlp_dc;
-        if (dyn_conv) {
-            mlp_dc = draft_dyn_conv_kernel(ctx, L.mlp_conv, hf);
-            hf = draft_dyn_conv_apply(ctx, w, L.mlp_conv, mlp_dc, 0, hf);
+        std::vector<ggml_tensor *> attn_by_lane(n_lanes);
+        for (size_t lane = 0; lane < n_lanes; ++lane) {
+            const DraftKvCacheRefs & cache = *lanes[lane].cache;
+            const DraftKvStepInputs & in = lanes[lane].inputs;
+
+            ggml_tensor * q = draft_lane_columns(ctx, q_packed, q_len, lane);
+            q = ggml_reshape_3d(ctx, q, head_dim, n_head, q_len);
+            q = ggml_rms_norm(ctx, q, eps);
+            q = ggml_mul(ctx, q, layer.q_norm);
+            q = draft_rope(ctx, q, in.positions_q, w);
+
+            ggml_tensor * kn = draft_lane_columns(ctx, k_packed, q_len, lane);
+            kn = ggml_reshape_3d(ctx, kn, head_dim, n_kv, q_len);
+            kn = ggml_rms_norm(ctx, kn, eps);
+            kn = ggml_mul(ctx, kn, layer.k_norm);
+            kn = draft_rope(ctx, kn, in.positions_q, w);
+            ggml_tensor * kn_rows = ggml_view_2d(
+                ctx, kn, kv_dim, q_len, kn->nb[2], 0);
+            ggml_tensor * vn_rows = draft_lane_columns(
+                ctx, v_packed, q_len, lane);
+            ggml_build_forward_expand(
+                gf, ggml_set_rows(ctx, cache.k[il], kn_rows, in.noise_rows));
+            ggml_build_forward_expand(
+                gf, ggml_set_rows(ctx, cache.v[il], vn_rows, in.noise_rows));
+
+            ggml_tensor * qfa = ggml_permute(ctx, q, 0, 2, 1, 3);
+            qfa = ggml_cont(ctx, qfa);
+            ggml_tensor * kview = ggml_view_3d(
+                ctx, cache.k[il], head_dim, n_kv, cache.kv_total,
+                ggml_row_size(cache.k[il]->type, head_dim),
+                cache.k[il]->nb[1], 0);
+            ggml_tensor * vview = ggml_view_3d(
+                ctx, cache.v[il], head_dim, n_kv, cache.kv_total,
+                ggml_row_size(cache.v[il]->type, head_dim),
+                cache.v[il]->nb[1], 0);
+            ggml_tensor * kfa = ggml_permute(ctx, kview, 0, 2, 1, 3);
+            ggml_tensor * vfa = ggml_permute(ctx, vview, 0, 2, 1, 3);
+            ggml_tensor * mask = layer_is_swa ? in.mask_swa : in.mask_full;
+            ggml_tensor * attn = ggml_flash_attn_ext(
+                ctx, qfa, kfa, vfa, mask,
+                1.0f / std::sqrt(static_cast<float>(head_dim)), 0.0f, 0.0f);
+
+            if (gate_packed) {
+                ggml_tensor * gate = draft_lane_columns(
+                    ctx, gate_packed, q_len, lane);
+                if (layer.attn_gate_per_head) {
+                    gate = ggml_reshape_3d(ctx, gate, 1, n_head, q_len);
+                } else {
+                    gate = ggml_reshape_3d(ctx, gate, head_dim, n_head, q_len);
+                }
+                gate = ggml_cast(ctx, gate, attn->type);
+                attn = ggml_mul(ctx, attn, gate);
+            }
+            attn_by_lane[lane] = ggml_reshape_2d(
+                ctx, attn, q_dim, q_len);
         }
-        ggml_tensor * g  = ggml_mul_mat(ctx, L.w_gate, hf);
-        g = ggml_silu(ctx, g);
-        ggml_tensor * u  = ggml_mul_mat(ctx, L.w_up,   hf);
-        ggml_tensor * gu = ggml_mul(ctx, g, u);
-        ggml_tensor * ffn_out = ggml_mul_mat(ctx, L.w_down, gu);
-        if (dyn_conv) {
-            ffn_out = draft_dyn_conv_apply(ctx, w, L.mlp_conv, mlp_dc, 1, ffn_out);
+
+        ggml_tensor * attn_packed = draft_pack_columns(ctx, attn_by_lane);
+        ggml_tensor * attn_out_packed =
+            ggml_mul_mat(ctx, layer.wo, attn_packed);
+        for (size_t lane = 0; lane < n_lanes; ++lane) {
+            ggml_tensor * attn_out = draft_lane_columns(
+                ctx, attn_out_packed, q_len, lane);
+            if (dyn_conv) {
+                attn_out = draft_dyn_conv_apply(
+                    ctx, w, layer.attn_conv, attn_dc[lane], 1, attn_out);
+            }
+            h[lane] = ggml_add(ctx, h[lane], attn_out);
         }
-        h = ggml_add(ctx, h, ffn_out);
+
+        std::vector<ggml_tensor *> hf(n_lanes);
+        std::vector<DraftDynConv> mlp_dc(n_lanes);
+        for (size_t lane = 0; lane < n_lanes; ++lane) {
+            hf[lane] = ggml_rms_norm(ctx, h[lane], eps);
+            hf[lane] = ggml_mul(ctx, hf[lane], layer.ffn_norm);
+            if (dyn_conv) {
+                mlp_dc[lane] = draft_dyn_conv_kernel(
+                    ctx, layer.mlp_conv, hf[lane]);
+                hf[lane] = draft_dyn_conv_apply(
+                    ctx, w, layer.mlp_conv, mlp_dc[lane], 0, hf[lane]);
+            }
+        }
+
+        ggml_tensor * hf_packed = draft_pack_columns(ctx, hf);
+        ggml_tensor * gate = ggml_mul_mat(ctx, layer.w_gate, hf_packed);
+        gate = ggml_silu(ctx, gate);
+        ggml_tensor * up = ggml_mul_mat(ctx, layer.w_up, hf_packed);
+        ggml_tensor * ffn = ggml_mul(ctx, gate, up);
+        ggml_tensor * ffn_out_packed = ggml_mul_mat(ctx, layer.w_down, ffn);
+        for (size_t lane = 0; lane < n_lanes; ++lane) {
+            ggml_tensor * ffn_out = draft_lane_columns(
+                ctx, ffn_out_packed, q_len, lane);
+            if (dyn_conv) {
+                ffn_out = draft_dyn_conv_apply(
+                    ctx, w, layer.mlp_conv, mlp_dc[lane], 1, ffn_out);
+            }
+            h[lane] = ggml_add(ctx, h[lane], ffn_out);
+        }
     }
 
-    ggml_tensor * out = ggml_rms_norm(ctx, h, eps);
-    out = ggml_mul(ctx, out, w.out_norm);
-    ggml_set_name(out, "draft_kv_hidden_out");
-
-    DraftGraphOutputs og{};
-    og.hidden_states = out;
-    og.logits = nullptr;
-    if (in.lm_head) {
-        ggml_tensor * logits = ggml_mul_mat(ctx, in.lm_head, out);
-        ggml_set_name(logits, "draft_kv_logits");
-        og.logits = logits;
+    std::vector<DraftGraphOutputs> outputs(n_lanes);
+    for (size_t lane = 0; lane < n_lanes; ++lane) {
+        ggml_tensor * out = ggml_rms_norm(ctx, h[lane], eps);
+        out = ggml_mul(ctx, out, w.out_norm);
+        outputs[lane].hidden_states = out;
+        outputs[lane].logits = nullptr;
+        if (lanes[lane].inputs.lm_head) {
+            outputs[lane].logits = ggml_mul_mat(
+                ctx, lanes[lane].inputs.lm_head, out);
+        }
     }
-    return og;
+    return outputs;
 }
 
 } // namespace dflash::common
