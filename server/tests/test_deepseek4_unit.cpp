@@ -82,10 +82,15 @@ static double elapsed_ms(TestClock::time_point t0, TestClock::time_point t1) {
 }
 
 static void test_moe_expert_major_default_threshold() {
-    unsetenv("DFLASH_MOE_EXPERT_MAJOR_PREFILL");
-    unsetenv("DFLASH_MOE_EXPERT_MAJOR_MIN_TOKENS");
-    TEST_ASSERT(!moe_expert_major_prefill_enabled(63));
-    TEST_ASSERT(moe_expert_major_prefill_enabled(64));
+    TEST_ASSERT(kMoeExpertMajorPrefillMinTokens == 64);
+    TEST_ASSERT(!moe_expert_major_prefill_policy_enabled(
+        63, true, kMoeExpertMajorPrefillMinTokens));
+    TEST_ASSERT(moe_expert_major_prefill_policy_enabled(
+        64, true, kMoeExpertMajorPrefillMinTokens));
+    TEST_ASSERT(!moe_expert_major_prefill_policy_enabled(
+        64, false, kMoeExpertMajorPrefillMinTokens));
+    TEST_ASSERT(moe_cold_input_first_policy_enabled(true, true, false));
+    TEST_ASSERT(!moe_cold_input_first_policy_enabled(true, true, true));
 }
 
 struct DeepSeek4FixtureOptions {

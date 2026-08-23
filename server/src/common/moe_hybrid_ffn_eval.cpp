@@ -2662,8 +2662,10 @@ bool moe_expert_major_prefill_enabled(int n_tokens) {
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
     }();
     static const int min_tokens =
-        env_int_or_default("DFLASH_MOE_EXPERT_MAJOR_MIN_TOKENS", 64);
-    return enabled && n_tokens >= min_tokens;
+        env_int_or_default("DFLASH_MOE_EXPERT_MAJOR_MIN_TOKENS",
+                           kMoeExpertMajorPrefillMinTokens);
+    return moe_expert_major_prefill_policy_enabled(
+        n_tokens, enabled, min_tokens);
 }
 
 // Expert-major prefill groups prompt rows by expert so the quantized GEMMs can
@@ -2703,6 +2705,17 @@ static bool full_cold_parallel_enabled() {
 static bool cold_input_first_enabled() {
     static const bool enabled = []() {
         const char * raw = std::getenv("DFLASH_MOE_COLD_INPUT_FIRST");
+        return raw && *raw && std::strcmp(raw, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool batched_peer_copies_enabled() {
+    static const bool enabled = []() {
+        const char * raw = std::getenv("GGML_BATCH_PEER_COPIES");
+        if (!raw || !*raw) {
+            raw = std::getenv("GGML_CUDA_BATCH_PEER_COPIES");
+        }
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -3545,8 +3558,9 @@ bool eval_moe_hybrid_ffn_batched(
         std::string hot_err;
         std::string cold_err;
         const auto cold_t0 = HybridClock::now();
-        const bool wait_for_cold_input =
-            cur_backend && cold_input_first_enabled();
+        const bool wait_for_cold_input = moe_cold_input_first_policy_enabled(
+            cur_backend != nullptr, cold_input_first_enabled(),
+            batched_peer_copies_enabled());
         std::unique_ptr<MoeInputReady> cold_input_ready;
         std::function<void()> signal_cold_input;
         std::future<bool> cold_future;
