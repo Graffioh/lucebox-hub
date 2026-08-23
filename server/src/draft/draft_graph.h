@@ -85,11 +85,18 @@ struct DraftKvStepInputs {
     ggml_tensor * mask_swa = nullptr;    // [kv_total, q_len] f16 (SWA layers)
     ggml_tensor * lm_head = nullptr;     // optional fused projection
 };
-DraftGraphOutputs build_draft_kv_step(
-    ggml_context *            ctx,
-    ggml_cgraph *             gf,
-    const DraftWeights &      w,
-    const DraftKvCacheRefs &  cache,
-    const DraftKvStepInputs & in);
+
+struct DraftKvLaneInputs {
+    const DraftKvCacheRefs * cache = nullptr;
+    DraftKvStepInputs inputs;
+};
+
+// Build one cached draft step for all lanes. Dense weight projections share
+// the packed column axis; positions, cache writes and attention stay per lane.
+std::vector<DraftGraphOutputs> build_draft_kv_steps(
+    ggml_context *                         ctx,
+    ggml_cgraph *                          gf,
+    const DraftWeights &                   w,
+    const std::vector<DraftKvLaneInputs> & lanes);
 
 } // namespace dflash::common
