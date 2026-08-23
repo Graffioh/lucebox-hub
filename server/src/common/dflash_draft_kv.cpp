@@ -96,10 +96,12 @@ bool draft_kv_init(DraftKvState & st,
     si.mask_full   = st.mask_full;
     si.mask_swa    = st.mask_swa;
     si.lm_head     = lm_head;
-    DraftGraphOutputs go = build_draft_kv_step(st.g_ctx, st.gf, dw, st.cache, si);
-    if (!go.hidden_states) return false;
-    st.hidden_states = go.hidden_states;
-    st.logits        = go.logits;
+    const std::vector<DraftKvLaneInputs> lanes{{&st.cache, si}};
+    const std::vector<DraftGraphOutputs> outputs =
+        build_draft_kv_steps(st.g_ctx, st.gf, dw, lanes);
+    if (outputs.size() != 1 || !outputs.front().hidden_states) return false;
+    st.hidden_states = outputs.front().hidden_states;
+    st.logits        = outputs.front().logits;
     ggml_set_output(st.hidden_states);
     ggml_build_forward_expand(st.gf, st.hidden_states);
     if (st.logits) {
@@ -334,6 +336,7 @@ void draft_kv_batch_free(DraftKvBatchGraph & batch) {
     batch.meta_arena.clear();
     batch.n_lanes = 0;
     batch.q_len = 0;
+    batch.backend = nullptr;
     batch.built_for = nullptr;
 }
 
@@ -397,6 +400,8 @@ static bool draft_kv_batch_build(
         batch.g_ctx, graph_capacity, false);
 
     batch.hidden_by_lane.reserve(static_cast<size_t>(n_lanes));
+    std::vector<DraftKvLaneInputs> lanes;
+    lanes.reserve(n_lanes_size);
     for (DraftKvState * state : lane_states) {
         DraftKvAppendInputs append{};
         append.n_rows = state->a_step;
@@ -415,8 +420,16 @@ static bool draft_kv_batch_build(
         step.noise_rows = state->noise_rows;
         step.mask_full = state->mask_full;
         step.mask_swa = state->mask_swa;
-        DraftGraphOutputs output = build_draft_kv_step(
-            batch.g_ctx, batch.gf, dw, state->cache, step);
+        lanes.push_back({&state->cache, step});
+    }
+
+    const std::vector<DraftGraphOutputs> outputs = build_draft_kv_steps(
+        batch.g_ctx, batch.gf, dw, lanes);
+    if (outputs.size() != lane_states.size()) {
+        draft_kv_batch_free(batch);
+        return false;
+    }
+    for (const DraftGraphOutputs & output : outputs) {
         if (!output.hidden_states) {
             draft_kv_batch_free(batch);
             return false;
@@ -439,6 +452,7 @@ static bool draft_kv_batch_build(
     batch.n_lanes = n_lanes;
     batch.q_len = dw.block_size;
     batch.built_for = &dw;
+    batch.backend = backend;
     batch.lane_states = lane_states;
     std::fprintf(stderr,
         "[draft-kv-batch] packed backbone ready lanes=%d q_len=%d "
@@ -460,7 +474,7 @@ bool draft_kv_batch_compute(
 
     const bool reusable =
         batch.gf && batch.built_for == static_cast<const void *>(&dw) &&
-        batch.lane_states == lane_states;
+        batch.backend == backend && batch.lane_states == lane_states;
     if (!reusable &&
         !draft_kv_batch_build(
             batch, dw, backend, lane_states)) {

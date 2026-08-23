@@ -107,6 +107,7 @@ struct DraftKvBatchGraph {
     int n_lanes = 0;
     int q_len = 0;
     const void * built_for = nullptr;
+    ggml_backend_t backend = nullptr;
     std::vector<DraftKvState *> lane_states;
 
     std::vector<uint8_t> meta_arena;
