@@ -1496,6 +1496,16 @@ if(DFLASH27B_TESTS)
     endif()
 
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_input_ready.cpp")
+        add_executable(test_moe_input_ready test/test_moe_input_ready.cpp)
+        target_include_directories(test_moe_input_ready PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(UNIX)
+            target_link_libraries(test_moe_input_ready PRIVATE pthread)
+        endif()
+        list(APPEND _raw_unit_test_targets test_moe_input_ready)
+    endif()
+
     # The production CUDA and ROCm images share this entrypoint. Keep native
     # server defaults intact unless an operator explicitly supplies an env
     # override; otherwise container launches can silently disable features

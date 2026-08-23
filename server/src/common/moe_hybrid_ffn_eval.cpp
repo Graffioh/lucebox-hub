@@ -1,5 +1,6 @@
 #include "moe_hybrid_ffn_eval.h"
 #include "cuda_graph_overrides.h"
+#include "moe_input_ready.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -14,6 +15,7 @@
 #include <functional>
 #include <future>
 #include <limits>
+#include <memory>
 #include <mutex>
 
 namespace dflash::common {
@@ -3180,7 +3182,8 @@ static bool eval_moe_owner_expert_major_batched(
         }
     }
     if (input_ready) {
-        ggml_backend_synchronize(backend);
+        // The async peer copy records a source event and queues a destination
+        // wait, so later cold work is ordered without blocking the host.
         input_ready();
     }
     if (packed_token_ids) {
@@ -3543,38 +3546,42 @@ bool eval_moe_hybrid_ffn_batched(
         const auto cold_t0 = HybridClock::now();
         const bool wait_for_cold_input =
             cur_backend && cold_input_first_enabled();
-        std::promise<void> cold_input_promise;
-        std::future<void> cold_input_future;
-        bool cold_input_signaled = false;
+        std::unique_ptr<MoeInputReady> cold_input_ready;
         std::function<void()> signal_cold_input;
+        std::future<bool> cold_future;
         if (wait_for_cold_input) {
-            cold_input_future = cold_input_promise.get_future();
-            signal_cold_input = [&]() {
-                if (!cold_input_signaled) {
-                    cold_input_signaled = true;
-                    cold_input_promise.set_value();
-                }
-            };
-        }
-        auto cold_future = std::async(std::launch::async, [&]() {
-            ScopedCudaGraphOverrides graph_scope(
-                heterogeneous_prefill_eager_enabled(
-                    p_cold_alloc != nullptr));
-            const bool ok = eval_moe_owner_expert_major_batched(
-                storage.cold_backend, cfg, desc,
-                storage.gate_cold, storage.up_cold, storage.down_cold,
-                storage.gate_up_cold, storage.cold_local_by_global,
-                cur_host, selected_ids, selected_weights, n_tokens,
-                /*include_shared=*/false, cold_partial, &cold_err,
-                cur_backend, gpu_backend, nullptr, nullptr,
-                p_cold_alloc, signal_cold_input);
-            if (signal_cold_input) {
-                signal_cold_input();
-            }
-            return ok;
-        });
-        if (wait_for_cold_input) {
-            cold_input_future.wait();
+            cold_input_ready = std::make_unique<MoeInputReady>(true);
+            signal_cold_input = [&]() { cold_input_ready->signal(); };
+            cold_future = launch_moe_input_ready_worker(*cold_input_ready, [&]() {
+                ScopedCudaGraphOverrides graph_scope(
+                    heterogeneous_prefill_eager_enabled(
+                        p_cold_alloc != nullptr));
+                return eval_moe_owner_expert_major_batched(
+                    storage.cold_backend, cfg, desc,
+                    storage.gate_cold, storage.up_cold, storage.down_cold,
+                    storage.gate_up_cold, storage.cold_local_by_global,
+                    cur_host, selected_ids, selected_weights, n_tokens,
+                    /*include_shared=*/false, cold_partial, &cold_err,
+                    cur_backend, gpu_backend, nullptr, nullptr,
+                    p_cold_alloc, signal_cold_input);
+            });
+            cold_input_ready->wait();
+        } else {
+            // Preserve the parent worker and call shape when the scheduling
+            // optimization is disabled.
+            cold_future = std::async(std::launch::async, [&]() {
+                ScopedCudaGraphOverrides graph_scope(
+                    heterogeneous_prefill_eager_enabled(
+                        p_cold_alloc != nullptr));
+                return eval_moe_owner_expert_major_batched(
+                    storage.cold_backend, cfg, desc,
+                    storage.gate_cold, storage.up_cold, storage.down_cold,
+                    storage.gate_up_cold, storage.cold_local_by_global,
+                    cur_host, selected_ids, selected_weights, n_tokens,
+                    /*include_shared=*/false, cold_partial, &cold_err,
+                    cur_backend, gpu_backend, nullptr, nullptr,
+                    p_cold_alloc);
+            });
         }
         const auto hot_t0 = HybridClock::now();
         const bool hot_ok = eval_moe_owner_expert_major_batched(
