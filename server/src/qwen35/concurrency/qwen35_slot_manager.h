@@ -87,6 +87,13 @@ public:
     // admitted prompt is guaranteed not to wait on another sequence.
     PrefillChunk append_prefill(int slot, int n_tokens);
 
+    // Materialize a copied checkpoint into this request's freshly-reserved
+    // physical pages. Valid only before ordinary prefill has advanced. The
+    // returned rows and block-table delta are the destinations into which the
+    // engine scatters the checkpoint's logical K/V rows. The slot remains in
+    // prefill so the uncached suffix can continue normally.
+    PrefillChunk seed_restored_prefix(int slot, int restored_tokens);
+
     // Record a finished prefill and expose the slot to decode.
     void commit_prefill(int slot);
 

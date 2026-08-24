@@ -250,6 +250,66 @@ static bool mentions(const std::vector<std::string> & violations,
 }
 
 int main() {
+    {
+        FakeSeqEngine engine(1);
+        PrefixStorePlan plan;
+        plan.restore = {3, 8};
+        plan.capture.id = 1;
+        plan.capture.checkpoint = {4, 16};
+        const auto result = engine.admit_with_prefix(
+            1, std::vector<int32_t>{1, 2, 3}, SamplerCfg{}, plan);
+        CHECK(result.status == SeqEngine::AdmitResult::Status::admitted);
+        CHECK(!engine.supports_prefix_store());
+        engine.retire(result.slot);
+    }
+
+    {
+        SeqEngine::StepPlan plan;
+        plan.prefills.push_back({0, 8});
+        SeqEngine::StepResult result;
+        SeqEngine::PrefillOutput output;
+        output.slot = 0;
+        output.prefix_store.status = PrefixStoreEvent::Status::saved;
+        output.prefix_store.ticket.id = 7;
+        output.prefix_store.ticket.checkpoint = {3, 8};
+        output.prefix_store.bytes = 4096;
+        result.prefills.push_back(output);
+        CHECK(validate_step_result(plan, result, 1).empty());
+
+        result.prefills[0].prefix_store.error = "saved with an error";
+        CHECK(validate_step_result(plan, result, 1).find(
+                  "saved prefix capture") != std::string::npos);
+
+        result.prefills[0].prefix_store.error.clear();
+        result.prefills[0].prefix_store.bytes = 0;
+        CHECK(validate_step_result(plan, result, 1).find(
+                  "omits its byte size") != std::string::npos);
+
+        result.prefills[0].prefix_store.status =
+            PrefixStoreEvent::Status::failed;
+        result.prefills[0].prefix_store.error = "copy failed";
+        result.prefills[0].prefix_store.bytes = 4096;
+        CHECK(validate_step_result(plan, result, 1).find(
+                  "committed bytes") != std::string::npos);
+
+        result.prefills[0].prefix_store = {};
+        result.prefills[0].prefix_store.elapsed_us = 1;
+        CHECK(validate_step_result(plan, result, 1).find(
+                  "inactive prefix capture") != std::string::npos);
+
+        result.prefills[0].prefix_store.status =
+            PrefixStoreEvent::Status::saved;
+        result.prefills[0].prefix_store.ticket = output.prefix_store.ticket;
+        result.prefills[0].prefix_store.bytes = output.prefix_store.bytes;
+        result.prefills[0].prefix_store.error.clear();
+        result.prefills[0].status =
+            SeqEngine::PrefillOutput::Status::failed;
+        result.prefills[0].error = "prefill failed";
+        CHECK(validate_step_result(plan, result, 1).find(
+                  "failed prefill carries a prefix capture") !=
+              std::string::npos);
+    }
+
     for (const int slots : {2, 4}) {
         FakeSeqEngine engine(slots);
         const auto violations = check_seq_engine_contract(engine);

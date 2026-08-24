@@ -2504,6 +2504,8 @@ bool snapshot_target_cache(const TargetWeights & w,
     snap.kv_k_type       = cache.kv_k_type;
     snap.max_ctx         = cache.max_ctx;
     snap.target_feat_cap = cache.target_feat_cap;
+    snap.is_thin         = false;
+    snap.is_paged        = false;
 
     return true;
 }
@@ -2593,6 +2595,477 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
     return true;
 }
 
+namespace {
+
+size_t blocks_for_prefix(int tokens, int block_size) {
+    return tokens <= 0 ? 0 :
+        ((size_t)tokens + (size_t)block_size - 1) / (size_t)block_size;
+}
+
+size_t contiguous_block_run(
+        const std::vector<uint32_t> & blocks,
+        size_t first,
+        size_t block_count) {
+    size_t run = 1;
+    while (first + run < block_count &&
+           (uint64_t)blocks[first + run] ==
+               (uint64_t)blocks[first + run - 1] + 1) {
+        ++run;
+    }
+    return run;
+}
+
+bool paged_tensor_layout_matches(
+        const ggml_tensor * dense, const ggml_tensor * paged,
+        int tokens) {
+    return dense && paged && dense->type == paged->type &&
+        dense->ne[0] == paged->ne[0] && dense->ne[1] == tokens &&
+        dense->ne[2] == paged->ne[2] && dense->ne[3] == paged->ne[3] &&
+        ggml_is_contiguous(dense) && ggml_is_contiguous(paged);
+}
+
+bool paged_rows_fit(
+        const ggml_tensor * tensor,
+        const std::vector<uint32_t> & blocks,
+        int block_size,
+        int tokens) {
+    if (!tensor || block_size <= 0 || tokens <= 0 ||
+        blocks.size() < blocks_for_prefix(tokens, block_size)) {
+        return false;
+    }
+    for (size_t logical = 0;
+         logical < blocks_for_prefix(tokens, block_size); ++logical) {
+        const uint64_t first =
+            (uint64_t)blocks[logical] * (uint64_t)block_size;
+        const int remaining = tokens - (int)logical * block_size;
+        const uint64_t count = (uint64_t)std::min(block_size, remaining);
+        if (first + count > (uint64_t)tensor->ne[1]) return false;
+    }
+    return true;
+}
+
+bool gather_paged_tensor(
+        ggml_backend_t backend,
+        ggml_tensor * source, ggml_tensor * dense,
+        const std::vector<uint32_t> & blocks,
+        int block_size, int tokens) {
+    if (!paged_tensor_layout_matches(dense, source, tokens) ||
+        !paged_rows_fit(source, blocks, block_size, tokens)) {
+        return false;
+    }
+    const size_t block_count = blocks_for_prefix(tokens, block_size);
+    for (int head = 0; head < (int)source->ne[2]; ++head) {
+        for (size_t logical = 0; logical < block_count;) {
+            const size_t run =
+                contiguous_block_run(blocks, logical, block_count);
+            const int logical_row = (int)logical * block_size;
+            const int count = std::min(
+                (int)run * block_size, tokens - logical_row);
+            const size_t bytes = (size_t)count * source->nb[1];
+            const size_t source_row =
+                (size_t)blocks[logical] * (size_t)block_size;
+            const size_t source_offset =
+                (size_t)head * source->nb[2] + source_row * source->nb[1];
+            const size_t dense_offset =
+                (size_t)head * dense->nb[2] +
+                (size_t)logical_row * dense->nb[1];
+            ggml_backend_tensor_get_async(
+                backend,
+                source, (char *)dense->data + dense_offset,
+                source_offset, bytes);
+            logical += run;
+        }
+    }
+    return true;
+}
+
+bool scatter_paged_tensor(
+        ggml_backend_t backend,
+        ggml_tensor * dense, ggml_tensor * destination,
+        const std::vector<uint32_t> & blocks,
+        int block_size, int tokens) {
+    if (!paged_tensor_layout_matches(dense, destination, tokens) ||
+        !paged_rows_fit(destination, blocks, block_size, tokens)) {
+        return false;
+    }
+    const size_t block_count = blocks_for_prefix(tokens, block_size);
+    for (int head = 0; head < (int)destination->ne[2]; ++head) {
+        for (size_t logical = 0; logical < block_count;) {
+            const size_t run =
+                contiguous_block_run(blocks, logical, block_count);
+            const int logical_row = (int)logical * block_size;
+            const int count = std::min(
+                (int)run * block_size, tokens - logical_row);
+            const size_t bytes = (size_t)count * destination->nb[1];
+            const size_t destination_row =
+                (size_t)blocks[logical] * (size_t)block_size;
+            const size_t destination_offset =
+                (size_t)head * destination->nb[2] +
+                destination_row * destination->nb[1];
+            const size_t dense_offset =
+                (size_t)head * dense->nb[2] +
+                (size_t)logical_row * dense->nb[1];
+            ggml_backend_tensor_set_async(
+                backend,
+                destination, (const char *)dense->data + dense_offset,
+                destination_offset, bytes);
+            logical += run;
+        }
+    }
+    return true;
+}
+
+bool recurrent_slab_matches(
+        const ggml_tensor * dense, const ggml_tensor * slotted,
+        int n_slots, int slot_axis) {
+    if (!dense || !slotted || n_slots < 1 || slot_axis < 0 ||
+        slot_axis >= GGML_MAX_DIMS || dense->type != slotted->type ||
+        !ggml_is_contiguous(dense) || !ggml_is_contiguous(slotted) ||
+        slotted->ne[slot_axis] != n_slots ||
+        dense->ne[slot_axis] != 1) return false;
+    for (int axis = 0; axis < GGML_MAX_DIMS; ++axis) {
+        if (axis != slot_axis && dense->ne[axis] != slotted->ne[axis])
+            return false;
+    }
+    return dense && slotted && n_slots > 0 &&
+        ggml_nbytes(dense) == ggml_nbytes(slotted) / (size_t)n_slots;
+}
+
+}  // namespace
+
+size_t estimate_paged_target_cache_snapshot_bytes(
+        const TargetCache & cache,
+        ggml_backend_t snapshot_backend,
+        int token_count) {
+    if (!snapshot_backend || cache.n_seq_slots < 1 || token_count <= 0 ||
+        token_count > cache.max_ctx ||
+        cache.attn_k.size() != cache.attn_v.size() ||
+        cache.ssm_state.size() != cache.conv_state.size()) {
+        return 0;
+    }
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if ((cache.attn_k[i] == nullptr) != (cache.attn_v[i] == nullptr)) {
+            return 0;
+        }
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        if ((cache.ssm_state[i] == nullptr) !=
+            (cache.conv_state[i] == nullptr)) {
+            return 0;
+        }
+    }
+
+    const int total_tensors = 2 * (int)cache.attn_k.size() +
+        2 * (int)cache.ssm_state.size();
+    ggml_init_params params{};
+    params.mem_size =
+        (size_t)(total_tensors + 16) * ggml_tensor_overhead();
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return 0;
+
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if (!cache.attn_k[i]) continue;
+        ggml_new_tensor_3d(
+            ctx, cache.attn_k[i]->type, cache.attn_k[i]->ne[0],
+            token_count, cache.attn_k[i]->ne[2]);
+        ggml_new_tensor_3d(
+            ctx, cache.attn_v[i]->type, cache.attn_v[i]->ne[0],
+            token_count, cache.attn_v[i]->ne[2]);
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        if (!cache.ssm_state[i]) continue;
+        ggml_tensor * ssm = cache.ssm_state[i];
+        ggml_tensor * conv = cache.conv_state[i];
+        ggml_new_tensor_3d(ctx, ssm->type, ssm->ne[0], ssm->ne[1], ssm->ne[2]);
+        ggml_new_tensor_2d(ctx, conv->type, conv->ne[0], conv->ne[1]);
+    }
+    const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+        ctx, ggml_backend_get_default_buffer_type(snapshot_backend));
+    ggml_free(ctx);
+    return bytes;
+}
+
+bool snapshot_paged_target_cache(
+        const TargetCache & cache,
+        ggml_backend_t snapshot_backend,
+        int seq_slot,
+        const std::vector<uint32_t> & block_table,
+        int block_size,
+        int token_count,
+        PrefixSnapshot & snap) {
+    if (!snapshot_backend || !cache.backend ||
+        cache.n_seq_slots < 1 || seq_slot < 0 ||
+        seq_slot >= cache.n_seq_slots || token_count <= 0 ||
+        token_count > cache.max_ctx || block_size <= 0 ||
+        block_table.size() < blocks_for_prefix(token_count, block_size) ||
+        cache.attn_k.size() != cache.attn_v.size() ||
+        cache.ssm_state.size() != cache.conv_state.size()) {
+        set_last_error("snapshot_paged_target_cache: invalid arguments");
+        return false;
+    }
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if ((cache.attn_k[i] == nullptr) !=
+            (cache.attn_v[i] == nullptr)) {
+            set_last_error(
+                "snapshot_paged_target_cache: incomplete attention pair");
+            return false;
+        }
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        if ((cache.ssm_state[i] == nullptr) !=
+            (cache.conv_state[i] == nullptr)) {
+            set_last_error(
+                "snapshot_paged_target_cache: incomplete recurrent pair");
+            return false;
+        }
+    }
+
+    const bool needs_alloc = !snap.ctx || !snap.is_paged ||
+        snap.cur_pos != token_count ||
+        snap.attn_k_snap.size() != cache.attn_k.size() ||
+        snap.attn_v_snap.size() != cache.attn_v.size() ||
+        snap.ssm_state_snap.size() != cache.ssm_state.size() ||
+        snap.conv_state_snap.size() != cache.conv_state.size();
+    if (needs_alloc) {
+        free_prefix_snapshot(snap);
+        const int total_tensors = 2 * (int)cache.attn_k.size() +
+            2 * (int)cache.ssm_state.size();
+        ggml_init_params params{};
+        params.mem_size =
+            (size_t)(total_tensors + 16) * ggml_tensor_overhead();
+        params.no_alloc = true;
+        snap.ctx = ggml_init(params);
+        if (!snap.ctx) {
+            set_last_error("paged PrefixSnapshot ggml_init failed");
+            return false;
+        }
+        snap.attn_k_snap.assign(cache.attn_k.size(), nullptr);
+        snap.attn_v_snap.assign(cache.attn_v.size(), nullptr);
+        snap.ssm_state_snap.assign(cache.ssm_state.size(), nullptr);
+        snap.conv_state_snap.assign(cache.conv_state.size(), nullptr);
+        for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+            if (!cache.attn_k[i] || !cache.attn_v[i]) continue;
+            snap.attn_k_snap[i] = ggml_new_tensor_3d(
+                snap.ctx, cache.attn_k[i]->type, cache.attn_k[i]->ne[0],
+                token_count, cache.attn_k[i]->ne[2]);
+            snap.attn_v_snap[i] = ggml_new_tensor_3d(
+                snap.ctx, cache.attn_v[i]->type, cache.attn_v[i]->ne[0],
+                token_count, cache.attn_v[i]->ne[2]);
+            char name[64];
+            std::snprintf(name, sizeof(name), "snap_cache_k_%zu", i);
+            ggml_set_name(snap.attn_k_snap[i], name);
+            std::snprintf(name, sizeof(name), "snap_cache_v_%zu", i);
+            ggml_set_name(snap.attn_v_snap[i], name);
+        }
+        for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+            if (!cache.ssm_state[i] || !cache.conv_state[i]) continue;
+            ggml_tensor * ssm = cache.ssm_state[i];
+            ggml_tensor * conv = cache.conv_state[i];
+            snap.ssm_state_snap[i] = ggml_new_tensor_3d(
+                snap.ctx, ssm->type, ssm->ne[0], ssm->ne[1], ssm->ne[2]);
+            snap.conv_state_snap[i] = ggml_new_tensor_2d(
+                snap.ctx, conv->type, conv->ne[0], conv->ne[1]);
+            char name[64];
+            std::snprintf(name, sizeof(name), "snap_ssm_state_%zu", i);
+            ggml_set_name(snap.ssm_state_snap[i], name);
+            std::snprintf(name, sizeof(name), "snap_conv_state_%zu", i);
+            ggml_set_name(snap.conv_state_snap[i], name);
+        }
+        snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, snapshot_backend);
+        if (!snap.buf) {
+            set_last_error("paged PrefixSnapshot buffer allocation failed");
+            free_prefix_snapshot(snap);
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if ((snap.attn_k_snap[i] == nullptr) !=
+            (snap.attn_v_snap[i] == nullptr)) {
+            set_last_error("paged snapshot incomplete attention pair");
+            free_prefix_snapshot(snap);
+            return false;
+        }
+        if ((!cache.attn_k[i] || !cache.attn_v[i]) !=
+            (!snap.attn_k_snap[i] || !snap.attn_v_snap[i]) ||
+            (cache.attn_k[i] &&
+             (!paged_tensor_layout_matches(
+                  snap.attn_k_snap[i], cache.attn_k[i], token_count) ||
+              !paged_tensor_layout_matches(
+                  snap.attn_v_snap[i], cache.attn_v[i], token_count) ||
+              !paged_rows_fit(cache.attn_k[i], block_table, block_size,
+                              token_count) ||
+              !paged_rows_fit(cache.attn_v[i], block_table, block_size,
+                              token_count)))) {
+            set_last_error("paged snapshot attention layout mismatch");
+            free_prefix_snapshot(snap);
+            return false;
+        }
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        ggml_tensor * ssm = cache.ssm_state[i];
+        ggml_tensor * conv = cache.conv_state[i];
+        ggml_tensor * dense_ssm = snap.ssm_state_snap[i];
+        ggml_tensor * dense_conv = snap.conv_state_snap[i];
+        if ((dense_ssm == nullptr) != (dense_conv == nullptr)) {
+            set_last_error("paged snapshot incomplete recurrent pair");
+            free_prefix_snapshot(snap);
+            return false;
+        }
+        if ((!ssm || !conv) != (!dense_ssm || !dense_conv)) {
+            set_last_error("paged snapshot recurrent layout mismatch");
+            free_prefix_snapshot(snap);
+            return false;
+        }
+        if (!ssm) continue;
+        if (!recurrent_slab_matches(
+                dense_ssm, ssm, cache.n_seq_slots, /*slot_axis=*/3) ||
+            !recurrent_slab_matches(
+                dense_conv, conv, cache.n_seq_slots, /*slot_axis=*/2)) {
+            set_last_error("paged snapshot recurrent slab mismatch");
+            free_prefix_snapshot(snap);
+            return false;
+        }
+    }
+
+    // Validate the entire topology before submitting any transfers. Then queue
+    // every logical K/V run and recurrent slab and synchronize once, avoiding
+    // one device-wide scheduler stall per tensor/run.
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if (!cache.attn_k[i]) continue;
+        gather_paged_tensor(
+            cache.backend, cache.attn_k[i], snap.attn_k_snap[i],
+            block_table, block_size, token_count);
+        gather_paged_tensor(
+            cache.backend, cache.attn_v[i], snap.attn_v_snap[i],
+            block_table, block_size, token_count);
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        if (!cache.ssm_state[i]) continue;
+        const size_t ssm_bytes = ggml_nbytes(snap.ssm_state_snap[i]);
+        const size_t conv_bytes = ggml_nbytes(snap.conv_state_snap[i]);
+        ggml_backend_tensor_get_async(
+            cache.backend,
+            cache.ssm_state[i], snap.ssm_state_snap[i]->data,
+            (size_t)seq_slot * ssm_bytes, ssm_bytes);
+        ggml_backend_tensor_get_async(
+            cache.backend,
+            cache.conv_state[i], snap.conv_state_snap[i]->data,
+            (size_t)seq_slot * conv_bytes, conv_bytes);
+    }
+    ggml_backend_synchronize(cache.backend);
+    snap.cur_pos = token_count;
+    snap.last_tok = -1;
+    snap.kv_k_type = cache.kv_k_type;
+    snap.max_ctx = cache.max_ctx;
+    snap.target_feat_cap = 0;
+    snap.target_feat_snap = nullptr;
+    snap.is_thin = false;
+    snap.is_paged = true;
+    return true;
+}
+
+bool replace_paged_target_cache(
+        const TargetCache & cache,
+        ggml_backend_t snapshot_backend,
+        int seq_slot,
+        const std::vector<uint32_t> & block_table,
+        int block_size,
+        int token_count,
+        PrefixSnapshot & destination) {
+    PrefixSnapshot candidate;
+    if (!snapshot_paged_target_cache(
+            cache, snapshot_backend, seq_slot, block_table, block_size,
+            token_count, candidate)) {
+        free_prefix_snapshot(candidate);
+        return false;
+    }
+    using std::swap;
+    swap(candidate, destination);
+    free_prefix_snapshot(candidate);
+    return true;
+}
+
+bool restore_paged_target_cache(
+        const PrefixSnapshot & snap,
+        TargetCache & cache,
+        int seq_slot,
+        const std::vector<uint32_t> & block_table,
+        int block_size) {
+    if (!snap.ctx || !snap.is_paged || !cache.backend ||
+        cache.n_seq_slots < 1 ||
+        seq_slot < 0 || seq_slot >= cache.n_seq_slots || block_size <= 0 ||
+        snap.cur_pos <= 0 || snap.cur_pos > cache.max_ctx ||
+        snap.max_ctx != cache.max_ctx || snap.kv_k_type != cache.kv_k_type ||
+        block_table.size() < blocks_for_prefix(snap.cur_pos, block_size) ||
+        cache.attn_k.size() != cache.attn_v.size() ||
+        cache.ssm_state.size() != cache.conv_state.size() ||
+        snap.attn_k_snap.size() != cache.attn_k.size() ||
+        snap.attn_v_snap.size() != cache.attn_v.size() ||
+        snap.ssm_state_snap.size() != cache.ssm_state.size() ||
+        snap.conv_state_snap.size() != cache.conv_state.size()) {
+        set_last_error("restore_paged_target_cache: incompatible checkpoint");
+        return false;
+    }
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if ((cache.attn_k[i] == nullptr) != (cache.attn_v[i] == nullptr) ||
+            (snap.attn_k_snap[i] == nullptr) !=
+                (snap.attn_v_snap[i] == nullptr) ||
+            (cache.attn_k[i] == nullptr) !=
+                (snap.attn_k_snap[i] == nullptr)) return false;
+        if (!cache.attn_k[i]) continue;
+        if (!paged_tensor_layout_matches(
+                snap.attn_k_snap[i], cache.attn_k[i], snap.cur_pos) ||
+            !paged_tensor_layout_matches(
+                snap.attn_v_snap[i], cache.attn_v[i], snap.cur_pos) ||
+            !paged_rows_fit(cache.attn_k[i], block_table, block_size,
+                            snap.cur_pos) ||
+            !paged_rows_fit(cache.attn_v[i], block_table, block_size,
+                            snap.cur_pos)) return false;
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        if ((cache.ssm_state[i] == nullptr) != (cache.conv_state[i] == nullptr) ||
+            (snap.ssm_state_snap[i] == nullptr) !=
+                (snap.conv_state_snap[i] == nullptr) ||
+            (cache.ssm_state[i] == nullptr) !=
+                (snap.ssm_state_snap[i] == nullptr)) return false;
+        if (!cache.ssm_state[i]) continue;
+        if (!recurrent_slab_matches(
+                snap.ssm_state_snap[i], cache.ssm_state[i],
+                cache.n_seq_slots, /*slot_axis=*/3) ||
+            !recurrent_slab_matches(
+                snap.conv_state_snap[i], cache.conv_state[i],
+                cache.n_seq_slots, /*slot_axis=*/2)) return false;
+    }
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if (!cache.attn_k[i]) continue;
+        if (!scatter_paged_tensor(
+                cache.backend, snap.attn_k_snap[i], cache.attn_k[i],
+                                  block_table, block_size, snap.cur_pos) ||
+            !scatter_paged_tensor(
+                cache.backend, snap.attn_v_snap[i], cache.attn_v[i],
+                                  block_table, block_size, snap.cur_pos)) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        if (!cache.ssm_state[i]) continue;
+        const size_t ssm_bytes = ggml_nbytes(snap.ssm_state_snap[i]);
+        const size_t conv_bytes = ggml_nbytes(snap.conv_state_snap[i]);
+        ggml_backend_tensor_set_async(
+            cache.backend,
+            cache.ssm_state[i], snap.ssm_state_snap[i]->data,
+            (size_t)seq_slot * ssm_bytes, ssm_bytes);
+        ggml_backend_tensor_set_async(
+            cache.backend,
+            cache.conv_state[i], snap.conv_state_snap[i]->data,
+            (size_t)seq_slot * conv_bytes, conv_bytes);
+    }
+    ggml_backend_synchronize(cache.backend);
+    return true;
+}
+
 void free_prefix_snapshot(PrefixSnapshot & snap) {
     if (snap.buf) { ggml_backend_buffer_free(snap.buf); snap.buf = nullptr; }
     if (snap.ctx) { ggml_free(snap.ctx);                snap.ctx = nullptr; }
@@ -2606,6 +3079,7 @@ void free_prefix_snapshot(PrefixSnapshot & snap) {
     snap.max_ctx         = 0;
     snap.target_feat_cap = 0;
     snap.is_thin         = false;
+    snap.is_paged        = false;
     snap.kv_start        = 0;
     snap.kv_end          = 0;
 }
@@ -2696,6 +3170,7 @@ bool snapshot_target_cache_thin(const TargetWeights & w,
     snap.kv_end    = kv_end;
     snap.cur_pos   = kv_end;
     snap.kv_k_type = cache.kv_k_type;
+    snap.is_paged   = false;
     snap.max_ctx   = cache.max_ctx;
     return true;
 }

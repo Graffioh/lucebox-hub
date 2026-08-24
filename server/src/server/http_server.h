@@ -92,6 +92,11 @@ struct ServerConfig {
     bool        enable_cors = true;
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
+    // Resident system-memory budget for copied paged checkpoints. The
+    // scheduler enforces it only when concurrent paged prefix storage is
+    // active. Zero means unlimited.
+    size_t      concurrent_prefix_cache_max_bytes = (size_t)4 * 1024 * 1024 * 1024;
+    bool        concurrent_paged_prefix_cache = false;
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
     // Extend the existing prefix cache through generated tool-call turns.
     bool        agent_turn_cache = false;
@@ -365,6 +370,8 @@ public:
     }
 
 private:
+    friend struct SchedulerTestHarness;
+
     // Client thread: read HTTP request, parse, enqueue job, wait.
     void handle_client(SocketHandle fd);
 

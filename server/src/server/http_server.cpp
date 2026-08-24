@@ -876,10 +876,25 @@ json build_props_body(const ServerConfig & config,
         }},
         {"pflash", pflash},
         {"prefix_cache", {
-            {"capacity",      pcs.capacity},
-            {"in_use",        pcs.in_use},
-            {"lifetime_hits", pcs.lifetime_hits},
+            {"capacity",           pcs.capacity},
+            {"in_use",             pcs.in_use},
+            {"lifetime_hits",      pcs.lifetime_hits},
             {"agent_turn_enabled", config.agent_turn_cache},
+            {"max_resident_bytes", pcs.max_resident_bytes},
+            {"resident_bytes",     pcs.resident_bytes},
+            {"budget_skips",        pcs.budget_skips},
+            {"capture_attempts",    pcs.capture_attempts},
+            {"capture_failures",    pcs.capture_failures},
+            {"capture_stall_ms_total",
+                (double)pcs.capture_stall_us_total / 1000.0},
+            {"capture_stall_ms_max",
+                (double)pcs.capture_stall_us_max / 1000.0},
+            {"restore_attempts",    pcs.restore_attempts},
+            {"restore_invalidations", pcs.restore_invalidations},
+            {"restore_stall_ms_total",
+                (double)pcs.restore_stall_us_total / 1000.0},
+            {"restore_stall_ms_max",
+                (double)pcs.restore_stall_us_max / 1000.0},
         }},
         {"full_cache", {
             {"enabled",       pcfs.enabled},
@@ -1111,7 +1126,9 @@ HttpServer::HttpServer(ModelBackend & backend,
     , tokenizer_(tokenizer)
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
-    , prefix_cache_(config.prefix_cache_cap, tokenizer)
+    , prefix_cache_(config.prefix_cache_cap, tokenizer,
+          config.concurrent_paged_prefix_cache
+              ? config.concurrent_prefix_cache_max_bytes : 0)
     , disk_cache_({config.disk_cache_dir,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,

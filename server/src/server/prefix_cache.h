@@ -94,7 +94,8 @@ public:
     static constexpr int MAX_CACHE_SLOTS = MAX_SLOTS - 1;
 
     // cap = number of prefix-cache slots (0 disables).
-    PrefixCache(int cap, const Tokenizer & tokenizer);
+    PrefixCache(int cap, const Tokenizer & tokenizer,
+                size_t max_resident_bytes = 0);
 
     bool disabled() const { return disabled_; }
 
@@ -105,6 +106,15 @@ public:
 
     // Look up the longest cached prefix. Returns (slot, prefix_len) or (-1, 0).
     std::pair<int, int> lookup(const std::vector<int32_t> & prompt_ids);
+    // Side-effect-free candidate for engines that must validate payloads.
+    std::pair<int, int> lookup_candidate(
+        const std::vector<int32_t> & prompt_ids,
+        int max_prefix_tokens);
+
+    // Promote and count only after an engine restored this checkpoint.
+    void record_inline_hit(
+        int slot, int prefix_len, size_t prompt_len);
+
 
     // Prepare an inline snapshot. `restored_prefix_len` prevents reserving a
     // slot for a boundary already covered by the restored snapshot.
@@ -118,19 +128,34 @@ public:
         bool prefer_tools_boundary = false,
         int forced_cut = 0);
 
+    // Apply the configured resident-byte budget to a prepared reservation.
+    // May redirect it to an existing victim even before the slot cap is full.
+    // Returns the final destination slot, or -1 when the capture should be
+    // skipped without disturbing committed entries.
+    int fit_inline_snap_budget(int prepared_slot, size_t estimated_bytes);
+
     // Confirm after daemon successfully saved the snapshot.
     // `protect` marks the entry non-evictable by unprotected traffic (tool pin).
     void confirm_inline_snap(int slot, int target_cut,
                              const std::vector<int32_t> & prompt_ids,
-                             bool protect = false);
+                             bool protect = false,
+                             size_t resident_bytes = 0);
 
     // Abort if the snapshot failed.
     void abort_inline_snap(int slot);
+
+    // Remove committed metadata for an engine-invalidated checkpoint without
+    // disturbing another request's in-flight capture reservation.
+    void invalidate_inline_snap(int slot);
 
     // Cancel before the backend slot is touched (for example when the selected
     // destination is also the snapshot being restored). Unlike abort, this
     // preserves the existing entry and only drops the pending reservation.
     void cancel_inline_snap(int slot);
+
+    // Record synchronous scheduler stalls caused by copied checkpoints.
+    void record_capture_attempt(uint64_t elapsed_us, bool success);
+    void record_restore_attempt(uint64_t elapsed_us, bool restored);
 
     // Drop all entries (e.g., after OOM recovery).
     void mark_all_cleared();
@@ -159,6 +184,17 @@ public:
         int capacity;
         int in_use;
         int64_t lifetime_hits;
+        uint64_t max_resident_bytes;
+        uint64_t resident_bytes;
+        uint64_t budget_skips;
+        uint64_t capture_attempts;
+        uint64_t capture_failures;
+        uint64_t capture_stall_us_total;
+        uint64_t capture_stall_us_max;
+        uint64_t restore_attempts;
+        uint64_t restore_invalidations;
+        uint64_t restore_stall_us_total;
+        uint64_t restore_stall_us_max;
     };
     struct FullStats {
         bool enabled;
@@ -190,6 +226,7 @@ private:
         int                  slot;
         std::vector<int32_t> ids;  // prefix tokens [0, target_cut) for prefix-aware eviction
         bool                 protect = false;  // sticky tools-boundary pin
+        size_t               resident_bytes = 0;
     };
     // Pending protect flag for the in-flight reservation (applied on confirm).
     bool pending_protect_ = false;
@@ -197,6 +234,8 @@ private:
     int next_slot_ = 0;
     PrefixHash pending_evict_key_{};
     bool has_pending_evict_ = false;
+    size_t max_resident_bytes_ = 0;
+    size_t resident_bytes_ = 0;
 
     // Full-cache state
     bool full_disabled_ = true;
@@ -215,6 +254,16 @@ private:
     // tearing across the daemon thread's increments. Relaxed ordering
     // is sufficient — no synchronization with other state required.
     std::atomic<int64_t> lifetime_hits_{0};       // inline cache hits
+    std::atomic<uint64_t> resident_bytes_count_{0};
+    std::atomic<uint64_t> budget_skips_{0};
+    std::atomic<uint64_t> capture_attempts_{0};
+    std::atomic<uint64_t> capture_failures_{0};
+    std::atomic<uint64_t> capture_stall_us_total_{0};
+    std::atomic<uint64_t> capture_stall_us_max_{0};
+    std::atomic<uint64_t> restore_attempts_{0};
+    std::atomic<uint64_t> restore_invalidations_{0};
+    std::atomic<uint64_t> restore_stall_us_total_{0};
+    std::atomic<uint64_t> restore_stall_us_max_{0};
     std::atomic<int64_t> full_lifetime_hits_{0};  // full-compress cache hits
     std::atomic<int64_t> full_disk_bytes_{0};     // best-effort snapshot of disk usage
     // Atomic mirrors of `entries_.size()` and `full_entries_.size()`.
@@ -229,7 +278,14 @@ private:
 
     // Helpers
     int find_entry(const PrefixHash & h) const;
+    int find_slot_entry(int slot) const;
+    void erase_inline_entry(int idx);
     void move_to_end(int idx);
+    std::pair<int, int> lookup_impl(
+        const std::vector<int32_t> & prompt_ids,
+        int max_prefix_tokens,
+        bool record_hit);
+
     int find_full_entry(const PrefixHash & h) const;
     void move_full_to_end(int idx);
 };

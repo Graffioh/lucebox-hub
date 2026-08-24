@@ -526,6 +526,7 @@ struct PrefixSnapshot {
 
     // Phase B: thin-mode snapshots cover only a KV-position range.
     bool is_thin  = false;
+    bool is_paged = false;  // logical K/V rows copied from a page table
     int  kv_start = 0;     // inclusive (only meaningful when is_thin)
     int  kv_end   = 0;     // exclusive (only meaningful when is_thin)
     // When is_thin == true:
@@ -553,6 +554,47 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache);
 
 // Free the snapshot's GPU buffers.
 void free_prefix_snapshot(PrefixSnapshot & snap);
+
+// Exact backend allocation size for the dense checkpoint layout used by
+// snapshot_paged_target_cache(). Returns zero when the cache topology or token
+// count is invalid. This lets the scheduler enforce a resident-memory budget
+// before allocating or copying a checkpoint.
+size_t estimate_paged_target_cache_snapshot_bytes(
+    const TargetCache & cache, ggml_backend_t snapshot_backend, int token_count);
+
+// Capture one live sequence from a multi-slot paged cache. Attention rows are
+// gathered through `block_table` into dense logical order in the copied
+// snapshot; recurrent state is copied only from `seq_slot`'s slab. The page
+// table itself is intentionally not retained: every restore owns fresh pages.
+bool snapshot_paged_target_cache(
+    const TargetCache & cache,
+    ggml_backend_t snapshot_backend,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size,
+    int token_count,
+    PrefixSnapshot & snap);
+
+// Atomically replace a paged snapshot. The incumbent remains valid when
+// allocation, layout validation, or any staged copy fails.
+bool replace_paged_target_cache(
+    const TargetCache & cache,
+    ggml_backend_t snapshot_backend,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size,
+    int token_count,
+    PrefixSnapshot & destination);
+
+// Restore a copied paged snapshot into fresh destination pages and one
+// recurrent-state slab. `block_table` describes the destination sequence and
+// must cover snap.cur_pos logical tokens.
+bool restore_paged_target_cache(
+    const PrefixSnapshot & snap,
+    TargetCache & cache,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size);
 
 // Thin snapshot: capture only KV slice [kv_start, kv_end).
 // SSM/conv/target_feat are not preserved (caller chains thin entries

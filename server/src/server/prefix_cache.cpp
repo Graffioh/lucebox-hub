@@ -220,8 +220,10 @@ int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
 
 // ─── PrefixCache ────────────────────────────────────────────────────────
 
-PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
+PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer,
+                         size_t max_resident_bytes)
     : cap_(std::min(cap, MAX_CACHE_SLOTS))
+    , max_resident_bytes_(max_resident_bytes)
 {
     if (cap_ <= 0) {
         disabled_ = true;
@@ -235,7 +237,13 @@ PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
         return;
     }
     disabled_ = false;
-    std::fprintf(stderr, "[pc] enabled: cap=%d family=%s\n", cap_, markers_.family.c_str());
+    if (max_resident_bytes_ > 0) {
+        std::fprintf(stderr, "[pc] enabled: cap=%d family=%s resident_budget=%zu MiB\n",
+                     cap_, markers_.family.c_str(), max_resident_bytes_ / (1024 * 1024));
+    } else {
+        std::fprintf(stderr, "[pc] enabled: cap=%d family=%s\n",
+                     cap_, markers_.family.c_str());
+    }
 }
 
 // ── LRU helpers ─────────────────────────────────────────────────────────
@@ -245,6 +253,23 @@ int PrefixCache::find_entry(const PrefixHash & h) const {
         if (entries_[i].hash == h) return i;
     }
     return -1;
+}
+
+int PrefixCache::find_slot_entry(int slot) const {
+    for (int i = 0; i < (int)entries_.size(); ++i) {
+        if (entries_[(size_t)i].slot == slot) return i;
+    }
+    return -1;
+}
+
+void PrefixCache::erase_inline_entry(int idx) {
+    if (idx < 0 || idx >= (int)entries_.size()) return;
+    const size_t bytes = entries_[(size_t)idx].resident_bytes;
+    resident_bytes_ = bytes <= resident_bytes_ ? resident_bytes_ - bytes : 0;
+    resident_bytes_count_.store(
+        (uint64_t)resident_bytes_, std::memory_order_relaxed);
+    entries_.erase(entries_.begin() + idx);
+    entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void PrefixCache::move_to_end(int idx) {
@@ -270,14 +295,30 @@ void PrefixCache::move_full_to_end(int idx) {
 
 // ── Inline prefix cache ─────────────────────────────────────────────────
 
-std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids) {
-    if (disabled_) return {-1, 0};
+std::pair<int, int> PrefixCache::lookup(
+        const std::vector<int32_t> & prompt_ids) {
+    return lookup_impl(
+        prompt_ids, (int)prompt_ids.size(), /*record_hit=*/true);
+}
+
+std::pair<int, int> PrefixCache::lookup_candidate(
+        const std::vector<int32_t> & prompt_ids,
+        int max_prefix_tokens) {
+    return lookup_impl(prompt_ids, max_prefix_tokens, /*record_hit=*/false);
+}
+
+std::pair<int, int> PrefixCache::lookup_impl(
+        const std::vector<int32_t> & prompt_ids,
+        int max_prefix_tokens,
+        bool record_hit) {
+    if (disabled_ || max_prefix_tokens <= 0) return {-1, 0};
 
     auto boundaries = find_all_boundaries(prompt_ids, markers_);
     int best_slot = -1, best_len = 0;
     int best_idx = -1;
 
     for (int cut : boundaries) {
+        if (cut > max_prefix_tokens) continue;
         auto key = hash_prefix(prompt_ids.data(), cut);
         int idx = find_entry(key);
         if (idx >= 0) {
@@ -288,8 +329,7 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
                 std::fprintf(stderr,
                     "[pc] lookup stale slot=%d key_cut=%d committed=%d — evicting\n",
                     entries_[idx].slot, cut, committed);
-                entries_.erase(entries_.begin() + idx);
-                entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+                erase_inline_entry(idx);
                 continue;
             }
             if (cut > best_len) {
@@ -305,7 +345,8 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
     for (int i = 0; i < (int)entries_.size(); ++i) {
         const auto & e = entries_[(size_t)i];
         const int len = (int)e.ids.size();
-        if (len <= best_len || len > (int)prompt_ids.size()) continue;
+        if (len <= best_len || len > (int)prompt_ids.size() ||
+            len > max_prefix_tokens) continue;
         if (!std::equal(e.ids.begin(), e.ids.end(), prompt_ids.begin())) {
             continue;
         }
@@ -314,13 +355,23 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
         best_idx = i;
     }
 
-    if (best_idx >= 0) {
-        move_to_end(best_idx);
-        lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
-        std::fprintf(stderr, "[pc] lookup hit slot=%d prefix_len=%d (of %zu total)\n",
-                     best_slot, best_len, prompt_ids.size());
-    }
+    if (best_idx >= 0 && record_hit)
+        record_inline_hit(best_slot, best_len, prompt_ids.size());
     return {best_slot, best_len};
+}
+
+void PrefixCache::record_inline_hit(
+        int slot, int prefix_len, size_t prompt_len) {
+    for (int i = 0; i < (int)entries_.size(); ++i) {
+        if (entries_[(size_t)i].slot != slot ||
+            (int)entries_[(size_t)i].ids.size() != prefix_len) continue;
+        move_to_end(i);
+        lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr,
+            "[pc] lookup hit slot=%d prefix_len=%d (of %zu total)\n",
+            slot, prefix_len, prompt_len);
+        return;
+    }
 }
 
 std::pair<int, int> PrefixCache::prepare_inline_snap(
@@ -386,17 +437,93 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
     return {slot, target_cut};
 }
 
+int PrefixCache::fit_inline_snap_budget(int prepared_slot,
+                                        size_t estimated_bytes) {
+    if (disabled_ || prepared_slot < 0) return -1;
+    if (max_resident_bytes_ == 0) return prepared_slot;
+
+    const auto fits = [&](int victim_idx) {
+        if (estimated_bytes == 0 || estimated_bytes > max_resident_bytes_) {
+            return false;
+        }
+        const size_t freed = victim_idx >= 0
+            ? entries_[(size_t)victim_idx].resident_bytes : 0;
+        const size_t after_free = freed <= resident_bytes_
+            ? resident_bytes_ - freed : 0;
+        return after_free <= max_resident_bytes_ &&
+            estimated_bytes <= max_resident_bytes_ - after_free;
+    };
+
+    int planned_victim = -1;
+    if (has_pending_evict_) {
+        planned_victim = find_entry(pending_evict_key_);
+    } else {
+        planned_victim = find_slot_entry(prepared_slot);
+    }
+    if (fits(planned_victim)) return prepared_slot;
+
+    // A byte budget may require replacement before the configured slot count
+    // is reached. Preserve the prefix-aware/protected eviction policy while
+    // considering only entries that free enough memory for this checkpoint.
+    const auto is_leaf = [&](int candidate) {
+        for (int i = 0; i < (int)entries_.size(); ++i) {
+            if (i != candidate &&
+                is_strict_prefix(entries_[(size_t)candidate].ids,
+                                 entries_[(size_t)i].ids)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    int victim = -1;
+    for (int pass = 0; pass < 4 && victim < 0; ++pass) {
+        const bool require_leaf = pass < 2;
+        const bool allow_protected = pass == 1 || pass == 3;
+        for (int i = 0; i < (int)entries_.size(); ++i) {
+            if (!fits(i)) continue;
+            if (require_leaf && !is_leaf(i)) continue;
+            if (!allow_protected && entries_[(size_t)i].protect) continue;
+            victim = i;
+            break;
+        }
+    }
+    if (victim >= 0) {
+        pending_evict_key_ = entries_[(size_t)victim].hash;
+        has_pending_evict_ = true;
+        const int slot = entries_[(size_t)victim].slot;
+        std::fprintf(stderr,
+            "[pc] resident budget redirects capture slot=%d -> %d "
+            "estimate=%zu resident=%zu budget=%zu\n",
+            prepared_slot, slot, estimated_bytes, resident_bytes_,
+            max_resident_bytes_);
+        return slot;
+    }
+
+    has_pending_evict_ = false;
+    pending_protect_ = false;
+    const uint64_t skipped =
+        budget_skips_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (skipped == 1 || skipped % 64 == 0) {
+        std::fprintf(stderr,
+            "[pc] resident budget skips capture estimate=%zu resident=%zu "
+            "budget=%zu (skips=%llu)\n",
+            estimated_bytes, resident_bytes_, max_resident_bytes_,
+            (unsigned long long)skipped);
+    }
+    return -1;
+}
+
 void PrefixCache::confirm_inline_snap(int slot, int target_cut,
                                       const std::vector<int32_t> & prompt_ids,
-                                      bool protect) {
+                                      bool protect,
+                                      size_t resident_bytes) {
     if (disabled_) return;
 
     // Evict the reserved entry (if any).
     if (has_pending_evict_) {
         int idx = find_entry(pending_evict_key_);
         if (idx >= 0) {
-            entries_.erase(entries_.begin() + idx);
-            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+            erase_inline_entry(idx);
         }
         has_pending_evict_ = false;
     }
@@ -411,8 +538,7 @@ void PrefixCache::confirm_inline_snap(int slot, int target_cut,
         if (entries_[(size_t)i].slot == slot) {
             std::fprintf(stderr,
                 "[pc] dropping stale entry for reused slot=%d\n", slot);
-            entries_.erase(entries_.begin() + i);
-            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+            erase_inline_entry(i);
         }
     }
 
@@ -421,11 +547,16 @@ void PrefixCache::confirm_inline_snap(int slot, int target_cut,
 
     auto key = hash_prefix(prompt_ids.data(), target_cut);
     std::vector<int32_t> ids(prompt_ids.begin(), prompt_ids.begin() + target_cut);
-    entries_.push_back({key, slot, std::move(ids), protect_entry});
+    entries_.push_back(
+        {key, slot, std::move(ids), protect_entry, resident_bytes});
     entries_size_count_.fetch_add(1, std::memory_order_relaxed);
+    resident_bytes_ += resident_bytes;
+    resident_bytes_count_.store(
+        (uint64_t)resident_bytes_, std::memory_order_relaxed);
     std::fprintf(stderr,
-                 "[pc] inline-snap committed slot=%d prefix_len=%d protect=%d\n",
-                 slot, target_cut, (int)protect_entry);
+        "[pc] inline-snap committed slot=%d prefix_len=%d protect=%d "
+        "bytes=%zu resident=%zu\n",
+        slot, target_cut, (int)protect_entry, resident_bytes, resident_bytes_);
 }
 
 void PrefixCache::abort_inline_snap(int slot) {
@@ -436,12 +567,23 @@ void PrefixCache::abort_inline_snap(int slot) {
     // hole left by an earlier aborted reservation.
     for (int i = (int)entries_.size() - 1; i >= 0; --i) {
         if (entries_[(size_t)i].slot == slot) {
-            entries_.erase(entries_.begin() + i);
-            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+            erase_inline_entry(i);
         }
     }
     has_pending_evict_ = false;
     pending_protect_ = false;
+}
+
+void PrefixCache::invalidate_inline_snap(int slot) {
+    if (disabled_) return;
+    // A restore can be invalidated while another concurrent request owns the
+    // sole pending capture reservation. Remove only the stale committed key:
+    // has_pending_evict_ and pending_protect_ belong to that other request.
+    for (int i = (int)entries_.size() - 1; i >= 0; --i) {
+        if (entries_[(size_t)i].slot == slot) {
+            erase_inline_entry(i);
+        }
+    }
 }
 
 void PrefixCache::cancel_inline_snap(int slot) {
@@ -454,11 +596,40 @@ void PrefixCache::cancel_inline_snap(int slot) {
     pending_protect_ = false;
 }
 
+static void update_atomic_max(std::atomic<uint64_t> & value,
+                              uint64_t candidate) {
+    uint64_t current = value.load(std::memory_order_relaxed);
+    while (current < candidate &&
+           !value.compare_exchange_weak(
+               current, candidate, std::memory_order_relaxed)) {
+    }
+}
+
+void PrefixCache::record_capture_attempt(uint64_t elapsed_us, bool success) {
+    capture_attempts_.fetch_add(1, std::memory_order_relaxed);
+    if (!success) {
+        capture_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
+    capture_stall_us_total_.fetch_add(elapsed_us, std::memory_order_relaxed);
+    update_atomic_max(capture_stall_us_max_, elapsed_us);
+}
+
+void PrefixCache::record_restore_attempt(uint64_t elapsed_us, bool restored) {
+    restore_attempts_.fetch_add(1, std::memory_order_relaxed);
+    if (!restored) {
+        restore_invalidations_.fetch_add(1, std::memory_order_relaxed);
+    }
+    restore_stall_us_total_.fetch_add(elapsed_us, std::memory_order_relaxed);
+    update_atomic_max(restore_stall_us_max_, elapsed_us);
+}
+
 void PrefixCache::mark_all_cleared() {
     if (disabled_) return;
     int n = (int)entries_.size();
     entries_.clear();
     entries_size_count_.store(0, std::memory_order_relaxed);
+    resident_bytes_ = 0;
+    resident_bytes_count_.store(0, std::memory_order_relaxed);
     next_slot_ = 0;
     has_pending_evict_ = false;
     pending_protect_ = false;
@@ -586,10 +757,30 @@ void PrefixCache::abort_full_snap(int slot) {
 }
 
 PrefixCache::InlineStats PrefixCache::stats() const {
-    if (disabled_) return {0, 0, 0};
-    return {cap_,
-            (int)entries_size_count_.load(std::memory_order_relaxed),
-            lifetime_hits_.load(std::memory_order_relaxed)};
+    InlineStats out{};
+    if (disabled_) return out;
+    out.capacity = cap_;
+    out.in_use =
+        (int)entries_size_count_.load(std::memory_order_relaxed);
+    out.lifetime_hits = lifetime_hits_.load(std::memory_order_relaxed);
+    out.max_resident_bytes = (uint64_t)max_resident_bytes_;
+    out.resident_bytes =
+        resident_bytes_count_.load(std::memory_order_relaxed);
+    out.budget_skips = budget_skips_.load(std::memory_order_relaxed);
+    out.capture_attempts = capture_attempts_.load(std::memory_order_relaxed);
+    out.capture_failures = capture_failures_.load(std::memory_order_relaxed);
+    out.capture_stall_us_total =
+        capture_stall_us_total_.load(std::memory_order_relaxed);
+    out.capture_stall_us_max =
+        capture_stall_us_max_.load(std::memory_order_relaxed);
+    out.restore_attempts = restore_attempts_.load(std::memory_order_relaxed);
+    out.restore_invalidations =
+        restore_invalidations_.load(std::memory_order_relaxed);
+    out.restore_stall_us_total =
+        restore_stall_us_total_.load(std::memory_order_relaxed);
+    out.restore_stall_us_max =
+        restore_stall_us_max_.load(std::memory_order_relaxed);
+    return out;
 }
 
 PrefixCache::FullStats PrefixCache::full_stats() const {
