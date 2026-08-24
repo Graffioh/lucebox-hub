@@ -41,6 +41,8 @@
 #include "common/specla_mode.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend-impl.h"
+#include "ggml-cuda.h"
 
 #include <cmath>
 #include <cstdio>
@@ -74,6 +76,24 @@ constexpr int CONV_CHANNELS = SSM_D_INNER + 2 * SSM_N_GROUP * SSM_D_STATE; // 61
 constexpr float EPS         = 1e-6f;
 constexpr float ROPE_THETA  = 10000000.0f;
 }  // namespace q35
+
+// CUDA and ROCm share ggml's CUDA backend interface. Tensor-parallel caches
+// use a meta backend, so inspect every rank-local backend before enabling ops
+// that have no CPU/Metal/Vulkan implementation.
+static bool supports_qwen35_fused_kernels(ggml_backend_t backend) {
+    if (ggml_backend_is_cuda(backend)) return true;
+    if (!ggml_backend_is_meta(backend)) return false;
+
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    if (n_backends == 0) return false;
+    for (size_t i = 0; i < n_backends; ++i) {
+        if (!ggml_backend_is_cuda(
+                ggml_backend_meta_simple_backend(backend, i))) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // ─── TargetCache allocation ─────────────────────────────────────────
 
@@ -1341,6 +1361,18 @@ static ggml_tensor * build_full_attn_block(
             // Never view past the read tensor (its rows may not be 256-aligned).
             win_len_padded = std::min(win_len_padded, (int)cache_k->ne[1]);
         }
+        // kvflash: KV lives at pool SLOTS, and the caller's mask is built in
+        // slot space over the whole pool. Slot indices are not bounded by the
+        // logical context length, so a view sized from kv_start can end below
+        // slots the mask still marks visible: those rows fall outside the
+        // view and the softmax row degenerates, which surfaces as an argmax
+        // of -1 for every verify row past the first. Span the whole pool
+        // instead; the mask, sized from that same pool, is what decides which
+        // slots are readable. Detect the mode by the pair only slot-mapped
+        // verify sets: a set_rows KV write together with an explicit mask.
+        if (kv_write_rows != nullptr && attn_mask != nullptr) {
+            win_len_padded = (int)cache_k->ne[1];
+        }
 
         // K and V from cache: a windowed view starting at win_start.
         ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
@@ -1398,6 +1430,7 @@ static ggml_tensor * build_delta_net_block(
     DeltaNetCapture * cap,        // optional: populated on capture_delta_intermediate
     ggml_tensor * parent_ids,     // optional [n_tokens] i32; tree mode when non-null
     bool skip_gdn_intermediate,
+    bool fused_kernel_backend,    // CUDA/HIP backend implements fused conv/raw gates
     // Supported shapes are one sequence with any number of timesteps
     // (prefill/verify), or compact decode with one timestep per mapped row.
     int n_seqs = 1,
@@ -1525,7 +1558,8 @@ static ggml_tensor * build_delta_net_block(
     }();
     const bool chunked_call = chunked_env_on && can_skip_gdn_intermediate && !ragged &&
         !active_slot_ids && !use_specla_factorized && !use_specla_hld && n_tokens > 1;
-    const bool fused_plain = fused_kernels_env && !parent_ids && !ragged && !active_slot_ids &&
+    const bool fused_plain = fused_kernels_env && fused_kernel_backend &&
+                             !parent_ids && !ragged && !active_slot_ids &&
                              !use_specla_factorized && !use_specla_hld;
     const bool fused_conv  = fused_plain;
     const bool raw_gates   = fused_plain && !chunked_call && L.ssm_gate_ba != nullptr;
@@ -2076,7 +2110,8 @@ static ggml_tensor * build_single_layer(
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
                                     n_tokens, cap_ptr, parent_ids,
-                                    /*skip_gdn_intermediate=*/true);
+                                    /*skip_gdn_intermediate=*/true,
+                                    supports_qwen35_fused_kernels(cache.backend));
     }
 
     cur = ggml_add(ctx, cur, inpSA);
@@ -2270,6 +2305,7 @@ QwenGraphOutputs build_qwen35_graph(
                                         conv_st, ssm_st,
                                         n_tokens, cap_ptr, in.parent_ids,
                                         /*skip_gdn_intermediate=*/true,
+                                        supports_qwen35_fused_kernels(cache.backend),
                                         in.n_seqs,
                                         in.prefill_segments,
                                         in.n_prefill_segments,
@@ -2477,7 +2513,8 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
         cur = build_delta_net_block(ctx, gf, w, L, cur,
                                     cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
                                     n_tokens, nullptr, nullptr,
-                                    skip_gdn_intermediate);
+                                    skip_gdn_intermediate,
+                                    supports_qwen35_fused_kernels(cache.backend));
     }
 
     cur = ggml_add(ctx, cur, inpSA);

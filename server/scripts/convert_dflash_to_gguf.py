@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import json
+import math
 import struct
 import sys
 from pathlib import Path
@@ -122,6 +123,16 @@ def load_arch(safetensors: Path, header: dict) -> dict:
                 a["yarn_orig_ctx"]  = int(rp.get("original_max_position_embeddings")
                                           or c.get("original_max_position_embeddings")
                                           or 0)
+                attn_factor = rp.get("attention_factor")
+                # GGML applies YaRN's standard 1 + 0.1*log(factor) magnitude
+                # internally. HF attention_factor is the final magnitude, so
+                # normalize only an explicit override; 1.0 retains GGML's
+                # standard default when the config omits it.
+                ggml_mscale = (1.0 + 0.1 * math.log(a["yarn_factor"])
+                               if a["yarn_factor"] > 1.0 else 1.0)
+                a["yarn_attn_factor"] = (
+                    float(attn_factor) / ggml_mscale
+                    if attn_factor is not None else 1.0)
                 a["yarn_beta_fast"] = float(rp.get("beta_fast", 32.0))
                 a["yarn_beta_slow"] = float(rp.get("beta_slow", 1.0))
         if dfc.get("mask_token_id") is not None:
@@ -528,6 +539,7 @@ def main():
         writer.add_string(f"{ARCH}.rope.scaling.type", "yarn")
         writer.add_float32(f"{ARCH}.rope.scaling.factor", a["yarn_factor"])
         writer.add_uint32(f"{ARCH}.rope.scaling.original_context_length", a["yarn_orig_ctx"])
+        writer.add_float32(f"{ARCH}.rope.scaling.attn_factor", a["yarn_attn_factor"])
         writer.add_float32(f"{ARCH}.rope.scaling.beta_fast", a["yarn_beta_fast"])
         writer.add_float32(f"{ARCH}.rope.scaling.beta_slow", a["yarn_beta_slow"])
 
