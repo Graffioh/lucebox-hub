@@ -112,9 +112,18 @@ struct tile_x_sizes {
     int sc;
 };
 
-// RDNA uses 128x128, eight-warp MMQ tiles by default. Q4_K narrows the row
-// dimension to 128x64, while ROCmFPX uses 64x64 four-warp tiles. Their
-// unpacking pressure makes the smaller tiles faster on gfx1151.
+// RDNA uses 128x128, eight-warp MMQ tiles by default. Template instances
+// compiled with GGML_CUDA_MMQ_SMALL_TILE use 64x64, four-warp tiles. Instances
+// that additionally define GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY take the small
+// tile on RDNA4 only and keep the stock shape on RDNA3:
+//  - ROCmFPX formats: their unpacking pressure makes the smaller tile faster
+//    on gfx1151;
+//  - IQ4_XS / Q5_K / Q6_K / Q8_0 (dense hybrid targets): at spec-decode
+//    verify widths (N<=16) the 128-row tile leaves a 5120-row projection
+//    with only 40 blocks on a 64-CU gfx1201; the small tile measured
+//    +12-23% there (mmq_probe) at the cost of ~8% prefill throughput.
+// Q4_K instead narrows only the row dimension to 128x64 (LUCEBOX_RDNA_MMQ_Y),
+// the shape measured best for packed concurrent prefill on gfx1151.
 #ifndef LUCEBOX_RDNA_MMQ_TILE_OVERRIDE
 #define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE 1
 #endif
@@ -127,8 +136,17 @@ struct tile_x_sizes {
 
 static int get_mmq_x_max_host(const int cc) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY)
+        // Dense hybrid targets: the 64-wide tile is a gfx1201 (RDNA4)
+        // measurement and its 128x128 big-tile twin dispatch is RDNA4-only,
+        // so RDNA3 keeps the stock shape.
+        return GGML_CUDA_CC_IS_RDNA4(cc) ? 64 : 128;
+#else
+        // ROCmFPX: unpacking pressure makes the small tile faster on gfx1151
+        // as well, which is the shape those instances were tuned with.
         return 64;
+#endif
 #else
         return 128;
 #endif
@@ -144,7 +162,7 @@ static int get_mmq_x_max_host(const int cc) {
 
 static constexpr __device__ int get_mmq_x_max_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE) && (defined(RDNA4) || !defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY))
     return 64;
 #else
     return 128;
@@ -174,8 +192,12 @@ static constexpr __device__ int get_mmq_x_max_device() {
 
 static int get_mmq_y_host(const int cc) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY)
+        return GGML_CUDA_CC_IS_RDNA4(cc) ? 64 : 128;
+#else
         return 64;
+#endif
 #elif defined(LUCEBOX_RDNA_MMQ_Y)
         return LUCEBOX_RDNA_MMQ_Y;
 #else
@@ -196,7 +218,7 @@ static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type
 
 static constexpr __device__ int get_mmq_y_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE) && (defined(RDNA4) || !defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY))
     return 64;
 #elif defined(LUCEBOX_RDNA_MMQ_Y)
     return LUCEBOX_RDNA_MMQ_Y;
@@ -361,8 +383,12 @@ static constexpr __device__ int mmq_get_granularity_device(const int /*mmq_x*/) 
 #if defined(GGML_USE_HIP)
 static int mmq_get_nwarps_host(const int cc, const int warp_size) {
     if (LUCEBOX_RDNA_TILE_HOST(cc)) {
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY)
+        return GGML_CUDA_CC_IS_RDNA4(cc) ? 4 : 8;
+#else
         return 4;
+#endif
 #elif defined(LUCEBOX_RDNA_MMQ_Y)
         return 4;
 #else
@@ -379,7 +405,7 @@ static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
 
 static constexpr __device__ int mmq_get_nwarps_device() {
 #if LUCEBOX_RDNA_TILE_DEVICE
-#if defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(GGML_CUDA_MMQ_SMALL_TILE) && (defined(RDNA4) || !defined(GGML_CUDA_MMQ_SMALL_TILE_RDNA4_ONLY))
     return 4;
 #elif defined(LUCEBOX_RDNA_MMQ_Y)
     return 4;
@@ -4333,7 +4359,7 @@ template <ggml_type type, int mmq_x, bool need_check>
 #if defined(GGML_USE_HIP)
 // RDNA4 is compute-bound on MMQ (WMMA path); allow compiler to use more VGPRs
 // (minBlocks=1 matches NVIDIA Volta+ behavior and reduces register spilling).
-#if defined(RDNA4) && !defined(GGML_CUDA_ROCMFPX_MMQ_TILE)
+#if defined(RDNA4) && !defined(GGML_CUDA_MMQ_SMALL_TILE)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
 #elif defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -4895,6 +4921,14 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
         if (mmq_x % granularity != 0 || mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {
             continue;
         }
+#if defined(GGML_CUDA_MMQ_SMALL_TILE)
+        // The 64-row/4-warp tile is pathological at mmq_x == 32 on gfx1201
+        // (17408x5120 IQ4_XS: N=16 443 GB/s, N=24..32 180 GB/s, N=48 315 GB/s
+        // in mmq_probe); a wider tile with more padding is still faster.
+        if (LUCEBOX_RDNA_TILE_HOST(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && mmq_x == 32) {
+            continue;
+        }
+#endif
 
         const int ntiles_x = (args.ncols_max + mmq_x - 1) / mmq_x;
 
