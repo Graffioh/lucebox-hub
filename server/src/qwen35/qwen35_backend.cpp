@@ -2594,10 +2594,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // that is itself growing.
     //
     // Measured on one R9700 with Qwen3.8-27B IQ4_XS + DFlash2 (decode tok/s):
-    //     prompt   block 16   block 12   block 8
-    //     26,728       44.2       44.0      42.5   <- crossover
-    //     39,861       32.7       40.2      46.0
-    //     81,365       23.3          -      27.8
+    //     prompt   wide (16)   narrowed (8)
+    //      6,208         63.2           71.1
+    //     13,148         51.9           54.9
+    //     26,728         43.4           46.9
+    //     39,861         32.7           45.5
+    // Narrowing inside a block-16 drafter also holds acceptance better than
+    // configuring the drafter at block 8 outright (0.414 vs 0.375 at 27K).
     // Below the crossover the wide block still wins by a lot (HumanEval-10
     // 204 vs 143.6 decode), so narrow only past it. Halving also raises
     // commit depth there (0.462*8+1 = 4.70 vs 0.200*16+1 = 4.20): fewer rows
@@ -2608,7 +2611,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // is reproducible and does not chase a moving target.
     static const int long_ctx_threshold = []() {
         const char * e = std::getenv("DFLASH_LONGCTX_BLOCK_TOKENS");
-        if (!e || !*e) return 32768;
+        if (!e || !*e) return 8192;
         const int v = std::atoi(e);
         return v > 0 ? v : 0;   // 0 disables the narrowing
     }();
