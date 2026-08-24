@@ -501,6 +501,7 @@ add_library(dflash_common STATIC
     src/qwen35/layer_split_daemon_loop.cpp
     src/qwen35/qwen35_daemon.cpp
     src/common/sampler.cpp
+    src/common/speculative_sampling.cpp
     src/common/backend_precision.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
@@ -1455,6 +1456,17 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/test)
         list(APPEND _raw_unit_test_targets test_chain_spec_shapes)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_speculative_sampling.cpp")
+        # Pure host-side sampler/distribution-preserving verification tests.
+        add_executable(test_speculative_sampling
+            test/test_speculative_sampling.cpp
+            src/common/sampler.cpp
+            src/common/speculative_sampling.cpp)
+        target_include_directories(test_speculative_sampling PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_speculative_sampling)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash2_selector_validation.cpp")
         # Pure host-side selector metadata/layout validation: no GPU.

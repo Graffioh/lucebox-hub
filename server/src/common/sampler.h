@@ -40,6 +40,38 @@ struct SamplerCfg {
     }
 };
 
+// The exact post-penalty, post-temperature, post-top-k/top-p distribution used
+// by sample_logits(). probabilities is dense by token id; support preserves
+// the inverse-CDF traversal order used by the sampler.
+struct SamplerDistribution {
+    std::vector<float> probabilities;
+    std::vector<int32_t> support;
+
+    bool valid() const;
+    float probability_of(int32_t token) const;
+    bool deterministic() const;
+};
+
+bool build_sampler_distribution(
+    const float * logits_in,
+    int vocab,
+    const SamplerCfg & cfg,
+    const std::vector<int32_t> & history,
+    SamplerDistribution & out);
+
+// Sample a prebuilt distribution with a caller-owned uniform in [0, 1).
+int sample_distribution(
+    const SamplerDistribution & distribution,
+    double r_uniform);
+
+// Model the minimum-token EOS floor as a probability-mass redirect so
+// speculative verification uses the same effective target law as AR decode.
+bool redirect_distribution_mass(
+    SamplerDistribution & distribution,
+    const int32_t * source_ids,
+    int source_count,
+    int32_t replacement);
+
 // Returns the chosen token id. cfg.temp == 0 -> caller should use argmax;
 // the chain assumes a positive temperature and falls back to a small floor.
 int sample_logits(const float * logits_in,

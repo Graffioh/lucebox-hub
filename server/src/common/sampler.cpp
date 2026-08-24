@@ -104,154 +104,295 @@ int sample_from_gpu_probs(std::vector<float> & probs, double top_p, double r_uni
 
 }  // namespace
 
+bool SamplerDistribution::valid() const {
+    if (probabilities.empty() || support.empty()) return false;
+    double total = 0.0;
+    for (float probability : probabilities) {
+        if (!std::isfinite(probability) || probability < 0.0f) return false;
+        total += probability;
+    }
+    double support_total = 0.0;
+    for (int32_t token : support) {
+        if (token < 0 || static_cast<size_t>(token) >= probabilities.size()) {
+            return false;
+        }
+        support_total += probabilities[static_cast<size_t>(token)];
+    }
+    return std::fabs(total - 1.0) <= 1e-4 &&
+           std::fabs(support_total - total) <= 1e-4;
+}
+
+float SamplerDistribution::probability_of(int32_t token) const {
+    if (token < 0 || static_cast<size_t>(token) >= probabilities.size()) {
+        return 0.0f;
+    }
+    return probabilities[static_cast<size_t>(token)];
+}
+
+bool SamplerDistribution::deterministic() const {
+    int positive = 0;
+    for (int32_t token : support) {
+        if (probability_of(token) > 0.0f && ++positive > 1) return false;
+    }
+    return positive == 1;
+}
+
+int sample_distribution(
+        const SamplerDistribution & distribution,
+        double r_uniform) {
+    if (distribution.probabilities.empty() || distribution.support.empty() ||
+        !std::isfinite(r_uniform) || r_uniform < 0.0 || r_uniform >= 1.0) {
+        return -1;
+    }
+    double total = 0.0;
+    for (int32_t token : distribution.support) {
+        if (token < 0 ||
+            static_cast<size_t>(token) >= distribution.probabilities.size()) {
+            return -1;
+        }
+        total += distribution.probability_of(token);
+    }
+    if (!(total > 0.0)) return -1;
+
+    const double target = r_uniform * total;
+    double cumulative = 0.0;
+    int last_positive = -1;
+    for (int32_t token : distribution.support) {
+        const float probability = distribution.probability_of(token);
+        if (probability <= 0.0f) continue;
+        last_positive = token;
+        cumulative += probability;
+        if (target <= cumulative) return token;
+    }
+    return last_positive;
+}
+
+bool redirect_distribution_mass(
+        SamplerDistribution & distribution,
+        const int32_t * source_ids,
+        int source_count,
+        int32_t replacement) {
+    if (!distribution.valid() || source_count < 0 ||
+        (source_count > 0 && !source_ids) || replacement < 0 ||
+        static_cast<size_t>(replacement) >= distribution.probabilities.size()) {
+        return false;
+    }
+
+    double redirected = 0.0;
+    for (int i = 0; i < source_count; ++i) {
+        const int32_t source = source_ids[i];
+        if (source < 0 ||
+            static_cast<size_t>(source) >= distribution.probabilities.size() ||
+            source == replacement) {
+            return false;
+        }
+        redirected += distribution.probabilities[static_cast<size_t>(source)];
+        distribution.probabilities[static_cast<size_t>(source)] = 0.0f;
+    }
+    distribution.probabilities[static_cast<size_t>(replacement)] +=
+        static_cast<float>(redirected);
+    if (std::find(distribution.support.begin(), distribution.support.end(),
+                  replacement) == distribution.support.end()) {
+        distribution.support.push_back(replacement);
+    }
+    return true;
+}
+
+static bool build_sampler_candidates(
+        const float * logits_in,
+        int vocab,
+        const SamplerCfg & cfg,
+        const std::vector<int32_t> & history,
+        std::vector<std::pair<float, int>> & candidates) {
+    candidates.clear();
+    if (!logits_in || vocab <= 0) return false;
+    candidates.resize(static_cast<size_t>(vocab));
+    for (int token = 0; token < vocab; ++token) {
+        candidates[static_cast<size_t>(token)] = {logits_in[token], token};
+    }
+
+    if (cfg.rep_pen > 1.0f && !history.empty()) {
+        const int window = std::min(
+            static_cast<int>(history.size()), cfg.rep_window);
+        const int from = static_cast<int>(history.size()) - window;
+        std::unordered_set<int> seen;
+        for (int i = from; i < static_cast<int>(history.size()); ++i) {
+            seen.insert(history[static_cast<size_t>(i)]);
+        }
+        for (auto & candidate : candidates) {
+            if (seen.count(candidate.second) != 0) {
+                candidate.first = candidate.first > 0.0f
+                    ? candidate.first / cfg.rep_pen
+                    : candidate.first * cfg.rep_pen;
+            }
+        }
+    }
+
+    if ((cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f) &&
+        !history.empty()) {
+        const int window = std::min(
+            static_cast<int>(history.size()), cfg.rep_window);
+        const int from = static_cast<int>(history.size()) - window;
+        std::unordered_map<int, int> counts;
+        for (int i = from; i < static_cast<int>(history.size()); ++i) {
+            ++counts[history[static_cast<size_t>(i)]];
+        }
+        for (auto & candidate : candidates) {
+            const auto it = counts.find(candidate.second);
+            if (it != counts.end()) {
+                candidate.first -= cfg.freq_pen * it->second;
+                candidate.first -= cfg.pres_pen;
+            }
+        }
+    }
+
+    if (cfg.temp <= 0.0f) {
+        const int token = std::max_element(
+            candidates.begin(), candidates.end(),
+            [](const auto & a, const auto & b) {
+                return a.first < b.first;
+            })->second;
+        candidates.assign(1, {1.0f, token});
+        return true;
+    }
+
+    const bool need_top_k = cfg.top_k > 0 && cfg.top_k < vocab;
+    const bool need_top_p = cfg.top_p > 0.0f && cfg.top_p < 1.0f;
+    if (need_top_k) {
+        std::partial_sort(
+            candidates.begin(), candidates.begin() + cfg.top_k,
+            candidates.end(),
+            [](const auto & a, const auto & b) {
+                return a.first > b.first;
+            });
+        candidates.resize(static_cast<size_t>(cfg.top_k));
+    }
+
+    const float inverse_temperature =
+        1.0f / std::max(1e-3f, cfg.temp);
+    const float max_logit = need_top_k
+        ? candidates.front().first
+        : std::max_element(
+              candidates.begin(), candidates.end(),
+              [](const auto & a, const auto & b) {
+                  return a.first < b.first;
+              })->first;
+    const float scaled_max = max_logit * inverse_temperature;
+
+    if (need_top_p && !need_top_k) {
+        double denominator = 0.0;
+        for (const auto & candidate : candidates) {
+            denominator += std::exp(
+                static_cast<double>(candidate.first) *
+                    inverse_temperature -
+                scaled_max);
+        }
+        const double target = static_cast<double>(cfg.top_p) * denominator;
+        const size_t cutoff = nucleus_cutoff(
+            candidates, target, [&](const auto & candidate) {
+                return std::exp(
+                    static_cast<double>(candidate.first) *
+                        inverse_temperature -
+                    scaled_max);
+            });
+        candidates.resize(cutoff);
+    }
+
+    double denominator = 0.0;
+    for (auto & candidate : candidates) {
+        candidate.first = std::exp(
+            candidate.first * inverse_temperature - scaled_max);
+        denominator += candidate.first;
+    }
+    if (!(denominator > 0.0) || !std::isfinite(denominator)) return false;
+    for (auto & candidate : candidates) {
+        candidate.first =
+            static_cast<float>(candidate.first / denominator);
+    }
+
+    if (need_top_p && need_top_k) {
+        double cumulative = 0.0;
+        size_t cutoff = candidates.size();
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            cumulative += candidates[i].first;
+            if (cumulative >= cfg.top_p) {
+                cutoff = i + 1;
+                break;
+            }
+        }
+        candidates.resize(cutoff);
+    }
+    return true;
+}
+
+bool build_sampler_distribution(
+        const float * logits_in,
+        int vocab,
+        const SamplerCfg & cfg,
+        const std::vector<int32_t> & history,
+        SamplerDistribution & out) {
+    out.probabilities.clear();
+    out.support.clear();
+
+    static thread_local std::vector<std::pair<float, int>> candidates;
+    if (!build_sampler_candidates(
+            logits_in, vocab, cfg, history, candidates)) {
+        return false;
+    }
+
+    double total = 0.0;
+    for (const auto & candidate : candidates) total += candidate.first;
+    if (!(total > 0.0) || !std::isfinite(total)) return false;
+
+    out.probabilities.assign(static_cast<size_t>(vocab), 0.0f);
+    out.support.reserve(candidates.size());
+    for (const auto & candidate : candidates) {
+        out.probabilities[static_cast<size_t>(candidate.second)] =
+            static_cast<float>(candidate.first / total);
+        out.support.push_back(candidate.second);
+    }
+    return true;
+}
+
 int sample_logits(const float * logits_in,
                   int vocab,
                   const SamplerCfg & cfg,
                   const std::vector<int32_t> & history,
                   std::mt19937_64 & rng) {
-    // Draw the single uniform up front, exactly once, and only when we will
-    // actually sample (temp>0; greedy returns before any draw). It is then
-    // threaded through every path below — the full-GPU draw, the GPU-assisted
-    // top_p draw, and the CPU draw all consume this same value — so the RNG
-    // stream advances identically no matter which path resolves the token
-    // (including a GPU→CPU fallback), keeping decode reproducible whether the
-    // GPU sampler is on or off.
     double r_uniform = 0.0;
     if (cfg.temp > 0.0f) {
-        std::uniform_real_distribution<double> u(0.0, 1.0);
-        r_uniform = u(rng);
+        std::uniform_real_distribution<double> uniform(0.0, 1.0);
+        r_uniform = uniform(rng);
     }
 
 #ifdef DFLASH27B_HAVE_GPU_SAMPLER
-    // GPU path (on by default; set DFLASH_GPU_SAMPLE=0 to disable). top_k>0,
-    // top_p in (0,1) (both unsupported on the GPU, see geometric_sampler_cuda.h),
-    // and any CUDA error return -1 and fall through to the CPU chain below.
     if (gpu_sampler_enabled() && gpu_sampler_supports(cfg)) {
-        const int g = geometric_sample_logits_cuda(logits_in, vocab, cfg, history, r_uniform,
-                                         /*logits_on_device=*/false);
-        if (g >= 0) return g;
+        const int token = geometric_sample_logits_cuda(
+            logits_in, vocab, cfg, history, r_uniform,
+            /*logits_on_device=*/false);
+        if (token >= 0) return token;
     }
-#endif
+
     const bool need_top_k = cfg.top_k > 0 && cfg.top_k < vocab;
     const bool need_top_p = cfg.top_p > 0.0f && cfg.top_p < 1.0f;
-
-#ifdef DFLASH27B_HAVE_GPU_SAMPLER
-    // Reaching here means the GPU either can't fully handle this config
-    // (top_k/top_p above) or is disabled. For pure top_p (no top_k), the GPU
-    // can still compute the shared, vocab-wide penalty+softmax prefix and
-    // hand back normalized probabilities, letting the CPU skip straight to
-    // nucleus_cutoff — worth it because that search's O(vocab) cost dominates
-    // regardless of who computed its input. top_k (with or without top_p) is
-    // deliberately excluded: its CPU cost is already cheap (partial_sort
-    // scales with k, not vocab), so the GPU round trip would make it slower,
-    // not faster (measured regression, not just "no win").
-    if (cfg.temp > 0.0f && need_top_p && !need_top_k && gpu_sampler_enabled()) {
-        std::vector<float> gpu_probs(vocab);
-        if (geometric_compute_probs_cuda(logits_in, vocab, cfg, history,
-                                         gpu_probs.data(), /*logits_on_device=*/false)) {
-            return sample_from_gpu_probs(gpu_probs, cfg.top_p, r_uniform);
+    if (cfg.temp > 0.0f && need_top_p && !need_top_k &&
+        gpu_sampler_enabled()) {
+        std::vector<float> gpu_probabilities(static_cast<size_t>(vocab));
+        if (geometric_compute_probs_cuda(
+                logits_in, vocab, cfg, history, gpu_probabilities.data(),
+                /*logits_on_device=*/false)) {
+            return sample_from_gpu_probs(
+                gpu_probabilities, cfg.top_p, r_uniform);
         }
-        // else: fall through to the full CPU chain below.
     }
 #endif
 
-    std::vector<std::pair<float, int>> cand(vocab);
-    for (int i = 0; i < vocab; i++) cand[i] = {logits_in[i], i};
-
-    // Multiplicative repetition penalty (HuggingFace-style).
-    if (cfg.rep_pen > 1.0f && !history.empty()) {
-        const int win  = std::min((int)history.size(), cfg.rep_window);
-        const int from = (int)history.size() - win;
-        std::unordered_set<int> seen;
-        for (int i = from; i < (int)history.size(); i++) seen.insert(history[i]);
-        for (auto & c : cand) {
-            if (seen.count(c.second)) {
-                c.first = (c.first > 0.0f) ? c.first / cfg.rep_pen
-                                           : c.first * cfg.rep_pen;
-            }
-        }
+    static thread_local std::vector<std::pair<float, int>> candidates;
+    if (!build_sampler_candidates(
+            logits_in, vocab, cfg, history, candidates)) {
+        return -1;
     }
-
-    // OpenAI-style additive frequency and presence penalties.
-    if ((cfg.freq_pen != 0.0f || cfg.pres_pen != 0.0f) && !history.empty()) {
-        const int win  = std::min((int)history.size(), cfg.rep_window);
-        const int from = (int)history.size() - win;
-        std::unordered_map<int, int> counts;
-        for (int i = from; i < (int)history.size(); i++) counts[history[i]]++;
-        for (auto & c : cand) {
-            auto it = counts.find(c.second);
-            if (it != counts.end()) {
-                c.first -= cfg.freq_pen * it->second;
-                c.first -= cfg.pres_pen;
-            }
-        }
-    }
-
-    // temp=0 → deterministic argmax (after penalties have been applied above).
-    // Independent of top_k/top_p (the single highest-logit token is always the
-    // answer), so this skips sorting/truncation entirely: an O(vocab) max scan
-    // beats the O(vocab log vocab) sort below. Ties go to the lowest token id
-    // (max_element returns the first of equal maxima), matching the GPU kernel.
-    if (cfg.temp <= 0.0f) {
-        return std::max_element(cand.begin(), cand.end(),
-                                [](auto & a, auto & b){ return a.first < b.first; })->second;
-    }
-
-    // Only sort/truncate when top_k or top_p actually need it. Softmax and the
-    // inverse-CDF draw below are order-independent, so the common case (plain
-    // temperature sampling, no truncation) skips sorting entirely.
-    if (need_top_k) {
-        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(),
-                          [](auto & a, auto & b){ return a.first > b.first; });
-        cand.resize(cfg.top_k);
-    }
-
-    const float inv_t = 1.0f / std::max(1e-3f, cfg.temp);
-    const float maxv_logit = need_top_k
-        ? cand.front().first
-        : std::max_element(cand.begin(), cand.end(),
-                           [](auto & a, auto & b){ return a.first < b.first; })->first;
-    const float maxv = maxv_logit * inv_t;
-
-    if (need_top_p && !need_top_k) {
-        // Nucleus cutoff over the full (untruncated) vocab. Z is the true
-        // full-vocab softmax denominator (one O(vocab) exp() pass, needed
-        // regardless to know the absolute mass threshold).
-        double Z = 0.0;
-        for (auto & c : cand) Z += std::exp((double)c.first * inv_t - maxv);
-        const double target = (double)cfg.top_p * Z;
-        const size_t cut = nucleus_cutoff(cand, target, [&](auto & c) {
-            return std::exp((double)c.first * inv_t - maxv);
-        });
-        cand.resize(cut);
-    }
-
-    double Z = 0.0;
-    std::vector<float> probs(cand.size());
-    for (size_t i = 0; i < cand.size(); i++) {
-        probs[i] = std::exp(cand[i].first * inv_t - maxv);
-        Z       += probs[i];
-    }
-    for (auto & p : probs) p = (float)(p / Z);
-
-    // top_k+top_p combined: cut the already top_k-truncated (and thus
-    // already-sorted) subset further to the top_p nucleus within it.
-    if (need_top_p && need_top_k) {
-        double cum = 0.0;
-        size_t cut = probs.size();
-        for (size_t i = 0; i < probs.size(); i++) {
-            cum += probs[i];
-            if (cum >= cfg.top_p) { cut = i + 1; break; }
-        }
-        probs.resize(cut); cand.resize(cut);
-    }
-
-    // Draw from the final candidate set. Same CDF walk as draw_from_weights
-    // above (it renormalizes internally, which is a no-op cost here since
-    // probs already sums to ~1) — reuse it instead of re-deriving the same
-    // loop a second time.
-    for (size_t i = 0; i < cand.size(); i++) cand[i].first = probs[i];
-    return draw_from_weights(cand, r_uniform);
+    return draw_from_weights(candidates, r_uniform);
 }
 
 bool parse_sampler_token(std::string & line, SamplerCfg & out) {
