@@ -12,6 +12,11 @@ static constexpr int PAGED_ATTN_BLOCKS_PER_PARTITION = 64;
 static constexpr int PAGED_ATTN_HEAD_DIM = 256;
 static constexpr int PAGED_ATTN_MAX_PACKED_WARPS = 8;
 
+static __host__ __device__ __forceinline__ int32_t paged_attn_ceil_div(
+        int64_t dividend, int32_t divisor) {
+    return (int32_t) (dividend / divisor + (dividend % divisor != 0));
+}
+
 // Partition count for n_blocks of context: enough partitions to cover the
 // blocks and to reach min_partitions for occupancy, but never more than the
 // blocks themselves or the cap. Host and device must agree on this so the
@@ -19,8 +24,7 @@ static constexpr int PAGED_ATTN_MAX_PACKED_WARPS = 8;
 static __host__ __device__ __forceinline__ int32_t paged_attn_partitions(
         int32_t n_blocks, int32_t min_partitions, int32_t cap) {
     const int32_t context_partitions =
-        (n_blocks + PAGED_ATTN_BLOCKS_PER_PARTITION - 1) /
-        PAGED_ATTN_BLOCKS_PER_PARTITION;
+        paged_attn_ceil_div(n_blocks, PAGED_ATTN_BLOCKS_PER_PARTITION);
     const int32_t requested =
         context_partitions > min_partitions
             ? context_partitions
@@ -311,11 +315,11 @@ static __global__ void paged_attn_decode(
     // Treat the candidate slab as a virtual tail of tree_width tokens. The
     // normal partition split then covers prefix and tree candidates in one
     // stable softmax; invisible siblings/padding resolve to no physical row.
-    const int32_t virtual_tokens = valid_query
-        ? kv_seq_len + (tree_query ? tree_width : 0)
+    const int64_t virtual_tokens = valid_query
+        ? (int64_t) kv_seq_len + (tree_query ? tree_width : 0)
         : 0;
     const int32_t n_logical_blocks =
-        (virtual_tokens + block_size - 1) / block_size;
+        paged_attn_ceil_div(virtual_tokens, block_size);
     const int32_t active_partitions =
         paged_attn_partitions(n_logical_blocks, min_partitions, n_partitions);
 
@@ -971,8 +975,7 @@ static bool try_launch_paged_attn(
     if (min_partitions > partition_limit) {
         min_partitions = partition_limit;
     }
-    const int32_t tree_blocks =
-        (tree_width + block_size - 1) / block_size;
+    const int32_t tree_blocks = paged_attn_ceil_div(tree_width, block_size);
     const int64_t partitionable_blocks =
         block_table->ne[0] + (parent_ids ? tree_blocks : 0);
     if (min_partitions > partitionable_blocks) {
@@ -982,10 +985,10 @@ static bool try_launch_paged_attn(
     // Size the launch from the live maximum committed prefix plus the virtual
     // tree tail. Ragged/tree rows still clamp their own active partition count
     // from device metadata.
-    const int32_t live_tokens =
-        max_kv_seq_len + (parent_ids ? tree_width : 0);
+    const int64_t live_tokens =
+        (int64_t) max_kv_seq_len + (parent_ids ? tree_width : 0);
     const int32_t live_blocks =
-        (live_tokens + block_size - 1) / block_size;
+        paged_attn_ceil_div(live_tokens, block_size);
     int32_t n_partitions = paged_attn_partitions(
         live_blocks, min_partitions, PAGED_ATTN_MAX_PARTITIONS);
 

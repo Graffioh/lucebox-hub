@@ -89,6 +89,9 @@ bool dflash2_score_candidates(const DraftWeights & dw,
     selector_layout.pred_vocab = sel.pred_cb->ne[1];
     selector_layout.succ_rank = sel.succ_cb->ne[0];
     selector_layout.succ_vocab = sel.succ_cb->ne[1];
+    if (ggml_tensor * lm_head = target.lm_head_tensor()) {
+        selector_layout.target_output_vocab = lm_head->ne[1];
+    }
     std::string selector_error;
     if (!validate_dflash2_selector_layout(
             selector_layout, selector_error)) {
@@ -105,6 +108,23 @@ bool dflash2_score_candidates(const DraftWeights & dw,
         return false;
     }
     if (out.lp.size() != (size_t)n_cand * K || out.ids.size() != (size_t)n_cand * K) return false;
+    const int64_t codebook_vocab = selector_layout.pred_vocab;
+    if (last_tok < 0 || last_tok >= codebook_vocab) {
+        std::fprintf(stderr,
+                     "dflash2_score_candidates: seed token %d is outside "
+                     "codebook vocab %lld\n",
+                     last_tok, (long long)codebook_vocab);
+        return false;
+    }
+    for (int32_t token_id : out.ids) {
+        if (token_id < 0 || token_id >= codebook_vocab) {
+            std::fprintf(stderr,
+                         "dflash2_score_candidates: candidate token %d is "
+                         "outside codebook vocab %lld\n",
+                         token_id, (long long)codebook_vocab);
+            return false;
+        }
+    }
 
     // 2. One graph on the draft backend: hproj(h) for every candidate position,
     //    successor rows for every candidate, predecessor rows for the seed and
