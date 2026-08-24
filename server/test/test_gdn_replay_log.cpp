@@ -77,7 +77,7 @@ size_t state_index(int slot, int head, int col, int row) {
     return (((size_t) slot*H + head)*S + col)*S + row;
 }
 
-size_t journal_index(
+size_t replay_log_index(
         int sequence, int token, int head, int width, int value) {
     return ((((size_t) sequence*T + token)*H + head)*width) + value;
 }
@@ -300,22 +300,22 @@ std::vector<float> ordinary_recurrence(
     return state;
 }
 
-std::vector<float> expected_journal(
+std::vector<float> expected_replay_log(
         const Inputs & in, bool kda, bool raw_gates) {
     const int gate_values = kda ? S : 1;
     const int width = gate_values + 2*S;
-    std::vector<float> journal((size_t) width*H*T*B);
+    std::vector<float> replay_log((size_t) width*H*T*B);
     std::vector<float> state = in.state;
     for (int sequence = 0; sequence < B; ++sequence) {
         for (int token = 0; token < T; ++token) {
             for (int head = 0; head < H; ++head) {
                 for (int row = 0; row < gate_values; ++row) {
-                    journal[journal_index(sequence, token, head, width, row)] =
+                    replay_log[replay_log_index(sequence, token, head, width, row)] =
                         resolved_gate(in, kda, raw_gates,
                                       sequence, token, head, row);
                 }
                 for (int row = 0; row < S; ++row) {
-                    journal[journal_index(
+                    replay_log[replay_log_index(
                         sequence, token, head, width,
                         gate_values + row)] =
                             in.k[key_index(sequence, token, head, row)];
@@ -338,7 +338,7 @@ std::vector<float> expected_journal(
                     const float delta =
                         (in.v[qkv_index(sequence, token, head, col)] -
                          (kda ? projection : scalar_gate*projection))*beta;
-                    journal[journal_index(
+                    replay_log[replay_log_index(
                         sequence, token, head, width,
                         gate_values + S + col)] = delta;
                     for (int row = 0; row < S; ++row) {
@@ -355,13 +355,13 @@ std::vector<float> expected_journal(
             }
         }
     }
-    return journal;
+    return replay_log;
 }
 
 struct CaseTensors {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
-    ggml_tensor * journal = nullptr;
+    ggml_tensor * replay_log = nullptr;
     ggml_tensor * identity_state = nullptr;
     ggml_tensor * mapped_state = nullptr;
     ggml_tensor * conv_input = nullptr;
@@ -372,18 +372,18 @@ struct CaseTensors {
 };
 
 bool commit_many_one_layer(
-        const ggml_tensor * journal,
+        const ggml_tensor * replay_log,
         ggml_tensor * state,
         const ggml_tensor * conv_input,
         ggml_tensor * conv_state,
         const ggml_tensor * accepted,
         const ggml_tensor * slots) {
-    const ggml_tensor * journals[] = {journal};
+    const ggml_tensor * replay_logs[] = {replay_log};
     ggml_tensor * states[] = {state};
     const ggml_tensor * conv_inputs[] = {conv_input};
     ggml_tensor * conv_states[] = {conv_state};
-    return ggml_backend_cuda_gdn_transition_journal_commit_many(
-        journals, states, conv_inputs, conv_states, 1, accepted, slots);
+    return ggml_backend_cuda_gdn_replay_log_commit_many(
+        replay_logs, states, conv_inputs, conv_states, 1, accepted, slots);
 }
 
 void destroy(CaseTensors & tensors) {
@@ -445,11 +445,11 @@ bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
     if (raw_gates) {
         ggml_gated_delta_net_set_raw_gates(result, gate_ba);
     }
-    tensors.journal =
-        ggml_gated_delta_net_capture_transition_journal(tensors.ctx, result);
-    ggml_set_output(tensors.journal);
+    tensors.replay_log =
+        ggml_gated_delta_net_capture_replay_log(tensors.ctx, result);
+    ggml_set_output(tensors.replay_log);
     ggml_cgraph * graph = ggml_new_graph(tensors.ctx);
-    ggml_build_forward_expand(graph, tensors.journal);
+    ggml_build_forward_expand(graph, tensors.replay_log);
 
     tensors.buffer = ggml_backend_alloc_ctx_tensors(tensors.ctx, backend);
     if (!tensors.buffer) {
@@ -481,14 +481,14 @@ bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
     }
 
     bool ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
-    std::vector<float> actual_journal((size_t) width*H*T*B);
+    std::vector<float> actual_replay_log((size_t) width*H*T*B);
     if (ok) {
         ggml_backend_tensor_get(
-            tensors.journal, actual_journal.data(), 0,
-            actual_journal.size()*sizeof(float));
+            tensors.replay_log, actual_replay_log.data(), 0,
+            actual_replay_log.size()*sizeof(float));
         ok = compare_vectors(
-            name, actual_journal,
-            expected_journal(inputs, kda, raw_gates), FIELD_TOLERANCE);
+            name, actual_replay_log,
+            expected_replay_log(inputs, kda, raw_gates), FIELD_TOLERANCE);
     }
 
     const std::vector<int32_t> identity_slots{0, 1, 2, 3};
@@ -508,7 +508,7 @@ bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
         ggml_backend_tensor_set(tensors.slots, identity_slots.data(), 0,
                                 identity_slots.size()*sizeof(identity_slots[0]));
         ok = commit_many_one_layer(
-            tensors.journal, tensors.identity_state,
+            tensors.replay_log, tensors.identity_state,
             tensors.conv_input, tensors.identity_conv_state,
             tensors.accepted, tensors.slots);
         if (ok) {
@@ -574,7 +574,7 @@ bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
         ggml_backend_tensor_set(tensors.slots, mapped_slots.data(), 0,
                                 mapped_slots.size()*sizeof(mapped_slots[0]));
         ok = commit_many_one_layer(
-            tensors.journal, tensors.mapped_state,
+            tensors.replay_log, tensors.mapped_state,
             tensors.conv_input, tensors.mapped_conv_state,
             tensors.accepted, tensors.slots);
         if (ok) {
@@ -603,7 +603,7 @@ bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
         ggml_backend_tensor_set(tensors.slots, identity_slots.data(), 0,
                                 identity_slots.size()*sizeof(identity_slots[0]));
         ok = !commit_many_one_layer(
-            tensors.journal, tensors.identity_state,
+            tensors.replay_log, tensors.identity_state,
             tensors.conv_input, tensors.identity_conv_state,
             tensors.accepted, tensors.slots);
         const std::vector<int32_t> out_of_range_slots{0, 99, 2, 3};
@@ -613,14 +613,14 @@ bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
         ggml_backend_tensor_set(tensors.slots, out_of_range_slots.data(), 0,
                                 out_of_range_slots.size()*sizeof(out_of_range_slots[0]));
         ok = ok && !commit_many_one_layer(
-            tensors.journal, tensors.identity_state,
+            tensors.replay_log, tensors.identity_state,
             tensors.conv_input, tensors.identity_conv_state,
             tensors.accepted, tensors.slots);
         const std::vector<int32_t> duplicate_slots{0, 0, 2, 3};
         ggml_backend_tensor_set(tensors.slots, duplicate_slots.data(), 0,
                                 duplicate_slots.size()*sizeof(duplicate_slots[0]));
         ok = ok && !commit_many_one_layer(
-            tensors.journal, tensors.identity_state,
+            tensors.replay_log, tensors.identity_state,
             tensors.conv_input, tensors.identity_conv_state,
             tensors.accepted, tensors.slots);
         ggml_backend_tensor_get(
@@ -636,7 +636,7 @@ bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
             identity_conv_base, 0.0f);
     }
 
-    std::printf("gdn transition journal %-10s: %s\n", name,
+    std::printf("gdn replay log %-10s: %s\n", name,
                 ok ? "PASS" : "FAIL");
     destroy(tensors);
     return ok;
@@ -680,11 +680,11 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
 
     ggml_tensor * result = ggml_gated_delta_net_tree(
         ctx, q, k, v, g, beta, base_state, parents);
-    ggml_tensor * journal =
-        ggml_gated_delta_net_capture_transition_journal(ctx, result);
-    ggml_set_output(journal);
+    ggml_tensor * replay_log =
+        ggml_gated_delta_net_capture_replay_log(ctx, result);
+    ggml_set_output(replay_log);
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, journal);
+    ggml_build_forward_expand(graph, replay_log);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buffer) {
@@ -730,7 +730,7 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
         slots, identity_slots.data(), 0,
         identity_slots.size()*sizeof(identity_slots[0]));
     ok = ok && commit_many_one_layer(
-        journal, committed_state, conv_input, conv_state, accepted, slots);
+        replay_log, committed_state, conv_input, conv_state, accepted, slots);
 
     std::vector<float> expected = inputs.state;
     const size_t slot_elements = (size_t) S*S*H;
@@ -762,14 +762,14 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
             0.0f);
     }
 
-    std::printf("gdn grouped tree journal         : %s\n",
+    std::printf("gdn grouped tree replay log         : %s\n",
                 ok ? "PASS" : "FAIL");
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     return ok;
 }
 
-bool test_journal_capture_owns_storage(ggml_backend_t backend) {
+bool test_replay_log_capture_owns_storage(ggml_backend_t backend) {
     constexpr int state_size = 16;
     constexpr int heads = 1;
     constexpr int tokens = 8;
@@ -797,19 +797,19 @@ bool test_journal_capture_owns_storage(ggml_backend_t backend) {
         ctx, GGML_TYPE_I32, tokens, sequences);
     ggml_tensor * result = ggml_gated_delta_net_tree(
         ctx, q, k, v, g, beta, state, parents);
-    ggml_tensor * journal =
-        ggml_gated_delta_net_capture_transition_journal(ctx, result);
-    ggml_set_output(journal);
+    ggml_tensor * replay_log =
+        ggml_gated_delta_net_capture_replay_log(ctx, result);
+    ggml_set_output(replay_log);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, result);
-    ggml_build_forward_expand(graph, journal);
+    ggml_build_forward_expand(graph, replay_log);
     ggml_gallocr_t alloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(backend));
     const bool allocated = alloc && ggml_gallocr_alloc_graph(alloc, graph);
-    const bool ok = allocated && journal->buffer && journal->data &&
-                    journal->view_src == nullptr;
-    std::printf("gdn journal owned C4/W8         : %s\n",
+    const bool ok = allocated && replay_log->buffer && replay_log->data &&
+                    replay_log->view_src == nullptr;
+    std::printf("gdn replay log owned C4/W8         : %s\n",
                 ok ? "PASS" : "FAIL");
     if (alloc) ggml_gallocr_free(alloc);
     ggml_free(ctx);
@@ -843,7 +843,7 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
         ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 4, 4);
     ggml_tensor * feature_rows =
         ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequences);
-    ggml_tensor * journal = ggml_new_tensor_4d(
+    ggml_tensor * replay_log = ggml_new_tensor_4d(
         ctx, GGML_TYPE_F32, 2*state_size + 1,
         heads, tokens, sequences);
     ggml_tensor * state = ggml_new_tensor_4d(
@@ -874,7 +874,7 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
         (size_t) ggml_nelements(conv_state), 3.75f);
     std::vector<float> zeros(
         (size_t) std::max(
-            ggml_nelements(journal), ggml_nelements(conv_input)),
+            ggml_nelements(replay_log), ggml_nelements(conv_input)),
         0.0f);
     std::vector<uint16_t> feature_source_values(
         (size_t) ggml_nelements(feature_source), 0x4000);
@@ -899,8 +899,8 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
         conv_state, conv_before.data(), 0,
         conv_before.size()*sizeof(float));
     ggml_backend_tensor_set(
-        journal, zeros.data(), 0,
-        (size_t) ggml_nelements(journal)*sizeof(float));
+        replay_log, zeros.data(), 0,
+        (size_t) ggml_nelements(replay_log)*sizeof(float));
     ggml_backend_tensor_set(
         conv_input, zeros.data(), 0,
         (size_t) ggml_nelements(conv_input)*sizeof(float));
@@ -914,13 +914,13 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
         accepted, &invalid_accepted, 0, sizeof(invalid_accepted));
 
     ggml_tensor * caches[] = {cache};
-    const ggml_tensor * journals[] = {journal};
+    const ggml_tensor * replay_logs[] = {replay_log};
     ggml_tensor * states[] = {state};
     const ggml_tensor * conv_inputs[] = {conv_input};
     ggml_tensor * conv_states[] = {conv_state};
     const bool rejected = !ggml_backend_cuda_tree_commit_transaction(
         caches, 1, feature_source, feature_destination, feature_rows,
-        journals, states, conv_inputs, conv_states, 1,
+        replay_logs, states, conv_inputs, conv_states, 1,
         commit_rows, accepted, active_slots,
         /*tree_scratch_base=*/4, /*tree_scratch_stride=*/1);
 
@@ -965,7 +965,7 @@ int main(int argc, char ** argv) {
         ggml_backend_free(backend);
         return ok ? 0 : 1;
     }
-    const bool gallocr_ok = test_journal_capture_owns_storage(backend);
+    const bool gallocr_ok = test_replay_log_capture_owns_storage(backend);
     if (argc == 2 && std::strcmp(argv[1], "--gallocr-only") == 0) {
         ggml_backend_free(backend);
         return gallocr_ok ? 0 : 1;
