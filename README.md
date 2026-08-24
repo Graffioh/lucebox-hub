@@ -53,6 +53,14 @@ Model links open the exact weights used by the measured setup. Drafter links ope
 | [Gemma 4 31B IT Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/blob/main/google_gemma-4-31B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/blob/main/gemma-4-31B-it-DFlash-q8_0.gguf) | Decode | **3.2×** |
 | [DeepSeek V4 Flash ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4 drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | Decode | Up to **1.81×** vs target-only, **32.7 vs 18.1 tok/s** |
 
+Experimental native `BailingMoE3` support is available for
+[`Ling 3.0 Flash`](https://huggingface.co/inclusionAI/Ling-3.0-flash). On a
+single DGX Spark, LuceBox serves the Q4_K_M GGUF at **34.6 tok/s** median
+autoregressive decode with Q4_0 KV cache. See the
+[DGX Spark integration and benchmark](server/docs/LING3_FLASH_DGX_SPARK.md)
+for the exact configuration, context sweep, tool-call test, and current
+limitations.
+
 ## Tested Machines (GPU/APU)
 
 The engine is not tied to one reference card. NVIDIA architectures are selected by CMake; HIP builds should target the device's exact `gfx` architecture.
