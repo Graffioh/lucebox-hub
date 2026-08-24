@@ -2228,7 +2228,8 @@ CompletionTokenCounts feed_non_streaming_tokens(
 json build_openai_completion_response(
         const ParsedRequest & req, const GenerateResult & result,
         int generation_cap, const GenTimings & timings,
-        const CompletionTokenCounts & counts, const SseEmitter & emitter) {
+        const CompletionTokenCounts & counts, const SseEmitter & emitter,
+        const Tokenizer * tokenizer = nullptr) {
     json message = {
         {"role", "assistant"},
         {"content", emitter.accumulated_text()},
@@ -2261,13 +2262,15 @@ json build_openai_completion_response(
         }
         message["tool_calls"] = tool_calls;
     }
-
     // The emitter only knows "stop" / "tool_calls"; it cannot see that the
     // daemon hit the n_gen cap. Derive "length" from the committed-token
     // count — OpenAI-compatible clients (open-webui, Cline) gate retry
     // logic on finish_reason == "length".
+    const bool is_eos = tokenizer && !result.tokens.empty() &&
+        (result.tokens.back() == tokenizer->eos_id() ||
+         result.tokens.back() == tokenizer->eos_chat_id());
     std::string finish_reason = emitter.finish_reason();
-    if (finish_reason == "stop" && counts.total >= generation_cap) {
+    if (finish_reason == "stop" && !is_eos && counts.total >= generation_cap) {
         finish_reason = "length";
     }
     // Degenerate decode (post-close repetition-loop watchdog) also reports
@@ -2330,7 +2333,8 @@ json build_openai_completion_response(
 json build_anthropic_response(
         const ParsedRequest & req, const GenerateResult & result,
         int generation_cap, const GenTimings & timings,
-        const CompletionTokenCounts & counts, const SseEmitter & emitter) {
+        const CompletionTokenCounts & counts, const SseEmitter & emitter,
+        const Tokenizer * tokenizer = nullptr) {
     json content = json::array();
     if (!emitter.reasoning_text().empty()) {
         content.push_back({
@@ -2347,31 +2351,33 @@ json build_anthropic_response(
         });
     }
     for (const auto & tool_call : emitter.tool_calls()) {
-        // Anthropic expects `input` as an object; arguments arrive as a
-        // JSON-encoded string. Fall back to an empty object on bad JSON.
-        json input;
-        try {
-            input = tool_call.arguments.empty()
-                ? json::object()
-                : json::parse(tool_call.arguments);
-        } catch (const std::exception &) {
-            input = json::object();
+        json input = json::object();
+        if (!tool_call.arguments.empty()) {
+            json parsed = json::parse(tool_call.arguments, nullptr, false);
+            if (!parsed.is_discarded() && parsed.is_object()) {
+                input = std::move(parsed);
+            } else {
+                input = {{"_raw", tool_call.arguments}};
+            }
         }
         content.push_back({
             {"type", "tool_use"},
             {"id", tool_call.id},
             {"name", tool_call.name},
-            {"input", input},
+            {"input", std::move(input)},
         });
     }
 
     // stop_reason is Anthropic's analog of finish_reason, with the same
     // length-vs-EOS distinction — Cline / Anthropic SDK clients gate
     // retry logic on stop_reason == "max_tokens".
+    const bool is_eos = tokenizer && !result.tokens.empty() &&
+        (result.tokens.back() == tokenizer->eos_id() ||
+         result.tokens.back() == tokenizer->eos_chat_id());
     std::string stop_reason;
     if (emitter.finish_reason() == "tool_calls") {
         stop_reason = "tool_use";
-    } else if (counts.total >= generation_cap) {
+    } else if (!is_eos && counts.total >= generation_cap) {
         stop_reason = "max_tokens";
     } else {
         stop_reason = "end_turn";
@@ -2447,14 +2453,15 @@ json build_responses_api_response(
 json build_non_streaming_response(
         const ParsedRequest & req, const GenerateResult & result,
         int generation_cap, const GenTimings & timings,
-        const CompletionTokenCounts & counts, SseEmitter & emitter) {
+        const CompletionTokenCounts & counts, SseEmitter & emitter,
+        const Tokenizer * tokenizer = nullptr) {
     switch (req.format) {
     case ApiFormat::OPENAI_CHAT:
         return build_openai_completion_response(
-            req, result, generation_cap, timings, counts, emitter);
+            req, result, generation_cap, timings, counts, emitter, tokenizer);
     case ApiFormat::ANTHROPIC:
         return build_anthropic_response(
-            req, result, generation_cap, timings, counts, emitter);
+            req, result, generation_cap, timings, counts, emitter, tokenizer);
     case ApiFormat::RESPONSES:
         return build_responses_api_response(
             req, result, timings, counts, emitter);
@@ -2470,7 +2477,7 @@ json build_non_streaming_response(
     const CompletionTokenCounts counts = feed_non_streaming_tokens(
         result.tokens, tokenizer, emitter);
     return build_non_streaming_response(
-        req, result, generation_cap, timings, counts, emitter);
+        req, result, generation_cap, timings, counts, emitter, &tokenizer);
 }
 
 // Prompt preparation applies exactly one compression policy: FlowKV for
@@ -3799,7 +3806,10 @@ void HttpServer::send_nonstream_response(
         ClientSendBuffer * send_buffer) {
     CompletionTokenCounts counts;
     counts.total = (int) gen_tokens.size();
-    emitter.emit_finish(counts.total, nullptr, n_gen_cap);
+    const bool is_eos = !gen_tokens.empty() &&
+        (gen_tokens.back() == tokenizer_.eos_id() ||
+         gen_tokens.back() == tokenizer_.eos_chat_id());
+    emitter.emit_finish(counts.total, nullptr, n_gen_cap, is_eos);
     const int first_content = emitter.first_content_token_index();
     const int emitted = emitter.emit_token_count();
     counts.reasoning = first_content < 0 ? emitted : first_content;
@@ -3811,7 +3821,7 @@ void HttpServer::send_nonstream_response(
     result.degenerate_decode_close = degenerate_decode_close;
 
     const json response = build_non_streaming_response(
-        req, result, n_gen_cap, gen_timings, counts, emitter);
+        req, result, n_gen_cap, gen_timings, counts, emitter, &tokenizer_);
 
     const std::string body = response.dump() + "\n";
     if (send_buffer) {
@@ -4081,8 +4091,12 @@ void HttpServer::process_job(ServerJob * job) {
     if (job->client_disconnected.load(std::memory_order_acquire)) {
         client_disconnected = true;
     }
+    const bool is_eos = !result.tokens.empty() &&
+        (result.tokens.back() == tokenizer_.eos_id() ||
+         result.tokens.back() == tokenizer_.eos_chat_id());
     if (req.stream && !client_disconnected) {
-        auto final_chunks = emitter.emit_finish(completion_tokens, &gen_timings, n_gen_cap);
+        auto final_chunks = emitter.emit_finish(
+            completion_tokens, &gen_timings, n_gen_cap, is_eos);
         remember_agent_turn(
             req, prepared, cache, result, emitter, completion_tokens,
             visible_output_seen, client_disconnected,

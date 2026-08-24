@@ -86,10 +86,12 @@ public:
     // usage chunk; Anthropic: message_delta usage; Responses:
     // response.completed usage). Pass nullptr to suppress, matching
     // the pre-timings API for unit tests that don't exercise that
-    // shape.
+    // shape. ended_on_eos keeps EOS-at-cap completions classified as "stop"
+    // instead of "length".
     std::vector<std::string> emit_finish(int completion_tokens,
                                          const GenTimings * timings = nullptr,
-                                         int generation_cap = -1);
+                                         int generation_cap = -1,
+                                         bool ended_on_eos = false);
 
     // Get the finish_reason for non-streaming responses.
     std::string finish_reason() const;
@@ -145,6 +147,9 @@ private:
 
     // Emit a content delta (format-specific).
     void emit_content_delta(std::vector<std::string> & out, const std::string & text);
+
+    // Emit a reasoning/thinking delta (format-specific).
+    void emit_reasoning_delta(std::vector<std::string> & out, const std::string & text);
 
     // SSE data line
     static std::string sse_data(const std::string & json_str);
