@@ -16,8 +16,8 @@
 
 namespace {
 
-__global__ void gdn_transition_journal_commit_kernel(
-        const float * journal,
+__global__ void gdn_replay_log_commit_kernel(
+        const float * replay_log,
         float * state,
         const int32_t * accepted_prefixes,
         const int32_t * active_slot_ids,
@@ -26,7 +26,7 @@ __global__ void gdn_transition_journal_commit_kernel(
         int n_tokens,
         int n_seqs,
         int n_state_slots,
-        int journal_width,
+        int replay_log_width,
         int gate_values) {
     const int sequence = blockIdx.z;
     const int head = blockIdx.y;
@@ -51,9 +51,9 @@ __global__ void gdn_transition_journal_commit_kernel(
     float current = state[state_offset];
 
     for (int token = 0; token < accepted; ++token) {
-        const float * transition = journal +
+        const float * transition = replay_log +
             (((size_t) sequence*n_tokens + token)*n_heads + head) *
-                journal_width;
+                replay_log_width;
         const float gate = gate_values == 1
             ? transition[0]
             : transition[row];
@@ -85,7 +85,7 @@ bool device_pointer(const void * pointer, int & device) {
 
 namespace {
 
-__global__ void gdn_conv_journal_commit_kernel(
+__global__ void gdn_conv_replay_log_commit_kernel(
         const float * conv_input,
         float * conv_state,
         const int32_t * accepted_prefixes,
@@ -176,8 +176,8 @@ enum class commit_mode {
     COMMIT_PREVALIDATED,
 };
 
-static bool gdn_transition_journal_commit_many_impl(
-        const ggml_tensor * const * journals,
+static bool gdn_replay_log_commit_many_impl(
+        const ggml_tensor * const * replay_logs,
         ggml_tensor * const * states,
         const ggml_tensor * const * conv_inputs,
         ggml_tensor * const * conv_states,
@@ -189,7 +189,7 @@ static bool gdn_transition_journal_commit_many_impl(
     const bool commit = mode != commit_mode::VALIDATE;
     const bool synchronize = mode == commit_mode::COMMIT;
     if (!prevalidated &&
-        (!journals || !states || !conv_inputs || !conv_states ||
+        (!replay_logs || !states || !conv_inputs || !conv_states ||
          n_layers <= 0 || !accepted_prefixes || !active_slot_ids ||
          accepted_prefixes->type != GGML_TYPE_I32 ||
          active_slot_ids->type != GGML_TYPE_I32 ||
@@ -216,25 +216,25 @@ static bool gdn_transition_journal_commit_many_impl(
         int common_state_slots = -1;
         std::vector<uint8_t> seen;
         for (int layer = 0; layer < n_layers; ++layer) {
-            const ggml_tensor * journal = journals[layer];
+            const ggml_tensor * replay_log = replay_logs[layer];
             ggml_tensor * state = states[layer];
             const ggml_tensor * conv_input = conv_inputs[layer];
             ggml_tensor * conv_state = conv_states[layer];
-            if (!journal || !state || !conv_input || !conv_state ||
-                journal->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
+            if (!replay_log || !state || !conv_input || !conv_state ||
+                replay_log->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
                 conv_input->type != GGML_TYPE_F32 || conv_state->type != GGML_TYPE_F32 ||
-                !ggml_is_contiguous(journal) || !ggml_is_contiguous(state) ||
+                !ggml_is_contiguous(replay_log) || !ggml_is_contiguous(state) ||
                 !ggml_is_contiguous(conv_input) || !ggml_is_contiguous(conv_state)) return false;
             const int64_t state_size = state->ne[0];
             const int64_t heads = state->ne[2];
-            const int64_t tokens = journal->ne[2];
+            const int64_t tokens = replay_log->ne[2];
             const int64_t state_slots = state->ne[3];
             if ((state_size != 16 && state_size != 32 &&
                  state_size != 64 && state_size != 128) ||
                 state->ne[1] != state_size || heads < 1 ||
-                journal->ne[1] != heads || journal->ne[3] != n_seqs ||
-                (journal->ne[0] != 2*state_size + 1 &&
-                 journal->ne[0] != 3*state_size) || tokens < 1 ||
+                replay_log->ne[1] != heads || replay_log->ne[3] != n_seqs ||
+                (replay_log->ne[0] != 2*state_size + 1 &&
+                 replay_log->ne[0] != 3*state_size) || tokens < 1 ||
                 conv_state->ne[0] < 1 || conv_state->ne[1] < 1 ||
                 conv_state->ne[2] != state_slots || conv_state->ne[3] != 1 ||
                 conv_input->ne[0] != conv_state->ne[0] + tokens ||
@@ -248,7 +248,7 @@ static bool gdn_transition_journal_commit_many_impl(
                 return false;
             }
             const void * pointers[] = {
-                journal->data, state->data, conv_input->data, conv_state->data,
+                replay_log->data, state->data, conv_input->data, conv_state->data,
             };
             for (const void * pointer : pointers) {
                 if (!same_device_pointer(pointer, device)) return false;
@@ -270,23 +270,23 @@ static bool gdn_transition_journal_commit_many_impl(
     constexpr int threads = 256;
     (void) cudaGetLastError();
     for (int layer = 0; layer < n_layers; ++layer) {
-        const ggml_tensor * journal = journals[layer];
+        const ggml_tensor * replay_log = replay_logs[layer];
         ggml_tensor * state = states[layer];
         const int state_size = (int) state->ne[0];
         const int heads = (int) state->ne[2];
-        const int tokens = (int) journal->ne[2];
-        const int journal_width = (int) journal->ne[0];
+        const int tokens = (int) replay_log->ne[2];
+        const int replay_log_width = (int) replay_log->ne[0];
         const int64_t state_elements = (int64_t) state_size*state_size;
         const dim3 state_grid(
             (unsigned int) ((state_elements + threads - 1)/threads),
             (unsigned int) heads, (unsigned int) n_seqs);
-        gdn_transition_journal_commit_kernel<<<state_grid, threads>>>(
-            (const float *) journal->data, (float *) state->data,
+        gdn_replay_log_commit_kernel<<<state_grid, threads>>>(
+            (const float *) replay_log->data, (float *) state->data,
             (const int32_t *) accepted_prefixes->data,
             (const int32_t *) active_slot_ids->data,
             state_size, heads, tokens, (int) n_seqs,
-            (int) state->ne[3], journal_width,
-            journal_width == 2*state_size + 1 ? 1 : state_size);
+            (int) state->ne[3], replay_log_width,
+            replay_log_width == 2*state_size + 1 ? 1 : state_size);
 
         const ggml_tensor * conv_input = conv_inputs[layer];
         ggml_tensor * conv_state = conv_states[layer];
@@ -295,7 +295,7 @@ static bool gdn_transition_journal_commit_many_impl(
         const dim3 conv_grid(
             (unsigned int) ((conv_elements + threads - 1)/threads),
             (unsigned int) n_seqs, 1);
-        gdn_conv_journal_commit_kernel<<<conv_grid, threads>>>(
+        gdn_conv_replay_log_commit_kernel<<<conv_grid, threads>>>(
             (const float *) conv_input->data, (float *) conv_state->data,
             (const int32_t *) accepted_prefixes->data,
             (const int32_t *) active_slot_ids->data,
@@ -306,21 +306,21 @@ static bool gdn_transition_journal_commit_many_impl(
     return !synchronize || cudaDeviceSynchronize() == cudaSuccess;
 }
 
-extern "C" bool ggml_backend_cuda_gdn_transition_journal_commit_many(
-        const ggml_tensor * const * journals,
+extern "C" bool ggml_backend_cuda_gdn_replay_log_commit_many(
+        const ggml_tensor * const * replay_logs,
         ggml_tensor * const * states,
         const ggml_tensor * const * conv_inputs,
         ggml_tensor * const * conv_states,
         int n_layers,
         const ggml_tensor * accepted_prefixes,
         const ggml_tensor * active_slot_ids) {
-    if (!gdn_transition_journal_commit_many_impl(
-            journals, states, conv_inputs, conv_states, n_layers,
+    if (!gdn_replay_log_commit_many_impl(
+            replay_logs, states, conv_inputs, conv_states, n_layers,
             accepted_prefixes, active_slot_ids, commit_mode::VALIDATE)) {
         return false;
     }
-    if (!gdn_transition_journal_commit_many_impl(
-            journals, states, conv_inputs, conv_states, n_layers,
+    if (!gdn_replay_log_commit_many_impl(
+            replay_logs, states, conv_inputs, conv_states, n_layers,
             accepted_prefixes, active_slot_ids, commit_mode::COMMIT)) {
         GGML_ABORT("recurrent commit failed after mutation began");
     }
@@ -501,7 +501,7 @@ extern "C" bool ggml_backend_cuda_tree_commit_transaction(
         const ggml_tensor * feature_source,
         ggml_tensor * feature_destination,
         const ggml_tensor * feature_destination_rows,
-        const ggml_tensor * const * journals,
+        const ggml_tensor * const * replay_logs,
         ggml_tensor * const * states,
         const ggml_tensor * const * conv_inputs,
         ggml_tensor * const * conv_states,
@@ -524,8 +524,8 @@ extern "C" bool ggml_backend_cuda_tree_commit_transaction(
         std::fprintf(stderr, "[gdn-transaction] feature preflight failed\n");
         return false;
     }
-    if (!gdn_transition_journal_commit_many_impl(
-            journals, states, conv_inputs, conv_states, n_layers,
+    if (!gdn_replay_log_commit_many_impl(
+            replay_logs, states, conv_inputs, conv_states, n_layers,
             accepted_prefixes, active_slot_ids, commit_mode::VALIDATE)) {
         std::fprintf(stderr, "[gdn-transaction] recurrent preflight failed\n");
         return false;
@@ -552,8 +552,8 @@ extern "C" bool ggml_backend_cuda_tree_commit_transaction(
             commit_mode::COMMIT_PREVALIDATED)) {
         GGML_ABORT("tree commit failed after feature mutation began");
     }
-    if (!gdn_transition_journal_commit_many_impl(
-            journals, states, conv_inputs, conv_states, n_layers,
+    if (!gdn_replay_log_commit_many_impl(
+            replay_logs, states, conv_inputs, conv_states, n_layers,
             accepted_prefixes, active_slot_ids,
             commit_mode::COMMIT_PREVALIDATED)) {
         GGML_ABORT("tree commit failed after recurrent mutation began");

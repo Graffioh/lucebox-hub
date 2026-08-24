@@ -1985,19 +1985,19 @@ if(DFLASH27B_TESTS)
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")
-       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gdn_transition_journal.cpp")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gdn_replay_log.cpp")
         dflash_add_ggml_gpu_executable(
-            test_gdn_transition_journal
-            test/test_gdn_transition_journal.cpp)
-        add_test(NAME gdn_transition_journal COMMAND test_gdn_transition_journal)
+            test_gdn_replay_log
+            test/test_gdn_replay_log.cpp)
+        add_test(NAME gdn_replay_log COMMAND test_gdn_replay_log)
         add_test(
-            NAME gdn_transition_journal_gallocr
-            COMMAND test_gdn_transition_journal --gallocr-only)
+            NAME gdn_replay_log_gallocr
+            COMMAND test_gdn_replay_log --gallocr-only)
         add_test(
-            NAME gdn_transition_journal_preflight
-            COMMAND test_gdn_transition_journal --preflight-only)
+            NAME gdn_replay_log_preflight
+            COMMAND test_gdn_replay_log --preflight-only)
         if(TARGET check)
-            add_dependencies(check test_gdn_transition_journal)
+            add_dependencies(check test_gdn_replay_log)
         endif()
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR

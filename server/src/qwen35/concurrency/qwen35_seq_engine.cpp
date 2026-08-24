@@ -876,23 +876,23 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         result.error = "fixed chain capture set is incomplete";
         return result;
     }
-    std::vector<const ggml_tensor *> journals;
+    std::vector<const ggml_tensor *> replay_logs;
     std::vector<ggml_tensor *> states;
     std::vector<const ggml_tensor *> conv_inputs;
     std::vector<ggml_tensor *> conv_states;
-    journals.reserve(n_delta);
+    replay_logs.reserve(n_delta);
     states.reserve(n_delta);
     conv_inputs.reserve(n_delta);
     conv_states.reserve(n_delta);
     for (size_t layer = 0; layer < n_delta; ++layer) {
         const DeltaNetCapture & capture = graph.delta_captures[layer];
-        if (!capture.transition_journal || !capture.conv_input ||
+        if (!capture.replay_log || !capture.conv_input ||
             !b_.cache_.ssm_state[layer] ||
             !b_.cache_.conv_state[layer]) {
             result.error = "fixed chain layer capture is incomplete";
             return result;
         }
-        journals.push_back(capture.transition_journal);
+        replay_logs.push_back(capture.replay_log);
         states.push_back(b_.cache_.ssm_state[layer]);
         conv_inputs.push_back(capture.conv_input);
         conv_states.push_back(b_.cache_.conv_state[layer]);
@@ -915,7 +915,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             caches.data(), static_cast<int>(caches.size()),
             graph.tree_features, b_.cache_.target_feat,
             graph.feature_commit_rows,
-            journals.data(), states.data(), conv_inputs.data(),
+            replay_logs.data(), states.data(), conv_inputs.data(),
             conv_states.data(), static_cast<int>(n_delta),
             graph.commit_rows, graph.accepted_prefixes,
             graph.commit_slot_ids,
