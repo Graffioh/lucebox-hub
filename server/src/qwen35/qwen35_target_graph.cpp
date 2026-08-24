@@ -312,7 +312,7 @@ bool create_target_cache_partial(const TargetWeights & w,
     // ── Rollback context: snapshots + intermediates ───────────────────
     // Multi-slot caches skip these entirely. Fixed chain verification keeps
     // speculative recurrent transitions in graph scratch and promotes only
-    // accepted prefixes through the compact GPU journal.
+    // accepted prefixes through the compact GPU replay log.
     if (!prefill_only && !multi_slot) {
         const int rb_tensors = 4 * n_delta;
         ggml_init_params ip{};
@@ -1706,7 +1706,7 @@ static ggml_tensor * build_delta_net_block(
         ? (seg_tree ? cap : nullptr) : cap;
     ggml_tensor * seg_parent_ids = mapped_tree
         ? (seg_tree ? parent_ids : nullptr) : parent_ids;
-    // Journal commit composes transitions in token order. Its fixed-chain
+    // Replay log commit composes transitions in token order. Its fixed-chain
     // capture therefore uses plain recurrence; parent IDs still drive tree
     // convolution and attention.
     const bool capture_chain_commit = seg_cap && seg_tree;
@@ -2093,10 +2093,10 @@ static ggml_tensor * build_delta_net_block(
         ggml_gated_delta_net_set_skip_intermediate(result, true);
     }
     if (capture_chain_commit) {
-        seg_cap->transition_journal =
-            ggml_gated_delta_net_capture_transition_journal(ctx, result);
-        ggml_set_output(seg_cap->transition_journal);
-        ggml_build_forward_expand(gf, seg_cap->transition_journal);
+        seg_cap->replay_log =
+            ggml_gated_delta_net_capture_replay_log(ctx, result);
+        ggml_set_output(seg_cap->replay_log);
+        ggml_build_forward_expand(gf, seg_cap->replay_log);
     }
 
     // Slice output and new_state out of the packed result

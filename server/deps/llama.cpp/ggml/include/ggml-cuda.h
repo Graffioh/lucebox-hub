@@ -110,10 +110,10 @@ GGML_BACKEND_API bool ggml_backend_cuda_topk_rows(const struct ggml_tensor * log
                                                   float * probs_out, int32_t * ids_out);
 
 // Batched concurrent-tree commit. Validation is fail-closed before any kernel
-// launches; all layer journals and convolution windows commit on one device
+// launches; all layer replay logs and convolution windows commit on one device
 // synchronization.
-GGML_BACKEND_API bool ggml_backend_cuda_gdn_transition_journal_commit_many(
-        const struct ggml_tensor * const * journals,
+GGML_BACKEND_API bool ggml_backend_cuda_gdn_replay_log_commit_many(
+        const struct ggml_tensor * const * replay_logs,
         struct ggml_tensor * const * states,
         const struct ggml_tensor * const * conv_inputs,
         struct ggml_tensor * const * conv_states,
@@ -142,7 +142,7 @@ GGML_BACKEND_API bool ggml_backend_cuda_tree_commit_transaction(
         const struct ggml_tensor * feature_source,
         struct ggml_tensor * feature_destination,
         const struct ggml_tensor * feature_destination_rows,
-        const struct ggml_tensor * const * journals,
+        const struct ggml_tensor * const * replay_logs,
         struct ggml_tensor * const * states,
         const struct ggml_tensor * const * conv_inputs,
         struct ggml_tensor * const * conv_states,

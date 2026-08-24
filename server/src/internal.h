@@ -732,10 +732,10 @@ bool specla_commit_accepted(TargetCache & cache,
 struct DeltaNetCapture {
     ggml_tensor * ssm_intermediate_states = nullptr;
     ggml_tensor * conv_input              = nullptr;
-    // Concurrent tree direct-commit data. The compact journal plus the
+    // Concurrent tree direct-commit data. The compact replay log plus the
     // tree conv input can advance accepted recurrent prefixes without a
     // second target-model forward. These are graph-owned outputs.
-    ggml_tensor * transition_journal      = nullptr;
+    ggml_tensor * replay_log              = nullptr;
 
     // SpecLA factor capture (DFLASH_SPECLA=1, docs/SPECLA.md). Persistent F32
     // aliases into the bank written by this verify. In the HLD path the
@@ -777,7 +777,7 @@ struct QwenGraphInputs {
     int           kv_start;       // position where the new tokens begin
     bool          capture_layers; // if true, write captured layer features into cache.target_feat
     bool          capture_delta_intermediate = false; // if true, populate out_delta_captures
-    bool          capture_tree_commit = false; // compact recurrent journal + tree features
+    bool          capture_tree_commit = false; // compact recurrent replay log + tree features
     bool          capture_moe_router = false; // if true, expose selected expert ids for MoE layers
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     int           logits_tail_rows = 0; // compute logits only for last n rows; 0 = all
