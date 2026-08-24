@@ -2586,7 +2586,45 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         return false;
     };
     const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
-    const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
+    // Long-context draft width. Verify attention runs through ggml's tile
+    // kernel (the vector kernel only covers a single query row), and that
+    // kernel's cost scales with the number of query rows AND with KV length.
+    // So a wide draft block, which is a clear win on short prompts, turns
+    // into a liability once the KV is large: the extra rows multiply a term
+    // that is itself growing.
+    //
+    // Measured on one R9700 with Qwen3.8-27B IQ4_XS + DFlash2 (decode tok/s):
+    //     prompt   block 16   block 12   block 8
+    //     26,728       44.2       44.0      42.5   <- crossover
+    //     39,861       32.7       40.2      46.0
+    //     81,365       23.3          -      27.8
+    // Below the crossover the wide block still wins by a lot (HumanEval-10
+    // 204 vs 143.6 decode), so narrow only past it. Halving also raises
+    // commit depth there (0.462*8+1 = 4.70 vs 0.200*16+1 = 4.20): fewer rows
+    // and deeper commits at the same time.
+    //
+    // The rule is a function of context length only. It deliberately does not
+    // look at the observed acceptance rate, so the width for a given prompt
+    // is reproducible and does not chase a moving target.
+    static const int long_ctx_threshold = []() {
+        const char * e = std::getenv("DFLASH_LONGCTX_BLOCK_TOKENS");
+        if (!e || !*e) return 32768;
+        const int v = std::atoi(e);
+        return v > 0 ? v : 0;   // 0 disables the narrowing
+    }();
+    const int q_len_cfg = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
+    const int q_len = (long_ctx_threshold > 0 && committed >= long_ctx_threshold)
+                          ? std::max(8, q_len_cfg / 2)
+                          : q_len_cfg;
+    if (q_len != q_len_cfg) {
+        static std::atomic<bool> s_narrowed_logged{false};
+        if (!s_narrowed_logged.exchange(true)) {
+            std::fprintf(stderr,
+                "[qwen35-spec] context %d >= %d: narrowing draft block %d -> %d "
+                "(wide blocks lose to verify-attention cost at long context)\n",
+                committed, long_ctx_threshold, q_len_cfg, q_len);
+        }
+    }
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
