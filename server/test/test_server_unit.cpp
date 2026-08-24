@@ -6522,3 +6522,81 @@ TEST_CASE(ServerUnitFixture, test_emitter_streaming_malformed_tool_in_think_answ
     TEST_ASSERT(em.tool_calls().empty());
     TEST_ASSERT(em.accumulated_text() == "The output is </parameter> end.");
 }
+
+TEST_CASE(ServerUnitFixture, test_escape_for_logging) {
+    // Standard escapes
+    TEST_ASSERT(escape_for_logging("hello\nworld\r\t'\\") == "hello\\nworld\\r\\t\\'\\\\");
+    // NUL byte (escaped as fixed-width \u0000 for consistency)
+    TEST_ASSERT(escape_for_logging(std::string("null\0byte", 9)) == "null\\u0000byte");
+    // Control byte followed by hex digit must be unambiguous (\u0001f)
+    TEST_ASSERT(escape_for_logging(std::string("\x01", 1) + "f") == "\\u0001f");
+    TEST_ASSERT(escape_for_logging(std::string("\x1f", 1) + "abc") == "\\u001fabc");
+    TEST_ASSERT(escape_for_logging(std::string("\x7f", 1) + "xyz") == "\\u007fxyz");
+}
+
+namespace {
+struct StderrCapture {
+    int old_stderr = -1;
+    std::FILE * file = nullptr;
+
+    StderrCapture() {
+        std::fflush(stderr);
+        file = std::tmpfile();
+        if (file == nullptr) return;
+
+        old_stderr = dup(STDERR_FILENO);
+        if (old_stderr == -1 || dup2(fileno(file), STDERR_FILENO) == -1) {
+            if (old_stderr != -1) close(old_stderr);
+            old_stderr = -1;
+            std::fclose(file);
+            file = nullptr;
+        }
+    }
+
+    std::string str() {
+        restore();
+        if (file == nullptr) return "";
+
+        std::rewind(file);
+        std::string out;
+        char buf[1024];
+        size_t n = 0;
+        while ((n = std::fread(buf, 1, sizeof(buf), file)) > 0) {
+            out.append(buf, n);
+        }
+        std::fclose(file);
+        file = nullptr;
+        return out;
+    }
+
+    void restore() {
+        if (old_stderr != -1) {
+            std::fflush(stderr);
+            dup2(old_stderr, STDERR_FILENO);
+            close(old_stderr);
+            old_stderr = -1;
+        }
+    }
+
+    ~StderrCapture() {
+        restore();
+        if (file != nullptr) std::fclose(file);
+    }
+};
+}  // namespace
+
+TEST_CASE(ServerUnitFixture, test_emitter_suppresses_malformed_multiline_tool_buffer) {
+    StderrCapture capture;
+
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT, read_tools(), false);
+    em.emit_start();
+    em.emit_token("<function_call>\n  <invoke name=\"read\">\n    malformed prose body with\nnew lines and \t tabs\n");
+    em.emit_finish(10);
+
+    std::string captured = capture.str();
+
+    TEST_ASSERT(em.tool_calls().empty());
+    TEST_ASSERT(em.accumulated_text().empty());
+    TEST_ASSERT(captured.find("[server] tool_call parse failed; suppressing buffered tool text") != std::string::npos);
+    TEST_ASSERT(captured.find("text='<function_call>\\n  <invoke name=\"read\">\\n    malformed prose body with\\nnew lines and \\t tabs\\n'") != std::string::npos);
+}
