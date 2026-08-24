@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <random>
 #include <variant>
 #include <vector>
 
@@ -104,9 +105,11 @@ private:
 
     struct PreparedChainDraft {
         bool valid = false;
+        bool sampled = false;
         int generated = -1;
         int32_t root = -1;
         std::vector<int32_t> tokens;
+        std::mt19937_64 rng_snapshot;
     };
 
     int max_prefills_;

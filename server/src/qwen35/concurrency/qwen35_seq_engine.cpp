@@ -15,12 +15,14 @@
 #include "common/ddtree.h"
 #include "common/dflash2_head.h"
 #include "common/sampler.h"
+#include "common/speculative_sampling.h"
 #include "internal.h"
 #include "ggml-cuda.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -189,8 +191,7 @@ bool Qwen35SeqEngine::chain_spec_input_capable(
         return false;
     }
     const Qwen35Slot & slot = slots_.slot(input.slot);
-    return slot.decoding() && !slot.sampler.needs_logit_processing() &&
-           slot.cur_pos >= 1 &&
+    return slot.decoding() && slot.cur_pos >= 1 &&
            slot.cur_pos + tree_width_ <= slots_.max_context();
 }
 
@@ -357,10 +358,13 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
         }
         PreparedChainDraft & prepared =
             prepared_chain_drafts_[static_cast<size_t>(lane.slot)];
+        const Qwen35Slot & slot = slots_.slot(lane.slot);
         prepared.valid = true;
-        prepared.generated = slots_.slot(lane.slot).generated_tokens();
+        prepared.sampled = slot.sampler.needs_logit_processing();
+        prepared.generated = slot.generated_tokens();
         prepared.root = lane.root;
         prepared.tokens = std::move(tokens);
+        if (prepared.sampled) prepared.rng_snapshot = slot.rng;
     }
     return true;
 }
@@ -508,6 +512,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     struct Proposal {
         size_t input_index = 0;
         int slot = -1;
+        bool sampled = false;
+        std::mt19937_64 rng;
         int32_t root = -1;
         DDTree tree;
         std::vector<int32_t> tokens;
@@ -550,6 +556,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             if (!prepared.valid || prepared.root != input.token ||
                 prepared.generated !=
                     slots_.slot(input.slot).generated_tokens() ||
+                (prepared.sampled &&
+                 prepared.rng_snapshot !=
+                    slots_.slot(input.slot).rng) ||
                 prepared.tokens.size() !=
                     static_cast<size_t>(tree_width)) {
                 result.error = "prepared DFlash2 chain became stale";
@@ -558,8 +567,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             Proposal proposal;
             proposal.input_index = i;
             proposal.slot = input.slot;
+            proposal.sampled = prepared.sampled;
             proposal.root = input.token;
             proposal.tokens = std::move(prepared.tokens);
+            if (proposal.sampled) proposal.rng = prepared.rng_snapshot;
             prepared = {};
             proposal.tree = make_chain_verify_tree(proposal.tokens);
             if (proposal.tree.n_nodes + 1 != tree_width) {
@@ -802,8 +813,16 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         graph.argmax_tokens, posterior.data(), 0,
         sizeof(int32_t) * posterior.size());
 
+    int sampled_proposals = 0;
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
+        if (proposal.sampled) {
+            proposal.accepted = {0};
+            proposal.path = {proposal.root};
+            ++sampled_proposals;
+            continue;
+        }
+
         const int row_base = ar_count + lane_index * tree_width;
         const int32_t * lane_posterior =
             posterior.data() + static_cast<size_t>(row_base);
@@ -835,6 +854,172 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         if (proposal.path.empty()) {
             result.error = "fixed chain min-token clamp removed the root";
             return result;
+        }
+    }
+
+    if (sampled_proposals > 0) {
+        const int vocab = b_.w_.n_vocab;
+        std::vector<int> active_lanes;
+        active_lanes.reserve(static_cast<size_t>(sampled_proposals));
+        std::vector<float> sampled_logits(
+            static_cast<size_t>(sampled_proposals) *
+            static_cast<size_t>(vocab));
+        std::vector<int32_t> sampling_history;
+        SamplerDistribution target_distribution;
+        SparseProposalDistribution draft_distribution;
+        // The selector traces one deterministic chain, so its conditional q
+        // at each depth is a point mass on that child. The standard p/q
+        // correction below is exact for this sparse distribution.
+        draft_distribution.token_ids.resize(1);
+        draft_distribution.probabilities = {1.0f};
+        std::uniform_real_distribution<double> uniform(0.0, 1.0);
+
+        const auto build_target_distribution =
+            [&](Proposal & proposal, const float * logits) {
+                const Qwen35Slot & slot = slots_.slot(proposal.slot);
+                sampling_history.clear();
+                sampling_history.reserve(
+                    slot.sample_history.size() + proposal.path.size());
+                sampling_history.insert(
+                    sampling_history.end(),
+                    slot.sample_history.begin(), slot.sample_history.end());
+                sampling_history.insert(
+                    sampling_history.end(),
+                    proposal.path.begin(), proposal.path.end());
+                if (!build_sampler_distribution(
+                        logits, vocab, slot.sampler, sampling_history,
+                        target_distribution)) {
+                    return false;
+                }
+
+                const int generated_before_next =
+                    slot.generated_tokens() +
+                    static_cast<int>(proposal.path.size());
+                if (min_tokens <= 0 ||
+                    generated_before_next >= min_tokens) {
+                    return true;
+                }
+
+                int replacement = -1;
+                float best_logit = std::numeric_limits<float>::lowest();
+                for (int token = 0; token < vocab; ++token) {
+                    if (token_is_eos(token)) continue;
+                    if (logits[static_cast<size_t>(token)] > best_logit) {
+                        best_logit = logits[static_cast<size_t>(token)];
+                        replacement = token;
+                    }
+                }
+                if (replacement < 0) return true;
+
+                int32_t eos_ids[2];
+                int eos_count = 0;
+                if (b_.w_.eos_id >= 0) {
+                    eos_ids[eos_count++] = b_.w_.eos_id;
+                }
+                if (b_.w_.eos_chat_id >= 0 &&
+                    b_.w_.eos_chat_id != b_.w_.eos_id) {
+                    eos_ids[eos_count++] = b_.w_.eos_chat_id;
+                }
+                return eos_count == 0 || redirect_distribution_mass(
+                    target_distribution, eos_ids, eos_count, replacement);
+            };
+
+        for (int depth = 0; depth < tree_width; ++depth) {
+            active_lanes.clear();
+            for (int lane_index = 0;
+                 lane_index < spec_count; ++lane_index) {
+                const Proposal & proposal =
+                    proposals[static_cast<size_t>(lane_index)];
+                if (proposal.sampled && proposal.pending < 0 &&
+                    proposal.accepted.size() ==
+                        static_cast<size_t>(depth + 1)) {
+                    active_lanes.push_back(lane_index);
+                }
+            }
+            if (active_lanes.empty()) break;
+
+            for (size_t active_index = 0;
+                 active_index < active_lanes.size(); ++active_index) {
+                const int lane_index = active_lanes[active_index];
+                const int graph_row =
+                    ar_count + lane_index * tree_width + depth;
+                ggml_backend_tensor_get_async(
+                    b_.target_backend_, graph.logits,
+                    sampled_logits.data() +
+                        active_index * static_cast<size_t>(vocab),
+                    static_cast<size_t>(graph_row) *
+                        static_cast<size_t>(vocab) * sizeof(float),
+                    static_cast<size_t>(vocab) * sizeof(float));
+            }
+            ggml_backend_synchronize(b_.target_backend_);
+
+            for (size_t active_index = 0;
+                 active_index < active_lanes.size(); ++active_index) {
+                Proposal & proposal = proposals[
+                    static_cast<size_t>(active_lanes[active_index])];
+                const float * logits = sampled_logits.data() +
+                    active_index * static_cast<size_t>(vocab);
+                if (!build_target_distribution(proposal, logits)) {
+                    result.error =
+                        "sampled chain target distribution failed";
+                    return result;
+                }
+
+                const bool terminal =
+                    depth + 1 >= tree_width ||
+                    token_is_eos(proposal.path.back());
+                if (terminal) {
+                    const double draw = target_distribution.deterministic()
+                        ? 0.0
+                        : uniform(proposal.rng);
+                    proposal.pending =
+                        sample_distribution(target_distribution, draw);
+                    if (proposal.pending < 0) {
+                        result.error = "sampled chain bonus draw failed";
+                        return result;
+                    }
+                    continue;
+                }
+
+                const int32_t proposed_token =
+                    proposal.tokens[static_cast<size_t>(depth + 1)];
+                draft_distribution.token_ids[0] = proposed_token;
+                const float acceptance =
+                    speculative_acceptance_probability(
+                        target_distribution, draft_distribution,
+                        proposed_token);
+                const bool accepted =
+                    acceptance >= 1.0f ||
+                    (acceptance > 0.0f &&
+                     uniform(proposal.rng) < acceptance);
+                if (accepted) {
+                    proposal.accepted.push_back(depth + 1);
+                    proposal.path.push_back(proposed_token);
+                    continue;
+                }
+
+                if (target_distribution.deterministic()) {
+                    proposal.pending =
+                        sample_distribution(target_distribution, 0.0);
+                } else if (!sample_speculative_residual(
+                               target_distribution, draft_distribution,
+                               uniform(proposal.rng), proposal.pending)) {
+                    result.error =
+                        "sampled chain residual draw failed";
+                    return result;
+                }
+                if (proposal.pending < 0) {
+                    result.error = "sampled chain rejection failed";
+                    return result;
+                }
+            }
+        }
+
+        for (const Proposal & proposal : proposals) {
+            if (proposal.sampled && proposal.pending < 0) {
+                result.error = "sampled chain did not resolve a token";
+                return result;
+            }
         }
     }
 
@@ -992,9 +1177,15 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     for (const StepInput & input : inputs) {
         slots_.commit_step(input.slot);
     }
+    for (const Proposal & proposal : proposals) {
+        if (proposal.sampled) {
+            slots_.slot(proposal.slot).rng = proposal.rng;
+        }
+    }
     staged_round.committed = true;
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
+        if (proposal.sampled) continue;
         const int graph_row = ar_count + lane_index * tree_width +
             proposal.accepted.back();
         proposal.pending = sample_graph_row(
