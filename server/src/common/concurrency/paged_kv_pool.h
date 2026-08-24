@@ -171,6 +171,10 @@ private:
         uint32_t kv_seq_len = 0;
         bool active = false;
         std::vector<uint32_t> block_table;
+        // LIFO stack of blocks removed by rollback_append(). Blocks are pushed
+        // in reverse logical order, so append() pops the original allocation
+        // order and reproduces the same physical rows on retry.
+        std::vector<uint32_t> retry_blocks;
         // Min-heap of blocks promised to this sequence but not yet made
         // visible by append(). Reserved blocks are excluded from the global
         // free list and returned by release()/reset().

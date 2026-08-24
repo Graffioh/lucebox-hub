@@ -1706,6 +1706,10 @@ static ggml_tensor * build_delta_net_block(
         ? (seg_tree ? cap : nullptr) : cap;
     ggml_tensor * seg_parent_ids = mapped_tree
         ? (seg_tree ? parent_ids : nullptr) : parent_ids;
+    // Journal commit composes transitions in token order. Its fixed-chain
+    // capture therefore uses plain recurrence; parent IDs still drive tree
+    // convolution and attention.
+    const bool capture_chain_commit = seg_cap && seg_tree;
     const bool can_skip_gdn_intermediate =
         skip_gdn_intermediate && !seg_parent_ids && !seg_cap;
     // Plain one-token decode has no in-graph consumer of the updated state:
@@ -2061,7 +2065,7 @@ static ggml_tensor * build_delta_net_block(
     if (seg_active && !seg_tree) {
         result = ggml_gated_delta_net_active_inplace(
             ctx, q_c, k_c, v_c, g_tensor, beta, s, seg.active_ids);
-    } else if (seg_parent_ids) {
+    } else if (seg_parent_ids && !capture_chain_commit) {
         // Tree verify: _tree_persist wires src[7] internally.
         result = persist_inter
             ? ggml_gated_delta_net_tree_persist(ctx, q_c, k_c, v_c, g_tensor, beta, s, seg_parent_ids, persist_inter)
@@ -2088,7 +2092,7 @@ static ggml_tensor * build_delta_net_block(
     if (can_skip_gdn_intermediate) {
         ggml_gated_delta_net_set_skip_intermediate(result, true);
     }
-    if (seg_cap && seg_tree) {
+    if (capture_chain_commit) {
         seg_cap->transition_journal =
             ggml_gated_delta_net_capture_transition_journal(ctx, result);
         ggml_set_output(seg_cap->transition_journal);

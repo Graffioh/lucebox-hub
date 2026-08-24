@@ -65,6 +65,10 @@ void dflash2_selector_graph_invalidate() {
     s_selector_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
+uint64_t dflash2_selector_graph_generation() {
+    return s_selector_generation.load(std::memory_order_relaxed);
+}
+
 bool dflash2_score_candidates(const DraftWeights & dw,
                               ggml_backend_t backend,
                               DFlashTarget & target,
@@ -131,7 +135,7 @@ bool dflash2_score_candidates(const DraftWeights & dw,
     //    every candidate. Built once per (n_cand, K) and reused across steps.
     const int n_rows_pred = 1 + n_cand * K;
     SelectorGraph & g = selector_graph();
-    const uint64_t cur_gen = s_selector_generation.load(std::memory_order_relaxed);
+    const uint64_t cur_gen = dflash2_selector_graph_generation();
     if (!g.ctx || g.dw != &dw || g.backend != backend || g.n_cand != n_cand ||
         g.K != K || g.gen != cur_gen) {
         selector_graph_free(g);

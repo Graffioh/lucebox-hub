@@ -392,8 +392,11 @@ void destroy(CaseTensors & tensors) {
     tensors = {};
 }
 
-bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
-    const char * name = raw_gates ? "scalar-raw" : kda ? "kda" : "scalar";
+bool run_case(ggml_backend_t backend, bool kda, bool raw_gates,
+              const char * dispatch) {
+    const char * kind = raw_gates ? "scalar-raw" : kda ? "kda" : "scalar";
+    char name[48];
+    std::snprintf(name, sizeof(name), "%s-%s", kind, dispatch);
     const int gate_values = kda ? S : 1;
     const int width = gate_values + 2*S;
     const Inputs inputs = make_inputs(kda, raw_gates);
@@ -643,9 +646,8 @@ bool run_case(ggml_backend_t backend, bool kda, bool raw_gates) {
 }
 
 
-bool run_grouped_tree_case(ggml_backend_t backend) {
+bool run_grouped_chain_case(ggml_backend_t backend) {
     const Inputs inputs = make_inputs(/*kda=*/false, /*raw_gates=*/false);
-    constexpr int width = 2*S + 1;
 
     ggml_init_params params{};
     params.mem_size = 8*1024*1024;
@@ -665,8 +667,6 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
         ctx, GGML_TYPE_F32, 1, H, T, B);
     ggml_tensor * base_state = ggml_new_tensor_4d(
         ctx, GGML_TYPE_F32, S, S, H, B);
-    ggml_tensor * parents = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_I32, T, B);
     ggml_tensor * committed_state = ggml_new_tensor_4d(
         ctx, GGML_TYPE_F32, S, S, H, B);
     ggml_tensor * accepted = ggml_new_tensor_1d(
@@ -678,8 +678,8 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
     ggml_tensor * conv_state = ggml_new_tensor_4d(
         ctx, GGML_TYPE_F32, CONV_WINDOW, CONV_CHANNELS, B, 1);
 
-    ggml_tensor * result = ggml_gated_delta_net_tree(
-        ctx, q, k, v, g, beta, base_state, parents);
+    ggml_tensor * result = ggml_gated_delta_net(
+        ctx, q, k, v, g, beta, base_state);
     ggml_tensor * journal =
         ggml_gated_delta_net_capture_transition_journal(ctx, result);
     ggml_set_output(journal);
@@ -704,16 +704,6 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
     upload_f32(base_state, inputs.state);
     const std::vector<float> conv_values = make_conv_input();
     upload_f32(conv_input, conv_values);
-
-    std::vector<int32_t> parent_ids((size_t) T*B, -1);
-    for (int sequence : {0, 2}) {
-        for (int token = 1; token < T; ++token) {
-            parent_ids[(size_t) sequence*T + token] = token - 1;
-        }
-    }
-    ggml_backend_tensor_set(
-        parents, parent_ids.data(), 0,
-        parent_ids.size()*sizeof(parent_ids[0]));
 
     bool ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
     const std::vector<int32_t> prefixes{T, 1, T, 1};
@@ -748,7 +738,7 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
             committed_state, actual.data(), 0,
             actual.size()*sizeof(float));
         ok = compare_vectors(
-            "grouped tree chain/root commit", actual, expected,
+            "grouped chain commit", actual, expected,
             STATE_TOLERANCE);
         std::vector<float> actual_conv(
             (size_t)CONV_WINDOW*CONV_CHANNELS*B);
@@ -756,13 +746,13 @@ bool run_grouped_tree_case(ggml_backend_t backend) {
             conv_state, actual_conv.data(), 0,
             actual_conv.size()*sizeof(float));
         ok = ok && compare_vectors(
-            "grouped tree convolution commit", actual_conv,
+            "grouped chain convolution commit", actual_conv,
             conv_state_for_slots(
                 conv_values, identity_slots, prefixes, B),
             0.0f);
     }
 
-    std::printf("gdn grouped tree journal         : %s\n",
+    std::printf("gdn grouped chain journal        : %s\n",
                 ok ? "PASS" : "FAIL");
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -793,10 +783,8 @@ bool test_journal_capture_owns_storage(ggml_backend_t backend) {
         ctx, GGML_TYPE_F32, 1, heads, tokens, sequences);
     ggml_tensor * state = ggml_new_tensor_4d(
         ctx, GGML_TYPE_F32, state_size, state_size, heads, sequences);
-    ggml_tensor * parents = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_I32, tokens, sequences);
-    ggml_tensor * result = ggml_gated_delta_net_tree(
-        ctx, q, k, v, g, beta, state, parents);
+    ggml_tensor * result = ggml_gated_delta_net(
+        ctx, q, k, v, g, beta, state);
     ggml_tensor * journal =
         ggml_gated_delta_net_capture_transition_journal(ctx, result);
     ggml_set_output(journal);
@@ -954,6 +942,7 @@ bool test_tree_commit_preflight_is_non_mutating(ggml_backend_t backend) {
 int main(int argc, char ** argv) {
     if (!test_raw_gate_protocol()) return 1;
     setenv("DFLASH_GDN_FORCE_GROUPED_COLS", "1", 1);
+    unsetenv("DFLASH_GDN_NO_GROUPED_COLS");
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
         std::fprintf(stderr, "GPU backend unavailable\n");
@@ -974,10 +963,15 @@ int main(int argc, char ** argv) {
         ggml_backend_free(backend);
         return 1;
     }
-    bool ok = run_case(backend, false, false);
-    ok = run_case(backend, true, false) && ok;
-    ok = run_case(backend, false, true) && ok;
-    ok = run_grouped_tree_case(backend) && ok;
+    bool ok = run_case(backend, false, false, "grouped");
+    ok = run_case(backend, false, true, "grouped") && ok;
+    ok = run_case(backend, true, false, "generic") && ok;
+    ok = run_grouped_chain_case(backend) && ok;
+    unsetenv("DFLASH_GDN_FORCE_GROUPED_COLS");
+    setenv("DFLASH_GDN_NO_GROUPED_COLS", "1", 1);
+    ok = run_case(backend, false, false, "scalar") && ok;
+    ok = run_case(backend, false, true, "scalar") && ok;
+    unsetenv("DFLASH_GDN_NO_GROUPED_COLS");
     ok = test_tree_commit_preflight_is_non_mutating(backend) && ok;
     ggml_backend_free(backend);
     return ok ? 0 : 1;

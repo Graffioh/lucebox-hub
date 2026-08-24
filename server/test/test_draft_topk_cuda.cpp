@@ -145,6 +145,11 @@ TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_dispatch_contract_host_only) {
     CHECK(!geometric_extract_draft_topk_cuda(
         invalid_device_pointer, 1, 8, 16,
         log_probs.data(), token_ids.data(), 1.0f));
+    CHECK(!geometric_extract_draft_topk_cuda(
+        invalid_device_pointer, 1, 128, 8,
+        log_probs.data(), token_ids.data(), 1.0f));
+    CHECK(log_probs[0] == 123.0f);
+    CHECK(token_ids[0] == 456);
 }
 
 TEST_CASE(DraftTopkCudaFixture, draft_topk_cuda_suite) {

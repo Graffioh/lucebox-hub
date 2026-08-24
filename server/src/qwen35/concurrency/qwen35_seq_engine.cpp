@@ -133,19 +133,27 @@ Qwen35SeqEngine::Qwen35SeqEngine(
 }
 
 Qwen35SeqEngine::~Qwen35SeqEngine() {
-    draft_kv_batch_free(batch_draft_graph_);
-    for (std::unique_ptr<DraftKvState> & state : dummy_draft_kv_) {
-        if (state) draft_kv_free(*state);
-    }
-    for (std::unique_ptr<DraftKvState> & state : slot_draft_kv_) {
-        if (state) draft_kv_free(*state);
-    }
+    release_draft_graphs();
     for (DraftFeatureMirror & mirror : slot_feature_mirrors_) {
         draft_feature_mirror_free(mirror);
     }
     if (feature_view_ctx_) {
         ggml_free(feature_view_ctx_);
         feature_view_ctx_ = nullptr;
+    }
+}
+
+void Qwen35SeqEngine::release_draft_graphs() {
+    draft_kv_batch_free(batch_draft_graph_);
+    for (std::unique_ptr<DraftKvState> & state : dummy_draft_kv_) {
+        if (state) draft_kv_free(*state);
+    }
+    dummy_draft_kv_.clear();
+    for (std::unique_ptr<DraftKvState> & state : slot_draft_kv_) {
+        if (state) {
+            draft_kv_free(*state);
+            state.reset();
+        }
     }
 }
 

@@ -21,6 +21,7 @@ struct ProjectionGraph {
     ggml_tensor * lm_head = nullptr;
     int n_positions = 0;
     std::vector<uint8_t> arena;
+    uint64_t generation = 0;
     ggml_context * ctx = nullptr;
     ggml_cgraph * gf = nullptr;
     ggml_gallocr_t galloc = nullptr;
@@ -35,6 +36,7 @@ struct BatchedSelectorGraph {
     int n_cand = 0;
     int K = 0;
     std::vector<uint8_t> arena;
+    uint64_t generation = 0;
     ggml_context * ctx = nullptr;
     ggml_cgraph * gf = nullptr;
     ggml_gallocr_t galloc = nullptr;
@@ -83,8 +85,10 @@ void free_selector_graph(BatchedSelectorGraph & graph) {
 bool ensure_projection_graph(
         ProjectionGraph & graph, const DraftWeights & dw,
         ggml_backend_t backend, ggml_tensor * lm_head, int n_positions) {
+    const uint64_t generation = dflash2_selector_graph_generation();
     if (graph.ctx && graph.dw == &dw && graph.backend == backend &&
-        graph.lm_head == lm_head && graph.n_positions == n_positions) {
+        graph.lm_head == lm_head && graph.n_positions == n_positions &&
+        graph.generation == generation) {
         return true;
     }
     free_projection_graph(graph);
@@ -122,15 +126,17 @@ bool ensure_projection_graph(
     graph.backend = backend;
     graph.lm_head = lm_head;
     graph.n_positions = n_positions;
+    graph.generation = generation;
     return true;
 }
 
 bool ensure_selector_graph(
         BatchedSelectorGraph & graph, const DraftWeights & dw,
         ggml_backend_t backend, int n_lanes, int n_cand, int K) {
+    const uint64_t generation = dflash2_selector_graph_generation();
     if (graph.ctx && graph.dw == &dw && graph.backend == backend &&
         graph.n_lanes == n_lanes && graph.n_cand == n_cand &&
-        graph.K == K) {
+        graph.K == K && graph.generation == generation) {
         return true;
     }
     free_selector_graph(graph);
@@ -188,6 +194,7 @@ bool ensure_selector_graph(
     graph.n_lanes = n_lanes;
     graph.n_cand = n_cand;
     graph.K = K;
+    graph.generation = generation;
     return true;
 }
 

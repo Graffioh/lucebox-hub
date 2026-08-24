@@ -2517,10 +2517,13 @@ extern "C" {
             int                   max_kv_seq_len);
 
     // Packed tree verification over the same paged K/V pool.
-    // Queries are flattened sequence-major: tree sequence s occupies rows
-    // [s*tree_width, (s+1)*tree_width). parent_ids is contiguous I32
-    // [tree_width, n_tree_seq] (root parent -1), and tree_sizes is contiguous
-    // I32 [n_tree_seq]. active_slot_ids is required and remains per query row;
+    // In a pure-tree batch, queries are flattened sequence-major and tree
+    // sequence s occupies rows [s*tree_width, (s+1)*tree_width). In a mixed
+    // AR/tree batch, the compact AR rows come first. Tree sequence s starts at
+    // ar_rows + s*tree_width, where
+    // ar_rows = q_rows - n_tree_seq*tree_width. parent_ids is tree-local,
+    // contiguous I32 [tree_width, n_tree_seq] (root parent -1), and tree_sizes
+    // is contiguous I32 [n_tree_seq]. active_slot_ids is required per query row;
     // it selects the physical block-table column and scratch slab. Each live
     // query attends its complete committed prefix from the block table plus
     // its own candidate node and ancestors from physical K/V rows

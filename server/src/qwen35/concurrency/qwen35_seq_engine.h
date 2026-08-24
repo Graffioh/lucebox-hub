@@ -54,6 +54,11 @@ public:
                     int prefill_quantum = 512);
     ~Qwen35SeqEngine() override;
 
+    // Destroy every graph that captures draft-weight tensors. Qwen35Backend
+    // calls this before freeing draft weights during park; states rebuild
+    // lazily after unpark.
+    void release_draft_graphs();
+
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
 

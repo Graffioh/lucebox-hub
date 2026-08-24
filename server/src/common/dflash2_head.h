@@ -14,6 +14,7 @@ namespace dflash::common {
 // member, so without this the cached graph would keep pointers to freed
 // selector weight tensors.
 void dflash2_selector_graph_invalidate();
+uint64_t dflash2_selector_graph_generation();
 
 // DFlash 2 candidate selector for greedy chain drafting.
 //

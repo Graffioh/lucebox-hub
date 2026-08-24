@@ -531,6 +531,12 @@ extern "C" bool ggml_backend_cuda_tree_commit_transaction(
         return false;
     }
 
+    int transaction_device = -1;
+    if (!device_pointer(active_slot_ids->data, transaction_device) ||
+        !same_device_pointer(feature_source->data, transaction_device)) {
+        std::fprintf(stderr, "[gdn-transaction] mixed-device arguments\n");
+        return false;
+    }
     // No recoverable error may escape after the first destination changes.
     // Returning false here would let the caller run fallback from a mixed
     // pre-commit/post-commit state.

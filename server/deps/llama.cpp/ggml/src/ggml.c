@@ -6961,6 +6961,7 @@ struct ggml_tensor * ggml_gated_delta_net_capture_transition_journal(
     GGML_ASSERT(ggml_is_contiguous(tensor));
     GGML_ASSERT(ggml_get_op_params_i32(tensor, 3) == 0);
     GGML_ASSERT(ggml_get_op_params_i32(tensor, 2) == 0);
+    GGML_ASSERT(tensor->src[6] == NULL);
 
     const struct ggml_tensor * v = tensor->src[2];
     const struct ggml_tensor * g = tensor->src[3];

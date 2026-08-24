@@ -876,6 +876,8 @@ bool Qwen35Backend::park(ParkTarget target) {
             remote_draft_.close();
         } else {
             step_graph_destroy(draft_sg_);
+            if (seq_engine_) seq_engine_->release_draft_graphs();
+            draft_kv_free(draft_kv_);
             free_draft_weights(dw_);
         }
         draft_parked_ = true;
@@ -883,6 +885,7 @@ bool Qwen35Backend::park(ParkTarget target) {
     }
     if (want_target_model && !target_parked_) {
         step_graph_destroy(proj_sg_);
+        dflash2_selector_graph_invalidate();
         free_target_weights(w_);
         target_parked_ = true;
         std::printf("[park] target released\n"); std::fflush(stdout);

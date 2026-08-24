@@ -626,9 +626,20 @@ bool load_draft_gguf(const std::string & path,
     if (swp_id >= 0 && gguf_get_kv_type(gctx, swp_id) == GGUF_TYPE_ARRAY &&
         gguf_get_arr_type(gctx, swp_id) == GGUF_TYPE_BOOL) {
         const size_t n = gguf_get_arr_n(gctx, swp_id);
+        if (n != out.layers.size()) {
+            char message[192];
+            std::snprintf(
+                message, sizeof(message),
+                "draft GGUF: attention.sliding_window_pattern has %zu entries "
+                "for %zu layers",
+                n, out.layers.size());
+            set_last_error(message);
+            ggml_free(meta_ctx); out.ctx = nullptr; gguf_free(gctx);
+            return false;
+        }
         const bool * pattern = static_cast<const bool *>(gguf_get_arr_data(gctx, swp_id));
         out.swa_pattern_loaded = true;
-        for (size_t il = 0; il < n && il < out.layers.size(); il++) {
+        for (size_t il = 0; il < n; il++) {
             out.layers[il].is_swa = pattern[il];
         }
     }
