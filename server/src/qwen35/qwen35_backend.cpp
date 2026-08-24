@@ -2609,15 +2609,17 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // The rule is a function of context length only. It deliberately does not
     // look at the observed acceptance rate, so the width for a given prompt
     // is reproducible and does not chase a moving target.
-    static const int long_ctx_threshold = []() {
-        const char * e = std::getenv("DFLASH_LONGCTX_BLOCK_TOKENS");
-        if (!e || !*e) return 8192;
-        const int v = std::atoi(e);
-        return v > 0 ? v : 0;   // 0 disables the narrowing
-    }();
+    // 8192 is deliberately above every prompt in the short-context benchmarks
+    // this engine is tuned for, so high-acceptance completion workloads, where
+    // the wide block earns its keep, are untouched.
+    constexpr int kLongCtxNarrowTokens = 8192;
+    // Floor at the DFlash2 checkpoint's own published block size: narrowing is
+    // about trimming verify rows, not about drafting below the width the
+    // drafter was trained to emit.
+    constexpr int kLongCtxMinBlock = 8;
     const int q_len_cfg = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int q_len = (long_ctx_threshold > 0 && committed >= long_ctx_threshold)
-                          ? std::max(8, q_len_cfg / 2)
+    const int q_len = committed >= kLongCtxNarrowTokens
+                          ? std::max(kLongCtxMinBlock, q_len_cfg / 2)
                           : q_len_cfg;
     if (q_len != q_len_cfg) {
         static std::atomic<bool> s_narrowed_logged{false};
@@ -2625,7 +2627,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             std::fprintf(stderr,
                 "[qwen35-spec] context %d >= %d: narrowing draft block %d -> %d "
                 "(wide blocks lose to verify-attention cost at long context)\n",
-                committed, long_ctx_threshold, q_len_cfg, q_len);
+                committed, kLongCtxNarrowTokens, q_len_cfg, q_len);
         }
     }
     const int max_verify_tokens = cfg_.ddtree_mode

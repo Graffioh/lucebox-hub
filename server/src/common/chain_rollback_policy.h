@@ -8,8 +8,13 @@
 namespace dflash::common {
 
 struct ChainRollbackPolicy {
-    bool checkpoint_f32 = false;
-    int fast_rollback_threshold = 5;
+    // Exact F32 per-token checkpoints, and the rollback-from-one-accepted-token
+    // they enable, are the tuned decode path: measured faster than the legacy
+    // F16 replay on every target we ship, with byte-identical output. They are
+    // therefore the default rather than something a launch script has to opt
+    // into. DFLASH_SINGLE_CHAIN_CHECKPOINT_F32=0 restores the legacy path.
+    bool checkpoint_f32 = true;
+    int fast_rollback_threshold = 1;
     bool diagnostics = false;
 };
 
@@ -29,7 +34,12 @@ inline ChainRollbackPolicy resolve_chain_rollback_policy(
         bool tensor_parallel = false,
         bool exact_fast_rollback = false) {
     ChainRollbackPolicy policy;
-    policy.checkpoint_f32 = env_flag_enabled("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32");
+    if (const char * e = std::getenv("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32")) {
+        policy.checkpoint_f32 = (e[0] != '\0' && std::strcmp(e, "0") != 0);
+    }
+    if (!policy.checkpoint_f32) {
+        policy.fast_rollback_threshold = 5;   // legacy F16 replay behaviour
+    }
     policy.diagnostics = env_flag_enabled("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG");
 
     // Lower thresholds are valid only with exact F32 checkpoints. This keeps
