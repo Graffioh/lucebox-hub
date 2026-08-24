@@ -588,8 +588,10 @@ bool migrate_prefill_cache(const TargetWeights & w,
     cache.rollback_ctx = ggml_init(ip);
     if (!cache.rollback_ctx) { set_last_error("rollback cache ggml_init failed"); return false; }
 
-    // Preserve the established F16 default. Opt in to PR #506's F32 checkpoint
-    // representation for single-GPU validation with an explicit environment flag.
+    // F32 checkpoints are the default: the rollback-from-first-accepted-token
+    // path depends on them and is the tuned decode path. They cost VRAM
+    // (+1.11 GiB on Qwen3.8-27B at 128K), so DFLASH_SINGLE_CHAIN_CHECKPOINT_F32=0
+    // restores the F16 representation and its rollback threshold of 5.
     const ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
     const ggml_type checkpoint_type = rollback_policy.checkpoint_f32
         ? GGML_TYPE_F32 : GGML_TYPE_F16;
