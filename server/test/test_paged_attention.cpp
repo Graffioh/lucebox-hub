@@ -578,7 +578,7 @@ void run_cyclic_tree_case() {
     REQUIRE_NOT_NULL(backend);
     const TestCase tree_case{"cyclic-tree", 4, {17}, false};
     const TreeMetadata tree_metadata{
-        4, 4,
+        4, 16,
         {-1, 2, 1, -1},
         {3},
     };
