@@ -1447,10 +1447,9 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_ddtree_path)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_chain_spec_shapes.cpp")
-        # Pure host-side DFlash2 chain topology and mixed-launch arithmetic.
+        # Pure host-side fixed-chain prefix, bucket, and EOS contracts.
         add_executable(test_chain_spec_shapes
-            test/test_chain_spec_shapes.cpp
-            src/common/ddtree.cpp)
+            test/test_chain_spec_shapes.cpp)
         target_include_directories(test_chain_spec_shapes PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/test)

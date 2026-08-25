@@ -12,7 +12,6 @@
 #include "attn_masks.h"
 #include "prefill_helpers.h"
 #include "common/concurrency/chain_spec_shapes.h"
-#include "common/ddtree.h"
 #include "common/dflash2_head.h"
 #include "common/sampler.h"
 #include "internal.h"
@@ -26,23 +25,10 @@
 
 namespace dflash::common {
 
-namespace {
-
-// Denser than pure power-of-2: reduces padding waste at non-power-of-2
-// live counts (e.g. C=5 uses bucket=6 at 17% waste vs bucket=8 at 37.5%).
-int decode_bucket_width(int live_count) {
-    static constexpr int buckets[] = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64};
-    for (int b : buckets)
-        if (b >= live_count) return b;
-    return 64;
-}
-
-} // namespace
-
 Qwen35SeqEngine::Qwen35SeqEngine(
         Qwen35Backend & backend, PagedKvPool & pool, int max_ctx,
-        int64_t scratch_row, int tree_width, int tree_scratch_base,
-        int tree_scratch_stride, int max_prefills,
+        int64_t scratch_row, FixedChainConfig fixed_chain,
+        int max_prefills,
         int mixed_prefill_tokens, int long_mixed_prefill_tokens,
         int long_prefill_threshold, int idle_prefill_tokens,
         int prefill_quantum)
@@ -53,22 +39,17 @@ Qwen35SeqEngine::Qwen35SeqEngine(
       idle_prefill_tokens_(std::max(1, idle_prefill_tokens)),
       prefill_quantum_(std::max(1, prefill_quantum)), b_(backend),
       slots_(pool, max_ctx), scratch_row_(scratch_row),
-      tree_width_(tree_width), tree_scratch_base_(tree_scratch_base),
-      tree_scratch_stride_(tree_scratch_stride) {
+      fixed_chain_(fixed_chain) {
     const int n_slots = slots_.slot_count();
     slot_draft_kv_.resize(static_cast<size_t>(n_slots));
-    prepared_chain_drafts_.resize(static_cast<size_t>(n_slots));
     seq_lens_.assign(static_cast<size_t>(n_slots), 0);
 
-    capture_features_ = tree_width_ > 1 && tree_width_ <= 16 &&
-        tree_width_ == b_.dw_.block_size && b_.dw_.selector.enabled &&
-        b_.cache_.target_feat && b_.cache_.target_feat_cap > 0 &&
-        b_.cfg_.paged_attention && b_.cfg_.fa_window == 0 &&
-        b_.cfg_.draft_path && !b_.cfg_.remote_draft.enabled() &&
-        !b_.split_gpus_ && !b_.cfg_.device.is_tensor_parallel() &&
-        b_.target_backend_ == b_.draft_backend_ &&
-        b_.cfg_.draft_gpu == b_.cfg_.device.gpu && b_.w_.output;
-    if (!capture_features_) return;
+    fixed_chain_ready_ = fixed_chain_.enabled && fixed_chain_.width > 1 &&
+        fixed_chain_.width <= 16 &&
+        fixed_chain_.width == b_.dw_.block_size &&
+        fixed_chain_.scratch_stride >= fixed_chain_.width &&
+        b_.cache_.target_feat && b_.cache_.target_feat_cap > 0;
+    if (!fixed_chain_ready_) return;
 
     ggml_init_params params{};
     params.mem_size = ggml_tensor_overhead() *
@@ -76,7 +57,7 @@ Qwen35SeqEngine::Qwen35SeqEngine(
     params.no_alloc = true;
     feature_view_ctx_ = ggml_init(params);
     if (!feature_view_ctx_) {
-        capture_features_ = false;
+        fixed_chain_ready_ = false;
         return;
     }
 
@@ -100,7 +81,7 @@ Qwen35SeqEngine::Qwen35SeqEngine(
         mirror.storage_type = b_.cache_.target_feat->type;
     }
 
-    if (n_slots <= 6 && tree_width_ == 8) {
+    if (n_slots <= 6 && fixed_chain_.width == 8) {
         bool draft_states_ready = true;
         for (int slot = 0; slot < n_slots; ++slot) {
             draft_states_ready =
@@ -158,7 +139,7 @@ void Qwen35SeqEngine::release_draft_graphs() {
 }
 
 DraftFeatureMirror * Qwen35SeqEngine::slot_feature_mirror(int slot) {
-    if (!capture_features_ || slot < 0 ||
+    if (!fixed_chain_ready_ || slot < 0 ||
         slot >= static_cast<int>(slot_feature_mirrors_.size())) {
         return nullptr;
     }
@@ -192,37 +173,39 @@ DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
 
 bool Qwen35SeqEngine::chain_spec_input_capable(
         const StepInput & input) const {
-    if (!capture_features_ || !input.allow_speculation ||
+    if (!fixed_chain_ready_ || !input.allow_speculation ||
         input.slot < 0 || input.slot >= slots_.slot_count()) {
         return false;
     }
     const Qwen35Slot & slot = slots_.slot(input.slot);
     return slot.decoding() && !slot.sampler.needs_logit_processing() &&
            slot.cur_pos >= 1 &&
-           slot.cur_pos + tree_width_ <= slots_.max_context();
+           slot.cur_pos + fixed_chain_.width <= slots_.max_context();
 }
 
-Qwen35SeqEngine::FixedServiceRound
-Qwen35SeqEngine::make_fixed_service_round(const StepPlan & plan) const {
-    if (!plan.prefills.empty()) return PromptServiceRound{};
-    SpeculativeDecodeRound round;
-    round.chain_lanes.resize(plan.decode.size(), 0);
+std::vector<uint8_t>
+Qwen35SeqEngine::select_chain_lanes(const StepPlan & plan) const {
+    std::vector<uint8_t> selected(plan.decode.size(), 0);
+    if (!plan.prefills.empty()) return selected;
     for (size_t i = 0; i < plan.decode.size(); ++i) {
-        round.chain_lanes[i] =
-            chain_spec_input_capable(plan.decode[i]) ? 1 : 0;
+        selected[i] = chain_spec_input_capable(plan.decode[i]) ? 1 : 0;
     }
-    return round;
+    return selected;
 }
 
-bool Qwen35SeqEngine::prepare_chain_drafts(
+std::optional<Qwen35SeqEngine::PreparedChainRound>
+Qwen35SeqEngine::prepare_chain_drafts(
         const std::vector<StepInput> & inputs,
         const std::vector<uint8_t> & selected) {
-    if (selected.size() != inputs.size() || !capture_features_ ||
-        tree_width_ <= 1 || tree_width_ != b_.dw_.block_size) {
-        return false;
+    if (selected.size() != inputs.size() || !fixed_chain_ready_ ||
+        fixed_chain_.width <= 1 || fixed_chain_.width != b_.dw_.block_size) {
+        return std::nullopt;
     }
+    PreparedChainRound round;
+    round.drafts.resize(inputs.size());
 
     struct Lane {
+        size_t input_index = 0;
         int slot = -1;
         int32_t root = -1;
         DraftKvState * state = nullptr;
@@ -232,17 +215,13 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
     lanes.reserve(inputs.size());
     const int hidden = b_.w_.n_embd;
     std::vector<int32_t> noise(
-        static_cast<size_t>(tree_width_), b_.w_.mask_token_id);
+        static_cast<size_t>(fixed_chain_.width), b_.w_.mask_token_id);
     std::vector<float> noise_embed(
-        static_cast<size_t>(hidden) * tree_width_);
+        static_cast<size_t>(hidden) * fixed_chain_.width);
 
     auto reset_lanes = [&]() {
         for (const Lane & lane : lanes) {
             if (lane.state) draft_kv_reset(*lane.state);
-            if (lane.slot >= 0 &&
-                lane.slot < static_cast<int>(prepared_chain_drafts_.size())) {
-                prepared_chain_drafts_[static_cast<size_t>(lane.slot)] = {};
-            }
         }
         for (const std::unique_ptr<DraftKvState> & state : dummy_draft_kv_) {
             if (state) draft_kv_reset(*state);
@@ -254,36 +233,35 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
         const StepInput & input = inputs[i];
         if (!chain_spec_input_capable(input)) {
             reset_lanes();
-            return false;
+            return std::nullopt;
         }
-        prepared_chain_drafts_[static_cast<size_t>(input.slot)] = {};
         DraftKvState * state = ensure_slot_draft_kv(input.slot);
         DraftFeatureMirror * mirror = slot_feature_mirror(input.slot);
         if (!state || !mirror) {
             if (state) draft_kv_reset(*state);
             reset_lanes();
-            return false;
+            return std::nullopt;
         }
-        lanes.push_back({input.slot, input.token, state, mirror});
+        lanes.push_back({i, input.slot, input.token, state, mirror});
         if (!draft_kv_begin_step(
                 *state, b_.dw_, b_.draft_backend_, *mirror,
                 slots_.slot(input.slot).cur_pos)) {
             reset_lanes();
-            return false;
+            return std::nullopt;
         }
         noise[0] = input.token;
         std::fill(
             noise.begin() + 1, noise.end(), b_.w_.mask_token_id);
         if (!b_.w_.embedder.embed(
-                noise.data(), tree_width_, noise_embed.data())) {
+                noise.data(), fixed_chain_.width, noise_embed.data())) {
             reset_lanes();
-            return false;
+            return std::nullopt;
         }
         ggml_backend_tensor_set(
             state->inp_embed, noise_embed.data(), 0,
             sizeof(float) * noise_embed.size());
     }
-    if (lanes.empty()) return true;
+    if (lanes.empty()) return round;
 
     const int bucket = chain_decode_bucket_width(
         static_cast<int>(lanes.size()));
@@ -306,16 +284,16 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
                 *dummy, b_.dw_, b_.draft_backend_, cap, nullptr)) {
             draft_kv_free(*dummy);
             reset_lanes();
-            return false;
+            return std::nullopt;
         }
         dummy_draft_kv_.push_back(std::move(dummy));
     }
     noise[0] = lanes.front().root;
     std::fill(noise.begin() + 1, noise.end(), b_.w_.mask_token_id);
     if (!b_.w_.embedder.embed(
-            noise.data(), tree_width_, noise_embed.data())) {
+            noise.data(), fixed_chain_.width, noise_embed.data())) {
         reset_lanes();
-        return false;
+        return std::nullopt;
     }
     for (int i = 0; i < dummy_count; ++i) {
         DraftKvState * dummy =
@@ -324,7 +302,7 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
                 *dummy, b_.dw_, b_.draft_backend_,
                 *lanes.front().mirror, 1)) {
             reset_lanes();
-            return false;
+            return std::nullopt;
         }
         ggml_backend_tensor_set(
             dummy->inp_embed, noise_embed.data(), 0,
@@ -340,7 +318,7 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
             batch_states, hidden_blocks) ||
         hidden_blocks.size() != batch_states.size()) {
         reset_lanes();
-        return false;
+        return std::nullopt;
     }
     std::vector<const float *> hidden_by_lane;
     hidden_by_lane.reserve(hidden_blocks.size());
@@ -349,28 +327,25 @@ bool Qwen35SeqEngine::prepare_chain_drafts(
     }
     if (!dflash2_select_chains_batched(
             b_.dw_, b_.draft_backend_, b_.w_.output, hidden_by_lane,
-            tree_width_, roots, proposals) ||
+            fixed_chain_.width, roots, proposals) ||
         proposals.size() != batch_states.size()) {
         reset_lanes();
-        return false;
+        return std::nullopt;
     }
 
     for (size_t lane_index = 0; lane_index < lanes.size(); ++lane_index) {
         const Lane & lane = lanes[lane_index];
         std::vector<int32_t> & tokens = proposals[lane_index];
-        if (tokens.size() != static_cast<size_t>(tree_width_) ||
+        if (tokens.size() != static_cast<size_t>(fixed_chain_.width) ||
             tokens.front() != lane.root) {
             reset_lanes();
-            return false;
+            return std::nullopt;
         }
         PreparedChainDraft & prepared =
-            prepared_chain_drafts_[static_cast<size_t>(lane.slot)];
-        prepared.valid = true;
-        prepared.generated = slots_.slot(lane.slot).generated_tokens();
-        prepared.root = lane.root;
+            round.drafts[lane.input_index];
         prepared.tokens = std::move(tokens);
     }
-    return true;
+    return round;
 }
 
 bool Qwen35SeqEngine::token_is_eos(int32_t token) const {
@@ -388,10 +363,6 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
             result.slot < static_cast<int>(slot_draft_kv_.size()) &&
             slot_draft_kv_[static_cast<size_t>(result.slot)]) {
             draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(result.slot)]);
-        }
-        if (result.slot >= 0 && result.slot <
-                static_cast<int>(prepared_chain_drafts_.size())) {
-            prepared_chain_drafts_[static_cast<size_t>(result.slot)] = {};
         }
     }
     return result;
@@ -505,7 +476,8 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
 }
 
 SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
-        const StepPlan & plan, const std::vector<uint8_t> & selected) {
+        const StepPlan & plan, const std::vector<uint8_t> & selected,
+        PreparedChainRound && prepared_round) {
     StepResult result;
     const std::vector<StepInput> & inputs = plan.decode;
     if (!plan.prefills.empty() || selected.size() != inputs.size()) {
@@ -516,11 +488,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     struct Proposal {
         size_t input_index = 0;
         int slot = -1;
-        int32_t root = -1;
-        DDTree tree;
         std::vector<int32_t> tokens;
-        std::vector<int> accepted;
-        std::vector<int32_t> path;
+        size_t accepted = 0;
         int32_t pending = -1;
         Qwen35SlotManager::StepAppend append;
         int seq_len = -1;
@@ -534,7 +503,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         int32_t pending = -1;
     };
 
-    const int tree_width = tree_width_;
+    const int tree_width = fixed_chain_.width;
     const int hidden = b_.w_.n_embd;
     const int n_head_kv = b_.w_.n_head_kv;
     const int n_slots = slots_.slot_count();
@@ -553,27 +522,21 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     for (size_t i = 0; i < inputs.size(); ++i) {
         const StepInput & input = inputs[i];
         if (selected[i]) {
-            PreparedChainDraft & prepared =
-                prepared_chain_drafts_[static_cast<size_t>(input.slot)];
-            if (!prepared.valid || prepared.root != input.token ||
-                prepared.generated !=
-                    slots_.slot(input.slot).generated_tokens() ||
-                prepared.tokens.size() !=
-                    static_cast<size_t>(tree_width)) {
-                result.error = "prepared DFlash2 chain became stale";
+            if (i >= prepared_round.drafts.size()) {
+                result.error = "prepared DFlash2 chain round is incomplete";
+                return result;
+            }
+            PreparedChainDraft & prepared = prepared_round.drafts[i];
+            if (prepared.tokens.size() !=
+                    static_cast<size_t>(tree_width) ||
+                prepared.tokens.front() != input.token) {
+                result.error = "prepared DFlash2 chain is invalid";
                 return result;
             }
             Proposal proposal;
             proposal.input_index = i;
             proposal.slot = input.slot;
-            proposal.root = input.token;
             proposal.tokens = std::move(prepared.tokens);
-            prepared = {};
-            proposal.tree = make_chain_verify_tree(proposal.tokens);
-            if (proposal.tree.n_nodes + 1 != tree_width) {
-                result.error = "prepared DFlash2 chain has invalid shape";
-                return result;
-            }
             proposal_for_input[i] = static_cast<int>(proposals.size());
             proposals.push_back(std::move(proposal));
         } else {
@@ -675,7 +638,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     if (!build_target_step_paged_tree(
             graph, b_.w_, b_.cache_, b_.target_backend_,
             tree_width, tree_bucket, max_prefix,
-            tree_scratch_base_, tree_scratch_stride_,
+            fixed_chain_.scratch_base, fixed_chain_.scratch_stride,
             b_.cfg_.kq_stride_pad, ar_count)) {
         result.error = "fixed chain target graph build failed";
         return result;
@@ -738,22 +701,18 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
                 proposal.tokens[static_cast<size_t>(node)];
             parents[static_cast<size_t>(tree_row)] = node == 0
                 ? -1
-                : proposal.tree.parents[static_cast<size_t>(node)];
+                : node - 1;
             query_slots[static_cast<size_t>(row)] = proposal.slot;
-            const int depth = node == 0
-                ? 0
-                : proposal.tree.depths[static_cast<size_t>(node) - 1];
-            const int position =
-                slots_.slot(proposal.slot).cur_pos + depth;
+            const int position = slots_.slot(proposal.slot).cur_pos + node;
             for (int axis = 0; axis < 3; ++axis) {
                 positions[static_cast<size_t>(axis) * total_rows + row] =
                     position;
             }
             for (int head = 0; head < n_head_kv; ++head) {
                 write_rows[static_cast<size_t>(head) * total_rows + row] =
-                    static_cast<int64_t>(tree_scratch_base_) +
+                    static_cast<int64_t>(fixed_chain_.scratch_base) +
                     static_cast<int64_t>(proposal.slot) *
-                        tree_scratch_stride_ + node;
+                        fixed_chain_.scratch_stride + node;
             }
         }
     }
@@ -815,32 +774,20 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         const int row_base = ar_count + lane_index * tree_width;
         const int32_t * lane_posterior =
             posterior.data() + static_cast<size_t>(row_base);
-        int32_t ignored_bonus = -1;
-        proposal.accepted = follow_verified_tree(
-            proposal.tree, lane_posterior, ignored_bonus);
+        size_t accepted = chain_verified_prefix(
+            proposal.tokens, lane_posterior, static_cast<size_t>(tree_width));
         const int room =
             slots_.max_context() - slots_.slot(proposal.slot).cur_pos;
-        truncate_verified_path(
-            proposal.accepted, static_cast<size_t>(std::max(0, room)),
-            lane_posterior, ignored_bonus);
-        if (proposal.accepted.empty()) {
+        accepted = std::min(accepted, static_cast<size_t>(std::max(0, room)));
+        if (accepted == 0) {
             result.error = "fixed chain accepted path is empty";
             return result;
         }
-        proposal.path.reserve(proposal.accepted.size());
-        for (int node : proposal.accepted) {
-            proposal.path.push_back(node == 0
-                ? proposal.root
-                : proposal.tree.token_ids[
-                    static_cast<size_t>(node) - 1]);
-        }
-        const size_t safe_prefix = chain_min_tokens_safe_prefix(
-            proposal.path,
+        proposal.accepted = chain_min_tokens_safe_prefix(
+            proposal.tokens.data(), accepted,
             slots_.slot(proposal.slot).generated_tokens(), min_tokens,
             [&](int32_t token) { return token_is_eos(token); });
-        proposal.path.resize(safe_prefix);
-        proposal.accepted.resize(safe_prefix);
-        if (proposal.path.empty()) {
+        if (proposal.accepted == 0) {
             result.error = "fixed chain min-token clamp removed the root";
             return result;
         }
@@ -875,11 +822,11 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
         proposal.append = slots_.append_tokens(
-            proposal.slot, proposal.path.data(),
-            static_cast<int>(proposal.path.size()));
+            proposal.slot, proposal.tokens.data(),
+            static_cast<int>(proposal.accepted));
         const Qwen35SlotManager::StepAppend & append = proposal.append;
         if (!append.ok ||
-            append.physical_rows.size() != proposal.path.size()) {
+            append.physical_rows.size() != proposal.accepted) {
             result.error = append.busy
                 ? "paged KV pool exhausted during chain staging"
                 : "accepted chain K/V staging failed";
@@ -894,15 +841,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         }
 
         accepted_prefixes[static_cast<size_t>(lane_index)] =
-            static_cast<int32_t>(proposal.path.size());
+            static_cast<int32_t>(proposal.accepted);
         commit_slots[static_cast<size_t>(lane_index)] = proposal.slot;
-        for (size_t depth = 0; depth < proposal.accepted.size(); ++depth) {
-            const int node = proposal.accepted[depth];
-            if (node != static_cast<int>(depth)) {
-                result.error = "DFlash2 chain acceptance is not contiguous";
-                return result;
-            }
-            const int flat = lane_index * tree_width + node;
+        for (size_t depth = 0; depth < proposal.accepted; ++depth) {
+            const int flat = lane_index * tree_width + static_cast<int>(depth);
             const int graph_row = ar_count + flat;
             commit_rows[static_cast<size_t>(flat)] =
                 append.physical_rows[depth];
@@ -911,7 +853,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
                 (append.position + static_cast<int>(depth)) % feature_cap;
         }
         proposal.seq_len =
-            append.position + static_cast<int>(proposal.path.size());
+            append.position + static_cast<int>(proposal.accepted);
     }
 
     ggml_backend_tensor_set(
@@ -977,7 +919,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             conv_states.data(), static_cast<int>(n_delta),
             graph.commit_rows, graph.accepted_prefixes,
             graph.commit_slot_ids,
-            tree_scratch_base_, tree_scratch_stride_)) {
+            fixed_chain_.scratch_base, fixed_chain_.scratch_stride)) {
         result.error = "fixed chain commit preflight failed";
         return result;
     }
@@ -1004,7 +946,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     for (int lane_index = 0; lane_index < spec_count; ++lane_index) {
         Proposal & proposal = proposals[static_cast<size_t>(lane_index)];
         const int graph_row = ar_count + lane_index * tree_width +
-            proposal.accepted.back();
+            static_cast<int>(proposal.accepted) - 1;
         proposal.pending = sample_graph_row(
             proposal.slot, graph_row,
             &posterior[static_cast<size_t>(graph_row)], &logits_buf_);
@@ -1033,7 +975,8 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
                 proposals[static_cast<size_t>(proposal_for_input[i])];
             output.token = proposal.pending;
             output.committed_tokens.assign(
-                proposal.path.begin() + 1, proposal.path.end());
+                proposal.tokens.begin() + 1,
+                proposal.tokens.begin() + proposal.accepted);
         } else {
             output.token =
                 ar_lanes[static_cast<size_t>(ar_for_input[i])].pending;
@@ -1104,16 +1047,15 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     const Qwen35RoctxRange roctx_service_round(
         "qwen35.service_round", service_round_metadata);
 
-    FixedServiceRound service_round = make_fixed_service_round(plan);
-    if (auto * decode_round =
-            std::get_if<SpeculativeDecodeRound>(&service_round)) {
-        const bool has_chain_lane = std::any_of(
-            decode_round->chain_lanes.begin(),
-            decode_round->chain_lanes.end(),
-            [](uint8_t selected) { return selected != 0; });
-        if (has_chain_lane &&
-            prepare_chain_drafts(inputs, decode_round->chain_lanes)) {
-            return step_chain_spec(plan, decode_round->chain_lanes);
+    std::vector<uint8_t> chain_lanes = select_chain_lanes(plan);
+    const bool has_chain_lane = std::any_of(
+        chain_lanes.begin(), chain_lanes.end(),
+        [](uint8_t selected) { return selected != 0; });
+    if (has_chain_lane) {
+        std::optional<PreparedChainRound> prepared =
+            prepare_chain_drafts(inputs, chain_lanes);
+        if (prepared) {
+            return step_chain_spec(plan, chain_lanes, std::move(*prepared));
         }
     }
 
@@ -1191,7 +1133,9 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
 
     const int live_count = (int)live_tokens_.size();
     const bool with_decode = live_count > 0;
-    const int decode_bucket = with_decode ? decode_bucket_width(live_count) : 0;
+    const int decode_bucket = with_decode
+        ? chain_decode_bucket_width(live_count)
+        : 0;
 
     dec_tokens_.assign((size_t)decode_bucket, 0);
     dec_rows_.assign((size_t)decode_bucket * n_head_kv, scratch_row_);
@@ -1239,7 +1183,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
             /*kv_start=*/0, /*n_tokens=*/n_total,
-            /*with_mask=*/false, /*capture=*/capture_features_,
+            /*with_mask=*/false, /*capture=*/fixed_chain_ready_,
             /*capture_delta_intermediate=*/false,
             /*fa_window=*/0, /*logits_tail_rows=*/0,
             b_.cfg_.kq_stride_pad,
@@ -1257,7 +1201,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         built = build_target_step(
             sg, w, b_.cache_, b_.target_backend_,
             /*kv_start=*/0, /*n_tokens=*/decode_bucket,
-            /*with_mask=*/false, /*capture=*/capture_features_,
+            /*with_mask=*/false, /*capture=*/fixed_chain_ready_,
             /*capture_delta_intermediate=*/false,
             /*fa_window=*/0, /*logits_tail_rows=*/0,
             b_.cfg_.kq_stride_pad,
@@ -1275,7 +1219,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
             /*compact_slots=*/true);
     }
     if (!built || !sg.kv_write_rows ||
-        (capture_features_ && !sg.target_feat_rows) ||
+        (fixed_chain_ready_ && !sg.target_feat_rows) ||
         (with_prefill &&
          (!sg.paged_query_seq_ids || !sg.paged_query_positions ||
           !sg.logits_row_indices))) {
@@ -1320,7 +1264,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         b_.target_backend_, sg.positions, pos_buf_.data(), 0,
         sizeof(int32_t) * pos_buf_.size());
 
-    if (capture_features_) {
+    if (fixed_chain_ready_) {
         const int cap = b_.cache_.target_feat_cap;
         const int dead_row = cap * n_slots;
         feature_rows_.assign(static_cast<size_t>(n_total), dead_row);
@@ -1477,10 +1421,6 @@ void Qwen35SeqEngine::retire(int slot) {
     if (slot >= 0 && slot < static_cast<int>(slot_draft_kv_.size()) &&
         slot_draft_kv_[static_cast<size_t>(slot)]) {
         draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(slot)]);
-    }
-    if (slot >= 0 &&
-        slot < static_cast<int>(prepared_chain_drafts_.size())) {
-        prepared_chain_drafts_[static_cast<size_t>(slot)] = {};
     }
     slots_.retire(slot);
 }

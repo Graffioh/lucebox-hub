@@ -1,8 +1,7 @@
 #pragma once
 
-#include "common/ddtree.h"
-
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -19,64 +18,20 @@ inline int chain_decode_bucket_width(int lanes) {
     return 64;
 }
 
-// draft_tokens[0] is the already-pending root; positions 1.. form the
-// proposal. DDTree's flat indices then coincide with chain depth.
-inline DDTree make_chain_verify_tree(
-        const std::vector<int32_t> & draft_tokens) {
-    DDTree tree;
-    if (draft_tokens.empty()) return tree;
-
-    tree.n_nodes = static_cast<int>(draft_tokens.size()) - 1;
-    tree.token_ids.assign(draft_tokens.begin() + 1, draft_tokens.end());
-    tree.depths.resize(static_cast<size_t>(tree.n_nodes));
-    tree.parents.resize(static_cast<size_t>(tree.n_nodes) + 1);
-    tree.child_maps.resize(static_cast<size_t>(tree.n_nodes) + 1);
-    tree.parents[0] = -1;
-    for (int node = 1; node <= tree.n_nodes; ++node) {
-        tree.depths[static_cast<size_t>(node) - 1] = node;
-        tree.parents[static_cast<size_t>(node)] = node - 1;
-        tree.child_maps[static_cast<size_t>(node) - 1]
-                       [tree.token_ids[static_cast<size_t>(node) - 1]] = node;
+// draft_tokens[0] is the already-pending root. The target posterior at row N
+// verifies draft_tokens[N + 1], so accepted tokens always form a prefix.
+inline size_t chain_verified_prefix(
+        const std::vector<int32_t> & draft_tokens,
+        const int32_t * posterior,
+        size_t posterior_count) {
+    if (draft_tokens.empty()) return 0;
+    size_t accepted = 1;
+    while (accepted < draft_tokens.size() &&
+           accepted - 1 < posterior_count &&
+           posterior[accepted - 1] == draft_tokens[accepted]) {
+        ++accepted;
     }
-
-    const int width = tree.n_nodes + 1;
-    tree.visibility.assign(static_cast<size_t>(width) * width, 0);
-    for (int row = 0; row < width; ++row) {
-        for (int col = 0; col <= row; ++col) {
-            tree.visibility[static_cast<size_t>(row) * width + col] = 1;
-        }
-    }
-    return tree;
-}
-
-struct ChainLaunchShape {
-    int spec_lanes = 0;
-    int tree_bucket = 0;
-    int tree_rows = 0;
-    int ar_lanes = 0;
-    int accepted_rows = 0;
-    int commit_rows = 0;
-};
-
-inline ChainLaunchShape chain_launch_shape(
-        const std::vector<uint8_t> & admitted,
-        const std::vector<int> & accepted_lengths,
-        int tree_width) {
-    ChainLaunchShape shape;
-    const size_t count = admitted.size();
-    for (size_t i = 0; i < count; ++i) {
-        if (admitted[i]) {
-            ++shape.spec_lanes;
-            if (i < accepted_lengths.size()) {
-                shape.accepted_rows += std::max(0, accepted_lengths[i]);
-            }
-        }
-    }
-    shape.ar_lanes = static_cast<int>(count) - shape.spec_lanes;
-    shape.tree_bucket = chain_decode_bucket_width(shape.spec_lanes);
-    shape.tree_rows = shape.tree_bucket * std::max(0, tree_width);
-    shape.commit_rows = shape.accepted_rows + shape.ar_lanes;
-    return shape;
+    return accepted;
 }
 
 // The pending root at path[0] was sampled by the preceding target step, so
@@ -87,17 +42,18 @@ inline ChainLaunchShape chain_launch_shape(
 // deeper accepted tokens that the scheduler would hide after retirement.
 template <typename IsEos>
 inline size_t chain_min_tokens_safe_prefix(
-        const std::vector<int32_t> & path,
+        const int32_t * path,
+        size_t path_size,
         int generated_tokens_before_root,
         int min_tokens,
         IsEos is_eos) {
     const int generated = std::max(0, generated_tokens_before_root);
-    for (size_t child = 1; child < path.size(); ++child) {
+    for (size_t child = 1; child < path_size; ++child) {
         if (!is_eos(path[child])) continue;
         return generated + static_cast<int>(child) < min_tokens
             ? child : child + 1;
     }
-    return path.size();
+    return path_size;
 }
 
 }  // namespace dflash::common

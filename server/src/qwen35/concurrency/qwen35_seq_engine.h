@@ -29,12 +29,19 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
-#include <variant>
+#include <optional>
 #include <vector>
 
 namespace dflash::common {
 
 class Qwen35Backend;
+
+struct FixedChainConfig {
+    bool enabled = false;
+    int width = 0;
+    int scratch_base = 0;
+    int scratch_stride = 0;
+};
 
 class Qwen35SeqEngine final : public SeqEngine {
 public:
@@ -44,8 +51,7 @@ public:
     // `max_prefills` bounds scheduler-selected prompt slices per traversal.
     Qwen35SeqEngine(Qwen35Backend & backend, PagedKvPool & pool,
                     int max_ctx, int64_t scratch_row,
-                    int tree_width, int tree_scratch_base,
-                    int tree_scratch_stride,
+                    FixedChainConfig fixed_chain,
                     int max_prefills = 8,
                     int mixed_prefill_tokens = 2048,
                     int long_mixed_prefill_tokens = 4096,
@@ -100,18 +106,11 @@ private:
         std::vector<float> embeddings;
     };
 
-    struct PromptServiceRound {};
-    struct SpeculativeDecodeRound {
-        std::vector<uint8_t> chain_lanes;
-    };
-    using FixedServiceRound =
-        std::variant<PromptServiceRound, SpeculativeDecodeRound>;
-
     struct PreparedChainDraft {
-        bool valid = false;
-        int generated = -1;
-        int32_t root = -1;
         std::vector<int32_t> tokens;
+    };
+    struct PreparedChainRound {
+        std::vector<PreparedChainDraft> drafts;
     };
 
     int max_prefills_;
@@ -131,30 +130,28 @@ private:
     int32_t sample_graph_row(int slot, int logits_row,
                              const int32_t * cached_argmax = nullptr,
                              std::vector<float> * logits_scratch = nullptr);
-    FixedServiceRound make_fixed_service_round(
+    std::vector<uint8_t> select_chain_lanes(
         const StepPlan & plan) const;
     bool chain_spec_input_capable(const StepInput & input) const;
     DraftFeatureMirror * slot_feature_mirror(int slot);
     DraftKvState * ensure_slot_draft_kv(int slot);
-    bool prepare_chain_drafts(
+    std::optional<PreparedChainRound> prepare_chain_drafts(
         const std::vector<StepInput> & inputs,
         const std::vector<uint8_t> & selected);
     StepResult step_chain_spec(
-        const StepPlan & plan, const std::vector<uint8_t> & selected);
+        const StepPlan & plan, const std::vector<uint8_t> & selected,
+        PreparedChainRound && prepared);
 
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
     int64_t         scratch_row_ = 0;
-    int             tree_width_ = 0;
-    int             tree_scratch_base_ = 0;
-    int             tree_scratch_stride_ = 0;
-    bool            capture_features_ = false;
+    FixedChainConfig fixed_chain_;
+    bool            fixed_chain_ready_ = false;
     ggml_context *  feature_view_ctx_ = nullptr;
     std::vector<DraftFeatureMirror> slot_feature_mirrors_;
     std::vector<std::unique_ptr<DraftKvState>> slot_draft_kv_;
     std::vector<std::unique_ptr<DraftKvState>> dummy_draft_kv_;
     DraftKvBatchGraph batch_draft_graph_;
-    std::vector<PreparedChainDraft> prepared_chain_drafts_;
 
     // Hoisted per-step buffers (reused across step() calls).
     std::vector<int>         output_rows_;

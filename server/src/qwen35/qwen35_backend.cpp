@@ -469,7 +469,8 @@ bool Qwen35Backend::init() {
         set_last_error("--max-concurrency requires --paged-attention");
         return false;
     }
-    const bool concurrent_local_chain =
+    FixedChainConfig fixed_chain;
+    fixed_chain.enabled =
         n_slots > 1 && cfg_.paged_attention && cfg_.fa_window == 0 &&
         cfg_.draft_path && !cfg_.ddtree_mode && !use_remote_draft &&
         !tensor_parallel && !split_gpus_ &&
@@ -477,19 +478,19 @@ bool Qwen35Backend::init() {
         cfg_.device.gpu == cfg_.draft_gpu &&
         dw_.selector.enabled && dw_.block_size > 1 &&
         dw_.block_size <= 16 && w_.output;
-    if (n_slots > 1 && cfg_.draft_path && !concurrent_local_chain) {
+    if (fixed_chain.enabled) {
+        fixed_chain.width = dw_.block_size;
+        fixed_chain.scratch_stride = paged_token_capacity(fixed_chain.width);
+    }
+    if (n_slots > 1 && cfg_.draft_path && !fixed_chain.enabled) {
         set_last_error(
             "concurrent paged DFlash2 requires a selector-enabled local "
             "same-device draft with block size in [2, 16] and a target "
             "lm_head");
         return false;
     }
-    const int tree_width =
-        concurrent_local_chain ? dw_.block_size : 0;
-    const int tree_stride = concurrent_local_chain
-        ? paged_token_capacity(tree_width) : 0;
     const int64_t scratch_tokens = PAGED_BLOCK_SIZE +
-        (int64_t)n_slots * tree_stride;
+        (int64_t)n_slots * fixed_chain.scratch_stride;
     // Concurrent slots share one physical pool. An explicit
     // --kv-pool-tokens is rounded up to a whole block; otherwise capacity is
     // derived from device-free memory after subtracting fixed concurrent cache
@@ -515,7 +516,7 @@ bool Qwen35Backend::init() {
             budget.reserve_bytes = kvf_budget.reserve_bytes;
             budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
                 w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
-                scratch_tokens, concurrent_local_chain);
+                scratch_tokens, fixed_chain.enabled);
             pool_tokens = paged_kv_auto_pool_tokens(
                 cfg_.device.max_ctx, n_slots, budget);
             const int64_t one_context =
@@ -550,7 +551,7 @@ bool Qwen35Backend::init() {
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
                              cfg_.paged_attention, n_slots,
-                             concurrent_local_chain)) {
+                             fixed_chain.enabled)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
     }
@@ -582,21 +583,20 @@ bool Qwen35Backend::init() {
             return false;
         }
         if (n_slots > 1) {
-            const int tree_scratch_base = (int)pool_tokens;
-            const int64_t dead_scratch_row =
-                pool_tokens + (int64_t)n_slots * tree_stride;
+            fixed_chain.scratch_base = (int)pool_tokens;
+            const int64_t dead_scratch_row = pool_tokens +
+                (int64_t)n_slots * fixed_chain.scratch_stride;
             seq_engine_ = std::make_unique<Qwen35SeqEngine>(
                 *this, *paged_kv_pool_, cfg_.device.max_ctx,
-                dead_scratch_row, tree_width,
-                tree_scratch_base, tree_stride,
+                dead_scratch_row, fixed_chain,
                 max_concurrent_prefills, mixed_prefill_tokens,
                 long_mixed_prefill_tokens, long_prefill_threshold,
                 idle_prefill_tokens, prefill_quantum);
-            if (concurrent_local_chain) {
+            if (fixed_chain.enabled) {
                 std::fprintf(stderr,
                     "[parallel-chain] fixed DFlash2 width=%d, "
                     "same-device paged full-attention greedy lanes\n",
-                    tree_width);
+                    fixed_chain.width);
             }
             std::printf("[parallel] %d decode slots, up to %d packed prefills "
                         "(mixed short/long %d/%d at >=%d tokens, "
@@ -651,7 +651,7 @@ bool Qwen35Backend::init() {
     // Init feature mirror when draft model is available (needed for spec decode).
     // On single-GPU, this is an F32 conversion buffer; on split-GPU, a cross-device mirror.
     if (cfg_.draft_path && !use_remote_draft &&
-        !concurrent_local_chain) {
+        !fixed_chain.enabled) {
         const int mirror_cap = std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
                                          cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
