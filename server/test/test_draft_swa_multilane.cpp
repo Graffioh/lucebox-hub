@@ -135,6 +135,18 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    DraftKvState batched_state;
+    if (!draft_kv_init_batched(
+            batched_state, resources.weights, resources.backend, CAPACITY) ||
+        batched_state.gf || batched_state.g_ctx || batched_state.galloc ||
+        !batched_state.meta_arena.empty()) {
+        std::fprintf(stderr,
+            "draft SWA qualification: batched init allocated a single-lane graph\n");
+        draft_kv_free(batched_state);
+        return 1;
+    }
+    draft_kv_free(batched_state);
+
     const std::array<int, N_LANES> committed = {65, 81, 133};
     const size_t hidden_elements =
         static_cast<size_t>(resources.weights.n_embd) *

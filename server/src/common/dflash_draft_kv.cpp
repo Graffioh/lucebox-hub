@@ -14,11 +14,12 @@ static inline int mask_align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 static constexpr uint16_t F16_ZERO    = 0x0000;
 static constexpr uint16_t F16_NEG_INF = 0xFC00;
 
-bool draft_kv_init(DraftKvState & st,
-                   const DraftWeights & dw,
-                   ggml_backend_t backend,
-                   int cap,
-                   ggml_tensor * lm_head) {
+static bool draft_kv_init_impl(DraftKvState & st,
+                               const DraftWeights & dw,
+                               ggml_backend_t backend,
+                               int cap,
+                               ggml_tensor * lm_head,
+                               bool batched) {
     if (cap <= 0 || dw.block_size <= 0) return false;
     static const bool disable_swa =
         std::getenv("DFLASH_DISABLE_DRAFT_SWA") != nullptr;
@@ -71,6 +72,22 @@ bool draft_kv_init(DraftKvState & st,
     // must be finite; pad feature rows must be finite for the trash-slot rows.
     ggml_backend_buffer_clear(st.mem_buf, 0);
 
+    // Static lane state used by both single-lane and batched graphs.
+    std::vector<int32_t> nrows((size_t)st.q_len);
+    for (int i = 0; i < st.q_len; i++) nrows[(size_t)i] = st.cap + i;
+    ggml_backend_tensor_set(st.noise_rows, nrows.data(), 0,
+                            sizeof(int32_t) * nrows.size());
+
+    st.built_for = &dw;
+    st.slot_pos.assign((size_t)st.cap, -1);
+    st.next_pos = 0;
+    std::fprintf(stderr,
+        "[draft-kv] ctx-KV ring active: cap=%d kv_total=%d a_step=%d "
+        "layers=%d f16 cache %.1f MiB\n",
+        st.cap, st.kv_total, st.a_step, dw.n_layer,
+        (double)(2ull * dw.n_layer * (size_t)kv_row * st.kv_total * 2) / (1024.0 * 1024.0));
+    if (batched) return true;
+
     // ── build the fixed-topology step graph once
     const size_t arena_sz = 16u * 1024 * 1024;
     st.meta_arena.resize(arena_sz);
@@ -115,21 +132,22 @@ bool draft_kv_init(DraftKvState & st,
         return false;
     }
 
-    // static noise scratch slots
-    std::vector<int32_t> nrows((size_t)st.q_len);
-    for (int i = 0; i < st.q_len; i++) nrows[(size_t)i] = st.cap + i;
-    ggml_backend_tensor_set(st.noise_rows, nrows.data(), 0,
-                            sizeof(int32_t) * nrows.size());
-
-    st.built_for = &dw;
-    st.slot_pos.assign((size_t)st.cap, -1);
-    st.next_pos = 0;
-    std::fprintf(stderr,
-        "[draft-kv] ctx-KV ring active: cap=%d kv_total=%d a_step=%d "
-        "layers=%d f16 cache %.1f MiB\n",
-        st.cap, st.kv_total, st.a_step, dw.n_layer,
-        (double)(2ull * dw.n_layer * (size_t)kv_row * st.kv_total * 2) / (1024.0 * 1024.0));
     return true;
+}
+
+bool draft_kv_init(DraftKvState & st,
+                   const DraftWeights & dw,
+                   ggml_backend_t backend,
+                   int cap,
+                   ggml_tensor * lm_head) {
+    return draft_kv_init_impl(st, dw, backend, cap, lm_head, false);
+}
+
+bool draft_kv_init_batched(DraftKvState & st,
+                           const DraftWeights & dw,
+                           ggml_backend_t backend,
+                           int cap) {
+    return draft_kv_init_impl(st, dw, backend, cap, nullptr, true);
 }
 
 void draft_kv_reset(DraftKvState & st) {
@@ -231,7 +249,8 @@ bool draft_kv_begin_step(DraftKvState & st,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
                          int committed) {
-    if (!st.gf || committed <= 0) return false;
+    if (!st.mem_buf || st.built_for != static_cast<const void *>(&dw) ||
+        committed <= 0) return false;
     // Rewind (prefix-cache restore / new shorter request): stale slots would
     // shadow live window positions, so rebuild from scratch.
     if (st.next_pos > committed) draft_kv_reset(st);
