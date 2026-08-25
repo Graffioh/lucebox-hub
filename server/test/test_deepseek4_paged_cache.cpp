@@ -1,10 +1,25 @@
 #include "deepseek4/deepseek4_paged_cache.h"
+#include "deepseek4/deepseek4_page_layout.h"
 #include "host_check.h"
 #include <cstdio>
 #include <limits>
 using namespace dflash::common;
 static int g_checks = 0;
 int main() {
+    uint32_t blocks = 0;
+    CHECK(plan_deepseek4_paged_pool_blocks(4096, 16, 0, blocks));
+    CHECK(blocks == 512);
+    CHECK(plan_deepseek4_paged_pool_blocks(4096, 16, 128, blocks));
+    CHECK(blocks == 1);
+    CHECK(plan_deepseek4_paged_pool_blocks(4096, 16, 129, blocks));
+    CHECK(blocks == 2);
+    CHECK(!plan_deepseek4_paged_pool_blocks(0, 16, 128, blocks));
+    CHECK(!plan_deepseek4_paged_pool_blocks(4096, 0, 128, blocks));
+    const uint64_t overflowing_tokens =
+        uint64_t(UINT32_MAX / DS4_PAGE_TOKENS) * DS4_PAGE_TOKENS + 1;
+    CHECK(!plan_deepseek4_paged_pool_blocks(
+        4096, 16, overflowing_tokens, blocks));
+
     DeepSeek4PagedCachePlan p, twice;
     CHECK(plan_deepseek4_paged_cache(512, 128, 3, 4096, 40, {0, 4, 128}, p));
     CHECK(p.max_blocks_per_sequence == 32 && p.physical_rows[0] == 0);
@@ -82,6 +97,10 @@ int main() {
     CHECK(rows[0].compressed_history.size() == 1);
     CHECK(rows[0].compressed_history[0] == 4);
     CHECK(rows[0].compressed_emitted && rows[0].compressed_scatter == 3);
+
+    const int64_t invalid_large_pos[] = {INT64_MAX};
+    CHECK(!prepare_deepseek4_gathered_lane_rows(
+        boundary_slot, invalid_large_pos, 1, boundary_table, 2, 2, 4, rows));
     std::printf("OK test_deepseek4_paged_cache (%d checks)\n", g_checks);
     return 0;
 }

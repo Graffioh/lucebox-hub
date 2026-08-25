@@ -36,6 +36,14 @@ struct DeepSeek4GatheredLaneRows {
     bool compressed_emitted = false;
 };
 
+// Convert the configured pool capacity into 128-token physical pages. A zero
+// request selects max_ctx * slots; an explicit request is honored even when it
+// is smaller than max_ctx.
+bool plan_deepseek4_paged_pool_blocks(uint32_t max_ctx,
+                                      uint32_t slots,
+                                      uint64_t requested_tokens,
+                                      uint32_t & physical_blocks);
+
 // block_tables is lane-major with block_table_stride entries per lane.
 // Physical block IDs may be fragmented and are validated against
 // physical_blocks.  History excludes the current token; compressed history is

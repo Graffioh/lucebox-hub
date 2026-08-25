@@ -1106,16 +1106,17 @@ bool DeepSeek4Backend::init() {
 
     const int max_ctx = cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192;
     if (cfg_.paged_attention) {
-        uint64_t requested = cfg_.kv_pool_tokens > 0
+        const uint64_t requested = cfg_.kv_pool_tokens > 0
             ? (uint64_t)cfg_.kv_pool_tokens
             : (uint64_t)max_ctx * (uint64_t)cfg_.max_concurrency;
-        requested = std::max<uint64_t>(requested, (uint64_t)max_ctx);
-        const uint64_t blocks64 =
-            (requested + DS4_PAGE_TOKENS - 1) / DS4_PAGE_TOKENS;
-        if (blocks64 == 0 || blocks64 > UINT32_MAX ||
+        uint32_t physical_blocks = 0;
+        if (!plan_deepseek4_paged_pool_blocks(
+                (uint32_t)max_ctx, (uint32_t)cfg_.max_concurrency,
+                cfg_.kv_pool_tokens > 0 ? (uint64_t)cfg_.kv_pool_tokens : 0,
+                physical_blocks) ||
             !create_deepseek4_paged_cache(
                 backend_, w_, (uint32_t)cfg_.max_concurrency,
-                (uint32_t)max_ctx, (uint32_t)blocks64, paged_cache_)) {
+                (uint32_t)max_ctx, physical_blocks, paged_cache_)) {
             std::fprintf(stderr,
                 "[deepseek4] paged cache allocation failed (ctx=%d slots=%d "
                 "requested_pool_tokens=%llu); reduce --max-ctx/--max-concurrency "

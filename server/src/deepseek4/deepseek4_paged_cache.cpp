@@ -21,6 +21,21 @@ bool add_mul(uint64_t & dst, uint64_t a, uint64_t b) {
 }
 }
 
+bool plan_deepseek4_paged_pool_blocks(uint32_t max_ctx, uint32_t slots,
+                                      uint64_t requested_tokens,
+                                      uint32_t & physical_blocks) {
+    physical_blocks = 0;
+    if (!max_ctx || !slots) return false;
+    const uint64_t pool_tokens = requested_tokens
+        ? requested_tokens
+        : uint64_t(max_ctx) * slots;
+    if (!pool_tokens) return false;
+    const uint64_t blocks = 1 + (pool_tokens - 1) / DS4_PAGE_TOKENS;
+    if (blocks > UINT32_MAX / DS4_PAGE_TOKENS) return false;
+    physical_blocks = static_cast<uint32_t>(blocks);
+    return true;
+}
+
 bool prepare_deepseek4_gathered_lane_rows(
         const int32_t * slots, const int64_t * positions, uint32_t lanes,
         const int32_t * block_tables, uint32_t block_table_stride,
@@ -54,6 +69,17 @@ bool prepare_deepseek4_gathered_lane_rows(
                            ds4_raw_ring_row(pos);
         if (!ratio) continue;
 
+        // Validate the current logical page before reserving history. A
+        // malformed, very large position must fail without attempting an
+        // allocation proportional to that untrusted value.
+        const uint64_t current_logical_block = pos / DS4_PAGE_TOKENS;
+        if (current_logical_block >= block_table_stride) return false;
+        const int32_t current_physical =
+            block_tables[size_t(lane) * block_table_stride + current_logical_block];
+        if (current_physical < 0 || uint32_t(current_physical) >= physical_blocks) {
+            return false;
+        }
+
         // Every completed group before the current token contributes one
         // chronological row.  Looking up each logical page (rather than
         // assuming contiguous physical pages) is the reference behaviour.
@@ -72,13 +98,8 @@ bool prepare_deepseek4_gathered_lane_rows(
                 row > uint64_t(INT64_MAX)) return false;
             rows.compressed_history.push_back(static_cast<int64_t>(row));
         }
-        const uint64_t logical_block = pos / DS4_PAGE_TOKENS;
-        if (logical_block >= block_table_stride) return false;
-        const int32_t physical =
-            block_tables[size_t(lane) * block_table_stride + logical_block];
-        if (physical < 0 || uint32_t(physical) >= physical_blocks) return false;
         uint64_t scatter = 0;
-        if (!ds4_compressed_page_row(pos, uint32_t(physical), ratio, scatter,
+        if (!ds4_compressed_page_row(pos, uint32_t(current_physical), ratio, scatter,
                                      rows.compressed_emitted) ||
             scatter > uint64_t(INT64_MAX)) return false;
         if (rows.compressed_emitted) rows.compressed_scatter = int64_t(scatter);
