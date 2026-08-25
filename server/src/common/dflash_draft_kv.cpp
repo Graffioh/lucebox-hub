@@ -99,12 +99,10 @@ static bool draft_kv_init_impl(DraftKvState & st,
     if (!st.g_ctx) return false;
     st.gf = ggml_new_graph_custom(st.g_ctx, 4096, false);
 
-    DraftKvAppendInputs ai{};
-    ai.n_rows    = st.a_step;
-    ai.feat      = st.ap_feat;
-    ai.positions = st.ap_pos;
-    ai.rows      = st.ap_rows;
-    if (!build_draft_kv_append(st.g_ctx, st.gf, dw, st.cache, ai)) return false;
+    const std::vector<DraftKvAppendLane> append_lanes{
+        {&st.cache, st.ap_feat, st.ap_pos, st.ap_rows},
+    };
+    if (!build_draft_kv_appends(st.g_ctx, st.gf, dw, append_lanes)) return false;
 
     DraftKvStepInputs si{};
     si.noise_embed = st.inp_embed;
@@ -221,8 +219,10 @@ static bool draft_kv_bulk_append(DraftKvState & st,
             ok = gctx != nullptr;
             if (ok) {
                 ggml_cgraph * g = ggml_new_graph_custom(gctx, 4096, false);
-                DraftKvAppendInputs ai{c, feat, tpos, trow};
-                ok = build_draft_kv_append(gctx, g, dw, st.cache, ai);
+                const std::vector<DraftKvAppendLane> append_lanes{
+                    {&st.cache, feat, tpos, trow},
+                };
+                ok = build_draft_kv_appends(gctx, g, dw, append_lanes);
                 if (!ok) std::fprintf(stderr, "[draft-kv] bulk: append build failed\n");
                 if (ok) {
                     ggml_gallocr_t ga =
@@ -419,19 +419,13 @@ static bool draft_kv_batch_build(
         batch.g_ctx, graph_capacity, false);
 
     batch.hidden_by_lane.reserve(static_cast<size_t>(n_lanes));
+    std::vector<DraftKvAppendLane> append_lanes;
+    append_lanes.reserve(n_lanes_size);
     std::vector<DraftKvLaneInputs> lanes;
     lanes.reserve(n_lanes_size);
     for (DraftKvState * state : lane_states) {
-        DraftKvAppendInputs append{};
-        append.n_rows = state->a_step;
-        append.feat = state->ap_feat;
-        append.positions = state->ap_pos;
-        append.rows = state->ap_rows;
-        if (!build_draft_kv_append(
-                batch.g_ctx, batch.gf, dw, state->cache, append)) {
-            draft_kv_batch_free(batch);
-            return false;
-        }
+        append_lanes.push_back(
+            {&state->cache, state->ap_feat, state->ap_pos, state->ap_rows});
 
         DraftKvStepInputs step{};
         step.noise_embed = state->inp_embed;
@@ -442,6 +436,11 @@ static bool draft_kv_batch_build(
         lanes.push_back({&state->cache, step});
     }
 
+    if (!build_draft_kv_appends(
+            batch.g_ctx, batch.gf, dw, append_lanes)) {
+        draft_kv_batch_free(batch);
+        return false;
+    }
     const std::vector<DraftGraphOutputs> outputs = build_draft_kv_steps(
         batch.g_ctx, batch.gf, dw, lanes);
     if (outputs.size() != lane_states.size()) {

@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace dflash::common {
 
@@ -387,60 +388,6 @@ DraftGraphOutputs build_draft_graph(
 // legacy concat-then-normalize math exactly; the only numeric difference is
 // the F16 cache storage (legacy keeps K/V in F32 for the one shot).
 
-// Per-layer ctx-side K/V rows in the head-major cache layout.
-// K: wk @ tf_kv → per-head k_norm → RoPE(positions) → [head_dim*n_kv, n] rows.
-// V: wv @ tf_kv, already row-shaped.
-static void draft_ctx_kv_rows(
-    ggml_context *       ctx,
-    const DraftWeights & w,
-    const DraftLayer &   L,
-    ggml_tensor *        target_feat,   // [hidden, n]
-    ggml_tensor *        positions,     // [n] i32 absolute
-    int                  n,
-    ggml_tensor **       k_rows_out,
-    ggml_tensor **       v_rows_out) {
-    const float eps = DFLASH27B_RMS_EPS;
-    ggml_tensor * tf_kv = target_feat;
-    if (w.context_kv_layer_norm) {
-        tf_kv = ggml_rms_norm(ctx, tf_kv, eps);
-        tf_kv = ggml_mul(ctx, tf_kv, L.attn_norm);
-    }
-    ggml_tensor * K = ggml_mul_mat(ctx, L.wk, tf_kv);          // [kv_dim, n]
-    K = ggml_reshape_3d(ctx, K, w.head_dim, w.n_head_kv, n);
-    K = ggml_rms_norm(ctx, K, eps);
-    K = ggml_mul     (ctx, K, L.k_norm);
-    K = draft_rope(ctx, K, positions, w);
-    // rope output is contiguous [head_dim, n_kv, n] → head-major rows view
-    *k_rows_out = ggml_view_2d(ctx, K, (int64_t)w.head_dim * w.n_head_kv, n,
-                               K->nb[2], 0);
-    *v_rows_out = ggml_mul_mat(ctx, L.wv, tf_kv);              // [kv_dim, n]
-}
-
-bool build_draft_kv_append(
-    ggml_context *              ctx,
-    ggml_cgraph *               gf,
-    const DraftWeights &        w,
-    const DraftKvCacheRefs &    cache,
-    const DraftKvAppendInputs & in) {
-    if (!in.feat || !in.positions || !in.rows || in.n_rows <= 0) return false;
-    static const bool disable_aux_hidden_norms =
-        std::getenv("DFLASH_DISABLE_DRAFT_AUX_NORMS") != nullptr;
-
-    ggml_tensor * target_feat = draft_fuse_features(
-        ctx, w, in.feat, in.n_rows, disable_aux_hidden_norms);
-    ggml_set_name(target_feat, "draft_kv_append_feat");
-
-    for (int il = 0; il < w.n_layer; il++) {
-        ggml_tensor * Krows = nullptr;
-        ggml_tensor * Vrows = nullptr;
-        draft_ctx_kv_rows(ctx, w, w.layers[il], target_feat, in.positions,
-                          in.n_rows, &Krows, &Vrows);
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache.k[il], Krows, in.rows));
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache.v[il], Vrows, in.rows));
-    }
-    return true;
-}
-
 static ggml_tensor * draft_pack_columns(
         ggml_context * ctx,
         const std::vector<ggml_tensor *> & lanes) {
@@ -457,6 +404,90 @@ static ggml_tensor * draft_lane_columns(
     return ggml_view_2d(
         ctx, packed, packed->ne[0], q_len, packed->nb[1],
         lane * static_cast<size_t>(q_len) * packed->nb[1]);
+}
+
+bool build_draft_kv_appends(
+        ggml_context *                         ctx,
+        ggml_cgraph *                          gf,
+        const DraftWeights &                   w,
+        const std::vector<DraftKvAppendLane> & lanes) {
+    if (!ctx || !gf || lanes.empty()) {
+        return false;
+    }
+
+    const int64_t append_width = lanes.front().feat
+        ? lanes.front().feat->ne[1]
+        : 0;
+    if (append_width <= 0 ||
+        lanes.size() > static_cast<size_t>(
+            std::numeric_limits<int>::max() / append_width)) {
+        return false;
+    }
+    const int packed_width =
+        static_cast<int>(append_width) * static_cast<int>(lanes.size());
+    const int64_t feature_width = lanes.front().feat->ne[0];
+
+    std::vector<ggml_tensor *> lane_features;
+    lane_features.reserve(lanes.size());
+    for (const DraftKvAppendLane & lane : lanes) {
+        if (!lane.cache || !lane.feat || !lane.positions || !lane.rows ||
+            lane.feat->ne[1] != append_width ||
+            lane.feat->ne[0] != feature_width ||
+            lane.positions->ne[0] != append_width ||
+            lane.rows->ne[0] != append_width ||
+            lane.cache->k.size() != static_cast<size_t>(w.n_layer) ||
+            lane.cache->v.size() != static_cast<size_t>(w.n_layer)) {
+            return false;
+        }
+        lane_features.push_back(lane.feat);
+    }
+
+    const int width = static_cast<int>(append_width);
+    static const bool disable_aux_hidden_norms =
+        std::getenv("DFLASH_DISABLE_DRAFT_AUX_NORMS") != nullptr;
+    ggml_tensor * packed_features =
+        draft_pack_columns(ctx, lane_features);
+    ggml_tensor * target_feat = draft_fuse_features(
+        ctx, w, packed_features, packed_width,
+        disable_aux_hidden_norms);
+    ggml_set_name(target_feat, "draft_kv_append_feat");
+
+    const float eps = DFLASH27B_RMS_EPS;
+    for (int il = 0; il < w.n_layer; ++il) {
+        const DraftLayer & layer = w.layers[il];
+        ggml_tensor * tf_kv = target_feat;
+        if (w.context_kv_layer_norm) {
+            tf_kv = ggml_rms_norm(ctx, tf_kv, eps);
+            tf_kv = ggml_mul(ctx, tf_kv, layer.attn_norm);
+        }
+        ggml_tensor * packed_k = ggml_mul_mat(ctx, layer.wk, tf_kv);
+        ggml_tensor * packed_v = ggml_mul_mat(ctx, layer.wv, tf_kv);
+
+        for (size_t lane_index = 0;
+             lane_index < lanes.size(); ++lane_index) {
+            const DraftKvAppendLane & lane = lanes[lane_index];
+            ggml_tensor * K = draft_lane_columns(
+                ctx, packed_k, width, lane_index);
+            K = ggml_reshape_3d(
+                ctx, K, w.head_dim, w.n_head_kv, width);
+            K = ggml_rms_norm(ctx, K, eps);
+            K = ggml_mul(ctx, K, layer.k_norm);
+            K = draft_rope(ctx, K, lane.positions, w);
+            ggml_tensor * Krows = ggml_view_2d(
+                ctx, K,
+                static_cast<int64_t>(w.head_dim) * w.n_head_kv,
+                width, K->nb[2], 0);
+            ggml_tensor * Vrows = draft_lane_columns(
+                ctx, packed_v, width, lane_index);
+            ggml_build_forward_expand(
+                gf, ggml_set_rows(
+                    ctx, lane.cache->k[il], Krows, lane.rows));
+            ggml_build_forward_expand(
+                gf, ggml_set_rows(
+                    ctx, lane.cache->v[il], Vrows, lane.rows));
+        }
+    }
+    return true;
 }
 
 std::vector<DraftGraphOutputs> build_draft_kv_steps(
