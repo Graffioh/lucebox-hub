@@ -62,14 +62,11 @@ struct DraftKvCacheRefs {
 
 struct DraftKvAppendLane {
     const DraftKvCacheRefs * cache = nullptr;
-    ggml_tensor * feat = nullptr;      // [n_target_layers*hidden, append_width] f32
-    ggml_tensor * positions = nullptr; // [append_width] i32, absolute
-    ggml_tensor * rows = nullptr;      // [append_width] i32, destination cache slots
+    ggml_tensor * feat = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * rows = nullptr;
 };
 
-// Pack equal-width lanes for the shared feature and K/V projections, then
-// apply positions and cache writes lane by lane. A single lane keeps its
-// tensor's exact append width.
 bool build_draft_kv_appends(
     ggml_context *                         ctx,
     ggml_cgraph *                          gf,
