@@ -86,6 +86,9 @@ static void print_usage(const char * prog) {
         "  --draft-ipc-bin <path>         Remote backend IPC daemon for mixed backends\n"
         "  --draft-ipc-work-dir <path>    Remote draft IPC scratch directory\n"
         "  --draft-ipc-ring-cap <N>       Remote draft feature ring capacity\n"
+        "  --draft-block-size <N>         Dense Qwen DFlash proposal/verify width\n"
+        "                                 (2..2x checkpoint metadata, max 32; default:\n"
+        "                                 metadata. e.g. 16 on the block-8 DFlash2)\n"
         "  --draft-swa <N>                Draft sliding-window attention size (0=off; e.g.\n"
         "                                 2048 for unsloth Qwen3.6 targets, per server/README.md.\n"
         "                                 Env: DFLASH27B_DRAFT_SWA)\n"
@@ -122,6 +125,7 @@ static void print_usage(const char * prog) {
         "                       (default: sized from available device memory)\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
+        "  --agent-turn-cache         Extend prefix caching through generated tool calls\n"
         "  --prefill-cache-slots <N> Full prompt/prefill cache slots (default: 0)\n"
         "  --fast-rollback     Enable speculative fast rollback (default: on)\n"
         "  --no-fast-rollback  Disable speculative fast rollback, even with --ddtree\n"
@@ -303,6 +307,19 @@ int main(int argc, char ** argv) {
             }
         } else if (std::strcmp(argv[i], "--draft-swa") == 0 && i + 1 < argc) {
             bargs.draft_swa_window = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--draft-block-size") == 0 && i + 1 < argc) {
+            const char * value = argv[++i];
+            const char * end = value + std::strlen(value);
+            const auto parsed = std::from_chars(
+                value, end, bargs.draft_block_size);
+            if (parsed.ec != std::errc{} || parsed.ptr != end ||
+                bargs.draft_block_size < 2 || bargs.draft_block_size > 32) {
+                std::fprintf(stderr,
+                    "--draft-block-size expects an integer in [2, 32] and no "
+                    "larger than 2x the drafter's checkpoint metadata, got '%s'\n",
+                    value);
+                return 2;
+            }
         } else if (std::strcmp(argv[i], "--draft-device") == 0 && i + 1 < argc) {
             if (!parse_placement_device(argv[++i], bargs.draft_device)) {
                 std::fprintf(stderr, "[server] bad --draft-device value (expected backend:gpu)\n");
@@ -418,6 +435,8 @@ int main(int argc, char ** argv) {
             sconfig.model_name = argv[++i];
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefix_cache_cap = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--agent-turn-cache") == 0) {
+            sconfig.agent_turn_cache = true;
         } else if (std::strcmp(argv[i], "--prefill-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefill_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--fast-rollback") == 0) {
@@ -807,6 +826,17 @@ int main(int argc, char ** argv) {
         sconfig.prefill_cache_cap = 0;
         sconfig.disk_cache_dir.clear();
         sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
+    }
+    if (sconfig.agent_turn_cache && bargs.paged_attention) {
+        std::fprintf(stderr,
+            "[server] --agent-turn-cache is not yet supported with "
+            "--paged-attention or --max-concurrency\n");
+        return 2;
+    }
+    if (sconfig.agent_turn_cache && sconfig.prefix_cache_cap <= 0) {
+        std::fprintf(stderr,
+            "[server] --agent-turn-cache requires an enabled inline prefix cache\n");
+        return 2;
     }
 
     // Sync max_ctx: if --max-ctx was not provided, use the backend's default.
@@ -1222,6 +1252,8 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
+    std::fprintf(stderr, "[server] │  agent_turn_cache= %s\n",
+                 sconfig.agent_turn_cache ? "ON" : "off");
     std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
