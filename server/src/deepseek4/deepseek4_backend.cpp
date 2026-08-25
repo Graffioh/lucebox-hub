@@ -1073,7 +1073,8 @@ bool DeepSeek4Backend::init() {
         (cfg_.max_concurrency < 1 || cfg_.max_concurrency > 16 ||
          cfg_.device.is_layer_split() ||
          cfg_.prefill_mode != PrefillAttentionMode::Exact ||
-         cfg_.fused_decode || env_flag_enabled("DFLASH_DS4_FUSED_DECODE") ||
+         cfg_.fused_decode || cfg_.fused_verify_f16_kv ||
+         env_flag_enabled("DFLASH_DS4_FUSED_DECODE") ||
          env_flag_enabled("DFLASH_DS4_SPEC"))) {
         std::fprintf(stderr,
             "[deepseek4] paged serving requires 1..16 local slots, exact "

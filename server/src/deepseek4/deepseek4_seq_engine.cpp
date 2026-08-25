@@ -179,10 +179,11 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
             continue;
         }
         const SeqSlot & slot = slots_.slot(slice.slot);
-        const bool commit = slot.cur_pos == (int)slot.prompt.size();
+        const bool commit = slot.cur_pos == slot.prompt_len;
         prefill_lanes.push_back(
             {slice.slot, (int)lane_tokens.size(), commit});
-        lane_tokens.push_back(slot.prompt[(size_t)slot.cur_pos - 1]);
+        lane_tokens.push_back(
+            slot.sample_history[(size_t)slot.cur_pos - 1]);
         lane_positions.push_back(slot.cur_pos - 1);
         lane_slots.push_back(slice.slot);
     }

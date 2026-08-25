@@ -375,9 +375,9 @@ When compression is on, multi-turn continuations automatically use **FlowKV**: a
 | `DFLASH_PREFILL_CACHE_SLOTS=N` | `0` | Container-entrypoint equivalent of `--prefill-cache-slots`; the native binary itself uses the CLI flag. |
 | `--kv-cache-dir <path>` | — | Persist prefix cache to disk |
 | `--kv-cache-budget N` | — | On-disk cache size cap |
-| `--paged-attention` | off | Exact 16-token block-table attention for Qwen3.6-27B; see [paged attention](optimizations/paged_attention/README.md) |
-| `--max-concurrency N` | `1` | Maximum concurrent sequence slots. Values 2–64 enable paged attention automatically. |
-| `--kv-pool-tokens N` | `0` (auto) | Shared physical K/V capacity for concurrent paged serving. Requires `--max-concurrency` greater than 1. Zero derives capacity from available device memory; explicit values are rounded to whole 16-token blocks. |
+| `--paged-attention` | off | Exact block-table attention for monolithic Qwen3.6-27B (16-token blocks) and DeepSeek4 on Strix Halo (128-token pages); see [paged attention](optimizations/paged_attention/README.md) and [DeepSeek4 concurrent serving](server/docs/DS4.md#strix-halo-concurrent-serving) |
+| `--max-concurrency N` | `1` | Maximum concurrent sequence slots. Values above 1 enable paged attention automatically; Qwen supports up to 64 and DeepSeek4 up to 16. |
+| `--kv-pool-tokens N` | `0` (auto) | Shared physical K/V capacity for concurrent paged serving. Requires `--max-concurrency` greater than 1. Zero derives capacity from available device memory; explicit values are rounded to the backend's page size. |
 | `--admission-coalesce-ms N` | `20` | Idle-to-busy batching window for concurrent serving, from 0 to 1000 ms; `0` disables it. |
 
 **Bounded KV residency (KVFlash)**

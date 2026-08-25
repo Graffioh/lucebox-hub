@@ -2104,13 +2104,12 @@ static ggml_tensor * build_mla_attention_lane_core(
             n_index_comp = lane.n_index_comp_history +
                 (gathered_emits_comp ? 1 : 0);
         } else {
-            const int n_index_comp_live = ds4_comp_rows_used(
-                lc.index_comp_kv, lc.n_index_comp, 4, token_pos);
+            const int n_index_comp_live = lane.n_index_comp_live;
             // Attention and index compression advance together at ratio 4.
-            GGML_ASSERT(lc.index_comp_kv && index_comp_kv_source);
+            GGML_ASSERT(lane.index_comp_kv && index_comp_kv_source);
             GGML_ASSERT(n_index_comp_live == n_comp_live);
             GGML_ASSERT(!masked_kv ||
-                        cached_inputs->padded_comp <= lc.index_comp_kv->ne[1]);
+                        cached_inputs->padded_comp <= lane.index_comp_kv->ne[1]);
             n_index_comp = masked_kv
                 ? cached_inputs->padded_comp
                 : n_index_comp_live;

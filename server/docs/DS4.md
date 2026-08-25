@@ -307,13 +307,18 @@ pass; each selected prompt advances by one exact token because the graph must
 not contain two rows from the same sequence.
 
 ```bash
-cmake -S . -B build-hip \
+hf download Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3 \
+  DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf \
+  --local-dir /path/to/models
+
+cmake -S server -B server/build-hip \
   -DDFLASH27B_GPU_BACKEND=hip \
   -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
   -DDFLASH27B_SERVER=ON
-cmake --build build-hip -j
+cmake --build server/build-hip -j
 
-./build-hip/dflash_server /path/to/deepseek4-target.gguf \
+./server/build-hip/dflash_server \
+  /path/to/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf \
   --target-device hip:0 \
   --paged-attention \
   --max-concurrency 16 \

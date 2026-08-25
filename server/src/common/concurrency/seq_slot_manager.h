@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "common/paged_kv_pool.h"
+#include "common/concurrency/paged_kv_pool.h"
 #include "common/sampler.h"
 #include "common/concurrency/seq_engine.h"
 
@@ -36,13 +36,21 @@ enum class SeqSlotPhase {
 struct SeqSlot {
     SeqSlotPhase phase = SeqSlotPhase::free;
     PagedKvSequenceHandle handle;
-    std::vector<int32_t> prompt;
+    // Prompt tokens are the immutable prefix of sample_history. Decode tokens
+    // append to the same allocation, avoiding a second full prompt copy.
+    int prompt_len = 0;
     int cur_pos = 0;
     SamplerCfg sampler;
     std::mt19937_64 rng{0x9E3779B97F4A7C15ull};
     // Penalty history is recorded as fed rather than sampled: the scheduler
     // may override a sample before the model consumes it.
     std::vector<int32_t> sample_history;
+
+    int generated_tokens() const {
+        return sample_history.size() > (size_t)prompt_len
+            ? (int)(sample_history.size() - (size_t)prompt_len)
+            : 0;
+    }
 
     bool active() const { return phase != SeqSlotPhase::free; }
     bool prefilling() const { return phase == SeqSlotPhase::prefill; }
@@ -68,9 +76,6 @@ public:
 
     struct PrefillChunk {
         bool ok = false;
-        // The pool is temporarily out of blocks; retrying after another slot
-        // retires can succeed. BlocksExhausted leaves the pool unchanged.
-        bool busy = false;
         std::vector<int64_t> rows;
         // Delta to patch into the slot's device block-table column.
         std::vector<int32_t> new_blocks;
@@ -110,6 +115,7 @@ public:
     int decoding_count() const;
     bool is_active(int slot) const;
     bool is_prefilling(int slot) const;
+    bool has_prefill_prompt_at_least(int tokens) const;
     SeqSlot & slot(int i) { return slots_[(size_t)i]; }
     const SeqSlot & slot(int i) const { return slots_[(size_t)i]; }
 

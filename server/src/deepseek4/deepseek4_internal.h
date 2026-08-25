@@ -26,7 +26,7 @@
 #include "internal.h"
 #include "common/layer_split_utils.h"
 #include "common/prefill_attention_mode.h"
-#include "common/paged_kv_pool.h"
+#include "common/concurrency/paged_kv_pool.h"
 #include "deepseek4_paged_cache.h"
 
 namespace dflash::common {

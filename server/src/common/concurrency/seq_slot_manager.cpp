@@ -84,6 +84,14 @@ bool SeqSlotManager::is_prefilling(int slot) const {
     return is_active(slot) && slots_[(size_t)slot].prefilling();
 }
 
+bool SeqSlotManager::has_prefill_prompt_at_least(int tokens) const {
+    if (tokens <= 0) return true;
+    return std::any_of(slots_.begin(), slots_.end(),
+        [tokens](const SeqSlot & slot) {
+            return slot.prefilling() && slot.prompt_len >= tokens;
+        });
+}
+
 SeqEngine::AdmitResult SeqSlotManager::admit(
         uint64_t request_id, const std::vector<int32_t> & prompt,
         const SamplerCfg & sampler) {
@@ -159,7 +167,7 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
     s.phase = SeqSlotPhase::prefill;
     s.handle = handle;
     s.cur_pos = 0;
-    s.prompt = prompt;
+    s.prompt_len = prompt_len;
     s.sampler = sampler;
     s.sample_history = prompt;
     // Same predicate the engine uses to pick CPU sampling over GPU argmax:
@@ -181,8 +189,8 @@ SeqSlotManager::PrefillChunk SeqSlotManager::append_prefill(
     if (!is_prefilling(slot) || n_tokens < 1) return out;
 
     SeqSlot & s = slots_[(size_t)slot];
-    if (s.cur_pos > (int)s.prompt.size() ||
-        n_tokens > (int)s.prompt.size() - s.cur_pos) {
+    if (s.cur_pos > s.prompt_len ||
+        n_tokens > s.prompt_len - s.cur_pos) {
         return out;
     }
 
@@ -196,7 +204,6 @@ SeqSlotManager::PrefillChunk SeqSlotManager::append_prefill(
                 "[parallel] reserved prefill capacity missing for slot %d\n",
                 slot);
         }
-        out.busy = false;
         return out;
     }
 
@@ -219,7 +226,7 @@ SeqSlotManager::PrefillChunk SeqSlotManager::append_prefill(
 void SeqSlotManager::commit_prefill(int slot) {
     if (!is_prefilling(slot)) return;
     SeqSlot & s = slots_[(size_t)slot];
-    if (s.cur_pos != (int)s.prompt.size()) return;
+    if (s.cur_pos != s.prompt_len) return;
     s.phase = SeqSlotPhase::decode;
 }
 
