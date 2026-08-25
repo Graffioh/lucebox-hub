@@ -83,6 +83,13 @@ bool draft_kv_init(DraftKvState & st,
                    int cap,
                    ggml_tensor * lm_head);
 
+// Allocate persistent lane state without the single-lane graph. Concurrent
+// decoding binds these states to DraftKvBatchGraph instead.
+bool draft_kv_init_batched(DraftKvState & st,
+                           const DraftWeights & dw,
+                           ggml_backend_t backend,
+                           int cap);
+
 // Invalidate all cached rows (new/rewound request). Cheap; the next
 // begin_step bulk-appends the live window from the feature ring.
 void draft_kv_reset(DraftKvState & st);

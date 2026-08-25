@@ -91,8 +91,8 @@ Qwen35SeqEngine::Qwen35SeqEngine(
             auto dummy = std::make_unique<DraftKvState>();
             const int draft_cap = std::min(
                 cap, std::max(1, b_.cfg_.draft_ctx_max));
-            if (draft_kv_init(
-                    *dummy, b_.dw_, b_.draft_backend_, draft_cap, nullptr)) {
+            if (draft_kv_init_batched(
+                    *dummy, b_.dw_, b_.draft_backend_, draft_cap)) {
                 dummy_draft_kv_.push_back(std::move(dummy));
             } else {
                 draft_kv_free(*dummy);
@@ -154,7 +154,7 @@ DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
     }
     std::unique_ptr<DraftKvState> & state =
         slot_draft_kv_[static_cast<size_t>(slot)];
-    if (state && state->gf &&
+    if (state && state->mem_buf &&
         state->built_for == static_cast<const void *>(&b_.dw_)) {
         return state.get();
     }
@@ -162,8 +162,8 @@ DraftKvState * Qwen35SeqEngine::ensure_slot_draft_kv(int slot) {
     state = std::make_unique<DraftKvState>();
     const int cap = std::min(
         mirror->cap, std::max(1, b_.cfg_.draft_ctx_max));
-    if (!draft_kv_init(
-            *state, b_.dw_, b_.draft_backend_, cap, nullptr)) {
+    if (!draft_kv_init_batched(
+            *state, b_.dw_, b_.draft_backend_, cap)) {
         draft_kv_free(*state);
         state.reset();
         return nullptr;
@@ -280,8 +280,8 @@ Qwen35SeqEngine::prepare_chain_drafts(
         std::max(1, b_.cfg_.draft_ctx_max));
     while (static_cast<int>(dummy_draft_kv_.size()) < dummy_count) {
         auto dummy = std::make_unique<DraftKvState>();
-        if (!draft_kv_init(
-                *dummy, b_.dw_, b_.draft_backend_, cap, nullptr)) {
+        if (!draft_kv_init_batched(
+                *dummy, b_.dw_, b_.draft_backend_, cap)) {
             draft_kv_free(*dummy);
             reset_lanes();
             return std::nullopt;
