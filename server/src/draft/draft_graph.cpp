@@ -406,6 +406,21 @@ static ggml_tensor * draft_lane_columns(
         lane * static_cast<size_t>(q_len) * packed->nb[1]);
 }
 
+static std::vector<DraftDynConv> draft_dyn_conv_kernels(
+        ggml_context * ctx, const DraftConvWeights & weights,
+        const std::vector<ggml_tensor *> & lanes, int q_len) {
+    if (lanes.size() == 1) {
+        return {draft_dyn_conv_kernel(ctx, weights, lanes.front())};
+    }
+    const DraftDynConv packed = draft_dyn_conv_kernel(
+        ctx, weights, draft_pack_columns(ctx, lanes));
+    std::vector<DraftDynConv> kernels(lanes.size());
+    for (size_t lane = 0; lane < lanes.size(); ++lane) {
+        kernels[lane].dyn = draft_lane_columns(ctx, packed.dyn, q_len, lane);
+    }
+    return kernels;
+}
+
 bool build_draft_kv_appends(
         ggml_context *                         ctx,
         ggml_cgraph *                          gf,
@@ -539,9 +554,11 @@ std::vector<DraftGraphOutputs> build_draft_kv_steps(
         for (size_t lane = 0; lane < n_lanes; ++lane) {
             hn[lane] = ggml_rms_norm(ctx, h[lane], eps);
             hn[lane] = ggml_mul(ctx, hn[lane], layer.attn_norm);
-            if (dyn_conv) {
-                attn_dc[lane] = draft_dyn_conv_kernel(
-                    ctx, layer.attn_conv, hn[lane]);
+        }
+        if (dyn_conv) {
+            attn_dc = draft_dyn_conv_kernels(
+                ctx, layer.attn_conv, hn, q_len);
+            for (size_t lane = 0; lane < n_lanes; ++lane) {
                 hn[lane] = draft_dyn_conv_apply(
                     ctx, w, layer.attn_conv, attn_dc[lane], 0, hn[lane]);
             }
@@ -632,9 +649,11 @@ std::vector<DraftGraphOutputs> build_draft_kv_steps(
         for (size_t lane = 0; lane < n_lanes; ++lane) {
             hf[lane] = ggml_rms_norm(ctx, h[lane], eps);
             hf[lane] = ggml_mul(ctx, hf[lane], layer.ffn_norm);
-            if (dyn_conv) {
-                mlp_dc[lane] = draft_dyn_conv_kernel(
-                    ctx, layer.mlp_conv, hf[lane]);
+        }
+        if (dyn_conv) {
+            mlp_dc = draft_dyn_conv_kernels(
+                ctx, layer.mlp_conv, hf, q_len);
+            for (size_t lane = 0; lane < n_lanes; ++lane) {
                 hf[lane] = draft_dyn_conv_apply(
                     ctx, w, layer.mlp_conv, mlp_dc[lane], 0, hf[lane]);
             }

@@ -393,7 +393,8 @@ bool check_packed_append_caches(
 int main(int argc, char ** argv) {
     if (argc == 1) {
         std::fprintf(stderr,
-            "usage: %s <dflash2.gguf> [gpu] [--append-only]\n", argv[0]);
+            "usage: %s <dflash2.gguf> [gpu] "
+            "[--append-only|--dynconv-only]\n", argv[0]);
         return 77;
     }
     if (argc > 4) {
@@ -403,15 +404,21 @@ int main(int argc, char ** argv) {
     int gpu = 0;
     bool gpu_set = false;
     bool append_only = false;
+    bool dynconv_only = false;
     for (int arg = 2; arg < argc; ++arg) {
         if (std::strcmp(argv[arg], "--append-only") == 0) {
             append_only = true;
+        } else if (std::strcmp(argv[arg], "--dynconv-only") == 0) {
+            dynconv_only = true;
         } else if (gpu_set) {
             return 2;
         } else {
             gpu = std::atoi(argv[arg]);
             gpu_set = true;
         }
+    }
+    if (append_only && dynconv_only) {
+        return 2;
     }
     Resources resources;
     resources.backend = ggml_backend_cuda_init(gpu);
@@ -424,6 +431,16 @@ int main(int argc, char ** argv) {
                      dflash27b_last_error());
         return 1;
     }
+    if (dynconv_only &&
+        (resources.weights.conv_kernel_size <= 0 ||
+         resources.weights.conv_group_size <= 0 ||
+         !std::all_of(resources.weights.layers.begin(), resources.weights.layers.end(),
+             [](const DraftLayer & layer) {
+                 return layer.attn_conv.present() && layer.mlp_conv.present();
+             }))) {
+        std::fprintf(stderr, "draft SWA qualification: dynamic convolution absent\n");
+        return 1;
+    }
     if (!check_packed_append_caches(
             resources.backend, resources.weights)) {
         return 1;
@@ -432,18 +449,21 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    const std::vector<bool> trained_pattern = layer_pattern(resources.weights);
-    if (!resources.weights.swa_pattern_loaded) {
-        std::fprintf(stderr, "draft SWA qualification: GGUF has no SWA pattern\n");
-        return 1;
-    }
-    const DraftSwaOverrideResult swa =
-        apply_draft_swa_window_override(resources.weights, SWA_WINDOW);
-    if (layer_pattern(resources.weights) != trained_pattern ||
-        swa.effective_window != SWA_WINDOW || swa.swa_layers == 0) {
-        std::fprintf(stderr,
-            "draft SWA qualification: override changed the trained pattern\n");
-        return 1;
+    if (!dynconv_only) {
+        const std::vector<bool> trained_pattern = layer_pattern(resources.weights);
+        if (!resources.weights.swa_pattern_loaded) {
+            std::fprintf(stderr,
+                "draft SWA qualification: GGUF has no SWA pattern\n");
+            return 1;
+        }
+        const DraftSwaOverrideResult swa =
+            apply_draft_swa_window_override(resources.weights, SWA_WINDOW);
+        if (layer_pattern(resources.weights) != trained_pattern ||
+            swa.effective_window != SWA_WINDOW || swa.swa_layers == 0) {
+            std::fprintf(stderr,
+                "draft SWA qualification: override changed the trained pattern\n");
+            return 1;
+        }
     }
 
     DraftKvState batched_state;
@@ -480,15 +500,19 @@ int main(int argc, char ** argv) {
         if (!draft_kv_begin_step(
                 state, resources.weights, resources.backend, unused_ring,
                 committed[static_cast<size_t>(lane)]) ||
-            !check_lane_mask(state, committed[static_cast<size_t>(lane)])) {
+            (!dynconv_only &&
+             !check_lane_mask(state, committed[static_cast<size_t>(lane)]))) {
             return 1;
         }
 
         std::vector<float> embedding(hidden_elements);
         for (size_t index = 0; index < embedding.size(); ++index) {
+            const size_t token = index / resources.weights.n_embd;
+            const size_t channel = index % resources.weights.n_embd;
             embedding[index] =
                 0.01f * static_cast<float>(lane + 1) +
-                0.0001f * static_cast<float>(index % 31);
+                0.0001f * static_cast<float>(
+                    (channel + 17 * (lane + 3) * (token + 1)) % 127);
         }
         ggml_backend_tensor_set(state.inp_embed, embedding.data(), 0,
                                 embedding.size() * sizeof(float));
@@ -536,6 +560,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    std::printf("draft SWA post-window three-lane qualification passed\n");
+    std::printf("draft %s three-lane qualification passed\n",
+                dynconv_only ? "dynamic-convolution" : "SWA post-window");
     return 0;
 }
