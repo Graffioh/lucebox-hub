@@ -343,10 +343,16 @@ inline std::string validate_step_result(
             return "failed prefill has invalid payload";
         const PrefixStoreEvent & store = output.prefix_store;
         if (store.status == PrefixStoreEvent::Status::none) {
-            if (store.ticket.valid() || !store.error.empty() ||
+            if (store.ticket.id != 0 ||
+                store.ticket.checkpoint.id != 0 ||
+                store.ticket.checkpoint.tokens != 0 ||
+                !store.error.empty() ||
                 store.bytes != 0 || store.elapsed_us != 0)
                 return "inactive prefix capture carries payload";
         } else {
+            if (store.status != PrefixStoreEvent::Status::saved &&
+                store.status != PrefixStoreEvent::Status::failed)
+                return "prefix capture has an unknown status";
             if (!store.ticket.valid())
                 return "prefix capture has an invalid ticket";
             if (output.status == PrefillStatus::failed)

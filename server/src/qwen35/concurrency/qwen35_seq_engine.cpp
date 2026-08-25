@@ -64,7 +64,10 @@ int Qwen35SeqEngine::checkpoint_index(PrefixStoreRef checkpoint) const {
 
 void Qwen35SeqEngine::discard_prefix_store(PrefixStoreRef checkpoint) {
     const int index = checkpoint_index(checkpoint);
-    if (index >= 0) free_prefix_snapshot(b_.prefix_snapshots_[index]);
+    if (index >= 0 &&
+        b_.prefix_snapshots_[index].cur_pos == checkpoint.tokens) {
+        free_prefix_snapshot(b_.prefix_snapshots_[index]);
+    }
 }
 
 bool Qwen35SeqEngine::arm_capture(
@@ -90,6 +93,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
     pending_captures_[(size_t)slot] = {};
     bool restored = false;
     if (plan.restore.valid()) {
+        result.prefix_store.restore_attempted = true;
         const int restore_index = checkpoint_index(plan.restore);
         const bool metadata_valid =
             restore_index >= 0 &&

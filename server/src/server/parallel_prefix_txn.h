@@ -2,7 +2,7 @@
 //
 // Policy metadata and checkpoint payload have different owners. This object
 // keeps their resolution ordered and makes every early exit cancel exactly
-// one untouched reservation. A fatal or mismatched outcome discards only this
+// one untouched reservation. A malformed saved outcome discards only this
 // transaction's payload and metadata; it never trusts an event-supplied id.
 
 #pragma once
@@ -66,7 +66,11 @@ public:
             const std::vector<int32_t> & prompt) {
         if (!active()) return Resolution::inactive;
         if (!event.attempted() || event.ticket != ticket_) {
-            abort();
+            if (event.status == PrefixStoreEvent::Status::saved) {
+                discard_saved();
+            } else {
+                cancel();
+            }
             return Resolution::mismatched;
         }
         if (event.status == PrefixStoreEvent::Status::saved) {
@@ -80,7 +84,7 @@ public:
             cancel();
             return Resolution::failed;
         }
-        abort();
+        cancel();
         return Resolution::mismatched;
     }
 
@@ -91,13 +95,19 @@ public:
     }
 
     void abort() {
-        if (!active()) return;
+        // A successful capture is resolved and cleared synchronously. An
+        // externally aborted active transaction therefore has only armed the
+        // capture and must preserve any incumbent in the reserved slot.
+        cancel();
+    }
+
+private:
+    void discard_saved() {
         engine_->discard_prefix_store(ticket_.checkpoint);
         policy_->abort_inline_snap(policy_slot_);
         clear();
     }
 
-private:
     void clear() {
         policy_ = nullptr;
         engine_ = nullptr;

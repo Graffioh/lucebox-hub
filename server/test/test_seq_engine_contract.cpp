@@ -297,6 +297,27 @@ int main() {
         CHECK(validate_step_result(plan, result, 1).find(
                   "inactive prefix capture") != std::string::npos);
 
+        result.prefills[0].prefix_store = {};
+        result.prefills[0].prefix_store.ticket.id = 7;
+        CHECK(validate_step_result(plan, result, 1).find(
+                  "inactive prefix capture") != std::string::npos);
+
+        result.prefills[0].prefix_store = {};
+        result.prefills[0].prefix_store.ticket.checkpoint.id = 3;
+        CHECK(validate_step_result(plan, result, 1).find(
+                  "inactive prefix capture") != std::string::npos);
+
+        result.prefills[0].prefix_store = {};
+        result.prefills[0].prefix_store.ticket.checkpoint.tokens = 8;
+        CHECK(validate_step_result(plan, result, 1).find(
+                  "inactive prefix capture") != std::string::npos);
+
+        result.prefills[0].prefix_store.status =
+            static_cast<PrefixStoreEvent::Status>(99);
+        result.prefills[0].prefix_store.ticket = output.prefix_store.ticket;
+        CHECK(validate_step_result(plan, result, 1).find(
+                  "unknown status") != std::string::npos);
+
         result.prefills[0].prefix_store.status =
             PrefixStoreEvent::Status::saved;
         result.prefills[0].prefix_store.ticket = output.prefix_store.ticket;

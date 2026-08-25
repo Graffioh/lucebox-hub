@@ -535,7 +535,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
         std::string prefix_protocol_error;
         const PrefixStoreAdmission & prefix = ar.prefix_store;
-        if (requested_plan.restore.valid()) {
+        if (prefix.restore_attempted) {
             prefix_cache_.record_restore_attempt(
                 prefix.restore_elapsed_us, prefix.restored.valid());
         }

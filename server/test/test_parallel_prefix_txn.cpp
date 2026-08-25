@@ -83,6 +83,24 @@ int main() {
     {
         FakePolicy policy;
         FakeEngine engine;
+        {
+            Txn destination(
+                policy, engine, /*policy_slot=*/3, ticket(/*id=*/11));
+            Txn source(
+                policy, engine, /*policy_slot=*/5, ticket(/*id=*/12));
+            destination = std::move(source);
+            CHECK(!source.active());
+            CHECK(destination.active());
+            CHECK(policy.cancelled == std::vector<int>({3}));
+            CHECK(policy.aborted.empty());
+            CHECK(engine.discarded.empty());
+        }
+        CHECK(policy.cancelled == std::vector<int>({3, 5}));
+    }
+
+    {
+        FakePolicy policy;
+        FakeEngine engine;
         Txn txn(policy, engine, /*policy_slot=*/3, ticket());
         CHECK(txn.resolve(
                   event(PrefixStoreEvent::Status::saved, ticket()),
@@ -129,8 +147,9 @@ int main() {
         FakeEngine engine;
         Txn txn(policy, engine, /*policy_slot=*/3, ticket());
         txn.abort();
-        CHECK(policy.aborted == std::vector<int>({3}));
-        CHECK(engine.discarded == std::vector<PrefixStoreRef>({{7, 16}}));
+        CHECK(policy.cancelled == std::vector<int>({3}));
+        CHECK(policy.aborted.empty());
+        CHECK(engine.discarded.empty());
     }
 
     std::printf("OK test_parallel_prefix_txn (%d checks)\n", g_checks);

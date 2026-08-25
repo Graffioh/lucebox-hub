@@ -56,6 +56,9 @@ struct PrefixStoreAdmission {
     PrefixStoreRef restored;
     PrefixStoreRef invalidated;
     PrefixCaptureTicket capture;
+    // True only after the engine begins validating/copying a requested
+    // restore. Admission can return busy before reaching that point.
+    bool restore_attempted = false;
     // Wall time spent validating/copying a requested restore. Non-zero for
     // both successful restores and invalidations so operators can see stalls.
     uint64_t restore_elapsed_us = 0;

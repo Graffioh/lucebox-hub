@@ -424,8 +424,13 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--prefix-cache-slots") == 0 && i + 1 < argc) {
             sconfig.prefix_cache_cap = std::atoi(argv[++i]);
         } else if (std::strcmp(
-                       argv[i], "--concurrent-prefix-cache-max-mib") == 0 &&
-                   i + 1 < argc) {
+                       argv[i], "--concurrent-prefix-cache-max-mib") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr,
+                    "[server] --concurrent-prefix-cache-max-mib requires "
+                    "a value\n");
+                return 2;
+            }
             const char * value = argv[++i];
             const char * end = value + std::strlen(value);
             uint64_t mib = 0;

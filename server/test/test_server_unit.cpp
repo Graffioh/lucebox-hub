@@ -3744,6 +3744,13 @@ public:
             result.error = "empty prompt";
             return result;
         }
+        if (defer_restore.load(std::memory_order_relaxed) &&
+            plan.restore.valid()) {
+            returned_busy_before_restore.store(true, std::memory_order_relaxed);
+            result.status = AdmitResult::Status::busy;
+            result.error = "restore admission deferred";
+            return result;
+        }
         int chosen = -1;
         for (int i = 0; i < (int)slots_.size(); ++i) {
             if (!slots_[(size_t)i].active) {
@@ -3765,6 +3772,7 @@ public:
         result.slot = chosen;
 
         if (plan.restore.valid()) {
+            result.prefix_store.restore_attempted = true;
             result.prefix_store.restore_elapsed_us = 2500;
             if (plan.restore == PrefixStoreRef{2, 2}) {
                 saw_stale_restore = true;
@@ -3827,6 +3835,8 @@ public:
 
     bool saw_capture = false;
     bool saw_stale_restore = false;
+    std::atomic<bool> defer_restore{false};
+    std::atomic<bool> returned_busy_before_restore{false};
     std::vector<PrefixStoreRef> discarded;
 
 private:
@@ -3842,6 +3852,78 @@ struct SchedulerPrefixBackend : MockBackend {
     SchedulerPrefixEngine engine;
     SeqEngine * seq_engine() override { return &engine; }
 };
+
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_counts_restore_only_after_engine_attempts_it) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    SchedulerPrefixBackend backend;
+    backend.engine.defer_restore.store(true, std::memory_order_relaxed);
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;
+    config.concurrent_prefix_cache_max_bytes = 1024;
+    config.concurrent_paged_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(backend, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    cache.confirm_inline_snap(
+        /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
+
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    ServerJob job;
+    job.fd = sockets[0];
+    job.req.format = ApiFormat::OPENAI_CHAT;
+    job.req.prompt_tokens = {1, 100, 999};
+    job.req.max_output = 1;
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "restore-after-busy";
+
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+
+    for (int i = 0; i < 1000 &&
+         !backend.engine.returned_busy_before_restore.load(
+             std::memory_order_relaxed); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool returned_busy =
+        backend.engine.returned_busy_before_restore.load(
+            std::memory_order_relaxed);
+    const auto pre_attempt_stats = cache.stats();
+    backend.engine.defer_restore.store(false, std::memory_order_relaxed);
+
+    std::unique_lock<std::mutex> lock(job.mu);
+    const bool done = job.cv.wait_for(
+        lock, std::chrono::seconds(5), [&] { return job.done; });
+    lock.unlock();
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+
+    close(sockets[0]);
+    close(sockets[1]);
+    unlink(path.c_str());
+
+    TEST_ASSERT(done);
+    TEST_ASSERT(returned_busy);
+    TEST_ASSERT(pre_attempt_stats.restore_attempts == 0);
+    TEST_ASSERT(pre_attempt_stats.restore_invalidations == 0);
+    TEST_ASSERT(pre_attempt_stats.restore_stall_us_total == 0);
+    TEST_ASSERT(pre_attempt_stats.restore_stall_us_max == 0);
+
+    const auto stats = cache.stats();
+    TEST_ASSERT(stats.restore_attempts == 1);
+    TEST_ASSERT(stats.restore_invalidations == 0);
+    TEST_ASSERT(stats.restore_stall_us_total == 2500);
+}
 
 TEST_CASE(ServerUnitFixture,
           test_scheduler_stale_restore_preserves_other_protected_capture) {
