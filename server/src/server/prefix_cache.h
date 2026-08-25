@@ -116,42 +116,68 @@ public:
         int slot, int prefix_len, size_t prompt_len);
 
 
-    // Prepare an inline snapshot. `restored_prefix_len` prevents reserving a
-    // slot for a boundary already covered by the restored snapshot.
-    // `prefer_tools_boundary` selects the system/tools head first (see
-    // select_inline_snapshot_boundary). When `forced_cut` > restored, that
-    // cut is used instead (PPP pin_end, including mid-message LCP cuts).
-    // Returns (slot, target_cut) or (-1, 0).
-    std::pair<int, int> prepare_inline_snap(
+    class InlineReservation {
+    public:
+        InlineReservation() = default;
+        ~InlineReservation();
+
+        InlineReservation(const InlineReservation &) = delete;
+        InlineReservation & operator=(const InlineReservation &) = delete;
+        InlineReservation(InlineReservation && other) noexcept;
+        InlineReservation & operator=(InlineReservation && other) noexcept;
+
+        bool active() const;
+        int slot() const { return slot_; }
+        int target_cut() const { return target_cut_; }
+
+        // Commit after the engine saved the payload, cancel before the target
+        // slot was touched, or abort after a failed write invalidated it.
+        bool commit(const std::vector<int32_t> & prompt_ids,
+                    size_t resident_bytes = 0, bool protect = false);
+        bool commit_at(const std::vector<int32_t> & prompt_ids,
+                       int committed_cut, size_t resident_bytes = 0,
+                       bool protect = false);
+        void cancel();
+        void abort();
+
+    private:
+        friend class PrefixCache;
+        InlineReservation(PrefixCache * cache, uint64_t id, int slot,
+                          int target_cut, PrefixHash victim, bool has_victim,
+                          bool protect);
+        void clear();
+        void take(InlineReservation && other);
+
+        PrefixCache * cache_ = nullptr;
+        uint64_t id_ = 0;
+        int slot_ = -1;
+        int target_cut_ = 0;
+        PrefixHash victim_{};
+        bool has_victim_ = false;
+        bool protect_ = false;
+    };
+
+    using InlineSnapshotSize = std::function<size_t(int target_cut)>;
+
+    // Select a boundary, destination, and optional budget victim as one owned
+    // operation. At most one reservation can be live; destroying it cancels
+    // without changing committed metadata.
+    InlineReservation reserve_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len = 0,
         bool prefer_tools_boundary = false,
-        int forced_cut = 0);
+        int forced_cut = 0,
+        InlineSnapshotSize estimate_bytes = {});
 
-    // Apply the configured resident-byte budget to a prepared reservation.
-    // May redirect it to an existing victim even before the slot cap is full.
-    // Returns the final destination slot, or -1 when the capture should be
-    // skipped without disturbing committed entries.
-    int fit_inline_snap_budget(int prepared_slot, size_t estimated_bytes);
-
-    // Confirm after daemon successfully saved the snapshot.
-    // `protect` marks the entry non-evictable by unprotected traffic (tool pin).
+    // Commit an already-materialized snapshot without a reservation. Used by
+    // cache import/bootstrap paths and tests.
     void confirm_inline_snap(int slot, int target_cut,
                              const std::vector<int32_t> & prompt_ids,
                              bool protect = false,
                              size_t resident_bytes = 0);
 
-    // Abort if the snapshot failed.
-    void abort_inline_snap(int slot);
-
-    // Remove committed metadata for an engine-invalidated checkpoint without
-    // disturbing another request's in-flight capture reservation.
+    // Remove committed metadata for an engine-invalidated checkpoint.
     void invalidate_inline_snap(int slot);
-
-    // Cancel before the backend slot is touched (for example when the selected
-    // destination is also the snapshot being restored). Unlike abort, this
-    // preserves the existing entry and only drops the pending reservation.
-    void cancel_inline_snap(int slot);
 
     // Record synchronous scheduler stalls caused by copied checkpoints.
     void record_capture_attempt(uint64_t elapsed_us, bool success);
@@ -228,12 +254,10 @@ private:
         bool                 protect = false;  // sticky tools-boundary pin
         size_t               resident_bytes = 0;
     };
-    // Pending protect flag for the in-flight reservation (applied on confirm).
-    bool pending_protect_ = false;
     std::vector<LruEntry> entries_;
     int next_slot_ = 0;
-    PrefixHash pending_evict_key_{};
-    bool has_pending_evict_ = false;
+    uint64_t active_inline_reservation_ = 0;
+    uint64_t next_inline_reservation_ = 1;
     size_t max_resident_bytes_ = 0;
     size_t resident_bytes_ = 0;
 
@@ -285,6 +309,16 @@ private:
         const std::vector<int32_t> & prompt_ids,
         int max_prefix_tokens,
         bool record_hit);
+    bool inline_reservation_active(uint64_t id) const;
+    void release_inline_reservation(uint64_t id);
+    bool commit_inline_reservation(InlineReservation & reservation,
+                                   const std::vector<int32_t> & prompt_ids,
+                                   int committed_cut, size_t resident_bytes,
+                                   bool protect);
+    void abort_inline_reservation(InlineReservation & reservation);
+    void replace_inline_entry(int slot, int target_cut,
+                              const std::vector<int32_t> & prompt_ids,
+                              bool protect, size_t resident_bytes);
 
     int find_full_entry(const PrefixHash & h) const;
     void move_full_to_end(int idx);

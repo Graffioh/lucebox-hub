@@ -77,7 +77,7 @@ bool Qwen35SeqEngine::arm_capture(
     if (!ticket.valid() || checkpoint_index(ticket.checkpoint) < 0 ||
         ticket.checkpoint.tokens <= restored_tokens ||
         ticket.checkpoint.tokens > sequence.prompt_len) return false;
-    pending_captures_[(size_t)slot] = ticket;
+    slots_.slot(slot).pending_capture = ticket;
     return true;
 }
 
@@ -90,10 +90,9 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
     if (result.status != AdmitResult::Status::admitted) return result;
 
     const int slot = result.slot;
-    pending_captures_[(size_t)slot] = {};
+    slots_.slot(slot).pending_capture = {};
     bool restored = false;
     if (plan.restore.valid()) {
-        result.prefix_store.restore_attempted = true;
         const int restore_index = checkpoint_index(plan.restore);
         const bool metadata_valid =
             restore_index >= 0 &&
@@ -101,7 +100,8 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
         PrefixSnapshot * snap = metadata_valid
             ? &b_.prefix_snapshots_[restore_index] : nullptr;
         const auto restore_started = std::chrono::steady_clock::now();
-        if (snap && snap->ctx && snap->is_paged &&
+        if (snap && snap->ctx &&
+            snap->layout == PrefixSnapshot::Layout::paged &&
             snap->cur_pos == plan.restore.tokens) {
             Qwen35SlotManager::PrefillChunk seeded =
                 slots_.seed_restored_prefix(slot, plan.restore.tokens);
@@ -277,7 +277,7 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
     stage.kv_pos = seq.cur_pos;
     stage.chunk = std::min(
         max_tokens, seq.prompt_len - stage.kv_pos);
-    const PrefixCaptureTicket capture = pending_captures_[(size_t)slot];
+    const PrefixCaptureTicket capture = slots_.slot(slot).pending_capture;
     if (capture.valid() &&
         stage.kv_pos < capture.checkpoint.tokens) {
         // Recurrent state is only checkpoint-consistent after compute, so a
@@ -682,11 +682,11 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         const int slot = plan.prefills[i].slot;
         PrefillOutput out;
         out.slot = slot;
-        const PrefixCaptureTicket capture = pending_captures_[(size_t)slot];
+        const PrefixCaptureTicket capture = slots_.slot(slot).pending_capture;
         if (capture.valid() &&
             slots_.slot(slot).cur_pos == capture.checkpoint.tokens) {
             out.prefix_store = capture_prefix(slot, capture);
-            pending_captures_[(size_t)slot] = {};
+            slots_.slot(slot).pending_capture = {};
         }
         if (prefills[i].commit) {
             out.status = PrefillOutput::Status::completed;
@@ -702,9 +702,6 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
 }
 
 void Qwen35SeqEngine::retire(int slot) {
-    if (slot >= 0 && slot < (int)pending_captures_.size()) {
-        pending_captures_[(size_t)slot] = {};
-    }
     if (!slots_.is_active(slot)) return;
     slots_.retire(slot);
 }

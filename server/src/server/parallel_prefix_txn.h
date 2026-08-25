@@ -15,7 +15,7 @@
 
 namespace dflash::common {
 
-template <typename Policy, typename Engine>
+template <typename Reservation, typename Engine>
 class BasicPrefixCaptureTxn {
 public:
     enum class Resolution {
@@ -28,13 +28,9 @@ public:
     BasicPrefixCaptureTxn() = default;
 
     BasicPrefixCaptureTxn(
-            Policy & policy,
-            Engine & engine,
-            int policy_slot,
+            Reservation reservation, Engine & engine,
             PrefixCaptureTicket ticket)
-        : policy_(&policy),
-          engine_(&engine),
-          policy_slot_(policy_slot),
+        : reservation_(std::move(reservation)), engine_(&engine),
           ticket_(ticket) {}
 
     ~BasicPrefixCaptureTxn() { cancel(); }
@@ -42,24 +38,16 @@ public:
     BasicPrefixCaptureTxn(const BasicPrefixCaptureTxn &) = delete;
     BasicPrefixCaptureTxn & operator=(
         const BasicPrefixCaptureTxn &) = delete;
-
-    BasicPrefixCaptureTxn(BasicPrefixCaptureTxn && other) noexcept {
-        take(std::move(other));
-    }
-
+    BasicPrefixCaptureTxn(BasicPrefixCaptureTxn &&) noexcept = default;
     BasicPrefixCaptureTxn & operator=(
-            BasicPrefixCaptureTxn && other) noexcept {
-        if (this == &other) return *this;
-        cancel();
-        take(std::move(other));
-        return *this;
-    }
+        BasicPrefixCaptureTxn &&) noexcept = default;
 
     bool active() const {
-        return policy_ && engine_ && policy_slot_ >= 0 && ticket_.valid();
+        return engine_ && ticket_.valid() && reservation_.active() &&
+            ticket_.checkpoint == PrefixStoreRef{
+                (uint64_t)reservation_.slot() + 1,
+                reservation_.target_cut()};
     }
-
-    const PrefixCaptureTicket & ticket() const { return ticket_; }
 
     Resolution resolve(
             const PrefixStoreEvent & event,
@@ -74,11 +62,9 @@ public:
             return Resolution::mismatched;
         }
         if (event.status == PrefixStoreEvent::Status::saved) {
-            policy_->confirm_inline_snap(
-                policy_slot_, ticket_.checkpoint.tokens, prompt,
-                /*protect=*/false, event.bytes);
+            const bool committed = reservation_.commit(prompt, event.bytes);
             clear();
-            return Resolution::saved;
+            return committed ? Resolution::saved : Resolution::failed;
         }
         if (event.status == PrefixStoreEvent::Status::failed) {
             cancel();
@@ -89,43 +75,24 @@ public:
     }
 
     void cancel() {
-        if (!active()) return;
-        policy_->cancel_inline_snap(policy_slot_);
+        reservation_.cancel();
         clear();
-    }
-
-    void abort() {
-        // A successful capture is resolved and cleared synchronously. An
-        // externally aborted active transaction therefore has only armed the
-        // capture and must preserve any incumbent in the reserved slot.
-        cancel();
     }
 
 private:
     void discard_saved() {
         engine_->discard_prefix_store(ticket_.checkpoint);
-        policy_->abort_inline_snap(policy_slot_);
+        reservation_.abort();
         clear();
     }
 
     void clear() {
-        policy_ = nullptr;
         engine_ = nullptr;
-        policy_slot_ = -1;
         ticket_ = {};
     }
 
-    void take(BasicPrefixCaptureTxn && other) {
-        policy_ = other.policy_;
-        engine_ = other.engine_;
-        policy_slot_ = other.policy_slot_;
-        ticket_ = other.ticket_;
-        other.clear();
-    }
-
-    Policy * policy_ = nullptr;
+    Reservation reservation_;
     Engine * engine_ = nullptr;
-    int policy_slot_ = -1;
     PrefixCaptureTicket ticket_;
 };
 

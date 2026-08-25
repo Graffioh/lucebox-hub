@@ -413,6 +413,7 @@ private:
         // When DiffPin rewrote tokens, full-cache keys must use
         // prepared.tokens (effective), not req.prompt_tokens.
         bool full_snap_key_effective = false;
+        PrefixCache::InlineReservation snap_reservation;
         int snap_slot = -1;
         int snap_cut = 0;
         bool snap_prepared = false;
@@ -423,7 +424,7 @@ private:
         GenerateRequest & generate_request);
     void finalize_generation_cache(
         const ParsedRequest & req, const PreparedPrompt & prepared,
-        const GenerationCacheState & cache, const GenerateResult & result,
+        GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
     void remember_agent_turn(

@@ -42,6 +42,7 @@ struct Qwen35Slot {
     int cur_pos = 0;
     SamplerCfg sampler;
     std::mt19937_64 rng{0x9E3779B97F4A7C15ull};
+    PrefixCaptureTicket pending_capture;
     // Penalty history is recorded as fed rather than sampled: the scheduler
     // may override a sample before the model consumes it.
     std::vector<int32_t> sample_history;

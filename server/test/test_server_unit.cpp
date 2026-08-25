@@ -2159,23 +2159,27 @@ TEST_CASE(ServerUnitFixture, test_restore_invalidation_preserves_pending_pin) {
 
     // Reserve the oldest slot for a protected tool-prefix capture, then
     // invalidate an unrelated restore while that reservation is in flight.
-    const auto prepared = cache.prepare_inline_snap(
+    auto prepared = cache.reserve_inline_snap(
         pinned, /*restored_prefix_len=*/0,
         /*prefer_tools_boundary=*/true, /*forced_cut=*/2);
-    TEST_ASSERT(prepared.first == 0);
-    TEST_ASSERT(prepared.second == 2);
+    TEST_ASSERT(prepared.slot() == 0);
+    TEST_ASSERT(prepared.target_cut() == 2);
+    auto blocked = cache.reserve_inline_snap(
+        next, /*restored_prefix_len=*/0,
+        /*prefer_tools_boundary=*/false, /*forced_cut=*/2);
+    TEST_ASSERT(!blocked.active());
     cache.invalidate_inline_snap(/*slot=*/1);
-    cache.confirm_inline_snap(prepared.first, prepared.second, pinned);
+    TEST_ASSERT(prepared.commit(pinned));
 
     // Refill the unrelated slot. The next eviction must choose this
     // unprotected entry, proving invalidation did not clear the pending pin.
     cache.confirm_inline_snap(1, 2, replacement);
-    const auto victim = cache.prepare_inline_snap(
+    auto victim = cache.reserve_inline_snap(
         next, /*restored_prefix_len=*/0,
         /*prefer_tools_boundary=*/false, /*forced_cut=*/2);
-    TEST_ASSERT(victim.first == 1);
-    TEST_ASSERT(victim.second == 2);
-    cache.cancel_inline_snap(victim.first);
+    TEST_ASSERT(victim.slot() == 1);
+    TEST_ASSERT(victim.target_cut() == 2);
+    victim.cancel();
 
     unlink(path.c_str());
 }
@@ -2191,34 +2195,26 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_resident_budget_and_stall_stats) 
     const std::vector<int32_t> replacement = {1, 300};
     const std::vector<int32_t> oversized = {1, 400};
 
-    auto prepared = cache.prepare_inline_snap(
-        pinned, 0, /*prefer_tools_boundary=*/true, /*forced_cut=*/2);
-    TEST_ASSERT(prepared.first == 0);
-    TEST_ASSERT(cache.fit_inline_snap_budget(prepared.first, 100) == 0);
-    cache.confirm_inline_snap(
-        /*slot=*/0, /*target_cut=*/2, pinned, /*protect=*/false,
-        /*resident_bytes=*/100);
+    auto prepared = cache.reserve_inline_snap(
+        pinned, 0, /*prefer_tools_boundary=*/true, /*forced_cut=*/2,
+        [](int) { return 100; });
+    TEST_ASSERT(prepared.slot() == 0);
+    TEST_ASSERT(prepared.commit(pinned, /*resident_bytes=*/100));
 
-    prepared = cache.prepare_inline_snap(
-        ordinary, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2);
-    TEST_ASSERT(prepared.first == 1);
-    TEST_ASSERT(cache.fit_inline_snap_budget(prepared.first, 100) == 1);
-    cache.confirm_inline_snap(
-        /*slot=*/1, /*target_cut=*/2, ordinary, /*protect=*/false,
-        /*resident_bytes=*/100);
+    prepared = cache.reserve_inline_snap(
+        ordinary, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2,
+        [](int) { return 100; });
+    TEST_ASSERT(prepared.slot() == 1);
+    TEST_ASSERT(prepared.commit(ordinary, /*resident_bytes=*/100));
 
     // A third slot exists, but its 150-byte checkpoint would exceed the
     // resident ceiling. Replace the oldest unprotected leaf (slot 1) while
     // preserving the protected tools pin in slot 0.
-    prepared = cache.prepare_inline_snap(
-        replacement, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2);
-    TEST_ASSERT(prepared.first == 2);
-    const int redirected =
-        cache.fit_inline_snap_budget(prepared.first, 150);
-    TEST_ASSERT(redirected == 1);
-    cache.confirm_inline_snap(
-        redirected, /*target_cut=*/2, replacement, /*protect=*/false,
-        /*resident_bytes=*/150);
+    prepared = cache.reserve_inline_snap(
+        replacement, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2,
+        [](int) { return 150; });
+    TEST_ASSERT(prepared.slot() == 1);
+    TEST_ASSERT(prepared.commit(replacement, /*resident_bytes=*/150));
 
     auto stats = cache.stats();
     TEST_ASSERT(stats.in_use == 2);
@@ -2226,10 +2222,10 @@ TEST_CASE(ServerUnitFixture, test_prefix_cache_resident_budget_and_stall_stats) 
     TEST_ASSERT(stats.resident_bytes == 250);
     TEST_ASSERT(cache.lookup(pinned).first == 0);
 
-    prepared = cache.prepare_inline_snap(
-        oversized, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2);
-    TEST_ASSERT(prepared.first >= 0);
-    TEST_ASSERT(cache.fit_inline_snap_budget(prepared.first, 301) == -1);
+    prepared = cache.reserve_inline_snap(
+        oversized, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2,
+        [](int) { return 301; });
+    TEST_ASSERT(!prepared.active());
     cache.record_capture_attempt(/*elapsed_us=*/1500, /*success=*/false);
     cache.record_restore_attempt(/*elapsed_us=*/2500, /*restored=*/false);
     stats = cache.stats();
@@ -3772,7 +3768,6 @@ public:
         result.slot = chosen;
 
         if (plan.restore.valid()) {
-            result.prefix_store.restore_attempted = true;
             result.prefix_store.restore_elapsed_us = 2500;
             if (plan.restore == PrefixStoreRef{2, 2}) {
                 saw_stale_restore = true;
@@ -4013,10 +4008,11 @@ TEST_CASE(ServerUnitFixture,
     // entry, proving the real scheduler preserved the other request's pin.
     cache.confirm_inline_snap(
         /*slot=*/1, /*target_cut=*/2, {1, 400}, false, 128);
-    const auto victim = cache.prepare_inline_snap(
-        {1, 500}, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2);
-    TEST_ASSERT(victim.first == 1);
-    cache.cancel_inline_snap(victim.first);
+    auto victim = cache.reserve_inline_snap(
+        {1, 500}, 0, /*prefer_tools_boundary=*/false, /*forced_cut=*/2,
+        [](int) { return 128; });
+    TEST_ASSERT(victim.slot() == 1);
+    victim.cancel();
 }
 #endif
 

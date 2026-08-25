@@ -524,12 +524,12 @@ struct PrefixSnapshot {
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 
-    // Phase B: thin-mode snapshots cover only a KV-position range.
-    bool is_thin  = false;
-    bool is_paged = false;  // logical K/V rows copied from a page table
-    int  kv_start = 0;     // inclusive (only meaningful when is_thin)
-    int  kv_end   = 0;     // exclusive (only meaningful when is_thin)
-    // When is_thin == true:
+    // Snapshot payload shape; one value avoids impossible flag combinations.
+    enum class Layout { empty, dense, thin, paged };
+    Layout layout = Layout::empty;
+    int  kv_start = 0;  // inclusive (only meaningful for Layout::thin)
+    int  kv_end   = 0;  // exclusive (only meaningful for Layout::thin)
+    // For Layout::thin:
     //   - attn_k_snap[i] / attn_v_snap[i] are sized
     //     [HEAD_DIM, kv_end-kv_start, N_HEAD_KV] (smaller than cache).
     //   - ssm_state_snap, conv_state_snap, target_feat_snap are NOT

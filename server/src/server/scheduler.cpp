@@ -26,7 +26,8 @@ namespace {
 // engine slot id returned from admit(), so scheduler and engine agree on
 // which engine-owned state record a request owns. This remains the one
 // external phase: sockets stay here, prompt/KV/sampler/progress stay in Qwen.
-using PrefixCaptureTxn = BasicPrefixCaptureTxn<PrefixCache, SeqEngine>;
+using PrefixCaptureTxn = BasicPrefixCaptureTxn<
+    PrefixCache::InlineReservation, SeqEngine>;
 
 struct SchedSlot {
     ServerJob * job = nullptr;
@@ -248,8 +249,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         SchedSlot & s = slots[(size_t)idx];
         if (!s.job) return;
         const ParsedRequest & req = s.job->req;
-        if (!backend_ok) s.cache_capture.abort();
-        else s.cache_capture.cancel();
+        s.cache_capture.cancel();
         // Stop monitor-thread heartbeats before queuing terminal frames.
         stop_job_stream(s.job, &s.send_buffer);
         const double decode_s = std::chrono::duration<double>(
@@ -463,8 +463,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         // invalidate a valid entry.
         PrefixStorePlan prefix_plan;
         PrefixCaptureTxn prepared_capture;
+        PrefixCache::InlineReservation capture_reservation;
         int restore_policy_slot = -1;
-        int capture_policy_slot = -1;
         const bool prefix_supported =
             engine.supports_prefix_store() && !prefix_cache_.disabled();
         if (prefix_supported) {
@@ -478,50 +478,33 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     (uint64_t)hit.first + 1, hit.second};
             }
 
-            const bool capture_reserved = std::any_of(
-                slots.begin(), slots.end(),
-                [](const SchedSlot & slot) {
-                    return slot.cache_capture.active();
+            capture_reservation = prefix_cache_.reserve_inline_snap(
+                req.prompt_tokens,
+                prefix_plan.restore.valid()
+                    ? prefix_plan.restore.tokens : 0,
+                /*prefer_tools_boundary=*/!req.tools.empty(),
+                req.pin_end_token,
+                [&engine](int target_cut) {
+                    return engine.estimate_prefix_store_bytes(target_cut);
                 });
-            if (!capture_reserved) {
-                const auto prepared = prefix_cache_.prepare_inline_snap(
-                    req.prompt_tokens,
-                    prefix_plan.restore.valid()
-                        ? prefix_plan.restore.tokens : 0,
-                    /*prefer_tools_boundary=*/!req.tools.empty(),
-                    req.pin_end_token);
-                if (prepared.first >= 0 && prepared.second > 0) {
-                    const size_t estimated_bytes =
-                        config_.concurrent_paged_prefix_cache &&
-                                config_.concurrent_prefix_cache_max_bytes > 0
-                            ? engine.estimate_prefix_store_bytes(
-                                  prepared.second)
-                            : 0;
-                    capture_policy_slot =
-                        prefix_cache_.fit_inline_snap_budget(
-                            prepared.first, estimated_bytes);
-                }
-                if (capture_policy_slot >= 0 && prepared.second > 0) {
-                    const uint64_t capture_id = next_prefix_capture_id++;
-                    if (next_prefix_capture_id == 0)
-                        next_prefix_capture_id = 1;
-                    prefix_plan.capture.id = capture_id;
-                    prefix_plan.capture.checkpoint = {
-                        (uint64_t)capture_policy_slot + 1, prepared.second};
-                    if (prefix_plan.restore.valid() &&
-                        prefix_plan.capture.checkpoint ==
-                            prefix_plan.restore) {
-                        prefix_cache_.cancel_inline_snap(
-                            capture_policy_slot);
-                        capture_policy_slot = -1;
-                        prefix_plan.capture = {};
-                    }
+            if (capture_reservation.active()) {
+                const uint64_t capture_id = next_prefix_capture_id++;
+                if (next_prefix_capture_id == 0)
+                    next_prefix_capture_id = 1;
+                prefix_plan.capture.id = capture_id;
+                prefix_plan.capture.checkpoint = {
+                    (uint64_t)capture_reservation.slot() + 1,
+                    capture_reservation.target_cut()};
+                if (prefix_plan.restore.valid() &&
+                    prefix_plan.capture.checkpoint == prefix_plan.restore) {
+                    capture_reservation.cancel();
+                    prefix_plan.capture = {};
                 }
             }
         }
         if (prefix_plan.capture.valid()) {
             prepared_capture = PrefixCaptureTxn(
-                prefix_cache_, engine, capture_policy_slot,
+                std::move(capture_reservation), engine,
                 prefix_plan.capture);
         }
 
@@ -535,7 +518,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
         std::string prefix_protocol_error;
         const PrefixStoreAdmission & prefix = ar.prefix_store;
-        if (prefix.restore_attempted) {
+        if (prefix.restore_attempted()) {
             prefix_cache_.record_restore_attempt(
                 prefix.restore_elapsed_us, prefix.restored.valid());
         }

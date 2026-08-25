@@ -48,20 +48,19 @@ inline bool operator!=(const PrefixCaptureTicket & a,
 struct PrefixStorePlan {
     PrefixStoreRef restore;
     PrefixCaptureTicket capture;
-
-    bool empty() const { return !restore.valid() && !capture.valid(); }
 };
 
 struct PrefixStoreAdmission {
     PrefixStoreRef restored;
     PrefixStoreRef invalidated;
     PrefixCaptureTicket capture;
-    // True only after the engine begins validating/copying a requested
-    // restore. Admission can return busy before reaching that point.
-    bool restore_attempted = false;
     // Wall time spent validating/copying a requested restore. Non-zero for
     // both successful restores and invalidations so operators can see stalls.
     uint64_t restore_elapsed_us = 0;
+
+    bool restore_attempted() const {
+        return restored.valid() || invalidated.valid();
+    }
 };
 
 struct PrefixStoreEvent {

@@ -175,7 +175,8 @@ TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_uses_fresh_pages) {
     CHECK(snapshot_paged_target_cache(
         cache, backend, /*seq_slot=*/1, source_blocks,
         /*block_size=*/16, /*token_count=*/20, snap));
-    CHECK(snap.is_paged && snap.cur_pos == 20);
+    CHECK(snap.layout == PrefixSnapshot::Layout::paged &&
+          snap.cur_pos == 20);
     CHECK(ggml_backend_buffer_get_size(snap.buf) == estimated_bytes);
 
     // An incomplete per-layer pair is invalid topology and must not replace
@@ -185,7 +186,8 @@ TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_uses_fresh_pages) {
         cache, backend, /*seq_slot=*/1, source_blocks,
         /*block_size=*/16, /*token_count=*/20, snap));
     cache.attn_v[0] = value;
-    CHECK(snap.is_paged && snap.cur_pos == 20);
+    CHECK(snap.layout == PrefixSnapshot::Layout::paged &&
+          snap.cur_pos == 20);
 
     // A failed shape-changing replacement must leave the incumbent payload
     // intact. Block 4 begins beyond this cache's 64 physical rows, so the
@@ -194,7 +196,8 @@ TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_uses_fresh_pages) {
     CHECK(!replace_paged_target_cache(
         cache, backend, /*seq_slot=*/1, invalid_source_blocks,
         /*block_size=*/16, /*token_count=*/17, snap));
-    CHECK(snap.is_paged && snap.cur_pos == 20);
+    CHECK(snap.layout == PrefixSnapshot::Layout::paged &&
+          snap.cur_pos == 20);
 
     set_tensor(key, std::vector<float>(keys.size(), 0.0f));
     set_tensor(value, std::vector<float>(values.size(), 0.0f));

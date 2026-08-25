@@ -52,8 +52,7 @@ public:
           long_prefill_threshold_(std::max(1, long_prefill_threshold)),
           idle_prefill_tokens_(std::max(1, idle_prefill_tokens)),
           prefill_quantum_(std::max(1, prefill_quantum)), pool_(pool),
-          b_(backend), slots_(pool, max_ctx), scratch_row_(scratch_row),
-          pending_captures_((size_t)pool.max_sequences()) {}
+          b_(backend), slots_(pool, max_ctx), scratch_row_(scratch_row) {}
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
@@ -133,7 +132,6 @@ private:
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
     int64_t         scratch_row_ = 0;
-    std::vector<PrefixCaptureTicket> pending_captures_;
 
     // Hoisted per-step buffers (reused across step() calls).
     std::vector<int>         output_rows_;
