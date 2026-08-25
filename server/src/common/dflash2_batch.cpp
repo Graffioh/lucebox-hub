@@ -240,8 +240,14 @@ bool dflash2_select_chains_batched(
     for (const float * hidden : hidden_by_lane) {
         if (!hidden) return false;
     }
-    for (int32_t token : last_tokens) {
+    for (size_t lane = 0; lane < last_tokens.size(); ++lane) {
+        const int32_t token = last_tokens[lane];
         if (token < 0 || token >= selector_layout.pred_vocab) {
+            std::fprintf(stderr,
+                         "dflash2_select_chains_batched: lane %zu seed token "
+                         "%d is outside codebook vocab %lld\n",
+                         lane, token,
+                         (long long)selector_layout.pred_vocab);
             return false;
         }
     }
