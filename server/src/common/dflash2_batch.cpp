@@ -240,6 +240,11 @@ bool dflash2_select_chains_batched(
     for (const float * hidden : hidden_by_lane) {
         if (!hidden) return false;
     }
+    for (int32_t token : last_tokens) {
+        if (token < 0 || token >= selector_layout.pred_vocab) {
+            return false;
+        }
+    }
 
     const int n_positions = n_lanes * n_cand;
     std::vector<float> candidate_hidden(

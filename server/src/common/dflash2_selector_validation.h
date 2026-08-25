@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace dflash::common {
@@ -16,11 +17,8 @@ struct DFlash2SelectorLayout {
     int64_t pred_vocab = 0;
     int64_t succ_rank = 0;
     int64_t succ_vocab = 0;
-    // Zero means that source is unavailable at this validation point. A
-    // partial target shard, for example, can declare n_vocab without owning
-    // the final output tensor; the concrete lm_head is checked again at use.
-    int64_t target_output_vocab = 0;
-    int64_t target_declared_vocab = 0;
+    std::optional<int64_t> target_output_vocab;
+    std::optional<int64_t> target_declared_vocab;
 };
 
 inline bool validate_dflash2_selector_layout(
@@ -63,26 +61,48 @@ inline bool validate_dflash2_selector_layout(
             " exceeds codebook vocab=" + std::to_string(layout.pred_vocab);
         return false;
     }
-    if (layout.target_output_vocab > 0 &&
-        layout.target_declared_vocab > 0 &&
-        layout.target_output_vocab != layout.target_declared_vocab) {
+    if (layout.target_output_vocab && *layout.target_output_vocab <= 0) {
+        error = "DFlash 2 target output/lm_head vocab must be positive (got " +
+            std::to_string(*layout.target_output_vocab) + ")";
+        return false;
+    }
+    if (layout.target_declared_vocab && *layout.target_declared_vocab <= 0) {
+        error = "DFlash 2 target.n_vocab must be positive (got " +
+            std::to_string(*layout.target_declared_vocab) + ")";
+        return false;
+    }
+    if (layout.target_output_vocab &&
+        layout.target_declared_vocab &&
+        *layout.target_output_vocab != *layout.target_declared_vocab) {
         error = "DFlash 2 target vocab mismatch: output/lm_head=" +
-            std::to_string(layout.target_output_vocab) + " target.n_vocab=" +
-            std::to_string(layout.target_declared_vocab);
+            std::to_string(*layout.target_output_vocab) + " target.n_vocab=" +
+            std::to_string(*layout.target_declared_vocab);
         return false;
     }
-    if (layout.target_output_vocab > 0 &&
-        layout.pred_vocab != layout.target_output_vocab) {
-        error = "DFlash 2 selector vocab mismatch: codebook=" +
-            std::to_string(layout.pred_vocab) + " target output/lm_head=" +
-            std::to_string(layout.target_output_vocab);
-        return false;
-    }
-    if (layout.target_declared_vocab > 0 &&
-        layout.pred_vocab != layout.target_declared_vocab) {
-        error = "DFlash 2 selector vocab mismatch: codebook=" +
-            std::to_string(layout.pred_vocab) + " target.n_vocab=" +
-            std::to_string(layout.target_declared_vocab);
+    const auto validate_target_bounds = [&] (
+            const std::optional<int64_t> & vocab,
+            const char * source) {
+        if (!vocab) {
+            return true;
+        }
+        if (layout.top_k > *vocab) {
+            error = "DFlash 2 selector top_k=" +
+                std::to_string(layout.top_k) + " exceeds target vocab (" +
+                source + ")=" + std::to_string(*vocab);
+            return false;
+        }
+        if (layout.pred_vocab < *vocab) {
+            error = "DFlash 2 selector codebook is too small: codebook=" +
+                std::to_string(layout.pred_vocab) + " " + source + "=" +
+                std::to_string(*vocab);
+            return false;
+        }
+        return true;
+    };
+    if (!validate_target_bounds(
+            layout.target_output_vocab, "target output/lm_head") ||
+        !validate_target_bounds(
+            layout.target_declared_vocab, "target.n_vocab")) {
         return false;
     }
     return true;

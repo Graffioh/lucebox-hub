@@ -599,10 +599,12 @@ bool load_draft_gguf(const std::string & path,
             selector_layout.pred_vocab = out.selector.pred_cb->ne[1];
             selector_layout.succ_rank = out.selector.succ_cb->ne[0];
             selector_layout.succ_vocab = out.selector.succ_cb->ne[1];
-            selector_layout.target_output_vocab =
-                target && target->output ? target->output->ne[1] : 0;
-            selector_layout.target_declared_vocab =
-                target ? target->n_vocab : 0;
+            if (target && target->output) {
+                selector_layout.target_output_vocab = target->output->ne[1];
+            }
+            if (target) {
+                selector_layout.target_declared_vocab = target->n_vocab;
+            }
             std::string selector_error;
             if (!validate_dflash2_selector_layout(
                     selector_layout, selector_error)) {

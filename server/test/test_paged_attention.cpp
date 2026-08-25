@@ -71,17 +71,21 @@ bool tree_visible(
         return false;
     }
 
+    bool visible = false;
     int current = query_node;
     for (int depth = 0; depth < tree_size; ++depth) {
         if (current == candidate) {
-            return true;
+            visible = true;
         }
         if (current < 0 || current >= tree_size) {
             return false;
         }
         const int parent =
             tree.parent_ids[tree_seq * tree.width + current];
-        if (parent == current) {
+        if (parent == -1) {
+            return visible;
+        }
+        if (parent < 0 || parent >= current) {
             return false;
         }
         current = parent;
@@ -569,6 +573,21 @@ void run_mixed_tree_case() {
     ggml_backend_free(backend);
 }
 
+void run_cyclic_tree_case() {
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    const TestCase tree_case{"cyclic-tree", 4, {17}, false};
+    const TreeMetadata tree_metadata{
+        4, 4,
+        {-1, 2, 1, -1},
+        {3},
+    };
+    const std::vector<int32_t> tree_slot_ids{0, 0, 0, 0};
+    CHECK(run_case(backend, tree_case, GGML_TYPE_F16, GGML_TYPE_F16,
+                   &tree_slot_ids, nullptr, &tree_metadata));
+    ggml_backend_free(backend);
+}
+
 void run_active_slot_case(const TestCase & test_case,
                           const std::vector<int32_t> & active_slot_ids) {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
@@ -637,6 +656,10 @@ TEST_CASE(PagedAttention, PackedTreesMatchReference) {
 
 TEST_CASE(PagedAttention, CompactArAndFixedChainMatchReference) {
     run_mixed_tree_case();
+}
+
+TEST_CASE(PagedAttention, CyclicParentMetadataIsMasked) {
+    run_cyclic_tree_case();
 }
 
 TEST_CASE(PagedAttention, RaggedCausalPositionsMatchReference) {

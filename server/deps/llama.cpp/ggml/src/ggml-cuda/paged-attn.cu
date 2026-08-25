@@ -33,10 +33,8 @@ static __host__ __device__ __forceinline__ int32_t paged_attn_partitions(
     return requested < available ? requested : available;
 }
 
-// parent_ids is a sequence-major [tree_width, n_tree_seq] table. Walk only
-// from the current query node toward the root; a candidate is visible iff it
-// appears on that chain. The bounded walk also turns malformed cycles or
-// out-of-range parents into invisible edges instead of an unsafe read.
+// parent_ids is a sequence-major [tree_width, n_tree_seq] table. Parents
+// precede children in the flat tree, and the root parent is -1.
 static __device__ __forceinline__ bool paged_attn_tree_visible(
         const char * __restrict__ parent_ids,
         int64_t parent_nb0,
@@ -50,10 +48,11 @@ static __device__ __forceinline__ bool paged_attn_tree_visible(
         return false;
     }
 
+    bool visible = false;
     int32_t current = query_node;
     for (int32_t depth = 0; depth < tree_size; ++depth) {
         if (current == candidate) {
-            return true;
+            visible = true;
         }
         if (current < 0 || current >= tree_size) {
             return false;
@@ -61,7 +60,10 @@ static __device__ __forceinline__ bool paged_attn_tree_visible(
         const int32_t parent = *(const int32_t *) (
             parent_ids + (int64_t) current * parent_nb0 +
             (int64_t) tree_seq * parent_nb1);
-        if (parent == current) {
+        if (parent == -1) {
+            return visible;
+        }
+        if (parent < 0 || parent >= current) {
             return false;
         }
         current = parent;

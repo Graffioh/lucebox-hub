@@ -45,30 +45,83 @@ int main() {
     CHECK(error.find("codebook vocab mismatch") != std::string::npos);
 
     layout = valid_layout();
-    layout.target_output_vocab--;
+    layout.pred_vocab += 64;
+    layout.succ_vocab += 64;
+    CHECK(validate_dflash2_selector_layout(layout, error));
+    CHECK(error.empty());
+
+    layout = valid_layout();
+    layout.target_output_vocab = 151935;
     CHECK(!validate_dflash2_selector_layout(layout, error));
     CHECK(error.find("target vocab mismatch") != std::string::npos);
 
     layout = valid_layout();
-    layout.target_declared_vocab = 0;
-    layout.target_output_vocab--;
+    layout.target_declared_vocab.reset();
+    layout.target_output_vocab = 151937;
     CHECK(!validate_dflash2_selector_layout(layout, error));
     CHECK(error.find("target output/lm_head") != std::string::npos);
 
     layout = valid_layout();
-    layout.target_output_vocab = 0;
-    layout.target_declared_vocab--;
+    layout.target_output_vocab.reset();
+    layout.target_declared_vocab = 151937;
     CHECK(!validate_dflash2_selector_layout(layout, error));
     CHECK(error.find("target.n_vocab") != std::string::npos);
 
     layout = valid_layout();
     layout.pred_vocab = 8;
     layout.succ_vocab = 8;
-    layout.target_output_vocab = 0;
-    layout.target_declared_vocab = 0;
+    layout.target_output_vocab.reset();
+    layout.target_declared_vocab.reset();
     layout.top_k = 9;
     CHECK(!validate_dflash2_selector_layout(layout, error));
     CHECK(error.find("exceeds codebook vocab") != std::string::npos);
+
+    layout = valid_layout();
+    layout.pred_vocab = 64;
+    layout.succ_vocab = 64;
+    layout.target_output_vocab = 8;
+    layout.target_declared_vocab.reset();
+    layout.top_k = 9;
+    CHECK(!validate_dflash2_selector_layout(layout, error));
+    CHECK(error.find("exceeds target vocab") != std::string::npos);
+
+    layout = valid_layout();
+    layout.target_output_vocab.reset();
+    layout.target_declared_vocab.reset();
+    CHECK(validate_dflash2_selector_layout(layout, error));
+
+    layout = valid_layout();
+    layout.target_declared_vocab.reset();
+    CHECK(validate_dflash2_selector_layout(layout, error));
+
+    layout = valid_layout();
+    layout.target_output_vocab.reset();
+    CHECK(validate_dflash2_selector_layout(layout, error));
+
+    for (int64_t invalid_vocab : {int64_t{0}, int64_t{-1}}) {
+        layout = valid_layout();
+        layout.target_declared_vocab.reset();
+        layout.target_output_vocab = invalid_vocab;
+        CHECK(!validate_dflash2_selector_layout(layout, error));
+        CHECK(error.find("target output/lm_head vocab must be positive") !=
+              std::string::npos);
+
+        layout = valid_layout();
+        layout.target_output_vocab.reset();
+        layout.target_declared_vocab = invalid_vocab;
+        CHECK(!validate_dflash2_selector_layout(layout, error));
+        CHECK(error.find("target.n_vocab must be positive") !=
+              std::string::npos);
+    }
+
+    layout = valid_layout();
+    layout.pred_vocab = 64;
+    layout.succ_vocab = 64;
+    layout.top_k = 9;
+    layout.target_output_vocab.reset();
+    layout.target_declared_vocab = 8;
+    CHECK(!validate_dflash2_selector_layout(layout, error));
+    CHECK(error.find("target.n_vocab") != std::string::npos);
 
     layout = valid_layout();
     layout.succ_rank = 31;
