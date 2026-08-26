@@ -506,9 +506,9 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
 
     BackendArgs ds4 = gate_args_hip_deepseek4();
     ds4.paged_attention = true;
-    ds4.max_concurrency = 16;
+    ds4.max_concurrency = DEEPSEEK4_MAX_PAGED_SEQUENCES;
     CHECK(gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
-    ds4.max_concurrency = 17;
+    ds4.max_concurrency = DEEPSEEK4_MAX_PAGED_SEQUENCES + 1;
     CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
     ds4.max_concurrency = 2;
     ds4.ds4_prefill_mode = PrefillAttentionMode::Sparse;

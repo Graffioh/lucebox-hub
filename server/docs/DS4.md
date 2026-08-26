@@ -293,16 +293,23 @@ a throughput profile.
 
 ### Strix Halo concurrent serving
 
-DeepSeek4 paged concurrency is deliberately a single-device path: one local
-HIP target on Strix Halo (`gfx1151`), with the complete model and every expert
-resident on that device. It does not use layer splitting, CUDA/HIP expert
-ownership, host-streamed experts, or DSpark.
+DeepSeek4 paged concurrency supports two resident HIP deployments:
+
+- one monolithic Strix Halo (`gfx1151`) target with every expert on that
+  device, through 6 lanes; and
+- the in-process R9700 (`gfx1201`) target + Strix Halo expert-parallel
+  deployment, through 6 lanes. The target keeps dense work and its selected
+  experts while the secondary owns the remaining materialized experts.
+
+The heterogeneous mode is route-level expert parallelism. It is not an
+explicit `--target-device hip:0,hip:1` layer split and does not use a remote
+target shard or host-streamed experts.
 
 The backend keeps raw MLA rows, compressed rows, indexer state, sequence
 lengths, and block tables in a persistent 128-token paged cache. The shared
 HTTP scheduler performs admission, cancellation, slow-client isolation, and
 fair continuous batching. DeepSeek4 lowers each scheduler plan into one exact
-gathered graph with up to 16 independent lanes. Decode rows share the weight
+gathered graph with up to 6 independent lanes. Decode rows share the weight
 pass; each selected prompt advances by one exact token because the graph must
 not contain two rows from the same sequence.
 
@@ -321,16 +328,45 @@ cmake --build server/build-hip -j
   /path/to/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf \
   --target-device hip:0 \
   --paged-attention \
-  --max-concurrency 16 \
-  --kv-pool-tokens 8192 \
+  --max-concurrency 6 \
+  --kv-pool-tokens 24576 \
   --max-ctx 4096 \
   --ds4-prefill exact \
   --prefix-cache-slots 0
 ```
 
-This mode fails closed for non-gfx1151 devices, CUDA, layer or remote target
-splits, `DFLASH_DS4_MOE_TP`, drafts/DSpark, DDTree, PFlash/KVFlash, fused
-decode, approximate prefill, windowed attention, and prefix-cache parking.
+For the R9700 + Strix Halo path, build one HIP binary for both architectures as
+described above, expose the R9700 first, and select the static in-process expert
+split:
+
+```bash
+export HIP_VISIBLE_DEVICES=<r9700-index>,<strix-index>
+export DFLASH_DS4_MOE_TP=1
+export DFLASH_DS4_MOE_TP_INPROC=1
+export DFLASH_DS4_MOE_TP_GPU=1
+export DFLASH_EXPERT_BUDGET_MB=11700
+
+./server/build-hip-dual/dflash_server \
+  /path/to/models/DeepSeek-V4-Flash.gguf \
+  --target-device hip:0 \
+  --peer-access \
+  --paged-attention \
+  --max-concurrency 6 \
+  --kv-pool-tokens 24576 \
+  --max-ctx 4096 \
+  --ds4-prefill exact \
+  --prefix-cache-slots 0
+```
+
+The heterogeneous paged cache and its full-context prefill staging allocation
+are charged against the R9700 before selecting resident experts. Increase
+`--kv-pool-tokens` only when the primary has enough memory for the larger
+shared history pool.
+
+Paged concurrency fails closed for other primary/secondary architecture pairs,
+CUDA or out-of-process expert ownership, explicit layer or remote target
+splits, drafts/DSpark, DDTree, PFlash/KVFlash, fused decode, approximate
+prefill, windowed attention, mutable expert caching, and prefix-cache parking.
 There is no automatic fallback to a slower or asymmetric execution mode.
 
 ### Local single-shard

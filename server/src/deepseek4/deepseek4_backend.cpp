@@ -150,13 +150,14 @@ static bool env_int_in_range(const char * name, int fallback,
     return true;
 }
 
-static bool is_gfx1151_device(int gpu) {
+static bool is_gfx_device(int gpu, const char * arch) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     cudaDeviceProp prop{};
     return cudaGetDeviceProperties(&prop, gpu) == cudaSuccess &&
-           std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+           std::strncmp(prop.gcnArchName, arch, std::strlen(arch)) == 0;
 #else
     (void) gpu;
+    (void) arch;
     return false;
 #endif
 }
@@ -664,8 +665,9 @@ static bool fill_profiled_hot_placement(const DeepSeek4Weights & w,
 // uses authoritative router statistics and evaluates every selected expert.
 static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
                                            ggml_backend_t backend,
-                                           int max_ctx,
+                                           uint64_t kv_bytes,
                                            bool all_cold,
+                                           bool paged,
                                            Ds4HybridBudgetInfo & out,
                                            std::string * err) {
     out = {};
@@ -686,11 +688,13 @@ static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
 
     out.core_bytes = moe_hybrid_core_bytes_from_memory(
         "deepseek4", out.gpu_free, out.gpu_total);
-    out.kv_bytes = estimate_ds4_cache_bytes(w, max_ctx);
+    out.kv_bytes = kv_bytes;
 
     // In all-cold mode the KV cache is owned by the secondary (Strix)
-    // backend, so it must not consume the primary GPU's expert budget.
-    const uint64_t main_charge = all_cold ? 0 : out.kv_bytes;
+    // backend in the legacy contiguous path, so it does not consume the
+    // primary GPU's expert budget there. Paged serving always owns both its
+    // staging cache and persistent page tensors on the primary target.
+    const uint64_t main_charge = all_cold && !paged ? 0 : out.kv_bytes;
     if (out.gpu_total > out.core_bytes + main_charge + out.warm_bytes + out.safety_bytes) {
         out.expert_budget = out.gpu_total - out.core_bytes - main_charge - out.warm_bytes - out.safety_bytes;
     }
@@ -793,11 +797,12 @@ bool DeepSeek4Backend::load_model() {
             ? compiled_placement_backend()
             : cfg_.device.backend;
 
-    // Paged concurrency, fused decode, and layer-major prefill require
-    // monolithic expert residency. Heterogeneous TP is the exception for
-    // non-paged modes: its fused graph owns the
-    // routed experts across two local GPU backends, so forcing a full load would
-    // disable the requested split before the TP runtime can initialize.
+    // Paged concurrency, fused decode, and layer-major prefill normally require
+    // monolithic expert residency. In-process heterogeneous TP is the explicit
+    // exception: its fused graph owns a fixed expert split across two local GPU
+    // backends, so forcing a full load would disable the requested placement
+    // before the TP runtime can initialize. init() has already rejected paged
+    // deployments outside the qualified R9700 + Strix Halo topology.
     const bool force_full = env_flag_enabled("DFLASH_DS4_FORCE_FULL_LOAD");
     const bool heterogeneous_tp = env_flag_enabled("DFLASH_DS4_MOE_TP");
     const bool need_monolithic =
@@ -1046,17 +1051,31 @@ bool DeepSeek4Backend::init() {
         const PlacementBackend target_backend =
             cfg_.device.backend == PlacementBackend::Auto
                 ? compiled_placement_backend() : cfg_.device.backend;
-        if (target_backend != PlacementBackend::Hip ||
-            !is_gfx1151_device(cfg_.device.gpu)) {
+        const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
+        if (target_backend != PlacementBackend::Hip) {
             std::fprintf(stderr,
-                "[deepseek4] paged concurrency currently requires one "
-                "local Strix Halo (gfx1151) HIP target\n");
+                "[deepseek4] paged concurrency requires a local HIP target\n");
             return false;
         }
-        if (env_flag_enabled("DFLASH_DS4_MOE_TP")) {
+        if (!tp.requested) {
+            if (!is_gfx_device(cfg_.device.gpu, "gfx1151")) {
+                std::fprintf(stderr,
+                    "[deepseek4] monolithic paged concurrency requires one "
+                    "local Strix Halo (gfx1151) target\n");
+                return false;
+            }
+        } else if (!tp.in_process || !tp.backend_valid ||
+                   tp.secondary_backend != PlacementBackend::Hip) {
             std::fprintf(stderr,
-                "[deepseek4] paged concurrency keeps all experts resident "
-                "on Strix Halo and cannot use DFLASH_DS4_MOE_TP\n");
+                "[deepseek4] heterogeneous paged concurrency requires "
+                "in-process HIP expert parallelism\n");
+            return false;
+        } else if (tp.secondary_gpu == cfg_.device.gpu ||
+                   !is_gfx_device(cfg_.device.gpu, "gfx1201") ||
+                   !is_gfx_device(tp.secondary_gpu, "gfx1151")) {
+            std::fprintf(stderr,
+                "[deepseek4] heterogeneous paged concurrency requires an "
+                "R9700 (gfx1201) target and Strix Halo (gfx1151) secondary\n");
             return false;
         }
     }
@@ -1070,15 +1089,17 @@ bool DeepSeek4Backend::init() {
     configure_gfx1201_hybrid_sub_batch_default(cfg_.device.gpu);
 
     if (cfg_.paged_attention &&
-        (cfg_.max_concurrency < 1 || cfg_.max_concurrency > 16 ||
+        (cfg_.max_concurrency < 1 ||
+         cfg_.max_concurrency > DEEPSEEK4_MAX_PAGED_SEQUENCES ||
          cfg_.device.is_layer_split() ||
          cfg_.prefill_mode != PrefillAttentionMode::Exact ||
          cfg_.fused_decode || cfg_.fused_verify_f16_kv ||
          env_flag_enabled("DFLASH_DS4_FUSED_DECODE") ||
          env_flag_enabled("DFLASH_DS4_SPEC"))) {
         std::fprintf(stderr,
-            "[deepseek4] paged serving requires 1..16 local slots, exact "
-            "prefill, and autoregressive non-fused decode\n");
+            "[deepseek4] paged serving requires 1..%d local slots, exact "
+            "prefill, and autoregressive non-fused decode\n",
+            DEEPSEEK4_MAX_PAGED_SEQUENCES);
         return false;
     }
 
@@ -1177,9 +1198,10 @@ bool DeepSeek4Backend::init() {
             *this, *paged_cache_.pool, max_ctx,
             paged_cache_.plan.max_blocks_per_sequence);
         std::fprintf(stderr,
-            "[deepseek4-parallel] enabled %d slots, %u x %d-token physical "
+            "[deepseek4-parallel] enabled %d slots mode=%s, %u x %d-token physical "
             "blocks; prefill is exact reference mode at one prompt token per slot per scheduler iteration\n",
-            cfg_.max_concurrency, paged_cache_.plan.physical_blocks,
+            cfg_.max_concurrency, moe_hybrid_ ? "r9700+strix" : "strix",
+            paged_cache_.plan.physical_blocks,
             DS4_PAGE_TOKENS);
     }
     const int active_experts =
@@ -1276,10 +1298,29 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
                                                        MoeHybridPlacement * decode_out,
                                                        std::string * err) const {
     if (decode_out) *decode_out = {};
+    uint64_t kv_bytes = estimate_ds4_cache_bytes(w, max_ctx);
+    if (cfg_.paged_attention) {
+        uint32_t physical_blocks = 0;
+        DeepSeek4PagedCachePlan paged_plan;
+        if (!plan_deepseek4_paged_pool_blocks(
+                (uint32_t)max_ctx, (uint32_t)cfg_.max_concurrency,
+                cfg_.kv_pool_tokens > 0 ? (uint64_t)cfg_.kv_pool_tokens : 0,
+                physical_blocks) ||
+            !plan_deepseek4_paged_cache(
+                (uint32_t)w.head_dim, (uint32_t)w.n_indexer_head_dim,
+                (uint32_t)cfg_.max_concurrency, (uint32_t)max_ctx,
+                physical_blocks, w.compress_ratios, paged_plan) ||
+            kv_bytes > UINT64_MAX - paged_plan.total_persistent_bytes) {
+            if (err) *err = "failed to plan paged KV memory for hybrid placement";
+            return false;
+        }
+        kv_bytes += paged_plan.total_persistent_bytes;
+    }
     Ds4HybridBudgetInfo budget;
     const Ds4MoeTpConfig tp = ds4_moe_tp_config(cfg_.device.gpu);
-    if (!compute_ds4_hybrid_budget_info(w, backend_, max_ctx,
-                                        tp.all_on_secondary, budget, err)) {
+    if (!compute_ds4_hybrid_budget_info(
+            w, backend_, kv_bytes, tp.all_on_secondary,
+            cfg_.paged_attention, budget, err)) {
         return false;
     }
 

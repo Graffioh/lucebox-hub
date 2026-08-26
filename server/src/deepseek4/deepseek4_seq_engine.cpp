@@ -20,10 +20,11 @@ bool DeepSeek4SeqEngine::token_is_eos(int32_t token) const {
 
 StepPlanLimits DeepSeek4SeqEngine::step_plan_limits(
         int decode_rows) const {
-    // The gathered graph accepts at most sixteen independent lanes and does
+    // The gathered graph accepts at most six independent lanes and does
     // not permit two rows from the same sequence. A prompt therefore advances
     // by one token while every live decoder still shares the same weight pass.
-    const int available = std::max(0, 16 - decode_rows);
+    const int available = std::max(
+        0, DEEPSEEK4_MAX_PAGED_SEQUENCES - decode_rows);
     return {available, 1, available, 1};
 }
 
@@ -100,7 +101,7 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
 
     const StepPlanLimits limits = step_plan_limits((int)inputs.size());
     if ((int)plan.prefills.size() > limits.max_prefill_sequences) {
-        return fail_step("DeepSeek4 step exceeds the sixteen-lane graph");
+        return fail_step("DeepSeek4 step exceeds the six-lane graph");
     }
     std::vector<uint8_t> prefill_seen((size_t)n_slots, 0);
     for (const PrefillSlice & slice : plan.prefills) {
@@ -189,8 +190,8 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     }
 
     if (lane_tokens.empty()) return result;
-    if (lane_tokens.size() > 16) {
-        return fail_step("DeepSeek4 gathered step exceeds sixteen lanes");
+    if (lane_tokens.size() > DEEPSEEK4_MAX_PAGED_SEQUENCES) {
+        return fail_step("DeepSeek4 gathered step exceeds six lanes");
     }
 
     std::vector<float> embeddings(

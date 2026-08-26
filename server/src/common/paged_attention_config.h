@@ -14,6 +14,7 @@
 namespace dflash::common {
 
 constexpr int PAGED_BLOCK_SIZE = 16;
+inline constexpr int DEEPSEEK4_MAX_PAGED_SEQUENCES = 6;
 
 constexpr int paged_block_count(int max_ctx) {
     return (max_ctx + PAGED_BLOCK_SIZE - 1) / PAGED_BLOCK_SIZE;

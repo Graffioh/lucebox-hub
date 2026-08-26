@@ -25,6 +25,7 @@
 
 #include "internal.h"
 #include "common/layer_split_utils.h"
+#include "common/paged_attention_config.h"
 #include "common/prefill_attention_mode.h"
 #include "common/concurrency/paged_kv_pool.h"
 #include "deepseek4_paged_cache.h"
@@ -373,7 +374,7 @@ bool create_deepseek4_paged_cache(ggml_backend_t backend,
                                   DeepSeek4PagedCache & out);
 void reset_deepseek4_paged_slot(DeepSeek4PagedCache & c, uint32_t slot);
 void free_deepseek4_paged_cache(DeepSeek4PagedCache & c);
-// Exact gathered-reference decode for 1..16 independent lanes. Inputs are
+// Exact gathered-reference decode for up to six independent lanes. Inputs are
 // lane-major; negative slots are inactive padding lanes. `out_logits` is
 // [n_vocab, lanes] and `out_argmax` is [lanes].
 bool deepseek4_paged_gathered_step(

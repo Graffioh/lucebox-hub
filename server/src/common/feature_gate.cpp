@@ -243,8 +243,9 @@ std::string check_feature_compatibility(
             return "--max-concurrency requires --paged-attention";
         }
         // Qwen's graph is qualified through 64 lanes. DeepSeek's gathered
-        // whole-model graph is intentionally bounded to 16 independent lanes.
-        const int max_slots = arch == "deepseek4" ? 16 : 64;
+        // whole-model graph has a smaller, separately qualified ceiling.
+        const int max_slots = arch == "deepseek4"
+            ? DEEPSEEK4_MAX_PAGED_SEQUENCES : 64;
         if (args.max_concurrency > max_slots) {
             return "--max-concurrency must be at most " +
                    std::to_string(max_slots) + " for " + arch;
