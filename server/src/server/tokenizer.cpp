@@ -138,10 +138,10 @@ static bool is_newline(uint32_t cp) {
 }
 
 // ─── Pre-tokenizer ─────────────────────────────────────────────────────
-// Matches the Qwen3.5 pattern:
+// Matches the Qwen/DeepSeek pattern:
 //   (?:'[sStTmMdD]|...) |
 //   [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ |
-//   \p{N} |
+//   \p{N}{1,3} |
 //   ' '?[^\s\p{L}\p{M}\p{N}]+[\r\n]* |
 //   \s*[\r\n]+ |
 //   \s+(?!\S) |
