@@ -857,14 +857,15 @@ static bool ds4_build_fused_verify_graph(
                 (hybrid_layer.gate_up_hot ||
                  (hybrid_layer.gate_hot && hybrid_layer.up_hot)) &&
                 hybrid_layer.down_hot;
-            // Legacy q>1 graphs represented six routes as 4 + (2 padded to
-            // 4). Native q1 decode already uses width six directly. Keep the
-            // decomposition as a bisectable fallback while validating the
-            // dedicated q4 MoE kernel's native route width on both GPUs.
+            // Legacy q>1 graphs represent six routes as 4 + 2. Native q1
+            // decode already uses width six directly. Keep the decomposition
+            // as a bisectable fallback while validating the dedicated q4 MoE
+            // kernel's native route width on both GPUs.
             // The dedicated multi-token MUL_MAT_ID kernel is indexed by token
             // width, not route width.  Once that kernel is enabled, keep all
-            // six routes in one owner graph: the legacy 4 + padded-2 split
-            // computes two duplicate expert paths whose weights are zero.
+            // six routes in one owner graph. Until then, retain the existing
+            // head-plus-tail reduction order without padding the two-route
+            // tail with duplicate zero-weight expert paths.
             const bool native_route_width =
                 !same_gpu_runtime ||
                 mixed_policy.native_route_width;
@@ -876,8 +877,8 @@ static bool ds4_build_fused_verify_graph(
 
                 ggml_tensor * first_ids = nullptr;
                 ggml_tensor * first_weights = nullptr;
-                ggml_tensor * padded_ids = nullptr;
-                ggml_tensor * padded_weights = nullptr;
+                ggml_tensor * tail_ids = nullptr;
+                ggml_tensor * tail_weights = nullptr;
                 for (int t = 0; t < lane_q; ++t) {
                     const size_t ids_row = (size_t) t * selected->nb[1];
                     const size_t weights_row = (size_t) t * router_weights->nb[1];
@@ -898,16 +899,12 @@ static bool ds4_build_fused_verify_graph(
                     ggml_tensor * weights_tail = ggml_cont(ctx, ggml_view_1d(
                         ctx, router_weights, 2,
                         weights_row + 4 * router_weights->nb[0]));
-                    ggml_tensor * ids_tail_padded = ggml_concat(
-                        ctx, ids_tail, ids_tail, 0);
-                    ggml_tensor * weights_tail_padded = ggml_concat(
-                        ctx, weights_tail, ggml_scale(ctx, weights_tail, 0.0f), 0);
-                    padded_ids = padded_ids
-                        ? ggml_concat(ctx, padded_ids, ids_tail_padded, 1)
-                        : ids_tail_padded;
-                    padded_weights = padded_weights
-                        ? ggml_concat(ctx, padded_weights, weights_tail_padded, 1)
-                        : weights_tail_padded;
+                    tail_ids = tail_ids
+                        ? ggml_concat(ctx, tail_ids, ids_tail, 1)
+                        : ids_tail;
+                    tail_weights = tail_weights
+                        ? ggml_concat(ctx, tail_weights, weights_tail, 1)
+                        : weights_tail;
                 }
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
@@ -921,12 +918,13 @@ static bool ds4_build_fused_verify_graph(
                 }
                 ffn_out = inputs.output;
 
+                hybrid_cfg.n_expert_used = 2;
                 if (!build_moe_hybrid_ffn_graph(
                         ctx,
                         hybrid_schedule_graph,
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il], ffn_normed,
-                        padded_ids, padded_weights, lane_q, inputs, false,
+                        tail_ids, tail_weights, lane_q, inputs, false,
                         allow_fused_combine, join_mode,
                         MoeHybridRouteBalance::Disabled)) {
                     return false;
