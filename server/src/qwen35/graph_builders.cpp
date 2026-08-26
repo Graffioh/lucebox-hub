@@ -818,16 +818,40 @@ bool build_target_step_paged_tree(
     int kq_stride_pad,
     int mapped_ar_seqs) {
     (void)kq_stride_pad;
-    step_graph_free(sg);
 
     if (mapped_ar_seqs < 0 || mapped_ar_seqs > cache.n_seq_slots) {
+        step_graph_free(sg);
         return false;
     }
     if (!detail::validate_target_paged_tree_layout(
             cache, tree_width, n_tree_seqs, paged_max_kv_len,
             tree_scratch_base, tree_scratch_stride)) {
+        step_graph_free(sg);
         return false;
     }
+    const int64_t table_capacity =
+        cache.paged_block_table->ne[0] * PAGED_BLOCK_SIZE;
+    const int64_t logical_capacity =
+        std::min<int64_t>(cache.max_ctx, table_capacity);
+    if (logical_capacity < 1 || logical_capacity > INT32_MAX) {
+        step_graph_free(sg);
+        return false;
+    }
+    const int64_t requested = std::min<int64_t>(
+        std::max<int64_t>(1, paged_max_kv_len), logical_capacity);
+    const int paged_launch_kv_len = static_cast<int>(
+        std::min<int64_t>(((requested + 255) / 256) * 256,
+                          logical_capacity));
+    const TargetPagedTreeGraphKey graph_key{
+        &w, &cache, backend, tree_width, n_tree_seqs,
+        paged_launch_kv_len, tree_scratch_base, tree_scratch_stride,
+        mapped_ar_seqs,
+    };
+    if (sg.paged_tree_key && *sg.paged_tree_key == graph_key) {
+        return true;
+    }
+    step_graph_free(sg);
+
     size_t graph_capacity = 0;
     if (!detail::target_paged_tree_graph_capacity(
             tree_width, n_tree_seqs, graph_capacity)) {
@@ -838,13 +862,11 @@ bool build_target_step_paged_tree(
 
     ggml_init_params ip{};
     ip.mem_size = 512 * 1024 * 1024;
-    static thread_local std::unique_ptr<uint8_t[]> g_tree_arena;
-    static thread_local size_t g_tree_arena_size = 0;
-    if (g_tree_arena_size < ip.mem_size) {
-        g_tree_arena.reset(new uint8_t[ip.mem_size]);
-        g_tree_arena_size = ip.mem_size;
+    if (!sg.paged_tree_meta_arena) {
+        sg.paged_tree_meta_arena.reset(
+            new uint8_t[ip.mem_size], std::default_delete<uint8_t[]>());
     }
-    ip.mem_buffer = g_tree_arena.get();
+    ip.mem_buffer = sg.paged_tree_meta_arena.get();
     ip.no_alloc = true;
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
@@ -917,7 +939,7 @@ bool build_target_step_paged_tree(
     gi.paged_query_positions = sg.paged_query_positions;
     gi.n_seqs = n_tree_seqs;
     gi.mapped_ar_seqs = mapped_ar_seqs;
-    gi.paged_max_kv_len = paged_max_kv_len;
+    gi.paged_max_kv_len = paged_launch_kv_len;
     gi.tree_width = tree_width;
     gi.tree_scratch_base = tree_scratch_base;
     gi.tree_scratch_stride = tree_scratch_stride;
@@ -963,7 +985,9 @@ bool build_target_step_paged_tree(
     ggml_set_name(sg.feature_commit_rows, "feature_commit_rows");
     sg.commit_buffer = ggml_backend_alloc_ctx_tensors(
         sg.commit_ctx, backend);
-    return sg.commit_buffer != nullptr;
+    if (!sg.commit_buffer) return false;
+    sg.paged_tree_key = graph_key;
+    return true;
 }
 
 

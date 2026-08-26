@@ -12,6 +12,7 @@
 using namespace CppUnitTestFramework;
 
 using dflash::common::TargetCache;
+using dflash::common::TargetPagedTreeGraphKey;
 using dflash::common::StepGraph;
 using dflash::common::restore_ssm_state;
 using dflash::common::snapshot_ssm_state;
@@ -142,6 +143,19 @@ TEST_CASE(RecurrentSnapshotFixture, validates_paged_tree_layout) {
         }
     }
 
+}
+
+TEST_CASE(RecurrentSnapshotFixture, invalidates_paged_tree_graph_cache_key) {
+    StepGraph graph;
+    graph.paged_tree_meta_arena.reset(
+        new uint8_t[1], std::default_delete<uint8_t[]>());
+    graph.paged_tree_key = TargetPagedTreeGraphKey{
+        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0};
+    step_graph_free(graph);
+    CHECK(!graph.paged_tree_key);
+    CHECK(graph.paged_tree_meta_arena);
+    step_graph_destroy(graph);
+    CHECK(!graph.paged_tree_meta_arena);
 }
 
 TEST_CASE(RecurrentSnapshotFixture, snapshot_and_restore_recurrent_state) {
