@@ -27,6 +27,15 @@ struct ProjectionGraph {
     ggml_gallocr_t galloc = nullptr;
     ggml_tensor * inp_hidden = nullptr;
     ggml_tensor * logits = nullptr;
+
+    ~ProjectionGraph() {
+        if (galloc) {
+            ggml_gallocr_free(galloc);
+        }
+        if (ctx) {
+            ggml_free(ctx);
+        }
+    }
 };
 
 struct BatchedSelectorGraph {
@@ -46,6 +55,15 @@ struct BatchedSelectorGraph {
     ggml_tensor * hproj = nullptr;
     ggml_tensor * succ = nullptr;
     ggml_tensor * pred = nullptr;
+
+    ~BatchedSelectorGraph() {
+        if (galloc) {
+            ggml_gallocr_free(galloc);
+        }
+        if (ctx) {
+            ggml_free(ctx);
+        }
+    }
 };
 
 ProjectionGraph & projection_graph() {
