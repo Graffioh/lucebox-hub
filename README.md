@@ -18,44 +18,43 @@
 </p>
 
 <p align="center">
-  <strong>Speculative inference for single GPUs and heterogeneous machines.</strong><br/>
-  Run the target, drafter, experts, and KV cache where each fits best: NVIDIA, AMD, Strix Halo, CPU, or system memory.
+  <strong>Speculative inference for single GPUs and heterogeneous machines.</strong>
 </p>
 
 ---
 
 ## Inference Engine Optimizations
 
-| Optimization | Use | Measured value |
+| Optimization | Measured setup | Result |
 |---|---|---:|
-| [DFlash, DFlash2, and DSpark](server/) | Speculative decode | **6.1×** Qwen 3.8; **2×** DeepSeek V4 |
-| [PFlash](optimizations/pflash/) | Speculative prefill | **8.2×** at 256K |
-| [Luce Spark](optimizations/spark/) | MoE expert offload | **~100 tok/s** in **14.6 GiB** |
-| [KVFlash](optimizations/kvflash/) | Bounded KV cache | **38.6 tok/s** at 256K with **72 MiB** resident KV |
-| [Heterogeneous and multi-GPU](server/docs/MIXED_BACKEND.md) | Mixed accelerators | **2.16×** AR on 2x RTX 3090; **51.1 tok/s** on R9700 + Strix Halo |
-| [Paged attention](optimizations/paged_attention/) | Concurrent serving | **1.35×** attention step; **82%** less KV memory |
-| [Megakernel](optimizations/megakernel/) | Fused Qwen 3.5 0.8B | **413 tok/s**, **1.87 tok/J** on RTX 3090 |
+| [DFlash2](https://www.lucebox.com/blog/qwen38-r9700) | Qwen 3.8 27B on one R9700 | **208.1 tok/s** average, **227.8 tok/s** peak |
+| [DSpark](https://www.lucebox.com/blog/deepseek-v4-flash-0731) | DeepSeek V4 on Strix Halo, native top-6 | **32.7 tok/s** high-acceptance median; **27.9 tok/s** mixed-eval average |
+| [PFlash](https://www.lucebox.com/blog/laguna-xs21) | Laguna XS 2.1 33B at 256K on RTX 3090 | **8.2×** faster prefill |
+| [Luce Spark](optimizations/spark/README.md) | Laguna XS 2.1 33B on RTX 3090 | **~100 tok/s** in **14.6 GiB** |
+| [KVFlash](https://www.lucebox.com/blog/laguna-xs21) | Laguna XS 2.1 33B at 256K on RTX 3090 | **152.3 tok/s** with an 8K pool |
+| [Heterogeneous execution](https://www.lucebox.com/#benchmark) | DeepSeek V4 on R9700 + Strix Halo | **86 tok/s** decode; **788 tok/s** prefill at 2K |
+| [Paged attention](optimizations/paged_attention/README.md) | Qwen 3.6 27B concurrent serving | **1.35×** attention step; **82%** less KV memory |
+| [Megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) | Qwen 3.5 0.8B on RTX 3090 | **413 tok/s**, **1.87 tok/J** |
 
 ---
 
 ## Supported Models and Drafters
 
-Speedups use vendored llama.cpp with Flash Attention and matching KV quantization. Combined results use the geometric mean of prefill and decode.
+Each result is tied to the model, workload, and hardware named in its source.
 
 <table>
 <tr>
 <td valign="top">
 
-| Model and path | Speedup |
+| Model and optimization | Speedup |
 |---|:---:|
-| Qwen 3.5 0.8B + [Megakernel](optimizations/megakernel/) | **~2×** |
-| [Qwen 3.8 27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) + DFlash2 on R9700 | **6.1×** decode |
-| Qwen 3.8 27B + DFlash2 vs llama.cpp with the same drafter | **3.5×** decode |
-| Laguna XS 2.1 33B + PFlash | **8.2×** at 256K |
-| Laguna XS 2.1 33B + DFlash | **1.7×** at 256K |
+| Qwen 3.5 0.8B + [Megakernel](optimizations/megakernel/README.md) | **1.9×** prefill; **1.55×** decode |
+| [Qwen 3.8 27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) + [DFlash2 on R9700](https://www.lucebox.com/blog/qwen38-r9700) | **6.4×** vs Lucebox AR; **3.8×** vs llama.cpp with the same drafter |
+| [Laguna XS 2.1 33B](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF) + [PFlash](https://www.lucebox.com/blog/laguna-xs21) | **8.2×** at 256K |
+| [Laguna XS 2.1 33B](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF) + [DFlash](https://www.lucebox.com/blog/laguna-xs21) | **1.7×** at 256K |
 | Gemma 4 26B-A4B | **1.31×** |
 | Gemma 4 31B IT | **3.2×** |
-| [DeepSeek V4 Flash ROCmFPX](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) | **2×** |
+| [DeepSeek V4 Flash](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) + [DSpark on Strix Halo](https://www.lucebox.com/blog/deepseek-v4-flash-0731) | Up to **1.81×** vs target-only, **32.7 vs 18.1 tok/s** |
 
 </td>
 <td valign="top">
@@ -79,9 +78,9 @@ The engine is not tied to one reference card. NVIDIA architectures are selected 
 
 | | Architecture | Hardware | Runtime | Evidence |
 |:---:|---|---|---|---|
-| <img src="assets/gpus/r9700.png" width="750" /> | RDNA4 `gfx1201` | Radeon AI PRO R9700 | ROCm 6.4+ | [Qwen 3.8 and DFlash2](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
-| <img src="assets/gpus/ryze395.png" width="750" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 6+ | [DeepSeek V4 and DSpark](server/docs/DS4.md#monolithic-hip) |
-| <img src="assets/gpus/7900xtx.png" width="750" /> | RDNA3 `gfx1100` | Radeon RX 7900 XT / XTX | ROCm 6+ | [Dual AMD qualification](server/docs/DS4.md#radeon-rx-7900-xt--strix-halo-true-top-k-6) |
+| <img src="assets/gpus/r9700.png" width="750" /> | RDNA4 `gfx1201` | Radeon AI PRO R9700 | ROCm 7.2 | [Qwen 3.8 and DFlash2](https://www.lucebox.com/blog/qwen38-r9700) |
+| <img src="assets/gpus/ryze395.png" width="750" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 7.2 | [DeepSeek V4 and DSpark](https://www.lucebox.com/blog/deepseek-v4-flash-0731) |
+| <img src="assets/gpus/7900xtx.png" width="750" /> | RDNA3 `gfx1100` | Radeon RX 7900 XT / XTX | ROCm 6+ | [Dual AMD qualification](https://github.com/Luce-Org/lucebox/pull/604) |
 | <img src="assets/gpus/3090.png" width="750" /> | Ampere `sm_86` | RTX 3090, A-series | CUDA 12.0 | [DFlash](server/RESULTS.md) and [Megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) |
 | <img src="assets/gpus/5090.png" width="750" /> | Blackwell `sm_120` | RTX 5090 | CUDA 12.8 | [DFlash](server/RESULTS.md#rtx-5090-blackwell-sm_120sm_120a-32-gb) |
 | <img src="assets/gpus/gb10.png" width="750" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | [Megakernel NVFP4](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
@@ -94,33 +93,23 @@ The engine is not tied to one reference card. NVIDIA architectures are selected 
 
 | Hardware | Model and path | Measured result | Notes |
 |---|---|---|---|
-| **R9700** | Qwen 3.8 27B + DFlash2 | **204.1 tok/s** HumanEval average, with requests above 230 tok/s | Block size 16 for code and math. Greedy output stayed byte-identical across the tested widths. [Details](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
-| **Strix Halo** | DeepSeek V4 + DSpark | **28.26 tok/s** at the model-default top-6; **32.12 tok/s** at top-4 on the uniform artifact | Top-4 is an explicit approximation and is not suitable for the adaptive artifact. [Details](server/docs/DS4.md#monolithic-hip) |
+| **R9700** | Qwen 3.8 27B + DFlash2 | **208.1 tok/s** HumanEval average; **227.8 tok/s** best request | Block size 16, greedy decode, ROCm 7.2. [Qwen 3.8 R9700 results](https://www.lucebox.com/blog/qwen38-r9700) |
+| **Strix Halo** | DeepSeek V4 + DSpark | **32.7 tok/s** median in the high-acceptance run; **27.9 tok/s** across the fixed 30-prompt evaluation | Every published result uses the model's native six routed experts. [DeepSeek V4 top-6 results](https://www.lucebox.com/blog/deepseek-v4-flash-0731) |
 | **RTX 5090** | Qwen 3.8 27B | **110.6 tok/s** for a 26,758-token prompt and 1,024-token continuation | Prefix-cache miss, full continuation, no CUDA or server errors. [Merged validation](https://github.com/Luce-Org/lucebox/pull/637) |
 
 ### Heterogeneous and parallel results
 
 | Hardware | Placement | Measured result | Status |
 |---|---|---|---|
-| **2x RTX 3090 + NVLink** | Qwen 3.8 target tensor parallel + DFlash2 | **79.7 tok/s**, **2.16x** autoregressive decode | [Merged validation](https://github.com/Luce-Org/lucebox/pull/637) |
+| **2x RTX 3090 + NVLink** | Qwen 3.8 target tensor parallel + DFlash2 | **79.7 tok/s**, **2.16×** autoregressive decode | [Merged validation](https://github.com/Luce-Org/lucebox/pull/637) |
 | **RX 7900 XT + Strix Halo** | DeepSeek V4 exact top-6 experts + fixed DSpark q=4 | **45.0 to 47.7 tok/s** decode; **111.2 tok/s** prefill at 132,981 tokens | [Qualified profile](https://github.com/Luce-Org/lucebox/pull/604) |
-| **R9700 + Strix Halo** | DeepSeek V4 in-process expert parallelism | **51.1 tok/s** decode; **415.52 tok/s** sparse prefill | Opt-in burn-in. The measured top-4 and sparse-prefill settings are approximate. [Qualification](https://github.com/Luce-Org/lucebox/pull/505) |
-| **RTX 3090 + Strix Halo** | DeepSeek V4 CUDA + HIP expert parallelism | **48.059 tok/s** median | Opt-in burn-in with top-4 routing. Exact-mode output identity was also validated. [Qualification](https://github.com/Luce-Org/lucebox/pull/570) |
+| **R9700 + Strix Halo** | DeepSeek V4 across both AMD devices | **86 tok/s** decode; **788 tok/s** prefill at 2K | Current Lucebox measurement. [Benchmark](https://www.lucebox.com/#benchmark) |
 
 These runs use different prompts, quantizations, and inference policies. They show which configurations work; they are not a cross-hardware ranking.
 
 ## Recommended Setups
 
-Use this table to choose a profile. The linked guides contain the complete build flags, model paths, and qualification notes.
-
-| Goal | Hardware and model | Starting configuration |
-|---|---|---|
-| Qwen on one AMD GPU | R9700 + Qwen 3.8 27B | `--target-device hip:0 --draft-device hip:0 --draft-block-size 16` for code and math; use block size 8 for prose. [HIP guide](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
-| Qwen on one NVIDIA GPU | RTX 30/40/50 + Qwen 3.8 27B | `--target-device cuda:0 --draft-device cuda:0`; start with the [source quick start](#run-the-server). |
-| DeepSeek on one APU | Strix Halo + DeepSeek V4 | `--target-device hip:0 --ds4-fused-decode`; keep the model-default top-6 on adaptive artifacts. [DS4 guide](server/docs/DS4.md#monolithic-hip) |
-| Qwen on two NVIDIA GPUs | 2x RTX 3090 + Qwen 3.8 27B | `--target-devices cuda:0,cuda:1 --target-split-mode tensor --peer-access` with DFlash2. [Multi-GPU guide](server/docs/MIXED_BACKEND.md) |
-| Exact heterogeneous AMD | RX 7900 XT + Strix Halo + DeepSeek V4 | Use the qualified true top-6 profile in [`serve_ds4_dual_rocm_128k.sh`](server/scripts/serve_ds4_dual_rocm_128k.sh). |
-| Lucebox heterogeneous profile | R9700 + Strix Halo + DeepSeek V4 | Use the opt-in in-process expert-parallel profile. Top-4 routing and sparse prefill remain explicit approximations. [DS4 guide](server/docs/DS4.md#in-process-heterogeneous-expert-parallel) |
+See [Recommended server setups](server/docs/RECOMMENDED_SETUPS.md) for the model and hardware matrix, including single-GPU and mixed-GPU profiles.
 
 ## Client Harnesses
 
@@ -174,7 +163,7 @@ Prebuilt images on GHCR track `main`. Mount the weights and serve the OpenAI-com
 | NVIDIA (CUDA 12+) | `:cuda12` |
 | AMD (ROCm 6+) | `:rocm` |
 
-Download the target and drafter from the [source quick start](#run-the-server) into `server/models/` first.
+Put the target in `server/models/` and its matching drafter in `server/models/draft/`. The [Docker tutorial](https://www.lucebox.com/blog/docker) lists the supported image tags and directory layout.
 
 </td>
 <td width="62%" valign="middle">
@@ -204,48 +193,50 @@ See the [Docker tutorial](https://lucebox.com/blog/docker) for the full setup.
 
 ## Run the Server
 
-This CUDA quick start serves Qwen 3.8 27B with DFlash2 on `:8000`. For HIP and mixed-device builds, use the [server guide](server/README.md).
+This is the measured Qwen 3.8 27B and DFlash2 profile from the [R9700 results](https://www.lucebox.com/blog/qwen38-r9700). The complete flag reference is in the [server guide](server/README.md#server-parameter-reference).
 
 ```bash
-# build (CUDA 12+, CMake 3.18+)
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox && cd lucebox
-cmake -B server/build -S server -DCMAKE_BUILD_TYPE=Release
-cmake --build server/build --target dflash_server -j
+# build (ROCm 7.2+, RDNA4)
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git
+cd lucebox
+cmake -S server -B server/build-hip -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+  -DDFLASH27B_GPU_BACKEND=hip \
+  -DDFLASH27B_HIP_ARCHITECTURES=gfx1201 \
+  -DGGML_HIP_MMQ_MFMA=ON \
+  -DGGML_HIP_NO_VMM=ON
+cmake --build server/build-hip --target dflash_server -j"$(nproc)"
 
-# default weights (~16 GB)
-hf download unsloth/Qwen3.8-27B-GGUF Qwen3.8-27B-UD-IQ4_XS.gguf --local-dir server/models/
-hf download incoai/Qwen3.8-27B-DFlash2 --local-dir server/models/dflash2-hf
+# target and DFlash2 drafter
+mkdir -p models
+huggingface-cli download unsloth/Qwen3.8-27B-GGUF \
+  Qwen3.8-27B-UD-IQ4_XS.gguf --local-dir models
+huggingface-cli download incoai/Qwen3.8-27B-DFlash2 --local-dir models/dflash2
 python server/scripts/convert_dflash_to_gguf.py \
-  server/models/dflash2-hf/model.safetensors server/models/draft/qwen38-dflash2-f16.gguf
+  models/dflash2/model.safetensors models/qwen38-dflash2-f16.gguf
 python server/scripts/quantize_dflash_draft.py \
-  server/models/draft/qwen38-dflash2-f16.gguf server/models/draft/qwen38-dflash2-q8_0.gguf --scheme q8_0
+  models/qwen38-dflash2-f16.gguf models/qwen38-dflash2-q8_0.gguf --scheme q8_0
 
-# run
-./server/build/dflash_server server/models/Qwen3.8-27B-UD-IQ4_XS.gguf \
-  --draft server/models/draft/qwen38-dflash2-q8_0.gguf \
-  --draft-block-size 16 \
-  --max-ctx 131072 \
+# launch the measured profile
+./server/build-hip/dflash_server models/Qwen3.8-27B-UD-IQ4_XS.gguf \
+  --draft models/qwen38-dflash2-q8_0.gguf \
+  --draft-block-size 16 --max-ctx 131072 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
-  --port 8000
-```
+  --port 8216
 
-### Making requests
-
-Use `temperature: 0` for deterministic output and the highest speculative-decoding acceptance:
-
-```bash
-curl :8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "dflash",
-  "messages": [{"role": "user", "content": "Write quicksort in Python."}],
-  "temperature": 0
-}'
+curl -s http://127.0.0.1:8216/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Write a Python LRU cache."}],
+       "max_tokens":256,"temperature":0}'
 ```
 
 ## Documentation
 
 | Topic | Guide |
 |---|---|
-| Build, runtime flags, and per-GPU setup | [Server guide](server/README.md) |
+| Recommended model and hardware profiles | [Recommended setups](server/docs/RECOMMENDED_SETUPS.md) |
+| Runtime parameters | [Server parameter reference](server/README.md#server-parameter-reference) |
 | OpenAI Chat Completions, Responses, and Anthropic Messages | [API reference](server/docs/API.md) |
 | CUDA, HIP, and mixed-device placement | [Mixed-backend guide](server/docs/MIXED_BACKEND.md) |
 | DeepSeek V4 single-device and heterogeneous profiles | [DeepSeek V4 guide](server/docs/DS4.md) |
