@@ -52,8 +52,7 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
 }
 
 size_t Qwen35SeqEngine::estimate_prefix_store_bytes(int tokens) const {
-    return estimate_paged_target_cache_snapshot_bytes(
-        b_.cache_, b_.snap_backend_, tokens);
+    return estimate_paged_target_cache_snapshot_bytes(b_.cache_, tokens);
 }
 
 int Qwen35SeqEngine::checkpoint_index(PrefixStoreRef checkpoint) const {
@@ -125,21 +124,23 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
             slots_.retire(slot);
             result = slots_.admit(request_id, prompt, sampler);
             result.prefix_store.invalidated = plan.restore;
-            result.prefix_store.restore_elapsed_us = restore_elapsed_us;
-            if (result.status != AdmitResult::Status::admitted) {
-                result.error = "cold admission failed after stale prefix restore";
-                return result;
+            if (result.status == AdmitResult::Status::admitted) {
+                reset_recurrent_slot(b_.cache_, result.slot);
+            } else {
+                result.error =
+                    "cold admission failed after stale prefix restore";
             }
-            reset_recurrent_slot(b_.cache_, result.slot);
         } else {
             result.prefix_store.restored = plan.restore;
-            result.prefix_store.restore_elapsed_us = restore_elapsed_us;
             std::fprintf(stderr,
                 "[parallel-pc] restored checkpoint=%llu seq_slot=%d "
                 "tokens=%d time_ms=%.1f\n",
                 (unsigned long long)plan.restore.id, slot,
                 plan.restore.tokens, (double)restore_elapsed_us / 1000.0);
         }
+        result.prefix_store.restore_attempted = true;
+        result.prefix_store.restore_elapsed_us = restore_elapsed_us;
+        if (result.status != AdmitResult::Status::admitted) return result;
     } else {
         reset_recurrent_slot(b_.cache_, slot);
     }
@@ -176,7 +177,7 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
     const auto capture_started = std::chrono::steady_clock::now();
     PrefixSnapshot & snapshot = b_.prefix_snapshots_[checkpoint];
     if (!replace_paged_target_cache(
-            b_.cache_, b_.snap_backend_, slot, sequence.block_table,
+            b_.cache_, slot, sequence.block_table,
             (int)pool_.block_size(), ticket.checkpoint.tokens, snapshot)) {
         event.elapsed_us =
             (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(

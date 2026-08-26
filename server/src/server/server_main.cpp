@@ -832,9 +832,15 @@ int main(int argc, char ** argv) {
     // classic single-sequence format and remain disabled in paged mode.
     if (bargs.paged_attention) {
         if (bargs.max_concurrency > 1) {
-            std::fprintf(stderr,
-                "[server] concurrent paged serving enables copied in-memory "
-                "prefix checkpoints; full-prefill and disk caches remain disabled\n");
+            if (sconfig.prefix_cache_cap > 0) {
+                std::fprintf(stderr,
+                    "[server] concurrent paged serving enables copied in-memory "
+                    "prefix checkpoints; full-prefill and disk caches remain disabled\n");
+            } else {
+                std::fprintf(stderr,
+                    "[server] concurrent paged serving: prefix checkpoints are "
+                    "disabled; full-prefill and disk caches remain disabled\n");
+            }
         } else {
             std::fprintf(stderr,
                 "[server] single-sequence --paged-attention still disables "

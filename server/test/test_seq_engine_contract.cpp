@@ -264,6 +264,21 @@ int main() {
     }
 
     {
+        PrefixStoreAdmission admission;
+        CHECK(!admission.malformed_restore_state());
+        admission.restored = {3, 0};
+        CHECK(admission.malformed_restore_state());
+        admission.restored = {3, 8};
+        CHECK(admission.malformed_restore_state());
+        admission.restore_attempted = true;
+        CHECK(!admission.malformed_restore_state());
+        admission.restored = {};
+        CHECK(admission.malformed_restore_state());
+        admission.invalidated = {3, -1};
+        CHECK(admission.malformed_restore_state());
+    }
+
+    {
         SeqEngine::StepPlan plan;
         plan.prefills.push_back({0, 8});
         SeqEngine::StepResult result;

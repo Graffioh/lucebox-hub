@@ -98,6 +98,33 @@ struct SchedulerTestHarness {
         server.stopping_.store(true, std::memory_order_relaxed);
         server.queue_cv_.notify_all();
     }
+
+    static void finalize_inline_snapshot(
+            HttpServer & server, const std::vector<int32_t> & prompt,
+            PrefixCache::InlineReservation reservation,
+            int slot, int requested_cut) {
+        ParsedRequest req;
+        req.prompt_tokens = prompt;
+        HttpServer::PreparedPrompt prepared;
+        prepared.tokens = prompt;
+        HttpServer::GenerationCacheState cache;
+        cache.snap_reservation = std::move(reservation);
+        cache.snap_slot = slot;
+        cache.snap_cut = requested_cut;
+        cache.snap_prepared = true;
+        GenerateResult result;
+        result.error.reset();
+        server.finalize_generation_cache(
+            req, prepared, cache, result,
+            /*completion_tokens=*/1,
+            /*visible_output_seen=*/true,
+            /*client_disconnected=*/false);
+    }
+
+    static const std::vector<int32_t> & slot_tokens(
+            const HttpServer & server, int slot) {
+        return server.slot_tokens_.at(slot);
+    }
 };
 }
 
@@ -3705,6 +3732,52 @@ struct MockBackend : ModelBackend {
     void shutdown() override {}
 };
 
+struct ShortInlineSnapshotBackend : MockBackend {
+    int saved_slot = -1;
+    int saved_position = 0;
+
+    bool snapshot_used(int slot) const override {
+        return slot == saved_slot && saved_position > 0;
+    }
+    int snapshot_cur_pos(int slot) const override {
+        return snapshot_used(slot) ? saved_position : 0;
+    }
+};
+
+TEST_CASE(ServerUnitFixture,
+          test_inline_snapshot_finalization_uses_actual_saved_position) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    ShortInlineSnapshotBackend backend;
+    ServerConfig config;
+    config.prefix_cache_cap = 2;
+    HttpServer server(backend, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    const std::vector<int32_t> prompt = {1, 100, 3, 101};
+    auto reservation = cache.reserve_inline_snap(
+        prompt, /*restored_prefix_len=*/0,
+        /*prefer_tools_boundary=*/false, /*forced_cut=*/4);
+    TEST_ASSERT(reservation.active());
+    TEST_ASSERT(reservation.target_cut() == 4);
+
+    backend.saved_slot = reservation.slot();
+    backend.saved_position = 3;
+    SchedulerTestHarness::finalize_inline_snapshot(
+        server, prompt, std::move(reservation), backend.saved_slot,
+        /*requested_cut=*/4);
+
+    const auto hit = cache.lookup(prompt);
+    TEST_ASSERT(hit.first == backend.saved_slot);
+    TEST_ASSERT(hit.second == backend.saved_position);
+    TEST_ASSERT(SchedulerTestHarness::slot_tokens(
+                    server, backend.saved_slot) ==
+                std::vector<int32_t>(prompt.begin(), prompt.begin() + 3));
+
+    unlink(path.c_str());
+}
+
 #if !defined(_WIN32)
 class SchedulerPrefixEngine final : public SeqEngine {
 public:
@@ -3768,8 +3841,14 @@ public:
         result.slot = chosen;
 
         if (plan.restore.valid()) {
+            result.prefix_store.restore_attempted = true;
             result.prefix_store.restore_elapsed_us = 2500;
-            if (plan.restore == PrefixStoreRef{2, 2}) {
+            if (unrequested_restore.load(std::memory_order_relaxed)) {
+                result.prefix_store.restored = {
+                    plan.restore.id + 1, plan.restore.tokens};
+            } else if (malformed_restore.load(std::memory_order_relaxed)) {
+                result.prefix_store.restored = {plan.restore.id, 0};
+            } else if (plan.restore == PrefixStoreRef{2, 2}) {
                 saw_stale_restore = true;
                 discarded.push_back(plan.restore);
                 result.prefix_store.invalidated = plan.restore;
@@ -3832,6 +3911,8 @@ public:
     bool saw_stale_restore = false;
     std::atomic<bool> defer_restore{false};
     std::atomic<bool> returned_busy_before_restore{false};
+    std::atomic<bool> unrequested_restore{false};
+    std::atomic<bool> malformed_restore{false};
     std::vector<PrefixStoreRef> discarded;
 
 private:
@@ -3885,9 +3966,11 @@ TEST_CASE(ServerUnitFixture,
         SchedulerTestHarness::run(server, backend.engine);
     });
 
-    for (int i = 0; i < 1000 &&
-         !backend.engine.returned_busy_before_restore.load(
-             std::memory_order_relaxed); ++i) {
+    const auto busy_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!backend.engine.returned_busy_before_restore.load(
+               std::memory_order_relaxed) &&
+           std::chrono::steady_clock::now() < busy_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     const bool returned_busy =
@@ -3918,6 +4001,118 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(stats.restore_attempts == 1);
     TEST_ASSERT(stats.restore_invalidations == 0);
     TEST_ASSERT(stats.restore_stall_us_total == 2500);
+}
+
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_rejects_malformed_restore_and_drops_stale_entry) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    SchedulerPrefixBackend backend;
+    backend.engine.malformed_restore.store(true, std::memory_order_relaxed);
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;
+    config.concurrent_prefix_cache_max_bytes = 1024;
+    config.concurrent_paged_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(backend, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    cache.confirm_inline_snap(
+        /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
+
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    ServerJob job;
+    job.fd = sockets[0];
+    job.req.format = ApiFormat::OPENAI_CHAT;
+    job.req.prompt_tokens = {1, 100, 999};
+    job.req.max_output = 1;
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "malformed-restore";
+
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+
+    std::unique_lock<std::mutex> lock(job.mu);
+    const bool done = job.cv.wait_for(
+        lock, std::chrono::seconds(5), [&] { return job.done; });
+    lock.unlock();
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+
+    close(sockets[0]);
+    close(sockets[1]);
+    unlink(path.c_str());
+
+    TEST_ASSERT(done);
+    TEST_ASSERT(cache.lookup_candidate({1, 100, 999}, 2).first == -1);
+    TEST_ASSERT(backend.engine.discarded ==
+                std::vector<PrefixStoreRef>({{1, 2}}));
+    const auto stats = cache.stats();
+    TEST_ASSERT(stats.restore_attempts == 1);
+    TEST_ASSERT(stats.restore_invalidations == 1);
+    TEST_ASSERT(stats.restore_stall_us_total == 2500);
+}
+
+TEST_CASE(ServerUnitFixture,
+          test_scheduler_discards_unrequested_restored_checkpoint) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    SchedulerPrefixBackend backend;
+    backend.engine.unrequested_restore.store(true, std::memory_order_relaxed);
+    ServerConfig config;
+    config.arch = "qwen35";
+    config.max_ctx = 64;
+    config.prefix_cache_cap = 2;
+    config.concurrent_prefix_cache_max_bytes = 1024;
+    config.concurrent_paged_prefix_cache = true;
+    config.admission_coalesce_ms = 0;
+    HttpServer server(backend, tokenizer, config);
+    PrefixCache & cache = SchedulerTestHarness::prefix_cache(server);
+    cache.confirm_inline_snap(
+        /*slot=*/0, /*target_cut=*/2, {1, 100}, false, 128);
+
+    int sockets[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    ServerJob job;
+    job.fd = sockets[0];
+    job.req.format = ApiFormat::OPENAI_CHAT;
+    job.req.prompt_tokens = {1, 100, 999};
+    job.req.max_output = 1;
+    job.req.stream = false;
+    job.req.model = "scheduler-test";
+    job.req.response_id = "unrequested-restore";
+
+    SchedulerTestHarness::enqueue(server, &job);
+    std::thread scheduler([&] {
+        SchedulerTestHarness::run(server, backend.engine);
+    });
+
+    std::unique_lock<std::mutex> lock(job.mu);
+    const bool done = job.cv.wait_for(
+        lock, std::chrono::seconds(5), [&] { return job.done; });
+    lock.unlock();
+    SchedulerTestHarness::stop(server);
+    scheduler.join();
+
+    close(sockets[0]);
+    close(sockets[1]);
+    unlink(path.c_str());
+
+    TEST_ASSERT(done);
+    TEST_ASSERT(backend.engine.discarded ==
+                std::vector<PrefixStoreRef>({{2, 2}}));
+    TEST_ASSERT(cache.lookup_candidate({1, 100, 999}, 2).first == 0);
 }
 
 TEST_CASE(ServerUnitFixture,

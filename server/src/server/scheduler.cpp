@@ -518,9 +518,21 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 
         std::string prefix_protocol_error;
         const PrefixStoreAdmission & prefix = ar.prefix_store;
-        if (prefix.restore_attempted()) {
+        if (prefix.restore_attempted) {
             prefix_cache_.record_restore_attempt(
                 prefix.restore_elapsed_us, prefix.restored.valid());
+        }
+        if (prefix.malformed_restore_state()) {
+            prefix_protocol_error =
+                "engine returned malformed prefix restore state";
+            // A malformed outcome does not tell us whether the engine-owned
+            // payload is still usable. Drop both sides of the requested
+            // checkpoint so a later lookup cannot retry stale metadata.
+            prepared_capture.cancel();
+            if (requested_plan.restore.valid() && restore_policy_slot >= 0) {
+                engine.discard_prefix_store(requested_plan.restore);
+                prefix_cache_.invalidate_inline_snap(restore_policy_slot);
+            }
         }
         if (prefix.invalidated.valid()) {
             if (prefix.invalidated != requested_plan.restore ||
@@ -538,6 +550,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
         if (prefix.restored.valid() &&
             prefix.restored != requested_plan.restore) {
+            engine.discard_prefix_store(prefix.restored);
             prefix_protocol_error =
                 "engine restored an unrequested prefix checkpoint";
         }

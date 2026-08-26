@@ -17,6 +17,7 @@ struct PrefixStoreRef {
     uint64_t id = 0;
     int tokens = 0;
 
+    bool empty() const { return id == 0 && tokens == 0; }
     bool valid() const { return id != 0 && tokens > 0; }
 };
 
@@ -54,12 +55,19 @@ struct PrefixStoreAdmission {
     PrefixStoreRef restored;
     PrefixStoreRef invalidated;
     PrefixCaptureTicket capture;
+    // True only after the engine begins validating/copying a requested
+    // restore. Keep this independent from the result references: malformed
+    // references must still count as attempts and be rejected by the caller.
+    bool restore_attempted = false;
     // Wall time spent validating/copying a requested restore. Non-zero for
     // both successful restores and invalidations so operators can see stalls.
     uint64_t restore_elapsed_us = 0;
 
-    bool restore_attempted() const {
-        return restored.valid() || invalidated.valid();
+    bool malformed_restore_state() const {
+        const bool has_result = !restored.empty() || !invalidated.empty();
+        return restore_attempted != has_result ||
+            (!restored.empty() && !restored.valid()) ||
+            (!invalidated.empty() && !invalidated.valid());
     }
 };
 

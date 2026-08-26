@@ -555,12 +555,12 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache);
 // Free the snapshot's GPU buffers.
 void free_prefix_snapshot(PrefixSnapshot & snap);
 
-// Exact backend allocation size for the dense checkpoint layout used by
+// Exact CPU-buffer allocation size for the dense checkpoint layout used by
 // snapshot_paged_target_cache(). Returns zero when the cache topology or token
 // count is invalid. This lets the scheduler enforce a resident-memory budget
 // before allocating or copying a checkpoint.
 size_t estimate_paged_target_cache_snapshot_bytes(
-    const TargetCache & cache, ggml_backend_t snapshot_backend, int token_count);
+    const TargetCache & cache, int token_count);
 
 // Capture one live sequence from a multi-slot paged cache. Attention rows are
 // gathered through `block_table` into dense logical order in the copied
@@ -568,7 +568,6 @@ size_t estimate_paged_target_cache_snapshot_bytes(
 // table itself is intentionally not retained: every restore owns fresh pages.
 bool snapshot_paged_target_cache(
     const TargetCache & cache,
-    ggml_backend_t snapshot_backend,
     int seq_slot,
     const std::vector<uint32_t> & block_table,
     int block_size,
@@ -579,7 +578,6 @@ bool snapshot_paged_target_cache(
 // allocation, layout validation, or any staged copy fails.
 bool replace_paged_target_cache(
     const TargetCache & cache,
-    ggml_backend_t snapshot_backend,
     int seq_slot,
     const std::vector<uint32_t> & block_table,
     int block_size,

@@ -167,23 +167,28 @@ TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_uses_fresh_pages) {
 
     const size_t estimated_bytes =
         estimate_paged_target_cache_snapshot_bytes(
-            cache, backend, /*token_count=*/20);
+            cache, /*token_count=*/20);
     CHECK(estimated_bytes > 0);
 
     PrefixSnapshot snap;
     const std::vector<uint32_t> source_blocks = {2, 0};
     CHECK(snapshot_paged_target_cache(
-        cache, backend, /*seq_slot=*/1, source_blocks,
+        cache, /*seq_slot=*/1, source_blocks,
         /*block_size=*/16, /*token_count=*/20, snap));
     CHECK(snap.layout == PrefixSnapshot::Layout::paged &&
           snap.cur_pos == 20);
     CHECK(ggml_backend_buffer_get_size(snap.buf) == estimated_bytes);
+    // Paged copies use get/set with snapshot tensor data as host staging.
+    // Keep that storage on a true CPU buffer, including on unified-memory
+    // compute backends.
+    CHECK(ggml_backend_buffer_get_type(snap.buf) ==
+          ggml_backend_cpu_buffer_type());
 
     // An incomplete per-layer pair is invalid topology and must not replace
     // the committed payload.
     cache.attn_v[0] = nullptr;
     CHECK(!replace_paged_target_cache(
-        cache, backend, /*seq_slot=*/1, source_blocks,
+        cache, /*seq_slot=*/1, source_blocks,
         /*block_size=*/16, /*token_count=*/20, snap));
     cache.attn_v[0] = value;
     CHECK(snap.layout == PrefixSnapshot::Layout::paged &&
@@ -194,7 +199,7 @@ TEST_CASE(RecurrentSnapshotFixture, copied_paged_prefix_uses_fresh_pages) {
     // staged copy fails after allocating a differently-sized candidate.
     const std::vector<uint32_t> invalid_source_blocks = {4, 0};
     CHECK(!replace_paged_target_cache(
-        cache, backend, /*seq_slot=*/1, invalid_source_blocks,
+        cache, /*seq_slot=*/1, invalid_source_blocks,
         /*block_size=*/16, /*token_count=*/17, snap));
     CHECK(snap.layout == PrefixSnapshot::Layout::paged &&
           snap.cur_pos == 20);

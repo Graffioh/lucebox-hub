@@ -3464,17 +3464,19 @@ void HttpServer::finalize_generation_cache(
                 std::fprintf(stderr,
                     "[pc] inline snapshot requested=%d saved=%d slot=%d\n",
                     cache.snap_cut, saved_position, cache.snap_slot);
-                cache.snap_reservation.commit(effective_prompt);
-                // Track for shutdown save. The key may be stricter than a
-                // Qwen chunk-aligned snapshot, which is safe: matching the
-                // longer token prefix necessarily matches saved KV rows.
+                cache.snap_reservation.commit_at(
+                    effective_prompt, saved_position);
+                // Track the same prefix published by the in-memory cache.
+                // Some backends may save short of the requested cut, so the
+                // shutdown key must not claim rows the snapshot lacks.
                 slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
                     effective_prompt.begin(),
-                    effective_prompt.begin() + cache.snap_cut);
+                    effective_prompt.begin() + saved_position);
                 if (!disk_cache_.disabled()) {
                     disk_cache_.learn_layout(cache.snap_slot);
                     if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
-                        disk_cache_.save(cache.snap_slot, effective_prompt);
+                        disk_cache_.save(
+                            cache.snap_slot, slot_tokens_[cache.snap_slot]);
                     }
                 }
             } else {

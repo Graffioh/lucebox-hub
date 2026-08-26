@@ -2649,6 +2649,12 @@ bool paged_rows_fit(
     return true;
 }
 
+ggml_backend_buffer_type_t paged_snapshot_buffer_type() {
+    // Paged gather/scatter passes snapshot tensor data to get/set as host
+    // staging, so even unified-memory compute backends need true CPU storage.
+    return ggml_backend_cpu_buffer_type();
+}
+
 enum class PagedCopyDirection { gather, scatter };
 
 void copy_paged_tensor(
@@ -2804,9 +2810,8 @@ bool paged_snapshot_matches(
 
 size_t estimate_paged_target_cache_snapshot_bytes(
         const TargetCache & cache,
-        ggml_backend_t snapshot_backend,
         int token_count) {
-    if (!snapshot_backend || cache.n_seq_slots < 1 || token_count <= 0 ||
+    if (cache.n_seq_slots < 1 || token_count <= 0 ||
         token_count > cache.max_ctx || !paged_cache_pairs_complete(cache)) {
         return 0;
     }
@@ -2815,21 +2820,19 @@ size_t estimate_paged_target_cache_snapshot_bytes(
     if (!create_paged_snapshot_layout(cache, token_count, layout)) return 0;
     const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
         layout.ctx,
-        ggml_backend_get_default_buffer_type(snapshot_backend));
+        paged_snapshot_buffer_type());
     free_prefix_snapshot(layout);
     return bytes;
 }
 
 bool snapshot_paged_target_cache(
         const TargetCache & cache,
-        ggml_backend_t snapshot_backend,
         int seq_slot,
         const std::vector<uint32_t> & block_table,
         int block_size,
         int token_count,
         PrefixSnapshot & snap) {
-    if (!snapshot_backend || !cache.backend ||
-        cache.n_seq_slots < 1 || seq_slot < 0 ||
+    if (!cache.backend || cache.n_seq_slots < 1 || seq_slot < 0 ||
         seq_slot >= cache.n_seq_slots || token_count <= 0 ||
         token_count > cache.max_ctx || block_size <= 0 ||
         block_table.size() < blocks_for_prefix(token_count, block_size) ||
@@ -2850,7 +2853,8 @@ bool snapshot_paged_target_cache(
             set_last_error("paged PrefixSnapshot ggml_init failed");
             return false;
         }
-        snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, snapshot_backend);
+        snap.buf = ggml_backend_alloc_ctx_tensors_from_buft(
+            snap.ctx, paged_snapshot_buffer_type());
         if (!snap.buf) {
             set_last_error("paged PrefixSnapshot buffer allocation failed");
             free_prefix_snapshot(snap);
@@ -2905,7 +2909,6 @@ bool snapshot_paged_target_cache(
 
 bool replace_paged_target_cache(
         const TargetCache & cache,
-        ggml_backend_t snapshot_backend,
         int seq_slot,
         const std::vector<uint32_t> & block_table,
         int block_size,
@@ -2913,8 +2916,8 @@ bool replace_paged_target_cache(
         PrefixSnapshot & destination) {
     PrefixSnapshot candidate;
     if (!snapshot_paged_target_cache(
-            cache, snapshot_backend, seq_slot, block_table, block_size,
-            token_count, candidate)) {
+            cache, seq_slot, block_table, block_size, token_count,
+            candidate)) {
         free_prefix_snapshot(candidate);
         return false;
     }
