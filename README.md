@@ -28,7 +28,7 @@
 
 | Optimization | Measured setup | Result |
 |---|---|---:|
-| [DFlash2](server/README.md) | Qwen 3.8 27B on one R9700 | **208.1 tok/s** average, **227.8 tok/s** peak |
+| [DFlash2](#run-the-server) | Qwen 3.8 27B on one R9700 | **208.1 tok/s** average, **227.8 tok/s** peak |
 | [DSpark](server/docs/DS4.md#dspark-speculative-decode) | DeepSeek V4 on Strix Halo, native top-6 | **32.7 tok/s** high-acceptance median; **27.9 tok/s** mixed-eval average |
 | [PFlash](optimizations/pflash/README.md) | Laguna XS 2.1 33B at 256K on RTX 3090 | **8.2×** faster prefill |
 | [Luce Spark](optimizations/spark/README.md) | Laguna XS 2.1 33B on RTX 3090 | **~100 tok/s** in **14.6 GiB** |
@@ -41,7 +41,7 @@
 
 ## Supported Models and Drafters
 
-Model names link directly to the target or drafter weights.
+Model links open the exact weights used by the measured setup. Drafter links open the published quant, or the source checkpoint when conversion is required.
 
 <table>
 <tr>
@@ -49,25 +49,25 @@ Model names link directly to the target or drafter weights.
 
 | Model and optimization | Speedup |
 |---|:---:|
-| [Qwen 3.5 0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) + [Megakernel](optimizations/megakernel/README.md) | **1.9×** prefill; **1.55×** decode |
-| [Qwen 3.8 27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) + [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) on R9700 | **6.4×** vs Lucebox AR; **3.8×** vs llama.cpp with the same drafter |
-| [Laguna XS 2.1 33B](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF) + PFlash with [Qwen3 0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | **8.2×** at 256K |
-| [Laguna XS 2.1 33B](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF) + [DFlash drafter](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF) | **1.7×** at 256K |
-| [Gemma 4 26B-A4B](https://huggingface.co/google/gemma-4-26B-A4B-it) + [DFlash drafter](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | **1.31×** |
-| [Gemma 4 31B IT](https://huggingface.co/google/gemma-4-31B-it) + [DFlash drafter](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | **3.2×** |
-| [DeepSeek V4 Flash ROCmFPX](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) + [DSpark drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF) | Up to **1.81×** vs target-only, **32.7 vs 18.1 tok/s** |
+| [Qwen 3.5 0.8B BF16](https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/model.safetensors-00001-of-00001.safetensors) + [Megakernel](optimizations/megakernel/README.md) | **1.9×** prefill; **1.55×** decode |
+| [Qwen 3.8 27B UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-IQ4_XS.gguf) + [DFlash2 source](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2/blob/main/model.safetensors), converted to Q8_0, on R9700 | **6.4×** vs Lucebox AR; **3.8×** vs llama.cpp with the same drafter |
+| [Laguna XS 2.1 33B Q4_K_M](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF/blob/main/Laguna-XS-2.1-Q4_K_M.gguf) + PFlash with [Qwen3 0.6B Q8_0](https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/blob/main/Qwen3-0.6B-Q8_0.gguf) | **8.2×** at 256K |
+| [Laguna XS 2.1 33B Q4_K_M](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF/blob/main/Laguna-XS-2.1-Q4_K_M.gguf) + [DFlash Q4 drafter](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF/blob/main/laguna-xs21-dflash-q4.gguf) | **1.7×** at 256K |
+| [Gemma 4 26B-A4B Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-26B-A4B-it-GGUF/blob/main/google_gemma-4-26B-A4B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF/blob/main/gemma-4-26B-A4B-it-DFlash-q8_0.gguf) | **1.31×** |
+| [Gemma 4 31B IT Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/blob/main/google_gemma-4-31B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/blob/main/gemma-4-31B-it-DFlash-q8_0.gguf) | **3.2×** |
+| [DeepSeek V4 Flash ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4 drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | Up to **1.81×** vs target-only, **32.7 vs 18.1 tok/s** |
 
 </td>
 <td valign="top">
 
 | Drafter or helper | Phase |
 |---|:---:|
-| [Qwen 3.8 27B DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | Decode |
-| [Gemma 4 26B-A4B](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | Decode |
-| [Gemma 4 31B](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | Decode |
-| [Laguna XS 2.1 33B](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF) | Decode |
-| [Qwen3 0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Prefill |
-| [DeepSeek V4 Flash DSpark](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF) | Decode |
+| [Qwen 3.8 27B DFlash2 source](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2/blob/main/model.safetensors) | Decode |
+| [Gemma 4 26B-A4B DFlash Q8_0](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF/blob/main/gemma-4-26B-A4B-it-DFlash-q8_0.gguf) | Decode |
+| [Gemma 4 31B DFlash Q8_0](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/blob/main/gemma-4-31B-it-DFlash-q8_0.gguf) | Decode |
+| [Laguna XS 2.1 DFlash Q4](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF/blob/main/laguna-xs21-dflash-q4.gguf) | Decode |
+| [Qwen3 0.6B Q8_0](https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/blob/main/Qwen3-0.6B-Q8_0.gguf) | Prefill |
+| [DeepSeek V4 Flash DSpark Q4RMFP4](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | Decode |
 
 </td>
 </tr>
@@ -79,31 +79,30 @@ The engine is not tied to one reference card. NVIDIA architectures are selected 
 
 | | Architecture | Hardware | Runtime | Details |
 |:---:|---|---|---|---|
-| <img src="assets/gpus/r9700.png" width="750" /> | RDNA4 `gfx1201` | Radeon AI PRO R9700 | ROCm 7.2 | [HIP setup](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
-| <img src="assets/gpus/ryze395.png" width="750" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 7.2 | [DeepSeek V4 setup](server/docs/DS4.md#monolithic-hip) |
-| <img src="assets/gpus/7900xtx.png" width="750" /> | RDNA3 `gfx1100` | Radeon RX 7900 XT / XTX | ROCm 6+ | [Dual AMD setup](server/docs/DS4.md#radeon-rx-7900-xt--strix-halo-true-top-k-6) |
-| <img src="assets/gpus/3090.png" width="750" /> | Ampere `sm_86` | RTX 3090, A-series | CUDA 12.0 | [DFlash](server/RESULTS.md) and [Megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) |
-| <img src="assets/gpus/5090.png" width="750" /> | Blackwell `sm_120` | RTX 5090 | CUDA 12.8 | [DFlash](server/RESULTS.md#rtx-5090-blackwell-sm_120sm_120a-32-gb) |
-| <img src="assets/gpus/gb10.png" width="750" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | [Megakernel NVFP4](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
-| <img src="assets/gpus/4090.png" width="750" /> | Ada `sm_89` | RTX 40xx | CUDA 12.0 | [Linux](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--cachyos-bare-metal-community) and [WSL2](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) community runs |
-| <img src="assets/gpus/2080ti.png" width="750" /> | Turing `sm_75` | RTX 2080 Ti | CUDA 12.0 | [DFlash](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
-| <img src="assets/gpus/v100.png" width="750" /> | Volta `sm_70`, Pascal `sm_61` | V100, P40 | CUDA 12.0 | Fallback paths |
-| Not pictured | Blackwell `sm_110` | Jetson AGX Thor | CUDA 13.0 | Builds, not benchmarked |
+| <img src="assets/gpus/r9700.png" width="750" /> | RDNA4 `gfx1201` | Radeon AI PRO R9700 | ROCm 7.2 | [Qwen 3.8 R9700 quick start](#run-the-server) |
+| <img src="assets/gpus/ryze395.png" width="750" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 7.2 | [DeepSeek V4 Strix profile](server/docs/RECOMMENDED_SETUPS.md#deepseek-v4-on-strix-halo) |
+| <img src="assets/gpus/7900xtx.png" width="750" /> | RDNA3 `gfx1100` | Radeon RX 7900 XT / XTX | ROCm 6+ | [DeepSeek V4 dual AMD profile](server/docs/DS4.md#radeon-rx-7900-xt--strix-halo-true-top-k-6) |
+| <img src="assets/gpus/3090.png" width="750" /> | Ampere `sm_86` | RTX 3090 | CUDA 12+ | [Qwen 3.5 DFlash results](server/RESULTS.md#headline--ar-vs-luce-dflash-at-concurrency-1) and [Megakernel results](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) |
+| <img src="assets/gpus/5090.png" width="750" /> | Blackwell `sm_120` | RTX 5090 | CUDA 12.8+ | [Qwen 3.6 Q4_K_M results](server/RESULTS.md#rtx-5090--q4_k_m-ddtree-budget-40-no-thinking-community) |
+| <img src="assets/gpus/gb10.png" width="750" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | [Qwen 3.5 NVFP4 results](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
+| <img src="assets/gpus/4090.png" width="750" /> | Ada `sm_89` | RTX 4090 | CUDA 12+ | [Linux](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--cachyos-bare-metal-community) and [WSL2](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) community runs |
+| <img src="assets/gpus/2080ti.png" width="750" /> | Turing `sm_75` | RTX 2080 Ti | CUDA 12.0 | [DFlash results](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
+| <img src="assets/gpus/v100.png" width="750" /> | Volta `sm_70`, Pascal `sm_61` | V100, P40 | CUDA 12.0 | [CUDA quick start](server/README.md#quick-start) |
+| Not pictured | Blackwell `sm_110` | Jetson AGX Thor | CUDA 13.0 | [Thor quick start](server/README.md#jetson-agx-thor-sm_110-cuda-130) |
 
 ### Single-device results
 
 | Hardware | Model | Measured result |
 |---|---|---|
-| **R9700** | [Qwen 3.8 27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) + [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | **208.1 tok/s** HumanEval average; **227.8 tok/s** best request |
-| **Strix Halo** | [DeepSeek V4 Flash ROCmFPX](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) + [DSpark](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF) | **32.7 tok/s** high-acceptance median; **27.9 tok/s** across the fixed 30-prompt evaluation, using all six routed experts |
-| **RTX 5090** | [Qwen 3.8 27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) + [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | **110.6 tok/s** for a 26,758-token prompt and 1,024-token continuation ([PR #637](https://github.com/Luce-Org/lucebox/pull/637)) |
+| **R9700** | [Qwen 3.8 27B UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-IQ4_XS.gguf) + [DFlash2 source](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2/blob/main/model.safetensors) | **208.1 tok/s** HumanEval average; **227.8 tok/s** best request |
+| **Strix Halo** | [DeepSeek V4 ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | **32.7 tok/s** high-acceptance median; **27.9 tok/s** across the fixed 30-prompt evaluation, using all six routed experts |
 
 ### Heterogeneous and parallel results
 
 | Hardware | Configuration | Measured result |
 |---|---|---|
 | **2x RTX 3090 + NVLink** | Qwen 3.8 target tensor parallel + DFlash2 | **79.7 tok/s**, **2.16×** autoregressive decode ([PR #637](https://github.com/Luce-Org/lucebox/pull/637)) |
-| **RX 7900 XT + Strix Halo** | DeepSeek V4 with all six experts + DSpark verification width 4 | **45.0 to 47.7 tok/s** decode; **111.2 tok/s** prefill at 132,981 tokens ([PR #604](https://github.com/Luce-Org/lucebox/pull/604)) |
+| **RX 7900 XT + Strix Halo** | DeepSeek V4 with all six experts + DSpark verification width 4 | **45.0 to 47.7 tok/s** decode; **111.2 tok/s** prefill at 132,981 tokens ([PR #604](https://github.com/Luce-Org/lucebox/pull/604#qualified-results)) |
 | **R9700 + Strix Halo** | DeepSeek V4 across both AMD devices | **86 tok/s** decode; **788 tok/s** prefill at 2K |
 
 These runs use different prompts, quantizations, and inference policies. They show which configurations work; they are not a cross-hardware ranking.
