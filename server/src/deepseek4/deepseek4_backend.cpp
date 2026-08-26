@@ -2149,10 +2149,13 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
          layer_range_hybrid);
     const bool exact_bands_enabled =
         env_flag_enabled("DFLASH_DS4_EXACT_PREFILL_BANDS");
-    const int base_chunk = deepseek4_prefill_chunk_tokens(
-        cfg_.prefill_mode,
-        exact_bands_enabled,
-        batch_supported, requested_chunk, layer_major_cap);
+    const int base_chunk =
+        cfg_.prefill_mode == PrefillAttentionMode::Exact &&
+        spec_drafter_ != nullptr
+            ? 1
+            : deepseek4_prefill_chunk_tokens(
+                  cfg_.prefill_mode, exact_bands_enabled,
+                  batch_supported, requested_chunk, layer_major_cap);
     const bool bound_hybrid_scratch =
         moe_hybrid_ &&
         cfg_.prefill_mode == PrefillAttentionMode::Sparse;
