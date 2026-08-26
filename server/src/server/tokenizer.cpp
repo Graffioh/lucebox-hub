@@ -213,9 +213,14 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
             }
         }
 
-        // Pattern 3: \p{N}  (single digit)
+        // Pattern 3: \p{N}{1,3}  (up to 3 digits)
         if (is_digit(cp)) {
-            pos += cplen;
+            int digit_count = 0;
+            while (digit_count < 3 && is_digit(cp)) {
+                pos += cplen;
+                digit_count++;
+                cp = peek_cp(pos, &cplen);
+            }
             pieces.push_back(text.substr(start, pos - start));
             continue;
         }
