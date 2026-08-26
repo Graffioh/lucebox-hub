@@ -26,30 +26,52 @@
 
 ## Inference Engine Optimizations
 
-Each path addresses a different bottleneck. The links include setup, limits, and measurements.
-
-| Optimization | Best for | What it does |
-|---|---|---|
-| [DFlash, DFlash2, and DSpark](server/) | Decode | A model-specific drafter proposes several tokens and the target verifies them together. |
-| [PFlash](optimizations/pflash/) | Long prompt prefill | A small drafter selects prompt blocks before the target processes them. |
-| [Luce Spark](optimizations/spark/) | Mixture-of-experts models | Keeps hot experts on the GPU and moves cold experts through bounded host-memory storage. |
-| [KVFlash](optimizations/kvflash/) | Long-context decode | Keeps a bounded KV working set on the GPU and recalls cold chunks from system memory. |
-| [Heterogeneous and multi-GPU execution](server/docs/MIXED_BACKEND.md) | Machines with more than one accelerator | Places targets, drafters, or experts across CUDA and HIP devices; also supports NVIDIA tensor parallelism. |
-| [Paged attention](optimizations/paged_attention/) | Concurrent serving | Shares a block-based KV pool across active requests. |
-| [Megakernel](optimizations/megakernel/) | Qwen 3.5 0.8B | Fuses 24 layers into one persistent CUDA dispatch. |
+| Optimization | Use | Measured value |
+|---|---|---:|
+| [DFlash, DFlash2, and DSpark](server/) | Speculative decode | **6.1×** Qwen 3.8; **2×** DeepSeek V4 |
+| [PFlash](optimizations/pflash/) | Speculative prefill | **8.2×** at 256K |
+| [Luce Spark](optimizations/spark/) | MoE expert offload | **~100 tok/s** in **14.6 GiB** |
+| [KVFlash](optimizations/kvflash/) | Bounded KV cache | **38.6 tok/s** at 256K with **72 MiB** resident KV |
+| [Heterogeneous and multi-GPU](server/docs/MIXED_BACKEND.md) | Mixed accelerators | **2.16×** AR on 2x RTX 3090; **51.1 tok/s** on R9700 + Strix Halo |
+| [Paged attention](optimizations/paged_attention/) | Concurrent serving | **1.35×** attention step; **82%** less KV memory |
+| [Megakernel](optimizations/megakernel/) | Fused Qwen 3.5 0.8B | **413 tok/s**, **1.87 tok/J** on RTX 3090 |
 
 ---
 
 ## Supported Models and Drafters
 
-The results below focus on Qwen 3.8 and DeepSeek V4. Qwen 3.5 and 3.6 remain supported, but their older measurements stay in the component docs instead of being presented as current results.
+Speedups use vendored llama.cpp with Flash Attention and matching KV quantization. Combined results use the geometric mean of prefill and decode.
 
-| Target | Acceleration paths | Drafter or helper |
-|---|---|---|
-| [**Qwen 3.8 27B**](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | DFlash2, CUDA tensor parallelism | [Qwen3.8 27B DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) |
-| [**DeepSeek V4 Flash ROCmFPX**](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) | DSpark, single-device HIP, heterogeneous expert parallelism | [DeepSeek V4 Flash DSpark](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF) |
-| **Laguna XS 2.1 33B** | DFlash, PFlash, Spark, KVFlash | [Laguna DFlash](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF) and [Qwen3 0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) for prefill |
-| **Gemma 4 26B-A4B and 31B IT** | DFlash, KVFlash | [26B drafter](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) and [31B drafter](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) |
+<table>
+<tr>
+<td valign="top">
+
+| Model and path | Speedup |
+|---|:---:|
+| Qwen 3.5 0.8B + [Megakernel](optimizations/megakernel/) | **~2×** |
+| [Qwen 3.8 27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) + DFlash2 on R9700 | **6.1×** decode |
+| Qwen 3.8 27B + DFlash2 vs llama.cpp with the same drafter | **3.5×** decode |
+| Laguna XS 2.1 33B + PFlash | **8.2×** at 256K |
+| Laguna XS 2.1 33B + DFlash | **1.7×** at 256K |
+| Gemma 4 26B-A4B | **1.31×** |
+| Gemma 4 31B IT | **3.2×** |
+| [DeepSeek V4 Flash ROCmFPX](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) | **2×** |
+
+</td>
+<td valign="top">
+
+| Drafter or helper | Phase |
+|---|:---:|
+| [Qwen 3.8 27B DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | Decode |
+| [Gemma 4 26B-A4B](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | Decode |
+| [Gemma 4 31B](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | Decode |
+| [Laguna XS 2.1 33B](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF) | Decode |
+| [Qwen3 0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Prefill |
+| [DeepSeek V4 Flash DSpark](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF) | Decode |
+
+</td>
+</tr>
+</table>
 
 ## Tested Machines (GPU/APU)
 
