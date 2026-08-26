@@ -7214,6 +7214,10 @@ bool deepseek4_paged_gathered_step(
             }
         }
     }
+    const DeepSeek4RoctxRange roctx_range(
+        "ds4.paged_gathered_step",
+        {InferencePhase::Batched, static_cast<int>(lanes), 0, w.n_layer,
+         device});
     auto * rt = static_cast<Ds4PagedGatheredRuntime *>(cache.gathered_runtime);
     if (!rt) {
         rt = new (std::nothrow) Ds4PagedGatheredRuntime;
