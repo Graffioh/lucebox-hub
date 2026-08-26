@@ -100,6 +100,10 @@ Use this table to choose a profile. The linked guides contain the complete build
 | Exact heterogeneous AMD | RX 7900 XT + Strix Halo + DeepSeek V4 | Use the qualified true top-6 profile in [`serve_ds4_dual_rocm_128k.sh`](server/scripts/serve_ds4_dual_rocm_128k.sh). |
 | Lucebox heterogeneous profile | R9700 + Strix Halo + DeepSeek V4 | Use the opt-in in-process expert-parallel profile. Top-4 routing and sparse prefill remain explicit approximations. [DS4 guide](server/docs/DS4.md#in-process-heterogeneous-expert-parallel) |
 
+The DS4 guide also documents the Strix long-context sparse-verifier profile and
+Qwen3-0.6B PFlash integration. PFlash is lossy prompt compression; keep it off
+for exact-retrieval and matched true-context benchmarks.
+
 ## Client Harnesses
 
 [`harness/`](harness/) runs Lucebox through popular coding clients and checks server compatibility.
