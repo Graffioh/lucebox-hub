@@ -2972,12 +2972,12 @@ extern "C" {
             struct ggml_tensor * tensor,
             bool                 skip_intermediate);
 
-    // CUDA/HIP fixed-chain journal in compact F32 [J,H,T,B] layout:
+    // CUDA/HIP fixed-chain replay log in compact F32 [J,H,T,B] layout:
     // scalar gate J=2*S_v+1 stores [g | k | delta], while KDA J=3*S_v
     // stores [g[S_v] | k | delta]. Delta is captured after the
     // state-dependent reduction. The returned tensor owns a compact copy so
     // graph allocation can release the much larger GDN result after capture.
-    GGML_API struct ggml_tensor * ggml_gated_delta_net_capture_transition_journal(
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_capture_replay_log(
             struct ggml_context * ctx,
             struct ggml_tensor  * tensor);
 

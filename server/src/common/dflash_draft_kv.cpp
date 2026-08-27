@@ -14,11 +14,12 @@ static inline int mask_align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 static constexpr uint16_t F16_ZERO    = 0x0000;
 static constexpr uint16_t F16_NEG_INF = 0xFC00;
 
-bool draft_kv_init(DraftKvState & st,
-                   const DraftWeights & dw,
-                   ggml_backend_t backend,
-                   int cap,
-                   ggml_tensor * lm_head) {
+static bool draft_kv_init_impl(DraftKvState & st,
+                               const DraftWeights & dw,
+                               ggml_backend_t backend,
+                               int cap,
+                               ggml_tensor * lm_head,
+                               bool batched) {
     if (cap <= 0 || dw.block_size <= 0) return false;
     static const bool disable_swa =
         std::getenv("DFLASH_DISABLE_DRAFT_SWA") != nullptr;
@@ -71,6 +72,22 @@ bool draft_kv_init(DraftKvState & st,
     // must be finite; pad feature rows must be finite for the trash-slot rows.
     ggml_backend_buffer_clear(st.mem_buf, 0);
 
+    // Static lane state used by both single-lane and batched graphs.
+    std::vector<int32_t> nrows((size_t)st.q_len);
+    for (int i = 0; i < st.q_len; i++) nrows[(size_t)i] = st.cap + i;
+    ggml_backend_tensor_set(st.noise_rows, nrows.data(), 0,
+                            sizeof(int32_t) * nrows.size());
+
+    st.built_for = &dw;
+    st.slot_pos.assign((size_t)st.cap, -1);
+    st.next_pos = 0;
+    std::fprintf(stderr,
+        "[draft-kv] ctx-KV ring active: cap=%d kv_total=%d a_step=%d "
+        "layers=%d f16 cache %.1f MiB\n",
+        st.cap, st.kv_total, st.a_step, dw.n_layer,
+        (double)(2ull * dw.n_layer * (size_t)kv_row * st.kv_total * 2) / (1024.0 * 1024.0));
+    if (batched) return true;
+
     // ── build the fixed-topology step graph once
     const size_t arena_sz = 16u * 1024 * 1024;
     st.meta_arena.resize(arena_sz);
@@ -96,10 +113,12 @@ bool draft_kv_init(DraftKvState & st,
     si.mask_full   = st.mask_full;
     si.mask_swa    = st.mask_swa;
     si.lm_head     = lm_head;
-    DraftGraphOutputs go = build_draft_kv_step(st.g_ctx, st.gf, dw, st.cache, si);
-    if (!go.hidden_states) return false;
-    st.hidden_states = go.hidden_states;
-    st.logits        = go.logits;
+    const std::vector<DraftKvLaneInputs> lanes{{&st.cache, si}};
+    const std::vector<DraftGraphOutputs> outputs =
+        build_draft_kv_steps(st.g_ctx, st.gf, dw, lanes);
+    if (outputs.size() != 1 || !outputs.front().hidden_states) return false;
+    st.hidden_states = outputs.front().hidden_states;
+    st.logits        = outputs.front().logits;
     ggml_set_output(st.hidden_states);
     ggml_build_forward_expand(st.gf, st.hidden_states);
     if (st.logits) {
@@ -113,21 +132,22 @@ bool draft_kv_init(DraftKvState & st,
         return false;
     }
 
-    // static noise scratch slots
-    std::vector<int32_t> nrows((size_t)st.q_len);
-    for (int i = 0; i < st.q_len; i++) nrows[(size_t)i] = st.cap + i;
-    ggml_backend_tensor_set(st.noise_rows, nrows.data(), 0,
-                            sizeof(int32_t) * nrows.size());
-
-    st.built_for = &dw;
-    st.slot_pos.assign((size_t)st.cap, -1);
-    st.next_pos = 0;
-    std::fprintf(stderr,
-        "[draft-kv] ctx-KV ring active: cap=%d kv_total=%d a_step=%d "
-        "layers=%d f16 cache %.1f MiB\n",
-        st.cap, st.kv_total, st.a_step, dw.n_layer,
-        (double)(2ull * dw.n_layer * (size_t)kv_row * st.kv_total * 2) / (1024.0 * 1024.0));
     return true;
+}
+
+bool draft_kv_init(DraftKvState & st,
+                   const DraftWeights & dw,
+                   ggml_backend_t backend,
+                   int cap,
+                   ggml_tensor * lm_head) {
+    return draft_kv_init_impl(st, dw, backend, cap, lm_head, false);
+}
+
+bool draft_kv_init_batched(DraftKvState & st,
+                           const DraftWeights & dw,
+                           ggml_backend_t backend,
+                           int cap) {
+    return draft_kv_init_impl(st, dw, backend, cap, nullptr, true);
 }
 
 void draft_kv_reset(DraftKvState & st) {
@@ -229,7 +249,8 @@ bool draft_kv_begin_step(DraftKvState & st,
                          ggml_backend_t backend,
                          const DraftFeatureMirror & ring,
                          int committed) {
-    if (!st.gf || committed <= 0) return false;
+    if (!st.mem_buf || st.built_for != static_cast<const void *>(&dw) ||
+        committed <= 0) return false;
     // Rewind (prefix-cache restore / new shorter request): stale slots would
     // shadow live window positions, so rebuild from scratch.
     if (st.next_pos > committed) draft_kv_reset(st);
@@ -334,6 +355,7 @@ void draft_kv_batch_free(DraftKvBatchGraph & batch) {
     batch.meta_arena.clear();
     batch.n_lanes = 0;
     batch.q_len = 0;
+    batch.backend = nullptr;
     batch.built_for = nullptr;
 }
 
@@ -397,6 +419,8 @@ static bool draft_kv_batch_build(
         batch.g_ctx, graph_capacity, false);
 
     batch.hidden_by_lane.reserve(static_cast<size_t>(n_lanes));
+    std::vector<DraftKvLaneInputs> lanes;
+    lanes.reserve(n_lanes_size);
     for (DraftKvState * state : lane_states) {
         DraftKvAppendInputs append{};
         append.n_rows = state->a_step;
@@ -415,8 +439,16 @@ static bool draft_kv_batch_build(
         step.noise_rows = state->noise_rows;
         step.mask_full = state->mask_full;
         step.mask_swa = state->mask_swa;
-        DraftGraphOutputs output = build_draft_kv_step(
-            batch.g_ctx, batch.gf, dw, state->cache, step);
+        lanes.push_back({&state->cache, step});
+    }
+
+    const std::vector<DraftGraphOutputs> outputs = build_draft_kv_steps(
+        batch.g_ctx, batch.gf, dw, lanes);
+    if (outputs.size() != lane_states.size()) {
+        draft_kv_batch_free(batch);
+        return false;
+    }
+    for (const DraftGraphOutputs & output : outputs) {
         if (!output.hidden_states) {
             draft_kv_batch_free(batch);
             return false;
@@ -439,6 +471,7 @@ static bool draft_kv_batch_build(
     batch.n_lanes = n_lanes;
     batch.q_len = dw.block_size;
     batch.built_for = &dw;
+    batch.backend = backend;
     batch.lane_states = lane_states;
     std::fprintf(stderr,
         "[draft-kv-batch] packed backbone ready lanes=%d q_len=%d "
@@ -460,7 +493,7 @@ bool draft_kv_batch_compute(
 
     const bool reusable =
         batch.gf && batch.built_for == static_cast<const void *>(&dw) &&
-        batch.lane_states == lane_states;
+        batch.backend == backend && batch.lane_states == lane_states;
     if (!reusable &&
         !draft_kv_batch_build(
             batch, dw, backend, lane_states)) {
