@@ -571,6 +571,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         pool_size -= size;
     }
 
+    bool is_legacy() const override {
+        return true;
+    }
+
     size_t trim() override {
         ggml_cuda_set_device(device);
         size_t freed = 0;
@@ -720,6 +724,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+    }
+
+    bool is_legacy() const override {
+        return false;
     }
 
     // VMM mappings form a contiguous reusable arena and do not suffer from
@@ -5205,6 +5213,27 @@ extern "C" size_t ggml_backend_cuda_graph_invalidate_range(
 #endif
 }
 
+static bool ggml_cuda_has_legacy_pool(const ggml_backend_cuda_context * cuda_ctx) {
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            const auto & pool = cuda_ctx->pools[device][stream];
+            if (pool != nullptr && pool->is_legacy()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+extern "C" bool ggml_backend_cuda_has_legacy_pool(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+
+    const auto * cuda_ctx = static_cast<const ggml_backend_cuda_context *>(backend->context);
+    return ggml_cuda_has_legacy_pool(cuda_ctx);
+}
+
 extern "C" size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend) {
     if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
         return 0;
@@ -5212,6 +5241,17 @@ extern "C" size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend) {
 
     ggml_backend_synchronize(backend);
     auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    const bool has_legacy_pool = ggml_cuda_has_legacy_pool(cuda_ctx);
+
+#ifdef USE_CUDA_GRAPH
+    if (has_legacy_pool) {
+        // Captured kernels retain internal temporary addresses that are not
+        // represented in node_props. Retire every executable before any of
+        // those cached blocks can be returned to the driver.
+        ggml_cuda_set_device(cuda_ctx->device);
+        cuda_ctx->cuda_graphs.clear();
+    }
+#endif
 
     // Per-evaluation activation memos own allocations from these pools.
     // Release them before destroying cached free blocks.

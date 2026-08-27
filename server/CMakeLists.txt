@@ -860,13 +860,16 @@ if(DFLASH27B_TESTS)
         endif()
     endif()
 
-    if(DFLASH27B_GPU_BACKEND STREQUAL "hip"
+    if((DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "cuda")
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_pool_shutdown.cpp")
         add_executable(test_cuda_pool_shutdown
             test/test_unit_main.cpp
             test/test_cuda_pool_shutdown.cpp)
-        set_source_files_properties(test/test_cuda_pool_shutdown.cpp PROPERTIES LANGUAGE HIP)
-        set_target_properties(test_cuda_pool_shutdown PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            set_source_files_properties(test/test_cuda_pool_shutdown.cpp PROPERTIES LANGUAGE HIP)
+            set_target_properties(test_cuda_pool_shutdown PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        endif()
         target_include_directories(test_cuda_pool_shutdown PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         target_link_libraries(test_cuda_pool_shutdown PRIVATE
