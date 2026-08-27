@@ -570,6 +570,23 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
     }
+
+    size_t trim() override {
+        ggml_cuda_set_device(device);
+        size_t freed = 0;
+        for (int i = 0; i < MAX_BUFFERS; ++i) {
+            ggml_cuda_buffer & b = buffer_pool[i];
+            if (b.ptr == nullptr) {
+                continue;
+            }
+            CUDA_CHECK(cudaFree(b.ptr));
+            freed += b.size;
+            pool_size -= b.size;
+            b.ptr = nullptr;
+            b.size = 0;
+        }
+        return freed;
+    }
 };
 
 // pool with virtual memory
@@ -703,6 +720,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+    }
+
+    // VMM mappings form a contiguous reusable arena and do not suffer from
+    // the fragmented legacy-pool failure this hook addresses.
+    size_t trim() override {
+        return 0;
     }
 };
 #endif // defined(GGML_USE_VMM)
@@ -5180,6 +5203,31 @@ extern "C" size_t ggml_backend_cuda_graph_invalidate_range(
     GGML_UNUSED(size);
     return 0;
 #endif
+}
+
+extern "C" size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+
+    ggml_backend_synchronize(backend);
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+
+    // Per-evaluation activation memos own allocations from these pools.
+    // Release them before destroying cached free blocks.
+    while (!cuda_ctx->luce_q8_memo.empty()) {
+        cuda_ctx->luce_q8_memo.pop_back();
+    }
+
+    size_t freed = 0;
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            if (cuda_ctx->pools[device][stream] != nullptr) {
+                freed += cuda_ctx->pools[device][stream]->trim();
+            }
+        }
+    }
+    return freed;
 }
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {

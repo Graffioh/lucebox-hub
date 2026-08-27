@@ -50,6 +50,11 @@ GGML_BACKEND_API size_t ggml_backend_cuda_graph_invalidate_range(
         const void *   begin,
         size_t         size);
 
+// Release cached temporary allocations held by a CUDA/HIP backend's legacy
+// device pools. The backend is synchronized first. VMM pools are already a
+// contiguous reusable arena and are left intact. Returns bytes released.
+GGML_BACKEND_API size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend);
+
 // Disable CUDA/HIP graph capture and replay on the calling thread. Returns the
 // previous value so scoped callers can restore nested overrides correctly.
 GGML_BACKEND_API bool ggml_backend_cuda_set_graphs_disabled_override(bool disabled);

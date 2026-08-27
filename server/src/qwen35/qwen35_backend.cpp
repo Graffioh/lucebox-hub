@@ -1317,7 +1317,17 @@ void Qwen35Backend::release_scratch() {
     flashprefill::dflash_bsa_free_persistent();
 #endif
 
-    std::fprintf(stderr, "[vram] released scratch buffers\n");
+    // Gallocr teardown does not release operator temporaries cached by the
+    // legacy CUDA/HIP pools. On non-VMM devices a long prefill can otherwise
+    // leave nearly all VRAM reserved and make the next differently shaped
+    // request fail despite having no live scratch tensors.
+    size_t trimmed = ggml_backend_cuda_trim_pool(target_backend_);
+    if (draft_backend_ && draft_backend_ != target_backend_) {
+        trimmed += ggml_backend_cuda_trim_pool(draft_backend_);
+    }
+
+    std::fprintf(stderr, "[vram] released scratch buffers; trimmed %.1f MiB from device pools\n",
+                 trimmed / (1024.0 * 1024.0));
 }
 
 // ── Generate (speculative decode) ───────────────────────────────────────

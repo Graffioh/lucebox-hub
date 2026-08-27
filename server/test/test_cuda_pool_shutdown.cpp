@@ -55,6 +55,7 @@ TEST_CASE(CudaPoolShutdownFixture, backend_pool_shutdown) {
     ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
 
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    ggml_backend_synchronize(backend);
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     if (status != GGML_STATUS_SUCCESS) {
@@ -62,8 +63,13 @@ TEST_CASE(CudaPoolShutdownFixture, backend_pool_shutdown) {
         REQUIRE_TRUE(false);
     }
 
-    // LUCE_Q8_MEMO intentionally retains the pool allocation after compute.
-    // Backend teardown must release that allocation before destroying its pool.
+    // LUCE_Q8_MEMO intentionally retains a pool allocation after compute.
+    // Request-boundary trimming must first release that memo, then return its
+    // cached block to the driver rather than retaining VRAM indefinitely.
+    const size_t trimmed = ggml_backend_cuda_trim_pool(backend);
+    REQUIRE(trimmed > 0);
+
+    // Backend teardown must remain safe after an explicit trim.
     ggml_backend_free(backend);
     REQUIRE_TRUE(true);
 }
