@@ -924,6 +924,97 @@ TEST_CASE(ServerUnitFixture, test_parse_bare_function_json_with_parameters) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_invoke_name_parameters) {
+    const std::string text =
+        "Let me read the file.\n\n"
+        "<function_call>\n"
+        "<invoke_name>read</invoke_name>\n"
+        "<parameters>\n"
+        "<path>/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go</path>\n"
+        "</parameters>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go");
+    }
+    TEST_ASSERT(result.cleaned_text == "Let me read the file.");
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_multiple_parameters) {
+    const std::string text =
+        "<function_call>\n"
+        "<invoke_name>bash</invoke_name>\n"
+        "<parameters>\n"
+        "<command>ls -la /tmp</command>\n"
+        "<timeout>10</timeout>\n"
+        "</parameters>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"timeout", {{"type", "integer"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la /tmp");
+        TEST_ASSERT(args["timeout"] == 10);
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml_invoke_name_parameters) {
+    const std::string text =
+        "<tool_call>\n"
+        "<invoke_name>read</invoke_name>\n"
+        "<parameters>\n"
+        "<path>/home/dpavlin/test.go</path>\n"
+        "</parameters>\n"
+        "</tool_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/home/dpavlin/test.go");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
 
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
