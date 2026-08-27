@@ -621,6 +621,11 @@ static bool parse_complete_parameter_body(const std::string & body,
 
 static bool parse_xml_tool_call_body(const std::string & body, const json & tools,
                                      std::string & name, json & args, std::string & raw_args) {
+    std::string trimmed = trim_ws(body);
+    if (trimmed.empty() || trimmed.front() == '{' || trimmed.find('<') == std::string::npos) {
+        return false;
+    }
+
     // 1. Look for function name in <invoke_name>, <name>, <tool_name>, <function_name>, or <invoke name="...">
     static const std::regex re_name(
         R"(<(?:invoke_name|name|tool_name|function_name)>\s*([A-Za-z_][\w.\-]*)\s*</(?:invoke_name|name|tool_name|function_name)>|<invoke\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?)");
