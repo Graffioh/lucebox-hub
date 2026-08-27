@@ -1128,6 +1128,37 @@ TEST_CASE(ServerUnitFixture, test_parse_xml_tool_call_invoke_envelope_attribute_
     TEST_ASSERT(result.cleaned_text.empty());
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml_function_name_tag) {
+    // Regression test for Violation:
+    // <tool_call> envelopes using <function_name> must be parsed cleanly by parse_xml_tool_call_body()
+    const std::string text =
+        "<tool_call>\n"
+        "<function_name>read</function_name>\n"
+        "<parameters>\n"
+        "<path>/tmp/test.txt</path>\n"
+        "</parameters>\n"
+        "</tool_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/tmp/test.txt");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
 
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {

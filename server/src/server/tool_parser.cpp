@@ -1111,7 +1111,11 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             const size_t close = text.find("</tool_call>", body_start);
             if (close == std::string::npos) break;
             const std::string body = text.substr(body_start, close - body_start);
-            if (body.find("<function") != std::string::npos) {
+            const bool is_legacy_qwen =
+                body.find("<function=") != std::string::npos ||
+                body.find("<function>") != std::string::npos ||
+                body.find("<function ") != std::string::npos;
+            if (is_legacy_qwen) {
                 pos = close + 12;
                 continue;
             }
@@ -1131,7 +1135,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             // Laguna bodies are `NAME<arg_key>...` (values may contain JSON —
             // the template serializes non-string args via tojson). Only leave
             // <function=...> and pure-JSON bodies to the Qwen patterns.
-            if (body.find("<function") == std::string::npos &&
+            if (!is_legacy_qwen &&
                 (first_key != std::string::npos ||
                  body.find('{') == std::string::npos)) {
                 std::string name = trim_ws(
