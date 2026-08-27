@@ -47,6 +47,39 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(DFLASH27B_COVERAGE
+    "Instrument C and C++ host code for LLVM source-based coverage" OFF)
+if(DFLASH27B_COVERAGE)
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang" OR
+       NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+            "DFLASH27B_COVERAGE requires Clang for both C and C++ "
+            "(configure with -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++)")
+    endif()
+
+    file(GLOB _dflash_llvm_tool_dirs
+        "/usr/lib/llvm-*/bin"
+        "/usr/local/opt/llvm*/bin")
+    find_program(DFLASH27B_LLVM_COV_EXECUTABLE
+        NAMES llvm-cov
+        HINTS ${_dflash_llvm_tool_dirs}
+        REQUIRED)
+    find_program(DFLASH27B_LLVM_PROFDATA_EXECUTABLE
+        NAMES llvm-profdata
+        HINTS ${_dflash_llvm_tool_dirs}
+        REQUIRED)
+    unset(_dflash_llvm_tool_dirs)
+
+    # CUDA/HIP device compilation is intentionally excluded: LLVM's
+    # source-based coverage records host-side C and C++ execution only.
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-generate>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fcoverage-mapping>)
+    add_link_options(
+        $<$<LINK_LANGUAGE:C>:-fprofile-instr-generate>
+        $<$<LINK_LANGUAGE:CXX>:-fprofile-instr-generate>)
+endif()
+
 # MSVC: treat source files as UTF-8 (the codebase contains UTF-8 string
 # literals such as  tags). Without this, MSVC defaults to the system
 # code page and emits C4819 warnings or garbles multi-byte literals.
@@ -1881,6 +1914,91 @@ if(DFLASH27B_TESTS)
             COMMENT "No unit-test binaries are enabled in this configuration"
         )
     endif()
+
+    if(DFLASH27B_COVERAGE)
+        set(_coverage_report_dir "${CMAKE_CURRENT_BINARY_DIR}/coverage")
+        set(_coverage_profile_dir "${_coverage_report_dir}/raw")
+        set(_coverage_object_list "${CMAKE_CURRENT_BINARY_DIR}/coverage_objects.txt")
+        set(_coverage_objects)
+        set(_coverage_deps)
+        set(_coverage_ctest_exclude)
+        foreach(_coverage_target IN LISTS _check_deps)
+            if(TARGET ${_coverage_target})
+                get_target_property(_coverage_sources ${_coverage_target} SOURCES)
+                set(_coverage_has_device_source FALSE)
+                foreach(_coverage_source IN LISTS _coverage_sources)
+                    get_source_file_property(_coverage_source_language
+                        "${_coverage_source}" LANGUAGE)
+                    if(_coverage_source MATCHES "\\.cu$" OR
+                       _coverage_source_language STREQUAL "CUDA" OR
+                       _coverage_source_language STREQUAL "HIP")
+                        set(_coverage_has_device_source TRUE)
+                        break()
+                    endif()
+                endforeach()
+                unset(_coverage_source)
+                unset(_coverage_source_language)
+
+                if(_coverage_has_device_source)
+                    # Host-side LLVM coverage cannot instrument CUDA sources.
+                    # Skip their standalone CTest entry and do not build them.
+                    list(APPEND _coverage_ctest_exclude "^${_coverage_target}$")
+                else()
+                    list(APPEND _coverage_deps ${_coverage_target})
+                    list(APPEND _coverage_objects "$<TARGET_FILE:${_coverage_target}>")
+                endif()
+                unset(_coverage_has_device_source)
+                unset(_coverage_sources)
+            endif()
+        endforeach()
+
+        if(NOT _coverage_objects)
+            message(FATAL_ERROR
+                "DFLASH27B_COVERAGE requires at least one registered test target")
+        endif()
+
+        file(GENERATE
+            OUTPUT "${_coverage_object_list}"
+            CONTENT "$<JOIN:${_coverage_objects},\n>\n")
+
+        if(_coverage_ctest_exclude)
+            list(JOIN _coverage_ctest_exclude "|" _coverage_ctest_exclude_regex)
+        else()
+            set(_coverage_ctest_exclude_regex "")
+        endif()
+
+        # This target intentionally depends on the test binaries rather than
+        # `check`: CTest must run with LLVM_PROFILE_FILE set to capture data.
+        add_custom_target(coverage
+            COMMAND ${CMAKE_COMMAND} -E rm -rf "${_coverage_report_dir}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_coverage_profile_dir}"
+            COMMAND ${CMAKE_COMMAND}
+                "-DCTEST_EXECUTABLE=${CMAKE_CTEST_COMMAND}"
+                "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                "-DCTEST_EXCLUDE_REGEX=${_coverage_ctest_exclude_regex}"
+                "-DLLVM_COV=${DFLASH27B_LLVM_COV_EXECUTABLE}"
+                "-DLLVM_PROFDATA=${DFLASH27B_LLVM_PROFDATA_EXECUTABLE}"
+                "-DPROFILE_DIR=${_coverage_profile_dir}"
+                "-DPROFILE_DATA=${_coverage_report_dir}/coverage.profdata"
+                "-DOBJECT_LIST_FILE=${_coverage_object_list}"
+                "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src"
+                "-DHTML_DIR=${_coverage_report_dir}/html"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunCoverageTests.cmake"
+            DEPENDS ${_coverage_deps}
+            USES_TERMINAL
+            VERBATIM
+            COMMENT "Running CTest and generating LLVM coverage reports")
+
+        unset(_coverage_report_dir)
+        unset(_coverage_profile_dir)
+        unset(_coverage_object_list)
+        unset(_coverage_objects)
+        unset(_coverage_deps)
+        unset(_coverage_ctest_exclude)
+        unset(_coverage_ctest_exclude_regex)
+        unset(_coverage_target)
+    endif()
+
     unset(_check_deps)
     unset(_raw_unit_test_targets)
 
