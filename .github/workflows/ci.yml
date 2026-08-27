@@ -213,6 +213,7 @@ jobs:
             test_ds4_mix_registry_teardown
             test_model_smoke
             test_batched_gdn
+            test_gdn_transition_journal
             test_concat_transpose
           )
           if [[ "$RUN_SPARSE_ATTENTION_TEST" == "true" ]]; then
@@ -233,7 +234,7 @@ jobs:
       - name: Run concurrent-serving kernel tests
         run: |
           ctest --test-dir server/build --output-on-failure \
-            -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$|concat_transpose$)' --no-tests=error
+            -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$|gdn_transition_journal_preflight$|concat_transpose$)' --no-tests=error
 
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
       # disabled by default because it builds dflash_server and lazy-loads the
