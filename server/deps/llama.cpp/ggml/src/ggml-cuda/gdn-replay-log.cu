@@ -66,6 +66,62 @@ __global__ void gdn_replay_log_commit_kernel(
     state[state_offset] = current;
 }
 
+__global__ void gdn_replay_log_commit_128_scalar_tile_kernel(
+        const float * replay_log,
+        float * state,
+        const int32_t * accepted_prefixes,
+        const int32_t * active_slot_ids,
+        int n_heads,
+        int n_tokens,
+        int n_seqs,
+        int n_state_slots) {
+    constexpr int state_size = 128;
+    constexpr int max_tokens = 8;
+    constexpr int values_per_token = 1 + 32 + 8;
+    const int sequence = blockIdx.z;
+    const int head = blockIdx.y;
+    if (sequence >= n_seqs || head >= n_heads) return;
+    const int slot = active_slot_ids[sequence];
+    const int accepted = accepted_prefixes[sequence];
+    if (slot < 0 || slot >= n_state_slots ||
+        accepted < 0 || accepted > n_tokens || accepted > max_tokens) {
+        return;
+    }
+    const int row_base = (blockIdx.x & 3)*32;
+    const int col_base = (blockIdx.x >> 2)*8;
+    const int row = row_base + (threadIdx.x & 31);
+    const int col = col_base + (threadIdx.x >> 5);
+    __shared__ float staged[max_tokens][values_per_token];
+    for (int item = threadIdx.x;
+         item < accepted*values_per_token;
+         item += blockDim.x) {
+        const int token = item/values_per_token;
+        const int field = item % values_per_token;
+        const float * transition = replay_log +
+            (((size_t) sequence*n_tokens + token)*n_heads + head) *
+                (2*state_size + 1);
+        if (field == 0) {
+            staged[token][0] = transition[0];
+        } else if (field <= 32) {
+            staged[token][field] = transition[row_base + field];
+        } else {
+            staged[token][field] =
+                transition[1 + state_size + col_base + field - 33];
+        }
+    }
+    __syncthreads();
+    const size_t state_offset =
+        (((size_t) slot*n_heads + head)*state_size + col)*state_size + row;
+    float current = state[state_offset];
+    for (int token = 0; token < accepted; ++token) {
+        current = fmaf(
+            staged[token][1 + (threadIdx.x & 31)],
+            staged[token][33 + (threadIdx.x >> 5)],
+            staged[token][0]*current);
+    }
+    state[state_offset] = current;
+}
+
 bool device_pointer(const void * pointer, int & device) {
     if (pointer == nullptr) return false;
     cudaPointerAttributes attributes{};
@@ -280,13 +336,22 @@ static bool gdn_replay_log_commit_many_impl(
         const dim3 state_grid(
             (unsigned int) ((state_elements + threads - 1)/threads),
             (unsigned int) heads, (unsigned int) n_seqs);
-        gdn_replay_log_commit_kernel<<<state_grid, threads>>>(
-            (const float *) replay_log->data, (float *) state->data,
-            (const int32_t *) accepted_prefixes->data,
-            (const int32_t *) active_slot_ids->data,
-            state_size, heads, tokens, (int) n_seqs,
-            (int) state->ne[3], replay_log_width,
-            replay_log_width == 2*state_size + 1 ? 1 : state_size);
+        if (state_size == 128 && replay_log_width == 2*state_size + 1 &&
+            tokens <= 8) {
+            gdn_replay_log_commit_128_scalar_tile_kernel<<<state_grid, threads>>>(
+                (const float *) replay_log->data, (float *) state->data,
+                (const int32_t *) accepted_prefixes->data,
+                (const int32_t *) active_slot_ids->data,
+                heads, tokens, (int) n_seqs, (int) state->ne[3]);
+        } else {
+            gdn_replay_log_commit_kernel<<<state_grid, threads>>>(
+                (const float *) replay_log->data, (float *) state->data,
+                (const int32_t *) accepted_prefixes->data,
+                (const int32_t *) active_slot_ids->data,
+                state_size, heads, tokens, (int) n_seqs,
+                (int) state->ne[3], replay_log_width,
+                replay_log_width == 2*state_size + 1 ? 1 : state_size);
+        }
 
         const ggml_tensor * conv_input = conv_inputs[layer];
         ggml_tensor * conv_state = conv_states[layer];

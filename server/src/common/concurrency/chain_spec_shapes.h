@@ -18,6 +18,12 @@ inline int chain_decode_bucket_width(int lanes) {
     return 64;
 }
 
+inline int chain_draft_bucket_width(int lanes) {
+    // Exact C=5 is stable for the draft graph. Target verification keeps the
+    // shared decode bucket because changing its MMQ shape changes numerics.
+    return lanes == 5 ? 5 : chain_decode_bucket_width(lanes);
+}
+
 // draft_tokens[0] is the already-pending root. The target posterior at row N
 // verifies draft_tokens[N + 1], so accepted tokens always form a prefix.
 inline size_t chain_verified_prefix(

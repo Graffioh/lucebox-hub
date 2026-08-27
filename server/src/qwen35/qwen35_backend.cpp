@@ -885,6 +885,7 @@ bool Qwen35Backend::park(ParkTarget target) {
         std::printf("[park] draft released\n"); std::fflush(stdout);
     }
     if (want_target_model && !target_parked_) {
+        step_graph_destroy(sg_);
         step_graph_destroy(proj_sg_);
         dflash2_selector_graph_invalidate();
         free_target_weights(w_);
@@ -956,6 +957,9 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.block_size = cfg_.draft_block_size;
             }
         }
+        // A reloaded drafter can select different target capture layers.
+        // Rebuild any retained target graph against the refreshed mapping.
+        step_graph_free(sg_);
         draft_parked_ = false;
         std::printf("[unpark] draft restored\n"); std::fflush(stdout);
     }

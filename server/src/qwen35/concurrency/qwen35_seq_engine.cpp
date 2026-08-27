@@ -263,7 +263,7 @@ Qwen35SeqEngine::prepare_chain_drafts(
     }
     if (lanes.empty()) return round;
 
-    const int bucket = chain_decode_bucket_width(
+    const int bucket = chain_draft_bucket_width(
         static_cast<int>(lanes.size()));
     std::vector<DraftKvState *> batch_states;
     std::vector<int32_t> roots;

@@ -1939,12 +1939,11 @@ static ggml_tensor * build_delta_net_block(
     }
 
     // Repeat Q and K from num_k_heads to num_v_heads so they match V's layout.
-    // The fused chain/tree gated_delta_net kernels broadcast heads themselves
+    // The fused active/chain/tree gated_delta_net kernels broadcast heads themselves
     // (v head h reads q/k head h % num_k_heads, the same tiling ggml_repeat
-    // produces); the chunked, compact-decode and SpecLA paths take the
-    // materialized copies.
+    // produces); the chunked and SpecLA paths take the materialized copies.
     if (num_k_heads != num_v_heads &&
-        (use_chunked || seg_active || use_specla_factorized || use_specla_hld)) {
+        (use_chunked || use_specla_factorized || use_specla_hld)) {
         q_c = ggml_repeat_4d(ctx, q_c, head_k_dim, num_v_heads, n_seq_tokens, seg_seqs);
         k_c = ggml_repeat_4d(ctx, k_c, head_k_dim, num_v_heads, n_seq_tokens, seg_seqs);
     }

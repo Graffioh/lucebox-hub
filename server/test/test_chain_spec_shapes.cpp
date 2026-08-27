@@ -37,6 +37,10 @@ int main() {
         CHECK(chain_decode_bucket_width(bucket_inputs[i]) ==
               bucket_expected[i]);
     }
+    CHECK(chain_draft_bucket_width(4) == 4);
+    CHECK(chain_draft_bucket_width(5) == 5);
+    CHECK(chain_draft_bucket_width(6) == 6);
+    CHECK(chain_draft_bucket_width(7) == 8);
 
     const auto eos = [](int32_t token) { return token == 2; };
     const std::vector<int32_t> eos_first_child = {10, 2, 11};

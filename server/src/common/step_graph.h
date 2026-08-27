@@ -1,9 +1,9 @@
 // StepGraph — per-forward-call compute graph container.
 //
-// Holds the ggml context, graph, allocator, and named tensor handles for one
-// forward step (prefill chunk, verify batch, or replay). Rebuilt per call
-// since kv_len varies, but the persistent CUDA allocator buffer is kept
-// alive across steps to avoid cudaMalloc/cudaFree churn.
+// Holds the ggml context, graph, allocator, and named tensor handles for a
+// forward topology (prefill chunk, verify batch, or replay). Most paths
+// rebuild as shapes vary; topology-stable paths can retain the graph. The
+// persistent CUDA allocator buffer stays alive across rebuilds.
 
 #pragma once
 
@@ -12,9 +12,16 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 
+#include <memory>
+#include <optional>
+#include <tuple>
 #include <vector>
 
 namespace dflash::common {
+
+using TargetPagedTreeGraphKey = std::tuple<
+    const TargetWeights *, const TargetCache *, ggml_backend_t,
+    int, int, int, int, int, int>;
 
 struct StepGraph {
     ggml_context *  ctx = nullptr;
@@ -22,12 +29,15 @@ struct StepGraph {
     ggml_gallocr_t  alloc = nullptr;
     ggml_context * commit_ctx = nullptr;
     ggml_backend_buffer_t commit_buffer = nullptr;
+    std::optional<TargetPagedTreeGraphKey> paged_tree_key;
 
     // Persistent metadata arena for the draft graph. Reusing the same arena
-    // across rebuilds keeps every ggml_tensor at a stable address, which is
-    // what the ggml-cuda graph cache keys on (nodes[0] pointer + src tensor
-    // pointers). A fresh malloc per step would defeat CUDA-graph replay.
+    // keeps ggml_tensor addresses stable for CUDA-graph replay.
     std::vector<uint8_t> meta_arena;
+
+    // Paged-tree metadata is retained with the graph. Use uninitialized
+    // storage: vector::resize would zero 512 MiB on the first decode round.
+    std::shared_ptr<uint8_t> paged_tree_meta_arena;
 
     // The ctx_len last used for ggml_gallocr_reserve (draft only).
     // When the real ctx_len fits within this, alloc_graph is a no-op.
@@ -143,12 +153,14 @@ inline void step_graph_free(StepGraph & sg) {
     sg.delta_captures.clear();
     sg.tree_features = nullptr;
     sg.moe_selected.clear();
+    sg.paged_tree_key.reset();
 }
 
 // Full cleanup: release the persistent gallocr + its CUDA buffer.
 inline void step_graph_destroy(StepGraph & sg) {
     if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
     step_graph_free(sg);
+    sg.paged_tree_meta_arena.reset();
     sg.meta_arena.clear();
     sg.meta_arena.shrink_to_fit();
     sg.alloc_reserved_ctx = 0;
