@@ -5320,10 +5320,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             // scheduler assigns every split a new uid when that happens. A
             // forced property-scan bypass is therefore valid only for the
             // exact generation that populated this cache entry.
-            // Scheduler graphs carry a non-zero generation uid. Direct graphs
-            // retain uid=0 and therefore keep the existing caller-guaranteed
-            // immutable-topology fast path.
-            const bool same_graph_generation = cgraph->uid == 0 ||
+            // A non-zero graph uid is required to bypass property inspection.
+            // Direct graphs with uid=0 retain ordinary property inspection.
+            const bool same_graph_generation = cgraph->uid != 0 &&
                                                cgraph->uid == graph->uid;
             const bool can_skip_props_check = ggml_cuda_skip_props_check
                                            && graph->warmup_complete
