@@ -1080,6 +1080,15 @@ if(DFLASH27B_TESTS)
         add_executable(test_draft_vs_reference test/test_draft_vs_reference.cpp)
         target_link_libraries(test_draft_vs_reference PRIVATE dflash_common)
     endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND GGML_CUDA_GRAPHS) OR
+       (DFLASH27B_GPU_BACKEND STREQUAL "hip" AND GGML_HIP_GRAPHS))
+        add_executable(test_direct_zero_uid_graph_aba test/test_direct_zero_uid_graph_aba.cpp)
+        target_include_directories(test_direct_zero_uid_graph_aba PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
+        target_link_libraries(test_direct_zero_uid_graph_aba PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        list(APPEND _raw_unit_test_targets test_direct_zero_uid_graph_aba)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_unit.cpp")
         add_executable(test_deepseek4_unit test/test_deepseek4_unit.cpp)
         target_include_directories(test_deepseek4_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -1920,6 +1929,9 @@ if(DFLASH27B_TESTS)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
                 set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
+                if(_unit_target STREQUAL "test_direct_zero_uid_graph_aba")
+                    set_tests_properties("${_unit_ctest_name}" PROPERTIES TIMEOUT 60)
+                endif()
                 if(_unit_target STREQUAL "test_rocmfp3_mix_registry")
                     # Its leak assertion reads GLOBAL free VRAM (cudaMemGetInfo) before and
                     # after 4000 register/unregister cycles, so any other test allocating on
