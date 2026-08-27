@@ -1046,6 +1046,7 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
             const size_t body_start = pos + 11;
             const size_t close = text.find("</tool_call>", body_start);
             if (close == std::string::npos) break;
+            const std::string body = text.substr(body_start, close - body_start);
             std::string xml_name;
             json xml_args;
             std::string xml_raw;
