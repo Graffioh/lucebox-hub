@@ -43,35 +43,15 @@
 
 Model links open the exact weights used by the measured setup. Drafter links open the published quant, or the source checkpoint when conversion is required.
 
-<table>
-<tr>
-<td valign="top">
-
-| Model and optimization | Speedup |
-|---|:---:|
-| [Qwen 3.5 0.8B BF16](https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/model.safetensors-00001-of-00001.safetensors) + [Megakernel](optimizations/megakernel/README.md) | **1.9×** prefill; **1.55×** decode |
-| [Qwen 3.8 27B UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-IQ4_XS.gguf) + [DFlash2 source](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2/blob/main/model.safetensors), converted to Q8_0, on R9700 | **6.4×** vs Lucebox AR; **3.8×** vs llama.cpp with the same drafter |
-| [Laguna XS 2.1 33B Q4_K_M](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF/blob/main/Laguna-XS-2.1-Q4_K_M.gguf) + PFlash with [Qwen3 0.6B Q8_0](https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/blob/main/Qwen3-0.6B-Q8_0.gguf) | **8.2×** at 256K |
-| [Laguna XS 2.1 33B Q4_K_M](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF/blob/main/Laguna-XS-2.1-Q4_K_M.gguf) + [DFlash Q4 drafter](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF/blob/main/laguna-xs21-dflash-q4.gguf) | **1.7×** at 256K |
-| [Gemma 4 26B-A4B Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-26B-A4B-it-GGUF/blob/main/google_gemma-4-26B-A4B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF/blob/main/gemma-4-26B-A4B-it-DFlash-q8_0.gguf) | **1.31×** |
-| [Gemma 4 31B IT Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/blob/main/google_gemma-4-31B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/blob/main/gemma-4-31B-it-DFlash-q8_0.gguf) | **3.2×** |
-| [DeepSeek V4 Flash ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4 drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | Up to **1.81×** vs target-only, **32.7 vs 18.1 tok/s** |
-
-</td>
-<td valign="top">
-
-| Drafter or helper | Phase |
-|---|:---:|
-| [Qwen 3.8 27B DFlash2 source](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2/blob/main/model.safetensors) | Decode |
-| [Gemma 4 26B-A4B DFlash Q8_0](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF/blob/main/gemma-4-26B-A4B-it-DFlash-q8_0.gguf) | Decode |
-| [Gemma 4 31B DFlash Q8_0](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/blob/main/gemma-4-31B-it-DFlash-q8_0.gguf) | Decode |
-| [Laguna XS 2.1 DFlash Q4](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF/blob/main/laguna-xs21-dflash-q4.gguf) | Decode |
-| [Qwen3 0.6B Q8_0](https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/blob/main/Qwen3-0.6B-Q8_0.gguf) | Prefill |
-| [DeepSeek V4 Flash DSpark Q4RMFP4](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | Decode |
-
-</td>
-</tr>
-</table>
+| Model and optimization | Phase | Speedup |
+|---|:---:|:---:|
+| [Qwen 3.5 0.8B BF16](https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/model.safetensors-00001-of-00001.safetensors) + [Megakernel](optimizations/megakernel/README.md) | Prefill + decode | **1.9×** prefill; **1.55×** decode |
+| [Qwen 3.8 27B UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-IQ4_XS.gguf) + [DFlash2 source](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2/blob/main/model.safetensors), converted to Q8_0, on R9700 | Decode | **6.4×** vs Lucebox AR; **3.8×** vs llama.cpp with the same drafter |
+| [Laguna XS 2.1 33B Q4_K_M](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF/blob/main/Laguna-XS-2.1-Q4_K_M.gguf) + PFlash with [Qwen3 0.6B Q8_0](https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/blob/main/Qwen3-0.6B-Q8_0.gguf) | Prefill | **8.2×** at 256K |
+| [Laguna XS 2.1 33B Q4_K_M](https://huggingface.co/poolside/Laguna-XS-2.1-GGUF/blob/main/Laguna-XS-2.1-Q4_K_M.gguf) + [DFlash Q4 drafter](https://huggingface.co/Lucebox/Laguna-XS-2.1-DFlash-GGUF/blob/main/laguna-xs21-dflash-q4.gguf) | Decode | **1.7×** at 256K |
+| [Gemma 4 26B-A4B Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-26B-A4B-it-GGUF/blob/main/google_gemma-4-26B-A4B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF/blob/main/gemma-4-26B-A4B-it-DFlash-q8_0.gguf) | Decode | **1.31×** |
+| [Gemma 4 31B IT Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/blob/main/google_gemma-4-31B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/blob/main/gemma-4-31B-it-DFlash-q8_0.gguf) | Decode | **3.2×** |
+| [DeepSeek V4 Flash ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4 drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | Decode | Up to **1.81×** vs target-only, **32.7 vs 18.1 tok/s** |
 
 ## Tested Machines (GPU/APU)
 
