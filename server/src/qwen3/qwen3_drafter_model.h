@@ -94,6 +94,30 @@ bool forward_qwen3_drafter_model(
     std::vector<float> & running_max,
     int score_query_end = -1);
 
+struct QueryCaptureSlice {
+    int chunk_offset = 0;
+    int query_offset = 0;
+    int tokens = 0;
+
+    bool valid() const { return tokens > 0; }
+};
+
+inline QueryCaptureSlice query_capture_slice(
+        int query_start,
+        int query_end,
+        int chunk_start,
+        int chunk_tokens) {
+    const int chunk_end = chunk_start + chunk_tokens;
+    const int overlap_start = query_start > chunk_start ? query_start : chunk_start;
+    const int overlap_end = query_end < chunk_end ? query_end : chunk_end;
+    if (overlap_start >= overlap_end) return {};
+    return {
+        overlap_start - chunk_start,
+        overlap_start - query_start,
+        overlap_end - overlap_start,
+    };
+}
+
 inline size_t count_nonfinite_scores(const float * values, size_t count) {
     size_t nonfinite = 0;
     for (size_t index = 0; index < count; ++index) {

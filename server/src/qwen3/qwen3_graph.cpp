@@ -471,14 +471,21 @@ bool forward_qwen3_drafter_model(
             // NoPE: capture pre-RoPE Q tail (only for layers that will be scored).
             if (nope_tail && il >= score_layer_start_pre) {
                 const int si = il - score_layer_start_pre;
-                if (query_start >= cs && query_end <= cs + cl) {
-                    const int local_lo_nr = query_start - cs;
+                const auto capture = query_capture_slice(
+                    query_start, query_end, cs, cl);
+                if (capture.valid()) {
                     ggml_tensor * Q_prenrope_tail = ggml_view_3d(
-                        gA, Q, D, H, n_lookahead,
+                        gA, Q, D, H, capture.tokens,
                         Q->nb[1], Q->nb[2],
-                        (size_t)local_lo_nr * Q->nb[2]);
+                        (size_t)capture.chunk_offset * Q->nb[2]);
+                    Q_prenrope_tail = ggml_cont(gA, Q_prenrope_tail);
+                    Q_prenrope_tail = ggml_reshape_1d(
+                        gA, Q_prenrope_tail, D * H * capture.tokens);
+                    ggml_tensor * Q_prenrope_dst = ggml_view_1d(
+                        gA, Q_norope_v[si].t, D * H * capture.tokens,
+                        (size_t)capture.query_offset * Q_norope_v[si].t->nb[2]);
                     ggml_build_forward_expand(gfA,
-                        ggml_cpy(gA, Q_prenrope_tail, Q_norope_v[si].t));
+                        ggml_cpy(gA, Q_prenrope_tail, Q_prenrope_dst));
                 }
             }
             Q = ggml_rope_ext(gA, Q, pos_chunk, nullptr, D,
@@ -522,15 +529,22 @@ bool forward_qwen3_drafter_model(
             ggml_build_forward_expand(gfA, ggml_cpy(gA, K, K_dst));
             ggml_build_forward_expand(gfA, ggml_cpy(gA, V, V_dst));
 
-            // Copy Q tail to Q_last_v[il] in the chunk that contains the tail.
-            if (!nope_tail && query_start >= cs && query_end <= cs + cl) {
-                const int local_lo = query_start - cs;
+            // Copy the overlapping Q-query slice; a query can straddle chunks.
+            const auto capture = query_capture_slice(
+                query_start, query_end, cs, cl);
+            if (!nope_tail && capture.valid()) {
                 ggml_tensor * Q_tail_local = ggml_view_3d(
-                    gA, Q, D, H, n_lookahead,
+                    gA, Q, D, H, capture.tokens,
                     Q->nb[1], Q->nb[2],
-                    (size_t)local_lo * Q->nb[2]);
+                    (size_t)capture.chunk_offset * Q->nb[2]);
+                Q_tail_local = ggml_cont(gA, Q_tail_local);
+                Q_tail_local = ggml_reshape_1d(
+                    gA, Q_tail_local, D * H * capture.tokens);
+                ggml_tensor * Q_tail_dst = ggml_view_1d(
+                    gA, Q_last_v[layer_cache_idx].t, D * H * capture.tokens,
+                    (size_t)capture.query_offset * Q_last_v[layer_cache_idx].t->nb[2]);
                 ggml_build_forward_expand(gfA,
-                    ggml_cpy(gA, Q_tail_local, Q_last_v[layer_cache_idx].t));
+                    ggml_cpy(gA, Q_tail_local, Q_tail_dst));
             }
 
             auto tA_setup1 = std::chrono::steady_clock::now();
