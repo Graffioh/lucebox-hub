@@ -1258,11 +1258,56 @@ TEST_CASE(ServerUnitFixture, test_render_deepseek4_chat_template_dsml_tools) {
         {"system", "You are an assistant."},
         {"user", "Hello"}
     };
-    std::string tools_json = R"([{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}}])";
+    std::string tools_json = R"([{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}])";
     std::string rendered = render_chat_template(msgs, ChatFormat::DEEPSEEK4, true, false, tools_json);
     TEST_ASSERT(rendered.find("<｜DSML｜tool_calls>") != std::string::npos);
     TEST_ASSERT(rendered.find("<｜DSML｜invoke name=\"$TOOL_NAME\">") != std::string::npos);
     TEST_ASSERT(rendered.find("\"name\":\"read\"") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_find_tool_syntax_start_arg_key_backtracking) {
+    std::string text = "Let me edit the file:\nedit<arg_key>path</arg_key><arg_val>/tmp/test.txt</arg_val>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {{"name", "edit"}}}}
+    });
+    size_t pos = std::string::npos;
+    TEST_ASSERT(find_tool_syntax_start(text, tools, pos));
+    TEST_ASSERT(pos == text.find("edit<arg_key>"));
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_string_attribute_semantics) {
+    // string="true" should preserve leading/trailing whitespace verbatim
+    // string="false" should parse JSON numbers/booleans/arrays/objects
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"custom_tool\">\n"
+        "<｜DSML｜parameter name=\"verbatim_str\" string=\"true\">  hello world  \n</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"json_num\" string=\"false\">42</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"json_bool\" string=\"false\">true</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"json_arr\" string=\"false\">[1, 2, 3]</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "custom_tool"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"verbatim_str", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "custom_tool");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["verbatim_str"] == "  hello world  \n");
+        TEST_ASSERT(args["json_num"] == 42);
+        TEST_ASSERT(args["json_bool"] == true);
+        TEST_ASSERT(args["json_arr"].is_array() && args["json_arr"].size() == 3);
+    }
 }
 
 
