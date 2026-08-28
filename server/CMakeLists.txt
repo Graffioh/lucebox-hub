@@ -1116,10 +1116,18 @@ if(DFLASH27B_TESTS)
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND GGML_CUDA_GRAPHS) OR
        (DFLASH27B_GPU_BACKEND STREQUAL "hip" AND GGML_HIP_GRAPHS))
         add_executable(test_direct_zero_uid_graph_aba test/test_direct_zero_uid_graph_aba.cpp)
+        # This host-only test calls the GGML C API; the linked backend owns the
+        # device code and runtime dependencies. No HIP language or shim is needed.
         target_include_directories(test_direct_zero_uid_graph_aba PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
         target_link_libraries(test_direct_zero_uid_graph_aba PRIVATE
             ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        target_compile_definitions(test_direct_zero_uid_graph_aba PRIVATE GGML_TEST_GRAPHS_ENABLED=1)
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_direct_zero_uid_graph_aba PRIVATE GGML_USE_HIP=1)
+        else()
+            target_compile_definitions(test_direct_zero_uid_graph_aba PRIVATE GGML_USE_CUDA=1)
+        endif()
         list(APPEND _raw_unit_test_targets test_direct_zero_uid_graph_aba)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_unit.cpp")
