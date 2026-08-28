@@ -9,6 +9,10 @@
 #include <cstring>
 #include <vector>
 
+#if !defined(GGML_TEST_GRAPHS_ENABLED) || GGML_TEST_GRAPHS_ENABLED != 1
+#error "Build this regression through its graph-enabled CMake target"
+#endif
+
 struct GraphStats {
     void * key = nullptr;
     int nodes = 0;
@@ -101,6 +105,8 @@ static int run_arm(int device, bool force_skip, GraphStats & stats) {
             ggml_backend_tensor_set(input, values.data(), 0, bytes);
             GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
             ggml_backend_tensor_get(output, result.data(), 0, bytes);
+            // Graph support is required at build time. Missing telemetry is a
+            // failure; only an explicitly disabled runtime graph may skip here.
             if (generation == 0 && submission == 0 && stats.records == 1 && !stats.enabled) {
                 std::fprintf(stderr, "SKIP: native graphs disabled for device %d or by environment\n", device);
                 ggml_backend_synchronize(backend);
@@ -171,7 +177,7 @@ int main(int argc, char ** argv) {
     }
     char description[256] = {};
     ggml_backend_cuda_get_device_description(device, description, sizeof(description));
-    std::fprintf(stderr, "Testing device %d: %s\n", device, description);
+    std::fprintf(stderr, "Testing %s device %d: %s\n", GGML_CUDA_NAME, device, description);
     int status = run_arm(device, false, stats);
     if (status == 0) {
         status = run_arm(device, true, stats);
