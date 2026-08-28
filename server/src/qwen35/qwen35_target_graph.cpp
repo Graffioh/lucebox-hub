@@ -234,8 +234,11 @@ bool create_target_cache_partial(const TargetWeights & w,
                 // [head_dim, max_ctx_alloc, n_head_kv]
                 ggml_tensor * K = ggml_new_tensor_3d(out.base_ctx, kv_k_type,
                                                      head_dim, max_ctx_alloc, w.n_head_kv);
-                ggml_tensor * V = ggml_new_tensor_3d(out.base_ctx, kv_v_type,
-                                                     w.n_embd_head_v, max_ctx_alloc, w.n_head_kv);
+                const int v_head_dim = w.is_bailingmoe3
+                    ? w.n_embd_head_v : head_dim;
+                ggml_tensor * V = ggml_new_tensor_3d(
+                    out.base_ctx, kv_v_type, v_head_dim,
+                    max_ctx_alloc, w.n_head_kv);
                 char name[64];
                 std::snprintf(name, sizeof(name), "cache_k_%d", il);
                 ggml_set_name(K, name);

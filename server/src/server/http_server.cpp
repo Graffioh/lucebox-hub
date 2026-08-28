@@ -2221,12 +2221,16 @@ enum class TokenDelivery {
 // MUST classify identically, or the reasoning/content split diverges
 // between streamed and non-streamed responses.
 TokenDelivery classify_generated_token(
-        Tokenizer & tokenizer, int32_t token, std::string & text) {
+        Tokenizer & tokenizer, SseEmitter & emitter,
+        int32_t token, std::string & text) {
     if (token == tokenizer.eos_id() || token == tokenizer.eos_chat_id()) {
         return TokenDelivery::kSkip;
     }
 
     const std::string & raw = tokenizer.raw_token(token);
+    if (emitter.suppress_undeclared_tool_protocol_token(raw)) {
+        return TokenDelivery::kSkip;
+    }
 
     // Gemma4 thinking channel (<|channel> / <channel|>) and Qwen3.6
     // thinking markers share one mapped dialect. The Qwen markers
@@ -2276,7 +2280,7 @@ CompletionTokenCounts feed_non_streaming_tokens(
     for (int32_t token : tokens) {
         std::string text;
         const TokenDelivery delivery =
-            classify_generated_token(tokenizer, token, text);
+            classify_generated_token(tokenizer, emitter, token, text);
         if (delivery == TokenDelivery::kSkip) continue;
 
         emitter.emit_token(text);
@@ -3818,7 +3822,7 @@ void HttpServer::configure_generation_io(
 
         std::string text;
         const TokenDelivery delivery =
-            classify_generated_token(tokenizer_, token, text);
+            classify_generated_token(tokenizer_, emitter, token, text);
         if (delivery == TokenDelivery::kSkip) return true;
 
         if (!text.empty()) {
@@ -3847,7 +3851,7 @@ bool HttpServer::deliver_generation_token(
 
     std::string text;
     const TokenDelivery delivery =
-        classify_generated_token(tokenizer_, token, text);
+        classify_generated_token(tokenizer_, emitter, token, text);
     if (delivery == TokenDelivery::kSkip) return true;
 
     // Non-stream replay counts every non-skipped token, including tokens

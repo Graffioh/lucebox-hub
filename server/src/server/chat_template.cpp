@@ -91,10 +91,11 @@ std::string render_chat_template(
             !messages.empty() && messages[0].role == "system";
         const std::string system_content = has_system
             ? messages[0].content : std::string();
-        const bool system_sets_thinking =
-            system_content.find("detailed thinking on") != std::string::npos ||
-            system_content.find("detailed thinking off") != std::string::npos;
         const char * thinking_option = enable_thinking ? "on" : "off";
+        const std::string thinking_directive =
+            std::string("detailed thinking ") + thinking_option;
+        const bool system_sets_requested_thinking =
+            system_content.find(thinking_directive) != std::string::npos;
 
         result += "<role>SYSTEM</role>";
         if (has_tools) {
@@ -128,22 +129,19 @@ std::string render_chat_template(
                 "<arg_value>{arg-value-2}</arg_value>\n"
                 "...\n"
                 "</tool_call>\n";
-            if (!system_sets_thinking) {
-                result += "detailed thinking ";
-                result += thinking_option;
+            if (!system_sets_requested_thinking) {
+                result += thinking_directive;
             }
             result += "<|role_end|>";
         } else if (has_system) {
             result += system_content;
-            if (!system_sets_thinking) {
+            if (!system_sets_requested_thinking) {
                 result += '\n';
-                result += "detailed thinking ";
-                result += thinking_option;
+                result += thinking_directive;
             }
             result += "<|role_end|>";
         } else {
-            result += "detailed thinking ";
-            result += thinking_option;
+            result += thinking_directive;
             result += "<|role_end|>";
         }
 

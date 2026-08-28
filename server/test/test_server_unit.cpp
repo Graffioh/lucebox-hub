@@ -3438,6 +3438,64 @@ TEST_CASE(ServerUnitFixture, test_bailingmoe3_render_thinking_and_tools) {
     TEST_ASSERT(out.compare(out.size() - suffix.size(), suffix.size(), suffix) == 0);
 }
 
+TEST_CASE(ServerUnitFixture, test_bailingmoe3_request_overrides_system_thinking) {
+    const std::vector<ChatMessage> thinking_on = {
+        {"system", "Keep this note. detailed thinking on", ""},
+        {"user", "Hello", ""},
+    };
+    const std::string disabled = render_chat_template(
+        thinking_on, ChatFormat::BAILINGMOE3,
+        /*add_generation_prompt=*/true,
+        /*enable_thinking=*/false,
+        /*tools_json=*/"");
+    const size_t prior_on = disabled.find("detailed thinking on");
+    const size_t requested_off = disabled.rfind("detailed thinking off");
+    TEST_ASSERT(prior_on != std::string::npos);
+    TEST_ASSERT(requested_off != std::string::npos && requested_off > prior_on);
+
+    const std::vector<ChatMessage> thinking_off = {
+        {"system", "Keep this note. detailed thinking off", ""},
+        {"user", "Hello", ""},
+    };
+    const std::string tools =
+        R"([{"type":"function","function":{"name":"weather"}}])";
+    const std::string enabled = render_chat_template(
+        thinking_off, ChatFormat::BAILINGMOE3,
+        /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true,
+        tools);
+    const size_t prior_off = enabled.find("detailed thinking off");
+    const size_t requested_on = enabled.rfind("detailed thinking on");
+    TEST_ASSERT(prior_off != std::string::npos);
+    TEST_ASSERT(requested_on != std::string::npos && requested_on > prior_off);
+}
+
+TEST_CASE(ServerUnitFixture, test_emitter_suppresses_undeclared_bailing_tool_block) {
+    auto em = make_emitter(ApiFormat::OPENAI_CHAT);
+    em.emit_start();
+
+    const auto deliver = [&](const std::string & raw_token) {
+        if (!em.suppress_undeclared_tool_protocol_token(raw_token)) {
+            em.emit_token(raw_token);
+        }
+    };
+    deliver("<tool_call>");
+    deliver("weather");
+    deliver("<arg_key>");
+    deliver("city");
+    deliver("</arg_key>");
+    deliver("<arg_value>");
+    deliver("Rome");
+    deliver("</arg_value>");
+    deliver("</tool_call>");
+    deliver("Visible answer");
+    em.emit_finish(10);
+
+    TEST_ASSERT(em.accumulated_text() == "Visible answer");
+    TEST_ASSERT(em.accumulated_text().find("weather") == std::string::npos);
+    TEST_ASSERT(em.accumulated_text().find("Rome") == std::string::npos);
+}
+
 TEST_CASE(ServerUnitFixture, test_bailingmoe3_router_builds_group_mask) {
     ggml_init_params params{};
     params.mem_size = 2 * 1024 * 1024;
