@@ -611,7 +611,7 @@ TEST_CASE(ServerUnitFixture, test_tool_syntax_scanner_declared_name_guards) {
 
     json invalid = edit_tools();
     invalid[0]["function"]["name"] = std::string(65, 'x');
-    TEST_ASSERT(tool_syntax_holdback(invalid) == 15);
+    TEST_ASSERT(tool_syntax_holdback(invalid) == 21);
     pos = std::string::npos;
     TEST_ASSERT(!find_tool_syntax_start("<" + std::string(65, 'x') + ">",
                                         invalid, pos));
@@ -1160,6 +1160,110 @@ TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml_function_name_tag) {
     TEST_ASSERT(result.cleaned_text.empty());
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_with_token) {
+    const std::string text =
+        "Let me read the file.\n\n"
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"read\">\n"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go");
+    }
+    TEST_ASSERT(result.cleaned_text == "Let me read the file.");
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_multiple_parameters) {
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la /tmp</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"timeout\" string=\"false\">10</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"timeout", {{"type", "integer"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la /tmp");
+        TEST_ASSERT(args["timeout"] == 10);
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_edit_tool) {
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"edit\">\n"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">/home/dpavlin/koha-rfid-go/server.go</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"edits\" string=\"false\">[{\"oldText\": \"err1\", \"newText\": \"err2\"}]</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "edit"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}},
+                     {"edits", {{"type", "array"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "edit");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/home/dpavlin/koha-rfid-go/server.go");
+        TEST_ASSERT(args["edits"].is_array());
+        TEST_ASSERT(args["edits"][0]["oldText"] == "err1");
+        TEST_ASSERT(args["edits"][0]["newText"] == "err2");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_render_deepseek4_chat_template_dsml_tools) {
+    std::vector<ChatMessage> msgs = {
+        {"system", "You are an assistant."},
+        {"user", "Hello"}
+    };
+    std::string tools_json = R"([{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}}])";
+    std::string rendered = render_chat_template(msgs, ChatFormat::DEEPSEEK4, true, false, tools_json);
+    TEST_ASSERT(rendered.find("<｜DSML｜tool_calls>") != std::string::npos);
+    TEST_ASSERT(rendered.find("<｜DSML｜invoke name=\"$TOOL_NAME\">") != std::string::npos);
+    TEST_ASSERT(rendered.find("\"name\":\"read\"") != std::string::npos);
+}
 
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {

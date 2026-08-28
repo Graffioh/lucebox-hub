@@ -54,6 +54,9 @@ static std::string generate_call_id() {
 }
 
 static const char TOOL_OPEN[] = "<tool_call>";
+static const char TOOL_CALLS_OPEN[] = "<tool_calls>";
+static const char DSML_PREFIX[] = "<｜DSML｜";
+static const char INVOKE_OPEN[] = "<invoke";
 static const char FUNCTION_CALL_OPEN[] = "<function_call>";
 static const char FUNCTION_CALLS_OPEN[] = "<function_calls>";
 static const char FUNCTION_OPEN[] = "<function=";
@@ -106,6 +109,9 @@ bool find_tool_syntax_start(const std::string & text, const json & tools,
     size_t idx = text.find('<');
     while (idx != std::string::npos) {
         if (text.compare(idx, sizeof(TOOL_OPEN) - 1, TOOL_OPEN) == 0 ||
+            text.compare(idx, sizeof(TOOL_CALLS_OPEN) - 1, TOOL_CALLS_OPEN) == 0 ||
+            text.compare(idx, sizeof(DSML_PREFIX) - 1, DSML_PREFIX) == 0 ||
+            text.compare(idx, sizeof(INVOKE_OPEN) - 1, INVOKE_OPEN) == 0 ||
             text.compare(idx, sizeof(FUNCTION_CALL_OPEN) - 1, FUNCTION_CALL_OPEN) == 0 ||
             text.compare(idx, sizeof(FUNCTION_CALLS_OPEN) - 1, FUNCTION_CALLS_OPEN) == 0 ||
             text.compare(idx, sizeof(FUNCTION_OPEN) - 1, FUNCTION_OPEN) == 0 ||
@@ -116,11 +122,14 @@ bool find_tool_syntax_start(const std::string & text, const json & tools,
             text.compare(idx, sizeof(TOOL_CODE_OPEN) - 1, TOOL_CODE_OPEN) == 0 ||
             text.compare(idx, sizeof(ATTRIBUTE_PARAMETER_OPEN) - 1,
                          ATTRIBUTE_PARAMETER_OPEN) == 0 ||
+            text.compare(idx, sizeof(ARG_KEY_OPEN) - 1, ARG_KEY_OPEN) == 0 ||
             declared_tool_open_at(text, idx, tools)) {
             pos = idx;
             return true;
         }
-        if (text.compare(idx, sizeof(ARG_KEY_OPEN) - 1, ARG_KEY_OPEN) == 0) {
+        // Check for bare tool tag without angle brackets if it follows a newline
+        // or start of text, e.g. "tool_name\n<arg_key>..."
+        if (idx == 0 || text[idx - 1] == '\n') {
             size_t start = idx;
             auto is_ident = [](char c) {
                 return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -138,10 +147,12 @@ bool find_tool_syntax_start(const std::string & text, const json & tools,
 }
 
 size_t tool_syntax_holdback(const json & tools) {
-    // Longest fixed opener is `<parameter name=` (16 bytes).
-    size_t holdback = std::max({sizeof(ATTRIBUTE_PARAMETER_OPEN) - 2,
+    size_t holdback = std::max({(size_t)21,
+                                sizeof(ATTRIBUTE_PARAMETER_OPEN) - 2,
                                 sizeof(FUNCTION_CALLS_OPEN) - 2,
                                 sizeof(FUNCTION_CALL_OPEN) - 2,
+                                sizeof(TOOL_CALLS_OPEN) - 2,
+                                sizeof(TOOL_OPEN) - 2,
                                 sizeof(BARE_FUNCTION_OPEN) - 2});
     if (!tools.is_array()) return holdback;
     for (const auto & tool : tools) {
@@ -617,7 +628,7 @@ static bool parse_complete_parameter_body(const std::string & body,
     return found_param && trim_ws(body.substr(cursor)).empty();
 }
 
-// ─── XML tool call parser (<function_call> / <tool_call> with tags) ────
+// ─── XML tool call parser (<function_call> / <tool_call> / <｜DSML｜tool_calls> with tags) ────
 
 static bool parse_xml_tool_call_body(const std::string & body, const json & tools,
                                      std::string & name, json & args, std::string & raw_args) {
@@ -634,10 +645,10 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
     }
 
     // 1. Look for function name in top-level XML envelope:
-    // a. <invoke name="...">...</invoke> or <invoke tool="...">...</invoke>
+    // a. <invoke name="...">...</invoke> or <invoke tool="...">...</invoke> (with optional ｜DSML｜ prefix)
     std::string param_section;
     static const std::regex re_invoke_envelope(
-        R"(^\s*<invoke\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</invoke>\s*$)");
+        R"(^\s*<(?:｜DSML｜)?invoke\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</(?:｜DSML｜)?invoke>\s*$)");
     std::smatch m_inv;
     if (std::regex_match(trimmed, m_inv, re_invoke_envelope)) {
         name = m_inv[1].str();
@@ -645,7 +656,7 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
     } else {
         // b. <invoke_name>NAME</invoke_name>, <tool_name>NAME</tool_name>, <function_name>NAME</function_name>, or leading <name>NAME</name>
         static const std::regex re_tag_name(
-            R"(^\s*<(invoke_name|name|tool_name|function_name)>\s*([A-Za-z_][\w.\-]*)\s*</\1>([\s\S]*)$)");
+            R"(^\s*<(?:｜DSML｜)?(invoke_name|name|tool_name|function_name)>\s*([A-Za-z_][\w.\-]*)\s*</(?:｜DSML｜)?\1>([\s\S]*)$)");
         std::smatch m_tag;
         if (std::regex_match(trimmed, m_tag, re_tag_name)) {
             name = m_tag[2].str();
@@ -660,8 +671,8 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
     const json props = find_tool_properties(tools, name);
     args = json::object();
 
-    // 2. Look for parameters section in <parameters>...</parameters> or <arguments>...</arguments>
-    static const std::regex re_section(R"(^\s*<(parameters|arguments)>([\s\S]*?)</\1>\s*$)");
+    // 2. Look for parameters section in <parameters>, <arguments>, etc.
+    static const std::regex re_section(R"(^\s*<(?:｜DSML｜)?(parameters|arguments|tool_calls|function_calls)>([\s\S]*?)</(?:｜DSML｜)?\1>\s*$)");
     std::smatch m_sec;
     std::string trimmed_params_sec = trim_ws(param_section);
     if (std::regex_match(trimmed_params_sec, m_sec, re_section)) {
@@ -693,9 +704,9 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
     }
 
     // 3. Extract parameter key-value pairs:
-    // a. Attribute style: <(param|parameter) name="key">value</...> or <parameter=key>value</parameter>
+    // a. Attribute style: <(param|parameter) name="key" string="true|false">value</...> or <parameter=key>value</parameter>
     static const std::regex re_attr_param(
-        R"(<(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</(?:param|parameter)>|<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
+        R"(<(?:｜DSML｜)?(?:param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?(?:true|false)["']?)?\s*>([\s\S]*?)</(?:｜DSML｜)?(?:param|parameter)>|<parameter=([A-Za-z_][\w.\-]*)>([\s\S]*?)</parameter>)");
     auto pbegin = std::sregex_iterator(trimmed_params.begin(), trimmed_params.end(), re_attr_param);
     auto pend = std::sregex_iterator();
     if (pbegin != pend) {
@@ -724,7 +735,7 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
     }
 
     // b. Element tag style: <key>value</key>
-    static const std::regex re_elem_param(R"(<([A-Za-z_][\w.\-]*)>([\s\S]*?)</\1>)");
+    static const std::regex re_elem_param(R"(<(?:｜DSML｜)?([A-Za-z_][\w.\-]*)>([\s\S]*?)</(?:｜DSML｜)?\1>)");
     auto ebegin = std::sregex_iterator(trimmed_params.begin(), trimmed_params.end(), re_elem_param);
     auto eend = std::sregex_iterator();
     if (ebegin != eend) {
@@ -739,7 +750,8 @@ static bool parse_xml_tool_call_body(const std::string & body, const json & tool
             std::string tag = (*it)[1].str();
             if (tag == "invoke_name" || tag == "name" || tag == "tool_name" ||
                 tag == "function_name" || tag == "parameters" || tag == "arguments" ||
-                tag == "function_call" || tag == "tool_call" || tag == "invoke") {
+                tag == "function_call" || tag == "tool_call" || tag == "tool_calls" ||
+                tag == "function_calls" || tag == "invoke") {
                 valid = false;
                 break;
             }
@@ -1463,11 +1475,11 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
         }
     }
 
-    // Pattern 4d: <function_calls> containing <invoke> blocks or JSON lines
+    // Pattern 4d: <function_calls> or <tool_calls> containing <invoke> blocks or JSON lines
     {
-        static const std::regex re_block(R"(<function_calls>([\s\S]*?)</function_calls>)");
-        static const std::regex re_invoke(R"(<invoke\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</invoke>)");
-        static const std::regex re_param(R"(<(param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</\1>)");
+        static const std::regex re_block(R"(<(?:｜DSML｜)?(?:function_calls|tool_calls)>([\s\S]*?)</(?:｜DSML｜)?(?:function_calls|tool_calls)>)");
+        static const std::regex re_invoke(R"(<(?:｜DSML｜)?invoke\s+(?:name|tool)\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?\s*>([\s\S]*?)</(?:｜DSML｜)?invoke>)");
+        static const std::regex re_param(R"(<(?:｜DSML｜)?(param|parameter)\s+name\s*=\s*["']?([A-Za-z_][\w.\-]*)["']?(?:\s+string\s*=\s*["']?(?:true|false)["']?)?\s*>([\s\S]*?)</(?:｜DSML｜)?\1>)");
 
         auto fbegin = std::sregex_iterator(text.begin(), text.end(), re_block);
         auto fend = std::sregex_iterator();

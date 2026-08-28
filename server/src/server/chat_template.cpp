@@ -386,16 +386,23 @@ std::string render_chat_template(
             result += "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
         }
         if (has_tools) {
-            result += "### Tools\n\n"
-                      "You may call functions to assist with the user query. "
-                      "All available function signatures are listed below:\n";
+            result += "## Tools\n\n"
+                      "You have access to a set of tools to help answer the user question. "
+                      "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
+                      "<｜DSML｜tool_calls>\n"
+                      "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
+                      "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
+                      "...\n"
+                      "</｜DSML｜invoke>\n"
+                      "<｜DSML｜invoke name=\"$TOOL_NAME2\">\n"
+                      "...\n"
+                      "</｜DSML｜invoke>\n"
+                      "</｜DSML｜tool_calls>\n\n"
+                      "String parameters should be specified as is and set `string=\"true\"`. "
+                      "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+                      "### Available Tool Schemas\n\n";
             append_available_tools(result, tools_json);
-            result += "For each function call, you MUST return a single JSON object "
-                      "within '<function_call>' and '</function_call>' tags, "
-                      "containing the function name and arguments, like this:\n"
-                      "<function_call>\n"
-                      "{\"name\": \"function_name\", \"arguments\": {\"param_name\": \"value\"}}\n"
-                      "</function_call>\n\n";
+            result += "\nYou MUST strictly follow the defined tool schemas to invoke tool calls.\n\n";
         }
         result += system_content;
 

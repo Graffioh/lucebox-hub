@@ -732,7 +732,14 @@ static std::string decode_gpt2_bpe(const std::string & tok) {
     while (p < end) {
         int cplen;
         uint32_t cp = utf8_decode(p, (size_t)(end - p), &cplen);
-        out.push_back((char)gpt2_unicode_to_byte(cp));
+        if ((cp >= 33 && cp <= 126) || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255)) {
+            out.push_back((char)cp);
+        } else if (cp >= 256 && cp < 256 + 68) {
+            out.push_back((char)gpt2_unicode_to_byte(cp));
+        } else {
+            // Raw Unicode codepoint (e.g. U+FF5C '｜', U+2581 '▁') — emit raw bytes
+            out.append(p, cplen);
+        }
         p += cplen;
     }
     return out;
