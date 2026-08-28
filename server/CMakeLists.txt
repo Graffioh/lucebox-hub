@@ -414,6 +414,7 @@ add_library(dflash_common STATIC
     src/qwen35/qwen35_target_graph.cpp
     src/qwen35/qwen35_roctx.cpp
     src/bailingmoe3/bailingmoe3_loader.cpp
+    src/bailingmoe3/bailingmoe3_graph.cpp
     src/bailingmoe3/bailingmoe3_backend.cpp
     src/draft/draft_gguf_loader.cpp
     src/draft/draft_safetensors_loader.cpp
