@@ -190,9 +190,10 @@ TEST_CASE(ChainRollbackPolicyFixture, asymmetric_v_cache_is_ling_only) {
     const auto check_width = [&](bool is_bailingmoe3, int expected) {
         weights.is_bailingmoe3 = is_bailingmoe3;
         dflash::common::TargetCache cache;
+        // This fixture has no recurrent layers, so no rollback cache is needed.
         const bool ok = dflash::common::create_target_cache_partial(
             weights, /*max_ctx=*/1, /*max_verify_tokens=*/1, backend, cache,
-            /*prefill_only=*/false, /*layer_begin=*/0, /*layer_end=*/1,
+            /*prefill_only=*/true, /*layer_begin=*/0, /*layer_end=*/1,
             /*allocate_target_feat=*/false, /*ctx_alloc=*/0,
             /*f32_ssm_intermediates=*/false);
         CHECK(ok);
