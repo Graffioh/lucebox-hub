@@ -2904,7 +2904,8 @@ std::string HttpServer::apply_pflash_compression(
             compress_request.input_ids.size() - (size_t) query_window.end);
     } else {
         std::fprintf(stderr,
-            "[pflash] scorer query mapping failed — using rendered prompt tail\n");
+            "[pflash] ERROR: scorer query mapping failed; refusing compression\n");
+        return "PFlash scorer query mapping failed";
     }
     compress_request.drafter_path = config_.pflash_drafter_path;
     compress_request.drafter_gpu = config_.pflash_drafter_gpu;
