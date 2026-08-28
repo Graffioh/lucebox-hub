@@ -30,7 +30,9 @@ public:
 
     bool compress(const std::vector<int32_t> & input_ids,
                   float keep_ratio,
-                  std::vector<int32_t> & compressed_ids);
+                  std::vector<int32_t> & compressed_ids,
+                  int score_query_end = -1,
+                  int score_query_tokens = 8);
 
     bool active() const { return active_; }
     void close();

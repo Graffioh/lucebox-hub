@@ -110,6 +110,62 @@ TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {
     CHECK(std::string(api_format_name(ApiFormat::COMPLETIONS)) == "completions");
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_scorer_uses_user_query_before_chat_suffix) {
+    const std::vector<int32_t> query{
+        90, 91, 100, 101, 102, 103, 104, 105, 106, 107,
+    };
+    const std::vector<int32_t> rendered{
+        1, 2, 100, 101, 102, 103, 104, 105, 106, 107,
+        200, 201, 202, 203, 204, 205, 206, 207,
+    };
+
+    const auto window = http_detail::find_pflash_query_window(rendered, query);
+
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.tokens == 8);
+    TEST_ASSERT(window.end == 10);
+    TEST_ASSERT((int)rendered.size() - window.end == 8);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_tolerates_one_bpe_boundary_token) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{
+        1, 2, 999, 11, 12, 13, 14, 15, 16, 17, 200, 201,
+    };
+
+    const auto window = http_detail::find_pflash_query_window(rendered, query);
+
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.tokens == 7);
+    TEST_ASSERT(window.end == 10);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_rejects_weak_punctuation_match) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{1, 2, 15, 16, 17, 200, 201};
+    TEST_ASSERT(!http_detail::find_pflash_query_window(rendered, query).valid());
+
+    const std::vector<int32_t> short_query{30, 31, 32};
+    const std::vector<int32_t> short_rendered{1, 30, 31, 32, 200};
+    const auto short_window =
+        http_detail::find_pflash_query_window(short_rendered, short_query);
+    TEST_ASSERT(short_window.valid());
+    TEST_ASSERT(short_window.tokens == 3);
+    TEST_ASSERT(short_window.end == 4);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_score_validation_counts_nan_and_inf) {
+    const float values[]{
+        0.0f,
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        1.0f,
+    };
+    TEST_ASSERT(count_nonfinite_scores(values, 5) == 3);
+    TEST_ASSERT(count_nonfinite_scores(values, 1) == 0);
+}
+
 TEST_CASE(ServerUnitFixture, test_daemon_io_external_cancellation_latches) {
     bool cancel = false;
     DaemonIO io;

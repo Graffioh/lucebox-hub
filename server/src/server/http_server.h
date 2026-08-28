@@ -262,6 +262,20 @@ bool canonical_assistant_content(
     const std::string & generated_text,
     std::string & content);
 
+struct PflashQueryWindow {
+    int end = -1;       // exclusive token offset in the rendered prompt
+    int tokens = 0;     // width of the matching query suffix
+
+    bool valid() const { return end >= tokens && tokens > 0; }
+};
+
+// Find the last sufficiently-specific suffix of the user query inside the
+// rendered drafter-tokenized prompt. Public for model-free regression tests.
+PflashQueryWindow find_pflash_query_window(
+    const std::vector<int32_t> & prompt,
+    const std::vector<int32_t> & query,
+    int max_tokens = 8);
+
 }  // namespace http_detail
 
 // ─── Parsed request ─────────────────────────────────────────────────────

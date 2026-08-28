@@ -186,6 +186,32 @@ HeartbeatSendResult try_send_sse_heartbeat(
     return HeartbeatSendResult::Complete;
 }
 
+PflashQueryWindow find_pflash_query_window(
+        const std::vector<int32_t> & prompt,
+        const std::vector<int32_t> & query,
+        int max_tokens) {
+    PflashQueryWindow result;
+    if (prompt.empty() || query.empty() || max_tokens < 1) return result;
+
+    const int widest = (std::min)(max_tokens, (int) query.size());
+    // For a short query, require all available tokens. For a normal query,
+    // four matching suffix tokens are enough to tolerate a BPE boundary
+    // difference without accidentally selecting a lone punctuation token.
+    const int narrowest = (std::min)(4, widest);
+    for (int width = widest; width >= narrowest; --width) {
+        const auto query_begin = query.end() - width;
+        for (int end = (int) prompt.size(); end >= width; --end) {
+            if (std::equal(query_begin, query.end(),
+                           prompt.begin() + end - width)) {
+                result.end = end;
+                result.tokens = width;
+                return result;
+            }
+        }
+    }
+    return result;
+}
+
 }  // namespace http_detail
 
 static std::string context_overflow_message(int max_ctx, int prompt_tokens, int max_output) {
@@ -2835,6 +2861,31 @@ std::string HttpServer::apply_pflash_compression(
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const std::string prompt_text = tokenizer_.decode(req.prompt_tokens);
     auto drafter_ids = drafter_tokenizer_->encode(prompt_text);
+
+    std::string last_user_text;
+    if (req.messages.is_array()) {
+        for (int index = (int) req.messages.size() - 1; index >= 0; --index) {
+            if (req.messages[index].value("role", "") != "user") continue;
+            const auto & content = req.messages[index]["content"];
+            if (content.is_string()) {
+                last_user_text = content.get<std::string>();
+            } else if (content.is_array()) {
+                for (const auto & part : content) {
+                    const std::string type = part.value("type", "");
+                    if (type == "text" || type == "input_text" ||
+                        type == "output_text") {
+                        last_user_text += part.value("text", "");
+                    }
+                }
+            }
+            break;
+        }
+    }
+    const auto query_ids = last_user_text.empty()
+        ? std::vector<int32_t>{}
+        : drafter_tokenizer_->encode(last_user_text);
+    const auto query_window = http_detail::find_pflash_query_window(
+        drafter_ids, query_ids);
     if (drafter_ids.empty()) {
         return "PFlash drafter tokenizer produced an empty prompt";
     }
@@ -2843,6 +2894,18 @@ std::string HttpServer::apply_pflash_compression(
     compress_request.input_ids = std::move(drafter_ids);
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
+    if (query_window.valid()) {
+        compress_request.score_query_end = query_window.end;
+        compress_request.score_query_tokens = query_window.tokens;
+        std::fprintf(stderr,
+            "[pflash] scorer query mapped to drafter tokens [%d,%d); "
+            "rendered suffix=%zu tokens\n",
+            query_window.end - query_window.tokens, query_window.end,
+            compress_request.input_ids.size() - (size_t) query_window.end);
+    } else {
+        std::fprintf(stderr,
+            "[pflash] scorer query mapping failed — using rendered prompt tail\n");
+    }
     compress_request.drafter_path = config_.pflash_drafter_path;
     compress_request.drafter_gpu = config_.pflash_drafter_gpu;
     compress_request.skip_park = config_.pflash_skip_park;
@@ -2866,7 +2929,9 @@ std::string HttpServer::apply_pflash_compression(
         }
         result.ok = pflash_remote_.compress(
             compress_request.input_ids, compress_request.keep_ratio,
-            result.compressed_ids);
+            result.compressed_ids,
+            compress_request.score_query_end,
+            compress_request.score_query_tokens);
         if (residency == DraftResidencyAction::ReleaseAfterUse) {
             pflash_remote_.close();
         }
@@ -2885,28 +2950,7 @@ std::string HttpServer::apply_pflash_compression(
 
     // Compression is allowed to be lossy, but the active user query must
     // survive. Re-append short queries when fewer than 80% of their tokens do.
-    std::string last_user_text;
-    if (req.messages.is_array()) {
-        for (int index = (int) req.messages.size() - 1; index >= 0; --index) {
-            if (req.messages[index].value("role", "") != "user") continue;
-            const auto & content = req.messages[index]["content"];
-            if (content.is_string()) {
-                last_user_text = content.get<std::string>();
-            } else if (content.is_array()) {
-                for (const auto & part : content) {
-                    const std::string type = part.value("type", "");
-                    if (type == "text" || type == "input_text" ||
-                        type == "output_text") {
-                        last_user_text += part.value("text", "");
-                    }
-                }
-            }
-            break;
-        }
-    }
-
     if (!last_user_text.empty()) {
-        const auto query_ids = drafter_tokenizer_->encode(last_user_text);
         int query_kept = 0;
         if (!query_ids.empty()) {
             int query_index = (int) query_ids.size() - 1;
