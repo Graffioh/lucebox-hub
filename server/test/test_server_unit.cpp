@@ -1293,7 +1293,10 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_string_attribute_semanti
              {"parameters", {
                  {"type", "object"},
                  {"properties", {
-                     {"verbatim_str", {{"type", "string"}}}
+                     {"verbatim_str", {{"type", "string"}}},
+                     {"json_num", {{"type", "integer"}}},
+                     {"json_bool", {{"type", "boolean"}}},
+                     {"json_arr", {{"type", "array"}}}
                  }}
              }}
          }}}
