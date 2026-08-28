@@ -925,6 +925,241 @@ TEST_CASE(ServerUnitFixture, test_parse_bare_function_json_with_parameters) {
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_invoke_name_parameters) {
+    const std::string text =
+        "Let me read the file.\n\n"
+        "<function_call>\n"
+        "<invoke_name>read</invoke_name>\n"
+        "<parameters>\n"
+        "<path>/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go</path>\n"
+        "</parameters>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/home/dpavlin/koha-rfid-go/internal/rfidops/ops.go");
+    }
+    TEST_ASSERT(result.cleaned_text == "Let me read the file.");
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_function_call_xml_multiple_parameters) {
+    const std::string text =
+        "<function_call>\n"
+        "<invoke_name>bash</invoke_name>\n"
+        "<parameters>\n"
+        "<command>ls -la /tmp</command>\n"
+        "<timeout>10</timeout>\n"
+        "</parameters>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"timeout", {{"type", "integer"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -la /tmp");
+        TEST_ASSERT(args["timeout"] == 10);
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml_invoke_name_parameters) {
+    const std::string text =
+        "<tool_call>\n"
+        "<invoke_name>read</invoke_name>\n"
+        "<parameters>\n"
+        "<path>/home/dpavlin/test.go</path>\n"
+        "</parameters>\n"
+        "</tool_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/home/dpavlin/test.go");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_legacy_tool_call_with_nested_name_tag) {
+    // Regression test for Violation 1:
+    // A legacy <tool_call><function=...> envelope whose parameter contains a nested <name> tag
+    // must NOT be hijacked by parse_xml_tool_call_body as envelope name.
+    const std::string text =
+        "<tool_call>\n"
+        "<function=edit_file>\n"
+        "<parameter=content>\n"
+        "function getTool() { return \"<name>other_tool</name>\"; }\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "edit_file"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"content", {{"type", "string"}}}
+                 }}
+             }}
+         }}},
+        {{"type", "function"}, {"function", {
+             {"name", "other_tool"},
+             {"parameters", {{"type", "object"}, {"properties", {}}}}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "edit_file");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["content"] == "function getTool() { return \"<name>other_tool</name>\"; }");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_xml_tool_call_malformed_parameters_rejected) {
+    // Regression test for Violation 2:
+    // When the parameter section is non-empty but malformed (unsupported/invalid syntax),
+    // parse_xml_tool_call_body must NOT emit an empty {} tool call.
+    const std::string text =
+        "<function_call>\n"
+        "<invoke_name>edit_file</invoke_name>\n"
+        "<parameters>\n"
+        "random unparseable garbage text\n"
+        "</parameters>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "edit_file"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"content", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.empty());
+    TEST_ASSERT(!result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_xml_tool_call_zero_arguments_accepted) {
+    // Genuinely zero-argument calls should be accepted.
+    const std::string text =
+        "<function_call>\n"
+        "<invoke_name>get_status</invoke_name>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "get_status"},
+             {"parameters", {{"type", "object"}, {"properties", {}}}}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "get_status");
+        TEST_ASSERT(result.tool_calls[0].arguments == "{}");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_xml_tool_call_invoke_envelope_attribute_style) {
+    const std::string text =
+        "<function_call>\n"
+        "<invoke name=\"read\">\n"
+        "<parameter name=\"path\">/tmp/test.txt</parameter>\n"
+        "</invoke>\n"
+        "</function_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/tmp/test.txt");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_call_xml_function_name_tag) {
+    // Regression test for Violation:
+    // <tool_call> envelopes using <function_name> must be parsed cleanly by parse_xml_tool_call_body()
+    const std::string text =
+        "<tool_call>\n"
+        "<function_name>read</function_name>\n"
+        "<parameters>\n"
+        "<path>/tmp/test.txt</path>\n"
+        "</parameters>\n"
+        "</tool_call>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "read"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "read");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["path"] == "/tmp/test.txt");
+    }
+    TEST_ASSERT(result.cleaned_text.empty());
+}
+
 
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
