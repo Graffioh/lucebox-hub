@@ -1643,6 +1643,7 @@ if(DFLASH27B_TESTS)
             test/test_qwen35moe_routing_stats.cpp
             test/test_qwen35moe_expert_placement.cpp
             test/test_qwen35moe_swap_manager.cpp
+            test/test_mmq_streamk_schedule.cpp
             test/test_moe_hybrid_storage.cpp)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             list(APPEND _server_unit_sources
@@ -1663,6 +1664,7 @@ if(DFLASH27B_TESTS)
             TAIL_GUARD_USE_NEW_FORMULA)
         target_include_directories(test_server_unit PRIVATE
             ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda
             ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(test_server_unit PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
