@@ -31,6 +31,7 @@
 //   conv_kernel      = 4
 
 #include "internal.h"
+#include "bailingmoe3_graph.h"
 #include "delta_net_chunked.h"
 #include "delta_net_specla.h"
 #include "kv_quant.h"
@@ -184,10 +185,13 @@ bool create_target_cache_partial(const TargetWeights & w,
     // The rotation costs two extra launches per attention layer. Decision
     // logic lives in common/kv_rotation.h and is shared with the disk
     // prefix cache identity salt: a cache written under one rotation basis
-    // must never be adopted by a session using the other.
-    out.kv_k_rotated = dflash_kv_k_rotation_enabled(ggml_type_name(kv_k_type));
+    // must never be adopted by a session using the other. Ling's latent MLA
+    // cache uses unequal K/V widths, so it cannot use the qwen FWHT path.
+    out.kv_k_rotated =
+        !w.is_bailingmoe3 &&
+        dflash_kv_k_rotation_enabled(ggml_type_name(kv_k_type));
 
-    const bool needs_256_stride =
+    const bool needs_256_stride = w.is_bailingmoe3 ||
         kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0;
     // kvflash mode: attention tensors are allocated at the (smaller)
     // physical pool capacity; logical positions are mapped to pool slots
@@ -230,8 +234,11 @@ bool create_target_cache_partial(const TargetWeights & w,
                 // [head_dim, max_ctx_alloc, n_head_kv]
                 ggml_tensor * K = ggml_new_tensor_3d(out.base_ctx, kv_k_type,
                                                      head_dim, max_ctx_alloc, w.n_head_kv);
-                ggml_tensor * V = ggml_new_tensor_3d(out.base_ctx, kv_v_type,
-                                                     head_dim, max_ctx_alloc, w.n_head_kv);
+                const int v_head_dim = w.is_bailingmoe3
+                    ? w.n_embd_head_v : head_dim;
+                ggml_tensor * V = ggml_new_tensor_3d(
+                    out.base_ctx, kv_v_type, v_head_dim,
+                    max_ctx_alloc, w.n_head_kv);
                 char name[64];
                 std::snprintf(name, sizeof(name), "cache_k_%d", il);
                 ggml_set_name(K, name);
@@ -2215,14 +2222,18 @@ static ggml_tensor * build_single_layer(
         for (int il = 0; il < layer_idx; il++) {
             if (((il + 1) % w.full_attention_interval) == 0) fa_idx++;
         }
-        cur = build_full_attn_block(ctx, gf, w, L, cur, positions, w.rope_sections,
-                                    cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                                    attn_mask, kv_start, n_tokens,
-                                    cache.kv_k_type, cache.kv_v_type,
-                                    cache.kv_k_rotated,
-                                    fa_window,
-                                    q_tail_capture, q_tail_start,
-                                    kv_write_rows);
+        cur = w.is_bailingmoe3
+            ? build_bailingmoe3_mla_block(
+                ctx, gf, w, L, cur, positions,
+                cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                attn_mask, kv_start, n_tokens)
+            : build_full_attn_block(
+                ctx, gf, w, L, cur, positions, w.rope_sections,
+                cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                attn_mask, kv_start, n_tokens,
+                cache.kv_k_type, cache.kv_v_type,
+                cache.kv_k_rotated, fa_window,
+                q_tail_capture, q_tail_start, kv_write_rows);
     } else {
         int dn_idx = 0;
         for (int il = 0; il < layer_idx; il++) {
@@ -2235,11 +2246,16 @@ static ggml_tensor * build_single_layer(
             cap_ptr->ssm_intermediate_states = cache.ssm_intermediate[dn_idx];
             cap_ptr->conv_input              = cache.conv_input_cache[dn_idx];
         }
-        cur = build_delta_net_block(ctx, gf, w, L, cur,
-                                    cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
-                                    n_tokens, cap_ptr, parent_ids,
-                                    /*skip_gdn_intermediate=*/true,
-                                    supports_qwen35_fused_kernels(cache.backend));
+        cur = w.is_bailingmoe3
+            ? build_bailingmoe3_kda_block(
+                ctx, gf, w, L, cur, cache.conv_state[dn_idx],
+                cache.ssm_state[dn_idx], n_tokens)
+            : build_delta_net_block(
+                ctx, gf, w, L, cur,
+                cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
+                n_tokens, cap_ptr, parent_ids,
+                /*skip_gdn_intermediate=*/true,
+                supports_qwen35_fused_kernels(cache.backend));
     }
 
     cur = ggml_add(ctx, cur, inpSA);
@@ -2247,8 +2263,9 @@ static ggml_tensor * build_single_layer(
     ggml_tensor * ffn_residual = cur;
     ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
     ggml_tensor * moe_selected = nullptr;
-    ggml_tensor * ffn  = w.is_moe ? build_qwen35moe_ffn(ctx, post, w, L, &moe_selected)
-                                  : build_swiglu_ffn(ctx, post, L);
+    ggml_tensor * ffn  = L.ffn_gate_inp
+        ? build_qwen35moe_ffn(ctx, post, w, L, &moe_selected)
+        : build_swiglu_ffn(ctx, post, L);
     if (moe_selected_out) {
         *moe_selected_out = moe_selected;
     }
@@ -2350,28 +2367,38 @@ QwenGraphOutputs build_qwen35_graph(
         if (is_attn) {
             const bool want_q_cap = in.q_capture && cache.q_cap;
             ggml_tensor * q_fa = nullptr;
-            cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
-                                        cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                                        in.attn_mask, in.kv_start, n_tokens,
-                                        cache.kv_k_type, cache.kv_v_type,
-                                        cache.kv_k_rotated,
-                                        in.fa_window,
-                                        /*q_tail_capture=*/nullptr,
-                                        /*q_tail_start=*/0,
-                                        in.kv_write_rows,
-                                        want_q_cap ? &q_fa : nullptr,
-                                        in.paged_block_table,
-                                        in.paged_kv_seq_lens,
-                                        in.paged_query_seq_ids,
-                                        in.paged_query_positions,
-                                        in.paged_max_kv_len,
-                                        in.active_slot_ids,
-                                        in.tree_sizes ? in.parent_ids : nullptr,
-                                        in.tree_sizes,
-                                        in.tree_width,
-                                        in.tree_scratch_base,
-                                        in.tree_scratch_stride,
-                                        cache.max_ctx);
+            if (w.is_bailingmoe3) {
+                GGML_ASSERT(!in.kv_write_rows && !in.paged_block_table &&
+                            !in.paged_query_seq_ids && !in.tree_sizes &&
+                            in.n_seqs == 1);
+                cur = build_bailingmoe3_mla_block(
+                    ctx, gf, w, L, cur, in.positions,
+                    cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                    in.attn_mask, in.kv_start, n_tokens);
+            } else {
+                cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
+                                            cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                                            in.attn_mask, in.kv_start, n_tokens,
+                                            cache.kv_k_type, cache.kv_v_type,
+                                            cache.kv_k_rotated,
+                                            in.fa_window,
+                                            /*q_tail_capture=*/nullptr,
+                                            /*q_tail_start=*/0,
+                                            in.kv_write_rows,
+                                            want_q_cap ? &q_fa : nullptr,
+                                            in.paged_block_table,
+                                            in.paged_kv_seq_lens,
+                                            in.paged_query_seq_ids,
+                                            in.paged_query_positions,
+                                            in.paged_max_kv_len,
+                                            in.active_slot_ids,
+                                            in.tree_sizes ? in.parent_ids : nullptr,
+                                            in.tree_sizes,
+                                            in.tree_width,
+                                            in.tree_scratch_base,
+                                            in.tree_scratch_stride,
+                                            cache.max_ctx);
+            }
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
                 // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx
@@ -2445,25 +2472,32 @@ QwenGraphOutputs build_qwen35_graph(
                     ssm_st->nb[1], ssm_st->nb[2], ssm_st->nb[3],
                     (size_t)in.seq_slot * ssm_st->nb[3]);
             }
-            cur = build_delta_net_block(ctx, gf, w, L, cur,
-                                        conv_st, ssm_st,
-                                        n_tokens, cap_ptr, in.parent_ids,
-                                        /*skip_gdn_intermediate=*/true,
-                                        supports_qwen35_fused_kernels(cache.backend),
-                                        in.n_seqs,
-                                        in.prefill_segments,
-                                        in.n_prefill_segments,
-                                        in.active_slot_ids,
-                                        in.state_slot_ids,
-                                        in.mapped_ar_seqs,
-                                        /*allow_inplace_state=*/
-                                            in.n_prefill_tokens == 0,
-                                        in.specla_m_strict, in.specla_m_incl,
-                                        in.specla_m_eye, in.specla_hld,
-                                        in.specla_n_boundaries,
-                                        in.specla_n_chains,
-                                        in.specla_n_waves,
-                                        in.specla_max_parallel_chains);
+            if (w.is_bailingmoe3) {
+                GGML_ASSERT(!cap_ptr && !in.parent_ids && in.n_seqs == 1 &&
+                            in.n_prefill_segments == 0 && !in.active_slot_ids);
+                cur = build_bailingmoe3_kda_block(
+                    ctx, gf, w, L, cur, conv_st, ssm_st, n_tokens);
+            } else {
+                cur = build_delta_net_block(ctx, gf, w, L, cur,
+                                            conv_st, ssm_st,
+                                             n_tokens, cap_ptr, in.parent_ids,
+                                             /*skip_gdn_intermediate=*/true,
+                                             supports_qwen35_fused_kernels(cache.backend),
+                                             in.n_seqs,
+                                             in.prefill_segments,
+                                             in.n_prefill_segments,
+                                             in.active_slot_ids,
+                                             in.state_slot_ids,
+                                             in.mapped_ar_seqs,
+                                             /*allow_inplace_state=*/
+                                                 in.n_prefill_tokens == 0,
+                                            in.specla_m_strict, in.specla_m_incl,
+                                            in.specla_m_eye, in.specla_hld,
+                                            in.specla_n_boundaries,
+                                            in.specla_n_chains,
+                                            in.specla_n_waves,
+                                             in.specla_max_parallel_chains);
+            }
             dn_idx++;
         }
 
@@ -2476,9 +2510,10 @@ QwenGraphOutputs build_qwen35_graph(
 
         // FFN (dense SwiGLU for qwen35, MoE for qwen35moe)
         ggml_tensor * moe_selected = nullptr;
-        ggml_tensor * ffn = w.is_moe ? build_qwen35moe_ffn(ctx, post, w, L,
-                                                           in.capture_moe_router ? &moe_selected : nullptr)
-                                     : build_swiglu_ffn(ctx, post, L);
+        ggml_tensor * ffn = L.ffn_gate_inp
+            ? build_qwen35moe_ffn(ctx, post, w, L,
+                                  in.capture_moe_router ? &moe_selected : nullptr)
+            : build_swiglu_ffn(ctx, post, L);
         if (in.capture_moe_router && moe_selected) {
             ggml_set_output(moe_selected);
             og_early.moe_selected[(size_t)il] = moe_selected;
@@ -2669,30 +2704,39 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
         for (int il = 0; il < layer_idx; il++) {
             if (((il + 1) % w.full_attention_interval) == 0) fa_idx++;
         }
-        cur = build_full_attn_block(ctx, gf, w, L, cur, positions, w.rope_sections,
-                                    cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                                    attn_mask, kv_start, n_tokens,
-                                    cache.kv_k_type, cache.kv_v_type,
-                                    cache.kv_k_rotated,
-                                    fa_window,
-                                    /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
-                                    kv_write_rows);
+        cur = w.is_bailingmoe3
+            ? build_bailingmoe3_mla_block(
+                ctx, gf, w, L, cur, positions,
+                cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                attn_mask, kv_start, n_tokens)
+            : build_full_attn_block(
+                ctx, gf, w, L, cur, positions, w.rope_sections,
+                cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                attn_mask, kv_start, n_tokens,
+                cache.kv_k_type, cache.kv_v_type,
+                cache.kv_k_rotated, fa_window,
+                /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
+                kv_write_rows);
     } else {
         int dn_idx = 0;
         for (int il = 0; il < layer_idx; il++) {
             if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
         }
-        cur = build_delta_net_block(ctx, gf, w, L, cur,
-                                    cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
-                                    n_tokens, nullptr, nullptr,
-                                    skip_gdn_intermediate,
-                                    supports_qwen35_fused_kernels(cache.backend));
+        cur = w.is_bailingmoe3
+            ? build_bailingmoe3_kda_block(
+                ctx, gf, w, L, cur, cache.conv_state[dn_idx],
+                cache.ssm_state[dn_idx], n_tokens)
+            : build_delta_net_block(
+                ctx, gf, w, L, cur,
+                cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
+                n_tokens, nullptr, nullptr, skip_gdn_intermediate,
+                supports_qwen35_fused_kernels(cache.backend));
     }
 
     cur = ggml_add(ctx, cur, inpSA);
     out.residual = cur;
     out.post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
-    if (w.is_moe) {
+    if (L.ffn_gate_inp) {
         // selected/weights are read back by the host (hybrid hot/cold expert
         // compute), not consumed in-graph. argsort_top_k yields a strided view
         // whose raw packed readback returns garbage ids for tokens > 0 (crash

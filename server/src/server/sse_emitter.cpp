@@ -115,6 +115,27 @@ SseEmitter::SseEmitter(ApiFormat format,
     }
 }
 
+bool SseEmitter::suppress_undeclared_tool_protocol_token(
+        const std::string & raw_token) {
+    if (has_request_tools(tools_)) return false;
+
+    if (raw_token == "<tool_call>") {
+        suppress_undeclared_tool_protocol_ = true;
+        return true;
+    }
+    if (suppress_undeclared_tool_protocol_) {
+        if (raw_token == "</tool_call>") {
+            suppress_undeclared_tool_protocol_ = false;
+        }
+        return true;
+    }
+
+    // Stray protocol delimiters are control tokens, not assistant content.
+    return raw_token == "</tool_call>" ||
+           raw_token == "<arg_key>" || raw_token == "</arg_key>" ||
+           raw_token == "<arg_value>" || raw_token == "</arg_value>";
+}
+
 // ─── SSE formatting helpers ─────────────────────────────────────────────
 
 std::string SseEmitter::sse_data(const std::string & json_str) {

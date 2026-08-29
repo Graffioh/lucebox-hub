@@ -52,6 +52,7 @@ Model links open the exact weights used by the measured setup. Drafter links ope
 | [Gemma 4 26B-A4B Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-26B-A4B-it-GGUF/blob/main/google_gemma-4-26B-A4B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF/blob/main/gemma-4-26B-A4B-it-DFlash-q8_0.gguf) | Decode | **1.31×** |
 | [Gemma 4 31B IT Q4_K_M](https://huggingface.co/bartowski/google_gemma-4-31B-it-GGUF/blob/main/google_gemma-4-31B-it-Q4_K_M.gguf) + [DFlash Q8_0 drafter](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF/blob/main/gemma-4-31B-it-DFlash-q8_0.gguf) | Decode | **3.2×** |
 | [DeepSeek V4 Flash ROCmFPX MIX Strix](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3/blob/main/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf) + [DSpark Q4RMFP4 drafter](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF/blob/main/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf) | Decode | Up to **1.81×** vs target-only, **32.7 vs 18.1 tok/s** |
+| [Ling 3.0 Flash 124B-A5.1B Q4_K_M](https://huggingface.co/bloomer010/Ling-3.0-flash-GGUF) | Decode | **34.6 tok/s** median AR on DGX Spark |
 
 ## Tested Machines (GPU/APU)
 
