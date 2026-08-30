@@ -80,6 +80,69 @@ static void force_chunk_neighborhood(std::vector<uint8_t> & forced, int n_chunks
     for (int c = lo; c <= hi; ++c) forced[(size_t)c] = 1;
 }
 
+static void write_compression_trace(
+        int input_tokens,
+        float keep_ratio,
+        int chunk_size,
+        int n_lookahead,
+        int pool_kernel,
+        int n_keep,
+        const std::vector<std::pair<float, int>> & chunk_means,
+        const std::vector<uint8_t> & selected,
+        const std::vector<uint8_t> & forced,
+        const std::vector<int32_t> & compressed_ids) {
+    const char * path = std::getenv("DFLASH_PFLASH_TRACE_PATH");
+    if (!path || !*path) return;
+
+    FILE * file = std::fopen(path, "a");
+    if (!file) {
+        std::fprintf(stderr, "[pflash-trace] cannot append %s\n", path);
+        return;
+    }
+
+    std::vector<float> scores(selected.size(), 0.0f);
+    for (const auto & chunk : chunk_means) {
+        scores[(size_t)chunk.second] = chunk.first;
+    }
+
+    std::fprintf(file,
+        "{\"schema_version\":1,\"input_tokens\":%d,\"keep_ratio\":%.9g,"
+        "\"chunk_size\":%d,\"n_lookahead\":%d,\"pool_kernel\":%d,"
+        "\"n_keep\":%d,\"chunk_scores\":[",
+        input_tokens, keep_ratio, chunk_size, n_lookahead, pool_kernel, n_keep);
+    for (size_t index = 0; index < scores.size(); ++index) {
+        if (index) std::fputc(',', file);
+        if (std::isfinite(scores[index])) {
+            std::fprintf(file, "%.9g", scores[index]);
+        } else {
+            std::fputs("null", file);
+        }
+    }
+    std::fputs("],\"selected_chunks\":[", file);
+    bool first = true;
+    for (size_t index = 0; index < selected.size(); ++index) {
+        if (!selected[index]) continue;
+        if (!first) std::fputc(',', file);
+        std::fprintf(file, "%zu", index);
+        first = false;
+    }
+    std::fputs("],\"forced_chunks\":[", file);
+    first = true;
+    for (size_t index = 0; index < forced.size(); ++index) {
+        if (!forced[index]) continue;
+        if (!first) std::fputc(',', file);
+        std::fprintf(file, "%zu", index);
+        first = false;
+    }
+    std::fputs("],\"compressed_ids\":[", file);
+    for (size_t index = 0; index < compressed_ids.size(); ++index) {
+        if (index) std::fputc(',', file);
+        std::fprintf(file, "%d", compressed_ids[index]);
+    }
+    std::fputs("]}\n", file);
+    std::fclose(file);
+}
+
 #if defined(DFLASH27B_BACKEND_HIP)
 bool prewarm_drafter_once(const Qwen3DrafterWeights & w) {
     static bool warmed = false;
@@ -874,6 +937,9 @@ std::vector<int32_t> drafter_score_and_compress(
         std::chrono::duration<double>(t2 - t0).count(),
         S, out.size(), (int)selected.size(), n_chunks, forced_count);
     std::fflush(stderr);
+
+    write_compression_trace(S, keep_ratio, chunk_size, n_lookahead,
+        pool_kernel, n_keep, chunk_means, selected_mask, forced, out);
 
     return out;
 }
