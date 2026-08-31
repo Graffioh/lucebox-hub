@@ -105,6 +105,10 @@ public:
     struct StepAppend {
         bool ok = false;
         bool busy = false;    // no physical block available right now
+        // The pool reported a successful append with malformed metadata and
+        // could not rewind it. Callers must fail the whole cohort because the
+        // allocator may have advanced even though `ok` is false.
+        bool rollback_failed = false;
         int64_t physical_row = -1;
         std::vector<int64_t> physical_rows;
         int count = 0;

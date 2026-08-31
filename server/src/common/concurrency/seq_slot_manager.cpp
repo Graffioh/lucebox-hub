@@ -277,6 +277,7 @@ SeqSlotManager::StepAppend SeqSlotManager::append_tokens(
         const PagedKvStatus rollback =
             pool_.rollback_append(s.handle, static_cast<uint32_t>(n_tokens));
         if (rollback != PagedKvStatus::Ok) {
+            out.rollback_failed = true;
             std::fprintf(stderr,
                 "[parallel] slot %d failed to roll back invalid append: %s\n",
                 slot, paged_kv_status_string(rollback));
