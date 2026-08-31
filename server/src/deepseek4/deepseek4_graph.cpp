@@ -1098,7 +1098,7 @@ struct DeepSeek4PagedSegmentPublication {
     ggml_tensor * emitted_indexer = nullptr;
 };
 
-[[maybe_unused]] static bool build_paged_segment_compressor_publication(
+static bool build_paged_segment_compressor_publication(
         ggml_context * ctx,
         ggml_cgraph * gf,
         const DeepSeek4Weights & w,
@@ -1992,8 +1992,9 @@ struct DeepSeek4MlaLaneBindings {
     ggml_tensor ** current_raw_out = nullptr;
     ggml_tensor ** current_comp_out = nullptr;
     ggml_tensor ** current_index_comp_out = nullptr;
-    // False is the padding/inactive-lane contract: build attention against the
-    // supplied padded history, but emit no persistent current-row mutations.
+    // False is the padding/inactive-lane or caller-managed-publication
+    // contract: build attention against supplied history, but emit no
+    // persistent raw/compressor mutations from this lane.
     bool write_enabled = true;
     DeepSeek4CompressorState * attn_compressor = nullptr;
     DeepSeek4CompressorState * indexer_compressor = nullptr;
@@ -5438,6 +5439,40 @@ struct Ds4FusedVerifyCache {
             int64_t index_off = -1;
             int64_t index_n = 0;
         };
+        struct PagedSegmentLayer {
+            // Stable views into the three shared paged upload bundles.
+            ggml_tensor * raw_gather = nullptr;
+            ggml_tensor * comp_gather = nullptr;
+            ggml_tensor * raw_write = nullptr;
+            ggml_tensor * raw_predecessor_read = nullptr;
+            ggml_tensor * ape_rows = nullptr;
+            ggml_tensor * token_state_rows = nullptr;
+            ggml_tensor * state_publish_rows = nullptr;
+            ggml_tensor * comp_write = nullptr;
+            ggml_tensor * comp_read = nullptr;
+            ggml_tensor * comp_position = nullptr;
+
+            // Element offsets/counts into those bundles. Keeping offsets, not
+            // host pointers, makes cache replay independent of staging-vector
+            // allocation and lifetime.
+            int64_t raw_gather_off = -1;
+            int64_t raw_gather_n = 0;
+            int64_t comp_gather_off = -1;
+            int64_t comp_gather_n = 0;
+            int64_t raw_write_off = -1;
+            int64_t raw_write_n = 0;
+            int64_t raw_read_off = -1;
+            int64_t raw_read_n = 0;
+            int64_t ape_off = -1;
+            int64_t ape_n = 0;
+            int64_t token_state_off = -1;
+            int64_t token_state_n = 0;
+            int64_t state_publish_off = -1;
+            int64_t state_publish_n = 0;
+            int64_t comp_write_off = -1;
+            int64_t comp_read_off = -1;
+            int64_t comp_position_off = -1;
+        };
         ggml_tensor * pos_q = nullptr;    // i32 [q]
         ggml_tensor * neg_q = nullptr;    // i32 [q]
         ggml_tensor * rawrows = nullptr;  // i64 [1,q]
@@ -5451,6 +5486,7 @@ struct Ds4FusedVerifyCache {
         // Keeping it per slot removes one allocation from every verify step.
         std::vector<float> mask_values;
         std::vector<PagedLane> paged;     // [layer*q], paged mode only
+        std::vector<PagedSegmentLayer> paged_segments; // [layer*segment]
         ggml_tensor * paged_i32 = nullptr;
         ggml_tensor * paged_i64 = nullptr;
         ggml_tensor * paged_gather = nullptr;
@@ -5473,6 +5509,67 @@ struct Ds4FusedVerifyCache {
         counter = 0;
     }
 };
+
+static constexpr int64_t DS4_PAGED_GATHERED_SHAPE_KEY_V1 =
+    0x5041474544LL;
+static_assert(DS4_PAGED_GATHERED_SHAPE_KEY_V1 !=
+              DEEPSEEK4_PAGED_SEGMENT_SHAPE_KEY_V1);
+
+static bool ds4_paged_slot_is_segment(
+        const DeepSeek4FusedDecodeGraph & slot) {
+    return slot.built() && !slot.shape_key.empty() &&
+           slot.shape_key.front() ==
+               DEEPSEEK4_PAGED_SEGMENT_SHAPE_KEY_V1;
+}
+
+// The paged runtime has one bounded bank for gathered and segment graphs.
+// Segment insertions replace segment shapes first. Gathered insertions replace
+// segment siblings before decode shapes. Preserve the hottest gathered decode
+// shape whenever another victim exists.
+static size_t ds4_pick_paged_graph_slot(
+        const Ds4FusedVerifyCache & cache,
+        size_t slot_limit,
+        bool inserting_segment) {
+    GGML_ASSERT(slot_limit > 0 && slot_limit <= cache.slots.size());
+    for (size_t i = 0; i < slot_limit; ++i) {
+        if (!cache.slots[i].built()) return i;
+    }
+
+    auto lru_of_kind = [&](bool segment, size_t skip) {
+        size_t pick = slot_limit;
+        for (size_t i = 0; i < slot_limit; ++i) {
+            if (i == skip || ds4_paged_slot_is_segment(cache.slots[i]) != segment) {
+                continue;
+            }
+            if (pick == slot_limit ||
+                cache.slots[i].last_use < cache.slots[pick].last_use) {
+                pick = i;
+            }
+        }
+        return pick;
+    };
+
+    if (!inserting_segment) {
+        const size_t segment = lru_of_kind(true, slot_limit);
+        if (segment != slot_limit) return segment;
+        return lru_of_kind(false, slot_limit);
+    }
+
+    const size_t segment = lru_of_kind(true, slot_limit);
+    if (segment != slot_limit) return segment;
+    if (slot_limit == 1) return 0;
+
+    size_t gathered_mru = slot_limit;
+    for (size_t i = 0; i < slot_limit; ++i) {
+        if (ds4_paged_slot_is_segment(cache.slots[i])) continue;
+        if (gathered_mru == slot_limit ||
+            cache.slots[i].last_use > cache.slots[gathered_mru].last_use) {
+            gathered_mru = i;
+        }
+    }
+    const size_t victim = lru_of_kind(false, gathered_mru);
+    return victim != slot_limit ? victim : gathered_mru;
+}
 
 struct DeepSeek4LayerRangeCache {
     ~DeepSeek4LayerRangeCache() { reset(); }
@@ -7495,7 +7592,123 @@ struct Ds4PagedGatheredRuntime {
     const MoeHybridStorage * hybrid_identity = nullptr;
     ggml_backend_t hybrid_cpu_backend = nullptr;
     ggml_backend_t hybrid_cold_backend = nullptr;
+    bool prepared_invocation = false;
 };
+
+struct DeepSeek4PagedSegmentPreparedStep {
+    Ds4PagedGatheredRuntime * runtime = nullptr;
+    DeepSeek4FusedDecodeGraph * graph = nullptr;
+    Ds4FusedVerifyCache::Extra * extra = nullptr;
+    const DeepSeek4Weights * weights = nullptr;
+    ggml_backend_t backend = nullptr;
+    MoeHybridStorage * hybrid = nullptr;
+    int q = 0;
+    std::vector<uint8_t> requested_logits;
+    std::vector<int32_t> row_slots;
+    bool submitted = false;
+    bool completed = false;
+};
+
+static bool ds4_validate_paged_segment_cache(
+        const DeepSeek4Weights & w,
+        const DeepSeek4PagedCache & cache,
+        const DeepSeek4PagedStepLayout & layout) {
+    if (!cache.ctx || !cache.buf || !cache.pool || w.n_layer <= 0 ||
+        w.n_embd <= 0 || w.n_vocab <= 0 ||
+        w.n_swa != int(DS4_PAGE_TOKENS) ||
+        !cache.plan.slots || !cache.plan.max_ctx ||
+        !cache.plan.physical_blocks ||
+        !cache.plan.max_blocks_per_sequence ||
+        cache.plan.max_blocks_per_sequence !=
+            1 + (cache.plan.max_ctx - 1) / DS4_PAGE_TOKENS ||
+        cache.pool->max_sequences() != cache.plan.slots ||
+        cache.pool->physical_block_count() != cache.plan.physical_blocks ||
+        cache.pool->block_size() != DS4_PAGE_TOKENS ||
+        w.layers.size() != size_t(w.n_layer) ||
+        w.compress_ratios.size() != size_t(w.n_layer) ||
+        cache.layers.size() != size_t(w.n_layer) ||
+        cache.plan.ratios != w.compress_ratios ||
+        cache.plan.physical_rows.size() != size_t(w.n_layer) ||
+        layout.slot_count != cache.plan.slots ||
+        layout.max_context != cache.plan.max_ctx ||
+        layout.block_table_stride != cache.plan.max_blocks_per_sequence ||
+        layout.physical_blocks != cache.plan.physical_blocks) {
+        return false;
+    }
+
+    auto shape = [](ggml_tensor * tensor, ggml_type type,
+                    int64_t n0, int64_t n1, int64_t n2) {
+        return tensor && tensor->type == type &&
+               tensor->ne[0] == n0 && tensor->ne[1] == n1 &&
+               tensor->ne[2] == n2 && tensor->ne[3] == 1 &&
+               ggml_is_contiguous_rows(tensor);
+    };
+    for (int il = 0; il < w.n_layer; ++il) {
+        const uint32_t ratio = w.compress_ratios[size_t(il)];
+        const DeepSeek4PagedLayerCache & layer = cache.layers[size_t(il)];
+        if ((ratio != 0 && ratio != 4 && ratio != 128) ||
+            layer.ratio != ratio ||
+            layer.physical_rows != cache.plan.physical_rows[size_t(il)] ||
+            !shape(layer.raw_kv, GGML_TYPE_F16, w.head_dim,
+                   DS4_PAGE_TOKENS, cache.plan.slots)) {
+            return false;
+        }
+        if (ratio == 0) {
+            if (layer.physical_rows != 0 || layer.comp_kv ||
+                layer.index_comp_kv ||
+                layer.attn_compressor.state_kv ||
+                layer.attn_compressor.state_score ||
+                layer.indexer_compressor.state_kv ||
+                layer.indexer_compressor.state_score) {
+                return false;
+            }
+            continue;
+        }
+        const int64_t state_rows = ratio == 4 ? 8 : 128;
+        const int64_t state_width = int64_t(w.head_dim) *
+                                    (ratio == 4 ? 2 : 1);
+        if (!layer.physical_rows ||
+            !shape(layer.comp_kv, GGML_TYPE_F16, w.head_dim,
+                   int64_t(layer.physical_rows), 1) ||
+            !shape(layer.attn_compressor.state_kv, GGML_TYPE_F32,
+                   state_width, state_rows, cache.plan.slots) ||
+            !shape(layer.attn_compressor.state_score, GGML_TYPE_F32,
+                   state_width, state_rows, cache.plan.slots)) {
+            return false;
+        }
+        if (ratio == 4) {
+            const int64_t index_width = int64_t(w.n_indexer_head_dim) * 2;
+            if (!shape(layer.index_comp_kv, GGML_TYPE_F16,
+                       w.n_indexer_head_dim,
+                       int64_t(layer.physical_rows), 1) ||
+                !shape(layer.indexer_compressor.state_kv, GGML_TYPE_F32,
+                       index_width, 8, cache.plan.slots) ||
+                !shape(layer.indexer_compressor.state_score, GGML_TYPE_F32,
+                       index_width, 8, cache.plan.slots)) {
+                return false;
+            }
+        } else if (layer.index_comp_kv ||
+                   layer.indexer_compressor.state_kv ||
+                   layer.indexer_compressor.state_score) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ds4_paged_hybrid_is_immutable(
+        const MoeHybridStorage * hybrid,
+        int n_layer) {
+    if (!hybrid) return true;
+    if (hybrid->layers.size() != size_t(n_layer) ||
+        !hybrid->cpu_backend || !hybrid->cold_backend) {
+        return false;
+    }
+    for (const MoeHybridLayerStorage & layer : hybrid->layers) {
+        if (layer.cache_slots > 0) return false;
+    }
+    return true;
+}
 
 void deepseek4_release_paged_gathered_runtime(DeepSeek4PagedCache & cache) {
     delete static_cast<Ds4PagedGatheredRuntime *>(cache.gathered_runtime);
@@ -7559,6 +7772,7 @@ bool deepseek4_paged_gathered_step(
         if (!rt) return false;
         cache.gathered_runtime = rt;
     }
+    if (rt->prepared_invocation) return false;
     if (rt->hybrid_identity != hybrid ||
         rt->hybrid_cpu_backend != (hybrid ? hybrid->cpu_backend : nullptr) ||
         rt->hybrid_cold_backend != (hybrid ? hybrid->cold_backend : nullptr)) {
@@ -7576,7 +7790,8 @@ bool deepseek4_paged_gathered_step(
     }
 
     std::vector<std::vector<DeepSeek4GatheredLaneRows>> prepared((size_t) w.n_layer);
-    std::vector<int64_t> key = {0x5041474544LL, (int64_t) lanes,
+    std::vector<int64_t> key = {DS4_PAGED_GATHERED_SHAPE_KEY_V1,
+                                (int64_t) lanes,
                                 token_ids ? 1 : 0, hybrid ? 1 : 0};
     for (uint32_t lane = 0; lane < lanes; ++lane) key.push_back(slots[lane]);
     for (int il = 0; il < w.n_layer; ++il) {
@@ -7615,11 +7830,8 @@ bool deepseek4_paged_gathered_step(
         }
     }
     if (!fg) {
-        size_t pick = 0;
-        for (size_t i = 0; i < slot_limit; ++i) {
-            if (!vc.slots[i].built()) { pick = i; break; }
-            if (vc.slots[i].last_use < vc.slots[pick].last_use) pick = i;
-        }
+        const size_t pick = ds4_pick_paged_graph_slot(
+            vc, slot_limit, /*inserting_segment=*/false);
         fg = &vc.slots[pick]; ex = &vc.extra[pick];
         fg->release_for_rebuild(vc.backend, vc.peer_backend);
         ex->reset();
@@ -7769,6 +7981,459 @@ bool deepseek4_paged_gathered_step(
         out_argmax[lane] = -1;
     }
     return true;
+}
+
+bool deepseek4_prepare_paged_segment_step(
+        ggml_backend_t backend,
+        int device,
+        const DeepSeek4Weights & w,
+        DeepSeek4PagedCache & cache,
+        const DeepSeek4PagedStepLayout & layout,
+        MoeHybridStorage * hybrid,
+        DeepSeek4PagedSegmentPreparedStep *& out) {
+    out = nullptr;
+    const size_t q = layout.token_ids.size();
+    if (!backend || w.n_embd <= 0 || q < 1 ||
+        q > size_t(DEEPSEEK4_MAX_PAGED_SEQUENCES) ||
+        q > std::numeric_limits<size_t>::max() / size_t(w.n_embd) ||
+        layout.embeddings.size() != q * size_t(w.n_embd) ||
+        layout.positions.size() != q ||
+        layout.row_to_segment.size() != q ||
+        layout.row_to_public_output.size() != q ||
+        layout.requested_full_logits.size() != q ||
+        !ds4_validate_paged_segment_cache(w, cache, layout) ||
+        !ds4_paged_hybrid_is_immutable(hybrid, w.n_layer)) {
+        return false;
+    }
+    for (int64_t position : layout.positions) {
+        if (position < 0 || position > INT32_MAX) return false;
+    }
+    bool saw_prefill = false;
+    for (const DeepSeek4PagedSegment & segment : layout.segments) {
+        saw_prefill = saw_prefill ||
+            segment.kind == DeepSeek4PagedSegmentKind::prefill;
+    }
+    if (!saw_prefill) return false;
+
+    auto * rt = static_cast<Ds4PagedGatheredRuntime *>(cache.gathered_runtime);
+    if (rt && rt->prepared_invocation) return false;
+    if (!rt) {
+        rt = new (std::nothrow) Ds4PagedGatheredRuntime;
+        if (!rt) return false;
+        cache.gathered_runtime = rt;
+    }
+    if (rt->hybrid_identity != hybrid ||
+        rt->hybrid_cpu_backend != (hybrid ? hybrid->cpu_backend : nullptr) ||
+        rt->hybrid_cold_backend !=
+            (hybrid ? hybrid->cold_backend : nullptr)) {
+        rt->model.fused_verify_graph_cache.destroy();
+        rt->hybrid_identity = hybrid;
+        rt->hybrid_cpu_backend = hybrid ? hybrid->cpu_backend : nullptr;
+        rt->hybrid_cold_backend = hybrid ? hybrid->cold_backend : nullptr;
+    }
+    if (!rt->model.matches(w, backend, device, 0, w.n_layer, true) &&
+        !initialize_layer_range_cache(
+            rt->model, backend, device, w, 0, w.n_layer, true)) {
+        std::fprintf(stderr,
+            "[deepseek4-paged] failed to initialize segment graph cache\n");
+        return false;
+    }
+
+    std::vector<std::vector<DeepSeek4LayerSegmentRows>> layer_rows(
+        size_t(w.n_layer));
+    for (int il = 0; il < w.n_layer; ++il) {
+        const uint32_t ratio = w.compress_ratios[size_t(il)];
+        if (cache.layers[size_t(il)].ratio != ratio ||
+            !prepare_deepseek4_paged_layer_rows(
+                layout, ratio, layer_rows[size_t(il)])) {
+            return false;
+        }
+    }
+
+    std::vector<int64_t> key;
+    if (!build_deepseek4_paged_segment_shape_key(
+            layout, layer_rows, /*token_id_mode=*/true,
+            hybrid != nullptr, key)) {
+        return false;
+    }
+
+    auto & vc = rt->model.fused_verify_graph_cache;
+    auto & mc = rt->model.fused_decode_graph_cache;
+    if (vc.owner_ctx != w.ctx || vc.backend != backend ||
+        vc.peer_backend != (hybrid ? hybrid->cold_backend : nullptr)) {
+        vc.destroy();
+        vc.owner_ctx = w.ctx;
+        vc.backend = backend;
+        vc.peer_backend = hybrid ? hybrid->cold_backend : nullptr;
+    }
+    if (mc.owner_ctx != w.ctx || mc.backend != backend) {
+        mc.destroy();
+        mc.owner_ctx = w.ctx;
+        mc.backend = backend;
+    }
+    if (!ds4_fused_ensure_fn_mirrors(
+            mc, backend, w, rt->model.hc_layer_weights,
+            rt->model.hc_output_weights)) {
+        return false;
+    }
+
+    ++vc.counter;
+    DeepSeek4FusedDecodeGraph * fg = nullptr;
+    Ds4FusedVerifyCache::Extra * ex = nullptr;
+    const size_t slot_limit = hybrid
+        ? ds4_fused_verify_hybrid_slot_limit() : vc.slots.size();
+    for (size_t i = 0; i < slot_limit; ++i) {
+        if (vc.slots[i].built() && vc.slots[i].shape_key == key) {
+            fg = &vc.slots[i];
+            ex = &vc.extra[i];
+            break;
+        }
+    }
+    if (!fg) {
+        const size_t pick = ds4_pick_paged_graph_slot(
+            vc, slot_limit, /*inserting_segment=*/true);
+        fg = &vc.slots[pick];
+        ex = &vc.extra[pick];
+        fg->release_for_rebuild(vc.backend, vc.peer_backend);
+        ex->reset();
+        if (!ds4_build_fused_verify_graph(
+                mc, *fg, *ex, backend, w, nullptr,
+                rt->model.hc_layer_weights,
+                rt->model.hc_output_weights,
+                rt->model.hash_routing_tables, 0, int(q),
+                /*have_token_ids=*/true, {}, hybrid, std::move(key),
+                &cache, nullptr, &layout, &layer_rows)) {
+            std::fprintf(stderr,
+                "[deepseek4-paged] failed to build segment graph (q=%zu)\n",
+                q);
+            fg->destroy(vc.backend, vc.peer_backend);
+            ex->reset();
+            return false;
+        }
+    }
+    fg->last_use = vc.counter;
+
+    std::vector<int32_t> pos(q);
+    std::vector<int32_t> neg_pos(q);
+    for (size_t row = 0; row < q; ++row) {
+        pos[row] = int32_t(layout.positions[row]);
+        neg_pos[row] = -pos[row];
+    }
+    ds4_fv_set(fg->inp_embed, layout.embeddings.data(),
+               layout.embeddings.size() * sizeof(float));
+    ds4_fv_set(ex->pos_q, pos.data(), pos.size() * sizeof(int32_t));
+    ds4_fv_set(ex->neg_q, neg_pos.data(),
+               neg_pos.size() * sizeof(int32_t));
+
+    std::vector<int32_t> bundle_i32(size_t(ex->paged_i32_n), 0);
+    std::vector<int64_t> bundle_i64(size_t(ex->paged_i64_n), 0);
+    std::vector<int32_t> bundle_gather(
+        size_t(ex->paged_gather_n), 0);
+    auto valid_range = [](int64_t off, int64_t count, int64_t total) {
+        return off >= 0 && count >= 0 && off <= total &&
+               count <= total - off;
+    };
+    auto checked_i32_row = [](int64_t value, int32_t & converted) {
+        if (value < 0 || value > INT32_MAX) return false;
+        converted = int32_t(value);
+        return true;
+    };
+
+    size_t metadata_index = 0;
+    for (int il = 0; il < w.n_layer; ++il) {
+        const int ratio = int(w.compress_ratios[size_t(il)]);
+        for (size_t si = 0; si < layout.segments.size(); ++si) {
+            if (metadata_index >= ex->paged_segments.size()) return false;
+            const DeepSeek4PagedSegment & segment = layout.segments[si];
+            const DeepSeek4LayerSegmentRows & rows =
+                layer_rows[size_t(il)][si];
+            const auto & px = ex->paged_segments[metadata_index++];
+            const bool decode =
+                segment.kind == DeepSeek4PagedSegmentKind::decode;
+            const bool emits = rows.emission_token >= 0;
+
+            const int64_t raw_capacity = int64_t(std::max<size_t>(
+                rows.immutable_raw_history.size(), 1));
+            if (px.raw_gather_n != raw_capacity ||
+                !valid_range(px.raw_gather_off, px.raw_gather_n,
+                             ex->paged_gather_n) ||
+                px.raw_write_n != int64_t(segment.row_count) ||
+                !valid_range(px.raw_write_off, px.raw_write_n,
+                             ex->paged_i64_n)) {
+                return false;
+            }
+            for (size_t i = 0; i < rows.immutable_raw_history.size(); ++i) {
+                int32_t value = 0;
+                if (!checked_i32_row(
+                        rows.immutable_raw_history[i], value)) {
+                    return false;
+                }
+                bundle_gather[size_t(px.raw_gather_off) + i] = value;
+            }
+            for (uint32_t i = 0; i < segment.row_count; ++i) {
+                const int64_t raw_write = rows.tokens[size_t(i)].raw_write_row;
+                if (raw_write < 0) return false;
+                bundle_i64[size_t(px.raw_write_off) + i] = raw_write;
+            }
+
+            const int64_t expected_raw_reads =
+                segment.row_count > 1 ? segment.row_count - 1 : 0;
+            if (expected_raw_reads > 0) {
+                if (px.raw_read_n != expected_raw_reads ||
+                    !valid_range(px.raw_read_off, px.raw_read_n,
+                                 ex->paged_gather_n)) {
+                    return false;
+                }
+                for (int64_t i = 0; i < expected_raw_reads; ++i) {
+                    int32_t value = 0;
+                    if (!checked_i32_row(
+                            rows.tokens[size_t(i)].raw_write_row, value)) {
+                        return false;
+                    }
+                    bundle_gather[size_t(px.raw_read_off + i)] = value;
+                }
+            } else if (px.raw_read_off != -1 || px.raw_read_n != 0) {
+                return false;
+            }
+
+            if (ratio == 0) {
+                if (px.comp_gather_off != -1 || px.comp_gather_n != 0 ||
+                    px.ape_off != -1 || px.ape_n != 0 ||
+                    px.token_state_off != -1 || px.token_state_n != 0 ||
+                    px.state_publish_off != -1 ||
+                    px.state_publish_n != 0 ||
+                    px.comp_write_off != -1 || px.comp_read_off != -1 ||
+                    px.comp_position_off != -1) {
+                    return false;
+                }
+                continue;
+            }
+
+            const int64_t comp_capacity = int64_t(std::max<size_t>(
+                rows.immutable_compressed_history.size(), 1));
+            if (px.comp_gather_n != comp_capacity ||
+                !valid_range(px.comp_gather_off, px.comp_gather_n,
+                             ex->paged_gather_n) ||
+                px.ape_n != int64_t(segment.row_count) ||
+                !valid_range(px.ape_off, px.ape_n, ex->paged_i32_n)) {
+                return false;
+            }
+            for (size_t i = 0;
+                 i < rows.immutable_compressed_history.size(); ++i) {
+                int32_t value = 0;
+                if (!checked_i32_row(
+                        rows.immutable_compressed_history[i], value)) {
+                    return false;
+                }
+                bundle_gather[size_t(px.comp_gather_off) + i] = value;
+            }
+            for (uint32_t i = 0; i < segment.row_count; ++i) {
+                bundle_i32[size_t(px.ape_off) + i] =
+                    rows.tokens[size_t(i)].attention_ape_phase;
+            }
+
+            if (decode) {
+                if (px.token_state_n != int64_t(segment.row_count) ||
+                    !valid_range(px.token_state_off, px.token_state_n,
+                                 ex->paged_i64_n) ||
+                    px.state_publish_off != -1 ||
+                    px.state_publish_n != 0) {
+                    return false;
+                }
+                for (uint32_t i = 0; i < segment.row_count; ++i) {
+                    bundle_i64[size_t(px.token_state_off) + i] =
+                        rows.tokens[size_t(i)].attention_state_row;
+                }
+            } else {
+                const int64_t state_rows = ratio == 4 ? 8 : 128;
+                if (px.token_state_off != -1 || px.token_state_n != 0 ||
+                    px.state_publish_n != state_rows ||
+                    !valid_range(px.state_publish_off,
+                                 px.state_publish_n,
+                                 ex->paged_i64_n)) {
+                    return false;
+                }
+                for (int64_t i = 0; i < state_rows; ++i) {
+                    bundle_i64[size_t(px.state_publish_off + i)] = i;
+                }
+            }
+
+            const bool needs_comp_io = decode || emits;
+            if (needs_comp_io) {
+                if (!valid_range(px.comp_write_off, 1,
+                                 ex->paged_i64_n) ||
+                    !valid_range(px.comp_read_off, 1,
+                                 ex->paged_i32_n) ||
+                    !valid_range(px.comp_position_off, 1,
+                                 ex->paged_i32_n)) {
+                    return false;
+                }
+                const int64_t comp_row = emits
+                    ? rows.compressed_write_row : 0;
+                int32_t comp_read = 0;
+                if (!checked_i32_row(comp_row, comp_read)) return false;
+                bundle_i64[size_t(px.comp_write_off)] = comp_row;
+                bundle_i32[size_t(px.comp_read_off)] = comp_read;
+                bundle_i32[size_t(px.comp_position_off)] = emits
+                    ? rows.compressed_position : 0;
+            } else if (px.comp_write_off != -1 ||
+                       px.comp_read_off != -1 ||
+                       px.comp_position_off != -1) {
+                return false;
+            }
+        }
+    }
+    if (metadata_index != ex->paged_segments.size()) return false;
+
+    ds4_fv_set(ex->paged_i32, bundle_i32.data(),
+               bundle_i32.size() * sizeof(int32_t));
+    ds4_fv_set(ex->paged_i64, bundle_i64.data(),
+               bundle_i64.size() * sizeof(int64_t));
+    ds4_fv_set(ex->paged_gather, bundle_gather.data(),
+               bundle_gather.size() * sizeof(int32_t));
+
+    for (int il = 0; il < w.n_layer; ++il) {
+        ggml_tensor * ids = fg->hash_ids[size_t(il)];
+        if (!ids) continue;
+        std::vector<int32_t> values(size_t(ids->ne[0]) * q);
+        for (size_t row = 0; row < q; ++row) {
+            const int32_t * source = hash_routing_row(
+                rt->model.hash_routing_tables[size_t(il)],
+                layout.token_ids[row], w.n_expert_used);
+            if (!source) return false;
+            std::memcpy(values.data() + row * size_t(ids->ne[0]), source,
+                        size_t(ids->ne[0]) * sizeof(int32_t));
+        }
+        ds4_fv_set(ids, values.data(), values.size() * sizeof(int32_t));
+    }
+
+    auto * prepared = new (std::nothrow) DeepSeek4PagedSegmentPreparedStep;
+    if (!prepared) return false;
+    try {
+        prepared->requested_logits = layout.requested_full_logits;
+        prepared->row_slots.resize(q);
+        for (size_t row = 0; row < q; ++row) {
+            const int32_t owner = layout.row_to_segment[row];
+            if (owner < 0 || size_t(owner) >= layout.segments.size()) {
+                delete prepared;
+                return false;
+            }
+            prepared->row_slots[row] = layout.segments[size_t(owner)].slot;
+        }
+    } catch (...) {
+        delete prepared;
+        return false;
+    }
+    prepared->runtime = rt;
+    prepared->graph = fg;
+    prepared->extra = ex;
+    prepared->weights = &w;
+    prepared->backend = backend;
+    prepared->hybrid = hybrid;
+    prepared->q = int(q);
+    rt->prepared_invocation = true;
+    out = prepared;
+    return true;
+}
+
+bool deepseek4_compute_paged_segment_step(
+        DeepSeek4PagedSegmentPreparedStep & prepared,
+        std::vector<float> & out_logits,
+        std::vector<int32_t> & out_argmax,
+        MoeHybridRoutingStats * routing_stats) {
+    out_logits.clear();
+    out_argmax.clear();
+    if (prepared.submitted || prepared.completed || !prepared.runtime ||
+        !prepared.runtime->prepared_invocation || !prepared.graph ||
+        !prepared.extra || !prepared.weights || !prepared.backend ||
+        prepared.q < 1 || prepared.extra->q != prepared.q ||
+        prepared.requested_logits.size() != size_t(prepared.q) ||
+        prepared.row_slots.size() != size_t(prepared.q) ||
+        !prepared.graph->built() || !prepared.extra->argmax) {
+        return false;
+    }
+
+    const size_t requested = size_t(std::count_if(
+        prepared.requested_logits.begin(),
+        prepared.requested_logits.end(),
+        [](uint8_t value) { return value != 0; }));
+    size_t logit_elements = 0;
+    size_t row_bytes = 0;
+    if (requested > 0) {
+        const DeepSeek4Weights & w = *prepared.weights;
+        const size_t n_vocab = size_t(w.n_vocab);
+        if (!prepared.graph->logits ||
+            prepared.graph->logits->type != GGML_TYPE_F32 ||
+            prepared.graph->logits->ne[0] != w.n_vocab ||
+            prepared.graph->logits->ne[1] != prepared.q ||
+            prepared.graph->logits->ne[2] != 1 ||
+            prepared.graph->logits->ne[3] != 1 ||
+            !ggml_is_contiguous_rows(prepared.graph->logits) ||
+            n_vocab > std::numeric_limits<size_t>::max() /
+                          size_t(prepared.q) ||
+            n_vocab > std::numeric_limits<size_t>::max() / sizeof(float)) {
+            return false;
+        }
+        logit_elements = n_vocab * size_t(prepared.q);
+        if (logit_elements >
+                std::numeric_limits<size_t>::max() / sizeof(float)) {
+            return false;
+        }
+        row_bytes = n_vocab * sizeof(float);
+    }
+
+    // This assignment is the mutation barrier's one-way edge: even a backend
+    // failure cannot make this invocation eligible for resubmission.
+    prepared.submitted = true;
+    const enum ggml_status status = prepared.graph->sched
+        ? ggml_backend_sched_graph_compute(
+            prepared.graph->sched, prepared.graph->sg.gf)
+        : ggml_backend_graph_compute(
+            prepared.backend, prepared.graph->sg.gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr,
+            "[deepseek4-paged] segment graph compute failed: status=%d\n",
+            int(status));
+        return false;
+    }
+
+    ds4_fused_consume_route_diagnostics(
+        *prepared.graph, prepared.hybrid, routing_stats,
+        prepared.row_slots.data());
+    out_argmax.resize(size_t(prepared.q));
+    ggml_backend_tensor_get(
+        prepared.extra->argmax, out_argmax.data(), 0,
+        out_argmax.size() * sizeof(int32_t));
+
+    if (requested > 0) {
+        const DeepSeek4Weights & w = *prepared.weights;
+        out_logits.assign(logit_elements, 0.0f);
+        if (requested == size_t(prepared.q)) {
+            ggml_backend_tensor_get(
+                prepared.graph->logits, out_logits.data(), 0,
+                out_logits.size() * sizeof(float));
+        } else {
+            for (int row = 0; row < prepared.q; ++row) {
+                if (!prepared.requested_logits[size_t(row)]) continue;
+                ggml_backend_tensor_get(
+                    prepared.graph->logits,
+                    out_logits.data() + size_t(row) * w.n_vocab,
+                    size_t(row) * prepared.graph->logits->nb[1],
+                    row_bytes);
+            }
+        }
+    }
+    prepared.completed = true;
+    return true;
+}
+
+void deepseek4_discard_paged_segment_step(
+        DeepSeek4PagedSegmentPreparedStep * prepared) {
+    if (!prepared) return;
+    if (prepared->runtime) {
+        prepared->runtime->prepared_invocation = false;
+    }
+    delete prepared;
 }
 
 bool deepseek4_step_layer_range(

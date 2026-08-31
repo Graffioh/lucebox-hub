@@ -1,4 +1,4 @@
-// ─── Fused whole-model graph (n_tokens = q in [1,5]) ────────────────────
+// ─── Fused whole-model graph (q in [1,5], or [1,6] for paged segments) ───
 // One whole-model graph per (q, flush, padded-comp) shape: batched attention
 // (causal mask input) + batched MoE, per-token fused HC chains, in-graph
 // optional drafter-feature capture and q-wide logits. The spec loop guarantees a
@@ -365,6 +365,23 @@ static ggml_tensor * ds4_fused_weights_for_selected(
     return weights;
 }
 
+// GGML has no control-dependency op. Make the full immutable gather an
+// ancestor of a wrapping raw-ring scatter by copying the values through a
+// concat that also consumes one gathered column. No arithmetic is introduced.
+static ggml_tensor * ds4_order_segment_write_after_snapshot(
+        ggml_context * ctx,
+        ggml_tensor * snapshot,
+        ggml_tensor * values) {
+    if (!snapshot || snapshot->ne[1] == 0) return ggml_cont(ctx, values);
+    ggml_tensor * guard = ggml_view_2d(
+        ctx, snapshot, snapshot->ne[0], 1, snapshot->nb[1], 0);
+    ggml_tensor * joined = ggml_concat(ctx, guard, values, 1);
+    ggml_tensor * tail = ggml_view_2d(
+        ctx, joined, values->ne[0], values->ne[1], joined->nb[1],
+        joined->nb[1]);
+    return ggml_cont(ctx, tail);
+}
+
 static bool ds4_build_fused_verify_graph(
         DeepSeek4FusedDecodeCache & mc,          // fn mirrors (shared with AR fused)
         DeepSeek4FusedDecodeGraph & fg,
@@ -382,10 +399,16 @@ static bool ds4_build_fused_verify_graph(
         MoeHybridStorage * hybrid,
         std::vector<int64_t> && shape_key,
         DeepSeek4PagedCache * paged_cache = nullptr,
-        const std::vector<std::vector<DeepSeek4GatheredLaneRows>> * paged_rows = nullptr) {
-    const bool paged_mode = paged_cache && paged_rows;
+        const std::vector<std::vector<DeepSeek4GatheredLaneRows>> * paged_rows = nullptr,
+        const DeepSeek4PagedStepLayout * segment_layout = nullptr,
+        const std::vector<std::vector<DeepSeek4LayerSegmentRows>> * segment_rows = nullptr) {
+    const bool gathered_paged_mode = paged_cache && paged_rows;
+    const bool segment_paged_mode =
+        paged_cache && segment_layout && segment_rows;
+    const bool paged_mode = gathered_paged_mode || segment_paged_mode;
+    if (gathered_paged_mode && segment_paged_mode) return false;
     if (!paged_mode && !cache) return false;
-    if (paged_mode) {
+    if (gathered_paged_mode) {
         if (q < 1 || q > 16 ||
             paged_rows->size() != (size_t) w.n_layer) {
             return false;
@@ -394,7 +417,35 @@ static bool ds4_build_fused_verify_graph(
             if (layer_rows.size() != (size_t) q) return false;
         }
     }
-    const size_t graph_capacity = q > 8 ? 131072u : 65536u;
+    if (segment_paged_mode) {
+        if (q < 1 || q > int(DEEPSEEK4_MAX_PAGED_SEQUENCES) ||
+            segment_layout->token_ids.size() != size_t(q) ||
+            segment_layout->segments.empty() ||
+            segment_rows->size() != size_t(w.n_layer)) {
+            return false;
+        }
+        bool saw_prefill = false;
+        for (const DeepSeek4PagedSegment & segment : segment_layout->segments) {
+            saw_prefill = saw_prefill ||
+                segment.kind == DeepSeek4PagedSegmentKind::prefill;
+        }
+        if (!saw_prefill) return false;
+        for (int il = 0; il < w.n_layer; ++il) {
+            const auto & rows = (*segment_rows)[size_t(il)];
+            if (rows.size() != segment_layout->segments.size()) return false;
+            for (const DeepSeek4LayerSegmentRows & segment : rows) {
+                if (segment.compression_ratio != w.compress_ratios[size_t(il)]) {
+                    return false;
+                }
+            }
+        }
+    }
+    // Segment mode adds publication, snapshot/scatter and tokenwise causal
+    // nodes to the same q-wide body. Keep it in the existing scheduler family
+    // but use the already-supported larger hash capacity; 64K is not proven
+    // sufficient for the worst six-row mixed topology.
+    const size_t graph_capacity =
+        segment_paged_mode || q > 8 ? 131072u : 65536u;
     std::array<ggml_backend_t, 3> sched_backends{};
     if (hybrid) {
         sched_backends = {backend, hybrid->cold_backend, hybrid->cpu_backend};
@@ -478,10 +529,21 @@ static bool ds4_build_fused_verify_graph(
     ggml_set_input(fg.mask_bundle);
     int64_t mask_off = 0;
 
-    // Back every gathered lane's scalar and index inputs with shared
-    // tensors. Their sizes are fixed by the prepared history shape key.
+    // Back paged scalar and index inputs with three shared tensors. Their
+    // sizes are fixed by the prepared topology key; dynamic addresses remain
+    // upload values rather than graph-cache identity.
+    int64_t paged_i32_total = 0;
+    int64_t paged_i64_total = 0;
     int64_t paged_gather_total = 0;
-    if (paged_mode) {
+    auto add_paged_count = [](int64_t & total, size_t count) {
+        if (count > size_t(INT64_MAX) ||
+            total > INT64_MAX - int64_t(count)) {
+            return false;
+        }
+        total += int64_t(count);
+        return true;
+    };
+    if (gathered_paged_mode) {
         for (int il = 0; il < w.n_layer; ++il) {
             const int layer_ratio = (int) w.compress_ratios[il];
             for (int t = 0; t < q; ++t) {
@@ -494,8 +556,48 @@ static bool ds4_build_fused_verify_graph(
                 }
             }
         }
-        ex.paged_i32_n = (int64_t) 5 * w.n_layer * q;
-        ex.paged_i64_n = (int64_t) 3 * w.n_layer * q;
+        paged_i32_total = (int64_t) 5 * w.n_layer * q;
+        paged_i64_total = (int64_t) 3 * w.n_layer * q;
+    } else if (segment_paged_mode) {
+        const size_t segment_count = segment_layout->segments.size();
+        ex.paged_segments.reserve(size_t(w.n_layer) * segment_count);
+        for (int il = 0; il < w.n_layer; ++il) {
+            const int ratio = int(w.compress_ratios[size_t(il)]);
+            for (size_t si = 0; si < segment_count; ++si) {
+                const DeepSeek4PagedSegment & segment =
+                    segment_layout->segments[si];
+                const DeepSeek4LayerSegmentRows & rows =
+                    (*segment_rows)[size_t(il)][si];
+                const bool decode =
+                    segment.kind == DeepSeek4PagedSegmentKind::decode;
+                const bool emits = rows.emission_token >= 0;
+                if (!add_paged_count(
+                        paged_gather_total,
+                        std::max<size_t>(rows.immutable_raw_history.size(), 1)) ||
+                    (ratio > 0 && !add_paged_count(
+                        paged_gather_total,
+                        std::max<size_t>(
+                            rows.immutable_compressed_history.size(), 1))) ||
+                    (segment.row_count > 1 && !add_paged_count(
+                        paged_gather_total, segment.row_count - 1)) ||
+                    !add_paged_count(paged_i64_total, segment.row_count) ||
+                    (ratio > 0 && !add_paged_count(
+                        paged_i32_total, segment.row_count)) ||
+                    (ratio > 0 && decode && !add_paged_count(
+                        paged_i64_total, segment.row_count)) ||
+                    (ratio > 0 && !decode && !add_paged_count(
+                        paged_i64_total, ratio == 4 ? 8 : 128)) ||
+                    (ratio > 0 && (decode || emits) &&
+                     (!add_paged_count(paged_i64_total, 1) ||
+                      !add_paged_count(paged_i32_total, 2)))) {
+                    return false;
+                }
+            }
+        }
+    }
+    if (paged_mode) {
+        ex.paged_i32_n = std::max<int64_t>(paged_i32_total, 1);
+        ex.paged_i64_n = std::max<int64_t>(paged_i64_total, 1);
         ex.paged_gather_n = std::max<int64_t>(paged_gather_total, 1);
         ex.paged_i32 = ggml_new_tensor_1d(
             ctx, GGML_TYPE_I32, ex.paged_i32_n);
@@ -507,6 +609,8 @@ static bool ds4_build_fused_verify_graph(
             ctx, GGML_TYPE_I32, ex.paged_gather_n);
         ggml_set_input(ex.paged_gather);
     }
+    int64_t paged_i32_off = 0;
+    int64_t paged_i64_off = 0;
     int64_t paged_gather_off = 0;
 
     // Keep every speculative or gathered lane in one HC tensor. HC kernels
@@ -546,7 +650,7 @@ static bool ds4_build_fused_verify_graph(
 
         // ── Attention ──
         ggml_tensor * attn_out = nullptr;
-        if (paged_mode) {
+        if (gathered_paged_mode) {
             // q denotes independent decode lanes here, not a causal sequence.
             // Gather each lane's immutable chronological history and run the
             // established MLA lane core at q=1; all surrounding HC/MoE/output
@@ -685,6 +789,317 @@ static bool ds4_build_fused_verify_graph(
                 attn_out = attn_out
                     ? ggml_concat(ctx, attn_out, lane_context, 1)
                     : lane_context;
+            }
+            attn_out = build_mla_output_projection(
+                ctx, attn_out, w, L, q, /*allow_grouped=*/false);
+        } else if (segment_paged_mode) {
+            // Dense projections stay q-wide. Only attention and recurrent
+            // publication are lowered into causal, owner-local segments.
+            DeepSeek4PagedLayerCache & plc =
+                paged_cache->layers[size_t(il)];
+            ggml_tensor * raw_flat = ggml_reshape_2d(
+                ctx, plc.raw_kv, w.head_dim,
+                int64_t(DS4_PAGE_TOKENS) * paged_cache->plan.slots);
+            ggml_tensor * attn_normed =
+                build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
+            DeepSeek4PreparedProjectedLane batched_proj =
+                build_mla_qkv_projection(ctx, attn_normed, w, L, q);
+            build_mla_qkv_rope(
+                ctx, batched_proj, w, ds4_rope_params(w, ratio), q,
+                ex.pos_q, /*fuse_q_rope=*/false);
+
+            auto view_i32 = [&](int64_t off, int64_t count) {
+                return ggml_view_1d(
+                    ctx, ex.paged_i32, count,
+                    size_t(off) * sizeof(int32_t));
+            };
+            auto view_i64 = [&](int64_t off, int64_t count) {
+                return ggml_view_1d(
+                    ctx, ex.paged_i64, count,
+                    size_t(off) * sizeof(int64_t));
+            };
+            auto view_gather = [&](int64_t off, int64_t count) {
+                return ggml_view_1d(
+                    ctx, ex.paged_gather, count,
+                    size_t(off) * sizeof(int32_t));
+            };
+            auto view_state = [&](ggml_tensor * tensor, int32_t slot) {
+                return ggml_view_2d(
+                    ctx, tensor, tensor->ne[0], tensor->ne[1],
+                    tensor->nb[1], size_t(slot) * tensor->nb[2]);
+            };
+            auto scalar_position = [&](ggml_tensor * tensor, uint32_t row) {
+                return ggml_view_1d(
+                    ctx, tensor, 1, size_t(row) * sizeof(int32_t));
+            };
+
+            for (size_t si = 0; si < segment_layout->segments.size(); ++si) {
+                const DeepSeek4PagedSegment & segment =
+                    segment_layout->segments[si];
+                const DeepSeek4LayerSegmentRows & rows =
+                    (*segment_rows)[size_t(il)][si];
+                const bool decode =
+                    segment.kind == DeepSeek4PagedSegmentKind::decode;
+                const bool prefill =
+                    segment.kind == DeepSeek4PagedSegmentKind::prefill;
+                const bool emits = rows.emission_token >= 0;
+                if ((!decode && !prefill) ||
+                    segment.row_offset + segment.row_count > uint32_t(q) ||
+                    rows.tokens.size() != size_t(segment.row_count) ||
+                    rows.slot != segment.slot || rows.compression_ratio !=
+                        uint32_t(ratio)) {
+                    return false;
+                }
+
+                auto & px = ex.paged_segments.emplace_back();
+                px.raw_gather_off = paged_gather_off;
+                px.raw_gather_n = int64_t(std::max<size_t>(
+                    rows.immutable_raw_history.size(), 1));
+                px.raw_gather = view_gather(
+                    px.raw_gather_off, px.raw_gather_n);
+                paged_gather_off += px.raw_gather_n;
+
+                ggml_tensor * immutable_raw = nullptr;
+                if (!rows.immutable_raw_history.empty()) {
+                    immutable_raw = ggml_get_rows(
+                        ctx, raw_flat, px.raw_gather);
+                    if (prefill) {
+                        immutable_raw = ggml_cont(ctx, immutable_raw);
+                    }
+                }
+
+                ggml_tensor * immutable_comp = nullptr;
+                if (ratio > 0) {
+                    px.comp_gather_off = paged_gather_off;
+                    px.comp_gather_n = int64_t(std::max<size_t>(
+                        rows.immutable_compressed_history.size(), 1));
+                    px.comp_gather = view_gather(
+                        px.comp_gather_off, px.comp_gather_n);
+                    paged_gather_off += px.comp_gather_n;
+                    if (!rows.immutable_compressed_history.empty()) {
+                        immutable_comp = ggml_get_rows(
+                            ctx, plc.comp_kv, px.comp_gather);
+                    }
+                }
+
+                px.raw_write_off = paged_i64_off;
+                px.raw_write_n = segment.row_count;
+                px.raw_write = view_i64(px.raw_write_off, px.raw_write_n);
+                paged_i64_off += px.raw_write_n;
+                if (segment.row_count > 1) {
+                    px.raw_read_off = paged_gather_off;
+                    px.raw_read_n = segment.row_count - 1;
+                    px.raw_predecessor_read = view_gather(
+                        px.raw_read_off, px.raw_read_n);
+                    paged_gather_off += px.raw_read_n;
+                }
+
+                if (ratio > 0) {
+                    px.ape_off = paged_i32_off;
+                    px.ape_n = segment.row_count;
+                    px.ape_rows = view_i32(px.ape_off, px.ape_n);
+                    paged_i32_off += px.ape_n;
+                    if (decode) {
+                        px.token_state_off = paged_i64_off;
+                        px.token_state_n = segment.row_count;
+                        px.token_state_rows = view_i64(
+                            px.token_state_off, px.token_state_n);
+                        paged_i64_off += px.token_state_n;
+                    } else {
+                        px.state_publish_off = paged_i64_off;
+                        px.state_publish_n = ratio == 4 ? 8 : 128;
+                        px.state_publish_rows = view_i64(
+                            px.state_publish_off, px.state_publish_n);
+                        paged_i64_off += px.state_publish_n;
+                    }
+                    if (decode || emits) {
+                        px.comp_write_off = paged_i64_off++;
+                        px.comp_write = view_i64(px.comp_write_off, 1);
+                        px.comp_read_off = paged_i32_off++;
+                        px.comp_read = view_i32(px.comp_read_off, 1);
+                        px.comp_position_off = paged_i32_off++;
+                        px.comp_position = view_i32(
+                            px.comp_position_off, 1);
+                    }
+                }
+
+                DeepSeek4CompressorState attn_state{};
+                DeepSeek4CompressorState index_state{};
+                if (ratio > 0) {
+                    attn_state.state_kv = view_state(
+                        plc.attn_compressor.state_kv, rows.slot);
+                    attn_state.state_score = view_state(
+                        plc.attn_compressor.state_score, rows.slot);
+                    if (ratio == 4) {
+                        index_state.state_kv = view_state(
+                            plc.indexer_compressor.state_kv, rows.slot);
+                        index_state.state_score = view_state(
+                            plc.indexer_compressor.state_score, rows.slot);
+                    }
+                }
+
+                ggml_tensor * segment_hidden = ggml_view_2d(
+                    ctx, attn_normed, n_embd, segment.row_count,
+                    attn_normed->nb[1],
+                    size_t(segment.row_offset) * attn_normed->nb[1]);
+                ggml_tensor * predecessor_rows = nullptr;
+                DeepSeek4PagedSegmentPublication publication{};
+                if (prefill) {
+                    ggml_tensor * segment_kv = ggml_view_2d(
+                        ctx, batched_proj.kv, w.head_dim, segment.row_count,
+                        batched_proj.kv->nb[1],
+                        size_t(segment.row_offset) * batched_proj.kv->nb[1]);
+                    // A one-row append cannot overwrite any of its 127 live
+                    // predecessors. Wider segments can wrap onto a row still
+                    // needed by an earlier query and require the dependency.
+                    ggml_tensor * ordered_values = segment.row_count > 1
+                        ? ds4_order_segment_write_after_snapshot(
+                            ctx, immutable_raw, segment_kv)
+                        : ggml_cont(ctx, segment_kv);
+                    ggml_tensor * post_raw = ggml_set_rows(
+                        ctx, raw_flat, ordered_values, px.raw_write);
+                    ggml_build_forward_expand(gf, post_raw);
+                    if (px.raw_read_n > 0) {
+                        predecessor_rows = ggml_get_rows(
+                            ctx, post_raw, px.raw_predecessor_read);
+                    }
+
+                    DeepSeek4PagedSegmentCompressorInputs publication_inputs{
+                        px.ape_rows,
+                        px.state_publish_rows,
+                        px.comp_write,
+                        px.comp_read,
+                        px.comp_position,
+                    };
+                    std::vector<DeepSeek4I64ArrayBinding> i64_bindings;
+                    std::vector<DeepSeek4I32ArrayBinding> i32_bindings;
+                    if (!build_paged_segment_compressor_publication(
+                            ctx, gf, w, il, segment_hidden,
+                            int(segment.start_position),
+                            int(segment.row_count), attn_state,
+                            ratio == 4 ? &index_state : nullptr,
+                            plc.comp_kv, plc.index_comp_kv, rows,
+                            publication_inputs, i64_bindings, i32_bindings,
+                            publication) ||
+                        !i64_bindings.empty() || !i32_bindings.empty()) {
+                        return false;
+                    }
+                }
+
+                for (uint32_t local = 0; local < segment.row_count; ++local) {
+                    const uint32_t model_row = segment.row_offset + local;
+                    const DeepSeek4SegmentTokenRows & token =
+                        rows.tokens[size_t(local)];
+                    ggml_tensor * pos = scalar_position(ex.pos_q, model_row);
+                    ggml_tensor * neg_pos =
+                        scalar_position(ex.neg_q, model_row);
+                    ggml_tensor * raw_history = immutable_raw;
+                    int n_raw_history = int(
+                        rows.immutable_raw_history.size());
+                    ggml_tensor * comp_history = immutable_comp;
+                    int n_comp_history = int(
+                        rows.immutable_compressed_history.size());
+
+                    if (prefill) {
+                        raw_history = nullptr;
+                        n_raw_history = 0;
+                        if (token.initial_raw_suffix > 0) {
+                            const int64_t first = int64_t(
+                                rows.immutable_raw_history.size()) -
+                                token.initial_raw_suffix;
+                            if (!immutable_raw || first < 0) return false;
+                            raw_history = ggml_view_2d(
+                                ctx, immutable_raw, w.head_dim,
+                                token.initial_raw_suffix,
+                                immutable_raw->nb[1],
+                                size_t(first) * immutable_raw->nb[1]);
+                            n_raw_history = token.initial_raw_suffix;
+                        }
+                        if (token.prior_segment_rows > 0) {
+                            if (!predecessor_rows ||
+                                token.prior_segment_rows > px.raw_read_n) {
+                                return false;
+                            }
+                            ggml_tensor * prior = ggml_view_2d(
+                                ctx, predecessor_rows, w.head_dim,
+                                token.prior_segment_rows,
+                                predecessor_rows->nb[1], 0);
+                            raw_history = raw_history
+                                ? ggml_concat(ctx, raw_history, prior, 1)
+                                : prior;
+                            n_raw_history += token.prior_segment_rows;
+                        }
+                        if (token.sees_emitted_compressed_row) {
+                            if (!publication.emitted_attention) return false;
+                            comp_history = comp_history
+                                ? ggml_concat(
+                                    ctx, comp_history,
+                                    publication.emitted_attention, 1)
+                                : publication.emitted_attention;
+                            ++n_comp_history;
+                        }
+                    }
+
+                    DeepSeek4MlaLaneBindings lane{};
+                    lane.history_mode =
+                        DeepSeek4MlaLaneBindings::HistoryMode::ChronologicalGathered;
+                    lane.raw_history = raw_history;
+                    lane.n_raw_history = n_raw_history;
+                    lane.comp_history = comp_history;
+                    lane.n_comp_history = n_comp_history;
+                    lane.raw_kv = raw_flat;
+                    lane.comp_kv = plc.comp_kv;
+                    lane.index_comp_kv = plc.index_comp_kv;
+                    lane.attn_compressor = &attn_state;
+                    lane.indexer_compressor = &index_state;
+                    lane.write_enabled = decode;
+                    if (decode) {
+                        lane.raw_write_rows = px.raw_write;
+                        lane.comp_write_rows = px.comp_write;
+                        lane.index_comp_write_rows = px.comp_write;
+                        lane.comp_read_rows = px.comp_read;
+                        lane.index_comp_read_rows = px.comp_read;
+                    }
+
+                    DeepSeek4AttentionGraphInputs inputs{};
+                    inputs.rope_pos = pos;
+                    inputs.neg_pos = neg_pos;
+                    if (decode && ratio > 0) {
+                        inputs.attn_ape_row = px.ape_rows;
+                        inputs.attn_state_rows = px.token_state_rows;
+                        inputs.attn_comp_pos = px.comp_position;
+                        inputs.index_ape_row = px.ape_rows;
+                        inputs.index_state_rows = px.token_state_rows;
+                        inputs.index_comp_pos = px.comp_position;
+                    }
+                    std::vector<DeepSeek4I32InputBinding> i32_bindings;
+                    std::vector<DeepSeek4I32ArrayBinding> i32_array_bindings;
+                    std::vector<DeepSeek4I64ArrayBinding> i64_array_bindings;
+                    ggml_tensor * hidden = ggml_view_2d(
+                        ctx, attn_normed, n_embd, 1,
+                        attn_normed->nb[1],
+                        size_t(model_row) * attn_normed->nb[1]);
+                    const DeepSeek4PreparedProjectedLane projected =
+                        ds4_slice_projected_lane(
+                            ctx, batched_proj, w, int(model_row), pos);
+                    ggml_tensor * lane_context = nullptr;
+                    ggml_tensor * built = build_mla_attention_lane_core(
+                        ctx, gf, hidden, w, L, lane, il,
+                        int(segment.start_position + local), 1, &inputs,
+                        i32_bindings, i32_array_bindings,
+                        i64_array_bindings, nullptr,
+                        DeepSeek4AttentionImpl::Explicit, &projected,
+                        &lane_context);
+                    if (!built || !lane_context ||
+                        !i32_bindings.empty() ||
+                        !i32_array_bindings.empty() ||
+                        !i64_array_bindings.empty()) {
+                        return false;
+                    }
+                    attn_out = attn_out
+                        ? ggml_concat(ctx, attn_out, lane_context, 1)
+                        : lane_context;
+                }
             }
             attn_out = build_mla_output_projection(
                 ctx, attn_out, w, L, q, /*allow_grouped=*/false);
@@ -963,6 +1378,15 @@ static bool ds4_build_fused_verify_graph(
         }
     }
 
+    if (segment_paged_mode &&
+        (paged_i32_off != paged_i32_total ||
+         paged_i64_off != paged_i64_total ||
+         paged_gather_off != paged_gather_total ||
+         ex.paged_segments.size() !=
+             size_t(w.n_layer) * segment_layout->segments.size())) {
+        return false;
+    }
+
     // ── Batched output HC merge → out_norm + lm_head ──
     ggml_tensor * onorm = ggml_rms_norm(ctx, hc_cur, w.hc_eps);
     ggml_tensor * omix = ggml_mul_mat(ctx, mc.fn_out_f16, onorm);
@@ -1117,6 +1541,18 @@ static bool ds4_build_fused_verify_graph(
             pin_main(px.index_gather);
             pin_main(px.raw_write); pin_main(px.comp_write); pin_main(px.comp_read); pin_main(px.ape);
             pin_main(px.state_row); pin_main(px.comp_pos);
+        }
+        for (const auto & px : ex.paged_segments) {
+            pin_main(px.raw_gather);
+            pin_main(px.comp_gather);
+            pin_main(px.raw_write);
+            pin_main(px.raw_predecessor_read);
+            pin_main(px.ape_rows);
+            pin_main(px.token_state_rows);
+            pin_main(px.state_publish_rows);
+            pin_main(px.comp_write);
+            pin_main(px.comp_read);
+            pin_main(px.comp_position);
         }
         for (ggml_tensor * hids : fg.hash_ids) pin_main(hids);
         for (const MoeHybridGraphInputs & inputs : fg.hybrid_inputs) {

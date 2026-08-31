@@ -29,6 +29,7 @@
 #include "common/prefill_attention_mode.h"
 #include "common/concurrency/paged_kv_pool.h"
 #include "deepseek4_paged_cache.h"
+#include "deepseek4_paged_segments.h"
 
 namespace dflash::common {
 
@@ -317,6 +318,7 @@ struct DeepSeek4PagedCache {
 };
 
 struct DeepSeek4Snapshot;
+struct DeepSeek4PagedSegmentPreparedStep;
 
 struct DeepSeek4RawRingSpan {
     int row = 0;
@@ -390,6 +392,25 @@ bool deepseek4_paged_gathered_step(
     std::vector<float> & out_logits, std::vector<int32_t> & out_argmax,
     MoeHybridStorage * moe_hybrid = nullptr,
     MoeHybridRoutingStats * routing_stats = nullptr);
+// Split preparation from submission so the sequence engine can still roll
+// back staged slot/page-table changes while graph construction and input
+// uploads are fallible. The prepared invocation pins its cache slot until it
+// is computed or discarded.
+bool deepseek4_prepare_paged_segment_step(
+    ggml_backend_t backend,
+    int device,
+    const DeepSeek4Weights & w,
+    DeepSeek4PagedCache & cache,
+    const DeepSeek4PagedStepLayout & layout,
+    MoeHybridStorage * moe_hybrid,
+    DeepSeek4PagedSegmentPreparedStep *& out);
+bool deepseek4_compute_paged_segment_step(
+    DeepSeek4PagedSegmentPreparedStep & prepared,
+    std::vector<float> & out_logits,
+    std::vector<int32_t> & out_argmax,
+    MoeHybridRoutingStats * routing_stats = nullptr);
+void deepseek4_discard_paged_segment_step(
+    DeepSeek4PagedSegmentPreparedStep * prepared);
 void deepseek4_release_paged_gathered_runtime(DeepSeek4PagedCache & cache);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
 // Release only reproducible large-batch graph arenas after prefill. KV/model
