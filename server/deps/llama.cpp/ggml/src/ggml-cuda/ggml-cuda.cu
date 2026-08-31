@@ -2836,12 +2836,16 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
             GGML_CUDA_CC_IS_RDNA3_5(cc) &&
             (!mix_mmq || !(mix_mmq[0] == '0' && mix_mmq[1] == '\0'));
 #endif
-        if (default_ds4_mix_gate_up_mmq ||
+        const bool mmvq_override_selects_node =
+            ggml_cuda_mmvq_max_ncols_override > 0 &&
+            ncols <= ggml_cuda_mmvq_max_ncols_override &&
+            (!ids || ncols <= get_mmvq_mmid_max_batch(src0->type, cc));
+        const bool mmq_selected =
+            default_ds4_mix_gate_up_mmq ||
             ggml_cuda_should_use_mmq(
                 src0->type, cc, ncols,
-                ids ? src0->ne[2] : /*n_experts=*/0) &&
-            !(ggml_cuda_mmvq_max_ncols_override > 0 &&
-              ncols <= ggml_cuda_mmvq_max_ncols_override)) {
+                ids ? src0->ne[2] : /*n_experts=*/0);
+        if (mmq_selected && !mmvq_override_selects_node) {
             ggml_cuda_mul_mat_q_pair(
                 ctx, up->src[0], gate->src[0], src1, ids, up, gate);
             ggml_cuda_op_swiglu_ds4(ctx, glu);

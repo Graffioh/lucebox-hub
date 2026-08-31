@@ -8854,9 +8854,22 @@ bool deepseek4_step_layer_range(
         exact_prefill_band ? 4 : n_tokens);
     const bool exact_multi_token_band =
         exact_prefill_band && n_tokens > 1 && n_tokens <= 4;
+    int exact_mmvq_max_ncols = exact_multi_token_band ? 4 : 0;
+    if (exact_mmvq_max_ncols > 0) {
+        // Four columns is the qualified exact-prefill width, but an explicit
+        // process policy remains authoritative when it asks for a lower
+        // MMVQ ceiling. Non-positive values retain the backend's existing
+        // "use the compiled maximum" meaning.
+        const char * configured = std::getenv("LUCE_MMVQ_MAX_NCOLS");
+        const int configured_max = configured ? std::atoi(configured) : 0;
+        if (configured_max > 0) {
+            exact_mmvq_max_ncols = std::min(
+                exact_mmvq_max_ncols, configured_max);
+        }
+    }
     ScopedCudaGraphOverrides exact_mmvq_scope(
         /*disable_graphs=*/false,
-        /*mmvq_max_ncols=*/exact_multi_token_band ? 4 : 0);
+        /*mmvq_max_ncols=*/exact_mmvq_max_ncols);
     if (first_chunk > 0 && first_chunk < n_tokens &&
         !fused_verify_candidate && !heterogeneous_sparse_prefill &&
         !standard_layer_major_prefill) {
