@@ -1196,7 +1196,7 @@ bool DeepSeek4Backend::init() {
             paged_cache_.plan.max_blocks_per_sequence);
         std::fprintf(stderr,
             "[deepseek4-parallel] enabled %d slots mode=%s, %u x %d-token physical "
-            "blocks; prefill is exact reference mode at one prompt token per slot per scheduler iteration\n",
+            "blocks; exact paged steps admit up to 6 model rows and up to 4 rows per compressor-safe prompt segment\n",
             cfg_.max_concurrency, moe_hybrid_ ? "r9700+strix" : "strix",
             paged_cache_.plan.physical_blocks,
             DS4_PAGE_TOKENS);

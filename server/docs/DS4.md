@@ -328,10 +328,15 @@ target shard or host-streamed experts.
 The backend keeps raw MLA rows, compressed rows, and indexer state in a
 persistent 128-token paged cache. The shared
 HTTP scheduler performs admission, cancellation, slow-client isolation, and
-fair continuous batching. DeepSeek4 lowers each scheduler plan into one exact
-gathered graph with up to 6 independent lanes. Decode rows share the weight
-pass; each selected prompt advances by one exact token because the graph must
-not contain two rows from the same sequence.
+fair continuous batching. DeepSeek4 lowers each scheduler plan privately into
+an exact paged graph with up to 6 model rows. Decode rows remain independent
+one-token lanes. Each selected prompt may contribute one compressor-safe
+segment with up to 4 rows; a prompt-only service step may use all 6 model
+rows. Model-wide weight
+operations are packed across all rows, while raw MLA history, compressed
+history, compressor state, and indexer recurrence remain causally ordered
+within each prompt segment. The shared scheduler and `StepPlan` stay
+model-neutral.
 
 ```bash
 hf download Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3 \
@@ -386,7 +391,7 @@ resident experts. Increase `--kv-pool-tokens` only when the primary has enough
 memory for the larger
 shared history pool.
 
-On monolithic gfx1151, a four-lane gathered step uses MMVF for each
+On monolithic gfx1151, a four-column paged step uses MMVF for each
 `[16384,24]` per-layer F16 hyper-connection mix projection. Set
 `DFLASH_GFX1151_HC_MMVF_Q4=0` to restore generic dispatch during burn-in.
 The `[16384,4]` output hyper-connection projection is not changed.

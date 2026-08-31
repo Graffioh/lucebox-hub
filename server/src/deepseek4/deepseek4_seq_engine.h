@@ -28,9 +28,9 @@ public:
     bool token_is_eos(int32_t token) const override;
 
 private:
+    StepResult step_decode_only(const std::vector<StepInput> & inputs);
+    StepResult step_with_paged_segments(const StepPlan & plan);
     bool set_block(int slot, int logical, int32_t physical);
-    void fail_prefill(int slot, std::vector<PrefillOutput> & outputs,
-                      const std::string & error);
 
     DeepSeek4Backend & b_;
     SeqSlotManager slots_;
