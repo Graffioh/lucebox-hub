@@ -868,6 +868,15 @@ if(DFLASH27B_TESTS)
         endif()
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_rocmfp2_mix_dispatch.cpp")
+        # Pure host-side row-count and strict opt-in dispatch contracts.
+        add_executable(test_rocmfp2_mix_dispatch
+            test/test_rocmfp2_mix_dispatch.cpp)
+        target_include_directories(test_rocmfp2_mix_dispatch PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        list(APPEND _raw_unit_test_targets test_rocmfp2_mix_dispatch)
+    endif()
+
     if((DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
         DFLASH27B_GPU_BACKEND STREQUAL "cuda")
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_pool_shutdown.cpp")

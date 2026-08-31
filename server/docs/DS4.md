@@ -393,6 +393,16 @@ The `[16384,4]` output hyper-connection projection is not changed.
 R9700-primary heterogeneous serving is unchanged because the per-layer
 projections remain on gfx1201.
 
+The ROCmFP2 four-row MoE path is an unqualified trial and remains off by
+default. Set `DFLASH_ROCMFP2_ROW4=1` before starting the server to select it
+only for qtype-106 MoE matvecs at q=3 or q=4 on gfx1151. Monolithic serving can
+reach it for every resident qtype-106 expert; in the R9700-primary split, only
+the secondary Strix-owned expert branch can reach it. q=1, q=2, q=5, gfx1201,
+and every non-gfx1151 target keep the existing two-row launch. The runtime
+caches the setting on first eligible dispatch, so restart the server after
+changing it. No correctness or performance qualification is claimed yet; keep
+it unset until the LuceLoop qualification run passes.
+
 Paged concurrency fails closed for other primary/secondary architecture pairs,
 CUDA or out-of-process expert ownership, explicit layer or remote target
 splits, drafts/DSpark, DDTree, PFlash/KVFlash, fused decode, approximate
