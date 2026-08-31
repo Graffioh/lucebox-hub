@@ -1,12 +1,17 @@
 #include "deepseek4_seq_engine.h"
 
 #include "deepseek4_backend.h"
+#include "deepseek4_dspark.h"
+#include "deepseek4_page_layout.h"
 #include "deepseek4_paged_segments.h"
+#include "common/adaptive_spec_width.h"
 #include "common/sampler.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <limits>
 #include <memory>
@@ -61,17 +66,37 @@ public:
     Ds4HostStepTransaction & operator=(Ds4HostStepTransaction &&) = delete;
 
     Ds4HostStage stage_decode(const SeqEngine::StepInput & input) {
+        return stage_decode_tokens(
+            input.slot, std::vector<int32_t>{input.token},
+            DeepSeek4PagedSegmentKind::decode);
+    }
+
+    Ds4HostStage stage_decode_tokens(
+            int slot_id,
+            const std::vector<int32_t> & tokens,
+            DeepSeek4PagedSegmentKind kind =
+                DeepSeek4PagedSegmentKind::speculative_decode) {
         Ds4HostStage stage;
-        if (!slots_.is_active(input.slot) ||
-            slots_.is_prefilling(input.slot)) {
+        const bool ordinary = kind == DeepSeek4PagedSegmentKind::decode;
+        const bool speculative =
+            kind == DeepSeek4PagedSegmentKind::speculative_decode;
+        if ((!ordinary && !speculative) ||
+            (ordinary && tokens.size() != 1) ||
+            (speculative &&
+             (tokens.empty() ||
+              tokens.size() > DEEPSEEK4_MAX_PAGED_SEGMENT_ROWS)) ||
+            std::any_of(tokens.begin(), tokens.end(),
+                [](int32_t token) { return token < 0; }) ||
+            !slots_.is_active(slot_id) || slots_.is_prefilling(slot_id)) {
             stage.status = Ds4HostStageStatus::row_failed;
             stage.error = "invalid DeepSeek4 decode staging slot";
             return stage;
         }
 
-        const int previous_cur_pos = slots_.slot(input.slot).cur_pos;
+        const int previous_cur_pos = slots_.slot(slot_id).cur_pos;
         const SeqSlotManager::StepAppend append =
-            slots_.append_token(input.slot, input.token);
+            slots_.append_tokens(
+                slot_id, tokens.data(), static_cast<int>(tokens.size()));
         if (!append.ok) {
             stage.status = append.rollback_failed
                 ? Ds4HostStageStatus::fatal
@@ -86,9 +111,9 @@ public:
         }
 
         AppendRecord record;
-        record.kind = DeepSeek4PagedSegmentKind::decode;
-        record.slot = input.slot;
-        record.count = 1;
+        record.kind = kind;
+        record.slot = slot_id;
+        record.count = static_cast<int32_t>(tokens.size());
         record.previous_cur_pos = previous_cur_pos;
         record.first_patch = patches_.size();
         appends_.push_back(record);
@@ -98,18 +123,21 @@ public:
         stage.first_new_block = append.first_new_block;
         stage.new_blocks = append.new_blocks;
 
-        const SeqSlot & slot = slots_.slot(input.slot);
+        const SeqSlot & slot = slots_.slot(slot_id);
         const bool scalar_delta_matches = append.new_blocks.empty()
             ? append.new_block < 0 && append.new_block_index < 0
             : append.new_block == append.new_blocks.front() &&
               append.new_block_index == append.first_new_block;
-        if (append.count != 1 || append.position != previous_cur_pos ||
-            append.physical_rows.size() != 1 ||
+        if (append.count != static_cast<int>(tokens.size()) ||
+            append.position != previous_cur_pos ||
+            append.physical_rows.size() != tokens.size() ||
             append.physical_row < 0 ||
             append.physical_row != append.physical_rows.front() ||
+            std::any_of(append.physical_rows.begin(),
+                append.physical_rows.end(),
+                [](int64_t row) { return row < 0; }) ||
             slot.cur_pos != previous_cur_pos ||
-            slot.staged_tokens.size() != 1 ||
-            slot.staged_tokens.front() != input.token ||
+            slot.staged_tokens != tokens ||
             !scalar_delta_matches) {
             std::string rollback_error;
             const bool rewound = rollback_last(rollback_error);
@@ -222,6 +250,11 @@ public:
         phase_ = Phase::submitted;
     }
 
+    void rearm_after_device_restore() noexcept {
+        assert(phase_ == Phase::submitted);
+        phase_ = Phase::armed;
+    }
+
     void finish_success() noexcept {
         assert(phase_ == Phase::submitted);
         appends_.clear();
@@ -315,9 +348,9 @@ private:
         patches_.resize(begin);
 
         const bool allocator_rewound =
-            record.kind == DeepSeek4PagedSegmentKind::decode
-                ? slots_.rollback_step(record.slot)
-                : slots_.rollback_prefill(record.slot, record.count);
+            record.kind == DeepSeek4PagedSegmentKind::prefill
+                ? slots_.rollback_prefill(record.slot, record.count)
+                : slots_.rollback_step(record.slot);
         if (!allocator_rewound) {
             remember("DeepSeek4 staged allocator rollback failed");
         }
@@ -325,7 +358,7 @@ private:
             slots_.slot(record.slot).cur_pos != record.previous_cur_pos) {
             remember("DeepSeek4 slot position did not rewind exactly");
         }
-        if (record.kind == DeepSeek4PagedSegmentKind::decode &&
+        if (record.kind != DeepSeek4PagedSegmentKind::prefill &&
             slots_.is_active(record.slot) &&
             !slots_.slot(record.slot).staged_tokens.empty()) {
             remember("DeepSeek4 decode tokens remained staged after rollback");
@@ -342,13 +375,240 @@ private:
     Phase phase_ = Phase::armed;
 };
 
+struct Ds4PagedSnapshotSpan {
+    ggml_tensor * tensor = nullptr;
+    size_t offset = 0;
+    std::vector<uint8_t> bytes;
+};
+
+struct Ds4PagedSpecSnapshot {
+    std::vector<Ds4PagedSnapshotSpan> spans;
+};
+
+bool snapshot_paged_span(
+        ggml_tensor * tensor, size_t offset, size_t bytes,
+        Ds4PagedSpecSnapshot & snapshot, std::string & error) {
+    if (!tensor || !bytes || offset > ggml_nbytes(tensor) ||
+        bytes > ggml_nbytes(tensor) - offset) {
+        error = "DeepSeek4 speculative snapshot span is out of range";
+        return false;
+    }
+    for (const Ds4PagedSnapshotSpan & existing : snapshot.spans) {
+        if (existing.tensor == tensor && existing.offset == offset &&
+            existing.bytes.size() == bytes) {
+            return true;
+        }
+    }
+    Ds4PagedSnapshotSpan span;
+    span.tensor = tensor;
+    span.offset = offset;
+    span.bytes.resize(bytes);
+    ggml_backend_tensor_get(
+        tensor, span.bytes.data(), offset, span.bytes.size());
+    snapshot.spans.push_back(std::move(span));
+    return true;
+}
+
+bool snapshot_paged_row(
+        ggml_tensor * tensor, int64_t row, size_t base_offset,
+        Ds4PagedSpecSnapshot & snapshot, std::string & error) {
+    if (!tensor || row < 0 || row >= tensor->ne[1]) {
+        error = "DeepSeek4 speculative snapshot row is out of range";
+        return false;
+    }
+    const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+    if (size_t(row) >
+        (std::numeric_limits<size_t>::max() - base_offset) / tensor->nb[1]) {
+        error = "DeepSeek4 speculative snapshot offset overflow";
+        return false;
+    }
+    return snapshot_paged_span(
+        tensor, base_offset + size_t(row) * tensor->nb[1], row_bytes,
+        snapshot, error);
+}
+
+bool save_paged_spec_snapshot(
+        const DeepSeek4PagedCache & cache,
+        const DeepSeek4PagedStepLayout & layout,
+        Ds4PagedSpecSnapshot & snapshot,
+        std::string & error) {
+    snapshot.spans.clear();
+    if (cache.layers.size() != cache.plan.ratios.size()) {
+        error = "DeepSeek4 speculative snapshot cache geometry is invalid";
+        return false;
+    }
+    for (size_t il = 0; il < cache.layers.size(); ++il) {
+        const DeepSeek4PagedLayerCache & layer = cache.layers[il];
+        std::vector<DeepSeek4LayerSegmentRows> layer_rows;
+        if (!prepare_deepseek4_paged_layer_rows(
+                layout, cache.plan.ratios[il], layer_rows) ||
+            layer_rows.size() != layout.segments.size()) {
+            error = "DeepSeek4 speculative snapshot layer layout failed";
+            return false;
+        }
+        for (size_t segment_index = 0;
+             segment_index < layout.segments.size(); ++segment_index) {
+            const DeepSeek4PagedSegment & segment =
+                layout.segments[segment_index];
+            const DeepSeek4LayerSegmentRows & rows =
+                layer_rows[segment_index];
+            if (segment.kind !=
+                    DeepSeek4PagedSegmentKind::speculative_decode ||
+                segment.slot < 0 ||
+                rows.tokens.size() != segment.row_count || !layer.raw_kv) {
+                error = "DeepSeek4 speculative snapshot received a non-candidate segment";
+                return false;
+            }
+
+            for (const DeepSeek4SegmentTokenRows & token : rows.tokens) {
+                if (token.raw_write_row < 0 ||
+                    token.raw_write_row / int64_t(DS4_PAGE_TOKENS) !=
+                        segment.slot) {
+                    error = "DeepSeek4 speculative raw snapshot owner is invalid";
+                    return false;
+                }
+                if (!snapshot_paged_row(
+                        layer.raw_kv,
+                        token.raw_write_row % int64_t(DS4_PAGE_TOKENS),
+                        size_t(segment.slot) * layer.raw_kv->nb[2],
+                        snapshot, error)) {
+                    return false;
+                }
+            }
+            if (!rows.compression_ratio) continue;
+
+            std::vector<int64_t> state_rows;
+            if (rows.compression_ratio == 4 && rows.emission_token >= 0) {
+                state_rows = {0, 1, 2, 3, 4, 5, 6, 7};
+            } else {
+                state_rows.reserve(rows.tokens.size());
+                for (const DeepSeek4SegmentTokenRows & token : rows.tokens) {
+                    state_rows.push_back(token.attention_state_row);
+                }
+            }
+            auto snapshot_state = [&](ggml_tensor * tensor) {
+                if (!tensor || segment.slot >= tensor->ne[2]) {
+                    error = "DeepSeek4 speculative state snapshot is out of range";
+                    return false;
+                }
+                for (int64_t row : state_rows) {
+                    if (!snapshot_paged_row(
+                            tensor, row,
+                            size_t(segment.slot) * tensor->nb[2],
+                            snapshot, error)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (!snapshot_state(layer.attn_compressor.state_kv) ||
+                !snapshot_state(layer.attn_compressor.state_score) ||
+                (rows.compression_ratio == 4 &&
+                 (!snapshot_state(layer.indexer_compressor.state_kv) ||
+                  !snapshot_state(layer.indexer_compressor.state_score)))) {
+                return false;
+            }
+            if (rows.emission_token >= 0 &&
+                (!snapshot_paged_row(
+                     layer.comp_kv, rows.compressed_write_row, 0,
+                     snapshot, error) ||
+                 (rows.compression_ratio == 4 &&
+                  !snapshot_paged_row(
+                      layer.index_comp_kv, rows.compressed_write_row, 0,
+                      snapshot, error)))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool restore_paged_spec_snapshot(
+        const Ds4PagedSpecSnapshot & snapshot,
+        std::string & error) {
+    for (auto it = snapshot.spans.rbegin();
+         it != snapshot.spans.rend(); ++it) {
+        if (!it->tensor || it->bytes.empty() ||
+            it->offset > ggml_nbytes(it->tensor) ||
+            it->bytes.size() > ggml_nbytes(it->tensor) - it->offset) {
+            error = "DeepSeek4 speculative restore span is out of range";
+            return false;
+        }
+        ggml_backend_tensor_set(
+            it->tensor, it->bytes.data(), it->offset, it->bytes.size());
+    }
+    return true;
+}
+
 } // namespace
 
 DeepSeek4SeqEngine::DeepSeek4SeqEngine(
         DeepSeek4Backend & backend, PagedKvPool & pool, int max_ctx,
         uint32_t table_stride)
     : b_(backend), slots_(pool, max_ctx), stride_(table_stride),
-      host_tables_((size_t)pool.max_sequences() * table_stride, -1) {}
+      host_tables_((size_t)pool.max_sequences() * table_stride, -1),
+      dspark_slots_(size_t(pool.max_sequences())) {
+    bool adaptive = adaptive_spec_width_globally_enabled();
+    if (const char * raw = std::getenv("DFLASH_DS4_ADAPTIVE_WIDTH")) {
+        adaptive = raw[0] && std::strcmp(raw, "0") != 0;
+    }
+    const int max_width = paged_dspark_max_width();
+    for (DsparkSlotState & state : dspark_slots_) {
+        state.width = std::make_unique<AdaptiveSpecWidth>(
+            max_width, 2, adaptive);
+    }
+}
+
+bool DeepSeek4SeqEngine::paged_dspark_enabled() const {
+    const char * value = std::getenv("DFLASH_DS4_PAGED_SPEC");
+    return value && value[0] && std::strcmp(value, "0") != 0 &&
+        b_.spec_enabled_ && b_.spec_drafter_ &&
+        b_.spec_drafter_->dspark_enabled;
+}
+
+int DeepSeek4SeqEngine::paged_dspark_max_width() const {
+    int cap = 4;
+    const char * q5 = std::getenv("DFLASH_DS4_Q5_VERIFY");
+    if (q5 && q5[0] == '1' && q5[1] == '\0') cap = 5;
+    if (const char * value = std::getenv("DFLASH_DS4_SPEC_Q")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value && end && *end == '\0' && parsed >= 2 &&
+            parsed <= cap) {
+            cap = static_cast<int>(parsed);
+        }
+    }
+    return cap;
+}
+
+int DeepSeek4SeqEngine::dspark_feature_width() const {
+    if (!b_.spec_drafter_ || b_.w_.n_embd <= 0 ||
+        b_.spec_drafter_->n_target_layers <= 0 ||
+        b_.spec_drafter_->n_target_layers >
+            std::numeric_limits<int>::max() / b_.w_.n_embd) {
+        return 0;
+    }
+    return b_.spec_drafter_->n_target_layers * b_.w_.n_embd;
+}
+
+void DeepSeek4SeqEngine::append_dspark_feature(
+        int slot, const float * feature) {
+    const int width = dspark_feature_width();
+    if (!feature || width <= 0 || b_.w_.n_swa <= 0 || slot < 0 ||
+        size_t(slot) >= dspark_slots_.size()) {
+        return;
+    }
+    std::vector<float> & ring = dspark_slots_[size_t(slot)].features;
+    if (ring.size() % size_t(width) != 0) ring.clear();
+    const size_t rows = ring.size() / size_t(width);
+    if (rows >= size_t(b_.w_.n_swa)) {
+        std::memmove(
+            ring.data(), ring.data() + width,
+            (ring.size() - size_t(width)) * sizeof(float));
+        ring.resize(ring.size() - size_t(width));
+    }
+    ring.insert(ring.end(), feature, feature + width);
+}
 
 bool DeepSeek4SeqEngine::token_is_eos(int32_t token) const {
     return deepseek4_is_eos_tok(token, b_.w_);
@@ -380,6 +640,9 @@ SeqEngine::AdmitResult DeepSeek4SeqEngine::admit(
     }
     std::fill_n(host_tables_.data() + (size_t)result.slot * stride_,
                 stride_, -1);
+    DsparkSlotState & dspark = dspark_slots_[size_t(result.slot)];
+    dspark.features.clear();
+    if (dspark.width) dspark.width->reset();
     reset_deepseek4_paged_slot(b_.paged_cache_, (uint32_t)result.slot);
     return result;
 }
@@ -471,13 +734,20 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
         }
     }
 
-    if (plan.prefills.empty()) return step_decode_only(inputs);
+    if (plan.prefills.empty()) {
+        return paged_dspark_enabled()
+            ? step_decode_with_dspark(inputs)
+            : step_decode_only(inputs);
+    }
     return step_with_paged_segments(plan);
 }
 
 SeqEngine::StepResult DeepSeek4SeqEngine::step_decode_only(
-        const std::vector<StepInput> & inputs) {
+        const std::vector<StepInput> & inputs,
+        const std::vector<int> * capture_layer_ids,
+        std::vector<float> * capture) {
     StepResult result;
+    if (capture) capture->clear();
     auto fail_step = [&](const std::string & error) {
         result.decode.clear();
         result.prefills.clear();
@@ -565,7 +835,8 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step_decode_only(
             embeddings.data(), lane_tokens.data(), lane_positions.data(),
             lane_slots.data(), (uint32_t)lane_tokens.size(),
             compact_tables.data(), stride_, logit_lanes.data(), logits, argmax,
-            b_.moe_hybrid_.get(), b_.routing_stats_.get())) {
+            b_.moe_hybrid_.get(), b_.routing_stats_.get(),
+            capture_layer_ids, capture)) {
         return fail_step("DeepSeek4 gathered paged graph failed");
     }
 
@@ -587,6 +858,355 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step_decode_only(
         out.token = sample_lane(out.slot, lane);
     }
     return result;
+}
+
+SeqEngine::StepResult DeepSeek4SeqEngine::step_decode_with_dspark(
+        const std::vector<StepInput> & inputs) {
+    struct DraftLane {
+        std::vector<int32_t> proposal;
+        int candidate_cap = 0;
+        int allocated = 0;
+        int accepted = 0;
+    };
+    struct CandidateLane {
+        size_t input_index = 0;
+        int slot = -1;
+        std::vector<int32_t> tokens;
+    };
+    struct CandidateExecution {
+        DeepSeek4PagedStepLayout layout;
+        Ds4PagedSpecSnapshot snapshot;
+        std::vector<int32_t> argmax;
+        std::vector<float> capture;
+        bool submitted = false;
+        bool fatal = false;
+    };
+
+    const DSparkDrafter * drafter = b_.spec_drafter_.get();
+    const int feature_width = dspark_feature_width();
+    if (!drafter || feature_width <= 0 ||
+        drafter->capture_layer_ids.empty()) {
+        return step_decode_only(inputs);
+    }
+
+    std::vector<DraftLane> drafts(inputs.size());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const StepInput & input = inputs[i];
+        const SeqSlot & slot = slots_.slot(input.slot);
+        DsparkSlotState & state = dspark_slots_[size_t(input.slot)];
+        if (!input.allow_speculation ||
+            slot.sampler.needs_logit_processing() ||
+            !state.width || state.features.empty() ||
+            state.features.size() % size_t(feature_width) != 0 ||
+            slot.cur_pos >= slots_.max_context()) {
+            continue;
+        }
+        const int context_tokens = static_cast<int>(
+            state.features.size() / size_t(feature_width));
+        const int proposal_width = state.width->next_width(
+            paged_dspark_max_width());
+        if (!deepseek4_dspark_propose_chain(
+                b_.backend_, b_.w_, *drafter, state.features.data(),
+                context_tokens, slot.cur_pos, input.token, proposal_width,
+                drafts[i].proposal)) {
+            drafts[i].proposal.clear();
+        }
+    }
+
+    std::vector<float> root_capture;
+    StepResult root = step_decode_only(
+        inputs, &drafter->capture_layer_ids, &root_capture);
+    if (!root.error.empty()) return root;
+
+    size_t successful_roots = 0;
+    for (const DecodeOutput & output : root.decode) {
+        successful_roots += output.failed ? 0 : 1;
+    }
+    if (root_capture.size() != successful_roots * size_t(feature_width)) {
+        root.decode.clear();
+        root.prefills.clear();
+        root.error = "DeepSeek4 paged DSpark root capture is malformed";
+        return root;
+    }
+    size_t capture_row = 0;
+    for (const DecodeOutput & output : root.decode) {
+        if (output.failed) continue;
+        append_dspark_feature(
+            output.slot,
+            root_capture.data() + capture_row * size_t(feature_width));
+        ++capture_row;
+    }
+
+    int candidate_budget = std::max(
+        0, int(DEEPSEEK4_MAX_PAGED_SEQUENCES) -
+               static_cast<int>(successful_roots));
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        if (i >= root.decode.size() || root.decode[i].failed ||
+            drafts[i].proposal.size() < 2 ||
+            drafts[i].proposal[1] != root.decode[i].token) {
+            continue;
+        }
+        const SeqSlot & slot = slots_.slot(inputs[i].slot);
+        int desired = std::min({
+            int(drafts[i].proposal.size()) - 1,
+            int(DEEPSEEK4_MAX_PAGED_SEGMENT_ROWS),
+            slots_.max_context() - slot.cur_pos,
+        });
+        for (int candidate = 0; candidate < desired; ++candidate) {
+            if (token_is_eos(drafts[i].proposal[size_t(candidate + 1)])) {
+                desired = candidate + 1;
+                break;
+            }
+        }
+        drafts[i].candidate_cap = desired > 0
+            ? deepseek4_safe_compressor_batch_tokens(
+                  b_.w_, slot.cur_pos, desired)
+            : 0;
+    }
+    while (candidate_budget > 0) {
+        bool granted = false;
+        for (DraftLane & draft : drafts) {
+            if (draft.allocated >= draft.candidate_cap) continue;
+            ++draft.allocated;
+            --candidate_budget;
+            granted = true;
+            if (!candidate_budget) break;
+        }
+        if (!granted) break;
+    }
+
+    std::vector<CandidateLane> offered;
+    for (size_t i = 0; i < drafts.size(); ++i) {
+        if (drafts[i].allocated < 1) continue;
+        CandidateLane lane;
+        lane.input_index = i;
+        lane.slot = inputs[i].slot;
+        lane.tokens.assign(
+            drafts[i].proposal.begin() + 1,
+            drafts[i].proposal.begin() + 1 + drafts[i].allocated);
+        offered.push_back(std::move(lane));
+    }
+    if (offered.empty()) return root;
+
+    auto execute_candidates = [&](const std::vector<CandidateLane> & lanes,
+                                  Ds4HostStepTransaction & transaction,
+                                  CandidateExecution & execution,
+                                  std::string & error) {
+        execution = {};
+        std::vector<DeepSeek4PagedSegmentSpec> specs;
+        specs.reserve(lanes.size());
+        for (const CandidateLane & lane : lanes) {
+            Ds4HostStage stage = transaction.stage_decode_tokens(
+                lane.slot, lane.tokens);
+            if (stage.status != Ds4HostStageStatus::staged) {
+                execution.fatal =
+                    stage.status == Ds4HostStageStatus::fatal;
+                error = stage.error.empty()
+                    ? "DeepSeek4 speculative host staging failed"
+                    : stage.error;
+                return false;
+            }
+            DeepSeek4PagedSegmentSpec spec;
+            spec.kind = DeepSeek4PagedSegmentKind::speculative_decode;
+            spec.slot = lane.slot;
+            spec.start_position = stage.start_position;
+            spec.row_count = static_cast<uint32_t>(lane.tokens.size());
+            spec.token_ids = lane.tokens;
+            spec.pool_write_rows = std::move(stage.pool_write_rows);
+            spec.first_new_block = stage.first_new_block;
+            spec.new_blocks = std::move(stage.new_blocks);
+            specs.push_back(std::move(spec));
+        }
+        if (!prepare_deepseek4_paged_step_layout(
+                specs, host_tables_, b_.paged_cache_.plan.slots,
+                b_.paged_cache_.plan.max_ctx,
+                b_.paged_cache_.plan.max_blocks_per_sequence,
+                b_.paged_cache_.plan.physical_blocks, execution.layout)) {
+            error = "DeepSeek4 speculative segment layout failed";
+            return false;
+        }
+        const size_t q = execution.layout.token_ids.size();
+        if (q < 1 || q > DEEPSEEK4_MAX_PAGED_SEQUENCES ||
+            q > std::numeric_limits<size_t>::max() / size_t(b_.w_.n_embd)) {
+            error = "DeepSeek4 speculative segment width is invalid";
+            return false;
+        }
+        execution.layout.embeddings.resize(q * size_t(b_.w_.n_embd));
+        if (!b_.w_.embedder.embed(
+                execution.layout.token_ids.data(), static_cast<int>(q),
+                execution.layout.embeddings.data())) {
+            error = "DeepSeek4 speculative embedding failed";
+            return false;
+        }
+
+        DeepSeek4PagedSegmentPreparedStep * raw_prepared = nullptr;
+        if (!deepseek4_prepare_paged_segment_step(
+                b_.backend_, b_.cfg_.device.gpu, b_.w_, b_.paged_cache_,
+                execution.layout, b_.moe_hybrid_.get(),
+                raw_prepared, &drafter->capture_layer_ids) ||
+            !raw_prepared) {
+            if (raw_prepared) {
+                deepseek4_discard_paged_segment_step(raw_prepared);
+            }
+            error = "DeepSeek4 speculative graph prepare failed";
+            return false;
+        }
+        using PreparedPtr = std::unique_ptr<
+            DeepSeek4PagedSegmentPreparedStep,
+            void (*)(DeepSeek4PagedSegmentPreparedStep *)>;
+        PreparedPtr prepared(
+            raw_prepared, deepseek4_discard_paged_segment_step);
+        if (!save_paged_spec_snapshot(
+                b_.paged_cache_, execution.layout,
+                execution.snapshot, error)) {
+            return false;
+        }
+
+        transaction.cross_device_mutation_barrier();
+        execution.submitted = true;
+        std::vector<float> logits;
+        if (!deepseek4_compute_paged_segment_step(
+                *prepared, logits, execution.argmax,
+                nullptr, &execution.capture)) {
+            error = "DeepSeek4 speculative graph failed";
+            return false;
+        }
+        if (!logits.empty() || execution.argmax.size() != q ||
+            execution.capture.size() != q * size_t(feature_width)) {
+            error = "DeepSeek4 speculative outputs are malformed";
+            return false;
+        }
+        return true;
+    };
+
+    auto rollback_candidates = [&](Ds4HostStepTransaction & transaction,
+                                   const CandidateExecution & execution,
+                                   std::string & error) {
+        if (execution.submitted) {
+            if (!restore_paged_spec_snapshot(execution.snapshot, error)) {
+                return false;
+            }
+            transaction.rearm_after_device_restore();
+        }
+        return transaction.rollback(error);
+    };
+
+    auto fallback_to_root = [&](const std::string & reason) {
+        std::fprintf(stderr,
+            "[deepseek4-parallel] paged DSpark fell back to gathered decode: %s\n",
+            reason.c_str());
+        return std::move(root);
+    };
+    auto fatal_after_root = [&](const std::string & error) {
+        root.decode.clear();
+        root.prefills.clear();
+        root.error = error;
+        return std::move(root);
+    };
+
+    Ds4HostStepTransaction transaction(
+        slots_, host_tables_, stride_, b_.paged_cache_.plan.physical_blocks);
+    CandidateExecution first;
+    std::string error;
+    if (!execute_candidates(offered, transaction, first, error)) {
+        const std::string primary = error;
+        std::string rollback_error;
+        if (!rollback_candidates(transaction, first, rollback_error)) {
+            return fatal_after_root(
+                "DeepSeek4 paged DSpark recovery failed after " + primary +
+                ": " + rollback_error);
+        }
+        if (first.fatal) return fatal_after_root(primary);
+        return fallback_to_root(primary);
+    }
+
+    bool all_accepted = true;
+    for (size_t lane_index = 0; lane_index < offered.size(); ++lane_index) {
+        const CandidateLane & lane = offered[lane_index];
+        const DeepSeek4PagedSegment & segment =
+            first.layout.segments[lane_index];
+        DraftLane & draft = drafts[lane.input_index];
+        int accepted = 1;
+        for (int candidate = 1;
+             candidate < static_cast<int>(lane.tokens.size()); ++candidate) {
+            const size_t posterior_row =
+                size_t(segment.row_offset) + size_t(candidate - 1);
+            if (draft.proposal[size_t(candidate + 1)] !=
+                    first.argmax[posterior_row]) {
+                break;
+            }
+            ++accepted;
+        }
+        draft.accepted = accepted;
+        all_accepted = all_accepted && accepted == int(lane.tokens.size());
+    }
+
+    const CandidateExecution * committed_execution = &first;
+    std::vector<CandidateLane> committed_lanes = offered;
+    std::unique_ptr<Ds4HostStepTransaction> replay_transaction;
+    CandidateExecution replay;
+    if (!all_accepted) {
+        std::string rollback_error;
+        if (!rollback_candidates(transaction, first, rollback_error)) {
+            return fatal_after_root(
+                "DeepSeek4 paged DSpark rejection rollback failed: " +
+                rollback_error);
+        }
+        for (CandidateLane & lane : committed_lanes) {
+            lane.tokens.resize(
+                size_t(drafts[lane.input_index].accepted));
+        }
+        replay_transaction = std::make_unique<Ds4HostStepTransaction>(
+            slots_, host_tables_, stride_,
+            b_.paged_cache_.plan.physical_blocks);
+        error.clear();
+        if (!execute_candidates(
+                committed_lanes, *replay_transaction, replay, error)) {
+            const std::string primary = error;
+            std::string replay_rollback_error;
+            if (!rollback_candidates(
+                    *replay_transaction, replay,
+                    replay_rollback_error)) {
+                return fatal_after_root(
+                    "DeepSeek4 paged DSpark replay recovery failed after " +
+                    primary + ": " + replay_rollback_error);
+            }
+            if (replay.fatal) return fatal_after_root(primary);
+            return fallback_to_root(primary);
+        }
+        committed_execution = &replay;
+    }
+
+    for (size_t lane_index = 0;
+         lane_index < committed_lanes.size(); ++lane_index) {
+        const CandidateLane & lane = committed_lanes[lane_index];
+        const DeepSeek4PagedSegment & segment =
+            committed_execution->layout.segments[lane_index];
+        DecodeOutput & output = root.decode[lane.input_index];
+        slots_.commit_step(lane.slot);
+        output.committed_tokens = lane.tokens;
+        output.token = committed_execution->argmax[
+            size_t(segment.row_offset + segment.row_count - 1)];
+        for (uint32_t local = 0; local < segment.row_count; ++local) {
+            const size_t row = size_t(segment.row_offset) + local;
+            append_dspark_feature(
+                lane.slot,
+                committed_execution->capture.data() +
+                    row * size_t(feature_width));
+        }
+        DsparkSlotState & state = dspark_slots_[size_t(lane.slot)];
+        if (state.width) {
+            state.width->observe(
+                drafts[lane.input_index].accepted + 1,
+                drafts[lane.input_index].allocated + 1);
+        }
+    }
+    if (replay_transaction) {
+        replay_transaction->finish_success();
+    } else {
+        transaction.finish_success();
+    }
+    return root;
 }
 
 SeqEngine::StepResult DeepSeek4SeqEngine::step_with_paged_segments(
@@ -857,9 +1477,13 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step_with_paged_segments(
     }
 
     DeepSeek4PagedSegmentPreparedStep * raw_prepared = nullptr;
+    const bool capture_dspark = paged_dspark_enabled();
+    const std::vector<int> * capture_ids = capture_dspark
+        ? &b_.spec_drafter_->capture_layer_ids : nullptr;
     if (!deepseek4_prepare_paged_segment_step(
             b_.backend_, b_.cfg_.device.gpu, b_.w_, b_.paged_cache_,
-            layout, b_.moe_hybrid_.get(), raw_prepared) || !raw_prepared) {
+            layout, b_.moe_hybrid_.get(), raw_prepared, capture_ids) ||
+        !raw_prepared) {
         if (raw_prepared) {
             deepseek4_discard_paged_segment_step(raw_prepared);
         }
@@ -876,8 +1500,10 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step_with_paged_segments(
 
     std::vector<float> logits;
     std::vector<int32_t> argmax;
+    std::vector<float> capture;
     if (!deepseek4_compute_paged_segment_step(
-            *prepared, logits, argmax, b_.routing_stats_.get())) {
+            *prepared, logits, argmax, b_.routing_stats_.get(),
+            capture_dspark ? &capture : nullptr)) {
         return fail_after_submit(
             "DeepSeek4 paged segment graph failed");
     }
@@ -907,6 +1533,13 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step_with_paged_segments(
         (!any_full_logits && !logits.empty())) {
         return fail_after_submit(
             "DeepSeek4 paged segment outputs are malformed");
+    }
+    const int feature_width = capture_dspark ? dspark_feature_width() : 0;
+    if (capture_dspark &&
+        (feature_width <= 0 ||
+         capture.size() != q * size_t(feature_width))) {
+        return fail_after_submit(
+            "DeepSeek4 paged segment DSpark capture is malformed");
     }
 
     auto sample_row = [&](int slot_id, int32_t model_row) {
@@ -944,6 +1577,16 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step_with_paged_segments(
         out.status = PrefillOutput::Status::completed;
         slots_.commit_prefill(out.slot);
     }
+    if (capture_dspark) {
+        for (const DeepSeek4PagedSegment & segment : layout.segments) {
+            for (uint32_t local = 0; local < segment.row_count; ++local) {
+                const size_t row = size_t(segment.row_offset) + local;
+                append_dspark_feature(
+                    segment.slot,
+                    capture.data() + row * size_t(feature_width));
+            }
+        }
+    }
     transaction.finish_success();
     return result;
 }
@@ -951,6 +1594,11 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step_with_paged_segments(
 void DeepSeek4SeqEngine::retire(int slot) {
     if (!slots_.is_active(slot)) return;
     slots_.retire(slot);
+    if (slot >= 0 && size_t(slot) < dspark_slots_.size()) {
+        DsparkSlotState & state = dspark_slots_[size_t(slot)];
+        state.features.clear();
+        if (state.width) state.width->reset();
+    }
     reset_deepseek4_paged_slot(b_.paged_cache_, (uint32_t)slot);
     std::fill_n(host_tables_.data() + (size_t)slot * stride_, stride_, -1);
 }

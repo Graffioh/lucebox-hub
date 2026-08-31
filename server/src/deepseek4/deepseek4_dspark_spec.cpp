@@ -541,6 +541,112 @@ double spec_ms_since(SpecClock::time_point t0) {
 
 }  // namespace
 
+bool deepseek4_dspark_propose_chain(
+        ggml_backend_t target_backend,
+        const DeepSeek4Weights & target_w,
+        const DSparkDrafter & drafter,
+        const float * context_features,
+        int context_tokens,
+        int committed,
+        int32_t root_token,
+        int max_width,
+        std::vector<int32_t> & out_tokens) {
+    out_tokens.clear();
+    if (!target_backend || !drafter.dspark_enabled ||
+        !drafter.core.backend || target_w.n_embd <= 0 ||
+        target_w.n_vocab <= 0 || !target_w.output ||
+        drafter.core.n_embd != target_w.n_embd ||
+        drafter.vocab_size != target_w.n_vocab ||
+        drafter.block_size < 1 ||
+        drafter.n_target_layers < 1 || committed < 0 || root_token < 0 ||
+        root_token >= target_w.n_vocab || context_tokens < 0 ||
+        context_tokens > target_w.n_swa ||
+        (context_tokens > 0 && !context_features)) {
+        return false;
+    }
+
+    const int width = std::clamp(
+        max_width, 1, std::min(drafter.block_size + 1, 5));
+    out_tokens.push_back(root_token);
+    if (width <= 1) return true;
+
+    const int n_embd = target_w.n_embd;
+    const int block = drafter.block_size;
+    std::vector<int32_t> noise_ids(size_t(block), drafter.mask_token_id);
+    noise_ids[0] = root_token;
+    std::vector<float> noise_embed(size_t(n_embd) * size_t(block));
+    if (!target_w.embedder.embed(
+            noise_ids.data(), block, noise_embed.data())) {
+        return false;
+    }
+
+    bool adaptive_width = adaptive_spec_width_globally_enabled();
+    if (const char * raw = std::getenv("DFLASH_DS4_ADAPTIVE_WIDTH")) {
+        adaptive_width = raw[0] && std::strcmp(raw, "0") != 0;
+    }
+    const bool use_confidence_width = adaptive_width && width <= 4 &&
+        drafter.confidence_w && drafter.confidence_b &&
+        (drafter.confidence_dim == n_embd ||
+         drafter.confidence_dim == n_embd + drafter.markov_rank);
+
+    std::vector<float> hidden;
+    std::vector<float> confidence_hidden;
+    if (!deepseek4_dspark_draft_forward(
+            drafter.core.backend, drafter, noise_embed.data(),
+            context_tokens > 0 ? context_features : nullptr,
+            context_tokens, committed, hidden,
+            use_confidence_width ? &confidence_hidden : nullptr) ||
+        hidden.size() != size_t(n_embd) * size_t(block) ||
+        (use_confidence_width &&
+         confidence_hidden.size() != hidden.size())) {
+        return false;
+    }
+
+    std::vector<float> padded_hidden(
+        size_t(n_embd) * size_t(block + 1), 0.0f);
+    std::memcpy(
+        padded_hidden.data() + n_embd, hidden.data(),
+        hidden.size() * sizeof(float));
+    std::vector<float> padded_confidence_hidden;
+    if (use_confidence_width) {
+        padded_confidence_hidden.assign(
+            size_t(n_embd) * size_t(block + 1), 0.0f);
+        std::memcpy(
+            padded_confidence_hidden.data() + n_embd,
+            confidence_hidden.data(),
+            confidence_hidden.size() * sizeof(float));
+    }
+
+    std::vector<float> confidence;
+    DraftWeights shim = make_dspark_shim(drafter);
+    if (!dspark_markov_correct_greedy_chain_fused(
+            shim, target_backend, target_w.output, padded_hidden.data(),
+            width, root_token, out_tokens,
+            use_confidence_width ? &confidence : nullptr,
+            use_confidence_width
+                ? padded_confidence_hidden.data() : nullptr) ||
+        out_tokens.empty() || out_tokens.front() != root_token) {
+        out_tokens.clear();
+        return false;
+    }
+
+    if (use_confidence_width && confidence.size() >= 2 &&
+        out_tokens.size() >= 3) {
+        const float p2 = confidence[0] * confidence[1];
+        int selected = p2 >= kConfidenceQ3Threshold ? 3 : 2;
+        if (selected == 3 && confidence.size() >= 3 &&
+            out_tokens.size() >= 4 &&
+            p2 * confidence[2] >= kConfidenceQ4Threshold) {
+            selected = 4;
+        }
+        out_tokens.resize(std::min(out_tokens.size(), size_t(selected)));
+    }
+    if (out_tokens.size() > size_t(width)) {
+        out_tokens.resize(size_t(width));
+    }
+    return true;
+}
+
 DeepSeek4SpecRollback::~DeepSeek4SpecRollback() {
     if (async_backend) {
         ggml_backend_synchronize(async_backend);

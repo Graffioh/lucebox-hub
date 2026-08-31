@@ -428,6 +428,21 @@ anchor all state-publication work and exposes no token or logits. Keep the
 switch unset until prompt TTFT, live-decoder TBT, output identity, and graph
 replay pass.
 
+Paged DSpark is a separate source-only experiment. Set
+`DFLASH_DS4_SPEC=1`, `DFLASH_DS4_PAGED_SPEC=1`, and `DFLASH_DS4_DRAFT` before
+startup. Ordinary decode still runs first through the existing gathered q=1
+lanes, preserving its target arithmetic. The drafter may then promote a
+matched continuation through one causal paged segment per selected lane, with
+at most four rows per segment;
+rejected rows restore the touched raw-ring, compressor/indexer state, and
+compressed-cache destinations before replaying only the accepted prefix.
+Mixed prefill/decode steps capture drafter features but do not speculate. The
+six-row service budget is shared by gathered roots and deeper candidates, so
+C6 remains ordinary decode and C5 can offer at most one candidate. This path
+has no correctness or performance qualification yet; keep
+`DFLASH_DS4_PAGED_SPEC` unset outside the draft trial and retain the existing
+cross-width, cancellation, rollback, graph-replay, and C1-C6 gates.
+
 PR #658's `DFLASH_MOE_FUSED_COMBINE=1` path also applies to paged serving.
 Each expert owner uses its ordered, masked post-MMID combine kernel in place of
 the older scalar combine operation. The existing owner join, shared expert,
@@ -437,8 +452,9 @@ owner-path performance pass on both supported deployments.
 
 Paged concurrency fails closed for other primary/secondary architecture pairs,
 CUDA or out-of-process expert ownership, explicit layer or remote target
-splits, drafts/DSpark, DDTree, PFlash/KVFlash, fused decode, approximate
-prefill, windowed attention, mutable expert caching, and prefix-cache parking.
+splits, DSpark without the explicit paged experiment gate, DDTree,
+PFlash/KVFlash, fused decode, approximate prefill, windowed attention, mutable
+expert caching, and prefix-cache parking.
 There is no automatic fallback to a slower or asymmetric execution mode.
 
 ### Local single-shard

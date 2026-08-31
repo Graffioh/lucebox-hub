@@ -146,6 +146,21 @@ bool deepseek4_dspark_draft_read_async_output(
                                           std::vector<float> * confidence_hidden = nullptr);
 void deepseek4_dspark_draft_wait(ggml_backend_t backend);
 
+// Build one greedy DSpark proposal without advancing target state. The first
+// output token is root_token; later entries are speculative children. This is
+// used by the paged-serving adapter with the same Markov and confidence-head
+// policy as the contiguous loop.
+bool deepseek4_dspark_propose_chain(
+    ggml_backend_t target_backend,
+    const DeepSeek4Weights & target_w,
+    const DSparkDrafter & drafter,
+    const float * context_features,
+    int context_tokens,
+    int committed,
+    int32_t root_token,
+    int max_width,
+    std::vector<int32_t> & out_tokens);
+
 // Batched target verify forward WITH feature capture (defined in
 // deepseek4_graph.cpp so it can reuse the target sub-builders). Runs the DS4
 // target over `n_tokens` embeddings at absolute position `kv_start` in one

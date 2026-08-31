@@ -1217,6 +1217,9 @@ bool DeepSeek4Backend::supports_batched_spec_feature_capture(
 }
 
 bool DeepSeek4Backend::init() {
+    const bool dspark_requested = env_flag_enabled("DFLASH_DS4_SPEC");
+    const bool paged_dspark_requested =
+        env_flag_enabled("DFLASH_DS4_PAGED_SPEC");
     if (cfg_.paged_attention) {
         const PlacementBackend target_backend =
             cfg_.device.backend == PlacementBackend::Auto
@@ -1264,13 +1267,20 @@ bool DeepSeek4Backend::init() {
     configure_gfx1201_hybrid_sub_batch_default(cfg_.device.gpu);
 
     if (cfg_.paged_attention &&
+        dspark_requested != paged_dspark_requested) {
+        std::fprintf(stderr,
+            "[deepseek4] experimental paged DSpark requires both "
+            "DFLASH_DS4_SPEC=1 and DFLASH_DS4_PAGED_SPEC=1\n");
+        return false;
+    }
+
+    if (cfg_.paged_attention &&
         (cfg_.max_concurrency < 1 ||
          cfg_.max_concurrency > DEEPSEEK4_MAX_PAGED_SEQUENCES ||
          cfg_.device.is_layer_split() ||
          cfg_.prefill_mode != PrefillAttentionMode::Exact ||
          cfg_.fused_decode || cfg_.fused_verify_f16_kv ||
-         env_flag_enabled("DFLASH_DS4_FUSED_DECODE") ||
-         env_flag_enabled("DFLASH_DS4_SPEC"))) {
+         env_flag_enabled("DFLASH_DS4_FUSED_DECODE"))) {
         std::fprintf(stderr,
             "[deepseek4] paged serving requires 1..%d local slots, exact "
             "prefill, and autoregressive non-fused decode\n",
@@ -1389,7 +1399,8 @@ bool DeepSeek4Backend::init() {
                  prefill_attention_mode_name(cfg_.prefill_mode),
                  moe_hybrid_ ? " [hybrid]" : "");
 
-    if (!cfg_.paged_attention && env_flag_enabled("DFLASH_DS4_SPEC")) {
+    if (dspark_requested &&
+        (!cfg_.paged_attention || paged_dspark_requested)) {
         const char * dp = std::getenv("DFLASH_DS4_DRAFT");
         if (dp && *dp) {
             spec_draft_path_ = dp;

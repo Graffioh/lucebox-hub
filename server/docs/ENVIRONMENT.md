@@ -51,6 +51,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_GFX1151_HC_MMVF_Q4` | 1 | KILL SWITCH (remove after burn-in): =0 restores generic dispatch for the four-column `[16384,24]` per-layer F16 hyper-connection mix projection on gfx1151. |
 | `DFLASH_DS4_BATCH_Q6_MMV` | unset | UNQUALIFIED OPT-IN: exact value `1` extends the registry-aware qtype-105/106 mixed-weight MMV and fused gate/up dispatch from q=5 to q=6. It does not enable q=6 speculative verification. The runtime caches the value on first dispatch; restart the server after changing it. |
 | `DFLASH_DS4_PAGED_OUTPUT_PACK` | unset | UNQUALIFIED OPT-IN: exact value `1` gathers decode rows and completed prompt tails before DS4 output HC, output norm, lm-head, and argmax in mixed paged steps. Intermediate-only steps retain one private sentinel output root. Restart the server after changing it. |
+| `DFLASH_DS4_PAGED_SPEC` | unset | UNQUALIFIED OPT-IN: with `DFLASH_DS4_SPEC=1`, adapt DSpark to exact paged continuous batching. Gathered q1 roots remain unchanged; matched deeper candidates use a bounded causal segment. C6 remains AR. See `DS4.md`. |
 | `DFLASH_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
 | `DFLASH_GFX1151_HC_MMVF_Q4` | 1 on gfx1151 for the DS4 `[16384,24]` q4 projection | BURN-IN KILL SWITCH: =0 restores the generic hipBLAS dispatch decision. |
 | `GGML_CUDA_MMQ_X` | unset | DEBUG: force a supported MMQ output-column tile width (8–128) for architecture tuning; invalid or over-budget values fall back to automatic selection. |
@@ -108,7 +109,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DRAFT_KV` - laguna_backend.cpp, qwen35_backend.cpp
 - `DFLASH_DRAFT_PERSIST` - laguna_backend.cpp
 - `DFLASH_DROP_COLD` - qwen35moe_backend.cpp, qwen35moe_pipelined_decode.cpp
-- `DFLASH_DS4_ADAPTIVE_WIDTH` - deepseek4_dspark_spec.cpp
+- `DFLASH_DS4_ADAPTIVE_WIDTH` - deepseek4_dspark_spec.cpp, deepseek4_seq_engine.cpp
 - `DFLASH_DS4_COMP_PAD_STRIDE` - deepseek4_graph.cpp
 - `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_CUDA_LAYERS` - deepseek4_layer_split_adapter.cpp
@@ -135,8 +136,10 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_QWEN35_ROCTX` - qwen35_roctx.cpp
 - `DFLASH_DS4_SEQ_VERIFY` - deepseek4_dspark_spec.cpp
 - `DFLASH_DS4_SPEC` - deepseek4_backend.cpp
+- `DFLASH_DS4_PAGED_SPEC` - deepseek4_backend.cpp, deepseek4_seq_engine.cpp
 - `DFLASH_DS4_SPEC_REFERENCE_EXACT` - deepseek4_dspark_spec.cpp
-- `DFLASH_DS4_SPEC_Q` - deepseek4_dspark_spec.cpp
+- `DFLASH_DS4_Q5_VERIFY` - deepseek4_dspark_spec.cpp, deepseek4_seq_engine.cpp
+- `DFLASH_DS4_SPEC_Q` - deepseek4_dspark_spec.cpp, deepseek4_seq_engine.cpp
 - `DFLASH_DS4_SPARSE_DECODE_FLASH` - deepseek4_backend.cpp, deepseek4_fused_verify.inc, deepseek4_graph.cpp
 - `DFLASH_DS4_TIMING` - deepseek4_backend.cpp, deepseek4_target_shard_ipc_daemon.cpp
 - `DFLASH_DS4_TP_CAPTURE_CACHE_SLOTS` - deepseek4_fused_verify.inc
