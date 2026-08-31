@@ -10,6 +10,7 @@
 
 #include "deepseek4_internal.h"
 #include "deepseek4_hc_cuda.h"
+#include "deepseek4_paged_segments.h"
 #include "deepseek4_roctx.h"
 #include "deepseek4_page_layout.h"
 #include "internal.h"
@@ -691,6 +692,31 @@ int deepseek4_safe_compressor_batch_tokens(const DeepSeek4Weights & w,
     return std::max(1, safe);
 }
 
+struct DeepSeek4PagedCompressorInputs {
+    ggml_tensor * ape_rows = nullptr;
+    ggml_tensor * state_publish_rows = nullptr;
+    ggml_tensor * compressed_write_rows = nullptr;
+    ggml_tensor * compressed_positions = nullptr;
+};
+
+static bool ds4_tensor_is_1d(ggml_tensor * tensor,
+                             ggml_type type,
+                             int64_t elements) {
+    return tensor && tensor->type == type &&
+           tensor->ne[0] == elements && tensor->ne[1] == 1 &&
+           tensor->ne[2] == 1 && tensor->ne[3] == 1;
+}
+
+static bool ds4_tensor_is_row_contiguous_2d(ggml_tensor * tensor,
+                                            ggml_type type,
+                                            int64_t columns,
+                                            int64_t rows) {
+    return tensor && tensor->type == type &&
+           tensor->ne[0] == columns && tensor->ne[1] == rows &&
+           tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+           ggml_is_contiguous_rows(tensor);
+}
+
 // Build an exact multi-token compressor update for prefill. Complete windows
 // are pooled as one batched tensor, so a 2K ubatch does not create hundreds of
 // serial softmax subgraphs. The state is assembled functionally from an
@@ -719,8 +745,9 @@ static bool build_compressor_prefill(
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
         ggml_tensor ** comp_cache_source_out,
-        bool indexer_qat) {
-    if (!cur_all || n_tokens <= 1 ||
+        bool indexer_qat,
+        const DeepSeek4PagedCompressorInputs * paged_inputs = nullptr) {
+    if (!cur_all || n_tokens < 1 || (!paged_inputs && n_tokens <= 1) ||
         n_tokens > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS ||
         (ratio != 4 && ratio != 128)) {
         return false;
@@ -729,6 +756,31 @@ static bool build_compressor_prefill(
     const int coff = ratio == 4 ? 2 : 1;
     const int comp_width = coff * head_dim;
     const int n_state_rows = ratio == 4 ? 2 * ratio : ratio;
+
+    if (paged_inputs) {
+        int pos_mod = kv_start % ratio;
+        if (pos_mod < 0) pos_mod += ratio;
+        const int to_boundary = ratio - pos_mod;
+        const bool emits = n_tokens == to_boundary;
+        if (n_tokens > to_boundary ||
+            !ds4_tensor_is_1d(paged_inputs->ape_rows,
+                              GGML_TYPE_I32, n_tokens) ||
+            !ds4_tensor_is_1d(paged_inputs->state_publish_rows,
+                              GGML_TYPE_I64, n_state_rows)) {
+            return false;
+        }
+        if (emits) {
+            if (!ds4_tensor_is_1d(paged_inputs->compressed_write_rows,
+                                  GGML_TYPE_I64, 1) ||
+                !ds4_tensor_is_1d(paged_inputs->compressed_positions,
+                                  GGML_TYPE_I32, 1)) {
+                return false;
+            }
+        } else if (paged_inputs->compressed_write_rows ||
+                   paged_inputs->compressed_positions) {
+            return false;
+        }
+    }
 
     struct Pair {
         ggml_tensor * kv = nullptr;
@@ -781,13 +833,18 @@ static bool build_compressor_prefill(
     Pair projected;
     projected.kv = ggml_mul_mat(ctx, kv_proj, cur_all);
     projected.score = ggml_mul_mat(ctx, gate_proj, cur_all);
-    ggml_tensor * ape_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(ape_rows);
-    std::vector<int32_t> ape_values((size_t) n_tokens);
-    for (int i = 0; i < n_tokens; ++i) {
-        ape_values[(size_t) i] = (kv_start + i) % ratio;
+    ggml_tensor * ape_rows = nullptr;
+    if (paged_inputs) {
+        ape_rows = paged_inputs->ape_rows;
+    } else {
+        ape_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(ape_rows);
+        std::vector<int32_t> ape_values((size_t) n_tokens);
+        for (int i = 0; i < n_tokens; ++i) {
+            ape_values[(size_t) i] = (kv_start + i) % ratio;
+        }
+        i32_array_inputs.push_back({ape_rows, std::move(ape_values)});
     }
-    i32_array_inputs.push_back({ape_rows, std::move(ape_values)});
     ggml_tensor * ape_cols = ggml_get_rows(ctx, ape, ape_rows);
     projected.score = ggml_add(ctx, projected.score,
                                ds4_cast_if_needed(ctx, ape_cols, GGML_TYPE_F32));
@@ -886,12 +943,14 @@ static bool build_compressor_prefill(
                 ggml_cont(ctx, selected_score), 2 * ratio, groups);
 
             const int first_boundary = kv_start + first_count - 1;
-            for (int g = 0; g < groups; ++g) {
-                const int boundary = first_boundary + g * ratio;
-                const int64_t comp_row = boundary / ratio;
-                GGML_ASSERT(comp_row >= 0 && comp_row < comp_cache->ne[1]);
-                comp_rows.push_back(comp_row);
-                comp_positions.push_back(boundary + 1 - ratio);
+            if (!paged_inputs) {
+                for (int g = 0; g < groups; ++g) {
+                    const int boundary = first_boundary + g * ratio;
+                    const int64_t comp_row = boundary / ratio;
+                    GGML_ASSERT(comp_row >= 0 && comp_row < comp_cache->ne[1]);
+                    comp_rows.push_back(comp_row);
+                    comp_positions.push_back(boundary + 1 - ratio);
+                }
             }
 
             Pair last_complete = view_pair_cols(
@@ -932,12 +991,14 @@ static bool build_compressor_prefill(
             pooled_batch = pool_groups(complete.kv, complete.score,
                                        ratio, groups);
             const int first_boundary = kv_start + to_boundary - 1;
-            for (int g = 0; g < groups; ++g) {
-                const int boundary = first_boundary + g * ratio;
-                const int64_t comp_row = boundary / ratio;
-                GGML_ASSERT(comp_row >= 0 && comp_row < comp_cache->ne[1]);
-                comp_rows.push_back(comp_row);
-                comp_positions.push_back(boundary + 1 - ratio);
+            if (!paged_inputs) {
+                for (int g = 0; g < groups; ++g) {
+                    const int boundary = first_boundary + g * ratio;
+                    const int64_t comp_row = boundary / ratio;
+                    GGML_ASSERT(comp_row >= 0 && comp_row < comp_cache->ne[1]);
+                    comp_rows.push_back(comp_row);
+                    comp_positions.push_back(boundary + 1 - ratio);
+                }
             }
 
             Pair last_complete = view_pair_cols(
@@ -954,11 +1015,16 @@ static bool build_compressor_prefill(
     }
 
     // Persist the exact sequential state using unique row indices.
-    ggml_tensor * state_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_state_rows);
-    ggml_set_input(state_rows);
-    std::vector<int64_t> state_row_values((size_t) n_state_rows);
-    for (int i = 0; i < n_state_rows; ++i) state_row_values[(size_t) i] = i;
-    i64_array_inputs.push_back({state_rows, std::move(state_row_values)});
+    ggml_tensor * state_rows = nullptr;
+    if (paged_inputs) {
+        state_rows = paged_inputs->state_publish_rows;
+    } else {
+        state_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_state_rows);
+        ggml_set_input(state_rows);
+        std::vector<int64_t> state_row_values((size_t) n_state_rows);
+        for (int i = 0; i < n_state_rows; ++i) state_row_values[(size_t) i] = i;
+        i64_array_inputs.push_back({state_rows, std::move(state_row_values)});
+    }
     final_state.kv = ggml_cont(ctx, final_state.kv);
     final_state.score = ggml_cont(ctx, final_state.score);
     ggml_tensor * state_kv_source = ggml_set_rows(ctx, state.state_kv,
@@ -971,11 +1037,18 @@ static bool build_compressor_prefill(
     ggml_tensor * comp_cache_source = comp_cache;
     if (pooled_batch) {
         ggml_tensor * pooled = pooled_batch;
-        const int n_pooled = (int) comp_positions.size();
-        ggml_tensor * comp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,
-                                                    n_pooled);
-        ggml_set_input(comp_pos);
-        i32_array_inputs.push_back({comp_pos, std::move(comp_positions)});
+        const int n_pooled = paged_inputs
+            ? (int) ggml_nelements(paged_inputs->compressed_positions)
+            : (int) comp_positions.size();
+        ggml_tensor * comp_pos = nullptr;
+        if (paged_inputs) {
+            comp_pos = paged_inputs->compressed_positions;
+        } else {
+            comp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,
+                                          n_pooled);
+            ggml_set_input(comp_pos);
+            i32_array_inputs.push_back({comp_pos, std::move(comp_positions)});
+        }
 
         const float rope_scale = rope_scale_factor > 0.0f
             ? (1.0f / rope_scale_factor) : 1.0f;
@@ -994,14 +1067,238 @@ static bool build_compressor_prefill(
             pooled = ggml_ds4_indexer_qat(ctx, pooled);
         }
 
-        ggml_tensor * comp_row_tensor = ggml_new_tensor_1d(
-            ctx, GGML_TYPE_I64, (int64_t) comp_rows.size());
-        ggml_set_input(comp_row_tensor);
-        i64_array_inputs.push_back({comp_row_tensor, std::move(comp_rows)});
+        ggml_tensor * comp_row_tensor = nullptr;
+        if (paged_inputs) {
+            comp_row_tensor = paged_inputs->compressed_write_rows;
+        } else {
+            comp_row_tensor = ggml_new_tensor_1d(
+                ctx, GGML_TYPE_I64, (int64_t) comp_rows.size());
+            ggml_set_input(comp_row_tensor);
+            i64_array_inputs.push_back({comp_row_tensor, std::move(comp_rows)});
+        }
         comp_cache_source = ggml_set_rows(ctx, comp_cache, pooled, comp_row_tensor);
         ggml_build_forward_expand(gf, comp_cache_source);
     }
     if (comp_cache_source_out) *comp_cache_source_out = comp_cache_source;
+    return true;
+}
+
+struct DeepSeek4PagedSegmentCompressorInputs {
+    ggml_tensor * ape_rows = nullptr;
+    ggml_tensor * state_publish_rows = nullptr;
+    ggml_tensor * comp_write_row = nullptr;
+    ggml_tensor * comp_read_row = nullptr;
+    ggml_tensor * comp_position = nullptr;
+};
+
+struct DeepSeek4PagedSegmentPublication {
+    ggml_tensor * attention_cache_source = nullptr;
+    ggml_tensor * indexer_cache_source = nullptr;
+    ggml_tensor * emitted_attention = nullptr;
+    ggml_tensor * emitted_indexer = nullptr;
+};
+
+[[maybe_unused]] static bool build_paged_segment_compressor_publication(
+        ggml_context * ctx,
+        ggml_cgraph * gf,
+        const DeepSeek4Weights & w,
+        int layer_index,
+        ggml_tensor * segment_hidden,
+        int start_position,
+        int row_count,
+        DeepSeek4CompressorState & attention_state,
+        DeepSeek4CompressorState * indexer_state,
+        ggml_tensor * attention_cache,
+        ggml_tensor * indexer_cache,
+        const DeepSeek4LayerSegmentRows & rows,
+        const DeepSeek4PagedSegmentCompressorInputs & inputs,
+        std::vector<DeepSeek4I64ArrayBinding> & i64_inputs,
+        std::vector<DeepSeek4I32ArrayBinding> & i32_inputs,
+        DeepSeek4PagedSegmentPublication & out) {
+    out = {};
+    out.attention_cache_source = attention_cache;
+    out.indexer_cache_source = indexer_cache;
+
+    if (!ctx || !gf || !segment_hidden || layer_index < 0 ||
+        size_t(layer_index) >= w.layers.size() ||
+        size_t(layer_index) >= w.compress_ratios.size() ||
+        row_count < 1 ||
+        row_count > int(DEEPSEEK4_MAX_PAGED_SEGMENT_ROWS) ||
+        start_position < 0 ||
+        start_position > std::numeric_limits<int>::max() - row_count ||
+        !ds4_tensor_is_row_contiguous_2d(
+            segment_hidden, GGML_TYPE_F32, w.n_embd, row_count) ||
+        rows.tokens.size() != size_t(row_count) ||
+        rows.compression_ratio != w.compress_ratios[size_t(layer_index)] ||
+        deepseek4_safe_compressor_batch_tokens(
+            w, start_position, row_count) != row_count) {
+        return false;
+    }
+
+    const DeepSeek4Layer & layer = w.layers[size_t(layer_index)];
+
+    const int ratio = int(rows.compression_ratio);
+    if (ratio != 0 && ratio != 4 && ratio != 128) return false;
+    if (ratio == 0) {
+        return rows.attention_state_slot == -1 &&
+               rows.indexer_state_slot == -1 &&
+               rows.emission_token == -1 &&
+               rows.compressed_write_row == -1 &&
+               rows.compressed_position == -1 &&
+               !inputs.ape_rows && !inputs.state_publish_rows &&
+               !inputs.comp_write_row && !inputs.comp_read_row &&
+               !inputs.comp_position;
+    }
+
+    const int n_state_rows = ratio == 4 ? 2 * ratio : ratio;
+    const int attention_width = (ratio == 4 ? 2 : 1) * w.head_dim;
+    const bool emits = rows.emission_token == row_count - 1;
+    const int expected_emission =
+        (start_position + row_count) % ratio == 0 ? row_count - 1 : -1;
+    if (rows.attention_state_slot != rows.slot ||
+        (ratio == 4
+            ? rows.indexer_state_slot != rows.slot
+            : rows.indexer_state_slot != -1) ||
+        rows.emission_token != expected_emission ||
+        (emits
+            ? (rows.compressed_write_row < 0 ||
+               rows.compressed_position !=
+                   start_position + row_count - ratio)
+            : (rows.compressed_write_row != -1 ||
+               rows.compressed_position != -1)) ||
+        !ds4_tensor_is_1d(inputs.ape_rows, GGML_TYPE_I32, row_count) ||
+        !ds4_tensor_is_1d(inputs.state_publish_rows,
+                          GGML_TYPE_I64, n_state_rows) ||
+        !ds4_tensor_is_row_contiguous_2d(
+            attention_state.state_kv, GGML_TYPE_F32,
+            attention_width, n_state_rows) ||
+        !ds4_tensor_is_row_contiguous_2d(
+            attention_state.state_score, GGML_TYPE_F32,
+            attention_width, n_state_rows) ||
+        !attention_cache || attention_cache->type != GGML_TYPE_F16 ||
+        attention_cache->ne[0] != w.head_dim || attention_cache->ne[1] < 1 ||
+        attention_cache->ne[2] != 1 || attention_cache->ne[3] != 1 ||
+        !ggml_is_contiguous_rows(attention_cache) ||
+        !layer.attn_compressor_ape || !layer.attn_compressor_kv ||
+        !layer.attn_compressor_gate || !layer.attn_compressor_norm) {
+        return false;
+    }
+
+    for (int i = 0; i < row_count; ++i) {
+        const DeepSeek4SegmentTokenRows & token = rows.tokens[size_t(i)];
+        const int phase = (start_position + i) % ratio;
+        const int64_t state_row = ratio == 4 ? ratio + phase : phase;
+        if (token.attention_ape_phase != phase ||
+            token.attention_state_row != state_row ||
+            token.indexer_ape_phase != (ratio == 4 ? phase : -1) ||
+            token.indexer_state_row != (ratio == 4 ? state_row : -1) ||
+            token.sees_emitted_compressed_row !=
+                (emits && i == row_count - 1)) {
+            return false;
+        }
+        for (int j = 0; j < i; ++j) {
+            if (rows.tokens[size_t(j)].attention_state_row == state_row) {
+                return false;
+            }
+        }
+    }
+
+    if (emits) {
+        if (rows.compressed_write_row >= attention_cache->ne[1] ||
+            rows.compressed_write_row >
+                std::numeric_limits<int32_t>::max() ||
+            !ds4_tensor_is_1d(inputs.comp_write_row, GGML_TYPE_I64, 1) ||
+            !ds4_tensor_is_1d(inputs.comp_read_row, GGML_TYPE_I32, 1) ||
+            !ds4_tensor_is_1d(inputs.comp_position, GGML_TYPE_I32, 1)) {
+            return false;
+        }
+    } else if (inputs.comp_write_row || inputs.comp_read_row ||
+               inputs.comp_position) {
+        return false;
+    }
+
+    if (ratio == 4) {
+        const int indexer_width = 2 * w.n_indexer_head_dim;
+        if (!indexer_state ||
+            !ds4_tensor_is_row_contiguous_2d(
+                indexer_state->state_kv, GGML_TYPE_F32,
+                indexer_width, n_state_rows) ||
+            !ds4_tensor_is_row_contiguous_2d(
+                indexer_state->state_score, GGML_TYPE_F32,
+                indexer_width, n_state_rows) ||
+            !indexer_cache ||
+            indexer_cache->type != GGML_TYPE_F16 ||
+            indexer_cache->ne[0] != w.n_indexer_head_dim ||
+            indexer_cache->ne[1] < 1 || indexer_cache->ne[2] != 1 ||
+            indexer_cache->ne[3] != 1 ||
+            !ggml_is_contiguous_rows(indexer_cache) ||
+            (emits && rows.compressed_write_row >= indexer_cache->ne[1]) ||
+            !layer.indexer_compressor_ape ||
+            !layer.indexer_compressor_kv ||
+            !layer.indexer_compressor_gate ||
+            !layer.indexer_compressor_norm) {
+            return false;
+        }
+    }
+
+    DeepSeek4PagedCompressorInputs paged_inputs {
+        inputs.ape_rows,
+        inputs.state_publish_rows,
+        inputs.comp_write_row,
+        inputs.comp_position,
+    };
+    if (!build_compressor_prefill(
+            ctx, gf, segment_hidden,
+            layer.attn_compressor_ape,
+            layer.attn_compressor_kv,
+            layer.attn_compressor_gate,
+            layer.attn_compressor_norm,
+            attention_state, attention_cache, ratio, w.head_dim,
+            start_position, row_count, w.n_rot, w.rms_eps,
+            w.compress_rope_freq_base, w.rope_scale_factor,
+            w.rope_yarn_beta_fast, w.rope_yarn_beta_slow,
+            int(w.rope_orig_ctx), i64_inputs, i32_inputs,
+            &out.attention_cache_source, false, &paged_inputs)) {
+        return false;
+    }
+
+    if (ratio == 4 && !build_compressor_prefill(
+            ctx, gf, segment_hidden,
+            layer.indexer_compressor_ape,
+            layer.indexer_compressor_kv,
+            layer.indexer_compressor_gate,
+            layer.indexer_compressor_norm,
+            *indexer_state, indexer_cache, ratio, w.n_indexer_head_dim,
+            start_position, row_count, w.n_rot, w.rms_eps,
+            w.compress_rope_freq_base, w.rope_scale_factor,
+            w.rope_yarn_beta_fast, w.rope_yarn_beta_slow,
+            int(w.rope_orig_ctx), i64_inputs, i32_inputs,
+            &out.indexer_cache_source, false, &paged_inputs)) {
+        return false;
+    }
+
+    if (!emits) return true;
+    if (!out.attention_cache_source ||
+        out.attention_cache_source->type != GGML_TYPE_F16 ||
+        (ratio == 4 &&
+         (!out.indexer_cache_source ||
+          out.indexer_cache_source->type != GGML_TYPE_F16))) {
+        return false;
+    }
+    out.emitted_attention = ggml_get_rows(
+        ctx, out.attention_cache_source, inputs.comp_read_row);
+    if (!out.emitted_attention ||
+        out.emitted_attention->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ratio == 4) {
+        out.emitted_indexer = ggml_get_rows(
+            ctx, out.indexer_cache_source, inputs.comp_read_row);
+        if (!out.emitted_indexer ||
+            out.emitted_indexer->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
     return true;
 }
 
