@@ -650,6 +650,16 @@ bool forward_qwen3_drafter_model(
                 free_hip_chunk_graph_b(gb);
                 ggml_gallocr_free(galloc); cleanup_all(); return false;
             }
+            // HIP D2D hipMemcpy can return before its null-stream copy finishes.
+            // GGML uses a nonblocking stream, so make the copy-in dependency explicit.
+            cudaError_t copy_in_sync_e = cudaStreamSynchronize(nullptr);
+            if (copy_in_sync_e != cudaSuccess) {
+                set_last_error(std::string("graph B copy-in synchronization failed at layer ") +
+                               std::to_string(il) + " chunk " + std::to_string(cs) + ": " +
+                               cudaGetErrorString(copy_in_sync_e));
+                free_hip_chunk_graph_b(gb);
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
             auto tB_copy_in1 = std::chrono::steady_clock::now();
             t_b_copy_in += std::chrono::duration<double>(tB_copy_in1 - tB_copy_in0).count();
             if (debug_first_layer) {
