@@ -147,6 +147,96 @@ int main() {
         mgr.retire(99);
     }
 
+    // A failed multi-token prefill step rewinds both logical progress and the
+    // page-table delta. Pages crossed by the chunk stay privately reserved,
+    // so retry receives exactly the same physical destinations.
+    {
+        PagedKvPool pool(/*physical_block_count=*/8,
+                         /*max_sequences=*/1, /*block_size=*/4);
+        Qwen35SlotManager mgr(pool, /*max_ctx=*/32);
+        const std::vector<int32_t> prompt = prompt_tokens(10);
+        auto a = admit(mgr, 11, prompt, greedy_sampler());
+        CHECK(is_admitted(a));
+
+        const auto prefix = mgr.append_prefill(a.slot, 3);
+        CHECK(prefix.ok && prefix.rows.size() == 3);
+        CHECK(mgr.slot(a.slot).cur_pos == 3);
+        PagedKvSequenceSnapshot before;
+        CHECK(pool.sequence(mgr.slot(a.slot).handle, before) ==
+              PagedKvStatus::Ok);
+        const uint32_t free_before = pool.free_block_count();
+
+        const auto first = mgr.append_prefill(a.slot, 6);
+        CHECK(first.ok && first.rows.size() == 6);
+        CHECK(first.rows.front() == 3 && first.rows.back() == 8);
+        CHECK(first.first_new_block == 1);
+        CHECK(first.new_blocks == std::vector<int32_t>({1, 2}));
+        CHECK(mgr.slot(a.slot).cur_pos == 9);
+
+        CHECK(mgr.rollback_prefill(a.slot, 6));
+        CHECK(mgr.is_prefilling(a.slot));
+        CHECK(mgr.slot(a.slot).cur_pos == 3);
+        CHECK(mgr.slot(a.slot).sample_history == prompt);
+        CHECK(mgr.slot(a.slot).staged_tokens.empty());
+
+        PagedKvSequenceSnapshot rolled_back;
+        CHECK(pool.sequence(mgr.slot(a.slot).handle, rolled_back) ==
+              PagedKvStatus::Ok);
+        CHECK(rolled_back.kv_seq_len == before.kv_seq_len);
+        CHECK(rolled_back.block_table == before.block_table);
+        CHECK(rolled_back.reserved_block_count ==
+              before.reserved_block_count);
+        CHECK(pool.free_block_count() == free_before);
+
+        const auto retry = mgr.append_prefill(a.slot, 6);
+        CHECK(retry.ok);
+        CHECK(retry.rows == first.rows);
+        CHECK(retry.first_new_block == first.first_new_block);
+        CHECK(retry.new_blocks == first.new_blocks);
+
+        // Invalid requests are rejected before either side of the transaction
+        // mutates. Committing prefill also closes the rollback API.
+        PagedKvSequenceSnapshot valid_state;
+        CHECK(pool.sequence(mgr.slot(a.slot).handle, valid_state) ==
+              PagedKvStatus::Ok);
+        const int valid_pos = mgr.slot(a.slot).cur_pos;
+        const uint32_t valid_free = pool.free_block_count();
+        CHECK(!mgr.rollback_prefill(a.slot, valid_pos + 1));
+        CHECK(!mgr.rollback_prefill(a.slot, 0));
+        CHECK(!mgr.rollback_prefill(-1, 1));
+        CHECK(!mgr.rollback_prefill(99, 1));
+        CHECK(mgr.slot(a.slot).cur_pos == valid_pos);
+        CHECK(mgr.slot(a.slot).sample_history == prompt);
+        PagedKvSequenceSnapshot after_invalid;
+        CHECK(pool.sequence(mgr.slot(a.slot).handle, after_invalid) ==
+              PagedKvStatus::Ok);
+        CHECK(after_invalid.kv_seq_len == valid_state.kv_seq_len);
+        CHECK(after_invalid.block_table == valid_state.block_table);
+        CHECK(after_invalid.reserved_block_count ==
+              valid_state.reserved_block_count);
+        CHECK(pool.free_block_count() == valid_free);
+
+        // Retirement releases visible, reserved, and retry-owned pages. The
+        // reused slot starts a fresh prefill at position zero.
+        CHECK(mgr.rollback_prefill(a.slot, 6));
+        CHECK(mgr.slot(a.slot).cur_pos == 3);
+        const PagedKvSequenceHandle old_handle = mgr.slot(a.slot).handle;
+        mgr.retire(a.slot);
+        CHECK(pool.free_block_count() == 8);
+        auto reused = admit(
+            mgr, 12, prompt_tokens(6), greedy_sampler());
+        CHECK(is_admitted(reused) && reused.slot == a.slot);
+        CHECK(mgr.slot(reused.slot).handle.generation !=
+              old_handle.generation);
+        CHECK(mgr.slot(reused.slot).cur_pos == 0);
+        CHECK(mgr.append_prefill(reused.slot, 6).ok);
+        mgr.commit_prefill(reused.slot);
+        CHECK(!mgr.is_prefilling(reused.slot));
+        CHECK(!mgr.rollback_prefill(reused.slot, 1));
+        CHECK(mgr.slot(reused.slot).cur_pos == 6);
+        CHECK(mgr.slot(reused.slot).sample_history == prompt_tokens(6));
+    }
+
     // A physically impossible headroom page does not make an otherwise useful
     // prompt impossible: this one-block pool falls back to prompt-only.
     {

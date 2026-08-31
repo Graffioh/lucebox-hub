@@ -94,6 +94,11 @@ public:
     // admitted prompt is guaranteed not to wait on another sequence.
     PrefillChunk append_prefill(int slot, int n_tokens);
 
+    // Reverse the most recent prompt allocation. The pool is rewound before
+    // cur_pos, so a failed rollback leaves both allocator and slot state
+    // unchanged. Phase and prompt/sample history are never modified.
+    bool rollback_prefill(int slot, int n_tokens);
+
     // Record a finished prefill and expose the slot to decode.
     void commit_prefill(int slot);
 

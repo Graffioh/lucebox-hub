@@ -229,6 +229,23 @@ SeqSlotManager::PrefillChunk SeqSlotManager::append_prefill(
     return out;
 }
 
+bool SeqSlotManager::rollback_prefill(int slot, int n_tokens) {
+    if (!is_prefilling(slot) || n_tokens < 1) return false;
+    SeqSlot & s = slots_[(size_t)slot];
+    if (n_tokens > s.cur_pos) return false;
+
+    const PagedKvStatus status = pool_.rollback_append(
+        s.handle, static_cast<uint32_t>(n_tokens));
+    if (status != PagedKvStatus::Ok) {
+        std::fprintf(stderr,
+            "[parallel] slot %d prefill append rollback failed: %s\n",
+            slot, paged_kv_status_string(status));
+        return false;
+    }
+    s.cur_pos -= n_tokens;
+    return true;
+}
+
 void SeqSlotManager::commit_prefill(int slot) {
     if (!is_prefilling(slot)) return;
     SeqSlot & s = slots_[(size_t)slot];
