@@ -274,7 +274,39 @@ struct PflashQueryWindow {
 PflashQueryWindow find_pflash_query_window(
     const std::vector<int32_t> & prompt,
     const std::vector<int32_t> & query,
-    int max_tokens = 8);
+    int max_tokens = 8,
+    int search_end = -1,
+    int search_begin = 0);
+
+PflashQueryWindow pflash_tail_query_window(
+    const std::vector<int32_t> & prompt,
+    int max_tokens,
+    int query_end = -1,
+    int query_begin = 0) noexcept;
+
+// Return the original prompt offset immediately before the stable trailing
+// suffix shared with a version whose latest user message carries a sentinel.
+// Invalid when no such bounded suffix can establish the semantic boundary.
+int pflash_query_search_end_from_sentinel(
+    const std::vector<int32_t> & original,
+    const std::vector<int32_t> & sentinel) noexcept;
+
+// Return the first token offset affected by a version whose selected message
+// content carries a leading sentinel. This is a conservative lower bound for
+// the selected content in the original rendered prompt.
+int pflash_query_search_begin_from_sentinel(
+    const std::vector<int32_t> & original,
+    const std::vector<int32_t> & sentinel) noexcept;
+
+std::string pflash_token_fingerprint(
+    const std::vector<int32_t> & ids);
+
+bool pflash_full_cache_restore_allowed(
+    bool longattncomp_environment_present) noexcept;
+bool pflash_continuation_must_fail_closed(
+    bool longattncomp_environment_present) noexcept;
+int pflash_target_token_ceiling(
+    int original_target_tokens, double keep_ratio) noexcept;
 
 }  // namespace http_detail
 

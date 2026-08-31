@@ -46,6 +46,7 @@
 #include <nlohmann/json.hpp>
 
 #include <filesystem>
+#include <algorithm>
 #include <cmath>
 #include <cerrno>
 #include <cstdio>
@@ -127,6 +128,24 @@ TEST_CASE(ServerUnitFixture, test_pflash_scorer_uses_user_query_before_chat_suff
     TEST_ASSERT((int)rendered.size() - window.end == 8);
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_scorer_maps_last_128_user_tokens) {
+    std::vector<int32_t> query;
+    for (int token = 0; token < 160; ++token) {
+        query.push_back(1000 + token);
+    }
+    std::vector<int32_t> rendered{1, 2};
+    rendered.insert(rendered.end(), query.begin(), query.end());
+    rendered.insert(rendered.end(), {200, 201, 202, 203});
+
+    const auto window =
+        http_detail::find_pflash_query_window(rendered, query, 128);
+
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.tokens == 128);
+    TEST_ASSERT(window.end == 162);
+    TEST_ASSERT((int)rendered.size() - window.end == 4);
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_tolerates_one_bpe_boundary_token) {
     const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
     const std::vector<int32_t> rendered{
@@ -138,6 +157,193 @@ TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_tolerates_one_bpe_boundar
     TEST_ASSERT(window.valid());
     TEST_ASSERT(window.tokens == 7);
     TEST_ASSERT(window.end == 10);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_stays_before_latest_user_boundary) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{
+        1, 2, 999, 11, 12, 13, 14, 15, 16, 17,
+        200, 201, 10, 11, 12, 13, 14, 15, 16, 17, 202,
+    };
+    // The sentinel changes the token at the user end, but the later template
+    // and assistant tokens remain stable. The common suffix establishes the
+    // semantic boundary after the original complete user suffix.
+    const std::vector<int32_t> sentinel_rendered{
+        1, 2, 999, 11, 12, 13, 14, 15, 16, 9999,
+        200, 201, 10, 11, 12, 13, 14, 15, 16, 17, 202,
+    };
+
+    const int search_end = http_detail::pflash_query_search_end_from_sentinel(
+        rendered, sentinel_rendered);
+    const auto bounded =
+        http_detail::find_pflash_query_window(rendered, query, 8, search_end);
+    const auto unbounded = http_detail::find_pflash_query_window(rendered, query);
+
+    TEST_ASSERT(search_end == 10);
+    TEST_ASSERT(bounded.valid());
+    TEST_ASSERT(bounded.tokens == 7);
+    TEST_ASSERT(bounded.end == 10);
+    TEST_ASSERT(unbounded.valid());
+    TEST_ASSERT(unbounded.tokens == 8);
+    TEST_ASSERT(unbounded.end == 20);
+    TEST_ASSERT(http_detail::pflash_query_search_end_from_sentinel(
+        rendered, std::vector<int32_t>{42}) < 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_bounded_mapping_prefers_latest_shortened_suffix) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{
+        1, 10, 11, 12, 13, 14, 15, 16, 17,
+        900, 11, 12, 13, 14, 15, 16, 17, 200, 201,
+    };
+
+    const auto bounded =
+        http_detail::find_pflash_query_window(rendered, query, 8, 17);
+    const auto unbounded = http_detail::find_pflash_query_window(rendered, query, 8);
+
+    TEST_ASSERT(bounded.valid());
+    TEST_ASSERT(bounded.end == 17);
+    TEST_ASSERT(bounded.tokens == 7);
+    // The compatibility path remains width-first when there is no semantic
+    // boundary, so the earlier exact duplicate still wins there.
+    TEST_ASSERT(unbounded.valid());
+    TEST_ASSERT(unbounded.end == 9);
+    TEST_ASSERT(unbounded.tokens == 8);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_bounded_mapping_rejects_earlier_duplicate) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{
+        1, 10, 11, 12, 13, 14, 15, 16, 17,
+        900, 11, 12, 13, 14, 15, 16, 999, 200,
+    };
+
+    const auto bounded =
+        http_detail::find_pflash_query_window(rendered, query, 8, 18);
+    const auto unbounded =
+        http_detail::find_pflash_query_window(rendered, query, 8);
+
+    TEST_ASSERT(!bounded.valid());
+    TEST_ASSERT(unbounded.valid());
+    TEST_ASSERT(unbounded.end == 9);
+    TEST_ASSERT(unbounded.tokens == 8);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_bounded_mapping_stays_inside_content_start) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    const std::vector<int32_t> rendered{
+        1, 2, 3, 4, 10, 11, 12, 13, 14, 15, 16, 17, 200,
+    };
+
+    const auto bounded = http_detail::find_pflash_query_window(
+        rendered, query, 8, 12, 5);
+
+    TEST_ASSERT(bounded.valid());
+    TEST_ASSERT(bounded.end == 12);
+    TEST_ASSERT(bounded.tokens == 7);
+    TEST_ASSERT(bounded.end - bounded.tokens == 5);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_maps_content_start_from_leading_sentinel) {
+    const std::vector<int32_t> rendered{1, 2, 10, 11, 12, 13, 20};
+    const std::vector<int32_t> sentinel_rendered{
+        1, 2, 999, 10, 11, 12, 13, 20,
+    };
+
+    TEST_ASSERT(http_detail::pflash_query_search_begin_from_sentinel(
+        rendered, sentinel_rendered) == 2);
+    TEST_ASSERT(http_detail::pflash_query_search_begin_from_sentinel(
+        rendered, rendered) < 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_responses_string_tails_only_raw_content) {
+    ToolMemory tool_memory;
+    const auto normalized = normalize_chat_messages(
+        json("raw completion input"), ApiFormat::RESPONSES, tool_memory);
+    TEST_ASSERT(normalized.size() == 1);
+    TEST_ASSERT(normalized[0].role == "user");
+    TEST_ASSERT(normalized[0].content == "raw completion input");
+
+    const std::vector<int32_t> rendered{
+        1, 2, 10, 11, 12, 13, 14, 200, 201,
+    };
+    const auto window = http_detail::pflash_tail_query_window(
+        rendered, 128, /*query_end=*/7, /*query_begin=*/2);
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.end == 7);
+    TEST_ASSERT(window.tokens == 5);
+    TEST_ASSERT(window.end - window.tokens == 2);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_parser_fingerprint_has_fixed_encoding) {
+    const std::vector<int32_t> ids{1, -2, 2147483647};
+    TEST_ASSERT(http_detail::pflash_token_fingerprint(ids) ==
+                "45409a0b0f44c5fd");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_tail_query_window) {
+    const auto empty = http_detail::pflash_tail_query_window({}, 128);
+    TEST_ASSERT(!empty.valid());
+
+    const std::vector<int32_t> short_prompt{1, 2, 3};
+    const auto short_tail =
+        http_detail::pflash_tail_query_window(short_prompt, 128);
+    TEST_ASSERT(short_tail.valid());
+    TEST_ASSERT(short_tail.end == 3);
+    TEST_ASSERT(short_tail.tokens == 3);
+
+    std::vector<int32_t> long_prompt(200);
+    const auto capped_tail =
+        http_detail::pflash_tail_query_window(long_prompt, 128);
+    TEST_ASSERT(capped_tail.valid());
+    TEST_ASSERT(capped_tail.end == 200);
+    TEST_ASSERT(capped_tail.tokens == 128);
+    const auto bounded_tail =
+        http_detail::pflash_tail_query_window(long_prompt, 128, 150);
+    TEST_ASSERT(bounded_tail.valid());
+    TEST_ASSERT(bounded_tail.end == 150);
+    TEST_ASSERT(bounded_tail.tokens == 128);
+    TEST_ASSERT(!http_detail::pflash_tail_query_window(long_prompt, 0).valid());
+    TEST_ASSERT(!http_detail::pflash_tail_query_window(long_prompt, 128, 0).valid());
+    TEST_ASSERT(!http_detail::pflash_tail_query_window(long_prompt, 128, 201).valid());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_normalizes_multipart_latest_user_for_reverse_lookup) {
+    ToolMemory tool_memory;
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "older user"}},
+        {{"role", "assistant"}, {"content", "assistant before latest"}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "input_text"}, {"text", "input-"}},
+            {{"type", "input_image"}, {"image_url", "ignored"}},
+            {{"type", "text"}, {"text", "text"}}
+        })}},
+        {{"role", "assistant"}, {"content", "assistant after latest"}},
+        {{"role", "tool"}, {"content", "tool after latest"}}
+    });
+
+    const auto normalized = normalize_chat_messages(
+        messages, ApiFormat::OPENAI_CHAT, tool_memory);
+    const auto latest_user = std::find_if(
+        normalized.rbegin(), normalized.rend(),
+        [](const ChatMessage & message) { return message.role == "user"; });
+    TEST_ASSERT(latest_user != normalized.rend());
+    if (latest_user != normalized.rend()) {
+        TEST_ASSERT(latest_user->content == "input-text");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_longattncomp_cache_and_continuation_policy) {
+    TEST_ASSERT(http_detail::pflash_full_cache_restore_allowed(false));
+    TEST_ASSERT(!http_detail::pflash_full_cache_restore_allowed(true));
+    TEST_ASSERT(!http_detail::pflash_continuation_must_fail_closed(false));
+    TEST_ASSERT(http_detail::pflash_continuation_must_fail_closed(true));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_target_token_ceiling_floors) {
+    TEST_ASSERT(http_detail::pflash_target_token_ceiling(7, 0.5) == 3);
+    TEST_ASSERT(http_detail::pflash_target_token_ceiling(120000, 16384.0 / 120000.0) == 16384);
+    TEST_ASSERT(http_detail::pflash_target_token_ceiling(-1, 0.5) < 0);
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_rejects_weak_punctuation_match) {

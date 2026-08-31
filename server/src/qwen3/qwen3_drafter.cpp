@@ -15,6 +15,7 @@
 
 #include "qwen3_drafter.h"
 #include "qwen3_drafter_model.h"
+#include "pflash_selection.h"
 #include "qwen3/anchor_params.h"
 #include "common/backend_precision.h"
 #include "internal.h"
@@ -80,6 +81,22 @@ static void force_chunk_neighborhood(std::vector<uint8_t> & forced, int n_chunks
     for (int c = lo; c <= hi; ++c) forced[(size_t)c] = 1;
 }
 
+struct PFlashTraceFields {
+    const std::vector<int32_t> * input_ids = nullptr;
+    int query_begin = -1;
+    int query_end = -1;
+    dflash::qwen3::PFlashSelectionMode selector_mode =
+        dflash::qwen3::PFlashSelectionMode::Legacy;
+    dflash::qwen3::PFlashQueryParser query_parser =
+        dflash::qwen3::PFlashQueryParser::SemanticUser;
+    int token_budget = 0;
+    dflash::qwen3::PFlashSelectionStop stop =
+        dflash::qwen3::PFlashSelectionStop::InvalidInput;
+    int retained_tokens = 0;
+    double retained_mass = 0.0;
+    const std::vector<double> * exact_chunk_scores = nullptr;
+};
+
 static void write_compression_trace(
         int input_tokens,
         float keep_ratio,
@@ -90,7 +107,8 @@ static void write_compression_trace(
         const std::vector<std::pair<float, int>> & chunk_means,
         const std::vector<uint8_t> & selected,
         const std::vector<uint8_t> & forced,
-        const std::vector<int32_t> & compressed_ids) {
+        const std::vector<int32_t> & compressed_ids,
+        const PFlashTraceFields * trace_fields = nullptr) {
     const char * path = std::getenv("DFLASH_PFLASH_TRACE_PATH");
     if (!path || !*path) return;
 
@@ -104,16 +122,58 @@ static void write_compression_trace(
     for (const auto & chunk : chunk_means) {
         scores[(size_t)chunk.second] = chunk.first;
     }
+    const bool has_exact_scores = trace_fields &&
+        trace_fields->exact_chunk_scores &&
+        trace_fields->exact_chunk_scores->size() == scores.size();
+    if (trace_fields &&
+        trace_fields->selector_mode !=
+            dflash::qwen3::PFlashSelectionMode::Legacy &&
+        !has_exact_scores) {
+        std::fclose(file);
+        std::fprintf(stderr, "[pflash-trace] exact strict scores unavailable\n");
+        return;
+    }
 
     std::fprintf(file,
-        "{\"schema_version\":1,\"input_tokens\":%d,\"keep_ratio\":%.9g,"
-        "\"chunk_size\":%d,\"n_lookahead\":%d,\"pool_kernel\":%d,"
+        "{\"schema_version\":%d,\"input_tokens\":%d,\"keep_ratio\":%.9g",
+        trace_fields ? 2 : 1, input_tokens, keep_ratio);
+    if (trace_fields) {
+        std::fputs(",\"input_ids\":[", file);
+        for (size_t index = 0; index < trace_fields->input_ids->size(); ++index) {
+            if (index) std::fputc(',', file);
+            std::fprintf(file, "%d", (*trace_fields->input_ids)[index]);
+        }
+        std::fprintf(file,
+            "],\"query_begin\":%d,\"query_end\":%d,"
+            "\"selector_mode\":\"%s\",\"query_parser\":\"%s\","
+            "\"token_budget\":%d,"
+            "\"retained_tokens\":%d",
+            trace_fields->query_begin, trace_fields->query_end,
+            dflash::qwen3::pflash_selection_mode_name(
+                trace_fields->selector_mode),
+            dflash::qwen3::pflash_query_parser_name(trace_fields->query_parser),
+            trace_fields->token_budget, trace_fields->retained_tokens);
+        if (trace_fields->selector_mode ==
+            dflash::qwen3::PFlashSelectionMode::Legacy) {
+            std::fputs(",\"stop_reason\":null,\"retained_mass\":null", file);
+        } else {
+            std::fprintf(file,
+                ",\"stop_reason\":\"%s\",\"retained_mass\":%.17g",
+                dflash::qwen3::pflash_selection_stop_name(trace_fields->stop),
+                trace_fields->retained_mass);
+        }
+    }
+    std::fprintf(file,
+        ",\"chunk_size\":%d,\"n_lookahead\":%d,\"pool_kernel\":%d,"
         "\"n_keep\":%d,\"chunk_scores\":[",
-        input_tokens, keep_ratio, chunk_size, n_lookahead, pool_kernel, n_keep);
+        chunk_size, n_lookahead, pool_kernel, n_keep);
     for (size_t index = 0; index < scores.size(); ++index) {
         if (index) std::fputc(',', file);
-        if (std::isfinite(scores[index])) {
-            std::fprintf(file, "%.9g", scores[index]);
+        const double score = has_exact_scores
+            ? (*trace_fields->exact_chunk_scores)[index]
+            : (double) scores[index];
+        if (std::isfinite(score)) {
+            std::fprintf(file, has_exact_scores ? "%.17g" : "%.9g", score);
         } else {
             std::fputs("null", file);
         }
@@ -141,6 +201,110 @@ static void write_compression_trace(
     }
     std::fputs("]}\n", file);
     std::fclose(file);
+}
+
+static std::vector<int32_t> select_longattncomp_chunks(
+        const std::vector<int32_t> & ids,
+        const std::vector<float> & token_scores,
+        float keep_ratio,
+        int n_lookahead,
+        int score_query_end,
+        int pool_kernel,
+        const dflash::qwen3::PFlashLongAttnCompConfig & config,
+        bool write_trace) {
+    const int input_tokens = (int) ids.size();
+    const int query_end = score_query_end < 0 ? input_tokens : score_query_end;
+    const int query_tokens = std::min(n_lookahead, query_end);
+    const int query_begin = query_end - query_tokens;
+    const int selector_budget = (int) std::floor(
+        (double) input_tokens * (double) keep_ratio);
+    const int n_chunks =
+        (input_tokens + config.chunk_size - 1) / config.chunk_size;
+
+    std::vector<dflash::qwen3::PFlashSelectionCandidate> candidates;
+    std::vector<std::pair<float, int>> chunk_means;
+    std::vector<double> exact_chunk_scores;
+    candidates.reserve((size_t) n_chunks);
+    chunk_means.reserve((size_t) n_chunks);
+    exact_chunk_scores.reserve((size_t) n_chunks);
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        const int begin = chunk * config.chunk_size;
+        const int end = std::min(input_tokens, begin + config.chunk_size);
+        double score = 0.0;
+        for (int token = begin; token < end; ++token) {
+            score += token_scores[(size_t) token];
+        }
+        score /= (double) std::max(1, end - begin);
+        const bool mandatory =
+            dflash::qwen3::pflash_chunk_is_structurally_required(
+                begin, end, query_begin, query_end, input_tokens);
+        candidates.push_back({(size_t) chunk, begin, end, score, mandatory});
+        chunk_means.push_back({(float) score, chunk});
+        exact_chunk_scores.push_back(score);
+    }
+
+    const auto selected = dflash::qwen3::select_pflash_candidates(
+        candidates,
+        dflash::qwen3::PFlashSelectionPolicy{selector_budget, config.top_p},
+        config.mode);
+    if (!selected.ok) {
+        set_last_error("PFlash LongAttnComp selection failed: " + selected.error);
+        std::fprintf(stderr,
+            "[pflash-longattncomp] ERROR mode=%s budget=%d stop=%s: %s\n",
+            dflash::qwen3::pflash_selection_mode_name(config.mode),
+            selector_budget,
+            dflash::qwen3::pflash_selection_stop_name(selected.stop),
+            selected.error.c_str());
+        std::fflush(stderr);
+        return {};
+    }
+
+    std::vector<uint8_t> selected_mask((size_t) n_chunks, 0);
+    std::vector<uint8_t> mandatory_mask((size_t) n_chunks, 0);
+    for (const auto & candidate : candidates) {
+        if (candidate.mandatory) mandatory_mask[candidate.ordinal] = 1;
+    }
+    for (size_t ordinal : selected.ordinals) {
+        if (ordinal >= selected_mask.size()) {
+            set_last_error("PFlash LongAttnComp selector returned an invalid ordinal");
+            return {};
+        }
+        selected_mask[ordinal] = 1;
+    }
+
+    std::vector<int32_t> output;
+    output.reserve((size_t) selected.retained_tokens);
+    for (const auto & candidate : candidates) {
+        if (!selected_mask[candidate.ordinal]) continue;
+        output.insert(output.end(),
+                      ids.begin() + candidate.begin,
+                      ids.begin() + candidate.end);
+    }
+
+    std::fprintf(stderr,
+        "[pflash-longattncomp] selected mode=%s chunk=%d query=%d "
+        "budget=%d selected_tokens=%zu chunks=%zu/%d stop=%s mass=%.9g\n",
+        dflash::qwen3::pflash_selection_mode_name(config.mode),
+        config.chunk_size, query_tokens, selector_budget, output.size(),
+        selected.ordinals.size(), n_chunks,
+        dflash::qwen3::pflash_selection_stop_name(selected.stop),
+        selected.retained_mass);
+    std::fflush(stderr);
+
+    if (write_trace) {
+        const int n_keep_approx = std::max(
+            1, (selector_budget + config.chunk_size - 1) / config.chunk_size);
+        const PFlashTraceFields strict_fields{
+            &ids, query_begin, query_end, config.mode, config.query_parser,
+            selector_budget,
+            selected.stop, selected.retained_tokens, selected.retained_mass,
+            &exact_chunk_scores};
+        write_compression_trace(
+            input_tokens, keep_ratio, config.chunk_size, query_tokens,
+            pool_kernel, n_keep_approx, chunk_means, selected_mask,
+            mandatory_mask, output, &strict_fields);
+    }
+    return output;
 }
 
 #if defined(DFLASH27B_BACKEND_HIP)
@@ -336,7 +500,8 @@ static std::vector<int32_t> qwen35_score_and_compress(
     int chunk_size,
     int n_lookahead,
     int pool_kernel,
-    int score_query_end) {
+    int score_query_end,
+    const dflash::qwen3::PFlashLongAttnCompConfig & experiment) {
 
     const int S = (int)ids.size();
     const int hidden = w.n_embd;
@@ -625,6 +790,12 @@ static std::vector<int32_t> qwen35_score_and_compress(
         smoothed[(size_t)j] = (n > 0) ? (s / (float)n) : 0.0f;
     }
     smooth_score.swap(smoothed);
+
+    if (experiment.selection_active) {
+        return select_longattncomp_chunks(
+            ids, smooth_score, keep_ratio, n_lookahead, score_query_end,
+            pk, experiment, true);
+    }
     
     std::vector<std::pair<float, int>> chunk_means;
     for (int c = 0; c < n_chunks; ++c) {
@@ -775,6 +946,29 @@ std::vector<int32_t> drafter_score_and_compress(
         set_last_error("drafter not loaded");
         return {};
     }
+
+    dflash::qwen3::PFlashLongAttnCompConfig experiment;
+    std::string experiment_error;
+    if (!dflash::qwen3::resolve_pflash_longattncomp(
+            (int) ids.size(), chunk_size, experiment, experiment_error)) {
+        set_last_error("invalid PFlash LongAttnComp config: " + experiment_error);
+        std::fprintf(stderr, "[pflash-longattncomp] ERROR config: %s\n",
+                     experiment_error.c_str());
+        std::fflush(stderr);
+        return {};
+    }
+    chunk_size = experiment.chunk_size;
+    if (experiment.configured) {
+        std::fprintf(stderr,
+            "[pflash-longattncomp] config mode=%s active=%d chunk=%d "
+            "query_parser=%s query_cap=%d query_actual=%d top_p=%.9g "
+            "input=%zu\n",
+            dflash::qwen3::pflash_selection_mode_name(experiment.mode),
+            (int) experiment.selection_active, experiment.chunk_size,
+            dflash::qwen3::pflash_query_parser_name(experiment.query_parser),
+            experiment.query_tokens, n_lookahead, experiment.top_p, ids.size());
+        std::fflush(stderr);
+    }
     if (ctx.arch == DrafterArch::Qwen35_0p8b) {
         if (!ctx.arch_state) {
             set_last_error("qwen35 drafter state missing");
@@ -782,7 +976,8 @@ std::vector<int32_t> drafter_score_and_compress(
         }
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
         return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
-                                         n_lookahead, pool_kernel, score_query_end);
+                                         n_lookahead, pool_kernel, score_query_end,
+                                         experiment);
     }
     const int S = (int)ids.size();
     if (S < n_lookahead + 1) {
@@ -822,6 +1017,12 @@ std::vector<int32_t> drafter_score_and_compress(
         int n = 0;
         for (int k = lo; k <= hi; ++k) { s += score[k]; ++n; }
         smooth[j] = (n > 0) ? (s / (float)n) : 0.0f;
+    }
+
+    if (experiment.selection_active) {
+        return select_longattncomp_chunks(
+            ids, smooth, keep_ratio, n_lookahead, score_query_end,
+            pool_kernel, experiment, true);
     }
 
     // ── 4. Chunk-top-K + span merge ───────────────────────────────────
@@ -938,8 +1139,18 @@ std::vector<int32_t> drafter_score_and_compress(
         S, out.size(), (int)selected.size(), n_chunks, forced_count);
     std::fflush(stderr);
 
+    const int query_end = score_query_end < 0 ? S : score_query_end;
+    const int query_begin = query_end - n_lookahead;
+    const int token_budget = (int) std::floor(
+        (double) S * (double) keep_ratio);
+    const PFlashTraceFields trace_fields{
+        &ids, query_begin, query_end, experiment.mode,
+        experiment.query_parser, token_budget,
+        dflash::qwen3::PFlashSelectionStop::InvalidInput, (int) out.size(),
+        0.0, nullptr};
     write_compression_trace(S, keep_ratio, chunk_size, n_lookahead,
-        pool_kernel, n_keep, chunk_means, selected_mask, forced, out);
+        pool_kernel, n_keep, chunk_means, selected_mask, forced, out,
+        &trace_fields);
 
     return out;
 }

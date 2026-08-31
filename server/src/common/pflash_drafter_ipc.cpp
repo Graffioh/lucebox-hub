@@ -3,10 +3,138 @@
 #include "pflash_drafter_ipc.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <sstream>
 
 namespace dflash::common {
+
+namespace {
+
+bool parse_int_token(const std::string & raw, int & out) {
+    if (raw.empty()) return false;
+    errno = 0;
+    char * end = nullptr;
+    const long value = std::strtol(raw.c_str(), &end, 10);
+    if (errno == ERANGE || end == raw.c_str() || *end != '\0' ||
+        value < INT_MIN || value > INT_MAX) {
+        return false;
+    }
+    out = (int) value;
+    return true;
+}
+
+bool parse_float_token(const std::string & raw, float & out) {
+    if (raw.empty()) return false;
+    errno = 0;
+    char * end = nullptr;
+    const float value = std::strtof(raw.c_str(), &end);
+    if (errno == ERANGE || end == raw.c_str() || *end != '\0' ||
+        !std::isfinite(value)) {
+        return false;
+    }
+    out = value;
+    return true;
+}
+
+bool validate_request_fields(
+        float keep_ratio,
+        int score_query_tokens,
+        const std::string & path,
+        std::string & error) {
+    if (!std::isfinite(keep_ratio) || keep_ratio < 0.0f || keep_ratio > 1.0f) {
+        error = "PFlash IPC keep_ratio must be finite and in [0, 1]";
+        return false;
+    }
+    if (score_query_tokens < 1) {
+        error = "PFlash IPC score_query_tokens must be positive";
+        return false;
+    }
+    if (path.empty()) {
+        error = "PFlash IPC token path must not be empty";
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool format_pflash_drafter_ipc_compress_command(
+        float keep_ratio,
+        int score_query_end,
+        int score_query_tokens,
+        const std::string & path,
+        std::string & out,
+        std::string & error) {
+    out.clear();
+    error.clear();
+    if (!validate_request_fields(keep_ratio, score_query_tokens, path, error)) {
+        return false;
+    }
+
+    char keep_text[64];
+    std::snprintf(keep_text, sizeof(keep_text), "%.9g", keep_ratio);
+
+    std::ostringstream line;
+    line << "compress2 " << keep_text << ' ' << score_query_end << ' '
+         << score_query_tokens << ' ' << path;
+    out = line.str();
+    return true;
+}
+
+bool parse_pflash_drafter_ipc_compress_command(
+        const std::string & line,
+        PFlashDrafterIpcCompressCommand & out,
+        std::string & error) {
+    out = {};
+    error.clear();
+
+    std::istringstream iss(line);
+    std::string command;
+    if (!(iss >> command)) {
+        error = "PFlash IPC command is empty";
+        return false;
+    }
+
+    std::string keep_raw;
+    std::string query_end_raw;
+    std::string query_tokens_raw;
+    if (!(iss >> keep_raw >> query_end_raw >> query_tokens_raw)) {
+        error = "PFlash IPC compress command is missing fields";
+        return false;
+    }
+    if (!parse_int_token(query_end_raw, out.score_query_end) ||
+        !parse_int_token(query_tokens_raw, out.score_query_tokens)) {
+        error = "PFlash IPC query fields must be integers";
+        return false;
+    }
+    out.path = read_line_tail(iss);
+
+    if (command == "compress2") {
+        if (!parse_float_token(keep_raw, out.keep_ratio)) {
+            error = "PFlash IPC keep_ratio must be a float";
+            return false;
+        }
+    } else if (command == "compress") {
+        int keep_x1000 = 0;
+        if (!parse_int_token(keep_raw, keep_x1000) ||
+            keep_x1000 < 0 || keep_x1000 > 1000) {
+            error = "PFlash IPC legacy keep_x1000 must be in [0, 1000]";
+            return false;
+        }
+        out.legacy_quantized_ratio = true;
+        out.keep_ratio = (float) keep_x1000 / 1000.0f;
+    } else {
+        error = "unknown PFlash IPC command";
+        return false;
+    }
+
+    return validate_request_fields(
+        out.keep_ratio, out.score_query_tokens, out.path, error);
+}
 
 bool PFlashDrafterIpcClient::start(
         const std::string & bin,
@@ -58,12 +186,15 @@ bool PFlashDrafterIpcClient::compress(
         std::fprintf(stderr, "pflash-ipc write tokens failed: %s\n", path.c_str());
         return false;
     }
-    int keep_x1000 = (int)std::lround(std::max(0.0f, keep_ratio) * 1000.0f);
-    keep_x1000 = std::max(0, std::min(1000, keep_x1000));
-
-    std::fprintf(cmd, "compress %d %d %d %s\n",
-                 keep_x1000, score_query_end, score_query_tokens,
-                 path.c_str());
+    std::string line;
+    std::string error;
+    if (!format_pflash_drafter_ipc_compress_command(
+            keep_ratio, score_query_end, score_query_tokens, path, line, error)) {
+        std::fprintf(stderr, "pflash-ipc bad compress request: %s\n", error.c_str());
+        std::remove(path.c_str());
+        return false;
+    }
+    std::fprintf(cmd, "%s\n", line.c_str());
     std::fflush(cmd);
 
     int32_t status = -1;

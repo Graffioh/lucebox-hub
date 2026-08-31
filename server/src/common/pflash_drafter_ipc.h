@@ -16,6 +16,27 @@
 
 namespace dflash::common {
 
+struct PFlashDrafterIpcCompressCommand {
+    bool legacy_quantized_ratio = false;
+    float keep_ratio = 0.0f;
+    int score_query_end = -1;
+    int score_query_tokens = 8;
+    std::string path;
+};
+
+bool format_pflash_drafter_ipc_compress_command(
+    float keep_ratio,
+    int score_query_end,
+    int score_query_tokens,
+    const std::string & path,
+    std::string & out,
+    std::string & error);
+
+bool parse_pflash_drafter_ipc_compress_command(
+    const std::string & line,
+    PFlashDrafterIpcCompressCommand & out,
+    std::string & error);
+
 class PFlashDrafterIpcClient {
 public:
     PFlashDrafterIpcClient() = default;

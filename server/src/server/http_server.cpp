@@ -24,6 +24,7 @@
 #include "pin_friendly_prompt.h"
 #include "common/kv_rotation.h"
 #include "common/sha1.h"
+#include "qwen3/pflash_selection.h"
 #include "freeze_history.h"
 
 #ifdef DFLASH_HAS_CURL
@@ -34,6 +35,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -189,18 +191,40 @@ HeartbeatSendResult try_send_sse_heartbeat(
 PflashQueryWindow find_pflash_query_window(
         const std::vector<int32_t> & prompt,
         const std::vector<int32_t> & query,
-        int max_tokens) {
+        int max_tokens,
+        int search_end,
+        int search_begin) {
     PflashQueryWindow result;
     if (prompt.empty() || query.empty() || max_tokens < 1) return result;
 
+    const int limit = search_end < 0
+        ? (int) prompt.size()
+        : (std::min)((int) prompt.size(), search_end);
+    if (limit < 1 || search_begin < 0 || search_begin >= limit) return result;
     const int widest = (std::min)(max_tokens, (int) query.size());
     // For a short query, require all available tokens. For a normal query,
     // four matching suffix tokens are enough to tolerate a BPE boundary
     // difference without accidentally selecting a lone punctuation token.
     const int narrowest = (std::min)(4, widest);
+    // A configured semantic boundary is the exact content end. Shorten only
+    // the suffix width there; accepting an earlier occurrence would silently
+    // turn a failed latest-user mapping into preceding context.
+    if (search_end >= 0) {
+        const int bounded_widest = (std::min)(widest, limit - search_begin);
+        for (int width = bounded_widest; width >= narrowest; --width) {
+            const auto query_begin = query.end() - width;
+            if (std::equal(query_begin, query.end(),
+                           prompt.begin() + limit - width)) {
+                result.end = limit;
+                result.tokens = width;
+                return result;
+            }
+        }
+        return result;
+    }
     for (int width = widest; width >= narrowest; --width) {
         const auto query_begin = query.end() - width;
-        for (int end = (int) prompt.size(); end >= width; --end) {
+        for (int end = limit; end >= width; --end) {
             if (std::equal(query_begin, query.end(),
                            prompt.begin() + end - width)) {
                 result.end = end;
@@ -210,6 +234,94 @@ PflashQueryWindow find_pflash_query_window(
         }
     }
     return result;
+}
+
+PflashQueryWindow pflash_tail_query_window(
+        const std::vector<int32_t> & prompt,
+        int max_tokens,
+        int query_end,
+        int query_begin) noexcept {
+    PflashQueryWindow result;
+    if (prompt.empty() || max_tokens < 1) return result;
+    result.end = query_end < 0
+        ? static_cast<int>(prompt.size())
+        : query_end;
+    if (result.end < 1 || result.end > static_cast<int>(prompt.size()) ||
+        query_begin < 0 || query_begin >= result.end) {
+        return {};
+    }
+    result.tokens = (std::min)(max_tokens, result.end - query_begin);
+    return result;
+}
+
+int pflash_query_search_end_from_sentinel(
+        const std::vector<int32_t> & original,
+        const std::vector<int32_t> & sentinel) noexcept {
+    size_t common_suffix = 0;
+    while (common_suffix < original.size() &&
+           common_suffix < sentinel.size() &&
+           original[original.size() - common_suffix - 1] ==
+               sentinel[sentinel.size() - common_suffix - 1]) {
+        ++common_suffix;
+    }
+    if (common_suffix == 0 || common_suffix >= original.size()) {
+        return -1;
+    }
+    return static_cast<int>(original.size() - common_suffix);
+}
+int pflash_query_search_begin_from_sentinel(
+        const std::vector<int32_t> & original,
+        const std::vector<int32_t> & sentinel) noexcept {
+    size_t common_prefix = 0;
+    while (common_prefix < original.size() &&
+           common_prefix < sentinel.size() &&
+           original[common_prefix] == sentinel[common_prefix]) {
+        ++common_prefix;
+    }
+    if (common_prefix >= original.size()) return -1;
+    return static_cast<int>(common_prefix);
+}
+
+std::string pflash_token_fingerprint(
+        const std::vector<int32_t> & ids) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (int32_t token : ids) {
+        const uint32_t value = static_cast<uint32_t>(token);
+        for (int shift = 0; shift < 32; shift += 8) {
+            hash ^= static_cast<uint8_t>(value >> shift);
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+
+    char encoded[17];
+    std::snprintf(encoded, sizeof(encoded), "%016llx",
+                  static_cast<unsigned long long>(hash));
+    return encoded;
+}
+
+
+bool pflash_full_cache_restore_allowed(
+        bool longattncomp_environment_present) noexcept {
+    return !longattncomp_environment_present;
+}
+
+bool pflash_continuation_must_fail_closed(
+        bool longattncomp_environment_present) noexcept {
+    return longattncomp_environment_present;
+}
+
+int pflash_target_token_ceiling(
+        int original_target_tokens, double keep_ratio) noexcept {
+    if (original_target_tokens < 0 || !std::isfinite(keep_ratio) ||
+        keep_ratio <= 0.0) {
+        return -1;
+    }
+    const double ceiling = std::floor(
+        static_cast<double>(original_target_tokens) * keep_ratio);
+    if (!std::isfinite(ceiling) || ceiling < 0.0 || ceiling > INT_MAX) {
+        return -1;
+    }
+    return static_cast<int>(ceiling);
 }
 
 }  // namespace http_detail
@@ -2844,8 +2956,11 @@ void HttpServer::apply_flowkv_compression(
 
 std::string HttpServer::apply_pflash_compression(
         const ParsedRequest & req, PreparedPrompt & prepared) {
+    const bool longattncomp_environment =
+        dflash::qwen3::has_pflash_longattncomp_environment();
     auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
-    if (full_slot >= 0) {
+    if (http_detail::pflash_full_cache_restore_allowed(
+            longattncomp_environment) && full_slot >= 0) {
         std::fprintf(stderr,
             "[pflash] full-cache hit slot=%d — skipping compress\n",
             full_slot);
@@ -2862,8 +2977,109 @@ std::string HttpServer::apply_pflash_compression(
     const std::string prompt_text = tokenizer_.decode(req.prompt_tokens);
     auto drafter_ids = drafter_tokenizer_->encode(prompt_text);
 
+    if (drafter_ids.empty()) {
+        return "PFlash drafter tokenizer produced an empty prompt";
+    }
+
+    dflash::qwen3::PFlashLongAttnCompConfig experiment;
+    std::string experiment_error;
+    if (!dflash::qwen3::resolve_pflash_longattncomp(
+            (int) drafter_ids.size(), 32, experiment, experiment_error)) {
+        return "invalid PFlash LongAttnComp config: " + experiment_error;
+    }
+
+    const bool messages_input =
+        req.messages.is_array() && !req.messages.empty();
+    const bool raw_text_input = req.messages.is_string();
+    const char * parser_input_kind = messages_input
+        ? "messages" : (raw_text_input ? "raw_text" : "unsupported");
+    std::string parser_selection_rule;
     std::string last_user_text;
-    if (req.messages.is_array()) {
+    int query_content_begin = -1;
+    int query_content_end = -1;
+    if (experiment.configured) {
+        if (!messages_input && !raw_text_input) {
+            return "PFlash LongAttnComp input has no parseable text";
+        }
+        try {
+            auto messages =
+                normalize_chat_messages(req.messages, req.format, tool_memory_);
+            if (messages.empty()) {
+                return "PFlash LongAttnComp normalized messages are empty";
+            }
+
+            int last_user_index = -1;
+            for (int index = (int) messages.size() - 1; index >= 0; --index) {
+                if (messages[(size_t) index].role == "user") {
+                    last_user_index = index;
+                    break;
+                }
+            }
+            if (last_user_index >= 0) {
+                last_user_text = messages[(size_t) last_user_index].content;
+            }
+
+            int boundary_index = (int) messages.size() - 1;
+            if (!raw_text_input &&
+                experiment.query_parser ==
+                    dflash::qwen3::PFlashQueryParser::SemanticUser) {
+                boundary_index = last_user_index;
+            }
+            if (boundary_index < 0 ||
+                (experiment.query_parser ==
+                     dflash::qwen3::PFlashQueryParser::SemanticUser &&
+                 !raw_text_input && last_user_text.empty())) {
+                return "PFlash LongAttnComp latest-user boundary is unavailable";
+            }
+
+            static constexpr const char * kContentBegin =
+                "__DFLASH_PFLASH_CONTENT_BEGIN_02C47F91__";
+            static constexpr const char * kContentEnd =
+                "__DFLASH_PFLASH_CONTENT_END_6E6B61A8__";
+            auto begin_messages = messages;
+            begin_messages[(size_t) boundary_index].content =
+                std::string(kContentBegin) +
+                begin_messages[(size_t) boundary_index].content;
+            auto end_messages = messages;
+            end_messages[(size_t) boundary_index].content += kContentEnd;
+
+            std::string begin_rendered;
+            std::string end_rendered;
+            std::string boundary_error;
+            if (!render_messages_to_text(
+                    begin_messages, req, /*add_generation_prompt=*/true,
+                    begin_rendered, boundary_error)) {
+                return "PFlash LongAttnComp content-start render failed: " +
+                    boundary_error;
+            }
+            boundary_error.clear();
+            if (!render_messages_to_text(
+                    end_messages, req, /*add_generation_prompt=*/true,
+                    end_rendered, boundary_error)) {
+                return "PFlash LongAttnComp content-end render failed: " +
+                    boundary_error;
+            }
+
+            const auto begin_ids = drafter_tokenizer_->encode(
+                tokenizer_.decode(tokenizer_.encode(begin_rendered)));
+            const auto end_ids = drafter_tokenizer_->encode(
+                tokenizer_.decode(tokenizer_.encode(end_rendered)));
+            query_content_begin =
+                http_detail::pflash_query_search_begin_from_sentinel(
+                    drafter_ids, begin_ids);
+            query_content_end =
+                http_detail::pflash_query_search_end_from_sentinel(
+                    drafter_ids, end_ids);
+            if (query_content_begin < 0 ||
+                query_content_end <= query_content_begin ||
+                query_content_end >= (int) drafter_ids.size()) {
+                return "PFlash LongAttnComp content boundary mapping failed";
+            }
+        } catch (const std::exception & error) {
+            return std::string("PFlash user-query normalization failed: ") +
+                   error.what();
+        }
+    } else if (req.messages.is_array()) {
         for (int index = (int) req.messages.size() - 1; index >= 0; --index) {
             if (req.messages[index].value("role", "") != "user") continue;
             const auto & content = req.messages[index]["content"];
@@ -2881,13 +3097,36 @@ std::string HttpServer::apply_pflash_compression(
             break;
         }
     }
-    const auto query_ids = last_user_text.empty()
-        ? std::vector<int32_t>{}
-        : drafter_tokenizer_->encode(last_user_text);
-    const auto query_window = http_detail::find_pflash_query_window(
-        drafter_ids, query_ids);
-    if (drafter_ids.empty()) {
-        return "PFlash drafter tokenizer produced an empty prompt";
+
+    std::vector<int32_t> semantic_query_ids;
+    std::vector<int32_t> expected_query_ids;
+    http_detail::PflashQueryWindow query_window;
+    if (!last_user_text.empty()) {
+        semantic_query_ids = drafter_tokenizer_->encode(last_user_text);
+    }
+    if (experiment.configured && raw_text_input) {
+        parser_selection_rule = "content_tail";
+        query_window = http_detail::pflash_tail_query_window(
+            drafter_ids, experiment.query_tokens,
+            query_content_end, query_content_begin);
+    } else if (experiment.configured &&
+               experiment.query_parser ==
+                   dflash::qwen3::PFlashQueryParser::ArbitraryTail) {
+        parser_selection_rule = "prompt_tail";
+        query_window = http_detail::pflash_tail_query_window(
+            drafter_ids, experiment.query_tokens, query_content_end);
+    } else if (!semantic_query_ids.empty()) {
+        if (experiment.configured) parser_selection_rule = "semantic_suffix";
+        query_window = http_detail::find_pflash_query_window(
+            drafter_ids, semantic_query_ids,
+            experiment.configured ? experiment.query_tokens : 8,
+            query_content_end,
+            experiment.configured ? query_content_begin : 0);
+        if (experiment.configured && query_window.valid()) {
+            expected_query_ids.assign(
+                semantic_query_ids.end() - query_window.tokens,
+                semantic_query_ids.end());
+        }
     }
 
     ModelBackend::CompressRequest compress_request;
@@ -2897,6 +3136,30 @@ std::string HttpServer::apply_pflash_compression(
     if (query_window.valid()) {
         compress_request.score_query_end = query_window.end;
         compress_request.score_query_tokens = query_window.tokens;
+        if (experiment.configured) {
+            const int query_begin = query_window.end - query_window.tokens;
+            const json provenance = {
+                {"schema_version", 1},
+                {"input_kind", parser_input_kind},
+                {"selection_rule", parser_selection_rule},
+                {"query_parser",
+                 dflash::qwen3::pflash_query_parser_name(
+                     experiment.query_parser)},
+                {"input_tokens", (int) compress_request.input_ids.size()},
+                {"input_fingerprint_fnv1a64",
+                 http_detail::pflash_token_fingerprint(
+                     compress_request.input_ids)},
+                {"content_begin", query_content_begin},
+                {"content_end", query_content_end},
+                {"query_begin", query_begin},
+                {"query_end", query_window.end},
+                {"requested_query_tokens", experiment.query_tokens},
+                {"expected_query_ids", expected_query_ids},
+            };
+            std::fprintf(stderr, "[pflash-parser] %s\n",
+                         provenance.dump().c_str());
+            std::fflush(stderr);
+        }
         std::fprintf(stderr,
             "[pflash] scorer query mapped to drafter tokens [%d,%d); "
             "rendered suffix=%zu tokens\n",
@@ -2951,36 +3214,53 @@ std::string HttpServer::apply_pflash_compression(
 
     // Compression is allowed to be lossy, but the active user query must
     // survive. Re-append short queries when fewer than 80% of their tokens do.
-    if (!last_user_text.empty()) {
+    if (!experiment.selection_active && !last_user_text.empty()) {
         int query_kept = 0;
-        if (!query_ids.empty()) {
-            int query_index = (int) query_ids.size() - 1;
+        if (!semantic_query_ids.empty()) {
+            int query_index = (int) semantic_query_ids.size() - 1;
             for (int kept_index = (int) result.compressed_ids.size() - 1;
                  kept_index >= 0 && query_index >= 0; --kept_index) {
-                if (result.compressed_ids[kept_index] == query_ids[query_index]) {
+                if (result.compressed_ids[kept_index] == semantic_query_ids[query_index]) {
                     ++query_kept;
                     --query_index;
                 }
             }
         }
         const float survival = (float) query_kept /
-            (std::max)(1, (int) query_ids.size());
+            (std::max)(1, (int) semantic_query_ids.size());
         std::fprintf(stderr,
             "[pflash] query survival: %d/%d (%.0f%%)\n",
-            query_kept, (int) query_ids.size(), survival * 100.0f);
-        if (survival < 0.80f && (int) query_ids.size() < 1000) {
+            query_kept, (int) semantic_query_ids.size(), survival * 100.0f);
+        if (survival < 0.80f && (int) semantic_query_ids.size() < 1000) {
             compressed_text += "\n" + last_user_text;
             std::fprintf(stderr,
                 "[pflash] query below 80%% — re-appended full query (%d tokens)\n",
-                (int) query_ids.size());
+                (int) semantic_query_ids.size());
         } else if (survival < 0.80f) {
             std::fprintf(stderr,
                 "[pflash] query below 80%% but too large to re-append (%d tokens)\n",
-                (int) query_ids.size());
+                (int) semantic_query_ids.size());
         }
     }
 
-    prepared.tokens = tokenizer_.encode(compressed_text);
+    auto final_tokens = tokenizer_.encode(compressed_text);
+    if (experiment.selection_active) {
+        const int target_ceiling = http_detail::pflash_target_token_ceiling(
+            prompt_tokens, compress_request.keep_ratio);
+        if (target_ceiling < 0) {
+            return "PFlash LongAttnComp target-token ceiling is invalid";
+        }
+        std::fprintf(stderr,
+            "[pflash-longattncomp] final target tokens=%zu ceiling=%d\n",
+            final_tokens.size(), target_ceiling);
+        std::fflush(stderr);
+        if ((int) final_tokens.size() > target_ceiling) {
+            return "PFlash LongAttnComp final prompt exceeds target-token ceiling "
+                "(" + std::to_string(final_tokens.size()) + " > " +
+                std::to_string(target_ceiling) + ")";
+        }
+    }
+    prepared.tokens = std::move(final_tokens);
     prepared.compressed = true;
     std::fprintf(stderr,
         "[pflash] %d -> %d -> %d tokens (%.1f%% kept)\n",
@@ -3004,6 +3284,27 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
              prompt_tokens >= config_.pflash_threshold);
         const bool continuation = should_compress &&
             is_continuation_request(req.messages);
+        const bool longattncomp_environment =
+            dflash::qwen3::has_pflash_longattncomp_environment();
+        if (should_compress && longattncomp_environment) {
+            dflash::qwen3::PFlashLongAttnCompConfig experiment;
+            std::string experiment_error;
+            if (!dflash::qwen3::resolve_pflash_longattncomp(
+                    0, 32, experiment, experiment_error)) {
+                prepared.error_status = 500;
+                prepared.error = "invalid PFlash LongAttnComp config: " +
+                    experiment_error;
+                return prepared;
+            }
+            if (http_detail::pflash_continuation_must_fail_closed(
+                    longattncomp_environment) &&
+                (continuation || req.disk_cache_policy.compress)) {
+                prepared.error_status = 500;
+                prepared.error =
+                    "PFlash LongAttnComp does not support continuation or FlowKV compression";
+                return prepared;
+            }
+        }
 
         if (should_compress && continuation && req.messages.is_array()) {
             // FlowKV owns continuation compression automatically. Falling
