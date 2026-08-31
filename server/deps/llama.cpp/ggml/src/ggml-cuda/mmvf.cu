@@ -4,6 +4,8 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
+#include <cstdlib>
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst,
@@ -834,6 +836,16 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                static const bool gfx1151_hc_q4_mmvf = [] {
+                    const char * value = std::getenv("DFLASH_GFX1151_HC_MMVF_Q4");
+                    return value == nullptr || std::atoi(value) != 0;
+                }();
+                if (gfx1151_hc_q4_mmvf &&
+                    cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+                    src0_ne[0] == 16384 && src0_ne[1] == 24 &&
+                    src0_ne[2] == 1 && src0_ne[3] == 1 && ne11 == 4) {
+                    return true;
+                }
                 if (fp16_mma_hardware_available(cc)) {
                     if (GGML_CUDA_CC_IS_RDNA3(cc)) {
                         return ne11 <= 3;

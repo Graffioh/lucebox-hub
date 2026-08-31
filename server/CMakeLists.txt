@@ -885,6 +885,23 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_cuda_pool_shutdown)
     endif()
 
+    if((DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmvf_dispatch.cpp")
+        add_executable(test_mmvf_dispatch test/test_mmvf_dispatch.cpp)
+        target_include_directories(test_mmvf_dispatch PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        target_link_libraries(test_mmvf_dispatch PRIVATE
+            ${DFLASH27B_GGML_BACKEND_TARGET} ggml ggml-base)
+        list(APPEND _raw_unit_test_targets test_mmvf_dispatch)
+        add_test(NAME mmvf_dispatch_disabled
+            COMMAND test_mmvf_dispatch disabled)
+        set_tests_properties(mmvf_dispatch_disabled PROPERTIES
+            ENVIRONMENT "DFLASH_GFX1151_HC_MMVF_Q4=0")
+    endif()
+
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda"
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_comm_api.cpp")
         add_executable(test_cuda_comm_api test/test_cuda_comm_api.cpp)
@@ -1897,6 +1914,8 @@ if(DFLASH27B_TESTS)
                 set(_unit_ctest_name "${_unit_target}")
                 if(_unit_target STREQUAL "test_cuda_pool_shutdown")
                     set(_unit_ctest_name cuda_pool_shutdown)
+                elseif(_unit_target STREQUAL "test_mmvf_dispatch")
+                    set(_unit_ctest_name mmvf_dispatch_enabled)
                 elseif(_unit_target STREQUAL "test_rocmfp4")
                     set(_unit_ctest_name rocmfp4_reference)
                 elseif(_unit_target STREQUAL "test_rocmfpx")
@@ -1920,6 +1939,10 @@ if(DFLASH27B_TESTS)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
                 set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
+                if(_unit_target STREQUAL "test_mmvf_dispatch")
+                    set_tests_properties("${_unit_ctest_name}" PROPERTIES
+                        ENVIRONMENT "DFLASH_GFX1151_HC_MMVF_Q4=1")
+                endif()
                 if(_unit_target STREQUAL "test_rocmfp3_mix_registry")
                     # Its leak assertion reads GLOBAL free VRAM (cudaMemGetInfo) before and
                     # after 4000 register/unregister cycles, so any other test allocating on

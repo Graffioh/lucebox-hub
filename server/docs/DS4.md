@@ -386,6 +386,13 @@ resident experts. Increase `--kv-pool-tokens` only when the primary has enough
 memory for the larger
 shared history pool.
 
+On monolithic gfx1151, a four-lane gathered step uses MMVF for each
+`[16384,24]` per-layer F16 hyper-connection mix projection. Set
+`DFLASH_GFX1151_HC_MMVF_Q4=0` to restore generic dispatch during burn-in.
+The `[16384,4]` output hyper-connection projection is not changed.
+R9700-primary heterogeneous serving is unchanged because the per-layer
+projections remain on gfx1201.
+
 Paged concurrency fails closed for other primary/secondary architecture pairs,
 CUDA or out-of-process expert ownership, explicit layer or remote target
 splits, drafts/DSpark, DDTree, PFlash/KVFlash, fused decode, approximate
