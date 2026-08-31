@@ -8502,7 +8502,7 @@ bool deepseek4_step_layer_range(
                 "materialized_cold=%d cold_backend_kind_gpu=%d "
                 "cold_backend_distinct=%d; verify falls back to the dense "
                 "full-expert path\n",
-                n_tokens, GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS,
+                n_tokens, GGML_CUDA_DS4_FUSED_VERIFY_MAX_TOKENS,
                 verify_hooks ? 1 : 0, out_logits ? 1 : 0,
                 ds4_backend_is_gpu(backend) ? 1 : 0,
                 moe_hybrid ? 1 : 0, expert_runtime ? 1 : 0,

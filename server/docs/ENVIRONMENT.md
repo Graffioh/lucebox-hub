@@ -46,6 +46,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
 | `DFLASH_GFX1151_HC_MMVF_Q4` | 1 | KILL SWITCH (remove after burn-in): =0 restores generic dispatch for the four-column `[16384,24]` per-layer F16 hyper-connection mix projection on gfx1151. |
 | `DFLASH_ROCMFP2_ROW4` | unset | UNQUALIFIED OPT-IN: exact value `1` selects four-row qtype-106 MoE matvecs only for q=3/q=4 on gfx1151. All other values keep the two-row path. The runtime caches the value on first eligible dispatch; restart the server after changing it. |
+| `DFLASH_DS4_BATCH_Q6_MMV` | unset | UNQUALIFIED OPT-IN: exact value `1` extends the registry-aware qtype-105/106 mixed-weight MMV and fused gate/up dispatch from q=5 to q=6. It does not enable q=6 speculative verification. The runtime caches the value on first dispatch; restart the server after changing it. |
 | `DFLASH_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | unset | DEBUG/A-B: restore the serial indexed-attention mask scan instead of the long-context HIP parallel scan. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
@@ -144,6 +145,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_GEMMA4_LAYER_SPLIT_UBATCH` - gemma4_layer_split_adapter.cpp
 - `DFLASH_GEMMA4_NO_KVPAD` - gemma4_graph.cpp
 - `DFLASH_GFX1151_HC_MMVF_Q4` - mmvf.cu
+- `DFLASH_DS4_BATCH_Q6_MMV` - ggml-cuda.cu
 - `DFLASH_ROCMFP2_ROW4` - rocmfp2_mix.cu
 - `DFLASH_GPU_ARGMAX` - qwen35_backend.cpp
 - `DFLASH_GPU_DRAFT_TOPK` - qwen35_dflash_target.cpp

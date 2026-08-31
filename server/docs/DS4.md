@@ -408,6 +408,16 @@ caches the setting on first eligible dispatch, so restart the server after
 changing it. No correctness or performance qualification is claimed yet; keep
 it unset until the LuceLoop qualification run passes.
 
+Six-row paged service can reach a separate unqualified direct-dispatch trial.
+Set `DFLASH_DS4_BATCH_Q6_MMV=1` before server startup to let the existing
+registry-aware qtype-105/106 mixed-weight matvec and fused gate/up kernels
+accept q=6. The kernel already maps model rows independently on `grid.z`; this
+switch changes only the q=5 dispatch ceiling and its matching graph-capture
+eligibility check. It does not enable the explicitly unsupported q=6 DSpark
+verifier. q=1 through q=5 are unchanged, q=7 and wider remain on the existing
+fallback, and the value is cached on first dispatch. Keep it unset until q=6
+output, state, graph-replay, and performance qualification passes.
+
 Paged concurrency fails closed for other primary/secondary architecture pairs,
 CUDA or out-of-process expert ownership, explicit layer or remote target
 splits, drafts/DSpark, DDTree, PFlash/KVFlash, fused decode, approximate

@@ -878,6 +878,15 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_rocmfp2_mix_dispatch)
     endif()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_mix_mmv_dispatch.cpp")
+        # Pure host-side q6 opt-in and width-boundary dispatch contract.
+        add_executable(test_ds4_mix_mmv_dispatch
+            test/test_ds4_mix_mmv_dispatch.cpp)
+        target_include_directories(test_ds4_mix_mmv_dispatch PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
+        list(APPEND _raw_unit_test_targets test_ds4_mix_mmv_dispatch)
+    endif()
+
     if((DFLASH27B_GPU_BACKEND STREQUAL "hip" OR
         DFLASH27B_GPU_BACKEND STREQUAL "cuda")
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cuda_pool_shutdown.cpp")
