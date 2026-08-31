@@ -10,6 +10,8 @@
 // Usage:
 //   test_generate <qwen35.gguf> <prompt_ids.bin> <n_gen> <out_ids.bin>
 //   test_generate --seq-engine-contract <qwen35.gguf> [slots]
+//   test_generate --seq-engine-mixed-spec-contract <qwen35.gguf>
+//                 <draft.gguf|safetensors> [slots]
 
 #include "dflash27b.h"
 #include "internal.h"
@@ -58,6 +60,14 @@ struct GenerateStepGraph {
     ggml_tensor *     inp_embed = nullptr;
     ggml_tensor *     positions = nullptr;
     ggml_tensor *     logits    = nullptr;
+};
+
+class ContractQwen35Backend final : public Qwen35Backend {
+public:
+    using Qwen35Backend::Qwen35Backend;
+
+    const StepGraph & step_graph() const { return target_step_graph(); }
+    const TargetCache & cache() const { return target_cache(); }
 };
 
 // Build a fresh single-token forward graph. We rebuild per step so that
@@ -125,9 +135,384 @@ static bool write_generate_tokens(const std::string & path,
     return (bool)f;
 }
 
-static int run_seq_engine_contract(const char * gguf_path, int slots) {
-    if (slots < 2 || slots > 64) {
-        std::fprintf(stderr, "slots must be in [2, 64], got %d\n", slots);
+static std::vector<std::string> check_mixed_spec_prompt_tail(
+        ContractQwen35Backend & backend, SeqEngine & engine) {
+    std::vector<std::string> violations;
+    const auto require = [&](bool ok, const char * message) {
+        if (!ok) violations.emplace_back(message);
+        return ok;
+    };
+    const auto capture_recurrent_state = [&](int slot,
+                                             std::vector<uint8_t> & bytes) {
+        const TargetCache & cache = backend.cache();
+        if (slot < 0 || slot >= cache.n_seq_slots) return false;
+        bytes.clear();
+        const auto append_slot = [&](ggml_tensor * tensor) {
+            if (!tensor || ggml_nbytes(tensor) % cache.n_seq_slots != 0) {
+                return false;
+            }
+            const size_t slab = ggml_nbytes(tensor) / cache.n_seq_slots;
+            const size_t old_size = bytes.size();
+            bytes.resize(old_size + slab);
+            ggml_backend_tensor_get(
+                tensor, bytes.data() + old_size,
+                static_cast<size_t>(slot) * slab, slab);
+            return true;
+        };
+        for (ggml_tensor * tensor : cache.conv_state) {
+            if (!append_slot(tensor)) return false;
+        }
+        for (ggml_tensor * tensor : cache.ssm_state) {
+            if (!append_slot(tensor)) return false;
+        }
+        return !bytes.empty();
+    };
+
+    std::vector<int32_t> completing_prompt(1024);
+    std::vector<int32_t> remaining_prompt(1025);
+    for (size_t i = 0; i < completing_prompt.size(); ++i) {
+        completing_prompt[i] = 11 + static_cast<int32_t>(i % 4);
+    }
+    for (size_t i = 0; i < remaining_prompt.size(); ++i) {
+        remaining_prompt[i] = 21 + static_cast<int32_t>(i % 5);
+    }
+
+    struct CaseResult {
+        int32_t prompt_token = -1;
+        int32_t decoder_token = -1;
+        int32_t peer_token = -1;
+        std::vector<uint8_t> recurrent_state;
+    };
+    const char * paged_wmma_env = std::getenv("DFLASH27B_PAGED_WMMA");
+    const bool paged_wmma = paged_wmma_env && std::atoi(paged_wmma_env) != 0;
+    uint64_t next_request_id = 100;
+    const auto run_case = [&](int tail_tokens, bool allow_speculation,
+                              bool ar_peer, CaseResult & output) {
+        const SamplerCfg greedy{};
+        const PrefixCaptureTicket completing_capture{
+            next_request_id++, {1, 1024}};
+        const PrefixCaptureTicket remaining_capture{
+            next_request_id++, {2, 1024}};
+        std::vector<int> live_slots;
+        const auto retire_all = [&]() {
+            for (int slot : live_slots) engine.retire(slot);
+            live_slots.clear();
+            engine.discard_prefix_store(completing_capture.checkpoint);
+            engine.discard_prefix_store(remaining_capture.checkpoint);
+        };
+        const auto admit = [&](const std::vector<int32_t> & prompt,
+                               PrefixCaptureTicket capture = {}) {
+            PrefixStorePlan prefix;
+            prefix.capture = capture;
+            const SeqEngine::AdmitResult admitted = capture.valid()
+                ? engine.admit_with_prefix(
+                      next_request_id++, prompt, greedy, prefix)
+                : engine.admit(next_request_id++, prompt, greedy);
+            if (admitted.status !=
+                SeqEngine::AdmitResult::Status::admitted) {
+                return -1;
+            }
+            live_slots.push_back(admitted.slot);
+            if (!require(admitted.prefix_store.capture == capture,
+                         "mixed-spec prefill did not arm its prefix capture")) {
+                return -1;
+            }
+            return admitted.slot;
+        };
+        const auto decode_token = [](
+                const SeqEngine::StepResult & result, int slot,
+                int32_t & token) {
+            const auto it = std::find_if(
+                result.decode.begin(), result.decode.end(),
+                [slot](const SeqEngine::DecodeOutput & row) {
+                    return row.slot == slot;
+                });
+            if (it == result.decode.end() || it->failed || it->token < 0) {
+                return false;
+            }
+            token = it->token;
+            return true;
+        };
+
+        const int established_a = admit({31, 32});
+        const int established_b = admit({41, 42});
+        if (!require(established_a >= 0 && established_b >= 0,
+                     "mixed-spec boundary fixture could not admit decoders")) {
+            retire_all();
+            return false;
+        }
+        SeqEngine::StepPlan establish_plan;
+        establish_plan.prefills.push_back({established_a, 2});
+        establish_plan.prefills.push_back({established_b, 2});
+        const SeqEngine::StepResult established = engine.step(establish_plan);
+        if (!require(established.ok() && established.prefills.size() == 2,
+                     "mixed-spec boundary fixture could not establish decoders")) {
+            retire_all();
+            return false;
+        }
+        int32_t token_a = -1;
+        int32_t token_b = -1;
+        for (const SeqEngine::PrefillOutput & row : established.prefills) {
+            if (row.slot == established_a) token_a = row.token;
+            if (row.slot == established_b) token_b = row.token;
+        }
+        if (!require(token_a >= 0 && token_b >= 0,
+                     "mixed-spec boundary decoder prefill did not complete")) {
+            retire_all();
+            return false;
+        }
+
+        const int completing = admit(completing_prompt, completing_capture);
+        const int remaining = admit(remaining_prompt, remaining_capture);
+        if (!require(completing >= 0 && remaining >= 0,
+                     "mixed-spec boundary fixture could not admit prefills")) {
+            retire_all();
+            return false;
+        }
+
+        // Preserve the original 512+512 mixed case. For shorter tails,
+        // seed both runs with identical ordinary steps so the final graph
+        // alone determines any durable-state difference.
+        const std::vector<int> seed_chunks = tail_tokens == 512
+            ? std::vector<int>{512} : std::vector<int>{512, 512 - tail_tokens};
+        for (int chunk : seed_chunks) {
+            const bool seed_speculation = allow_speculation && tail_tokens == 512;
+            SeqEngine::StepPlan first_plan;
+            first_plan.decode.push_back(
+                {established_a, token_a, seed_speculation});
+            first_plan.decode.push_back(
+                {established_b, token_b, seed_speculation && !ar_peer});
+            first_plan.prefills.push_back({completing, chunk});
+            first_plan.prefills.push_back({remaining, chunk});
+            const SeqEngine::StepResult first = engine.step(first_plan);
+            if (!require(first.ok() && first.prefills.size() == 2,
+                         "mixed-spec boundary first prefill chunks failed") ||
+                !require(validate_step_result(
+                             first_plan, first, engine.slot_count()).empty(),
+                         "mixed-spec seed step returned invalid row results") ||
+                !require(decode_token(first, established_a, token_a) &&
+                             decode_token(first, established_b, token_b),
+                         "mixed-spec boundary first decode rows failed")) {
+                retire_all();
+                return false;
+            }
+            for (const auto & row : first.prefills) {
+                require(!row.prefix_store.attempted(),
+                        "mixed-spec prefix capture occurred before its boundary");
+            }
+        }
+
+        SeqEngine::StepPlan boundary_plan;
+        boundary_plan.decode.push_back(
+            {established_a, token_a, allow_speculation});
+        boundary_plan.decode.push_back(
+            {established_b, token_b, allow_speculation && !ar_peer});
+        boundary_plan.prefills.push_back({completing, tail_tokens});
+        boundary_plan.prefills.push_back({remaining, tail_tokens});
+        const SeqEngine::StepResult boundary = engine.step(boundary_plan);
+        if (!require(boundary.ok(),
+                     "mixed-spec 1024-token boundary step failed") ||
+            !require(validate_step_result(
+                         boundary_plan, boundary, engine.slot_count()).empty(),
+                     "mixed-spec boundary returned invalid row results") ||
+            !require(decode_token(boundary, established_a, token_a) &&
+                         decode_token(boundary, established_b, token_b),
+                     "mixed-spec boundary decode rows failed")) {
+            retire_all();
+            return false;
+        }
+        const auto completing_row = std::find_if(
+            boundary.prefills.begin(), boundary.prefills.end(),
+            [completing](const SeqEngine::PrefillOutput & row) {
+                return row.slot == completing;
+            });
+        const auto remaining_row = std::find_if(
+            boundary.prefills.begin(), boundary.prefills.end(),
+            [remaining](const SeqEngine::PrefillOutput & row) {
+                return row.slot == remaining;
+            });
+        if (!require(
+                completing_row != boundary.prefills.end() &&
+                    completing_row->status ==
+                        SeqEngine::PrefillOutput::Status::completed,
+                "mixed-spec boundary completing prefill did not complete") ||
+            !require(
+                remaining_row != boundary.prefills.end() &&
+                    remaining_row->status ==
+                        SeqEngine::PrefillOutput::Status::advanced,
+                "mixed-spec boundary peer did not remain in prefill")) {
+            retire_all();
+            return false;
+        }
+        const auto saved_capture = [](const PrefixStoreEvent & event,
+                                      PrefixCaptureTicket expected) {
+            return event.status == PrefixStoreEvent::Status::saved &&
+                event.ticket == expected && event.bytes > 0 &&
+                event.error.empty();
+        };
+        require(saved_capture(completing_row->prefix_store, completing_capture),
+                "mixed-spec completing prefill did not save its prefix capture");
+        require(saved_capture(remaining_row->prefix_store, remaining_capture),
+                "mixed-spec advancing prefill did not save its prefix capture");
+        output.prompt_token = completing_row->token;
+        output.decoder_token = token_a;
+        output.peer_token = token_b;
+        if (!require(capture_recurrent_state(
+                         completing, output.recurrent_state),
+                     "mixed-spec boundary recurrent-state capture failed")) {
+            retire_all();
+            return false;
+        }
+
+        // Keeping up to eight ordinary rows preserves the quantized/floating
+        // matvec routes (MMVQ/MMVF). Opt-in WMMA also retains its ordinary graph.
+        const bool expect_tree = allow_speculation &&
+            2 * tail_tokens + 2 > 8 && !paged_wmma;
+        const StepGraph & graph = backend.step_graph();
+        if (!expect_tree) {
+            require(!graph.parent_ids,
+                    "mixed prefill changed the protected ordinary target graph");
+            for (const auto & row : boundary.decode) {
+                require(row.committed_tokens.empty(),
+                        "ordinary mixed-prefill fallback returned speculative tokens");
+            }
+        } else {
+            const bool tree_graph = require(
+                graph.parent_ids && graph.logits_row_indices &&
+                    graph.argmax_tokens,
+                "mixed prefill did not retain the fixed-chain target graph");
+            if (tree_graph) {
+                const int tree_width =
+                    static_cast<int>(graph.parent_ids->ne[0]);
+                const int tree_lanes =
+                    static_cast<int>(graph.parent_ids->ne[1]);
+                const int logits_count =
+                    static_cast<int>(graph.logits_row_indices->ne[0]);
+                const int ar_rows = ar_peer ? 1 : 0;
+                require(tree_width == 8 && tree_lanes == 2 - ar_rows,
+                        "mixed prefill used the wrong fixed-chain W8 bucket");
+                const int expected_logits = tree_width * tree_lanes + 1 + ar_rows;
+                require(logits_count == expected_logits,
+                        "mixed prefill produced the wrong compact logits shape");
+                if (logits_count == expected_logits) {
+                    std::vector<int32_t> logits_rows(
+                        static_cast<size_t>(logits_count), -1);
+                    ggml_backend_tensor_get(
+                        graph.logits_row_indices, logits_rows.data(), 0,
+                        sizeof(int32_t) * logits_rows.size());
+                    require(logits_rows[0] == tail_tokens - 1,
+                            "mixed speculative prompt tail did not gather its final row");
+                    for (int row = 1; row < logits_count; ++row) {
+                        require(
+                            logits_rows[static_cast<size_t>(row)] ==
+                                2 * tail_tokens + row - 1,
+                            "mixed speculative tree logits were not gathered "
+                            "after the direct prefix");
+                    }
+                }
+            }
+        }
+        // The peer's capture boundary precedes prompt completion. Its next
+        // ordinary step must complete without emitting the capture a second time.
+        SeqEngine::StepPlan finish_plan;
+        finish_plan.decode = {
+            {established_a, token_a, false},
+            {established_b, token_b, false},
+            {completing, output.prompt_token, false}};
+        finish_plan.prefills.push_back({remaining, 1});
+        const SeqEngine::StepResult finished = engine.step(finish_plan);
+        require(finished.ok() &&
+                    std::all_of(finished.decode.begin(), finished.decode.end(),
+                                [](const auto & row) { return !row.failed; }) &&
+                    validate_step_result(
+                        finish_plan, finished, engine.slot_count()).empty() &&
+                    finished.prefills.size() == 1 &&
+                    finished.prefills[0].status ==
+                        SeqEngine::PrefillOutput::Status::completed &&
+                    !finished.prefills[0].prefix_store.attempted(),
+                "mixed-spec prefix capture disrupted the remaining prefill");
+        retire_all();
+        return true;
+    };
+
+    for (int tail_tokens : {512, 9, 3, 1}) {
+        CaseResult ordinary;
+        if (!run_case(tail_tokens, false, false, ordinary)) continue;
+        // Tail nine stays above the protected matvec range and checks compact
+        // AR rows beside a speculative lane with identical seed history.
+        const int variants = tail_tokens == 9 ? 2 : 1;
+        for (int variant = 0; variant < variants; ++variant) {
+            CaseResult speculative;
+            if (!run_case(tail_tokens, true, variant == 1, speculative)) continue;
+            require(speculative.prompt_token == ordinary.prompt_token,
+                    "mixed speculation changed the 1024-token prompt-tail result");
+            require(speculative.recurrent_state == ordinary.recurrent_state,
+                    "mixed speculation changed durable convolution/Gated DeltaNet state");
+            const bool ordinary_route = paged_wmma || 2 * tail_tokens + 2 <= 8;
+            if (ordinary_route) {
+                require(speculative.decoder_token == ordinary.decoder_token,
+                        "mixed-prefill fallback changed the decoder's next token");
+            }
+            if (variant == 1 || ordinary_route) {
+                require(speculative.peer_token == ordinary.peer_token,
+                        "mixed speculation changed the ordinary peer's next token");
+            }
+        }
+    }
+    // The first pending token is at position 249, so a width-eight proposal
+    // crosses the ordinary 256-token attention launch window. Keep this
+    // round ordinary even though its twenty rows exceed the matvec fallback.
+    std::vector<int> boundary_slots;
+    const auto admit_boundary = [&](int count, int32_t token) {
+        const auto admitted = engine.admit(
+            next_request_id++, std::vector<int32_t>(count, token), SamplerCfg{});
+        if (!require(admitted.status == SeqEngine::AdmitResult::Status::admitted,
+                     "launch-boundary fixture could not admit a request")) {
+            return -1;
+        }
+        boundary_slots.push_back(admitted.slot);
+        return admitted.slot;
+    };
+    const int boundary_a = admit_boundary(249, 31);
+    const int boundary_b = admit_boundary(249, 41);
+    if (boundary_a >= 0 && boundary_b >= 0) {
+        SeqEngine::StepPlan seed;
+        seed.prefills = {{boundary_a, 249}, {boundary_b, 249}};
+        const auto seeded = engine.step(seed);
+        if (require(seeded.ok() && seeded.prefills.size() == 2,
+                    "launch-boundary fixture could not seed decoders")) {
+            const int prefill_a = admit_boundary(9, 11);
+            const int prefill_b = admit_boundary(9, 21);
+            if (prefill_a >= 0 && prefill_b >= 0) {
+                SeqEngine::StepPlan crossing;
+                for (const auto & row : seeded.prefills) {
+                    crossing.decode.push_back({row.slot, row.token, true});
+                }
+                crossing.prefills = {{prefill_a, 9}, {prefill_b, 9}};
+                const auto result = engine.step(crossing);
+                require(result.ok() &&
+                            validate_step_result(crossing, result,
+                                                 engine.slot_count()).empty(),
+                        "launch-boundary fallback returned invalid results");
+                require(!backend.step_graph().parent_ids,
+                        "mixed chain crossed the ordinary attention launch window");
+                for (const auto & row : result.decode) {
+                    require(!row.failed && row.committed_tokens.empty(),
+                            "launch-boundary fallback attempted speculation");
+                }
+            }
+        }
+    }
+    for (int slot : boundary_slots) engine.retire(slot);
+    return violations;
+}
+
+static int run_seq_engine_contract(
+        const char * gguf_path, const char * draft_path, int slots) {
+    const int min_slots = draft_path ? 4 : 2;
+    if (slots < min_slots || slots > 64) {
+        std::fprintf(stderr, "slots must be in [%d, 64], got %d\n",
+                     min_slots, slots);
         return 2;
     }
 
@@ -140,13 +525,18 @@ static int run_seq_engine_contract(const char * gguf_path, int slots) {
 
     Qwen35Config cfg;
     cfg.target_path = gguf_path;
+    cfg.draft_path = draft_path;
+    cfg.draft_block_size = draft_path ? 8 : 0;
     cfg.device.gpu = 0;
-    cfg.device.max_ctx = 256;
+    cfg.device.max_ctx = draft_path ? 1152 : 256;
     cfg.draft_gpu = 0;
     cfg.paged_attention = true;
     cfg.max_concurrency = slots;
+    cfg.kv_pool_tokens = draft_path
+        ? static_cast<int64_t>(cfg.device.max_ctx) * slots
+        : 0;
 
-    Qwen35Backend backend(cfg);
+    ContractQwen35Backend backend(cfg);
     if (!backend.init()) {
         std::fprintf(stderr, "seq-engine backend init failed: %s\n",
                      dflash27b_last_error());
@@ -160,15 +550,21 @@ static int run_seq_engine_contract(const char * gguf_path, int slots) {
         return 1;
     }
 
-    const std::vector<std::string> violations =
-        check_seq_engine_contract(*engine);
+    std::vector<std::string> violations = check_seq_engine_contract(*engine);
+    if (violations.empty() && draft_path) {
+        std::vector<std::string> mixed_violations =
+            check_mixed_spec_prompt_tail(backend, *engine);
+        violations.insert(
+            violations.end(), mixed_violations.begin(),
+            mixed_violations.end());
+    }
     for (const std::string & violation : violations) {
         std::fprintf(stderr, "seq-engine contract: %s\n", violation.c_str());
     }
     if (!violations.empty()) return 1;
 
-    std::printf("seq-engine contract passed against Qwen35Backend (%d slots)\n",
-                slots);
+    std::printf("seq-engine %scontract passed against Qwen35Backend (%d slots)\n",
+                draft_path ? "mixed-spec " : "", slots);
     return 0;
 }
 
@@ -182,14 +578,28 @@ int main(int argc, char ** argv) {
             return 2;
         }
         const int slots = argc == 4 ? std::atoi(argv[3]) : 4;
-        return run_seq_engine_contract(argv[2], slots);
+        return run_seq_engine_contract(argv[2], nullptr, slots);
+    }
+    if (argc >= 2 &&
+        std::strcmp(argv[1], "--seq-engine-mixed-spec-contract") == 0) {
+        if (argc < 4 || argc > 5) {
+            std::fprintf(stderr,
+                "usage: %s --seq-engine-mixed-spec-contract "
+                "<qwen35.gguf> <draft.gguf|safetensors> [slots]\n",
+                argv[0]);
+            return 2;
+        }
+        const int slots = argc == 5 ? std::atoi(argv[4]) : 4;
+        return run_seq_engine_contract(argv[2], argv[3], slots);
     }
 
     if (argc < 5) {
         std::fprintf(stderr,
             "usage: %s <qwen35.gguf> <prompt_ids.bin> <n_gen> <out_ids.bin>\n"
-            "       %s --seq-engine-contract <qwen35.gguf> [slots]\n",
-            argv[0], argv[0]);
+            "       %s --seq-engine-contract <qwen35.gguf> [slots]\n"
+            "       %s --seq-engine-mixed-spec-contract <qwen35.gguf> "
+            "<draft.gguf|safetensors> [slots]\n",
+            argv[0], argv[0], argv[0]);
         return 2;
     }
     const char * gguf_path   = argv[1];

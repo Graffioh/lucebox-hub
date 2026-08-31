@@ -5818,7 +5818,8 @@ static struct ggml_tensor * ggml_paged_attn_ext_impl(
         struct ggml_tensor  * tree_sizes,
         int                   tree_width,
         int                   tree_scratch_base,
-        int                   tree_scratch_stride) {
+        int                   tree_scratch_stride,
+        int                   reference_query_rows) {
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q4_0 || v->type == GGML_TYPE_Q8_0);
@@ -5831,6 +5832,8 @@ static struct ggml_tensor * ggml_paged_attn_ext_impl(
     GGML_ASSERT(query_positions == NULL || query_positions->type == GGML_TYPE_I32);
 
     const bool tree_mode = parent_ids != NULL || tree_sizes != NULL;
+    GGML_ASSERT(reference_query_rows >= 0);
+    GGML_ASSERT(tree_mode || reference_query_rows == 0);
     GGML_ASSERT((parent_ids == NULL) == (tree_sizes == NULL));
     GGML_ASSERT(!tree_mode || active_slot_ids != NULL);
     // Mixed direct-commit batches use causal positions for a compact AR
@@ -5913,6 +5916,7 @@ static struct ggml_tensor * ggml_paged_attn_ext_impl(
     ggml_set_op_params_i32(result, 3, tree_width);
     ggml_set_op_params_i32(result, 4, tree_scratch_base);
     ggml_set_op_params_i32(result, 5, tree_scratch_stride);
+    ggml_set_op_params_i32(result, 6, reference_query_rows);
 
     result->op     = GGML_OP_PAGED_ATTN;
     result->src[0] = q;
@@ -5943,7 +5947,7 @@ struct ggml_tensor * ggml_paged_attn_ext(
     return ggml_paged_attn_ext_impl(
         ctx, q, k, v, block_table, kv_seq_lens,
         active_slot_ids, query_positions, scale, block_size,
-        max_kv_seq_len, NULL, NULL, 0, 0, 0);
+        max_kv_seq_len, NULL, NULL, 0, 0, 0, 0);
 }
 
 struct ggml_tensor * ggml_paged_attn_ext_tree(
@@ -5961,7 +5965,8 @@ struct ggml_tensor * ggml_paged_attn_ext_tree(
         struct ggml_tensor  * parent_ids,
         struct ggml_tensor  * tree_sizes,
         int                   tree_scratch_base,
-        int                   tree_scratch_stride) {
+        int                   tree_scratch_stride,
+        int                   reference_query_rows) {
     GGML_ASSERT(parent_ids != NULL);
     GGML_ASSERT(parent_ids->ne[0] > 0 && parent_ids->ne[0] <= INT_MAX);
     const int tree_width = (int) parent_ids->ne[0];
@@ -5969,7 +5974,7 @@ struct ggml_tensor * ggml_paged_attn_ext_tree(
         ctx, q, k, v, block_table, kv_seq_lens,
         active_slot_ids, query_positions, scale, block_size,
         max_kv_seq_len, parent_ids, tree_sizes, tree_width,
-        tree_scratch_base, tree_scratch_stride);
+        tree_scratch_base, tree_scratch_stride, reference_query_rows);
 }
 
 // ggml_flash_attn_back

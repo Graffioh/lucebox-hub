@@ -247,6 +247,7 @@ static __global__ void paged_attn_decode(
         int32_t tree_row_offset,
         int32_t tree_scratch_base,
         int32_t tree_scratch_stride,
+        bool causal_tree_partitions,
         float scale) {
     constexpr int nthreads = WARP_SIZE;
     constexpr int values_per_load = 4;
@@ -315,12 +316,13 @@ static __global__ void paged_attn_decode(
         : (kv_seq_len_raw < table_capacity
             ? kv_seq_len_raw
             : (int32_t) table_capacity);
-    // Treat the candidate slab as a virtual tail of tree_width tokens. The
-    // normal partition split then covers prefix and tree candidates in one
-    // stable softmax; invisible siblings/padding resolve to no physical row.
+    // Ordinary trees partition the full virtual candidate slab. Mixed
+    // fixed chains use each node's causal extent so invisible future nodes
+    // cannot change the reduction of the ordinary committed prefix.
+    const int32_t candidate_tokens = tree_query
+        ? (causal_tree_partitions ? query_node + 1 : tree_width) : 0;
     const int64_t virtual_tokens = valid_query
-        ? (int64_t) kv_seq_len + (tree_query ? tree_width : 0)
-        : 0;
+        ? (int64_t) kv_seq_len + candidate_tokens : 0;
     const int32_t n_logical_blocks =
         paged_attn_ceil_div(virtual_tokens, block_size);
     const int32_t active_partitions =
@@ -800,7 +802,8 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
     const int32_t tree_width = ggml_get_op_params_i32(dst, 3);
     const int32_t tree_scratch_base = ggml_get_op_params_i32(dst, 4);
     const int32_t tree_scratch_stride = ggml_get_op_params_i32(dst, 5);
-    if (block_size <= 0 ||
+    const int32_t reference_query_rows = ggml_get_op_params_i32(dst, 6);
+    if (reference_query_rows < 0 || block_size <= 0 ||
         max_kv_seq_len <= 0 ||
         (int64_t) max_kv_seq_len + tree_width > INT32_MAX ||
         k->ne[1] % block_size != 0) {
@@ -810,7 +813,7 @@ bool ggml_cuda_paged_attn_supported(const ggml_tensor * dst) {
     if (!tree_mode) {
         return tree_width == 0 &&
                tree_scratch_base == 0 &&
-               tree_scratch_stride == 0;
+               tree_scratch_stride == 0 && reference_query_rows == 0;
     }
 
     if (tree_width <= 0 ||
@@ -905,6 +908,7 @@ static bool try_launch_paged_attn(
     const int32_t tree_width = ggml_get_op_params_i32(dst, 3);
     const int32_t tree_scratch_base = ggml_get_op_params_i32(dst, 4);
     const int32_t tree_scratch_stride = ggml_get_op_params_i32(dst, 5);
+    const int32_t reference_query_rows = ggml_get_op_params_i32(dst, 6);
 
     const int32_t n_head    = (int32_t) q->ne[2];
     const int32_t n_head_kv = (int32_t) k->ne[2];
@@ -957,7 +961,9 @@ static bool try_launch_paged_attn(
         1);
 
     const int64_t output_rows = q->ne[1] * q->ne[2];
-    const int64_t work_groups = q->ne[1] * head_groups;
+    const int64_t partition_rows = reference_query_rows > 0
+        ? reference_query_rows : q->ne[1];
+    const int64_t work_groups = partition_rows * head_groups;
     const int64_t target_blocks =
         (int64_t) ggml_cuda_info().devices[ctx.device].nsm *
         max_blocks_per_sm;
@@ -971,25 +977,26 @@ static bool try_launch_paged_attn(
     // repeat the per-partition fixed costs. Scale the cap so the total
     // partition count stays roughly constant across batch sizes.
     int32_t partition_limit =
-        PAGED_ATTN_MAX_PARTITIONS / (int32_t) q->ne[1];
+        (int32_t) (PAGED_ATTN_MAX_PARTITIONS / partition_rows);
     if (partition_limit < 32) {
         partition_limit = 32;
     }
     if (min_partitions > partition_limit) {
         min_partitions = partition_limit;
     }
-    const int32_t tree_blocks = paged_attn_ceil_div(tree_width, block_size);
-    const int64_t partitionable_blocks =
-        block_table->ne[0] + (parent_ids ? tree_blocks : 0);
+    const int32_t launch_tree_width = parent_ids && reference_query_rows == 0
+        ? tree_width : 0;
+    const int32_t tree_blocks = paged_attn_ceil_div(launch_tree_width, block_size);
+    const int64_t partitionable_blocks = block_table->ne[0] + tree_blocks;
     if (min_partitions > partitionable_blocks) {
         min_partitions = (int32_t) partitionable_blocks;
     }
 
-    // Size the launch from the live maximum committed prefix plus the virtual
-    // tree tail. Ragged/tree rows still clamp their own active partition count
-    // from device metadata.
+    // Reference partitions use the ordinary launch bound, already covering
+    // every candidate. Other trees retain their full virtual-tail bound.
+    // Each row still derives its active partitions from device metadata.
     const int64_t live_tokens =
-        (int64_t) max_kv_seq_len + (parent_ids ? tree_width : 0);
+        (int64_t) max_kv_seq_len + launch_tree_width;
     const int32_t live_blocks =
         paged_attn_ceil_div(live_tokens, block_size);
     int32_t n_partitions = paged_attn_partitions(
@@ -1089,6 +1096,7 @@ static bool try_launch_paged_attn(
             : 0,
         tree_scratch_base,
         tree_scratch_stride,
+        reference_query_rows > 0,
         scale);
 
     if (n_partitions > 1) {
