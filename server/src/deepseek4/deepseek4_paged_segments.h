@@ -7,6 +7,8 @@
 namespace dflash::common {
 
 inline constexpr uint32_t DEEPSEEK4_MAX_PAGED_SEGMENT_ROWS = 4;
+inline constexpr int64_t DEEPSEEK4_PAGED_SEGMENT_SHAPE_KEY_V1 =
+    0x4453345345470001LL;
 
 enum class DeepSeek4PagedSegmentKind : uint8_t {
     decode,
@@ -125,5 +127,15 @@ bool prepare_deepseek4_paged_layer_rows(
     const DeepSeek4PagedStepLayout & layout,
     uint32_t compression_ratio,
     std::vector<DeepSeek4LayerSegmentRows> & out);
+
+// Build only the graph topology key. Token values, physical cache addresses,
+// output selection, and other uploaded values intentionally do not fragment
+// replay. layer_rows is layer-major and must describe every layout segment.
+bool build_deepseek4_paged_segment_shape_key(
+    const DeepSeek4PagedStepLayout & layout,
+    const std::vector<std::vector<DeepSeek4LayerSegmentRows>> & layer_rows,
+    bool token_id_mode,
+    bool hybrid_mode,
+    std::vector<int64_t> & out);
 
 } // namespace dflash::common

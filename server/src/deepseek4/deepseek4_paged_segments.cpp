@@ -4,6 +4,7 @@
 #include "deepseek4_page_layout.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <unordered_set>
@@ -14,6 +15,7 @@ namespace {
 
 static_assert(DEEPSEEK4_MAX_PAGED_SEGMENT_ROWS <=
               uint32_t(DEEPSEEK4_MAX_PAGED_SEQUENCES));
+static_assert(DEEPSEEK4_PAGED_SEGMENT_SHAPE_KEY_V1 != 0x5041474544LL);
 
 bool checked_table_size(uint32_t slots, uint32_t stride, size_t & size) {
     if (!slots || !stride ||
@@ -50,6 +52,54 @@ bool segment_table_row(const DeepSeek4PagedStepLayout & layout,
     physical_block = layout.compact_block_tables[index];
     return physical_block >= 0 &&
            uint32_t(physical_block) < layout.physical_blocks;
+}
+
+bool same_token_rows(const DeepSeek4SegmentTokenRows & lhs,
+                     const DeepSeek4SegmentTokenRows & rhs) {
+    return lhs.raw_write_row == rhs.raw_write_row &&
+           lhs.initial_raw_suffix == rhs.initial_raw_suffix &&
+           lhs.prior_segment_rows == rhs.prior_segment_rows &&
+           lhs.attention_ape_phase == rhs.attention_ape_phase &&
+           lhs.attention_state_row == rhs.attention_state_row &&
+           lhs.indexer_ape_phase == rhs.indexer_ape_phase &&
+           lhs.indexer_state_row == rhs.indexer_state_row &&
+           lhs.sees_emitted_compressed_row ==
+               rhs.sees_emitted_compressed_row;
+}
+
+bool same_layer_rows(const std::vector<DeepSeek4LayerSegmentRows> & lhs,
+                     const std::vector<DeepSeek4LayerSegmentRows> & rhs) {
+    if (lhs.size() != rhs.size()) return false;
+    for (size_t i = 0; i < lhs.size(); ++i) {
+        const DeepSeek4LayerSegmentRows & a = lhs[i];
+        const DeepSeek4LayerSegmentRows & b = rhs[i];
+        if (a.slot != b.slot ||
+            a.compression_ratio != b.compression_ratio ||
+            a.attention_state_slot != b.attention_state_slot ||
+            a.indexer_state_slot != b.indexer_state_slot ||
+            a.immutable_raw_history != b.immutable_raw_history ||
+            a.immutable_compressed_history !=
+                b.immutable_compressed_history ||
+            a.tokens.size() != b.tokens.size() ||
+            a.emission_token != b.emission_token ||
+            a.compressed_write_row != b.compressed_write_row ||
+            a.compressed_position != b.compressed_position) {
+            return false;
+        }
+        for (size_t token = 0; token < a.tokens.size(); ++token) {
+            if (!same_token_rows(a.tokens[token], b.tokens[token])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+int ratio_index(uint32_t ratio) {
+    if (ratio == 0) return 0;
+    if (ratio == 4) return 1;
+    if (ratio == 128) return 2;
+    return -1;
 }
 
 } // namespace
@@ -494,6 +544,107 @@ bool prepare_deepseek4_paged_layer_rows(
         return false;
     }
     out = std::move(prepared);
+    return true;
+}
+
+bool build_deepseek4_paged_segment_shape_key(
+        const DeepSeek4PagedStepLayout & layout,
+        const std::vector<std::vector<DeepSeek4LayerSegmentRows>> & layer_rows,
+        bool token_id_mode,
+        bool hybrid_mode,
+        std::vector<int64_t> & out) {
+    out.clear();
+    const size_t q = layout.token_ids.size();
+    const size_t segment_count = layout.segments.size();
+    if (!q || q > size_t(DEEPSEEK4_MAX_PAGED_SEQUENCES) ||
+        !segment_count || segment_count > q || layer_rows.empty() ||
+        layer_rows.size() > size_t(INT64_MAX)) {
+        return false;
+    }
+
+    bool saw_prefill = false;
+    for (const DeepSeek4PagedSegment & segment : layout.segments) {
+        saw_prefill = saw_prefill ||
+            segment.kind == DeepSeek4PagedSegmentKind::prefill;
+    }
+    if (!saw_prefill) return false;
+
+    std::array<std::vector<DeepSeek4LayerSegmentRows>, 3> canonical;
+    std::array<bool, 3> prepared = {false, false, false};
+    if (!prepare_deepseek4_paged_layer_rows(layout, 0, canonical[0])) {
+        return false;
+    }
+    prepared[0] = true;
+    for (const std::vector<DeepSeek4LayerSegmentRows> & layer : layer_rows) {
+        if (layer.size() != segment_count) return false;
+        const uint32_t ratio = layer.front().compression_ratio;
+        const int index = ratio_index(ratio);
+        if (index < 0) return false;
+        if (!prepared[size_t(index)]) {
+            if (!prepare_deepseek4_paged_layer_rows(
+                    layout, ratio, canonical[size_t(index)])) {
+                return false;
+            }
+            prepared[size_t(index)] = true;
+        }
+        if (!same_layer_rows(layer, canonical[size_t(index)])) {
+            return false;
+        }
+    }
+
+    const size_t per_layer = segment_count * 7 + q * 2;
+    const size_t fixed = 5 + segment_count * 6;
+    if (per_layer &&
+        layer_rows.size() >
+            (std::numeric_limits<size_t>::max() - fixed) / per_layer) {
+        return false;
+    }
+    std::vector<int64_t> key;
+    key.reserve(fixed + layer_rows.size() * per_layer);
+    key.push_back(DEEPSEEK4_PAGED_SEGMENT_SHAPE_KEY_V1);
+    key.push_back(static_cast<int64_t>(q));
+    key.push_back(static_cast<int64_t>(segment_count));
+    key.push_back(token_id_mode ? 1 : 0);
+    key.push_back(hybrid_mode ? 1 : 0);
+    for (const DeepSeek4PagedSegment & segment : layout.segments) {
+        key.push_back(segment.slot);
+        key.push_back(segment.row_offset);
+        key.push_back(segment.row_count);
+        key.push_back(segment.kind == DeepSeek4PagedSegmentKind::decode
+                          ? 0 : 1);
+        key.push_back(segment.phase4);
+        key.push_back(segment.phase128);
+    }
+
+    for (const std::vector<DeepSeek4LayerSegmentRows> & layer : layer_rows) {
+        for (size_t segment_index = 0; segment_index < segment_count;
+             ++segment_index) {
+            const DeepSeek4PagedSegment & segment =
+                layout.segments[segment_index];
+            const DeepSeek4LayerSegmentRows & rows = layer[segment_index];
+            const uint32_t ratio = rows.compression_ratio;
+            const bool emits = rows.emission_token >= 0;
+            const int64_t raw_live = static_cast<int64_t>(
+                rows.immutable_raw_history.size());
+            const int64_t comp_live = static_cast<int64_t>(
+                rows.immutable_compressed_history.size());
+            const int64_t state_publish_rows =
+                segment.kind == DeepSeek4PagedSegmentKind::prefill && ratio
+                    ? (ratio == 4 ? 8 : 128) : 0;
+            key.push_back(ratio);
+            key.push_back(raw_live);
+            key.push_back(std::max<int64_t>(1, raw_live));
+            key.push_back(comp_live);
+            key.push_back(std::max<int64_t>(1, comp_live));
+            key.push_back(emits ? 1 : 0);
+            key.push_back(state_publish_rows);
+            for (const DeepSeek4SegmentTokenRows & token : rows.tokens) {
+                key.push_back(token.initial_raw_suffix);
+                key.push_back(token.prior_segment_rows);
+            }
+        }
+    }
+    out = std::move(key);
     return true;
 }
 

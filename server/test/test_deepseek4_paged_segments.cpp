@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <initializer_list>
 #include <limits>
+#include <utility>
 #include <vector>
 
 using namespace dflash::common;
@@ -56,6 +57,18 @@ DeepSeek4PagedSegmentSpec segment(
         }
     }
     return spec;
+}
+
+std::vector<std::vector<DeepSeek4LayerSegmentRows>> layer_set(
+        const DeepSeek4PagedStepLayout & layout,
+        std::initializer_list<uint32_t> ratios) {
+    std::vector<std::vector<DeepSeek4LayerSegmentRows>> out;
+    for (uint32_t ratio : ratios) {
+        std::vector<DeepSeek4LayerSegmentRows> rows;
+        CHECK(prepare_deepseek4_paged_layer_rows(layout, ratio, rows));
+        out.push_back(std::move(rows));
+    }
+    return out;
 }
 
 void check_singleton_parity(DeepSeek4PagedSegmentKind kind,
@@ -366,6 +379,210 @@ int main() {
         CHECK(rows[0].immutable_compressed_history.back() == 63);
         CHECK(rows[0].emission_token == 1);
         CHECK(rows[0].compressed_write_row == 224);
+    }
+
+    // Segment graph keys retain topology while planner-valid dynamic metadata,
+    // output selection, and physical cache placement replay through one key.
+    // The graph boundary separately validates embedding payload dimensions.
+    {
+        std::vector<int32_t> tables = block_tables(3, 1);
+        set_table(tables, 1, 0, {1});
+        set_table(tables, 1, 1, {4});
+        DeepSeek4PagedStepLayout layout;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {
+                segment(DeepSeek4PagedSegmentKind::decode, 0, 8, 1,
+                        tables, 1),
+                segment(DeepSeek4PagedSegmentKind::prefill, 1, 10, 2,
+                        tables, 1, true),
+            },
+            tables, 3, 128, 1, 6, layout));
+        auto layers = layer_set(layout, {0, 4, 128});
+        std::vector<int64_t> key;
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            layout, layers, true, false, key));
+        CHECK(!key.empty());
+        CHECK(key.front() == DEEPSEEK4_PAGED_SEGMENT_SHAPE_KEY_V1);
+        CHECK(key.front() != 0x5041474544LL);
+
+        std::vector<int32_t> dynamic_tables = block_tables(3, 1);
+        set_table(dynamic_tables, 1, 0, {2});
+        set_table(dynamic_tables, 1, 1, {5});
+        DeepSeek4PagedSegmentSpec dynamic_decode = segment(
+            DeepSeek4PagedSegmentKind::decode, 0, 8, 1,
+            dynamic_tables, 1, false, true);
+        DeepSeek4PagedSegmentSpec dynamic_prefill = segment(
+            DeepSeek4PagedSegmentKind::prefill, 1, 10, 2,
+            dynamic_tables, 1);
+        for (int32_t & token : dynamic_decode.token_ids) token += 101;
+        for (int32_t & token : dynamic_prefill.token_ids) token += 303;
+        DeepSeek4PagedStepLayout dynamic_layout;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {dynamic_decode, dynamic_prefill}, dynamic_tables,
+            3, 128, 1, 6, dynamic_layout));
+        dynamic_layout.embeddings = {1.0f, 2.0f, 3.0f};
+        auto dynamic_layers = layer_set(dynamic_layout, {0, 4, 128});
+        std::vector<int64_t> dynamic_key;
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            dynamic_layout, dynamic_layers, true, false, dynamic_key));
+        CHECK(dynamic_key == key);
+
+        std::vector<int64_t> other_key;
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            layout, layers, false, false, other_key));
+        CHECK(other_key != key);
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            layout, layers, true, true, other_key));
+        CHECK(other_key != key);
+
+        std::vector<int32_t> slot_tables = block_tables(3, 1);
+        set_table(slot_tables, 1, 0, {1});
+        set_table(slot_tables, 1, 2, {4});
+        DeepSeek4PagedStepLayout other_slot;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {
+                segment(DeepSeek4PagedSegmentKind::decode, 0, 8, 1,
+                        slot_tables, 1),
+                segment(DeepSeek4PagedSegmentKind::prefill, 2, 10, 2,
+                        slot_tables, 1, true),
+            },
+            slot_tables, 3, 128, 1, 6, other_slot));
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            other_slot, layer_set(other_slot, {0, 4, 128}),
+            true, false, other_key));
+        CHECK(other_key != key);
+
+        DeepSeek4PagedStepLayout other_kind;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {
+                segment(DeepSeek4PagedSegmentKind::prefill, 0, 8, 1,
+                        tables, 1),
+                segment(DeepSeek4PagedSegmentKind::prefill, 1, 10, 2,
+                        tables, 1, true),
+            },
+            tables, 3, 128, 1, 6, other_kind));
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            other_kind, layer_set(other_kind, {0, 4, 128}),
+            true, false, other_key));
+        CHECK(other_key != key);
+
+        DeepSeek4PagedStepLayout other_phase;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {
+                segment(DeepSeek4PagedSegmentKind::decode, 0, 8, 1,
+                        tables, 1),
+                segment(DeepSeek4PagedSegmentKind::prefill, 1, 9, 2,
+                        tables, 1, true),
+            },
+            tables, 3, 128, 1, 6, other_phase));
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            other_phase, layer_set(other_phase, {0, 4, 128}),
+            true, false, other_key));
+        CHECK(other_key != key);
+
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            layout, {layers[0]}, true, false, other_key));
+        CHECK(other_key != key);
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            layout, {layers[1]}, true, false, dynamic_key));
+        CHECK(dynamic_key != other_key);
+
+        std::vector<int32_t> row_tables = block_tables(2, 1);
+        set_table(row_tables, 1, 0, {0});
+        set_table(row_tables, 1, 1, {1});
+        DeepSeek4PagedStepLayout rows12;
+        DeepSeek4PagedStepLayout rows21;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {
+                segment(DeepSeek4PagedSegmentKind::prefill, 0, 8, 1,
+                        row_tables, 1),
+                segment(DeepSeek4PagedSegmentKind::prefill, 1, 8, 2,
+                        row_tables, 1),
+            },
+            row_tables, 2, 128, 1, 2, rows12));
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {
+                segment(DeepSeek4PagedSegmentKind::prefill, 0, 8, 2,
+                        row_tables, 1),
+                segment(DeepSeek4PagedSegmentKind::prefill, 1, 8, 1,
+                        row_tables, 1),
+            },
+            row_tables, 2, 128, 1, 2, rows21));
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            rows12, layer_set(rows12, {0}), false, false, other_key));
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            rows21, layer_set(rows21, {0}), false, false, dynamic_key));
+        CHECK(other_key != dynamic_key);
+
+        // Same q/owner/kind/phase with different raw-history and suffix
+        // topology must not replay the same graph.
+        std::vector<int32_t> history_tables = block_tables(1, 2);
+        set_table(history_tables, 2, 0, {0, 1});
+        DeepSeek4PagedStepLayout at0;
+        DeepSeek4PagedStepLayout at128;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {segment(DeepSeek4PagedSegmentKind::prefill, 0, 0, 2,
+                     history_tables, 2)},
+            history_tables, 1, 256, 2, 2, at0));
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {segment(DeepSeek4PagedSegmentKind::prefill, 0, 128, 2,
+                     history_tables, 2)},
+            history_tables, 1, 256, 2, 2, at128));
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            at0, layer_set(at0, {0}), false, false, other_key));
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            at128, layer_set(at128, {0}), false, false, dynamic_key));
+        CHECK(other_key != dynamic_key);
+
+        // Absolute positions and page deltas remain dynamic when every keyed
+        // topology consequence is identical.
+        std::vector<int32_t> shifted_tables = block_tables(1, 3);
+        set_table(shifted_tables, 3, 0, {0, 1, 2});
+        DeepSeek4PagedStepLayout at256;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {segment(DeepSeek4PagedSegmentKind::prefill, 0, 256, 2,
+                     shifted_tables, 3)},
+            shifted_tables, 1, 384, 3, 3, at256));
+        DeepSeek4PagedStepLayout shifted_at128;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {segment(DeepSeek4PagedSegmentKind::prefill, 0, 128, 2,
+                     shifted_tables, 3)},
+            shifted_tables, 1, 384, 3, 3, shifted_at128));
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            shifted_at128, layer_set(shifted_at128, {0}),
+            false, false, other_key));
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            at256, layer_set(at256, {0}),
+            false, false, dynamic_key));
+        CHECK(other_key == dynamic_key);
+
+        std::vector<int64_t> stale_key = {7};
+        DeepSeek4PagedStepLayout stale_layout = layout;
+        ++stale_layout.positions[0];
+        CHECK(!build_deepseek4_paged_segment_shape_key(
+            stale_layout, layers, true, false, stale_key));
+        CHECK(stale_key.empty());
+        stale_key = {7};
+        auto stale_layers = layers;
+        ++stale_layers[0][1].tokens[0].raw_write_row;
+        CHECK(!build_deepseek4_paged_segment_shape_key(
+            layout, stale_layers, true, false, stale_key));
+        CHECK(stale_key.empty());
+        stale_key = {7};
+        CHECK(!build_deepseek4_paged_segment_shape_key(
+            layout, {}, true, false, stale_key));
+        CHECK(stale_key.empty());
+
+        DeepSeek4PagedStepLayout decode_only;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {segment(DeepSeek4PagedSegmentKind::decode, 0, 8, 1,
+                     tables, 1)},
+            tables, 3, 128, 1, 6, decode_only));
+        stale_key = {7};
+        CHECK(!build_deepseek4_paged_segment_shape_key(
+            decode_only, layer_set(decode_only, {0}),
+            true, false, stale_key));
+        CHECK(stale_key.empty());
     }
 
     // Invalid ownership, shape, ordering, addressing, and unsafe compressor
