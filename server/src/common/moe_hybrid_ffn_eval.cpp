@@ -872,7 +872,8 @@ static bool build_batched_routed_graph(
     // Weight and sum over experts: [n_embd, n_used, n_tokens] * [1, n_used, n_tokens]
     if (!defer_route_reduction && allow_fused_combine &&
         (force_fused_combine || moe_hybrid_graph_policy().fused_combine)) {
-        *out_routed = track(ggml_laguna_moe_combine(ctx, experts, wts));
+        *out_routed = track(ggml_ds4_moe_fused_combine_shared(
+            ctx, experts, wts, nullptr));
         return *out_routed != nullptr;
     }
 

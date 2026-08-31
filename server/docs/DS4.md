@@ -429,6 +429,13 @@ anchor all state-publication work and exposes no token or logits. Keep the
 switch unset until prompt TTFT, live-decoder TBT, output identity, and graph
 replay pass.
 
+PR #658's `DFLASH_MOE_FUSED_COMBINE=1` path also applies to paged serving.
+Each expert owner uses its ordered, masked post-MMID combine kernel in place of
+the older scalar combine operation. The existing owner join, shared expert,
+top-6 head4-plus-tail2 grouping, and cross-runtime canonical reduction remain
+unchanged. This PR598 adapter is unqualified until C1-C6 output identity and
+owner-path performance pass on both supported deployments.
+
 Paged concurrency fails closed for other primary/secondary architecture pairs,
 CUDA or out-of-process expert ownership, explicit layer or remote target
 splits, drafts/DSpark, DDTree, PFlash/KVFlash, fused decode, approximate
