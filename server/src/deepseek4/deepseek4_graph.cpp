@@ -7772,6 +7772,7 @@ struct DeepSeek4PagedSegmentPreparedStep {
     int q = 0;
     int output_count = 0;
     int graph_output_q = 0;
+    int capture_count = 0;
     std::vector<uint8_t> requested_logits;
     std::vector<int32_t> row_slots;
     bool submitted = false;
@@ -7900,12 +7901,24 @@ bool deepseek4_paged_gathered_step(
         uint32_t block_table_stride, const uint8_t * logit_lanes,
         std::vector<float> & out_logits, std::vector<int32_t> & out_argmax,
         MoeHybridStorage * hybrid,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats,
+        const std::vector<int> * capture_layer_ids,
+        std::vector<float> * out_capture) {
+    if (out_capture) out_capture->clear();
+    const std::vector<int> empty_capture;
+    const std::vector<int> & capture_ids = capture_layer_ids
+        ? *capture_layer_ids : empty_capture;
     if (!backend || !embeddings || !positions || !slots || !block_tables ||
         !logit_lanes ||
         lanes < 1 || lanes > DEEPSEEK4_MAX_PAGED_SEQUENCES ||
         cache.layers.size() != (size_t) w.n_layer ||
-        block_table_stride < cache.plan.max_blocks_per_sequence) return false;
+        block_table_stride < cache.plan.max_blocks_per_sequence ||
+        ((!capture_ids.empty()) != (out_capture != nullptr))) return false;
+    std::vector<uint8_t> capture_seen(size_t(std::max(w.n_layer, 0)), 0);
+    for (int layer : capture_ids) {
+        if (layer < 0 || layer >= w.n_layer ||
+            capture_seen[size_t(layer)]++) return false;
+    }
     for (uint32_t lane = 0; lane < lanes; ++lane) {
         if (slots[lane] < 0) continue;
         if ((uint32_t) slots[lane] >= cache.plan.slots || positions[lane] < 0 ||
@@ -7970,6 +7983,8 @@ bool deepseek4_paged_gathered_step(
     std::vector<int64_t> key = {DS4_PAGED_GATHERED_SHAPE_KEY_V1,
                                 (int64_t) lanes,
                                 token_ids ? 1 : 0, hybrid ? 1 : 0};
+    key.push_back(int64_t(capture_ids.size()));
+    for (int layer : capture_ids) key.push_back(layer);
     for (uint32_t lane = 0; lane < lanes; ++lane) key.push_back(slots[lane]);
     for (int il = 0; il < w.n_layer; ++il) {
         const uint32_t ratio = cache.layers[(size_t) il].ratio;
@@ -8016,7 +8031,7 @@ bool deepseek4_paged_gathered_step(
                 mc, *fg, *ex, backend, w, nullptr,
                 rt->model.hc_layer_weights, rt->model.hc_output_weights,
                 rt->model.hash_routing_tables, 0, (int) lanes,
-                token_ids != nullptr, {}, hybrid, std::move(key),
+                token_ids != nullptr, capture_ids, hybrid, std::move(key),
                 &cache, &prepared)) {
             std::fprintf(stderr,
                 "[deepseek4-paged] failed to build gathered graph "
@@ -8123,6 +8138,22 @@ bool deepseek4_paged_gathered_step(
         return false;
     }
     ds4_fused_consume_route_diagnostics(*fg, hybrid, routing_stats, slots);
+    if (out_capture) {
+        const int64_t capture_width =
+            int64_t(capture_ids.size()) * w.n_embd;
+        if (!ex->capture || ex->capture->type != GGML_TYPE_F32 ||
+            ex->capture->ne[0] != capture_width ||
+            ex->capture->ne[1] != lanes || ex->capture->ne[2] != 1 ||
+            ex->capture->ne[3] != 1 || capture_width < 1 ||
+            size_t(capture_width) >
+                std::numeric_limits<size_t>::max() / lanes) {
+            return false;
+        }
+        out_capture->resize(size_t(capture_width) * lanes);
+        ggml_backend_tensor_get(
+            ex->capture, out_capture->data(), 0,
+            out_capture->size() * sizeof(float));
+    }
     out_argmax.resize(lanes);
     ggml_backend_tensor_get(ex->argmax, out_argmax.data(), 0,
                             out_argmax.size() * sizeof(int32_t));
@@ -8167,8 +8198,12 @@ bool deepseek4_prepare_paged_segment_step(
         DeepSeek4PagedCache & cache,
         const DeepSeek4PagedStepLayout & layout,
         MoeHybridStorage * hybrid,
-        DeepSeek4PagedSegmentPreparedStep *& out) {
+        DeepSeek4PagedSegmentPreparedStep *& out,
+        const std::vector<int> * capture_layer_ids) {
     out = nullptr;
+    const std::vector<int> empty_capture;
+    const std::vector<int> & capture_ids = capture_layer_ids
+        ? *capture_layer_ids : empty_capture;
     const size_t q = layout.token_ids.size();
     if (!backend || w.n_embd <= 0 || q < 1 ||
         q > size_t(DEEPSEEK4_MAX_PAGED_SEQUENCES) ||
@@ -8182,13 +8217,18 @@ bool deepseek4_prepare_paged_segment_step(
         !ds4_paged_hybrid_is_immutable(hybrid, w.n_layer)) {
         return false;
     }
+    std::vector<uint8_t> capture_seen(size_t(std::max(w.n_layer, 0)), 0);
+    for (int layer : capture_ids) {
+        if (layer < 0 || layer >= w.n_layer ||
+            capture_seen[size_t(layer)]++) return false;
+    }
     for (int64_t position : layout.positions) {
         if (position < 0 || position > INT32_MAX) return false;
     }
     bool saw_prefill = false;
     for (const DeepSeek4PagedSegment & segment : layout.segments) {
         saw_prefill = saw_prefill ||
-            segment.kind == DeepSeek4PagedSegmentKind::prefill;
+            segment.kind != DeepSeek4PagedSegmentKind::decode;
     }
     if (!saw_prefill) return false;
 
@@ -8233,6 +8273,8 @@ bool deepseek4_prepare_paged_segment_step(
             hybrid != nullptr, key)) {
         return false;
     }
+    key.push_back(int64_t(capture_ids.size()));
+    for (int layer : capture_ids) key.push_back(layer);
     const bool pack_outputs = ds4_paged_output_pack_enabled();
     if (pack_outputs) {
         key.push_back(DS4_PAGED_OUTPUT_PACK_KEY_V1);
@@ -8283,7 +8325,7 @@ bool deepseek4_prepare_paged_segment_step(
                 rt->model.hc_layer_weights,
                 rt->model.hc_output_weights,
                 rt->model.hash_routing_tables, 0, int(q),
-                /*have_token_ids=*/true, {}, hybrid, std::move(key),
+                /*have_token_ids=*/true, capture_ids, hybrid, std::move(key),
                 &cache, nullptr, &layout, &layer_rows, pack_outputs)) {
             std::fprintf(stderr,
                 "[deepseek4-paged] failed to build segment graph (q=%zu)\n",
@@ -8548,6 +8590,7 @@ bool deepseek4_prepare_paged_segment_step(
     prepared->q = int(q);
     prepared->output_count = int(output_count);
     prepared->graph_output_q = graph_output_q;
+    prepared->capture_count = int(capture_ids.size());
     rt->prepared_invocation = true;
     out = prepared;
     return true;
@@ -8557,9 +8600,11 @@ bool deepseek4_compute_paged_segment_step(
         DeepSeek4PagedSegmentPreparedStep & prepared,
         std::vector<float> & out_logits,
         std::vector<int32_t> & out_argmax,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats,
+        std::vector<float> * out_capture) {
     out_logits.clear();
     out_argmax.clear();
+    if (out_capture) out_capture->clear();
     if (prepared.submitted || prepared.completed || !prepared.runtime ||
         !prepared.runtime->prepared_invocation || !prepared.graph ||
         !prepared.extra || !prepared.weights || !prepared.backend ||
@@ -8569,6 +8614,8 @@ bool deepseek4_compute_paged_segment_step(
         prepared.extra->output_q != prepared.graph_output_q ||
         prepared.requested_logits.size() != size_t(prepared.output_count) ||
         prepared.row_slots.size() != size_t(prepared.q) ||
+        prepared.capture_count < 0 ||
+        ((prepared.capture_count > 0) != (out_capture != nullptr)) ||
         !prepared.graph->built() || !prepared.extra->argmax ||
         prepared.extra->argmax->type != GGML_TYPE_I32 ||
         prepared.extra->argmax->ne[0] != prepared.graph_output_q ||
@@ -8625,6 +8672,24 @@ bool deepseek4_compute_paged_segment_step(
     ds4_fused_consume_route_diagnostics(
         *prepared.graph, prepared.hybrid, routing_stats,
         prepared.row_slots.data());
+    if (out_capture) {
+        const int64_t capture_width = int64_t(prepared.capture_count) *
+            prepared.weights->n_embd;
+        if (!prepared.extra->capture ||
+            prepared.extra->capture->type != GGML_TYPE_F32 ||
+            prepared.extra->capture->ne[0] != capture_width ||
+            prepared.extra->capture->ne[1] != prepared.q ||
+            prepared.extra->capture->ne[2] != 1 ||
+            prepared.extra->capture->ne[3] != 1 || capture_width < 1 ||
+            size_t(capture_width) >
+                std::numeric_limits<size_t>::max() / size_t(prepared.q)) {
+            return false;
+        }
+        out_capture->resize(size_t(capture_width) * size_t(prepared.q));
+        ggml_backend_tensor_get(
+            prepared.extra->capture, out_capture->data(), 0,
+            out_capture->size() * sizeof(float));
+    }
     out_argmax.resize(size_t(prepared.output_count));
     if (!out_argmax.empty()) {
         ggml_backend_tensor_get(

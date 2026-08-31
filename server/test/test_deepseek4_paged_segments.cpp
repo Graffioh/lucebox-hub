@@ -270,6 +270,48 @@ int main() {
         CHECK(rows.size() == 6);
     }
 
+    // A paged DSpark candidate segment publishes state causally like prefill
+    // but exposes every posterior row to prefix acceptance. Its graph key is
+    // distinct from an otherwise identical prompt segment.
+    {
+        std::vector<int32_t> tables = block_tables(1, 1);
+        set_table(tables, 1, 0, {2});
+        DeepSeek4PagedStepLayout speculative;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {segment(DeepSeek4PagedSegmentKind::speculative_decode,
+                     0, 20, 3, tables, 1)},
+            tables, 1, 128, 1, 3, speculative));
+        CHECK(speculative.public_output_rows ==
+              std::vector<int32_t>({0, 1, 2}));
+        CHECK(speculative.row_to_public_output ==
+              std::vector<int32_t>({0, 1, 2}));
+        CHECK(speculative.requested_full_logits ==
+              std::vector<uint8_t>({0, 0, 0}));
+        std::vector<DeepSeek4LayerSegmentRows> speculative_rows;
+        CHECK(prepare_deepseek4_paged_layer_rows(
+            speculative, 4, speculative_rows));
+        CHECK(speculative_rows.size() == 1);
+        CHECK(speculative_rows[0].tokens.size() == 3);
+        CHECK(speculative_rows[0].tokens[0].prior_segment_rows == 0);
+        CHECK(speculative_rows[0].tokens[1].prior_segment_rows == 1);
+        CHECK(speculative_rows[0].tokens[2].prior_segment_rows == 2);
+
+        DeepSeek4PagedStepLayout prefill;
+        CHECK(prepare_deepseek4_paged_step_layout(
+            {segment(DeepSeek4PagedSegmentKind::prefill,
+                     0, 20, 3, tables, 1)},
+            tables, 1, 128, 1, 3, prefill));
+        std::vector<int64_t> speculative_key;
+        std::vector<int64_t> prefill_key;
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            speculative, layer_set(speculative, {4}), true, false,
+            speculative_key));
+        CHECK(build_deepseek4_paged_segment_shape_key(
+            prefill, layer_set(prefill, {4}), true, false,
+            prefill_key));
+        CHECK(speculative_key != prefill_key);
+    }
+
     // Snapshot geometry survives a raw-ring wrap. Each later query drops one
     // old snapshot row and reads one more predecessor through the F16 ring.
     {

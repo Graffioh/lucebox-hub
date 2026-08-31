@@ -13,6 +13,10 @@ inline constexpr int64_t DEEPSEEK4_PAGED_SEGMENT_SHAPE_KEY_V1 =
 enum class DeepSeek4PagedSegmentKind : uint8_t {
     decode,
     prefill,
+    // Candidate rows after an ordinary gathered q=1 root has already
+    // verified the first candidate. These rows use prompt-style causal state
+    // publication but expose every posterior row to the DSpark acceptor.
+    speculative_decode,
 };
 
 // One caller-owned slot in a service step. Tokens and pool rows are in
@@ -106,9 +110,10 @@ struct DeepSeek4PagedStepLayout {
     std::vector<int32_t> compact_block_tables;
 };
 
-// Validate and lower a decode-first list of unique slot owners. Decode
-// segments contain exactly one row, prefill segments contain one to four, and
-// the entire step contains at most six rows. The source table is slot-major.
+// Validate and lower a decode-first list of unique slot owners. Ordinary
+// decode segments contain exactly one row; prefill and speculative-decode
+// segments contain one to four. The entire step contains at most six rows.
+// The source table is slot-major.
 // max_context is the cache plan's exclusive logical-position bound. Every
 // visible physical page must have exactly one segment owner.
 bool prepare_deepseek4_paged_step_layout(

@@ -391,7 +391,9 @@ bool deepseek4_paged_gathered_step(
     uint32_t block_table_stride, const uint8_t * logit_lanes,
     std::vector<float> & out_logits, std::vector<int32_t> & out_argmax,
     MoeHybridStorage * moe_hybrid = nullptr,
-    MoeHybridRoutingStats * routing_stats = nullptr);
+    MoeHybridRoutingStats * routing_stats = nullptr,
+    const std::vector<int> * capture_layer_ids = nullptr,
+    std::vector<float> * out_capture = nullptr);
 // Split preparation from submission so the sequence engine can still roll
 // back staged slot/page-table changes while graph construction and input
 // uploads are fallible. The prepared invocation pins its cache slot until it
@@ -403,7 +405,8 @@ bool deepseek4_prepare_paged_segment_step(
     DeepSeek4PagedCache & cache,
     const DeepSeek4PagedStepLayout & layout,
     MoeHybridStorage * moe_hybrid,
-    DeepSeek4PagedSegmentPreparedStep *& out);
+    DeepSeek4PagedSegmentPreparedStep *& out,
+    const std::vector<int> * capture_layer_ids = nullptr);
 // Default mode returns q model rows. With paged output packing enabled, both
 // vectors use public-output order and may be empty for an intermediate-only
 // prompt step.
@@ -411,7 +414,8 @@ bool deepseek4_compute_paged_segment_step(
     DeepSeek4PagedSegmentPreparedStep & prepared,
     std::vector<float> & out_logits,
     std::vector<int32_t> & out_argmax,
-    MoeHybridRoutingStats * routing_stats = nullptr);
+    MoeHybridRoutingStats * routing_stats = nullptr,
+    std::vector<float> * out_capture = nullptr);
 void deepseek4_discard_paged_segment_step(
     DeepSeek4PagedSegmentPreparedStep * prepared);
 void deepseek4_release_paged_gathered_runtime(DeepSeek4PagedCache & cache);

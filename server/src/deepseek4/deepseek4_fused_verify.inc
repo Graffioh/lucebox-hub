@@ -429,7 +429,7 @@ static bool ds4_build_fused_verify_graph(
         bool saw_prefill = false;
         for (const DeepSeek4PagedSegment & segment : segment_layout->segments) {
             saw_prefill = saw_prefill ||
-                segment.kind == DeepSeek4PagedSegmentKind::prefill;
+                segment.kind != DeepSeek4PagedSegmentKind::decode;
         }
         if (!saw_prefill) return false;
         for (int il = 0; il < w.n_layer; ++il) {
@@ -844,8 +844,11 @@ static bool ds4_build_fused_verify_graph(
                     segment.kind == DeepSeek4PagedSegmentKind::decode;
                 const bool prefill =
                     segment.kind == DeepSeek4PagedSegmentKind::prefill;
+                const bool speculative = segment.kind ==
+                    DeepSeek4PagedSegmentKind::speculative_decode;
+                const bool causal_segment = prefill || speculative;
                 const bool emits = rows.emission_token >= 0;
-                if ((!decode && !prefill) ||
+                if ((!decode && !causal_segment) ||
                     segment.row_offset + segment.row_count > uint32_t(q) ||
                     rows.tokens.size() != size_t(segment.row_count) ||
                     rows.slot != segment.slot || rows.compression_ratio !=
@@ -865,7 +868,7 @@ static bool ds4_build_fused_verify_graph(
                 if (!rows.immutable_raw_history.empty()) {
                     immutable_raw = ggml_get_rows(
                         ctx, raw_flat, px.raw_gather);
-                    if (prefill) {
+                    if (causal_segment) {
                         immutable_raw = ggml_cont(ctx, immutable_raw);
                     }
                 }
@@ -946,7 +949,7 @@ static bool ds4_build_fused_verify_graph(
                     size_t(segment.row_offset) * attn_normed->nb[1]);
                 ggml_tensor * predecessor_rows = nullptr;
                 DeepSeek4PagedSegmentPublication publication{};
-                if (prefill) {
+                if (causal_segment) {
                     ggml_tensor * segment_kv = ggml_view_2d(
                         ctx, batched_proj.kv, w.head_dim, segment.row_count,
                         batched_proj.kv->nb[1],
@@ -1002,7 +1005,7 @@ static bool ds4_build_fused_verify_graph(
                     int n_comp_history = int(
                         rows.immutable_compressed_history.size());
 
-                    if (prefill) {
+                    if (causal_segment) {
                         raw_history = nullptr;
                         n_raw_history = 0;
                         if (token.initial_raw_suffix > 0) {

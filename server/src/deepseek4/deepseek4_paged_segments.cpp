@@ -142,16 +142,20 @@ bool prepare_deepseek4_paged_step_layout(
         const DeepSeek4PagedSegmentSpec & spec = specs[segment_index];
         const bool decode = spec.kind == DeepSeek4PagedSegmentKind::decode;
         const bool prefill = spec.kind == DeepSeek4PagedSegmentKind::prefill;
-        if (!decode && !prefill) return false;
-        if (decode && saw_prefill) return false;
+        const bool speculative =
+            spec.kind == DeepSeek4PagedSegmentKind::speculative_decode;
+        if (!decode && !prefill && !speculative) return false;
+        if ((decode || speculative) && saw_prefill) return false;
         saw_prefill = saw_prefill || prefill;
         if (spec.slot < 0 || uint32_t(spec.slot) >= slot_count ||
             !slot_owners.insert(spec.slot).second ||
             spec.start_position < 0 || spec.start_position > INT32_MAX ||
             (decode && spec.row_count != 1) ||
-            (prefill && (spec.row_count < 1 ||
-                         spec.row_count > DEEPSEEK4_MAX_PAGED_SEGMENT_ROWS)) ||
-            (decode && spec.prompt_tail) ||
+            ((prefill || speculative) &&
+             (spec.row_count < 1 ||
+              spec.row_count > DEEPSEEK4_MAX_PAGED_SEGMENT_ROWS)) ||
+            ((decode || speculative) && spec.prompt_tail) ||
+            (speculative && spec.needs_full_logits) ||
             spec.token_ids.size() != spec.row_count ||
             spec.pool_write_rows.size() != spec.row_count ||
             (spec.new_blocks.empty() != (spec.first_new_block < 0))) {
@@ -178,6 +182,8 @@ bool prepare_deepseek4_paged_step_layout(
         segment.prompt_tail = spec.prompt_tail;
         segment.output_row = decode
             ? int32_t(total_rows)
+            : speculative
+                ? int32_t(total_rows + spec.row_count - 1)
             : (spec.prompt_tail
                 ? int32_t(total_rows + spec.row_count - 1) : -1);
         segment.phase4 = uint8_t(uint64_t(spec.start_position) % 4);
@@ -263,6 +269,17 @@ bool prepare_deepseek4_paged_step_layout(
     prepared.row_to_public_output.assign(total_rows, -1);
     prepared.requested_full_logits.assign(total_rows, 0);
     for (size_t i = 0; i < prepared.segments.size(); ++i) {
+        const DeepSeek4PagedSegment & segment = prepared.segments[i];
+        if (segment.kind ==
+                DeepSeek4PagedSegmentKind::speculative_decode) {
+            for (uint32_t local = 0; local < segment.row_count; ++local) {
+                const int32_t row = int32_t(segment.row_offset + local);
+                prepared.row_to_public_output[size_t(row)] =
+                    static_cast<int32_t>(prepared.public_output_rows.size());
+                prepared.public_output_rows.push_back(row);
+            }
+            continue;
+        }
         const int32_t output_row = prepared.segments[i].output_row;
         if (output_row < 0) continue;
         if (uint32_t(output_row) >= total_rows) return false;
@@ -319,8 +336,10 @@ bool prepare_deepseek4_paged_layer_rows(
             segment.kind == DeepSeek4PagedSegmentKind::decode;
         const bool prefill =
             segment.kind == DeepSeek4PagedSegmentKind::prefill;
-        if ((!decode && !prefill) ||
-            (decode && saw_prefill) ||
+        const bool speculative =
+            segment.kind == DeepSeek4PagedSegmentKind::speculative_decode;
+        if ((!decode && !prefill && !speculative) ||
+            ((decode || speculative) && saw_prefill) ||
             segment.slot < 0 || uint32_t(segment.slot) >= layout.slot_count ||
             segment.row_offset != expected_offset ||
             !segment.row_count ||
@@ -348,9 +367,11 @@ bool prepare_deepseek4_paged_layer_rows(
         if (!segment_slots.insert(segment.slot).second) return false;
         const int32_t expected_output_row = decode
             ? int32_t(segment.row_offset)
+            : speculative
+                ? int32_t(segment.row_offset + segment.row_count - 1)
             : (segment.prompt_tail
                 ? int32_t(segment.row_offset + segment.row_count - 1) : -1);
-        if ((decode && segment.prompt_tail) ||
+        if (((decode || speculative) && segment.prompt_tail) ||
             segment.output_row != expected_output_row) {
             return false;
         }
@@ -400,7 +421,8 @@ bool prepare_deepseek4_paged_layer_rows(
                 }
                 ++derived_new_block_count;
             }
-            const bool is_output = int32_t(row) == expected_output_row;
+            const bool is_output = speculative ||
+                int32_t(row) == expected_output_row;
             if (is_output) {
                 if (expected_public_output >=
                         layout.public_output_rows.size() ||
@@ -565,7 +587,7 @@ bool build_deepseek4_paged_segment_shape_key(
     bool saw_prefill = false;
     for (const DeepSeek4PagedSegment & segment : layout.segments) {
         saw_prefill = saw_prefill ||
-            segment.kind == DeepSeek4PagedSegmentKind::prefill;
+            segment.kind != DeepSeek4PagedSegmentKind::decode;
     }
     if (!saw_prefill) return false;
 
@@ -611,7 +633,9 @@ bool build_deepseek4_paged_segment_shape_key(
         key.push_back(segment.row_offset);
         key.push_back(segment.row_count);
         key.push_back(segment.kind == DeepSeek4PagedSegmentKind::decode
-                          ? 0 : 1);
+                          ? 0
+                          : segment.kind == DeepSeek4PagedSegmentKind::prefill
+                              ? 1 : 2);
         key.push_back(segment.phase4);
         key.push_back(segment.phase128);
     }
@@ -629,7 +653,7 @@ bool build_deepseek4_paged_segment_shape_key(
             const int64_t comp_live = static_cast<int64_t>(
                 rows.immutable_compressed_history.size());
             const int64_t state_publish_rows =
-                segment.kind == DeepSeek4PagedSegmentKind::prefill && ratio
+                segment.kind != DeepSeek4PagedSegmentKind::decode && ratio
                     ? (ratio == 4 ? 8 : 128) : 0;
             key.push_back(ratio);
             key.push_back(raw_live);
