@@ -437,6 +437,7 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_graph.cpp
     src/deepseek4/deepseek4_roctx.cpp
     src/deepseek4/deepseek4_paged_cache.cpp
+    src/deepseek4/deepseek4_paged_segments.cpp
     src/deepseek4/deepseek4_seq_engine.cpp
     src/deepseek4/deepseek4_backend.cpp
     src/deepseek4/deepseek4_daemon.cpp
@@ -1471,6 +1472,18 @@ if(DFLASH27B_TESTS)
         target_include_directories(test_deepseek4_paged_cache PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_deepseek4_paged_cache)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_paged_segments.cpp")
+        # Pure DS4 host geometry: no model, ggml, or GPU is required.
+        add_executable(test_deepseek4_paged_segments
+            test/test_deepseek4_paged_segments.cpp
+            src/deepseek4/deepseek4_paged_cache.cpp
+            src/deepseek4/deepseek4_paged_segments.cpp)
+        target_compile_definitions(test_deepseek4_paged_segments PRIVATE
+            DFLASH_DS4_PLAN_ONLY=1)
+        target_include_directories(test_deepseek4_paged_segments PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        list(APPEND _raw_unit_test_targets test_deepseek4_paged_segments)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_slot_manager.cpp")
         # Host-side slot bookkeeping test (concurrent serving): no GPU.
