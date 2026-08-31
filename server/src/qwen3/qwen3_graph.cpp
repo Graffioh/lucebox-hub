@@ -478,11 +478,10 @@ bool forward_qwen3_drafter_model(
                         gA, Q, D, H, capture.tokens,
                         Q->nb[1], Q->nb[2],
                         (size_t)capture.chunk_offset * Q->nb[2]);
-                    Q_prenrope_tail = ggml_cont(gA, Q_prenrope_tail);
-                    Q_prenrope_tail = ggml_reshape_1d(
-                        gA, Q_prenrope_tail, D * H * capture.tokens);
-                    ggml_tensor * Q_prenrope_dst = ggml_view_1d(
-                        gA, Q_norope_v[si].t, D * H * capture.tokens,
+                    ggml_tensor * Q_prenrope_dst = ggml_view_3d(
+                        gA, Q_norope_v[si].t, D, H, capture.tokens,
+                        Q_norope_v[si].t->nb[1],
+                        Q_norope_v[si].t->nb[2],
                         (size_t)capture.query_offset * Q_norope_v[si].t->nb[2]);
                     ggml_build_forward_expand(gfA,
                         ggml_cpy(gA, Q_prenrope_tail, Q_prenrope_dst));
@@ -537,11 +536,10 @@ bool forward_qwen3_drafter_model(
                     gA, Q, D, H, capture.tokens,
                     Q->nb[1], Q->nb[2],
                     (size_t)capture.chunk_offset * Q->nb[2]);
-                Q_tail_local = ggml_cont(gA, Q_tail_local);
-                Q_tail_local = ggml_reshape_1d(
-                    gA, Q_tail_local, D * H * capture.tokens);
-                ggml_tensor * Q_tail_dst = ggml_view_1d(
-                    gA, Q_last_v[layer_cache_idx].t, D * H * capture.tokens,
+                ggml_tensor * Q_tail_dst = ggml_view_3d(
+                    gA, Q_last_v[layer_cache_idx].t, D, H, capture.tokens,
+                    Q_last_v[layer_cache_idx].t->nb[1],
+                    Q_last_v[layer_cache_idx].t->nb[2],
                     (size_t)capture.query_offset * Q_last_v[layer_cache_idx].t->nb[2]);
                 ggml_build_forward_expand(gfA,
                     ggml_cpy(gA, Q_tail_local, Q_tail_dst));
