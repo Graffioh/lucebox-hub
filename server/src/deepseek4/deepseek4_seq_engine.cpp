@@ -886,18 +886,24 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step_with_paged_segments(
         layout.requested_full_logits.begin(),
         layout.requested_full_logits.end(),
         [](uint8_t requested) { return requested != 0; });
+    const size_t public_output_count = layout.public_output_rows.size();
+    if (argmax.size() != q && argmax.size() != public_output_count) {
+        return fail_after_submit(
+            "DeepSeek4 paged segment output width is malformed");
+    }
+    const bool outputs_are_packed =
+        argmax.size() == public_output_count;
     size_t expected_logits = 0;
     if (any_full_logits) {
         if (b_.w_.n_vocab <= 0 ||
-            q > std::numeric_limits<size_t>::max() /
+            argmax.size() > std::numeric_limits<size_t>::max() /
                     size_t(b_.w_.n_vocab)) {
             return fail_after_submit(
                 "DeepSeek4 segment logits size overflow");
         }
-        expected_logits = q * size_t(b_.w_.n_vocab);
+        expected_logits = argmax.size() * size_t(b_.w_.n_vocab);
     }
-    if (argmax.size() != q ||
-        (any_full_logits && logits.size() != expected_logits) ||
+    if ((any_full_logits && logits.size() != expected_logits) ||
         (!any_full_logits && !logits.empty())) {
         return fail_after_submit(
             "DeepSeek4 paged segment outputs are malformed");
@@ -905,11 +911,15 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step_with_paged_segments(
 
     auto sample_row = [&](int slot_id, int32_t model_row) {
         SeqSlot & seq = slots_.slot(slot_id);
+        const int32_t public_row =
+            layout.row_to_public_output[size_t(model_row)];
+        const size_t output_row = outputs_are_packed
+            ? size_t(public_row) : size_t(model_row);
         if (!seq.sampler.needs_logit_processing()) {
-            return argmax[size_t(model_row)];
+            return argmax[output_row];
         }
         return sample_logits(
-            logits.data() + size_t(model_row) * size_t(b_.w_.n_vocab),
+            logits.data() + output_row * size_t(b_.w_.n_vocab),
             b_.w_.n_vocab, seq.sampler, seq.sample_history, seq.rng);
     };
 

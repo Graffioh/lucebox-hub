@@ -404,6 +404,9 @@ bool deepseek4_prepare_paged_segment_step(
     const DeepSeek4PagedStepLayout & layout,
     MoeHybridStorage * moe_hybrid,
     DeepSeek4PagedSegmentPreparedStep *& out);
+// Default mode returns q model rows. With paged output packing enabled, both
+// vectors use public-output order and may be empty for an intermediate-only
+// prompt step.
 bool deepseek4_compute_paged_segment_step(
     DeepSeek4PagedSegmentPreparedStep & prepared,
     std::vector<float> & out_logits,

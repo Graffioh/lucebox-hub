@@ -401,12 +401,14 @@ static bool ds4_build_fused_verify_graph(
         DeepSeek4PagedCache * paged_cache = nullptr,
         const std::vector<std::vector<DeepSeek4GatheredLaneRows>> * paged_rows = nullptr,
         const DeepSeek4PagedStepLayout * segment_layout = nullptr,
-        const std::vector<std::vector<DeepSeek4LayerSegmentRows>> * segment_rows = nullptr) {
+        const std::vector<std::vector<DeepSeek4LayerSegmentRows>> * segment_rows = nullptr,
+        bool pack_segment_outputs = false) {
     const bool gathered_paged_mode = paged_cache && paged_rows;
     const bool segment_paged_mode =
         paged_cache && segment_layout && segment_rows;
     const bool paged_mode = gathered_paged_mode || segment_paged_mode;
     if (gathered_paged_mode && segment_paged_mode) return false;
+    if (pack_segment_outputs && !segment_paged_mode) return false;
     if (!paged_mode && !cache) return false;
     if (gathered_paged_mode) {
         if (q < 1 || q > 16 ||
@@ -1387,16 +1389,37 @@ static bool ds4_build_fused_verify_graph(
         return false;
     }
 
-    // ── Batched output HC merge → out_norm + lm_head ──
-    ggml_tensor * onorm = ggml_rms_norm(ctx, hc_cur, w.hc_eps);
+    // Intermediate prompt rows have already published every persistent model
+    // state they own. Keep the body q-wide, then gather only decode rows and
+    // completed prompt tails for the public output projection. A no-output
+    // prefill step retains one private sentinel row as the terminal graph root.
+    ggml_tensor * output_hc = hc_cur;
+    int output_q = q;
+    if (pack_segment_outputs) {
+        const size_t public_count =
+            segment_layout->public_output_rows.size();
+        if (public_count > size_t(q)) return false;
+        output_q = int(std::max<size_t>(public_count, 1));
+        if (public_count < size_t(q)) {
+            ex.output_rows = ggml_new_tensor_1d(
+                ctx, GGML_TYPE_I32, output_q);
+            ggml_set_input(ex.output_rows);
+            output_hc = ggml_get_rows(ctx, hc_cur, ex.output_rows);
+        }
+    }
+    ex.output_q = output_q;
+    ggml_tensor * onorm = ggml_rms_norm(ctx, output_hc, w.hc_eps);
     ggml_tensor * omix = ggml_mul_mat(ctx, mc.fn_out_f16, onorm);
-    omix = ggml_reshape_2d(ctx, omix, ggml_nelements(omix) / q, q);
+    omix = ggml_reshape_2d(
+        ctx, omix, ggml_nelements(omix) / output_q, output_q);
     ggml_tensor * obase = ds4_fused_hc_base_f32(ctx, w.output_hc_base);
     if (!obase || hc_out_weights.scale_data.empty()) return false;
     ggml_tensor * final_all = ggml_ds4_hc_out(
-        ctx, omix, obase, hc_cur, n_hc, hc_out_weights.scale_data[0]);
+        ctx, omix, obase, output_hc, n_hc,
+        hc_out_weights.scale_data[0]);
     ggml_tensor * out_normed = build_rms_norm(ctx, final_all, w.out_norm, w.rms_eps);
-    fg.logits = ggml_mul_mat(ctx, w.output, out_normed);   // [n_vocab, q]
+    fg.logits = ggml_mul_mat(
+        ctx, w.output, out_normed);   // [n_vocab, output_q]
     ggml_set_output(fg.logits);
     ggml_build_forward_expand(gf, fg.logits);
     if (paged_mode || ds4_env_flag("DFLASH_DS4_GPU_ARGMAX_VERIFY")) {
@@ -1536,6 +1559,7 @@ static bool ds4_build_fused_verify_graph(
         pin_main(ex.paged_i32);
         pin_main(ex.paged_i64);
         pin_main(ex.paged_gather);
+        pin_main(ex.output_rows);
         for (const auto & px : ex.paged) {
             pin_main(px.pos); pin_main(px.neg_pos); pin_main(px.raw_gather); pin_main(px.comp_gather);
             pin_main(px.index_gather);

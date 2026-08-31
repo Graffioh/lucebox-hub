@@ -5481,7 +5481,8 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * st4 = nullptr;      // i64 [1,q]
         ggml_tensor * st128 = nullptr;    // i64 [1,q]
         ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap,q], token-major
-        ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
+        ggml_tensor * output_rows = nullptr; // i32 [output_q], segment mode
+        ggml_tensor * argmax = nullptr;   // i32 [output_q], optional greedy output
         // Reused host staging for the context-sized additive attention mask.
         // Keeping it per slot removes one allocation from every verify step.
         std::vector<float> mask_values;
@@ -5494,6 +5495,7 @@ struct Ds4FusedVerifyCache {
         int64_t paged_i64_n = 0;
         int64_t paged_gather_n = 0;
         int q = 0;
+        int output_q = 0;
 
         void reset() { *this = Extra{}; }
     };
@@ -5512,6 +5514,8 @@ struct Ds4FusedVerifyCache {
 
 static constexpr int64_t DS4_PAGED_GATHERED_SHAPE_KEY_V1 =
     0x5041474544LL;
+static constexpr int64_t DS4_PAGED_OUTPUT_PACK_KEY_V1 =
+    0x4453344f55545001LL;
 static_assert(DS4_PAGED_GATHERED_SHAPE_KEY_V1 !=
               DEEPSEEK4_PAGED_SEGMENT_SHAPE_KEY_V1);
 
@@ -7603,11 +7607,21 @@ struct DeepSeek4PagedSegmentPreparedStep {
     ggml_backend_t backend = nullptr;
     MoeHybridStorage * hybrid = nullptr;
     int q = 0;
+    int output_count = 0;
+    int graph_output_q = 0;
     std::vector<uint8_t> requested_logits;
     std::vector<int32_t> row_slots;
     bool submitted = false;
     bool completed = false;
 };
+
+static bool ds4_paged_output_pack_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("DFLASH_DS4_PAGED_OUTPUT_PACK");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
 
 static bool ds4_validate_paged_segment_cache(
         const DeepSeek4Weights & w,
@@ -8056,6 +8070,11 @@ bool deepseek4_prepare_paged_segment_step(
             hybrid != nullptr, key)) {
         return false;
     }
+    const bool pack_outputs = ds4_paged_output_pack_enabled();
+    if (pack_outputs) {
+        key.push_back(DS4_PAGED_OUTPUT_PACK_KEY_V1);
+        key.push_back(int64_t(layout.public_output_rows.size()));
+    }
 
     auto & vc = rt->model.fused_verify_graph_cache;
     auto & mc = rt->model.fused_decode_graph_cache;
@@ -8102,7 +8121,7 @@ bool deepseek4_prepare_paged_segment_step(
                 rt->model.hc_output_weights,
                 rt->model.hash_routing_tables, 0, int(q),
                 /*have_token_ids=*/true, {}, hybrid, std::move(key),
-                &cache, nullptr, &layout, &layer_rows)) {
+                &cache, nullptr, &layout, &layer_rows, pack_outputs)) {
             std::fprintf(stderr,
                 "[deepseek4-paged] failed to build segment graph (q=%zu)\n",
                 q);
@@ -8124,6 +8143,27 @@ bool deepseek4_prepare_paged_segment_step(
     ds4_fv_set(ex->pos_q, pos.data(), pos.size() * sizeof(int32_t));
     ds4_fv_set(ex->neg_q, neg_pos.data(),
                neg_pos.size() * sizeof(int32_t));
+    const size_t output_count = pack_outputs
+        ? layout.public_output_rows.size() : q;
+    const int graph_output_q = int(std::max<size_t>(output_count, 1));
+    if (ex->output_q != graph_output_q ||
+        (output_count < q) != (ex->output_rows != nullptr)) {
+        return false;
+    }
+    if (ex->output_rows) {
+        if (ex->output_rows->type != GGML_TYPE_I32 ||
+            ex->output_rows->ne[0] != graph_output_q ||
+            ex->output_rows->ne[1] != 1 ||
+            ex->output_rows->ne[2] != 1 ||
+            ex->output_rows->ne[3] != 1) {
+            return false;
+        }
+        std::vector<int32_t> output_rows(size_t(graph_output_q), 0);
+        std::copy(layout.public_output_rows.begin(),
+                  layout.public_output_rows.end(), output_rows.begin());
+        ds4_fv_set(ex->output_rows, output_rows.data(),
+                   output_rows.size() * sizeof(int32_t));
+    }
 
     std::vector<int32_t> bundle_i32(size_t(ex->paged_i32_n), 0);
     std::vector<int64_t> bundle_i64(size_t(ex->paged_i64_n), 0);
@@ -8310,7 +8350,19 @@ bool deepseek4_prepare_paged_segment_step(
     auto * prepared = new (std::nothrow) DeepSeek4PagedSegmentPreparedStep;
     if (!prepared) return false;
     try {
-        prepared->requested_logits = layout.requested_full_logits;
+        prepared->requested_logits.reserve(output_count);
+        if (pack_outputs) {
+            for (int32_t model_row : layout.public_output_rows) {
+                if (model_row < 0 || size_t(model_row) >= q) {
+                    delete prepared;
+                    return false;
+                }
+                prepared->requested_logits.push_back(
+                    layout.requested_full_logits[size_t(model_row)]);
+            }
+        } else {
+            prepared->requested_logits = layout.requested_full_logits;
+        }
         prepared->row_slots.resize(q);
         for (size_t row = 0; row < q; ++row) {
             const int32_t owner = layout.row_to_segment[row];
@@ -8331,6 +8383,8 @@ bool deepseek4_prepare_paged_segment_step(
     prepared->backend = backend;
     prepared->hybrid = hybrid;
     prepared->q = int(q);
+    prepared->output_count = int(output_count);
+    prepared->graph_output_q = graph_output_q;
     rt->prepared_invocation = true;
     out = prepared;
     return true;
@@ -8347,9 +8401,24 @@ bool deepseek4_compute_paged_segment_step(
         !prepared.runtime->prepared_invocation || !prepared.graph ||
         !prepared.extra || !prepared.weights || !prepared.backend ||
         prepared.q < 1 || prepared.extra->q != prepared.q ||
-        prepared.requested_logits.size() != size_t(prepared.q) ||
+        prepared.output_count < 0 || prepared.output_count > prepared.q ||
+        prepared.graph_output_q != std::max(prepared.output_count, 1) ||
+        prepared.extra->output_q != prepared.graph_output_q ||
+        prepared.requested_logits.size() != size_t(prepared.output_count) ||
         prepared.row_slots.size() != size_t(prepared.q) ||
-        !prepared.graph->built() || !prepared.extra->argmax) {
+        !prepared.graph->built() || !prepared.extra->argmax ||
+        prepared.extra->argmax->type != GGML_TYPE_I32 ||
+        prepared.extra->argmax->ne[0] != prepared.graph_output_q ||
+        prepared.extra->argmax->ne[1] != 1 ||
+        prepared.extra->argmax->ne[2] != 1 ||
+        prepared.extra->argmax->ne[3] != 1 ||
+        !prepared.graph->logits ||
+        prepared.graph->logits->type != GGML_TYPE_F32 ||
+        prepared.graph->logits->ne[0] != prepared.weights->n_vocab ||
+        prepared.graph->logits->ne[1] != prepared.graph_output_q ||
+        prepared.graph->logits->ne[2] != 1 ||
+        prepared.graph->logits->ne[3] != 1 ||
+        !ggml_is_contiguous_rows(prepared.graph->logits)) {
         return false;
     }
 
@@ -8362,19 +8431,12 @@ bool deepseek4_compute_paged_segment_step(
     if (requested > 0) {
         const DeepSeek4Weights & w = *prepared.weights;
         const size_t n_vocab = size_t(w.n_vocab);
-        if (!prepared.graph->logits ||
-            prepared.graph->logits->type != GGML_TYPE_F32 ||
-            prepared.graph->logits->ne[0] != w.n_vocab ||
-            prepared.graph->logits->ne[1] != prepared.q ||
-            prepared.graph->logits->ne[2] != 1 ||
-            prepared.graph->logits->ne[3] != 1 ||
-            !ggml_is_contiguous_rows(prepared.graph->logits) ||
-            n_vocab > std::numeric_limits<size_t>::max() /
-                          size_t(prepared.q) ||
+        if (n_vocab > std::numeric_limits<size_t>::max() /
+                          size_t(prepared.output_count) ||
             n_vocab > std::numeric_limits<size_t>::max() / sizeof(float)) {
             return false;
         }
-        logit_elements = n_vocab * size_t(prepared.q);
+        logit_elements = n_vocab * size_t(prepared.output_count);
         if (logit_elements >
                 std::numeric_limits<size_t>::max() / sizeof(float)) {
             return false;
@@ -8400,20 +8462,22 @@ bool deepseek4_compute_paged_segment_step(
     ds4_fused_consume_route_diagnostics(
         *prepared.graph, prepared.hybrid, routing_stats,
         prepared.row_slots.data());
-    out_argmax.resize(size_t(prepared.q));
-    ggml_backend_tensor_get(
-        prepared.extra->argmax, out_argmax.data(), 0,
-        out_argmax.size() * sizeof(int32_t));
+    out_argmax.resize(size_t(prepared.output_count));
+    if (!out_argmax.empty()) {
+        ggml_backend_tensor_get(
+            prepared.extra->argmax, out_argmax.data(), 0,
+            out_argmax.size() * sizeof(int32_t));
+    }
 
     if (requested > 0) {
         const DeepSeek4Weights & w = *prepared.weights;
         out_logits.assign(logit_elements, 0.0f);
-        if (requested == size_t(prepared.q)) {
+        if (requested == size_t(prepared.output_count)) {
             ggml_backend_tensor_get(
                 prepared.graph->logits, out_logits.data(), 0,
                 out_logits.size() * sizeof(float));
         } else {
-            for (int row = 0; row < prepared.q; ++row) {
+            for (int row = 0; row < prepared.output_count; ++row) {
                 if (!prepared.requested_logits[size_t(row)]) continue;
                 ggml_backend_tensor_get(
                     prepared.graph->logits,

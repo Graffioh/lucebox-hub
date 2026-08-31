@@ -418,6 +418,17 @@ verifier. q=1 through q=5 are unchanged, q=7 and wider remain on the existing
 fallback, and the value is cached on first dispatch. Keep it unset until q=6
 output, state, graph-replay, and performance qualification passes.
 
+`DFLASH_DS4_PAGED_OUTPUT_PACK=1` enables a separate unqualified output trial.
+The model body remains q-wide, but only decode rows and completed prompt tails
+continue through output HC, output norm, lm-head, and argmax. Output row count
+is graph topology while concrete model-row indices are uploaded inputs, so
+different output-row masks can replay when the existing segment and slot
+topology is otherwise identical. Slot IDs still fragment the current segment
+key. A step with no public output retains one private sentinel projection to
+anchor all state-publication work and exposes no token or logits. Keep the
+switch unset until prompt TTFT, live-decoder TBT, output identity, and graph
+replay pass.
+
 Paged concurrency fails closed for other primary/secondary architecture pairs,
 CUDA or out-of-process expert ownership, explicit layer or remote target
 splits, drafts/DSpark, DDTree, PFlash/KVFlash, fused decode, approximate
