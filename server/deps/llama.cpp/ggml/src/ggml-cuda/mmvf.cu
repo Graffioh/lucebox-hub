@@ -836,9 +836,18 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                // DeepSeek V4's hyper-connection projection is a very thin
+                // [16384, 24] F16 matrix.  Speculative verification normally
+                // reaches it with four columns.  gfx1151 is classified as
+                // RDNA 3.5 below, where the generic crossover stops at three
+                // columns and sends q=4 to hipBLAS.  On Strix Halo that tiny
+                // GEMM is launch/tiling bound; the row-split Wave32 MMVF path
+                // is the better fit.  Keep this narrowly scoped until wider
+                // RDNA 3.5 shapes have their own measurements.
                 static const bool gfx1151_hc_q4_mmvf = [] {
-                    const char * value = std::getenv("DFLASH_GFX1151_HC_MMVF_Q4");
-                    return value == nullptr || std::atoi(value) != 0;
+                    const char * value = std::getenv(
+                        "DFLASH_GFX1151_HC_MMVF_Q4");
+                    return !value || std::atoi(value) != 0;
                 }();
                 if (gfx1151_hc_q4_mmvf &&
                     cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&

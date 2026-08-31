@@ -543,9 +543,83 @@ __device__ __forceinline__ void mix_block_accum(
     }
 }
 
-// Reuse one activation load across four independent output-row folds on the
-// gfx1151 q=3/q=4 MoE path. Every accumulator keeps mix_block_accum's
-// ascending-j sequence and `scale * weight * x` association.
+// Accumulate the same activation block into two output rows. Keeping the two
+// row folds in one j-loop makes activation reuse explicit: xc[col0 + j] has one
+// live range and feeds both independent accumulators. Each accumulator still
+// sees exactly the same ascending-j sequence and expression as
+// mix_block_accum(), so this does not reassociate either dot product.
+__device__ __forceinline__ void mix_block_accum2(
+        const uint8_t * __restrict__ b0, const uint8_t * __restrict__ b1,
+        const float * __restrict__ xc, int col0,
+        int mode, const float * __restrict__ lut, float & acc0, float & acc1) {
+#if defined(__HIP_PLATFORM_AMD__) && defined(__gfx1151__)
+    uint64_t codes0, codes1;
+    uint16_t meta0, meta1;
+    MIX_MEMCPY(&codes0, b0, sizeof(codes0));
+    MIX_MEMCPY(&meta0, b0 + MIX_QS, sizeof(meta0));
+    MIX_MEMCPY(&codes1, b1, sizeof(codes1));
+    MIX_MEMCPY(&meta1, b1 + MIX_QS, sizeof(meta1));
+    const uint8_t m00 = (uint8_t) meta0;
+    const uint8_t m01 = (uint8_t) (meta0 >> 8);
+    const uint8_t m10 = (uint8_t) meta1;
+    const uint8_t m11 = (uint8_t) (meta1 >> 8);
+#else
+    const uintptr_t addr0 = (uintptr_t) b0;
+    const uintptr_t addr1 = (uintptr_t) b1;
+    const uint8_t * base80 = (const uint8_t *) MIX_ASSUME_ALIGNED(
+            (const void *) (addr0 & ~(uintptr_t) 7), 8);
+    const uint8_t * base81 = (const uint8_t *) MIX_ASSUME_ALIGNED(
+            (const void *) (addr1 & ~(uintptr_t) 7), 8);
+    const int sh0 = (int) (addr0 & 7) * 8;
+    const int sh1 = (int) (addr1 & 7) * 8;
+    uint64_t lo0, hi0, lo1, hi1;
+    MIX_MEMCPY(&lo0, base80, 8);
+    MIX_MEMCPY(&hi0, base80 + 8, 8);
+    MIX_MEMCPY(&lo1, base81, 8);
+    MIX_MEMCPY(&hi1, base81 + 8, 8);
+    const uint64_t codes0 = (sh0 == 0) ? lo0 : ((lo0 >> sh0) | (hi0 << (64 - sh0)));
+    const uint64_t codes1 = (sh1 == 0) ? lo1 : ((lo1 >> sh1) | (hi1 << (64 - sh1)));
+    const uint8_t m00 = (uint8_t) (hi0 >> sh0);
+    const uint8_t m01 = (uint8_t) (hi0 >> (sh0 + 8));
+    const uint8_t m10 = (uint8_t) (hi1 >> sh1);
+    const uint8_t m11 = (uint8_t) (hi1 >> (sh1 + 8));
+#endif
+    if (mode == 0) {
+        const float s00 = mix_ue4m3(m00), s01 = mix_ue4m3(m01);
+        const float s10 = mix_ue4m3(m10), s11 = mix_ue4m3(m11);
+        #pragma unroll
+        for (int j = 0; j < MIX_QK; ++j) {
+            const float x = xc[col0 + j];
+            const float rs0 = (j < MIX_QK/2) ? s00 : s01;
+            const float rs1 = (j < MIX_QK/2) ? s10 : s11;
+            acc0 += rs0 * mix_fp2_fixed(mix_fp2_code_u64(codes0, j)) * x;
+            acc1 += rs1 * mix_fp2_fixed(mix_fp2_code_u64(codes1, j)) * x;
+        }
+    } else {
+        const float s00 = mix_ue4m3(m00 & 0x7F), s01 = mix_ue4m3(m01 & 0x7F);
+        const float s10 = mix_ue4m3(m10 & 0x7F), s11 = mix_ue4m3(m11 & 0x7F);
+        const float * bk00 = lut + (m00 >> 7) * MIX_K;
+        const float * bk01 = lut + (m01 >> 7) * MIX_K;
+        const float * bk10 = lut + (m10 >> 7) * MIX_K;
+        const float * bk11 = lut + (m11 >> 7) * MIX_K;
+        #pragma unroll
+        for (int j = 0; j < MIX_QK; ++j) {
+            const float x = xc[col0 + j];
+            const float rs0 = (j < MIX_QK/2) ? s00 : s01;
+            const float rs1 = (j < MIX_QK/2) ? s10 : s11;
+            const float * rbk0 = (j < MIX_QK/2) ? bk00 : bk01;
+            const float * rbk1 = (j < MIX_QK/2) ? bk10 : bk11;
+            acc0 += rs0 * rbk0[mix_fp2_code_u64(codes0, j)] * x;
+            acc1 += rs1 * rbk1[mix_fp2_code_u64(codes1, j)] * x;
+        }
+    }
+}
+
+// The gfx1151 verifier exposes enough independent workgroups that a wave can
+// spend a few more registers to reuse each activation across four output rows.
+// Each accumulator keeps the exact per-row operation and summation order of
+// mix_block_accum(), so the optimization is bit-preserving rather than an
+// approximate reduction change.
 __device__ __forceinline__ void mix_block_accum4(
         const uint8_t * __restrict__ b0, const uint8_t * __restrict__ b1,
         const uint8_t * __restrict__ b2, const uint8_t * __restrict__ b3,
@@ -611,10 +685,8 @@ __device__ __forceinline__ void mix_block_accum4(
         }
     }
 #else
-    mix_block_accum(b0, xc, col0, mode, lut, acc0);
-    mix_block_accum(b1, xc, col0, mode, lut, acc1);
-    mix_block_accum(b2, xc, col0, mode, lut, acc2);
-    mix_block_accum(b3, xc, col0, mode, lut, acc3);
+    mix_block_accum2(b0, b1, xc, col0, mode, lut, acc0, acc1);
+    mix_block_accum2(b2, b3, xc, col0, mode, lut, acc2, acc3);
 #endif
 }
 
@@ -771,13 +843,15 @@ __global__ void mix_matvec_rocmfp2_slice_kernel(
         #pragma unroll
         for (int u = 0; u < MIX_UNROLL; ++u) {
             const int b = blk + u * MIX_WARP;
-            mix_block_accum(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc0);
-            mix_block_accum(rowbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc1);
+            mix_block_accum2(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES,
+                             rowbase1 + (int64_t) b * MIX_BLOCK_BYTES,
+                             xcol, b * MIX_QK, mode, s_lut, acc0, acc1);
         }
     }
     for (; blk < nb; blk += MIX_WARP) {
-        mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc0);
-        mix_block_accum(rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc1);
+        mix_block_accum2(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES,
+                         rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES,
+                         xcol, blk * MIX_QK, mode, s_lut, acc0, acc1);
     }
     #pragma unroll
     for (int off = MIX_WARP/2; off > 0; off >>= 1) {
@@ -828,7 +902,7 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     constexpr bool DUAL_GLU     = GLU_MODE == 1;
     constexpr bool FINALIZE_GLU = GLU_MODE == 2;
     static_assert(ROWS_PER_WARP == 2 || ROWS_PER_WARP == 4,
-                  "ROCmFP2 MoE rows per warp must be 2 or 4");
+                  "ROCmFP2 MoE rows per wave must be 2 or 4");
     const int warps_per_block = blockDim.x / MIX_WARP;
     const int warp  = blockIdx.x * warps_per_block + (threadIdx.x / MIX_WARP);
     const int row0  = warp * ROWS_PER_WARP;
@@ -877,7 +951,7 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
         return;
     }
 
-    const bool two   = (row0 + 1) < out;         // false only for an odd-out tail warp
+    const bool two  = (row0 + 1) < out;         // false only for an odd-out tail warp
     const bool three = (row0 + 2) < out;
     const bool four  = (row0 + 3) < out;
     const uint8_t     * edata   = data + (int64_t) expert * nb02;
@@ -911,12 +985,18 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
     // src1 is [in, ne11, ntok]; the get_rows-equivalent row for (slot, token)
     // is token*ne11 + slot%ne11 — i.e. token column + the slot%ne11 broadcast.
     const float * xcol = src1 + (int64_t) token * src1_s2 + (int64_t) (slot % ne11) * src1_s1;
-    // Every row keeps the same fixed-j accumulation order. The legacy two-row
-    // instantiation still calls mix_block_accum once per row. The gfx1151 row4
-    // instantiation shares each activation load across four independent folds.
+    // Two output rows in one warp. Each row is folded by the SAME mix_block_accum
+    // that the single-row path uses (byte-identical inlined body, same fixed j
+    // order, same acc-add chain) so acc0/acc1 are bit-for-bit identical to the
+    // single-row kernel's output for those rows. The two calls per block share the
+    // same __restrict__ xcol + col0, so the compiler CSEs the strided activation
+    // loads to one issue per element — halving activation LSU issue on this partly
+    // load-instruction-bound matvec — WITHOUT reordering either row's summation.
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     // Gate accumulates in its own registers over the SAME block order, so gacc is bit-identical
-    // to what the separate gate launch produced. Every gate/up fold shares the same `xcol`.
+    // to what the separate gate launch produced. All four folds share one `xcol`, so the fused
+    // form reads the activation column once for four rows instead of once for two -- on a launch
+    // that is partly load-issue bound, that is the second saving after the launch itself.
     float gacc0 = 0.0f, gacc1 = 0.0f, gacc2 = 0.0f, gacc3 = 0.0f;
     int blk = lane;
     for (; blk + (MIX_UNROLL - 1) * MIX_WARP < nb; blk += MIX_UNROLL * MIX_WARP) {
@@ -931,8 +1011,9 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
                                  xcol, b * MIX_QK, mode, s_lut,
                                  acc0, acc1, acc2, acc3);
             } else {
-                mix_block_accum(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc0);
-                mix_block_accum(rowbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, mode, s_lut, acc1);
+                mix_block_accum2(rowbase0 + (int64_t) b * MIX_BLOCK_BYTES,
+                                 rowbase1 + (int64_t) b * MIX_BLOCK_BYTES,
+                                 xcol, b * MIX_QK, mode, s_lut, acc0, acc1);
             }
             if (DUAL_GLU) {
                 if constexpr (ROWS_PER_WARP == 4) {
@@ -943,8 +1024,10 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
                                      xcol, b * MIX_QK, gmode, s_lut + 2 * MIX_K,
                                      gacc0, gacc1, gacc2, gacc3);
                 } else {
-                    mix_block_accum(growbase0 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc0);
-                    mix_block_accum(growbase1 + (int64_t) b * MIX_BLOCK_BYTES, xcol, b * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc1);
+                    mix_block_accum2(growbase0 + (int64_t) b * MIX_BLOCK_BYTES,
+                                     growbase1 + (int64_t) b * MIX_BLOCK_BYTES,
+                                     xcol, b * MIX_QK, gmode, s_lut + 2 * MIX_K,
+                                     gacc0, gacc1);
                 }
             }
         }
@@ -958,8 +1041,9 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
                              xcol, blk * MIX_QK, mode, s_lut,
                              acc0, acc1, acc2, acc3);
         } else {
-            mix_block_accum(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc0);
-            mix_block_accum(rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, mode, s_lut, acc1);
+            mix_block_accum2(rowbase0 + (int64_t) blk * MIX_BLOCK_BYTES,
+                             rowbase1 + (int64_t) blk * MIX_BLOCK_BYTES,
+                             xcol, blk * MIX_QK, mode, s_lut, acc0, acc1);
         }
         if (DUAL_GLU) {
             if constexpr (ROWS_PER_WARP == 4) {
@@ -970,8 +1054,10 @@ __global__ void mix_matvec_rocmfp2_moe_kernel(
                                  xcol, blk * MIX_QK, gmode, s_lut + 2 * MIX_K,
                                  gacc0, gacc1, gacc2, gacc3);
             } else {
-                mix_block_accum(growbase0 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc0);
-                mix_block_accum(growbase1 + (int64_t) blk * MIX_BLOCK_BYTES, xcol, blk * MIX_QK, gmode, s_lut + 2 * MIX_K, gacc1);
+                mix_block_accum2(growbase0 + (int64_t) blk * MIX_BLOCK_BYTES,
+                                 growbase1 + (int64_t) blk * MIX_BLOCK_BYTES,
+                                 xcol, blk * MIX_QK, gmode, s_lut + 2 * MIX_K,
+                                 gacc0, gacc1);
             }
         }
     }
@@ -1084,10 +1170,8 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id(
         n_expert_used <= 0 || n_tokens <= 0 || ne11 <= 0) {
         return false;
     }
-    const bool row4_opt_in = e.gfx1151 &&
-        (n_tokens == 3 || n_tokens == 4) && mix_gfx1151_row4_enabled();
     const auto launch = rocmfp2_mix_moe_launch_policy(
-        e.gfx1151, n_tokens, row4_opt_in);
+        e.gfx1151, n_tokens, mix_gfx1151_row4_enabled());
     const int threads = launch.warps_per_block * MIX_WARP;
     const int rows_per_block = launch.rows_per_warp * launch.warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
@@ -1136,10 +1220,8 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
         return false;   // not a matched pair; the caller's two-launch path is still correct
     }
     const bool strix_tuned = eu.gfx1151 && eg.gfx1151;
-    const bool row4_opt_in = strix_tuned &&
-        (n_tokens == 3 || n_tokens == 4) && mix_gfx1151_row4_enabled();
     const auto launch = rocmfp2_mix_moe_launch_policy(
-        strix_tuned, n_tokens, row4_opt_in);
+        strix_tuned, n_tokens, mix_gfx1151_row4_enabled());
     const int threads = launch.warps_per_block * MIX_WARP;
     const int rows_per_block = launch.rows_per_warp * launch.warps_per_block;
     dim3 grid((out + rows_per_block - 1) / rows_per_block, n_expert_used, n_tokens);
@@ -1149,33 +1231,33 @@ bool ggml_cuda_rocmfp2_mix_mul_mat_id_glu(
             src1, ids, dst, in, out, eu.n_experts, ne11,
             ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
             (const uint8_t *) eg.base, eg.nb02, eg.codebooks, eg.modes, glu_limit);
-    } else if (launch.rows_per_warp == 4) {
-        // q=3/q=4 keep the existing two-pass GLU split. Only each projection's
-        // output-row grouping changes.
-        mix_matvec_rocmfp2_moe_kernel<0, 4><<<grid, dim3(threads), 0, stream>>>(
-            (const uint8_t *) eu.base, eu.nb02, eu.codebooks, eu.modes,
-            src1, ids, dst, in, out, eu.n_experts, ne11,
-            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
-            nullptr, 0, nullptr, nullptr, 0.0f);
-        mix_matvec_rocmfp2_moe_kernel<2, 4><<<grid, dim3(threads), 0, stream>>>(
-            (const uint8_t *) eg.base, eg.nb02, eg.codebooks, eg.modes,
-            src1, ids, dst, in, out, eg.n_experts, ne11,
-            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
-            nullptr, 0, nullptr, nullptr, glu_limit);
     } else {
         // A wide verifier makes the dual-tensor kernel's register pressure more
         // expensive than its saved launch. Keep both projections at the ordinary
         // kernel's occupancy and fold SwiGLU into the second launch in-place.
-        mix_matvec_rocmfp2_moe_kernel<0, 2><<<grid, dim3(threads), 0, stream>>>(
-            (const uint8_t *) eu.base, eu.nb02, eu.codebooks, eu.modes,
-            src1, ids, dst, in, out, eu.n_experts, ne11,
-            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
-            nullptr, 0, nullptr, nullptr, 0.0f);
-        mix_matvec_rocmfp2_moe_kernel<2, 2><<<grid, dim3(threads), 0, stream>>>(
-            (const uint8_t *) eg.base, eg.nb02, eg.codebooks, eg.modes,
-            src1, ids, dst, in, out, eg.n_experts, ne11,
-            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
-            nullptr, 0, nullptr, nullptr, glu_limit);
+        if (launch.rows_per_warp == 4) {
+            mix_matvec_rocmfp2_moe_kernel<0, 4><<<grid, dim3(threads), 0, stream>>>(
+                (const uint8_t *) eu.base, eu.nb02, eu.codebooks, eu.modes,
+                src1, ids, dst, in, out, eu.n_experts, ne11,
+                ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
+                nullptr, 0, nullptr, nullptr, 0.0f);
+            mix_matvec_rocmfp2_moe_kernel<2, 4><<<grid, dim3(threads), 0, stream>>>(
+                (const uint8_t *) eg.base, eg.nb02, eg.codebooks, eg.modes,
+                src1, ids, dst, in, out, eg.n_experts, ne11,
+                ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
+                nullptr, 0, nullptr, nullptr, glu_limit);
+        } else {
+            mix_matvec_rocmfp2_moe_kernel<0, 2><<<grid, dim3(threads), 0, stream>>>(
+                (const uint8_t *) eu.base, eu.nb02, eu.codebooks, eu.modes,
+                src1, ids, dst, in, out, eu.n_experts, ne11,
+                ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
+                nullptr, 0, nullptr, nullptr, 0.0f);
+            mix_matvec_rocmfp2_moe_kernel<2, 2><<<grid, dim3(threads), 0, stream>>>(
+                (const uint8_t *) eg.base, eg.nb02, eg.codebooks, eg.modes,
+                src1, ids, dst, in, out, eg.n_experts, ne11,
+                ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2,
+                nullptr, 0, nullptr, nullptr, glu_limit);
+        }
     }
     return true;
 }

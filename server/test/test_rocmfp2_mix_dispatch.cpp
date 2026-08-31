@@ -27,20 +27,20 @@ bool expect_policy(
 int main() {
     bool ok = true;
 
-    ok &= expect(!rocmfp2_mix_row4_env_enabled(nullptr),
-                 "an unset opt-in was enabled");
-    ok &= expect(!rocmfp2_mix_row4_env_enabled(""),
-                 "an empty opt-in was enabled");
+    ok &= expect(rocmfp2_mix_row4_env_enabled(nullptr),
+                 "the qualified default was disabled");
+    ok &= expect(rocmfp2_mix_row4_env_enabled(""),
+                 "an empty nonzero policy disabled row4");
     ok &= expect(!rocmfp2_mix_row4_env_enabled("0"),
                  "value 0 enabled row4");
-    ok &= expect(!rocmfp2_mix_row4_env_enabled("true"),
-                 "a non-numeric value enabled row4");
-    ok &= expect(!rocmfp2_mix_row4_env_enabled("01"),
-                 "a zero-prefixed value enabled row4");
-    ok &= expect(!rocmfp2_mix_row4_env_enabled("10"),
-                 "a value beginning with 1 enabled row4");
-    ok &= expect(!rocmfp2_mix_row4_env_enabled("1 "),
-                 "a suffixed value enabled row4");
+    ok &= expect(rocmfp2_mix_row4_env_enabled("true"),
+                 "a nonzero policy disabled row4");
+    ok &= expect(rocmfp2_mix_row4_env_enabled("01"),
+                 "a non-exact zero policy disabled row4");
+    ok &= expect(rocmfp2_mix_row4_env_enabled("10"),
+                 "a nonzero numeric policy disabled row4");
+    ok &= expect(rocmfp2_mix_row4_env_enabled("1 "),
+                 "a nonzero suffixed policy disabled row4");
     ok &= expect(rocmfp2_mix_row4_env_enabled("1"),
                  "the exact opt-in value did not enable row4");
 
@@ -52,10 +52,10 @@ int main() {
                         "gfx1151 q1 launch policy changed");
     ok &= expect_policy(true, 2, true, 2, 8,
                         "gfx1151 q2 launch policy changed");
-    ok &= expect_policy(true, 5, true, 2, 4,
-                        "gfx1151 q5 launch policy changed");
-    ok &= expect_policy(true, 6, true, 2, 4,
-                        "gfx1151 q6 launch policy changed");
+    ok &= expect_policy(true, 5, true, 4, 2,
+                        "gfx1151 q5 did not select row4");
+    ok &= expect_policy(true, 6, true, 4, 2,
+                        "gfx1151 q6 did not select row4");
     ok &= expect_policy(true, 3, false, 2, 4,
                         "disabled gfx1151 q3 did not use row2");
     ok &= expect_policy(true, 4, false, 2, 4,

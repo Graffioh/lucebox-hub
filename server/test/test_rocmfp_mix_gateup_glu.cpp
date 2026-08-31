@@ -122,7 +122,7 @@ TEST_CASE(RocmfpMixGateupGluFixture, fused_gateup_glu) {
 
     // in must be a multiple of 128: the wide block load reads 128 weights at a time and would
     // read past the tensor on the final block (register_host enforces this).
-    // On gfx1151, three tokens exercises the low-register two-pass GLU finalizer. q <= 2
+    // Three tokens exercises the low-register two-pass GLU finalizer. q <= 2
     // uses the one-pass kernel and is checked separately below.
     const int in = 256, out = 64, n_experts = 6, n_used = 3, ntok = 3;
     const int nb = in / QK;
@@ -226,8 +226,8 @@ TEST_CASE(RocmfpMixGateupGluFixture, fused_gateup_glu) {
     std::fprintf(stderr, "worst relative deviation from the host reference: %.3e\n", worst);
     CHECK(worst < 1e-5);
 
-    // On gfx1151, q <= 2 selects the one-pass dual-projection kernel. Exercise that
-    // width separately while the main ntok=3 case above covers the two-pass finalizer.
+    // q <= 2 selects the one-pass dual-projection kernel. Exercise that branch
+    // separately while the main ntok=3 case above covers the two-pass finalizer.
     {
         const int one_tok = 1;
         const size_t one_yn = (size_t) out * n_used;

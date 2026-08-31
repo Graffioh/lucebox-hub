@@ -72,6 +72,15 @@ static double median(std::vector<double> v) {
     return v[v.size() / 2];
 }
 
+static uint64_t fnv1a64(const std::vector<float> & values) {
+    uint64_t hash = 1469598103934665603ull;
+    const uint8_t * bytes = reinterpret_cast<const uint8_t *>(values.data());
+    for (size_t i = 0; i < sizeof(float) * values.size(); ++i) {
+        hash = (hash ^ bytes[i]) * 1099511628211ull;
+    }
+    return hash;
+}
+
 int main(int argc, char ** argv) {
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) {
@@ -91,8 +100,11 @@ int main(int argc, char ** argv) {
     const int in = 4096, out = 2048, n_experts = 8, n_used = 6;
     const int ntok = argc > 1 ? std::atoi(argv[1]) : 4;
     const bool fp3 = argc > 2 && std::strcmp(argv[2], "q3") == 0;
-    if (ntok <= 0 || ntok > 16 || (argc > 2 && !fp3 && std::strcmp(argv[2], "q2") != 0)) {
-        std::fprintf(stderr, "usage: %s [tokens:1..16] [q2|q3]\n", argv[0]);
+    const bool fixed_levels = argc > 3 && std::strcmp(argv[3], "fixed") == 0;
+    if (ntok <= 0 || ntok > 16 ||
+        (argc > 2 && !fp3 && std::strcmp(argv[2], "q2") != 0) ||
+        (argc > 3 && !fixed_levels && std::strcmp(argv[3], "learned") != 0)) {
+        std::fprintf(stderr, "usage: %s [tokens:1..16] [q2|q3] [learned|fixed]\n", argv[0]);
         return 2;
     }
     const int block_bytes = fp3 ? 14 : 10;
@@ -108,7 +120,7 @@ int main(int argc, char ** argv) {
     }
     std::vector<uint16_t> books((size_t) n_experts * 2 * levels);
     for (size_t i = 0; i < books.size(); ++i) books[i] = f32_to_bf16(-0.5f + 0.2f * (float) (i % 5));
-    std::vector<uint8_t> modes(n_experts, 1);
+    std::vector<uint8_t> modes(n_experts, fixed_levels ? 0 : 1);
 
     void * d_up = nullptr, * d_gate = nullptr;
     float * d_x = nullptr, * d_a = nullptr, * d_b = nullptr;
@@ -208,29 +220,48 @@ int main(int argc, char ** argv) {
     for (int r = 0; r < REPS; ++r) { u.push_back(time_unfused()); f.push_back(time_fused()); }
 
     const double mu = median(u), mf = median(f);
-    std::fprintf(stderr, "geometry: qtype=%s in=%d out=%d top_k=%d ntok=%d  "
+    std::fprintf(stderr, "geometry: qtype=%s levels=%s in=%d out=%d top_k=%d ntok=%d  "
                          "(%d iters x %d interleaved reps)\n",
-                 fp3 ? "q3-mix" : "q2-mix", in, out, n_used, ntok, ITERS, REPS);
+                 fp3 ? "q3-mix" : "q2-mix", fixed_levels ? "fixed" : "learned",
+                 in, out, n_used, ntok, ITERS, REPS);
     std::fprintf(stderr, "  unfused (2 launches, swiglu NOT counted): %8.4f ms/step  [",
                  mu);
     for (double v : u) std::fprintf(stderr, " %.4f", v);
-    const int fused_launches = !fp3 && strix_tuned && ntok > 2 ? 2 : 1;
+    const int fused_launches = fp3 || ntok <= 2 ? 1 : 2;
     std::fprintf(stderr, " ]\n  fused   (%d launch%s, swiglu included): %8.4f ms/step  [",
-                 fused_launches, fused_launches == 1 ? "" : "es", mf);
+                 fused_launches, fused_launches == 1 ? " " : "es", mf);
     for (double v : f) std::fprintf(stderr, " %.4f", v);
     std::fprintf(stderr, " ]\n");
     std::fprintf(stderr, "  fused is %+.2f%% vs unfused (negative = faster)\n", 100.0 * (mf / mu - 1.0));
     std::fprintf(stderr, "  per-layer saving %.4f ms -> over 43 layers %.3f ms/step\n",
                  mu - mf, (mu - mf) * 43.0);
 
-    std::vector<float> result(yn);
-    HIP_OK(hipMemcpy(result.data(), d_a, sizeof(float) * yn, hipMemcpyDeviceToHost));
-    uint64_t result_hash = 1469598103934665603ull;
-    const uint8_t * result_bytes = reinterpret_cast<const uint8_t *>(result.data());
-    for (size_t i = 0; i < sizeof(float) * yn; ++i) {
-        result_hash = (result_hash ^ result_bytes[i]) * 1099511628211ull;
+    // Hash both raw projections and the fused output after timing. This catches
+    // mode-specific numerical drift even when the generated-token hash happens
+    // to remain unchanged.
+    if (!mul_mat_id(d_up, d_x, d_ids, d_a, in, out, n_used, ntok, 1,
+            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, stream) ||
+        !mul_mat_id(d_gate, d_x, d_ids, d_b, in, out, n_used, ntok, 1,
+            ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, stream)) {
+        std::fprintf(stderr, "FAIL: raw projection dispatch rejected\n");
+        return 1;
     }
-    std::fprintf(stderr, "  result fnv1a64: %016llx\n", (unsigned long long) result_hash);
+    HIP_OK(hipStreamSynchronize(stream));
+    std::vector<float> up_result(yn), gate_result(yn), fused_result(yn);
+    HIP_OK(hipMemcpy(up_result.data(), d_a, sizeof(float) * yn, hipMemcpyDeviceToHost));
+    HIP_OK(hipMemcpy(gate_result.data(), d_b, sizeof(float) * yn, hipMemcpyDeviceToHost));
+    if (!mul_mat_id_glu(d_up, d_gate, d_x, d_ids, d_a, in, out, n_used,
+            ntok, 1, ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, 7.0f, stream)) {
+        std::fprintf(stderr, "FAIL: fused projection dispatch rejected\n");
+        return 1;
+    }
+    HIP_OK(hipStreamSynchronize(stream));
+    HIP_OK(hipMemcpy(fused_result.data(), d_a, sizeof(float) * yn, hipMemcpyDeviceToHost));
+    std::fprintf(stderr, "  raw up/gate fnv1a64: %016llx %016llx\n",
+                 (unsigned long long) fnv1a64(up_result),
+                 (unsigned long long) fnv1a64(gate_result));
+    std::fprintf(stderr, "  result fnv1a64: %016llx\n",
+                 (unsigned long long) fnv1a64(fused_result));
 
     unregister_mix(d_gate);
     unregister_mix(d_up);
