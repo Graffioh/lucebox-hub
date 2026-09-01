@@ -21,8 +21,9 @@ enum class Status {
 
 struct Metric {
     std::string name;
+    std::string error_measure = "max_abs";
     double tolerance = 0.0;
-    double max_abs_error = 0.0;
+    double observed_error = 0.0;
     size_t worst_index = 0;
     bool finite = true;
     bool passed = false;
@@ -52,39 +53,85 @@ inline const char * status_name(Status status) {
     return "fail";
 }
 
-inline Metric compare_f32(
+inline Metric compare_f32_impl(
         std::string name,
         const std::vector<float> & candidate,
         const std::vector<float> & reference,
-        double tolerance) {
+        double tolerance,
+        bool normalized_mse) {
     Metric result;
     result.name = std::move(name);
+    result.error_measure = normalized_mse ? "normalized_mse" : "max_abs";
     result.tolerance = tolerance;
+    if (!std::isfinite(tolerance)) {
+        result.reason = "non-finite tolerance";
+        return result;
+    }
+    if (tolerance < 0.0) {
+        result.reason = "negative tolerance";
+        return result;
+    }
     if (candidate.size() != reference.size()) {
-        result.max_abs_error = std::numeric_limits<double>::infinity();
+        result.observed_error = std::numeric_limits<double>::infinity();
         result.finite = false;
         result.reason = "size mismatch";
         return result;
     }
+    if (candidate.empty()) {
+        result.reason = "no samples";
+        return result;
+    }
 
+    double squared_error = 0.0;
+    double reference_power = 0.0;
+    double worst_error = 0.0;
     for (size_t i = 0; i < candidate.size(); ++i) {
         if (!std::isfinite(candidate[i]) || !std::isfinite(reference[i])) {
-            result.max_abs_error = std::numeric_limits<double>::infinity();
+            result.observed_error = std::numeric_limits<double>::infinity();
             result.worst_index = i;
             result.finite = false;
             result.reason = "non-finite value";
             return result;
         }
-        const double error = std::fabs(
-            static_cast<double>(candidate[i]) - reference[i]);
-        if (error > result.max_abs_error) {
-            result.max_abs_error = error;
+        const double error = static_cast<double>(candidate[i]) - reference[i];
+        const double absolute_error = std::fabs(error);
+        if (absolute_error > worst_error) {
+            worst_error = absolute_error;
             result.worst_index = i;
         }
+        if (normalized_mse) {
+            squared_error += error*error;
+            reference_power +=
+                static_cast<double>(reference[i])*reference[i];
+        } else {
+            result.observed_error = worst_error;
+        }
     }
-    result.passed = result.max_abs_error <= tolerance;
+    if (normalized_mse) {
+        result.observed_error =
+            squared_error/std::max(reference_power, 1.0e-30);
+    }
+    result.passed = result.observed_error <= tolerance;
     if (!result.passed) result.reason = "tolerance exceeded";
     return result;
+}
+
+inline Metric compare_f32(
+        std::string name,
+        const std::vector<float> & candidate,
+        const std::vector<float> & reference,
+        double tolerance) {
+    return compare_f32_impl(
+        std::move(name), candidate, reference, tolerance, false);
+}
+
+inline Metric compare_f32_nmse(
+        std::string name,
+        const std::vector<float> & candidate,
+        const std::vector<float> & reference,
+        double tolerance) {
+    return compare_f32_impl(
+        std::move(name), candidate, reference, tolerance, true);
 }
 
 inline CaseResult evaluate(
@@ -95,9 +142,15 @@ inline CaseResult evaluate(
     result.name = std::move(name);
     result.metrics = std::move(metrics);
     result.route = std::move(route);
+    if (result.metrics.empty()) {
+        result.reason = "no metrics";
+        return result;
+    }
     result.status = result.route.matched &&
             std::all_of(result.metrics.begin(), result.metrics.end(),
-                        [](const Metric & metric) { return metric.passed; })
+                        [](const Metric & metric) {
+                            return metric.finite && metric.passed;
+                        })
         ? Status::pass
         : Status::fail;
     if (!result.route.matched) {
@@ -105,8 +158,14 @@ inline CaseResult evaluate(
     } else {
         const auto failed = std::find_if(
             result.metrics.begin(), result.metrics.end(),
-            [](const Metric & metric) { return !metric.passed; });
-        if (failed != result.metrics.end()) result.reason = failed->reason;
+            [](const Metric & metric) {
+                return !metric.finite || !metric.passed;
+            });
+        if (failed != result.metrics.end()) {
+            result.reason = failed->reason.empty() && !failed->finite
+                ? "non-finite metric"
+                : failed->reason;
+        }
     }
     return result;
 }
@@ -120,6 +179,7 @@ inline CaseResult unsupported(std::string name, std::string reason) {
 }
 
 inline Status aggregate_status(const std::vector<CaseResult> & cases) {
+    if (cases.empty()) return Status::fail;
     if (std::any_of(cases.begin(), cases.end(), [](const CaseResult & result) {
             return result.status == Status::fail;
         })) {
@@ -172,7 +232,8 @@ inline void write_json(
         std::ostream & out,
         const std::string & backend,
         const std::vector<CaseResult> & cases) {
-    out << "{\"schema\":\"lucebox.kernel_qualification.v1\""
+    out << std::setprecision(std::numeric_limits<double>::max_digits10)
+        << "{\"schema\":\"lucebox.kernel_qualification.v1\""
         << ",\"backend\":" << json_string(backend)
         << ",\"status\":" << json_string(status_name(aggregate_status(cases)))
         << ",\"cases\":[";
@@ -192,10 +253,17 @@ inline void write_json(
             const Metric & metric = result.metrics[metric_index];
             if (metric_index != 0) out << ',';
             out << "{\"name\":" << json_string(metric.name)
-                << ",\"tolerance\":" << metric.tolerance
-                << ",\"max_abs_error\":";
-            if (std::isfinite(metric.max_abs_error)) {
-                out << metric.max_abs_error;
+                << ",\"error_measure\":"
+                << json_string(metric.error_measure)
+                << ",\"tolerance\":";
+            if (std::isfinite(metric.tolerance)) {
+                out << metric.tolerance;
+            } else {
+                out << "null";
+            }
+            out << ",\"observed_error\":";
+            if (std::isfinite(metric.observed_error)) {
+                out << metric.observed_error;
             } else {
                 out << "null";
             }

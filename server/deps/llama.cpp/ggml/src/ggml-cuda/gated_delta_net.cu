@@ -16,6 +16,22 @@ extern "C" size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void) {
     return g_gdn_grouped_cols_launch_count;
 }
 
+static bool gdn_grouped_cols_supported(int device) {
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count) {
+        return false;
+    }
+    const int cc = info.devices[device].cc;
+    const int warp_size = info.devices[device].warp_size;
+    return ((GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) ||
+            GGML_CUDA_CC_IS_AMD(cc)) &&
+        (warp_size == 32 || warp_size == 64);
+}
+
+extern "C" bool ggml_backend_cuda_supports_gdn_grouped_cols(int device) {
+    return gdn_grouped_cols_supported(device);
+}
+
 // Tree-mode parent index sentinel: a node whose parent is the pre-block state
 // (i.e. a "root" node in the DFS-flattened tree) uses this value in
 // parent_ids[]. Any value < 0 triggers a reload from curr_state.
@@ -634,9 +650,7 @@ static void launch_gated_delta_net(
     const bool use_grouped_cols = force_grouped_cols ||
         (!disable_grouped_cols && !ampere_nvidia);
     const bool take_grouped_cols = S_v == 128 && !KDA && use_grouped_cols &&
-        ((GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) ||
-         GGML_CUDA_CC_IS_AMD(cc)) &&
-        (warp_size == 32 || warp_size == 64);
+        gdn_grouped_cols_supported(ggml_cuda_get_device());
     if (take_grouped_cols) {
         ++g_gdn_grouped_cols_launch_count;
     } else {
