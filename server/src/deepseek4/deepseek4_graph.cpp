@@ -3427,7 +3427,13 @@ static bool ds4_cpu_has_f16c() {
     static int supported = -1;
     if (supported < 0) {
         __builtin_cpu_init();
+#if defined(__clang__) && __clang_major__ < 15
+        // Clang 14 does not accept "f16c" in __builtin_cpu_supports().
+        // AVX2-capable x86 CPUs also provide F16C.
+        supported = __builtin_cpu_supports("avx2") ? 1 : 0;
+#else
         supported = (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c")) ? 1 : 0;
+#endif
     }
     return supported == 1;
 }
