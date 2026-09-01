@@ -888,6 +888,14 @@ if(DFLASH27B_TESTS)
     set(_raw_unit_test_targets)
     enable_testing()
 
+    add_executable(
+        test_kernel_qualification_core
+        test/test_kernel_qualification_core.cpp)
+    target_include_directories(
+        test_kernel_qualification_core PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    list(APPEND _raw_unit_test_targets test_kernel_qualification_core)
+
     # Header-only platform shims must remain independently buildable and
     # runnable on hosted Windows workers without a GPU.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_platform_compat.cpp")
@@ -2108,6 +2116,26 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
     endfunction()
+
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS
+           "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kernel_qualification_gdn.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_kernel_qualification_gdn
+            test/test_kernel_qualification_gdn.cpp)
+        target_include_directories(
+            test_kernel_qualification_gdn PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        add_test(
+            NAME kernel_qualification_gdn
+            COMMAND test_kernel_qualification_gdn)
+        set_tests_properties(
+            kernel_qualification_gdn PROPERTIES SKIP_RETURN_CODE 77)
+        if(TARGET check)
+            add_dependencies(check test_kernel_qualification_gdn)
+        endif()
+    endif()
 
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")

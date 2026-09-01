@@ -74,6 +74,11 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_concat_transpose_f32_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_launch_count(void);
 
+// Calling-thread launch counters for the scalar and grouped-column GDN
+// kernels. Focused qualification tests use these to reject silent fallback.
+GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_scalar_launch_count(void);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_gdn_grouped_cols_launch_count(void);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
