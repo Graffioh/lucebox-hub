@@ -178,10 +178,12 @@ bool build_hip_chunk_graph_b(const Qwen3DrafterLayer & L,
     return true;
 }
 
-void warm_hip_chunk_graph_b_once(ggml_backend_t backend, HipChunkGraphB & out) {
+bool warm_hip_chunk_graph_b_once(ggml_backend_t backend,
+                                 HipChunkGraphB & out,
+                                 std::string & error) {
     static bool warmed = false;
     if (warmed) {
-        return;
+        return true;
     }
 
     struct ggml_tensor * warm_tensors[] = {
@@ -190,13 +192,27 @@ void warm_hip_chunk_graph_b_once(ggml_backend_t backend, HipChunkGraphB & out) {
     for (ggml_tensor * t : warm_tensors) {
         cudaError_t e = cudaMemset(t->data, 0, ggml_nbytes(t));
         if (e != cudaSuccess) {
-            return;
+            error = std::string("memset failed: ") + cudaGetErrorString(e);
+            return false;
         }
     }
 
-    ggml_backend_graph_compute(backend, out.gf_proj_add);
-    ggml_backend_graph_compute(backend, out.gf_ffn);
+    const ggml_status proj_status =
+        ggml_backend_graph_compute(backend, out.gf_proj_add);
+    if (proj_status != GGML_STATUS_SUCCESS) {
+        error = std::string("projection graph failed: ") +
+                ggml_status_to_string(proj_status);
+        return false;
+    }
+    const ggml_status ffn_status =
+        ggml_backend_graph_compute(backend, out.gf_ffn);
+    if (ffn_status != GGML_STATUS_SUCCESS) {
+        error = std::string("FFN graph failed: ") +
+                ggml_status_to_string(ffn_status);
+        return false;
+    }
     warmed = true;
+    return true;
 }
 #endif
 
@@ -393,7 +409,17 @@ bool forward_qwen3_drafter_model(
             return false;
         }
         ggml_backend_tensor_set(t_ids, ids.data(), 0, (size_t)S * sizeof(int32_t));
-        ggml_backend_graph_compute(w.backend, gf);
+        const ggml_status embed_status =
+            ggml_backend_graph_compute(w.backend, gf);
+        if (embed_status != GGML_STATUS_SUCCESS) {
+            set_last_error(std::string("embed graph compute failed: ") +
+                           ggml_status_to_string(embed_status));
+            ggml_gallocr_free(galloc);
+            if (in_buf) ggml_backend_buffer_free(in_buf);
+            ggml_free(gctx);
+            cleanup_all();
+            return false;
+        }
         ggml_gallocr_free(galloc);
         if (in_buf) ggml_backend_buffer_free(in_buf);
         ggml_free(gctx);
@@ -556,10 +582,19 @@ bool forward_qwen3_drafter_model(
             auto tA_alloc1 = std::chrono::steady_clock::now();
             t_a_alloc += std::chrono::duration<double>(tA_alloc1 - tA_alloc0).count();
             auto tA0 = std::chrono::steady_clock::now();
-            ggml_backend_graph_compute(w.backend, gfA);
+            const ggml_status graph_a_status =
+                ggml_backend_graph_compute(w.backend, gfA);
             ggml_backend_synchronize(w.backend);
             auto tA1 = std::chrono::steady_clock::now();
             t_compute_a += std::chrono::duration<double>(tA1 - tA0).count();
+            if (graph_a_status != GGML_STATUS_SUCCESS) {
+                set_last_error(std::string("graph A compute failed at layer ") +
+                               std::to_string(il) + " chunk " +
+                               std::to_string(cs) + ": " +
+                               ggml_status_to_string(graph_a_status));
+                ggml_free(gA);
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
             if (debug_first_layer) {
                 std::fprintf(stderr,
                              "[qwen3-0.6b-fp dbg] layer0 chunk A done setup=%.3fs alloc=%.3fs compute=%.3fs\n",
@@ -586,7 +621,20 @@ bool forward_qwen3_drafter_model(
             set_last_error("flash_prefill_forward failed at layer " + std::to_string(il));
             ggml_gallocr_free(galloc); cleanup_all(); return false;
         }
-        cudaDeviceSynchronize();
+        cudaError_t fp_launch_e = cudaGetLastError();
+        if (fp_launch_e != cudaSuccess) {
+            set_last_error(std::string("flash_prefill launch failed at layer ") +
+                           std::to_string(il) + ": " +
+                           cudaGetErrorString(fp_launch_e));
+            ggml_gallocr_free(galloc); cleanup_all(); return false;
+        }
+        cudaError_t fp_sync_e = cudaDeviceSynchronize();
+        if (fp_sync_e != cudaSuccess) {
+            set_last_error(std::string("flash_prefill synchronization failed at layer ") +
+                           std::to_string(il) + ": " +
+                           cudaGetErrorString(fp_sync_e));
+            ggml_gallocr_free(galloc); cleanup_all(); return false;
+        }
         auto tF1 = std::chrono::steady_clock::now();
         t_fp += std::chrono::duration<double>(tF1 - tF0).count();
         if (debug_first_layer) {
@@ -613,7 +661,13 @@ bool forward_qwen3_drafter_model(
         }
 
         auto tB_warm0 = std::chrono::steady_clock::now();
-        warm_hip_chunk_graph_b_once(w.backend, gb);
+        std::string warm_error;
+        if (!warm_hip_chunk_graph_b_once(w.backend, gb, warm_error)) {
+            set_last_error(std::string("graph B warmup failed at layer ") +
+                           std::to_string(il) + ": " + warm_error);
+            free_hip_chunk_graph_b(gb);
+            ggml_gallocr_free(galloc); cleanup_all(); return false;
+        }
         auto tB_warm1 = std::chrono::steady_clock::now();
         t_b_warm += std::chrono::duration<double>(tB_warm1 - tB_warm0).count();
         if (debug_first_layer) {
@@ -697,11 +751,21 @@ bool forward_qwen3_drafter_model(
             double proj_s = 0, ffn_s = 0;
             auto one = [&](ggml_cgraph * gf, double & acc) {
                 auto ts0 = std::chrono::steady_clock::now();
-                ggml_backend_graph_compute(w.backend, gf);
+                const ggml_status status =
+                    ggml_backend_graph_compute(w.backend, gf);
                 auto ts1 = std::chrono::steady_clock::now();
                 acc = std::chrono::duration<double>(ts1 - ts0).count();
+                return status;
             };
-            one(gb.gf_proj_add, proj_s);
+            const ggml_status proj_status = one(gb.gf_proj_add, proj_s);
+            if (proj_status != GGML_STATUS_SUCCESS) {
+                set_last_error(std::string("graph B projection compute failed at layer ") +
+                               std::to_string(il) + " chunk " +
+                               std::to_string(cs) + ": " +
+                               ggml_status_to_string(proj_status));
+                free_hip_chunk_graph_b(gb);
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
 
             auto tB_norm0 = std::chrono::steady_clock::now();
             launch_rms_norm_mul_w_f32(
@@ -710,11 +774,36 @@ bool forward_qwen3_drafter_model(
                 (float *)gb.hf->data,
                 cl, hidden, eps,
                 /*stream=*/nullptr);
-            cudaDeviceSynchronize();
+            cudaError_t rms_launch_e = cudaGetLastError();
+            if (rms_launch_e != cudaSuccess) {
+                set_last_error(std::string("graph B RMSNorm launch failed at layer ") +
+                               std::to_string(il) + " chunk " +
+                               std::to_string(cs) + ": " +
+                               cudaGetErrorString(rms_launch_e));
+                free_hip_chunk_graph_b(gb);
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
+            cudaError_t rms_sync_e = cudaDeviceSynchronize();
+            if (rms_sync_e != cudaSuccess) {
+                set_last_error(std::string("graph B RMSNorm synchronization failed at layer ") +
+                               std::to_string(il) + " chunk " +
+                               std::to_string(cs) + ": " +
+                               cudaGetErrorString(rms_sync_e));
+                free_hip_chunk_graph_b(gb);
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
             auto tB_norm1 = std::chrono::steady_clock::now();
             t_b_norm += std::chrono::duration<double>(tB_norm1 - tB_norm0).count();
 
-            one(gb.gf_ffn, ffn_s);
+            const ggml_status ffn_status = one(gb.gf_ffn, ffn_s);
+            if (ffn_status != GGML_STATUS_SUCCESS) {
+                set_last_error(std::string("graph B FFN compute failed at layer ") +
+                               std::to_string(il) + " chunk " +
+                               std::to_string(cs) + ": " +
+                               ggml_status_to_string(ffn_status));
+                free_hip_chunk_graph_b(gb);
+                ggml_gallocr_free(galloc); cleanup_all(); return false;
+            }
             auto tB1 = std::chrono::steady_clock::now();
             t_compute_b += std::chrono::duration<double>(tB1 - tB0).count();
 
