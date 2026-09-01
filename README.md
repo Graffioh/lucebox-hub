@@ -222,6 +222,7 @@ curl -s http://127.0.0.1:8216/v1/chat/completions \
 | DeepSeek V4 single-device and heterogeneous profiles | [DeepSeek V4 guide](server/docs/DS4.md) |
 | Environment variables | [Environment reference](server/docs/ENVIRONMENT.md) |
 | Server internals | [Architecture](server/docs/ARCHITECTURE.md) |
+| Serving and engine component design | [Engine components](docs/specs/engine-components.md) |
 | Client integration and qualification | [Harness guide](harness/README.md) |
 
 Benchmarks stay with each implementation: [DFlash](server/RESULTS.md), [PFlash](optimizations/pflash/), [Spark](optimizations/spark/), [KVFlash](optimizations/kvflash/), and [Megakernel](optimizations/megakernel/).
