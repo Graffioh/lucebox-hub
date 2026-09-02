@@ -7,6 +7,7 @@
 // Run:   ./test_server_unit
 
 #include "CppUnitTestFramework.hpp"
+#include "scoped_env.h"
 
 #include "server/sse_emitter.h"
 #include "server/tool_parser.h"
@@ -82,6 +83,14 @@ std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
     ToolMemory & tool_memory);
+
+struct HttpServerTestAccess {
+    static std::string apply_pflash_compression(
+            HttpServer & server, const ParsedRequest & req) {
+        HttpServer::PreparedPrompt prepared;
+        return server.apply_pflash_compression(req, prepared);
+    }
+};
 }
 
 namespace {
@@ -273,6 +282,17 @@ TEST_CASE(ServerUnitFixture, test_pflash_responses_string_tails_only_raw_content
     TEST_ASSERT(window.end == 7);
     TEST_ASSERT(window.tokens == 5);
     TEST_ASSERT(window.end - window.tokens == 2);
+}
+
+TEST_CASE(ServerUnitFixture, test_compress_result_fails_closed_on_empty_ids) {
+    const auto failed = ModelBackend::CompressResult::from_compressed_ids({});
+    const auto succeeded =
+        ModelBackend::CompressResult::from_compressed_ids({11, 12});
+
+    TEST_ASSERT(!failed.ok);
+    TEST_ASSERT(failed.compressed_ids.empty());
+    TEST_ASSERT(succeeded.ok);
+    TEST_ASSERT(succeeded.compressed_ids == std::vector<int32_t>({11, 12}));
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_parser_fingerprint_has_fixed_encoding) {
@@ -4644,6 +4664,53 @@ struct MockBackend : ModelBackend {
     void free_drafter() override {}
     void shutdown() override {}
 };
+
+struct MockPflashCompressBackend : MockBackend {
+    int compress_calls = 0;
+    CompressRequest last_request;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        last_request = request;
+        return CompressResult::from_compressed_ids(request.input_ids);
+    }
+};
+
+TEST_CASE(ServerUnitFixture, test_pflash_default_raw_text_maps_user_query) {
+    luce_test::ScopedEnvVar mode{"PFLASH_LONGATTNCOMP_MODE", nullptr};
+    luce_test::ScopedEnvVar chunk{"PFLASH_LONGATTNCOMP_CHUNK_SIZE", nullptr};
+    luce_test::ScopedEnvVar query{"PFLASH_LONGATTNCOMP_QUERY_TOKENS", nullptr};
+    luce_test::ScopedEnvVar parser{"PFLASH_LONGATTNCOMP_QUERY_PARSER", nullptr};
+    luce_test::ScopedEnvVar top_p{"PFLASH_LONGATTNCOMP_TOP_P", nullptr};
+
+    const std::string tokenizer_path =
+        write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(tokenizer_path.c_str()));
+
+    MockPflashCompressBackend backend;
+    ServerConfig config;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(backend, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::RESPONSES;
+        request.messages = "x";
+        request.prompt_tokens = tokenizer.encode("x");
+
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+
+    TEST_ASSERT(backend.compress_calls == 1);
+    TEST_ASSERT(backend.last_request.score_query_end == 1);
+    TEST_ASSERT(backend.last_request.score_query_tokens == 1);
+    unlink(tokenizer_path.c_str());
+}
 
 struct MockBatchCompressBackend : MockBackend {
     int compress_calls = 0;

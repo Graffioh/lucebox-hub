@@ -3079,6 +3079,8 @@ std::string HttpServer::apply_pflash_compression(
             return std::string("PFlash user-query normalization failed: ") +
                    error.what();
         }
+    } else if (raw_text_input) {
+        last_user_text = req.messages.get<std::string>();
     } else if (req.messages.is_array()) {
         for (int index = (int) req.messages.size() - 1; index >= 0; --index) {
             if (req.messages[index].value("role", "") != "user") continue;

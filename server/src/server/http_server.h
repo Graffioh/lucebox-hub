@@ -422,6 +422,8 @@ public:
     }
 
 private:
+    friend struct HttpServerTestAccess;
+
     // Client thread: read HTTP request, parse, enqueue job, wait.
     void handle_client(SocketHandle fd);
 

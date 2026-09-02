@@ -438,6 +438,14 @@ struct ModelBackend {
     struct CompressResult {
         bool                 ok = false;
         std::vector<int32_t> compressed_ids;  // surviving token IDs
+
+        static CompressResult from_compressed_ids(
+                std::vector<int32_t> ids) {
+            CompressResult result;
+            result.compressed_ids = std::move(ids);
+            result.ok = !result.compressed_ids.empty();
+            return result;
+        }
     };
 
     // Typed compress API (preferred for in-process callers).
