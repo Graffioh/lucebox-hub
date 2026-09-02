@@ -1,4 +1,4 @@
-# Serving and engine components
+# LuceEngine component design
 
 Status: Draft
 
@@ -6,564 +6,784 @@ Source snapshot: `upstream/main` at `298031aa`
 
 ## Summary
 
-Lucebox has two local generation paths behind one HTTP server:
+Lucebox currently exposes two local generation paths to `HttpServer`:
 
-- The classic worker runs one complete request through `ModelBackend`.
-- The concurrent scheduler advances several requests through `SeqEngine`.
+- A worker runs a complete request through `ModelBackend::generate()`.
+- A scheduler advances concurrent requests through `SeqEngine`.
 
-Both paths are valid. A full-request backend call and an iteration-level engine
-step solve different problems, so this design does not combine them behind a
-new universal interface. It instead defines the ownership boundaries between
-the HTTP edge, serving coordination, model execution, architecture runtime,
-GGML, auxiliary processes, and the client response.
+This split let continuous batching land without rewriting every model family.
+It now makes the HTTP layer responsible for model scheduling and gives
+request-level generation two unrelated shapes.
 
-The first implementation work should preserve the established types and split
-the large `http_server.cpp` translation unit by responsibility. Later changes
-can share narrowly defined response and error state without forcing the two
-execution paths into the same lifecycle.
-
-## Goals
-
-- Make a request traceable from the socket to GGML and back to the client.
-- State which component owns transport, request policy, scheduling, model
-  state, tensor execution, and response formatting.
-- Keep JSON and HTTP concerns out of model and GGML code.
-- Preserve the distinction between whole-request and iteration-level
-  execution.
-- Reduce the amount of server state a reader must hold in mind at once.
-- Reuse current names when they already describe their responsibility.
-- Introduce new types only when they remove duplicated state or make failure
-  handling explicit.
-- Provide an incremental migration that can be reviewed and verified in small
-  changes.
-
-## Non-goals
-
-- Replacing `ModelBackend` and `SeqEngine` with one engine interface.
-- Copying the process topology of vLLM or SGLang.
-- Moving the normal local request path behind IPC.
-- Renaming every request, slot, callback, or result type.
-- Splitting every optional `ModelBackend` capability at once.
-- Changing scheduling policy, cache behavior, or API output in the first file
-  split.
-- Defining a request-wide `GenerationPlan` type.
-- Hiding architecture-specific graph and cache state behind generic maps or
-  untyped payloads.
-
-## Current request paths
-
-### Startup
-
-`server_main.cpp` resolves configuration, creates the selected backend and
-tokenizer, constructs `HttpServer`, and calls `HttpServer::run()`.
-
-At startup, `HttpServer::run()` selects the execution loop:
-
-- If `ModelBackend::seq_engine()` returns `nullptr`, it starts `worker_loop()`.
-- If the backend exposes a `SeqEngine`, it starts `scheduler_loop()`.
-- The upstream proxy path remains an HTTP concern and bypasses local model
-  execution for the forwarded request.
-
-Today, Qwen 3.5 is the worked concurrent implementation under
-`server/src/qwen35/concurrency/`. Other model families use the classic path.
-
-### Relationship to inference configuration
-
-The configuration design in
-[PR #688](https://github.com/Luce-Org/lucebox/pull/688) owns startup input,
-validation, and backend construction. This design begins after the backend and
-server configuration have been resolved.
-
-The two changes should meet at existing constructor boundaries. The component
-work should not move startup parsing into `HttpServer`, and the configuration
-work should not introduce request-lifecycle types. The initial server file
-split uses `ServerConfig` and `ModelBackend` as they exist, so it can be stacked
-or merged independently of the configuration refactor.
-
-### Common HTTP edge
-
-The request enters through these existing components:
+The target has one request boundary:
 
 ```text
-client socket
-  -> HttpServer::handle_client()
-  -> HttpServer::route_request()
-  -> request parsing, chat rendering, and tokenization
-  -> ParsedRequest
-  -> ServerJob
-  -> server queue
-```
-
-`ParsedRequest` is the normalized, model-ready representation of one supported
-HTTP request. It contains prompt tokens, sampling settings, output limits,
-streaming mode, tools, stop sequences, and the API fields needed to construct
-the response.
-
-`ServerJob` connects that request to its client socket and completion wait. The
-client thread owns the job on its stack. The worker or scheduler borrows it
-until it signals completion.
-
-### Classic execution
-
-The classic worker owns the complete lifecycle of one request:
-
-```text
-ServerJob
-  -> HttpServer::process_job()
-  -> prepare prompt and cache state
-  -> GenerateRequest
-  -> ModelBackend::generate() or restore_and_generate()
-  -> architecture-specific prefill and decode
-  -> GGML graph execution
-  -> GenerateResult
-```
-
-`process_job()` also coordinates FlowKV, PFlash, prefix snapshots, draft
-residency, agent-turn memory, status reporting, and final response delivery.
-These are serving policies around generation. They are not responsibilities of
-GGML.
-
-`ModelBackend::generate()` represents one complete prefill and decode cycle.
-The backend selects autoregressive, speculative, or other model-specific
-execution. `GenerateRequest` and `GenerateResult` are the typed boundary for
-that call.
-
-`DaemonIO` carries the legacy daemon stream descriptor together with token,
-cancellation, and observation callbacks. The HTTP server uses the callbacks;
-the stdin daemon protocol still uses the descriptor. This mixed role should be
-reduced only after the two callers can be migrated independently.
-
-### Concurrent execution
-
-The concurrent path keeps request policy in the scheduler and model state in
-the engine:
-
-```text
-ServerJob
-  -> HttpServer::scheduler_loop()
-  -> SchedSlot
-  -> SeqEngine::admit()
-  -> SeqEngine::step()
-  -> architecture-specific batched forward and sampling
-  -> GGML graph execution
-  -> SeqEngine::StepResult
-```
-
-The scheduler owns admission order, fairness, output caps, stop conditions,
-thinking-budget token substitution, client backpressure, and retirement. Its
-`SchedSlot` contains only server-side request progress and response state.
-
-The engine owns slot allocation, prompt progress, paged KV blocks, recurrent
-state, graph shapes, tensor inputs, batched forward execution, and sampling.
-Those details remain inside the architecture implementation. The scheduler
-sees only slot identifiers and the existing `SeqEngine` inputs and outputs.
-
-`SeqEngine::StepPlan` is intentionally limited to one scheduler iteration. It
-is not a request-wide configuration object and should remain named for the
-single step it describes.
-
-### Response path
-
-Both local execution paths use the same response components:
-
-```text
-token or terminal result
-  -> SseEmitter
-  -> API-specific events or complete JSON
-  -> direct socket write in the classic worker
-     or ClientSendBuffer in the concurrent scheduler
+HTTP or daemon adapter
+  -> LuceEngine::generate()
+       -> request lifecycle and scheduling
+       -> model execution capability
+       -> model-family state
+       -> GGML
+  <- token events and one terminal result
+  -> protocol formatting
   -> client
 ```
 
-`SseEmitter` currently owns two concerns:
+The boundary is structural. C++ access modifiers do not define it.
+`LuceEngine` owns request scheduling, model access, cancellation, and
+completion. `HttpServer` owns HTTP and sockets. Model-family code owns weights,
+caches, graphs, and GGML objects.
 
-1. Semantic response state, including reasoning, content, tool calls, stop
-   sequences, and finish reason.
-2. OpenAI, Anthropic, and Responses API event formatting.
+There is one request-level function named `generate()`. The final design does
+not retain `ModelBackend::generate()` below `LuceEngine::generate()`, and it
+does not present `ModelBackend` and `SeqEngine` as peer engines.
 
-This combination keeps behavior consistent today, but it makes non-streaming
-and streaming response construction harder to reason about. A later extraction
-can move the first concern into `ResponseState` while keeping `SseEmitter` as
-the established wire-format component.
+## Goals
 
-`ClientSendBuffer` is specific to the shared concurrent loop. It prevents a
-slow reader from blocking other active sequences. The classic worker can write
-directly because it serves only one generation at a time.
+- Give HTTP and daemon generation one operation with one lifecycle.
+- Keep scheduling mode out of request callers.
+- Define each component by the decisions and state it owns.
+- Keep HTTP, JSON, SSE, and socket types out of engine and model execution.
+- Keep GGML, graph, cache-layout, and device types out of HTTP and engine
+  request types.
+- Preserve the concurrency invariants introduced by PR #594.
+- Preserve serial generation behavior, including speculative empty-output
+  retry, snapshot restore, cache behavior, and cancellation.
+- Make request data safe to retain after `generate()` returns.
+- Give shutdown and model control one serialization point.
+- Migrate in steps that leave one usable request path after each change.
 
-### Auxiliary process execution
+## Non-goals
 
-IPC is an optional branch inside backend and optimization implementations. It
-is not the normal boundary between `HttpServer` and `ModelBackend`.
+- Copying the multi-process topology of vLLM or SGLang.
+- Moving normal local generation behind IPC.
+- Making every model family implement continuous batching.
+- Forcing complete-request and batch-step execution into the same low-level
+  method.
+- Passing `ParsedRequest` or `ServerConfig` into model-family code.
+- Adding a request-wide `GenerationPlan` type.
+- Renaming existing types without moving ownership.
+- Splitting every optional backend capability before its callers move.
+
+## Why the current split exists
+
+`ModelBackend` and `SeqEngine` were created for different callers and at
+different times.
+
+Commit `3d1dcad85` introduced `ModelBackend` as the shared adapter for the
+line-oriented daemon. Its whole-request operation matched the daemon command:
+prefill, decode, stream tokens, and return a result. The same interface also
+collected park, snapshot, compression, and command hooks.
+
+Commits `35784218` and `9daa25c2`, followed by
+[PR #594](https://github.com/Luce-Org/lucebox/pull/594), added concurrent Qwen
+serving in two parts. `SeqEngine` first defined model-side slot execution.
+`scheduler_loop()` then added admission, fair prefill, cancellation, and
+non-blocking client delivery. `HttpServer::run()` selected the scheduler only
+when a backend returned a sequence engine.
+
+That history explains the asymmetry. It does not require the HTTP server to
+keep choosing between the two paths.
+
+The useful boundary from PR #594 remains:
+
+- Request coordination owns admission order, fairness, stop decisions,
+  cancellation, client progress, and retirement.
+- Model execution owns slot allocation, KV blocks, recurrent state, graph
+  shapes, batched forward execution, and sampling.
+
+The new structure moves request coordination into `LuceEngine`. It does not
+move it into GGML or model-family code.
+
+## Current flow
+
+### Startup
+
+`server_main.cpp` constructs a backend, a tokenizer, and `HttpServer`.
+`HttpServer::run()` then checks `ModelBackend::seq_engine()` once:
 
 ```text
-ModelBackend or architecture runtime
-  -> role-specific IPC client
-  -> BackendIpcProcess
-  -> draft, compression, shard, or expert subprocess
+seq_engine() == nullptr  -> worker_loop()
+seq_engine() != nullptr  -> scheduler_loop()
 ```
 
-`BackendIpcProcess` owns process launch, pipes, shared payload setup, status
-transport, scratch paths, and shutdown. Role-specific clients such as
-`DFlashDraftIpcClient`, `PFlashDrafterIpcClient`, and
-`TargetShardIpcSession` own their payload protocols.
+The upstream proxy forces the worker path even when the backend has a
+`SeqEngine`.
 
-This distinction matters for both naming and failure handling. A transport
-failure belongs to the IPC session. A generation or model failure belongs to a
-typed engine result. The server should not need to decode subprocess strings.
+### Complete-request execution
+
+```text
+HttpServer::process_job()
+  -> prompt preparation and cache selection
+  -> GenerateRequest
+  -> ModelBackend::generate() or restore_and_generate()
+  -> model-specific prefill and decode
+  -> GGML graph execution
+  -> DaemonIO token callbacks
+  -> GenerateResult
+  -> cache and response finalization
+```
+
+`process_job()` owns HTTP state and model-serving policy in one function. It
+coordinates PFlash, FlowKV, prefix snapshots, draft residency, generation
+limits, status, token delivery, and response completion.
+
+### Batch execution
+
+```text
+HttpServer::scheduler_loop()
+  -> SchedSlot
+  -> SeqEngine::admit()
+  -> build StepPlan
+  -> SeqEngine::step()
+  -> apply token and stop policy
+  -> buffer client output
+  -> SeqEngine::retire()
+```
+
+`SchedSlot` contains two kinds of state. Request progress, slot identity, token
+history, and cancellation belong to generation. Sockets, `SseEmitter`, and
+`ClientSendBuffer` belong to HTTP response delivery.
+
+`Qwen35SeqEngine` is not a peer of `Qwen35Backend`. The backend owns the
+sequence engine, paged KV pool, weights, graphs, and GGML backends. The
+sequence engine borrows those resources to run batched steps.
 
 ## Target ownership
 
-The dependency direction should remain one way:
+### Composition and lifetime
+
+The configuration design in
+[PR #688](https://github.com/Luce-Org/lucebox/pull/688) and its implementation
+follow-up own launch-time input, validation, and model construction. The engine
+design begins after backend construction succeeds:
 
 ```text
-HTTP and API edge
-  -> serving request state
-    -> classic worker or concurrent scheduler
-      -> ModelBackend or SeqEngine
-        -> architecture runtime
-          -> GGML
-
-architecture runtime
-  -> optional role-specific IPC client
-    -> BackendIpcProcess
-
-GGML result
-  -> typed backend or engine result
-    -> response state
-      -> API events or response JSON
-        -> socket or ClientSendBuffer
+BackendArgs + BackendAdmissionContext
+  -> BackendPlan
+  -> create_backend(plan)
+  -> BackendRuntime
+  -> LuceEngine
+  -> HttpServer
 ```
 
-### HTTP and API edge
+`BackendPlan` remains launch-time data. It is not a request or scheduler plan.
+`BackendRuntime` owns the validated plan and the model-family resources whose
+configuration points into it.
 
-Owned by `server/src/server/`.
+`LuceEngine` takes ownership of `BackendRuntime`. `HttpServer` borrows
+`LuceEngine` for the duration of server execution. This ownership gives the
+shutdown order a concrete shape:
 
-Responsibilities:
+1. `HttpServer` stops accepting work and cancels its live generations.
+2. `LuceEngine` rejects new requests, completes or retires active work, and
+   joins its execution thread.
+3. `BackendRuntime` releases model and device resources as part of
+   `LuceEngine` destruction.
 
-- Accept sockets and parse HTTP framing.
-- Route supported endpoints.
-- Validate JSON and map API aliases into one internal representation.
-- Apply chat templates and tokenize prompts.
-- Construct API-specific success and error responses.
-- Detect client disconnects and manage streaming headers.
+`ServerConfig` remains the HTTP and request-default configuration. Construct
+`LuceEngine` with only scheduler, cache, and output-channel values that the
+engine owns. Do not pass the full `ServerConfig` into backend preparation,
+backend construction, or model code.
 
-The edge may depend on tokenizer, chat-template, and API-format code. Model and
-GGML code must not depend on HTTP status codes, SSE frames, or request JSON.
+### Caller view
 
-### Serving request state
+HTTP prepares an owned model request and receives a generation handle:
 
-Keep these current names:
+```cpp
+GenerateRequest request = make_generate_request(parsed_request);
+Generation generation = engine.generate(std::move(request));
 
-- `ParsedRequest` for the normalized request accepted by local serving.
-- `ServerJob` for the socket-bound queued unit and its completion wait.
-- `GenerationInputs` for the classic worker's private aggregate.
-- `SchedSlot` for one request's server-side concurrent state.
+for (;;) {
+    GenerateEvent event = generation.next();
+    if (const auto * tokens = std::get_if<TokenBatch>(&event)) {
+        response.write(tokens->tokens);
+        continue;
+    }
+    if (const auto * progress = std::get_if<GenerationProgress>(&event)) {
+        status.update(*progress);
+        continue;
+    }
 
-These names match their scope. Promoting `GenerationInputs` into a shared
-engine contract would be a mistake because the classic and concurrent paths do
-not consume the same unit of work.
+    response.finish(std::get<GenerateCompleted>(event).result);
+    break;
+}
+```
 
-The main improvement is ownership, not renaming. Fields should move out of
-these structures only when another component becomes their clear owner.
+The daemon uses the same operation and maps events to its descriptor protocol.
+Neither caller checks concurrency, engine slots, or model type.
 
-### Serving coordination
+Upstream forwarding remains an HTTP transport operation. It does not pretend
+to be local generation.
 
-The classic worker and concurrent scheduler should remain separate loops.
-They can share pure policy functions and response construction, but not a
-synthetic lifecycle interface.
+### Request and completion
 
-The classic worker owns:
+The existing names remain where their meaning still fits:
 
-- Whole-request prompt preparation and cache restore.
-- Request-scoped draft residency.
-- One call to `ModelBackend::generate()` or `restore_and_generate()`.
-- Whole-request cache finalization and performance reporting.
+```cpp
+struct GenerateRequest {
+    std::vector<int32_t> prompt;
+    int n_gen;
+    SamplerCfg sampler;
+    BudgetHook budget_hook;
+    std::vector<std::string> stop_sequences;
+    std::optional<SnapshotId> restore_from;
+    std::optional<SnapshotCapture> capture;
 
-The concurrent scheduler owns:
+    // These become owned values instead of pointers into an HTTP stack frame.
+    std::vector<int32_t> hint_tokens;
+    std::vector<int32_t> stall_tool_prefix_tokens;
+    std::vector<int32_t> stall_action_suffix_tokens;
+    std::vector<int32_t> stall_skip_tokens;
+};
 
-- Admission and fairness.
-- Prefill slice selection.
-- Batched decode iteration order.
-- Per-slot stop and retirement decisions.
-- Non-blocking response delivery.
+struct TokenBatch {
+    std::vector<int32_t> tokens;
+};
 
-Small shared functions should describe the value they resolve, for example
-`resolve_generation_cap()`, rather than collecting unrelated decisions into a
-new request-wide object.
+struct GenerationProgress {
+    GenerationPhase phase;
+    int processed_tokens;
+};
 
-### Model execution
+struct GenerateCompleted {
+    GenerateResult result;
+};
 
-Keep the two current contracts:
+using GenerateEvent =
+    std::variant<TokenBatch, GenerationProgress, GenerateCompleted>;
+```
 
-- `ModelBackend` owns backend lifetime, whole-request generation, snapshots,
-  and optional capabilities.
-- `SeqEngine` is the optional interface for backends that can keep several
-  live sequences and execute scheduler-selected work together.
+`GenerateRequest` contains model-ready, transport-free input. It does not
+contain a file descriptor, JSON value, HTTP format, response identifier, or
+socket callback.
 
-`ModelBackend::seq_engine()` is enough to select the concurrent path. A third
-base class named `Engine`, `ServingEngine`, or similar would add indirection
-without removing either existing contract.
+The request owns normalized stop strings. `LuceEngine` receives the model's
+token decoder as a construction dependency and keeps one incremental matcher
+per request. A stop string may cross token boundaries. It is not reduced to a
+list of independently tokenized suffixes.
 
-`ModelBackend` is broad, but its optional methods should be extracted only when
-there is a concrete caller and more than one useful implementation. Until
-then, grouped methods and capability checks are easier to follow than a set of
-one-method interfaces.
+The first migration keeps the existing complete token vector in
+`GenerateResult`. The generation operation owns that vector. Token events are
+bounded in-flight copies used for streaming. This preserves daemon, cache, and
+telemetry callers while making the memory cost explicit.
 
-Concurrent failures should eventually reuse `GenerateError` and
-`GenerateErrorCode` rather than add another string-based error family. The
-exact migration can update `AdmitResult`, `DecodeOutput`, `PrefillOutput`, and
-`StepResult` independently while preserving each result's current scope.
+### `Generation`
 
-### Architecture runtime and GGML
+```cpp
+class Generation {
+public:
+    GenerateEvent next();
+    void cancel(GenerationCancelReason reason);
+    ~Generation();
+};
 
-Owned by model-family directories such as `qwen35/`, `gemma4/`, `laguna/`,
-and `deepseek4/`, together with genuinely model-neutral helpers in `common/`.
+class LuceEngine {
+public:
+    LuceEngine(std::unique_ptr<BackendRuntime> runtime,
+               const TokenDecoder & decoder,
+               LuceEngineConfig config);
 
-Responsibilities:
+    Generation generate(GenerateRequest request);
+    ControlResult control(ControlCommand command);
+    void shutdown();
+};
+```
 
-- Load weights and choose device placement.
-- Own model-specific KV, recurrent, and speculative state.
-- Build graphs and bind tensor inputs.
-- Execute GGML backends and read outputs.
-- Implement model-specific prefill, decode, and sampling mechanisms.
+`Generation` is move-only. It owns a reference to channel and terminal state.
+Dropping an unfinished handle cancels its request.
 
-The engine boundary should expose tokens, sampling configuration, progress,
-timings, and typed failures. It should not expose graph tensors, allocator
-handles, block-table layouts, or architecture-specific state to the server.
+Each request has a bounded token channel and a separate terminal cell. Model
+execution never waits for a socket. When a consumer stops draining and the
+channel fills, `LuceEngine` cancels only that request with a typed output
+backpressure result. The terminal cell remains writable even when the token
+channel is full.
 
-Code belongs in `common/` only when at least two model families can use the
-same semantics. Similar graph code is not automatically the same component if
-the model invariants differ.
+The request queue is bounded. When the queue is full, or shutdown has started,
+`generate()` returns an already-completed `Generation` with a typed rejection.
+It does not block or throw. HTTP calls `generate()` before committing streaming
+headers, so it can map an immediate rejection to a normal HTTP status.
 
-### Response state and transport
+`shutdown()` is idempotent. It wakes every waiting `Generation`, publishes one
+terminal result for each request, retires model state on the engine thread,
+and joins before returning. A `Generation` handle may outlive `LuceEngine`, but
+after shutdown it contains only detached channel and terminal state. It cannot
+retain a backend, executor, observer, or engine pointer.
 
-Keep these current names:
+### `LuceEngine`
 
-- `SseEmitter` for API event construction and SSE framing.
-- `ClientSendBuffer` for non-blocking concurrent socket output.
+`LuceEngine` owns:
 
-Introduce `ResponseState` only when semantic accumulation is physically moved
-out of `SseEmitter`. It should own content, reasoning, tool-call parsing, stop
-matching, and finish reason. It should not know about SSE syntax, HTTP status,
-or sockets.
+- The bounded request queue and engine thread.
+- Request IDs and operation state.
+- Selection of serial or continuous-batch coordination at construction.
+- Admission order, fair prefill selection, generation limits, cancellation,
+  retry decisions, and retirement.
+- Incremental stop matching and thinking-budget token decisions before the
+  token returns to model KV.
+- Typed terminal completion and output-channel backpressure.
+- Prefix-cache policy and coordination with physical snapshots.
+- Typed model controls serialized with live generation.
+- Backend lifetime and orderly shutdown.
 
-The draft terminal-error change in
-[PR #689](https://github.com/Luce-Org/lucebox/pull/689) is the first part of
-this boundary. It gives the API layer one response error representation while
-preserving `GenerateError` as the backend-facing failure.
+`LuceEngine` does not own HTTP routes, API response formats, sockets, GGML
+graphs, block tables, or architecture-specific cache layouts.
 
-### IPC transport
+The serial and batch coordinators are implementation components inside this
+ownership boundary. They are not alternate entry points. Both consume the
+same engine request state and publish through the same `Generation` channel.
 
-Keep `BackendIpcProcess` as the process and transport owner. Keep payload
-semantics in role-specific clients.
+### Model execution capabilities
 
-An IPC client should either complete one protocol transaction or invalidate
-the session. This prevents a partial read or write from being mistaken for the
-next response. A small shared helper for marking a process unusable is
-preferable to a generic request envelope shared by unrelated IPC modes.
+Complete-request and batch-step execution remain different below
+`LuceEngine`. Their contracts use names on the same axis:
+
+```cpp
+class SingleRequestExecutor {
+public:
+    virtual GenerateResult execute(
+        const GenerateRequest & request,
+        ExecutionHooks & hooks) = 0;
+};
+
+class BatchExecutor {
+public:
+    virtual SlotClaim claim(const GenerateRequest & request) = 0;
+    virtual StepPlanLimits step_limits(int decode_rows) const = 0;
+    virtual BatchStepResult step(const BatchStepPlan & plan) = 0;
+    virtual void retire(SlotId slot) = 0;
+    virtual bool token_is_eos(int32_t token) const = 0;
+};
+```
+
+`ExecutionHooks` is transport-free. It supplies cancellation, progress, and a
+synchronous pre-commit token decision. For each sampled token, the
+single-request executor asks the hook whether to accept, replace, or stop
+before it writes that token to reusable KV state. Accepted tokens then enter
+the bounded `Generation` channel. Progress reports are model-neutral and may
+be coalesced when a consumer falls behind.
+
+The batch coordinator performs the same decision directly because
+`BatchExecutor::step()` already returns pending tokens before the next step
+commits them. This keeps one owner for stop matching and force-close policy
+without making a complete-request backend expose a batch-step lifecycle.
+
+A model backend supplies exactly one execution capability. The type selected
+at construction is fixed for the engine lifetime.
+
+`ModelBackend::generate()` does not exist in the final structure. Existing
+`generate_impl()` bodies move to `SingleRequestExecutor::execute()`. Existing
+`SeqEngine` implementations move to `BatchExecutor` after the scheduler sits
+behind `LuceEngine`.
+
+This is not a universal low-level engine interface. It records the two real
+model execution units without making HTTP understand either one.
+
+### Model-family and GGML boundary
+
+`BackendRuntime` and the model-family backend own:
+
+- Loaded weights and model configuration.
+- Target and draft GGML backends.
+- KV, recurrent, and speculative state.
+- Graph construction and tensor binding.
+- Model-specific prefill, decode, verification, and sampling.
+- Scratch buffers and device placement.
+- Physical snapshot capture and restore.
+- Role-specific IPC clients.
+
+No `ggml_*` type, graph tensor, allocator, block table, or model-specific state
+crosses into `LuceEngine`, `Generation`, or `HttpServer`.
+
+`ModelBackend` remains the migration name for this resource owner. Do not
+rename it until generation and daemon concerns have moved out and its final
+responsibility can be judged from the remaining code.
+
+### Stop conditions and token commitment
+
+Stop conditions that affect model progress belong to generation policy, not
+wire formatting. `LuceEngine` owns EOS, generation limits, normalized stop
+sequences, cancellation, and thinking-budget force-close.
+
+The engine must decide whether to continue before a sampled token is fed back
+into KV. This preserves the current batch invariant that a force-close or stop
+decision can replace or reject a pending token before the next step commits
+it. API-specific reasoning, tool-call, and event formatting remain in
+`SseEmitter` or a later transport-neutral semantic response component.
+
+The incremental stop matcher and budget hook live in engine request state. The
+single-request executor calls `ExecutionHooks` before commit. The batch
+coordinator applies the same decision to each pending token before it builds
+the next step. HTTP never decides whether model execution continues. It only
+formats token events already accepted by generation policy.
+
+### Retry ownership
+
+`LuceEngine` owns the common empty speculative-output decision now implemented
+by `ModelBackend::generate()` and `restore_and_generate()`.
+
+The single-request coordinator preserves the current retry and result-merge
+behavior. The token policy withholds suppressed EOS-only output, so an attempt
+marked `empty_visible_output` cannot leak token events before the retry. The
+coordinator retries once with autoregressive decode and merges timing,
+restored-prefix, speculation, budget-close, and degeneration metadata exactly
+as the current wrapper does.
+
+A batch retry is allowed only when the executor reports that no visible token
+was published and the attempt can be reset without reusing partially mutated
+state. Otherwise the engine returns a typed failure. Retiring and re-admitting
+a slot is not sufficient proof of rollback.
+
+### Cache and snapshot boundary
+
+Prefix policy and physical model state have different owners:
+
+```text
+LuceEngine cache component
+  -> prefix keys, selection, eviction, request association
+  -> opaque SnapshotId and backend-neutral metadata
+
+model-family snapshot component
+  -> physical images, release, import, and export
+  -> GGML buffers and architecture-specific representation
+```
+
+The model backend supplies a snapshot capability beside its execution
+capability:
+
+```cpp
+class SnapshotStore {
+public:
+    virtual SnapshotResult release(SnapshotId id) = 0;
+    virtual SnapshotExport export_snapshot(SnapshotId id) = 0;
+    virtual SnapshotResult import_snapshot(SnapshotImport image) = 0;
+};
+```
+
+`LuceEngine` is the only coordinator of this capability and invokes it at an
+engine safe point. The selected execution capability applies snapshots to its
+own state. `SingleRequestExecutor::execute()` handles `restore_from` before
+prefill. `BatchExecutor::claim()` binds `restore_from` to the claimed slot as
+one atomic admission operation. A batch executor that cannot restore returns a
+typed unsupported result without claiming a slot.
+
+`GenerateRequest::capture` asks the selected executor to capture its request
+state at the specified position and return an opaque `SnapshotId`. The
+executor and the model-family snapshot component share the physical
+representation below the engine boundary. Unsupported operations never fall
+back to a second generation path.
+
+`DiskPrefixCache` currently reads `ModelBackend::SnapshotRef`, including raw
+GGML handles. The target replaces that crossing with an owned snapshot
+transaction or stream. A failed import must leave no adopted partial state.
+
+Model-cache validity must depend on engine facts such as accepted tokens and
+terminal state. API or socket visibility must not enter model execution.
+Client-visible conversation memory can remain a response-layer concern when
+its validity depends on what reached the client.
+
+### Control and daemon boundary
+
+Park, unpark, explicit snapshots, compression, bootstrap, and daemon-specific
+commands are control operations. They do not become `GenerateRequest` modes or
+extra `generate()` functions.
+
+The daemon adapter parses its line protocol into typed commands. `LuceEngine`
+serializes those commands through the engine thread so they cannot race model
+execution. Each command declares one lifecycle rule: reject while busy, queue
+behind active work, drain active work, or cancel active work. Model-family code
+implements the mechanism after the engine establishes the safe state.
+
+`DaemonIO`, string commands, and file descriptors stop at the daemon adapter.
+Model execution receives `ExecutionHooks` and typed control values. Model
+progress enters those hooks and becomes coalesced
+`GenerationProgress` events. This preserves live status without passing a
+daemon or HTTP observer into model-family code.
+
+### Response and transport boundary
+
+`HttpServer` owns:
+
+- HTTP framing, routes, and request validation.
+- API aliases, chat rendering, and tokenization.
+- Sockets, disconnect detection, CORS, and heartbeats.
+- SSE and non-streaming response formatting.
+- Translation of typed engine failures into HTTP or stream errors.
+
+Each client thread consumes its `Generation` and remains the only code that
+writes that socket. This removes `SocketHandle`, `ServerJob`, `SseEmitter`, and
+`ClientSendBuffer` from engine scheduler state.
+
+Streaming headers may already be committed when generation fails. The HTTP
+adapter maps the same typed terminal error to either a normal HTTP error or the
+matching stream error based on its own connection state. This keeps the
+terminal boundary in
+[PR #689](https://github.com/Luce-Org/lucebox/pull/689) intact.
+
+Keep the name `SseEmitter` until semantic accumulation is physically moved out
+of it. A later extraction should separate response meaning from SSE framing,
+but that change is not required to introduce `LuceEngine`.
+
+### IPC boundary
+
+`BackendIpcProcess` remains the owner of process launch, pipes, shared payload
+setup, framing, and shutdown. Role-specific clients continue to own their
+payload protocols.
+
+IPC stays below the model execution capability. `LuceEngine` receives typed
+execution or control outcomes. It does not receive pipe descriptors or decode
+subprocess strings.
+
+## Final dependency direction
+
+```text
+server_main
+  -> BackendPlan
+  -> BackendRuntime
+  -> LuceEngine
+       -> request coordinator
+            -> SingleRequestExecutor
+            or BatchExecutor
+                 -> model-family resources
+                 -> optional role-specific IPC
+                 -> GGML
+  -> HttpServer
+       -> Generation
+       -> response formatting
+       -> client socket
+```
+
+The model backend and batch executor are not alternative top-level paths.
+`BackendRuntime` owns the model resources. `LuceEngine` owns one request
+lifecycle and uses the execution capability supplied by those resources.
 
 ## Source organization
 
-The first structural change should split `http_server.cpp` without changing
-the `HttpServer` class or request behavior:
+The target directory structure follows owned state:
 
-| File | Responsibility |
+| Path | Responsibility |
 |---|---|
-| `http_server.cpp` | Server lifetime, accept loop, socket I/O, job queue, and disconnect monitoring |
-| `http_routes.cpp` | Endpoint routing, request validation, chat rendering, tokenization, and `ParsedRequest` construction |
-| `generation_worker.cpp` | Classic `worker_loop()`, `process_job()`, prompt preparation, cache lifecycle, and backend call |
-| `scheduler.cpp` | Concurrent admission, iteration policy, slot lifecycle, and buffered delivery |
-| `sse_emitter.cpp` | Existing semantic stream state and API event formatting until `ResponseState` is extracted |
+| `server/src/engine/luce_engine.{h,cpp}` | Request submission, `Generation`, lifecycle, cancellation, and shutdown |
+| `server/src/engine/coordinator.{h,cpp}` | Serial and continuous-batch request coordination and shared policy |
+| `server/src/engine/generation_channel.h` | Bounded token delivery and one terminal result |
+| `server/src/engine/stop_matcher.{h,cpp}` | Incremental text stops and pre-commit token decisions |
+| `server/src/engine/prefix_cache.{h,cpp}` | Prefix policy and opaque snapshot association |
+| `server/src/common/generation_executor.h` | `SingleRequestExecutor` and `BatchExecutor` contracts |
+| `server/src/server/http_server.{h,cpp}` | Listener, client lifetime, routes, and HTTP framing |
+| `server/src/server/response_writer.{h,cpp}` | `SseEmitter`, JSON responses, and typed error mapping |
+| `server/src/common/daemon_loop.{h,cpp}` | Legacy command parsing and protocol output during migration |
+| `server/src/<model-family>/` | Execution capability and physical model state |
 
-This split changes file ownership, not public interfaces. Existing
-`HttpServer` member functions can be defined across the translation units.
-Tests and the server target should compile the same source set.
+Do not move files only to match this table. Move a file when the state and
+decisions listed here move with it.
 
-After the split, helpers that are used by only one file should move into that
-file's anonymous namespace. Helpers shared by classic and concurrent serving
-should have narrow typed signatures in a server-local header.
+## Migration
 
-## Migration order
+### 1. Add owned request and generation output
 
-### 1. Make terminal results explicit
+Make `GenerateRequest` own its optional token vectors. Add `Generation` with a
+bounded request queue, bounded token channel, typed terminal result, idempotent
+cancellation, immediate rejection, and shutdown tests.
 
-Land the API-facing terminal error boundary from PR #689. Both execution paths
-must branch on success or failure before success finalization, cache updates,
-or HTTP 200 responses.
+### 2. Put both current loops behind `LuceEngine`
 
-### 2. Split the server translation unit
+Move the job queue and worker ownership out of `HttpServer`. Wrap the current
+worker and scheduler without changing model mechanics. Switch HTTP and daemon
+generation callers to `LuceEngine::generate()`.
 
-Create `http_routes.cpp` and `generation_worker.cpp`, then move existing
-functions with no behavior or naming changes. Update both the server target and
-model-free test target together.
+At this point callers have one request operation, but transitional lower
+interfaces still exist.
 
-This change creates reviewable component boundaries before adding new types.
+### 3. Split scheduler state from transport state
 
-### 3. Extract semantic response state
+Move request IDs, admission, prefill progress, pending tokens, cancellation,
+generation limits, retry state, and retirement into engine-owned state. Keep
+sockets, `SseEmitter`, heartbeats, and wire formatting in HTTP-owned state.
 
-Move content, reasoning, tool-call, stop-sequence, and finish-reason state from
-`SseEmitter` into `ResponseState`.
+Delete `ClientSendBuffer` from scheduler state after client threads consume
+bounded `Generation` channels directly.
 
-Both streaming and non-streaming builders should consume the same state.
-`SseEmitter` should remain responsible for API events and SSE framing. This
-keeps the familiar name and removes the current accumulation ambiguity.
+### 4. Rename lower execution operations by role
 
-### 4. Share only common request policy
+Move existing whole-request implementations to
+`SingleRequestExecutor::execute()`. Move `SeqEngine` implementations to
+`BatchExecutor` only after the scheduler no longer lives in `HttpServer`.
 
-Extract pure helpers for values that classic and concurrent serving must
-derive identically, beginning with generation cap, thinking budget, EOS
-classification, and terminal error mapping.
+Update HTTP support runs, cache staging, and daemon callers in the same wave.
+Delete `ModelBackend::generate()`, `restore_and_generate()`, `generate_impl()`,
+and `seq_engine()` when their final callers migrate.
 
-Do not create a shared request executor. Each path should call the helper at
-the point where it owns the relevant decision.
+### 5. Move shared generation policy once
 
-### 5. Type concurrent engine failures
+Move generation limits, stop decisions, thinking-budget substitution,
+speculative empty-output retry, cancellation reasons, and terminal completion
+into `LuceEngine`. Preserve the current serial behavior with focused tests.
+Add `ExecutionHooks` before moving the serial stop and force-close decisions.
 
-Replace free-form `SeqEngine` failure strings with `GenerateError` values.
-Keep admission, per-row, and whole-step results distinct. The scheduler can
-then map both classic and concurrent failures through the same response error
-function.
+### 6. Move cache and control ownership
 
-### 6. Narrow `DaemonIO`
+Separate prefix policy from physical snapshots. Replace raw snapshot handles
+with `SnapshotStore` and an owned transaction. Parse daemon commands at the
+adapter and serialize typed controls through `LuceEngine::control()`.
 
-Move the legacy file-descriptor behavior behind the daemon caller. Let HTTP
-generation pass only the existing token callback, cancellation probe, and
-inference observer responsibilities needed by the backend.
+### 7. Delete compatibility structure
 
-Migrate all callers in the same change before deleting unused fields. Do not
-add a compatibility wrapper that preserves both shapes indefinitely.
+Remove the HTTP execution-mode branch, the old worker and scheduler entry
+points, `DaemonIO` from HTTP generation, transport fields in scheduler slots,
+and temporary adapters. The migration is incomplete while any caller can
+bypass `LuceEngine::generate()` for local generation.
 
-### 7. Harden IPC transactions
+## Required invariants
 
-Centralize the rule that a framing, payload, or subprocess failure closes the
-affected `BackendIpcProcess`. Keep the error returned to generation typed and
-specific to the role-specific client.
+The migration must preserve these facts from PR #594:
 
-### 8. Revisit optional backend capabilities
+- One engine thread is the only caller that mutates model execution state.
+- Admission claims capacity without running model compute.
+- Request and slot identity remain stable until retirement.
+- Each decode step covers every selected live row exactly once.
+- Prefill work is bounded, fair, and may progress beside active decode.
+- A pending token may be substituted before the executor commits it to KV.
+- Each selected row returns one explicit outcome.
+- A possibly mutating step failure retires the affected cohort before another
+  step.
+- Temporary capacity pressure preserves FIFO order.
+- Permanent capacity failure returns a typed terminal result.
+- A slow or disconnected consumer cannot block progress for other requests.
+- Retirement releases all model-owned request state and is safe after failure.
 
-After call sites are narrow and covered by tests, measure whether snapshots,
-compression, parking, or remote draft support benefit from separate capability
-interfaces. Extract only the groups that reduce real coupling.
+The migration must also preserve these complete-request facts:
 
-## Naming rules
-
-New names should reveal both scope and owner:
-
-- Use `Request` and `Response` for API or whole-request data.
-- Use `Admission`, `Slot`, `Prefill`, `Decode`, and `Step` for scheduler and
-  concurrent engine data.
-- Use `Backend` for model-family lifetime and capability ownership.
-- Use `Ipc` plus the remote role for subprocess clients and sessions.
-- Use `State` only for data that persists across calls.
-- Use `Result` for a completed operation with success or failure.
-
-Avoid names that hide the unit of work. In particular, do not introduce
-`GenerationPlan`, `ApiRequest`, `ServingRequest`, `OwnedGenerationPlan`,
-`GenerationCallbacks`, `RequestSlotState`, or `ApiStreamEncoder` as renames of
-the current types. The established names are clearer when their ownership is
-documented and their files are smaller.
+- Empty speculative output retries through autoregressive decode exactly once.
+- Restored-prefix and timing metadata survive retry.
+- Cancellation is checked during prefill and decode.
+- Prefix restore and cache staging cannot race live model work.
+- Draft residency changes occur only at an engine safe point.
+- Streaming and non-streaming calls receive one terminal success or failure.
 
 ## Verification
 
-Each migration step should leave both execution paths usable.
+Each implementation step must include checks at the boundary it changes:
 
-Required checks:
+- Model-free tests for `Generation` ownership, cancellation, bounded output,
+  immediate overload rejection, terminal delivery, shutdown, and a handle
+  destroyed after its engine.
+- Existing `SeqEngine` contract tests against `BatchExecutor` after migration.
+- Serial empty-output retry and result-merge tests.
+- Streaming and non-streaming success and failure for every API format.
+- Disconnects during admission, prefill, decode, and final output.
+- A slow client while other batch slots continue.
+- Stop and force-close decisions before the next KV commit.
+- Cohort retirement after a partially mutating batch failure.
+- Prefix restore, disk snapshot failure cleanup, and cache staging.
+- Park, unpark, and shutdown while requests are queued or active.
+- Coalesced progress delivery without an HTTP or daemon observer below the
+  engine boundary.
+- Static dependency checks that keep HTTP types out of engine and model code,
+  and GGML types out of HTTP and engine request headers.
 
-- Build `dflash_server` for the enabled CUDA or HIP configuration.
-- Build and run the model-free server unit tests.
-- Run `test_seq_engine_contract` for each concurrent engine.
-- Exercise streaming and non-streaming success responses for all supported API
-  formats.
-- Exercise classic and concurrent backend failures and verify non-200 or SSE
-  error termination.
-- Exercise client disconnects during prefill and decode.
-- Exercise a slow concurrent reader and verify other slots continue.
-- Exercise prefix restore, request-scoped draft residency, and upstream proxy
-  paths after moving the classic worker.
-- Check that model-family and `common/` sources do not construct HTTP JSON or
-  SSE frames.
-- Check that server sources do not depend on architecture-specific graph or KV
-  structures.
+## Lessons from other engines
 
-The file split should produce no wire-format or scheduling changes. A useful
-review technique is to compare the moved function bodies before and after the
-split and keep functional edits in later commits.
+The useful comparison is component ownership, not process count.
+
+- [vLLM](https://github.com/vllm-project/vllm/blob/main/docs/design/arch_overview.md)
+  keeps HTTP input and output processing separate from an engine core that
+  owns scheduling, KV management, and worker coordination. Lucebox can use the
+  ownership split without adopting ZMQ or one worker process per GPU.
+- [SGLang](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/io_struct.py)
+  uses distinct typed messages between API, tokenization, scheduling, and
+  model execution. Lucebox needs fewer stages, but it benefits from the same
+  rule that wire objects stop at the API boundary.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README-dev.md)
+  separates HTTP routes, task queues, inference slots, task results, and
+  response readers. Lucebox differs because several model families still own
+  complete-request execution, so the lower capability boundary must admit
+  both honest execution shapes.
 
 ## Alternatives rejected
 
-### One universal engine interface
+### Keep both paths under a facade
 
-`ModelBackend::generate()` completes a request. `SeqEngine::step()` advances a
-selected batch by one iteration. A common interface would either expose both
-lifecycle models or reduce one to callbacks around the other. Neither result
-simplifies the caller.
+`LuceEngine::generate()` calling another request-level
+`ModelBackend::generate()` would add a pass-through layer. It would hide the
+name conflict without moving retry, cache, cancellation, or lifecycle
+ownership.
 
-### An internal event bus
+### Force every backend into `admit()`, `step()`, and `retire()`
 
-The request path is direct and performance-sensitive. Typed calls and results
-make ownership and failure propagation visible. An event bus would obscure
-ordering, lifetime, and cancellation without adding a current deployment
-benefit.
+A single step protocol looks uniform, but it makes every complete-request
+backend expose resumable state only to satisfy the abstraction. The target
+keeps one request interface and two honest model execution capabilities.
 
-### IPC between HTTP and every backend
+### Rename `ModelBackend` to `LuceEngine`
 
-vLLM and SGLang use process boundaries to support their deployment and
-scheduling designs. Lucebox currently has a direct in-process local path plus
-targeted subprocesses for heterogeneous execution. Mandatory IPC would add
-serialization and lifecycle work without resolving the current source
-organization problem.
+The current type owns daemon commands, resource controls, complete-request
+execution, snapshots, and optional batch execution. Renaming it would not move
+the HTTP scheduler or split its responsibilities.
 
-### A broad rename pass
+### Keep scheduling in `HttpServer`
 
-The current names mostly identify real units: parsed request, server job,
-backend request and result, scheduler slot, engine step, SSE emitter, send
-buffer, and IPC process. Moving responsibilities first gives any future rename
-concrete evidence and keeps review focused.
+This would preserve duplicate request state, cancellation, shutdown, and
+completion behavior. HTTP would still depend on model execution mode.
 
-### Splitting all `ModelBackend` capabilities now
+### Put sockets in `LuceEngine`
 
-Small interfaces are useful when they let callers depend on less. Creating one
-interface per optional method before narrowing callers would increase the
-number of types without changing ownership.
+Socket ownership would couple scheduling to HTTP and retain separate blocking
+and non-blocking send paths. The existing client thread can consume a bounded
+`Generation` without exposing transport to the engine.
 
-### JSON below the server layer
+### Add mandatory IPC
 
-JSON is part of the external API contract. Passing it into backend or engine
-code couples model execution to current endpoints and makes non-HTTP callers
-harder to support.
+An in-process boundary is sufficient. IPC adds serialization and subprocess
+lifecycle but does not improve source ownership.
 
-## Related designs
+## Synthesis decision
 
-These projects support the ownership direction in this document, but Lucebox
-should not copy their process layouts.
+Two target shapes were compared.
 
-- [vLLM architecture overview](https://github.com/vllm-project/vllm/blob/main/docs/design/arch_overview.md)
-  separates API input and output processing from an engine core that owns
-  scheduling, KV cache management, and worker coordination. Its API and engine
-  core communicate across ZMQ because vLLM chooses a multi-process topology.
-- [SGLang manager I/O structures](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/io_struct.py)
-  distinguish external generation input from tokenized scheduler input. The
-  useful lesson is the typed boundary between stages, not the number of
-  manager processes.
-- [llama.cpp server developer guide](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README-dev.md)
-  separates HTTP context, routes, tasks, queues, inference slots, task results,
-  and response readers. It also keeps JSON formatting and chat templates in
-  the HTTP layer and passes native C++ types to inference slots.
+The selected design keeps `SingleRequestExecutor` and `BatchExecutor` as
+separate model capabilities under one `LuceEngine`. This matches the existing
+model state machines and avoids making serial backends imitate continuous
+batching.
 
-Lucebox differs in two important ways. It supports a classic whole-request
-backend path beside continuous batching, and it uses auxiliary IPC inside
-specific heterogeneous execution features. The target structure must make
-those differences explicit.
+The rejected design used one scheduler and one `admit/step/retire` contract for
+every model, with serial represented as capacity one. Its final diagram was
+smaller, but the migration required every model family to become resumable and
+moved model differences into a wider shared step protocol.
+
+The selected design takes four details from that alternative: an explicit
+split of `SchedSlot` state, a bounded generation channel consumed by client
+threads, the PR #594 invariant checklist, and a migration that first moves
+both loops behind `LuceEngine` before renaming lower contracts.
+
+## Tradeoffs
+
+- We accept two model-execution capabilities in exchange for one honest
+  request lifecycle and no fake universal step method.
+- We accept one engine thread and per-request channels in serial mode in
+  exchange for the same cancellation, control, output, and shutdown behavior
+  for every model.
+- We accept owned copies of optional request token vectors in exchange for
+  safe asynchronous lifetime.
+- We cancel a request whose output channel remains full so one client cannot
+  stop shared model progress.
+- We move backend ownership into `LuceEngine` so model controls cannot bypass
+  the engine's single-writer rule.
 
 ## Open questions
 
-- Should `ResponseState` be extracted immediately after the file split, or
-  should terminal error parity land in both paths first?
-- Which serving policies must reach parity before another model family exposes
-  `SeqEngine`?
-- Can the daemon protocol stop sharing `DaemonIO` with the HTTP server without
-  affecting external scripts?
-- Should all concurrent failures use `GenerateError`, or is a smaller subset
-  sufficient for `SeqEngine`?
-- When this design is implemented, should `server/docs/ARCHITECTURE.md` become
-  an operational overview that links here for component ownership?
+- Which park and compression controls reject, queue, drain, or cancel active
+  requests?
+- Should snapshot export materialize one owned image or stream chunks to the
+  disk cache?
+- Which cache policies depend on client-visible output and therefore must stay
+  above model-state caching?
+- Can every batched speculative implementation prove safe retry after an empty
+  output, or should some return a typed non-retryable failure?
+- Should `server/docs/ARCHITECTURE.md` become the short operational overview
+  that links to this target design?
+
+## Next implementation step
+
+Add an owned `GenerateRequest` and a model-free `Generation` channel test. The
+test must prove bounded publication, one terminal result, idempotent
+cancellation, overload behavior, and shutdown wakeup before model code moves.
