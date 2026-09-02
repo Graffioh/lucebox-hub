@@ -382,16 +382,17 @@ static bool ds4_build_fused_verify_graph(
         MoeHybridStorage * hybrid,
         std::vector<int64_t> && shape_key,
         DeepSeek4PagedCache * paged_cache = nullptr,
-        const std::vector<std::vector<DeepSeek4GatheredLaneRows>> * paged_rows = nullptr) {
+        const Ds4GatheredRowsByRatio * paged_rows = nullptr) {
     const bool paged_mode = paged_cache && paged_rows;
     if (!paged_mode && !cache) return false;
     if (paged_mode) {
-        if (q < 1 || q > 16 ||
-            paged_rows->size() != (size_t) w.n_layer) {
-            return false;
-        }
-        for (const auto & layer_rows : *paged_rows) {
-            if (layer_rows.size() != (size_t) q) return false;
+        if (q < 1 || q > 16) return false;
+        for (uint32_t ratio : w.compress_ratios) {
+            const int ratio_index = ds4_gathered_ratio_index(ratio);
+            if (ratio_index < 0 ||
+                (*paged_rows)[(size_t) ratio_index].size() != (size_t) q) {
+                return false;
+            }
         }
     }
     const size_t graph_capacity = q > 8 ? 131072u : 65536u;
@@ -484,8 +485,11 @@ static bool ds4_build_fused_verify_graph(
     if (paged_mode) {
         for (int il = 0; il < w.n_layer; ++il) {
             const int layer_ratio = (int) w.compress_ratios[il];
+            const int ratio_index =
+                ds4_gathered_ratio_index((uint32_t) layer_ratio);
             for (int t = 0; t < q; ++t) {
-                const auto & rows = (*paged_rows)[(size_t) il][(size_t) t];
+                const auto & rows =
+                    (*paged_rows)[(size_t) ratio_index][(size_t) t];
                 paged_gather_total +=
                     (int64_t) std::max<size_t>(rows.raw_history.size(), 1);
                 if (layer_ratio > 0) {
@@ -526,6 +530,7 @@ static bool ds4_build_fused_verify_graph(
             paged_mode ? nullptr : &cache->layers[(size_t) il];
         const HcLayerWeightsCpu & hlw = hc_weights[(size_t) il];
         const int ratio = (int) w.compress_ratios[il];
+        const int ratio_index = ds4_gathered_ratio_index((uint32_t) ratio);
 
         const int lane_q = q;
         const int lane_start = 0;
@@ -563,7 +568,8 @@ static bool ds4_build_fused_verify_graph(
                 ctx, batched_proj, w, ds4_rope_params(w, ratio), q,
                 ex.pos_q, /*fuse_q_rope=*/false);
             for (int t = 0; t < q; ++t) {
-                const auto & rows = (*paged_rows)[(size_t) il][(size_t) t];
+                const auto & rows =
+                    (*paged_rows)[(size_t) ratio_index][(size_t) t];
                 auto & px = ex.paged.emplace_back();
                 const int64_t lane_idx = (int64_t) il * q + t;
                 px.i32_base = lane_idx * 5;

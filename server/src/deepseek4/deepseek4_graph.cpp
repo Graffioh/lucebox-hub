@@ -5177,6 +5177,16 @@ struct Ds4FusedVerifyCache {
     }
 };
 
+using Ds4GatheredRowsByRatio =
+    std::array<std::vector<DeepSeek4GatheredLaneRows>, 3>;
+
+static int ds4_gathered_ratio_index(uint32_t ratio) {
+    if (ratio == 0) return 0;
+    if (ratio == 4) return 1;
+    if (ratio == 128) return 2;
+    return -1;
+}
+
 struct DeepSeek4LayerRangeCache {
     ~DeepSeek4LayerRangeCache() { reset(); }
 
@@ -7278,16 +7288,23 @@ bool deepseek4_paged_gathered_step(
         return false;
     }
 
-    std::vector<std::vector<DeepSeek4GatheredLaneRows>> prepared((size_t) w.n_layer);
+    Ds4GatheredRowsByRatio prepared;
+    std::array<bool, 3> ratio_prepared{};
     std::vector<int64_t> key = {0x5041474544LL, (int64_t) lanes,
                                 token_ids ? 1 : 0, hybrid ? 1 : 0};
     for (uint32_t lane = 0; lane < lanes; ++lane) key.push_back(slots[lane]);
     for (int il = 0; il < w.n_layer; ++il) {
         const uint32_t ratio = cache.layers[(size_t) il].ratio;
-        if (!prepare_deepseek4_gathered_lane_rows(
-                slots, positions, lanes, block_tables, block_table_stride,
-                cache.plan.physical_blocks, ratio, prepared[(size_t) il])) return false;
-        for (const auto & row : prepared[(size_t) il]) {
+        const int ratio_index = ds4_gathered_ratio_index(ratio);
+        if (ratio_index < 0) return false;
+        auto & rows = prepared[(size_t) ratio_index];
+        if (!ratio_prepared[(size_t) ratio_index]) {
+            if (!prepare_deepseek4_gathered_lane_rows(
+                    slots, positions, lanes, block_tables, block_table_stride,
+                    cache.plan.physical_blocks, ratio, rows)) return false;
+            ratio_prepared[(size_t) ratio_index] = true;
+        }
+        for (const auto & row : rows) {
             key.push_back((int64_t) row.raw_history.size());
             key.push_back((int64_t) row.compressed_history.size());
             key.push_back(row.slot < 0 ? -1 :
@@ -7366,8 +7383,10 @@ bool deepseek4_paged_gathered_step(
     size_t pi = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) cache.layers[(size_t) il].ratio;
+        const int ratio_index = ds4_gathered_ratio_index((uint32_t) ratio);
+        if (ratio_index < 0) return false;
         for (uint32_t lane = 0; lane < lanes; ++lane, ++pi) {
-            const auto & row = prepared[(size_t) il][lane];
+            const auto & row = prepared[(size_t) ratio_index][lane];
             const auto & px = ex->paged[pi];
             if (px.i32_base < 0 || px.i64_base < 0) return false;
             const int32_t pos = (int32_t) row.position;
