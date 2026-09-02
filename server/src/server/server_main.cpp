@@ -17,6 +17,7 @@
 #include "common/backend_factory.h"
 #include "common/chain_rollback_policy.h"
 #include "common/layer_split_utils.h"
+#include "common/model_capabilities.h"
 #include "common/spark_corpus.h"
 #include "common/moe_routing_collector.h"
 #include "common/moe_hybrid_routing_stats.h"
@@ -249,10 +250,6 @@ int main(int argc, char ** argv) {
     bool target_devices_seen = false;
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
-    bool adaptive_experts_set = false;  // --adaptive-experts (MoE architectures only)
-    bool ddtree_tau_set = false;
-    bool specla_top_k_set = false;
-    int  specla_top_k = 4;
 
     // Track which thinking-budget tunables the operator set via CLI.
     // Those values win over the model card (spec §3.1: "Explicit CLI
@@ -447,13 +444,15 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--specla-top-k") == 0 && i + 1 < argc) {
             const char * value = argv[++i];
             const char * end = value + std::strlen(value);
-            const auto parsed = std::from_chars(value, end, specla_top_k);
-            if (parsed.ec != std::errc{} || parsed.ptr != end || specla_top_k <= 0) {
+            const auto parsed = std::from_chars(
+                value, end, bargs.specla_top_k);
+            if (parsed.ec != std::errc{} || parsed.ptr != end ||
+                bargs.specla_top_k <= 0) {
                 std::fprintf(stderr,
                     "--specla-top-k expects a positive integer, got '%s'\n", value);
                 return 2;
             }
-            specla_top_k_set = true;
+            bargs.specla_top_k_explicit = true;
         } else if (std::strcmp(argv[i], "--ddtree") == 0) {
             bargs.ddtree_mode = true;
             bargs.fast_rollback = true;
@@ -472,7 +471,7 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             bargs.ddtree_tau = tau;
-            ddtree_tau_set = true;
+            bargs.ddtree_tau_explicit = true;
         } else if (std::strcmp(argv[i], "--adaptive-experts") == 0) {
             const char * tau = "0.80";
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -486,7 +485,7 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             set_environment_variable("DFLASH_ADAPTIVE_K_TAU", tau, false);  // explicit env still wins
-            adaptive_experts_set = true;
+            bargs.adaptive_experts_requested = true;
         } else if (std::strcmp(argv[i], "--verify-width") == 0 && i + 1 < argc) {
             bargs.verify_width = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-fast-rollback") == 0) {
@@ -677,7 +676,7 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
-    if (specla_top_k_set && !bargs.specla_mode) {
+    if (bargs.specla_top_k_explicit && !bargs.specla_mode) {
         std::fprintf(stderr, "[server] --specla-top-k requires --specla\n");
         return 2;
     }
@@ -686,8 +685,8 @@ int main(int argc, char ** argv) {
             "[server] --specla is incompatible with --no-fast-rollback\n");
         return 2;
     }
-    if (bargs.specla_mode && !ddtree_tau_set) {
-        bargs.ddtree_tau = 6.0f;
+    if (bargs.specla_mode && !bargs.specla_top_k_explicit) {
+        bargs.specla_top_k = specla_tree_topk();
     }
 
     if (fast_rollback_forced_off) {
@@ -732,87 +731,54 @@ int main(int argc, char ** argv) {
     // Ask the factory to resolve model/placement facts and apply its feature
     // admission policy before any setup work. server_main only maps the
     // categorized result to the existing process exit convention.
-    BackendFeatureConfig backend_features;
-    backend_features.pflash_enabled =
-        sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
-    backend_features.pflash_drafter_configured =
-        !sconfig.pflash_drafter_path.empty();
-    backend_features.draft_residency = sconfig.draft_residency;
-    backend_features.routing_stats_requested =
+    bargs.routing_stats_requested =
         sconfig.freq_tracking || !sconfig.collect_routing_path.empty();
-    backend_features.adaptive_experts_requested = adaptive_experts_set;
+
+    BackendAdmissionContext backend_admission;
+    backend_admission.pflash_enabled =
+        sconfig.pflash_mode != ServerConfig::PflashMode::OFF;
+    backend_admission.pflash_drafter_configured =
+        !sconfig.pflash_drafter_path.empty();
+    backend_admission.draft_residency = sconfig.draft_residency;
     // Fixed pools are known incompatibilities before model setup. Automatic
     // sizing needs the backend's real VRAM budget; if it produces a live pool,
     // the backend rejects the pairing after sizing.
-    backend_features.kvflash_enabled =
-        kvflash_fixed_pool_requested(std::getenv("DFLASH_KVFLASH"));
-    const BackendPreparation backend_preparation =
-        prepare_backend(bargs, backend_features);
-    if (!backend_preparation.ok()) {
+    const char * kvflash_config = std::getenv("DFLASH_KVFLASH");
+    backend_admission.kvflash = kvflash_fixed_pool_requested(kvflash_config)
+        ? KvFlashRequest::Fixed
+        : kvflash_pool_requested(kvflash_config)
+            ? KvFlashRequest::Auto
+            : KvFlashRequest::Off;
+    BackendPreparation backend_preparation =
+        prepare_backend(bargs, backend_admission);
+    if (const auto * failure =
+            std::get_if<BackendPreparationFailure>(&backend_preparation)) {
+        for (const std::string & warning : failure->warnings) {
+            std::fprintf(stderr, "[server] warning: %s\n", warning.c_str());
+        }
         std::fprintf(stderr, "[server] %s\n",
-                     backend_preparation.message.c_str());
-        return backend_preparation.error ==
+                     failure->message.c_str());
+        return failure->error ==
                 BackendPreparationError::FeatureCompatibility
             ? 2
             : 1;
     }
+    BackendPlan backend_plan =
+        std::get<BackendPlan>(std::move(backend_preparation));
     // Options that parsed cleanly but do nothing on this model. Reported up
     // front so they are visible before the backend's own startup chatter.
-    for (const std::string & warning : backend_preparation.warnings) {
+    for (const std::string & warning : backend_plan.warnings()) {
         std::fprintf(stderr, "[server] warning: %s\n", warning.c_str());
     }
-    const ResolvedBackendPlan & backend_plan = backend_preparation.plan;
-    const std::string & arch = backend_plan.arch();
-    const bool kvflash_requested =
-        kvflash_pool_requested(std::getenv("DFLASH_KVFLASH"));
+    // All later reporting and serving setup reads the normalized snapshot.
+    // Backend construction itself can only consume backend_plan.
+    bargs = backend_plan.args();
+    const std::string arch = backend_plan.arch();
     if (target_split_fast_rollback_cli && arch != "qwen35") {
         std::fprintf(stderr,
             "[server] --target-split-fast-rollback is only supported for "
             "qwen35 targets (detected '%s')\n", arch.c_str());
         return 2;
-    }
-
-    // SpecLA is the verification mode, not a proposal algorithm. Select the
-    // proposal adapter supported by this model. Qwen3.6 currently has a
-    // DDTree adapter; future model families may select DSpark here instead.
-    if (bargs.specla_mode) {
-        const bool supported = arch == "qwen35" && !bargs.device.is_multi_device();
-        if (supported) {
-            if (!bargs.draft_path) {
-                std::fprintf(stderr,
-                    "[server] Qwen3.6 SpecLA requires --draft <path>\n");
-                return 2;
-            }
-            bargs.ddtree_mode = true;
-            if (kvflash_requested) {
-                // KVFlash installs a paged attention-KV layout and therefore
-                // disables the factor-cache migration required by SpecLA.
-                // Keep the compatible proposal adapter, but report the
-                // effective verification mode accurately.
-                std::fprintf(stderr,
-                    "[server] warning: --specla is unavailable with KVFlash; "
-                    "using ordinary DDTree verification\n");
-                bargs.specla_mode = false;
-                unset_environment_variable("DFLASH_SPECLA");
-            } else {
-                set_environment_variable("DFLASH_SPECLA", "1", true);
-                if (specla_top_k_set) {
-                    set_environment_variable(
-                        "DFLASH_SPECLA_TOPK", std::to_string(specla_top_k).c_str(), true);
-                } else {
-                    specla_top_k = specla_tree_topk();
-                }
-            }
-        } else {
-            std::fprintf(stderr,
-                "[server] warning: --specla is unavailable for architecture '%s' "
-                "with placement %s; using the architecture's normal decode path\n",
-                arch.c_str(), placement_device_name(bargs.device).c_str());
-            bargs.specla_mode = false;
-            if (!ddtree_tau_set) {
-                bargs.ddtree_tau = std::numeric_limits<float>::infinity();
-            }
-        }
     }
 
     // Paged decode owns its K/V through a block table that the snapshot format
@@ -903,9 +869,11 @@ int main(int argc, char ** argv) {
     }
 
     // Load tokenizer.
-    std::fprintf(stderr, "[server] loading tokenizer from %s\n", bargs.model_path);
+    std::fprintf(
+        stderr, "[server] loading tokenizer from %s\n",
+        bargs.model_path.c_str());
     Tokenizer tokenizer;
-    if (!tokenizer.load_from_gguf(bargs.model_path)) {
+    if (!tokenizer.load_from_gguf(bargs.model_path.c_str())) {
         std::fprintf(stderr, "[server] tokenizer load failed\n");
         return 1;
     }
@@ -989,11 +957,12 @@ int main(int argc, char ** argv) {
                 arch.c_str());
         }
     }
-    auto backend = create_backend(bargs, backend_plan);
-    if (!backend) {
+    auto backend_runtime = create_backend(std::move(backend_plan));
+    if (!backend_runtime) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
     }
+    ModelBackend * backend = &backend_runtime->backend();
     // Cross-check the capability table against the backend that was actually
     // built. arch_supports_remote_draft() admitted this launch from the arch
     // string alone; if the two ever disagree the table is stale, and failing
@@ -1010,14 +979,14 @@ int main(int argc, char ** argv) {
     // ── Thinking-budget v2: resolve model card and apply to ServerConfig ──
     // Reuse the metadata captured during factory preparation instead of
     // opening the GGUF header again.
-    const std::string & general_name = backend_plan.model().name;
-    const std::string & general_arch = backend_plan.arch();
+    const std::string & general_name = backend_runtime->plan().model().name;
+    const std::string & general_arch = backend_runtime->plan().arch();
     std::fprintf(stderr,
         "[server] gguf meta: general.name='%s' general.architecture='%s'\n",
         general_name.c_str(), general_arch.c_str());
 
     ModelCard card = resolve_model_card(
-        bargs.model_path ? bargs.model_path : "",
+        bargs.model_path,
         general_name,
         general_arch,
         /*repo_root_hint=*/"");
@@ -1150,8 +1119,10 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] ╭─── Configuration ───────────────────────────────────╮\n");
     std::fprintf(stderr, "[server] │  host            = %s\n", sconfig.host.c_str());
     std::fprintf(stderr, "[server] │  port            = %d\n", sconfig.port);
-    std::fprintf(stderr, "[server] │  model           = %s\n", bargs.model_path);
-    std::fprintf(stderr, "[server] │  draft           = %s\n", bargs.draft_path ? bargs.draft_path : "(none)");
+    std::fprintf(stderr, "[server] │  model           = %s\n", bargs.model_path.c_str());
+    std::fprintf(
+        stderr, "[server] │  draft           = %s\n",
+        bargs.draft_path ? bargs.draft_path->c_str() : "(none)");
     std::fprintf(stderr, "[server] │  model_name      = %s\n", sconfig.model_name.c_str());
     std::fprintf(stderr, "[server] │  max_ctx         = %d\n", sconfig.max_ctx);
     // max_tokens default for requests that omit the field. The request
@@ -1243,7 +1214,7 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
     std::fprintf(stderr, "[server] │  specla          = %s\n", bargs.specla_mode ? "ON" : "off");
     if (bargs.specla_mode) {
-        std::fprintf(stderr, "[server] │  specla_top_k    = %d\n", specla_top_k);
+        std::fprintf(stderr, "[server] │  specla_top_k    = %d\n", bargs.specla_top_k);
         std::fprintf(stderr, "[server] │  ddtree_tau      = %.3g\n", bargs.ddtree_tau);
     }
     std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
@@ -1294,8 +1265,8 @@ int main(int argc, char ** argv) {
     // — the /props handler reads them lockless from config_ so they need to
     // be set BEFORE the HttpServer constructor copies sconfig.
     sconfig.arch         = arch;
-    sconfig.model_path   = bargs.model_path ? bargs.model_path : "";
-    sconfig.draft_path   = bargs.draft_path ? bargs.draft_path : "";
+    sconfig.model_path   = bargs.model_path;
+    sconfig.draft_path   = bargs.draft_path.value_or("");
     sconfig.fa_window    = bargs.fa_window;
     sconfig.ddtree_budget = bargs.ddtree_budget;
     sconfig.speculative_enabled = bargs.ddtree_mode;
