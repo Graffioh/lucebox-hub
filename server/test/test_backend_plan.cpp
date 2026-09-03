@@ -27,7 +27,11 @@ struct CanCreateBackend<
     : std::true_type {};
 
 static_assert(CanCreateBackend<BackendPlan>::value);
+static_assert(CanCreateBackend<const BackendPlan &>::value);
 static_assert(!CanCreateBackend<BackendArgs>::value);
+static_assert(std::is_same_v<
+    decltype(create_backend(std::declval<const BackendPlan &>())),
+    std::unique_ptr<ModelBackend>>);
 static_assert(std::is_move_constructible_v<BackendPlan>);
 static_assert(!std::is_move_assignable_v<BackendPlan>);
 

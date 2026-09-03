@@ -21,12 +21,12 @@ class BackendPlanBuilder;
 }
 
 class BackendPlan;
-class BackendRuntime;
 class ModelBackend;
 
-// The sole construction entry point. It consumes a valid plan and returns a
-// runtime that keeps the plan's owned path storage alive.
-std::unique_ptr<BackendRuntime> create_backend(BackendPlan plan);
+// The sole construction entry point. Architecture configs own any path data
+// retained by the returned backend, so the plan may have an independent
+// lifetime after construction.
+std::unique_ptr<ModelBackend> create_backend(const BackendPlan & plan);
 
 class BackendPlan final {
 public:
@@ -56,7 +56,8 @@ private:
         SpeclaEnvironmentAction::Preserve;
 
     friend class detail::BackendPlanBuilder;
-    friend std::unique_ptr<BackendRuntime> create_backend(BackendPlan plan);
+    friend std::unique_ptr<ModelBackend> create_backend(
+        const BackendPlan & plan);
 };
 
 enum class BackendPreparationError {
@@ -79,32 +80,5 @@ using BackendPreparation =
 BackendPreparation prepare_backend(
     BackendArgs args,
     BackendAdmissionContext admission = {});
-
-// Owns the immutable plan together with the backend. Several existing backend
-// config structs retain c_str() pointers, so the plan must share their
-// lifetime and be destroyed after the backend.
-class BackendRuntime final {
-public:
-    ~BackendRuntime();
-
-    BackendRuntime(const BackendRuntime &) = delete;
-    BackendRuntime & operator=(const BackendRuntime &) = delete;
-    BackendRuntime(BackendRuntime &&) = delete;
-    BackendRuntime & operator=(BackendRuntime &&) = delete;
-
-    ModelBackend & backend() { return *backend_; }
-    const ModelBackend & backend() const { return *backend_; }
-    const BackendPlan & plan() const { return plan_; }
-
-private:
-    explicit BackendRuntime(BackendPlan plan);
-
-    // Declaration order is intentional: backend_ is destroyed before plan_,
-    // keeping its borrowed path pointers valid through backend teardown.
-    BackendPlan plan_;
-    std::unique_ptr<ModelBackend> backend_;
-
-    friend std::unique_ptr<BackendRuntime> create_backend(BackendPlan plan);
-};
 
 }  // namespace dflash::common

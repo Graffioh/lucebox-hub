@@ -957,12 +957,12 @@ int main(int argc, char ** argv) {
                 arch.c_str());
         }
     }
-    auto backend_runtime = create_backend(std::move(backend_plan));
-    if (!backend_runtime) {
+    auto backend_owner = create_backend(backend_plan);
+    if (!backend_owner) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
     }
-    ModelBackend * backend = &backend_runtime->backend();
+    ModelBackend * backend = backend_owner.get();
     // Cross-check the capability table against the backend that was actually
     // built. arch_supports_remote_draft() admitted this launch from the arch
     // string alone; if the two ever disagree the table is stale, and failing
@@ -979,8 +979,8 @@ int main(int argc, char ** argv) {
     // ── Thinking-budget v2: resolve model card and apply to ServerConfig ──
     // Reuse the metadata captured during factory preparation instead of
     // opening the GGUF header again.
-    const std::string & general_name = backend_runtime->plan().model().name;
-    const std::string & general_arch = backend_runtime->plan().arch();
+    const std::string & general_name = backend_plan.model().name;
+    const std::string & general_arch = backend_plan.arch();
     std::fprintf(stderr,
         "[server] gguf meta: general.name='%s' general.architecture='%s'\n",
         general_name.c_str(), general_arch.c_str());

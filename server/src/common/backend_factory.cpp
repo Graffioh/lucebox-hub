@@ -21,7 +21,9 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <optional>
 #include <type_traits>
+#include <utility>
 
 namespace dflash::common {
 
@@ -113,16 +115,47 @@ DFLASH_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
 #undef DFLASH_CHECK_ARCH
 #undef DFLASH_CHECK_ARCH_OPTION
 
+// Every config retained by a backend or adapter owns its path storage.
+// Borrowed C strings are confined to immediate loader and C API calls.
+static_assert(std::is_same_v<
+    decltype(Qwen35Config{}.target_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(Qwen35Config{}.draft_path), std::optional<std::string>>);
+static_assert(std::is_same_v<
+    decltype(Qwen35LayerSplitAdapterConfig{}.target_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(Qwen35LayerSplitAdapterConfig{}.draft_path),
+    std::optional<std::string>>);
+static_assert(std::is_same_v<
+    decltype(BailingMoe3Config{}.model_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(LagunaBackendArgs{}.target_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(LagunaBackendArgs{}.draft_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(LagunaLayerSplitAdapterConfig{}.target_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(Qwen3BackendConfig{}.model_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(Gemma4BackendConfig{}.model_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(Gemma4BackendConfig{}.draft_path),
+    std::optional<std::string>>);
+static_assert(std::is_same_v<
+    decltype(Gemma4LayerSplitAdapterConfig{}.target_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(DeepSeek4BackendConfig{}.model_path), std::string>);
+static_assert(std::is_same_v<
+    decltype(DeepSeek4LayerSplitAdapterConfig{}.target_path), std::string>);
+
 std::unique_ptr<ModelBackend> construct_backend(
     const BackendArgs & args,
     const std::string & arch) {
     if (arch == "qwen35") {
         if (args.device.is_layer_split()) {
             Qwen35LayerSplitAdapterConfig cfg;
-            cfg.target_path        = args.model_path.c_str();
-            cfg.draft_path         = args.draft_path
-                ? args.draft_path->c_str()
-                : nullptr;
+            cfg.target_path        = args.model_path;
+            cfg.draft_path         = args.draft_path;
             cfg.device             = args.device;
             cfg.draft_gpu          = args.draft_device.gpu;
             cfg.remote_draft       = args.remote_draft;
@@ -137,7 +170,8 @@ std::unique_ptr<ModelBackend> construct_backend(
                 : DFLASH27B_DRAFT_BLOCK_SIZE;
             cfg.run_dflash         = args.draft_path.has_value();
 
-            auto adapter = std::make_unique<Qwen35LayerSplitAdapter>(cfg);
+            auto adapter = std::make_unique<Qwen35LayerSplitAdapter>(
+                std::move(cfg));
             auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
             if (!backend->init()) {
                 std::fprintf(stderr, "[backend_factory] LayerSplitBackend(qwen35) init failed\n");
@@ -147,10 +181,8 @@ std::unique_ptr<ModelBackend> construct_backend(
         }
 
         Qwen35Config cfg;
-        cfg.target_path        = args.model_path.c_str();
-        cfg.draft_path         = args.draft_path
-            ? args.draft_path->c_str()
-            : nullptr;
+        cfg.target_path        = args.model_path;
+        cfg.draft_path         = args.draft_path;
         cfg.device             = args.device;
         cfg.draft_gpu          = args.draft_device.gpu;
         cfg.remote_draft       = args.remote_draft;
@@ -172,7 +204,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.ddtree_tau         = args.ddtree_tau;
         cfg.use_feature_mirror = args.use_feature_mirror;
 
-        auto backend = std::make_unique<Qwen35Backend>(cfg);
+        auto backend = std::make_unique<Qwen35Backend>(std::move(cfg));
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] Qwen35Backend init failed\n");
             return nullptr;
@@ -181,10 +213,8 @@ std::unique_ptr<ModelBackend> construct_backend(
 
     } else if (arch == "qwen35moe") {
         Qwen35Config cfg;
-        cfg.target_path        = args.model_path.c_str();
-        cfg.draft_path         = args.draft_path
-            ? args.draft_path->c_str()
-            : nullptr;
+        cfg.target_path        = args.model_path;
+        cfg.draft_path         = args.draft_path;
         cfg.device             = args.device;
         cfg.draft_gpu          = args.draft_device.gpu;
         cfg.stream_fd          = args.stream_fd;
@@ -201,7 +231,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         cfg.ddtree_tau         = args.ddtree_tau;
         cfg.use_feature_mirror = args.use_feature_mirror;
 
-        auto backend = std::make_unique<Qwen35MoeBackend>(cfg);
+        auto backend = std::make_unique<Qwen35MoeBackend>(std::move(cfg));
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] Qwen35MoeBackend init failed\n");
             return nullptr;
@@ -210,11 +240,11 @@ std::unique_ptr<ModelBackend> construct_backend(
 
     } else if (arch == "bailingmoe3") {
         BailingMoe3Config cfg;
-        cfg.model_path = args.model_path.c_str();
+        cfg.model_path = args.model_path;
         cfg.device = args.device;
         cfg.stream_fd = args.stream_fd;
 
-        auto backend = std::make_unique<BailingMoe3Backend>(cfg);
+        auto backend = std::make_unique<BailingMoe3Backend>(std::move(cfg));
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] BailingMoe3Backend init failed\n");
             return nullptr;
@@ -224,12 +254,13 @@ std::unique_ptr<ModelBackend> construct_backend(
     } else if (arch == "laguna") {
         if (args.device.is_layer_split()) {
             LagunaLayerSplitAdapterConfig cfg;
-            cfg.target_path = args.model_path.c_str();
+            cfg.target_path = args.model_path;
             cfg.device      = args.device;
             cfg.remote_target_shard = args.remote_target_shard;
             cfg.chunk       = args.chunk;
 
-            auto adapter = std::make_unique<LagunaLayerSplitAdapter>(cfg);
+            auto adapter = std::make_unique<LagunaLayerSplitAdapter>(
+                std::move(cfg));
             auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
             if (!backend->init()) {
                 std::fprintf(stderr, "[backend_factory] LayerSplitBackend(laguna) init failed\n");
@@ -254,7 +285,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         lcfg.chunk       = args.chunk;
         // kv_type defaults to Q8_0 in LagunaBackendArgs
 
-        auto backend = std::make_unique<LagunaBackend>(lcfg);
+        auto backend = std::make_unique<LagunaBackend>(std::move(lcfg));
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] LagunaBackend init failed\n");
             return nullptr;
@@ -263,12 +294,12 @@ std::unique_ptr<ModelBackend> construct_backend(
 
     } else if (arch == "qwen3") {
         Qwen3BackendConfig qcfg;
-        qcfg.model_path = args.model_path.c_str();
+        qcfg.model_path = args.model_path;
         qcfg.device     = args.device;
         qcfg.stream_fd  = args.stream_fd;
         qcfg.chunk      = args.chunk;
 
-        auto backend = std::make_unique<Qwen3Backend>(qcfg);
+        auto backend = std::make_unique<Qwen3Backend>(std::move(qcfg));
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] Qwen3Backend init failed\n");
             return nullptr;
@@ -278,13 +309,14 @@ std::unique_ptr<ModelBackend> construct_backend(
     } else if (arch == "gemma4") {
         if (args.device.is_layer_split()) {
             Gemma4LayerSplitAdapterConfig cfg;
-            cfg.target_path = args.model_path.c_str();
+            cfg.target_path = args.model_path;
             cfg.device      = args.device;
             cfg.remote_target_shard = args.remote_target_shard;
             cfg.chunk       = args.chunk;
             cfg.fa_window   = args.fa_window;
 
-            auto adapter = std::make_unique<Gemma4LayerSplitAdapter>(cfg);
+            auto adapter = std::make_unique<Gemma4LayerSplitAdapter>(
+                std::move(cfg));
             auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
             if (!backend->init()) {
                 std::fprintf(stderr, "[backend_factory] LayerSplitBackend(gemma4) init failed\n");
@@ -294,10 +326,8 @@ std::unique_ptr<ModelBackend> construct_backend(
         }
 
         Gemma4BackendConfig gcfg;
-        gcfg.model_path    = args.model_path.c_str();
-        gcfg.draft_path    = args.draft_path
-            ? args.draft_path->c_str()
-            : nullptr;
+        gcfg.model_path    = args.model_path;
+        gcfg.draft_path    = args.draft_path;
         gcfg.draft_gpu     = args.draft_device.gpu;
         gcfg.draft_ctx_max = args.draft_ctx_max;
         gcfg.device        = args.device;
@@ -308,7 +338,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         // --fa-window on single-device gemma4.
         gcfg.fa_window     = args.fa_window;
 
-        auto backend = std::make_unique<Gemma4Backend>(gcfg);
+        auto backend = std::make_unique<Gemma4Backend>(std::move(gcfg));
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] Gemma4Backend init failed\n");
             return nullptr;
@@ -325,7 +355,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         if (!args.device.is_layer_split() &&
             !args.remote_target_shard.enabled()) {
             DeepSeek4BackendConfig cfg;
-            cfg.model_path = args.model_path.c_str();
+            cfg.model_path = args.model_path;
             cfg.device     = args.device;
             cfg.stream_fd  = args.stream_fd;
             cfg.max_ctx    = args.device.max_ctx;
@@ -335,7 +365,7 @@ std::unique_ptr<ModelBackend> construct_backend(
             cfg.fused_verify_f16_kv = args.ds4_fused_verify_f16_kv;
             cfg.prefill_mode = args.ds4_prefill_mode;
 
-            auto backend = std::make_unique<DeepSeek4Backend>(cfg);
+            auto backend = std::make_unique<DeepSeek4Backend>(std::move(cfg));
             if (!backend->init()) {
                 std::fprintf(stderr, "[backend_factory] DeepSeek4Backend init failed\n");
                 return nullptr;
@@ -345,12 +375,13 @@ std::unique_ptr<ModelBackend> construct_backend(
 
         // Explicit local splits and CUDA/HIP remote splits use the adapter.
         DeepSeek4LayerSplitAdapterConfig cfg;
-        cfg.target_path        = args.model_path.c_str();
+        cfg.target_path        = args.model_path;
         cfg.device             = args.device;
         cfg.remote_target_shard = args.remote_target_shard;
         cfg.chunk              = args.chunk;
 
-        auto adapter = std::make_unique<DeepSeek4LayerSplitAdapter>(cfg);
+        auto adapter = std::make_unique<DeepSeek4LayerSplitAdapter>(
+            std::move(cfg));
         auto backend = std::make_unique<LayerSplitBackend>(std::move(adapter));
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] LayerSplitBackend(deepseek4) init failed\n");
@@ -385,23 +416,15 @@ BackendPreparation prepare_backend(
         compiled_placement_backend());
 }
 
-BackendRuntime::BackendRuntime(BackendPlan plan)
-    : plan_(std::move(plan)) {}
-
-BackendRuntime::~BackendRuntime() = default;
-
-std::unique_ptr<BackendRuntime> create_backend(BackendPlan plan) {
-    auto runtime = std::unique_ptr<BackendRuntime>(
-        new BackendRuntime(std::move(plan)));
-
-    switch (runtime->plan_.specla_environment_) {
+std::unique_ptr<ModelBackend> create_backend(const BackendPlan & plan) {
+    switch (plan.specla_environment_) {
         case BackendPlan::SpeclaEnvironmentAction::Preserve:
             break;
         case BackendPlan::SpeclaEnvironmentAction::Enable:
             set_environment_variable("DFLASH_SPECLA", "1", true);
-            if (runtime->plan_.args_.specla_top_k_explicit) {
+            if (plan.args_.specla_top_k_explicit) {
                 const std::string top_k =
-                    std::to_string(runtime->plan_.args_.specla_top_k);
+                    std::to_string(plan.args_.specla_top_k);
                 set_environment_variable(
                     "DFLASH_SPECLA_TOPK", top_k.c_str(), true);
             }
@@ -414,13 +437,8 @@ std::unique_ptr<BackendRuntime> create_backend(BackendPlan plan) {
     std::fprintf(
         stderr,
         "[backend_factory] detected arch=%s\n",
-        runtime->plan_.arch().c_str());
-    runtime->backend_ = construct_backend(
-        runtime->plan_.args_, runtime->plan_.arch());
-    if (!runtime->backend_) {
-        return nullptr;
-    }
-    return runtime;
+        plan.arch().c_str());
+    return construct_backend(plan.args_, plan.arch());
 }
 
 }  // namespace dflash::common
