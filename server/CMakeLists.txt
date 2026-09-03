@@ -548,6 +548,7 @@ add_library(dflash_common STATIC
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
     src/common/peer_access.cpp
+    src/engine/luce_engine.cpp
     # ── Server components (tokenizer, chat template) ──
     src/server/tokenizer.cpp
     src/server/chat_template.cpp
@@ -1658,6 +1659,8 @@ if(DFLASH27B_TESTS)
         set(_server_unit_sources
             test/test_unit_main.cpp
             test/test_server_unit.cpp
+            test/test_generation.cpp
+            test/test_luce_engine.cpp
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_keep_ratio.cpp
@@ -1691,6 +1694,7 @@ if(DFLASH27B_TESTS)
         endif()
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
+            src/engine/generation.cpp
             src/server/http_server.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
@@ -1718,6 +1722,9 @@ if(DFLASH27B_TESTS)
             target_link_libraries(test_server_unit PRIVATE CURL::libcurl)
         endif()
         target_link_libraries(test_server_unit PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        if(UNIX)
+            target_link_libraries(test_server_unit PRIVATE pthread)
+        endif()
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             find_package(CUDAToolkit REQUIRED)
             target_link_libraries(test_server_unit PRIVATE CUDA::cudart)

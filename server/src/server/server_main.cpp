@@ -24,6 +24,7 @@
 #include "common/platform_env.h"
 #include "common/peer_access.h"
 #include "common/specla_mode.h"
+#include "engine/luce_engine.h"
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
 #include "kvflash_pager.h"
@@ -1371,7 +1372,8 @@ int main(int argc, char ** argv) {
         }
     }
 
-    HttpServer server(*backend, tokenizer, sconfig);
+    dflash::engine::LuceEngine engine(std::move(backend_owner));
+    HttpServer server(engine, tokenizer, sconfig);
     server.set_chat_format(chat_format_for_arch(arch));
     g_server = &server;
     std::signal(SIGTERM, signal_handler);
@@ -1419,7 +1421,5 @@ int main(int argc, char ** argv) {
         routing_collector.close();
     }
 
-    // Cleanup.
-    backend->shutdown();
     return ret;
 }
