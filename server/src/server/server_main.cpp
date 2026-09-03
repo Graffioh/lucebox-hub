@@ -750,7 +750,7 @@ int main(int argc, char ** argv) {
             ? KvFlashRequest::Auto
             : KvFlashRequest::Off;
     BackendPreparation backend_preparation =
-        prepare_backend(bargs, backend_admission);
+        prepare_backend(std::move(bargs), backend_admission);
     if (const auto * failure =
             std::get_if<BackendPreparationFailure>(&backend_preparation)) {
         for (const std::string & warning : failure->warnings) {
@@ -770,10 +770,10 @@ int main(int argc, char ** argv) {
     for (const std::string & warning : backend_plan.warnings()) {
         std::fprintf(stderr, "[server] warning: %s\n", warning.c_str());
     }
-    // All later reporting and serving setup reads the normalized snapshot.
-    // Backend construction itself can only consume backend_plan.
-    bargs = backend_plan.args();
-    const std::string arch = backend_plan.arch();
+    // All later reporting and serving setup reads a const view of the same
+    // normalized snapshot that backend construction consumes.
+    const BackendArgs & backend_args = backend_plan.args();
+    const std::string & arch = backend_plan.arch();
     if (target_split_fast_rollback_cli && arch != "qwen35") {
         std::fprintf(stderr,
             "[server] --target-split-fast-rollback is only supported for "
@@ -785,7 +785,7 @@ int main(int argc, char ** argv) {
     // cannot describe yet, so the caches it would restore into are turned off.
     // This rewrites ServerConfig rather than rejecting the launch, which is why
     // it lives here and not in the gate.
-    if (bargs.paged_attention) {
+    if (backend_args.paged_attention) {
         std::fprintf(stderr,
             "[server] --paged-attention disables prefix/prefill snapshots "
             "until their format stores page tables\n");
@@ -794,7 +794,7 @@ int main(int argc, char ** argv) {
         sconfig.disk_cache_dir.clear();
         sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
     }
-    if (sconfig.agent_turn_cache && bargs.paged_attention) {
+    if (sconfig.agent_turn_cache && backend_args.paged_attention) {
         std::fprintf(stderr,
             "[server] --agent-turn-cache is not yet supported with "
             "--paged-attention or --max-concurrency\n");
@@ -810,11 +810,13 @@ int main(int argc, char ** argv) {
     // This prevents the HTTP server from accepting prompts larger than the
     // KV cache the backend actually allocates.
     if (sconfig.max_ctx <= 0) {
-        sconfig.max_ctx = bargs.device.max_ctx;
+        sconfig.max_ctx = backend_args.device.max_ctx;
     }
     const PFlashDrafterPlacement pflash_placement =
         resolve_pflash_drafter_placement(
-            bargs.device, bargs.draft_device, bargs.remote_draft,
+            backend_args.device,
+            backend_args.draft_device,
+            backend_args.remote_draft,
             sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
     sconfig.pflash_drafter_gpu = pflash_placement.drafter_gpu;
     sconfig.pflash_remote_drafter = pflash_placement.remote_drafter;
@@ -860,7 +862,7 @@ int main(int argc, char ** argv) {
     }
 
     if (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped &&
-        !(pflash_enabled || bargs.draft_path)) {
+        !(pflash_enabled || backend_args.draft_path)) {
         std::fprintf(stderr,
             "[server] --draft-residency=request-scoped ignored: requires "
             "--prefill-compression or --draft\n");
@@ -871,9 +873,9 @@ int main(int argc, char ** argv) {
     // Load tokenizer.
     std::fprintf(
         stderr, "[server] loading tokenizer from %s\n",
-        bargs.model_path.c_str());
+        backend_args.model_path.c_str());
     Tokenizer tokenizer;
-    if (!tokenizer.load_from_gguf(bargs.model_path.c_str())) {
+    if (!tokenizer.load_from_gguf(backend_args.model_path.c_str())) {
         std::fprintf(stderr, "[server] tokenizer load failed\n");
         return 1;
     }
@@ -906,7 +908,7 @@ int main(int argc, char ** argv) {
     }
 
     // Create backend.
-    g_peer_access_opt_in = bargs.device.peer_access;
+    g_peer_access_opt_in = backend_args.device.peer_access;
     std::fprintf(stderr, "[server] creating backend...\n");
     if (spark_autotune) {
         // Self-tuning hot/cold MoE residency: enable the bounded expert cache
@@ -917,7 +919,8 @@ int main(int argc, char ** argv) {
         const bool is_laguna = (arch == "laguna");
         if (arch_has_expert_offload(arch)) {
             const std::string pfx = is_laguna ? "DFLASH_LAGUNA_" : "DFLASH_QWEN35MOE_";
-            const std::string profile = std::string(bargs.model_path) + ".spark.csv";
+            const std::string profile =
+                backend_args.model_path + ".spark.csv";
             std::FILE * pf = std::fopen(profile.c_str(), "rb");
             const bool have_profile = (pf != nullptr);
             if (pf) std::fclose(pf);
@@ -967,7 +970,7 @@ int main(int argc, char ** argv) {
     // built. arch_supports_remote_draft() admitted this launch from the arch
     // string alone; if the two ever disagree the table is stale, and failing
     // here beats routing draft work to a backend that cannot serve it.
-    if (bargs.remote_draft.enabled() && bargs.draft_path &&
+    if (backend_args.remote_draft.enabled() && backend_args.draft_path &&
         !backend->supports_remote_draft()) {
         std::fprintf(stderr,
             "[server] internal: architecture '%s' is listed as supporting "
@@ -986,7 +989,7 @@ int main(int argc, char ** argv) {
         general_name.c_str(), general_arch.c_str());
 
     ModelCard card = resolve_model_card(
-        bargs.model_path,
+        backend_args.model_path,
         general_name,
         general_arch,
         /*repo_root_hint=*/"");
@@ -1081,7 +1084,8 @@ int main(int argc, char ** argv) {
     // Backends without hybrid/routing support skip this (live calibration still
     // applies).
     if (spark_autotune && backend->spark_wants_bootstrap()) {
-        const std::string spark_profile = std::string(bargs.model_path) + ".spark.csv";
+        const std::string spark_profile =
+            backend_args.model_path + ".spark.csv";
         std::FILE * spf = std::fopen(spark_profile.c_str(), "rb");
         const bool spark_have_profile = (spf != nullptr);
         if (spf) std::fclose(spf);
@@ -1119,10 +1123,11 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] ╭─── Configuration ───────────────────────────────────╮\n");
     std::fprintf(stderr, "[server] │  host            = %s\n", sconfig.host.c_str());
     std::fprintf(stderr, "[server] │  port            = %d\n", sconfig.port);
-    std::fprintf(stderr, "[server] │  model           = %s\n", bargs.model_path.c_str());
+    std::fprintf(stderr, "[server] │  model           = %s\n",
+                 backend_args.model_path.c_str());
     std::fprintf(
         stderr, "[server] │  draft           = %s\n",
-        bargs.draft_path ? bargs.draft_path->c_str() : "(none)");
+        backend_args.draft_path ? backend_args.draft_path->c_str() : "(none)");
     std::fprintf(stderr, "[server] │  model_name      = %s\n", sconfig.model_name.c_str());
     std::fprintf(stderr, "[server] │  max_ctx         = %d\n", sconfig.max_ctx);
     // max_tokens default for requests that omit the field. The request
@@ -1152,77 +1157,89 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │                    max=%d (%s)\n",
                  sconfig.effort_tiers.max, src_of(cli_set.effort_max));
     std::fprintf(stderr, "[server] │  target_device   = %s\n",
-                 placement_device_name(bargs.device).c_str());
+                 placement_device_name(backend_args.device).c_str());
     std::fprintf(stderr, "[server] │  target_split    = %s\n",
-                 target_split_mode_name(bargs.device.split_mode));
-    if (bargs.device.is_multi_device()) {
+                 target_split_mode_name(backend_args.device.split_mode));
+    if (backend_args.device.is_multi_device()) {
         std::fprintf(stderr, "[server] │  target_devices  =");
-        for (size_t i = 0; i < bargs.device.layer_split_gpus.size(); ++i) {
+        for (size_t i = 0;
+             i < backend_args.device.layer_split_gpus.size(); ++i) {
             std::fprintf(stderr, " %s:%d",
-                         placement_backend_name(bargs.device.layer_split_backend(i)),
-                         bargs.device.layer_split_gpus[i]);
+                         placement_backend_name(
+                             backend_args.device.layer_split_backend(i)),
+                         backend_args.device.layer_split_gpus[i]);
         }
         std::fprintf(stderr, "\n");
-        if (bargs.remote_target_shard.enabled()) {
+        if (backend_args.remote_target_shard.enabled()) {
             std::fprintf(stderr, "[server] │  target_shard_ipc= %s\n",
-                         bargs.remote_target_shard.ipc_bin.c_str());
-            if (!bargs.remote_target_shard.work_dir.empty()) {
+                         backend_args.remote_target_shard.ipc_bin.c_str());
+            if (!backend_args.remote_target_shard.work_dir.empty()) {
                 std::fprintf(stderr, "[server] │  target_shard_dir= %s\n",
-                             bargs.remote_target_shard.work_dir.c_str());
+                             backend_args.remote_target_shard.work_dir.c_str());
             }
         }
     }
     std::fprintf(stderr, "[server] │  draft_device    = %s\n",
-                 placement_device_name(bargs.draft_device).c_str());
+                 placement_device_name(backend_args.draft_device).c_str());
     std::fprintf(stderr, "[server] │  draft_exec      = %s\n",
-                 bargs.remote_draft.enabled() && bargs.draft_path ? "remote-ipc" : "local");
-    if (bargs.remote_draft.enabled()) {
+                 backend_args.remote_draft.enabled() && backend_args.draft_path
+                     ? "remote-ipc"
+                     : "local");
+    if (backend_args.remote_draft.enabled()) {
         std::fprintf(stderr, "[server] │  draft_ipc_bin  = %s\n",
-                     bargs.remote_draft.ipc_bin.c_str());
-        if (!bargs.remote_draft.work_dir.empty()) {
+                     backend_args.remote_draft.ipc_bin.c_str());
+        if (!backend_args.remote_draft.work_dir.empty()) {
             std::fprintf(stderr, "[server] │  draft_ipc_dir  = %s\n",
-                         bargs.remote_draft.work_dir.c_str());
+                         backend_args.remote_draft.work_dir.c_str());
         }
         std::fprintf(stderr, "[server] │  draft_ipc_cap  = %d\n",
-                     bargs.remote_draft.ring_cap);
+                     backend_args.remote_draft.ring_cap);
     }
     std::fprintf(stderr, "[server] │  peer_access     = %s\n",
-                 bargs.device.peer_access ? "ON" : "off");
-    std::fprintf(stderr, "[server] │  chunk           = %d\n", bargs.chunk);
+                 backend_args.device.peer_access ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  chunk           = %d\n",
+                 backend_args.chunk);
     std::fprintf(stderr, "[server] │  admission_wait  = %d ms\n",
                  sconfig.admission_coalesce_ms);
     if (arch == "deepseek4") {
         std::fprintf(stderr, "[server] │  ds4_fused      = %s\n",
-                     bargs.ds4_fused_decode ? "ON" : "off");
+                     backend_args.ds4_fused_decode ? "ON" : "off");
         std::fprintf(stderr, "[server] │  ds4_verify_f16kv= %s\n",
-                     bargs.ds4_fused_verify_f16_kv ? "ON" : "off");
-        if (bargs.ds4_expert_top_k > 0) {
+                     backend_args.ds4_fused_verify_f16_kv ? "ON" : "off");
+        if (backend_args.ds4_expert_top_k > 0) {
             std::fprintf(stderr, "[server] │  ds4_expert_topk= %d\n",
-                         bargs.ds4_expert_top_k);
+                         backend_args.ds4_expert_top_k);
         } else {
             std::fprintf(stderr, "[server] │  ds4_expert_topk= model default\n");
         }
         std::fprintf(stderr, "[server] │  ds4_prefill     = %s\n",
-                     prefill_attention_mode_name(bargs.ds4_prefill_mode));
+                     prefill_attention_mode_name(backend_args.ds4_prefill_mode));
     }
-    std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
-    if (bargs.fa_window > 0) {
+    std::fprintf(stderr, "[server] │  fa_window       = %d\n",
+                 backend_args.fa_window);
+    if (backend_args.fa_window > 0) {
         std::fprintf(stderr, "[server] │  ⚠  fa_window > 0 drops system prompt / "
                              "tool definitions from attention at long contexts.\n"
                              "[server] │     Use --fa-window 0 for tool-call workloads.\n");
     }
-    std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
-    std::fprintf(stderr, "[server] │  specla          = %s\n", bargs.specla_mode ? "ON" : "off");
-    if (bargs.specla_mode) {
-        std::fprintf(stderr, "[server] │  specla_top_k    = %d\n", bargs.specla_top_k);
-        std::fprintf(stderr, "[server] │  ddtree_tau      = %.3g\n", bargs.ddtree_tau);
+    std::fprintf(stderr, "[server] │  ddtree          = %s\n",
+                 backend_args.ddtree_mode ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  specla          = %s\n",
+                 backend_args.specla_mode ? "ON" : "off");
+    if (backend_args.specla_mode) {
+        std::fprintf(stderr, "[server] │  specla_top_k    = %d\n",
+                     backend_args.specla_top_k);
+        std::fprintf(stderr, "[server] │  ddtree_tau      = %.3g\n",
+                     backend_args.ddtree_tau);
     }
-    std::fprintf(stderr, "[server] │  fast_rollback   = %s\n", bargs.fast_rollback ? "ON" : "off");
-    if (bargs.device.is_layer_split()) {
+    std::fprintf(stderr, "[server] │  fast_rollback   = %s\n",
+                 backend_args.fast_rollback ? "ON" : "off");
+    if (backend_args.device.is_layer_split()) {
         std::fprintf(stderr, "[server] │  split_rollback  = %s\n",
                      split_chain_fast_rollback_enabled() ? "ON" : "off");
     }
-    std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
+    std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n",
+                 backend_args.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
     std::fprintf(stderr, "[server] │  agent_turn_cache= %s\n",
                  sconfig.agent_turn_cache ? "ON" : "off");
@@ -1256,7 +1273,7 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[server] │  draft_residency = %s\n",
                  draft_residency_policy_name(sconfig.draft_residency));
-    if (bargs.draft_path) {
+    if (backend_args.draft_path) {
         std::fprintf(stderr, "[server] │  lazy_draft      = %s\n", sconfig.lazy_draft ? "ON" : "off");
     }
     std::fprintf(stderr, "[server] ╰─────────────────────────────────────────────────────╯\n\n");
@@ -1265,12 +1282,12 @@ int main(int argc, char ** argv) {
     // — the /props handler reads them lockless from config_ so they need to
     // be set BEFORE the HttpServer constructor copies sconfig.
     sconfig.arch         = arch;
-    sconfig.model_path   = bargs.model_path;
-    sconfig.draft_path   = bargs.draft_path.value_or("");
-    sconfig.fa_window    = bargs.fa_window;
-    sconfig.ddtree_budget = bargs.ddtree_budget;
-    sconfig.speculative_enabled = bargs.ddtree_mode;
-    sconfig.target_sharding     = bargs.device.is_layer_split();
+    sconfig.model_path   = backend_args.model_path;
+    sconfig.draft_path   = backend_args.draft_path.value_or("");
+    sconfig.fa_window    = backend_args.fa_window;
+    sconfig.ddtree_budget = backend_args.ddtree_budget;
+    sconfig.speculative_enabled = backend_args.ddtree_mode;
+    sconfig.target_sharding     = backend_args.device.is_layer_split();
     // KV type: report the operator's choice if set, else the family default
     // the backend resolves (the tq3_0 auto policy was removed; laguna uses
     // q8_0, base default q4_0). Matches the printed table above.
@@ -1282,10 +1299,10 @@ int main(int argc, char ** argv) {
 #else
         "cuda";
 #endif
-    sconfig.chunk         = bargs.chunk;
-    sconfig.target_device = placement_device_name(bargs.device);
-    sconfig.draft_device  = bargs.draft_path
-                                ? placement_device_name(bargs.draft_device)
+    sconfig.chunk         = backend_args.chunk;
+    sconfig.target_device = placement_device_name(backend_args.device);
+    sconfig.draft_device  = backend_args.draft_path
+                                ? placement_device_name(backend_args.draft_device)
                                 : std::string();
     // Tokenizer ID: best-effort. The Tokenizer class doesn't currently
     // expose the GGUF metadata key it was loaded from, so leave empty
@@ -1352,7 +1369,7 @@ int main(int argc, char ** argv) {
     }
 
     // Lazy-draft: park decode draft at startup to free VRAM (~3.3 GB).
-    if (sconfig.lazy_draft && bargs.draft_path) {
+    if (sconfig.lazy_draft && backend_args.draft_path) {
         backend->park(ParkTarget::DraftModel);
     }
 
