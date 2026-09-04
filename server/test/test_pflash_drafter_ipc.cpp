@@ -96,3 +96,28 @@ TEST_CASE(PFlashDrafterIpcFixture, formatter_fails_closed_on_invalid_values) {
         REQUIRE(!error.empty());
     }
 }
+
+TEST_CASE(PFlashDrafterIpcFixture, capture_command_is_explicit_and_fail_closed) {
+    PFlashDrafterIpcCaptureCommand parsed;
+    std::string error;
+    REQUIRE(parse_pflash_drafter_ipc_capture_command(
+        "capture_post_block12 120000 128 /tmp/pflash capture", parsed, error));
+    REQUIRE(error.empty());
+    REQUIRE(parsed.score_query_end == 120000);
+    REQUIRE(parsed.score_query_tokens == 128);
+    REQUIRE(parsed.request_dir == "/tmp/pflash capture");
+
+    const char * bad_lines[] = {
+        "capture_post_block12 120000 128",
+        "capture_post_block12 127 128 /tmp/capture",
+        "capture_post_block12 120000 0 /tmp/capture",
+        "capture_post_block12 120000 128 relative/capture",
+        "compress2 0.5 120000 128 /tmp/capture",
+    };
+    for (const char * line : bad_lines) {
+        PFlashDrafterIpcCaptureCommand invalid;
+        REQUIRE(!parse_pflash_drafter_ipc_capture_command(
+            line, invalid, error));
+        REQUIRE(!error.empty());
+    }
+}

@@ -241,8 +241,10 @@ bool forward_qwen3_drafter_model(
     const std::vector<int32_t> & ids,
     int n_lookahead,
     std::vector<float> & running_max,
-    int score_query_end)
+    int score_query_end,
+    std::vector<uint16_t> * post_block12_bf16)
 {
+    if (post_block12_bf16) post_block12_bf16->clear();
     if (!w.backend || !w.tok_embd) {
         set_last_error("forward_qwen3_drafter_model: weights not loaded");
         return false;
@@ -293,6 +295,11 @@ bool forward_qwen3_drafter_model(
     }();
     const int fwd_layer_limit_pre = (early_exit_pre > 0 && early_exit_pre < w.n_layer)
         ? early_exit_pre : w.n_layer;
+    if (post_block12_bf16 && fwd_layer_limit_pre <= 12) {
+        set_last_error(
+            "forward_qwen3_drafter_model: block 12 unavailable for capture");
+        return false;
+    }
     const ScoreRange pre_range = compute_score_range(w.n_layer, score_layers_pre, fwd_layer_limit_pre);
     const int score_layer_start_pre = pre_range.start;
     const int n_score_layers = pre_range.count(); // K_norope/Q_norope sized to this, not n_layer
@@ -874,6 +881,37 @@ bool forward_qwen3_drafter_model(
             ggml_free(gB);
         }
 #endif
+
+        if (il == 12 && post_block12_bf16) {
+            ggml_backend_synchronize(w.backend);
+            post_block12_bf16->resize((size_t)S * hidden);
+            std::vector<float> capture_chunk(
+                (size_t)hidden * chunk_s_ff_v);
+            for (int cs = 0; cs < S; cs += chunk_s_ff_v) {
+                const int cl = std::min(chunk_s_ff_v, S - cs);
+                const size_t count = (size_t)hidden * cl;
+                const size_t offset = (size_t)cs * hidden;
+                ggml_backend_tensor_get(
+                    hidden_buf.t, capture_chunk.data(),
+                    offset * sizeof(float), count * sizeof(float));
+                if (count_nonfinite_scores(capture_chunk.data(), count) != 0) {
+                    post_block12_bf16->clear();
+                    set_last_error(
+                        "forward_qwen3_drafter_model: block 12 capture contains non-finite values");
+                    ggml_gallocr_free(galloc);
+                    cleanup_all();
+                    return false;
+                }
+                ggml_fp32_to_bf16_row(
+                    capture_chunk.data(),
+                    reinterpret_cast<ggml_bf16_t *>(
+                        post_block12_bf16->data() + offset),
+                    count);
+            }
+            ggml_gallocr_free(galloc);
+            cleanup_all();
+            return true;
+        }
 
         if (il == 0 || il == fwd_layer_limit - 1) {
             std::fprintf(stderr,

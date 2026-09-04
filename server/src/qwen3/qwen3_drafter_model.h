@@ -80,6 +80,10 @@ void free_qwen3_drafter_model(Qwen3DrafterWeights & w);
 //   ids         — input token IDs of length S (drafter vocab)
 //   n_lookahead — number of query tokens for scorer attention (=8)
 //   score_query_end — exclusive end of query window; negative selects the tail
+//   post_block12_bf16 — optional diagnostic capture of the residual after
+//                       transformer block 12, laid out as [S, n_embd]. When
+//                       present, the forward returns after producing it and
+//                       does not populate meaningful scores.
 //
 // Outputs:
 //   running_max — flat [n_lookahead, S] f32, max-over-heads-and-layers of
@@ -92,7 +96,8 @@ bool forward_qwen3_drafter_model(
     const std::vector<int32_t> & ids,
     int n_lookahead,
     std::vector<float> & running_max,
-    int score_query_end = -1);
+    int score_query_end = -1,
+    std::vector<uint16_t> * post_block12_bf16 = nullptr);
 
 struct QueryCaptureSlice {
     int chunk_offset = 0;

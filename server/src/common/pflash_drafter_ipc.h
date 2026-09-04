@@ -24,6 +24,12 @@ struct PFlashDrafterIpcCompressCommand {
     std::string path;
 };
 
+struct PFlashDrafterIpcCaptureCommand {
+    int score_query_end = -1;
+    int score_query_tokens = 0;
+    std::string request_dir;
+};
+
 bool format_pflash_drafter_ipc_compress_command(
     float keep_ratio,
     int score_query_end,
@@ -35,6 +41,11 @@ bool format_pflash_drafter_ipc_compress_command(
 bool parse_pflash_drafter_ipc_compress_command(
     const std::string & line,
     PFlashDrafterIpcCompressCommand & out,
+    std::string & error);
+
+bool parse_pflash_drafter_ipc_capture_command(
+    const std::string & line,
+    PFlashDrafterIpcCaptureCommand & out,
     std::string & error);
 
 class PFlashDrafterIpcClient {

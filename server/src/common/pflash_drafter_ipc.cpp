@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <sstream>
 
 namespace dflash::common {
@@ -134,6 +135,44 @@ bool parse_pflash_drafter_ipc_compress_command(
 
     return validate_request_fields(
         out.keep_ratio, out.score_query_tokens, out.path, error);
+}
+
+bool parse_pflash_drafter_ipc_capture_command(
+        const std::string & line,
+        PFlashDrafterIpcCaptureCommand & out,
+        std::string & error) {
+    out = {};
+    error.clear();
+
+    std::istringstream iss(line);
+    std::string command;
+    std::string query_end_raw;
+    std::string query_tokens_raw;
+    if (!(iss >> command >> query_end_raw >> query_tokens_raw)) {
+        error = "PFlash IPC capture command is missing fields";
+        return false;
+    }
+    if (command != "capture_post_block12") {
+        error = "unknown PFlash IPC capture command";
+        return false;
+    }
+    if (!parse_int_token(query_end_raw, out.score_query_end) ||
+        !parse_int_token(query_tokens_raw, out.score_query_tokens)) {
+        error = "PFlash IPC capture query fields must be integers";
+        return false;
+    }
+    out.request_dir = read_line_tail(iss);
+    if (out.score_query_tokens < 1 ||
+        out.score_query_end < out.score_query_tokens) {
+        error = "PFlash IPC capture query span is invalid";
+        return false;
+    }
+    if (out.request_dir.empty() ||
+        !std::filesystem::path(out.request_dir).is_absolute()) {
+        error = "PFlash IPC capture request directory must be absolute";
+        return false;
+    }
+    return true;
 }
 
 bool PFlashDrafterIpcClient::start(
