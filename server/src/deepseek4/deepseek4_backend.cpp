@@ -179,7 +179,7 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
     // target device (which is gfx1201 in the R9700 + gfx1151 launch).
     if (env_flag_enabled("DFLASH_DS4_Q5_VERIFY")) {
         if (std::getenv("LUCE_MMVQ_MAX_NCOLS") == nullptr &&
-            ::setenv("LUCE_MMVQ_MAX_NCOLS", "5", 0) != 0) {
+            set_environment_variable("LUCE_MMVQ_MAX_NCOLS", "5", false) != 0) {
             std::fprintf(stderr,
                          "[deepseek4] failed to set LUCE_MMVQ_MAX_NCOLS=5\n");
             return false;
@@ -191,7 +191,7 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
         }
 
         const char * fp4_x4 = std::getenv("DFLASH_CUDA_MMVQ_FP4_X4");
-        if (!fp4_x4 && ::setenv("DFLASH_CUDA_MMVQ_FP4_X4", "1", 0) != 0) {
+        if (!fp4_x4 && set_environment_variable("DFLASH_CUDA_MMVQ_FP4_X4", "1", false) != 0) {
             std::fprintf(stderr,
                          "[deepseek4] failed to enable ROCmFP4 x4 MMVQ\n");
             return false;
@@ -211,7 +211,7 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
             std::getenv("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1") == nullptr &&
             cudaGetDeviceProperties(&prop, gpu) == cudaSuccess &&
             std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0 &&
-            ::setenv("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1", "1", 0) == 0) {
+            set_environment_variable("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1", "1", false) == 0) {
             std::fprintf(stderr,
                          "[deepseek4] gfx1201 DSpark q5: defaulting "
                          "ROCmFP4 x4+1 MMVQ\n");
@@ -229,7 +229,7 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
         return true;
     }
 
-    if (::setenv("LUCE_MMVQ_MAX_NCOLS", "4", 0) == 0) {
+    if (set_environment_variable("LUCE_MMVQ_MAX_NCOLS", "4", false) == 0) {
         std::fprintf(stderr,
                      "[deepseek4] gfx1151 DSpark: defaulting "
                      "LUCE_MMVQ_MAX_NCOLS=4\n");
@@ -293,7 +293,7 @@ static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
     // older AMD parts.  ROCmFPX MMVQ on gfx1201 is qualified through q=4;
     // using that width removes 75% of hot-owner launches while retaining the
     // stable vector kernel instead of the pathological full-batch MMQ path.
-    if (::setenv("DFLASH_MMQ_SUB_BATCH", "4", 0) == 0) {
+    if (set_environment_variable("DFLASH_MMQ_SUB_BATCH", "4", false) == 0) {
         std::fprintf(stderr,
                      "[deepseek4] gfx1201 hybrid prefill: defaulting hot "
                      "expert sub-batch to 4\n");
@@ -1659,7 +1659,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
             return false;
         }
         if ((!mix_mmq || !mix_mmq[0]) &&
-            ::setenv("DFLASH_DS4_MIX_MMQ_PREFILL", "1", 1) != 0) {
+            set_environment_variable("DFLASH_DS4_MIX_MMQ_PREFILL", "1", true) != 0) {
             std::fprintf(stderr,
                          "[deepseek4] failed to enable mixed-expert MMQ prefill\n");
             return false;
