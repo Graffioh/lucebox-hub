@@ -359,6 +359,7 @@ namespace CppUnitTestFramework {
 
             logger->BeginRun(all_test_cases.size());
 
+            size_t selected_count = 0;
             size_t pass_count = 0;
             size_t fail_count = 0;
             size_t skip_count = 0;
@@ -370,6 +371,7 @@ namespace CppUnitTestFramework {
                     continue;
                 }
 
+                ++selected_count;
                 logger->EnterTest(test_case.Name);
 
                 bool test_failed = true;
@@ -402,6 +404,11 @@ namespace CppUnitTestFramework {
 
             logger->EndRun(pass_count, fail_count, skip_count);
 
+            if (selected_count == 0) {
+                std::cerr << "No test cases matched the selection" << std::endl;
+                return 1;
+            }
+
             if (fail_count != 0) {
                 return 1;
             }
@@ -432,7 +439,7 @@ namespace CppUnitTestFramework {
                 }
 
                 for (auto& tag : test_tags) {
-                    if (tag == keyword) {
+                    if (!options->ExactMatch && tag == keyword) {
                         return true;
                     }
                 }

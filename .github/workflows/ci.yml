@@ -34,8 +34,8 @@ jobs:
       - name: Lint Python surfaces touched by lucebox tooling
         run: uv run --frozen --extra dev ruff check .
 
-      - name: Test DS4 benchmark tools
-        run: uv run --frozen --extra dev pytest -q harness/tests/test_ds4_benchmark_tools.py
+      - name: Run model-free unit tests
+        run: uv run --frozen --extra dev pytest -q
 
   build:
     name: Build (cmake + uv sync --extra megakernel)
