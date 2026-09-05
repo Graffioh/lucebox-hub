@@ -713,10 +713,7 @@ std::vector<int32_t> drafter_score_and_compress(
         return {};
     }
     if (ctx.arch == DrafterArch::Qwen35_0p8b) {
-        if (score_query_end < 0) {
-            set_last_error("qwen35 scorer query window out of range");
-            return {};
-        }
+        if (score_query_end < 0) score_query_end = (int) ids.size();
         if (!ctx.arch_state) {
             set_last_error("qwen35 drafter state missing");
             return {};
