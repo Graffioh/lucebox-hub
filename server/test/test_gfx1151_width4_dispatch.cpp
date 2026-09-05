@@ -171,7 +171,7 @@ int main() {
     if (std::strncmp(properties.gcnArchName, "gfx1151", 7) != 0) {
         std::printf("SKIP: gfx1151 width-4 dispatch test expects gfx1151 (found %s)\n",
                     properties.gcnArchName);
-        return 0;
+        return 77;
     }
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {

@@ -989,22 +989,6 @@ if(DFLASH27B_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_gfx1151_width4_dispatch)
 
-        add_executable(test_rope_tail test/test_rope_tail.cpp)
-        set_source_files_properties(test/test_rope_tail.cpp PROPERTIES LANGUAGE HIP)
-        set_target_properties(test_rope_tail PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
-        target_include_directories(test_rope_tail PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
-        target_link_libraries(test_rope_tail PRIVATE
-            ggml
-            ggml-base
-            ggml-cpu
-            ${DFLASH27B_GGML_BACKEND_TARGET}
-            hip::host)
-        list(APPEND _raw_unit_test_targets test_rope_tail)
-
-
-
-
         # Benchmark, not a test: built with the tests but deliberately NOT added to
         # _raw_unit_test_targets, so ctest stays deterministic. Measures the launch-count
         # claim the fusion rests on.
@@ -1019,6 +1003,10 @@ if(DFLASH27B_TESTS)
     add_executable(test_qwen35_tensor_parallel test/test_qwen35_tensor_parallel.cpp)
     target_include_directories(test_qwen35_tensor_parallel PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     target_link_libraries(test_qwen35_tensor_parallel PRIVATE dflash_common)
+
+    add_executable(test_rope_tail test/test_rope_tail.cpp)
+    target_compile_definitions(test_rope_tail PRIVATE DFLASH_ROPE_TEST_GPU=1)
+    target_link_libraries(test_rope_tail PRIVATE ggml ggml-base ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET})
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND _dflash_cuda_min_sm GREATER_EQUAL 80 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
         add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
@@ -1498,28 +1486,14 @@ if(DFLASH27B_TESTS)
         # Pure host-side allocator test: no model, ggml, or GPU is required.
         add_executable(test_paged_kv_pool
             test/test_paged_kv_pool.cpp
+            test/test_deepseek4_page_layout.cpp
+            test/test_deepseek4_paged_cache.cpp
+            src/deepseek4/deepseek4_paged_cache.cpp
             src/common/concurrency/paged_kv_pool.cpp)
+        target_compile_definitions(test_paged_kv_pool PRIVATE DFLASH_DS4_PLAN_ONLY=1)
         target_include_directories(test_paged_kv_pool PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_page_layout.cpp")
-        add_executable(test_deepseek4_page_layout
-            test/test_deepseek4_page_layout.cpp)
-        target_include_directories(test_deepseek4_page_layout PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/include)
-        list(APPEND _raw_unit_test_targets test_deepseek4_page_layout)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_deepseek4_paged_cache.cpp")
-        add_executable(test_deepseek4_paged_cache
-            test/test_deepseek4_paged_cache.cpp
-            src/deepseek4/deepseek4_paged_cache.cpp)
-        target_compile_definitions(test_deepseek4_paged_cache PRIVATE
-            DFLASH_DS4_PLAN_ONLY=1)
-        target_include_directories(test_deepseek4_paged_cache PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        list(APPEND _raw_unit_test_targets test_deepseek4_paged_cache)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_seq_slot_manager.cpp")
         # Host-side slot bookkeeping test (concurrent serving): no GPU.
@@ -1948,6 +1922,8 @@ if(DFLASH27B_TESTS)
         test_cuda_comm_api
         test_mmq_streamk_iq4_xs
         test_rms_norm_hip
+        test_rope_tail
+        test_paged_kv_pool
         test_rocmfp3_mix_registry
         test_rocmfp_mix_slice_matvec
         test_rocmfp_mix_gateup_glu

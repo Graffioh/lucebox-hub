@@ -390,7 +390,11 @@ bool deepseek4_paged_gathered_step(
     const uint8_t * logit_lanes,
     std::vector<float> & out_logits, std::vector<int32_t> & out_argmax,
     MoeHybridStorage * moe_hybrid = nullptr,
-    MoeHybridRoutingStats * routing_stats = nullptr);
+    MoeHybridRoutingStats * routing_stats = nullptr,
+    DeepSeek4StepTelemetry * telemetry = nullptr);
+void log_deepseek4_step_telemetry(
+    const char * phase, int tokens, int steps, double wall_s,
+    const DeepSeek4StepTelemetry & telemetry);
 void deepseek4_release_paged_gathered_runtime(DeepSeek4PagedCache & cache);
 void reset_deepseek4_cache(DeepSeek4Cache & c);
 // Release only reproducible large-batch graph arenas after prefill. KV/model

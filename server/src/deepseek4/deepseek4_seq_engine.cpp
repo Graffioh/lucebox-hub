@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 
 namespace dflash::common {
 
@@ -66,6 +69,11 @@ void DeepSeek4SeqEngine::fail_prefill(
 }
 
 SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
+    using Clock = std::chrono::steady_clock;
+    const auto phase_t0 = Clock::now();
+    const char * timing_env = std::getenv("DFLASH_DS4_TIMING");
+    const bool timing = timing_env && *timing_env && std::strcmp(timing_env, "0") != 0;
+    DeepSeek4StepTelemetry telemetry;
     StepResult result;
     const std::vector<StepInput> & inputs = plan.decode;
     const int n_slots = slots_.slot_count();
@@ -186,6 +194,7 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
         return fail_step("DeepSeek4 gathered step exceeds six lanes");
     }
 
+    const auto embed_t0 = Clock::now();
     std::vector<float> embeddings(
         (size_t)b_.w_.n_embd * lane_tokens.size());
     if (!b_.w_.embedder.embed(lane_tokens.data(), (int)lane_tokens.size(),
@@ -193,6 +202,8 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
         return fail_step("DeepSeek4 token embedding failed");
     }
 
+    if (timing) telemetry.embed_us += std::chrono::duration_cast<
+        std::chrono::microseconds>(Clock::now() - embed_t0).count();
     std::vector<int32_t> compact_tables(
         lane_tokens.size() * stride_, -1);
     for (size_t lane = 0; lane < lane_slots.size(); ++lane) {
@@ -225,10 +236,12 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
             lane_slots.data(), (uint32_t)lane_tokens.size(),
             compact_tables.data(), stride_, bucket_history,
             logit_lanes.data(), logits, argmax,
-            b_.moe_hybrid_.get(), b_.routing_stats_.get())) {
+            b_.moe_hybrid_.get(), b_.routing_stats_.get(),
+            timing ? &telemetry : nullptr)) {
         return fail_step("DeepSeek4 gathered paged graph failed");
     }
 
+    const auto sample_t0 = Clock::now();
     auto sample_lane = [&](int slot_id, int lane) {
         SeqSlot & slot = slots_.slot(slot_id);
         if (!slot.sampler.needs_logit_processing()) {
@@ -255,6 +268,14 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
             slots_.commit_prefill(prefill.slot);
         }
         result.prefills.push_back(std::move(out));
+    }
+    if (timing) {
+        telemetry.sample_us += std::chrono::duration_cast<std::chrono::microseconds>(
+            Clock::now() - sample_t0).count();
+        const char * phase = plan.prefills.empty() ? "paged-decode"
+            : inputs.empty() ? "paged-prefill" : "paged-mixed";
+        log_deepseek4_step_telemetry(phase, (int)lane_tokens.size(), 1,
+            std::chrono::duration<double>(Clock::now() - phase_t0).count(), telemetry);
     }
     return result;
 }

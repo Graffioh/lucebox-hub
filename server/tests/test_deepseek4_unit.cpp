@@ -4260,6 +4260,62 @@ static void test_hc_scratch_shape_capacity() {
 #endif
 #endif
 
+static void test_paged_cache_allocation(ggml_backend_t backend) {
+    std::fprintf(stderr, "  paged cache allocation and slot reset...");
+    DeepSeek4Weights weights;
+    weights.n_layer = 3;
+    weights.head_dim = 16;
+    weights.n_indexer_head_dim = 8;
+    weights.compress_ratios = {0, 4, 128};
+    DeepSeek4PagedCache cache;
+    for (uint32_t slots : {1u, 3u}) {
+        if (!create_deepseek4_paged_cache(backend, weights, slots, 257, 5, cache)) {
+            TEST_ASSERT_MSG(false, "paged cache creation failed");
+            return;
+        }
+        uint64_t raw_bytes = 0, compressed_bytes = 0, state_bytes = 0;
+        for (const auto & layer : cache.layers) {
+            raw_bytes += ggml_nbytes(layer.raw_kv);
+            for (const auto * tensor : {layer.comp_kv, layer.index_comp_kv}) {
+                if (tensor) compressed_bytes += ggml_nbytes(tensor);
+            }
+            for (auto * tensor : {layer.attn_compressor.state_kv,
+                                  layer.attn_compressor.state_score,
+                                  layer.indexer_compressor.state_kv,
+                                  layer.indexer_compressor.state_score}) {
+                if (!tensor) continue;
+                state_bytes += ggml_nbytes(tensor);
+                std::vector<float> values(ggml_nelements(tensor), 1.0f);
+                ggml_backend_tensor_set(tensor, values.data(), 0, ggml_nbytes(tensor));
+            }
+        }
+        TEST_ASSERT(raw_bytes == cache.plan.raw_bytes);
+        TEST_ASSERT(compressed_bytes == cache.plan.compressed_bytes);
+        TEST_ASSERT(state_bytes == cache.plan.state_bytes);
+        TEST_ASSERT(cache.layers[0].comp_kv == nullptr);
+        TEST_ASSERT(cache.layers[0].attn_compressor.state_kv == nullptr);
+        TEST_ASSERT(cache.layers[2].index_comp_kv == nullptr);
+        reset_deepseek4_paged_slot(cache, slots - 1);
+        for (const auto & layer : cache.layers) {
+            for (auto * tensor : {layer.attn_compressor.state_kv,
+                                  layer.attn_compressor.state_score,
+                                  layer.indexer_compressor.state_kv,
+                                  layer.indexer_compressor.state_score}) {
+                if (!tensor) continue;
+                std::vector<float> values(ggml_nelements(tensor));
+                ggml_backend_tensor_get(tensor, values.data(), 0, ggml_nbytes(tensor));
+                const size_t slot_elements = tensor->nb[2] / sizeof(float);
+                for (size_t i = 0; i < values.size(); ++i) {
+                    TEST_ASSERT(values[i] == (i / slot_elements == slots - 1 ? 0.0f : 1.0f));
+                }
+            }
+        }
+        free_deepseek4_paged_cache(cache);
+        TEST_ASSERT(!cache.ctx && !cache.buf && !cache.pool && cache.layers.empty());
+    }
+    std::fprintf(stderr, " done\n");
+}
+
 int main() {
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
@@ -4267,6 +4323,7 @@ int main() {
         return 1;
     }
 
+    test_paged_cache_allocation(backend);
     test_compressor_pooling_correctness(backend);
     test_moe_expert_major_default_threshold();
     test_chunked_graph_allocator(backend);

@@ -5913,7 +5913,7 @@ static void ggml_compute_forward_rope_flt(
                 if (last_i2 != i2) {
                     if (!mrope_used) {
                         const int64_t p = pos[i2];
-                        ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                        ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, is_tail ? n_dims : ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
                     }
                     else {
                         const int64_t p_t = pos[i2];

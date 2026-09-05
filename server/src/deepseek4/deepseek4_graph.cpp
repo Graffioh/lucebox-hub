@@ -5156,6 +5156,9 @@ struct Ds4FusedVerifyCache {
         // Reused host staging for the context-sized additive attention mask.
         // Keeping it per slot removes one allocation from every verify step.
         std::vector<float> mask_values;
+        std::vector<int32_t> bundle_i32;
+        std::vector<int64_t> bundle_i64;
+        std::vector<int32_t> bundle_gather;
         std::vector<PagedLane> paged;     // [layer*q], paged mode only
         ggml_tensor * paged_i32 = nullptr;
         ggml_tensor * paged_i64 = nullptr;
@@ -7217,7 +7220,9 @@ bool deepseek4_paged_gathered_step(
         const uint8_t * logit_lanes,
         std::vector<float> & out_logits, std::vector<int32_t> & out_argmax,
         MoeHybridStorage * hybrid,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats,
+        DeepSeek4StepTelemetry * telemetry) {
+    const auto step_t0 = Ds4TimingClock::now();
     if (!backend || !embeddings || !positions || !slots || !block_tables ||
         !logit_lanes ||
         lanes < 1 || lanes > DEEPSEEK4_MAX_PAGED_SEQUENCES ||
@@ -7256,6 +7261,7 @@ bool deepseek4_paged_gathered_step(
             }
         }
     }
+    const auto build_t0 = Ds4TimingClock::now();
     const DeepSeek4RoctxRange roctx_range(
         "ds4.paged_gathered_step",
         {InferencePhase::Batched, static_cast<int>(lanes), 0, w.n_layer,
@@ -7376,6 +7382,8 @@ bool deepseek4_paged_gathered_step(
             return false;
         }
     }
+    if (telemetry) telemetry->full_graph_build_us += ds4_elapsed_us(build_t0, Ds4TimingClock::now());
+    const auto set_t0 = Ds4TimingClock::now();
     fg->last_use = vc.counter;
     ds4_fv_set(fg->inp_embed, embeddings,
                sizeof(float) * (size_t) w.n_embd * lanes);
@@ -7393,12 +7401,12 @@ bool deepseek4_paged_gathered_step(
         ds4_fv_set(ex->neg_q, neg_batch.data(), sizeof(int32_t) * lanes);
     }
 
-    std::vector<int32_t> bundle_i32(
-        (size_t) std::max<int64_t>(ex->paged_i32_n, 0), 0);
-    std::vector<int64_t> bundle_i64(
-        (size_t) std::max<int64_t>(ex->paged_i64_n, 0), 0);
-    std::vector<int32_t> bundle_gather(
-        (size_t) std::max<int64_t>(ex->paged_gather_n, 0), 0);
+    auto & bundle_i32 = ex->bundle_i32;
+    bundle_i32.resize((size_t) std::max<int64_t>(ex->paged_i32_n, 0), 0);
+    auto & bundle_i64 = ex->bundle_i64;
+    bundle_i64.resize((size_t) std::max<int64_t>(ex->paged_i64_n, 0), 0);
+    auto & bundle_gather = ex->bundle_gather;
+    bundle_gather.resize((size_t) std::max<int64_t>(ex->paged_gather_n, 0), 0);
     std::vector<float> & mask_values = ex->mask_values;
     if (bucket_history) {
         const size_t mask_count = (size_t) ggml_nelements(fg->mask_bundle);
@@ -7497,6 +7505,8 @@ bool deepseek4_paged_gathered_step(
     // replay saves only about 0.2 us per launch. Keep the ggml graph reuse
     // and execute eagerly; this also skips the per-round node-property scan.
     // The heterogeneous path keeps its long-lived bucketed graphs and replay.
+    if (telemetry) telemetry->full_graph_set_us += ds4_elapsed_us(set_t0, Ds4TimingClock::now());
+    const auto compute_t0 = Ds4TimingClock::now();
     ScopedCudaGraphOverrides monolithic_eager_scope(!hybrid);
     const enum ggml_status status = fg->sched
         ? ggml_backend_sched_graph_compute(fg->sched, fg->sg.gf)
@@ -7507,6 +7517,8 @@ bool deepseek4_paged_gathered_step(
             (int) status);
         return false;
     }
+    if (telemetry) telemetry->full_graph_compute_us += ds4_elapsed_us(compute_t0, Ds4TimingClock::now());
+    const auto read_t0 = Ds4TimingClock::now();
     ds4_fused_consume_route_diagnostics(*fg, hybrid, routing_stats, slots);
     out_argmax.resize(lanes);
     ggml_backend_tensor_get(ex->argmax, out_argmax.data(), 0,
@@ -7541,6 +7553,10 @@ bool deepseek4_paged_gathered_step(
                         w.n_vocab, 0.0f);
         }
         out_argmax[lane] = -1;
+    }
+    if (telemetry) {
+        telemetry->full_graph_read_us += ds4_elapsed_us(read_t0, Ds4TimingClock::now());
+        telemetry->total_us += ds4_elapsed_us(step_t0, Ds4TimingClock::now());
     }
     return true;
 }

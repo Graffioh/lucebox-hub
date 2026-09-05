@@ -254,15 +254,22 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
 static void configure_gfx1151_paged_mmvq_default(int gpu, bool paged_attention) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (!paged_attention || env_flag_enabled("DFLASH_DS4_SPEC") ||
-        std::getenv("LUCE_MMVQ_MAX_NCOLS") != nullptr ||
         !is_gfx_device(gpu, "gfx1151")) {
         return;
     }
-    if (::setenv("LUCE_MMVQ_MAX_NCOLS", "5", 0) == 0) {
+    if (std::getenv("LUCE_MMVQ_MAX_NCOLS") == nullptr &&
+        set_environment_variable("LUCE_MMVQ_MAX_NCOLS", "5", false) == 0) {
         std::fprintf(stderr,
                      "[deepseek4] gfx1151 paged decode: defaulting "
                      "LUCE_MMVQ_MAX_NCOLS=5 (four- and five-column ROCmFP4 "
                      "MMVQ)\n");
+    }
+    for (const char * name : {"DFLASH_CUDA_MMVQ_FP4_X4",
+                              "DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1",
+                              "DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24"}) {
+        if (set_environment_variable(name, "1", false) != 0) {
+            std::fprintf(stderr, "[deepseek4] failed to default %s=1\n", name);
+        }
     }
 #else
     (void) gpu;
@@ -409,42 +416,6 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
 
 static double ms(uint64_t us) {
     return (double)us / 1000.0;
-}
-
-static void log_step_tel(const char * phase,
-                         int tokens,
-                         int steps,
-                         double wall_s,
-                         const DeepSeek4StepTelemetry & t) {
-    const double tok_s = wall_s > 0.0 ? (double)tokens / wall_s : 0.0;
-    std::fprintf(stderr,
-        "[deepseek4-timing] %s tokens=%d steps=%d wall=%.3fs %.2f tok/s "
-        "step=%.1fms embed=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
-        "full_build=%.1fms full_set=%.1fms full_compute=%.1fms full_read=%.1fms "
-        "ffn_build=%.1fms ffn_compute=%.1fms ffn_read=%.1fms "
-        "route_build=%.1fms route_compute=%.1fms route_read=%.1fms route_select=%.1fms "
-        "ffn=%.1fms hot=%.1fms cold=%.1fms combine=%.1fms partition=%.1fms "
-        "ffn_hot_graph_build=%llu ffn_hot_graph_hit=%llu ffn_cold_graph_build=%llu ffn_cold_graph_hit=%llu "
-        "hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
-        "hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
-        "hot_sel=%d cold_sel=%d\n",
-        phase, tokens, steps, wall_s, tok_s,
-        ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
-        ms(t.full_graph_build_us), ms(t.full_graph_set_us),
-        ms(t.full_graph_compute_us), ms(t.full_graph_read_us),
-        ms(t.ffn_build_us), ms(t.ffn_compute_us), ms(t.ffn_read_us),
-        ms(t.route_build_us), ms(t.route_compute_us), ms(t.route_read_us), ms(t.route_select_us),
-        ms(t.ffn_eval_us), ms(t.ffn_hot_us), ms(t.ffn_cold_us), ms(t.ffn_combine_us),
-        ms(t.ffn_partition_us),
-        (unsigned long long)t.ffn_hot_graph_builds, (unsigned long long)t.ffn_hot_graph_hits,
-        (unsigned long long)t.ffn_cold_graph_builds, (unsigned long long)t.ffn_cold_graph_hits,
-        ms(t.hc_pre_attn_us + t.hc_pre_ffn_us),
-        ms(t.hc_pre_build_us),
-        ms(t.hc_pre_input_us),
-        ms(t.hc_pre_compute_us),
-        ms(t.hc_post_attn_us + t.hc_post_ffn_us),
-        ms(t.output_us), ms(t.sample_us), ms(t.emit_us),
-        t.hot_selected, t.cold_selected);
 }
 
 static uint64_t layer_expert_bytes(const DeepSeek4Layer & layer, int n_expert) {
@@ -781,6 +752,43 @@ static MoeLayerDesc make_ds4_expert_layer_desc(const DeepSeek4Layer & layer) {
 }
 
 }  // namespace
+
+void log_deepseek4_step_telemetry(const char * phase,
+                         int tokens,
+                         int steps,
+                         double wall_s,
+                         const DeepSeek4StepTelemetry & t) {
+    const double tok_s = wall_s > 0.0 ? (double)tokens / wall_s : 0.0;
+    std::fprintf(stderr,
+        "[deepseek4-timing] %s tokens=%d steps=%d wall=%.3fs %.2f tok/s "
+        "step=%.1fms embed=%.1fms attn_build=%.1fms attn_compute=%.1fms attn_read=%.1fms "
+        "full_build=%.1fms full_set=%.1fms full_compute=%.1fms full_read=%.1fms "
+        "ffn_build=%.1fms ffn_compute=%.1fms ffn_read=%.1fms "
+        "route_build=%.1fms route_compute=%.1fms route_read=%.1fms route_select=%.1fms "
+        "ffn=%.1fms hot=%.1fms cold=%.1fms combine=%.1fms partition=%.1fms "
+        "ffn_hot_graph_build=%llu ffn_hot_graph_hit=%llu ffn_cold_graph_build=%llu ffn_cold_graph_hit=%llu "
+        "hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
+        "hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
+        "hot_sel=%d cold_sel=%d\n",
+        phase, tokens, steps, wall_s, tok_s,
+        ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
+        ms(t.full_graph_build_us), ms(t.full_graph_set_us),
+        ms(t.full_graph_compute_us), ms(t.full_graph_read_us),
+        ms(t.ffn_build_us), ms(t.ffn_compute_us), ms(t.ffn_read_us),
+        ms(t.route_build_us), ms(t.route_compute_us), ms(t.route_read_us), ms(t.route_select_us),
+        ms(t.ffn_eval_us), ms(t.ffn_hot_us), ms(t.ffn_cold_us), ms(t.ffn_combine_us),
+        ms(t.ffn_partition_us),
+        (unsigned long long)t.ffn_hot_graph_builds, (unsigned long long)t.ffn_hot_graph_hits,
+        (unsigned long long)t.ffn_cold_graph_builds, (unsigned long long)t.ffn_cold_graph_hits,
+        ms(t.hc_pre_attn_us + t.hc_pre_ffn_us),
+        ms(t.hc_pre_build_us),
+        ms(t.hc_pre_input_us),
+        ms(t.hc_pre_compute_us),
+        ms(t.hc_post_attn_us + t.hc_post_ffn_us),
+        ms(t.output_us), ms(t.sample_us), ms(t.emit_us),
+        t.hot_selected, t.cold_selected);
+}
+
 
 DeepSeek4Backend::DeepSeek4Backend(const DeepSeek4BackendConfig & cfg)
     : cfg_(cfg) {}
@@ -2353,7 +2361,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                      finite ? max_value : 0.0f);
     }
     if (timing) {
-        log_step_tel("prefill", n_total, steps, elapsed_s(phase_t0), tel_acc);
+        log_deepseek4_step_telemetry("prefill", n_total, steps, elapsed_s(phase_t0), tel_acc);
     }
     if (spec_enabled_ && spec_drafter_) {
         deepseek4_release_prefill_scratch(cache_, moe_hybrid_.get());
@@ -2498,7 +2506,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         }
     }
     if (timing) {
-        log_step_tel("decode", (int)out_tokens.size(), steps, elapsed_s(phase_t0), tel_acc);
+        log_deepseek4_step_telemetry("decode", (int)out_tokens.size(), steps, elapsed_s(phase_t0), tel_acc);
     }
     return true;
 }

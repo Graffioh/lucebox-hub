@@ -68,18 +68,18 @@ bool prepare_deepseek4_gathered_lane_rows(
             static_cast<uint32_t>(rows.raw_history.size());
         rows.raw_scatter = int64_t(rows.slot) * DS4_PAGE_TOKENS +
                            ds4_raw_ring_row(pos);
-        if (!ratio) continue;
-
-        // Validate the current logical page before reserving history. A
-        // malformed, very large position must fail without attempting an
-        // allocation proportional to that untrusted value.
+        // Validate all active pages even when this layer has no compressor.
+        // Bound the position before reserving compressed history.
         const uint64_t current_logical_block = pos / DS4_PAGE_TOKENS;
         if (current_logical_block >= block_table_stride) return false;
-        const int32_t current_physical =
-            block_tables[size_t(lane) * block_table_stride + current_logical_block];
-        if (current_physical < 0 || uint32_t(current_physical) >= physical_blocks) {
-            return false;
+        const int32_t * lane_table = block_tables + size_t(lane) * block_table_stride;
+        for (uint64_t block = 0; block <= current_logical_block; ++block) {
+            if (lane_table[block] < 0 || uint32_t(lane_table[block]) >= physical_blocks) {
+                return false;
+            }
         }
+        if (!ratio) continue;
+        const int32_t current_physical = lane_table[current_logical_block];
 
         // Every completed group before the current token contributes one
         // chronological row.  Looking up each logical page (rather than
@@ -89,10 +89,7 @@ bool prepare_deepseek4_gathered_lane_rows(
         for (uint64_t group = 0; group < completed; ++group) {
             const uint64_t end_token = group * ratio + ratio - 1;
             const uint64_t logical_block = end_token / DS4_PAGE_TOKENS;
-            if (logical_block >= block_table_stride) return false;
-            const int32_t physical =
-                block_tables[size_t(lane) * block_table_stride + logical_block];
-            if (physical < 0 || uint32_t(physical) >= physical_blocks) return false;
+            const int32_t physical = lane_table[logical_block];
             uint64_t row = 0; bool emitted = false;
             if (!ds4_compressed_page_row(end_token, uint32_t(physical), ratio,
                                          row, emitted) || !emitted ||
@@ -182,6 +179,25 @@ bool create_deepseek4_paged_cache(ggml_backend_t backend,
             l.indexer_compressor.state_kv = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, iw, 8, slots);
             l.indexer_compressor.state_score = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32, iw, 8, slots);
         }
+    }
+    uint64_t raw_bytes = 0, compressed_bytes = 0, state_bytes = 0;
+    for (const auto & layer : out.layers) {
+        raw_bytes += ggml_nbytes(layer.raw_kv);
+        for (const auto * tensor : {layer.comp_kv, layer.index_comp_kv}) {
+            if (tensor) compressed_bytes += ggml_nbytes(tensor);
+        }
+        for (const auto * tensor : {layer.attn_compressor.state_kv,
+                                   layer.attn_compressor.state_score,
+                                   layer.indexer_compressor.state_kv,
+                                   layer.indexer_compressor.state_score}) {
+            if (tensor) state_bytes += ggml_nbytes(tensor);
+        }
+    }
+    if (raw_bytes != plan.raw_bytes || compressed_bytes != plan.compressed_bytes ||
+        state_bytes != plan.state_bytes) {
+        std::fprintf(stderr, "[deepseek4] paged cache tensor sizes disagree with allocation plan\n");
+        free_deepseek4_paged_cache(out);
+        return false;
     }
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) { free_deepseek4_paged_cache(out); return false; }

@@ -1,20 +1,22 @@
 #include "deepseek4/deepseek4_page_layout.h"
-#include "host_check.h"
+#include "CppUnitTestFramework.hpp"
 
 #include <cstdint>
-#include <cstdio>
 #include <limits>
 
 using namespace dflash::common;
 
-static int g_checks = 0;
+namespace { struct DeepSeek4PageLayoutFixture {}; }
 
-int main() {
+TEST_CASE(DeepSeek4PageLayoutFixture, raw_ring_wraps) {
     CHECK(ds4_raw_ring_row(0) == 0);
     CHECK(ds4_raw_ring_row(127) == 127);
     CHECK(ds4_raw_ring_row(128) == 0);
     CHECK(ds4_raw_ring_row(255) == 127);
 
+}
+
+TEST_CASE(DeepSeek4PageLayoutFixture, compressed_page_rows) {
     uint64_t row = 999;
     bool emitted = true;
     CHECK(ds4_compressed_page_row(3, 7, 4, row, emitted));
@@ -37,6 +39,11 @@ int main() {
     CHECK(ds4_compressed_page_row(255, 2, 128, row, emitted));
     CHECK(emitted && row == 2);
 
+}
+
+TEST_CASE(DeepSeek4PageLayoutFixture, invalid_geometry) {
+    uint64_t row = 999;
+    bool emitted = true;
     uint64_t capacity = 0;
     CHECK(ds4_compressed_page_capacity(5, 4, capacity) && capacity == 160);
     CHECK(ds4_compressed_page_capacity(5, 128, capacity) && capacity == 5);
@@ -48,6 +55,4 @@ int main() {
         std::numeric_limits<uint64_t>::max(), 4, row, emitted));
     CHECK(!ds4_compressed_page_row(3, 0, 16, row, emitted));
 
-    std::printf("OK test_deepseek4_page_layout (%d checks)\n", g_checks);
-    return 0;
 }
