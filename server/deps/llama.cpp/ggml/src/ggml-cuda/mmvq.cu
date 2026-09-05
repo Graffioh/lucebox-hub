@@ -2012,7 +2012,9 @@ static void mul_mat_vec_q_moe_launch(
             std::getenv("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24");
         return e && e[0] == '1' && e[1] == '\0';
     }();
-    const bool fp3_packed24 = fp3_packed24_configured &&
+    const bool fp3_packed24 =
+        (fp3_packed24_configured ||
+         is_gfx1151(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) &&
         std::getenv("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE") == nullptr;
     static const bool fp2_packed32 = []() {
         const char * e =
@@ -2255,8 +2257,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 0, ids_stride, stream);
             return;
         }
-        if (!has_ids && ncols_dst == 5 && rocmfp4_x4_enabled() &&
-            rocmfp4_q5_x4_plus1_enabled()) {
+        // gfx1151 five-lane paged decode: the x4+1 kernel keeps the
+        // single-column accumulation order per column and beats both MMQ and
+        // the generic five-column MMVQ on every DeepSeek4 dense shape, so it
+        // is the default there; other devices keep the opt-in flags.
+        if (!has_ids && ncols_dst == 5 &&
+            (is_gfx1151(cc) ||
+             (rocmfp4_x4_enabled() && rocmfp4_q5_x4_plus1_enabled()))) {
             constexpr int c_ncols_dst = 5;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(
                 c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst,

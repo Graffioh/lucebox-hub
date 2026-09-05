@@ -977,6 +977,31 @@ if(DFLASH27B_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_rocmfpx_mmq)
 
+        add_executable(test_gfx1151_width4_dispatch test/test_gfx1151_width4_dispatch.cpp)
+        set_source_files_properties(test/test_gfx1151_width4_dispatch.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_gfx1151_width4_dispatch PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_gfx1151_width4_dispatch PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_gfx1151_width4_dispatch PRIVATE
+            ggml
+            ggml-base
+            ${DFLASH27B_GGML_BACKEND_TARGET}
+            hip::host)
+        list(APPEND _raw_unit_test_targets test_gfx1151_width4_dispatch)
+
+        add_executable(test_rope_tail test/test_rope_tail.cpp)
+        set_source_files_properties(test/test_rope_tail.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_rope_tail PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_rope_tail PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_rope_tail PRIVATE
+            ggml
+            ggml-base
+            ggml-cpu
+            ${DFLASH27B_GGML_BACKEND_TARGET}
+            hip::host)
+        list(APPEND _raw_unit_test_targets test_rope_tail)
+
 
 
 
