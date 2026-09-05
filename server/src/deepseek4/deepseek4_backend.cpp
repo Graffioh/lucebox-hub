@@ -240,6 +240,36 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
     return true;
 }
 
+// Monolithic paged decode on gfx1151 batches up to six lanes through plain
+// mul_mat, so the dense ROCmFP4 projections run at ne11 == live lanes. The
+// shared MMVQ/MMQ crossover leaves ne11 >= 4 on the 16-wide MMQ tile, where
+// most of the tile is padding. The gfx1151 four-column and five-column MMVQ
+// specializations decode each weight fragment once for all lanes and keep
+// the single-column accumulation order per column; six lanes stay on MMQ
+// because the generic six-column MMVQ loses on the K=1024 shapes. Fixed-C4
+// measured +34.3% output-window throughput against 75266c29 with the
+// four-column crossover. Explicit LUCE_MMVQ_MAX_NCOLS still wins, DSpark keeps
+// its own default above, and heterogeneous serving (gfx1201 target) is
+// unchanged.
+static void configure_gfx1151_paged_mmvq_default(int gpu, bool paged_attention) {
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (!paged_attention || env_flag_enabled("DFLASH_DS4_SPEC") ||
+        std::getenv("LUCE_MMVQ_MAX_NCOLS") != nullptr ||
+        !is_gfx_device(gpu, "gfx1151")) {
+        return;
+    }
+    if (::setenv("LUCE_MMVQ_MAX_NCOLS", "5", 0) == 0) {
+        std::fprintf(stderr,
+                     "[deepseek4] gfx1151 paged decode: defaulting "
+                     "LUCE_MMVQ_MAX_NCOLS=5 (four- and five-column ROCmFP4 "
+                     "MMVQ)\n");
+    }
+#else
+    (void) gpu;
+    (void) paged_attention;
+#endif
+}
+
 static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (std::getenv("DFLASH_MMQ_SUB_BATCH") != nullptr) {
@@ -1083,6 +1113,7 @@ bool DeepSeek4Backend::init() {
     if (!configure_dspark_mmvq_defaults(cfg_.device.gpu)) {
         return false;
     }
+    configure_gfx1151_paged_mmvq_default(cfg_.device.gpu, cfg_.paged_attention);
     configure_gfx1201_hybrid_sub_batch_default(cfg_.device.gpu);
 
     if (cfg_.paged_attention &&

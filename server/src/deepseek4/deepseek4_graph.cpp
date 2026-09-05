@@ -613,12 +613,12 @@ static ggml_tensor * ds4_cast_if_needed(
 
 // ─── Helper: Partial RoPE (tail rotation) ───────────────────────────────
 // DS4 applies RoPE only to the last n_rot dimensions of each head.
-// ggml_rope_ext applies to the first n_dims, so we split, rope the tail, concat.
-//
-// x: [head_dim, n_heads, n_tokens] (3D) — applies tail RoPE to each head.
-// pos: [n_tokens] I32 — position for each token.
-// Returns: [head_dim, n_heads, n_tokens] with last n_rot dims rotated.
-
+// DS4 rotates the tail n_rot dims of each head with sequential pairs
+// (GGML_ROPE_TYPE_NORMAL). GGML_ROPE_TYPE_TAIL rotates the last n_dims in
+// place and passes the head through, so this is one launch instead of two
+// contiguity copies, a rotation, and a concat; every rotated element sees the
+// same angle it saw in the extracted tail tensor (theta and the YaRN
+// correction still derive from n_rot), so the result is bit-identical.
 static ggml_tensor * build_tail_rope_3d(ggml_context * ctx,
                                          ggml_tensor * x,
                                          ggml_tensor * pos,
@@ -633,23 +633,11 @@ static ggml_tensor * build_tail_rope_3d(ggml_context * ctx,
                                          float beta_fast,
                                          float beta_slow,
                                          int n_ctx_orig) {
-    const int n_nope = head_dim - n_rot;
-    // Split: nope [n_nope, n_heads, n_tokens], tail [n_rot, n_heads, n_tokens]
-    ggml_tensor * nope = ggml_view_3d(ctx, x, n_nope, n_heads, n_tokens,
-                                       x->nb[1], x->nb[2], 0);
-    ggml_tensor * tail = ggml_view_3d(ctx, x, n_rot, n_heads, n_tokens,
-                                       x->nb[1], x->nb[2],
-                                       (size_t)n_nope * ggml_type_size(x->type));
-    // tail is non-contiguous (stride between heads = head_dim, not n_rot)
-    tail = ggml_cont(ctx, tail);
-    // Apply rope to the contiguous tail: [n_rot, n_heads, n_tokens]
-    // DS4 uses standard sequential pairs (i, i+1), which is GGML_ROPE_TYPE_NORMAL
-    tail = ggml_rope_ext(ctx, tail, pos, nullptr,
-                         n_rot, GGML_ROPE_TYPE_NORMAL, n_ctx_orig,
+    GGML_ASSERT(x->ne[0] == head_dim && x->ne[1] == n_heads && x->ne[2] == n_tokens);
+    return ggml_rope_ext(ctx, x, pos, nullptr,
+                         n_rot, GGML_ROPE_TYPE_NORMAL | GGML_ROPE_TYPE_TAIL, n_ctx_orig,
                          freq_base, freq_scale,
                          ext_factor, attn_factor, beta_fast, beta_slow);
-    // Concat nope + tail along dim 0 → [head_dim, n_heads, n_tokens]
-    return ggml_concat(ctx, ggml_cont(ctx, nope), tail, 0);
 }
 
 // For KV (single head): x is [head_dim, n_tokens]
@@ -1556,6 +1544,13 @@ static int ds4_padded_comp_rows(int n_comp, int cap) {
     const int stride = ds4_comp_pad_stride();
     const int padded = ((n_comp + stride - 1) / stride) * stride;
     return padded < cap ? padded : cap;
+}
+
+static int ds4_padded_gathered_raw_rows(int n_raw) {
+    if (n_raw <= 0) return 0;
+    constexpr int stride = 16;
+    const int padded = ((n_raw + stride - 1) / stride) * stride;
+    return std::min(padded, (int) DS4_PAGE_TOKENS - 1);
 }
 
 static ggml_tensor * build_indexer_topk(
@@ -5146,6 +5141,8 @@ struct Ds4FusedVerifyCache {
             int64_t comp_n = 0;
             int64_t index_off = -1;
             int64_t index_n = 0;
+            int64_t mask_off = -1;
+            int64_t mask_n = 0;
         };
         ggml_tensor * pos_q = nullptr;    // i32 [q]
         ggml_tensor * neg_q = nullptr;    // i32 [q]
@@ -7216,7 +7213,8 @@ bool deepseek4_paged_gathered_step(
         DeepSeek4PagedCache & cache, const float * embeddings,
         const int32_t * token_ids, const int64_t * positions,
         const int32_t * slots, uint32_t lanes, const int32_t * block_tables,
-        uint32_t block_table_stride, const uint8_t * logit_lanes,
+        uint32_t block_table_stride, bool bucket_history,
+        const uint8_t * logit_lanes,
         std::vector<float> & out_logits, std::vector<int32_t> & out_argmax,
         MoeHybridStorage * hybrid,
         MoeHybridRoutingStats * routing_stats) {
@@ -7286,18 +7284,50 @@ bool deepseek4_paged_gathered_step(
 
     std::vector<std::vector<DeepSeek4GatheredLaneRows>> prepared((size_t) w.n_layer);
     std::vector<int64_t> key = {0x5041474544LL, (int64_t) lanes,
-                                token_ids ? 1 : 0, hybrid ? 1 : 0};
+                                token_ids ? 1 : 0, hybrid ? 1 : 0,
+                                bucket_history ? 1 : 0};
     for (uint32_t lane = 0; lane < lanes; ++lane) key.push_back(slots[lane]);
+    // The gathered lane rows depend on the layer only through its compress
+    // ratio (0, 4, or 128), so prepare each ratio once per round and copy;
+    // the per-layer copies are still padded independently below.
+    std::vector<DeepSeek4GatheredLaneRows> rows_by_ratio[3];
+    bool rows_ready[3] = {false, false, false};
     for (int il = 0; il < w.n_layer; ++il) {
         const uint32_t ratio = cache.layers[(size_t) il].ratio;
-        if (!prepare_deepseek4_gathered_lane_rows(
-                slots, positions, lanes, block_tables, block_table_stride,
-                cache.plan.physical_blocks, ratio, prepared[(size_t) il])) return false;
-        for (const auto & row : prepared[(size_t) il]) {
+        const int ri = ratio == 0 ? 0 : ratio == 4 ? 1 : 2;
+        if (!rows_ready[ri]) {
+            if (!prepare_deepseek4_gathered_lane_rows(
+                    slots, positions, lanes, block_tables, block_table_stride,
+                    cache.plan.physical_blocks, ratio, rows_by_ratio[ri])) return false;
+            rows_ready[ri] = true;
+        }
+        prepared[(size_t) il] = rows_by_ratio[ri];
+        for (auto & row : prepared[(size_t) il]) {
+            if (bucket_history) {
+                row.raw_history.resize(
+                    (size_t) ds4_padded_gathered_raw_rows(
+                        (int) row.raw_history_valid),
+                    0);
+            }
+            if (bucket_history && ratio > 0) {
+                row.compressed_history.resize(
+                    (size_t) ds4_padded_comp_rows(
+                        (int) row.compressed_history_valid,
+                        (int) cache.layers[(size_t) il].physical_rows),
+                    0);
+            }
             key.push_back((int64_t) row.raw_history.size());
             key.push_back((int64_t) row.compressed_history.size());
-            key.push_back(row.slot < 0 ? -1 :
-                (ratio ? row.position % ratio : row.position % DS4_PAGE_TOKENS));
+            // The gathered graph's topology depends on the lane's position only
+            // through whether this round emits a compressed row: the state
+            // row, the APE row, the compressed write row, the ring scatter row,
+            // and the gather lists are all device inputs uploaded every round.
+            // Keying on the emit flag (as the bucketed path already does) lets
+            // the exact path reuse its graph on rounds whose history sizes
+            // repeat, which is every non-emit round once the raw window is
+            // full, instead of rebuilding every round.
+            key.push_back(row.slot < 0 ? -1
+                : (ratio > 0 && row.compressed_emitted ? 1 : 0));
         }
     }
 
@@ -7337,7 +7367,7 @@ bool deepseek4_paged_gathered_step(
                 rt->model.hc_layer_weights, rt->model.hc_output_weights,
                 rt->model.hash_routing_tables, 0, (int) lanes,
                 token_ids != nullptr, {}, hybrid, std::move(key),
-                &cache, &prepared)) {
+                &cache, &prepared, bucket_history)) {
             std::fprintf(stderr,
                 "[deepseek4-paged] failed to build gathered graph "
                 "(lanes=%u)\n", lanes);
@@ -7369,6 +7399,14 @@ bool deepseek4_paged_gathered_step(
         (size_t) std::max<int64_t>(ex->paged_i64_n, 0), 0);
     std::vector<int32_t> bundle_gather(
         (size_t) std::max<int64_t>(ex->paged_gather_n, 0), 0);
+    std::vector<float> & mask_values = ex->mask_values;
+    if (bucket_history) {
+        const size_t mask_count = (size_t) ggml_nelements(fg->mask_bundle);
+        if (mask_values.size() != mask_count) {
+            mask_values.resize(mask_count);
+        }
+        std::fill(mask_values.begin(), mask_values.end(), 0.0f);
+    }
     size_t pi = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         const int ratio = (int) cache.layers[(size_t) il].ratio;
@@ -7410,6 +7448,22 @@ bool deepseek4_paged_gathered_step(
                 bundle_i32[(size_t) px.i32_base + 3] = ape;
                 bundle_i32[(size_t) px.i32_base + 4] = pos + 1 - ratio;
             }
+            if (bucket_history) {
+                if (px.mask_off < 0 || px.mask_n < 1 ||
+                    px.mask_off + px.mask_n > (int64_t) mask_values.size()) {
+                    return false;
+                }
+                for (size_t i = row.raw_history_valid;
+                     i < row.raw_history.size(); ++i) {
+                    mask_values[(size_t) px.mask_off + i] = -1.0e30f;
+                }
+                const size_t comp_base = (size_t) px.mask_off +
+                                         row.raw_history.size() + 1;
+                for (size_t i = row.compressed_history_valid;
+                     i < row.compressed_history.size(); ++i) {
+                    mask_values[comp_base + i] = -1.0e30f;
+                }
+            }
         }
     }
     ds4_fv_set(ex->paged_i32, bundle_i32.data(),
@@ -7418,6 +7472,10 @@ bool deepseek4_paged_gathered_step(
                bundle_i64.size() * sizeof(int64_t));
     ds4_fv_set(ex->paged_gather, bundle_gather.data(),
                bundle_gather.size() * sizeof(int32_t));
+    if (bucket_history) {
+        ds4_fv_set(fg->mask_bundle, mask_values.data(),
+                   mask_values.size() * sizeof(float));
+    }
     if (token_ids) {
         for (int il = 0; il < w.n_layer; ++il) {
             ggml_tensor * ids = fg->hash_ids[(size_t) il]; if (!ids) continue;
@@ -7433,6 +7491,13 @@ bool deepseek4_paged_gathered_step(
             ds4_fv_set(ids, values.data(), values.size() * sizeof(int32_t));
         }
     }
+    // Monolithic exact serving reuses a gathered graph for only a few rounds
+    // (history sizes change at every compressed-row emit), so a HIP graph
+    // capture of this node count (about 12 ms on gfx1151) never amortizes:
+    // replay saves only about 0.2 us per launch. Keep the ggml graph reuse
+    // and execute eagerly; this also skips the per-round node-property scan.
+    // The heterogeneous path keeps its long-lived bucketed graphs and replay.
+    ScopedCudaGraphOverrides monolithic_eager_scope(!hybrid);
     const enum ggml_status status = fg->sched
         ? ggml_backend_sched_graph_compute(fg->sched, fg->sg.gf)
         : ggml_backend_graph_compute(backend, fg->sg.gf);

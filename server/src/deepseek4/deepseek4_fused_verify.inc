@@ -382,7 +382,8 @@ static bool ds4_build_fused_verify_graph(
         MoeHybridStorage * hybrid,
         std::vector<int64_t> && shape_key,
         DeepSeek4PagedCache * paged_cache = nullptr,
-        const std::vector<std::vector<DeepSeek4GatheredLaneRows>> * paged_rows = nullptr) {
+        const std::vector<std::vector<DeepSeek4GatheredLaneRows>> * paged_rows = nullptr,
+        bool paged_history_buckets = false) {
     const bool paged_mode = paged_cache && paged_rows;
     if (!paged_mode && !cache) return false;
     if (paged_mode) {
@@ -459,19 +460,32 @@ static bool ds4_build_fused_verify_graph(
     // row through the in-graph ring update and has no preserved-row suffix,
     // matching the established single-token fused-decode topology.
     int64_t mask_total = 0;
-    for (int il = 0; il < w.n_layer; ++il) {
-        const int ratio = (int) w.compress_ratios[il];
-        int padded = 0;
-        if (!paged_mode && ratio > 0 && cache->layers[(size_t) il].comp_kv) {
-            const int n_comp = ds4_comp_rows_used(
-                cache->layers[(size_t) il].comp_kv,
-                cache->layers[(size_t) il].n_comp, ratio,
-                kv_start + q - 1);
-            padded = ds4_padded_comp_rows(
-                n_comp, (int) cache->layers[(size_t) il].comp_kv->ne[1]);
+    if (paged_mode && paged_history_buckets) {
+        for (int il = 0; il < w.n_layer; ++il) {
+            const int ratio = (int) w.compress_ratios[il];
+            for (int t = 0; t < q; ++t) {
+                const auto & rows = (*paged_rows)[(size_t) il][(size_t) t];
+                const int emitted =
+                    ratio > 0 && rows.compressed_emitted ? 1 : 0;
+                mask_total += (int64_t) rows.raw_history.size() + 1 +
+                              rows.compressed_history.size() + emitted;
+            }
         }
-        const int preserved_rows = q > 1 ? q : 0;
-        mask_total += (int64_t) (w.n_swa + padded + preserved_rows) * q;
+    } else if (!paged_mode) {
+        for (int il = 0; il < w.n_layer; ++il) {
+            const int ratio = (int) w.compress_ratios[il];
+            int padded = 0;
+            if (ratio > 0 && cache->layers[(size_t) il].comp_kv) {
+                const int n_comp = ds4_comp_rows_used(
+                    cache->layers[(size_t) il].comp_kv,
+                    cache->layers[(size_t) il].n_comp, ratio,
+                    kv_start + q - 1);
+                padded = ds4_padded_comp_rows(
+                    n_comp, (int) cache->layers[(size_t) il].comp_kv->ne[1]);
+            }
+            const int preserved_rows = q > 1 ? q : 0;
+            mask_total += (int64_t) (w.n_swa + padded + preserved_rows) * q;
+        }
     }
     fg.mask_bundle = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
                                         std::max<int64_t>(mask_total, 1));
@@ -657,6 +671,19 @@ static bool ds4_build_fused_verify_graph(
                 ci.attn_ape_row = px.ape; ci.attn_state_rows = px.state_row;
                 ci.attn_comp_pos = px.comp_pos; ci.index_ape_row = px.ape;
                 ci.index_state_rows = px.state_row; ci.index_comp_pos = px.comp_pos;
+                if (paged_history_buckets) {
+                    px.mask_off = mask_off;
+                    px.mask_n = (int64_t) rows.raw_history.size() + 1 +
+                                rows.compressed_history.size() +
+                                (ratio > 0 && rows.compressed_emitted ? 1 : 0);
+                    ci.attn_row_mask = ggml_view_2d(
+                        ctx, fg.mask_bundle, px.mask_n, 1,
+                        (size_t) px.mask_n * sizeof(float),
+                        (size_t) px.mask_off * sizeof(float));
+                    ci.padded_comp = (int) rows.compressed_history.size() +
+                        (ratio > 0 && rows.compressed_emitted ? 1 : 0);
+                    mask_off += px.mask_n;
+                }
                 std::vector<DeepSeek4I32InputBinding> ib;
                 std::vector<DeepSeek4I32ArrayBinding> iab;
                 std::vector<DeepSeek4I64ArrayBinding> lab;
@@ -962,6 +989,7 @@ static bool ds4_build_fused_verify_graph(
                 ctx, mean, n_embd, lane_q);                       // [n_embd,q]
         }
     }
+    GGML_ASSERT(mask_off == mask_total);
 
     // ── Batched output HC merge → out_norm + lm_head ──
     ggml_tensor * onorm = ggml_rms_norm(ctx, hc_cur, w.hc_eps);

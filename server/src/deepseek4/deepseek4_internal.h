@@ -386,7 +386,8 @@ bool deepseek4_paged_gathered_step(
     DeepSeek4PagedCache & cache, const float * embeddings,
     const int32_t * token_ids, const int64_t * positions,
     const int32_t * slots, uint32_t lanes, const int32_t * block_tables,
-    uint32_t block_table_stride, const uint8_t * logit_lanes,
+    uint32_t block_table_stride, bool bucket_history,
+    const uint8_t * logit_lanes,
     std::vector<float> & out_logits, std::vector<int32_t> & out_argmax,
     MoeHybridStorage * moe_hybrid = nullptr,
     MoeHybridRoutingStats * routing_stats = nullptr);

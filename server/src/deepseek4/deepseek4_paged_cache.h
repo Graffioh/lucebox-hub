@@ -30,6 +30,8 @@ struct DeepSeek4GatheredLaneRows {
     int64_t position = 0;
     std::vector<int64_t> raw_history;
     std::vector<int64_t> compressed_history;
+    uint32_t raw_history_valid = 0;
+    uint32_t compressed_history_valid = 0;
     int64_t raw_scatter = -1;
     int64_t compressed_scatter = -1;
     bool compressed_emitted = false;

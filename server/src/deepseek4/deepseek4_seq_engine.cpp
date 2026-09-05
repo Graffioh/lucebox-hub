@@ -218,11 +218,13 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
 
     std::vector<float> logits;
     std::vector<int32_t> argmax;
+    const bool bucket_history = plan.prefills.empty() && b_.moe_hybrid_;
     if (!deepseek4_paged_gathered_step(
             b_.backend_, b_.cfg_.device.gpu, b_.w_, b_.paged_cache_,
             embeddings.data(), lane_tokens.data(), lane_positions.data(),
             lane_slots.data(), (uint32_t)lane_tokens.size(),
-            compact_tables.data(), stride_, logit_lanes.data(), logits, argmax,
+            compact_tables.data(), stride_, bucket_history,
+            logit_lanes.data(), logits, argmax,
             b_.moe_hybrid_.get(), b_.routing_stats_.get())) {
         return fail_step("DeepSeek4 gathered paged graph failed");
     }

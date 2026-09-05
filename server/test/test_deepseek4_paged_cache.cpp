@@ -51,19 +51,25 @@ int main() {
         slots, positions, 3, tables, 3, 8, 4, rows));
     CHECK(rows.size() == 3);
     CHECK(rows[0].raw_history == std::vector<int64_t>({256, 257, 258}));
+    CHECK(rows[0].raw_history_valid == 3);
     CHECK(rows[0].raw_scatter == 259);
     CHECK(rows[0].compressed_emitted && rows[0].compressed_scatter == 4 * 32);
     CHECK(rows[0].compressed_history.empty());
+    CHECK(rows[0].compressed_history_valid == 0);
     CHECK(rows[1].raw_history.size() == 127);
     CHECK(rows[1].raw_history.front() == 5 * 128 + 4);
     CHECK(rows[1].raw_history.back() == 5 * 128 + 2);
     CHECK(rows[1].compressed_history.size() == 64);
+    CHECK(rows[1].raw_history_valid == 127);
+    CHECK(rows[1].compressed_history_valid == 64);
     CHECK(rows[1].compressed_history.front() == 6 * 32);
     CHECK(rows[1].compressed_history[31] == 6 * 32 + 31);
     CHECK(rows[1].compressed_history[32] == 1 * 32);
     CHECK(rows[1].compressed_history.back() == 1 * 32 + 31);
     CHECK(rows[1].compressed_emitted && rows[1].compressed_scatter == 7 * 32);
     CHECK(rows[2].raw_history.empty() && rows[2].compressed_history.empty());
+    CHECK(rows[2].raw_history_valid == 0 &&
+          rows[2].compressed_history_valid == 0);
     CHECK(rows[2].raw_scatter == -1 && rows[2].compressed_scatter == -1);
     CHECK(rows[2].position == 0);
 

@@ -64,6 +64,8 @@ bool prepare_deepseek4_gathered_lane_rows(
             rows.raw_history.push_back(
                 int64_t(rows.slot) * DS4_PAGE_TOKENS + ds4_raw_ring_row(p));
         }
+        rows.raw_history_valid =
+            static_cast<uint32_t>(rows.raw_history.size());
         rows.raw_scatter = int64_t(rows.slot) * DS4_PAGE_TOKENS +
                            ds4_raw_ring_row(pos);
         if (!ratio) continue;
@@ -97,6 +99,8 @@ bool prepare_deepseek4_gathered_lane_rows(
                 row > uint64_t(INT64_MAX)) return false;
             rows.compressed_history.push_back(static_cast<int64_t>(row));
         }
+        rows.compressed_history_valid =
+            static_cast<uint32_t>(rows.compressed_history.size());
         uint64_t scatter = 0;
         if (!ds4_compressed_page_row(pos, uint32_t(current_physical), ratio, scatter,
                                      rows.compressed_emitted) ||
