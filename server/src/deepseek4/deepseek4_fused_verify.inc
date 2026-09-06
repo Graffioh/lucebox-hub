@@ -396,11 +396,12 @@ static bool ds4_build_fused_verify_graph(
         }
     }
     // A step that packs chronological prompt rows keeps the established
-    // per-column arithmetic: dense projections run in parts of at most four
-    // columns (the MMVQ/MMVF widths that are bit-identical per column to the
-    // single-lane kernels), and routed experts run in parts as wide as the
-    // number of live sequences, exactly as the same-concurrency decode round.
-    // A round with one row per sequence keeps its unpartitioned graph.
+    // per-column arithmetic: dense projections run in parts sized by weight
+    // type (ROCmFP4 sixteen columns on the gfx1151 weight-reuse kernel,
+    // narrow F16 eight on MMVF, four otherwise), all bit-identical per column
+    // to the single-lane kernels, and routed experts run in parts of at most
+    // eight rows on the multi-token expert kernel. A round with one row per
+    // sequence keeps its unpartitioned graph.
     int projection_columns = 0;
     int moe_columns = 0;
     if (paged_mode && !hybrid) {
@@ -414,8 +415,15 @@ static bool ds4_build_fused_verify_graph(
         }
         if (active_rows > (int)active_slots.size()) {
             projection_columns = DEEPSEEK4_MAX_PROMPT_ROWS_PER_STEP;
-            moe_columns = std::min(DEEPSEEK4_MAX_PROMPT_ROWS_PER_STEP,
-                                   (int)active_slots.size());
+            // The multi-token expert kernel gives every token its own warp
+            // with a fixed per-row K traversal, so a part's arithmetic does
+            // not depend on how many tokens share the launch; eight rows is
+            // the RDNA3 MUL_MAT_ID ceiling for the FP2/FP3 expert types. A
+            // single live sequence keeps one-row parts: its decode rounds use
+            // the single-token expert kernel, whose arithmetic differs from
+            // the multi-token kernel's.
+            moe_columns = active_slots.size() == 1
+                ? 1 : std::min(DEEPSEEK4_MAX_MOE_ROWS_PER_PART, active_rows);
         }
     }
     const size_t graph_capacity = q > 8 ? 131072u : 65536u;
