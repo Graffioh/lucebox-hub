@@ -1235,10 +1235,14 @@ bool DeepSeek4Backend::init() {
             paged_cache_.plan.max_blocks_per_sequence);
         std::fprintf(stderr,
             "[deepseek4-parallel] enabled %d slots mode=%s, %u x %d-token physical "
-            "blocks; prefill is exact reference mode at one prompt token per slot per scheduler iteration\n",
+            "blocks; prefill is exact reference mode at %s\n",
             cfg_.max_concurrency, moe_hybrid_ ? "r9700+strix" : "strix",
             paged_cache_.plan.physical_blocks,
-            DS4_PAGE_TOKENS);
+            DS4_PAGE_TOKENS,
+            moe_hybrid_
+                ? "one prompt token per slot per scheduler iteration"
+                : "up to four chronological prompt rows per slot and sixteen "
+                  "rows per scheduler iteration");
     }
     const int active_experts =
         w_.routed_expert_top_k > 0 ? w_.routed_expert_top_k : w_.n_expert_used;
