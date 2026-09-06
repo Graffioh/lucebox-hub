@@ -473,11 +473,14 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
-    // 1024 (upstream 256): LUCE_Q8_MEMO keeps one pooled q8_1 activation
+    // 8192 (upstream 256): LUCE_Q8_MEMO keeps one pooled q8_1 activation
     // buffer per quantized matmul alive across a whole graph evaluation
-    // (~300 on a 64-layer hybrid), and a full pool falls back to freeing
-    // in-flight buffers with cudaFree.
-    static const int MAX_BUFFERS = 1024;
+    // (~300 on a 64-layer hybrid, more than 1024 on a DeepSeek4 gathered
+    // graph that packs sixteen prompt rows), and a full pool falls back to
+    // freeing in-flight buffers with cudaFree, which serializes the stream.
+    // Scans stop at the high-water slot, so a mostly empty pool costs no
+    // more than the smaller one did.
+    static const int MAX_BUFFERS = 8192;
 
     int device;
     struct ggml_cuda_buffer {
@@ -487,6 +490,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
+    int high_water = 0;  // one past the highest slot ever occupied
 
     explicit ggml_cuda_pool_leg(int device) :
         device(device) {
@@ -511,7 +515,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 #endif
         size_t best_diff = 1ull << 36;
         int ibest = -1;
-        for (int i = 0; i < MAX_BUFFERS; ++i) {
+        for (int i = 0; i < high_water; ++i) {
             ggml_cuda_buffer& b = buffer_pool[i];
             if (b.ptr != nullptr) {
 #ifdef DEBUG_CUDA_MALLOC
@@ -557,13 +561,19 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void free(void * ptr, size_t size) override {
-        for (int i = 0; i < MAX_BUFFERS; ++i) {
+        for (int i = 0; i < high_water; ++i) {
             ggml_cuda_buffer& b = buffer_pool[i];
             if (b.ptr == nullptr) {
                 b.ptr = ptr;
                 b.size = size;
                 return;
             }
+        }
+        if (high_water < MAX_BUFFERS) {
+            ggml_cuda_buffer& b = buffer_pool[high_water++];
+            b.ptr = ptr;
+            b.size = size;
+            return;
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);

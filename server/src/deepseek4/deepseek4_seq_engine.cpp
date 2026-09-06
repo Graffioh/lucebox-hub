@@ -23,12 +23,18 @@ bool DeepSeek4SeqEngine::token_is_eos(int32_t token) const {
 
 StepPlanLimits DeepSeek4SeqEngine::step_plan_limits(
         int decode_rows) const {
-    // The gathered graph accepts at most six independent lanes and does
-    // not permit two rows from the same sequence. A prompt therefore advances
-    // by one token while every live decoder still shares the same weight pass.
+    // The gathered graph accepts at most six independent sequences. A live
+    // decoder owns one row. On the monolithic exact path a prompt may add up
+    // to four chronological rows per step, sixteen rows in total; each row is
+    // its own gathered lane and reads the rows before it in graph order.
+    // Heterogeneous execution keeps one prompt token per lane.
     const int available = std::max(
         0, DEEPSEEK4_MAX_PAGED_SEQUENCES - decode_rows);
-    return {available, 1, available, 1};
+    if (b_.moe_hybrid_) return {available, 1, available, 1};
+    const int rows = std::max(0, DEEPSEEK4_MAX_GATHERED_ROWS - decode_rows);
+    const int sequences = std::min(available, rows);
+    return {sequences, DEEPSEEK4_MAX_PROMPT_ROWS_PER_STEP, rows,
+            DEEPSEEK4_MAX_PROMPT_ROWS_PER_STEP};
 }
 
 SeqEngine::AdmitResult DeepSeek4SeqEngine::admit(
@@ -104,9 +110,14 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
         return fail_step("DeepSeek4 step exceeds the six-lane graph");
     }
     std::vector<uint8_t> prefill_seen((size_t)n_slots, 0);
+    int prefill_rows = 0;
     for (const PrefillSlice & slice : plan.prefills) {
+        prefill_rows += slice.max_tokens;
         if (slice.slot < 0 || slice.slot >= n_slots ||
-            slice.max_tokens != 1 || prefill_seen[(size_t)slice.slot] ||
+            slice.max_tokens < 1 ||
+            slice.max_tokens > limits.max_prefill_tokens_per_sequence ||
+            prefill_rows > limits.max_prefill_tokens_total ||
+            prefill_seen[(size_t)slice.slot] ||
             decode_seen[(size_t)slice.slot] ||
             !slots_.is_prefilling(slice.slot)) {
             return fail_step("invalid or duplicate DeepSeek4 prefill row");
@@ -165,33 +176,43 @@ SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     std::vector<PrefillLane> prefill_lanes;
     prefill_lanes.reserve(plan.prefills.size());
     for (const PrefillSlice & slice : plan.prefills) {
+        const SeqSlot & before = slots_.slot(slice.slot);
+        const int remaining = before.prompt_len - before.cur_pos;
+        const int n_rows = std::min(slice.max_tokens, remaining);
         SeqSlotManager::PrefillChunk chunk =
-            slots_.append_prefill(slice.slot, 1);
-        if (!chunk.ok || chunk.rows.size() != 1) {
+            slots_.append_prefill(slice.slot, n_rows);
+        if (n_rows < 1 || !chunk.ok || chunk.rows.size() != (size_t) n_rows) {
             fail_prefill(slice.slot, result.prefills,
                          "DeepSeek4 prefill K/V append failed");
             continue;
         }
-        if (!chunk.new_blocks.empty() &&
-            !set_block(slice.slot, chunk.first_new_block,
-                       chunk.new_blocks.front())) {
+        bool blocks_ok = true;
+        for (size_t i = 0; i < chunk.new_blocks.size(); ++i) {
+            blocks_ok = set_block(slice.slot, chunk.first_new_block + (int) i,
+                                  chunk.new_blocks[i]) && blocks_ok;
+        }
+        if (!blocks_ok) {
             fail_prefill(slice.slot, result.prefills,
                          "DeepSeek4 prefill block-table update failed");
             continue;
         }
         const SeqSlot & slot = slots_.slot(slice.slot);
         const bool commit = slot.cur_pos == slot.prompt_len;
+        // One gathered lane per prompt row, in chronological order. Only the
+        // chunk's last row can need logits.
+        const int first = slot.cur_pos - n_rows;
+        for (int pos = first; pos < slot.cur_pos; ++pos) {
+            lane_tokens.push_back(slot.sample_history[(size_t) pos]);
+            lane_positions.push_back(pos);
+            lane_slots.push_back(slice.slot);
+        }
         prefill_lanes.push_back(
-            {slice.slot, (int)lane_tokens.size(), commit});
-        lane_tokens.push_back(
-            slot.sample_history[(size_t)slot.cur_pos - 1]);
-        lane_positions.push_back(slot.cur_pos - 1);
-        lane_slots.push_back(slice.slot);
+            {slice.slot, (int) lane_tokens.size() - 1, commit});
     }
 
     if (lane_tokens.empty()) return result;
-    if (lane_tokens.size() > DEEPSEEK4_MAX_PAGED_SEQUENCES) {
-        return fail_step("DeepSeek4 gathered step exceeds six lanes");
+    if (lane_tokens.size() > (size_t) DEEPSEEK4_MAX_GATHERED_ROWS) {
+        return fail_step("DeepSeek4 gathered step exceeds sixteen rows");
     }
 
     const auto embed_t0 = Clock::now();

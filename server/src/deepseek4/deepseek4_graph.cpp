@@ -1733,6 +1733,27 @@ static Ds4RopeParams ds4_rope_params(const DeepSeek4Weights & w, int ratio) {
     return p;
 }
 
+// Keep a causal prompt chunk on the same per-column matmul dispatch as
+// one gathered step. Higher tensor axes (output-projection groups) stay intact.
+static ggml_tensor * ds4_mul_mat_columns(
+        ggml_context * ctx, ggml_tensor * weights, ggml_tensor * input,
+        int columns) {
+    if (columns <= 0 || input->ne[1] <= columns) {
+        return ggml_mul_mat(ctx, weights, input);
+    }
+    ggml_tensor * result = nullptr;
+    for (int64_t first = 0; first < input->ne[1]; first += columns) {
+        const int64_t count = std::min<int64_t>(columns, input->ne[1] - first);
+        ggml_tensor * part = ggml_view_4d(
+            ctx, input, input->ne[0], count, input->ne[2], input->ne[3],
+            input->nb[1], input->nb[2], input->nb[3],
+            (size_t)first * input->nb[1]);
+        ggml_tensor * projected = ggml_mul_mat(ctx, weights, part);
+        result = result ? ggml_concat(ctx, result, projected, 1) : projected;
+    }
+    return result;
+}
+
 // Q/KV projections and their tail RoPE are independent per token. A paged
 // caller can evaluate them once at width q and hand each lane a column view,
 // avoiding one reread of all three projection weights per active lane.
@@ -1741,15 +1762,15 @@ static DeepSeek4PreparedProjectedLane build_mla_qkv_projection(
         ggml_tensor * cur,
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
-        int n_tokens) {
+        int n_tokens, int projection_columns = 0) {
     DeepSeek4PreparedProjectedLane out;
-    ggml_tensor * qr = ggml_mul_mat(ctx, L.attn_q_a, cur);
+    ggml_tensor * qr = ds4_mul_mat_columns(ctx, L.attn_q_a, cur, projection_columns);
     qr = build_rms_norm(ctx, qr, L.attn_q_a_norm, w.rms_eps);
-    ggml_tensor * q = ggml_mul_mat(ctx, L.attn_q_b, qr);
+    ggml_tensor * q = ds4_mul_mat_columns(ctx, L.attn_q_b, qr, projection_columns);
     q = ggml_reshape_3d(ctx, q, w.head_dim, w.n_head, n_tokens);
     q = ggml_rms_norm(ctx, q, w.rms_eps);
 
-    ggml_tensor * kv = ggml_mul_mat(ctx, L.attn_kv, cur);
+    ggml_tensor * kv = ds4_mul_mat_columns(ctx, L.attn_kv, cur, projection_columns);
     kv = build_rms_norm(ctx, kv, L.attn_kv_a_norm, w.rms_eps);
 
     out.normalized_q_lora = qr;
@@ -1787,7 +1808,7 @@ static ggml_tensor * build_mla_output_projection(
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
         int n_tokens,
-        bool allow_grouped) {
+        bool allow_grouped, int projection_columns = 0) {
     const int group_dim = w.head_dim * (w.n_head / w.n_out_group);
     attn_out = ggml_reshape_3d(
         ctx, attn_out, group_dim, w.n_out_group, n_tokens);
@@ -1797,7 +1818,7 @@ static ggml_tensor * build_mla_output_projection(
     }
     ggml_tensor * out_a_3d = ggml_reshape_3d(
         ctx, L.attn_output_a, group_dim, w.n_lora_o, w.n_out_group);
-    ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);
+    ggml_tensor * attn_low = ds4_mul_mat_columns(ctx, out_a_3d, attn_out, projection_columns);
 
     const bool grouped_output_projection =
         allow_grouped && n_tokens > 1 &&
@@ -1808,7 +1829,7 @@ static ggml_tensor * build_mla_output_projection(
     attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));
     attn_low = ggml_reshape_2d(
         ctx, attn_low, (int64_t) w.n_lora_o * w.n_out_group, n_tokens);
-    return ggml_mul_mat(ctx, L.attn_output_b, attn_low);
+    return ds4_mul_mat_columns(ctx, L.attn_output_b, attn_low, projection_columns);
 }
 
 // One lane's column of a batched prologue. These are views only.
@@ -5336,12 +5357,12 @@ static ggml_tensor * ds4_build_fused_hc_pre(
         ggml_tensor * fn,
         ggml_tensor * base,
         const HcWeightsCpu & cw,
-        ggml_tensor ** out_split) {
+        ggml_tensor ** out_split, int projection_columns = 0) {
     if (!fn || !base || !cw.loaded || cw.scale_data.size() < 3) return nullptr;
     const int mix_dim = 2 * w.n_hc + w.n_hc * w.n_hc;
     const int64_t n_tokens = hc_flat->ne[1];
     ggml_tensor * normed = ggml_rms_norm(ctx, hc_flat, w.hc_eps);
-    ggml_tensor * mix = ggml_mul_mat(ctx, fn, normed);
+    ggml_tensor * mix = ds4_mul_mat_columns(ctx, fn, normed, projection_columns);
     mix = n_tokens == 1
         ? ggml_reshape_1d(ctx, mix, mix_dim)
         : ggml_reshape_2d(ctx, mix, mix_dim, n_tokens);
@@ -7225,7 +7246,7 @@ bool deepseek4_paged_gathered_step(
     const auto step_t0 = Ds4TimingClock::now();
     if (!backend || !embeddings || !positions || !slots || !block_tables ||
         !logit_lanes ||
-        lanes < 1 || lanes > DEEPSEEK4_MAX_PAGED_SEQUENCES ||
+        lanes < 1 || lanes > (uint32_t) DEEPSEEK4_MAX_GATHERED_ROWS ||
         cache.layers.size() != (size_t) w.n_layer ||
         block_table_stride < cache.plan.max_blocks_per_sequence) return false;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -7233,13 +7254,26 @@ bool deepseek4_paged_gathered_step(
         if ((uint32_t) slots[lane] >= cache.plan.slots || positions[lane] < 0 ||
             (uint64_t) positions[lane] >= cache.plan.max_ctx ||
             positions[lane] > INT32_MAX) return false;
-        for (uint32_t prior = 0; prior < lane; ++prior)
-            if (slots[prior] == slots[lane]) return false;
+        int repeated = 0;
+        int64_t previous_position = -1;
+        for (uint32_t prior = 0; prior < lane; ++prior) {
+            if (slots[prior] != slots[lane]) continue;
+            ++repeated;
+            previous_position = positions[prior];
+            for (uint32_t logical = 0; logical < block_table_stride; ++logical) {
+                if (block_tables[(size_t)prior * block_table_stride + logical] !=
+                    block_tables[(size_t)lane * block_table_stride + logical]) return false;
+            }
+        }
+        if (repeated && (hybrid || bucket_history ||
+                         repeated >= DEEPSEEK4_MAX_PROMPT_ROWS_PER_STEP ||
+                         positions[lane] != previous_position + 1)) return false;
     }
     // Active logical pages must have valid, exclusive physical ownership.
     // Aliasing would make one lane's compressor write mutate another lane's
     // chronological history and is therefore malformed addressing.
     std::vector<int32_t> physical_owner(cache.plan.physical_blocks, -1);
+    std::vector<int64_t> physical_logical(cache.plan.physical_blocks, -1);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
         if (slots[lane] < 0) continue;
         const uint64_t last_block = (uint64_t) positions[lane] / DS4_PAGE_TOKENS;
@@ -7247,8 +7281,11 @@ bool deepseek4_paged_gathered_step(
         for (uint64_t logical = 0; logical <= last_block; ++logical) {
             const int32_t physical = block_tables[(size_t) lane * block_table_stride + logical];
             if (physical < 0 || (uint32_t) physical >= cache.plan.physical_blocks ||
-                physical_owner[(size_t) physical] >= 0) return false;
-            physical_owner[(size_t) physical] = (int32_t) lane;
+                (physical_owner[(size_t)physical] >= 0 &&
+                 (physical_owner[(size_t)physical] != slots[lane] ||
+                  physical_logical[(size_t)physical] != (int64_t)logical))) return false;
+            physical_owner[(size_t)physical] = slots[lane];
+            physical_logical[(size_t)physical] = (int64_t)logical;
         }
     }
     if (hybrid) {

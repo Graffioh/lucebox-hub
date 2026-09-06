@@ -395,6 +395,29 @@ static bool ds4_build_fused_verify_graph(
             if (layer_rows.size() != (size_t) q) return false;
         }
     }
+    // A step that packs chronological prompt rows keeps the established
+    // per-column arithmetic: dense projections run in parts of at most four
+    // columns (the MMVQ/MMVF widths that are bit-identical per column to the
+    // single-lane kernels), and routed experts run in parts as wide as the
+    // number of live sequences, exactly as the same-concurrency decode round.
+    // A round with one row per sequence keeps its unpartitioned graph.
+    int projection_columns = 0;
+    int moe_columns = 0;
+    if (paged_mode && !hybrid) {
+        std::vector<int32_t> active_slots;
+        int active_rows = 0;
+        for (const auto & row : (*paged_rows)[0]) {
+            if (row.slot < 0) continue;
+            ++active_rows;
+            if (std::find(active_slots.begin(), active_slots.end(), row.slot) == active_slots.end())
+                active_slots.push_back(row.slot);
+        }
+        if (active_rows > (int)active_slots.size()) {
+            projection_columns = DEEPSEEK4_MAX_PROMPT_ROWS_PER_STEP;
+            moe_columns = std::min(DEEPSEEK4_MAX_PROMPT_ROWS_PER_STEP,
+                                   (int)active_slots.size());
+        }
+    }
     const size_t graph_capacity = q > 8 ? 131072u : 65536u;
     std::array<ggml_backend_t, 3> sched_backends{};
     if (hybrid) {
@@ -552,7 +575,7 @@ static bool ds4_build_fused_verify_graph(
         ggml_tensor * split_attn = nullptr;
         ggml_tensor * attn_working = ds4_build_fused_hc_pre(
             ctx, w, hc_flat, mc.fn_attn_f16[(size_t) il], L.hc_attn_base,
-            hlw.attn, &split_attn);
+            hlw.attn, &split_attn, projection_columns);
         if (!attn_working) return false;
         // HC-pre stores working and split values together per token. Materialize
         // the strided working view once, replacing q kernels and q-1 concats.
@@ -572,7 +595,7 @@ static bool ds4_build_fused_verify_graph(
             ggml_tensor * attn_normed =
                 build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
             DeepSeek4PreparedProjectedLane batched_proj =
-                build_mla_qkv_projection(ctx, attn_normed, w, L, q);
+                build_mla_qkv_projection(ctx, attn_normed, w, L, q, projection_columns);
             build_mla_qkv_rope(
                 ctx, batched_proj, w, ds4_rope_params(w, ratio), q,
                 ex.pos_q, /*fuse_q_rope=*/false);
@@ -709,12 +732,15 @@ static bool ds4_build_fused_verify_graph(
                             ? INT32_MIN : iab[0].values[0]);
                     return false;
                 }
+                // Complete the chronological read before a later prompt row
+                // mutates this slot's raw ring or compressor state.
+                ggml_build_forward_expand(gf, lane_context);
                 attn_out = attn_out
                     ? ggml_concat(ctx, attn_out, lane_context, 1)
                     : lane_context;
             }
             attn_out = build_mla_output_projection(
-                ctx, attn_out, w, L, q, /*allow_grouped=*/false);
+                ctx, attn_out, w, L, q, /*allow_grouped=*/false, projection_columns);
         } else {
         // ── Batched speculative attention ──
         DeepSeek4AttentionGraphInputs ain{};
@@ -789,7 +815,7 @@ static bool ds4_build_fused_verify_graph(
         ggml_tensor * split_ffn = nullptr;
         ggml_tensor * ffn_working = ds4_build_fused_hc_pre(
             ctx, w, hc_flat, mc.fn_ffn_f16[(size_t) il], L.hc_ffn_base,
-            hlw.ffn, &split_ffn);
+            hlw.ffn, &split_ffn, projection_columns);
         if (!ffn_working) return false;
         ggml_tensor * ffn_in = ggml_cont(ctx, ffn_working);
 
@@ -836,8 +862,16 @@ static bool ds4_build_fused_verify_graph(
             router_weights = routing.weights;
             router_nodes = routing.nodes;
         } else {
-            ffn_out = build_moe_ffn(
-                ctx, ffn_normed, w, L, il, lane_q);
+            const int columns = moe_columns > 0 ? moe_columns : lane_q;
+            for (int first = 0; first < lane_q; first += columns) {
+                const int count = std::min(columns, lane_q - first);
+                ggml_tensor * part = moe_columns > 0
+                    ? ggml_cont(ctx, ggml_view_2d(ctx, ffn_normed, n_embd, count,
+                        ffn_normed->nb[1], (size_t)first * ffn_normed->nb[1]))
+                    : ffn_normed;
+                ggml_tensor * one = build_moe_ffn(ctx, part, w, L, il, count);
+                ffn_out = ffn_out ? ggml_concat(ctx, ffn_out, one, 1) : one;
+            }
         }
 
         if (hybrid) {
@@ -993,14 +1027,14 @@ static bool ds4_build_fused_verify_graph(
 
     // ── Batched output HC merge → out_norm + lm_head ──
     ggml_tensor * onorm = ggml_rms_norm(ctx, hc_cur, w.hc_eps);
-    ggml_tensor * omix = ggml_mul_mat(ctx, mc.fn_out_f16, onorm);
+    ggml_tensor * omix = ds4_mul_mat_columns(ctx, mc.fn_out_f16, onorm, projection_columns);
     omix = ggml_reshape_2d(ctx, omix, ggml_nelements(omix) / q, q);
     ggml_tensor * obase = ds4_fused_hc_base_f32(ctx, w.output_hc_base);
     if (!obase || hc_out_weights.scale_data.empty()) return false;
     ggml_tensor * final_all = ggml_ds4_hc_out(
         ctx, omix, obase, hc_cur, n_hc, hc_out_weights.scale_data[0]);
     ggml_tensor * out_normed = build_rms_norm(ctx, final_all, w.out_norm, w.rms_eps);
-    fg.logits = ggml_mul_mat(ctx, w.output, out_normed);   // [n_vocab, q]
+    fg.logits = ds4_mul_mat_columns(ctx, w.output, out_normed, projection_columns);   // [n_vocab, q]
     ggml_set_output(fg.logits);
     ggml_build_forward_expand(gf, fg.logits);
     if (paged_mode || ds4_env_flag("DFLASH_DS4_GPU_ARGMAX_VERIFY")) {
