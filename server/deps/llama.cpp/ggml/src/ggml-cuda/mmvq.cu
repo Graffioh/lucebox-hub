@@ -699,13 +699,17 @@ static bool is_gfx1151(const int cc) {
     return cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
 }
 
-// Dense four-column projections use the same weight row for every column.
-// Decode each packed ROCmFP4 fragment once while preserving the original
-// per-column DP4A and floating-point accumulation order.
-static __device__ __forceinline__ void vec_dot_rocmfp4_fast_q8_1_4cols(
+// Dense narrow projections (two to four columns) use the same weight row for
+// every column. Decode each packed ROCmFP4 fragment once while preserving the
+// original per-column DP4A and floating-point accumulation order, so every
+// column equals the single-column kernel bit for bit.
+template <int ncols>
+static __device__ __forceinline__ void vec_dot_rocmfp4_fast_q8_1_ncols(
         const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
         const uint32_t stride_col_y, const int kby, const int kbx, const int iqs,
-        float (&result)[4]) {
+        float (&result)[ncols]) {
+    static_assert(ncols >= 2 && ncols <= 4,
+                  "weight reuse covers two to four dense columns");
     const block_rocmfp4_fast * bq4 = (const block_rocmfp4_fast *) vbq + kbx;
 
     int2 weights[VDR_ROCMFP4_FAST_Q8_1_MMVQ];
@@ -716,9 +720,9 @@ static __device__ __forceinline__ void vec_dot_rocmfp4_fast_q8_1_4cols(
     }
 
     const float weight_scale = rocmfp4_ue4m3_to_fp32_half_finite(bq4->e);
-    int sums[4] = {};
+    int sums[ncols] = {};
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
+    for (int j = 0; j < ncols; ++j) {
         const block_q8_1 * bq8 = &y[j*stride_col_y + kby];
         const int * q8 = (const int *) bq8->qs + iqs;
 #pragma unroll
@@ -788,8 +792,9 @@ static __global__ void mul_mat_vec_q(
                   "partial K-loop unrolling is limited to the profiled FP4FAST path");
     static_assert(!reuse_rocmfp4_weights ||
                   (type == GGML_TYPE_Q4_0_ROCMFP4_FAST &&
-                   ncols_dst == 4 && fixed_ncols_x == 0 && !unroll_k_loop_2),
-                  "weight reuse is limited to the four-column FP4FAST path");
+                   ncols_dst >= 2 && ncols_dst <= 4 &&
+                   fixed_ncols_x == 0 && !unroll_k_loop_2),
+                  "weight reuse is limited to the two- to four-column FP4FAST path");
     static_assert(!c_fp3_packed24 || type == GGML_TYPE_Q3_0_ROCMFPX,
                   "packed FP3 MMVQ specialization requires ROCmFP3 weights");
     static_assert(!c_fp4_x4 ||
@@ -907,22 +912,22 @@ static __global__ void mul_mat_vec_q(
 
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                float dots[4];
-                vec_dot_rocmfp4_fast_q8_1_4cols(
+                float dots[ncols_dst];
+                vec_dot_rocmfp4_fast_q8_1_ncols<ncols_dst>(
                     vx, y, stride_col_y, kby,
                     kbx_offset + i*stride_row_x + kbx, kqs, dots);
 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
+                for (int j = 0; j < ncols_dst; ++j) {
                     tmp[j][i] += dots[j];
                 }
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        float gate_dots[4];
-                        vec_dot_rocmfp4_fast_q8_1_4cols(
+                        float gate_dots[ncols_dst];
+                        vec_dot_rocmfp4_fast_q8_1_ncols<ncols_dst>(
                             vgate, y, stride_col_y, kby,
                             kbx_offset + i*stride_row_x + kbx, kqs, gate_dots);
 #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
+                        for (int j = 0; j < ncols_dst; ++j) {
                             tmp_gate[j][i] += gate_dots[j];
                         }
                     }
@@ -1877,7 +1882,8 @@ static void mul_mat_vec_rocmfp4_unroll2_launch(
         ids_stride, stream);
 }
 
-static void mul_mat_vec_rocmfp4_4col_reuse_launch(
+template <int ncols_dst>
+static void mul_mat_vec_rocmfp4_reuse_launch(
         const void * vx, const void * vy,
         const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y,
@@ -1890,7 +1896,8 @@ static void mul_mat_vec_rocmfp4_4col_reuse_launch(
         const uint32_t stride_sample_dst, const uint32_t ids_stride,
         const int warp_size, const mmvq_parameter_table_id table_id,
         cudaStream_t stream) {
-    constexpr int ncols_dst = 4;
+    static_assert(ncols_dst >= 2 && ncols_dst <= 4,
+                  "weight reuse covers two to four dense columns");
     const auto dims = calc_launch_params<GGML_TYPE_Q4_0_ROCMFP4_FAST>(
         ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
     mul_mat_vec_q_switch_fusion<
@@ -2301,14 +2308,25 @@ static void mul_mat_vec_q_switch_ncols_dst(
     // per-lane K traversal and accumulation order, so exact validated shapes
     // use the faster kernel without a serving-time tuning flag.
     if constexpr (type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
-        if (is_gfx1151(cc) && !has_ids && ncols_dst == 4) {
-            mul_mat_vec_rocmfp4_4col_reuse_launch(
-                vx, vy, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
-                nchannels_dst, stride_row_x, stride_col_y, stride_col_dst,
-                channel_ratio_fd, stride_channel_x, stride_channel_y,
-                stride_channel_dst, nsamples_dst, sample_ratio_fd,
-                stride_sample_x, stride_sample_y, stride_sample_dst,
-                ids_stride, warp_size, table_id, stream);
+        // Two and three columns previously took the generic per-column
+        // kernel, which decodes the same weight fragment once per column and
+        // runs several times slower than the four-column reuse kernel on
+        // gfx1151; the reuse kernel is bit-identical per column at every width.
+        if (is_gfx1151(cc) && !has_ids && ncols_dst >= 2 && ncols_dst <= 4) {
+#define GGML_ROCMFP4_REUSE_LAUNCH(NC) \
+            mul_mat_vec_rocmfp4_reuse_launch<NC>( \
+                vx, vy, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, \
+                nchannels_dst, stride_row_x, stride_col_y, stride_col_dst, \
+                channel_ratio_fd, stride_channel_x, stride_channel_y, \
+                stride_channel_dst, nsamples_dst, sample_ratio_fd, \
+                stride_sample_x, stride_sample_y, stride_sample_dst, \
+                ids_stride, warp_size, table_id, stream)
+            switch (ncols_dst) {
+                case 2: GGML_ROCMFP4_REUSE_LAUNCH(2); break;
+                case 3: GGML_ROCMFP4_REUSE_LAUNCH(3); break;
+                default: GGML_ROCMFP4_REUSE_LAUNCH(4); break;
+            }
+#undef GGML_ROCMFP4_REUSE_LAUNCH
             return;
         }
         if (is_gfx1151(cc) && ncols_dst == 1) {
