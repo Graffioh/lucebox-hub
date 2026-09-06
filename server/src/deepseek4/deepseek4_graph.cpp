@@ -1733,11 +1733,23 @@ static Ds4RopeParams ds4_rope_params(const DeepSeek4Weights & w, int ratio) {
     return p;
 }
 
-// Keep a causal prompt chunk on the same per-column matmul dispatch as
-// one gathered step. Higher tensor axes (output-projection groups) stay intact.
+// Keep a packed prompt step on per-column-exact matmul dispatch. The
+// requested width is the generic per-column-exact MMVQ/MMVF width; ROCmFP4
+// dense weights have a gfx1151 weight-reuse kernel that is bit-identical per
+// column up to sixteen columns and reads the weights once, and narrow F16
+// weights stay exact on MMVF through eight columns. Higher tensor axes
+// (output-projection groups) stay intact.
+static int ds4_projection_part_columns(const ggml_tensor * weights, int columns) {
+    if (columns <= 0) return 0;
+    if (weights->type == GGML_TYPE_Q4_0_ROCMFP4_FAST) return std::max(columns, 16);
+    if (weights->type == GGML_TYPE_F16) return std::max(columns, 8);
+    return columns;
+}
+
 static ggml_tensor * ds4_mul_mat_columns(
         ggml_context * ctx, ggml_tensor * weights, ggml_tensor * input,
         int columns) {
+    columns = ds4_projection_part_columns(weights, columns);
     if (columns <= 0 || input->ne[1] <= columns) {
         return ggml_mul_mat(ctx, weights, input);
     }
