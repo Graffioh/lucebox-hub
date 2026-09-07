@@ -578,6 +578,10 @@ The legacy `GGML_DS4_INDEXER_PACK_Q4` variable remains an alias.
 
 DeepSeek4 supports the shared in-process Qwen3-0.6B PFlash scorer:
 
+PFlash is supported for monolithic serving only. Layer-split and paged-serving
+configurations reject prefill compression at startup; paged serving cannot
+park a target while it owns live sequence state.
+
 ```bash
 ./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
