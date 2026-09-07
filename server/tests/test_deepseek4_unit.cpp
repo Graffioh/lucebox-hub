@@ -1812,6 +1812,113 @@ static void test_dspark_raw_ring_rollback_after_wrap(ggml_backend_t backend) {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_dspark_compressor_rollback(ggml_backend_t backend, int copy_mode = 0) {
+    std::fprintf(stderr, "  test_dspark_compressor_rollback (%s, mode=%d) ...",
+                 ggml_backend_name(backend), copy_mode);
+    ggml_backend_t copy_backend = copy_mode == 0 ? nullptr : backend;
+    const bool pinned = copy_mode == 2;
+    ggml_context * ctx = ggml_init({64 * ggml_tensor_overhead(), nullptr, true});
+    TEST_ASSERT(ctx != nullptr);
+    if (!ctx) return;
+    DeepSeek4Weights weights;
+    weights.compress_ratios = {4, 128};
+    DeepSeek4Cache cache;
+    cache.layers.resize(2);
+    std::vector<ggml_tensor *> tensors;
+    for (int il = 0; il < 2; ++il) {
+        for (auto * state : {&cache.layers[il].attn_compressor,
+                            &cache.layers[il].indexer_compressor}) {
+            state->state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 3, il == 0 ? 8 : 128);
+            state->state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, il == 0 ? 8 : 128);
+            tensors.push_back(state->state_kv);
+            tensors.push_back(state->state_score);
+        }
+    }
+    auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    TEST_ASSERT(buffer != nullptr);
+    if (!buffer) { ggml_free(ctx); return; }
+    std::vector<std::vector<uint8_t>> initial;
+    for (size_t ti = 0; ti < tensors.size(); ++ti) {
+        write_tensor_pattern(tensors[ti], 11 + (int) ti);
+        initial.push_back(read_tensor_bytes(tensors[ti]));
+    }
+    auto load = [&](const std::vector<std::vector<uint8_t>> & state) {
+        for (size_t ti = 0; ti < tensors.size(); ++ti)
+            ggml_backend_tensor_set(tensors[ti], state[ti].data(), 0, state[ti].size());
+    };
+    // Independent sequential state transition. Distinct byte patterns exercise
+    // exact restoration of both F16 KV and F32 score rows without rounding.
+    auto advance = [&](std::vector<std::vector<uint8_t>> & state, int pos, int count) {
+        for (size_t ti = 0; ti < tensors.size(); ++ti) {
+            const int ratio = ti < 4 ? 4 : 128;
+            const size_t stride = tensors[ti]->nb[1];
+            for (int i = 0; i < count; ++i) {
+                const int slot = (pos + i) % ratio;
+                const int row = ratio == 4 ? 4 + slot : slot;
+                std::fill_n(state[ti].begin() + row * stride, stride,
+                            (uint8_t) (160 + 8 * ti + i));
+                if (ratio == 4 && slot == 3)
+                    std::copy_n(state[ti].begin() + 4 * stride, 4 * stride, state[ti].begin());
+            }
+        }
+    };
+    {
+        DeepSeek4SpecRollback rollback;
+        for (int pos = 0; pos < 128; ++pos) {
+            // Six exercises legacy staging capacity, not q6 verifier support.
+            for (int q = 1; q <= 6; ++q) {
+                for (int accepted = 0; accepted <= q; ++accepted) {
+                    load(initial);
+                    deepseek4_spec_rollback_save(cache, rollback, pos, q, copy_backend, pinned);
+                    ggml_backend_synchronize(backend);
+                    if (pinned && pos == 0 && q == 1 && accepted == 0) {
+                        const auto host_type = ggml_backend_dev_host_buffer_type(
+                            ggml_backend_get_device(backend));
+                        TEST_ASSERT(rollback.pinned_buf && rollback.pinned_base);
+                        TEST_ASSERT(rollback.pinned_buf &&
+                            ggml_backend_buffer_get_type(rollback.pinned_buf) == host_type);
+                    }
+                    auto verified = initial;
+                    advance(verified, pos, q);
+                    load(verified);
+                    // Production restores to the start and replays for q>4.
+                    const int keep = q > 4 && accepted < q ? 0 : accepted;
+                    const int boundary = pos + 3 - (pos & 3);
+                    const bool restore_prev = boundary < pos + q && boundary >= pos + keep;
+                    deepseek4_spec_rollback_apply(rollback, weights, cache, pos + keep,
+                                                 restore_prev, copy_backend, pinned);
+                    ggml_backend_synchronize(backend);
+                    if (q > 4 && accepted < q) {
+                        std::vector<std::vector<uint8_t>> restored;
+                        for (auto * t : tensors) restored.push_back(read_tensor_bytes(t));
+                        advance(restored, pos, accepted);
+                        load(restored);
+                    }
+                    auto expected = initial;
+                    advance(expected, pos, accepted);
+                    for (size_t ti = 0; ti < tensors.size(); ++ti) {
+                        if (read_tensor_bytes(tensors[ti]) != expected[ti]) {
+                            std::fprintf(stderr, " pos=%d q=%d accepted=%d tensor=%zu", pos, q, accepted, ti);
+                            TEST_ASSERT(false);
+                            // One actionable failure, not thousands of duplicates.
+                            ggml_backend_buffer_free(buffer);
+                            ggml_free(ctx);
+                            return;
+                        }
+                    }
+                    TEST_ASSERT(cache.cur_pos == pos + keep);
+                    TEST_ASSERT(cache.layers[0].n_comp == (pos + keep) / 4);
+                    TEST_ASSERT(cache.layers[0].n_index_comp == (pos + keep) / 4);
+                    TEST_ASSERT(cache.layers[1].n_comp == (pos + keep) / 128);
+                }
+            }
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    std::fprintf(stderr, " done\n");
+}
+
 static void test_snapshot_save_restore() {
     std::fprintf(stderr, "  test_snapshot_save_restore ...");
 
@@ -4154,6 +4261,7 @@ int main() {
     test_hybrid_prefill_chunk_tokens();
     test_dspark_park_all_releases_drafter();
     test_dspark_raw_ring_rollback_after_wrap(backend);
+    test_dspark_compressor_rollback(backend);
     test_snapshot_save_restore();
     test_monolithic_snapshot_preserves_decode_state();
     test_spec_feature_tail_is_bounded();
@@ -4166,6 +4274,15 @@ int main() {
     test_ffn_graph_reuse_microbench(backend);
     test_output_graph_reuse_microbench(backend);
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+    {
+        auto gpu = ggml_backend_cuda_init(0);
+        if (gpu) {
+            for (int mode = 0; mode < 3; ++mode) test_dspark_compressor_rollback(gpu, mode);
+            ggml_backend_free(gpu);
+        } else {
+            std::fprintf(stderr, "  test_dspark_compressor_rollback GPU skipped (no device)\n");
+        }
+    }
     test_ds4_flash_attention_keep_cap_gpu();
     test_ds4_flash_attention_parallel_index_scan_gpu();
     test_ds4_indexer_score_packed_q4_gpu();

@@ -14,10 +14,10 @@
 //     restored after wrap (accepted rows remain committed),
 //   - comp rows are index-addressed (pos / ratio)        -> idempotent,
 //   - n_comp / n_index_comp are pure functions of commit position,
-//   - the other non-idempotent state is the ratio-4 compressor prev-half
-//     (4 rows/state, flushed cur->prev at chunk boundaries), a few KB/layer,
-//     saved host-side before the verify and restored only when the flush
-//     happened at-or-past the rollback point.
+//   - rejected compressor ring rows are restored in both ratio-4 and
+//     ratio-128 layers; a later pool reads these even before replacement,
+//   - the ratio-4 prev-half is also restored when a rejected boundary flushed
+//     current rows into it. Accepted boundaries and current rows are kept.
 // The legacy full-snapshot + double-verify path is kept behind
 // DFLASH_DS4_FULL_SNAP=1 for A/B validation.
 
@@ -256,13 +256,27 @@ constexpr float kConfidenceQ3Threshold = 0.40f;
 constexpr float kConfidenceQ4Threshold = 0.30f;
 
 // ── Light rollback state ────────────────────────────────────────────────
-// Save the ratio-4 rolling state, HC state, and the raw SWA rows that a q<=5
+// Save the ratio-4 rolling state, HC state, and the ring rows a speculative
 // verify may overwrite. Pinned host storage lets the GPU copy this compact
 // rollback state on its stream before the verifier without a host fence.
 // prev-half = first 4 rows of a [comp_width, 8] ratio-4 rolling state.
-// ratio-128 states ([comp_width, 128]) are pure position rings -> skip.
+// Ratio-128 states need only the touched ring rows, not the full 128 rows.
+constexpr int kRollbackMaxTokens = 6; // Preserve the existing raw-ring staging capacity.
+
 size_t prev_half_bytes(const ggml_tensor * t) {
     return t && t->ne[1] == 8 ? (size_t) t->nb[1] * 4 : 0;
+}
+
+size_t rollback_state_bytes(const ggml_tensor * t) {
+    if (!t) return 0;
+    if (t->ne[1] == 8) return 2 * prev_half_bytes(t);
+    return t->ne[1] == 128 ? t->nb[1] * kRollbackMaxTokens : 0;
+}
+
+int rollback_ring_row(const ggml_tensor * t, int pos) {
+    const int period = t->ne[1] == 8 ? 4 : (int) t->ne[1];
+    const int row = pos % period;
+    return row < 0 ? row + period : row;
 }
 
 size_t align_up_rollback(size_t value, size_t alignment) {
@@ -291,18 +305,18 @@ bool init_pinned_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & 
         const DeepSeek4LayerCache & lc = cache.layers[il];
         DeepSeek4SpecRollback::Layer & s = rb.layers[il];
         assign_pinned_span(
-            s.pinned_attn_kv, prev_half_bytes(lc.attn_compressor.state_kv), total);
+            s.pinned_attn_kv, rollback_state_bytes(lc.attn_compressor.state_kv), total);
         assign_pinned_span(
-            s.pinned_attn_sc, prev_half_bytes(lc.attn_compressor.state_score), total);
+            s.pinned_attn_sc, rollback_state_bytes(lc.attn_compressor.state_score), total);
         assign_pinned_span(
-            s.pinned_idx_kv, prev_half_bytes(lc.indexer_compressor.state_kv), total);
+            s.pinned_idx_kv, rollback_state_bytes(lc.indexer_compressor.state_kv), total);
         assign_pinned_span(
-            s.pinned_idx_sc, prev_half_bytes(lc.indexer_compressor.state_score), total);
+            s.pinned_idx_sc, rollback_state_bytes(lc.indexer_compressor.state_score), total);
         s.raw_row_bytes = lc.raw_kv
             ? ggml_row_size(lc.raw_kv->type, lc.raw_kv->ne[0]) : 0;
         // The DSpark artifact exposes five proposal rows, so the widest
         // verifier batch is seed + five candidates.
-        assign_pinned_span(s.pinned_raw_rows, s.raw_row_bytes * 6, total);
+        assign_pinned_span(s.pinned_raw_rows, s.raw_row_bytes * kRollbackMaxTokens, total);
     }
     assign_pinned_span(
         rb.pinned_hc, cache.hc_state ? ggml_nbytes(cache.hc_state) : 0, total);
@@ -325,51 +339,50 @@ bool init_pinned_rollback(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & 
     return true;
 }
 
-void save_prev_half(ggml_backend_t backend, ggml_tensor * t,
-                    std::vector<uint8_t> & buf, bool async_copy) {
-    if (!t || t->ne[1] != 8) { buf.clear(); return; }
-    const size_t bytes = (size_t) t->nb[1] * 4;
-    if (buf.size() != bytes) buf.resize(bytes);
-    if (async_copy) {
-        ggml_backend_tensor_get_async(backend, t, buf.data(), 0, bytes);
-    } else {
-        ggml_backend_tensor_get(t, buf.data(), 0, bytes);
+void save_rollback_state(ggml_backend_t backend, ggml_tensor * t,
+                         uint8_t * dst, bool async_copy, int pos, int count) {
+    if (rollback_state_bytes(t) == 0) return;
+    const bool rolling = t->ne[1] == 8;
+    const size_t bytes = rolling ? rollback_state_bytes(t) : t->nb[1];
+    for (int i = 0; i < (rolling ? 1 : count); ++i) {
+        const size_t offset = rolling ? 0 : rollback_ring_row(t, pos + i) * t->nb[1];
+        if (async_copy) {
+            ggml_backend_tensor_get_async(backend, t, dst + i * bytes, offset, bytes);
+        } else {
+            ggml_backend_tensor_get(t, dst + i * bytes, offset, bytes);
+        }
     }
 }
 
-void restore_prev_half(ggml_backend_t backend, ggml_tensor * t,
-                       const std::vector<uint8_t> & buf, bool async_copy) {
-    if (!t || buf.empty()) return;
-    if (async_copy) {
-        ggml_backend_tensor_set_async(backend, t, buf.data(), 0, buf.size());
-    } else {
-        ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+void restore_rollback_state(ggml_backend_t backend, ggml_tensor * t,
+                            const uint8_t * src, bool async_copy,
+                            int pos, int count, int first_rejected, bool restore_prev) {
+    if (rollback_state_bytes(t) == 0) return;
+    const bool rolling = t->ne[1] == 8;
+    if (rolling && restore_prev) {
+        const size_t bytes = prev_half_bytes(t);
+        if (async_copy) ggml_backend_tensor_set_async(backend, t, src, 0, bytes);
+        else            ggml_backend_tensor_set(t, src, 0, bytes);
     }
-}
-
-void save_prev_half_pinned(ggml_backend_t backend, ggml_tensor * t,
-                           uint8_t * base,
-                           const DeepSeek4SpecRollback::PinnedSpan & span) {
-    if (!t || span.size == 0) return;
-    GGML_ASSERT(span.size == prev_half_bytes(t));
-    ggml_backend_tensor_get_async(
-        backend, t, base + span.offset, 0, span.size);
-}
-
-void restore_prev_half_pinned(ggml_backend_t backend, ggml_tensor * t,
-                              const uint8_t * base,
-                              const DeepSeek4SpecRollback::PinnedSpan & span) {
-    if (!t || span.size == 0) return;
-    GGML_ASSERT(span.size == prev_half_bytes(t));
-    ggml_backend_tensor_set_async(
-        backend, t, base + span.offset, 0, span.size);
+    // Direct truncation is used for q<=4 (no aliased current-window slots).
+    // Wider rejected verifies restore to pos and replay the accepted prefix.
+    for (int i = first_rejected; i < count; ++i) {
+        const int row = (rolling ? 4 : 0) + rollback_ring_row(t, pos + i);
+        const size_t offset = row * t->nb[1];
+        const uint8_t * saved = src + (rolling ? offset : i * t->nb[1]);
+        if (async_copy) {
+            ggml_backend_tensor_set_async(backend, t, saved, offset, t->nb[1]);
+        } else {
+            ggml_backend_tensor_set(t, saved, offset, t->nb[1]);
+        }
+    }
 }
 
 void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb,
                         ggml_backend_t backend, bool async_copy,
                         bool pinned_copy, int raw_pos, int raw_count) {
     rb.raw_pos = raw_pos;
-    rb.raw_count = std::clamp(raw_count, 0, 6);
+    rb.raw_count = std::clamp(raw_count, 0, kRollbackMaxTokens);
     rb.layers.resize(cache.layers.size());
     if (async_copy || pinned_copy) {
         rb.async_backend = backend;
@@ -379,25 +392,23 @@ void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         const DeepSeek4LayerCache & lc = cache.layers[il];
         DeepSeek4SpecRollback::Layer & s = rb.layers[il];
-        if (use_pinned) {
-            save_prev_half_pinned(
-                backend, lc.attn_compressor.state_kv,
-                rb.pinned_base, s.pinned_attn_kv);
-            save_prev_half_pinned(
-                backend, lc.attn_compressor.state_score,
-                rb.pinned_base, s.pinned_attn_sc);
-            save_prev_half_pinned(
-                backend, lc.indexer_compressor.state_kv,
-                rb.pinned_base, s.pinned_idx_kv);
-            save_prev_half_pinned(
-                backend, lc.indexer_compressor.state_score,
-                rb.pinned_base, s.pinned_idx_sc);
-        } else {
-            save_prev_half(backend, lc.attn_compressor.state_kv,       s.attn_kv, async_copy);
-            save_prev_half(backend, lc.attn_compressor.state_score,    s.attn_sc, async_copy);
-            save_prev_half(backend, lc.indexer_compressor.state_kv,    s.idx_kv, async_copy);
-            save_prev_half(backend, lc.indexer_compressor.state_score, s.idx_sc, async_copy);
-        }
+        auto save_state = [&](ggml_tensor * t, std::vector<uint8_t> & buf,
+                              const DeepSeek4SpecRollback::PinnedSpan & span) {
+            const size_t bytes = rollback_state_bytes(t);
+            if (bytes == 0) { buf.clear(); return; }
+            if (use_pinned) {
+                GGML_ASSERT(span.size == bytes);
+            } else {
+                buf.resize(bytes);
+            }
+            save_rollback_state(backend, t,
+                use_pinned ? rb.pinned_base + span.offset : buf.data(),
+                use_pinned || async_copy, rb.raw_pos, rb.raw_count);
+        };
+        save_state(lc.attn_compressor.state_kv, s.attn_kv, s.pinned_attn_kv);
+        save_state(lc.attn_compressor.state_score, s.attn_sc, s.pinned_attn_sc);
+        save_state(lc.indexer_compressor.state_kv, s.idx_kv, s.pinned_idx_kv);
+        save_state(lc.indexer_compressor.state_score, s.idx_sc, s.pinned_idx_sc);
 
         s.raw_row_bytes = lc.raw_kv
             ? ggml_row_size(lc.raw_kv->type, lc.raw_kv->ne[0]) : 0;
@@ -449,7 +460,8 @@ void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb
 // crossed a ratio-4 boundary at-or-past commit_pos: that flush filled the
 // prev-half rows with a chunk containing rejected tokens, so put the
 // pre-verify rows back. (A boundary strictly inside the committed range is a
-// legitimate flush and must be kept.)
+// legitimate flush and must be kept.) Rejected current/ring rows are restored
+// regardless of whether a ratio-4 boundary was crossed.
 void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weights & w,
                          DeepSeek4Cache & cache, int commit_pos, bool restore_prev,
                          ggml_backend_t backend, bool async_copy,
@@ -461,31 +473,26 @@ void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weight
         const uint32_t ratio = il < w.compress_ratios.size() ? w.compress_ratios[il] : 0;
         if (ratio > 0) lc.n_comp = commit_pos / (int) ratio;
         if (ratio == 4) lc.n_index_comp = commit_pos / 4;
-        if (restore_prev && il < rb.layers.size()) {
+        const int first_rejected = std::clamp(commit_pos - rb.raw_pos, 0, rb.raw_count);
+        if (il < rb.layers.size()) {
             const DeepSeek4SpecRollback::Layer & s = rb.layers[il];
-            if (use_pinned) {
-                restore_prev_half_pinned(
-                    backend, lc.attn_compressor.state_kv,
-                    rb.pinned_base, s.pinned_attn_kv);
-                restore_prev_half_pinned(
-                    backend, lc.attn_compressor.state_score,
-                    rb.pinned_base, s.pinned_attn_sc);
-                restore_prev_half_pinned(
-                    backend, lc.indexer_compressor.state_kv,
-                    rb.pinned_base, s.pinned_idx_kv);
-                restore_prev_half_pinned(
-                    backend, lc.indexer_compressor.state_score,
-                    rb.pinned_base, s.pinned_idx_sc);
-            } else {
-                restore_prev_half(backend, lc.attn_compressor.state_kv,       s.attn_kv, async_copy);
-                restore_prev_half(backend, lc.attn_compressor.state_score,    s.attn_sc, async_copy);
-                restore_prev_half(backend, lc.indexer_compressor.state_kv,    s.idx_kv, async_copy);
-                restore_prev_half(backend, lc.indexer_compressor.state_score, s.idx_sc, async_copy);
-            }
+            auto restore_state = [&](ggml_tensor * t, const std::vector<uint8_t> & buf,
+                                     const DeepSeek4SpecRollback::PinnedSpan & span) {
+                const size_t bytes = rollback_state_bytes(t);
+                if (bytes == 0) return;
+                GGML_ASSERT((use_pinned ? span.size : buf.size()) == bytes);
+                restore_rollback_state(backend, t,
+                    use_pinned ? rb.pinned_base + span.offset : buf.data(),
+                    use_pinned || async_copy, rb.raw_pos, rb.raw_count,
+                    first_rejected, restore_prev);
+            };
+            restore_state(lc.attn_compressor.state_kv, s.attn_kv, s.pinned_attn_kv);
+            restore_state(lc.attn_compressor.state_score, s.attn_sc, s.pinned_attn_sc);
+            restore_state(lc.indexer_compressor.state_kv, s.idx_kv, s.pinned_idx_kv);
+            restore_state(lc.indexer_compressor.state_score, s.idx_sc, s.pinned_idx_sc);
         }
         if (il < rb.layers.size() && lc.raw_kv && lc.raw_kv->ne[1] > 0) {
             const DeepSeek4SpecRollback::Layer & s = rb.layers[il];
-            const int first_rejected = std::max(0, commit_pos - rb.raw_pos);
             for (int t = first_rejected;
                  t < rb.raw_count && s.raw_row_bytes > 0;
                  ++t) {
@@ -552,9 +559,12 @@ DeepSeek4SpecRollback::~DeepSeek4SpecRollback() {
 void deepseek4_spec_rollback_save(const DeepSeek4Cache & cache,
                                   DeepSeek4SpecRollback & rollback,
                                   int raw_pos,
-                                  int raw_count) {
-    spec_rollback_save(cache, rollback, nullptr,
-                       /*async_copy=*/false, /*pinned_copy=*/false,
+                                  int raw_count,
+                                  ggml_backend_t backend,
+                                  bool pinned_copy) {
+    GGML_ASSERT(!pinned_copy || backend);
+    spec_rollback_save(cache, rollback, backend,
+                       /*async_copy=*/backend != nullptr, pinned_copy,
                        raw_pos, raw_count);
 }
 
@@ -562,10 +572,12 @@ void deepseek4_spec_rollback_apply(const DeepSeek4SpecRollback & rollback,
                                    const DeepSeek4Weights & weights,
                                    DeepSeek4Cache & cache,
                                    int commit_pos,
-                                   bool restore_prev) {
+                                   bool restore_prev,
+                                   ggml_backend_t backend,
+                                   bool pinned_copy) {
+    GGML_ASSERT(!pinned_copy || backend);
     spec_rollback_apply(rollback, weights, cache, commit_pos, restore_prev,
-                        nullptr, /*async_copy=*/false,
-                        /*pinned_copy=*/false);
+                        backend, /*async_copy=*/backend != nullptr, pinned_copy);
 }
 
 // Batched target verify + capture: wraps the existing multi-token
