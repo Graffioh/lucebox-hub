@@ -7,6 +7,7 @@
 
 #include <limits>
 
+#include "placement/draft_residency.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
@@ -21,6 +22,7 @@ namespace dflash::common {
 struct BackendFeatureConfig {
     bool pflash_enabled = false;
     bool pflash_drafter_configured = false;
+    DraftResidencyPolicy draft_residency = DraftResidencyPolicy::Auto;
 
     // MoE-only server features. Recorded here so the gate can report them as
     // inert on a dense architecture; both are applied via env vars at parse
@@ -66,12 +68,12 @@ struct BackendArgs {
     // Attention and speculative-decode options. Individual backends consume
     // only the fields they support.
     int             fa_window        = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
-    bool            paged_attention  = false;  // 16-token paged K/V blocks for AR decode
+    bool            paged_attention  = false;  // model-specific paged K/V blocks for AR decode
     // Concurrent decode slots (--max-concurrency). > 1 requires paged_attention;
     // the backend serves that many sequences through the seq_* slot API.
     int             max_concurrency  = 1;
     // Total paged K/V pool in tokens shared by all slots (--kv-pool-tokens;
-    // block-rounded). 0 = derive capacity from available device memory.
+    // model-page-rounded). 0 = derive capacity from available device memory.
     long long       kv_pool_tokens   = 0;
     int             kq_stride_pad    = 32;
     int             draft_block_size = 0;  // 0 = drafter metadata
