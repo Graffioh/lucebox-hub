@@ -9543,12 +9543,53 @@ bool prefix_tensors_compatible(const ggml_tensor * snap,
 
 }  // namespace
 
+namespace {
+
+// Stable per-layer snapshot tensor names (ondisk prefix cache keys on them).
+const char * const kDs4SnapLayerNames[7] = {
+    "ds4_snap_raw_kv_%d",
+    "ds4_snap_comp_kv_%d",
+    "ds4_snap_index_kv_%d",
+    "ds4_snap_attn_cs_kv_%d",
+    "ds4_snap_attn_cs_score_%d",
+    "ds4_snap_idx_cs_kv_%d",
+    "ds4_snap_idx_cs_score_%d",
+};
+const char * const kDs4SnapHcName     = "ds4_hc_state_snap";
+const char * const kDs4SnapMetaName   = "ds4_snap_meta";
+const char * const kDs4SnapLogitsName = "ds4_snap_last_logits";
+const char * const kDs4SnapFeatName   = "ds4_snap_spec_feat";
+
+std::string ds4_snap_name(const char * prefix, const char * fmt, int il) {
+    char buf[GGML_MAX_NAME];
+    std::snprintf(buf, sizeof(buf), fmt, il);
+    std::string name = prefix ? prefix : "";
+    name += buf;
+    return name;
+}
+
+ggml_tensor * ds4_find_snap_tensor(ggml_context * ctx, const std::string & name) {
+    if (!ctx || name.empty() || name.size() >= (size_t) GGML_MAX_NAME) {
+        return nullptr;
+    }
+    return ggml_get_tensor(ctx, name.c_str());
+}
+
+}  // namespace
+
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
-                             DeepSeek4Snapshot & out) {
+                             DeepSeek4Snapshot & out,
+                             const DeepSeek4SnapshotAux * aux) {
     if (!snapshot_backend || !cache.ctx || !cache.buf || !cache.hc_state ||
         cache.layers.size() != (size_t)cache.n_layer || cache.cur_pos < 0 ||
         cache.cur_pos > cache.max_ctx) {
+        return false;
+    }
+    if (aux && ((aux->n_logits > 0 && !aux->logits) ||
+                (aux->n_spec_feat > 0 && !aux->spec_feat) ||
+                aux->n_logits > (size_t) std::numeric_limits<int>::max() ||
+                aux->n_spec_feat > (size_t) std::numeric_limits<int>::max())) {
         return false;
     }
     for (const auto & layer : cache.layers) {
@@ -9573,7 +9614,7 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
     }
 
     out.layers.resize((size_t)cache.n_layer);
-    out.hc_state_snap = clone_snapshot_tensor(out.ctx, cache.hc_state, "ds4_hc_state_snap");
+    out.hc_state_snap = clone_snapshot_tensor(out.ctx, cache.hc_state, kDs4SnapHcName);
     if (!out.hc_state_snap) {
         free_deepseek4_snapshot(out);
         return false;
@@ -9582,22 +9623,29 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
     for (int il = 0; il < cache.n_layer; ++il) {
         const auto & src = cache.layers[(size_t)il];
         auto & dst = out.layers[(size_t)il];
-        dst.raw_kv = clone_snapshot_tensor(out.ctx, src.raw_kv, nullptr);
+        const std::string nm_raw   = ds4_snap_name(nullptr, kDs4SnapLayerNames[0], il);
+        const std::string nm_comp  = ds4_snap_name(nullptr, kDs4SnapLayerNames[1], il);
+        const std::string nm_index = ds4_snap_name(nullptr, kDs4SnapLayerNames[2], il);
+        const std::string nm_a_kv  = ds4_snap_name(nullptr, kDs4SnapLayerNames[3], il);
+        const std::string nm_a_sc  = ds4_snap_name(nullptr, kDs4SnapLayerNames[4], il);
+        const std::string nm_i_kv  = ds4_snap_name(nullptr, kDs4SnapLayerNames[5], il);
+        const std::string nm_i_sc  = ds4_snap_name(nullptr, kDs4SnapLayerNames[6], il);
+        dst.raw_kv = clone_snapshot_tensor(out.ctx, src.raw_kv, nm_raw.c_str());
         dst.comp_kv = src.comp_kv
-            ? clone_snapshot_rows(out.ctx, src.comp_kv, src.n_comp, nullptr)
+            ? clone_snapshot_rows(out.ctx, src.comp_kv, src.n_comp, nm_comp.c_str())
             : nullptr;
         dst.index_comp_kv = src.index_comp_kv
             ? clone_snapshot_rows(out.ctx, src.index_comp_kv,
-                                  src.n_index_comp, nullptr)
+                                  src.n_index_comp, nm_index.c_str())
             : nullptr;
         dst.attn_compressor.state_kv =
-            clone_snapshot_tensor(out.ctx, src.attn_compressor.state_kv, nullptr);
+            clone_snapshot_tensor(out.ctx, src.attn_compressor.state_kv, nm_a_kv.c_str());
         dst.attn_compressor.state_score =
-            clone_snapshot_tensor(out.ctx, src.attn_compressor.state_score, nullptr);
+            clone_snapshot_tensor(out.ctx, src.attn_compressor.state_score, nm_a_sc.c_str());
         dst.indexer_compressor.state_kv =
-            clone_snapshot_tensor(out.ctx, src.indexer_compressor.state_kv, nullptr);
+            clone_snapshot_tensor(out.ctx, src.indexer_compressor.state_kv, nm_i_kv.c_str());
         dst.indexer_compressor.state_score =
-            clone_snapshot_tensor(out.ctx, src.indexer_compressor.state_score, nullptr);
+            clone_snapshot_tensor(out.ctx, src.indexer_compressor.state_score, nm_i_sc.c_str());
         if (!dst.raw_kv ||
             (src.comp_kv && !dst.comp_kv) ||
             (src.index_comp_kv && !dst.index_comp_kv) ||
@@ -9610,15 +9658,59 @@ bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
         }
     }
 
+    if (aux) {
+        const int64_t n_meta = kDeepSeek4SnapMetaBase + 2 * (int64_t) cache.n_layer;
+        out.meta_snap = ggml_new_tensor_1d(out.ctx, GGML_TYPE_I32, n_meta);
+        out.last_logits_snap = ggml_new_tensor_1d(
+            out.ctx, GGML_TYPE_F32, (int64_t) std::max<size_t>(1, aux->n_logits));
+        // Variable length lives in ne[1]: the ondisk layout fingerprint
+        // normalizes that dimension, so short and long windows share a layout.
+        out.spec_feat_snap = ggml_new_tensor_2d(
+            out.ctx, GGML_TYPE_F32, 1, (int64_t) std::max<size_t>(1, aux->n_spec_feat));
+        if (!out.meta_snap || !out.last_logits_snap || !out.spec_feat_snap) {
+            free_deepseek4_snapshot(out);
+            return false;
+        }
+        ggml_set_name(out.meta_snap, kDs4SnapMetaName);
+        ggml_set_name(out.last_logits_snap, kDs4SnapLogitsName);
+        ggml_set_name(out.spec_feat_snap, kDs4SnapFeatName);
+    }
+
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, snapshot_backend);
     if (!out.buf) {
         free_deepseek4_snapshot(out);
         return false;
     }
+    if (aux) {
+        // Unused physical slots (one-row placeholders, empty logits / window)
+        // are zeroed so serialized bytes are deterministic.
+        ggml_backend_buffer_clear(out.buf, 0);
+    }
 
     if (!copy_tensor_from_backend(cache.hc_state, out.hc_state_snap)) {
         free_deepseek4_snapshot(out);
         return false;
+    }
+    if (aux) {
+        std::vector<int32_t> meta((size_t) (kDeepSeek4SnapMetaBase + 2 * cache.n_layer), 0);
+        meta[0] = kDeepSeek4SnapMetaVersion;
+        meta[1] = cache.n_layer;
+        meta[2] = (int32_t) aux->n_logits;
+        meta[3] = (int32_t) aux->n_spec_feat;
+        meta[4] = cache.cur_pos;
+        for (int il = 0; il < cache.n_layer; ++il) {
+            meta[(size_t) (kDeepSeek4SnapMetaBase + 2 * il)]     = cache.layers[(size_t) il].n_comp;
+            meta[(size_t) (kDeepSeek4SnapMetaBase + 2 * il + 1)] = cache.layers[(size_t) il].n_index_comp;
+        }
+        ggml_backend_tensor_set(out.meta_snap, meta.data(), 0, meta.size() * sizeof(int32_t));
+        if (aux->n_logits > 0) {
+            ggml_backend_tensor_set(out.last_logits_snap, aux->logits, 0,
+                                    aux->n_logits * sizeof(float));
+        }
+        if (aux->n_spec_feat > 0) {
+            ggml_backend_tensor_set(out.spec_feat_snap, aux->spec_feat, 0,
+                                    aux->n_spec_feat * sizeof(float));
+        }
     }
     for (int il = 0; il < cache.n_layer; ++il) {
         const auto & src = cache.layers[(size_t)il];
@@ -9757,11 +9849,99 @@ bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
 
 
 void free_deepseek4_snapshot(DeepSeek4Snapshot & s) {
-    if (s.buf) { ggml_backend_buffer_free(s.buf); s.buf = nullptr; }
-    if (s.ctx) { ggml_free(s.ctx); s.ctx = nullptr; }
+    if (s.owns_storage) {
+        if (s.buf) { ggml_backend_buffer_free(s.buf); }
+        if (s.ctx) { ggml_free(s.ctx); }
+    }
+    s.buf = nullptr;
+    s.ctx = nullptr;
+    s.owns_storage = true;
     s.layers.clear();
     s.cur_pos = 0;
     s.hc_state_snap = nullptr;
+    s.meta_snap = nullptr;
+    s.last_logits_snap = nullptr;
+    s.spec_feat_snap = nullptr;
+}
+
+bool deepseek4_snapshot_bind(ggml_context * ctx,
+                             ggml_backend_buffer_t buf,
+                             const char * name_prefix,
+                             bool take_ownership,
+                             DeepSeek4Snapshot & out,
+                             DeepSeek4SnapshotBindInfo * info) {
+    free_deepseek4_snapshot(out);
+    if (!ctx || !buf) return false;
+
+    const std::string pfx = name_prefix ? name_prefix : "";
+    ggml_tensor * meta = ds4_find_snap_tensor(ctx, pfx + kDs4SnapMetaName);
+    if (!meta || meta->type != GGML_TYPE_I32 || ggml_n_dims(meta) != 1 ||
+        meta->ne[0] < kDeepSeek4SnapMetaBase || !meta->data) {
+        return false;
+    }
+    std::vector<int32_t> m((size_t) meta->ne[0], 0);
+    ggml_backend_tensor_get(meta, m.data(), 0, m.size() * sizeof(int32_t));
+    if (m[0] != kDeepSeek4SnapMetaVersion) return false;
+    const int n_layer = m[1];
+    const int n_vocab = m[2];
+    const int n_spec_feat = m[3];
+    const int cur_pos = m[4];
+    if (n_layer <= 0 || n_layer > 4096 || n_vocab < 0 || n_spec_feat < 0 ||
+        cur_pos < 0 ||
+        meta->ne[0] != (int64_t) (kDeepSeek4SnapMetaBase + 2 * n_layer)) {
+        return false;
+    }
+
+    DeepSeek4Snapshot tmp;
+    tmp.hc_state_snap = ds4_find_snap_tensor(ctx, pfx + kDs4SnapHcName);
+    tmp.meta_snap = meta;
+    tmp.last_logits_snap = ds4_find_snap_tensor(ctx, pfx + kDs4SnapLogitsName);
+    tmp.spec_feat_snap = ds4_find_snap_tensor(ctx, pfx + kDs4SnapFeatName);
+    if (!tmp.hc_state_snap || !tmp.last_logits_snap || !tmp.spec_feat_snap ||
+        tmp.last_logits_snap->type != GGML_TYPE_F32 ||
+        tmp.spec_feat_snap->type != GGML_TYPE_F32 ||
+        ggml_nelements(tmp.last_logits_snap) < (int64_t) std::max(1, n_vocab) ||
+        ggml_nelements(tmp.spec_feat_snap) < (int64_t) std::max(1, n_spec_feat)) {
+        return false;
+    }
+
+    tmp.layers.resize((size_t) n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        auto & L = tmp.layers[(size_t) il];
+        L.raw_kv = ds4_find_snap_tensor(ctx, ds4_snap_name(name_prefix, kDs4SnapLayerNames[0], il));
+        L.comp_kv = ds4_find_snap_tensor(ctx, ds4_snap_name(name_prefix, kDs4SnapLayerNames[1], il));
+        L.index_comp_kv = ds4_find_snap_tensor(ctx, ds4_snap_name(name_prefix, kDs4SnapLayerNames[2], il));
+        L.attn_compressor.state_kv = ds4_find_snap_tensor(ctx, ds4_snap_name(name_prefix, kDs4SnapLayerNames[3], il));
+        L.attn_compressor.state_score = ds4_find_snap_tensor(ctx, ds4_snap_name(name_prefix, kDs4SnapLayerNames[4], il));
+        L.indexer_compressor.state_kv = ds4_find_snap_tensor(ctx, ds4_snap_name(name_prefix, kDs4SnapLayerNames[5], il));
+        L.indexer_compressor.state_score = ds4_find_snap_tensor(ctx, ds4_snap_name(name_prefix, kDs4SnapLayerNames[6], il));
+        L.n_comp = m[(size_t) (kDeepSeek4SnapMetaBase + 2 * il)];
+        L.n_index_comp = m[(size_t) (kDeepSeek4SnapMetaBase + 2 * il + 1)];
+        if (!L.raw_kv || L.n_comp < 0 || L.n_index_comp < 0 ||
+            (!L.comp_kv && L.n_comp != 0) ||
+            (!L.index_comp_kv && L.n_index_comp != 0) ||
+            (L.comp_kv && L.comp_kv->ne[1] != std::max(1, L.n_comp)) ||
+            (L.index_comp_kv && L.index_comp_kv->ne[1] != std::max(1, L.n_index_comp))) {
+            return false;
+        }
+    }
+    // Every tensor must be backed by host memory (CPU snapshot buffer).
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (!t->data) return false;
+    }
+
+    out = tmp;
+    out.cur_pos = cur_pos;
+    out.ctx = ctx;
+    out.buf = buf;
+    out.owns_storage = take_ownership;
+    if (info) {
+        info->n_layer = n_layer;
+        info->n_vocab = n_vocab;
+        info->n_spec_feat = n_spec_feat;
+        info->cur_pos = cur_pos;
+    }
+    return true;
 }
 
 }  // namespace dflash::common

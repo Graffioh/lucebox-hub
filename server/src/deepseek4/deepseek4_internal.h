@@ -317,6 +317,8 @@ struct DeepSeek4PagedCache {
 };
 
 struct DeepSeek4Snapshot;
+struct DeepSeek4SnapshotAux;
+struct DeepSeek4SnapshotBindInfo;
 
 struct DeepSeek4RawRingSpan {
     int row = 0;
@@ -411,11 +413,29 @@ bool build_deepseek4_head4_tail2_routes(
     ggml_tensor * router_weights,
     int n_tokens,
     DeepSeek4Head4Tail2Routes & out);
+// Copy the live cache into a right-sized CPU snapshot. Every tensor gets a
+// stable name (ds4_snap_*) so the ondisk prefix cache can serialize the
+// context and deepseek4_snapshot_bind() can rebind it after a reload. When
+// `aux` is given, the host-side logits / DSpark feature window are stored as
+// extra tensors together with an I32 meta tensor (row counts, cur_pos).
 bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
                              ggml_backend_t snapshot_backend,
-                             DeepSeek4Snapshot & out);
+                             DeepSeek4Snapshot & out,
+                             const DeepSeek4SnapshotAux * aux = nullptr);
 bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
                                 DeepSeek4Cache & cache);
+// Rebind a deserialized snapshot context (tensors named as written by
+// deepseek4_snapshot_save, optionally prefixed by `name_prefix`) into `out`.
+// Requires the meta tensor; fills row counts and cur_pos from it and
+// validates that every tensor referenced by the meta exists with a sane
+// shape. `out` takes ownership of ctx/buf iff `take_ownership`. Returns
+// false (and leaves `out` empty) on any inconsistency.
+bool deepseek4_snapshot_bind(ggml_context * ctx,
+                             ggml_backend_buffer_t buf,
+                             const char * name_prefix,
+                             bool take_ownership,
+                             DeepSeek4Snapshot & out,
+                             DeepSeek4SnapshotBindInfo * info);
 
 // Largest prefix of [kv_start, kv_start + n_tokens) that reaches at most the
 // next learned-compressor boundary. Multi-token dynamic forwards split on
@@ -533,8 +553,42 @@ struct DeepSeek4Snapshot {
         DeepSeek4CompressorState indexer_compressor;
     };
     std::vector<LayerSnap> layers;
+    // Optional serialization sidecars (ondisk prefix cache). Present when the
+    // snapshot was saved with DeepSeek4SnapshotAux or adopted from disk.
+    //   meta_snap        I32 [kDeepSeek4SnapMetaBase + 2 * n_layer]
+    //   last_logits_snap F32 [n_vocab]
+    //   spec_feat_snap   F32 [1, max(1, n_spec_feat)]  (logical length in meta)
+    ggml_tensor * meta_snap        = nullptr;
+    ggml_tensor * last_logits_snap = nullptr;
+    ggml_tensor * spec_feat_snap   = nullptr;
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+    // false when ctx/buf are shared with (and freed by) another owner, e.g.
+    // one merged ondisk context bound into several layer-split shard snapshots.
+    bool                  owns_storage = true;
+};
+
+// Host-side decode state persisted next to the cache tensors so an adopted
+// (deserialized) snapshot can resume exactly like an in-memory one.
+struct DeepSeek4SnapshotAux {
+    const float * logits = nullptr;
+    size_t        n_logits = 0;
+    const float * spec_feat = nullptr;
+    size_t        n_spec_feat = 0;
+};
+
+// Layout of DeepSeek4Snapshot::meta_snap (I32):
+//   [0] version, [1] n_layer, [2] n_vocab, [3] n_spec_feat, [4] cur_pos,
+//   then per layer: n_comp, n_index_comp.
+constexpr int kDeepSeek4SnapMetaVersion = 1;
+constexpr int kDeepSeek4SnapMetaBase = 5;
+
+// Metadata recovered by deepseek4_snapshot_bind().
+struct DeepSeek4SnapshotBindInfo {
+    int n_layer = 0;
+    int n_vocab = 0;
+    int n_spec_feat = 0;
+    int cur_pos = 0;
 };
 
 void free_deepseek4_snapshot(DeepSeek4Snapshot & s);

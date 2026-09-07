@@ -11,6 +11,7 @@
 #include "common/backend_ipc.h"
 #include "common/dspark_head.h"
 #include "common/layer_split_backend.h"
+#include "server/disk_prefix_cache.h"
 #include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
 #include "common/moe_hybrid_ffn_eval.h"
@@ -2172,6 +2173,343 @@ static void test_monolithic_snapshot_preserves_decode_state() {
     TEST_ASSERT(backend.snapshot_aux_[0].last_logits.empty());
     TEST_ASSERT(backend.snapshot_aux_[0].spec_feat_window.empty());
     TEST_ASSERT(!backend.snapshot_restore(0));
+
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+// Every DeepSeek snapshot tensor must carry a stable name: the ondisk prefix
+// cache keys on names and fingerprints the layout from them.
+static bool all_snapshot_tensors_named(ggml_context * ctx, size_t * count_out) {
+    size_t n = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (!t->name[0]) return false;
+        n++;
+    }
+    if (count_out) *count_out = n;
+    return true;
+}
+
+static std::string make_test_disk_cache_dir(const char * tag) {
+    return "/tmp/dflash_test_ds4_disk_" + std::string(tag) + "_" +
+           std::to_string((long) getpid());
+}
+
+static void remove_test_disk_cache_dir(const std::string & dir) {
+    const std::string cmd = "rm -rf '" + dir + "'";
+    const int rc = std::system(cmd.c_str());
+    (void) rc;
+}
+
+// Rebuild a snapshot context the way DiskPrefixCache::read_file() does after
+// deserializing: fresh 4-D tensors by name/type/shape in a CPU buffer with
+// the bytes copied over. Lets adapter-level tests exercise snapshot_adopt
+// without going through a ModelBackend.
+static bool clone_snapshot_context_like_disk_reader(ggml_context * src_ctx,
+                                                    ggml_context ** ctx_out,
+                                                    ggml_backend_buffer_t * buf_out,
+                                                    ggml_backend_t * backend_out) {
+    size_t n = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(src_ctx); t; t = ggml_get_next_tensor(src_ctx, t)) n++;
+    ggml_init_params ip{};
+    ip.mem_size = ggml_tensor_overhead() * (n + 4) + 4096;
+    ip.no_alloc = true;
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    for (ggml_tensor * t = ggml_get_first_tensor(src_ctx); t; t = ggml_get_next_tensor(src_ctx, t)) {
+        ggml_tensor * d = ggml_new_tensor(ctx, t->type, 4, t->ne);
+        if (!d) { ggml_free(ctx); return false; }
+        ggml_set_name(d, t->name);
+    }
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    if (!cpu) { ggml_free(ctx); return false; }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    if (!buf) { ggml_free(ctx); ggml_backend_free(cpu); return false; }
+    std::vector<uint8_t> tmp;
+    for (ggml_tensor * t = ggml_get_first_tensor(src_ctx); t; t = ggml_get_next_tensor(src_ctx, t)) {
+        ggml_tensor * d = ggml_get_tensor(ctx, t->name);
+        if (!d || ggml_nbytes(d) != ggml_nbytes(t)) {
+            ggml_backend_buffer_free(buf); ggml_free(ctx); ggml_backend_free(cpu);
+            return false;
+        }
+        tmp.resize(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size());
+        ggml_backend_tensor_set(d, tmp.data(), 0, tmp.size());
+    }
+    *ctx_out = ctx;
+    *buf_out = buf;
+    *backend_out = cpu;
+    return true;
+}
+
+static void test_monolithic_snapshot_disk_roundtrip() {
+    std::fprintf(stderr, "  test_monolithic_snapshot_disk_roundtrip ...");
+
+    DeepSeek4BackendConfig cfg;
+    DeepSeek4Backend backend(cfg);
+    TEST_ASSERT(init_monolithic_snapshot_test_backend(backend));
+    if (!backend.cache_.buf || backend.cache_.layers.empty()) {
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+
+    // Slots that were never saved export nothing.
+    TEST_ASSERT(backend.snapshot_ref(0).ctx == nullptr);
+
+    auto & layer = backend.cache_.layers[0];
+    write_tensor_pattern(layer.raw_kv, 5);
+    write_tensor_pattern(layer.comp_kv, 23);
+    write_tensor_pattern(layer.index_comp_kv, 37);
+    write_tensor_pattern(layer.attn_compressor.state_kv, 43);
+    write_tensor_pattern(layer.attn_compressor.state_score, 61);
+    write_tensor_pattern(layer.indexer_compressor.state_kv, 73);
+    write_tensor_pattern(layer.indexer_compressor.state_score, 89);
+    write_tensor_pattern(backend.cache_.hc_state, 101);
+    layer.n_comp = 5;
+    layer.n_index_comp = 3;
+    backend.cache_.cur_pos = 7;
+    backend.last_logits_ = {1.0f, 4.0f, 2.0f};
+    backend.last_logits_pos_ = 7;
+    backend.spec_feat_window_ = {9.0f, 8.0f, 7.0f, 6.0f};
+
+    const auto raw_before = read_tensor_bytes(layer.raw_kv);
+    const auto comp_before = read_tensor_rows(layer.comp_kv, layer.n_comp);
+    const auto index_before = read_tensor_rows(layer.index_comp_kv, layer.n_index_comp);
+    const auto attn_kv_before = read_tensor_bytes(layer.attn_compressor.state_kv);
+    const auto attn_score_before = read_tensor_bytes(layer.attn_compressor.state_score);
+    const auto idx_kv_before = read_tensor_bytes(layer.indexer_compressor.state_kv);
+    const auto idx_score_before = read_tensor_bytes(layer.indexer_compressor.state_score);
+    const auto hc_before = read_tensor_bytes(backend.cache_.hc_state);
+
+    TEST_ASSERT(backend.snapshot_save(0));
+    const ModelBackend::SnapshotRef ref = backend.snapshot_ref(0);
+    TEST_ASSERT(ref.ctx != nullptr);
+    TEST_ASSERT(ref.buf != nullptr);
+    TEST_ASSERT(ref.cur_pos == 7);
+    size_t n_named = 0;
+    TEST_ASSERT(all_snapshot_tensors_named(ref.ctx, &n_named));
+    // hc + 7 per-layer + meta + logits + features
+    TEST_ASSERT(n_named == 11);
+    TEST_ASSERT(backend.snapshots_[0].meta_snap != nullptr);
+    TEST_ASSERT(backend.snapshots_[0].last_logits_snap != nullptr);
+    TEST_ASSERT(backend.snapshots_[0].spec_feat_snap != nullptr);
+
+    // Real ondisk cache: write slot 0, then read it back into slot 1.
+    const std::string dir = make_test_disk_cache_dir("mono");
+    remove_test_disk_cache_dir(dir);
+    DiskCacheConfig dcfg;
+    dcfg.cache_dir = dir;
+    dcfg.min_tokens = 1;
+    DiskPrefixCache disk(dcfg, backend);
+    TEST_ASSERT(disk.init());
+    TEST_ASSERT(!disk.disabled());
+    const std::vector<int32_t> prompt = {11, 12, 13, 14, 15, 16, 17};
+    TEST_ASSERT(disk.save(0, prompt));
+    TEST_ASSERT(!disk.disabled());
+    TEST_ASSERT(disk.total_bytes() > 0);
+
+    // Wipe the in-memory snapshot and the live cache before reloading.
+    backend.snapshot_free(0);
+    TEST_ASSERT(!backend.snapshot_used(0));
+    ggml_backend_buffer_clear(backend.cache_.buf, 0);
+    backend.cache_.cur_pos = 0;
+    layer.n_comp = 0;
+    layer.n_index_comp = 0;
+    backend.last_logits_ = {-1.0f};
+    backend.last_logits_pos_ = -1;
+    backend.spec_feat_window_.clear();
+
+    TEST_ASSERT(disk.lookup(prompt, 1));
+    TEST_ASSERT(backend.snapshot_used(1));
+    TEST_ASSERT(backend.snapshot_cur_pos(1) == 7);
+    TEST_ASSERT(backend.snapshots_[1].layers.size() == 1);
+    TEST_ASSERT(backend.snapshots_[1].layers[0].n_comp == 5);
+    TEST_ASSERT(backend.snapshots_[1].layers[0].n_index_comp == 3);
+    TEST_ASSERT(backend.snapshot_aux_[1].last_logits ==
+                std::vector<float>({1.0f, 4.0f, 2.0f}));
+    TEST_ASSERT(backend.snapshot_aux_[1].spec_feat_window ==
+                std::vector<float>({9.0f, 8.0f, 7.0f, 6.0f}));
+    // An adopted snapshot is exportable again (re-save after restart).
+    TEST_ASSERT(backend.snapshot_ref(1).ctx != nullptr);
+
+    TEST_ASSERT(backend.snapshot_restore(1));
+    TEST_ASSERT(backend.cache_.cur_pos == 7);
+    TEST_ASSERT(layer.n_comp == 5);
+    TEST_ASSERT(layer.n_index_comp == 3);
+    TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == raw_before);
+    TEST_ASSERT(read_tensor_rows(layer.comp_kv, 5) == comp_before);
+    TEST_ASSERT(read_tensor_rows(layer.index_comp_kv, 3) == index_before);
+    TEST_ASSERT(read_tensor_bytes(layer.attn_compressor.state_kv) == attn_kv_before);
+    TEST_ASSERT(read_tensor_bytes(layer.attn_compressor.state_score) == attn_score_before);
+    TEST_ASSERT(read_tensor_bytes(layer.indexer_compressor.state_kv) == idx_kv_before);
+    TEST_ASSERT(read_tensor_bytes(layer.indexer_compressor.state_score) == idx_score_before);
+    TEST_ASSERT(read_tensor_bytes(backend.cache_.hc_state) == hc_before);
+    TEST_ASSERT(backend.last_logits_ == std::vector<float>({1.0f, 4.0f, 2.0f}));
+    TEST_ASSERT(backend.spec_feat_window_ ==
+                std::vector<float>({9.0f, 8.0f, 7.0f, 6.0f}));
+    TEST_ASSERT(backend.last_logits_pos_ == 7);
+
+    // Exact full-prompt hit decodes from the reloaded logits.
+    GenerateRequest exact;
+    exact.prompt.assign(7, 0);
+    exact.n_gen = 1;
+    const GenerateResult exact_result =
+        backend.restore_and_generate_impl(1, exact, DaemonIO{});
+    TEST_ASSERT(exact_result.ok());
+    TEST_ASSERT(exact_result.tokens == std::vector<int32_t>({1}));
+
+    // A snapshot with a different length, zero compressed rows and an empty
+    // DSpark window must land in the SAME layout (no fingerprint churn).
+    backend.cache_.cur_pos = 3;
+    layer.n_comp = 0;
+    layer.n_index_comp = 0;
+    backend.last_logits_ = {0.5f, 0.25f, 0.125f};
+    backend.last_logits_pos_ = 3;
+    backend.spec_feat_window_.clear();
+    TEST_ASSERT(backend.snapshot_save(2));
+    const std::vector<int32_t> prompt3 = {21, 22, 23};
+    const size_t bytes_before = disk.total_bytes();
+    TEST_ASSERT(disk.save(2, prompt3));
+    TEST_ASSERT(disk.total_bytes() > bytes_before);
+    backend.snapshot_free(2);
+    TEST_ASSERT(disk.lookup(prompt3, 4));
+    TEST_ASSERT(backend.snapshot_used(4));
+    TEST_ASSERT(backend.snapshot_cur_pos(4) == 3);
+    TEST_ASSERT(backend.snapshots_[4].layers[0].n_comp == 0);
+    TEST_ASSERT(backend.snapshots_[4].layers[0].n_index_comp == 0);
+    TEST_ASSERT(backend.snapshot_aux_[4].spec_feat_window.empty());
+    TEST_ASSERT(backend.snapshot_aux_[4].last_logits ==
+                std::vector<float>({0.5f, 0.25f, 0.125f}));
+    TEST_ASSERT(backend.snapshot_restore(4));
+    TEST_ASSERT(backend.cache_.cur_pos == 3);
+    TEST_ASSERT(layer.n_comp == 0);
+    // The first entry is still readable after the second save.
+    TEST_ASSERT(disk.lookup(prompt, 5));
+    TEST_ASSERT(backend.snapshot_cur_pos(5) == 7);
+
+    // Adopt rejects a context whose position disagrees with the header.
+    {
+        ggml_init_params ip{};
+        ip.mem_size = ggml_tensor_overhead() * 4 + 1024;
+        ip.no_alloc = true;
+        ggml_context * bad_ctx = ggml_init(ip);
+        TEST_ASSERT(bad_ctx != nullptr);
+        ggml_tensor * junk = ggml_new_tensor_1d(bad_ctx, GGML_TYPE_F32, 4);
+        ggml_set_name(junk, "not_a_snapshot");
+        ggml_backend_t cpu = ggml_backend_cpu_init();
+        ggml_backend_buffer_t bad_buf = ggml_backend_alloc_ctx_tensors(bad_ctx, cpu);
+        TEST_ASSERT(bad_buf != nullptr);
+        TEST_ASSERT(!backend.snapshot_adopt(6, bad_ctx, bad_buf, 7, -1));
+        TEST_ASSERT(!backend.snapshot_used(6));
+        ggml_backend_buffer_free(bad_buf);
+        ggml_free(bad_ctx);
+        ggml_backend_free(cpu);
+    }
+
+    for (int i = 0; i < 8; ++i) backend.snapshot_free(i);
+    remove_test_disk_cache_dir(dir);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_layer_split_snapshot_disk_roundtrip() {
+    std::fprintf(stderr, "  test_layer_split_snapshot_disk_roundtrip ...");
+
+    auto adapter = make_test_adapter();
+    TEST_ASSERT(init_snapshot_test_shard(adapter));
+    if (adapter.shards_.empty() || !adapter.shards_[0].backend) {
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+    adapter.snapshot_backends_.assign(1, adapter.shards_[0].backend);
+
+    auto & cache = adapter.shards_[0].cache;
+    auto & layer = cache.layers[0];
+    write_tensor_pattern(layer.raw_kv, 7);
+    write_tensor_pattern(layer.comp_kv, 19);
+    write_tensor_pattern(layer.index_comp_kv, 31);
+    write_tensor_pattern(layer.attn_compressor.state_kv, 47);
+    write_tensor_pattern(layer.attn_compressor.state_score, 59);
+    write_tensor_pattern(layer.indexer_compressor.state_kv, 71);
+    write_tensor_pattern(layer.indexer_compressor.state_score, 83);
+    write_tensor_pattern(cache.hc_state, 97);
+    const auto raw_before = read_tensor_bytes(layer.raw_kv);
+    const auto comp_before = read_tensor_rows(layer.comp_kv, 5);
+    const auto index_before = read_tensor_rows(layer.index_comp_kv, 3);
+    const auto hc_before = read_tensor_bytes(cache.hc_state);
+
+    layer.n_comp = 5;
+    layer.n_index_comp = 3;
+    cache.cur_pos = 7;
+    adapter.cur_pos_ = 7;
+    adapter.last_tok_ = 4242;
+    adapter.hc_state_ = {1.0f, 2.0f, 3.0f, 4.0f};
+    adapter.prefill_last_logits_ = {9.0f, 8.0f, 7.0f};
+
+    TEST_ASSERT(adapter.snapshot_save(0));
+    const ModelBackend::SnapshotRef ref = adapter.snapshot_ref(0);
+    TEST_ASSERT(ref.ctx != nullptr);
+    TEST_ASSERT(ref.cur_pos == 7);
+    TEST_ASSERT(ref.last_tok == 4242);
+    size_t n_named = 0;
+    TEST_ASSERT(all_snapshot_tensors_named(ref.ctx, &n_named));
+    // shard: hc + 7 layer + meta + logits + feat = 11, plus 3 adapter tensors
+    TEST_ASSERT(n_named == 14);
+    TEST_ASSERT(ggml_get_tensor(ref.ctx, "ls0_ds4_snap_comp_kv_0") != nullptr);
+    TEST_ASSERT(ggml_get_tensor(ref.ctx, "ls_meta") != nullptr);
+
+    // Simulate the ondisk roundtrip (serialize -> deserialize) by rebuilding
+    // the merged context exactly like DiskPrefixCache::read_file() does.
+    ggml_context * re_ctx = nullptr;
+    ggml_backend_buffer_t re_buf = nullptr;
+    ggml_backend_t re_cpu = nullptr;
+    TEST_ASSERT(clone_snapshot_context_like_disk_reader(ref.ctx, &re_ctx, &re_buf, &re_cpu));
+    if (!re_ctx) {
+        std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+        return;
+    }
+
+    adapter.snapshot_free(0);
+    TEST_ASSERT(!adapter.snapshot_used(0));
+    TEST_ASSERT(adapter.snapshots_[0].disk_ctx == nullptr);
+    ggml_backend_buffer_clear(cache.buf, 0);
+    cache.cur_pos = 0;
+    layer.n_comp = 0;
+    layer.n_index_comp = 0;
+    adapter.cur_pos_ = 0;
+    adapter.last_tok_ = -1;
+    adapter.hc_state_.assign(4, 0.0f);
+    adapter.prefill_last_logits_.clear();
+
+    // A context with the wrong position is rejected and left to the caller.
+    TEST_ASSERT(!adapter.snapshot_adopt(2, re_ctx, re_buf, 6, 4242));
+    TEST_ASSERT(!adapter.snapshot_used(2));
+    TEST_ASSERT(adapter.snapshot_adopt(2, re_ctx, re_buf, 7, 4242));
+    TEST_ASSERT(adapter.snapshot_used(2));
+    TEST_ASSERT(adapter.snapshot_cur_pos(2) == 7);
+    TEST_ASSERT(adapter.snapshots_[2].shards.size() == 1);
+    TEST_ASSERT(!adapter.snapshots_[2].shards[0].owns_storage);
+    TEST_ASSERT(adapter.snapshots_[2].disk_ctx != nullptr);
+    // Re-exportable after adoption.
+    TEST_ASSERT(adapter.snapshot_ref(2).ctx != nullptr);
+
+    TEST_ASSERT(adapter.snapshot_restore(2));
+    TEST_ASSERT(adapter.cur_pos_ == 7);
+    TEST_ASSERT(adapter.last_tok_ == 4242);
+    TEST_ASSERT(adapter.hc_state_ == std::vector<float>({1.0f, 2.0f, 3.0f, 4.0f}));
+    TEST_ASSERT(adapter.prefill_last_logits_ == std::vector<float>({9.0f, 8.0f, 7.0f}));
+    TEST_ASSERT(cache.cur_pos == 7);
+    TEST_ASSERT(layer.n_comp == 5);
+    TEST_ASSERT(layer.n_index_comp == 3);
+    TEST_ASSERT(read_tensor_bytes(layer.raw_kv) == raw_before);
+    TEST_ASSERT(read_tensor_rows(layer.comp_kv, 5) == comp_before);
+    TEST_ASSERT(read_tensor_rows(layer.index_comp_kv, 3) == index_before);
+    TEST_ASSERT(read_tensor_bytes(cache.hc_state) == hc_before);
+
+    // Freeing an adopted slot must not double-free the shared context.
+    adapter.snapshot_free(2);
+    TEST_ASSERT(!adapter.snapshot_used(2));
+    TEST_ASSERT(adapter.snapshots_[2].disk_ctx == nullptr);
+    TEST_ASSERT(adapter.snapshots_[2].shards[0].ctx == nullptr);
+    ggml_backend_free(re_cpu);  // buffer/context were owned by the adopted slot
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
@@ -4393,6 +4731,8 @@ int main() {
     test_dspark_raw_ring_rollback_after_wrap(backend);
     test_snapshot_save_restore();
     test_monolithic_snapshot_preserves_decode_state();
+    test_monolithic_snapshot_disk_roundtrip();
+    test_layer_split_snapshot_disk_roundtrip();
     test_spec_feature_tail_is_bounded();
     test_dspark_prefill_capture_boundaries();
     test_reset_request_state();

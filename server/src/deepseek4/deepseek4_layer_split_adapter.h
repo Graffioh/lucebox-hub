@@ -66,6 +66,13 @@ public:
     bool snapshot_used(int slot) const override;
     int snapshot_cur_pos(int slot) const override;
     bool snapshot_restore(int slot) override;
+    // Ondisk prefix cache: per-shard snapshots are merged into one named CPU
+    // context (ls<shard>_ prefix + adapter-level meta/hc/logits tensors).
+    // Mixed (remote IPC) target splits stay memory-only.
+    ModelBackend::SnapshotRef snapshot_ref(int slot) const override;
+    bool snapshot_adopt(int slot, ggml_context * ctx,
+                        ggml_backend_buffer_t buf, int cur_pos,
+                        int32_t last_tok) override;
     int current_last_token() const override { return last_tok_; }
 
     void free_drafter() override {}
@@ -107,8 +114,16 @@ private:
         std::vector<float> prefill_last_logits;
         std::vector<DeepSeek4Snapshot> shards;
         bool used = false;
+        // Merged serialization context (owned here). After snapshot_save it
+        // is a copy of the shard snapshots; after snapshot_adopt the shard
+        // snapshots alias it (owns_storage=false).
+        ggml_context *        disk_ctx = nullptr;
+        ggml_backend_buffer_t disk_buf = nullptr;
+        ggml_backend_t        disk_backend = nullptr;  // CPU backend owning disk_buf (save path)
     };
     std::vector<Snapshot> snapshots_;
+    bool rebuild_disk_snapshot(int slot);
+    void free_disk_snapshot(int slot);
 
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};

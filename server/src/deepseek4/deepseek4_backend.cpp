@@ -2679,16 +2679,29 @@ bool DeepSeek4Backend::snapshot_save(int slot) {
     }
 
     snapshot_free(slot);
-    if (!deepseek4_snapshot_save(cache_, snap_backend_, snapshots_[slot])) {
+
+    // Host-side decode state travels inside the snapshot context as well, so
+    // the ondisk prefix cache can persist and rebind it (see snapshot_adopt).
+    std::vector<float> feat_tail;
+    try {
+        feat_tail = spec_feat_window_;
+        keep_spec_feature_tail(feat_tail, (size_t) std::max(0, w_.n_swa));
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+    DeepSeek4SnapshotAux aux_in;
+    aux_in.logits = last_logits_.data();
+    aux_in.n_logits = last_logits_.size();
+    aux_in.spec_feat = feat_tail.empty() ? nullptr : feat_tail.data();
+    aux_in.n_spec_feat = feat_tail.size();
+    if (!deepseek4_snapshot_save(cache_, snap_backend_, snapshots_[slot], &aux_in)) {
         return false;
     }
 
     try {
         auto & aux = snapshot_aux_[slot];
         aux.last_logits = last_logits_;
-        aux.spec_feat_window = spec_feat_window_;
-        keep_spec_feature_tail(aux.spec_feat_window,
-                               (size_t) std::max(0, w_.n_swa));
+        aux.spec_feat_window = std::move(feat_tail);
         aux.used = true;
     } catch (const std::bad_alloc &) {
         snapshot_free(slot);
@@ -2725,6 +2738,119 @@ bool DeepSeek4Backend::snapshot_used(int slot) const {
 int DeepSeek4Backend::snapshot_cur_pos(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return 0;
     return snapshots_[slot].cur_pos;
+}
+
+ModelBackend::SnapshotRef DeepSeek4Backend::snapshot_ref(int slot) const {
+    SnapshotRef ref;
+    // Paged concurrent serving has no monolithic cache to restore into.
+    if (cfg_.paged_attention || !snapshot_used(slot)) return ref;
+    const auto & snap = snapshots_[slot];
+    // Only snapshots that carry the serialization sidecar are exportable.
+    if (!snap.meta_snap || !snap.last_logits_snap || !snap.spec_feat_snap) {
+        return ref;
+    }
+    ref.ctx = snap.ctx;
+    ref.buf = snap.buf;
+    ref.cur_pos = snap.cur_pos;
+    ref.last_tok = -1;  // DeepSeek resumes from stored logits, not a seed token
+    return ref;
+}
+
+bool DeepSeek4Backend::snapshot_adopt(int slot, ggml_context * ctx,
+                                      ggml_backend_buffer_t buf, int cur_pos,
+                                      int32_t last_tok) {
+    (void) last_tok;
+    if (cfg_.paged_attention) return false;  // see snapshot_ref()
+    if (slot < 0 || slot >= PREFIX_SLOTS || !ctx || !buf || cur_pos <= 0) {
+        return false;
+    }
+    if (w_.n_layer <= 0 || w_.n_vocab <= 0 ||
+        w_.compress_ratios.size() != (size_t) w_.n_layer) {
+        std::fprintf(stderr,
+                     "[deepseek4] snapshot adopt slot=%d rejected: weights not "
+                     "loaded\n", slot);
+        return false;
+    }
+    // The live cache may be absent while the target is parked; the layer
+    // schedule from the weights is enough to validate the file. Capacity
+    // checks against the live cache happen below when it exists, and again
+    // in deepseek4_snapshot_restore().
+    const bool have_cache = cache_.ctx && cache_.layers.size() == (size_t) w_.n_layer;
+
+    DeepSeek4Snapshot snap;
+    DeepSeek4SnapshotBindInfo info;
+    if (!deepseek4_snapshot_bind(ctx, buf, nullptr, /*take_ownership=*/true,
+                                 snap, &info)) {
+        std::fprintf(stderr,
+                     "[deepseek4] snapshot adopt slot=%d rejected: bind failed\n",
+                     slot);
+        return false;
+    }
+    // `snap` now points at ctx/buf but must not free them on the error paths
+    // below: the caller keeps ownership until we return true.
+    snap.owns_storage = false;
+
+    auto reject = [&](const char * why) {
+        std::fprintf(stderr,
+                     "[deepseek4] snapshot adopt slot=%d rejected: %s "
+                     "(pos=%d meta_pos=%d layers=%d/%d vocab=%d/%d)\n",
+                     slot, why, cur_pos, info.cur_pos, info.n_layer,
+                     w_.n_layer, info.n_vocab, w_.n_vocab);
+        return false;
+    };
+    if (info.cur_pos != cur_pos) return reject("position mismatch");
+    if (info.n_layer != w_.n_layer) return reject("layer count mismatch");
+    if (info.n_vocab != w_.n_vocab) return reject("vocab mismatch");
+    if (have_cache && cur_pos > cache_.max_ctx) return reject("exceeds max_ctx");
+    // The compression schedule decides which tensors each layer needs; a
+    // snapshot from another schedule cannot be adopted.
+    for (size_t il = 0; il < snap.layers.size(); ++il) {
+        const uint32_t ratio = w_.compress_ratios[il];
+        const bool want_comp = ratio > 0;
+        const bool want_index = ratio == 4;
+        const auto & got = snap.layers[il];
+        if ((!!got.comp_kv) != want_comp ||
+            (!!got.index_comp_kv) != want_index ||
+            (!!got.attn_compressor.state_kv) != want_comp ||
+            (!!got.attn_compressor.state_score) != want_comp ||
+            (!!got.indexer_compressor.state_kv) != want_index ||
+            (!!got.indexer_compressor.state_score) != want_index) {
+            return reject("layer layout mismatch");
+        }
+        if (have_cache) {
+            const auto & live = cache_.layers[il];
+            if ((live.comp_kv && got.n_comp > live.comp_kv->ne[1]) ||
+                (live.index_comp_kv && got.n_index_comp > live.index_comp_kv->ne[1]) ||
+                (!!live.comp_kv) != want_comp || (!!live.index_comp_kv) != want_index) {
+                return reject("compressed rows exceed cache capacity");
+            }
+        }
+    }
+
+    SnapshotAux aux;
+    try {
+        aux.last_logits.resize((size_t) info.n_vocab);
+        ggml_backend_tensor_get(snap.last_logits_snap, aux.last_logits.data(), 0,
+                                aux.last_logits.size() * sizeof(float));
+        aux.spec_feat_window.resize((size_t) info.n_spec_feat);
+        if (info.n_spec_feat > 0) {
+            ggml_backend_tensor_get(snap.spec_feat_snap, aux.spec_feat_window.data(),
+                                    0, aux.spec_feat_window.size() * sizeof(float));
+        }
+        aux.used = true;
+    } catch (const std::bad_alloc &) {
+        return reject("out of memory");
+    }
+
+    snapshot_free(slot);
+    snap.owns_storage = true;
+    snapshots_[slot] = snap;
+    snapshot_aux_[slot] = std::move(aux);
+    std::fprintf(stderr,
+                 "[deepseek4] snapshot adopted slot=%d pos=%d size=%.1f MiB\n",
+                 slot, cur_pos,
+                 (double) ggml_backend_buffer_get_size(buf) / (1024.0 * 1024.0));
+    return true;
 }
 
 bool DeepSeek4Backend::snapshot_restore(int slot) {
