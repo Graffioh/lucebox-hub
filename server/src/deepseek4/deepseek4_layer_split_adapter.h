@@ -99,6 +99,8 @@ private:
     DeepSeek4LayerSplitAdapterConfig cfg_;
     std::vector<DeepSeek4LayerSplitShard> shards_;
     TargetShardIpcSession remote_target_shard_;
+    // Filled by the shared layer-split runtime helpers; DeepSeek snapshots
+    // do not use them (one merged host context per slot, see snapshot_save).
     std::vector<ggml_backend_t> snapshot_backends_;
 
     // HC state persists across all layers (shared between shards)
@@ -114,16 +116,13 @@ private:
         std::vector<float> prefill_last_logits;
         std::vector<DeepSeek4Snapshot> shards;
         bool used = false;
-        // Merged serialization context (owned here). After snapshot_save it
-        // is a copy of the shard snapshots; after snapshot_adopt the shard
-        // snapshots alias it (owns_storage=false).
-        ggml_context *        disk_ctx = nullptr;
-        ggml_backend_buffer_t disk_buf = nullptr;
-        ggml_backend_t        disk_backend = nullptr;  // CPU backend owning disk_buf (save path)
+        // One merged host context holds every shard snapshot (aliased with
+        // owns_storage=false) plus the adapter-level tensors; it is also what
+        // the ondisk prefix cache serializes. Owned by the slot.
+        ggml_context *        ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
     };
     std::vector<Snapshot> snapshots_;
-    bool rebuild_disk_snapshot(int slot);
-    void free_disk_snapshot(int slot);
 
     SamplerCfg sampler_;
     std::mt19937_64 sampler_rng_{std::random_device{}()};

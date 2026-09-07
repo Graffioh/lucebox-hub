@@ -764,14 +764,12 @@ bool DiskPrefixCache::read_file(const std::string & path, int slot) {
         ggml_set_name(t, ent.name.c_str());
     }
 
-    // Allocate buffer on CPU backend.
-    ggml_backend_t cpu = ggml_backend_cpu_init();
-    if (!cpu) { ggml_free(ctx); std::fclose(f); return false; }
-
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    // Host buffer from the CPU buffer type: no backend object to keep alive;
+    // the adopting backend frees the buffer in snapshot_free().
+    ggml_backend_buffer_t buf =
+        ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
     if (!buf) {
         ggml_free(ctx);
-        ggml_backend_free(cpu);
         std::fclose(f);
         return false;
     }
@@ -786,7 +784,6 @@ bool DiskPrefixCache::read_file(const std::string & path, int slot) {
             if (std::fread(read_buf.data(), 1, chunk, f) != chunk) {
                 ggml_backend_buffer_free(buf);
                 ggml_free(ctx);
-                ggml_backend_free(cpu);
                 std::fclose(f);
                 return false;
             }
@@ -800,16 +797,8 @@ bool DiskPrefixCache::read_file(const std::string & path, int slot) {
     if (!backend_.snapshot_adopt(slot, ctx, buf, (int)hdr.cur_pos, hdr.last_tok)) {
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
-        ggml_backend_free(cpu);
         return false;
     }
-
-    // The cpu backend must persist as long as the buffer is alive. The buffer
-    // does NOT own the backend, so we cannot free it here. Since snapshot_free
-    // only frees buf + ctx, we accept a small leak of the lightweight cpu
-    // backend object (~64 bytes per load). For a bounded disk cache this is
-    // negligible. A proper fix would store cpu alongside the snapshot.
-
     return true;
 }
 

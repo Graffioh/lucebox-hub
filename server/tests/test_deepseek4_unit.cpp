@@ -12,11 +12,13 @@
 #include "common/dspark_head.h"
 #include "common/layer_split_backend.h"
 #include "server/disk_prefix_cache.h"
+#include "deepseek4/deepseek4_snapshot.h"
 #include "common/layer_split_runtime.h"
 #include "common/layer_split_utils.h"
 #include "common/moe_hybrid_ffn_eval.h"
 #include "deepseek4/deepseek4_dspark.h"
 
+#include <filesystem>
 #include <memory>
 #include <random>
 #include <sstream>
@@ -1968,7 +1970,6 @@ static void test_snapshot_save_restore() {
         std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
         return;
     }
-    adapter.snapshot_backends_.assign(1, adapter.shards_[0].backend);
 
     auto & cache = adapter.shards_[0].cache;
     auto & layer = cache.layers[0];
@@ -2195,19 +2196,20 @@ static std::string make_test_disk_cache_dir(const char * tag) {
 }
 
 static void remove_test_disk_cache_dir(const std::string & dir) {
-    const std::string cmd = "rm -rf '" + dir + "'";
-    const int rc = std::system(cmd.c_str());
-    (void) rc;
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 // Rebuild a snapshot context the way DiskPrefixCache::read_file() does after
-// deserializing: fresh 4-D tensors by name/type/shape in a CPU buffer with
-// the bytes copied over. Lets adapter-level tests exercise snapshot_adopt
-// without going through a ModelBackend.
+// deserializing: fresh 4-D tensors by name/type/shape in a host buffer with
+// the bytes copied over. `override_name`/`override_ne1` corrupt one tensor's
+// row count to exercise validation. Lets adapter-level tests exercise
+// snapshot_adopt without going through a ModelBackend.
 static bool clone_snapshot_context_like_disk_reader(ggml_context * src_ctx,
                                                     ggml_context ** ctx_out,
                                                     ggml_backend_buffer_t * buf_out,
-                                                    ggml_backend_t * backend_out) {
+                                                    const char * override_name = nullptr,
+                                                    int64_t override_ne1 = 0) {
     size_t n = 0;
     for (ggml_tensor * t = ggml_get_first_tensor(src_ctx); t; t = ggml_get_next_tensor(src_ctx, t)) n++;
     ggml_init_params ip{};
@@ -2216,28 +2218,27 @@ static bool clone_snapshot_context_like_disk_reader(ggml_context * src_ctx,
     ggml_context * ctx = ggml_init(ip);
     if (!ctx) return false;
     for (ggml_tensor * t = ggml_get_first_tensor(src_ctx); t; t = ggml_get_next_tensor(src_ctx, t)) {
-        ggml_tensor * d = ggml_new_tensor(ctx, t->type, 4, t->ne);
+        int64_t ne[4] = {t->ne[0], t->ne[1], t->ne[2], t->ne[3]};
+        if (override_name && std::strcmp(t->name, override_name) == 0) ne[1] = override_ne1;
+        ggml_tensor * d = ggml_new_tensor(ctx, t->type, 4, ne);
         if (!d) { ggml_free(ctx); return false; }
         ggml_set_name(d, t->name);
     }
-    ggml_backend_t cpu = ggml_backend_cpu_init();
-    if (!cpu) { ggml_free(ctx); return false; }
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu);
-    if (!buf) { ggml_free(ctx); ggml_backend_free(cpu); return false; }
+    ggml_backend_buffer_t buf =
+        ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    if (!buf) { ggml_free(ctx); return false; }
+    ggml_backend_buffer_clear(buf, 0);
     std::vector<uint8_t> tmp;
     for (ggml_tensor * t = ggml_get_first_tensor(src_ctx); t; t = ggml_get_next_tensor(src_ctx, t)) {
         ggml_tensor * d = ggml_get_tensor(ctx, t->name);
-        if (!d || ggml_nbytes(d) != ggml_nbytes(t)) {
-            ggml_backend_buffer_free(buf); ggml_free(ctx); ggml_backend_free(cpu);
-            return false;
-        }
-        tmp.resize(ggml_nbytes(t));
-        ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size());
-        ggml_backend_tensor_set(d, tmp.data(), 0, tmp.size());
+        if (!d) { ggml_backend_buffer_free(buf); ggml_free(ctx); return false; }
+        const size_t bytes = std::min(ggml_nbytes(t), ggml_nbytes(d));
+        tmp.resize(bytes);
+        ggml_backend_tensor_get(t, tmp.data(), 0, bytes);
+        ggml_backend_tensor_set(d, tmp.data(), 0, bytes);
     }
     *ctx_out = ctx;
     *buf_out = buf;
-    *backend_out = cpu;
     return true;
 }
 
@@ -2386,7 +2387,7 @@ static void test_monolithic_snapshot_disk_roundtrip() {
     TEST_ASSERT(disk.lookup(prompt, 5));
     TEST_ASSERT(backend.snapshot_cur_pos(5) == 7);
 
-    // Adopt rejects a context whose position disagrees with the header.
+    // Adopt rejects a context that is not a snapshot at all ...
     {
         ggml_init_params ip{};
         ip.mem_size = ggml_tensor_overhead() * 4 + 1024;
@@ -2395,14 +2396,40 @@ static void test_monolithic_snapshot_disk_roundtrip() {
         TEST_ASSERT(bad_ctx != nullptr);
         ggml_tensor * junk = ggml_new_tensor_1d(bad_ctx, GGML_TYPE_F32, 4);
         ggml_set_name(junk, "not_a_snapshot");
-        ggml_backend_t cpu = ggml_backend_cpu_init();
-        ggml_backend_buffer_t bad_buf = ggml_backend_alloc_ctx_tensors(bad_ctx, cpu);
+        ggml_backend_buffer_t bad_buf =
+            ggml_backend_alloc_ctx_tensors_from_buft(bad_ctx, ggml_backend_cpu_buffer_type());
         TEST_ASSERT(bad_buf != nullptr);
         TEST_ASSERT(!backend.snapshot_adopt(6, bad_ctx, bad_buf, 7, -1));
         TEST_ASSERT(!backend.snapshot_used(6));
         ggml_backend_buffer_free(bad_buf);
         ggml_free(bad_ctx);
-        ggml_backend_free(cpu);
+    }
+    // ... a snapshot whose tensors do not match the model geometry (raw
+    // window with the wrong row count) ...
+    {
+        const ModelBackend::SnapshotRef good = backend.snapshot_ref(5);
+        TEST_ASSERT(good.ctx != nullptr);
+        ggml_context * bad_ctx = nullptr;
+        ggml_backend_buffer_t bad_buf = nullptr;
+        TEST_ASSERT(clone_snapshot_context_like_disk_reader(
+            good.ctx, &bad_ctx, &bad_buf, "ds4_snap_raw_kv_0", backend.w_.n_swa + 1));
+        TEST_ASSERT(!backend.snapshot_adopt(6, bad_ctx, bad_buf, good.cur_pos, -1));
+        TEST_ASSERT(!backend.snapshot_used(6));
+        ggml_backend_buffer_free(bad_buf);
+        ggml_free(bad_ctx);
+    }
+    // ... and one whose header position disagrees with the meta.
+    {
+        const ModelBackend::SnapshotRef good = backend.snapshot_ref(5);
+        ggml_context * re_ctx = nullptr;
+        ggml_backend_buffer_t re_buf = nullptr;
+        TEST_ASSERT(clone_snapshot_context_like_disk_reader(good.ctx, &re_ctx, &re_buf));
+        TEST_ASSERT(!backend.snapshot_adopt(6, re_ctx, re_buf, good.cur_pos + 1, -1));
+        TEST_ASSERT(!backend.snapshot_used(6));
+        // A faithful clone is adopted and owned by the slot afterwards.
+        TEST_ASSERT(backend.snapshot_adopt(6, re_ctx, re_buf, good.cur_pos, -1));
+        TEST_ASSERT(backend.snapshot_used(6));
+        TEST_ASSERT(backend.snapshots_[6].owns_storage);
     }
 
     for (int i = 0; i < 8; ++i) backend.snapshot_free(i);
@@ -2419,7 +2446,6 @@ static void test_layer_split_snapshot_disk_roundtrip() {
         std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
         return;
     }
-    adapter.snapshot_backends_.assign(1, adapter.shards_[0].backend);
 
     auto & cache = adapter.shards_[0].cache;
     auto & layer = cache.layers[0];
@@ -2449,6 +2475,9 @@ static void test_layer_split_snapshot_disk_roundtrip() {
     TEST_ASSERT(ref.ctx != nullptr);
     TEST_ASSERT(ref.cur_pos == 7);
     TEST_ASSERT(ref.last_tok == 4242);
+    // The shard snapshot aliases the slot's single merged context: no copy.
+    TEST_ASSERT(adapter.snapshots_[0].shards[0].ctx == ref.ctx);
+    TEST_ASSERT(!adapter.snapshots_[0].shards[0].owns_storage);
     size_t n_named = 0;
     TEST_ASSERT(all_snapshot_tensors_named(ref.ctx, &n_named));
     // shard: hc + 7 layer + meta + logits + feat = 11, plus 3 adapter tensors
@@ -2456,20 +2485,37 @@ static void test_layer_split_snapshot_disk_roundtrip() {
     TEST_ASSERT(ggml_get_tensor(ref.ctx, "ls0_ds4_snap_comp_kv_0") != nullptr);
     TEST_ASSERT(ggml_get_tensor(ref.ctx, "ls_meta") != nullptr);
 
+    // In-memory restore works from the merged context.
+    cache.cur_pos = 0;
+    layer.n_comp = 0;
+    TEST_ASSERT(adapter.snapshot_restore(0));
+    TEST_ASSERT(cache.cur_pos == 7);
+    TEST_ASSERT(layer.n_comp == 5);
+
     // Simulate the ondisk roundtrip (serialize -> deserialize) by rebuilding
     // the merged context exactly like DiskPrefixCache::read_file() does.
     ggml_context * re_ctx = nullptr;
     ggml_backend_buffer_t re_buf = nullptr;
-    ggml_backend_t re_cpu = nullptr;
-    TEST_ASSERT(clone_snapshot_context_like_disk_reader(ref.ctx, &re_ctx, &re_buf, &re_cpu));
+    TEST_ASSERT(clone_snapshot_context_like_disk_reader(ref.ctx, &re_ctx, &re_buf));
     if (!re_ctx) {
         std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
         return;
     }
+    // A geometry mismatch inside one shard is rejected before adoption.
+    {
+        ggml_context * bad_ctx = nullptr;
+        ggml_backend_buffer_t bad_buf = nullptr;
+        TEST_ASSERT(clone_snapshot_context_like_disk_reader(
+            ref.ctx, &bad_ctx, &bad_buf, "ls0_ds4_snap_attn_cs_kv_0", 3));
+        TEST_ASSERT(!adapter.snapshot_adopt(3, bad_ctx, bad_buf, 7, 4242));
+        TEST_ASSERT(!adapter.snapshot_used(3));
+        ggml_backend_buffer_free(bad_buf);
+        ggml_free(bad_ctx);
+    }
 
     adapter.snapshot_free(0);
     TEST_ASSERT(!adapter.snapshot_used(0));
-    TEST_ASSERT(adapter.snapshots_[0].disk_ctx == nullptr);
+    TEST_ASSERT(adapter.snapshots_[0].ctx == nullptr);
     ggml_backend_buffer_clear(cache.buf, 0);
     cache.cur_pos = 0;
     layer.n_comp = 0;
@@ -2487,7 +2533,7 @@ static void test_layer_split_snapshot_disk_roundtrip() {
     TEST_ASSERT(adapter.snapshot_cur_pos(2) == 7);
     TEST_ASSERT(adapter.snapshots_[2].shards.size() == 1);
     TEST_ASSERT(!adapter.snapshots_[2].shards[0].owns_storage);
-    TEST_ASSERT(adapter.snapshots_[2].disk_ctx != nullptr);
+    TEST_ASSERT(adapter.snapshots_[2].ctx == re_ctx);
     // Re-exportable after adoption.
     TEST_ASSERT(adapter.snapshot_ref(2).ctx != nullptr);
 
@@ -2507,9 +2553,8 @@ static void test_layer_split_snapshot_disk_roundtrip() {
     // Freeing an adopted slot must not double-free the shared context.
     adapter.snapshot_free(2);
     TEST_ASSERT(!adapter.snapshot_used(2));
-    TEST_ASSERT(adapter.snapshots_[2].disk_ctx == nullptr);
+    TEST_ASSERT(adapter.snapshots_[2].ctx == nullptr);
     TEST_ASSERT(adapter.snapshots_[2].shards[0].ctx == nullptr);
-    ggml_backend_free(re_cpu);  // buffer/context were owned by the adopted slot
 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }

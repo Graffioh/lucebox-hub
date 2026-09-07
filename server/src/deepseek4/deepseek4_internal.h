@@ -317,8 +317,6 @@ struct DeepSeek4PagedCache {
 };
 
 struct DeepSeek4Snapshot;
-struct DeepSeek4SnapshotAux;
-struct DeepSeek4SnapshotBindInfo;
 
 struct DeepSeek4RawRingSpan {
     int row = 0;
@@ -371,6 +369,30 @@ bool create_deepseek4_cache(ggml_backend_t backend,
                              int max_ctx,
                              DeepSeek4Cache & out);
 
+// Per-layer cache geometry implied by the weights. Single source of truth for
+// create_deepseek4_cache() and for snapshot declaration/validation
+// (deepseek4_snapshot.h), so the two can never disagree on shapes.
+struct DeepSeek4LayerGeometry {
+    uint32_t ratio = 0;            // compress ratio: 0 (raw window only), 4 or 128
+    int64_t  head_dim = 0;         // raw / compressed row width (F16)
+    int64_t  raw_rows = 0;         // n_swa
+    bool     has_comp = false;     // ratio > 0: comp_kv + attn compressor state
+    int64_t  comp_width = 0;       // attn compressor state width (F32)
+    int64_t  comp_state_rows = 0;
+    bool     has_index = false;    // ratio == 4: index_comp_kv + indexer state
+    int64_t  index_dim = 0;        // indexer row width (F16)
+    int64_t  index_state_width = 0;  // indexer compressor state width (F32)
+    int64_t  index_state_rows = 0;
+    // Compressed-row capacity for a cache of `max_ctx` tokens (0 if !has_comp).
+    int64_t comp_capacity(int max_ctx) const {
+        return has_comp ? (int64_t) max_ctx / (int64_t) ratio + 16 : 0;
+    }
+};
+DeepSeek4LayerGeometry deepseek4_layer_geometry(const DeepSeek4Weights & w, int layer);
+inline int64_t deepseek4_hc_state_elements(const DeepSeek4Weights & w) {
+    return (int64_t) w.n_hc * (int64_t) w.n_embd;
+}
+
 void free_deepseek4_cache(DeepSeek4Cache & c);
 bool create_deepseek4_paged_cache(ggml_backend_t backend,
                                   const DeepSeek4Weights & w,
@@ -413,29 +435,6 @@ bool build_deepseek4_head4_tail2_routes(
     ggml_tensor * router_weights,
     int n_tokens,
     DeepSeek4Head4Tail2Routes & out);
-// Copy the live cache into a right-sized CPU snapshot. Every tensor gets a
-// stable name (ds4_snap_*) so the ondisk prefix cache can serialize the
-// context and deepseek4_snapshot_bind() can rebind it after a reload. When
-// `aux` is given, the host-side logits / DSpark feature window are stored as
-// extra tensors together with an I32 meta tensor (row counts, cur_pos).
-bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
-                             ggml_backend_t snapshot_backend,
-                             DeepSeek4Snapshot & out,
-                             const DeepSeek4SnapshotAux * aux = nullptr);
-bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
-                                DeepSeek4Cache & cache);
-// Rebind a deserialized snapshot context (tensors named as written by
-// deepseek4_snapshot_save, optionally prefixed by `name_prefix`) into `out`.
-// Requires the meta tensor; fills row counts and cur_pos from it and
-// validates that every tensor referenced by the meta exists with a sane
-// shape. `out` takes ownership of ctx/buf iff `take_ownership`. Returns
-// false (and leaves `out` empty) on any inconsistency.
-bool deepseek4_snapshot_bind(ggml_context * ctx,
-                             ggml_backend_buffer_t buf,
-                             const char * name_prefix,
-                             bool take_ownership,
-                             DeepSeek4Snapshot & out,
-                             DeepSeek4SnapshotBindInfo * info);
 
 // Largest prefix of [kv_start, kv_start + n_tokens) that reaches at most the
 // next learned-compressor boundary. Multi-token dynamic forwards split on
@@ -568,29 +567,5 @@ struct DeepSeek4Snapshot {
     bool                  owns_storage = true;
 };
 
-// Host-side decode state persisted next to the cache tensors so an adopted
-// (deserialized) snapshot can resume exactly like an in-memory one.
-struct DeepSeek4SnapshotAux {
-    const float * logits = nullptr;
-    size_t        n_logits = 0;
-    const float * spec_feat = nullptr;
-    size_t        n_spec_feat = 0;
-};
-
-// Layout of DeepSeek4Snapshot::meta_snap (I32):
-//   [0] version, [1] n_layer, [2] n_vocab, [3] n_spec_feat, [4] cur_pos,
-//   then per layer: n_comp, n_index_comp.
-constexpr int kDeepSeek4SnapMetaVersion = 1;
-constexpr int kDeepSeek4SnapMetaBase = 5;
-
-// Metadata recovered by deepseek4_snapshot_bind().
-struct DeepSeek4SnapshotBindInfo {
-    int n_layer = 0;
-    int n_vocab = 0;
-    int n_spec_feat = 0;
-    int cur_pos = 0;
-};
-
-void free_deepseek4_snapshot(DeepSeek4Snapshot & s);
 
 }  // namespace dflash::common

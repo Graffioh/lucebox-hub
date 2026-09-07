@@ -4,6 +4,7 @@
 #include "deepseek4_backend.h"
 #include "deepseek4_budget_hook.h"
 #include "deepseek4_internal.h"
+#include "deepseek4_snapshot.h"
 #include "deepseek4_page_layout.h"
 #include "common/dynamic_backend.h"
 #include "common/peer_access.h"
@@ -2764,67 +2765,28 @@ bool DeepSeek4Backend::snapshot_adopt(int slot, ggml_context * ctx,
     if (slot < 0 || slot >= PREFIX_SLOTS || !ctx || !buf || cur_pos <= 0) {
         return false;
     }
-    if (w_.n_layer <= 0 || w_.n_vocab <= 0 ||
-        w_.compress_ratios.size() != (size_t) w_.n_layer) {
+    auto reject = [&](const std::string & why) {
         std::fprintf(stderr,
-                     "[deepseek4] snapshot adopt slot=%d rejected: weights not "
-                     "loaded\n", slot);
-        return false;
-    }
-    // The live cache may be absent while the target is parked; the layer
-    // schedule from the weights is enough to validate the file. Capacity
-    // checks against the live cache happen below when it exists, and again
-    // in deepseek4_snapshot_restore().
-    const bool have_cache = cache_.ctx && cache_.layers.size() == (size_t) w_.n_layer;
-
-    DeepSeek4Snapshot snap;
-    DeepSeek4SnapshotBindInfo info;
-    if (!deepseek4_snapshot_bind(ctx, buf, nullptr, /*take_ownership=*/true,
-                                 snap, &info)) {
-        std::fprintf(stderr,
-                     "[deepseek4] snapshot adopt slot=%d rejected: bind failed\n",
-                     slot);
-        return false;
-    }
-    // `snap` now points at ctx/buf but must not free them on the error paths
-    // below: the caller keeps ownership until we return true.
-    snap.owns_storage = false;
-
-    auto reject = [&](const char * why) {
-        std::fprintf(stderr,
-                     "[deepseek4] snapshot adopt slot=%d rejected: %s "
-                     "(pos=%d meta_pos=%d layers=%d/%d vocab=%d/%d)\n",
-                     slot, why, cur_pos, info.cur_pos, info.n_layer,
-                     w_.n_layer, info.n_vocab, w_.n_vocab);
+                     "[deepseek4] snapshot adopt slot=%d pos=%d rejected: %s\n",
+                     slot, cur_pos, why.c_str());
         return false;
     };
+
+    // Structural rebind, then a full type/shape check against the geometry
+    // the loaded weights imply. The live cache may be absent while the
+    // target is parked; its capacity is checked when it exists and again by
+    // deepseek4_snapshot_restore().
+    DeepSeek4Snapshot snap;
+    DeepSeek4SnapshotBindInfo info;
+    if (!deepseek4_snapshot_bind(ctx, buf, nullptr, /*take_ownership=*/false, snap, &info)) {
+        return reject("bind failed");
+    }
     if (info.cur_pos != cur_pos) return reject("position mismatch");
-    if (info.n_layer != w_.n_layer) return reject("layer count mismatch");
     if (info.n_vocab != w_.n_vocab) return reject("vocab mismatch");
-    if (have_cache && cur_pos > cache_.max_ctx) return reject("exceeds max_ctx");
-    // The compression schedule decides which tensors each layer needs; a
-    // snapshot from another schedule cannot be adopted.
-    for (size_t il = 0; il < snap.layers.size(); ++il) {
-        const uint32_t ratio = w_.compress_ratios[il];
-        const bool want_comp = ratio > 0;
-        const bool want_index = ratio == 4;
-        const auto & got = snap.layers[il];
-        if ((!!got.comp_kv) != want_comp ||
-            (!!got.index_comp_kv) != want_index ||
-            (!!got.attn_compressor.state_kv) != want_comp ||
-            (!!got.attn_compressor.state_score) != want_comp ||
-            (!!got.indexer_compressor.state_kv) != want_index ||
-            (!!got.indexer_compressor.state_score) != want_index) {
-            return reject("layer layout mismatch");
-        }
-        if (have_cache) {
-            const auto & live = cache_.layers[il];
-            if ((live.comp_kv && got.n_comp > live.comp_kv->ne[1]) ||
-                (live.index_comp_kv && got.n_index_comp > live.index_comp_kv->ne[1]) ||
-                (!!live.comp_kv) != want_comp || (!!live.index_comp_kv) != want_index) {
-                return reject("compressed rows exceed cache capacity");
-            }
-        }
+    const bool have_cache = cache_.ctx && cache_.layers.size() == (size_t) w_.n_layer;
+    std::string why;
+    if (!deepseek4_snapshot_validate(w_, have_cache ? cache_.max_ctx : 0, snap, &why)) {
+        return reject(why);
     }
 
     SnapshotAux aux;
@@ -2843,7 +2805,7 @@ bool DeepSeek4Backend::snapshot_adopt(int slot, ggml_context * ctx,
     }
 
     snapshot_free(slot);
-    snap.owns_storage = true;
+    snap.owns_storage = true;  // ownership of ctx/buf transfers on success
     snapshots_[slot] = snap;
     snapshot_aux_[slot] = std::move(aux);
     std::fprintf(stderr,
