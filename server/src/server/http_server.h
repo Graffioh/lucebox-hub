@@ -360,10 +360,13 @@ public:
     // Set the chat template format (detected from model arch).
     void set_chat_format(ChatFormat fmt) { chat_format_ = fmt; }
 
-    // Start listening. Blocks until shutdown() is called.
-    int run();
+    // Start one listener. Optional model contexts are borrowed until run()
+    // returns, must include this first, and each must have a sequence engine.
+    // Each context gets its own existing batch scheduler, never another socket.
+    int run(const std::vector<HttpServer *> & models = {});
 
-    // Signal the server to stop accepting new connections and drain.
+    // Finalize after run() returns; also called by the destructor.
+    // Use request_stop() to stop a running listener from another thread.
     void shutdown();
 
     // Async-signal-safe: only sets the stopping flag. The accept loop polls
@@ -378,6 +381,11 @@ public:
 private:
     // Client thread: read HTTP request, parse, enqueue job, wait.
     void handle_client(SocketHandle fd);
+
+    struct HttpRequest;
+    void start_worker();
+    bool route_model_request(SocketHandle fd, const HttpRequest & hr);
+    json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
     // lifecycle of one dequeued request, including signaling completion.
@@ -598,6 +606,17 @@ private:
     };
     std::unordered_map<PrefixHash, std::string,
                        PrefixHashHasher, PrefixHashEqual> frozen_content_cache_;
+
+    // Immutable model table after run() starts; only reservations mutate under
+    // routing_mu_. A reservation spans parsing through job retirement/output
+    // draining, so disconnects never make still-running engine work invisible.
+    struct RoutedModel {
+        HttpServer * server;
+        int capacity;
+        int in_flight = 0;
+    };
+    std::vector<RoutedModel> models_;
+    std::mutex routing_mu_;
 
     // Worker thread.
     std::thread                     worker_thread_;

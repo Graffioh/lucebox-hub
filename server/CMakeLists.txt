@@ -1721,6 +1721,7 @@ if(DFLASH27B_TESTS)
         set(_server_unit_sources
             test/test_unit_main.cpp
             test/test_server_unit.cpp
+            test/test_model_routing.cpp
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_keep_ratio.cpp

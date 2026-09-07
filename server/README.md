@@ -176,6 +176,13 @@ current monolithic Qwen3.5/Qwen3.6 path uses DDTree with tested defaults.
 Hardware- or checkpoint-specific overrides remain available through
 `--ddtree-budget`, `--ddtree-tau`, `--specla-top-k`, and `--draft-swa`.
 
+### Multiple models, one endpoint
+
+Use `--next-model` to load another independently batched model in the same
+process. Requests with `model: "auto"` use available model capacity; explicit
+names stay pinned. See [model routing](docs/MODEL_ROUTING.md) for the R9700 +
+Strix Halo 2+2 recipe, admission policy, and current validation limits.
+
 ### Compression proxy mode
 
 `dflash_server` can run as a **PFlash compression proxy** in front of any

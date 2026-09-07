@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,6 +75,10 @@ static void print_usage(const char * prog) {
         "Usage: %s <model.gguf> [options]\n"
         "\n"
         "Options:\n"
+        "  --next-model <path>  Load another model in this process; repeat its options\n"
+        "                      after this separator. One listener, independent batches.\n"
+        "                      Use unique --model-name values and --max-concurrency.\n"
+        "                      Requests with model=auto use available model capacity.\n"
         "  --draft <path>       Draft model for speculative decode\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
@@ -232,7 +237,36 @@ static void print_usage(const char * prog) {
         "\n", prog);
 }
 
-int main(int argc, char ** argv) {
+// Own everything borrowed by a model's HTTP/scheduler context. Shutdown must
+// join the worker and client users before releasing backend or tokenizer state.
+struct LoadedModel {
+    Tokenizer tokenizer;
+    Tokenizer drafter_tokenizer;
+    std::unique_ptr<ModelBackend> backend;
+    MoeRoutingCollector routing_collector;
+    std::unique_ptr<HttpServer> server;
+    bool freq_tracking = false;
+
+    ~LoadedModel() {
+        server.reset();
+        if (!backend) return;
+        if (freq_tracking) {
+            if (const auto * stats = backend->get_routing_stats()) {
+                stats->print_freq_analysis();
+            } else {
+                std::fprintf(stderr, "[server] --freq: no routing stats available (model may not be MoE)\n");
+            }
+        }
+        if (routing_collector.is_open()) {
+            backend->set_routing_collector(nullptr);
+            routing_collector.close();
+        }
+        backend->shutdown();
+    }
+};
+
+static int load_model(int argc, char ** argv, LoadedModel & loaded,
+                      bool multi_model) {
     if (argc < 2 || argv[1][0] == '-') {
         print_usage(argv[0]);
         return 2;
@@ -731,6 +765,17 @@ int main(int argc, char ** argv) {
         bargs.paged_attention = true;
     }
 
+    if (multi_model && (!bargs.paged_attention || bargs.device.is_multi_device() ||
+            bargs.remote_draft.enabled() || bargs.remote_target_shard.enabled() ||
+            sconfig.pflash_mode != ServerConfig::PflashMode::OFF ||
+            !sconfig.pflash_upstream_base.empty() || sconfig.lazy_draft ||
+            sconfig.freq_tracking || !sconfig.collect_routing_path.empty())) {
+        std::fprintf(stderr,
+            "[server] --next-model requires local paged serving per model; "
+            "compression, sharding, request-scoped drafts and routing collection are unsupported\n");
+        return 2;
+    }
+
     // Ask the factory to resolve model/placement facts and apply its feature
     // admission policy before any setup work. server_main only maps the
     // categorized result to the existing process exit convention.
@@ -906,14 +951,14 @@ int main(int argc, char ** argv) {
 
     // Load tokenizer.
     std::fprintf(stderr, "[server] loading tokenizer from %s\n", bargs.model_path);
-    Tokenizer tokenizer;
+    Tokenizer & tokenizer = loaded.tokenizer;
     if (!tokenizer.load_from_gguf(bargs.model_path)) {
         std::fprintf(stderr, "[server] tokenizer load failed\n");
         return 1;
     }
 
     // Load pflash drafter tokenizer (if pflash enabled).
-    Tokenizer drafter_tokenizer;
+    Tokenizer & drafter_tokenizer = loaded.drafter_tokenizer;
     if (pflash_enabled) {
         std::fprintf(stderr, "[server] loading pflash drafter tokenizer from %s\n",
                      sconfig.pflash_drafter_path.c_str());
@@ -991,7 +1036,8 @@ int main(int argc, char ** argv) {
                 arch.c_str());
         }
     }
-    auto backend = create_backend(bargs, backend_plan);
+    auto & backend = loaded.backend;
+    backend = create_backend(bargs, backend_plan);
     if (!backend) {
         std::fprintf(stderr, "[server] backend creation failed\n");
         return 1;
@@ -1373,11 +1419,10 @@ int main(int argc, char ** argv) {
         }
     }
 
-    HttpServer server(*backend, tokenizer, sconfig);
+    loaded.server = std::make_unique<HttpServer>(*backend, tokenizer, sconfig);
+    HttpServer & server = *loaded.server;
     server.set_chat_format(chat_format_for_arch(arch));
-    g_server = &server;
-    std::signal(SIGTERM, signal_handler);
-    std::signal(SIGINT, signal_handler);
+    loaded.freq_tracking = sconfig.freq_tracking;
     if (pflash_enabled) {
         server.set_drafter_tokenizer(&drafter_tokenizer);
     }
@@ -1388,7 +1433,7 @@ int main(int argc, char ** argv) {
     }
 
     // Set up routing data collector (--collect-routing)
-    MoeRoutingCollector routing_collector;
+    auto & routing_collector = loaded.routing_collector;
     if (!sconfig.collect_routing_path.empty()) {
         if (!routing_collector.open(sconfig.collect_routing_path)) {
             std::fprintf(stderr, "[server] failed to open routing collector output\n");
@@ -1402,26 +1447,73 @@ int main(int argc, char ** argv) {
         }
     }
 
-    int ret = server.run();
+    return 0;
+}
 
-    // Print frequency analysis at shutdown (--freq)
-    if (sconfig.freq_tracking) {
-        const auto * stats = backend->get_routing_stats();
-        if (stats) {
-            stats->print_freq_analysis();
+int main(int argc, char ** argv) {
+    // Reuse the existing per-model CLI and loader. Argument strings belong to
+    // main's argv and outlive every backend, including factories borrowing paths.
+    std::vector<std::vector<char *>> model_args(1, {argv[0]});
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--next-model") == 0) {
+            model_args.push_back({argv[0]});
         } else {
-            std::fprintf(stderr, "[server] --freq: no routing stats available "
-                                 "(model may not be MoE)\n");
+            model_args.back().push_back(argv[i]);
+        }
+    }
+    const bool multi_model = model_args.size() > 1;
+    std::set<std::string> names;
+    for (size_t m = 0; m < model_args.size(); ++m) {
+        const auto & args = model_args[m];
+        if (args.size() < 2 || args[1][0] == '-') {
+            print_usage(argv[0]);
+            return 2;
+        }
+        if (!multi_model) continue;
+        std::string name = "dflash";
+        for (size_t i = 2; i < args.size(); ++i) {
+            const std::string arg = args[i];
+            if (arg == "--model-name" && i + 1 < args.size()) name = args[i + 1];
+            if (m > 0 && (arg == "--host" || arg == "--port" || arg == "--no-cors")) {
+                std::fprintf(stderr, "[server] %s belongs before --next-model: there is one listener\n", args[i]);
+                return 2;
+            }
+            // These CLI switches change process-global settings, sometimes read
+            // lazily during execution. They cannot be scoped to a model. Shared
+            // KV/kernel settings can instead be supplied once in the environment.
+            if (arg == "--cache-type-k" || arg == "--cache-type-v" ||
+                arg == "--peer-access" || arg == "--no-fast-rollback" ||
+                arg == "--target-split-fast-rollback" ||
+                arg == "--adaptive-experts" || arg == "--specla" ||
+                arg == "--specla-top-k" || arg.rfind("--kvflash", 0) == 0 ||
+                arg.rfind("--spark", 0) == 0) {
+                std::fprintf(stderr, "[server] %s changes process-wide policy and is not supported with --next-model\n", args[i]);
+                return 2;
+            }
+        }
+        if (name.empty() || name == "auto" || !names.insert(name).second) {
+            std::fprintf(stderr, "[server] --next-model requires unique, nonempty --model-name values other than auto\n");
+            return 2;
         }
     }
 
-    // Close routing collector (prints summary)
-    if (routing_collector.is_open()) {
-        backend->set_routing_collector(nullptr);
-        routing_collector.close();
+    std::vector<std::unique_ptr<LoadedModel>> loaded;
+    std::vector<HttpServer *> servers;
+    // All initialization (including backend environment defaults) finishes
+    // before starting any scheduler. No worker observes model-loading mutations.
+    for (auto & args : model_args) {
+        auto model = std::make_unique<LoadedModel>();
+        const int count = (int)args.size();
+        args.push_back(nullptr);
+        const int ret = load_model(count, args.data(), *model, multi_model);
+        if (ret != 0) return ret;
+        servers.push_back(model->server.get());
+        loaded.push_back(std::move(model));
     }
-
-    // Cleanup.
-    backend->shutdown();
+    g_server = servers.front();
+    std::signal(SIGTERM, signal_handler);
+    std::signal(SIGINT, signal_handler);
+    const int ret = multi_model ? g_server->run(servers) : g_server->run();
+    g_server = nullptr;
     return ret;
 }

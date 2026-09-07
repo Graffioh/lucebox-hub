@@ -18,6 +18,7 @@
 
 #include "http_server.h"
 #include "admission.h"
+#include "common/concurrency/seq_engine.h"
 #include "sse_emitter.h"
 #include "prompt_normalize.h"
 #include "tool_hint.h"
@@ -1112,6 +1113,67 @@ static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg)
     return salt;
 }
 
+// One source for model discovery in both single- and multi-model serving.
+static json model_list(const ServerConfig & config, bool codex_schema) {
+    // Codex sends ?client_version= — serve the Codex-specific schema.
+    if (codex_schema) {
+        json codex_models = {
+            {"models", json::array({
+                {{"slug", config.model_name},
+                 {"display_name", config.model_name},
+                 {"description", "Local DFlash speculative-decoding server"},
+                 {"default_reasoning_level", "low"},
+                 // Spec §4.2: every tier activates the phase-1 envelope;
+                 // the difference is the budget cap selected from the
+                 // model card's effort_tiers. Descriptions surface the
+                 // resolved cap so clients can pick a tier purposefully.
+                 {"supported_reasoning_levels", json::array({
+                     {{"effort", "low"},
+                      {"description", "Phase-1 budget at the model card's low tier ("
+                                      + std::to_string(config.effort_tiers.low)
+                                      + " tokens)"}},
+                     {{"effort", "medium"},
+                      {"description", "Phase-1 budget at the model card's medium tier ("
+                                      + std::to_string(config.effort_tiers.medium)
+                                      + " tokens)"}},
+                     {{"effort", "high"},
+                      {"description", "Phase-1 budget at the model card's standard recommendation ("
+                                      + std::to_string(config.effort_tiers.high)
+                                      + " tokens)"}},
+                     {{"effort", "x-high"},
+                      {"description", "Phase-1 budget between high and the complex-problem ceiling ("
+                                      + std::to_string(config.effort_tiers.x_high)
+                                      + " tokens)"}},
+                     {{"effort", "max"},
+                      {"description", "Phase-1 budget at the model card's complex-problem ceiling ("
+                                      + std::to_string(config.effort_tiers.max)
+                                      + " tokens)"}},
+                 })},
+                 {"shell_type", "shell_command"},
+                 {"visibility", "list"},
+                 {"supported_in_api", true},
+                 {"priority", 1},
+                 {"context_window", config.max_ctx},
+                 {"supports_reasoning_summaries", false},
+                 {"supports_parallel_tool_calls", false}}
+            })}
+        };
+        return codex_models;
+    }
+    json models = {
+        {"object", "list"},
+        {"data", json::array({
+            {{"id", config.model_name},
+             {"object", "model"},
+             {"owned_by", "dflash"},
+             {"created", 1700000000},
+             {"context_length", config.max_ctx},
+             {"max_context_length", config.max_ctx}}
+        })}
+    };
+    return models;
+}
+
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
 HttpServer::HttpServer(ModelBackend & backend,
@@ -1370,7 +1432,46 @@ void HttpServer::shutdown() {
     }
 }
 
-int HttpServer::run() {
+void HttpServer::start_worker() {
+    // A backend-provided sequence engine replaces the one-request worker
+    // with the concurrent scheduler. Upstream forwarding stays on the
+    // classic path even when the local backend exposes an engine.
+    if (SeqEngine * engine = backend_.seq_engine();
+        engine && config_.pflash_upstream_base.empty()) {
+        worker_thread_ =
+            std::thread([this, engine]() { scheduler_loop(*engine); });
+    } else {
+        worker_thread_ = std::thread([this]() { worker_loop(); });
+    }
+}
+
+int HttpServer::run(const std::vector<HttpServer *> & models) {
+    if (!models.empty()) {
+        if (models.size() < 2 || models.front() != this) {
+            std::fprintf(stderr, "[server] model routing requires this listener first and at least two models\n");
+            return 2;
+        }
+        std::unordered_set<std::string> names;
+        std::unordered_set<ModelBackend *> backends;
+        for (HttpServer * model : models) {
+            SeqEngine * engine = model ? model->backend_.seq_engine() : nullptr;
+            if (!engine || engine->slot_count() < 1 ||
+                model->worker_thread_.joinable() ||
+                !model->config_.pflash_upstream_base.empty() ||
+                model->config_.model_name.empty() || model->config_.model_name == "auto" ||
+                !names.insert(model->config_.model_name).second ||
+                !backends.insert(&model->backend_).second) {
+                std::fprintf(stderr, "[server] model routing requires distinct local sequence engines and unique names other than auto\n");
+                return 2;
+            }
+        }
+        for (HttpServer * model : models) {
+            models_.push_back({model, model->backend_.seq_engine()->slot_count()});
+            // CORS belongs to the one listener even when a peer formats output.
+            model->config_.enable_cors = config_.enable_cors;
+        }
+    }
+
 #if !defined(_WIN32)
     // Ignore SIGPIPE so send() returns EPIPE instead of killing the process.
     signal(SIGPIPE, SIG_IGN);
@@ -1437,15 +1538,10 @@ int HttpServer::run() {
     std::fprintf(stderr, "[server] listening on http://%s:%d\n",
                  config_.host.c_str(), config_.port);
 
-    // A backend-provided sequence engine replaces the one-request worker
-    // with the concurrent scheduler. Upstream forwarding stays on the
-    // classic path even when the local backend exposes an engine.
-    if (SeqEngine * engine = backend_.seq_engine();
-        engine && config_.pflash_upstream_base.empty()) {
-        worker_thread_ =
-            std::thread([this, engine]() { scheduler_loop(*engine); });
+    if (models_.empty()) {
+        start_worker();
     } else {
-        worker_thread_ = std::thread([this]() { worker_loop(); });
+        for (auto & model : models_) model.server->start_worker();
     }
 
     // Accept loop.
@@ -1486,28 +1582,23 @@ int HttpServer::run() {
         }).detach();
     }
 
-    // Wake the worker thread so it can observe stopping_ and exit.
-    queue_cv_.notify_all();
-
-    // Wait for client threads to drain, but bound it: a client mid-stream (long
-    // SSE generation) must not hold the process resident on shutdown. After the
-    // grace period we proceed — detached client threads are torn down on exit.
-    {
-        std::unique_lock<std::mutex> lk(clients_mu_);
-        bool drained = clients_cv_.wait_for(
-            lk, std::chrono::seconds(5),
-            [this]() { return active_clients_.load() == 0; });
-        if (!drained) {
-            std::fprintf(stderr,
-                         "[server] shutdown: %d client thread(s) still active "
-                         "after grace period, exiting anyway\n",
-                         active_clients_.load());
-        }
+    auto stop_worker = [](HttpServer * server) {
+        server->request_stop();
+        server->queue_cv_.notify_all();
+    };
+    stop_worker(this);
+    for (auto & model : models_) stop_worker(model.server);
+    if (worker_thread_.joinable()) worker_thread_.join();
+    for (auto & model : models_) {
+        if (model.server->worker_thread_.joinable()) model.server->worker_thread_.join();
     }
 
-    // Wait for worker to finish.
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
+    // Every handler borrows a model context. Do not destroy those contexts
+    // after an arbitrary grace period. Reads poll stopping_; workers have
+    // retired all jobs and unblocked their client monitors before this wait.
+    {
+        std::unique_lock<std::mutex> lk(clients_mu_);
+        clients_cv_.wait(lk, [this]() { return active_clients_.load() == 0; });
     }
 
     // Persist disk cache (worker joined — no race on slot_tokens_).
@@ -1524,12 +1615,8 @@ int HttpServer::run() {
     }
 
 #if defined(_WIN32)
-    // Intentionally NOT calling WSACleanup() here. Detached client threads
-    // may still be running after the 5-second shutdown grace period (e.g. a
-    // client mid-stream on a long SSE generation). Tearing down Winsock
-    // underneath them causes spurious socket errors. The OS reclaims all
-    // Winsock resources on process exit, so retaining it for the full process
-    // lifetime is safe and avoids the race.
+    // Status-event sockets remain owned until shutdown(). Keep Winsock alive
+    // for their cleanup; the process reclaims the global runtime on exit.
 #endif
 
     return 0;
@@ -1557,6 +1644,23 @@ void HttpServer::handle_client(SocketHandle fd) {
         send_response(fd, 200, "application/json", "{\"status\":\"ok\"}\n");
         socket_close(fd);
         return;
+    }
+
+    if (!models_.empty() && hr.method == "GET") {
+        if (hr.path == "/props" || hr.path == "/status/json") {
+            json body = hr.path == "/props"
+                ? build_props_body(config_, prefix_cache_, tool_memory_)
+                : status_.to_json();
+            body.update(model_routing_status());
+            send_response(fd, 200, "application/json", body.dump() + "\n");
+            socket_close(fd);
+            return;
+        }
+        if (hr.path == "/status" || hr.path == "/status/events") {
+            send_error(fd, 404, "multi-model status is available at /status/json");
+            socket_close(fd);
+            return;
+        }
     }
 
     // Introspection: server config + cache stats + arch + capabilities.
@@ -1622,76 +1726,109 @@ void HttpServer::handle_client(SocketHandle fd) {
         return;  // Do NOT close fd — it's now owned by the SSE broadcast loop.
     }
 
-    // Models endpoint.
+    // Models endpoint (including the existing Codex discovery schema).
     if (hr.method == "GET" && hr.path == "/v1/models") {
-        // Codex sends ?client_version= — serve the Codex-specific schema.
-        if (hr.query.find("client_version") != std::string::npos) {
-            json codex_models = {
-                {"models", json::array({
-                    {{"slug", config_.model_name},
-                     {"display_name", config_.model_name},
-                     {"description", "Local DFlash speculative-decoding server"},
-                     {"default_reasoning_level", "low"},
-                     // Spec §4.2: every tier activates the phase-1 envelope;
-                     // the difference is the budget cap selected from the
-                     // model card's effort_tiers. Descriptions surface the
-                     // resolved cap so clients can pick a tier purposefully.
-                     {"supported_reasoning_levels", json::array({
-                         {{"effort", "low"},
-                          {"description", "Phase-1 budget at the model card's low tier ("
-                                          + std::to_string(config_.effort_tiers.low)
-                                          + " tokens)"}},
-                         {{"effort", "medium"},
-                          {"description", "Phase-1 budget at the model card's medium tier ("
-                                          + std::to_string(config_.effort_tiers.medium)
-                                          + " tokens)"}},
-                         {{"effort", "high"},
-                          {"description", "Phase-1 budget at the model card's standard recommendation ("
-                                          + std::to_string(config_.effort_tiers.high)
-                                          + " tokens)"}},
-                         {{"effort", "x-high"},
-                          {"description", "Phase-1 budget between high and the complex-problem ceiling ("
-                                          + std::to_string(config_.effort_tiers.x_high)
-                                          + " tokens)"}},
-                         {{"effort", "max"},
-                          {"description", "Phase-1 budget at the model card's complex-problem ceiling ("
-                                          + std::to_string(config_.effort_tiers.max)
-                                          + " tokens)"}},
-                     })},
-                     {"shell_type", "shell_command"},
-                     {"visibility", "list"},
-                     {"supported_in_api", true},
-                     {"priority", 1},
-                     {"context_window", config_.max_ctx},
-                     {"supports_reasoning_summaries", false},
-                     {"supports_parallel_tool_calls", false}}
-                })}
-            };
-            send_response(fd, 200, "application/json", codex_models.dump() + "\n");
-            socket_close(fd);
-            return;
+        const bool codex_schema = hr.query.find("client_version") != std::string::npos;
+        json response = model_list(config_, codex_schema);
+        if (!models_.empty()) {
+            const char * key = codex_schema ? "models" : "data";
+            ServerConfig automatic = config_;
+            automatic.model_name = "auto";
+            for (size_t i = 0; i < models_.size(); ++i) {
+                const auto & cfg = models_[i].server->config_;
+                automatic.max_ctx = std::min(automatic.max_ctx, cfg.max_ctx);
+                if (i != 0) response[key].push_back(model_list(cfg, codex_schema)[key][0]);
+            }
+            response[key].push_back(model_list(automatic, codex_schema)[key][0]);
         }
-        json models = {
-            {"object", "list"},
-            {"data", json::array({
-                {{"id", config_.model_name},
-                 {"object", "model"},
-                 {"owned_by", "dflash"},
-                 {"created", 1700000000},
-                 {"context_length", config_.max_ctx},
-                 {"max_context_length", config_.max_ctx}}
-            })}
-        };
-        send_response(fd, 200, "application/json", models.dump() + "\n");
+        send_response(fd, 200, "application/json", response.dump() + "\n");
         socket_close(fd);
         return;
     }
 
     // Route POST endpoints.
-    if (!route_request(fd, hr)) {
+    if (!(models_.empty() ? route_request(fd, hr) : route_model_request(fd, hr))) {
         send_error(fd, 404, "unknown endpoint");
     }
     socket_close(fd);
+}
+
+// The shared listener chooses a model before interpreting any model-specific
+// defaults, templates or token IDs. Calling route_request directly reuses that
+// model's HTTP lifecycle and scheduler without forwarding/re-parsing HTTP.
+bool HttpServer::route_model_request(SocketHandle fd, const HttpRequest & hr) {
+    if (hr.method != "POST" ||
+        (hr.path != "/v1/chat/completions" &&
+         hr.path != "/v1/responses" && hr.path != "/v1/messages" &&
+         hr.path != "/v1/messages/count_tokens")) return false;
+
+    json body;
+    std::string requested;
+    try {
+        body = json::parse(hr.body);
+        requested = body.value("model", config_.model_name);
+    } catch (const std::exception & e) {
+        send_error(fd, 400, std::string("invalid model request: ") + e.what());
+        return true;
+    }
+    const bool count_only = hr.path == "/v1/messages/count_tokens";
+    if (count_only && requested == "auto") {
+        send_error(fd, 400, "count_tokens requires an explicit model: tokenizers differ");
+        return true;
+    }
+
+    RoutedModel * selected = nullptr;
+    bool known = requested == "auto";
+    {
+        std::lock_guard<std::mutex> lock(routing_mu_);
+        if (!stopping_.load()) {
+            for (auto & model : models_) {
+                if (requested != "auto" && requested != model.server->config_.model_name) continue;
+                known = true;
+                if (!count_only && model.in_flight >= model.capacity) continue;
+                if (!selected || (int64_t)model.in_flight * selected->capacity <
+                                 (int64_t)selected->in_flight * model.capacity) selected = &model;
+            }
+            if (selected && !count_only) ++selected->in_flight;
+        }
+    }
+    if (!selected) {
+        send_error(fd, known ? 503 : 404,
+            known ? "model capacity exhausted or server stopping" : "unknown model");
+        return true;
+    }
+    // Release after route_request returns: the existing job monitor waits for
+    // engine retirement and output draining, even when the client disconnects.
+    struct Reservation {
+        std::mutex & mutex;
+        RoutedModel * model;
+        ~Reservation() {
+            if (model) {
+                std::lock_guard<std::mutex> lock(mutex);
+                --model->in_flight;
+            }
+        }
+    } reservation{routing_mu_, count_only ? nullptr : selected};
+    body["model"] = selected->server->config_.model_name;
+    HttpRequest routed = hr;
+    routed.body = body.dump();
+    return selected->server->route_request(fd, routed);
+}
+
+json HttpServer::model_routing_status() {
+    json models = json::array();
+    std::lock_guard<std::mutex> lock(routing_mu_);
+    for (const auto & model : models_) {
+        HttpServer & server = *model.server;
+        models.push_back({{"id", server.config_.model_name},
+            {"capacity", model.capacity}, {"in_flight", model.in_flight},
+            {"target_device", server.config_.target_device},
+            {"draft_device", server.config_.draft_device},
+            {"max_context", server.config_.max_ctx},
+            {"props", build_props_body(server.config_, server.prefix_cache_, server.tool_memory_)},
+            {"status", server.status_.to_json()}});
+    }
+    return {{"routing", "least-occupied"}, {"automatic_model", "auto"}, {"models", models}};
 }
 
 // ─── Request parsing ────────────────────────────────────────────────────
@@ -4314,11 +4451,20 @@ ServerJob * HttpServer::dequeue_for(
 // ─── HTTP I/O ───────────────────────────────────────────────────────────
 
 bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
-#if defined(_WIN32)
-    // On Windows, accept() may return a socket that inherits the non-blocking
-    // mode of the listen socket. Force blocking mode for reliable recv().
-    sock_set_block(fd);
-#endif
+    sock_set_nonblock(fd);
+    auto receive = [&](char * data, size_t size) -> ssize_t {
+        while (!stopping_.load()) {
+            struct pollfd pfd{fd, POLLIN, 0};
+            const int ready = poll(&pfd, 1, 100);
+            if (ready < 0 && sock_is_eintr(sock_errno())) continue;
+            if (ready < 0 || (pfd.revents & (POLLERR | POLLNVAL))) return -1;
+            if (ready == 0) continue;
+            const ssize_t n = recv(fd, data, size, 0);
+            if (n < 0 && (sock_is_eintr(sock_errno()) || sock_is_eagain(sock_errno()))) continue;
+            return n;
+        }
+        return -1;
+    };
     std::string buf;
     buf.reserve(8192);
     char tmp[4096];
@@ -4326,15 +4472,7 @@ bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
     // Read until we find the header/body boundary (\r\n\r\n or \n\n).
     ssize_t hend = -1;
     while (hend < 0 && buf.size() < 65536) {
-        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && sock_is_eintr(sock_errno())) continue;
-#if defined(_WIN32)
-        if (n < 0 && sock_is_eagain(sock_errno())) {
-            struct pollfd pfd{fd, POLLIN, 0};
-            poll(&pfd, 1, 1000);
-            continue;
-        }
-#endif
+        ssize_t n = receive(tmp, sizeof(tmp));
         if (n <= 0) return false;
         buf.append(tmp, n);
 
@@ -4399,15 +4537,7 @@ bool HttpServer::read_http_request(SocketHandle fd, HttpRequest & out) {
 
     // Read body.
     while ((ssize_t)buf.size() < hend + content_length) {
-        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n < 0 && sock_is_eintr(sock_errno())) continue;
-#if defined(_WIN32)
-        if (n < 0 && sock_is_eagain(sock_errno())) {
-            struct pollfd pfd{fd, POLLIN, 0};
-            poll(&pfd, 1, 1000);
-            continue;
-        }
-#endif
+        ssize_t n = receive(tmp, sizeof(tmp));
         if (n <= 0) return false;
         buf.append(tmp, n);
     }
@@ -4422,6 +4552,7 @@ bool HttpServer::send_all(SocketHandle fd, const void * data, size_t len) {
     // Stall deadline resets on each successful write (ds4 pattern).
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (sent < len) {
+        if (stopping_.load()) return false;
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline - std::chrono::steady_clock::now()).count();
         if (remaining <= 0) return false;  // stall timeout
