@@ -4270,6 +4270,33 @@ struct ggml_tensor * ggml_soft_max_ext_inplace(
     return ggml_soft_max_impl(ctx, a, mask, scale, max_bias, true);
 }
 
+struct ggml_tensor * ggml_soft_max_ext_sink_col(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * sinks,
+        float                 scale) {
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(sinks && sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(sinks));
+    GGML_ASSERT(ggml_nelements(sinks) == ggml_nrows(a));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    int32_t params[3] = { 0, 0, /*sink_col*/ 1 };
+    const float max_bias = 0.0f;
+    memcpy(params + 0, &scale,    sizeof(float));
+    memcpy(params + 1, &max_bias, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_SOFT_MAX;
+    result->src[0] = a;
+    result->src[1] = NULL;
+    result->src[2] = sinks;
+
+    return result;
+}
+
 void ggml_soft_max_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

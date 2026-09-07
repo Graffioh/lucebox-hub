@@ -252,6 +252,10 @@
 #define GGML_ROPE_TYPE_MROPE  8
 #define GGML_ROPE_TYPE_VISION 24
 #define GGML_ROPE_TYPE_IMROPE 40 // binary: 101000
+// Lucebox: rotate the LAST n_dims of each row (NORMAL pairing) and pass the
+// leading ne0 - n_dims through unchanged, so a tail-rotary head (DeepSeek4)
+// is one launch instead of split, rotate, and concat. Combine with NORMAL only.
+#define GGML_ROPE_TYPE_TAIL   64
 
 #define GGML_MROPE_SECTIONS   4
 
@@ -1808,6 +1812,16 @@ extern "C" {
             struct ggml_tensor  * mask,
             float                 scale,
             float                 max_bias);
+
+    // Lucebox: softmax over [a | sink] per row with the sink as a virtual last
+    // column, scale folded in (a*scale), no mask. sinks holds one value per row
+    // of a (ne[0] == ggml_nrows(a)). Bit-identical to scale -> concat(sink) ->
+    // soft_max -> view, in one launch with a contiguous result of a's shape.
+    GGML_API struct ggml_tensor * ggml_soft_max_ext_sink_col(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * sinks,
+            float                 scale);
 
     GGML_API void ggml_soft_max_add_sinks(
             struct ggml_tensor * a,
