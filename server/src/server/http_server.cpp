@@ -1575,10 +1575,10 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
         active_clients_.fetch_add(1);
         std::thread([this, client_fd]() {
             handle_client(client_fd);
-            if (active_clients_.fetch_sub(1) == 1) {
-                std::lock_guard<std::mutex> lk(clients_mu_);
-                clients_cv_.notify_all();
-            }
+            // Publish completion under the same lock used by run()'s wait.
+            // Once it observes zero, no detached handler may touch this object.
+            std::lock_guard<std::mutex> lk(clients_mu_);
+            if (active_clients_.fetch_sub(1) == 1) clients_cv_.notify_all();
         }).detach();
     }
 
@@ -1747,31 +1747,18 @@ void HttpServer::handle_client(SocketHandle fd) {
     }
 
     // Route POST endpoints.
-    if (!(models_.empty() ? route_request(fd, hr) : route_model_request(fd, hr))) {
+    if (!route_request(fd, hr)) {
         send_error(fd, 404, "unknown endpoint");
     }
     socket_close(fd);
 }
 
-// The shared listener chooses a model before interpreting any model-specific
-// defaults, templates or token IDs. Calling route_request directly reuses that
-// model's HTTP lifecycle and scheduler without forwarding/re-parsing HTTP.
-bool HttpServer::route_model_request(SocketHandle fd, const HttpRequest & hr) {
-    if (hr.method != "POST" ||
-        (hr.path != "/v1/chat/completions" &&
-         hr.path != "/v1/responses" && hr.path != "/v1/messages" &&
-         hr.path != "/v1/messages/count_tokens")) return false;
-
-    json body;
-    std::string requested;
-    try {
-        body = json::parse(hr.body);
-        requested = body.value("model", config_.model_name);
-    } catch (const std::exception & e) {
-        send_error(fd, 400, std::string("invalid model request: ") + e.what());
-        return true;
-    }
-    const bool count_only = hr.path == "/v1/messages/count_tokens";
+// Endpoint structure is parsed once by the listener. Model defaults, templates
+// and token IDs are resolved only by the selected model's handler.
+bool HttpServer::route_model_request(SocketHandle fd, ParsedRequest & req,
+                                     bool count_only) {
+    json & body = req.raw_body;
+    const std::string requested = body.value("model", config_.model_name);
     if (count_only && requested == "auto") {
         send_error(fd, 400, "count_tokens requires an explicit model: tokenizers differ");
         return true;
@@ -1793,8 +1780,18 @@ bool HttpServer::route_model_request(SocketHandle fd, const HttpRequest & hr) {
         }
     }
     if (!selected) {
-        send_error(fd, known ? 503 : 404,
-            known ? "model capacity exhausted or server stopping" : "unknown model");
+        if (known) {
+            send_error(fd, 503, "model '" + requested +
+                "' has no available capacity or the server is stopping; retry when a slot is free");
+        } else {
+            std::string available;
+            for (const auto & model : models_) {
+                if (!available.empty()) available += ", ";
+                available += model.server->config_.model_name;
+            }
+            send_error(fd, 404, "unknown model '" + requested +
+                "'; available models: " + available + ", auto");
+        }
         return true;
     }
     // Release after route_request returns: the existing job monitor waits for
@@ -1810,9 +1807,7 @@ bool HttpServer::route_model_request(SocketHandle fd, const HttpRequest & hr) {
         }
     } reservation{routing_mu_, count_only ? nullptr : selected};
     body["model"] = selected->server->config_.model_name;
-    HttpRequest routed = hr;
-    routed.body = body.dump();
-    return selected->server->route_request(fd, routed);
+    return selected->server->handle_model_request(fd, req, count_only);
 }
 
 json HttpServer::model_routing_status() {
@@ -2270,12 +2265,23 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
     ParsedRequest req;
     bool count_tokens_only = false;
     try {
-        const json body = json::parse(hr.body);
-        req.raw_body = body;
-        if (!parse_common_request_fields(fd, body, req)) return true;
+        req.raw_body = json::parse(hr.body);
         if (!parse_endpoint_request(
-                hr.path, body, req, count_tokens_only)) return false;
+                hr.path, req.raw_body, req, count_tokens_only)) return false;
+        return models_.empty()
+            ? handle_model_request(fd, req, count_tokens_only)
+            : route_model_request(fd, req, count_tokens_only);
+    } catch (const std::exception & e) {
+        send_error(fd, 400, std::string("JSON parse error: ") + e.what());
+        return true;
+    }
+}
 
+bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
+                                      bool count_tokens_only) {
+    try {
+        const json & body = req.raw_body;
+        if (!parse_common_request_fields(fd, body, req)) return true;
         const std::vector<ChatMessage> chat_messages =
             normalize_chat_messages(req.messages, req.format, tool_memory_);
         // Reasoning must be applied BEFORE rendering: the template injects

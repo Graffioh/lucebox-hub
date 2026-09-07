@@ -384,7 +384,8 @@ private:
 
     struct HttpRequest;
     void start_worker();
-    bool route_model_request(SocketHandle fd, const HttpRequest & hr);
+    bool route_model_request(SocketHandle fd, ParsedRequest & req, bool count_only);
+    bool handle_model_request(SocketHandle fd, ParsedRequest & req, bool count_only);
     json model_routing_status();
 
     // Worker thread: process jobs sequentially. process_job owns the
