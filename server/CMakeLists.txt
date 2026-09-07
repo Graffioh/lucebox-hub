@@ -469,6 +469,8 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
     src/deepseek4/deepseek4_roctx.cpp
+    src/deepseek4/deepseek4_paged_cache.cpp
+    src/deepseek4/deepseek4_seq_engine.cpp
     src/deepseek4/deepseek4_backend.cpp
     src/deepseek4/deepseek4_daemon.cpp
     src/deepseek4/deepseek4_layer_split_adapter.cpp
@@ -505,7 +507,7 @@ add_library(dflash_common STATIC
     src/common/draft_swa.cpp
     src/common/dflash_spec_decode.cpp
     src/common/concurrency/paged_kv_pool.cpp
-    src/qwen35/concurrency/qwen35_slot_manager.cpp
+    src/common/concurrency/seq_slot_manager.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -1490,7 +1492,11 @@ if(DFLASH27B_TESTS)
         # Pure host-side allocator test: no model, ggml, or GPU is required.
         add_executable(test_paged_kv_pool
             test/test_paged_kv_pool.cpp
+            test/test_deepseek4_page_layout.cpp
+            test/test_deepseek4_paged_cache.cpp
+            src/deepseek4/deepseek4_paged_cache.cpp
             src/common/concurrency/paged_kv_pool.cpp)
+        target_compile_definitions(test_paged_kv_pool PRIVATE DFLASH_DS4_PLAN_ONLY=1)
         target_include_directories(test_paged_kv_pool PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         list(APPEND _raw_unit_test_targets test_paged_kv_pool)
@@ -1499,7 +1505,7 @@ if(DFLASH27B_TESTS)
         # Host-side slot bookkeeping test (concurrent serving): no GPU.
         add_executable(test_seq_slot_manager
             test/test_seq_slot_manager.cpp
-            src/qwen35/concurrency/qwen35_slot_manager.cpp
+            src/common/concurrency/seq_slot_manager.cpp
             src/common/concurrency/paged_kv_pool.cpp)
         target_include_directories(test_seq_slot_manager PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1923,6 +1929,7 @@ if(DFLASH27B_TESTS)
         test_mmq_streamk_iq4_xs
         test_rms_norm_hip
         test_rope_tail
+        test_paged_kv_pool
         test_rocmfp3_mix_registry
         test_rocmfp_mix_slice_matvec
         test_rocmfp_mix_gateup_glu
