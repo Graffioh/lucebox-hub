@@ -2823,7 +2823,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }();
     const int luce_mmvq_max_ncols = ggml_cuda_mmvq_max_ncols_override > 0
         ? ggml_cuda_mmvq_max_ncols_override
-        : luce_mmvq_max_ncols_env;
+        : ctx.mmvq_max_ncols > 0 ? ctx.mmvq_max_ncols : luce_mmvq_max_ncols_env;
     // The mix qtypes have no generic MMVQ path because their per-expert
     // codebooks live in an out-of-band registry. Decode uses the dedicated
     // fused kernels below. Sparse prefill can opt into their registry-aware
@@ -5659,6 +5659,13 @@ static ggml_guid_t ggml_backend_cuda_guid() {
 
 bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+}
+
+bool ggml_backend_cuda_set_mmvq_max_ncols(ggml_backend_t backend, int max_ncols) {
+    if (!ggml_backend_is_cuda(backend) || max_ncols < 0) return false;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    ctx->mmvq_max_ncols = max_ncols;
+    return true;
 }
 
 bool ggml_backend_cuda_set_low_priority_stream(ggml_backend_t backend) {

@@ -240,21 +240,13 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
     return true;
 }
 
-// Monolithic paged serving packs up to sixteen chronological prompt rows.
-// The gfx1151 dense ROCmFP4 weight-reuse kernel preserves single-column
-// arithmetic through that width. Keep those projections on MMVQ while
-// honoring an explicit LUCE_MMVQ_MAX_NCOLS setting.
-static void configure_gfx1151_paged_mmvq_default(int gpu, bool paged_attention) {
+// Kernel variants used by the qualified gfx1151 paged path. Its MMVQ width
+// belongs to the owning backend context, never to the process environment.
+static void configure_gfx1151_paged_kernel_defaults(int gpu, bool paged_attention) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (!paged_attention || env_flag_enabled("DFLASH_DS4_SPEC") ||
         !is_gfx_device(gpu, "gfx1151")) {
         return;
-    }
-    if (std::getenv("LUCE_MMVQ_MAX_NCOLS") == nullptr &&
-        set_environment_variable("LUCE_MMVQ_MAX_NCOLS", "16", false) == 0) {
-        std::fprintf(stderr,
-                     "[deepseek4] gfx1151 paged serving: defaulting "
-                     "LUCE_MMVQ_MAX_NCOLS=16 (ROCmFP4 weight-reuse MMVQ)\n");
     }
     for (const char * name : {"DFLASH_CUDA_MMVQ_FP4_X4",
                               "DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1",
@@ -1113,7 +1105,7 @@ bool DeepSeek4Backend::init() {
     if (!configure_dspark_mmvq_defaults(cfg_.device.gpu)) {
         return false;
     }
-    configure_gfx1151_paged_mmvq_default(cfg_.device.gpu, cfg_.paged_attention);
+    configure_gfx1151_paged_kernel_defaults(cfg_.device.gpu, cfg_.paged_attention);
     configure_gfx1201_hybrid_sub_batch_default(cfg_.device.gpu);
 
     if (cfg_.paged_attention &&
@@ -1136,6 +1128,14 @@ bool DeepSeek4Backend::init() {
         std::fprintf(stderr, "[deepseek4] failed to create CUDA backend (gpu=%d)\n",
                      cfg_.device.gpu);
         return false;
+    }
+
+    // Paged monolithic serving is admitted only on gfx1151. Preserve its
+    // qualified width without changing the shared policy seen by other models.
+    if (cfg_.paged_attention && is_gfx_device(cfg_.device.gpu, "gfx1151") &&
+        !std::getenv("LUCE_MMVQ_MAX_NCOLS")) {
+        if (!ggml_backend_cuda_set_mmvq_max_ncols(backend_, 16)) return false;
+        std::fprintf(stderr, "[deepseek4] model-local MMVQ width=16 (gfx1151 paged serving)\n");
     }
 
     snap_backend_ = ggml_backend_init_by_name("cpu", nullptr);

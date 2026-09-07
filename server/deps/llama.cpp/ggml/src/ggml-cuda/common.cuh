@@ -1416,6 +1416,9 @@ struct ggml_cuda_stream_context {
 };
 
 struct ggml_backend_cuda_context {
+    // Plain quantized matmul crossover, configured before graph execution.
+    // Zero inherits the shared environment/default; thread overrides win.
+    int mmvq_max_ncols = 0;
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;

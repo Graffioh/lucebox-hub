@@ -11,20 +11,30 @@ quality collaboration.
 
 ## Qwen on R9700 plus DS4 on Strix Halo
 
-Build with both `gfx1201` and `gfx1151` code objects. Set `R9700_GPU` and
+Build with both `gfx1201` and `gfx1151` code objects using the project's
+architecture option (the generic CMake architecture setting is overridden):
+
+```bash
+cmake -S . -B build-hip -DDFLASH27B_GPU_BACKEND=hip \
+  '-DDFLASH27B_HIP_ARCHITECTURES=gfx1201;gfx1151' -DGGML_HIP_NO_VMM=ON
+cmake --build build-hip --target dflash_server -j "$(nproc)"
+```
+
+Run those commands from `server/` in a HIP-configured build environment.
+Set `R9700_GPU` and
 `STRIX_GPU` to the appropriate device indices in your ROCm environment; ensure
 any inherited device-visibility settings agree with that mapping. In this
 example the visible devices become `hip:0` (R9700) and `hip:1` (Strix Halo).
 Replace the model paths with your actual target and compatible draft files.
 
 ```bash
-HIP_VISIBLE_DEVICES="$R9700_GPU,$STRIX_GPU" \
-DFLASH27B_KV_K=q4_0 DFLASH27B_KV_V=q4_0 \
+ROCR_VISIBLE_DEVICES="$R9700_GPU,$STRIX_GPU" \
 ./build-hip/dflash_server /models/Qwen3.8-27B-IQ4_XS.gguf \
   --host 127.0.0.1 --port 8080 \
   --model-name qwen --target-device hip:0 \
   --draft /models/Qwen3.8-27B-DFlash2-Q8_0.gguf --draft-device hip:0 \
-  --max-ctx 4096 --max-concurrency 2 \
+  --max-ctx 4096 --max-concurrency 2 --kv-pool-tokens 8192 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
   --next-model /models/DeepSeek-V4-Flash-ROCMFP2-STRIX.gguf \
   --model-name ds4 --target-device hip:1 \
   --max-ctx 4096 --max-concurrency 2 --ds4-prefill exact
@@ -40,7 +50,61 @@ models; the routing table derives each model's capacity from its sequence
 engine. Give each model a unique, nonempty `--model-name`, excluding the
 reserved name `auto`. Host, port, and CORS configuration belong to the first
 model's listener. All models load before any worker starts or the endpoint
-opens. A load failure exits and releases models already loaded.
+opens. Every block is parsed and checked for CLI errors and duplicate names
+before loading starts; errors identify the offending block. A load failure
+exits and releases models already loaded.
+
+### Keep startup settings together
+
+For a launch script, Bash arrays make the shared listener and each model's
+settings easy to edit without mixing their scope:
+
+```bash
+listener=(--host 127.0.0.1 --port 8080)
+qwen=("$QWEN_MODEL" --model-name qwen --target-device hip:0
+      --draft "$QWEN_DRAFT" --draft-device hip:0
+      --max-ctx 4096 --max-concurrency 2 --kv-pool-tokens 8192
+      --cache-type-k q8_0 --cache-type-v q8_0)
+ds4=("$DS4_MODEL" --model-name ds4 --target-device hip:1
+     --max-ctx 4096 --max-concurrency 2 --ds4-prefill exact)
+ROCR_VISIBLE_DEVICES="$R9700_GPU,$STRIX_GPU" \
+  ./build-hip/dflash_server "${qwen[@]}" "${listener[@]}" \
+  --next-model "${ds4[@]}"
+```
+
+Set the three model-path variables and the two GPU indices first. All CLI
+options in a model block start from that model's own defaults; they do not
+inherit the previous block. This includes context, concurrency, draft options,
+sampling defaults, templates, and admission coalescing. Omitted values are
+resolved against the corresponding model card where supported.
+
+Qwen's `--cache-type-k/v` overrides are stored in its backend configuration and
+apply to both KV budgeting and allocation. They override environment defaults
+without changing them. DS4 uses its own fixed cache layout: those two flags do
+not alter DS4's cache and emit a warning if supplied. Its old Q4 launch flags
+should be omitted.
+
+Environment variables remain **process-wide**. Set ROCm visibility and shared
+kernel controls once, before the executable. There is no per-model `env` block:
+arbitrary environment isolation cannot be promised within one process, and
+some kernel controls are cached or read while requests run. DS4's automatic
+16-column MMVQ setting belongs to its GPU backend context, so it does not
+change Qwen's drafter dispatch.
+Explicit environment overrides still need to be compatible with the chosen
+shared process. Do not copy two separate launch environments blindly.
+
+Inspect the effective settings and current occupancy after startup:
+
+```bash
+curl -s http://127.0.0.1:8080/props | jq '.models[] | {
+  id, target_device, draft_device, capacity, in_flight, max_context,
+  props
+}'
+```
+
+Each response's `model` tells clients which model answered. Use an explicit
+model name for stable behavior across a conversation; use `auto` when either
+model is acceptable.
 
 ## Request selection and admission
 
@@ -62,7 +126,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   An explicitly selected full model returns 503 even if another is idle.
   Unknown model names return 404. This version adds no global waiting queue
   and performs no retries or fallback to another model.
-- Reservations cover parsing, pending admission, generation, retirement, and
+- Reservations cover model-specific parsing, pending admission, generation, retirement, and
   final output draining. They are released exactly once when the selected
   request handler returns. A disconnect does not free capacity while the
   engine still owns the request. Slow output draining can conservatively hold
@@ -110,21 +174,32 @@ client has sent only part of an upload.
 Each model must expose a local paged sequence engine. The initial CLI rejects
 sharded targets, remote drafts, PFlash/compression forwarding, request-scoped
 drafts, and expert-routing collection in this mode. It also rejects per-model
-CLI switches that mutate process-wide policy, including KV-type overrides,
-SpecLA, KVFlash, Spark, peer access, and rollback overrides. Shared KV and kernel
-environment settings remain process-wide; they are not isolated per model.
+CLI switches that mutate process-wide policy, including SpecLA, KVFlash, Spark,
+peer access, and rollback overrides. Qwen KV-type CLI overrides are per-model;
+shared environment defaults and kernel settings remain process-wide.
 Existing single-model launches retain their CLI behavior.
 
-The implementation was compiled for HIP `gfx1151;gfx1201`. Host-only HTTP
-integration tests exercise the real listener and scheduler with two controlled
-sequence engines: 2+2 admission and overload, independent progress, per-model
-tokenization/templates/sampling defaults, malformed input and failed admission,
-reset/disconnect retirement, streaming, discovery, and shutdown with an
-incomplete upload. The full model-free server suite also passes.
+The implementation was compiled for both HIP `gfx1151` and `gfx1201`, verified
+in the actual compile commands. The model-free server suite passes all 456
+tests. HTTP integration tests cover routing, distinct tokenizers/templates and
+sampling defaults, malformed input, overload, cancellation, response protocols,
+and handler lifetimes. A GPU regression verifies independent backend dispatch
+settings and preserves the tested ROCmFP4 arithmetic through 16 columns.
 
-**Real-model simultaneous two-GPU execution is not yet qualified.** GPU execution
-was deferred because a separate benchmark was running. Before promoting this
-feature, run the exact Qwen/DFlash2 + monolithic DS4 pair together, confirm both
-workers advance at C=4 with a 2+2 split, and check mixed prompts, cancellation,
-slot reuse, output validity, and shutdown. Host tests do not establish GPU
-runtime isolation, numerical correctness, or a performance improvement.
+The real Qwen3.8-27B IQ4_XS + Q8_0 DFlash2 pair on R9700 and monolithic
+DeepSeek-V4-Flash ROCMFP2 on Strix passed the 2+2 workload with 4,096-token
+context limits:
+
+- Explicit and automatic C4 routing both reached two active reservations per model.
+- Each model's generated outputs matched between its C2 run and mixed C4 run
+  on the two comparison prompts. DS4 also matched its previous environment-based
+  dispatch control after moving that default into its own backend context.
+- The repository canonical concurrency benchmark completed 12/12 mixed
+  code/prose requests, each with 128 completion tokens, across three C4 waves.
+- TCP-reset cancellation and subsequent slot reuse passed on each model.
+- Shutdown with a request active on each model and an incomplete HTTP upload
+  closed every connection and exited successfully.
+
+These are short-prompt serving checks on this exact pair. They do not qualify
+long-context quality, additional models/devices, or a performance improvement.
+Arbitrary per-model environment variables remain unsupported.

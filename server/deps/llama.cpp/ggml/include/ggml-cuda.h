@@ -115,6 +115,11 @@ GGML_BACKEND_API int ggml_backend_cuda_get_device_id(ggml_backend_t backend);
 // changing concurrent requests or other CUDA/HIP backends.
 GGML_BACKEND_API int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols);
 
+// Set one backend's plain quantized-matmul crossover before executing graphs.
+// Zero inherits the environment/default. Unlike the thread override, this
+// does not force an exact-MMVQ policy for routed MoE operations.
+GGML_BACKEND_API bool ggml_backend_cuda_set_mmvq_max_ncols(ggml_backend_t backend, int max_ncols);
+
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 

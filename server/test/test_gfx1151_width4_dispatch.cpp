@@ -16,10 +16,13 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
+#include "scoped_env.h"
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -150,18 +153,52 @@ bool test_rocmfp4_packed_columns(ggml_backend_t backend) {
         for (float & v : input) {
             v = lcg_uniform() * 3.0f;
         }
-        const int previous = ggml_backend_cuda_set_mmvq_max_ncols_override(16);
+        if (!ggml_backend_cuda_set_mmvq_max_ncols(backend, 16)) return false;
         for (int n = 2; n <= 16; ++n) {
             ok = check_columns(backend, shape.label, T, shape.k, shape.m, n, wbytes, input) && ok;
         }
-        ggml_backend_cuda_set_mmvq_max_ncols_override(previous);
     }
+    return ok;
+}
+
+// A DS4 backend's wide default must not select an unsupported >8-column Q8
+// vector kernel in another model's backend, even on the same physical GPU.
+bool test_backend_default_isolation() {
+    ggml_backend_t other = ggml_backend_cuda_init(0);
+    if (!other) return false;
+    constexpr int K = 256, M = 32, N = 16;
+    const auto * traits = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, K);
+    std::vector<uint8_t> weights(row_bytes * M);
+    std::vector<float> row(K), decoded(K), expected(M * N);
+    lcg_state = 0x13579u;
+    for (int r = 0; r < M; ++r) {
+        for (float & v : row) v = lcg_uniform() * 0.05f;
+        traits->from_float_ref(row.data(), weights.data() + row_bytes * r, K);
+        traits->to_float(weights.data() + row_bytes * r, decoded.data(), K);
+        double sum = 0;
+        for (float v : decoded) sum += v;
+        for (int c = 0; c < N; ++c) expected[c * M + r] = (c % 2 ? -1 : 1) * sum;
+    }
+    std::vector<float> input(K * N), output;
+    for (int c = 0; c < N; ++c) {
+        std::fill_n(input.data() + c * K, K, c % 2 ? -1.0f : 1.0f);
+    }
+    bool ok = compute(other, GGML_TYPE_Q8_0, K, M, N, weights, input.data(), output);
+    if (ok) {
+        for (size_t i = 0; i < output.size(); ++i) {
+            ok = ok && std::isfinite(output[i]) && std::fabs(output[i] - expected[i]) < 1e-4f;
+        }
+    }
+    ggml_backend_free(other);
+    std::printf("%s per-backend MMVQ default: second context Q8 N=16\n", ok ? "PASS" : "FAIL");
     return ok;
 }
 
 } // namespace
 
 int main() {
+    const luce_test::ScopedEnvVar shared_crossover("LUCE_MMVQ_MAX_NCOLS", "3");
     hipDeviceProp_t properties{};
     if (hipGetDeviceProperties(&properties, 0) != hipSuccess) {
         std::fprintf(stderr, "failed to query HIP device 0\n");
@@ -180,6 +217,7 @@ int main() {
     const bool previous_graphs = ggml_backend_cuda_set_graphs_disabled_override(true);
     bool ok = test_narrow_f16(backend);
     ok = test_rocmfp4_packed_columns(backend) && ok;
+    ok = test_backend_default_isolation() && ok;
     ggml_backend_cuda_set_graphs_disabled_override(previous_graphs);
     ggml_backend_free(backend);
     std::printf("%s\n", ok ? "PASS gfx1151 width-4 dispatch" : "FAIL gfx1151 width-4 dispatch");
