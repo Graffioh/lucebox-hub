@@ -2644,14 +2644,16 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
     }
     if (load_request == nullptr) return results;
 
+    // Parking releases target/cache buffers, including the expert backend.
+    // Drain their queued work before releasing any of those dependencies.
+    if (backend_) ggml_backend_synchronize(backend_);
+    if (spec_backend_) ggml_backend_synchronize(spec_backend_);
+    if (expert_backend_) ggml_backend_synchronize(expert_backend_);
     const bool was_parked = parked_;
     if (!load_request->skip_park && !parked_ &&
         !park(ParkTarget::TargetModel)) {
         return results;
     }
-    if (backend_) ggml_backend_synchronize(backend_);
-    if (spec_backend_) ggml_backend_synchronize(spec_backend_);
-
     if (pflash_drafter_loaded_ &&
         (pflash_drafter_path_ != load_request->drafter_path ||
          pflash_drafter_gpu_ != load_request->drafter_gpu)) {
@@ -2663,6 +2665,7 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
                           pflash_drafter_ctx_)) {
             std::fprintf(stderr, "[deepseek4-pflash] load failed: %s\n",
                          dflash27b_last_error());
+            release_pflash_drafter();
             if (!load_request->skip_park && !was_parked) {
                 unpark(ParkTarget::TargetModel);
             }
@@ -2739,7 +2742,7 @@ bool DeepSeek4Backend::handle_compress(const std::string & line,
 }
 
 void DeepSeek4Backend::release_pflash_drafter() {
-    if (!pflash_drafter_loaded_) return;
+    // A failed load can own a backend even before the loaded flag is set.
     dflash::common::free_drafter(pflash_drafter_ctx_);
     pflash_drafter_loaded_ = false;
     pflash_drafter_path_.clear();

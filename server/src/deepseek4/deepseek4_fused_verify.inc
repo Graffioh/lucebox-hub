@@ -542,6 +542,10 @@ static bool ds4_build_fused_verify_graph(
         // top-k boundary, preserving fused-graph replay.
         const bool sparse_attention =
             ds4_env_flag("DFLASH_DS4_SPARSE_DECODE_FLASH") && ratio > 0 &&
+            // The exact indexer carries saved raw rows for batched lanes.
+            // Coarse block selection has no saved-row contract; retain the
+            // explicit verifier there instead of pruning raw history.
+            (lane_q == 1 || ratio == 4) &&
             padded > 2 * w.n_indexer_top_k;
         const DeepSeek4AttentionImpl attention_impl = sparse_attention
             ? DeepSeek4AttentionImpl::SparseFlash

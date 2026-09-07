@@ -319,6 +319,13 @@ struct DeepSeek4BackendConfig {
 
 // ─── Function declarations ──────────────────────────────────────────────
 
+// Select compressed rows plus the saved raw suffix of a batched verifier.
+// Indices are relative to the end of the physical raw ring. Causal visibility
+// remains in the attention mask; saving a row does not make it visible to all lanes.
+ggml_tensor * deepseek4_indexed_attention_rows(
+    ggml_context * ctx, ggml_tensor * compressed_topk,
+    int compressed_rows, int preserved_rows);
+
 bool load_deepseek4_gguf(const std::string & path,
                           ggml_backend_t backend,
                           DeepSeek4Weights & out);

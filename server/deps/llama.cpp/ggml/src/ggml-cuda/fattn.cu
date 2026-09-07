@@ -478,7 +478,7 @@ __global__ static void ds4_fa_indexed_rows_parallel_kernel(
 // A shared-memory bitonic sort restores ascending physical-row order, matching
 // the old top-k -> mask -> physical scan path and therefore preserving each
 // reduction lane's accumulation order exactly.
-template <typename Mask>
+template <typename Mask, int SORT_WIDTH>
 __global__ static void ds4_fa_indexed_rows_topk_kernel(
         const Mask    * mask,
         const int32_t * topk,
@@ -494,7 +494,6 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
     const int tid = (int) threadIdx.x;
     if (t >= n_tokens) return;
 
-    constexpr int SORT_WIDTH = 512;
     constexpr int N_OWNERS = 256;
     constexpr int INVALID_ROW = 0x7fffffff;
     __shared__ int sorted_rows[SORT_WIDTH];
@@ -570,6 +569,26 @@ __global__ static void ds4_fa_indexed_rows_topk_kernel(
                 token_owner_ranks[write++] = rank;
             }
         }
+    }
+}
+
+template <typename Mask>
+static void ds4_launch_indexed_rows_topk(
+        const Mask * mask, const int32_t * topk,
+        int * selected_rows, int * selected_counts,
+        int * owner_offsets, int * owner_ranks,
+        int n_tokens, int n_kv, int raw_rows, int capacity,
+        cudaStream_t stream) {
+    // The learned top-512 stays on its original launch. A batched verifier
+    // appends a small saved-raw suffix and needs the next sorting bucket.
+    if (capacity <= 512) {
+        ds4_fa_indexed_rows_topk_kernel<Mask, 512><<<n_tokens, 512, 0, stream>>>(
+            mask, topk, selected_rows, selected_counts, owner_offsets, owner_ranks,
+            n_tokens, n_kv, raw_rows, capacity);
+    } else {
+        ds4_fa_indexed_rows_topk_kernel<Mask, 1024><<<n_tokens, 1024, 0, stream>>>(
+            mask, topk, selected_rows, selected_counts, owner_offsets, owner_ranks,
+            n_tokens, n_kv, raw_rows, capacity);
     }
 }
 
@@ -1789,7 +1808,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
     }
     const int n_comp_rows = n_kv - raw_rows;
     if (indexer_topk &&
-        (sparse_keep_rows >= 0 || -sparse_keep_rows > 512 ||
+        (sparse_keep_rows >= 0 || -sparse_keep_rows > 1024 ||
          -sparse_keep_rows > n_comp_rows ||
          indexer_topk->type != GGML_TYPE_I32 ||
          indexer_topk->ne[0] != -sparse_keep_rows ||
@@ -1994,12 +2013,12 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 getenv("GGML_DS4_FA_SERIAL_INDEX_SCAN") == nullptr;
             if (mask->type == GGML_TYPE_F16) {
                 if (indexer_topk) {
-                    ds4_fa_indexed_rows_topk_kernel<half><<<n_tokens, 512, 0, stream>>>(
+                    ds4_launch_indexed_rows_topk<half>(
                         (const half *) mask->data,
                         (const int32_t *) indexer_topk->data,
                         indexed_rows, indexed_counts,
                         indexed_owner_offsets, indexed_owner_ranks,
-                        n_tokens, n_kv, raw_rows, indexed_capacity);
+                        n_tokens, n_kv, raw_rows, indexed_capacity, stream);
                 } else if (parallel_index_scan) {
                     ds4_fa_indexed_rows_parallel_kernel<half><<<n_tokens, 256, 0, stream>>>(
                         (const half *) mask->data, indexed_rows, indexed_counts,
@@ -2015,12 +2034,12 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                 }
             } else {
                 if (indexer_topk) {
-                    ds4_fa_indexed_rows_topk_kernel<float><<<n_tokens, 512, 0, stream>>>(
+                    ds4_launch_indexed_rows_topk<float>(
                         (const float *) mask->data,
                         (const int32_t *) indexer_topk->data,
                         indexed_rows, indexed_counts,
                         indexed_owner_offsets, indexed_owner_ranks,
-                        n_tokens, n_kv, raw_rows, indexed_capacity);
+                        n_tokens, n_kv, raw_rows, indexed_capacity, stream);
                 } else if (parallel_index_scan) {
                     ds4_fa_indexed_rows_parallel_kernel<float><<<n_tokens, 256, 0, stream>>>(
                         (const float *) mask->data, indexed_rows, indexed_counts,

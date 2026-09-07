@@ -47,6 +47,26 @@
 
 namespace dflash::common {
 
+ggml_tensor * deepseek4_indexed_attention_rows(
+        ggml_context * ctx, ggml_tensor * compressed_topk,
+        int compressed_rows, int preserved_rows) {
+    GGML_ASSERT(compressed_topk && compressed_topk->type == GGML_TYPE_I32);
+    GGML_ASSERT(compressed_rows >= 0 && preserved_rows >= 0);
+    if (preserved_rows == 0) return compressed_topk;
+    // ARANGE uses F32, so its integer endpoints must be exactly representable.
+    GGML_ASSERT((int64_t) compressed_rows + preserved_rows <= (1 << 24));
+    auto * saved = ggml_cast(ctx, ggml_arange(
+        ctx, (float) compressed_rows, (float) (compressed_rows + preserved_rows),
+        1.0f), GGML_TYPE_I32);
+    auto * shape = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, preserved_rows, compressed_topk->ne[1]);
+    saved = ggml_repeat(ctx, saved, shape);
+    // The suffix is not part of the learned top-k competition. Append all of
+    // it to each lane's row list; the existing causal mask hides overwritten,
+    // not-yet-written and future rows. No host binding is needed on replay.
+    return ggml_concat(ctx, compressed_topk, saved, 0);
+}
+
 namespace {
 using Ds4TimingClock = std::chrono::steady_clock;
 
@@ -2091,6 +2111,10 @@ static ggml_tensor * build_mla_attention(
             score_mask = ggml_reshape_2d(ctx, cmask, n_attn, n_tokens);
         }
     }
+    if (indexer_topk) {
+        indexer_topk = deepseek4_indexed_attention_rows(
+            ctx, indexer_topk, n_comp_attn, n_old_rows);
+    }
     const bool direct_indexer_topk = indexer_topk &&
         ds4_env_flag("DFLASH_DS4_DIRECT_INDEXER_TOPK");
     if (indexer_topk) {
@@ -2272,7 +2296,7 @@ static ggml_tensor * build_mla_attention(
             ggml_flash_attn_ext_set_ds4_sparse(
                 context, n_raw, w.n_swa,
                 indexer_topk
-                    ? -w.n_indexer_top_k
+                    ? -(int) indexer_topk->ne[0]
                     : attention_impl == DeepSeek4AttentionImpl::SparseFlash
                         ? w.n_indexer_top_k : 0,
                 32);
