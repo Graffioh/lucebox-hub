@@ -482,16 +482,20 @@ bool deepseek4_snapshot_bind(ggml_context * ctx,
     free_deepseek4_snapshot(out);
     if (!ctx || !buf) return false;
 
+    // Bound the meta length before allocating from it: a corrupt file must
+    // not drive the read size.
+    constexpr int64_t kMaxLayers = 4096;
+    constexpr int64_t kMaxMetaLen = kDeepSeek4SnapMetaBase + 2 * kMaxLayers;
     ggml_tensor * meta = find_named(ctx, deepseek4_snapshot_tensor_name(name_prefix, kDeepSeek4SnapMetaName));
     if (!meta || meta->type != GGML_TYPE_I32 || ggml_n_dims(meta) != 1 ||
-        meta->ne[0] < kDeepSeek4SnapMetaBase || !meta->data) {
+        meta->ne[0] < kDeepSeek4SnapMetaBase || meta->ne[0] > kMaxMetaLen || !meta->data) {
         return false;
     }
     std::vector<int32_t> m((size_t) meta->ne[0], 0);
     ggml_backend_tensor_get(meta, m.data(), 0, m.size() * sizeof(int32_t));
     if (m[0] != kDeepSeek4SnapMetaVersion) return false;
     const int n_layer = m[1], n_vocab = m[2], n_spec_feat = m[3], cur_pos = m[4];
-    if (n_layer <= 0 || n_layer > 4096 || n_vocab < 0 || n_spec_feat < 0 || cur_pos < 0 ||
+    if (n_layer <= 0 || n_layer > kMaxLayers || n_vocab < 0 || n_spec_feat < 0 || cur_pos < 0 ||
         meta->ne[0] != (int64_t) (kDeepSeek4SnapMetaBase + 2 * n_layer)) {
         return false;
     }

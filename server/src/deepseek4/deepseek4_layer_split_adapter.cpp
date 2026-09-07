@@ -719,20 +719,20 @@ bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {
     if (!buf) return fail();
     ggml_backend_buffer_clear(buf, 0);
 
+    // From here on the slot owns ctx/buf; snapshot_free() releases them and
+    // the remote shard's slot together on every later failure path.
+    snap.ctx = ctx;
+    snap.buf = buf;
     for (size_t i = 0; i < shards_.size(); ++i) {
         snap.shards[i].ctx = ctx;
         snap.shards[i].buf = buf;
         if (!deepseek4_snapshot_fill(shards_[i].cache, &empty_aux, snap.shards[i])) {
-            for (auto & shard_snap : snap.shards) shard_snap = DeepSeek4Snapshot{};
-            ggml_backend_buffer_free(buf);
-            ggml_free(ctx);
+            snapshot_free(slot);
             return false;
         }
     }
     if (use_mixed_target_split() && !remote_target_shard_.snapshot_save(slot)) {
-        for (auto & shard_snap : snap.shards) shard_snap = DeepSeek4Snapshot{};
-        ggml_backend_buffer_free(buf);
-        ggml_free(ctx);
+        snapshot_free(slot);
         return false;
     }
 
@@ -744,8 +744,6 @@ bool DeepSeek4LayerSplitAdapter::snapshot_save(int slot) {
     ds4_split_set_vec(hc, hc_state_);
     ds4_split_set_vec(logits, prefill_last_logits_);
 
-    snap.ctx = ctx;
-    snap.buf = buf;
     snap.cur_pos = cur_pos_;
     snap.last_tok = last_tok_;
     snap.hc_state = hc_state_;
