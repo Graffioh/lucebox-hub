@@ -26,6 +26,7 @@
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
 #include "kvflash_pager.h"
+#include "kv_quant.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -265,24 +266,14 @@ struct LoadedModel {
     }
 };
 
-static int load_model(int argc, char ** argv, LoadedModel & loaded,
-                      bool multi_model) {
-    if (argc < 2 || argv[1][0] == '-') {
-        print_usage(argv[0]);
-        return 2;
-    }
-
-    // Parse arguments.
+struct ModelOptions {
     BackendArgs bargs;
     ServerConfig sconfig;
-    bargs.model_path = argv[1];
     bool   spark_autotune = false; // --spark: self-tuning hot/cold MoE residency
     int    spark_slots = -1;       // --spark-slots: explicit cache slots/layer (-1=auto)
     double spark_vram_gib = 0.0;   // --spark-vram: total VRAM target in GiB (0=use card)
     std::string cache_type_k;  // explicit --cache-type-k override
     std::string cache_type_v;  // explicit --cache-type-v override
-    bool target_device_seen = false;
-    bool target_devices_seen = false;
     bool fast_rollback_forced_off = false;
     bool target_split_fast_rollback_cli = false;
     bool adaptive_experts_set = false;  // --adaptive-experts (MoE architectures only)
@@ -313,7 +304,49 @@ static int load_model(int argc, char ** argv, LoadedModel & loaded,
     bool legacy_max_tokens_set = false;
     int  legacy_max_tokens_val = 0;
 
+};
+
+static int parse_model_options(int argc, char ** argv, ModelOptions & model,
+                               bool multi_model, bool first_model) {
+    if (argc < 2 || argv[1][0] == '-') {
+        print_usage(argv[0]);
+        return 2;
+    }
+    auto & bargs = model.bargs;
+    auto & sconfig = model.sconfig;
+    auto & spark_autotune = model.spark_autotune;
+    auto & spark_slots = model.spark_slots;
+    auto & spark_vram_gib = model.spark_vram_gib;
+    auto & cache_type_k = model.cache_type_k;
+    auto & cache_type_v = model.cache_type_v;
+    auto & fast_rollback_forced_off = model.fast_rollback_forced_off;
+    auto & target_split_fast_rollback_cli = model.target_split_fast_rollback_cli;
+    auto & adaptive_experts_set = model.adaptive_experts_set;
+    auto & ddtree_tau_set = model.ddtree_tau_set;
+    auto & specla_top_k_set = model.specla_top_k_set;
+    auto & specla_top_k = model.specla_top_k;
+    auto & cli_set = model.cli_set;
+    auto & legacy_max_tokens_set = model.legacy_max_tokens_set;
+    auto & legacy_max_tokens_val = model.legacy_max_tokens_val;
+    bool target_device_seen = false;
+    bool target_devices_seen = false;
+    bargs.model_path = argv[1];
+
     for (int i = 2; i < argc; i++) {
+        const std::string option = argv[i];
+        if (multi_model && !first_model &&
+            (option == "--host" || option == "--port" || option == "--no-cors")) {
+            std::fprintf(stderr, "[server] %s belongs in the first model block: there is one listener\n", argv[i]);
+            return 2;
+        }
+        if (multi_model && (option == "--peer-access" ||
+            option == "--no-fast-rollback" || option == "--target-split-fast-rollback" ||
+            option == "--adaptive-experts" || option == "--specla" ||
+            option == "--specla-top-k" || option.rfind("--kvflash", 0) == 0 ||
+            option.rfind("--spark", 0) == 0)) {
+            std::fprintf(stderr, "[server] %s changes process-wide policy and cannot be scoped to a model\n", argv[i]);
+            return 2;
+        }
         if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
             bargs.draft_path = argv[++i];
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -726,6 +759,42 @@ static int load_model(int argc, char ** argv, LoadedModel & loaded,
         bargs.ddtree_tau = 6.0f;
     }
 
+    for (const auto * type : {&cache_type_k, &cache_type_v}) {
+        if (!type->empty() && dflash::parse_kv_type(type->c_str()) == GGML_TYPE_COUNT) {
+            std::fprintf(stderr, "[server] invalid KV cache type '%s' (use f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0 or tq3_0)\n", type->c_str());
+            return 2;
+        }
+    }
+    // Validate every block before model files or GPU resources are loaded.
+    if (bargs.max_concurrency > 1) bargs.paged_attention = true;
+    if (multi_model && (!bargs.paged_attention || bargs.device.is_multi_device() ||
+            bargs.remote_draft.enabled() || bargs.remote_target_shard.enabled() ||
+            sconfig.pflash_mode != ServerConfig::PflashMode::OFF ||
+            !sconfig.pflash_upstream_base.empty() || sconfig.lazy_draft ||
+            sconfig.freq_tracking || !sconfig.collect_routing_path.empty())) {
+        std::fprintf(stderr, "[server] model '%s' requires local paged serving; compression, sharding, request-scoped drafts and routing collection are unsupported with --next-model\n", sconfig.model_name.c_str());
+        return 2;
+    }
+    return 0;
+}
+
+static int load_model(ModelOptions & model, LoadedModel & loaded) {
+    auto & bargs = model.bargs;
+    auto & sconfig = model.sconfig;
+    auto & spark_autotune = model.spark_autotune;
+    auto & spark_slots = model.spark_slots;
+    auto & spark_vram_gib = model.spark_vram_gib;
+    auto & cache_type_k = model.cache_type_k;
+    auto & cache_type_v = model.cache_type_v;
+    auto & fast_rollback_forced_off = model.fast_rollback_forced_off;
+    auto & target_split_fast_rollback_cli = model.target_split_fast_rollback_cli;
+    auto & adaptive_experts_set = model.adaptive_experts_set;
+    auto & ddtree_tau_set = model.ddtree_tau_set;
+    auto & specla_top_k_set = model.specla_top_k_set;
+    auto & specla_top_k = model.specla_top_k;
+    auto & cli_set = model.cli_set;
+    auto & legacy_max_tokens_set = model.legacy_max_tokens_set;
+    auto & legacy_max_tokens_val = model.legacy_max_tokens_val;
     if (fast_rollback_forced_off) {
         bargs.fast_rollback = false;
         target_split_fast_rollback_cli = false;
@@ -756,24 +825,6 @@ static int load_model(int argc, char ** argv, LoadedModel & loaded,
         if (const char * e = std::getenv("DFLASH27B_DRAFT_SWA")) {
             bargs.draft_swa_window = std::atoi(e);
         }
-    }
-
-    // Concurrent serving is implemented by the paged engine, so one user-facing
-    // concurrency flag selects the complete serving mode. Keep the feature gate
-    // strict for non-CLI callers that construct BackendArgs directly.
-    if (bargs.max_concurrency > 1) {
-        bargs.paged_attention = true;
-    }
-
-    if (multi_model && (!bargs.paged_attention || bargs.device.is_multi_device() ||
-            bargs.remote_draft.enabled() || bargs.remote_target_shard.enabled() ||
-            sconfig.pflash_mode != ServerConfig::PflashMode::OFF ||
-            !sconfig.pflash_upstream_base.empty() || sconfig.lazy_draft ||
-            sconfig.freq_tracking || !sconfig.collect_routing_path.empty())) {
-        std::fprintf(stderr,
-            "[server] --next-model requires local paged serving per model; "
-            "compression, sharding, request-scoped drafts and routing collection are unsupported\n");
-        return 2;
     }
 
     // Ask the factory to resolve model/placement facts and apply its feature
@@ -919,12 +970,25 @@ static int load_model(int argc, char ** argv, LoadedModel & loaded,
         ensure_stats_env("DFLASH_LAGUNA_NEXT_PLACEMENT_OUT", "/dev/null");
     }
 
-    // Explicit --cache-type-k/v override via env vars.
-    if (!cache_type_k.empty()) {
-        set_environment_variable("DFLASH27B_KV_K", cache_type_k.c_str(), true);
-    }
-    if (!cache_type_v.empty()) {
-        set_environment_variable("DFLASH27B_KV_V", cache_type_v.c_str(), true);
+    // Monolithic Qwen owns its KV overrides, including allocation/budgeting.
+    // DS4 has a family-specific cache layout and never consumed these flags.
+    if (arch == "qwen35" && !bargs.device.is_multi_device()) {
+        if (!cache_type_k.empty()) bargs.cache_type_k = dflash::parse_kv_type(cache_type_k.c_str());
+        if (!cache_type_v.empty()) bargs.cache_type_v = dflash::parse_kv_type(cache_type_v.c_str());
+        dflash::resolve_kv_types(bargs.cache_type_k, bargs.cache_type_v,
+                                bargs.cache_type_k, bargs.cache_type_v);
+        cache_type_k = dflash::kv_type_name(bargs.cache_type_k);
+        cache_type_v = dflash::kv_type_name(bargs.cache_type_v);
+    } else if (arch == "deepseek4") {
+        if (!cache_type_k.empty() || !cache_type_v.empty()) {
+            std::fprintf(stderr, "[server] model '%s': --cache-type-k/v are ignored by DeepSeek4's fixed cache layout\n", sconfig.model_name.c_str());
+        }
+        cache_type_k = cache_type_v = "fixed (deepseek4)";
+    } else {
+        // Preserve existing single-model architectures and remote-shard launches.
+        // These paths cannot participate in multi-model paged serving.
+        if (!cache_type_k.empty()) set_environment_variable("DFLASH27B_KV_K", cache_type_k.c_str(), true);
+        if (!cache_type_v.empty()) set_environment_variable("DFLASH27B_KV_V", cache_type_v.c_str(), true);
     }
 
     // TQ3_0 KV auto-selection was removed (2026-07): tq3_0 saved ~40% VRAM on
@@ -1306,17 +1370,9 @@ static int load_model(int argc, char ** argv, LoadedModel & loaded,
     std::fprintf(stderr, "[server] │  prefill_cache   = %d slots\n", sconfig.prefill_cache_cap);
     std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
     std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
-#ifdef GGML_USE_HIP
-        cache_type_k.empty() ? "q4_0 (default, HIP)" : cache_type_k.c_str());
-#else
         cache_type_k.empty() ? "family default" : cache_type_k.c_str());
-#endif
     std::fprintf(stderr, "[server] │  cache_type_v    = %s\n",
-#ifdef GGML_USE_HIP
-        cache_type_v.empty() ? "q4_0 (default, HIP)" : cache_type_v.c_str());
-#else
         cache_type_v.empty() ? "family default" : cache_type_v.c_str());
-#endif
     std::fprintf(stderr, "[server] │  pflash          = %s\n",
         sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" :
         sconfig.pflash_mode == ServerConfig::PflashMode::ALWAYS ? "always" : "off");
@@ -1462,38 +1518,37 @@ int main(int argc, char ** argv) {
         }
     }
     const bool multi_model = model_args.size() > 1;
+    std::vector<ModelOptions> options(model_args.size());
     std::set<std::string> names;
     for (size_t m = 0; m < model_args.size(); ++m) {
-        const auto & args = model_args[m];
-        if (args.size() < 2 || args[1][0] == '-') {
-            print_usage(argv[0]);
+        auto & args = model_args[m];
+        const int count = (int)args.size();
+        args.push_back(nullptr);
+        const int ret = parse_model_options(count, args.data(), options[m], multi_model, m == 0);
+        if (ret != 0) {
+            std::fprintf(stderr, "[server] invalid model block %zu (%s)\n", m + 1,
+                options[m].sconfig.model_name.c_str());
+            return ret;
+        }
+        const auto & name = options[m].sconfig.model_name;
+        if (multi_model && (name.empty() || name == "auto" || !names.insert(name).second)) {
+            std::fprintf(stderr, "[server] model block %zu: --model-name must be unique, nonempty and different from auto (got '%s')\n", m + 1, name.c_str());
             return 2;
         }
-        if (!multi_model) continue;
-        std::string name = "dflash";
-        for (size_t i = 2; i < args.size(); ++i) {
-            const std::string arg = args[i];
-            if (arg == "--model-name" && i + 1 < args.size()) name = args[i + 1];
-            if (m > 0 && (arg == "--host" || arg == "--port" || arg == "--no-cors")) {
-                std::fprintf(stderr, "[server] %s belongs before --next-model: there is one listener\n", args[i]);
-                return 2;
-            }
-            // These CLI switches change process-global settings, sometimes read
-            // lazily during execution. They cannot be scoped to a model. Shared
-            // KV/kernel settings can instead be supplied once in the environment.
-            if (arg == "--cache-type-k" || arg == "--cache-type-v" ||
-                arg == "--peer-access" || arg == "--no-fast-rollback" ||
-                arg == "--target-split-fast-rollback" ||
-                arg == "--adaptive-experts" || arg == "--specla" ||
-                arg == "--specla-top-k" || arg.rfind("--kvflash", 0) == 0 ||
-                arg.rfind("--spark", 0) == 0) {
-                std::fprintf(stderr, "[server] %s changes process-wide policy and is not supported with --next-model\n", args[i]);
-                return 2;
-            }
-        }
-        if (name.empty() || name == "auto" || !names.insert(name).second) {
-            std::fprintf(stderr, "[server] --next-model requires unique, nonempty --model-name values other than auto\n");
-            return 2;
+    }
+
+    if (multi_model) {
+        const auto & listener = options.front().sconfig;
+        std::fprintf(stderr, "[server] one listener at %s:%d; %zu independent models (environment settings are shared)\n",
+            listener.host.c_str(), listener.port, options.size());
+        for (size_t m = 0; m < options.size(); ++m) {
+            auto & option = options[m];
+            option.sconfig.host = listener.host;
+            option.sconfig.port = listener.port;
+            option.sconfig.enable_cors = listener.enable_cors;
+            std::fprintf(stderr, "[server] model %zu: %s target=%s slots=%d\n",
+                m + 1, option.sconfig.model_name.c_str(),
+                placement_device_name(option.bargs.device).c_str(), option.bargs.max_concurrency);
         }
     }
 
@@ -1501,11 +1556,9 @@ int main(int argc, char ** argv) {
     std::vector<HttpServer *> servers;
     // All initialization (including backend environment defaults) finishes
     // before starting any scheduler. No worker observes model-loading mutations.
-    for (auto & args : model_args) {
+    for (auto & option : options) {
         auto model = std::make_unique<LoadedModel>();
-        const int count = (int)args.size();
-        args.push_back(nullptr);
-        const int ret = load_model(count, args.data(), *model, multi_model);
+        const int ret = load_model(option, *model);
         if (ret != 0) return ret;
         servers.push_back(model->server.get());
         loaded.push_back(std::move(model));

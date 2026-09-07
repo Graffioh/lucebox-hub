@@ -266,7 +266,7 @@ Qwen35Backend::~Qwen35Backend() { shutdown(); }
 KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
                                                      int64_t gpu_free) const {
     ggml_type kv_k = GGML_TYPE_Q8_0, kv_v = GGML_TYPE_Q8_0;
-    dflash::resolve_kv_types(kv_k, kv_v);
+    dflash::resolve_kv_types(kv_k, kv_v, cfg_.cache_type_k, cfg_.cache_type_v);
     KvFlashAutoBudget b;
     b.free_bytes      = gpu_free;
     // Single source of truth with the qwen35moe placement path — see kv_quant.h.
@@ -552,7 +552,7 @@ bool Qwen35Backend::init() {
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
                              cfg_.paged_attention, n_slots,
-                             fixed_chain.enabled)) {
+                             fixed_chain.enabled, cfg_.cache_type_k, cfg_.cache_type_v)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
     }
