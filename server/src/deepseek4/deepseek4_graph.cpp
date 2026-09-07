@@ -1026,7 +1026,9 @@ static void build_compressor_step(
         int kv_start_all = -1,
         bool indexer_qat = false,
         ggml_tensor ** current_comp_out = nullptr,
-        bool paged_physical_row = false) {
+        bool paged_physical_row = false,
+        ggml_tensor * prepared_kv = nullptr,
+        ggml_tensor * prepared_score = nullptr) {
     if (!gf || !cur_last || !ape || !kv_proj || !gate_proj || !norm_weight ||
         !state.state_kv || !state.state_score || !comp_cache || ratio <= 0) {
         return;
@@ -1053,8 +1055,10 @@ static void build_compressor_step(
     // For ratio-4: write into second half of state (rows ratio..2*ratio-1)
     const int row = (ratio == 4) ? (ratio + pos_mod) : pos_mod;
 
-    ggml_tensor * kv_cur = ggml_mul_mat(ctx, kv_proj, cur_last);
-    ggml_tensor * sc_cur = ggml_mul_mat(ctx, gate_proj, cur_last);
+    // Gathered lanes may share the token-independent projections. State
+    // writes, pooling and rotation below still execute in lane order.
+    ggml_tensor * kv_cur = prepared_kv ? prepared_kv : ggml_mul_mat(ctx, kv_proj, cur_last);
+    ggml_tensor * sc_cur = prepared_score ? prepared_score : ggml_mul_mat(ctx, gate_proj, cur_last);
     ggml_tensor * state_kv_source = state.state_kv;
     ggml_tensor * state_score_source = state.state_score;
     ggml_tensor * comp_cache_source = comp_cache;
@@ -1728,6 +1732,8 @@ struct DeepSeek4PreparedProjectedLane {
     ggml_tensor * q = nullptr;
     ggml_tensor * kv = nullptr;
     ggml_tensor * rope_pos = nullptr;
+    ggml_tensor * compressor_kv = nullptr;
+    ggml_tensor * compressor_score = nullptr;
 };
 
 // Per-layer RoPE parameters. Compressed layers use YaRN scaling, and
@@ -1884,6 +1890,14 @@ static DeepSeek4PreparedProjectedLane ds4_slice_projected_lane(
         ctx, batched.kv, batched.kv->ne[0], 1, batched.kv->nb[1],
         (size_t) lane * batched.kv->nb[1]);
     out.rope_pos = lane_rope_pos;
+    if (batched.compressor_kv) {
+        out.compressor_kv = ggml_view_2d(ctx, batched.compressor_kv,
+            batched.compressor_kv->ne[0], 1, batched.compressor_kv->nb[1],
+            (size_t) lane * batched.compressor_kv->nb[1]);
+        out.compressor_score = ggml_view_2d(ctx, batched.compressor_score,
+            batched.compressor_score->ne[0], 1, batched.compressor_score->nb[1],
+            (size_t) lane * batched.compressor_score->nb[1]);
+    }
     return out;
 }
 
@@ -2118,7 +2132,9 @@ static ggml_tensor * build_mla_attention_lane_core(
                               kv_start,
                               false,
                               lane.current_comp_out,
-                              gathered_history);
+                              gathered_history,
+                              prepared ? prepared->compressor_kv : nullptr,
+                              prepared ? prepared->compressor_score : nullptr);
     }
 
     ggml_tensor * index_comp_kv_source = lane.index_comp_kv;

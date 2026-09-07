@@ -605,6 +605,19 @@ static bool ds4_build_fused_verify_graph(
                 build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
             DeepSeek4PreparedProjectedLane batched_proj =
                 build_mla_qkv_projection(ctx, attn_normed, w, L, q, projection_columns);
+            // Monolithic paged serving uses gfx1151. Its ROCmFP4 MMVQ
+            // preserves each column's arithmetic through sixteen rows.
+            // Only projections are shared: same-slot compressor mutations
+            // remain chronological inside each lane below.
+            if (!hybrid && q > 1 && ratio > 0 && L.attn_compressor_kv &&
+                L.attn_compressor_gate &&
+                L.attn_compressor_kv->type == GGML_TYPE_Q4_0_ROCMFP4_FAST &&
+                L.attn_compressor_gate->type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                batched_proj.compressor_kv = ds4_mul_mat_columns(
+                    ctx, L.attn_compressor_kv, attn_normed, projection_columns);
+                batched_proj.compressor_score = ds4_mul_mat_columns(
+                    ctx, L.attn_compressor_gate, attn_normed, projection_columns);
+            }
             build_mla_qkv_rope(
                 ctx, batched_proj, w, ds4_rope_params(w, ratio), q,
                 ex.pos_q, /*fuse_q_rope=*/false);
