@@ -999,6 +999,19 @@ if(DFLASH27B_TESTS)
             hip::host)
         list(APPEND _raw_unit_test_targets test_gfx1151_width4_dispatch)
 
+        add_executable(test_qwen35_gdn_verify_fusion test/test_qwen35_gdn_verify_fusion.cpp)
+        set_source_files_properties(test/test_qwen35_gdn_verify_fusion.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_qwen35_gdn_verify_fusion PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_qwen35_gdn_verify_fusion PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+        target_link_libraries(test_qwen35_gdn_verify_fusion PRIVATE
+            ggml
+            ggml-base
+            ${DFLASH27B_GGML_BACKEND_TARGET}
+            hip::host)
+        list(APPEND _raw_unit_test_targets test_qwen35_gdn_verify_fusion)
+
+
         add_executable(test_softmax_sink_col test/test_softmax_sink_col.cpp)
         set_source_files_properties(test/test_softmax_sink_col.cpp PROPERTIES LANGUAGE HIP)
         set_target_properties(test_softmax_sink_col PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
