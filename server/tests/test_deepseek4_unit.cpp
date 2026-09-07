@@ -1842,9 +1842,17 @@ static void test_dspark_compressor_rollback(ggml_backend_t backend, int copy_mod
         write_tensor_pattern(tensors[ti], 11 + (int) ti);
         initial.push_back(read_tensor_bytes(tensors[ti]));
     }
-    auto load = [&](const std::vector<std::vector<uint8_t>> & state) {
-        for (size_t ti = 0; ti < tensors.size(); ++ti)
-            ggml_backend_tensor_set(tensors[ti], state[ti].data(), 0, state[ti].size());
+    auto load = [&](const std::vector<std::vector<uint8_t>> & state,
+                    bool async = false) {
+        for (size_t ti = 0; ti < tensors.size(); ++ti) {
+            if (async) {
+                ggml_backend_tensor_set_async(
+                    copy_backend, tensors[ti], state[ti].data(), 0, state[ti].size());
+            } else {
+                ggml_backend_tensor_set(
+                    tensors[ti], state[ti].data(), 0, state[ti].size());
+            }
+        }
     };
     // Independent sequential state transition. Distinct byte patterns exercise
     // exact restoration of both F16 KV and F32 score rows without rounding.
@@ -1868,9 +1876,8 @@ static void test_dspark_compressor_rollback(ggml_backend_t backend, int copy_mod
             // Six exercises legacy staging capacity, not q6 verifier support.
             for (int q = 1; q <= 6; ++q) {
                 for (int accepted = 0; accepted <= q; ++accepted) {
-                    load(initial);
+                    load(initial, copy_backend != nullptr);
                     deepseek4_spec_rollback_save(cache, rollback, pos, q, copy_backend, pinned);
-                    ggml_backend_synchronize(backend);
                     if (pinned && pos == 0 && q == 1 && accepted == 0) {
                         const auto host_type = ggml_backend_dev_host_buffer_type(
                             ggml_backend_get_device(backend));
@@ -1880,13 +1887,13 @@ static void test_dspark_compressor_rollback(ggml_backend_t backend, int copy_mod
                     }
                     auto verified = initial;
                     advance(verified, pos, q);
-                    load(verified);
+                    load(verified, copy_backend != nullptr);
                     // Production restores to the start and replays for q>4.
                     const int keep = q > 4 && accepted < q ? 0 : accepted;
                     const int boundary = pos + 3 - (pos & 3);
                     const bool restore_prev = boundary < pos + q && boundary >= pos + keep;
-                    deepseek4_spec_rollback_apply(rollback, weights, cache, pos + keep,
-                                                 restore_prev, copy_backend, pinned);
+                    deepseek4_spec_rollback_apply(
+                        rollback, weights, cache, pos + keep, restore_prev);
                     ggml_backend_synchronize(backend);
                     if (q > 4 && accepted < q) {
                         std::vector<std::vector<uint8_t>> restored;

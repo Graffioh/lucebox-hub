@@ -201,6 +201,7 @@ struct DeepSeek4SpecRollback {
     ggml_backend_buffer_t pinned_buf = nullptr;
     uint8_t * pinned_base = nullptr;
     ggml_backend_t async_backend = nullptr;
+    bool uses_pinned_copy = false;
 
     DeepSeek4SpecRollback() = default;
     ~DeepSeek4SpecRollback();
@@ -209,8 +210,9 @@ struct DeepSeek4SpecRollback {
 };
 
 // Supplying backend selects stream-ordered copies; pinned_copy requests the
-// same pinned-host staging used by the speculative loop. Backend must outlive
-// rollback. For q>4 rejection, restore to raw_pos and replay the accepted prefix.
+// same pinned-host staging used by the speculative loop. The saved copy mode
+// is also used by apply. Backend must outlive rollback. For q>4 rejection,
+// restore to raw_pos and replay the accepted prefix.
 void deepseek4_spec_rollback_save(const DeepSeek4Cache & cache,
                                   DeepSeek4SpecRollback & rollback,
                                   int raw_pos,
@@ -222,9 +224,7 @@ void deepseek4_spec_rollback_apply(const DeepSeek4SpecRollback & rollback,
                                    const DeepSeek4Weights & weights,
                                    DeepSeek4Cache & cache,
                                    int commit_pos,
-                                   bool restore_prev,
-                                   ggml_backend_t backend = nullptr,
-                                   bool pinned_copy = false);
+                                   bool restore_prev);
 
 // Run DSpark speculative decode: draft block_size candidates with `drafter`,
 // verify against the DS4 target in one batched forward, accept the matching

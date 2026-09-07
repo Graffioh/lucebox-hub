@@ -381,14 +381,17 @@ void restore_rollback_state(ggml_backend_t backend, ggml_tensor * t,
 void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb,
                         ggml_backend_t backend, bool async_copy,
                         bool pinned_copy, int raw_pos, int raw_count) {
+    ggml_backend_t saved_backend = (async_copy || pinned_copy) ? backend : nullptr;
+    if (rb.async_backend && rb.async_backend != saved_backend) {
+        ggml_backend_synchronize(rb.async_backend);
+    }
+    rb.async_backend = saved_backend;
     rb.raw_pos = raw_pos;
     rb.raw_count = std::clamp(raw_count, 0, kRollbackMaxTokens);
     rb.layers.resize(cache.layers.size());
-    if (async_copy || pinned_copy) {
-        rb.async_backend = backend;
-    }
     const bool use_pinned =
         pinned_copy && init_pinned_rollback(cache, rb, backend);
+    rb.uses_pinned_copy = use_pinned;
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         const DeepSeek4LayerCache & lc = cache.layers[il];
         DeepSeek4SpecRollback::Layer & s = rb.layers[il];
@@ -418,7 +421,7 @@ void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb
             continue;
         }
         if (!use_pinned) {
-            s.raw_rows.resize(s.raw_row_bytes * (size_t) rb.raw_count);
+            s.raw_rows.resize(s.raw_row_bytes * kRollbackMaxTokens);
         }
         for (int t = 0; t < rb.raw_count; ++t) {
             int row = (rb.raw_pos + t) % (int) lc.raw_kv->ne[1];
@@ -463,10 +466,11 @@ void spec_rollback_save(const DeepSeek4Cache & cache, DeepSeek4SpecRollback & rb
 // legitimate flush and must be kept.) Rejected current/ring rows are restored
 // regardless of whether a ratio-4 boundary was crossed.
 void spec_rollback_apply(const DeepSeek4SpecRollback & rb, const DeepSeek4Weights & w,
-                         DeepSeek4Cache & cache, int commit_pos, bool restore_prev,
-                         ggml_backend_t backend, bool async_copy,
-                         bool pinned_copy) {
-    const bool use_pinned = pinned_copy && rb.pinned_buf && rb.pinned_base;
+                         DeepSeek4Cache & cache, int commit_pos, bool restore_prev) {
+    ggml_backend_t backend = rb.async_backend;
+    const bool async_copy = backend != nullptr;
+    const bool use_pinned = rb.uses_pinned_copy;
+    GGML_ASSERT(!use_pinned || (backend && rb.pinned_buf && rb.pinned_base));
     cache.cur_pos = commit_pos;
     for (size_t il = 0; il < cache.layers.size(); ++il) {
         DeepSeek4LayerCache & lc = cache.layers[il];
@@ -572,12 +576,8 @@ void deepseek4_spec_rollback_apply(const DeepSeek4SpecRollback & rollback,
                                    const DeepSeek4Weights & weights,
                                    DeepSeek4Cache & cache,
                                    int commit_pos,
-                                   bool restore_prev,
-                                   ggml_backend_t backend,
-                                   bool pinned_copy) {
-    GGML_ASSERT(!pinned_copy || backend);
-    spec_rollback_apply(rollback, weights, cache, commit_pos, restore_prev,
-                        backend, /*async_copy=*/backend != nullptr, pinned_copy);
+                                   bool restore_prev) {
+    spec_rollback_apply(rollback, weights, cache, commit_pos, restore_prev);
 }
 
 // Batched target verify + capture: wraps the existing multi-token
@@ -1032,9 +1032,7 @@ bool run_deepseek4_dspark_spec_decode(
                 }
             } else {
                 spec_rollback_apply(
-                    rollback, target_w, target_cache, pos, boundary_crossed,
-                    backend, async_rollback || pinned_rollback,
-                    pinned_rollback);
+                    rollback, target_w, target_cache, pos, boundary_crossed);
             }
             std::fprintf(stderr, "[ds4-spec] verify failed\n");
             ok = false;
@@ -1090,9 +1088,7 @@ bool run_deepseek4_dspark_spec_decode(
             // accepted prefix (at most q5), which is exact and rare at high
             // acceptance.
             spec_rollback_apply(
-                rollback, target_w, target_cache, pos, true,
-                backend, async_rollback || pinned_rollback,
-                pinned_rollback);
+                rollback, target_w, target_cache, pos, true);
             std::vector<int32_t> kv_toks;
             kv_toks.reserve((size_t) accept);
             kv_toks.push_back(lt);
@@ -1109,9 +1105,7 @@ bool run_deepseek4_dspark_spec_decode(
             // the commit point (its chunk then contains rejected tokens).
             const bool restore_prev = boundary_crossed && first_boundary >= commit_pos;
             spec_rollback_apply(
-                rollback, target_w, target_cache, commit_pos, restore_prev,
-                backend, async_rollback || pinned_rollback,
-                pinned_rollback);
+                rollback, target_w, target_cache, commit_pos, restore_prev);
         }
         // accept == q on the fast path: cur_pos/n_comp already exact, keep.
         tm_apply += spec_ms_since(t0);
