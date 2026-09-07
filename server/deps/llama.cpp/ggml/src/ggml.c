@@ -1200,9 +1200,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT_GROUPED_SRC",
 
     "PAGED_ATTN",
+
+    "DS4_MOE_COMBINE",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1327,9 +1329,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "X*grouped(Y)",
 
     "paged_attn(q,k,v)",
+
+    "ds4_moe_combine(down,w,shared)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4264,6 +4268,33 @@ struct ggml_tensor * ggml_soft_max_ext_inplace(
         float                 scale,
         float                 max_bias) {
     return ggml_soft_max_impl(ctx, a, mask, scale, max_bias, true);
+}
+
+struct ggml_tensor * ggml_soft_max_ext_sink_col(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * sinks,
+        float                 scale) {
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(sinks && sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(sinks));
+    GGML_ASSERT(ggml_nelements(sinks) == ggml_nrows(a));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    int32_t params[3] = { 0, 0, /*sink_col*/ 1 };
+    const float max_bias = 0.0f;
+    memcpy(params + 0, &scale,    sizeof(float));
+    memcpy(params + 1, &max_bias, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_SOFT_MAX;
+    result->src[0] = a;
+    result->src[1] = NULL;
+    result->src[2] = sinks;
+
+    return result;
 }
 
 void ggml_soft_max_add_sinks(
@@ -9308,5 +9339,40 @@ struct ggml_tensor * ggml_ds4_indexer_mask(
     result->src[0] = base_mask;
     result->src[1] = selected;
     ggml_set_op_params_i32(result, 0, raw_rows);
+    return result;
+}
+
+struct ggml_tensor * ggml_ds4_moe_fused_combine_shared(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * down_e,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * shared_out) {
+    GGML_ASSERT(down_e != NULL);
+    GGML_ASSERT(weights != NULL);
+    GGML_ASSERT(down_e->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(down_e->nb[0] == sizeof(float));
+    GGML_ASSERT(down_e->ne[0] % 4 == 0);
+    GGML_ASSERT(down_e->ne[3] == 1);
+    GGML_ASSERT(weights->nb[0] == sizeof(float));
+    GGML_ASSERT(down_e->ne[1] == weights->ne[0]);
+    GGML_ASSERT(down_e->ne[2] == weights->ne[1]);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(weights->ne[3] == 1);
+    if (shared_out != NULL) {
+        GGML_ASSERT(shared_out->type == GGML_TYPE_F32);
+        GGML_ASSERT(shared_out->nb[0] == sizeof(float));
+        GGML_ASSERT(shared_out->ne[0] == down_e->ne[0]);
+        GGML_ASSERT(shared_out->ne[1] == down_e->ne[2]);
+        GGML_ASSERT(shared_out->ne[2] == 1);
+        GGML_ASSERT(shared_out->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, down_e->ne[0], down_e->ne[2]);
+    result->op = GGML_OP_DS4_MOE_COMBINE;
+    result->src[0] = down_e;
+    result->src[1] = weights;
+    result->src[2] = shared_out;
     return result;
 }

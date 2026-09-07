@@ -252,6 +252,10 @@
 #define GGML_ROPE_TYPE_MROPE  8
 #define GGML_ROPE_TYPE_VISION 24
 #define GGML_ROPE_TYPE_IMROPE 40 // binary: 101000
+// Lucebox: rotate the LAST n_dims of each row (NORMAL pairing) and pass the
+// leading ne0 - n_dims through unchanged, so a tail-rotary head (DeepSeek4)
+// is one launch instead of split, rotate, and concat. Combine with NORMAL only.
+#define GGML_ROPE_TYPE_TAIL   64
 
 #define GGML_MROPE_SECTIONS   4
 
@@ -616,6 +620,8 @@ extern "C" {
         GGML_OP_MUL_MAT_GROUPED_SRC,
 
         GGML_OP_PAGED_ATTN,
+
+        GGML_OP_DS4_MOE_COMBINE,
 
         GGML_OP_COUNT,
     };
@@ -1807,6 +1813,16 @@ extern "C" {
             float                 scale,
             float                 max_bias);
 
+    // Lucebox: softmax over [a | sink] per row with the sink as a virtual last
+    // column, scale folded in (a*scale), no mask. sinks holds one value per row
+    // of a (ne[0] == ggml_nrows(a)). Bit-identical to scale -> concat(sink) ->
+    // soft_max -> view, in one launch with a contiguous result of a's shape.
+    GGML_API struct ggml_tensor * ggml_soft_max_ext_sink_col(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * sinks,
+            float                 scale);
+
     GGML_API void ggml_soft_max_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2746,6 +2762,14 @@ extern "C" {
             struct ggml_tensor  * base_mask,
             struct ggml_tensor  * selected,
             int                   raw_rows);
+
+    // Direct AST Fused MoE Combine Epilogue: down_e[n_embd, n_used, n_tokens] +
+    // weights[n_used, n_tokens] + shared_out[n_embd, n_tokens] -> dst[n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_ds4_moe_fused_combine_shared(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * down_e,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * shared_out);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

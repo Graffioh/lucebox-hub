@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/moe-fused-combine.cuh"
 #include "ggml-cuda/rocmfp3_mix.cuh"
 #include "ggml-cuda/rocmfp2_mix.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -473,19 +474,18 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
-    // 1024 (upstream 256): LUCE_Q8_MEMO keeps one pooled q8_1 activation
-    // buffer per quantized matmul alive across a whole graph evaluation
-    // (~300 on a 64-layer hybrid), and a full pool falls back to freeing
-    // in-flight buffers with cudaFree.
-    static const int MAX_BUFFERS = 1024;
+    // Free buffers keyed by size. alloc() takes the smallest cached buffer
+    // that fits, the same best-fit choice the original linear scan made, and
+    // free() returns a buffer to the cache; both are O(log n). A DeepSeek4
+    // gathered graph that packs prompt rows memoizes thousands of q8_1
+    // activations per evaluation (LUCE_Q8_MEMO keeps one per quantized
+    // matmul), so the original per-operation scan of the whole pool and its
+    // cudaFree fallback on a full pool (which serializes the stream) both
+    // showed up in the round time. 8192 (upstream 256) bounds the cache.
+    static const int MAX_BUFFERS = 8192;
 
     int device;
-    struct ggml_cuda_buffer {
-        void * ptr = nullptr;
-        size_t size = 0;
-    };
-
-    ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
+    std::multimap<size_t, void *> free_buffers;
     size_t pool_size = 0;
 
     explicit ggml_cuda_pool_leg(int device) :
@@ -494,52 +494,20 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     ~ggml_cuda_pool_leg() {
         ggml_cuda_set_device(device);
-        for (int i = 0; i < MAX_BUFFERS; ++i) {
-            ggml_cuda_buffer & b = buffer_pool[i];
-            if (b.ptr != nullptr) {
-                CUDA_CHECK(cudaFree(b.ptr));
-                pool_size -= b.size;
-            }
+        for (auto & entry : free_buffers) {
+            CUDA_CHECK(cudaFree(entry.second));
+            pool_size -= entry.first;
         }
+        free_buffers.clear();
         GGML_ASSERT(pool_size == 0);
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
-#ifdef DEBUG_CUDA_MALLOC
-        int nnz = 0;
-        size_t max_size = 0;
-#endif
-        size_t best_diff = 1ull << 36;
-        int ibest = -1;
-        for (int i = 0; i < MAX_BUFFERS; ++i) {
-            ggml_cuda_buffer& b = buffer_pool[i];
-            if (b.ptr != nullptr) {
-#ifdef DEBUG_CUDA_MALLOC
-                ++nnz;
-                if (b.size > max_size) max_size = b.size;
-#endif
-                if (b.size >= size) {
-                    size_t diff = b.size - size;
-                    if (diff < best_diff) {
-                        best_diff = diff;
-                        ibest = i;
-                        if (!best_diff) {
-                            void * ptr = b.ptr;
-                            *actual_size = b.size;
-                            b.ptr = nullptr;
-                            b.size = 0;
-                            return ptr;
-                        }
-                    }
-                }
-            }
-        }
-        if (ibest >= 0) {
-            ggml_cuda_buffer& b = buffer_pool[ibest];
-            void * ptr = b.ptr;
-            *actual_size = b.size;
-            b.ptr = nullptr;
-            b.size = 0;
+        auto it = free_buffers.lower_bound(size);
+        if (it != free_buffers.end()) {
+            void * ptr = it->second;
+            *actual_size = it->first;
+            free_buffers.erase(it);
             return ptr;
         }
         void * ptr;
@@ -549,21 +517,13 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(ggml_cuda_device_malloc(&ptr, look_ahead_size, device));
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
-#ifdef DEBUG_CUDA_MALLOC
-        GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
-                           (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
-#endif
         return ptr;
     }
 
     void free(void * ptr, size_t size) override {
-        for (int i = 0; i < MAX_BUFFERS; ++i) {
-            ggml_cuda_buffer& b = buffer_pool[i];
-            if (b.ptr == nullptr) {
-                b.ptr = ptr;
-                b.size = size;
-                return;
-            }
+        if ((int) free_buffers.size() < MAX_BUFFERS) {
+            free_buffers.emplace(size, ptr);
+            return;
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
@@ -578,17 +538,12 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     size_t trim() override {
         ggml_cuda_set_device(device);
         size_t freed = 0;
-        for (int i = 0; i < MAX_BUFFERS; ++i) {
-            ggml_cuda_buffer & b = buffer_pool[i];
-            if (b.ptr == nullptr) {
-                continue;
-            }
-            CUDA_CHECK(cudaFree(b.ptr));
-            freed += b.size;
-            pool_size -= b.size;
-            b.ptr = nullptr;
-            b.size = 0;
+        for (auto & entry : free_buffers) {
+            CUDA_CHECK(cudaFree(entry.second));
+            freed += entry.first;
+            pool_size -= entry.first;
         }
+        free_buffers.clear();
         return freed;
     }
 };
@@ -768,6 +723,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
+        copy_event = nullptr;
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
@@ -2827,10 +2783,12 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
             GGML_CUDA_CC_IS_RDNA3_5(cc) &&
             (!mix_mmq || !(mix_mmq[0] == '0' && mix_mmq[1] == '\0'));
 #endif
-        if (default_ds4_mix_gate_up_mmq ||
-            ggml_cuda_should_use_mmq(
-                src0->type, cc, ncols,
-                ids ? src0->ne[2] : /*n_experts=*/0)) {
+        if ((default_ds4_mix_gate_up_mmq ||
+             ggml_cuda_should_use_mmq(
+                 src0->type, cc, ncols,
+                 ids ? src0->ne[2] : /*n_experts=*/0)) &&
+            !(ggml_cuda_mmvq_max_ncols_override > 0 &&
+              ncols <= ggml_cuda_mmvq_max_ncols_override)) {
             ggml_cuda_mul_mat_q_pair(
                 ctx, up->src[0], gate->src[0], src1, ids, up, gate);
             ggml_cuda_op_swiglu_ds4(ctx, glu);
@@ -3465,6 +3423,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DS4_INDEXER_MASK:
             ggml_cuda_op_ds4_indexer_mask(ctx, dst);
             break;
+        case GGML_OP_DS4_MOE_COMBINE:
+            ggml_cuda_op_ds4_moe_combine(ctx, dst);
+            break;
         case GGML_OP_GROUP_NORM:
             ggml_cuda_op_group_norm(ctx, dst);
             break;
@@ -3852,14 +3813,13 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
+        ggml_cuda_set_device(cuda_ctx_src->device);
         if (!cuda_ctx_src->copy_event) {
-            ggml_cuda_set_device(cuda_ctx_src->device);
-            CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(
+                &cuda_ctx_src->copy_event, cudaEventDisableTiming));
         }
-        {
-            CUDA_CHECK(cudaEventRecord(
-                cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
-        }
+        CUDA_CHECK(cudaEventRecord(
+            cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
 
         // wait on dst stream for the copy to complete
         CUDA_CHECK(cudaStreamWaitEvent(
@@ -3986,7 +3946,6 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
-        GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
     }
@@ -5320,10 +5279,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             // scheduler assigns every split a new uid when that happens. A
             // forced property-scan bypass is therefore valid only for the
             // exact generation that populated this cache entry.
-            // Scheduler graphs carry a non-zero generation uid. Direct graphs
-            // retain uid=0 and therefore keep the existing caller-guaranteed
-            // immutable-topology fast path.
-            const bool same_graph_generation = cgraph->uid == 0 ||
+            // A non-zero graph uid is required to bypass property inspection.
+            // Direct graphs with uid=0 retain ordinary property inspection.
+            const bool same_graph_generation = cgraph->uid != 0 &&
                                                cgraph->uid == graph->uid;
             const bool can_skip_props_check = ggml_cuda_skip_props_check
                                            && graph->warmup_complete
@@ -5759,6 +5717,22 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     CUDA_CHECK(cudaMemGetInfo(free, total));
 }
 
+void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return (void *) cuda_ctx->stream();
+}
+
+int ggml_backend_cuda_get_device_id(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return -1;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return cuda_ctx->device;
+}
+
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;
@@ -6066,6 +6040,22 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[1]->type == GGML_TYPE_I32 &&
                    ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op->src[1]);
+        case GGML_OP_DS4_MOE_COMBINE:
+            // CUDA/HIP allocations are aligned, but views can start between
+            // float4 boundaries. GGML folds nested views into view_offs, which
+            // is available even before the scheduler allocates their buffers.
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] % 4 == 0 &&
+                   op->src[0]->view_offs % sizeof(float4) == 0 &&
+                   op->src[0]->nb[1] % sizeof(float4) == 0 &&
+                   op->src[0]->nb[2] % sizeof(float4) == 0 &&
+                   op->src[1]->nb[1] % sizeof(float) == 0 &&
+                   op->nb[1] % sizeof(float4) == 0 &&
+                   (op->src[2] == nullptr ||
+                    (op->src[2]->type == GGML_TYPE_F32 &&
+                     op->src[2]->view_offs % sizeof(float4) == 0 &&
+                     op->src[2]->nb[1] % sizeof(float4) == 0));
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_GROUPED_SRC:
         case GGML_OP_MUL_MAT_ID:
