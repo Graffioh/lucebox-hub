@@ -248,6 +248,105 @@ bool rejects_unaligned_weight_stride(ggml_backend_t hip) {
     return rejected;
 }
 
+bool offset_view_test(ggml_backend_t backend, int input_index,
+                      size_t offset, bool nested, bool expect_support) {
+    ggml_init_params params{};
+    params.mem_size = 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+
+    constexpr int top_k = 4;
+    constexpr int tokens = 3;
+    ggml_tensor * inputs[3];
+    const int64_t widths[] = {kEmbeddings, top_k, kEmbeddings};
+    const int64_t rows[] = {top_k, tokens, tokens};
+    const int64_t planes[] = {tokens, 1, 1};
+    for (int i = 0; i < 3; ++i) {
+        const size_t size = widths[i] * rows[i] * planes[i];
+        ggml_tensor * storage = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_F32, size + 16);
+        ggml_set_input(storage);
+        const size_t input_offset = i == input_index ? offset : 0;
+        // GGML folds a view of a view into an offset from the original storage.
+        const size_t parent_offset = nested && input_offset >= sizeof(float)
+            ? sizeof(float) : 0;
+        if (nested) {
+            storage = ggml_view_1d(ctx, storage, size + 8, parent_offset);
+        }
+        inputs[i] = ggml_view_3d(
+            ctx, storage, widths[i], rows[i], planes[i],
+            widths[i] * sizeof(float), widths[i] * rows[i] * sizeof(float),
+            input_offset - parent_offset);
+    }
+    ggml_tensor * combined = ggml_ds4_moe_fused_combine_shared(
+        ctx, inputs[0], inputs[1], inputs[2]);
+    ggml_set_output(combined);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, combined);
+
+    const ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    const bool before = ggml_backend_dev_supports_op(device, combined);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        std::fprintf(stderr, "[ds4-moe-combine] offset-view allocation failed\n");
+        ggml_free(ctx);
+        return false;
+    }
+    const bool after = ggml_backend_dev_supports_op(device, combined);
+    bool ok = before == expect_support && after == expect_support;
+    // Never launch a known-unsupported layout, even when testing a broken
+    // admission guard: the regression should fail without aborting the process.
+    if (expect_support && before && after) {
+        const float values[] = {1.0f, 0.5f, 2.0f};
+        for (int i = 0; i < 3; ++i) {
+            const std::vector<float> data(ggml_nelements(inputs[i]), values[i]);
+            ggml_backend_tensor_set(inputs[i], data.data(), 0, ggml_nbytes(inputs[i]));
+        }
+        const bool computed = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        ok = computed && ok;
+        if (computed) {
+            ggml_backend_synchronize(backend);
+            std::vector<float> output(ggml_nelements(combined));
+            ggml_backend_tensor_get(combined, output.data(), 0, ggml_nbytes(combined));
+            for (float value : output) {
+                ok = (value == 4.0f) && ok;
+            }
+        }
+    }
+    if (!ok) {
+        std::fprintf(stderr,
+                     "[ds4-moe-combine] %s offset-view failure input=%d offset=%zu "
+                     "nested=%d expected_support=%d before=%d after=%d\n",
+                     ggml_backend_name(backend), input_index, offset, nested,
+                     expect_support, before, after);
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool offset_view_tests(ggml_backend_t cpu, ggml_backend_t hip) {
+    bool ok = true;
+    int cases = 0;
+    for (int input_index = 0; input_index < 3; ++input_index) {
+        for (size_t offset : {0u, 4u, 8u, 12u, 16u, 32u}) {
+            for (bool nested : {false, true}) {
+                // Down/shared use float4 loads; weights use scalar float loads.
+                const bool hip_supported = input_index == 1 || offset % 16 == 0;
+                ok = offset_view_test(cpu, input_index, offset, nested, true) && ok;
+                ok = offset_view_test(hip, input_index, offset, nested, hip_supported) && ok;
+                ++cases;
+            }
+        }
+    }
+    std::printf("[ds4-moe-combine] offset views: %d CPU/HIP cases %s\n",
+                cases, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 bool equal_floats(const std::vector<float> & expected,
                   const std::vector<float> & actual,
                   const char * label,
@@ -435,6 +534,7 @@ int main(int argc, char ** argv) {
     bool ok = meta_allocation_test(hip, false) &&
               meta_allocation_test(hip, true) &&
               rejects_unaligned_weight_stride(hip);
+    ok = offset_view_tests(cpu, hip) && ok;
     for (const CombineCase & test : cases) {
         const Inputs inputs = make_inputs(test);
         std::vector<float> cpu_output;

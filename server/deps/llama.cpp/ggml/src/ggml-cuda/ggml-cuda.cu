@@ -5971,14 +5971,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op->src[1]);
         case GGML_OP_DS4_MOE_COMBINE:
+            // CUDA/HIP allocations are aligned, but views can start between
+            // float4 boundaries. GGML folds nested views into view_offs, which
+            // is available even before the scheduler allocates their buffers.
             return op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] % 4 == 0 &&
+                   op->src[0]->view_offs % sizeof(float4) == 0 &&
                    op->src[0]->nb[1] % sizeof(float4) == 0 &&
                    op->src[0]->nb[2] % sizeof(float4) == 0 &&
                    op->src[1]->nb[1] % sizeof(float) == 0 &&
                    op->nb[1] % sizeof(float4) == 0 &&
-                   (op->src[2] == nullptr || (op->src[2]->type == GGML_TYPE_F32 && op->src[2]->nb[1] % sizeof(float4) == 0));
+                   (op->src[2] == nullptr ||
+                    (op->src[2]->type == GGML_TYPE_F32 &&
+                     op->src[2]->view_offs % sizeof(float4) == 0 &&
+                     op->src[2]->nb[1] % sizeof(float4) == 0));
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_GROUPED_SRC:
         case GGML_OP_MUL_MAT_ID:
