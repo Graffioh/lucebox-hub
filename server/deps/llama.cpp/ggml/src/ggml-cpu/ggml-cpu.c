@@ -3018,7 +3018,7 @@ struct ggml_cplan ggml_graph_plan(
                             // conversion between F32 and I32
                             (node->src[0]->type == GGML_TYPE_F32 && node->src[1] && node->src[1]->type == GGML_TYPE_I32) ||
                             (node->src[0]->type == GGML_TYPE_I32 && node->src[1] && node->src[1]->type == GGML_TYPE_F32)) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
+                            cur = ggml_type_size(GGML_TYPE_F32) * (node->ne[0] + 1) * n_tasks; // +1: sink-column mode
                         }
                     } break;
                 case GGML_OP_ADD:
