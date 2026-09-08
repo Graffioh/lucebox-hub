@@ -93,7 +93,11 @@ client cancellation and capacity reuse, and shutdown. Six CLI checks cover
 invalid capacities, listener placement, duplicate names, shared-policy flags,
 and unsupported single-request model families.
 
-Hardware qualification of Qwen C4 plus DS4 C1 with DSpark is pending. The
+Hardware qualification of Qwen C4 plus DS4 C1 with DSpark is pending. A load
+of the 0731 target was stopped before readiness under host memory pressure
+(about 4.8 GiB minimum available); the idle system then reported only about
+97 GiB available, below the target and draft's combined weight size. This
+attempt does not establish whether the hybrid fits on a clean system. The
 example above is a launch recipe, not a measured performance claim. In
 particular, the hybrid's model residency, DSpark activation, generated-output
 comparisons, and time to the first final-answer token still need a GPU run.
