@@ -16,10 +16,10 @@ public:
                std::min(verified_width, remaining_budget));
     }
 
-    void record_tree(int accepted_emitted, int candidate_nodes) {
-        // Count actual topology nodes, not graph-padding rows. All branches
-        // were offered, even though only one path can be committed.
-        record(accepted_emitted, 1 + candidate_nodes);
+    void record_tree(int accepted_emitted, int candidate_nodes, int remaining_budget) {
+        // Count actual topology nodes, not graph-padding rows. Like chain
+        // telemetry, cap offers by the request's remaining output budget.
+        record(accepted_emitted, std::min(1 + candidate_nodes, remaining_budget));
     }
 
     int accepted() const { return accepted_; }

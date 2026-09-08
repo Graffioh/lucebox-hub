@@ -41,8 +41,8 @@ TEST_CASE(SpecAcceptanceFixture, early_stop_counts_only_emitted_accepts) {
 
 TEST_CASE(SpecAcceptanceFixture, tree_only_counts_actual_topology_with_root) {
     SpecAcceptanceStats stats;
-    stats.record_tree(4, 7); // four emitted positions out of root + seven nodes
-    stats.record_tree(2, 3); // padded verify capacity must not enter this API
+    stats.record_tree(4, 7, 20); // four emitted positions out of root + seven nodes
+    stats.record_tree(2, 3, 16); // padded verify capacity must not enter this API
     CHECK(stats.accepted() == 6);
     CHECK(stats.offered() == 12);
     CHECK(stats.rate() == 0.5f);
@@ -50,7 +50,7 @@ TEST_CASE(SpecAcceptanceFixture, tree_only_counts_actual_topology_with_root) {
 
 TEST_CASE(SpecAcceptanceFixture, mixed_tree_chain_and_ar_tail_keep_one_denominator) {
     SpecAcceptanceStats stats;
-    stats.record_tree(3, 4);
+    stats.record_tree(3, 4, 20);
     stats.record_chain(2, 3, 3, 20);
     CHECK(stats.accepted() == 5);
     CHECK(stats.offered() == 8);
@@ -62,11 +62,23 @@ TEST_CASE(SpecAcceptanceFixture, mixed_tree_chain_and_ar_tail_keep_one_denominat
 
 TEST_CASE(SpecAcceptanceFixture, seed_only_tree_and_variable_chain_widths_stay_bounded) {
     SpecAcceptanceStats stats;
-    stats.record_tree(1, 0);
+    stats.record_tree(1, 0, 100);
     for (int width : {2, 3, 5, 8, 4, 2}) {
         stats.record_chain(width, width, width, 100);
     }
     CHECK(stats.accepted() == 25);
     CHECK(stats.offered() == 25);
+    CHECK(stats.rate() == 1.0f);
+}
+
+TEST_CASE(SpecAcceptanceFixture, final_tree_budget_matches_chain_accounting) {
+    SpecAcceptanceStats stats;
+    stats.record_tree(3, 7, 3);
+    CHECK(stats.accepted() == 3);
+    CHECK(stats.offered() == 3);
+    CHECK(stats.rate() == 1.0f);
+    stats.record_tree(1, 15, 1); // only the root can be emitted
+    CHECK(stats.accepted() == 4);
+    CHECK(stats.offered() == 4);
     CHECK(stats.rate() == 1.0f);
 }

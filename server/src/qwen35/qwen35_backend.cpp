@@ -3455,7 +3455,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
 
             // Seed-inclusive, like chain telemetry; exclude graph padding.
-            acceptance.record_tree(accepted_emitted, tree.n_nodes);
+            acceptance.record_tree(accepted_emitted, tree.n_nodes, need_commit_budget);
 
             if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
 
