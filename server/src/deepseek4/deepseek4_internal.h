@@ -441,6 +441,10 @@ void reset_deepseek4_cache(DeepSeek4Cache & c);
 // state and the DSpark feature tail remain live for the following decode.
 void deepseek4_release_prefill_scratch(DeepSeek4Cache & c,
                                        MoeHybridStorage * moe_hybrid);
+// Invalid/future raw-ring rows after all writes of a batched verifier.
+// Each span is bounded by n_swa, including batches that overwrite the full ring.
+int deepseek4_verify_raw_mask_spans(
+    int kv_start, int n_swa, int q, int lane, DeepSeek4RawRingSpan spans[2]);
 int deepseek4_previous_raw_ring_spans(
     int kv_start,
     int n_swa,

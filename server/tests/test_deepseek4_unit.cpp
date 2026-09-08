@@ -1362,6 +1362,71 @@ struct ScopedEnvVar {
     std::string old_value;
 };
 
+static void test_verify_raw_mask_spans() {
+    std::fprintf(stderr, "  test_verify_raw_mask_spans ...");
+    int cases = 0;
+    for (int n_swa : {1, 2, 4, 8, 128}) {
+        for (int kv_start = 0; kv_start < 2 * n_swa + 8; ++kv_start) {
+            for (int q : {1, 2, 3, 4, 5, 8, 16}) {
+                std::vector<int> ring(n_swa, -1);
+                for (int pos = 0; pos < kv_start + q; ++pos) {
+                    ring[(size_t) (pos % n_swa)] = pos;
+                }
+                for (int lane = 0; lane < q; ++lane) {
+                    DeepSeek4RawRingSpan spans[2];
+                    const int count = deepseek4_verify_raw_mask_spans(
+                        kv_start, n_swa, q, lane, spans);
+                    TEST_ASSERT(count >= 0 && count <= 2);
+                    std::vector<bool> masked(n_swa, false);
+                    for (int j = 0; j < count; ++j) {
+                        TEST_ASSERT(spans[j].row >= 0 && spans[j].count > 0);
+                        TEST_ASSERT(spans[j].row + spans[j].count <= n_swa);
+                        for (int row = spans[j].row;
+                             row < spans[j].row + spans[j].count && row < n_swa; ++row) {
+                            if (row >= 0) masked[(size_t) row] = true;
+                        }
+                    }
+                    for (int row = 0; row < n_swa; ++row) {
+                        TEST_ASSERT(masked[(size_t) row] ==
+                            (ring[(size_t) row] < 0 || ring[(size_t) row] > kv_start + lane));
+                    }
+                    ++cases;
+                }
+            }
+        }
+    }
+    std::fprintf(stderr, " %d cases\n", cases);
+}
+
+#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+static void test_failed_init_preserves_sparse_opt_in() {
+    std::fprintf(stderr, "  test_failed_init_preserves_sparse_opt_in ...\n");
+    if (ggml_backend_cuda_get_device_count() == 0) return;
+    ScopedEnvVar spec("DFLASH_DS4_SPEC");
+    ScopedEnvVar draft("DFLASH_DS4_DRAFT");
+    ScopedEnvVar sparse("DFLASH_DS4_SPARSE_DECODE_FLASH");
+    ScopedEnvVar mmvq("LUCE_MMVQ_MAX_NCOLS");
+    setenv("DFLASH_DS4_SPEC", "1", 1);
+    unsetenv("DFLASH_DS4_DRAFT");
+    // The removed gfx1151 auto-enable ran in init() BEFORE load_model().
+    // Deliberately fail at model loading: even a failed init with no drafter
+    // must not change process-wide sparse-verifier policy for the next model.
+    // This tests early-init side effects, not successful verifier construction.
+    const std::string missing_model = make_temp_gguf_path("missing");
+    for (const char * value : {static_cast<const char *>(nullptr), "0", "1"}) {
+        if (value) setenv("DFLASH_DS4_SPARSE_DECODE_FLASH", value, 1);
+        else unsetenv("DFLASH_DS4_SPARSE_DECODE_FLASH");
+        DeepSeek4BackendConfig cfg;
+        cfg.model_path = missing_model.c_str();
+        cfg.device.gpu = 0;
+        DeepSeek4Backend backend(cfg);
+        TEST_ASSERT(!backend.init());
+        const char * actual = std::getenv("DFLASH_DS4_SPARSE_DECODE_FLASH");
+        TEST_ASSERT(value ? actual && std::strcmp(actual, value) == 0 : !actual);
+    }
+}
+#endif
+
 static DeepSeek4LayerSplitAdapter make_test_adapter() {
     DeepSeek4LayerSplitAdapterConfig cfg;
     cfg.device.gpu = 0;
@@ -3751,7 +3816,7 @@ static void test_ds4_saved_raw_rows_replay_gpu() {
 
 static bool run_ds4_preserved_raw_rows_case(
         ggml_backend_t backend, int width, int compressed_rows,
-        bool visible_suffix, ggml_type kv_type, bool direct) {
+        bool visible_suffix, ggml_type kv_type, bool direct, int replays = 1) {
     constexpr int dim = 512, heads = 64, raw_rows = 128, top_k = 512;
     const int saved = width > 1 ? width : 0;
     const int rows = raw_rows + compressed_rows + saved;
@@ -3805,36 +3870,56 @@ static bool run_ds4_preserved_raw_rows_case(
                 iddata[(size_t) t * top_k + c] = row;
             }
         }
-        ggml_backend_tensor_set(q, qdata.data(), 0, ggml_nbytes(q));
+        std::vector<ggml_fp16_t> half;
         if (kv_type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> half(kvdata.size());
+            half.resize(kvdata.size());
             std::transform(kvdata.begin(), kvdata.end(), half.begin(), ggml_fp32_to_fp16);
-            ggml_backend_tensor_set(kv, half.data(), 0, ggml_nbytes(kv));
-        } else {
-            ggml_backend_tensor_set(kv, kvdata.data(), 0, ggml_nbytes(kv));
         }
-        ggml_backend_tensor_set(mask, maskdata.data(), 0, ggml_nbytes(mask));
-        ggml_backend_tensor_set(topk, iddata.data(), 0, ggml_nbytes(topk));
-        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
-        if (ok) {
-            std::vector<float> actual(ggml_nelements(result)), actual_mask(maskdata.size());
-            ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
-            ggml_backend_tensor_get(indexed_mask, actual_mask.data(), 0, ggml_nbytes(indexed_mask));
-            for (int t = 0; t < width; ++t) {
-                // Zero queries give equal attention weights. Keeping the saved
-                // suffix replaces exactly the hidden future ring slots.
-                const int visible = visible_suffix ? std::max(0, saved - t - 1) : 0;
-                const float expected = 0.25f + float(visible) / (raw_rows + top_k - t % 3);
-                for (int h = 0; h < heads; ++h) {
-                    for (int d = 0; d < dim; ++d) {
-                        const float value = actual[((size_t) t * heads + h) * dim + d];
-                        ok &= std::isfinite(value) &&
-                              std::abs(value - (d == 0 ? expected : 0.0f)) < 1.0e-6f;
+        for (int replay = 0; ok && replay < replays; ++replay) {
+            // Gallocr may reuse an input's storage after its last consumer.
+            // Refresh fixture inputs on every launch, as the caller must.
+            ggml_backend_tensor_set(q, qdata.data(), 0, ggml_nbytes(q));
+            if (kv_type == GGML_TYPE_F16) {
+                ggml_backend_tensor_set(kv, half.data(), 0, ggml_nbytes(kv));
+            } else {
+                ggml_backend_tensor_set(kv, kvdata.data(), 0, ggml_nbytes(kv));
+            }
+            ggml_backend_tensor_set(mask, maskdata.data(), 0, ggml_nbytes(mask));
+            ggml_backend_tensor_set(topk, iddata.data(), 0, ggml_nbytes(topk));
+            ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+            if (ok) {
+                std::vector<float> actual(ggml_nelements(result)), actual_mask(maskdata.size());
+                ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+                ggml_backend_tensor_get(indexed_mask, actual_mask.data(), 0, ggml_nbytes(indexed_mask));
+                for (int t = 0; t < width; ++t) {
+                    // Zero queries give equal attention weights. Keeping the saved
+                    // suffix replaces exactly the hidden future ring slots.
+                    const int visible = visible_suffix ? std::max(0, saved - t - 1) : 0;
+                    const float expected = 0.25f + float(visible) / (raw_rows + top_k - t % 3);
+                    for (int h = 0; h < heads; ++h) {
+                        for (int d = 0; d < dim; ++d) {
+                            const float value = actual[((size_t) t * heads + h) * dim + d];
+                            const float reference = d == 0 ? expected : 0.0f;
+                            const bool matches = std::isfinite(value) &&
+                                std::abs(value - reference) < 1.0e-6f;
+                            if (ok && !matches) {
+                                std::fprintf(stderr,
+                                    " saved-row output mismatch replay=%d token=%d head=%d dim=%d actual=%.9g expected=%.9g\n",
+                                    replay, t, h, d, value, reference);
+                            }
+                            ok &= matches;
+                        }
                     }
-                }
-                for (int r = 0; r < rows; ++r) {
-                    const size_t at = (size_t) t * rows + r;
-                    ok &= (actual_mask[at] > -1.0e20f) == (maskdata[at] > -1.0e20f);
+                    for (int r = 0; r < rows; ++r) {
+                        const size_t at = (size_t) t * rows + r;
+                        const bool matches = (actual_mask[at] > -1.0e20f) == (maskdata[at] > -1.0e20f);
+                        if (ok && !matches) {
+                            std::fprintf(stderr,
+                                " saved-row mask mismatch replay=%d token=%d row=%d actual=%.9g expected=%.9g\n",
+                                replay, t, r, actual_mask[at], maskdata[at]);
+                        }
+                        ok &= matches;
+                    }
                 }
             }
         }
@@ -3872,6 +3957,11 @@ static void test_ds4_preserved_raw_rows_gpu() {
     }
     std::fprintf(stderr, " %d/%d cases passed\n", passed, cases);
     TEST_ASSERT_MSG(passed == cases, "indexed attention lost saved raw KV rows or exposed future rows");
+    // CI exposed an intermittent failure in this long-context, multi-wave
+    // shape. Exercise repeated launches/replays without relaxing parity.
+    TEST_ASSERT_MSG(run_ds4_preserved_raw_rows_case(
+        backend, 5, 30720, true, GGML_TYPE_F16, false, 128),
+        "indexed attention saved-row replay stress failed");
     ggml_backend_free(backend);
 }
 
@@ -4141,8 +4231,8 @@ static void test_ds4_flash_rope_replay_gpu() {
     ggml_backend_free(backend);
 }
 
-static void test_ds4_topk_block_radix_gpu() {
-    std::fprintf(stderr, "  test_ds4_topk_block_radix_gpu ...");
+static void test_ds4_topk_block_radix_gpu(int ncols) {
+    std::fprintf(stderr, "  test_ds4_topk_block_radix_gpu ncols=%d ...", ncols);
 #if !defined(GGML_USE_HIP)
     std::fprintf(stderr, " skipped (HIP-only candidate)\n");
     return;
@@ -4153,7 +4243,6 @@ static void test_ds4_topk_block_radix_gpu() {
         return;
     }
 
-    constexpr int ncols = 4160;
     constexpr int nrows = 4;
     constexpr int k = 512;
     ggml_context * ctx = make_test_context(1u << 20);
@@ -4181,11 +4270,12 @@ static void test_ds4_topk_block_radix_gpu() {
         std::vector<float> score_data((size_t) ncols * nrows);
         for (int row = 0; row < nrows; ++row) {
             for (int col = 0; col < ncols; ++col) {
-                // 4051 is coprime with 4160, producing one exact permutation
-                // of unique integer-valued scores per row. Output order is not
-                // part of TOP_K's contract, so compare the selected sets.
+                // Odd multiplication permutes 24-bit integers, so scores are
+                // unique and exactly representable for every tested shape.
+                // Output order is not part of TOP_K's contract.
                 score_data[(size_t) row * ncols + col] =
-                    (float) (((col * 4051) + row * 997) % ncols);
+                    (float) (((uint32_t) col * 2654435761u +
+                              (uint32_t) row * 2246822519u) & 0x00ffffffu);
             }
         }
         ggml_backend_tensor_set(scores, score_data.data(), 0,
@@ -4199,7 +4289,7 @@ static void test_ds4_topk_block_radix_gpu() {
             /*disable_graphs=*/true,
             /*mmvq_max_ncols=*/0,
             /*skip_property_check=*/false);
-        unsetenv("GGML_DS4_TOPK_BLOCK_RADIX");
+        setenv("GGML_DS4_TOPK_BLOCK_RADIX", "0", 1);
         TEST_ASSERT_MSG(
             ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             "reference long-context top-k failed");
@@ -4243,7 +4333,8 @@ static void test_ds4_topk_block_radix_gpu() {
         for (int row = 0; row < nrows; ++row) {
             for (int col = 0; col < ncols; ++col) {
                 score_data[(size_t) row * ncols + col] =
-                    (float) (((col * 4051) + row * 997) % ncols);
+                    (float) (((uint32_t) col * 2654435761u +
+                              (uint32_t) row * 2246822519u) & 0x00ffffffu);
             }
         }
         ggml_backend_tensor_set(scores, score_data.data(), 0,
@@ -4253,7 +4344,7 @@ static void test_ds4_topk_block_radix_gpu() {
             if (block_radix) {
                 setenv("GGML_DS4_TOPK_BLOCK_RADIX", "1", 1);
             } else {
-                unsetenv("GGML_DS4_TOPK_BLOCK_RADIX");
+                setenv("GGML_DS4_TOPK_BLOCK_RADIX", "0", 1);
             }
             constexpr int warmups = 5;
             constexpr int iterations = 100;
@@ -5406,6 +5497,7 @@ int main() {
     test_indexer_mask_cpu(backend);
     test_hash_routing_lookup();
     test_raw_ring_spans_after_wrap();
+    test_verify_raw_mask_spans();
     test_auto_split_computation();
     test_layer_range_validation();
     test_hc_state_dimensions();
@@ -5455,13 +5547,17 @@ int main() {
         }
     }
     test_ds4_flash_attention_keep_cap_gpu();
+    test_failed_init_preserves_sparse_opt_in();
     test_ds4_flash_attention_parallel_index_scan_gpu(512);
     test_ds4_flash_attention_parallel_index_scan_gpu(1024);
     test_ds4_saved_raw_rows_replay_gpu();
     test_ds4_preserved_raw_rows_gpu();
     test_ds4_indexer_score_packed_small_gpu();
     test_ds4_flash_rope_replay_gpu();
-    test_ds4_topk_block_radix_gpu();
+    for (int ncols : {4160, 5121, 8192, 8193, 12288, 12289,
+                     16384, 28673, 30720, 32768}) {
+        test_ds4_topk_block_radix_gpu(ncols);
+    }
     test_ds4_flash_attention_inverse_rope_fallback_gpu();
     test_hc_post_strided_split_gpu();
     test_hc_pre_kernel_gpu();

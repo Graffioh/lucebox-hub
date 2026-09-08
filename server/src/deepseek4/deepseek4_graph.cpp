@@ -40,6 +40,7 @@
 #include <mutex>
 #include <functional>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
@@ -249,6 +250,32 @@ bool build_deepseek4_head4_tail2_routes(
     out.tail_weights = materialize(router_weights, 4, 2);
     return out.head_ids && out.head_weights &&
            out.tail_ids && out.tail_weights;
+}
+
+int deepseek4_verify_raw_mask_spans(
+        int kv_start, int n_swa, int q, int lane,
+        DeepSeek4RawRingSpan spans[2]) {
+    GGML_ASSERT(spans && kv_start >= 0 && n_swa > 0 && q > 0);
+    GGML_ASSERT(lane >= 0 && lane < q);
+    const int64_t end = (int64_t) kv_start + q;
+    const int64_t pos = (int64_t) kv_start + lane;
+    if (end <= n_swa) {
+        const int begin = (int) pos + 1;
+        spans[0] = {begin, n_swa - begin};
+        return begin < n_swa ? 1 : 0;
+    }
+    const int future = q - 1 - lane;
+    if (future >= n_swa) {
+        spans[0] = {0, n_swa};
+        return 1;
+    }
+    if (future == 0) return 0;
+    const int begin = (int) ((pos + 1) % n_swa);
+    const int first = std::min(future, n_swa - begin);
+    spans[0] = {begin, first};
+    if (first == future) return 1;
+    spans[1] = {0, future - first};
+    return 2;
 }
 
 int deepseek4_previous_raw_ring_spans(
@@ -5336,7 +5363,8 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * capture = nullptr;  // f32 [n_embd*ncap,q], token-major
         ggml_tensor * argmax = nullptr;   // i32 [q], optional greedy output
         // Reused host staging for the context-sized additive attention mask.
-        // Keeping it per slot removes one allocation from every verify step.
+        // Keeping it per slot removes allocation churn in both full and
+        // sparse-range mask update modes.
         std::vector<float> mask_values;
         std::vector<int32_t> bundle_i32;
         std::vector<int64_t> bundle_i64;
