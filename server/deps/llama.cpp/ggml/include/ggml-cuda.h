@@ -51,14 +51,16 @@ GGML_BACKEND_API size_t ggml_backend_cuda_graph_invalidate_range(
         const void *   begin,
         size_t         size);
 
-// Returns true when the backend has instantiated a legacy device pool. This
-// lets callers and tests distinguish a trimmable cache from a VMM arena.
+// Returns true when the CUDA/HIP backend has instantiated a legacy device
+// pool. Meta backends recursively inspect every rank-local backend. This lets
+// callers and tests distinguish a trimmable cache from a VMM arena.
 GGML_BACKEND_API bool ggml_backend_cuda_has_legacy_pool(ggml_backend_t backend);
 
-// Release cached temporary allocations held by a CUDA/HIP backend's legacy
-// device pools. The backend is synchronized first, and graph executables that
-// may reference released pool blocks are retired. VMM pools are already a
-// contiguous reusable arena and are left intact. Returns bytes released.
+// Release cached temporary allocations held by CUDA/HIP legacy device pools.
+// Meta backends recursively trim every rank-local backend. Each CUDA/HIP
+// backend is synchronized first, and graph executables that may reference
+// released pool blocks are retired. VMM pools are already a contiguous
+// reusable arena and are left intact. Returns total bytes released.
 GGML_BACKEND_API size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend);
 
 // Disable CUDA/HIP graph capture and replay on the calling thread. Returns the

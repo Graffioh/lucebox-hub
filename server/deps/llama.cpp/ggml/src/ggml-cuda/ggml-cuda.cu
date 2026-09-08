@@ -5197,7 +5197,22 @@ static bool ggml_cuda_has_legacy_pool(const ggml_backend_cuda_context * cuda_ctx
 }
 
 extern "C" bool ggml_backend_cuda_has_legacy_pool(ggml_backend_t backend) {
-    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+    if (backend == nullptr) {
+        return false;
+    }
+
+    if (ggml_backend_is_meta(backend)) {
+        const size_t n_backends = ggml_backend_meta_n_backends(backend);
+        for (size_t i = 0; i < n_backends; ++i) {
+            if (ggml_backend_cuda_has_legacy_pool(
+                    ggml_backend_meta_simple_backend(backend, i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (!ggml_backend_is_cuda(backend)) {
         return false;
     }
 
@@ -5206,7 +5221,21 @@ extern "C" bool ggml_backend_cuda_has_legacy_pool(ggml_backend_t backend) {
 }
 
 extern "C" size_t ggml_backend_cuda_trim_pool(ggml_backend_t backend) {
-    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+    if (backend == nullptr) {
+        return 0;
+    }
+
+    if (ggml_backend_is_meta(backend)) {
+        size_t freed = 0;
+        const size_t n_backends = ggml_backend_meta_n_backends(backend);
+        for (size_t i = 0; i < n_backends; ++i) {
+            freed += ggml_backend_cuda_trim_pool(
+                ggml_backend_meta_simple_backend(backend, i));
+        }
+        return freed;
+    }
+
+    if (!ggml_backend_is_cuda(backend)) {
         return 0;
     }
 
