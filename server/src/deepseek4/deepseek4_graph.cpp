@@ -9334,6 +9334,31 @@ bool deepseek4_step_layer_range(
 
 // ─── Cache management ───────────────────────────────────────────────────
 
+DeepSeek4LayerGeometry deepseek4_layer_geometry(const DeepSeek4Weights & w, int layer) {
+    DeepSeek4LayerGeometry g;
+    g.ratio = (layer >= 0 && (size_t) layer < w.compress_ratios.size())
+        ? w.compress_ratios[(size_t) layer] : 0;
+    g.head_dim = w.head_dim;
+    g.raw_rows = w.n_swa;
+    g.has_comp = g.ratio > 0;
+    g.has_index = g.ratio == 4;
+    if (g.has_comp) {
+        // Compressor state: width = coff * head_dim (2x for ratio-4, 1x for
+        // ratio-128); rows = 2*ratio for ratio-4 (prev + current window),
+        // ratio otherwise.
+        const int64_t coff = g.has_index ? 2 : 1;
+        g.comp_width = coff * (int64_t) w.head_dim;
+        g.comp_state_rows = g.has_index ? 2 * (int64_t) g.ratio : (int64_t) g.ratio;
+    }
+    if (g.has_index) {
+        // Indexer compressor: width = 2 * indexer head dim, same double buffer.
+        g.index_dim = w.n_indexer_head_dim;
+        g.index_state_width = 2 * (int64_t) w.n_indexer_head_dim;
+        g.index_state_rows = 2 * (int64_t) g.ratio;
+    }
+    return g;
+}
+
 bool create_deepseek4_cache(ggml_backend_t backend,
                              const DeepSeek4Weights & w,
                              int max_ctx,
@@ -9353,9 +9378,9 @@ bool create_deepseek4_cache(ggml_backend_t backend,
 
     for (int il = 0; il < w.n_layer; ++il) {
         DeepSeek4LayerCache & lc = out.layers[il];
-        const uint32_t ratio = w.compress_ratios[il];
+        const DeepSeek4LayerGeometry g = deepseek4_layer_geometry(w, il);
 
-        lc.raw_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, w.head_dim, w.n_swa);
+        lc.raw_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, g.head_dim, g.raw_rows);
         char name[64];
         std::snprintf(name, sizeof(name), "ds4_raw_kv_%d", il);
         ggml_set_name(lc.raw_kv, name);
@@ -9363,37 +9388,28 @@ bool create_deepseek4_cache(ggml_backend_t backend,
         lc.n_comp = 0;
         lc.n_index_comp = 0;
 
-        if (ratio <= 0) {
+        if (!g.has_comp) {
             continue;
         }
 
-        const int comp_cap = max_ctx / (int) ratio + 16;
-        lc.comp_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, w.head_dim, comp_cap);
+        const int64_t comp_cap = g.comp_capacity(max_ctx);
+        lc.comp_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, g.head_dim, comp_cap);
         std::snprintf(name, sizeof(name), "ds4_comp_kv_%d", il);
         ggml_set_name(lc.comp_kv, name);
 
-        // Compressor state dimensions: comp_width = coff * head_dim
-        // Number of state rows: 2*ratio for ratio-4 (prev+cur windows), ratio for ratio-128
-        const int coff = (ratio == 4) ? 2 : 1;
-        const int comp_width = coff * (int)w.head_dim;
-        const int n_state_rows = (ratio == 4) ? (2 * ratio) : ratio;
-        lc.attn_compressor.state_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, comp_width, n_state_rows);
-        lc.attn_compressor.state_score = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, comp_width, n_state_rows);
+        lc.attn_compressor.state_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, g.comp_width, g.comp_state_rows);
+        lc.attn_compressor.state_score = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, g.comp_width, g.comp_state_rows);
         std::snprintf(name, sizeof(name), "ds4_comp_state_kv_%d", il);
         ggml_set_name(lc.attn_compressor.state_kv, name);
         std::snprintf(name, sizeof(name), "ds4_comp_state_score_%d", il);
         ggml_set_name(lc.attn_compressor.state_score, name);
 
-        if (ratio == 4) {
-            // Indexer comp_width = 2 * indexer_head_dim = 256
-            const int index_comp_width = 2 * (int)w.n_indexer_head_dim;
-            const int index_state_rows = 2 * ratio;  // same double-buffer for ratio-4
-            lc.index_comp_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16,
-                                                  w.n_indexer_head_dim, comp_cap);
+        if (g.has_index) {
+            lc.index_comp_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F16, g.index_dim, comp_cap);
             lc.indexer_compressor.state_kv = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
-                                                                index_comp_width, index_state_rows);
+                                                                g.index_state_width, g.index_state_rows);
             lc.indexer_compressor.state_score = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
-                                                                   index_comp_width, index_state_rows);
+                                                                   g.index_state_width, g.index_state_rows);
             std::snprintf(name, sizeof(name), "ds4_index_comp_kv_%d", il);
             ggml_set_name(lc.index_comp_kv, name);
             std::snprintf(name, sizeof(name), "ds4_index_state_kv_%d", il);
@@ -9403,7 +9419,7 @@ bool create_deepseek4_cache(ggml_backend_t backend,
         }
     }
 
-    out.hc_state = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, (int64_t)w.n_hc * w.n_embd);
+    out.hc_state = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, deepseek4_hc_state_elements(w));
     ggml_set_name(out.hc_state, "ds4_hc_state");
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
@@ -9492,329 +9508,6 @@ void deepseek4_release_prefill_scratch(
                      free_before / (1024.0 * 1024.0),
                      free_after / (1024.0 * 1024.0));
     }
-}
-
-namespace {
-
-ggml_tensor * clone_snapshot_tensor(ggml_context * ctx,
-                                    const ggml_tensor * src,
-                                    const char * name) {
-    if (!ctx || !src) return nullptr;
-    ggml_tensor * dst = ggml_dup_tensor(ctx, const_cast<ggml_tensor *>(src));
-    if (!dst) return nullptr;
-    if (name && *name) ggml_set_name(dst, name);
-    return dst;
-}
-
-ggml_tensor * clone_snapshot_rows(ggml_context * ctx,
-                                  const ggml_tensor * src,
-                                  int live_rows,
-                                  const char * name) {
-    if (!ctx || !src || ggml_n_dims(src) != 2 || live_rows < 0 ||
-        live_rows > src->ne[1]) {
-        return nullptr;
-    }
-    // GGML tensors cannot have an empty physical dimension. Keep one
-    // allocated row for an empty logical prefix, but copy zero bytes below.
-    const int64_t allocated_rows = std::max(1, live_rows);
-    ggml_tensor * dst = ggml_new_tensor_2d(
-        ctx, src->type, src->ne[0], allocated_rows);
-    if (!dst) return nullptr;
-    if (name && *name) ggml_set_name(dst, name);
-    return dst;
-}
-
-size_t tensor_prefix_bytes(const ggml_tensor * tensor, int rows) {
-    if (!tensor || rows <= 0) return 0;
-    return ggml_row_size(tensor->type, tensor->ne[0]) * (size_t) rows;
-}
-
-bool copy_tensor_prefix_from_backend(const ggml_tensor * src,
-                                     ggml_tensor * dst,
-                                     int rows) {
-    if (!src || !dst || rows < 0) return false;
-    const size_t bytes = tensor_prefix_bytes(src, rows);
-    if (bytes > ggml_nbytes(src) || bytes > ggml_nbytes(dst)) return false;
-    if (bytes > 0) ggml_backend_tensor_get(src, dst->data, 0, bytes);
-    return true;
-}
-
-bool copy_tensor_prefix_to_backend(const ggml_tensor * src,
-                                   ggml_tensor * dst,
-                                   int rows) {
-    if (!src || !dst || rows < 0) return false;
-    const size_t bytes = tensor_prefix_bytes(src, rows);
-    if (bytes > ggml_nbytes(src) || bytes > ggml_nbytes(dst)) return false;
-    if (bytes > 0) ggml_backend_tensor_set(dst, src->data, 0, bytes);
-    return true;
-}
-
-bool copy_tensor_from_backend(const ggml_tensor * src, ggml_tensor * dst) {
-    if (!src || !dst) return false;
-    const size_t bytes = ggml_nbytes(src);
-    if (bytes != ggml_nbytes(dst)) return false;
-    ggml_backend_tensor_get(src, dst->data, 0, bytes);
-    return true;
-}
-
-bool copy_tensor_to_backend(const ggml_tensor * src, ggml_tensor * dst) {
-    if (!src || !dst) return false;
-    const size_t bytes = ggml_nbytes(src);
-    if (bytes != ggml_nbytes(dst)) return false;
-    ggml_backend_tensor_set(dst, src->data, 0, bytes);
-    return true;
-}
-
-bool tensors_compatible(const ggml_tensor * a, const ggml_tensor * b) {
-    if (!!a != !!b) return false;
-    if (!a) return true;
-    if (a->type != b->type || ggml_n_dims(a) != ggml_n_dims(b)) return false;
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        if (a->ne[i] != b->ne[i]) return false;
-    }
-    return true;
-}
-
-bool prefix_tensors_compatible(const ggml_tensor * snap,
-                               const ggml_tensor * cache,
-                               int live_rows) {
-    if (!!snap != !!cache) return false;
-    if (!snap) return live_rows == 0;
-    // A right-sized zero/one-row tensor reports one logical GGML dimension,
-    // while its full-capacity cache tensor reports two. Compare the physical
-    // row layout instead of ggml_n_dims() so those valid snapshots restore.
-    if (live_rows < 0 || cache->ne[1] <= 0 ||
-        snap->type != cache->type ||
-        snap->ne[0] != cache->ne[0] || live_rows > cache->ne[1]) {
-        return false;
-    }
-    for (int i = 2; i < GGML_MAX_DIMS; ++i) {
-        if (snap->ne[i] != cache->ne[i]) return false;
-    }
-    return snap->ne[1] == std::max(1, live_rows);
-}
-
-}  // namespace
-
-bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
-                             ggml_backend_t snapshot_backend,
-                             DeepSeek4Snapshot & out) {
-    if (!snapshot_backend || !cache.ctx || !cache.buf || !cache.hc_state ||
-        cache.layers.size() != (size_t)cache.n_layer || cache.cur_pos < 0 ||
-        cache.cur_pos > cache.max_ctx) {
-        return false;
-    }
-    for (const auto & layer : cache.layers) {
-        if (layer.n_comp < 0 || layer.n_index_comp < 0 ||
-            (layer.comp_kv && layer.n_comp > layer.comp_kv->ne[1]) ||
-            (!layer.comp_kv && layer.n_comp != 0) ||
-            (layer.index_comp_kv &&
-             layer.n_index_comp > layer.index_comp_kv->ne[1]) ||
-            (!layer.index_comp_kv && layer.n_index_comp != 0)) {
-            return false;
-        }
-    }
-
-    free_deepseek4_snapshot(out);
-
-    ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * (size_t)(cache.n_layer * 8 + 8) + 4096;
-    ip.no_alloc = true;
-    out.ctx = ggml_init(ip);
-    if (!out.ctx) {
-        return false;
-    }
-
-    out.layers.resize((size_t)cache.n_layer);
-    out.hc_state_snap = clone_snapshot_tensor(out.ctx, cache.hc_state, "ds4_hc_state_snap");
-    if (!out.hc_state_snap) {
-        free_deepseek4_snapshot(out);
-        return false;
-    }
-
-    for (int il = 0; il < cache.n_layer; ++il) {
-        const auto & src = cache.layers[(size_t)il];
-        auto & dst = out.layers[(size_t)il];
-        dst.raw_kv = clone_snapshot_tensor(out.ctx, src.raw_kv, nullptr);
-        dst.comp_kv = src.comp_kv
-            ? clone_snapshot_rows(out.ctx, src.comp_kv, src.n_comp, nullptr)
-            : nullptr;
-        dst.index_comp_kv = src.index_comp_kv
-            ? clone_snapshot_rows(out.ctx, src.index_comp_kv,
-                                  src.n_index_comp, nullptr)
-            : nullptr;
-        dst.attn_compressor.state_kv =
-            clone_snapshot_tensor(out.ctx, src.attn_compressor.state_kv, nullptr);
-        dst.attn_compressor.state_score =
-            clone_snapshot_tensor(out.ctx, src.attn_compressor.state_score, nullptr);
-        dst.indexer_compressor.state_kv =
-            clone_snapshot_tensor(out.ctx, src.indexer_compressor.state_kv, nullptr);
-        dst.indexer_compressor.state_score =
-            clone_snapshot_tensor(out.ctx, src.indexer_compressor.state_score, nullptr);
-        if (!dst.raw_kv ||
-            (src.comp_kv && !dst.comp_kv) ||
-            (src.index_comp_kv && !dst.index_comp_kv) ||
-            (src.attn_compressor.state_kv && !dst.attn_compressor.state_kv) ||
-            (src.attn_compressor.state_score && !dst.attn_compressor.state_score) ||
-            (src.indexer_compressor.state_kv && !dst.indexer_compressor.state_kv) ||
-            (src.indexer_compressor.state_score && !dst.indexer_compressor.state_score)) {
-            free_deepseek4_snapshot(out);
-            return false;
-        }
-    }
-
-    out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, snapshot_backend);
-    if (!out.buf) {
-        free_deepseek4_snapshot(out);
-        return false;
-    }
-
-    if (!copy_tensor_from_backend(cache.hc_state, out.hc_state_snap)) {
-        free_deepseek4_snapshot(out);
-        return false;
-    }
-    for (int il = 0; il < cache.n_layer; ++il) {
-        const auto & src = cache.layers[(size_t)il];
-        auto & dst = out.layers[(size_t)il];
-        dst.n_comp = src.n_comp;
-        dst.n_index_comp = src.n_index_comp;
-        if (!copy_tensor_from_backend(src.raw_kv, dst.raw_kv) ||
-            (src.comp_kv &&
-             !copy_tensor_prefix_from_backend(src.comp_kv, dst.comp_kv,
-                                              src.n_comp)) ||
-            (src.index_comp_kv &&
-             !copy_tensor_prefix_from_backend(src.index_comp_kv,
-                                              dst.index_comp_kv,
-                                              src.n_index_comp)) ||
-            (src.attn_compressor.state_kv &&
-             !copy_tensor_from_backend(src.attn_compressor.state_kv,
-                                       dst.attn_compressor.state_kv)) ||
-            (src.attn_compressor.state_score &&
-             !copy_tensor_from_backend(src.attn_compressor.state_score,
-                                       dst.attn_compressor.state_score)) ||
-            (src.indexer_compressor.state_kv &&
-             !copy_tensor_from_backend(src.indexer_compressor.state_kv,
-                                       dst.indexer_compressor.state_kv)) ||
-            (src.indexer_compressor.state_score &&
-             !copy_tensor_from_backend(src.indexer_compressor.state_score,
-                                       dst.indexer_compressor.state_score))) {
-            free_deepseek4_snapshot(out);
-            return false;
-        }
-    }
-
-    out.cur_pos = cache.cur_pos;
-    return true;
-}
-
-bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
-                                DeepSeek4Cache & cache) {
-    if (!snap.ctx || !cache.ctx || !cache.buf || !snap.hc_state_snap ||
-        snap.layers.size() != cache.layers.size() || snap.cur_pos < 0 ||
-        snap.cur_pos > cache.max_ctx) {
-        std::fprintf(stderr,
-                     "[deepseek4] snapshot restore: invalid header "
-                     "(snap_ctx=%d cache_ctx=%d snap_layers=%zu "
-                     "cache_layers=%zu pos=%d max_ctx=%d)\n",
-                     snap.ctx != nullptr, cache.ctx != nullptr,
-                     snap.layers.size(), cache.layers.size(),
-                     snap.cur_pos, cache.max_ctx);
-        return false;
-    }
-    if (!tensors_compatible(snap.hc_state_snap, cache.hc_state)) {
-        std::fprintf(stderr,
-                     "[deepseek4] snapshot restore: incompatible HC state\n");
-        return false;
-    }
-
-    // Validate the complete layout before changing the live cache. Compressed
-    // tensors are deliberately right-sized to their logical row counts;
-    // inactive capacity rows are not part of the snapshot contract.
-    for (size_t il = 0; il < cache.layers.size(); ++il) {
-        const auto & src = snap.layers[il];
-        const auto & dst = cache.layers[il];
-        const bool raw_ok = tensors_compatible(src.raw_kv, dst.raw_kv);
-        const bool comp_ok = prefix_tensors_compatible(
-            src.comp_kv, dst.comp_kv, src.n_comp);
-        const bool index_ok = prefix_tensors_compatible(
-            src.index_comp_kv, dst.index_comp_kv, src.n_index_comp);
-        const bool attn_kv_ok = tensors_compatible(
-            src.attn_compressor.state_kv, dst.attn_compressor.state_kv);
-        const bool attn_score_ok = tensors_compatible(
-            src.attn_compressor.state_score, dst.attn_compressor.state_score);
-        const bool index_kv_ok = tensors_compatible(
-            src.indexer_compressor.state_kv, dst.indexer_compressor.state_kv);
-        const bool index_score_ok = tensors_compatible(
-            src.indexer_compressor.state_score,
-            dst.indexer_compressor.state_score);
-        if (!raw_ok || !comp_ok || !index_ok || !attn_kv_ok ||
-            !attn_score_ok || !index_kv_ok || !index_score_ok) {
-            std::fprintf(stderr,
-                         "[deepseek4] snapshot restore: incompatible layer %zu "
-                         "(raw=%d comp=%d[%d/%lld/%lld] "
-                         "index=%d[%d/%lld/%lld] states=%d/%d/%d/%d)\n",
-                         il, raw_ok, comp_ok, src.n_comp,
-                         (long long) (src.comp_kv ? src.comp_kv->ne[1] : 0),
-                         (long long) (dst.comp_kv ? dst.comp_kv->ne[1] : 0),
-                         index_ok, src.n_index_comp,
-                         (long long) (src.index_comp_kv
-                             ? src.index_comp_kv->ne[1] : 0),
-                         (long long) (dst.index_comp_kv
-                             ? dst.index_comp_kv->ne[1] : 0),
-                         attn_kv_ok, attn_score_ok,
-                         index_kv_ok, index_score_ok);
-            return false;
-        }
-    }
-
-    if (!copy_tensor_to_backend(snap.hc_state_snap, cache.hc_state)) {
-        std::fprintf(stderr,
-                     "[deepseek4] snapshot restore: HC copy failed\n");
-        return false;
-    }
-    for (size_t il = 0; il < cache.layers.size(); ++il) {
-        const auto & src = snap.layers[il];
-        auto & dst = cache.layers[il];
-        if (!copy_tensor_to_backend(src.raw_kv, dst.raw_kv) ||
-            (src.comp_kv &&
-             !copy_tensor_prefix_to_backend(src.comp_kv, dst.comp_kv,
-                                            src.n_comp)) ||
-            (src.index_comp_kv &&
-             !copy_tensor_prefix_to_backend(src.index_comp_kv,
-                                            dst.index_comp_kv,
-                                            src.n_index_comp)) ||
-            (src.attn_compressor.state_kv &&
-             !copy_tensor_to_backend(src.attn_compressor.state_kv,
-                                     dst.attn_compressor.state_kv)) ||
-            (src.attn_compressor.state_score &&
-             !copy_tensor_to_backend(src.attn_compressor.state_score,
-                                     dst.attn_compressor.state_score)) ||
-            (src.indexer_compressor.state_kv &&
-             !copy_tensor_to_backend(src.indexer_compressor.state_kv,
-                                     dst.indexer_compressor.state_kv)) ||
-            (src.indexer_compressor.state_score &&
-             !copy_tensor_to_backend(src.indexer_compressor.state_score,
-                                       dst.indexer_compressor.state_score))) {
-            std::fprintf(stderr,
-                         "[deepseek4] snapshot restore: layer %zu copy failed\n",
-                         il);
-            return false;
-        }
-        dst.n_comp = src.n_comp;
-        dst.n_index_comp = src.n_index_comp;
-    }
-
-    cache.cur_pos = snap.cur_pos;
-    return true;
-}
-
-
-void free_deepseek4_snapshot(DeepSeek4Snapshot & s) {
-    if (s.buf) { ggml_backend_buffer_free(s.buf); s.buf = nullptr; }
-    if (s.ctx) { ggml_free(s.ctx); s.ctx = nullptr; }
-    s.layers.clear();
-    s.cur_pos = 0;
-    s.hc_state_snap = nullptr;
 }
 
 }  // namespace dflash::common

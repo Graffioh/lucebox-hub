@@ -67,6 +67,13 @@ public:
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
+    // Ondisk prefix cache: DeepSeek snapshots are CPU ggml contexts whose
+    // tensors carry stable names plus a meta/logits/feature sidecar, so they
+    // serialize and rebind like the Qwen snapshots do.
+    SnapshotRef snapshot_ref(int slot) const override;
+    bool snapshot_adopt(int slot, ggml_context * ctx,
+                        ggml_backend_buffer_t buf, int cur_pos,
+                        int32_t last_tok = -1) override;
 
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,

@@ -468,6 +468,7 @@ add_library(dflash_common STATIC
     # DeepSeek V4 Flash target arch
     src/deepseek4/deepseek4_loader.cpp
     src/deepseek4/deepseek4_graph.cpp
+    src/deepseek4/deepseek4_snapshot.cpp
     src/deepseek4/deepseek4_roctx.cpp
     src/deepseek4/deepseek4_paged_cache.cpp
     src/deepseek4/deepseek4_seq_engine.cpp
