@@ -598,6 +598,13 @@ On gfx1151, the exact block-radix selector is also the default for the DS4
 hipCUB full-sort path. `test_deepseek4_unit` checks selected-set parity across
 tile boundaries; `bench_ds4_topk` separately measures selector timing.
 
+On gfx1151, dense/sparse approximate prefill also enables registry-aware
+mixed-ROCmFP MMQ automatically. The decision belongs to the model and its
+matmul operations, not the process environment, so a later exact-mode model
+keeps its existing dispatch. `DFLASH_DS4_MIX_MMQ_PREFILL=0` at model load is
+the kill switch. Other model integrations can reuse the graph-local
+`ggml_mul_mat_set_mixed_mmq` policy after qualifying their model and device.
+
 For experimental long sparse prefill, set both
 `DFLASH_DS4_DIRECT_INDEXER_TOPK=1` and `GGML_CUDA_MLA_STREAM_TOPK=1`. This
 enables a reusable D512 K-equals-V streaming attention path that shares each
