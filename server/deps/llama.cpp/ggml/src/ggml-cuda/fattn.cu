@@ -103,6 +103,7 @@ struct ds4_inverse_rope_params {
     int   enabled;
     int   forward_q_enabled;
     int   kv_start;
+    const int32_t * positions;
     float freq_scale;
     float ext_factor;
     float attn_factor;
@@ -157,7 +158,8 @@ __device__ static __forceinline__ void ds4_inverse_rope_coefficients(
         const ds4_inverse_rope_params & p,
         float & cos_theta, float & sin_theta) {
     ds4_rope_coefficients_at_position(
-        pair, -(p.kv_start + token), p, cos_theta, sin_theta);
+        pair, -(p.positions ? p.positions[token] : p.kv_start + token),
+        p, cos_theta, sin_theta);
 }
 
 // Forward counterpart of ds4_inverse_rope_coefficients. Keep the expressions
@@ -169,7 +171,8 @@ __device__ static __forceinline__ void ds4_forward_rope_coefficients(
         const ds4_inverse_rope_params & p,
         float & cos_theta, float & sin_theta) {
     ds4_rope_coefficients_at_position(
-        pair, p.kv_start + token, p, cos_theta, sin_theta);
+        pair, p.positions ? p.positions[token] : p.kv_start + token,
+        p, cos_theta, sin_theta);
 }
 
 __device__ static __forceinline__ void ds4_apply_inverse_rope_pair(
@@ -1796,6 +1799,14 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32_supported(const ggml_tensor * dst)
     const int raw_window = (int) (ds4_layout >> 16);
     const int sparse_block_size = (int) (ds4_layout & 0xffffu);
     const int rope_flags = ggml_get_op_params_i32(dst, 7);
+    const ggml_tensor * rope_positions = dst->src[6];
+    if (rope_positions &&
+        ((rope_flags & 1) == 0 || rope_positions->type != GGML_TYPE_I32 ||
+         rope_positions->ne[0] != n_tokens || rope_positions->ne[1] != 1 ||
+         rope_positions->ne[2] != 1 || rope_positions->ne[3] != 1 ||
+         !ggml_is_contiguous(rope_positions))) {
+        return false;
+    }
     if (sparse_keep_rows == INT_MIN) {
         return false;
     }
@@ -1887,6 +1898,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
     inverse_rope.forward_q_enabled = (rope_flags & 2) != 0;
     if (rope_flags != 0) {
         inverse_rope.kv_start = ggml_get_op_params_i32(dst, 8);
+        inverse_rope.positions = dst->src[6]
+            ? static_cast<const int32_t *>(dst->src[6]->data) : nullptr;
         const float freq_base = ggml_get_op_params_f32(dst, 9);
         inverse_rope.freq_scale = ggml_get_op_params_f32(dst, 10);
         inverse_rope.ext_factor = ggml_get_op_params_f32(dst, 11);

@@ -569,6 +569,16 @@ remains off by default. It changes verifier floating-point inputs and can
 change generated tokens, so re-run workload quality checks before enabling it
 for another checkpoint.
 
+Cached sparse decode and verification retain standalone forward-Q RoPE.
+The fused-Q variant failed the strict five-line retrieval control even when
+an explicit-attention control used the same selected rows. Keeping this
+rotation separate restored the control's output without disabling sparse
+flash attention, native F16 KV, or adaptive verification. Fused inverse RoPE
+reads runtime token positions so graph replay cannot retain a previous
+step's position. Uncached prefill keeps both fused rotations. This targeted
+check does not establish universal output identity or qualify all contexts;
+the sparse verifier remains opt-in.
+
 On RDNA3.5 and RDNA4, speculative widths 2–5 use the packed small-CM rocWMMA
 indexer by default. It is bit-identical to the generic indexer in the GPU unit
 test and can be disabled with `GGML_DS4_INDEXER_PACK_SMALL=0` for diagnosis.

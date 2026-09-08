@@ -2009,7 +2009,13 @@ static ggml_tensor * build_mla_attention_lane_core(
     // D=512 flash prefill can rotate Q's 64-d tail inside the exact attention
     // kernel. This avoids materializing cont(nope), cont(tail), rope(tail),
     // and concat(nope, tail) while retaining the same F32 rounding boundary.
-    const bool fuse_q_rope = attention_impl != DeepSeek4AttentionImpl::Explicit &&
+    // Cached decode/verification uses the standalone Q rotation. Fusing it
+    // changes the adaptive sparse verifier's output even with identical
+    // selected rows; keep the validated rounding/materialization boundary.
+    // This does not disable sparse flash attention, native F16 KV, inverse
+    // RoPE fusion, or the uncached prefill optimization.
+    const bool fuse_q_rope = !cached_inputs &&
+                             attention_impl != DeepSeek4AttentionImpl::Explicit &&
                              n_tokens > 1 && head_dim == 512 && n_rot == 64;
     if (prepared) {
         projected = *prepared;
@@ -2677,6 +2683,13 @@ static ggml_tensor * build_mla_attention_lane_core(
                     context, kv_start, rope_freq, rope_scale, rope_ext,
                     rope_attn, w.rope_yarn_beta_fast,
                     w.rope_yarn_beta_slow, rope_n_ctx_orig, fuse_q_rope);
+                // Cached AR/verifier graphs reuse a shape at new positions.
+                // Bind the already-uploaded position tensor so both fused
+                // rotations advance with the graph instead of using kv_start
+                // from the first build. Prefill's fixed-position path is unchanged.
+                if (cached_inputs) {
+                    ggml_flash_attn_ext_set_ds4_rope_positions(context, rope_pos);
+                }
                 inverse_rope_fused = true;
             }
         }

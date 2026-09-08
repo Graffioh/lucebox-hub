@@ -3290,6 +3290,145 @@ static void test_ds4_indexer_score_packed_small_gpu() {
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_ds4_flash_rope_replay_gpu() {
+    std::fprintf(stderr, "  test_ds4_flash_rope_replay_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only contract)\n");
+    return;
+#endif
+    auto backend = ggml_backend_cuda_init(0);
+    if (!backend) {
+        std::fprintf(stderr, " skipped (no GPU backend)\n");
+        return;
+    }
+    constexpr int dim = 512, heads = 4, raw = 128, comp = 640, keep = 512;
+    constexpr int starts[] = {7680, 7688, 131072, 7680};
+    int passed = 0, cases = 0;
+    for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int width = 1; width <= 5; ++width) {
+            for (bool forward : {false, true}) {
+                ++cases;
+                auto ctx = make_test_context(2u << 20);
+                const int rows = raw + comp;
+                auto q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, width, heads);
+                auto kv = ggml_new_tensor_3d(ctx, type, dim, rows, 1);
+                auto mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, rows, width);
+                auto topk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, keep, width);
+                auto positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, width);
+                auto negative_positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, width);
+                for (auto input : {q, kv, mask, topk, positions, negative_positions}) ggml_set_input(input);
+                auto attention = [&](int start) {
+                    auto out = ggml_flash_attn_ext(ctx, q, kv, kv, mask,
+                        1.0f / std::sqrt(float(dim)), 0.0f, 0.0f);
+                    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+                    ggml_flash_attn_ext_set_ds4_sparse(out, raw, raw, -keep, 32);
+                    ggml_flash_attn_ext_set_ds4_indexer_topk(out, topk);
+                    ggml_flash_attn_ext_set_ds4_inverse_rope(out, start,
+                        10000.0f, 1.0f / 16.0f, 1.0f, 1.0f, 32.0f, 1.0f, 8192, forward);
+                    ggml_set_output(out);
+                    return out;
+                };
+                auto dynamic = attention(starts[0]);
+                // Replay positions are runtime inputs, not part of the shape
+                // key. The baseline ignores this input and uses stale RoPE.
+                ggml_flash_attn_ext_set_ds4_rope_positions(dynamic, positions);
+                if (type == GGML_TYPE_F32 && width == 2 && forward) {
+                    auto strided = ggml_view_1d(ctx, positions, width, 0);
+                    strided->nb[0] = 2 * sizeof(int32_t);
+                    for (auto invalid : {
+                            ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width),
+                            ggml_new_tensor_1d(ctx, GGML_TYPE_I32, width + 1),
+                            ggml_new_tensor_2d(ctx, GGML_TYPE_I32, width, 2),
+                            strided}) {
+                        // Bypass the setter to exercise backend validation of
+                        // malformed imported graphs without launching them.
+                        dynamic->src[6] = invalid;
+                        TEST_ASSERT_MSG(!ggml_backend_supports_op(backend, dynamic),
+                                        "DS4 flash accepted invalid runtime RoPE positions");
+                    }
+                    dynamic->src[6] = positions;
+                }
+                std::vector<ggml_tensor *> reference;
+                auto graph = ggml_new_graph_custom(ctx, 64, false);
+                ggml_build_forward_expand(graph, dynamic);
+                for (int start : starts) {
+                    reference.push_back(attention(start));
+                    ggml_build_forward_expand(graph, reference.back());
+                }
+                // Also compare with the actual standalone GGML RoPE path,
+                // not just another instance of the fused implementation.
+                auto rope = [&](ggml_tensor * input, ggml_tensor * pos) {
+                    return ggml_rope_ext(ctx, input, pos, nullptr, 64,
+                        GGML_ROPE_TYPE_NORMAL | GGML_ROPE_TYPE_TAIL, 8192,
+                        10000.0f, 1.0f / 16.0f, 1.0f, 1.0f, 32.0f, 1.0f);
+                };
+                auto native_q = forward
+                    ? ggml_permute(ctx, rope(ggml_permute(ctx, q, 0, 2, 1, 3), positions), 0, 2, 1, 3)
+                    : q;
+                auto native_attention = ggml_flash_attn_ext(ctx, native_q, kv, kv, mask,
+                    1.0f / std::sqrt(float(dim)), 0.0f, 0.0f);
+                ggml_flash_attn_ext_set_prec(native_attention, GGML_PREC_F32);
+                ggml_flash_attn_ext_set_ds4_sparse(native_attention, raw, raw, -keep, 32);
+                ggml_flash_attn_ext_set_ds4_indexer_topk(native_attention, topk);
+                auto native = rope(native_attention, negative_positions);
+                ggml_set_output(native);
+                ggml_build_forward_expand(graph, native);
+                auto alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+                bool ok = ggml_backend_supports_op(backend, dynamic) &&
+                          ggml_gallocr_alloc_graph(alloc, graph);
+                if (ok) {
+                    std::vector<float> qdata(ggml_nelements(q)), kvdata(ggml_nelements(kv));
+                    for (size_t i = 0; i < qdata.size(); ++i)
+                        qdata[i] = float(int((i * 17) % 71) - 35) * 0.0125f;
+                    for (size_t i = 0; i < kvdata.size(); ++i)
+                        kvdata[i] = float(int((i * 29 + i / dim) % 83) - 41) * 0.025f;
+                    std::vector<ggml_fp16_t> masks(ggml_nelements(mask), ggml_fp32_to_fp16(0));
+                    std::vector<int32_t> ids(ggml_nelements(topk));
+                    for (int t = 0; t < width; ++t) {
+                        for (int k = 0; k < keep; ++k)
+                            ids[(size_t)t * keep + k] = (29 * k + 17 * t) % comp;
+                    }
+                    ggml_backend_tensor_set(q, qdata.data(), 0, ggml_nbytes(q));
+                    if (type == GGML_TYPE_F16) {
+                        std::vector<ggml_fp16_t> half(kvdata.size());
+                        std::transform(kvdata.begin(), kvdata.end(), half.begin(), ggml_fp32_to_fp16);
+                        ggml_backend_tensor_set(kv, half.data(), 0, ggml_nbytes(kv));
+                    } else ggml_backend_tensor_set(kv, kvdata.data(), 0, ggml_nbytes(kv));
+                    ggml_backend_tensor_set(mask, masks.data(), 0, ggml_nbytes(mask));
+                    ggml_backend_tensor_set(topk, ids.data(), 0, ggml_nbytes(topk));
+                    for (size_t run = 0; run < reference.size(); ++run) {
+                        std::vector<int32_t> pos(width);
+                        for (int t = 0; t < width; ++t) pos[t] = starts[run] + t;
+                        ggml_backend_tensor_set(positions, pos.data(), 0, ggml_nbytes(positions));
+                        for (int & value : pos) value = -value;
+                        ggml_backend_tensor_set(negative_positions, pos.data(), 0, ggml_nbytes(negative_positions));
+                        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+                            ok = false;
+                            break;
+                        }
+                        std::vector<float> actual(ggml_nelements(dynamic)), expected(actual.size());
+                        ggml_backend_tensor_get(dynamic, actual.data(), 0, ggml_nbytes(dynamic));
+                        ggml_backend_tensor_get(reference[run], expected.data(), 0, ggml_nbytes(dynamic));
+                        for (size_t i = 0; i < actual.size(); ++i)
+                            ok &= std::isfinite(actual[i]) && actual[i] == expected[i];
+                        ggml_backend_tensor_get(native, expected.data(), 0, ggml_nbytes(native));
+                        for (size_t i = 0; i < actual.size(); ++i)
+                            ok &= nearly_equal(actual[i], expected[i], 2.0e-5f, 2.0e-5f);
+                    }
+                }
+                if (!ok) std::fprintf(stderr, " FAIL width=%d kv=%s forward=%d",
+                                      width, ggml_type_name(type), forward);
+                passed += ok;
+                ggml_gallocr_free(alloc);
+                ggml_free(ctx);
+            }
+        }
+    }
+    std::fprintf(stderr, " %d/%d cases passed\n", passed, cases);
+    TEST_ASSERT_MSG(passed == cases, "fused RoPE replay used stale token positions");
+    ggml_backend_free(backend);
+}
+
 static void test_ds4_topk_block_radix_gpu() {
     std::fprintf(stderr, "  test_ds4_topk_block_radix_gpu ...");
 #if !defined(GGML_USE_HIP)
@@ -4593,6 +4732,7 @@ int main() {
     test_ds4_flash_attention_parallel_index_scan_gpu(1024);
     test_ds4_preserved_raw_rows_gpu();
     test_ds4_indexer_score_packed_small_gpu();
+    test_ds4_flash_rope_replay_gpu();
     test_ds4_topk_block_radix_gpu();
     test_ds4_flash_attention_inverse_rope_fallback_gpu();
     test_hc_post_strided_split_gpu();
