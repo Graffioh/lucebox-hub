@@ -23,6 +23,7 @@
 
 #include "deepseek4_dspark.h"
 #include "deepseek4_internal.h"
+#include "deepseek4_snapshot.h"
 #include "deepseek4_roctx.h"
 #include "internal.h"
 #include "common/dspark_head.h"

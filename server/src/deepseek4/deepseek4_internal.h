@@ -369,6 +369,30 @@ bool create_deepseek4_cache(ggml_backend_t backend,
                              int max_ctx,
                              DeepSeek4Cache & out);
 
+// Per-layer cache geometry implied by the weights. Single source of truth for
+// create_deepseek4_cache() and for snapshot declaration/validation
+// (deepseek4_snapshot.h), so the two can never disagree on shapes.
+struct DeepSeek4LayerGeometry {
+    uint32_t ratio = 0;            // compress ratio: 0 (raw window only), 4 or 128
+    int64_t  head_dim = 0;         // raw / compressed row width (F16)
+    int64_t  raw_rows = 0;         // n_swa
+    bool     has_comp = false;     // ratio > 0: comp_kv + attn compressor state
+    int64_t  comp_width = 0;       // attn compressor state width (F32)
+    int64_t  comp_state_rows = 0;
+    bool     has_index = false;    // ratio == 4: index_comp_kv + indexer state
+    int64_t  index_dim = 0;        // indexer row width (F16)
+    int64_t  index_state_width = 0;  // indexer compressor state width (F32)
+    int64_t  index_state_rows = 0;
+    // Compressed-row capacity for a cache of `max_ctx` tokens (0 if !has_comp).
+    int64_t comp_capacity(int max_ctx) const {
+        return has_comp ? (int64_t) max_ctx / (int64_t) ratio + 16 : 0;
+    }
+};
+DeepSeek4LayerGeometry deepseek4_layer_geometry(const DeepSeek4Weights & w, int layer);
+inline int64_t deepseek4_hc_state_elements(const DeepSeek4Weights & w) {
+    return (int64_t) w.n_hc * (int64_t) w.n_embd;
+}
+
 void free_deepseek4_cache(DeepSeek4Cache & c);
 bool create_deepseek4_paged_cache(ggml_backend_t backend,
                                   const DeepSeek4Weights & w,
@@ -411,11 +435,6 @@ bool build_deepseek4_head4_tail2_routes(
     ggml_tensor * router_weights,
     int n_tokens,
     DeepSeek4Head4Tail2Routes & out);
-bool deepseek4_snapshot_save(const DeepSeek4Cache & cache,
-                             ggml_backend_t snapshot_backend,
-                             DeepSeek4Snapshot & out);
-bool deepseek4_snapshot_restore(const DeepSeek4Snapshot & snap,
-                                DeepSeek4Cache & cache);
 
 // Largest prefix of [kv_start, kv_start + n_tokens) that reaches at most the
 // next learned-compressor boundary. Multi-token dynamic forwards split on
@@ -533,10 +552,20 @@ struct DeepSeek4Snapshot {
         DeepSeek4CompressorState indexer_compressor;
     };
     std::vector<LayerSnap> layers;
+    // Optional serialization sidecars (ondisk prefix cache). Present when the
+    // snapshot was saved with DeepSeek4SnapshotAux or adopted from disk.
+    //   meta_snap        I32 [kDeepSeek4SnapMetaBase + 2 * n_layer]
+    //   last_logits_snap F32 [n_vocab]
+    //   spec_feat_snap   F32 [1, max(1, n_spec_feat)]  (logical length in meta)
+    ggml_tensor * meta_snap        = nullptr;
+    ggml_tensor * last_logits_snap = nullptr;
+    ggml_tensor * spec_feat_snap   = nullptr;
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
+    // false when ctx/buf are shared with (and freed by) another owner, e.g.
+    // one merged ondisk context bound into several layer-split shard snapshots.
+    bool                  owns_storage = true;
 };
 
-void free_deepseek4_snapshot(DeepSeek4Snapshot & s);
 
 }  // namespace dflash::common

@@ -5030,10 +5030,144 @@ static std::array<uint8_t, 16> read_layout_id_from_cache_dir(const std::string &
     return id;
 }
 
+// Layout mock with a settable live position that can also adopt
+// deserialized snapshots (lookup path).
+struct MockBackendWithAdopt : MockBackendWithLayout {
+    std::vector<std::pair<ggml_context *, ggml_backend_buffer_t>> adopted_;
+    int adopted_cur_pos_ = 0;
+    int cur_pos_ = kMaxPos;
+    ~MockBackendWithAdopt() {
+        for (auto & p : adopted_) {
+            if (p.second) ggml_backend_buffer_free(p.second);
+            if (p.first) ggml_free(p.first);
+        }
+    }
+    SnapshotRef snapshot_ref(int slot) const override {
+        SnapshotRef ref = MockBackendWithLayout::snapshot_ref(slot);
+        ref.cur_pos = cur_pos_;
+        return ref;
+    }
+    int snapshot_cur_pos(int) const override { return cur_pos_; }
+    bool snapshot_adopt(int, ggml_context * ctx, ggml_backend_buffer_t buf,
+                        int cur_pos, int32_t) override {
+        adopted_.push_back({ctx, buf});
+        adopted_cur_pos_ = cur_pos;
+        return true;
+    }
+};
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_snapshot_past_key) {
+    // A snapshot of kMaxPos positions may only be filed under a key that
+    // covers at least kMaxPos tokens; shorter keys are refused on save and,
+    // for files that already exist, on read.
+    MockBackendWithAdopt backend;
+    std::string dir = test_tmp_path("dflash_test_past_key").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+
+    std::vector<int32_t> short_key;
+    for (int i = 0; i < MockBackendWithLayout::kMaxPos - 4; ++i) short_key.push_back(i + 1);
+    std::vector<int32_t> full_key;
+    for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) full_key.push_back(i + 1);
+
+    TEST_ASSERT(!cache.save(0, short_key));
+    TEST_ASSERT(cache.total_bytes() == 0);
+    TEST_ASSERT(cache.save(0, full_key));
+    TEST_ASSERT(cache.total_bytes() > 0);
+    TEST_ASSERT(!cache.lookup(short_key, 1));
+    TEST_ASSERT(cache.lookup(full_key, 1));
+    TEST_ASSERT(backend.adopted_cur_pos_ == MockBackendWithLayout::kMaxPos);
+
+    // Forge the pre-fix shape on disk: key shorter than the snapshot. The
+    // scan keys entries by the header's token hash, so only the header
+    // fields need rewriting (token_count at byte 32, token_hash at byte 36
+    // of the 80-byte field-by-field header).
+    {
+        std::string forged;
+        for (auto & entry : fs::recursive_directory_iterator(dir)) {
+            if (entry.path().extension() == ".dkv") {
+                forged = (entry.path().parent_path() /
+                          (std::string(32, 'f') + ".dkv")).string();
+                fs::copy_file(entry.path(), forged, fs::copy_options::overwrite_existing);
+                break;
+            }
+        }
+        TEST_ASSERT(!forged.empty());
+        FILE * f = std::fopen(forged.c_str(), "r+b");
+        TEST_ASSERT(f != nullptr);
+        if (f) {
+            const uint32_t short_count = (uint32_t)short_key.size();
+            PrefixHash ph = hash_prefix(short_key.data(), (int)short_key.size());
+            std::fseek(f, 32, SEEK_SET);
+            TEST_ASSERT(std::fwrite(&short_count, 4, 1, f) == 1);
+            TEST_ASSERT(std::fwrite(ph.data(), 16, 1, f) == 1);
+            std::fclose(f);
+        }
+        DiskPrefixCache reopened(cfg, backend);
+        TEST_ASSERT(reopened.init());
+        reopened.learn_layout(0);
+        TEST_ASSERT(!reopened.lookup(short_key, 2));   // rejected + removed
+        TEST_ASSERT(!fs::exists(forged));
+        TEST_ASSERT(reopened.lookup(full_key, 2));     // consistent file survives
+    }
+    rm_rf(dir);
+}
+
+TEST_CASE(ServerUnitFixture, test_disk_cache_continued_keys_full_prefix) {
+    // Continued checkpoints are paced by the interval but keyed by the
+    // tokens the snapshot really covers, so only a prompt containing all of
+    // them can hit.
+    MockBackendWithAdopt backend;
+    std::string dir = test_tmp_path("dflash_test_continued_key").string();
+    rm_rf(dir);
+    DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
+    cfg.continued_interval = 10;   // 32 positions -> crosses at 30
+    DiskPrefixCache cache(cfg, backend);
+    TEST_ASSERT(cache.init());
+    cache.learn_layout(0);
+
+    std::vector<int32_t> tokens;
+    for (int i = 0; i < 60; ++i) tokens.push_back(100 + i);
+    const int cur_pos = MockBackendWithLayout::kMaxPos;  // 32 -> bucket 30
+    backend.cur_pos_ = cur_pos;
+    TEST_ASSERT(cache.maybe_store_continued(0, tokens, cur_pos));
+    std::vector<int32_t> aligned(tokens.begin(), tokens.begin() + 30);
+    std::vector<int32_t> covered(tokens.begin(), tokens.begin() + cur_pos);
+    TEST_ASSERT(!cache.lookup(aligned, 1));
+    TEST_ASSERT(cache.lookup(covered, 1));
+    TEST_ASSERT(backend.adopted_cur_pos_ == cur_pos);
+    const size_t bytes_after_first = cache.total_bytes();
+    TEST_ASSERT(bytes_after_first > 0);
+
+    // Same interval bucket: no second checkpoint.
+    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, cur_pos));
+    backend.cur_pos_ = 38;  // still bucket 30
+    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 38));
+    TEST_ASSERT(cache.total_bytes() == bytes_after_first);
+
+    // Crossing into bucket 40 fires again, keyed by the 42 covered tokens.
+    backend.cur_pos_ = 42;
+    TEST_ASSERT(cache.maybe_store_continued(0, tokens, 42));
+    TEST_ASSERT(cache.total_bytes() > bytes_after_first);
+    std::vector<int32_t> bucket(tokens.begin(), tokens.begin() + 40);
+    std::vector<int32_t> covered2(tokens.begin(), tokens.begin() + 42);
+    TEST_ASSERT(!cache.lookup(bucket, 2));
+    TEST_ASSERT(cache.lookup(covered2, 2));
+    TEST_ASSERT(backend.adopted_cur_pos_ == 42);
+    // The earlier checkpoint is still there, and bucket 40 does not refire.
+    TEST_ASSERT(cache.lookup(covered, 3));
+    backend.cur_pos_ = 47;
+    TEST_ASSERT(!cache.maybe_store_continued(0, tokens, 47));
+    rm_rf(dir);
+}
+
 TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     MockBackendWithLayout backend;
     std::vector<int32_t> prompt;
-    for (int i = 0; i < 10; ++i) prompt.push_back(i + 1);
+    for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) prompt.push_back(i + 1);
 
     // Salt A: non-zero.
     std::array<uint8_t, 16> salt_a{};
@@ -5095,7 +5229,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
     // (default-constructed identity_salt_ is already all-zero).
     MockBackendWithLayout backend;
     std::vector<int32_t> prompt;
-    for (int i = 0; i < 10; ++i) prompt.push_back(i + 1);
+    for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) prompt.push_back(i + 1);
 
     std::string dir1 = test_tmp_path("dflash_test_salt_zero1").string();
     rm_rf(dir1);
