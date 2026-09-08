@@ -1408,6 +1408,10 @@ static void test_failed_init_preserves_sparse_opt_in() {
     ScopedEnvVar mmvq("LUCE_MMVQ_MAX_NCOLS");
     setenv("DFLASH_DS4_SPEC", "1", 1);
     unsetenv("DFLASH_DS4_DRAFT");
+    // The removed gfx1151 auto-enable ran in init() BEFORE load_model().
+    // Deliberately fail at model loading: even a failed init with no drafter
+    // must not change process-wide sparse-verifier policy for the next model.
+    // This tests early-init side effects, not successful verifier construction.
     const std::string missing_model = make_temp_gguf_path("missing");
     for (const char * value : {static_cast<const char *>(nullptr), "0", "1"}) {
         if (value) setenv("DFLASH_DS4_SPARSE_DECODE_FLASH", value, 1);

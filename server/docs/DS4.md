@@ -563,7 +563,7 @@ batched explicit or sparse verifier attention instead of converting the full
 cache to F32 on every speculative step. With
 `DFLASH_DS4_SPARSE_DECODE_FLASH=1`, the verifier keeps explicit attention for
 short histories. Single-lane or ratio-4 layouts switch to sparse attention
-once it removes at least half of the compressed rows. Other batched layouts
+once it removes more than half of the compressed rows. Other batched layouts
 retain explicit attention because coarse block selection does not preserve
 the overwritten raw-row suffix. The ratio-4 learned indexer appends that
 suffix to its selected rows and applies the causal mask to it. Key-side

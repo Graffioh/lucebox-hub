@@ -2,6 +2,7 @@
 #include "concurrency/qwen35_seq_engine.h"
 #include "common/chain_rollback_policy.h"
 #include "common/adaptive_spec_width.h"
+#include "common/spec_acceptance.h"
 #include "common/draft_block_size.h"
 #include "common/draft_swa.h"
 #include "placement/skip_park_guard.h"
@@ -2817,8 +2818,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     int n_generated     = 0;
     int n_draft_steps   = 0;
-    int n_accept_sum    = 0;
-    int n_spec_offered_sum = 0;
+    SpecAcceptanceStats acceptance;
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
@@ -3454,8 +3454,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 if (target->is_eos(tok)) { hit_eos = true; break; }
             }
 
-            // Telemetry: accepted children (exclude the always-committed root).
-            n_accept_sum += std::max(0, accepted_emitted - 1);
+            // Seed-inclusive, like chain telemetry; exclude graph padding.
+            acceptance.record_tree(accepted_emitted, tree.n_nodes);
 
             if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
 
@@ -3777,7 +3777,6 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         if (!ar_step) {
             width_controller.observe(accept_n, v_len);
-            n_spec_offered_sum += v_len;
         }
         // Track hint acceptance telemetry.
         if (hint_fill > 0) {
@@ -4025,7 +4024,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         // accounting; 1-token burst steps would otherwise dilute the rate
         // that steers the PFlash residency bandit.
         if (!ar_step) {
-            n_accept_sum += std::min(accept_n, emitted);
+            acceptance.record_chain(accept_n, v_len, emitted, need_commit_budget);
         }
         n_draft_steps++;
 
@@ -4063,9 +4062,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (floor_to_ar) {
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_spec_offered_sum);
-            out_accept_rate =
-                (float)((double)n_accept_sum / (double)total_draft_pos);
+            out_accept_rate = acceptance.rate();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 if (!finish_speculative_state()) return false;
@@ -4108,9 +4105,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.cur_pos = committed;
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = std::max(1, n_spec_offered_sum);
-            out_accept_rate =
-                (float)((double)n_accept_sum / (double)total_draft_pos);
+            out_accept_rate = acceptance.rate();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 if (!finish_speculative_state()) return false;
@@ -4139,14 +4134,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_spec_offered_sum);
-    const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
-    out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
+    const double accept_pct = 100.0 * acceptance.rate();
+    out_accept_rate = acceptance.rate();
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
                  n_generated, decode_s,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
-                 n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
+                 n_draft_steps, acceptance.accepted(), acceptance.offered(), accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
     if (n_ar_burst_steps > 0) {
         std::fprintf(stderr, "[spec-decode] adaptive: %d of %d steps ran as plain decode "

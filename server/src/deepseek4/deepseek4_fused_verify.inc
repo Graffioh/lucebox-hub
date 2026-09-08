@@ -887,7 +887,7 @@ static bool ds4_build_fused_verify_graph(
         std::vector<DeepSeek4F32ArrayBinding> f32ab;
         // Sparse attention pays a fixed indexer/compaction cost. Keep the
         // established explicit kernel while history is small, then switch per
-        // layer once sparse work can remove at least half of the compressed
+        // layer once sparse work can remove more than half of the compressed
         // rows. This also avoids a transient identity binding at the exact
         // top-k boundary, preserving fused-graph replay.
         const bool sparse_attention =

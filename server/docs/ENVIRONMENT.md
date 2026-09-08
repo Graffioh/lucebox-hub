@@ -38,7 +38,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_COMP_PAD_STRIDE` | 16 | BURN-IN: compressed-KV padding bucket (`16`, `32`, `64`, or `128`); wider exact-masked buckets reduce verifier graph recapture churn. |
 | `DFLASH_DS4_INCREMENTAL_VERIFY_MASK` | 1 for masks at least 4 MiB | BURN-IN KILL SWITCH: =0 rebuilds and transfers the complete fused-verifier attention mask from the host on every step. |
 | `DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES` | 4194304 | DEBUG/A-B: minimum fused-verifier mask size for GPU zeroing plus negative-range updates. |
-| `DFLASH_DS4_SPARSE_DECODE_FLASH` | 0 | Experimental single-HIP-target verifier attention. Opt in with =1; may change generated tokens. Uses model sparse top-k only when it removes at least half of the compressed rows. |
+| `DFLASH_DS4_SPARSE_DECODE_FLASH` | 0 | Experimental single-HIP-target verifier attention. Opt in with =1; may change generated tokens. Uses model sparse top-k only when it removes more than half of the compressed rows. |
 | `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` | unset | DEBUG: restore the materialized output projection when diagnosing grouped-view copies across unlike runtimes. |
 | `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | compiled backend / target device | Select the in-process DSpark backend and device. |
 | `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | auto-discovered beside the executable | Explicit peer module file path for a mixed CUDA+HIP build. |
@@ -53,7 +53,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
 | `DFLASH_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
 | `DFLASH_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
-| `GGML_CUDA_MLA_SPLIT_KV` / `GGML_DS4_FA_SPLIT_KV` | 1 on gfx1151 indexed decode; unset elsewhere | BURN-IN: force the reusable split-KV MLA schedule. Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` (or legacy `GGML_DS4_FA_NO_SPLIT_KV=1`) to disable it. |
+| `GGML_CUDA_MLA_SPLIT_KV` / `GGML_DS4_FA_SPLIT_KV` | 1 on gfx1151 indexed decode; unset elsewhere | BURN-IN: =1 forces the reusable split-KV MLA schedule. Unset, empty, or =0 does not force it (the device default still applies). Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` (or legacy `GGML_DS4_FA_NO_SPLIT_KV=1`) to disable it; either kill switch overrides either force flag, while empty/=0 kill switches have no effect. |
 | `GGML_DS4_TOPK_BLOCK_RADIX` | 1 on gfx1151 | BURN-IN KILL SWITCH: =0 restores hipCUB full sort for DS4-shaped 512-row top-k selection. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | unset | DEBUG/A-B: restore the serial indexed-attention mask scan instead of the long-context HIP parallel scan. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | 1 for qualified long heterogeneous prefill | KILL SWITCH: =0 restores per-layer route/owner scratch allocation. |
@@ -70,7 +70,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 
 ## Full inventory (generated)
 
-`grep -rE 'getenv\("[A-Z0-9_]+"\)' server/src` - regenerate when adding or removing variables.
+`grep -rE 'getenv\("[A-Z0-9_]+"\)' server/src` - regenerate when adding or removing variables. Also include backend variables and helper-based reads (such as `ds4_env_flag_enabled`) under `server/deps/llama.cpp/ggml/src`.
 
 - `DFLASH27B_CHUNKED` - qwen35_target_graph.cpp
 - `DFLASH27B_DRAFT_FP16` - draft_safetensors_loader.cpp
@@ -274,6 +274,11 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_TOPK_SPLIT` - geometric_draft_topk_cuda.cu
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
+- `GGML_CUDA_MLA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_CUDA_MLA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_DS4_FA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_DS4_FA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_DS4_TOPK_BLOCK_RADIX` - top-k.cu
 - `HOME` - spark_corpus.cpp
 - `LUCE_Q8_MEMO` - mmvq.cu (set to 0 to disable q8_1 activation memoisation; on by default)
 - `LUCE_MMQ_BIG_PREFILL` - mmq.cu (=0 disables the RDNA4 128-wide MMQ tiles for large prefill batches)

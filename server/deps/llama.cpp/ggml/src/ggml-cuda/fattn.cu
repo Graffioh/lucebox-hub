@@ -6,6 +6,7 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn-chunked.cuh"
 #include "fattn.cuh"
+#include "ds4-env.cuh"
 
 #if defined(GGML_USE_HIP)
 
@@ -2423,14 +2424,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const bool split_kv_default =
             cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
-        const bool split_kv_forced =
-            getenv("GGML_CUDA_MLA_SPLIT_KV") != nullptr ||
-            getenv("GGML_DS4_FA_SPLIT_KV") != nullptr;
-        const bool split_kv_disabled =
-            getenv("GGML_CUDA_MLA_NO_SPLIT_KV") != nullptr ||
-            getenv("GGML_DS4_FA_NO_SPLIT_KV") != nullptr;
         if (indexed_mask && n_tokens <= split_kv_max_decode_tokens &&
-            !split_kv_disabled && (split_kv_forced || split_kv_default)) {
+            ds4_mla_split_kv_enabled(split_kv_default)) {
             constexpr int split_count = 2;
             const int split_stride =
                 (raw_window + indexed_capacity + split_count - 1) /
