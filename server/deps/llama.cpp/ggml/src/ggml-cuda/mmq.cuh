@@ -1,10 +1,10 @@
 #pragma once
 
 #include "common.cuh"
+#include "mmq-tile-selection.h"
 #include "vecdotq.cuh"
 #include "mma.cuh"
 
-#include <climits>
 #include <cstdint>
 #include <cstdlib>
 
@@ -5126,9 +5126,6 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int mmq_x_max = get_mmq_x_max_host(cc);
     const int mmq_y = get_mmq_y_host(cc);
 
-    int mmq_x_best  = 0;
-    int ntiles_x_best = INT_MAX;
-
     static const int forced_mmq_x = []() {
         const char * raw = std::getenv("GGML_CUDA_MMQ_X");
         if (!raw || !*raw) return 0;
@@ -5162,40 +5159,27 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
             }
         }
     }
-    if (requested_mmq_x > 0 && requested_mmq_x <= mmq_x_max) {
-        const int granularity = mmq_get_granularity_host(requested_mmq_x, cc);
-        if (requested_mmq_x % granularity == 0 &&
-            mmq_get_nbytes_shared<type>(
-                requested_mmq_x, mmq_y, cc, warp_size, nwarps) <= smpbo) {
-            mmq_x_best = requested_mmq_x;
-            ntiles_x_best = 1;
-        }
-    }
-
-    for (int mmq_x = 8;
-         mmq_x_best == 0 && mmq_x <= mmq_x_max && ntiles_x_best > 1;
-         mmq_x += 8) {
+    const auto supported_tile = [&](int mmq_x) {
         const int granularity = mmq_get_granularity_host(mmq_x, cc);
-
-        if (mmq_x % granularity != 0 || mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {
-            continue;
-        }
+        return mmq_x % granularity == 0 &&
+            mmq_get_nbytes_shared<type>(
+                mmq_x, mmq_y, cc, warp_size, nwarps) <= smpbo;
+    };
+    const auto skip_automatic_tile = [&](int mmq_x) {
 #if defined(GGML_CUDA_MMQ_SMALL_TILE)
         // The 64-row/4-warp tile is pathological at mmq_x == 32 on gfx1201
         // (17408x5120 IQ4_XS: N=16 443 GB/s, N=24..32 180 GB/s, N=48 315 GB/s
         // in mmq_probe); a wider tile with more padding is still faster.
         if (LUCEBOX_RDNA_TILE_HOST(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && mmq_x == 32) {
-            continue;
+            return true;
         }
 #endif
-
-        const int ntiles_x = (args.ncols_max + mmq_x - 1) / mmq_x;
-
-        if (ntiles_x < ntiles_x_best) {
-            mmq_x_best = mmq_x;
-            ntiles_x_best = ntiles_x;
-        }
-    }
+        (void) mmq_x;
+        return false;
+    };
+    const int mmq_x_best = ggml_cuda_mmq_select_x(
+        args.ncols_max, mmq_x_max, requested_mmq_x,
+        supported_tile, skip_automatic_tile);
 
     switch (mmq_x_best) {
         case   8:

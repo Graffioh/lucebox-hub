@@ -1584,6 +1584,7 @@ if(DFLASH27B_TESTS)
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_spec_width.cpp
+            test/test_mmq_tile_selection.cpp
             test/test_adaptive_keep_ratio.cpp
             test/test_skip_park_guard.cpp
             test/test_bandit_integration.cpp
