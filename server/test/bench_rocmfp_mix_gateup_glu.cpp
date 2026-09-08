@@ -87,6 +87,12 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "SKIP: no HIP device\n");
         return 0;
     }
+    int device = 0;
+    hipDeviceProp_t properties{};
+    HIP_OK(hipGetDevice(&device));
+    HIP_OK(hipGetDeviceProperties(&properties, device));
+    const bool strix_tuned =
+        std::strncmp(properties.gcnArchName, "gfx1151", 7) == 0;
 
     // DeepSeek-V4-Flash verifier geometry: hidden 4096, n_ff_exp 2048,
     // model-default top-k 6. The optional first argument selects the verifier
@@ -221,18 +227,17 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "  unfused (2 launches, swiglu NOT counted): %8.4f ms/step  [",
                  mu);
     for (double v : u) std::fprintf(stderr, " %.4f", v);
-    const int fused_launches = fp3 || ntok <= 2 ? 1 : 2;
+    const int fused_launches = !fp3 && strix_tuned && ntok > 2 ? 2 : 1;
     std::fprintf(stderr, " ]\n  fused   (%d launch%s, swiglu included): %8.4f ms/step  [",
-                 fused_launches, fused_launches == 1 ? " " : "es", mf);
+                 fused_launches, fused_launches == 1 ? "" : "es", mf);
     for (double v : f) std::fprintf(stderr, " %.4f", v);
     std::fprintf(stderr, " ]\n");
     std::fprintf(stderr, "  fused is %+.2f%% vs unfused (negative = faster)\n", 100.0 * (mf / mu - 1.0));
     std::fprintf(stderr, "  per-layer saving %.4f ms -> over 43 layers %.3f ms/step\n",
                  mu - mf, (mu - mf) * 43.0);
 
-    // Hash both raw projections and the fused output after timing. This catches
-    // mode-specific numerical drift even when the generated-token hash happens
-    // to remain unchanged.
+    // Record diagnostic hashes after timing for cross-run comparisons.
+    // Correctness is checked against host references by test_rocmfp_mix_gateup_glu.
     if (!mul_mat_id(d_up, d_x, d_ids, d_a, in, out, n_used, ntok, 1,
             ids_s0, ids_s1, src1_s1, src1_s2, dst_s1, dst_s2, stream) ||
         !mul_mat_id(d_gate, d_x, d_ids, d_b, in, out, n_used, ntok, 1,

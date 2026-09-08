@@ -4665,6 +4665,11 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
 }
 
 static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if ((op->op == GGML_OP_ROPE || op->op == GGML_OP_ROPE_BACK) &&
+        (op->op_params[2] & GGML_ROPE_TYPE_TAIL)) {
+        return false;
+    }
+
     ggml_backend_sycl_device_context *sycl_ctx =
         (ggml_backend_sycl_device_context *)dev->context;
     int device = sycl_ctx->device;
@@ -4913,7 +4918,8 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DIAG_MASK_INF:
             return true;
         case GGML_OP_SOFT_MAX:
-            return true;
+            // Sink-column mode is handled by a supporting backend.
+            return ggml_get_op_params_i32(op, 2) == 0;
         case GGML_OP_SOFT_MAX_BACK: {
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
@@ -4956,8 +4962,26 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
         case GGML_OP_GATED_LINEAR_ATTN:
             return true;
-        case GGML_OP_GATED_DELTA_NET:
-            return op->src[8] == nullptr;
+        case GGML_OP_GATED_DELTA_NET: {
+            // The SYCL kernel consumes only src[0..5] and writes final state
+            // into the result tensor.
+            const ggml_tensor * values = op->src[2];
+            if (values == nullptr) {
+                return false;
+            }
+            const int64_t state_width = values->ne[0];
+            const bool supported_state_width =
+                state_width == 16 || state_width == 32 ||
+                state_width == 64 || state_width == 128;
+            return supported_state_width &&
+                   op->src[6] == nullptr &&
+                   op->src[7] == nullptr &&
+                   op->src[8] == nullptr &&
+                   ggml_get_op_params_i32(op, 1) == 0 &&
+                   ggml_get_op_params_i32(op, 2) != 1 &&
+                   ggml_get_op_params_i32(op, 3) == 0 &&
+                   ggml_get_op_params_i32(op, 10) != 1;
+        }
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&

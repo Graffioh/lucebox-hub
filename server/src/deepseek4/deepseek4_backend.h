@@ -16,6 +16,7 @@
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
 #include "qwen3/qwen3_drafter.h"
+#include "deepseek4_seq_engine.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -66,6 +67,13 @@ public:
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
+    // Ondisk prefix cache: DeepSeek snapshots are CPU ggml contexts whose
+    // tensors carry stable names plus a meta/logits/feature sidecar, so they
+    // serialize and rebind like the Qwen snapshots do.
+    SnapshotRef snapshot_ref(int slot) const override;
+    bool snapshot_adopt(int slot, ggml_context * ctx,
+                        ggml_backend_buffer_t buf, int cur_pos,
+                        int32_t last_tok = -1) override;
 
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,
@@ -79,6 +87,7 @@ public:
     void free_drafter() override;
 
     void shutdown() override;
+    SeqEngine * seq_engine() override { return seq_engine_.get(); }
 
     const MoeHybridRoutingStats * get_routing_stats() const override {
         return routing_stats_.get();
@@ -91,6 +100,8 @@ private:
     ggml_backend_t         expert_backend_ = nullptr;
     DeepSeek4Weights       w_;
     DeepSeek4Cache         cache_;
+    DeepSeek4PagedCache    paged_cache_;
+    std::unique_ptr<DeepSeek4SeqEngine> seq_engine_;
     bool                   parked_       = false;
 
     // Sampler
@@ -187,6 +198,7 @@ private:
     MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;
+    friend class DeepSeek4SeqEngine;
 };
 
 }  // namespace dflash::common

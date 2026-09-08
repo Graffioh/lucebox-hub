@@ -2212,9 +2212,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         const int fallback_steps = hybrid_spec_min_steps_before_ar();
         if (!io.is_cancelled() && !hit_eos && fallback_steps > 0 &&
             n_draft_steps >= fallback_steps && n_generated < n_gen) {
-            const int total_draft_pos_so_far = shared_feedback_width
-                ? std::max(1, n_offered_sum)
-                : std::max(1, n_draft_steps * q_len);
+            const int total_draft_pos_so_far = std::max(1, n_offered_sum);
             const float accept_rate_value =
                 (float)((double)n_accept_sum / (double)total_draft_pos_so_far);
             const float min_accept = hybrid_spec_min_accept_rate();
@@ -2240,9 +2238,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = shared_feedback_width
-        ? std::max(1, n_offered_sum)
-        : std::max(1, n_draft_steps * q_len);
+    const int total_draft_pos = std::max(1, n_offered_sum);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     if (accept_rate_out) {
         *accept_rate_out = total_draft_pos > 0
