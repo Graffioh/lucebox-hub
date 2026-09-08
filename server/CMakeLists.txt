@@ -1783,6 +1783,7 @@ if(DFLASH27B_TESTS)
             TAIL_GUARD_USE_NEW_FORMULA)
         target_include_directories(test_server_unit PRIVATE
             ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda
             ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
