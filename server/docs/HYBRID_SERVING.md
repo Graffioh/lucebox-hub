@@ -93,11 +93,33 @@ client cancellation and capacity reuse, and shutdown. Six CLI checks cover
 invalid capacities, listener placement, duplicate names, shared-policy flags,
 and unsupported single-request model families.
 
-Hardware qualification of Qwen C4 plus DS4 C1 with DSpark is pending. A load
-of the 0731 target was stopped before readiness under host memory pressure
-(about 4.8 GiB minimum available); the idle system then reported only about
-97 GiB available, below the target and draft's combined weight size. This
-attempt does not establish whether the hybrid fits on a clean system. The
-example above is a launch recipe, not a measured performance claim. In
-particular, the hybrid's model residency, DSpark activation, generated-output
-comparisons, and time to the first final-answer token still need a GPU run.
+Hardware qualification passed on R9700 plus Strix Halo with Qwen C4 and
+DS4 C1: five simultaneous requests, independent Qwen completion while DS4
+continued, HTTP 503 for a second DS4 request, disconnect cancellation and
+capacity reuse on both workers, and active shutdown (1.88 seconds, exit 0).
+DSpark ran on the existing non-paged DS4 path with fused decode and six
+experts. Six DS4 outputs, replayed with identical request bodies in a
+standalone DS4 process, matched the hybrid outputs exactly.
+
+After clearing caches, the successful hybrid run started with about 122.5 GiB
+host memory available and recorded a minimum of 12.40 GiB. An earlier load
+was stopped under memory pressure; it is excluded from these results.
+This qualifies the tested short requests, not full-context capacity or a
+long-running mixed workload.
+
+A three-task code smoke experiment used four differently instructed Qwen
+proposals followed by DS4 synthesis. Proposals took 2.29–3.45 seconds;
+DS4 prefill then took 30.14–45.87 seconds. The first final-answer token
+arrived after 33.76–49.51 seconds, including proposals. Estimated visible
+streaming speed was 29.30–35.96 tokens/s (median 31.22); server-reported
+decode was 25.8–30.7 tokens/s. The visible estimate divides completion
+tokens minus one by the interval between first and last content chunks;
+speculative chunks can contain multiple tokens, so it is not a precise
+per-token timing measurement. Sustained 30 tokens/s is not established.
+
+Qwen alone passed 3/3 code checks, DS4 alone 1/3, and synthesis 2/3.
+The DS4 failures also reproduced in the standalone control. These three
+one-pass tasks do not establish a general quality improvement. The tested
+DS4 target was the 0731 artifact, with the installed
+`DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4-denseF16.gguf` draft; this is not a
+claim to reproduce the article's exact draft artifact or benchmark.
