@@ -1,6 +1,7 @@
 #include "CppUnitTestFramework.hpp"
 #include "scoped_env.h"
 #include "ggml-backend.h"
+#include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
 
@@ -13,7 +14,9 @@ namespace {
 struct CudaPoolShutdownFixture : CppUnitTestFramework::CommonFixture {
     using CppUnitTestFramework::CommonFixture::CommonFixture;
 
-    void exercise_pool_trim(ggml_backend_t backend);
+    void exercise_pool_trim(
+        ggml_backend_t backend,
+        ggml_backend_t expected_pool_backend = nullptr);
 };
 
 ggml_backend_meta_split_state mirrored_split_state(
@@ -21,7 +24,9 @@ ggml_backend_meta_split_state mirrored_split_state(
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1, {1}};
 }
 
-void CudaPoolShutdownFixture::exercise_pool_trim(ggml_backend_t backend) {
+void CudaPoolShutdownFixture::exercise_pool_trim(
+        ggml_backend_t backend,
+        ggml_backend_t expected_pool_backend) {
     REQUIRE(backend != nullptr);
 
     ggml_init_params params{};
@@ -62,9 +67,12 @@ void CudaPoolShutdownFixture::exercise_pool_trim(ggml_backend_t backend) {
     // LUCE_Q8_MEMO intentionally retains a pool allocation after compute.
     // Trimming must first release that memo, then return its cached block to
     // the driver rather than retaining VRAM indefinitely.
+    const bool expected_has_legacy_pool = ggml_backend_cuda_has_legacy_pool(
+        expected_pool_backend ? expected_pool_backend : backend);
     const bool has_legacy_pool = ggml_backend_cuda_has_legacy_pool(backend);
+    REQUIRE(has_legacy_pool == expected_has_legacy_pool);
     const size_t trimmed = ggml_backend_cuda_trim_pool(backend);
-    if (has_legacy_pool) {
+    if (expected_has_legacy_pool) {
         REQUIRE(trimmed > 0);
     } else {
         REQUIRE(trimmed == 0);
@@ -114,7 +122,9 @@ TEST_CASE(CudaPoolShutdownFixture, meta_backend_pool_shutdown) {
         return;
     }
 
-    exercise_pool_trim(backend);
+    ggml_backend_t rank_backend = ggml_backend_meta_simple_backend(backend, 0);
+    REQUIRE(rank_backend != nullptr);
+    exercise_pool_trim(backend, rank_backend);
     ggml_backend_free(backend);
     REQUIRE_TRUE(true);
 }
