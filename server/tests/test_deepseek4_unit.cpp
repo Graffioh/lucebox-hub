@@ -3816,7 +3816,7 @@ static void test_ds4_saved_raw_rows_replay_gpu() {
 
 static bool run_ds4_preserved_raw_rows_case(
         ggml_backend_t backend, int width, int compressed_rows,
-        bool visible_suffix, ggml_type kv_type, bool direct) {
+        bool visible_suffix, ggml_type kv_type, bool direct, int replays = 1) {
     constexpr int dim = 512, heads = 64, raw_rows = 128, top_k = 512;
     const int saved = width > 1 ? width : 0;
     const int rows = raw_rows + compressed_rows + saved;
@@ -3870,36 +3870,56 @@ static bool run_ds4_preserved_raw_rows_case(
                 iddata[(size_t) t * top_k + c] = row;
             }
         }
-        ggml_backend_tensor_set(q, qdata.data(), 0, ggml_nbytes(q));
+        std::vector<ggml_fp16_t> half;
         if (kv_type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> half(kvdata.size());
+            half.resize(kvdata.size());
             std::transform(kvdata.begin(), kvdata.end(), half.begin(), ggml_fp32_to_fp16);
-            ggml_backend_tensor_set(kv, half.data(), 0, ggml_nbytes(kv));
-        } else {
-            ggml_backend_tensor_set(kv, kvdata.data(), 0, ggml_nbytes(kv));
         }
-        ggml_backend_tensor_set(mask, maskdata.data(), 0, ggml_nbytes(mask));
-        ggml_backend_tensor_set(topk, iddata.data(), 0, ggml_nbytes(topk));
-        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
-        if (ok) {
-            std::vector<float> actual(ggml_nelements(result)), actual_mask(maskdata.size());
-            ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
-            ggml_backend_tensor_get(indexed_mask, actual_mask.data(), 0, ggml_nbytes(indexed_mask));
-            for (int t = 0; t < width; ++t) {
-                // Zero queries give equal attention weights. Keeping the saved
-                // suffix replaces exactly the hidden future ring slots.
-                const int visible = visible_suffix ? std::max(0, saved - t - 1) : 0;
-                const float expected = 0.25f + float(visible) / (raw_rows + top_k - t % 3);
-                for (int h = 0; h < heads; ++h) {
-                    for (int d = 0; d < dim; ++d) {
-                        const float value = actual[((size_t) t * heads + h) * dim + d];
-                        ok &= std::isfinite(value) &&
-                              std::abs(value - (d == 0 ? expected : 0.0f)) < 1.0e-6f;
+        for (int replay = 0; ok && replay < replays; ++replay) {
+            // Gallocr may reuse an input's storage after its last consumer.
+            // Refresh fixture inputs on every launch, as the caller must.
+            ggml_backend_tensor_set(q, qdata.data(), 0, ggml_nbytes(q));
+            if (kv_type == GGML_TYPE_F16) {
+                ggml_backend_tensor_set(kv, half.data(), 0, ggml_nbytes(kv));
+            } else {
+                ggml_backend_tensor_set(kv, kvdata.data(), 0, ggml_nbytes(kv));
+            }
+            ggml_backend_tensor_set(mask, maskdata.data(), 0, ggml_nbytes(mask));
+            ggml_backend_tensor_set(topk, iddata.data(), 0, ggml_nbytes(topk));
+            ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+            if (ok) {
+                std::vector<float> actual(ggml_nelements(result)), actual_mask(maskdata.size());
+                ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+                ggml_backend_tensor_get(indexed_mask, actual_mask.data(), 0, ggml_nbytes(indexed_mask));
+                for (int t = 0; t < width; ++t) {
+                    // Zero queries give equal attention weights. Keeping the saved
+                    // suffix replaces exactly the hidden future ring slots.
+                    const int visible = visible_suffix ? std::max(0, saved - t - 1) : 0;
+                    const float expected = 0.25f + float(visible) / (raw_rows + top_k - t % 3);
+                    for (int h = 0; h < heads; ++h) {
+                        for (int d = 0; d < dim; ++d) {
+                            const float value = actual[((size_t) t * heads + h) * dim + d];
+                            const float reference = d == 0 ? expected : 0.0f;
+                            const bool matches = std::isfinite(value) &&
+                                std::abs(value - reference) < 1.0e-6f;
+                            if (ok && !matches) {
+                                std::fprintf(stderr,
+                                    " saved-row output mismatch replay=%d token=%d head=%d dim=%d actual=%.9g expected=%.9g\n",
+                                    replay, t, h, d, value, reference);
+                            }
+                            ok &= matches;
+                        }
                     }
-                }
-                for (int r = 0; r < rows; ++r) {
-                    const size_t at = (size_t) t * rows + r;
-                    ok &= (actual_mask[at] > -1.0e20f) == (maskdata[at] > -1.0e20f);
+                    for (int r = 0; r < rows; ++r) {
+                        const size_t at = (size_t) t * rows + r;
+                        const bool matches = (actual_mask[at] > -1.0e20f) == (maskdata[at] > -1.0e20f);
+                        if (ok && !matches) {
+                            std::fprintf(stderr,
+                                " saved-row mask mismatch replay=%d token=%d row=%d actual=%.9g expected=%.9g\n",
+                                replay, t, r, actual_mask[at], maskdata[at]);
+                        }
+                        ok &= matches;
+                    }
                 }
             }
         }
@@ -3937,6 +3957,11 @@ static void test_ds4_preserved_raw_rows_gpu() {
     }
     std::fprintf(stderr, " %d/%d cases passed\n", passed, cases);
     TEST_ASSERT_MSG(passed == cases, "indexed attention lost saved raw KV rows or exposed future rows");
+    // CI exposed an intermittent failure in this long-context, multi-wave
+    // shape. Exercise repeated launches/replays without relaxing parity.
+    TEST_ASSERT_MSG(run_ds4_preserved_raw_rows_case(
+        backend, 5, 30720, true, GGML_TYPE_F16, false, 128),
+        "indexed attention saved-row replay stress failed");
     ggml_backend_free(backend);
 }
 

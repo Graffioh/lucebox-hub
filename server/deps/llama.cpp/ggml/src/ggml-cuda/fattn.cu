@@ -952,6 +952,8 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
         max_score[j] = reduction[(size_t) j * N_THREADS];
     }
+    // Retire all reads of the maxima before reusing reduction for sums.
+    __syncthreads();
     for (int r = tid; r < n_kv; r += blockDim.x) {
 #pragma unroll
         for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
@@ -1318,6 +1320,8 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
         max_score[j] = reduction[(size_t) j * N_THREADS];
     }
+    // Retire all reads of the maxima before reusing reduction for sums.
+    __syncthreads();
     for (int iteration = 0; iteration < score_iteration_count; ++iteration) {
         int score_index;
         int bound_value;
@@ -1720,6 +1724,9 @@ __global__ static void ds4_flash_attn_d512_indexed_split_stage1_kernel(
     for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
         split_max[j] = reduction[(size_t) j * N_THREADS];
     }
+    // Every wave must finish reading the maxima before the scratch rows are
+    // reused for sums. A faster wave can otherwise overwrite another's max.
+    __syncthreads();
     for (int slot = split_begin + tid; slot < split_end;
          slot += N_THREADS) {
         const int score_index = slot - split_begin;
