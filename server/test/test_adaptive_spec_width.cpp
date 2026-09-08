@@ -55,6 +55,24 @@ TEST_CASE(AdaptiveSpecWidthFixture, respects_minimum_width) {
     CHECK(width.next_width() == 6);
 }
 
+TEST_CASE(AdaptiveSpecWidthFixture, shared_policy_can_back_off_to_two_rows) {
+    AdaptiveSpecWidth width(16, 2, true);
+    for (int step = 0; step < 20; ++step) {
+        width.observe(1, width.next_width());
+    }
+    CHECK(width.next_width() == 2);
+    width.observe(2, 2);
+    width.observe(width.next_width(), width.next_width());
+    CHECK(width.next_width() > 2);
+}
+
+TEST_CASE(AdaptiveSpecWidthFixture, one_row_model_is_valid_with_two_row_floor) {
+    AdaptiveSpecWidth width(1, 2, true);
+    CHECK(width.next_width() == 1);
+    width.observe(1, 1);
+    CHECK(width.next_width() == 1);
+}
+
 TEST_CASE(AdaptiveSpecWidthFixture, disabled_controller_preserves_proposal) {
     AdaptiveSpecWidth width(16, 2, false);
     CHECK(width.next_width() == 16);

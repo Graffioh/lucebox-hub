@@ -8,6 +8,7 @@
 #include "common/ggml_graph_precision.h"
 #include "common/sampler.h"
 #include "common/adaptive_spec_width.h"
+#include "common/spec_acceptance.h"
 #include "common/dflash_spec_decode.h"
 #include "dflash_draft_graph.h"
 #include "dflash_feature_ring.h"
@@ -1998,8 +1999,10 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
     }();
     const bool shared_feedback_width =
         forced_verify_width == 0 && adaptive_spec_width_globally_enabled();
+    // The opt-in feedback policy can back off to seed + one candidate.
+    // Keep the legacy six-row floor below when shared feedback is disabled.
     AdaptiveSpecWidth width_controller(
-        q_len, std::min(6, q_len), shared_feedback_width);
+        q_len, 2, shared_feedback_width);
     int observed_max_accept = 1;
 
     int32_t last_tok = target_cache().last_tok;
@@ -2016,8 +2019,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 
     int n_generated = 0;
     int n_draft_steps = 0;
-    int n_accept_sum = 0;
-    int n_offered_sum = 0;
+    SpecAcceptanceStats acceptance;
 
     // Allocate DeltaNet rollback snapshot tensors (no-op if already present).
     // Without these, snapshot_ssm_state/restore_ssm_state silently do nothing
@@ -2150,7 +2152,6 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
         } else {
             observed_max_accept = std::max(observed_max_accept, accept_n);
         }
-        n_offered_sum += verify_width;
         int bonus_tok = (accept_n < verify_width) ? target_tok[accept_n - 1] : -1;
         int commit_n = accept_n + (bonus_tok >= 0 ? 1 : 0);
         if (commit_n > need_commit_budget) {
@@ -2207,16 +2208,12 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
             kvflash_maybe_reselect((int)out_tokens.size());
         }
         n_generated += emitted;
-        n_accept_sum += std::min(accept_n, emitted);
+        acceptance.record_chain(accept_n, verify_width, emitted, need_commit_budget);
         n_draft_steps++;
         const int fallback_steps = hybrid_spec_min_steps_before_ar();
         if (!io.is_cancelled() && !hit_eos && fallback_steps > 0 &&
             n_draft_steps >= fallback_steps && n_generated < n_gen) {
-            const int total_draft_pos_so_far = shared_feedback_width
-                ? std::max(1, n_offered_sum)
-                : std::max(1, n_draft_steps * q_len);
-            const float accept_rate_value =
-                (float)((double)n_accept_sum / (double)total_draft_pos_so_far);
+            const float accept_rate_value = acceptance.rate();
             const float min_accept = hybrid_spec_min_accept_rate();
             if (accept_rate_value < min_accept) {
                 const int ar_n_gen = n_gen - n_generated;
@@ -2228,6 +2225,7 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
                 target_cache().last_tok = last_tok;
                 const bool ok = run_pipelined_decode_path(
                     committed, ar_n_gen, out_tokens, io);
+                if (accept_rate_out) *accept_rate_out = acceptance.rate();
                 io.emit(-1);
                 return ok;
             }
@@ -2240,21 +2238,17 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = shared_feedback_width
-        ? std::max(1, n_offered_sum)
-        : std::max(1, n_draft_steps * q_len);
-    const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
+    const double accept_pct = 100.0 * acceptance.rate();
     if (accept_rate_out) {
-        *accept_rate_out = total_draft_pos > 0
-            ? (float)((double)n_accept_sum / (double)total_draft_pos) : 0.0f;
+        *accept_rate_out = acceptance.rate();
     }
     std::fprintf(stderr, "[hybrid-spec] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f AL=%.2f\n",
                  n_generated, decode_s,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
-                 n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
+                 n_draft_steps, acceptance.accepted(), acceptance.offered(), accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0,
-                 n_draft_steps > 0 ? (double)n_accept_sum / (double)n_draft_steps : 0.0);
+                 n_draft_steps > 0 ? (double)acceptance.accepted() / (double)n_draft_steps : 0.0);
 
     io.emit(-1);
     return true;

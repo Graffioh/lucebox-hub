@@ -488,6 +488,14 @@ __device__ __forceinline__ void mix_block_accum2(
         const uint8_t * __restrict__ b0, const uint8_t * __restrict__ b1,
         const float * __restrict__ xc, int col0,
         int mode, const float * __restrict__ lut, float & acc0, float & acc1) {
+    // HIP contracts the paired fixed-level loop differently from the original
+    // single-row loop (covered by the slice parity test). Keep that mode on
+    // the reference fold; learned codebooks retain paired activation reuse.
+    if (mode == 0) {
+        mix_block_accum(b0, xc, col0, mode, lut, acc0);
+        mix_block_accum(b1, xc, col0, mode, lut, acc1);
+        return;
+    }
 #if defined(__HIP_PLATFORM_AMD__) && defined(__gfx1151__)
     MixFp3Words qs0, qs1;
     uint16_t meta0, meta1;
@@ -508,18 +516,7 @@ __device__ __forceinline__ void mix_block_accum2(
     const uint8_t m00 = qs0[MIX_QS + 0], m01 = qs0[MIX_QS + 1];
     const uint8_t m10 = qs1[MIX_QS + 0], m11 = qs1[MIX_QS + 1];
 #endif
-    if (mode == 0) {
-        const float s00 = mix_ue4m3(m00), s01 = mix_ue4m3(m01);
-        const float s10 = mix_ue4m3(m10), s11 = mix_ue4m3(m11);
-        #pragma unroll
-        for (int j = 0; j < MIX_QK; ++j) {
-            const float x = xc[col0 + j];
-            const float rs0 = (j < MIX_QK/2) ? s00 : s01;
-            const float rs1 = (j < MIX_QK/2) ? s10 : s11;
-            acc0 = fmaf(rs0 * mix_fp3_fixed(mix_fp3_code(qs0, j)), x, acc0);
-            acc1 = fmaf(rs1 * mix_fp3_fixed(mix_fp3_code(qs1, j)), x, acc1);
-        }
-    } else {
+    {
         const float s00 = mix_ue4m3(m00 & 0x7F), s01 = mix_ue4m3(m01 & 0x7F);
         const float s10 = mix_ue4m3(m10 & 0x7F), s11 = mix_ue4m3(m11 & 0x7F);
         const float * bk00 = lut + (m00 >> 7) * MIX_K;
@@ -533,8 +530,8 @@ __device__ __forceinline__ void mix_block_accum2(
             const float rs1 = (j < MIX_QK/2) ? s10 : s11;
             const float * rbk0 = (j < MIX_QK/2) ? bk00 : bk01;
             const float * rbk1 = (j < MIX_QK/2) ? bk10 : bk11;
-            acc0 = fmaf(rs0 * rbk0[mix_fp3_code(qs0, j)], x, acc0);
-            acc1 = fmaf(rs1 * rbk1[mix_fp3_code(qs1, j)], x, acc1);
+            acc0 += rs0 * rbk0[mix_fp3_code(qs0, j)] * x;
+            acc1 += rs1 * rbk1[mix_fp3_code(qs1, j)] * x;
         }
     }
 }

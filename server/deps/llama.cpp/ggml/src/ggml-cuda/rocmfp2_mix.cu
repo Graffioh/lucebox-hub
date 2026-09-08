@@ -107,7 +107,6 @@ static bool mix_gfx1151_row4_enabled() {
     }();
     return enabled;
 }
-
 // RAII device switch: restores the previous device even on the early-return error paths.
 struct MixDeviceGuard {
     int prev = -1;

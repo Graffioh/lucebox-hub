@@ -6,6 +6,7 @@
 
 #include "qwen35_backend.h"
 #include "qwen35moe_backend.h"
+#include "bailingmoe3_backend.h"
 #include "laguna_backend.h"
 #include "laguna_layer_split_adapter.h"
 #include "qwen3_backend.h"
@@ -92,6 +93,7 @@ constexpr bool layer_split_carries(FeatureSupport support) {
 
 DFLASH_CHECK_ARCH("qwen35",    Qwen35Config,          Qwen35LayerSplitAdapterConfig);
 DFLASH_CHECK_ARCH("qwen35moe", Qwen35Config,          NoLayerSplitConfig);
+DFLASH_CHECK_ARCH("bailingmoe3", BailingMoe3Config,   NoLayerSplitConfig);
 DFLASH_CHECK_ARCH("laguna",    LagunaBackendArgs,     LagunaLayerSplitAdapterConfig);
 DFLASH_CHECK_ARCH("qwen3",     Qwen3BackendConfig,    NoLayerSplitConfig);
 DFLASH_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfig);
@@ -102,6 +104,9 @@ DFLASH_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapte
 // forwards both fields only for dense qwen35. Pairing the MoE Never rows with
 // that shared struct would fail a check that is really about dispatch.
 DFLASH_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
+                         has_paged_attention, paged_attn);
+DFLASH_CHECK_ARCH_OPTION("deepseek4", DeepSeek4BackendConfig,
+                         DeepSeek4LayerSplitAdapterConfig,
                          has_paged_attention, paged_attn);
 DFLASH_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
                          has_draft_block_size, draft_block_size);
@@ -321,6 +326,19 @@ std::unique_ptr<ModelBackend> create_backend(
         }
         return backend;
 
+    } else if (arch == "bailingmoe3") {
+        BailingMoe3Config cfg;
+        cfg.model_path = args.model_path;
+        cfg.device = args.device;
+        cfg.stream_fd = args.stream_fd;
+
+        auto backend = std::make_unique<BailingMoe3Backend>(cfg);
+        if (!backend->init()) {
+            std::fprintf(stderr, "[backend_factory] BailingMoe3Backend init failed\n");
+            return nullptr;
+        }
+        return backend;
+
     } else if (arch == "laguna") {
         if (args.device.is_layer_split()) {
             LagunaLayerSplitAdapterConfig cfg;
@@ -430,6 +448,9 @@ std::unique_ptr<ModelBackend> create_backend(
             cfg.fused_decode = args.ds4_fused_decode;
             cfg.fused_verify_f16_kv = args.ds4_fused_verify_f16_kv;
             cfg.prefill_mode = args.ds4_prefill_mode;
+            cfg.paged_attention = args.paged_attention;
+            cfg.max_concurrency = args.max_concurrency;
+            cfg.kv_pool_tokens = args.kv_pool_tokens;
 
             auto backend = std::make_unique<DeepSeek4Backend>(cfg);
             if (!backend->init()) {

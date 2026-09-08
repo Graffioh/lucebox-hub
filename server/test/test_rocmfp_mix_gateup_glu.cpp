@@ -11,11 +11,11 @@
 //
 // WHAT IS PROVEN HERE, and what is not:
 //
-//  * The two dot products are bit-identical to the unfused launches. That IS assertable and is
-//    the property the whole change rests on: FUSE_GLU is a template parameter over ONE
-//    accumulation body, so the fold order per row cannot drift between instantiations. Checked
-//    by running the unfused entry point and comparing against the fused result reconstructed
-//    through the inverse of the clamp-free branch (see `exact_when_unclamped`).
+//  * The two dot products are bit-identical to the unfused launches. That IS assertable:
+//    every GLU mode instantiates ONE accumulation body, and the two-pass finalizer reads the
+//    ordinary up result written by that same body. Checked by running the unfused entry point
+//    and comparing against the fused result reconstructed through the inverse of the
+//    clamp-free branch (see `exact_when_unclamped`).
 //
 //  * The GLU value is compared to a HOST reference at a tight tolerance, not bit-exactly. The
 //    kernel applies ggml_cuda_op_swiglu_ds4_single on device; the device and host expf() are not
@@ -122,9 +122,9 @@ TEST_CASE(RocmfpMixGateupGluFixture, fused_gateup_glu) {
 
     // in must be a multiple of 128: the wide block load reads 128 weights at a time and would
     // read past the tensor on the final block (register_host enforces this).
-    // Three tokens exercises the low-register two-pass GLU finalizer. q <= 2
-    // uses the one-pass kernel and is checked separately below.
-    const int in = 256, out = 64, n_experts = 6, n_used = 3, ntok = 3;
+    // On gfx1151, q > 2 exercises the two-pass GLU finalizer. The sweep below
+    // also covers the one-pass kernel and every supported DS4 verifier width.
+    const int in = 256, out = 64, n_experts = 6, n_used = 3, ntok = 5;
     const int nb = in / QK;
     const size_t rows_bytes = (size_t) out * nb * BLOCK_BYTES;
 
@@ -149,6 +149,9 @@ TEST_CASE(RocmfpMixGateupGluFixture, fused_gateup_glu) {
         books_gate[i] = f32_to_bf16( 0.5f - 0.21f * (float) (i % 5));
     }
     std::vector<uint8_t> modes_up(n_experts, 1), modes_gate(n_experts, 1);  // 1 = adaptive
+    // Routed experts 1/3/5 cover fixed/learned, learned/fixed and learned/learned.
+    modes_up[1] = 0;
+    modes_gate[3] = 0;
 
     void * d_up = nullptr, * d_gate = nullptr;
     float * d_x = nullptr, * d_up_out = nullptr, * d_gate_out = nullptr, * d_fused = nullptr;
@@ -226,11 +229,10 @@ TEST_CASE(RocmfpMixGateupGluFixture, fused_gateup_glu) {
     std::fprintf(stderr, "worst relative deviation from the host reference: %.3e\n", worst);
     CHECK(worst < 1e-5);
 
-    // q <= 2 selects the one-pass dual-projection kernel. Exercise that branch
-    // separately while the main ntok=3 case above covers the two-pass finalizer.
-    {
-        const int one_tok = 1;
-        const size_t one_yn = (size_t) out * n_used;
+    // Exercise width changes on the same allocations, including both sides of
+    // the gfx1151 one-pass/two-pass dispatch boundary.
+    for (int one_tok = 1; one_tok < ntok; ++one_tok) {
+        const size_t one_yn = (size_t) out * n_used * one_tok;
         CHECK(ggml_cuda_rocmfp2_mix_mul_mat_id(d_up, d_x, d_ids, d_up_out,
                                                in, out, n_used, one_tok, 1,
                                                ids_s0, ids_s1, src1_s1, src1_s2,
@@ -253,6 +255,7 @@ TEST_CASE(RocmfpMixGateupGluFixture, fused_gateup_glu) {
                           cudaMemcpyDeviceToHost));
         double one_worst = 0.0;
         for (size_t i = 0; i < one_yn; ++i) {
+            CHECK(std::isfinite(one_u[i]) && std::isfinite(one_g[i]) && std::isfinite(one_f[i]));
             const float ref = host_swiglu_ds4(one_g[i], one_u[i], limit);
             const double denom = std::fmax(1e-6, std::fabs((double) ref));
             one_worst = std::fmax(one_worst,

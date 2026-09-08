@@ -2,7 +2,9 @@
 #include "concurrency/qwen35_seq_engine.h"
 #include "common/chain_rollback_policy.h"
 #include "common/adaptive_spec_width.h"
+#include "common/spec_acceptance.h"
 #include "common/draft_block_size.h"
+#include "common/draft_swa.h"
 #include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
@@ -35,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -181,7 +184,8 @@ static FILE * open_dflash_floor_log() {
 // staging K/V or staging recurrent slab to reserve.
 static int64_t concurrent_fixed_cache_bytes(
         const TargetWeights & w, int max_ctx, int n_slots,
-        int64_t kv_bytes_per_token) {
+        int64_t kv_bytes_per_token, int64_t scratch_tokens,
+        bool fixed_chain) {
     const int64_t n_full_attn =
         w.n_layer / w.full_attention_interval;
     const int64_t n_delta = w.n_layer - n_full_attn;
@@ -196,7 +200,10 @@ static int64_t concurrent_fixed_cache_bytes(
         state_per_layer * n_delta * (int64_t)n_slots;
     const int64_t target_feat =
         (int64_t)w.n_capture_layers * w.n_embd *
-        std::min(max_ctx, 4096) * (int64_t)sizeof(uint16_t);
+        (fixed_chain
+             ? (int64_t)std::min(max_ctx, 4096) * n_slots + 1
+             : (int64_t)std::min(max_ctx, 4096)) *
+        (int64_t)sizeof(uint16_t);
     const int64_t q_capture =
         (int64_t)w.n_embd_head_k * w.n_head * n_full_attn *
         (int64_t)sizeof(float);
@@ -204,7 +211,7 @@ static int64_t concurrent_fixed_cache_bytes(
         ((int64_t)paged_block_count(max_ctx) * n_slots + n_slots) *
         (int64_t)sizeof(int32_t);
     const int64_t scratch =
-        kv_bytes_per_token * PAGED_BLOCK_SIZE;
+        kv_bytes_per_token * scratch_tokens;
     return recurrent + target_feat + q_capture +
            paged_metadata + scratch;
 }
@@ -359,11 +366,10 @@ bool Qwen35Backend::init() {
         apply_drafter_capture_layer_ids(dw_, w_);
 
         if (cfg_.draft_swa_window > 0) {
-            dw_.swa_window = cfg_.draft_swa_window;
-            for (int il = 0; il < dw_.n_layer - 1; il++)
-                dw_.layers[il].is_swa = true;
+            const DraftSwaOverrideResult swa =
+                apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
             std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
-                        dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
+                        swa.swa_layers, swa.total_layers, swa.effective_window);
         }
 
         // Legacy 8-layer drafter YaRN from config flags. Applied here AND in
@@ -467,6 +473,28 @@ bool Qwen35Backend::init() {
         set_last_error("--max-concurrency requires --paged-attention");
         return false;
     }
+    FixedChainConfig fixed_chain;
+    fixed_chain.enabled =
+        n_slots > 1 && cfg_.paged_attention && cfg_.fa_window == 0 &&
+        cfg_.draft_path && !cfg_.ddtree_mode && !use_remote_draft &&
+        !tensor_parallel && !split_gpus_ &&
+        target_backend_ == draft_backend_ &&
+        cfg_.device.gpu == cfg_.draft_gpu &&
+        dw_.selector.enabled && dw_.block_size > 1 &&
+        dw_.block_size <= 16 && w_.output;
+    if (fixed_chain.enabled) {
+        fixed_chain.width = dw_.block_size;
+        fixed_chain.scratch_stride = paged_token_capacity(fixed_chain.width);
+    }
+    if (n_slots > 1 && cfg_.draft_path && !fixed_chain.enabled) {
+        set_last_error(
+            "concurrent paged DFlash2 requires a selector-enabled local "
+            "same-device draft with block size in [2, 16] and a target "
+            "lm_head");
+        return false;
+    }
+    const int64_t scratch_tokens = PAGED_BLOCK_SIZE +
+        (int64_t)n_slots * fixed_chain.scratch_stride;
     // Concurrent slots share one physical pool. An explicit
     // --kv-pool-tokens is rounded up to a whole block; otherwise capacity is
     // derived from device-free memory after subtracting fixed concurrent cache
@@ -477,9 +505,12 @@ bool Qwen35Backend::init() {
     int64_t pool_tokens = 0;
     if (n_slots > 1) {
         if (cfg_.kv_pool_tokens > 0) {
+            const int64_t max_pool_tokens =
+                ((int64_t)INT32_MAX - scratch_tokens) /
+                PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE;
             pool_tokens = (int64_t)paged_token_capacity(
                 (int)std::min<int64_t>(
-                    cfg_.kv_pool_tokens, INT32_MAX - PAGED_BLOCK_SIZE));
+                    cfg_.kv_pool_tokens, max_pool_tokens));
         } else {
             PagedKvAutoBudget budget;
             // TODO: Size tensor-parallel pools from each device's free memory
@@ -488,7 +519,8 @@ bool Qwen35Backend::init() {
             budget.bytes_per_token = kvf_budget.bytes_per_token;
             budget.reserve_bytes = kvf_budget.reserve_bytes;
             budget.fixed_cache_bytes = concurrent_fixed_cache_bytes(
-                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token);
+                w_, cfg_.device.max_ctx, n_slots, budget.bytes_per_token,
+                scratch_tokens, fixed_chain.enabled);
             pool_tokens = paged_kv_auto_pool_tokens(
                 cfg_.device.max_ctx, n_slots, budget);
             const int64_t one_context =
@@ -510,19 +542,20 @@ bool Qwen35Backend::init() {
                 return false;
             }
         }
-        if (pool_tokens + PAGED_BLOCK_SIZE > INT32_MAX) {
+        if (pool_tokens + scratch_tokens > INT32_MAX) {
             set_last_error("paged KV pool exceeds INT32_MAX tokens");
             return false;
         }
     }
     const int ctx_alloc = n_slots > 1
-        ? (int)(pool_tokens + PAGED_BLOCK_SIZE)
+        ? (int)(pool_tokens + scratch_tokens)
         : (cfg_.paged_attention
                ? paged_token_capacity(cfg_.device.max_ctx)
                : kvflash_tokens_);
     if (!create_target_cache(w_, cfg_.device.max_ctx, max_verify_tokens, target_backend_, cache_,
                              /*prefill_only=*/true, ctx_alloc,
-                             cfg_.paged_attention, n_slots)) {
+                             cfg_.paged_attention, n_slots,
+                             fixed_chain.enabled)) {
         std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
         return false;
     }
@@ -554,12 +587,21 @@ bool Qwen35Backend::init() {
             return false;
         }
         if (n_slots > 1) {
+            fixed_chain.scratch_base = (int)pool_tokens;
+            const int64_t dead_scratch_row = pool_tokens +
+                (int64_t)n_slots * fixed_chain.scratch_stride;
             seq_engine_ = std::make_unique<Qwen35SeqEngine>(
                 *this, *paged_kv_pool_, cfg_.device.max_ctx,
-                /*scratch_row=*/pool_tokens,
+                dead_scratch_row, fixed_chain,
                 max_concurrent_prefills, mixed_prefill_tokens,
                 long_mixed_prefill_tokens, long_prefill_threshold,
                 idle_prefill_tokens, prefill_quantum);
+            if (fixed_chain.enabled) {
+                std::fprintf(stderr,
+                    "[parallel-chain] fixed DFlash2 width=%d, "
+                    "same-device paged full-attention greedy lanes\n",
+                    fixed_chain.width);
+            }
             std::printf("[parallel] %d decode slots, up to %d packed prefills "
                         "(mixed short/long %d/%d at >=%d tokens, "
                         "idle %d, quantum %d), "
@@ -612,7 +654,8 @@ bool Qwen35Backend::init() {
 
     // Init feature mirror when draft model is available (needed for spec decode).
     // On single-GPU, this is an F32 conversion buffer; on split-GPU, a cross-device mirror.
-    if (cfg_.draft_path && !use_remote_draft) {
+    if (cfg_.draft_path && !use_remote_draft &&
+        !fixed_chain.enabled) {
         const int mirror_cap = std::min({cfg_.draft_ctx_max, cfg_.device.max_ctx,
                                          cache_.target_feat_cap > 0 ? cache_.target_feat_cap : cfg_.device.max_ctx});
         if (!draft_feature_mirror_init(feature_mirror_, draft_backend_,
@@ -837,13 +880,17 @@ bool Qwen35Backend::park(ParkTarget target) {
             remote_draft_.close();
         } else {
             step_graph_destroy(draft_sg_);
+            if (seq_engine_) seq_engine_->release_draft_graphs();
+            draft_kv_free(draft_kv_);
             free_draft_weights(dw_);
         }
         draft_parked_ = true;
         std::printf("[park] draft released\n"); std::fflush(stdout);
     }
     if (want_target_model && !target_parked_) {
+        step_graph_destroy(sg_);
         step_graph_destroy(proj_sg_);
+        dflash2_selector_graph_invalidate();
         free_target_weights(w_);
         target_parked_ = true;
         std::printf("[park] target released\n"); std::fflush(stdout);
@@ -898,9 +945,10 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.rope_n_ctx_orig = cfg_.draft_yarn_orig_ctx;
             }
             if (cfg_.draft_swa_window > 0) {
-                dw_.swa_window = cfg_.draft_swa_window;
-                for (int il = 0; il < dw_.n_layer - 1; il++)
-                    dw_.layers[il].is_swa = true;
+                const DraftSwaOverrideResult swa =
+                    apply_draft_swa_window_override(dw_, cfg_.draft_swa_window);
+                std::printf("[unpark] draft SWA layers: %d/%d (window=%d)\n",
+                            swa.swa_layers, swa.total_layers, swa.effective_window);
             }
             // Re-apply the runtime block-size override: without this a
             // park/unpark cycle silently reverts to checkpoint metadata
@@ -912,6 +960,9 @@ bool Qwen35Backend::unpark(ParkTarget target) {
                 dw_.block_size = cfg_.draft_block_size;
             }
         }
+        // A reloaded drafter can select different target capture layers.
+        // Rebuild any retained target graph against the refreshed mapping.
+        step_graph_free(sg_);
         draft_parked_ = false;
         std::printf("[unpark] draft restored\n"); std::fflush(stdout);
     }
@@ -1266,6 +1317,7 @@ DFlashTarget * Qwen35Backend::dflash_target() {
 
 void Qwen35Backend::shutdown() {
     const bool use_remote_draft = cfg_.remote_draft.enabled();
+    seq_engine_.reset();
     end_paged_sequence();
     free_drafter();
     step_graph_destroy(sg_);
@@ -1318,7 +1370,17 @@ void Qwen35Backend::release_scratch() {
     flashprefill::dflash_bsa_free_persistent();
 #endif
 
-    std::fprintf(stderr, "[vram] released scratch buffers\n");
+    // Gallocr teardown does not release operator temporaries cached by the
+    // legacy CUDA/HIP pools. On non-VMM devices a long prefill can otherwise
+    // leave nearly all VRAM reserved and make the next differently shaped
+    // request fail despite having no live scratch tensors.
+    size_t trimmed = ggml_backend_cuda_trim_pool(target_backend_);
+    if (draft_backend_ && draft_backend_ != target_backend_) {
+        trimmed += ggml_backend_cuda_trim_pool(draft_backend_);
+    }
+
+    std::fprintf(stderr, "[vram] released scratch buffers; trimmed %.1f MiB from device pools\n",
+                 trimmed / (1024.0 * 1024.0));
 }
 
 // ── Generate (speculative decode) ───────────────────────────────────────
@@ -1557,7 +1619,8 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         const bool pool = kvflash_active();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/cache_.cur_pos, /*n_tokens=*/1,
-                               /*with_mask=*/pool, /*capture=*/false,
+                               /*with_mask=*/pool || w_.is_bailingmoe3,
+                               /*capture=*/false,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*logits_tail_rows=*/0,
@@ -1651,6 +1714,29 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     int prefill_ubatch = qwen35_prefill_ubatch(512);
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;
+
+    // The HIP legacy pool retains freed graph temporaries. During a long,
+    // shape-changing prefill those cached blocks can fragment VRAM until the
+    // next allocation fails even though a large part of the pool is idle.
+    // Trimming is deliberately opt-in and performed only between completed
+    // chunks: ggml_backend_cuda_trim_pool() synchronizes the backend and
+    // retires captured graphs before returning cached blocks to the driver.
+    static const int prefill_pool_trim_tokens = []() {
+        const char * value = std::getenv("DFLASH_PREFILL_POOL_TRIM_TOKENS");
+        if (value == nullptr || value[0] == '\0') return 0;
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
+            std::fprintf(stderr,
+                "[vram] ignoring invalid DFLASH_PREFILL_POOL_TRIM_TOKENS=%s\n",
+                value);
+            return 0;
+        }
+        return (int)parsed;
+    }();
+    int64_t next_prefill_pool_trim = prefill_pool_trim_tokens > 0
+        ? ((int64_t)kv_offset / prefill_pool_trim_tokens + 1) * prefill_pool_trim_tokens
+        : INT64_MAX;
 
     // kvflash: a prompt that fits the pool prefills contiguously (identity
     // mapping, normal chunking). A LARGER prompt switches to POOLED CHUNKED
@@ -1880,6 +1966,22 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
 
         start += n_tokens;
+
+        if (prefill_pool_trim_tokens > 0 && start < prompt_len &&
+            (int64_t)committed >= next_prefill_pool_trim &&
+            ggml_backend_cuda_has_legacy_pool(target_backend_)) {
+            const size_t freed = ggml_backend_cuda_trim_pool(target_backend_);
+            std::fprintf(stderr,
+                "[vram] prefill pool trim at token %d: freed %.1f MiB\n",
+                committed, (double)freed / (1024.0 * 1024.0));
+            while (next_prefill_pool_trim <= (int64_t)committed) {
+                if (next_prefill_pool_trim > INT64_MAX - prefill_pool_trim_tokens) {
+                    next_prefill_pool_trim = INT64_MAX;
+                    break;
+                }
+                next_prefill_pool_trim += prefill_pool_trim_tokens;
+            }
+        }
     }
 
     if (kvflash_active()) {
@@ -2196,7 +2298,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         const bool paged = cfg_.paged_attention;
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/committed, /*n_tokens=*/1,
-                               /*with_mask=*/pool, /*capture=*/false,
+                               /*with_mask=*/pool || w_.is_bailingmoe3,
+                               /*capture=*/false,
                                /*capture_delta_intermediate=*/false,
                                /*fa_window=*/0,
                                /*logits_tail_rows=*/0,
@@ -2232,7 +2335,12 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             ggml_backend_tensor_set(sg_.kv_write_rows, row_vals.data(), 0,
                                     sizeof(int64_t) * n_head_kv);
         }
-        if (pool) kvflash_upload_mask();
+        if (pool) {
+            kvflash_upload_mask();
+        } else if (w_.is_bailingmoe3) {
+            upload_qwen35_causal_mask(
+                sg_.attn_mask, committed, 1, cfg_.kq_stride_pad);
+        }
 
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
@@ -2704,8 +2812,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // visible to the rows we keep, and would break the fixed block_size
     // contract the IPC drafter validates against.
     // Clamped to q_len: a checkpoint whose published block is below the
-    // narrowing floor never widens past its own block. The legacy accept-rate
-    // denominator is preserved unless shared adaptive width is enabled.
+    // narrowing floor never widens past its own block. Acceptance accounting
+    // uses the actual offered width, including confidence-trimmed drafts.
     const int verify_cap = committed >= kLongCtxNarrowTokens
                                ? std::min(q_len, std::max(kLongCtxMinVerify, q_len / 2))
                                : q_len;
@@ -2750,9 +2858,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     int n_generated     = 0;
     int n_draft_steps   = 0;
-    int n_accept_sum    = 0;
-    int n_spec_offered_sum = 0;
-    int n_spec_steps       = 0;
+    SpecAcceptanceStats acceptance;
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
@@ -3388,8 +3494,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 if (target->is_eos(tok)) { hit_eos = true; break; }
             }
 
-            // Telemetry: accepted children (exclude the always-committed root).
-            n_accept_sum += std::max(0, accepted_emitted - 1);
+            // Seed-inclusive, like chain telemetry; exclude graph padding.
+            acceptance.record_tree(accepted_emitted, tree.n_nodes, need_commit_budget);
 
             if (accepted_emitted <= 0) { step_graph_destroy(draft_sg); break; }
 
@@ -3711,7 +3817,6 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         if (!ar_step) {
             width_controller.observe(accept_n, v_len);
-            n_spec_offered_sum += v_len;
         }
         // Track hint acceptance telemetry.
         if (hint_fill > 0) {
@@ -3955,12 +4060,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
         cache_.cur_pos = committed;
         n_generated += emitted + injected;
-        // Only steps that proposed a full draft block enter the accept-rate
+        // Only speculative steps enter the accept-rate
         // accounting; 1-token burst steps would otherwise dilute the rate
         // that steers the PFlash residency bandit.
         if (!ar_step) {
-            n_accept_sum += std::min(accept_n, emitted);
-            n_spec_steps++;
+            acceptance.record_chain(accept_n, v_len, emitted, need_commit_budget);
         }
         n_draft_steps++;
 
@@ -3998,11 +4102,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         if (floor_to_ar) {
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = shared_feedback_width
-                ? std::max(1, n_spec_offered_sum)
-                : std::max(1, n_spec_steps * verify_cap);
-            out_accept_rate =
-                (float)((double)n_accept_sum / (double)total_draft_pos);
+            out_accept_rate = acceptance.rate();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 if (!finish_speculative_state()) return false;
@@ -4045,11 +4145,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             cache_.cur_pos = committed;
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
-            const int total_draft_pos = shared_feedback_width
-                ? std::max(1, n_spec_offered_sum)
-                : std::max(1, n_spec_steps * verify_cap);
-            out_accept_rate =
-                (float)((double)n_accept_sum / (double)total_draft_pos);
+            out_accept_rate = acceptance.rate();
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 if (!finish_speculative_state()) return false;
@@ -4078,16 +4174,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = shared_feedback_width
-        ? std::max(1, n_spec_offered_sum)
-        : std::max(1, n_spec_steps * verify_cap);
-    const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
-    out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
+    const double accept_pct = 100.0 * acceptance.rate();
+    out_accept_rate = acceptance.rate();
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
                  n_generated, decode_s,
                  n_generated > 0 ? n_generated / decode_s : 0.0,
-                 n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
+                 n_draft_steps, acceptance.accepted(), acceptance.offered(), accept_pct,
                  n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
     if (n_ar_burst_steps > 0) {
         std::fprintf(stderr, "[spec-decode] adaptive: %d of %d steps ran as plain decode "

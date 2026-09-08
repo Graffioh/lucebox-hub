@@ -4,6 +4,7 @@
 #include "mmq-tile-selection.h"
 #include "vecdotq.cuh"
 #include "mma.cuh"
+#include "mmq-streamk-schedule.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -5056,14 +5057,19 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
+    // On the validated SM86 path, also avoid launching more CTAs than useful MMQ iteration chunks.
     const int ntiles_dst = ntx * nty * ntzw;
-    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
-    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    // SM86 always uses the regular MMQ iteration width. MXFP4 only switches
+    // to MMQ_ITER_K_MXFP4_FP4 in the Blackwell device path.
+    const int iter_k = MMQ_ITER_K;
+    const bool enable_useful_chunk_cap = (cc == 860); // NVIDIA SM86 only; fail closed elsewhere.
+    const int stream_k_blocks = mmq_stream_k_nblocks(
+        ntiles_dst, nsm, args.ncols_x, iter_k, GGML_CUDA_CC_IS_NVIDIA(cc), enable_useful_chunk_cap);
+    const dim3 block_nums_stream_k(stream_k_blocks, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
-    const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+    const bool fixup_needed = mmq_stream_k_fixup_needed(ntiles_dst, stream_k_blocks);
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
@@ -5290,4 +5296,5 @@ void ggml_cuda_op_mul_mat_q(
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+bool ggml_cuda_mixed_mmq_enabled(const ggml_tensor * op, bool default_enabled = false);
+bool ggml_cuda_should_use_mmq(const ggml_tensor * op, int cc, int64_t ne11, int64_t n_experts);

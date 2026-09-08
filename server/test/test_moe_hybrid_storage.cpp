@@ -12,6 +12,24 @@ namespace {
 struct MoeHybridStorageFixture {};
 }
 
+TEST_CASE(MoeHybridStorageFixture, storage_identity_includes_mixed_mmq_policy) {
+    MoeHybridConfig cfg;
+    MoeHybridStorage storage;
+    cfg.n_layer = storage.placement.n_layer = 1;
+    cfg.n_expert = storage.placement.n_expert = 2;
+    cfg.n_expert_used = storage.placement.n_expert_used = 1;
+    storage.placement.hot_counts = {0};
+    storage.placement.hot_expert_ids = {{}};
+    storage.layers.resize(1);
+    REQUIRE(storage.matches(cfg));
+    cfg.mixed_mmq_policy = GGML_MIXED_MMQ_ENABLED;
+    REQUIRE(!storage.matches(cfg));
+    storage.mixed_mmq_policy = cfg.mixed_mmq_policy;
+    REQUIRE(storage.matches(cfg));
+    cfg.mixed_mmq_policy = GGML_MIXED_MMQ_DISABLED;
+    REQUIRE(!storage.matches(cfg));
+}
+
 TEST_CASE(MoeHybridStorageFixture, expert_residency_tracks_model_sized_expert_sets) {
     MoeHybridLayerStorage storage;
     storage.reset_expert_vram_mask(320);

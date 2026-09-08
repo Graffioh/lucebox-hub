@@ -2,7 +2,8 @@
 #include "ggml-cuda.h"
 #include "ggml.h"
 
-#include <algorithm>
+// Performance-only tile sweep. The ctest-registered test_deepseek4_unit checks
+// exact selected-set parity and padded -infinity ties across these shapes.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -12,7 +13,6 @@
 namespace {
 
 struct RunResult {
-    std::vector<int32_t> indices;
     double milliseconds = 0.0;
 };
 
@@ -89,48 +89,12 @@ bool compute_topk(
         std::chrono::duration<double, std::milli>(end - begin).count() /
         iterations;
 
-    if (ok) {
-        result.indices.resize((size_t) nrows * k);
-        ggml_backend_tensor_get(
-            selected,
-            result.indices.data(),
-            0,
-            result.indices.size() * sizeof(int32_t));
-    }
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
     return ok;
 }
 
-bool same_selected_set(
-        const std::vector<int32_t> & reference,
-        const std::vector<int32_t> & candidate,
-        int ncols,
-        int nrows,
-        int k) {
-    if (reference.size() != candidate.size()) {
-        return false;
-    }
-    for (int row = 0; row < nrows; ++row) {
-        const auto begin = (size_t) row * k;
-        std::vector<int32_t> expected(
-            reference.begin() + begin, reference.begin() + begin + k);
-        std::vector<int32_t> actual(
-            candidate.begin() + begin, candidate.begin() + begin + k);
-        if (std::any_of(actual.begin(), actual.end(), [ncols](int32_t index) {
-                return index < 0 || index >= ncols;
-            })) {
-            return false;
-        }
-        std::sort(expected.begin(), expected.end());
-        std::sort(actual.begin(), actual.end());
-        if (expected != actual) {
-            return false;
-        }
-    }
-    return true;
-}
 
 }  // namespace
 
@@ -159,22 +123,20 @@ int main() {
                 backend, ncols, nrows, k, false, 2, iterations, full_sort) &&
             compute_topk(
                 backend, ncols, nrows, k, true, 2, iterations, hierarchical);
-        const bool exact = ran && same_selected_set(
-            full_sort.indices, hierarchical.indices, ncols, nrows, k);
         const double speedup = hierarchical.milliseconds > 0.0
             ? full_sort.milliseconds / hierarchical.milliseconds
             : 0.0;
         std::printf(
             "ncols=%d rows=%d k=%d full_sort=%.3f ms hierarchical=%.3f ms "
-            "speedup=%.2fx exact_set=%s\n",
+            "speedup=%.2fx status=%s\n",
             ncols,
             nrows,
             k,
             full_sort.milliseconds,
             hierarchical.milliseconds,
             speedup,
-            exact ? "yes" : "NO");
-        all_ok = all_ok && exact;
+            ran ? "ok" : "FAILED");
+        all_ok = all_ok && ran;
     }
 
     unsetenv("GGML_DS4_TOPK_BLOCK_RADIX");
