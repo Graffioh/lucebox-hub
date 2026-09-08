@@ -3420,6 +3420,107 @@ static void test_ds4_flash_attention_parallel_index_scan_gpu(int selected_rows) 
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
+static void test_ds4_saved_raw_rows_replay_gpu() {
+    std::fprintf(stderr, "  test_ds4_saved_raw_rows_replay_gpu ...");
+#if !defined(GGML_USE_HIP)
+    std::fprintf(stderr, " skipped (HIP-only replay qualification)\n");
+    return;
+#endif
+    auto * backend = ggml_backend_cuda_init(0);
+    TEST_ASSERT_MSG(backend != nullptr, "GPU backend unavailable");
+    if (!backend) return;
+    constexpr int dim = 512, ring_rows = 128;
+    int passed = 0, cases = 0;
+    for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int width = 2; width <= 5; ++width) {
+            auto * ctx = make_test_context(4u << 20);
+            TEST_ASSERT(ctx != nullptr);
+            if (!ctx) continue;
+            auto * ring = ggml_new_tensor_2d(ctx, type, dim, ring_rows);
+            auto * read_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, width);
+            auto * write_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, width);
+            auto * replacement = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dim, width);
+            for (auto * input : {ring, read_rows, write_rows, replacement}) {
+                ggml_set_input(input);
+            }
+            auto * saved = deepseek4_preserve_raw_rows(ctx, ring, read_rows);
+            TEST_ASSERT(saved->type == type);
+            ggml_set_output(saved);
+            auto * graph = ggml_new_graph_custom(ctx, 128, false);
+            ggml_build_forward_expand(graph, saved);
+            auto * updated = ggml_set_rows(ctx, ring, replacement, write_rows);
+            ggml_set_output(updated);
+            ggml_build_forward_expand(graph, updated);
+            auto alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            const bool allocated = ggml_gallocr_alloc_graph(alloc, graph);
+            TEST_ASSERT(allocated);
+            if (allocated) {
+                std::vector<float> original((size_t) dim * ring_rows);
+                for (int r = 0; r < ring_rows; ++r) {
+                    for (int d = 0; d < dim; ++d) {
+                        original[(size_t) r * dim + d] = (float) r + (d % 4) * 0.25f;
+                    }
+                }
+                std::vector<ggml_fp16_t> original_f16(original.size());
+                std::transform(original.begin(), original.end(), original_f16.begin(), ggml_fp32_to_fp16);
+                std::vector<float> new_values((size_t) dim * width, -32.0f);
+                std::vector<int32_t> reads(width);
+                std::vector<int64_t> writes(width);
+                for (int position : {124, 124, 127, 128, 132, 255, 7680, 131072, 124}) {
+                    for (int t = 0; t < width; ++t) reads[t] = (position + t) % ring_rows;
+                    std::copy(reads.begin(), reads.end(), writes.begin());
+                    ggml_backend_tensor_set(ring,
+                        type == GGML_TYPE_F16 ? (const void *) original_f16.data() : original.data(),
+                        0, ggml_nbytes(ring));
+                    ggml_backend_tensor_set(read_rows, reads.data(), 0, ggml_nbytes(read_rows));
+                    ggml_backend_tensor_set(write_rows, writes.data(), 0, ggml_nbytes(write_rows));
+                    ggml_backend_tensor_set(replacement, new_values.data(), 0, ggml_nbytes(replacement));
+                    ScopedCudaGraphOverrides replay(
+                        /*disable_graphs=*/false, /*mmvq_max_ncols=*/0,
+                        /*skip_property_check=*/true);
+                    bool ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+                    std::vector<float> actual((size_t) dim * width), actual_ring(original.size());
+                    if (ok && type == GGML_TYPE_F16) {
+                        std::vector<ggml_fp16_t> half_saved(actual.size()), half_ring(actual_ring.size());
+                        ggml_backend_tensor_get(saved, half_saved.data(), 0, ggml_nbytes(saved));
+                        ggml_backend_tensor_get(updated, half_ring.data(), 0, ggml_nbytes(updated));
+                        std::transform(half_saved.begin(), half_saved.end(), actual.begin(), ggml_fp16_to_fp32);
+                        std::transform(half_ring.begin(), half_ring.end(), actual_ring.begin(), ggml_fp16_to_fp32);
+                    } else if (ok) {
+                        ggml_backend_tensor_get(saved, actual.data(), 0, ggml_nbytes(saved));
+                        ggml_backend_tensor_get(updated, actual_ring.data(), 0, ggml_nbytes(updated));
+                    }
+                    for (int t = 0; t < width && ok; ++t) {
+                        for (int d = 0; d < dim; ++d) {
+                            ok &= actual[(size_t) t * dim + d] == original[(size_t) reads[t] * dim + d];
+                        }
+                    }
+                    for (int r = 0; r < ring_rows && ok; ++r) {
+                        const bool replaced = std::find(reads.begin(), reads.end(), r) != reads.end();
+                        for (int d = 0; d < dim; ++d) {
+                            ok &= actual_ring[(size_t) r * dim + d] ==
+                                (replaced ? -32.0f : original[(size_t) r * dim + d]);
+                        }
+                    }
+                    ++cases;
+                    passed += ok;
+                    if (!ok) {
+                        std::fprintf(stderr, " FAIL q=%d type=%s pos=%d;",
+                                     width, ggml_type_name(type), position);
+                    }
+                }
+            }
+            ggml_backend_cuda_graph_invalidate_range(
+                backend, ggml_get_mem_buffer(ctx), ggml_get_mem_size(ctx));
+            ggml_gallocr_free(alloc);
+            ggml_free(ctx);
+        }
+    }
+    ggml_backend_free(backend);
+    std::fprintf(stderr, " %d/%d cases passed\n", passed, cases);
+    TEST_ASSERT_MSG(cases == 72 && passed == cases, "cached verifier saved rows from a stale ring position");
+}
+
 static bool run_ds4_preserved_raw_rows_case(
         ggml_backend_t backend, int width, int compressed_rows,
         bool visible_suffix, ggml_type kv_type, bool direct) {
@@ -5115,6 +5216,7 @@ int main() {
     test_ds4_flash_attention_keep_cap_gpu();
     test_ds4_flash_attention_parallel_index_scan_gpu(512);
     test_ds4_flash_attention_parallel_index_scan_gpu(1024);
+    test_ds4_saved_raw_rows_replay_gpu();
     test_ds4_preserved_raw_rows_gpu();
     test_ds4_indexer_score_packed_small_gpu();
     test_ds4_flash_rope_replay_gpu();

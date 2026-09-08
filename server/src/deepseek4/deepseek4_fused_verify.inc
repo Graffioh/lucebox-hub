@@ -475,6 +475,8 @@ static bool ds4_build_fused_verify_graph(
     ex.pos_q = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);  ggml_set_input(ex.pos_q);
     ex.neg_q = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);  ggml_set_input(ex.neg_q);
     ex.rawrows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.rawrows);
+    ex.saved_rawrows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);
+    ggml_set_input(ex.saved_rawrows);
     ex.ape4 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);   ggml_set_input(ex.ape4);
     ex.ape128 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q); ggml_set_input(ex.ape128);
     ex.st4 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.st4);
@@ -833,6 +835,7 @@ static bool ds4_build_fused_verify_graph(
         ain.rope_pos = ex.pos_q;
         ain.neg_pos = ex.neg_q;
         ain.raw_kv_rows = ex.rawrows;
+        ain.preserved_raw_rows = ex.saved_rawrows;
         if (ratio > 0) {
             int n_flush = 0;
             for (int t = 0; t < lane_q; ++t) {
@@ -1272,6 +1275,7 @@ static bool ds4_build_fused_verify_graph(
         pin_main(ex.pos_q);
         pin_main(ex.neg_q);
         pin_main(ex.rawrows);
+        pin_main(ex.saved_rawrows);
         pin_main(ex.ape4);
         pin_main(ex.ape128);
         pin_main(ex.st4);
@@ -1544,6 +1548,8 @@ static int ds4_try_fused_verify_step(
     ds4_fv_set(ex->neg_q, iv.data(), sizeof(int32_t) * q);
     for (int i = 0; i < q; ++i) lv[(size_t) i] = (kv_start + i) % w.n_swa;
     ds4_fv_set(ex->rawrows, lv.data(), sizeof(int64_t) * q);
+    for (int i = 0; i < q; ++i) iv[(size_t) i] = (int32_t) lv[(size_t) i];
+    ds4_fv_set(ex->saved_rawrows, iv.data(), sizeof(int32_t) * q);
     for (int i = 0; i < q; ++i) iv[(size_t) i] = (kv_start + i) % 4;
     ds4_fv_set(ex->ape4, iv.data(), sizeof(int32_t) * q);
     for (int i = 0; i < q; ++i) lv[(size_t) i] = 4 + (kv_start + i) % 4;

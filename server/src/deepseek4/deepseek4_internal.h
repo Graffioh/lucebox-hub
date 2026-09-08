@@ -356,6 +356,11 @@ ggml_tensor * deepseek4_indexed_attention_rows(
     ggml_context * ctx, ggml_tensor * compressed_topk,
     int compressed_rows, int preserved_rows);
 
+// Snapshot the raw rows a cached verifier is about to overwrite. Expand this
+// tensor before the ring writes; row indices are supplied again on each replay.
+ggml_tensor * deepseek4_preserve_raw_rows(
+    ggml_context * ctx, ggml_tensor * raw_kv, ggml_tensor * rows);
+
 bool load_deepseek4_gguf(const std::string & path,
                           ggml_backend_t backend,
                           DeepSeek4Weights & out);

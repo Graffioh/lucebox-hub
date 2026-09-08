@@ -561,10 +561,13 @@ export DFLASH_DS4_SPEC_Q=4
 batched explicit or sparse verifier attention instead of converting the full
 cache to F32 on every speculative step. With
 `DFLASH_DS4_SPARSE_DECODE_FLASH=1`, the verifier keeps explicit attention for
-short histories and switches each layer to the model's sparse top-k attention
-once it removes at least half of the compressed rows. Key-side accumulation
-remains F32 through 512 attention rows to preserve the short-context quality
-baseline. The option is currently qualified only for a single HIP target and
+short histories. Single-lane or ratio-4 layouts switch to sparse attention
+once it removes at least half of the compressed rows. Other batched layouts
+retain explicit attention because coarse block selection does not preserve
+the overwritten raw-row suffix. The ratio-4 learned indexer appends that
+suffix to its selected rows and applies the causal mask to it. Key-side
+accumulation remains F32 through 512 attention rows to preserve the
+short-context quality baseline. The option is currently qualified only for a single HIP target and
 remains off by default. It changes verifier floating-point inputs and can
 change generated tokens, so re-run workload quality checks before enabling it
 for another checkpoint.
@@ -578,6 +581,11 @@ reads runtime token positions so graph replay cannot retain a previous
 step's position. Uncached prefill keeps both fused rotations. This targeted
 check does not establish universal output identity or qualify all contexts;
 the sparse verifier remains opt-in.
+
+Cached batched verification also gathers overwritten raw rows using the
+current runtime ring indices before updating the cache. Those saved rows
+remain in the native cache dtype and in the ratio-4 sparse selection, so ring
+wraps do not require falling back to full-history explicit attention.
 
 On RDNA3.5 and RDNA4, speculative widths 2–5 use the packed small-CM rocWMMA
 indexer by default. It is bit-identical to the generic indexer in the GPU unit

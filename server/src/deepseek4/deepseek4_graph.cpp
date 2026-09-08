@@ -48,6 +48,22 @@
 
 namespace dflash::common {
 
+ggml_tensor * deepseek4_preserve_raw_rows(
+        ggml_context * ctx, ggml_tensor * raw_kv, ggml_tensor * rows) {
+    GGML_ASSERT(raw_kv && ggml_is_matrix(raw_kv));
+    GGML_ASSERT(raw_kv->type == GGML_TYPE_F16 || raw_kv->type == GGML_TYPE_F32);
+    GGML_ASSERT(rows && rows->type == GGML_TYPE_I32 && ggml_is_vector(rows));
+    GGML_ASSERT(rows->ne[0] > 0 && rows->ne[0] <= raw_kv->ne[1]);
+    // Cached graphs advance around the ring without changing their topology.
+    // Read the same runtime indices used by the upcoming set_rows, rather
+    // than baking the first step's physical offsets into view nodes.
+    auto * saved = ggml_get_rows(ctx, raw_kv, rows);
+    // GET_ROWS returns F32. Round-trip only this q-row suffix to retain native
+    // F16 verification; do not convert the full raw/compressed cache.
+    return raw_kv->type == GGML_TYPE_F16
+        ? ggml_cast(ctx, saved, GGML_TYPE_F16) : saved;
+}
+
 ggml_tensor * deepseek4_indexed_attention_rows(
         ggml_context * ctx, ggml_tensor * compressed_topk,
         int compressed_rows, int preserved_rows) {
@@ -354,6 +370,7 @@ struct DeepSeek4AttentionGraphInputs {
     ggml_tensor * rope_pos = nullptr;
     ggml_tensor * neg_pos = nullptr;
     ggml_tensor * raw_kv_rows = nullptr;
+    ggml_tensor * preserved_raw_rows = nullptr; // I32 runtime ring read indices
     ggml_tensor * attn_ape_row = nullptr;
     ggml_tensor * attn_state_rows = nullptr;
     ggml_tensor * attn_comp_rows = nullptr;
@@ -2047,16 +2064,12 @@ static ggml_tensor * build_mla_attention_lane_core(
     if (!gathered_history && fused_causal) {
         // Fused verify: ALWAYS q preserved rows so the topology is stable;
         // unwrapped/garbage rows are masked by the host-filled mask values.
-        for (int ti = 0; ti < n_tokens; ti++) {
-            ggml_tensor * slot = ggml_view_2d(
-                ctx, lane.raw_kv, head_dim, 1, lane.raw_kv->nb[1],
-                (size_t)((kv_start + ti) % w.n_swa) * lane.raw_kv->nb[1]);
-            ggml_tensor * saved = ggml_cont(ctx, slot);
-            ggml_build_forward_expand(gf, saved);
-            old_rows_scratch = old_rows_scratch
-                ? ggml_concat(ctx, old_rows_scratch, saved, 1) : saved;
-            n_old_rows++;
-        }
+        GGML_ASSERT(cached_inputs->preserved_raw_rows &&
+                    cached_inputs->preserved_raw_rows->ne[0] == n_tokens);
+        old_rows_scratch = deepseek4_preserve_raw_rows(
+            ctx, lane.raw_kv, cached_inputs->preserved_raw_rows);
+        ggml_build_forward_expand(gf, old_rows_scratch);
+        n_old_rows = n_tokens;
         old_rows_scratch_f16 = old_rows_scratch;
         old_rows_scratch = ds4_cast_if_needed(ctx, old_rows_scratch, GGML_TYPE_F32);
     } else if (!gathered_history && causal_batch && !layer_major_batch) {
@@ -5299,6 +5312,7 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * pos_q = nullptr;    // i32 [q]
         ggml_tensor * neg_q = nullptr;    // i32 [q]
         ggml_tensor * rawrows = nullptr;  // i64 [1,q]
+        ggml_tensor * saved_rawrows = nullptr; // i32 [q], gather before ring writes
         ggml_tensor * ape4 = nullptr;     // i32 [q]
         ggml_tensor * ape128 = nullptr;   // i32 [q]
         ggml_tensor * st4 = nullptr;      // i64 [1,q]
