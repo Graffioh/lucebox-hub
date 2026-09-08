@@ -168,6 +168,27 @@ void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
         args, "qwen35", PlacementBackend::Cuda, features).empty());
 }
 
+void test_feature_gate_ds4_pflash_rejects_layer_split() {
+    BackendArgs args = gate_args_hip_deepseek4();
+    BackendFeatureConfig features;
+    features.pflash_enabled = true;
+    features.pflash_drafter_configured = true;
+    CHECK(gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
+    args.device.layer_split_gpus = {0, 1};
+    args.device.layer_split_backends = {PlacementBackend::Hip, PlacementBackend::Hip};
+    CHECK(!gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
+    features.pflash_enabled = false;
+    CHECK(gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
+
+    // Current main also supports DS4 paged serving, which cannot park its
+    // live target state for PFlash. Keep that independent admission guard.
+    args = gate_args_hip_deepseek4();
+    args.paged_attention = true;
+    CHECK(gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
+    features.pflash_enabled = true;
+    CHECK(!gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
+}
+
 void test_feature_gate_validates_target_split_topology() {
     BackendArgs weights;
     weights.model_path = "/nonexistent/model.gguf";
@@ -714,6 +735,7 @@ void test_model_capability_tables() {
     CHECK(!arch_has_expert_offload("qwen35"));
     // deepseek4 is mixture-of-experts but has no hot/cold offload path.
     CHECK(!arch_has_expert_offload("deepseek4"));
+    CHECK(arch_supports_pflash_compression("deepseek4"));
 
     // Every capability predicate must be false for an architecture the
     // factory cannot build, so no rule can admit an unbuildable model.
@@ -751,6 +773,7 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_draft_block_size_requires_local_draft();
     test_draft_block_size_override_respects_checkpoint_horizon();
     test_feature_gate_pflash_requires_drafter_and_supported_arch();
+    test_feature_gate_ds4_pflash_rejects_layer_split();
     test_feature_gate_validates_target_split_topology();
     test_feature_gate_tensor_parallel_requirements();
     test_feature_gate_ds4_prefill_requires_deepseek4();

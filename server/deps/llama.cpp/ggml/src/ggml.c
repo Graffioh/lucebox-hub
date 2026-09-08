@@ -5668,6 +5668,19 @@ void ggml_flash_attn_ext_set_ds4_inverse_rope(
     ggml_set_op_params_i32(a, 15, n_ctx_orig);
 }
 
+void ggml_flash_attn_ext_set_ds4_rope_positions(
+        struct ggml_tensor * a,
+        struct ggml_tensor * positions) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT((ggml_get_op_params_i32(a, 7) & 1) != 0);
+    GGML_ASSERT(a->src[6] == NULL);
+    GGML_ASSERT(positions && positions->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(positions));
+    GGML_ASSERT(positions->ne[0] == a->src[0]->ne[1]);
+    GGML_ASSERT(positions->ne[1] == 1 && positions->ne[2] == 1 && positions->ne[3] == 1);
+    a->src[6] = positions;
+}
+
 bool ggml_flash_attn_ext_is_ds4(const struct ggml_tensor * a) {
     return a && a->op == GGML_OP_FLASH_ATTN_EXT &&
            (ggml_get_op_params_i32(a, 6) != 0 ||

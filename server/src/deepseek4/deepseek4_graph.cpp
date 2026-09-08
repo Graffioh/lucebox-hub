@@ -48,6 +48,42 @@
 
 namespace dflash::common {
 
+ggml_tensor * deepseek4_preserve_raw_rows(
+        ggml_context * ctx, ggml_tensor * raw_kv, ggml_tensor * rows) {
+    GGML_ASSERT(raw_kv && ggml_is_matrix(raw_kv));
+    GGML_ASSERT(raw_kv->type == GGML_TYPE_F16 || raw_kv->type == GGML_TYPE_F32);
+    GGML_ASSERT(rows && rows->type == GGML_TYPE_I32 && ggml_is_vector(rows));
+    GGML_ASSERT(rows->ne[0] > 0 && rows->ne[0] <= raw_kv->ne[1]);
+    // Cached graphs advance around the ring without changing their topology.
+    // Read the same runtime indices used by the upcoming set_rows, rather
+    // than baking the first step's physical offsets into view nodes.
+    auto * saved = ggml_get_rows(ctx, raw_kv, rows);
+    // GET_ROWS returns F32. Round-trip only this q-row suffix to retain native
+    // F16 verification; do not convert the full raw/compressed cache.
+    return raw_kv->type == GGML_TYPE_F16
+        ? ggml_cast(ctx, saved, GGML_TYPE_F16) : saved;
+}
+
+ggml_tensor * deepseek4_indexed_attention_rows(
+        ggml_context * ctx, ggml_tensor * compressed_topk,
+        int compressed_rows, int preserved_rows) {
+    GGML_ASSERT(compressed_topk && compressed_topk->type == GGML_TYPE_I32);
+    GGML_ASSERT(compressed_rows >= 0 && preserved_rows >= 0);
+    if (preserved_rows == 0) return compressed_topk;
+    // ARANGE uses F32, so its integer endpoints must be exactly representable.
+    GGML_ASSERT((int64_t) compressed_rows + preserved_rows <= (1 << 24));
+    auto * saved = ggml_cast(ctx, ggml_arange(
+        ctx, (float) compressed_rows, (float) (compressed_rows + preserved_rows),
+        1.0f), GGML_TYPE_I32);
+    auto * shape = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_I32, preserved_rows, compressed_topk->ne[1]);
+    saved = ggml_repeat(ctx, saved, shape);
+    // The suffix is not part of the learned top-k competition. Append all of
+    // it to each lane's row list; the existing causal mask hides overwritten,
+    // not-yet-written and future rows. No host binding is needed on replay.
+    return ggml_concat(ctx, compressed_topk, saved, 0);
+}
+
 namespace {
 using Ds4TimingClock = std::chrono::steady_clock;
 
@@ -334,6 +370,7 @@ struct DeepSeek4AttentionGraphInputs {
     ggml_tensor * rope_pos = nullptr;
     ggml_tensor * neg_pos = nullptr;
     ggml_tensor * raw_kv_rows = nullptr;
+    ggml_tensor * preserved_raw_rows = nullptr; // I32 runtime ring read indices
     ggml_tensor * attn_ape_row = nullptr;
     ggml_tensor * attn_state_rows = nullptr;
     ggml_tensor * attn_comp_rows = nullptr;
@@ -1589,6 +1626,20 @@ static int ds4_padded_gathered_raw_rows(int n_raw) {
     return std::min(padded, (int) DS4_PAGE_TOKENS - 1);
 }
 
+ggml_tensor * deepseek4_indexer_visibility_suffix(
+        ggml_context * ctx, ggml_tensor * mask, int first_scored, int n_scored) {
+    if (!mask) return nullptr;
+    GGML_ASSERT(mask->type == GGML_TYPE_F32 && ggml_is_matrix(mask));
+    GGML_ASSERT(first_scored >= 0 && n_scored > 0);
+    GGML_ASSERT(mask->ne[1] == (int64_t) first_scored + n_scored);
+    if (first_scored == 0) return mask;
+    // Query, head weights, positions and per-token visibility must all start
+    // at the same lane after skipping the identity-selected prefix.
+    return ggml_cont(ctx, ggml_view_2d(
+        ctx, mask, mask->ne[0], n_scored, mask->nb[1],
+        (size_t) first_scored * mask->nb[1]));
+}
+
 static ggml_tensor * build_indexer_topk(
         ggml_context * ctx,
         ggml_tensor * qr_norm,        // [n_lora_q, n_tokens]
@@ -1629,6 +1680,8 @@ static ggml_tensor * build_indexer_topk(
     };
     qr_norm = token_slice(qr_norm, (int) qr_norm->ne[0]);
     cur = token_slice(cur, (int) cur->ne[0]);
+    visibility_mask = deepseek4_indexer_visibility_suffix(
+        ctx, visibility_mask, first_scored, n_scored);
     if (first_scored > 0) {
         rope_pos = ggml_view_1d(
             ctx, rope_pos, n_scored,
@@ -1989,7 +2042,13 @@ static ggml_tensor * build_mla_attention_lane_core(
     // D=512 flash prefill can rotate Q's 64-d tail inside the exact attention
     // kernel. This avoids materializing cont(nope), cont(tail), rope(tail),
     // and concat(nope, tail) while retaining the same F32 rounding boundary.
-    const bool fuse_q_rope = attention_impl != DeepSeek4AttentionImpl::Explicit &&
+    // Cached decode/verification uses the standalone Q rotation. Fusing it
+    // changes the adaptive sparse verifier's output even with identical
+    // selected rows; keep the validated rounding/materialization boundary.
+    // This does not disable sparse flash attention, native F16 KV, inverse
+    // RoPE fusion, or the uncached prefill optimization.
+    const bool fuse_q_rope = !cached_inputs &&
+                             attention_impl != DeepSeek4AttentionImpl::Explicit &&
                              n_tokens > 1 && head_dim == 512 && n_rot == 64;
     if (prepared) {
         projected = *prepared;
@@ -2021,16 +2080,12 @@ static ggml_tensor * build_mla_attention_lane_core(
     if (!gathered_history && fused_causal) {
         // Fused verify: ALWAYS q preserved rows so the topology is stable;
         // unwrapped/garbage rows are masked by the host-filled mask values.
-        for (int ti = 0; ti < n_tokens; ti++) {
-            ggml_tensor * slot = ggml_view_2d(
-                ctx, lane.raw_kv, head_dim, 1, lane.raw_kv->nb[1],
-                (size_t)((kv_start + ti) % w.n_swa) * lane.raw_kv->nb[1]);
-            ggml_tensor * saved = ggml_cont(ctx, slot);
-            ggml_build_forward_expand(gf, saved);
-            old_rows_scratch = old_rows_scratch
-                ? ggml_concat(ctx, old_rows_scratch, saved, 1) : saved;
-            n_old_rows++;
-        }
+        GGML_ASSERT(cached_inputs->preserved_raw_rows &&
+                    cached_inputs->preserved_raw_rows->ne[0] == n_tokens);
+        old_rows_scratch = deepseek4_preserve_raw_rows(
+            ctx, lane.raw_kv, cached_inputs->preserved_raw_rows);
+        ggml_build_forward_expand(gf, old_rows_scratch);
+        n_old_rows = n_tokens;
         old_rows_scratch_f16 = old_rows_scratch;
         old_rows_scratch = ds4_cast_if_needed(ctx, old_rows_scratch, GGML_TYPE_F32);
     } else if (!gathered_history && causal_batch && !layer_major_batch) {
@@ -2227,11 +2282,13 @@ static ggml_tensor * build_mla_attention_lane_core(
                 ? cached_inputs->padded_comp
                 : n_index_comp_live;
             if (masked_kv && n_index_comp > 0) {
-                index_visibility_mask = ggml_view_2d(
+                // Each verifier lane owns a full causal-mask column. Preserve
+                // the per-lane compressed visibility when compacting it.
+                index_visibility_mask = ggml_cont(ctx, ggml_view_2d(
                     ctx, cached_inputs->attn_row_mask,
-                    n_index_comp, 1,
-                    (size_t) n_index_comp * sizeof(float),
-                    (size_t) w.n_swa * sizeof(float));
+                    n_index_comp, n_tokens,
+                    cached_inputs->attn_row_mask->nb[1],
+                    (size_t) w.n_swa * sizeof(float)));
             }
         }
         indexer_topk = build_indexer_topk(
@@ -2318,19 +2375,24 @@ static ggml_tensor * build_mla_attention_lane_core(
     } else {
         kv_attn = raw_kv_view(0, n_raw);
     }
-    const bool fused_explicit_f16_kv = w.fused_verify_f16_kv &&
+    const bool fused_verify_f16_kv = w.fused_verify_f16_kv &&
         masked_kv && n_tokens > 1 &&
-        attention_impl == DeepSeek4AttentionImpl::Explicit &&
         kv_attn->type == GGML_TYPE_F32 &&
         raw_kv_source->type == GGML_TYPE_F16 &&
         (!comp_history_source ||
          comp_history_source->type == GGML_TYPE_F16) &&
         (!old_rows_scratch_f16 ||
          old_rows_scratch_f16->type == GGML_TYPE_F16);
-    if (fused_explicit_f16_kv) {
+    const bool fused_explicit_f16_kv = fused_verify_f16_kv &&
+        attention_impl == DeepSeek4AttentionImpl::Explicit;
+    const bool fused_sparse_f16_kv = fused_verify_f16_kv &&
+        attention_impl == DeepSeek4AttentionImpl::SparseFlash;
+    if (fused_explicit_f16_kv || fused_sparse_f16_kv) {
         // DS4's persistent MLA caches are already F16. Feed those tensors
-        // directly to the established explicit attention matmuls instead of
-        // casting the entire long-context cache to F32 on every verifier step.
+        // directly to the attention implementation instead of casting the
+        // entire long-context cache to F32 on every verifier step.
+        // Current writes are consumed through their set_rows results, while
+        // preserved overwritten rows retain the same cached F16 values.
         kv_attn = ggml_view_2d(
             ctx, raw_kv_source, head_dim, n_raw, raw_kv_source->nb[1], 0);
         if (n_comp_attn > 0 && comp_history_source) {
@@ -2344,10 +2406,14 @@ static ggml_tensor * build_mla_attention_lane_core(
                 ctx, kv_attn, old_rows_scratch_f16, 1);
         }
         static std::atomic<bool> explicit_f16_kv_logged{false};
-        if (!explicit_f16_kv_logged.exchange(true)) {
+        static std::atomic<bool> sparse_f16_kv_logged{false};
+        std::atomic<bool> & logged = fused_sparse_f16_kv
+            ? sparse_f16_kv_logged : explicit_f16_kv_logged;
+        if (!logged.exchange(true)) {
             std::fprintf(stderr,
-                "[deepseek4] fused explicit F16 K/V active: tokens=%d "
+                "[deepseek4] fused %s F16 K/V active: tokens=%d "
                 "compressed=%d\n",
+                fused_sparse_f16_kv ? "sparse" : "explicit",
                 n_tokens, n_comp_attn);
         }
     } else {
@@ -2446,6 +2512,10 @@ static ggml_tensor * build_mla_attention_lane_core(
             f32_array_inputs->push_back({cmask, std::move(mvals)});
             score_mask = ggml_reshape_2d(ctx, cmask, n_attn, n_tokens);
         }
+    }
+    if (indexer_topk) {
+        indexer_topk = deepseek4_indexed_attention_rows(
+            ctx, indexer_topk, n_comp_attn, n_old_rows);
     }
     const bool direct_indexer_topk = indexer_topk &&
         ds4_env_flag("DFLASH_DS4_DIRECT_INDEXER_TOPK");
@@ -2605,7 +2675,12 @@ static ggml_tensor * build_mla_attention_lane_core(
             // The DS4 D=512 kernel consumes Q strides directly, avoiding a full
             // [D,H,T] -> [D,T,H] materialization for every layer.
             ggml_tensor * q_fa = ggml_permute(ctx, q, 0, 2, 1, 3);
-            ggml_tensor * kv_fa = ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
+            // The DS4 D=512 kernel has native F16 K/V specializations. Keep
+            // fused verifier caches in their persistent representation and
+            // avoid a full long-context F16 -> F32 conversion every step.
+            ggml_tensor * kv_fa = fused_sparse_f16_kv
+                ? kv_attn
+                : ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
             ggml_tensor * k_fa = ggml_reshape_3d(ctx, kv_fa, head_dim, n_attn, 1);
             ggml_tensor * v_fa = k_fa;
             ggml_tensor * mask_fa = score_mask
@@ -2623,7 +2698,7 @@ static ggml_tensor * build_mla_attention_lane_core(
             ggml_flash_attn_ext_set_ds4_sparse(
                 context, n_raw, w.n_swa,
                 indexer_topk
-                    ? -w.n_indexer_top_k
+                    ? -(int) indexer_topk->ne[0]
                     : attention_impl == DeepSeek4AttentionImpl::SparseFlash
                         ? w.n_indexer_top_k : 0,
                 32);
@@ -2637,6 +2712,13 @@ static ggml_tensor * build_mla_attention_lane_core(
                     context, kv_start, rope_freq, rope_scale, rope_ext,
                     rope_attn, w.rope_yarn_beta_fast,
                     w.rope_yarn_beta_slow, rope_n_ctx_orig, fuse_q_rope);
+                // Cached AR/verifier graphs reuse a shape at new positions.
+                // Bind the already-uploaded position tensor so both fused
+                // rotations advance with the graph instead of using kv_start
+                // from the first build. Prefill's fixed-position path is unchanged.
+                if (cached_inputs) {
+                    ggml_flash_attn_ext_set_ds4_rope_positions(context, rope_pos);
+                }
                 inverse_rope_fused = true;
             }
         }
@@ -5246,6 +5328,7 @@ struct Ds4FusedVerifyCache {
         ggml_tensor * pos_q = nullptr;    // i32 [q]
         ggml_tensor * neg_q = nullptr;    // i32 [q]
         ggml_tensor * rawrows = nullptr;  // i64 [1,q]
+        ggml_tensor * saved_rawrows = nullptr; // i32 [q], gather before ring writes
         ggml_tensor * ape4 = nullptr;     // i32 [q]
         ggml_tensor * ape128 = nullptr;   // i32 [q]
         ggml_tensor * st4 = nullptr;      // i64 [1,q]

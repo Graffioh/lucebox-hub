@@ -547,6 +547,8 @@ Run the converted drafter against a DeepSeek4 target with:
 ```bash
 export DFLASH_DS4_SPEC=1
 export DFLASH_DS4_FUSED_VERIFY=1
+# Experimental, single HIP target only; may change generated tokens:
+# export DFLASH_DS4_SPARSE_DECODE_FLASH=1
 export DFLASH_DS4_DRAFT=/path/to/dflash-draft.gguf
 export DFLASH_DS4_SPEC_Q=4
 
@@ -557,12 +559,39 @@ export DFLASH_DS4_SPEC_Q=4
 ```
 
 `--ds4-fused-verify-f16-kv` feeds the persistent F16 MLA cache directly to
-batched explicit verifier attention instead of converting the full cache to
-F32 on every speculative step. Key-side accumulation remains F32 through 512
-attention rows to preserve the short-context quality baseline. The option is
-currently qualified only for a single HIP target and remains off by default.
-It changes verifier floating-point inputs and can change generated tokens, so
-re-run workload quality checks before enabling it for another checkpoint.
+batched explicit or sparse verifier attention instead of converting the full
+cache to F32 on every speculative step. With
+`DFLASH_DS4_SPARSE_DECODE_FLASH=1`, the verifier keeps explicit attention for
+short histories. Single-lane or ratio-4 layouts switch to sparse attention
+once it removes at least half of the compressed rows. Other batched layouts
+retain explicit attention because coarse block selection does not preserve
+the overwritten raw-row suffix. The ratio-4 learned indexer appends that
+suffix to its selected rows and applies the causal mask to it. Key-side
+accumulation remains F32 through 512 attention rows to preserve the
+short-context quality baseline. The option is currently qualified only for a single HIP target and
+remains off by default. It changes verifier floating-point inputs and can
+change generated tokens, so re-run workload quality checks before enabling it
+for another checkpoint.
+
+Cached sparse decode and verification retain standalone forward-Q RoPE.
+The fused-Q variant failed the strict five-line retrieval control even when
+an explicit-attention control used the same selected rows. Keeping this
+rotation separate restored the control's output without disabling sparse
+flash attention, native F16 KV, or adaptive verification. Fused inverse RoPE
+reads runtime token positions so graph replay cannot retain a previous
+step's position. Uncached prefill keeps both fused rotations. This targeted
+check does not establish universal output identity or qualify all contexts;
+the sparse verifier remains opt-in.
+
+Cached batched verification also gathers overwritten raw rows using the
+current runtime ring indices before updating the cache. Those saved rows
+remain in the native cache dtype and in the ratio-4 sparse selection, so ring
+wraps do not require falling back to full-history explicit attention.
+
+On RDNA3.5 and RDNA4, speculative widths 2–5 use the packed small-CM rocWMMA
+indexer by default. It is bit-identical to the generic indexer in the GPU unit
+test and can be disabled with `GGML_DS4_INDEXER_PACK_SMALL=0` for diagnosis.
+The legacy `GGML_DS4_INDEXER_PACK_Q4` variable remains an alias.
 
 `DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
 whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
@@ -779,6 +808,39 @@ GSM+Math accuracy and measured 31.94 tok/s weighted, within 0.6% of fixed q=4
 at 32.12 tok/s. These numbers are workload-specific; the confidence policy is
 enabled only when DSpark is explicitly enabled and the draft artifact contains
 a compatible confidence head.
+
+## PFlash prompt compression
+
+DeepSeek4 supports the shared in-process Qwen3-0.6B PFlash scorer.
+
+PFlash is supported for monolithic serving only. Layer-split and paged-serving
+configurations reject prefill compression at startup; paged serving cannot
+park a target while it owns live sequence state.
+
+```bash
+./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
+  --target-device hip:0 \
+  --prefill-compression auto \
+  --prefill-drafter /path/to/Qwen3-0.6B-BF16.gguf \
+  --prefill-skip-park
+```
+
+The HTTP path converts target tokens to text, scores Qwen tokens, decodes the
+kept Qwen spans, and tokenizes that text for DeepSeek4. This cross-tokenizer
+round trip is required; drafter token IDs are never passed directly to the
+target. Omit `--prefill-skip-park` when the target, DSpark drafter, and PFlash
+drafter do not fit together.
+
+PFlash reduces TTFT and the effective context used during generation, but it
+is lossy prompt compression. Disable it for matched true-context throughput
+or exact-retrieval comparisons.
+
+The legacy daemon command `compress <tokens-file> <keep-x1000> <drafter-path>
+[nopark]` retains its shared wire contract: backend-local GPU 0 and a drafter
+kept loaded until `free drafter` or parking. That protocol has no GPU-placement
+or request-scoped-residency fields. Use the HTTP path or typed `compress` /
+`compress_batch` API when those controls are required. Typed keep ratios must
+be finite and in [0,1]; zero requests the scorer's minimum retained chunk.
 
 ## Example: CUDA + Halo Layer Split
 

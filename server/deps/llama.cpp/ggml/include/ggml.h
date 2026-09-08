@@ -2471,6 +2471,13 @@ extern "C" {
             int                  n_ctx_orig,
             bool                 q_unrotated);
 
+    // Optional runtime positions for both fused RoPE directions. I32 [n_query]
+    // replaces kv_start + query_index, allowing a cached graph to advance
+    // without rebuilding its topology or retaining stale position constants.
+    GGML_API void ggml_flash_attn_ext_set_ds4_rope_positions(
+            struct ggml_tensor * a,
+            struct ggml_tensor * positions);
+
     // True when flash_attn_ext carries the DS4 sparse-layout or fused-RoPE
     // contract. Backends must implement that complete contract or reject it.
     GGML_API bool ggml_flash_attn_ext_is_ds4(

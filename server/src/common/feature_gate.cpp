@@ -52,6 +52,10 @@ std::string check_feature_compatibility(
         !features.pflash_drafter_configured) {
         return "--prefill-compression requires --prefill-drafter";
     }
+    if (features.pflash_enabled && arch == "deepseek4" &&
+        args.device.is_layer_split()) {
+        return "--prefill-compression is not supported with DeepSeek4 layer splitting";
+    }
 
     // ── target/draft backend mixing × remote draft IPC
     if (mixed_draft_placement && !args.remote_draft.enabled()) {

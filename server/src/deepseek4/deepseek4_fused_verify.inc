@@ -475,6 +475,8 @@ static bool ds4_build_fused_verify_graph(
     ex.pos_q = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);  ggml_set_input(ex.pos_q);
     ex.neg_q = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);  ggml_set_input(ex.neg_q);
     ex.rawrows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.rawrows);
+    ex.saved_rawrows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);
+    ggml_set_input(ex.saved_rawrows);
     ex.ape4 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q);   ggml_set_input(ex.ape4);
     ex.ape128 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, q); ggml_set_input(ex.ape128);
     ex.st4 = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, q); ggml_set_input(ex.st4);
@@ -833,6 +835,7 @@ static bool ds4_build_fused_verify_graph(
         ain.rope_pos = ex.pos_q;
         ain.neg_pos = ex.neg_q;
         ain.raw_kv_rows = ex.rawrows;
+        ain.preserved_raw_rows = ex.saved_rawrows;
         if (ratio > 0) {
             int n_flush = 0;
             for (int t = 0; t < lane_q; ++t) {
@@ -881,13 +884,34 @@ static bool ds4_build_fused_verify_graph(
         std::vector<DeepSeek4I32InputBinding> i32b;
         std::vector<DeepSeek4I32ArrayBinding> i32ab;
         std::vector<DeepSeek4I64ArrayBinding> i64ab;
+        std::vector<DeepSeek4F32ArrayBinding> f32ab;
+        // Sparse attention pays a fixed indexer/compaction cost. Keep the
+        // established explicit kernel while history is small, then switch per
+        // layer once sparse work can remove at least half of the compressed
+        // rows. This also avoids a transient identity binding at the exact
+        // top-k boundary, preserving fused-graph replay.
+        const bool sparse_attention =
+            ds4_env_flag("DFLASH_DS4_SPARSE_DECODE_FLASH") && ratio > 0 &&
+            // The exact indexer carries saved raw rows for batched lanes.
+            // Coarse block selection has no saved-row contract; retain the
+            // explicit verifier there instead of pruning raw history.
+            (lane_q == 1 || ratio == 4) &&
+            padded > 2 * w.n_indexer_top_k;
+        const DeepSeek4AttentionImpl attention_impl = sparse_attention
+            ? DeepSeek4AttentionImpl::SparseFlash
+            : DeepSeek4AttentionImpl::Explicit;
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
         attn_out = build_mla_attention(ctx, gf, normed, w, L, *lc, il,
                                                      lane_kv_start, lane_q, &ain,
-                                                     i32b, i32ab, i64ab);
+                                                     i32b, i32ab, i64ab,
+                                                     &f32ab, attention_impl);
         if (!attn_out) return false;
-        if (!i32b.empty() || !i32ab.empty() || !i64ab.empty()) {
-            std::fprintf(stderr, "[ds4-fused-verify] layer %d dynamic bindings; cannot fuse\n", il);
+        if (!i32b.empty() || !i32ab.empty() || !i64ab.empty() ||
+            !f32ab.empty()) {
+            std::fprintf(stderr,
+                "[ds4-fused-verify] layer %d dynamic bindings "
+                "(%zu/%zu/%zu/%zu); cannot fuse\n",
+                il, i32b.size(), i32ab.size(), i64ab.size(), f32ab.size());
             return false;
         }
         }
@@ -1251,6 +1275,7 @@ static bool ds4_build_fused_verify_graph(
         pin_main(ex.pos_q);
         pin_main(ex.neg_q);
         pin_main(ex.rawrows);
+        pin_main(ex.saved_rawrows);
         pin_main(ex.ape4);
         pin_main(ex.ape128);
         pin_main(ex.st4);
@@ -1523,6 +1548,8 @@ static int ds4_try_fused_verify_step(
     ds4_fv_set(ex->neg_q, iv.data(), sizeof(int32_t) * q);
     for (int i = 0; i < q; ++i) lv[(size_t) i] = (kv_start + i) % w.n_swa;
     ds4_fv_set(ex->rawrows, lv.data(), sizeof(int64_t) * q);
+    for (int i = 0; i < q; ++i) iv[(size_t) i] = (int32_t) lv[(size_t) i];
+    ds4_fv_set(ex->saved_rawrows, iv.data(), sizeof(int32_t) * q);
     for (int i = 0; i < q; ++i) iv[(size_t) i] = (kv_start + i) % 4;
     ds4_fv_set(ex->ape4, iv.data(), sizeof(int32_t) * q);
     for (int i = 0; i < q; ++i) lv[(size_t) i] = 4 + (kv_start + i) % 4;
