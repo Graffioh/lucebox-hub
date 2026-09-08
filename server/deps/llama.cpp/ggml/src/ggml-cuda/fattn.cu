@@ -10,6 +10,12 @@
 
 #include <type_traits>
 
+static thread_local size_t g_mla_stream_topk_launch_count = 0;
+
+extern "C" size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void) {
+    return g_mla_stream_topk_launch_count;
+}
+
 #if defined(GGML_USE_HIP)
 
 __device__ static float ds4_fa_block_sum(float v) {
@@ -2692,49 +2698,31 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             const dim3 streaming_grid(
                 (unsigned) n_tokens,
                 (unsigned) (n_heads / streaming_heads), 1);
+            const auto launch_streaming = [&](auto stage_f32, auto use_fast_exp) {
+                ds4_flash_attn_d512_streaming_topk_kernel<
+                    half, half, streaming_heads, 16,
+                    decltype(stage_f32)::value, decltype(use_fast_exp)::value>
+                    <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
+                        (float *) dst->data, (const float *) Q->data,
+                        q_stride_token, q_stride_head,
+                        (const half *) K->data,
+                        (const half *) mask->data,
+                        sinks ? (const float *) sinks->data : nullptr,
+                        n_tokens, n_heads, n_kv, scale,
+                        visibility_bounds, indexed_rows, indexed_counts,
+                        indexed_capacity, inverse_rope,
+                        inverse_rope_coefficients,
+                        forward_rope_coefficients);
+            };
             if (f32_stage && fast_exp) {
-                ds4_flash_attn_d512_streaming_topk_kernel<
-                    half, half, streaming_heads, 16, true, true>
-                    <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
-                        (float *) dst->data, (const float *) Q->data,
-                        q_stride_token, q_stride_head,
-                        (const half *) K->data,
-                        (const half *) mask->data,
-                        sinks ? (const float *) sinks->data : nullptr,
-                        n_tokens, n_heads, n_kv, scale,
-                        visibility_bounds, indexed_rows, indexed_counts,
-                        indexed_capacity, inverse_rope,
-                        inverse_rope_coefficients,
-                        forward_rope_coefficients);
+                launch_streaming(std::true_type{}, std::true_type{});
             } else if (f32_stage) {
-                ds4_flash_attn_d512_streaming_topk_kernel<
-                    half, half, streaming_heads, 16, true>
-                    <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
-                        (float *) dst->data, (const float *) Q->data,
-                        q_stride_token, q_stride_head,
-                        (const half *) K->data,
-                        (const half *) mask->data,
-                        sinks ? (const float *) sinks->data : nullptr,
-                        n_tokens, n_heads, n_kv, scale,
-                        visibility_bounds, indexed_rows, indexed_counts,
-                        indexed_capacity, inverse_rope,
-                        inverse_rope_coefficients,
-                        forward_rope_coefficients);
+                launch_streaming(std::true_type{}, std::false_type{});
             } else {
-                ds4_flash_attn_d512_streaming_topk_kernel<half, half>
-                    <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
-                        (float *) dst->data, (const float *) Q->data,
-                        q_stride_token, q_stride_head,
-                        (const half *) K->data,
-                        (const half *) mask->data,
-                        sinks ? (const float *) sinks->data : nullptr,
-                        n_tokens, n_heads, n_kv, scale,
-                        visibility_bounds, indexed_rows, indexed_counts,
-                        indexed_capacity, inverse_rope,
-                        inverse_rope_coefficients,
-                        forward_rope_coefficients);
+                launch_streaming(std::false_type{}, std::false_type{});
             }
             CUDA_CHECK(cudaGetLastError());
+            ++g_mla_stream_topk_launch_count;
             return true;
         }
         // AITER-style split-KV schedule, implemented directly in the native HIP

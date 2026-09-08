@@ -77,6 +77,7 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_concat_transpose_f32_count(void);
 // rather than only checking numerical output.
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmq_launch_count(void);
+GGML_BACKEND_API size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_mmvq_mmid_grouped_launch_count(void);
 
 // Calling-thread launch counters for the scalar and grouped-column GDN

@@ -25,6 +25,18 @@ static ggml_tensor * mixed_mmq(ggml_tensor * op, ggml_mixed_mmq_policy policy) {
     return op;
 }
 
+// Single-token fallbacks build a complete local graph. Set the policy before
+// allocation/admission, including matmuls hidden inside helper subgraphs.
+static void set_graph_mixed_mmq_policy(ggml_cgraph * graph, ggml_mixed_mmq_policy policy) {
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        ggml_tensor * op = ggml_graph_node(graph, i);
+        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID ||
+            op->op == GGML_OP_MUL_MAT_GROUPED_SRC) {
+            ggml_mul_mat_set_mixed_mmq(op, policy);
+        }
+    }
+}
+
 // NVFP4 scale2: if weight has a per-tensor scale, multiply the matmul result
 // by that scale. No-op when scale==1.0f (non-NVFP4 models).
 inline ggml_tensor * apply_scale2(ggml_context * ctx, ggml_tensor * mm_result, float scale) {
@@ -431,6 +443,7 @@ static bool run_routed_subset(ggml_backend_t backend,
                               int n_embd,
                               int n_ff_exp,
                               float swiglu_clamp,
+                              ggml_mixed_mmq_policy mixed_mmq_policy,
                               const float * cur_host,
                               const int32_t * selected_ids,
                               const float * selected_weights,
@@ -516,6 +529,7 @@ static bool run_routed_subset(ggml_backend_t backend,
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
     ggml_set_output(routed);
     ggml_build_forward_expand(gf, routed);
+    set_graph_mixed_mmq_policy(gf, mixed_mmq_policy);
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!ggml_gallocr_alloc_graph(alloc, gf)) {
         if (err) *err = "ggml_gallocr_alloc_graph failed";
@@ -612,6 +626,7 @@ static bool run_hot_and_shared_ffn_gpu(
     int n_embd,
     int n_ff_exp,
     float swiglu_clamp,
+    ggml_mixed_mmq_policy mixed_mmq_policy,
     const float * cur_host,
     const int32_t * hot_ids,
     const float * hot_weights,
@@ -698,6 +713,7 @@ static bool run_hot_and_shared_ffn_gpu(
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 2048, false);
     ggml_set_output(combined);
     ggml_build_forward_expand(gf, combined);
+    set_graph_mixed_mmq_policy(gf, mixed_mmq_policy);
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!ggml_gallocr_alloc_graph(alloc, gf)) {
         if (err) *err = "fused hot+shared gallocr failed";
@@ -1427,6 +1443,7 @@ bool build_cached_hot_graph(
     out.gf = ggml_new_graph_custom(out.ctx, 2048, false);
     ggml_set_output(out.output);
     ggml_build_forward_expand(out.gf, out.output);
+    set_graph_mixed_mmq_policy(out.gf, options.mixed_mmq_policy);
     out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
         out.free();
@@ -1449,7 +1466,8 @@ bool build_cached_cold_graph(
     int n_embd,
     int n_ff_exp,
     int n_cold,
-    float swiglu_clamp) {
+    float swiglu_clamp,
+    ggml_mixed_mmq_policy mixed_mmq_policy) {
 
     out.free();
     out.n_hot = n_cold;  // reuse field for "n experts in this graph"
@@ -1507,6 +1525,7 @@ bool build_cached_cold_graph(
     out.gf = ggml_new_graph_custom(out.ctx, 1024, false);
     ggml_set_output(out.output);
     ggml_build_forward_expand(out.gf, out.output);
+    set_graph_mixed_mmq_policy(out.gf, mixed_mmq_policy);
     out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
     if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
         out.free();
@@ -1745,7 +1764,7 @@ bool eval_moe_hybrid_ffn_single(
                                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                                    desc, cfg.n_embd, cfg.n_ff_exp, n_hot_graph,
-                                   CachedHotGraphOptions{cfg.swiglu_clamp});
+                                   CachedHotGraphOptions{cfg.swiglu_clamp, false, 0, cfg.mixed_mmq_policy});
             if (telemetry) telemetry->hot_graph_build_us += elapsed_us(graph_build_t0, HybridClock::now());
         } else if (telemetry) {
             telemetry->hot_graph_hits++;
@@ -1776,7 +1795,7 @@ bool eval_moe_hybrid_ffn_single(
                                             storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                             desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                                             desc, cfg.n_embd, cfg.n_ff_exp,
-                                            cfg.swiglu_clamp,
+                                            cfg.swiglu_clamp, cfg.mixed_mmq_policy,
                                             cur_host,
                                             hot_ids.empty() ? nullptr : hot_ids.data(),
                                             hot_weights.empty() ? nullptr : hot_weights.data(),
@@ -1812,7 +1831,7 @@ bool eval_moe_hybrid_ffn_single(
             build_cached_cold_graph(cold_graph, cold_backend,
                                     storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                                     desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                                    cfg.n_embd, cfg.n_ff_exp, n_cold_graph, cfg.swiglu_clamp);
+                                    cfg.n_embd, cfg.n_ff_exp, n_cold_graph, cfg.swiglu_clamp, cfg.mixed_mmq_policy);
             if (telemetry) telemetry->cold_graph_build_us += elapsed_us(graph_build_t0, HybridClock::now());
         } else if (telemetry) {
             telemetry->cold_graph_hits++;
@@ -1839,7 +1858,7 @@ bool eval_moe_hybrid_ffn_single(
             if (!run_routed_subset(cold_backend,
                                    storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                                   cfg.n_embd, cfg.n_ff_exp, cfg.swiglu_clamp,
+                                   cfg.n_embd, cfg.n_ff_exp, cfg.swiglu_clamp, cfg.mixed_mmq_policy,
                                    cur_host, cold_ids.data(), cold_weights.data(), n_cold, cold, err)) {
                 if (hot_async_launched) ggml_backend_synchronize(gpu_backend);
                 return false;
@@ -4056,7 +4075,7 @@ bool eval_moe_hybrid_ffn_gpu_resident(
                                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                                    desc, n_embd, cfg.n_ff_exp, n_selected,
-                                   CachedHotGraphOptions{cfg.swiglu_clamp, true, cfg.n_expert});
+                                   CachedHotGraphOptions{cfg.swiglu_clamp, true, cfg.n_expert, cfg.mixed_mmq_policy});
         }
         if (!storage.hot_graph.valid() || !storage.hot_graph.global_ids ||
             !storage.hot_graph.hot_local_lut || !storage.hot_graph.valid_lut ||
@@ -4104,7 +4123,7 @@ bool eval_moe_hybrid_ffn_gpu_resident(
                 build_cached_cold_graph(storage.cold_graph, cpu_backend,
                                         storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                                         desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                                        n_embd, cfg.n_ff_exp, n_cold2, cfg.swiglu_clamp);
+                                        n_embd, cfg.n_ff_exp, n_cold2, cfg.swiglu_clamp, cfg.mixed_mmq_policy);
             }
             if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold2) return false;
             ggml_backend_tensor_set(storage.cold_graph.inp, post_host.data(), 0, sizeof(float) * (size_t)n_embd);
@@ -4131,7 +4150,7 @@ bool eval_moe_hybrid_ffn_gpu_resident(
                                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                    desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
                                    desc, n_embd, cfg.n_ff_exp, n_hot,
-                                   CachedHotGraphOptions{cfg.swiglu_clamp});
+                                   CachedHotGraphOptions{cfg.swiglu_clamp, false, 0, cfg.mixed_mmq_policy});
         }
         if (storage.hot_graph.valid() && storage.hot_graph.n_hot == n_hot) {
             // GPU→GPU copy: ffn_post → hot_graph.inp (no PCIe!)
@@ -4188,7 +4207,7 @@ bool eval_moe_hybrid_ffn_gpu_resident(
                 build_cached_cold_graph(storage.cold_graph, cold_backend,
                                         storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
                                         desc.ffn_gate_exps_s, desc.ffn_up_exps_s, desc.ffn_down_exps_s, desc.ffn_gate_up_exps_s,
-                                        n_embd, cfg.n_ff_exp, n_cold, cfg.swiglu_clamp);
+                                        n_embd, cfg.n_ff_exp, n_cold, cfg.swiglu_clamp, cfg.mixed_mmq_policy);
             }
             if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
                 if (hot_async_launched) ggml_backend_synchronize(gpu_backend);

@@ -618,10 +618,19 @@ int main(int argc, char ** argv) {
     }
     const bool combine_only =
         argc == 2 && std::strcmp(argv[1], "--combine-only") == 0;
-    if (argc != 1 && !combine_only) {
+    const bool mmid_only =
+        argc == 2 && std::strcmp(argv[1], "--mmid-only") == 0;
+    if (argc != 1 && !combine_only && !mmid_only) {
         std::fprintf(stderr,
-                     "usage: %s [--combine-only|--child legacy|grouped|masked-fused OUTPUT]\n",
+                     "usage: %s [--combine-only|--mmid-only|--child legacy|grouped|masked-fused OUTPUT]\n",
                      argv[0]);
+        return 2;
+    }
+    const char * width_filter = std::getenv("DFLASH_MMID_TEST_WIDTH");
+    if (!combine_only && width_filter && std::atoi(width_filter) > 0) {
+        std::fprintf(stderr,
+                     "DFLASH_MMID_TEST_WIDTH is supported only with --child; "
+                     "the parent validates the complete dispatch matrix\n");
         return 2;
     }
 
@@ -638,16 +647,18 @@ int main(int argc, char ** argv) {
     setenv("DFLASH_MOE_COMBINE_VEC4", "1", 0);
 #endif
 
-    ggml_backend_t combine_backend = ggml_backend_cuda_init(0);
-    if (combine_backend == nullptr) {
-        std::fprintf(stderr, "GPU backend unavailable for combine parity\n");
-        return 1;
-    }
-    const bool combine_parity = run_combine_parity_and_benchmark(combine_backend);
-    ggml_backend_free(combine_backend);
-    if (!combine_parity) {
-        std::fprintf(stderr, "grouped MoE fused-combine parity failed\n");
-        return 1;
+    if (!mmid_only) {
+        ggml_backend_t combine_backend = ggml_backend_cuda_init(0);
+        if (combine_backend == nullptr) {
+            std::fprintf(stderr, "GPU backend unavailable for combine parity\n");
+            return 1;
+        }
+        const bool combine_parity = run_combine_parity_and_benchmark(combine_backend);
+        ggml_backend_free(combine_backend);
+        if (!combine_parity) {
+            std::fprintf(stderr, "grouped MoE fused-combine parity failed\n");
+            return 1;
+        }
     }
     if (combine_only) {
         return 0;

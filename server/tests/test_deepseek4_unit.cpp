@@ -2,6 +2,9 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#if defined(GGML_USE_HIP)
+#include <hip/hip_runtime_api.h>
+#endif
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
 #include "ggml-cuda.h"
 #include "common/cuda_graph_overrides.h"
@@ -4019,6 +4022,12 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
 #if !defined(GGML_USE_HIP)
     std::fprintf(stderr, " skipped (HIP-only candidate)\n");
     return;
+#else
+    hipDeviceProp_t properties{};
+    if (hipGetDeviceProperties(&properties, 0) != hipSuccess || properties.warpSize != 32) {
+        std::fprintf(stderr, " skipped (requires native wave32)\n");
+        return;
+    }
 #endif
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) {
@@ -4118,9 +4127,11 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
         std::vector<float> candidate_fast_exp(reference.size());
         setenv("GGML_CUDA_MLA_STREAM_TOPK", "0", 1);
         setenv("GGML_CUDA_MLA_STREAM_FAST_EXP", "0", 1);
+        const size_t streaming_launches = ggml_backend_cuda_get_mla_stream_topk_launch_count();
         TEST_ASSERT_MSG(
             ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             "grouped compact attention reference failed");
+        TEST_ASSERT(ggml_backend_cuda_get_mla_stream_topk_launch_count() == streaming_launches);
         ggml_backend_tensor_get(output, reference.data(), 0,
                                 reference.size() * sizeof(float));
 
@@ -4129,6 +4140,7 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
         TEST_ASSERT_MSG(
             ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             "F16-staged streaming top-k attention failed");
+        TEST_ASSERT(ggml_backend_cuda_get_mla_stream_topk_launch_count() == streaming_launches + 1);
         ggml_backend_tensor_get(output, candidate_f16_stage.data(), 0,
                                 candidate_f16_stage.size() * sizeof(float));
 
@@ -4136,6 +4148,7 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
         TEST_ASSERT_MSG(
             ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             "F32-staged streaming top-k attention failed");
+        TEST_ASSERT(ggml_backend_cuda_get_mla_stream_topk_launch_count() == streaming_launches + 2);
         ggml_backend_tensor_get(output, candidate_f32_stage.data(), 0,
                                 candidate_f32_stage.size() * sizeof(float));
 
@@ -4143,6 +4156,7 @@ static void test_ds4_flash_attention_streaming_topk_gpu() {
         TEST_ASSERT_MSG(
             ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
             "fast-exp streaming top-k attention failed");
+        TEST_ASSERT(ggml_backend_cuda_get_mla_stream_topk_launch_count() == streaming_launches + 3);
         ggml_backend_tensor_get(output, candidate_fast_exp.data(), 0,
                                 candidate_fast_exp.size() * sizeof(float));
 

@@ -1117,6 +1117,11 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE
             ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_deepseek4_mmid_grouped_cuda)
+        add_test(NAME deepseek4_mmid_grouped_cuda_reject_parent_width
+            COMMAND ${CMAKE_COMMAND} -E env DFLASH_MMID_TEST_WIDTH=16
+                $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda> --mmid-only)
+        set_tests_properties(deepseek4_mmid_grouped_cuda_reject_parent_width
+            PROPERTIES WILL_FAIL TRUE)
     endif()
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_moe_combine_cuda.cpp")
         add_executable(test_ds4_moe_combine_cuda test/test_ds4_moe_combine_cuda.cpp)

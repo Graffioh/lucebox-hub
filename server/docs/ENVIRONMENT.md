@@ -54,7 +54,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
 | `DFLASH_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
 | `DFLASH_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
-| `DFLASH_GFX1151_HC_MMVF_Q4` | 1 on gfx1151 for the DS4 `[16384,24]` q4 projection | BURN-IN KILL SWITCH: =0 restores the generic hipBLAS dispatch decision. |
+| `DFLASH_CUDA_MMVF_NARROW_F16` | enabled on qualified gfx1151 narrow F16 matmuls | BURN-IN KILL SWITCH: =0 restores the generic dispatch decision for the narrow F16 projection optimization, unless an explicit `LUCE_MMVF_MAX_NCOLS_F16` ceiling overrides it. |
 | `GGML_CUDA_MMQ_X` | unset | DEBUG: force a supported MMQ output-column tile width (8–128) for architecture tuning; invalid or over-budget values fall back to automatic selection. |
 | `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` | unset | BURN-IN: on sparse-route gfx1151 grouped MoE MMQ, choose the measured ROCmFP2/3/4 output tile from routed rows per expert; ordinary matmuls, unmeasured formats, and other devices are unchanged. |
 | `GGML_CUDA_MMQ_MOE_PERSISTENT` | unset | EXPERIMENTAL: on prefill-sized (at least 256-token) sparse grouped ROCmFP2/3/4 MMQ on gfx1151, build a compact device-side expert-tile queue and consume it with bounded persistent workers. Short batches, ordinary matmuls, unmeasured formats, and other devices are unchanged. |
@@ -98,6 +98,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_ADAPTIVE_WIDTH_THETA` - adaptive_verify_width.h
 - `DFLASH_COLD_THREADS` - moe_expert_compute_cpu.cpp
 - `DFLASH_CUDA_BACKEND_PATH` - dynamic_backend.cpp
+- `DFLASH_CUDA_MMVF_NARROW_F16` - ggml-cuda/mmvf.cu
 - `DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_CUDA_MMVQ_MOE_KERNEL` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_DISABLE_DRAFT_ATTN` - draft_graph.cpp
@@ -118,6 +119,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_DENSE_TP_MASK` - deepseek4_loader.cpp
 - `DFLASH_DS4_DENSE_TP_STRIX_FRACTION` - deepseek4_loader.cpp
 - `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` - deepseek4_graph.cpp
+- `DFLASH_DS4_DIRECT_INDEXER_TOPK` - deepseek4_graph.cpp
 - `DFLASH_DS4_DRAFT` - deepseek4_backend.cpp
 - `DFLASH_DS4_DRAFT_BACKEND` - deepseek4_backend.cpp
 - `DFLASH_DS4_DRAFT_GPU` - deepseek4_backend.cpp
@@ -235,6 +237,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_MOE_FIXED_SLOT_MAX` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FULL_COLD_PARALLEL` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FUSED_COMBINE` - moe_hybrid_ffn_eval.cpp
+- `DFLASH_MOE_COMBINE_VEC4` - ggml-cuda/moe-fused.cu
 - `DFLASH_MOE_PREFILL_DEVICE_INPUT` - deepseek4_graph.cpp
 - `DFLASH_MOE_PREFILL_HOT_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_PREFILL_MASKED_COLD` - moe_hybrid_ffn_eval.cpp
@@ -287,6 +290,14 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
 - `GGML_CUDA_MLA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_CUDA_MMQ_X` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MMQ_MOE_PERSISTENT` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MLA_STREAM_TOPK` - ggml-cuda/fattn.cu
+- `GGML_DS4_FA_STREAM_TOPK` - ggml-cuda/fattn.cu (compatibility alias)
+- `GGML_CUDA_MLA_STREAM_F32_STAGE` - ggml-cuda/fattn.cu
+- `GGML_CUDA_MLA_STREAM_FAST_EXP` - ggml-cuda/fattn.cu
 - `GGML_CUDA_MLA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
 - `GGML_DS4_FA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
 - `GGML_DS4_FA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
