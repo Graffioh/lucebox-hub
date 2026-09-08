@@ -2,12 +2,15 @@
 
 `--next-model` loads another model in the same `dflash_server` process. There
 is one listening socket. Each model keeps its own tokenizer, chat template,
-model-card defaults, sequence engine, and existing continuous-batch scheduler
-on an independent worker thread.
+model-card defaults, and existing execution path on an independent worker
+thread: a continuous-batch scheduler or the DeepSeek4 single-request worker.
 
 This is the first load-routing implementation. It does not combine models in
 one GPU batch, share KV state, move an active request between models, or perform
 quality collaboration.
+
+For Qwen batching with DS4 + DSpark at concurrency one, use the
+[hybrid recipe](HYBRID_SERVING.md).
 
 ## Qwen on R9700 plus DS4 on Strix Halo
 
@@ -47,7 +50,7 @@ with the real model files before increasing context or concurrency.
 
 Options after `--next-model` belong to that model. Repeat it to register more
 models; the routing table derives each model's capacity from its sequence
-engine. Give each model a unique, nonempty `--model-name`, excluding the
+engine, or uses capacity one for a single-request worker. Give each model a unique, nonempty `--model-name`, excluding the
 reserved name `auto`. Host, port, and CORS configuration belong to the first
 model's listener. All models load before any worker starts or the endpoint
 opens. Every block is parsed and checked for CLI errors and duplicate names
@@ -97,7 +100,7 @@ Inspect the effective settings and current occupancy after startup:
 
 ```bash
 curl -s http://127.0.0.1:8080/props | jq '.models[] | {
-  id, target_device, draft_device, capacity, in_flight, max_context,
+  id, execution_mode, target_device, draft_device, capacity, in_flight, max_context,
   props
 }'
 ```
@@ -158,20 +161,24 @@ per model after routing.
 
 `/props` retains the first/default model's existing properties and adds
 `routing: "least-occupied"`, `automatic_model: "auto"`, and a `models` array.
-Each entry includes its name, slot capacity, current reservation count,
+Each entry includes its name, execution mode (`batched` or `single-request`),
+slot capacity, current reservation count,
 device placement, model properties, and scheduler status. `/status/json` adds
 the same routing snapshot to the default model's status. The single-model HTML
 status page and status-event stream are unavailable in multi-model mode; use
 the JSON snapshot to inspect both workers.
 
-SIGINT/SIGTERM stops admission and signals every scheduler. Each scheduler
-retires its requests; the listener waits for workers and request handlers
+SIGINT/SIGTERM stops admission and signals every worker. Batch schedulers
+retire their requests; the single-request worker polls cancellation at the
+backend's existing work boundaries. The listener waits for workers and request handlers
 before model state is destroyed. HTTP reads are interruptible even when a
 client has sent only part of an upload.
 
 ## Initial supported scope and validation
 
-Each model must expose a local paged sequence engine. The initial CLI rejects
+Models can expose a local paged sequence engine or use DeepSeek4's normal
+single-request path. See [hybrid serving](HYBRID_SERVING.md) for batched Qwen
+with single-request DS4 + DSpark. The CLI rejects
 sharded targets, remote drafts, PFlash/compression forwarding, request-scoped
 drafts, and expert-routing collection in this mode. It also rejects per-model
 CLI switches that mutate process-wide policy, including SpecLA, KVFlash, Spark,

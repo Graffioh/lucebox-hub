@@ -362,7 +362,7 @@ public:
 
     // Start one listener. Optional model contexts are borrowed until run()
     // returns, must include this first, and each must have a sequence engine.
-    // Each context gets its own existing batch scheduler, never another socket.
+    // Each context gets its existing scheduler or single-request worker, never another socket.
     int run(const std::vector<HttpServer *> & models = {});
 
     // Finalize after run() returns; also called by the destructor.

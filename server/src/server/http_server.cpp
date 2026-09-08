@@ -1455,18 +1455,19 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
         std::unordered_set<ModelBackend *> backends;
         for (HttpServer * model : models) {
             SeqEngine * engine = model ? model->backend_.seq_engine() : nullptr;
-            if (!engine || engine->slot_count() < 1 ||
+            if (!model || (engine && engine->slot_count() < 1) ||
                 model->worker_thread_.joinable() ||
                 !model->config_.pflash_upstream_base.empty() ||
                 model->config_.model_name.empty() || model->config_.model_name == "auto" ||
                 !names.insert(model->config_.model_name).second ||
                 !backends.insert(&model->backend_).second) {
-                std::fprintf(stderr, "[server] model routing requires distinct local sequence engines and unique names other than auto\n");
+                std::fprintf(stderr, "[server] model routing requires distinct local backends and unique names other than auto\n");
                 return 2;
             }
         }
         for (HttpServer * model : models) {
-            models_.push_back({model, model->backend_.seq_engine()->slot_count()});
+            SeqEngine * engine = model->backend_.seq_engine();
+            models_.push_back({model, engine ? engine->slot_count() : 1});
             // CORS belongs to the one listener even when a peer formats output.
             model->config_.enable_cors = config_.enable_cors;
         }
@@ -1817,6 +1818,7 @@ json HttpServer::model_routing_status() {
         HttpServer & server = *model.server;
         models.push_back({{"id", server.config_.model_name},
             {"capacity", model.capacity}, {"in_flight", model.in_flight},
+            {"execution_mode", server.backend_.seq_engine() ? "batched" : "single-request"},
             {"target_device", server.config_.target_device},
             {"draft_device", server.config_.draft_device},
             {"max_context", server.config_.max_ctx},
@@ -3936,8 +3938,9 @@ void HttpServer::configure_generation_io(
         ServerJob * job, const ParsedRequest & req, SseEmitter & emitter,
         GenerationOutputState & output, DaemonIO & io) {
     io.stream_fd = -1;
-    io.should_cancel = [job]() {
-        return job->client_disconnected.load(std::memory_order_acquire);
+    io.should_cancel = [this, job]() {
+        return stopping_.load(std::memory_order_relaxed) ||
+               job->client_disconnected.load(std::memory_order_acquire);
     };
     io.observer = [this](const char *, const std::vector<int32_t> & tokens) {
         std::vector<std::string> token_strings;

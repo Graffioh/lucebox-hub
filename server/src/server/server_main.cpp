@@ -77,8 +77,8 @@ static void print_usage(const char * prog) {
         "\n"
         "Options:\n"
         "  --next-model <path>  Load another model in this process; repeat its options\n"
-        "                      after this separator. One listener, independent batches.\n"
-        "                      Use unique --model-name values and --max-concurrency.\n"
+        "                      after this separator. One listener, independent workers.\n"
+        "                      Use unique --model-name values and per-model concurrency.\n"
         "                      Requests with model=auto use available model capacity.\n"
         "  --draft <path>       Draft model for speculative decode\n"
         "  --port <N>           Listen port (default: 8080)\n"
@@ -124,7 +124,7 @@ static void print_usage(const char * prog) {
         "                       Qwen3.6 targets with 16-token blocks, or DeepSeek4\n"
         "                       targets with 128-token blocks. This mode is experimental.\n"
         "  --max-concurrency <N>  Maximum concurrent decode sequences\n"
-        "                         (enables paged attention; default: 1)\n"
+        "                         (N > 1 enables paged attention; default: 1)\n"
         "  --admission-coalesce-ms <N>  Idle-to-busy batching window\n"
         "                               (default: 20; 0 disables)\n"
         "  --kv-pool-tokens <N> Total paged K/V pool shared by all\n"
@@ -766,19 +766,24 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         }
     }
     // Validate every block before model files or GPU resources are loaded.
+    if (multi_model && bargs.max_concurrency < 1) {
+        std::fprintf(stderr, "[server] --max-concurrency must be positive for model '%s'\n",
+            sconfig.model_name.c_str());
+        return 2;
+    }
     if (bargs.max_concurrency > 1) bargs.paged_attention = true;
-    if (multi_model && (!bargs.paged_attention || bargs.device.is_multi_device() ||
+    if (multi_model && (bargs.device.is_multi_device() ||
             bargs.remote_draft.enabled() || bargs.remote_target_shard.enabled() ||
             sconfig.pflash_mode != ServerConfig::PflashMode::OFF ||
             !sconfig.pflash_upstream_base.empty() || sconfig.lazy_draft ||
             sconfig.freq_tracking || !sconfig.collect_routing_path.empty())) {
-        std::fprintf(stderr, "[server] model '%s' requires local paged serving; compression, sharding, request-scoped drafts and routing collection are unsupported with --next-model\n", sconfig.model_name.c_str());
+        std::fprintf(stderr, "[server] model '%s' requires local serving; compression, sharding, request-scoped drafts and routing collection are unsupported with --next-model\n", sconfig.model_name.c_str());
         return 2;
     }
     return 0;
 }
 
-static int load_model(ModelOptions & model, LoadedModel & loaded) {
+static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_model) {
     auto & bargs = model.bargs;
     auto & sconfig = model.sconfig;
     auto & spark_autotune = model.spark_autotune;
@@ -861,6 +866,12 @@ static int load_model(ModelOptions & model, LoadedModel & loaded) {
     }
     const ResolvedBackendPlan & backend_plan = backend_preparation.plan;
     const std::string & arch = backend_plan.arch();
+    if (multi_model && !bargs.paged_attention && arch != "deepseek4") {
+        std::fprintf(stderr,
+            "[server] model '%s': single-request routing currently supports DeepSeek4; "
+            "use --max-concurrency for a supported batched model\n", sconfig.model_name.c_str());
+        return 2;
+    }
     const bool kvflash_requested =
         kvflash_pool_requested(std::getenv("DFLASH_KVFLASH"));
     if (target_split_fast_rollback_cli && arch != "qwen35") {
@@ -1546,9 +1557,10 @@ int main(int argc, char ** argv) {
             option.sconfig.host = listener.host;
             option.sconfig.port = listener.port;
             option.sconfig.enable_cors = listener.enable_cors;
-            std::fprintf(stderr, "[server] model %zu: %s target=%s slots=%d\n",
+            std::fprintf(stderr, "[server] model %zu: %s target=%s slots=%d execution=%s\n",
                 m + 1, option.sconfig.model_name.c_str(),
-                placement_device_name(option.bargs.device).c_str(), option.bargs.max_concurrency);
+                placement_device_name(option.bargs.device).c_str(), option.bargs.max_concurrency,
+                option.bargs.paged_attention ? "batched" : "single-request");
         }
     }
 
@@ -1558,7 +1570,7 @@ int main(int argc, char ** argv) {
     // before starting any scheduler. No worker observes model-loading mutations.
     for (auto & option : options) {
         auto model = std::make_unique<LoadedModel>();
-        const int ret = load_model(option, *model);
+        const int ret = load_model(option, *model, multi_model);
         if (ret != 0) return ret;
         servers.push_back(model->server.get());
         loaded.push_back(std::move(model));

@@ -165,6 +165,54 @@ struct RoutedBackend : ModelBackend {
     void shutdown() override {}
 };
 
+// Exercises the existing ModelBackend::generate path without a SeqEngine.
+// The gate models work boundaries where real backends poll DaemonIO cancellation.
+struct HeldSingleBackend final : RoutedBackend {
+    SeqEngine * seq_engine() override { return nullptr; }
+    GenerateResult generate_impl(const GenerateRequest & req, const DaemonIO & io) override {
+        std::unique_lock<std::mutex> lock(mu);
+        ++calls;
+        prompts.push_back(req.prompt);
+        temperatures.push_back(req.sampler.temp);
+        cv.notify_all();
+        const auto deadline = Clock::now() + 5s;
+        while (!released && !io.is_cancelled() && Clock::now() < deadline) {
+            cv.wait_for(lock, 10ms);
+        }
+        GenerateResult result;
+        if (io.is_cancelled()) {
+            ++cancellations;
+            cv.notify_all();
+        } else if (!released) {
+            return result; // Bounded failure if the server never cancels or releases us.
+        } else {
+            result.tokens = {0, 2};
+            for (int32_t token : result.tokens) io.emit(token);
+        }
+        result.succeed();
+        return result;
+    }
+    void wait_calls(int count) {
+        std::unique_lock<std::mutex> lock(mu);
+        ROUTING_CHECK(cv.wait_for(lock, 5s, [&] { return calls >= count; }));
+    }
+    void wait_cancellations(int count) {
+        std::unique_lock<std::mutex> lock(mu);
+        ROUTING_CHECK(cv.wait_for(lock, 5s, [&] { return cancellations >= count; }));
+    }
+    void finish() {
+        std::lock_guard<std::mutex> lock(mu);
+        released = true;
+        cv.notify_all();
+    }
+    std::mutex mu;
+    std::condition_variable cv;
+    bool released = false;
+    int calls = 0, cancellations = 0;
+    std::vector<std::vector<int32_t>> prompts;
+    std::vector<float> temperatures;
+};
+
 void load_tokenizer(Tokenizer & tokenizer, bool second) {
     gguf_context * ctx = gguf_init_empty();
     const char * first[] = {"q", "x", "<eos>", "y", "s"};
@@ -186,13 +234,14 @@ void load_tokenizer(Tokenizer & tokenizer, bool second) {
 class RunningModels {
 public:
     RoutedBackend first, second;
+    HeldSingleBackend single;
     Tokenizer first_tok, second_tok;
     std::unique_ptr<HttpServer> listener, peer;
     std::thread runner;
     int port = 0;
     std::atomic<int> result{-1};
 
-    RunningModels() {
+    explicit RunningModels(bool single_peer = false) {
         load_tokenizer(first_tok, false);
         load_tokenizer(second_tok, true);
         // Obtain a loopback test port from the OS, then hand it to HttpServer.
@@ -220,7 +269,8 @@ public:
         config.model_name = "ds4";
         config.chat_template_src = "y{{ messages[0]['content'] }}";
         config.sampler_defaults.temperature = 0.7f;
-        peer = std::make_unique<HttpServer>(second, second_tok, config);
+        ModelBackend & peer_backend = single_peer ? static_cast<ModelBackend &>(single) : second;
+        peer = std::make_unique<HttpServer>(peer_backend, second_tok, config);
         reservation.close();
         runner = std::thread([this] { result = listener->run({listener.get(), peer.get()}); });
         try {
@@ -241,6 +291,7 @@ public:
         listener->request_stop();
         first.engine.finish();
         second.engine.finish();
+        single.finish();
         if (runner.joinable()) runner.join();
     }
     Socket connect_client() {
@@ -404,6 +455,62 @@ TEST_CASE(ModelRoutingFixture, test_shutdown_drains_both_models_and_incomplete_u
     ROUTING_CHECK(models.result == 0);
     ROUTING_CHECK(models.first.engine.retirements == 1);
     ROUTING_CHECK(models.second.engine.retirements == 1);
+}
+
+TEST_CASE(ModelRoutingFixture, test_hybrid_admission_uses_single_capacity_and_independent_workers) {
+    RunningModels models(true);
+    const auto props = models.get("/props")["models"];
+    ROUTING_CHECK(props[0]["capacity"] == 2 && props[0]["execution_mode"] == "batched");
+    ROUTING_CHECK(props[1]["capacity"] == 1 && props[1]["execution_mode"] == "single-request");
+    auto first = models.post(chat());
+    models.first.engine.wait_admissions(1);
+    auto second = models.post(chat());
+    models.single.wait_calls(1);
+    auto third = models.post(chat());
+    models.first.engine.wait_admissions(2);
+    models.wait_load(2, 1);
+    response_body(models.post(chat()).read(), 503);
+    response_body(models.post(chat("ds4")).read(), 503);
+    models.first.engine.finish();
+    ROUTING_CHECK(response_body(first.read())["model"] == "qwen");
+    ROUTING_CHECK(response_body(third.read())["model"] == "qwen");
+    models.wait_load(0, 1);
+    models.single.finish();
+    const auto body = response_body(second.read());
+    ROUTING_CHECK(body["model"] == "ds4");
+    ROUTING_CHECK(body["choices"][0]["message"]["content"] == "s");
+    models.wait_load(0, 0);
+    ROUTING_CHECK(models.single.prompts[0] == std::vector<int32_t>({1, 3}));
+    ROUTING_CHECK(models.single.temperatures[0] == 0.7f);
+}
+
+TEST_CASE(ModelRoutingFixture, test_hybrid_disconnect_cancels_single_worker_and_reuses_capacity) {
+    RunningModels models(true);
+    auto client = models.post(chat("ds4", true));
+    models.single.wait_calls(1);
+    linger reset{1, 0};
+    ROUTING_CHECK(setsockopt(client.get(), SOL_SOCKET, SO_LINGER, &reset, sizeof(reset)) == 0);
+    client.close();
+    models.single.wait_cancellations(1);
+    models.wait_load(0, 0);
+    models.single.finish();
+    const auto stream = models.post(chat("ds4", true)).read();
+    ROUTING_CHECK(stream.find("\"model\":\"ds4\"") != std::string::npos);
+    ROUTING_CHECK(stream.find("\"content\":\"s\"") != std::string::npos);
+    ROUTING_CHECK(stream.find("data: [DONE]") != std::string::npos);
+}
+
+TEST_CASE(ModelRoutingFixture, test_hybrid_shutdown_cancels_single_worker_before_destroying_contexts) {
+    RunningModels models(true);
+    auto first = models.post(chat("qwen"));
+    auto second = models.post(chat("ds4"));
+    models.first.engine.wait_admissions(1);
+    models.single.wait_calls(1);
+    models.listener->request_stop();
+    models.single.wait_cancellations(1);
+    models.runner.join();
+    ROUTING_CHECK(models.result == 0);
+    ROUTING_CHECK(models.first.engine.retirements == 1);
 }
 #undef ROUTING_CHECK
 #endif

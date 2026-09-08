@@ -178,10 +178,12 @@ Hardware- or checkpoint-specific overrides remain available through
 
 ### Multiple models, one endpoint
 
-Use `--next-model` to load another independently batched model in the same
+Use `--next-model` to load another independently served model in the same
 process. Requests with `model: "auto"` use available model capacity; explicit
 names stay pinned. See [model routing](docs/MODEL_ROUTING.md) for the R9700 +
 Strix Halo 2+2 recipe, admission policy, and current validation limits.
+[Hybrid serving](docs/HYBRID_SERVING.md) combines batched Qwen with the normal
+DS4 single-request path, including DSpark.
 
 ### Compression proxy mode
 
