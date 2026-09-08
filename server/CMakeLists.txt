@@ -923,7 +923,8 @@ if(DFLASH27B_TESTS)
             set_target_properties(test_cuda_pool_shutdown PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
         endif()
         target_include_directories(test_cuda_pool_shutdown PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src)
         target_link_libraries(test_cuda_pool_shutdown PRIVATE
             ${DFLASH27B_GGML_BACKEND_TARGET} ggml ggml-base)
         list(APPEND _raw_unit_test_targets test_cuda_pool_shutdown)
@@ -1783,6 +1784,7 @@ if(DFLASH27B_TESTS)
             TAIL_GUARD_USE_NEW_FORMULA)
         target_include_directories(test_server_unit PRIVATE
             ${DFLASH27B_SRC_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda
             ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")

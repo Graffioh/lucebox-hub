@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1712,6 +1713,29 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     const int prompt_len = (int)tokens.size();
     prefill_last_logits_valid_ = false;
 
+    // The HIP legacy pool retains freed graph temporaries. During a long,
+    // shape-changing prefill those cached blocks can fragment VRAM until the
+    // next allocation fails even though a large part of the pool is idle.
+    // Trimming is deliberately opt-in and performed only between completed
+    // chunks: ggml_backend_cuda_trim_pool() synchronizes the backend and
+    // retires captured graphs before returning cached blocks to the driver.
+    static const int prefill_pool_trim_tokens = []() {
+        const char * value = std::getenv("DFLASH_PREFILL_POOL_TRIM_TOKENS");
+        if (value == nullptr || value[0] == '\0') return 0;
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
+            std::fprintf(stderr,
+                "[vram] ignoring invalid DFLASH_PREFILL_POOL_TRIM_TOKENS=%s\n",
+                value);
+            return 0;
+        }
+        return (int)parsed;
+    }();
+    int64_t next_prefill_pool_trim = prefill_pool_trim_tokens > 0
+        ? ((int64_t)kv_offset / prefill_pool_trim_tokens + 1) * prefill_pool_trim_tokens
+        : INT64_MAX;
+
     // kvflash: a prompt that fits the pool prefills contiguously (identity
     // mapping, normal chunking). A LARGER prompt switches to POOLED CHUNKED
     // PREFILL: pager-chunk-sized batches whose KV rows are slot-mapped via
@@ -1940,6 +1964,22 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         }
 
         start += n_tokens;
+
+        if (prefill_pool_trim_tokens > 0 && start < prompt_len &&
+            (int64_t)committed >= next_prefill_pool_trim &&
+            ggml_backend_cuda_has_legacy_pool(target_backend_)) {
+            const size_t freed = ggml_backend_cuda_trim_pool(target_backend_);
+            std::fprintf(stderr,
+                "[vram] prefill pool trim at token %d: freed %.1f MiB\n",
+                committed, (double)freed / (1024.0 * 1024.0));
+            while (next_prefill_pool_trim <= (int64_t)committed) {
+                if (next_prefill_pool_trim > INT64_MAX - prefill_pool_trim_tokens) {
+                    next_prefill_pool_trim = INT64_MAX;
+                    break;
+                }
+                next_prefill_pool_trim += prefill_pool_trim_tokens;
+            }
+        }
     }
 
     if (kvflash_active()) {
