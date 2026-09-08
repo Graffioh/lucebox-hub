@@ -1626,6 +1626,20 @@ static int ds4_padded_gathered_raw_rows(int n_raw) {
     return std::min(padded, (int) DS4_PAGE_TOKENS - 1);
 }
 
+ggml_tensor * deepseek4_indexer_visibility_suffix(
+        ggml_context * ctx, ggml_tensor * mask, int first_scored, int n_scored) {
+    if (!mask) return nullptr;
+    GGML_ASSERT(mask->type == GGML_TYPE_F32 && ggml_is_matrix(mask));
+    GGML_ASSERT(first_scored >= 0 && n_scored > 0);
+    GGML_ASSERT(mask->ne[1] == (int64_t) first_scored + n_scored);
+    if (first_scored == 0) return mask;
+    // Query, head weights, positions and per-token visibility must all start
+    // at the same lane after skipping the identity-selected prefix.
+    return ggml_cont(ctx, ggml_view_2d(
+        ctx, mask, mask->ne[0], n_scored, mask->nb[1],
+        (size_t) first_scored * mask->nb[1]));
+}
+
 static ggml_tensor * build_indexer_topk(
         ggml_context * ctx,
         ggml_tensor * qr_norm,        // [n_lora_q, n_tokens]
@@ -1666,6 +1680,8 @@ static ggml_tensor * build_indexer_topk(
     };
     qr_norm = token_slice(qr_norm, (int) qr_norm->ne[0]);
     cur = token_slice(cur, (int) cur->ne[0]);
+    visibility_mask = deepseek4_indexer_visibility_suffix(
+        ctx, visibility_mask, first_scored, n_scored);
     if (first_scored > 0) {
         rope_pos = ggml_view_1d(
             ctx, rope_pos, n_scored,

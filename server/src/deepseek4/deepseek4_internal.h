@@ -361,6 +361,10 @@ ggml_tensor * deepseek4_indexed_attention_rows(
 ggml_tensor * deepseek4_preserve_raw_rows(
     ggml_context * ctx, ggml_tensor * raw_kv, ggml_tensor * rows);
 
+// Keep a per-token indexer visibility mask aligned with the scored suffix.
+ggml_tensor * deepseek4_indexer_visibility_suffix(
+    ggml_context * ctx, ggml_tensor * mask, int first_scored, int n_scored);
+
 bool load_deepseek4_gguf(const std::string & path,
                           ggml_backend_t backend,
                           DeepSeek4Weights & out);

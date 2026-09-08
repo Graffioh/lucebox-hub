@@ -547,7 +547,8 @@ Run the converted drafter against a DeepSeek4 target with:
 ```bash
 export DFLASH_DS4_SPEC=1
 export DFLASH_DS4_FUSED_VERIFY=1
-export DFLASH_DS4_SPARSE_DECODE_FLASH=1
+# Experimental, single HIP target only; may change generated tokens:
+# export DFLASH_DS4_SPARSE_DECODE_FLASH=1
 export DFLASH_DS4_DRAFT=/path/to/dflash-draft.gguf
 export DFLASH_DS4_SPEC_Q=4
 
@@ -591,32 +592,6 @@ On RDNA3.5 and RDNA4, speculative widths 2–5 use the packed small-CM rocWMMA
 indexer by default. It is bit-identical to the generic indexer in the GPU unit
 test and can be disabled with `GGML_DS4_INDEXER_PACK_SMALL=0` for diagnosis.
 The legacy `GGML_DS4_INDEXER_PACK_Q4` variable remains an alias.
-
-### PFlash prompt compression
-
-DeepSeek4 supports the shared in-process Qwen3-0.6B PFlash scorer:
-
-PFlash is supported for monolithic serving only. Layer-split and paged-serving
-configurations reject prefill compression at startup; paged serving cannot
-park a target while it owns live sequence state.
-
-```bash
-./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
-  --target-device hip:0 \
-  --prefill-compression auto \
-  --prefill-drafter /path/to/Qwen3-0.6B-BF16.gguf \
-  --prefill-skip-park
-```
-
-The HTTP path converts target tokens to text, scores Qwen tokens, decodes the
-kept Qwen spans, and tokenizes that text for DeepSeek4. This cross-tokenizer
-round trip is required; drafter token IDs are never passed directly to the
-target. Omit `--prefill-skip-park` when the target, DSpark drafter, and PFlash
-drafter do not fit together.
-
-PFlash reduces TTFT and the effective context used during generation, but it
-is lossy prompt compression. Disable it for matched true-context throughput
-or exact-retrieval comparisons.
 
 `DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
 whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
@@ -833,6 +808,39 @@ GSM+Math accuracy and measured 31.94 tok/s weighted, within 0.6% of fixed q=4
 at 32.12 tok/s. These numbers are workload-specific; the confidence policy is
 enabled only when DSpark is explicitly enabled and the draft artifact contains
 a compatible confidence head.
+
+## PFlash prompt compression
+
+DeepSeek4 supports the shared in-process Qwen3-0.6B PFlash scorer.
+
+PFlash is supported for monolithic serving only. Layer-split and paged-serving
+configurations reject prefill compression at startup; paged serving cannot
+park a target while it owns live sequence state.
+
+```bash
+./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
+  --target-device hip:0 \
+  --prefill-compression auto \
+  --prefill-drafter /path/to/Qwen3-0.6B-BF16.gguf \
+  --prefill-skip-park
+```
+
+The HTTP path converts target tokens to text, scores Qwen tokens, decodes the
+kept Qwen spans, and tokenizes that text for DeepSeek4. This cross-tokenizer
+round trip is required; drafter token IDs are never passed directly to the
+target. Omit `--prefill-skip-park` when the target, DSpark drafter, and PFlash
+drafter do not fit together.
+
+PFlash reduces TTFT and the effective context used during generation, but it
+is lossy prompt compression. Disable it for matched true-context throughput
+or exact-retrieval comparisons.
+
+The legacy daemon command `compress <tokens-file> <keep-x1000> <drafter-path>
+[nopark]` retains its shared wire contract: backend-local GPU 0 and a drafter
+kept loaded until `free drafter` or parking. That protocol has no GPU-placement
+or request-scoped-residency fields. Use the HTTP path or typed `compress` /
+`compress_batch` API when those controls are required. Typed keep ratios must
+be finite and in [0,1]; zero requests the scorer's minimum retained chunk.
 
 ## Example: CUDA + Halo Layer Split
 

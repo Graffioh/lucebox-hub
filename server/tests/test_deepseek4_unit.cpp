@@ -1906,7 +1906,7 @@ static void test_pflash_rejects_invalid_requests() {
 
     ModelBackend::CompressRequest invalid_ratio;
     invalid_ratio.input_ids = {1, 2, 3};
-    invalid_ratio.keep_ratio = 0.0f;
+    invalid_ratio.keep_ratio = -0.1f;
     invalid_ratio.drafter_path = "/nonexistent/drafter.gguf";
     const auto results = backend.compress_batch({empty, invalid_ratio});
     TEST_ASSERT(results.size() == 2);
@@ -1935,6 +1935,120 @@ static void test_pflash_failed_load_releases_backend() {
     TEST_ASSERT(backend.pflash_drafter_ctx_.gpu == -1);
     // Also keep a failing baseline run leak-free.
     dflash::common::free_drafter(backend.pflash_drafter_ctx_);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_pflash_keep_ratio_contract() {
+    std::fprintf(stderr, "  test_pflash_keep_ratio_contract ...");
+    struct ParkProbe : DeepSeek4Backend {
+        ParkProbe() : DeepSeek4Backend(DeepSeek4BackendConfig{}) {}
+        int park_calls = 0;
+        bool park(ParkTarget) override {
+            ++park_calls;
+            return false; // Stop before model loading; only validate admission.
+        }
+    };
+    for (float ratio : {0.0f, 0.5f, 1.0f, -0.1f, 1.1f,
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::infinity(),
+                        -std::numeric_limits<float>::infinity()}) {
+        ParkProbe backend;
+        ModelBackend::CompressRequest request;
+        request.input_ids = {1, 2, 3};
+        request.drafter_path = "/nonexistent/pflash-admission.gguf";
+        request.keep_ratio = ratio;
+        const bool valid = std::isfinite(ratio) && ratio >= 0.0f && ratio <= 1.0f;
+        TEST_ASSERT(!backend.compress(request).ok);
+        TEST_ASSERT(backend.park_calls == (valid ? 1 : 0));
+    }
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_indexer_visibility_suffix() {
+    std::fprintf(stderr, "  test_indexer_visibility_suffix ...");
+    auto * backend = ggml_backend_cpu_init();
+    TEST_ASSERT(backend != nullptr);
+    if (!backend) return;
+    constexpr int rows = 528, tokens = 5;
+    int passed = 0;
+    for (int first = 0; first < tokens; ++first) {
+        auto * ctx = make_test_context(4u << 20);
+        TEST_ASSERT(ctx != nullptr);
+        if (!ctx) continue;
+        auto * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, tokens);
+        ggml_set_input(mask);
+        auto * suffix = deepseek4_indexer_visibility_suffix(ctx, mask, first, tokens - first);
+        TEST_ASSERT(deepseek4_indexer_visibility_suffix(ctx, nullptr, first, tokens - first) == nullptr);
+        ggml_set_output(suffix);
+        auto * graph = ggml_new_graph_custom(ctx, 32, false);
+        ggml_build_forward_expand(graph, suffix);
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        TEST_ASSERT(buffer != nullptr);
+        if (buffer) {
+            std::vector<float> values((size_t) rows * tokens);
+            for (int t = 0; t < tokens; ++t) {
+                for (int r = 0; r < rows; ++r) values[(size_t) t * rows + r] = (float) (t * 1000 + r);
+            }
+            ggml_backend_tensor_set(mask, values.data(), 0, ggml_nbytes(mask));
+            bool ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+            std::vector<float> actual((size_t) ggml_nelements(suffix));
+            ggml_backend_tensor_get(suffix, actual.data(), 0, ggml_nbytes(suffix));
+            const std::vector<float> expected(values.begin() + (size_t) first * rows, values.end());
+            ok &= suffix->ne[0] == rows && suffix->ne[1] == tokens - first;
+            ok &= ggml_is_contiguous(suffix) && actual == expected;
+            passed += ok;
+            if (!ok) std::fprintf(stderr, " FAIL first=%d;", first);
+        }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(backend);
+    std::fprintf(stderr, " %d/%d cases passed\n", passed, tokens);
+    TEST_ASSERT(passed == tokens);
+}
+
+static void test_pflash_legacy_compress_contract() {
+    std::fprintf(stderr, "  test_pflash_legacy_compress_contract ...");
+    struct CompressProbe : DeepSeek4Backend {
+        CompressProbe() : DeepSeek4Backend(DeepSeek4BackendConfig{}) {}
+        CompressRequest captured{};
+        int calls = 0;
+        CompressResult compress(const CompressRequest & request) override {
+            ++calls;
+            captured = request;
+            CompressResult result;
+            result.ok = true;
+            result.compressed_ids = {request.input_ids.front()};
+            return result;
+        }
+    };
+    char path[] = "/tmp/ds4-compress-contract-XXXXXX";
+    const int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    const int32_t ids[] = {11, 22, 33};
+    const bool written = write(fd, ids, sizeof(ids)) == (ssize_t) sizeof(ids);
+    close(fd);
+    TEST_ASSERT(written);
+    if (!written) { unlink(path); return; }
+    for (bool skip_park : {false, true}) {
+        CompressProbe backend;
+        std::vector<int32_t> output;
+        DaemonIO io;
+        io.on_token = [&](int32_t token) { output.push_back(token); return true; };
+        const std::string command = std::string("compress ") + path +
+            " 0 /unused/drafter with spaces.gguf" + (skip_park ? " nopark" : "");
+        TEST_ASSERT(backend.handle_compress(command, io));
+        TEST_ASSERT(backend.calls == 1);
+        TEST_ASSERT(backend.captured.input_ids == std::vector<int32_t>({11, 22, 33}));
+        TEST_ASSERT(backend.captured.keep_ratio == 0.0f);
+        TEST_ASSERT(backend.captured.drafter_path == "/unused/drafter with spaces.gguf");
+        TEST_ASSERT(backend.captured.skip_park == skip_park);
+        TEST_ASSERT(backend.captured.drafter_gpu == 0);
+        TEST_ASSERT(backend.captured.residency_action == DraftResidencyAction::KeepLoaded);
+        TEST_ASSERT(output == std::vector<int32_t>({11}));
+    }
+    unlink(path);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -5198,6 +5312,9 @@ int main() {
     test_dspark_park_all_releases_drafter();
     test_pflash_rejects_invalid_requests();
     test_pflash_failed_load_releases_backend();
+    test_pflash_keep_ratio_contract();
+    test_indexer_visibility_suffix();
+    test_pflash_legacy_compress_contract();
     test_dspark_raw_ring_rollback_after_wrap(backend);
     test_snapshot_save_restore();
     test_monolithic_snapshot_preserves_decode_state();

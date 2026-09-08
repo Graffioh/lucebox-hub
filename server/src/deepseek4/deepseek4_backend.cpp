@@ -2880,12 +2880,14 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
     std::vector<CompressResult> results(requests.size());
     if (requests.empty()) return results;
 
+    const auto valid_request = [](const CompressRequest & request) {
+        return !request.input_ids.empty() && !request.drafter_path.empty() &&
+            std::isfinite(request.keep_ratio) &&
+            request.keep_ratio >= 0.0f && request.keep_ratio <= 1.0f;
+    };
     const CompressRequest * load_request = nullptr;
     for (const CompressRequest & request : requests) {
-        if (request.input_ids.empty() || request.drafter_path.empty() ||
-            request.keep_ratio <= 0.0f || request.keep_ratio > 1.0f) {
-            continue;
-        }
+        if (!valid_request(request)) continue;
         if (load_request == nullptr) {
             load_request = &request;
         } else if (request.drafter_path != load_request->drafter_path ||
@@ -2940,10 +2942,7 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
 
     for (size_t index = 0; index < requests.size(); ++index) {
         const CompressRequest & request = requests[index];
-        if (request.input_ids.empty() || request.drafter_path.empty() ||
-            request.keep_ratio <= 0.0f || request.keep_ratio > 1.0f) {
-            continue;
-        }
+        if (!valid_request(request)) continue;
         CompressResult & result = results[index];
         result.compressed_ids = drafter_score_and_compress(
             pflash_drafter_ctx_, request.input_ids, request.keep_ratio);
@@ -2963,6 +2962,8 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
 
 bool DeepSeek4Backend::handle_compress(const std::string & line,
                                        const DaemonIO & io) {
+    // Legacy wire format has no GPU/residency fields: retain backend-local
+    // GPU 0 and KeepLoaded. HTTP uses the typed API for those controls.
     std::istringstream iss(line.size() > 9 ? line.substr(9) : std::string{});
     std::string prompt_path;
     std::string drafter_path;
