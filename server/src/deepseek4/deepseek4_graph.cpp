@@ -571,10 +571,13 @@ static bool build_cached_decode_ffn_graph(
         ggml_tensor * cur_3d = ggml_reshape_3d(out.sg.ctx, ffn_normed, w.n_embd, 1, n_tokens);
         ggml_tensor * gate_e = ggml_mul_mat_id(out.sg.ctx, L.ffn_gate_exps, cur_3d, out.hash_ids);
         ggml_tensor * up_e = ggml_mul_mat_id(out.sg.ctx, L.ffn_up_exps, cur_3d, out.hash_ids);
+        ggml_mul_mat_set_mixed_mmq(gate_e, w.mixed_mmq_policy);
+        ggml_mul_mat_set_mixed_mmq(up_e, w.mixed_mmq_policy);
         gate_e = ggml_reshape_3d(out.sg.ctx, gate_e, n_ff_exp, n_used, n_tokens);
         up_e = ggml_reshape_3d(out.sg.ctx, up_e, n_ff_exp, n_used, n_tokens);
         ggml_tensor * mid_e = build_clamped_swiglu(out.sg.ctx, gate_e, up_e, w.swiglu_clamp_exp);
         ggml_tensor * down_e = ggml_mul_mat_id(out.sg.ctx, L.ffn_down_exps, mid_e, out.hash_ids);
+        ggml_mul_mat_set_mixed_mmq(down_e, w.mixed_mmq_policy);
         down_e = ggml_reshape_3d(out.sg.ctx, down_e, w.n_embd, n_used, n_tokens);
 
         ggml_tensor * probs_3d = ggml_reshape_3d(out.sg.ctx, probs, 1, w.n_expert, n_tokens);
@@ -3539,6 +3542,7 @@ struct Ds4MoeRouting {
 
 static MoeHybridConfig make_ds4_moe_hybrid_config(const DeepSeek4Weights & w) {
     MoeHybridConfig cfg;
+    cfg.mixed_mmq_policy = w.mixed_mmq_policy;
     cfg.n_embd = w.n_embd;
     cfg.n_expert = w.n_expert;
     cfg.n_expert_used = ds4_effective_expert_count(w);
@@ -3793,12 +3797,15 @@ static ggml_tensor * build_moe_ffn(
         ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
         ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, routing.selected);
         ggml_tensor * up_e = ggml_mul_mat_id(ctx, L.ffn_up_exps, cur_3d, routing.selected);
+        ggml_mul_mat_set_mixed_mmq(gate_e, w.mixed_mmq_policy);
+        ggml_mul_mat_set_mixed_mmq(up_e, w.mixed_mmq_policy);
 
         gate_e = ggml_reshape_3d(ctx, gate_e, n_ff_exp, n_used, n_tokens);
         up_e = ggml_reshape_3d(ctx, up_e, n_ff_exp, n_used, n_tokens);
         ggml_tensor * mid_e = build_clamped_swiglu(ctx, gate_e, up_e, w.swiglu_clamp_exp);
 
         ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, routing.selected);
+        ggml_mul_mat_set_mixed_mmq(down_e, w.mixed_mmq_policy);
         down_e = ggml_reshape_3d(ctx, down_e, n_embd, n_used, n_tokens);
 
         if (ds4_moe_fused_combine_enabled()) {
@@ -5588,10 +5595,13 @@ static ggml_tensor * ds4_build_hash_routed_ffn(
         ctx, ffn_normed, w.n_embd, 1, n_tokens);
     ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, hash_ids);
     ggml_tensor * up_e = ggml_mul_mat_id(ctx, L.ffn_up_exps, cur_3d, hash_ids);
+    ggml_mul_mat_set_mixed_mmq(gate_e, w.mixed_mmq_policy);
+    ggml_mul_mat_set_mixed_mmq(up_e, w.mixed_mmq_policy);
     gate_e = ggml_reshape_3d(ctx, gate_e, n_ff_exp, n_used, n_tokens);
     up_e = ggml_reshape_3d(ctx, up_e, n_ff_exp, n_used, n_tokens);
     ggml_tensor * mid_e = build_clamped_swiglu(ctx, gate_e, up_e, w.swiglu_clamp_exp);
     ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, hash_ids);
+    ggml_mul_mat_set_mixed_mmq(down_e, w.mixed_mmq_policy);
     down_e = ggml_reshape_3d(ctx, down_e, w.n_embd, n_used, n_tokens);
 
     ggml_tensor * probs_3d = ggml_reshape_3d(

@@ -161,6 +161,7 @@ struct DeepSeek4Layer {
 // ─── Global weights ─────────────────────────────────────────────────────
 
 struct DeepSeek4Weights {
+    ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT;
     ggml_context *        ctx     = nullptr;
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;

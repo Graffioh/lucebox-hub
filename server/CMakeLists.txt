@@ -1109,14 +1109,45 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE CUDA::cudart)
         endif()
-        # The grouped test includes rocmfpx.h unconditionally; expose it to both
+        # The grouped test includes the ROCm quantizers; expose them to both
         # backends (previously only HIP resolved it, so the default CUDA build
         # could not compile this target).
         target_include_directories(test_deepseek4_mmid_grouped_cuda PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfp4
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
         target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE
             ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_deepseek4_mmid_grouped_cuda)
+        add_test(NAME deepseek4_mmid_grouped_cuda_reject_parent_width
+            COMMAND ${CMAKE_COMMAND} -E env DFLASH_MMID_TEST_WIDTH=16
+                $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda> --mmid-only)
+        set_tests_properties(deepseek4_mmid_grouped_cuda_reject_parent_width
+            PROPERTIES WILL_FAIL TRUE)
+        add_test(NAME deepseek4_mmid_grouped_cuda_benchmark_accounting
+            COMMAND $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
+                --test-benchmark-iterations)
+        add_test(NAME deepseek4_mmid_grouped_cuda_benchmark_config
+            COMMAND ${CMAKE_COMMAND}
+                -DTEST_EXECUTABLE=$<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
+                -DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/mmid_benchmark_config
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmid_benchmark_config.cmake)
+        set_tests_properties(deepseek4_mmid_grouped_cuda_benchmark_config
+            PROPERTIES SKIP_REGULAR_EXPRESSION "mmid-benchmark-config.*SKIP: no supported GPU")
+        foreach(_mmid_cli_case IN ITEMS parent_benchmark no_gpu)
+            add_test(NAME deepseek4_mmid_grouped_cuda_${_mmid_cli_case}
+                COMMAND ${CMAKE_COMMAND}
+                    -DTEST_EXECUTABLE=$<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
+                    -DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/mmid_cli_${_mmid_cli_case}
+                    -DTEST_CASE=${_mmid_cli_case}
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmid_cli.cmake)
+        endforeach()
+        unset(_mmid_cli_case)
+        add_test(NAME deepseek4_mmid_grouped_cuda_combine_override
+            COMMAND ${CMAKE_COMMAND} -E env DFLASH_MOE_COMBINE_VEC4=0
+                DFLASH_MOE_COMBINE_BENCH=0 --unset=DFLASH_MOE_COMBINE_BENCH_TOKENS
+                $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda> --combine-only)
+        set_tests_properties(deepseek4_mmid_grouped_cuda_combine_override
+            PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_moe_combine_cuda.cpp")
         add_executable(test_ds4_moe_combine_cuda test/test_ds4_moe_combine_cuda.cpp)
@@ -1754,6 +1785,8 @@ if(DFLASH27B_TESTS)
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_spec_width.cpp
+            test/test_mmq_tile_selection.cpp
+            test/test_mixed_mmq_policy.cpp
             test/test_spec_acceptance.cpp
             test/test_ds4_env.cpp
             test/test_adaptive_keep_ratio.cpp
