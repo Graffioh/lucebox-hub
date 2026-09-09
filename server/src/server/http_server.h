@@ -294,7 +294,8 @@ PflashQueryWindow find_pflash_query_window(
     const std::vector<int32_t> & query,
     int max_tokens = 8,
     int search_end = -1,
-    int search_begin = 0);
+    int search_begin = 0,
+    bool anchored = true);
 
 PflashQueryWindow pflash_tail_query_window(
     const std::vector<int32_t> & prompt,

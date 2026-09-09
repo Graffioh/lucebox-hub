@@ -193,7 +193,8 @@ PflashQueryWindow find_pflash_query_window(
         const std::vector<int32_t> & query,
         int max_tokens,
         int search_end,
-        int search_begin) {
+        int search_begin,
+        bool anchored) {
     PflashQueryWindow result;
     if (prompt.empty() || query.empty() || max_tokens < 1) return result;
 
@@ -209,7 +210,7 @@ PflashQueryWindow find_pflash_query_window(
     // A configured semantic boundary is the exact content end. Shorten only
     // the suffix width there; accepting an earlier occurrence would silently
     // turn a failed latest-user mapping into preceding context.
-    if (search_end >= 0) {
+    if (search_end >= 0 && anchored) {
         const int bounded_widest = (std::min)(widest, limit - search_begin);
         for (int width = bounded_widest; width >= narrowest; --width) {
             const auto query_begin = query.end() - width;
@@ -222,9 +223,13 @@ PflashQueryWindow find_pflash_query_window(
         }
         return result;
     }
+    // Unanchored: the latest occurrence of the (suffix-trimmed) query inside
+    // [search_begin, limit). An explicit query may sit before trailing
+    // instructions, so it is not required to end at the content boundary.
+    const int floor = (std::max)(0, search_begin);
     for (int width = widest; width >= narrowest; --width) {
         const auto query_begin = query.end() - width;
-        for (int end = limit; end >= width; --end) {
+        for (int end = limit; end - width >= floor; --end) {
             if (std::equal(query_begin, query.end(),
                            prompt.begin() + end - width)) {
                 result.end = end;
@@ -3288,7 +3293,8 @@ std::string HttpServer::apply_pflash_compression(
             drafter_ids, semantic_query_ids,
             experiment.configured ? experiment.query_tokens : 8,
             query_content_end,
-            experiment.configured ? query_content_begin : 0);
+            experiment.configured ? query_content_begin : 0,
+            /*anchored=*/ req.pflash_query.empty());
         if (experiment.configured && query_window.valid()) {
             expected_query_ids.assign(
                 semantic_query_ids.end() - query_window.tokens,

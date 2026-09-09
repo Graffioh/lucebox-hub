@@ -199,6 +199,25 @@ TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_stays_before_latest_user_
         rendered, std::vector<int32_t>{42}) < 0);
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_explicit_query_matches_before_trailing_content) {
+    // An explicit query sits before trailing instructions inside the latest
+    // user content; anchored matching (message tail) must fail, unanchored
+    // matching must find its latest occurrence and tolerate a leading-token
+    // boundary difference from tokenizing the query on its own.
+    const std::vector<int32_t> query{5, 10, 11, 12, 13, 14};   // 5 = boundary drift
+    const std::vector<int32_t> rendered{
+        1, 2, 3, 10, 11, 12, 13, 14, 300, 301, 302, 303, 304, 305, 306, 307,
+    };
+    const auto anchored = http_detail::find_pflash_query_window(rendered, query, 8, 16, 1);
+    const auto explicit_window = http_detail::find_pflash_query_window(rendered, query, 8, 16, 1, false);
+    TEST_ASSERT(!anchored.valid());
+    TEST_ASSERT(explicit_window.valid());
+    TEST_ASSERT(explicit_window.end == 8);
+    TEST_ASSERT(explicit_window.tokens == 5);
+    const auto out_of_window = http_detail::find_pflash_query_window(rendered, query, 8, 16, 9, false);
+    TEST_ASSERT(!out_of_window.valid());
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_bounded_mapping_prefers_latest_shortened_suffix) {
     const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
     const std::vector<int32_t> rendered{
