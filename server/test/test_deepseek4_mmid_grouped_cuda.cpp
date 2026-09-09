@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
+#include "rocmfp4.h"
 #include "rocmfpx.h"
 
 #include <cuda_runtime.h>
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <sstream>
 #include <string>
@@ -24,6 +26,14 @@
 #else
 #include <unistd.h>
 #endif
+
+// Both the child and its independent output/dispatch checks use this matrix.
+static constexpr ggml_type k_test_types[] = {
+    GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
+    GGML_TYPE_Q5_K, GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
+    GGML_TYPE_Q4_0_ROCMFP4_FAST,
+};
+static constexpr int k_test_widths[] = {2, 4, 8, 9, 16, 32, 48, 64};
 
 template <typename Compute>
 static ggml_status run_benchmark_iterations(int requested, Compute compute, int & completed) {
@@ -77,7 +87,9 @@ static bool run_case(
         const int parsed = raw ? std::atoi(raw) : 0;
         return parsed > 0 ? parsed : fallback;
     };
-    if (std::getenv("DFLASH_MMID_BENCH_ITERS")) {
+    const int benchmark_iterations = env_positive("DFLASH_MMID_BENCH_ITERS", 0);
+    const bool benchmark = benchmark_iterations > 0;
+    if (benchmark) {
         k_dim = env_positive("DFLASH_MMID_BENCH_K", k_dim);
         n_rows = env_positive("DFLASH_MMID_BENCH_ROWS", n_rows);
         n_experts = env_positive("DFLASH_MMID_BENCH_EXPERTS", n_experts);
@@ -99,9 +111,14 @@ static bool run_case(
         fused_ds4 ? ggml_new_tensor_3d(ctx, type, k_dim, n_rows, n_experts) : nullptr;
     ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_dim, 1, width);
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, width);
+    // Model weights stay live across fused operations and benchmark replays.
+    // INPUT alone lets gallocr recycle a weight after its unfused last use,
+    // so a later GLU output can alias a weight still read by the fused kernel.
     ggml_set_input(weights);
+    ggml_set_output(weights);
     if (gate_weights != nullptr) {
         ggml_set_input(gate_weights);
+        ggml_set_output(gate_weights);
     }
     ggml_set_input(input);
     ggml_set_input(ids);
@@ -122,7 +139,6 @@ static bool run_case(
         return false;
     }
 
-    const bool benchmark = std::getenv("DFLASH_MMID_BENCH_ITERS") != nullptr;
     std::mt19937 rng(20260713u + (unsigned) type * 97u + (unsigned) width);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::vector<float> weights_f;
@@ -149,6 +165,10 @@ static bool run_case(
                   k_dim, nullptr)
         : type == GGML_TYPE_Q3_0_ROCMFPX
             ? rocmfpx_quantize_fp3(
+                  weights_f.data(), weights_q.data(), n_rows * n_experts,
+                  k_dim, nullptr)
+        : type == GGML_TYPE_Q4_0_ROCMFP4_FAST
+            ? rocmfp4_quantize_q4_0_fast(
                   weights_f.data(), weights_q.data(), n_rows * n_experts,
                   k_dim, nullptr)
             : ggml_quantize_chunk(
@@ -187,10 +207,6 @@ static bool run_case(
     ggml_backend_synchronize(backend);
 
     ggml_status status = ggml_backend_graph_compute(backend, graph);
-    int benchmark_iterations = 0;
-    if (const char * raw = std::getenv("DFLASH_MMID_BENCH_ITERS")) {
-        benchmark_iterations = std::max(0, std::atoi(raw));
-    }
     if (status == GGML_STATUS_SUCCESS && benchmark_iterations > 0) {
         ggml_backend_synchronize(backend);
         const auto start = std::chrono::steady_clock::now();
@@ -286,23 +302,15 @@ static int run_child(const char * mode, const char * output_path) {
         ggml_backend_free(backend);
         return ok ? 0 : 1;
     }
-    const ggml_type types[] = {
-        GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
-        GGML_TYPE_Q5_K, GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
-        GGML_TYPE_Q4_0_ROCMFP4_FAST,
-    };
     int width_filter = 0;
     if (const char * raw = std::getenv("DFLASH_MMID_TEST_WIDTH")) {
         width_filter = std::max(0, std::atoi(raw));
     }
     const std::vector<int> widths = width_filter > 0
         ? std::vector<int>{width_filter}
-        : std::vector<int>{2, 4, 8, 9, 16, 32, 48, 64};
+        : std::vector<int>(std::begin(k_test_widths), std::end(k_test_widths));
     bool ok = output.good();
-    for (ggml_type type : types) {
-        if (type == GGML_TYPE_Q4_0_ROCMFP4_FAST && width_filter == 0) {
-            continue;
-        }
+    for (ggml_type type : k_test_types) {
         for (int width : widths) {
             if ((width_filter > 0 && width != width_filter) ||
                 (width >= 32 &&
@@ -745,11 +753,6 @@ int main(int argc, char ** argv) {
     const size_t legacy_grouped = count_records(legacy_log, "variant=grouped");
     const size_t grouped_grouped = count_records(grouped_log, "variant=grouped");
 
-    const ggml_type types[] = {
-        GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
-        GGML_TYPE_Q5_K, GGML_TYPE_Q2_0_ROCMFP2, GGML_TYPE_Q3_0_ROCMFPX,
-    };
-    const int widths[] = {2, 4, 8, 9, 16, 32, 48, 64};
     size_t offset = 0;
     size_t compared_bytes = 0;
     int compared_cases = 0;
@@ -757,11 +760,12 @@ int main(int argc, char ** argv) {
     int tolerant_cases = 0;
     bool output_parity = legacy.size() == grouped.size() && !legacy.empty();
     bool grouped_dispatch = true;
-    for (ggml_type type : types) {
-        for (int width : widths) {
+    for (ggml_type type : k_test_types) {
+        for (int width : k_test_widths) {
             if (width >= 32 &&
                 type != GGML_TYPE_Q2_0_ROCMFP2 &&
-                type != GGML_TYPE_Q3_0_ROCMFPX) {
+                type != GGML_TYPE_Q3_0_ROCMFPX &&
+                type != GGML_TYPE_Q4_0_ROCMFP4_FAST) {
                 continue;
             }
             const bool legacy_mmvq = has_mmvq_record(legacy_log, type, width);
@@ -771,7 +775,12 @@ int main(int argc, char ** argv) {
                 }
                 const size_t case_bytes = (size_t) 128 * 8 * width * sizeof(float);
                 const bool require_exact = legacy_mmvq && !fused_ds4;
-                if (width <= 16) {
+                if (type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+                    // FAST is not admitted by the grouped-type mask. Verify
+                    // its numerical fallback without widening kernel policy.
+                    grouped_dispatch = !has_mmvq_record(
+                        grouped_log, type, width, "grouped") && grouped_dispatch;
+                } else if (width <= 16) {
                     grouped_dispatch =
                         has_mmvq_record(grouped_log, type, width, "grouped") && grouped_dispatch;
                 }
@@ -793,7 +802,7 @@ int main(int argc, char ** argv) {
             }
         }
     }
-    output_parity = output_parity && offset == legacy.size() && compared_cases == 76;
+    output_parity = output_parity && offset == legacy.size() && compared_cases == 89;
     const size_t masked_case_bytes = (size_t) 128 * 8 * 32 * sizeof(float);
     const bool masked_fused_zero = masked_fused.size() == masked_case_bytes;
     const bool pass = legacy_status == 0 && grouped_status == 0 &&
