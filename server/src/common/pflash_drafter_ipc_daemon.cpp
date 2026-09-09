@@ -45,7 +45,7 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
         std::string cmd;
         iss >> cmd;
         if (cmd == "quit" || cmd == "exit") break;
-        if (cmd == "compress" || cmd == "compress2") {
+        if (cmd == "compress" || cmd == "compress2" || cmd == "compress3") {
             PFlashDrafterIpcCompressCommand request;
             std::string parse_error;
             if (!parse_pflash_drafter_ipc_compress_command(line, request, parse_error)) {
@@ -64,7 +64,8 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
             auto compressed = drafter_score_and_compress(
                 ctx, input_ids, request.keep_ratio, /*chunk_size=*/32,
                 request.score_query_tokens, /*pool_kernel=*/13,
-                request.score_query_end);
+                request.score_query_end,
+                request.required_instruction_spans);
             if (compressed.empty()) {
                 std::fprintf(stderr, "[pflash-ipc-daemon] compress returned empty\n");
                 stream_status(stream_fd, -1);

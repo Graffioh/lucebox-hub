@@ -65,6 +65,7 @@ struct Qwen3DrafterWeights {
     int n_vocab    = 151936;
     int n_ctx_max  = 40960;
     float rope_theta = 1000000.0f;
+    bool longattncomp_head_loaded = false;
 };
 
 bool load_qwen3_drafter_model(const std::string & gguf_path,

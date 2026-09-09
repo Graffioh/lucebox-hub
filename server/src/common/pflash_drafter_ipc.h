@@ -8,6 +8,7 @@
 
 #include "backend_ipc.h"
 #include "io_utils.h"
+#include "pflash_types.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +22,7 @@ struct PFlashDrafterIpcCompressCommand {
     float keep_ratio = 0.0f;
     int score_query_end = -1;
     int score_query_tokens = 8;
+    std::vector<PFlashTokenSpan> required_instruction_spans;
     std::string path;
 };
 
@@ -28,6 +30,15 @@ bool format_pflash_drafter_ipc_compress_command(
     float keep_ratio,
     int score_query_end,
     int score_query_tokens,
+    const std::string & path,
+    std::string & out,
+    std::string & error);
+
+bool format_pflash_drafter_ipc_compress_command(
+    float keep_ratio,
+    int score_query_end,
+    int score_query_tokens,
+    const std::vector<PFlashTokenSpan> & required_instruction_spans,
     const std::string & path,
     std::string & out,
     std::string & error);
@@ -53,7 +64,9 @@ public:
                   float keep_ratio,
                   std::vector<int32_t> & compressed_ids,
                   int score_query_end = -1,
-                  int score_query_tokens = 8);
+                  int score_query_tokens = 8,
+                  const std::vector<PFlashTokenSpan> &
+                      required_instruction_spans = {});
 
     bool active() const { return active_; }
     void close();

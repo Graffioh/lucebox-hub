@@ -95,6 +95,7 @@ struct PFlashTraceFields {
     int retained_tokens = 0;
     double retained_mass = 0.0;
     const std::vector<double> * exact_chunk_scores = nullptr;
+    const std::vector<PFlashTokenSpan> * required_instruction_spans = nullptr;
 };
 
 static void write_compression_trace(
@@ -136,7 +137,7 @@ static void write_compression_trace(
 
     std::fprintf(file,
         "{\"schema_version\":%d,\"input_tokens\":%d,\"keep_ratio\":%.9g",
-        trace_fields ? 2 : 1, input_tokens, keep_ratio);
+        trace_fields ? 3 : 1, input_tokens, keep_ratio);
     if (trace_fields) {
         std::fputs(",\"input_ids\":[", file);
         for (size_t index = 0; index < trace_fields->input_ids->size(); ++index) {
@@ -153,6 +154,18 @@ static void write_compression_trace(
                 trace_fields->selector_mode),
             dflash::qwen3::pflash_query_parser_name(trace_fields->query_parser),
             trace_fields->token_budget, trace_fields->retained_tokens);
+        std::fputs(",\"required_instruction_spans\":[", file);
+        if (trace_fields->required_instruction_spans) {
+            for (size_t index = 0;
+                 index < trace_fields->required_instruction_spans->size();
+                 ++index) {
+                if (index) std::fputc(',', file);
+                const auto & span =
+                    (*trace_fields->required_instruction_spans)[index];
+                std::fprintf(file, "[%d,%d]", span.begin, span.end);
+            }
+        }
+        std::fputc(']', file);
         if (trace_fields->selector_mode ==
             dflash::qwen3::PFlashSelectionMode::Legacy) {
             std::fputs(",\"stop_reason\":null,\"retained_mass\":null", file);
@@ -211,6 +224,8 @@ static std::vector<int32_t> select_longattncomp_chunks(
         int score_query_end,
         int pool_kernel,
         const dflash::qwen3::PFlashLongAttnCompConfig & config,
+        const std::vector<PFlashTokenSpan> & required_instruction_spans,
+        bool direct_mass,
         bool write_trace) {
     const int input_tokens = (int) ids.size();
     const int query_end = score_query_end < 0 ? input_tokens : score_query_end;
@@ -234,10 +249,13 @@ static std::vector<int32_t> select_longattncomp_chunks(
         for (int token = begin; token < end; ++token) {
             score += token_scores[(size_t) token];
         }
-        score /= (double) std::max(1, end - begin);
+        if (!direct_mass) {
+            score /= (double) std::max(1, end - begin);
+        }
         const bool mandatory =
             dflash::qwen3::pflash_chunk_is_structurally_required(
-                begin, end, query_begin, query_end, input_tokens);
+                begin, end, query_begin, query_end, input_tokens,
+                required_instruction_spans);
         candidates.push_back({(size_t) chunk, begin, end, score, mandatory});
         chunk_means.push_back({(float) score, chunk});
         exact_chunk_scores.push_back(score);
@@ -298,7 +316,7 @@ static std::vector<int32_t> select_longattncomp_chunks(
             &ids, query_begin, query_end, config.mode, config.query_parser,
             selector_budget,
             selected.stop, selected.retained_tokens, selected.retained_mass,
-            &exact_chunk_scores};
+            &exact_chunk_scores, &required_instruction_spans};
         write_compression_trace(
             input_tokens, keep_ratio, config.chunk_size, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,
@@ -501,7 +519,8 @@ static std::vector<int32_t> qwen35_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const dflash::qwen3::PFlashLongAttnCompConfig & experiment) {
+    const dflash::qwen3::PFlashLongAttnCompConfig & experiment,
+    const std::vector<PFlashTokenSpan> & required_instruction_spans) {
 
     const int S = (int)ids.size();
     const int hidden = w.n_embd;
@@ -794,7 +813,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
     if (experiment.selection_active) {
         return select_longattncomp_chunks(
             ids, smooth_score, keep_ratio, n_lookahead, score_query_end,
-            pk, experiment, true);
+            pk, experiment, required_instruction_spans, false, true);
     }
     
     std::vector<std::pair<float, int>> chunk_means;
@@ -941,7 +960,8 @@ std::vector<int32_t> drafter_score_and_compress(
     int chunk_size,
     int n_lookahead,
     int pool_kernel,
-    int score_query_end) {
+    int score_query_end,
+    const std::vector<PFlashTokenSpan> & required_instruction_spans) {
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
         return {};
@@ -958,6 +978,26 @@ std::vector<int32_t> drafter_score_and_compress(
         return {};
     }
     chunk_size = experiment.chunk_size;
+    if (!experiment.selection_active && !required_instruction_spans.empty()) {
+        set_last_error(
+            "PFlash instruction spans require strict LongAttnComp selection");
+        std::fprintf(stderr,
+            "[pflash-longattncomp] ERROR instruction spans require strict selection\n");
+        std::fflush(stderr);
+        return {};
+    }
+    if (experiment.selection_active) {
+        std::string span_error;
+        if (!dflash::qwen3::validate_pflash_instruction_spans(
+                required_instruction_spans, (int) ids.size(), span_error)) {
+            set_last_error("invalid PFlash instruction spans: " + span_error);
+            std::fprintf(stderr,
+                "[pflash-longattncomp] ERROR instruction spans: %s\n",
+                span_error.c_str());
+            std::fflush(stderr);
+            return {};
+        }
+    }
     if (experiment.configured) {
         std::fprintf(stderr,
             "[pflash-longattncomp] config mode=%s active=%d chunk=%d "
@@ -977,7 +1017,8 @@ std::vector<int32_t> drafter_score_and_compress(
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
         return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
                                          n_lookahead, pool_kernel, score_query_end,
-                                         experiment);
+                                         experiment,
+                                         required_instruction_spans);
     }
     const int S = (int)ids.size();
     if (S < n_lookahead + 1) {
@@ -1021,8 +1062,11 @@ std::vector<int32_t> drafter_score_and_compress(
 
     if (experiment.selection_active) {
         return select_longattncomp_chunks(
-            ids, smooth, keep_ratio, n_lookahead, score_query_end,
-            pool_kernel, experiment, true);
+            ids, ctx.weights.longattncomp_head_loaded ? score : smooth,
+            keep_ratio, n_lookahead, score_query_end,
+            ctx.weights.longattncomp_head_loaded ? 1 : pool_kernel,
+            experiment, required_instruction_spans,
+            ctx.weights.longattncomp_head_loaded, true);
     }
 
     // ── 4. Chunk-top-K + span merge ───────────────────────────────────

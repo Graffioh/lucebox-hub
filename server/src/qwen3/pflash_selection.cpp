@@ -73,7 +73,9 @@ bool pflash_chunk_is_structurally_required(
         int end,
         int query_begin,
         int query_end,
-        int input_tokens) noexcept {
+        int input_tokens,
+        const std::vector<dflash::common::PFlashTokenSpan> &
+            required_instruction_spans) noexcept {
     if (begin < 0 || end <= begin || query_begin < 0 ||
         query_end < query_begin || input_tokens < query_end ||
         end > input_tokens) {
@@ -82,7 +84,40 @@ bool pflash_chunk_is_structurally_required(
     const bool query_chunk = begin < query_end && end > query_begin;
     const bool structural_suffix_chunk =
         begin < input_tokens && end > query_end;
-    return query_chunk || structural_suffix_chunk;
+    if (query_chunk || structural_suffix_chunk) return true;
+    for (const auto & span : required_instruction_spans) {
+        if (begin < span.end && end > span.begin) return true;
+    }
+    return false;
+}
+
+bool validate_pflash_instruction_spans(
+        const std::vector<dflash::common::PFlashTokenSpan> & spans,
+        int input_tokens,
+        std::string & error) noexcept {
+    error.clear();
+    if (input_tokens < 0) {
+        error = "PFlash input token count must not be negative";
+        return false;
+    }
+    if (spans.size() > dflash::common::kPFlashMaxInstructionSpans) {
+        error = "PFlash has too many instruction spans";
+        return false;
+    }
+    int previous_end = 0;
+    for (const auto & span : spans) {
+        if (span.begin < 0 || span.end <= span.begin ||
+            span.end > input_tokens) {
+            error = "PFlash instruction span is outside the input";
+            return false;
+        }
+        if (span.begin < previous_end) {
+            error = "PFlash instruction spans must be ordered and non-overlapping";
+            return false;
+        }
+        previous_end = span.end;
+    }
+    return true;
 }
 
 PFlashSelectionResult select_pflash_candidates(
@@ -143,7 +178,7 @@ PFlashSelectionResult select_pflash_candidates(
             if (length > policy.token_budget - result.retained_tokens) {
                 result = {};
                 result.stop = PFlashSelectionStop::MandatoryQueryExceedsBudget;
-                result.error = "mandatory PFlash query tokens exceed the token budget";
+                result.error = "mandatory PFlash retention tokens exceed the token budget";
                 return result;
             }
             selected_candidates.push_back(&candidate);

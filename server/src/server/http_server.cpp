@@ -282,6 +282,63 @@ int pflash_query_search_begin_from_sentinel(
     return static_cast<int>(common_prefix);
 }
 
+PflashInstructionMessagePlan plan_pflash_instruction_messages(
+        const std::vector<ChatMessage> & messages) {
+    PflashInstructionMessagePlan plan;
+    for (size_t index = 0; index < messages.size(); ++index) {
+        const auto & message = messages[index];
+        const bool instruction_role =
+            message.role == "system" || message.role == "developer";
+        if (instruction_role && !message.content.empty()) {
+            plan.instruction_messages.push_back(index);
+        }
+    }
+    return plan;
+}
+
+PFlashTokenSpan pflash_changed_token_span(
+        const std::vector<int32_t> & original,
+        const std::vector<int32_t> & variant) noexcept {
+    size_t common_prefix = 0;
+    while (common_prefix < original.size() &&
+           common_prefix < variant.size() &&
+           original[common_prefix] == variant[common_prefix]) {
+        ++common_prefix;
+    }
+
+    size_t common_suffix = 0;
+    while (common_suffix < original.size() - common_prefix &&
+           common_suffix < variant.size() - common_prefix &&
+           original[original.size() - common_suffix - 1] ==
+               variant[variant.size() - common_suffix - 1]) {
+        ++common_suffix;
+    }
+
+    const int begin = static_cast<int>(common_prefix);
+    const int end = static_cast<int>(original.size() - common_suffix);
+    return end > begin ? PFlashTokenSpan{begin, end}
+                       : PFlashTokenSpan{-1, -1};
+}
+
+std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
+        std::vector<PFlashTokenSpan> spans) {
+    std::sort(spans.begin(), spans.end(), [] (
+            const PFlashTokenSpan & left,
+            const PFlashTokenSpan & right) {
+        return left.begin < right.begin ||
+            (left.begin == right.begin && left.end < right.end);
+    });
+    std::vector<PFlashTokenSpan> result;
+    for (const PFlashTokenSpan & span : spans) {
+        if (!result.empty() && span.begin <= result.back().end) {
+            result.back().end = std::max(result.back().end, span.end);
+        } else {
+            result.push_back(span);
+        }
+    }
+    return result;
+}
+
 std::string pflash_token_fingerprint(
         const std::vector<int32_t> & ids) {
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -2997,6 +3054,7 @@ std::string HttpServer::apply_pflash_compression(
     std::string last_user_text;
     int query_content_begin = -1;
     int query_content_end = -1;
+    std::vector<PFlashTokenSpan> required_instruction_spans;
     if (experiment.configured) {
         if (!messages_input && !raw_text_input) {
             return "PFlash LongAttnComp input has no parseable text";
@@ -3036,47 +3094,147 @@ std::string HttpServer::apply_pflash_compression(
                 "__DFLASH_PFLASH_CONTENT_BEGIN_02C47F91__";
             static constexpr const char * kContentEnd =
                 "__DFLASH_PFLASH_CONTENT_END_6E6B61A8__";
-            auto begin_messages = messages;
-            begin_messages[(size_t) boundary_index].content =
-                std::string(kContentBegin) +
-                begin_messages[(size_t) boundary_index].content;
-            auto end_messages = messages;
-            end_messages[(size_t) boundary_index].content += kContentEnd;
+            const auto map_message_content = [&] (
+                    size_t message_index,
+                    int & content_begin,
+                    int & content_end,
+                    std::string & boundary_error) -> bool {
+                auto begin_messages = messages;
+                begin_messages[message_index].content =
+                    std::string(kContentBegin) +
+                    begin_messages[message_index].content;
+                auto end_messages = messages;
+                end_messages[message_index].content += kContentEnd;
 
-            std::string begin_rendered;
-            std::string end_rendered;
+                std::string begin_rendered;
+                std::string end_rendered;
+                if (!render_messages_to_text(
+                        begin_messages, req, /*add_generation_prompt=*/true,
+                        begin_rendered, boundary_error)) {
+                    boundary_error = "content-start render failed: " +
+                        boundary_error;
+                    return false;
+                }
+                boundary_error.clear();
+                if (!render_messages_to_text(
+                        end_messages, req, /*add_generation_prompt=*/true,
+                        end_rendered, boundary_error)) {
+                    boundary_error = "content-end render failed: " +
+                        boundary_error;
+                    return false;
+                }
+
+                const auto begin_ids = drafter_tokenizer_->encode(
+                    tokenizer_.decode(tokenizer_.encode(begin_rendered)));
+                const auto end_ids = drafter_tokenizer_->encode(
+                    tokenizer_.decode(tokenizer_.encode(end_rendered)));
+                content_begin =
+                    http_detail::pflash_query_search_begin_from_sentinel(
+                        drafter_ids, begin_ids);
+                content_end =
+                    http_detail::pflash_query_search_end_from_sentinel(
+                        drafter_ids, end_ids);
+                if (content_begin < 0 || content_end <= content_begin ||
+                    content_end >= (int) drafter_ids.size()) {
+                    boundary_error = "content boundary mapping failed";
+                    return false;
+                }
+                return true;
+            };
+            const auto map_rendered_message = [&] (
+                    size_t message_index,
+                    PFlashTokenSpan & message_span,
+                    std::string & boundary_error) -> bool {
+                auto without_message = messages;
+                without_message.erase(without_message.begin() + message_index);
+
+                std::string without_message_rendered;
+                if (!render_messages_to_text(
+                        without_message, req, /*add_generation_prompt=*/true,
+                        without_message_rendered, boundary_error)) {
+                    boundary_error = "message-removal render failed: " +
+                        boundary_error;
+                    return false;
+                }
+                const auto without_message_ids = drafter_tokenizer_->encode(
+                    tokenizer_.decode(tokenizer_.encode(
+                        without_message_rendered)));
+                message_span = http_detail::pflash_changed_token_span(
+                    drafter_ids, without_message_ids);
+                if (message_span.begin < 0) {
+                    boundary_error =
+                        "complete rendered message did not map to a prompt span";
+                    return false;
+                }
+                return true;
+            };
+
             std::string boundary_error;
-            if (!render_messages_to_text(
-                    begin_messages, req, /*add_generation_prompt=*/true,
-                    begin_rendered, boundary_error)) {
-                return "PFlash LongAttnComp content-start render failed: " +
-                    boundary_error;
+            if (!map_message_content(
+                    (size_t) boundary_index,
+                    query_content_begin, query_content_end,
+                    boundary_error)) {
+                return "PFlash LongAttnComp " + boundary_error;
             }
-            boundary_error.clear();
-            if (!render_messages_to_text(
-                    end_messages, req, /*add_generation_prompt=*/true,
-                    end_rendered, boundary_error)) {
-                return "PFlash LongAttnComp content-end render failed: " +
-                    boundary_error;
-            }
-
-            const auto begin_ids = drafter_tokenizer_->encode(
-                tokenizer_.decode(tokenizer_.encode(begin_rendered)));
-            const auto end_ids = drafter_tokenizer_->encode(
-                tokenizer_.decode(tokenizer_.encode(end_rendered)));
-            query_content_begin =
-                http_detail::pflash_query_search_begin_from_sentinel(
-                    drafter_ids, begin_ids);
-            query_content_end =
-                http_detail::pflash_query_search_end_from_sentinel(
-                    drafter_ids, end_ids);
             if (query_content_begin < 0 ||
                 query_content_end <= query_content_begin ||
                 query_content_end >= (int) drafter_ids.size()) {
                 return "PFlash LongAttnComp content boundary mapping failed";
             }
+
+            if (experiment.selection_active) {
+                const auto instruction_plan =
+                    http_detail::plan_pflash_instruction_messages(messages);
+                for (size_t instruction_index :
+                        instruction_plan.instruction_messages) {
+                    PFlashTokenSpan instruction_span;
+                    boundary_error.clear();
+                    if (!map_rendered_message(
+                            instruction_index, instruction_span,
+                            boundary_error)) {
+                        return "PFlash LongAttnComp instruction mapping failed: " +
+                            boundary_error;
+                    }
+                    required_instruction_spans.push_back(instruction_span);
+                }
+
+                if (!req.tools.is_null() && !req.tools.empty()) {
+                    ParsedRequest tool_free_req = req;
+                    tool_free_req.tools = json::array();
+                    std::string tool_free_rendered;
+                    boundary_error.clear();
+                    if (!render_messages_to_text(
+                            messages, tool_free_req,
+                            /*add_generation_prompt=*/true,
+                            tool_free_rendered, boundary_error)) {
+                        return "PFlash LongAttnComp tool mapping failed: " +
+                            boundary_error;
+                    }
+                    const auto tool_free_ids = drafter_tokenizer_->encode(
+                        tokenizer_.decode(tokenizer_.encode(tool_free_rendered)));
+                    const PFlashTokenSpan tool_span =
+                        http_detail::pflash_changed_token_span(
+                            drafter_ids, tool_free_ids);
+                    if (tool_span.begin < 0) {
+                        return "PFlash LongAttnComp tool mapping failed: "
+                            "tools did not produce a retained prompt span";
+                    }
+                    required_instruction_spans.push_back(tool_span);
+                }
+
+                required_instruction_spans =
+                    http_detail::canonicalize_pflash_token_spans(
+                        std::move(required_instruction_spans));
+                std::string instruction_error;
+                if (!dflash::qwen3::validate_pflash_instruction_spans(
+                        required_instruction_spans,
+                        (int) drafter_ids.size(), instruction_error)) {
+                    return "PFlash LongAttnComp instruction mapping failed: " +
+                        instruction_error;
+                }
+            }
         } catch (const std::exception & error) {
-            return std::string("PFlash user-query normalization failed: ") +
+            return std::string("PFlash retention normalization failed: ") +
                    error.what();
         }
     } else if (raw_text_input) {
@@ -3133,6 +3291,8 @@ std::string HttpServer::apply_pflash_compression(
 
     ModelBackend::CompressRequest compress_request;
     compress_request.input_ids = std::move(drafter_ids);
+    compress_request.required_instruction_spans =
+        std::move(required_instruction_spans);
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
     if (query_window.valid()) {
@@ -3140,6 +3300,11 @@ std::string HttpServer::apply_pflash_compression(
         compress_request.score_query_tokens = query_window.tokens;
         if (experiment.configured) {
             const int query_begin = query_window.end - query_window.tokens;
+            json instruction_spans = json::array();
+            for (const auto & span :
+                    compress_request.required_instruction_spans) {
+                instruction_spans.push_back({span.begin, span.end});
+            }
             const json provenance = {
                 {"schema_version", 1},
                 {"input_kind", parser_input_kind},
@@ -3157,6 +3322,7 @@ std::string HttpServer::apply_pflash_compression(
                 {"query_end", query_window.end},
                 {"requested_query_tokens", experiment.query_tokens},
                 {"expected_query_ids", expected_query_ids},
+                {"required_instruction_spans", instruction_spans},
             };
             std::fprintf(stderr, "[pflash-parser] %s\n",
                          provenance.dump().c_str());
@@ -3197,7 +3363,8 @@ std::string HttpServer::apply_pflash_compression(
             compress_request.input_ids, compress_request.keep_ratio,
             result.compressed_ids,
             compress_request.score_query_end,
-            compress_request.score_query_tokens);
+            compress_request.score_query_tokens,
+            compress_request.required_instruction_spans);
         if (residency == DraftResidencyAction::ReleaseAfterUse) {
             pflash_remote_.close();
         }

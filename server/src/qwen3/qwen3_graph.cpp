@@ -262,10 +262,11 @@ bool forward_qwen3_drafter_model(
     const float rope_b = w.rope_theta;
     // Pre-RoPE tail scoring: removes RoPE distance decay from the score signal.
     // Default ON; set DFLASH_FP_NOPE_TAIL=0 to disable (saves ~K_curr_v memory).
-    static const bool nope_tail = []() -> bool {
+    static const bool configured_nope_tail = []() -> bool {
         const char * e = std::getenv("DFLASH_FP_NOPE_TAIL");
         return e == nullptr || std::string(e) != "0";
     }();
+    const bool nope_tail = w.longattncomp_head_loaded || configured_nope_tail;
 
     if (n_lookahead < 1 || S < n_lookahead + 1) {
         set_last_error("forward_qwen3_drafter_model: S too small");
@@ -291,9 +292,13 @@ bool forward_qwen3_drafter_model(
         if (e) { int v = std::atoi(e); if (v > 0) return v; }
         return -1;
     }();
-    const int fwd_layer_limit_pre = (early_exit_pre > 0 && early_exit_pre < w.n_layer)
-        ? early_exit_pre : w.n_layer;
-    const ScoreRange pre_range = compute_score_range(w.n_layer, score_layers_pre, fwd_layer_limit_pre);
+    const int fwd_layer_limit_pre = w.longattncomp_head_loaded
+        ? 14
+        : ((early_exit_pre > 0 && early_exit_pre < w.n_layer)
+            ? early_exit_pre : w.n_layer);
+    const ScoreRange pre_range = w.longattncomp_head_loaded
+        ? ScoreRange{13, 14}
+        : compute_score_range(w.n_layer, score_layers_pre, fwd_layer_limit_pre);
     const int score_layer_start_pre = pre_range.start;
     const int n_score_layers = pre_range.count(); // K_norope/Q_norope sized to this, not n_layer
 
@@ -377,7 +382,9 @@ bool forward_qwen3_drafter_model(
     {
         std::vector<float> m((size_t)n_lookahead * S, 0.0f);
         for (int t = 0; t < n_lookahead; ++t) {
-            const int visible_end = query_start + t + 1;
+            const int visible_end = w.longattncomp_head_loaded
+                ? query_start
+                : query_start + t + 1;
             for (int j = 0; j < S; ++j) {
                 m[(size_t)t * S + j] = (j < visible_end) ? 0.0f : -INFINITY;
             }
@@ -425,8 +432,6 @@ bool forward_qwen3_drafter_model(
         ggml_free(gctx);
     }
 
-    const int & early_exit_n = early_exit_pre;  // alias for readability in loop below
-
     // Per-layer A→FA→B loop.
     ggml_gallocr_t galloc = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(w.backend));
@@ -447,8 +452,7 @@ bool forward_qwen3_drafter_model(
     double t_b_warm = 0.0, t_b_setup = 0.0, t_b_alloc = 0.0, t_b_copy_in = 0.0, t_b_norm = 0.0, t_compute_b = 0.0, t_b_copy_out = 0.0;
     double t_fp = 0.0;
 
-    const int fwd_layer_limit = (early_exit_n > 0 && early_exit_n < w.n_layer)
-        ? early_exit_n : w.n_layer;
+    const int fwd_layer_limit = fwd_layer_limit_pre;
 
     for (int il = 0; il < fwd_layer_limit; ++il) {
         const auto & L = w.layers[il];
@@ -604,6 +608,10 @@ bool forward_qwen3_drafter_model(
                 std::fflush(stderr);
             }
             ggml_free(gA);
+        }
+
+        if (w.longattncomp_head_loaded && il == 13) {
+            continue;
         }
 
         // ── Attention dispatch ──
@@ -974,15 +982,25 @@ bool forward_qwen3_drafter_model(
 
         for (int t = 0; t < n_lookahead; ++t) {
             for (int j = 0; j < S; ++j) {
-                float m = -INFINITY;
-                for (int h = 0; h < H; ++h) {
-                    float v = probs_h[(size_t)j
-                                      + (size_t)t * S
-                                      + (size_t)h * S * n_lookahead];
-                    if (v > m) m = v;
-                }
                 size_t idx = (size_t)t * S + j;
-                if (m > running_max[idx]) running_max[idx] = m;
+                if (w.longattncomp_head_loaded) {
+                    float sum = 0.0f;
+                    for (int h = 0; h < H; ++h) {
+                        sum += probs_h[(size_t)j
+                                       + (size_t)t * S
+                                       + (size_t)h * S * n_lookahead];
+                    }
+                    running_max[idx] = sum / (float)H;
+                } else {
+                    float m = -INFINITY;
+                    for (int h = 0; h < H; ++h) {
+                        float v = probs_h[(size_t)j
+                                          + (size_t)t * S
+                                          + (size_t)h * S * n_lookahead];
+                        if (v > m) m = v;
+                    }
+                    if (m > running_max[idx]) running_max[idx] = m;
+                }
             }
         }
     }

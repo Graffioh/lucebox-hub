@@ -109,6 +109,64 @@ TEST_CASE(PFlashSelectionFixture, structural_suffix_only_chunk_is_mandatory_and_
     require_ordinals(result, {1, 2});
 }
 
+TEST_CASE(PFlashSelectionFixture, instruction_overlap_is_mandatory_without_changing_optional_ranking) {
+    constexpr int input_tokens = 120000;
+    constexpr int query_begin = 119872;
+    constexpr int query_end = 120000;
+    const std::vector<dflash::common::PFlashTokenSpan> instructions{
+        {0, 384},
+        {4096, 4352},
+    };
+    std::string error;
+    REQUIRE(validate_pflash_instruction_spans(
+        instructions, input_tokens, error));
+    REQUIRE(error.empty());
+    REQUIRE(pflash_chunk_is_structurally_required(
+        0, 1024, query_begin, query_end, input_tokens, instructions));
+    REQUIRE(pflash_chunk_is_structurally_required(
+        4096, 5120, query_begin, query_end, input_tokens, instructions));
+    REQUIRE(!pflash_chunk_is_structurally_required(
+        1024, 2048, query_begin, query_end, input_tokens, instructions));
+
+    const std::vector<PFlashSelectionCandidate> candidates{
+        candidate(0, 0, 1024, 0.0, true),
+        candidate(1, 1024, 2048, 10.0),
+        candidate(2, 2048, 3072, 1.0),
+        candidate(3, 4096, 5120, 0.0, true),
+        candidate(4, 119872, 120000, 0.0, true),
+    };
+    const auto result = select_pflash_candidates(
+        candidates, {3200, 0.95}, PFlashSelectionMode::BudgetOnly);
+
+    REQUIRE(result.ok);
+    REQUIRE(result.stop == PFlashSelectionStop::BudgetReached);
+    REQUIRE(result.retained_tokens == 3200);
+    require_ordinals(result, {0, 1, 3, 4});
+}
+
+TEST_CASE(PFlashSelectionFixture, invalid_instruction_spans_fail_closed) {
+    constexpr int input_tokens = 32;
+    const std::vector<std::vector<dflash::common::PFlashTokenSpan>> invalid{
+        {{-1, 2}},
+        {{4, 4}},
+        {{4, 3}},
+        {{0, 4}, {3, 6}},
+        {{8, 12}, {0, 4}},
+        {{0, 33}},
+    };
+    for (const auto & spans : invalid) {
+        std::string error;
+        REQUIRE(!validate_pflash_instruction_spans(
+            spans, input_tokens, error));
+        REQUIRE(!error.empty());
+    }
+    std::vector<dflash::common::PFlashTokenSpan> too_many(65, {0, 1});
+    std::string error;
+    REQUIRE(!validate_pflash_instruction_spans(
+        too_many, input_tokens, error));
+    REQUIRE(!error.empty());
+}
+
 TEST_CASE(PFlashSelectionFixture, cumulative_top_p_is_scale_invariant_and_keeps_crossing_chunk) {
     const std::vector<PFlashSelectionCandidate> base{
         candidate(0, 0, 4, 6.0),

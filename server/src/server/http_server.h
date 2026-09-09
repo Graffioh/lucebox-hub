@@ -269,6 +269,24 @@ struct PflashQueryWindow {
     bool valid() const { return end >= tokens && tokens > 0; }
 };
 
+struct PflashInstructionMessagePlan {
+    std::vector<size_t> instruction_messages;
+};
+
+PflashInstructionMessagePlan plan_pflash_instruction_messages(
+    const std::vector<ChatMessage> & messages);
+
+// Return the conservative token interval in `original` changed by rendering
+// a request variant. Used to retain tool definitions independently of where
+// an arbitrary chat template places them.
+PFlashTokenSpan pflash_changed_token_span(
+    const std::vector<int32_t> & original,
+    const std::vector<int32_t> & variant) noexcept;
+
+// Sort and merge overlapping/adjacent mapped spans before selector validation.
+std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
+    std::vector<PFlashTokenSpan> spans);
+
 // Find the last sufficiently-specific suffix of the user query inside the
 // rendered drafter-tokenized prompt. Public for model-free regression tests.
 PflashQueryWindow find_pflash_query_window(

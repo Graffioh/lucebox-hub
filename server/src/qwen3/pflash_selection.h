@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/pflash_types.h"
+
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -52,7 +54,14 @@ bool pflash_chunk_is_structurally_required(
     int end,
     int query_begin,
     int query_end,
-    int input_tokens) noexcept;
+    int input_tokens,
+    const std::vector<dflash::common::PFlashTokenSpan> &
+        required_instruction_spans = {}) noexcept;
+
+bool validate_pflash_instruction_spans(
+    const std::vector<dflash::common::PFlashTokenSpan> & spans,
+    int input_tokens,
+    std::string & error) noexcept;
 
 PFlashSelectionResult select_pflash_candidates(
     const std::vector<PFlashSelectionCandidate> & candidates,

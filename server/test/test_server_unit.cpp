@@ -265,6 +265,155 @@ TEST_CASE(ServerUnitFixture, test_pflash_maps_content_start_from_leading_sentine
         rendered, rendered) < 0);
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_instruction_plan_covers_tools_and_late_developer_roles) {
+    const std::vector<ChatMessage> messages{
+        {"system", "system instruction", ""},
+        {"developer", "leading developer instruction", ""},
+        {"user", "document text", ""},
+        {"assistant", "prior answer", ""},
+        {"developer", "late developer instruction", ""},
+        {"tool", "tool result is history", "call-1"},
+        {"user", "latest query", ""},
+    };
+    const auto plan = http_detail::plan_pflash_instruction_messages(messages);
+
+    TEST_ASSERT(plan.instruction_messages ==
+                std::vector<size_t>({0, 1, 4}));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_instruction_plan_handles_empty_instructions) {
+    const std::vector<ChatMessage> tool_only{
+        {"user", "use the tool", ""},
+    };
+    const auto tool_plan =
+        http_detail::plan_pflash_instruction_messages(tool_only);
+    TEST_ASSERT(tool_plan.instruction_messages.empty());
+
+    const std::vector<ChatMessage> empty_instruction{
+        {"system", "", ""},
+        {"user", "plain query", ""},
+    };
+    const auto empty_plan =
+        http_detail::plan_pflash_instruction_messages(empty_instruction);
+    TEST_ASSERT(empty_plan.instruction_messages.empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_tool_span_follows_arbitrary_jinja_placement) {
+    static const char TPL[] =
+        "{%- for m in messages -%}{{ m.content }}{%- endfor -%}"
+        "{%- if tools -%}|TOOLS:{{ tools[0].function.name }}{%- endif -%}";
+    const std::vector<ChatMessage> messages{{"user", "query-first", ""}};
+    const std::string tools =
+        R"([{"type":"function","function":{"name":"late_lookup"}}])";
+    const std::string with_tools = render_chat_template_jinja(
+        TPL, messages, "", "", true, false, tools);
+    const std::string without_tools = render_chat_template_jinja(
+        TPL, messages, "", "", true, false, "[]");
+    const std::vector<int32_t> original(with_tools.begin(), with_tools.end());
+    const std::vector<int32_t> variant(without_tools.begin(), without_tools.end());
+
+    const PFlashTokenSpan span =
+        http_detail::pflash_changed_token_span(original, variant);
+    TEST_ASSERT(span.begin >= (int) messages[0].content.size());
+    TEST_ASSERT(span.end == (int) original.size());
+    TEST_ASSERT(with_tools.substr(
+        (size_t) span.begin, (size_t) (span.end - span.begin)).find(
+            "late_lookup") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_instruction_span_follows_reordered_jinja_message) {
+    static const char TPL[] =
+        "{%- for m in messages -%}{%- if m.role == 'user' -%}"
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>"
+        "{%- endif -%}{%- endfor -%}"
+        "{%- for m in messages -%}{%- if m.role == 'system' -%}"
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>"
+        "{%- endif -%}{%- endfor -%}";
+    const std::vector<ChatMessage> messages{
+        {"system", "retain this rule", ""},
+        {"user", "question first", ""},
+    };
+    const std::string rendered = render_chat_template_jinja(
+        TPL, messages, "", "", true, false);
+    auto without_system = messages;
+    without_system.erase(without_system.begin());
+    const std::string variant_rendered = render_chat_template_jinja(
+        TPL, without_system, "", "", true, false);
+    const std::vector<int32_t> original(rendered.begin(), rendered.end());
+    const std::vector<int32_t> variant(
+        variant_rendered.begin(), variant_rendered.end());
+
+    const PFlashTokenSpan span =
+        http_detail::pflash_changed_token_span(original, variant);
+    TEST_ASSERT(span.begin > (int) messages[1].content.size());
+    const std::string retained = rendered.substr(
+        (size_t) span.begin, (size_t) (span.end - span.begin));
+    TEST_ASSERT(retained.find("<system>") != std::string::npos);
+    TEST_ASSERT(retained.find(messages[0].content) != std::string::npos);
+    TEST_ASSERT(retained.find("</system>") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_instruction_spans_are_canonicalized) {
+    const auto spans = http_detail::canonicalize_pflash_token_spans(
+        {{12, 20}, {0, 4}, {3, 8}, {20, 24}});
+    TEST_ASSERT(spans == std::vector<PFlashTokenSpan>({{0, 8}, {12, 24}}));
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_qwen_tool_prefix_boundary_covers_schema) {
+    const std::vector<ChatMessage> messages{{"user", "find weather", ""}};
+    const std::string tools =
+        R"([{"type":"function","function":{"name":"lookup_weather"}}])";
+    const std::string sentinel = "__PFLASH_BEGIN_02C47F91__";
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, true, false, tools);
+    auto marked_messages = messages;
+    marked_messages[0].content = sentinel + marked_messages[0].content;
+    const std::string marked = render_chat_template(
+        marked_messages, ChatFormat::QWEN3, true, false, tools);
+    const std::vector<int32_t> rendered_ids(rendered.begin(), rendered.end());
+    const std::vector<int32_t> marked_ids(marked.begin(), marked.end());
+
+    const int prefix_end = http_detail::pflash_query_search_begin_from_sentinel(
+        rendered_ids, marked_ids);
+    TEST_ASSERT(prefix_end > 0);
+    TEST_ASSERT(rendered.substr(0, (size_t) prefix_end).find("lookup_weather") !=
+                std::string::npos);
+    TEST_ASSERT(rendered.substr(0, (size_t) prefix_end).find("find weather") ==
+                std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_qwen_late_developer_span_covers_role_envelope) {
+    const std::vector<ChatMessage> messages{
+        {"user", std::string(930, 'u'), ""},
+        {"assistant", "history", ""},
+        {"developer", std::string(180, 'd'), ""},
+        {"user", "latest query", ""},
+    };
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, true, false);
+    auto without_developer = messages;
+    without_developer.erase(without_developer.begin() + 2);
+    const std::string without_developer_rendered = render_chat_template(
+        without_developer, ChatFormat::QWEN3, true, false);
+    const std::vector<int32_t> ids(rendered.begin(), rendered.end());
+    const std::vector<int32_t> variant(
+        without_developer_rendered.begin(), without_developer_rendered.end());
+
+    const PFlashTokenSpan span =
+        http_detail::pflash_changed_token_span(ids, variant);
+    const size_t content_begin = rendered.find(messages[2].content);
+    TEST_ASSERT(content_begin != std::string::npos);
+    TEST_ASSERT(span.begin >= 0);
+    TEST_ASSERT((size_t) span.begin < content_begin);
+    TEST_ASSERT((size_t) span.end > content_begin + messages[2].content.size());
+    TEST_ASSERT(span.begin < 1024);
+    TEST_ASSERT(span.end > 1024);
+    TEST_ASSERT(rendered.substr(
+        (size_t) span.begin,
+        (size_t) (span.end - span.begin)).find("developer") !=
+        std::string::npos);
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_responses_string_tails_only_raw_content) {
     ToolMemory tool_memory;
     const auto normalized = normalize_chat_messages(
