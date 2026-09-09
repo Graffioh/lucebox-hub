@@ -18,12 +18,14 @@
 #include "pflash_selection.h"
 #include "qwen3/anchor_params.h"
 #include "common/backend_precision.h"
+#include "common/gguf_inspect.h"
 #include "internal.h"
 #include "anchor_scan.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <chrono>
@@ -31,6 +33,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -47,17 +50,172 @@ static void build_causal_mask_f16(std::vector<uint16_t> & out, int kv_len, int n
     const int kv_pad = align_up_i(kv_len, 32);
     const int q_pad = align_up_i(n_tokens, 32);
     out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
+    static_assert(F16_ZERO == 0, "visible mask entries are zero-filled with memset");
     for (int q = 0; q < n_tokens; ++q) {
-        const int abs_q = kv_start + q;
-        for (int k = 0; k <= abs_q && k < kv_len; ++k) {
-            out[(size_t)q * kv_pad + k] = F16_ZERO;
+        const int visible = std::min(kv_len, kv_start + q + 1);
+        if (visible > 0) {
+            std::memset(out.data() + (size_t)q * kv_pad, 0, (size_t)visible * sizeof(uint16_t));
         }
     }
 }
 
+// Qwen3.5-0.8B LongAttnComp scorer. Features are the residual entering
+// full-attention block 15 after the first 15 blocks (twelve GatedDeltaNet and
+// three full-attention blocks). Block 15's own Q/K projections score the
+// context without RoPE, exactly like the Qwen3-0.6B block-13 head; an
+// optional trained head replaces those two projections.
+static constexpr int kQwen35HeadBlock = 15;
+static constexpr const char * kQwen35HeadSchema = "qwen3_5_0_8b_nope_qk_mass_v1";
+static constexpr const char * kQwen35HeadBaseModel = "Qwen/Qwen3.5-0.8B";
+static constexpr const char * kQwen35HeadFeatureTap =
+    "post_block14_residual_before_block15";
+
+// create_target_cache honours DFLASH27B_KV_TQ3; the drafter cache never wants
+// the TurboQuant rotation, so force it off while the cache is created.
+struct ScopedKvTq3Off {
+    ScopedKvTq3Off() {
+#if defined(_WIN32)
+        char * raw = nullptr;
+        size_t len = 0;
+        _dupenv_s(&raw, &len, "DFLASH27B_KV_TQ3");
+        had_ = raw != nullptr;
+        old_ = had_ ? raw : "";
+        free(raw);
+        _putenv_s("DFLASH27B_KV_TQ3", "0");
+#else
+        const char * raw = std::getenv("DFLASH27B_KV_TQ3");
+        had_ = raw != nullptr;
+        old_ = had_ ? raw : "";
+        setenv("DFLASH27B_KV_TQ3", "0", 1);
+#endif
+    }
+    ~ScopedKvTq3Off() {
+#if defined(_WIN32)
+        // _putenv_s with empty value removes the variable on MSVCRT.
+        _putenv_s("DFLASH27B_KV_TQ3", had_ ? old_.c_str() : "");
+#else
+        if (had_) setenv("DFLASH27B_KV_TQ3", old_.c_str(), 1);
+        else unsetenv("DFLASH27B_KV_TQ3");
+#endif
+    }
+    bool had_ = false;
+    std::string old_;
+};
+
 struct Qwen35DrafterState {
     TargetWeights weights;
+    std::string gguf_sha256;
+    ggml_context *        head_ctx = nullptr;
+    ggml_backend_buffer_t head_buf = nullptr;
+    ggml_tensor *         head_wq  = nullptr;  // [hidden, n_head * head_dim], query rows only
+    ggml_tensor *         head_wk  = nullptr;  // [hidden, n_head_kv * head_dim]
+    bool                  head_loaded = false;
 };
+
+static void free_qwen35_head(Qwen35DrafterState & st) {
+    if (st.head_buf) { ggml_backend_buffer_free(st.head_buf); st.head_buf = nullptr; }
+    if (st.head_ctx) { ggml_free(st.head_ctx); st.head_ctx = nullptr; }
+    st.head_wq = st.head_wk = nullptr;
+    st.head_loaded = false;
+}
+
+static bool qwen35_metadata_equals(gguf_context * g, const char * key,
+                                   const std::string & expected) {
+    const int id = gguf_find_key(g, key);
+    return id >= 0 && gguf_get_kv_type(g, id) == GGUF_TYPE_STRING &&
+           expected == gguf_get_val_str(g, id);
+}
+
+static bool qwen35_head_block_available(const TargetWeights & w, std::string & error) {
+    if (w.n_layer <= kQwen35HeadBlock || (size_t)kQwen35HeadBlock >= w.layers.size()) {
+        error = "qwen35 LongAttnComp scorer needs at least 16 blocks";
+        return false;
+    }
+    const TargetLayer & L = w.layers[(size_t)kQwen35HeadBlock];
+    if (((kQwen35HeadBlock + 1) % w.full_attention_interval) != 0 ||
+        !L.wq || !L.wk || !L.attn_norm || !L.q_norm || !L.k_norm) {
+        error = "qwen35 LongAttnComp scorer block 15 is not a full-attention block";
+        return false;
+    }
+    return true;
+}
+
+// Optional trained head for the block-15 tap. Fails closed on any contract
+// mismatch, mirroring the Qwen3-0.6B head loader.
+static bool load_qwen35_longattncomp_head(const std::string & path,
+                                          Qwen35DrafterState & st) {
+    const TargetWeights & w = st.weights;
+    std::string block_error;
+    if (!qwen35_head_block_available(w, block_error)) {
+        set_last_error(block_error);
+        return false;
+    }
+    if (st.gguf_sha256.empty()) {
+        set_last_error("LongAttnComp head requires the drafter GGUF identity hash");
+        return false;
+    }
+    ggml_context * data_ctx = nullptr;
+    gguf_init_params params{ /*no_alloc=*/ false, /*ctx=*/ &data_ctx };
+    gguf_context * g = gguf_init_from_file(path.c_str(), params);
+    if (!g) {
+        set_last_error("LongAttnComp head GGUF could not be opened: " + path);
+        return false;
+    }
+    auto fail = [&](const std::string & message) {
+        free_qwen35_head(st);
+        gguf_free(g);
+        if (data_ctx) ggml_free(data_ctx);
+        set_last_error(message);
+        return false;
+    };
+    if (!qwen35_metadata_equals(g, "general.architecture", "longattncomp") ||
+        !qwen35_metadata_equals(g, "longattncomp.schema", kQwen35HeadSchema) ||
+        !qwen35_metadata_equals(g, "longattncomp.base_model", kQwen35HeadBaseModel) ||
+        !qwen35_metadata_equals(g, "longattncomp.runtime_gguf_sha256", st.gguf_sha256) ||
+        !qwen35_metadata_equals(g, "longattncomp.feature_tap", kQwen35HeadFeatureTap)) {
+        return fail("LongAttnComp head metadata does not match the loaded Qwen3.5-0.8B drafter");
+    }
+    struct Contract {
+        const char * name;
+        int64_t ne0;
+        int64_t ne1;
+        ggml_tensor ** destination;
+    };
+    const Contract contracts[] = {
+        {"longattncomp.attn_q.weight", (int64_t)w.n_embd,
+         (int64_t)w.n_head * w.n_embd_head_k, &st.head_wq},
+        {"longattncomp.attn_k.weight", (int64_t)w.n_embd,
+         (int64_t)w.n_head_kv * w.n_embd_head_k, &st.head_wk},
+    };
+    ggml_init_params head_params{};
+    head_params.mem_size = 4 * ggml_tensor_overhead();
+    head_params.no_alloc = true;
+    st.head_ctx = ggml_init(head_params);
+    if (!st.head_ctx) return fail("LongAttnComp head context allocation failed");
+    for (const auto & contract : contracts) {
+        ggml_tensor * source = data_ctx ? ggml_get_tensor(data_ctx, contract.name) : nullptr;
+        if (!source || source->type != GGML_TYPE_F32 || ggml_n_dims(source) != 2 ||
+            source->ne[0] != contract.ne0 || source->ne[1] != contract.ne1) {
+            return fail(std::string("LongAttnComp head tensor contract mismatch: ") +
+                        contract.name);
+        }
+        *contract.destination =
+            ggml_new_tensor_2d(st.head_ctx, GGML_TYPE_F32, contract.ne0, contract.ne1);
+        ggml_set_name(*contract.destination, contract.name);
+    }
+    st.head_buf = ggml_backend_alloc_ctx_tensors(st.head_ctx, w.backend);
+    if (!st.head_buf) return fail("LongAttnComp head buffer allocation failed");
+    for (const auto & contract : contracts) {
+        ggml_tensor * source = ggml_get_tensor(data_ctx, contract.name);
+        ggml_backend_tensor_set(*contract.destination, source->data, 0, ggml_nbytes(source));
+    }
+    gguf_free(g);
+    ggml_free(data_ctx);
+    st.head_loaded = true;
+    std::fprintf(stderr, "[qwen35-drafter] loaded LongAttnComp head: %s\n", path.c_str());
+    std::fflush(stderr);
+    return true;
+}
 
 static int env_int(const char * name, int fallback) {
     if (const char * v = std::getenv(name)) {
@@ -441,9 +599,29 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
 
     if (arch == DrafterArch::Qwen35_0p8b) {
         auto * st = new Qwen35DrafterState();
-        if (!load_target_gguf(gguf_path, out.backend, st->weights)) {
+        // The scorer never needs logits, and tied-embedding Qwen3.5-0.8B
+        // exports omit output.weight, so skip the lm_head entirely.
+        TargetLoadPlan plan;
+        plan.load_output = false;
+        if (!load_target_gguf_partial(gguf_path, out.backend, plan, st->weights)) {
             delete st;
             return false;
+        }
+        if (const char * head_path = std::getenv("PFLASH_LONGATTNCOMP_HEAD_GGUF")) {
+            const auto identity = read_gguf_metadata(gguf_path, /*compute_sha256=*/ true);
+            st->gguf_sha256 = identity.ok ? identity.sha256 : std::string();
+            if (!*head_path || !load_qwen35_longattncomp_head(head_path, *st)) {
+                if (!*head_path) {
+                    set_last_error("PFLASH_LONGATTNCOMP_HEAD_GGUF is empty");
+                }
+                std::fprintf(stderr,
+                    "[qwen35-drafter] ERROR: LongAttnComp head load failed, "
+                    "refusing to serve without it\n");
+                std::fflush(stderr);
+                free_target_weights(st->weights);
+                delete st;
+                return false;
+            }
         }
         out.arch_state = st;
         out.loaded = true;
@@ -499,6 +677,7 @@ void free_drafter(DrafterContext & ctx) {
 void free_drafter_weights(DrafterContext & ctx) {
     if (ctx.arch == DrafterArch::Qwen35_0p8b && ctx.arch_state) {
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
+        free_qwen35_head(*st);
         free_target_weights(st->weights);
         delete st;
         ctx.arch_state = nullptr;
@@ -536,33 +715,12 @@ static std::vector<int32_t> qwen35_score_and_compress(
     std::vector<float> running_max((size_t)n_lookahead * S, -INFINITY);
 
     TargetCache cache;
-#if defined(_WIN32)
-    char *  old_tq3_raw = nullptr;
-    size_t  old_tq3_len = 0;
-    _dupenv_s(&old_tq3_raw, &old_tq3_len, "DFLASH27B_KV_TQ3");
-    const bool had_old_tq3 = (old_tq3_raw != nullptr);
-    std::string old_tq3_s  = had_old_tq3 ? old_tq3_raw : "";
-    free(old_tq3_raw);
-    _putenv_s("DFLASH27B_KV_TQ3", "0");
-    auto restore_tq3 = [&]() {
-        // _putenv_s with empty value removes the variable on MSVCRT.
-        _putenv_s("DFLASH27B_KV_TQ3", had_old_tq3 ? old_tq3_s.c_str() : "");
-    };
-#else
-    const char * old_tq3 = std::getenv("DFLASH27B_KV_TQ3");
-    std::string old_tq3_s = old_tq3 ? old_tq3 : "";
-    const bool had_old_tq3 = (old_tq3 != nullptr);
-    setenv("DFLASH27B_KV_TQ3", "0", 1);
-    auto restore_tq3 = [&]() {
-        if (had_old_tq3) setenv("DFLASH27B_KV_TQ3", old_tq3_s.c_str(), 1);
-        else unsetenv("DFLASH27B_KV_TQ3");
-    };
-#endif
-    if (!create_target_cache(w, S, 0, w.backend, cache, true)) {
-        restore_tq3();
-        return {};
+    {
+        ScopedKvTq3Off tq3_off;
+        if (!create_target_cache(w, S, 0, w.backend, cache, true)) {
+            return {};
+        }
     }
-    restore_tq3();
 
     ggml_init_params act_ip{};
     act_ip.mem_size = (size_t)8 * ggml_tensor_overhead() + 4096;
@@ -953,6 +1111,293 @@ static std::vector<int32_t> qwen35_score_and_compress(
     return out_ids;
 }
 
+// LongAttnComp scoring for the Qwen3.5-0.8B drafter: run blocks 0..14, then
+// score every context token against the query window with block 15's NoPE
+// Q/K (or a trained replacement) and select chunks by attention mass. This
+// is the runtime counterpart of the Python retention screen (trial 0075).
+static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
+    Qwen35DrafterState & st,
+    const std::vector<int32_t> & ids,
+    float keep_ratio,
+    int n_lookahead,
+    int score_query_end,
+    const dflash::qwen3::PFlashLongAttnCompConfig & experiment,
+    const std::vector<PFlashTokenSpan> & required_instruction_spans) {
+
+    TargetWeights & w = st.weights;
+    const int S = (int)ids.size();
+    const int hidden = w.n_embd;
+    const int H = w.n_head;
+    const int Hk = w.n_head_kv;
+    const int D = w.n_embd_head_k;
+    std::string block_error;
+    if (!qwen35_head_block_available(w, block_error)) {
+        set_last_error(block_error);
+        return {};
+    }
+    if (n_lookahead < 1 || S < n_lookahead + 1) {
+        set_last_error("qwen35 LongAttnComp scorer input is too short");
+        return {};
+    }
+    const int query_end = score_query_end < 0 ? S : score_query_end;
+    if (query_end < n_lookahead || query_end > S) {
+        set_last_error("qwen35 LongAttnComp scorer query window out of range");
+        return {};
+    }
+    const int query_start = query_end - n_lookahead;
+    const TargetLayer & L = w.layers[(size_t)kQwen35HeadBlock];
+
+    auto t0 = std::chrono::steady_clock::now();
+    TargetCache cache;
+    {
+        ScopedKvTq3Off tq3_off;
+        if (!create_target_cache(w, S, 0, w.backend, cache, true)) {
+            return {};
+        }
+    }
+
+    ggml_init_params act_ip{};
+    act_ip.mem_size = (size_t)8 * ggml_tensor_overhead() + 4096;
+    act_ip.no_alloc = true;
+    ggml_context * act_ctx = ggml_init(act_ip);
+    if (!act_ctx) {
+        free_target_cache(cache);
+        set_last_error("qwen35 drafter activation ctx init failed");
+        return {};
+    }
+    ggml_tensor * act_in = ggml_new_tensor_2d(act_ctx, GGML_TYPE_F32, hidden, S);
+    ggml_tensor * act_out = ggml_new_tensor_2d(act_ctx, GGML_TYPE_F32, hidden, S);
+    ggml_backend_buffer_t act_buf = ggml_backend_alloc_ctx_tensors(act_ctx, w.backend);
+    if (!act_buf) {
+        ggml_free(act_ctx);
+        free_target_cache(cache);
+        set_last_error("qwen35 drafter activation allocation failed");
+        return {};
+    }
+    auto cleanup = [&]() {
+        ggml_backend_buffer_free(act_buf);
+        ggml_free(act_ctx);
+        free_target_cache(cache);
+    };
+
+    {
+        const int batch = 2048;
+        std::vector<float> emb((size_t)hidden * batch);
+        for (int i = 0; i < S; i += batch) {
+            const int n = std::min(batch, S - i);
+            if (!w.embedder.embed(ids.data() + i, n, emb.data())) {
+                cleanup();
+                set_last_error("qwen35 drafter embedding failed");
+                return {};
+            }
+            ggml_backend_tensor_set(act_in, emb.data(), (size_t)i * act_in->nb[1],
+                                    (size_t)hidden * n * sizeof(float));
+        }
+    }
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
+    const int ubatch = 1024;
+    std::vector<uint16_t> mask_bits;
+    for (int il = 0; il < kQwen35HeadBlock; ++il) {
+        const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
+        for (int start = 0; start < S; start += ubatch) {
+            const int n = std::min(ubatch, S - start);
+            const int kv_len = start + n;
+            ggml_init_params ip{};
+            ip.mem_size = 512 * 1024 * 1024;
+            ip.no_alloc = true;
+            ggml_context * ctx = ggml_init(ip);
+            if (!ctx) {
+                ggml_gallocr_free(alloc); cleanup();
+                set_last_error("qwen35 drafter layer graph ctx init failed");
+                return {};
+            }
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
+            ggml_tensor * inp = ggml_view_2d(ctx, act_in, hidden, n, act_in->nb[1],
+                                             (size_t)start * act_in->nb[1]);
+            ggml_tensor * pos = nullptr;
+            ggml_tensor * mask = nullptr;
+            if (is_attn) {
+                pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4 * n);
+                ggml_set_input(pos);
+                mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
+                                          align_up_i(kv_len, 32), align_up_i(n, 32));
+                ggml_set_input(mask);
+            }
+            ggml_tensor * out = build_qwen35_layer(ctx, gf, w, cache, il, inp, pos, mask,
+                                                   start, n, false, 0);
+            ggml_tensor * dst = ggml_view_2d(ctx, act_out, hidden, n, act_out->nb[1],
+                                             (size_t)start * act_out->nb[1]);
+            if (ggml_nelements(out) != ggml_nelements(dst)) {
+                ggml_free(ctx); ggml_gallocr_free(alloc); cleanup();
+                set_last_error("qwen35 layer output shape mismatch");
+                return {};
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, out, dst));
+            if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+                ggml_free(ctx); ggml_gallocr_free(alloc); cleanup();
+                set_last_error("qwen35 drafter graph allocation failed");
+                return {};
+            }
+            if (is_attn) {
+                std::vector<int32_t> p4((size_t)4 * n, 0);
+                for (int i = 0; i < n; ++i) {
+                    const int p = start + i;
+                    p4[(size_t)0 * n + i] = p;
+                    p4[(size_t)1 * n + i] = p;
+                    p4[(size_t)2 * n + i] = p;
+                }
+                ggml_backend_tensor_set(pos, p4.data(), 0, p4.size() * sizeof(int32_t));
+                build_causal_mask_f16(mask_bits, kv_len, n, start);
+                ggml_backend_tensor_set(mask, mask_bits.data(), 0,
+                                        mask_bits.size() * sizeof(uint16_t));
+            }
+            const auto status = ggml_backend_graph_compute(w.backend, gf);
+            ggml_free(ctx);
+            if (status != GGML_STATUS_SUCCESS) {
+                ggml_gallocr_free(alloc); cleanup();
+                set_last_error("qwen35 drafter graph compute failed");
+                return {};
+            }
+        }
+        std::swap(act_in, act_out);
+    }
+    ggml_gallocr_free(alloc);
+    auto t1 = std::chrono::steady_clock::now();
+
+    // Block-15 NoPE Q/K scoring: softmax over keys before the query window,
+    // then mean over heads and query tokens. The query never scores itself.
+    // Keys are projected in chunks so no intermediate tensor puts the
+    // sequence length into a HIP grid y/z dimension (65,535 limit); the
+    // logits land in one [S, n_lookahead, H] buffer for a single softmax.
+    const int key_chunk = 8192;
+    const int n_key_chunks = (S + key_chunk - 1) / key_chunk;
+    ggml_init_params lip{};
+    lip.mem_size = (size_t)8 * ggml_tensor_overhead() + 4096;
+    lip.no_alloc = true;
+    ggml_context * lctx = ggml_init(lip);
+    if (!lctx) {
+        cleanup();
+        set_last_error("qwen35 score buffer ctx allocation failed");
+        return {};
+    }
+    ggml_tensor * logits = ggml_new_tensor_3d(lctx, GGML_TYPE_F32, S, n_lookahead, H);
+    ggml_tensor * mask = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, S, n_lookahead);
+    ggml_backend_buffer_t lbuf = ggml_backend_alloc_ctx_tensors(lctx, w.backend);
+    if (!lbuf) {
+        ggml_free(lctx); cleanup();
+        set_last_error("qwen35 score buffer allocation failed");
+        return {};
+    }
+    {
+        std::vector<float> m((size_t)n_lookahead * S, -INFINITY);
+        for (int t = 0; t < n_lookahead; ++t) {
+            std::fill_n(m.begin() + (size_t)t * S, (size_t)query_start, 0.0f);
+        }
+        ggml_backend_tensor_set(mask, m.data(), 0, m.size() * sizeof(float));
+    }
+    ggml_init_params sip{};
+    sip.mem_size = ggml_tensor_overhead() * (size_t)(64 + 24 * n_key_chunks) +
+                   ggml_graph_overhead_custom(4096, false) + 64 * 1024;
+    sip.no_alloc = true;
+    ggml_context * sctx = ggml_init(sip);
+    if (!sctx) {
+        ggml_backend_buffer_free(lbuf); ggml_free(lctx); cleanup();
+        set_last_error("qwen35 score graph ctx allocation failed");
+        return {};
+    }
+    ggml_cgraph * sgf = ggml_new_graph_custom(sctx, 4096, false);
+    ggml_tensor * wk_src = st.head_loaded ? st.head_wk : L.wk;
+    ggml_tensor * x_q = ggml_view_2d(sctx, act_in, hidden, n_lookahead, act_in->nb[1],
+                                     (size_t)query_start * act_in->nb[1]);
+    ggml_tensor * q_in = ggml_mul(sctx, ggml_rms_norm(sctx, x_q, w.rms_eps), L.attn_norm);
+    ggml_tensor * Q = nullptr;
+    if (st.head_loaded) {
+        Q = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, st.head_wq, q_in), D, H, n_lookahead);
+    } else {
+        // Native block 15 packs query and gate rows per head; keep the query half.
+        ggml_tensor * QG = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, L.wq, q_in),
+                                           D * 2, H, n_lookahead);
+        Q = ggml_view_3d(sctx, QG, D, H, n_lookahead,
+                         ggml_element_size(QG) * D * 2,
+                         ggml_element_size(QG) * D * 2 * H, 0);
+    }
+    Q = ggml_mul(sctx, ggml_rms_norm(sctx, Q, w.rms_eps), L.q_norm);
+    ggml_tensor * Q_perm = ggml_cont(sctx, ggml_permute(sctx, Q, 0, 2, 1, 3));  // [D, n_lookahead, H]
+    for (int b = 0; b < S; b += key_chunk) {
+        const int n = std::min(key_chunk, S - b);
+        ggml_tensor * x_c = ggml_view_2d(sctx, act_in, hidden, n, act_in->nb[1],
+                                         (size_t)b * act_in->nb[1]);
+        ggml_tensor * x_norm = ggml_mul(sctx, ggml_rms_norm(sctx, x_c, w.rms_eps), L.attn_norm);
+        ggml_tensor * K = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, wk_src, x_norm), D, Hk, n);
+        K = ggml_mul(sctx, ggml_rms_norm(sctx, K, w.rms_eps), L.k_norm);
+        K = ggml_cont(sctx, ggml_permute(sctx, K, 0, 2, 1, 3));  // [D, n, Hk]
+        ggml_tensor * K_score = K;
+        if (H != Hk) {
+            const int gqa = H / Hk;
+            ggml_tensor * K_4d = ggml_reshape_4d(sctx, K, D, n, 1, Hk);
+            ggml_tensor * K_tpl = ggml_new_tensor_4d(sctx, GGML_TYPE_F32, D, n, gqa, Hk);
+            K_score = ggml_reshape_3d(sctx, ggml_repeat(sctx, K_4d, K_tpl), D, n, H);
+        }
+        ggml_tensor * part = ggml_mul_mat(sctx, K_score, Q_perm);  // [n, n_lookahead, H]
+        ggml_tensor * dst = ggml_view_3d(sctx, logits, n, n_lookahead, H,
+                                         logits->nb[1], logits->nb[2],
+                                         (size_t)b * logits->nb[0]);
+        ggml_build_forward_expand(sgf, ggml_cpy(sctx, part, dst));
+    }
+    ggml_tensor * probs = ggml_soft_max_ext(sctx, logits, mask,
+                                            1.0f / std::sqrt((float)D), 0.0f);
+    ggml_set_output(probs);
+    ggml_build_forward_expand(sgf, probs);
+    ggml_gallocr_t salloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
+    if (!ggml_gallocr_alloc_graph(salloc, sgf)) {
+        ggml_gallocr_free(salloc); ggml_free(sctx);
+        ggml_backend_buffer_free(lbuf); ggml_free(lctx); cleanup();
+        set_last_error("qwen35 score graph allocation failed");
+        return {};
+    }
+    const auto score_status = ggml_backend_graph_compute(w.backend, sgf);
+    if (score_status != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(salloc); ggml_free(sctx);
+        ggml_backend_buffer_free(lbuf); ggml_free(lctx); cleanup();
+        set_last_error("qwen35 score graph compute failed");
+        return {};
+    }
+    std::vector<float> probs_h((size_t)S * n_lookahead * H);
+    ggml_backend_tensor_get(probs, probs_h.data(), 0, probs_h.size() * sizeof(float));
+    ggml_gallocr_free(salloc);
+    ggml_free(sctx);
+    ggml_backend_buffer_free(lbuf);
+    ggml_free(lctx);
+    cleanup();
+    const size_t nonfinite = count_nonfinite_scores(probs_h.data(), probs_h.size());
+    if (nonfinite != 0) {
+        const std::string message =
+            "non-finite Qwen3.5 LongAttnComp scores: " + std::to_string(nonfinite) +
+            "/" + std::to_string(probs_h.size());
+        std::fprintf(stderr, "[pflash] ERROR: %s\n", message.c_str());
+        std::fflush(stderr);
+        set_last_error(message);
+        return {};
+    }
+    std::vector<float> token_mass;
+    longattncomp_mean_token_mass(probs_h.data(), S, n_lookahead, H, token_mass);
+    auto t2 = std::chrono::steady_clock::now();
+    std::fprintf(stderr,
+        "[qwen35-longattncomp] forward %.2fs (blocks 0-%d, S=%d) score %.2fs "
+        "total %.2fs head=%s\n",
+        std::chrono::duration<double>(t1 - t0).count(), kQwen35HeadBlock - 1, S,
+        std::chrono::duration<double>(t2 - t1).count(),
+        std::chrono::duration<double>(t2 - t0).count(),
+        st.head_loaded ? "trained" : "native-block15");
+    std::fflush(stderr);
+
+    return select_longattncomp_chunks(
+        ids, token_mass, keep_ratio, n_lookahead, score_query_end,
+        /*pool_kernel=*/1, experiment, required_instruction_spans,
+        /*direct_mass=*/true, /*write_trace=*/true);
+}
+
 std::vector<int32_t> drafter_score_and_compress(
     DrafterContext & ctx,
     const std::vector<int32_t> & ids,
@@ -1015,6 +1460,20 @@ std::vector<int32_t> drafter_score_and_compress(
             return {};
         }
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
+        // Strict LongAttnComp selection scores with the block-15 head; the
+        // legacy all-layer running-max scorer stays available for legacy
+        // selection or when PFLASH_QWEN35_LEGACY_SCORER=1 forces it.
+        const char * legacy_scorer = std::getenv("PFLASH_QWEN35_LEGACY_SCORER");
+        const bool force_legacy = legacy_scorer && std::string(legacy_scorer) == "1";
+        if (experiment.selection_active && !force_legacy) {
+            return qwen35_longattncomp_score_and_compress(
+                *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
+                required_instruction_spans);
+        }
+        if (st->head_loaded) {
+            set_last_error("Qwen3.5 LongAttnComp head requires strict selection");
+            return {};
+        }
         return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
                                          n_lookahead, pool_kernel, score_query_end,
                                          experiment,

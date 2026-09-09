@@ -1,6 +1,7 @@
 #include "CppUnitTestFramework.hpp"
 
 #include "qwen3/pflash_selection.h"
+#include "qwen3/qwen3_drafter_model.h"
 #include "scoped_env.h"
 
 #include <cmath>
@@ -470,4 +471,26 @@ TEST_CASE(PFlashSelectionFixture, mode_and_stop_names_are_stable) {
         "mandatory_query_exceeds_budget");
     REQUIRE(std::string(pflash_query_parser_name(PFlashQueryParser::SemanticUser)) == "latest_user");
     REQUIRE(std::string(pflash_query_parser_name(PFlashQueryParser::ArbitraryTail)) == "arbitrary_tail");
+}
+
+TEST_CASE(PFlashSelectionFixture, longattncomp_token_mass_averages_heads_and_queries) {
+    // ggml layout [n_keys=3, n_queries=2, n_heads=2]: key index fastest.
+    const std::vector<float> probs = {
+        0.2f, 0.3f, 0.5f,   // head 0, query 0
+        0.6f, 0.4f, 0.0f,   // head 0, query 1
+        0.0f, 0.0f, 1.0f,   // head 1, query 0
+        1.0f, 0.0f, 0.0f,   // head 1, query 1
+    };
+    std::vector<float> mass;
+    dflash::common::longattncomp_mean_token_mass(probs.data(), 3, 2, 2, mass);
+    REQUIRE(mass.size() == 3u);
+    CHECK(std::fabs(mass[0] - 0.45f) < 1e-6f);
+    CHECK(std::fabs(mass[1] - 0.175f) < 1e-6f);
+    CHECK(std::fabs(mass[2] - 0.375f) < 1e-6f);
+    double total = 0.0;
+    for (float value : mass) total += value;
+    CHECK(std::fabs(total - 1.0) < 1e-6);
+
+    dflash::common::longattncomp_mean_token_mass(probs.data(), 0, 2, 2, mass);
+    CHECK(mass.empty());
 }

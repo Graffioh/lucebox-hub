@@ -127,4 +127,25 @@ inline size_t count_nonfinite_scores(const float * values, size_t count) {
     return nonfinite;
 }
 
+// LongAttnComp token mass: mean over heads and query tokens of softmax
+// probabilities laid out as ggml [n_keys, n_queries, n_heads] (ne0 fastest).
+inline void longattncomp_mean_token_mass(
+        const float * probs,
+        int n_keys,
+        int n_queries,
+        int n_heads,
+        std::vector<float> & out) {
+    out.assign((size_t) n_keys, 0.0f);
+    if (n_keys <= 0 || n_queries <= 0 || n_heads <= 0) return;
+    std::vector<double> sum((size_t) n_keys, 0.0);
+    for (int h = 0; h < n_heads; ++h) {
+        for (int t = 0; t < n_queries; ++t) {
+            const float * row = probs + ((size_t) h * n_queries + t) * n_keys;
+            for (int j = 0; j < n_keys; ++j) sum[(size_t) j] += row[j];
+        }
+    }
+    const double denominator = (double) n_heads * (double) n_queries;
+    for (int j = 0; j < n_keys; ++j) out[(size_t) j] = (float) (sum[(size_t) j] / denominator);
+}
+
 } // namespace dflash::common
