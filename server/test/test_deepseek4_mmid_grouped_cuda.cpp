@@ -25,6 +25,42 @@
 #include <unistd.h>
 #endif
 
+template <typename Compute>
+static ggml_status run_benchmark_iterations(int requested, Compute compute, int & completed) {
+    completed = 0;
+    while (completed < requested) {
+        const ggml_status status = compute();
+        if (status != GGML_STATUS_SUCCESS) return status;
+        ++completed;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+// Exercise early failures without intentionally faulting a GPU context.
+static int test_benchmark_iterations() {
+    for (int fail_after : {-1, 0, 1, 2}) {
+        int calls = 0;
+        int completed = -1;
+        const ggml_status status = run_benchmark_iterations(3, [&] {
+            return calls++ == fail_after ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
+        }, completed);
+        const int expected_completed = fail_after < 0 ? 3 : fail_after;
+        const int expected_calls = fail_after < 0 ? 3 : fail_after + 1;
+        const ggml_status expected_status = fail_after < 0
+            ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+        if (status != expected_status || completed != expected_completed || calls != expected_calls) {
+            std::fprintf(stderr, "benchmark accounting failed: fail_after=%d calls=%d completed=%d\n",
+                         fail_after, calls, completed);
+            return 1;
+        }
+    }
+    int completed = -1;
+    const auto status = run_benchmark_iterations(0, [] { return GGML_STATUS_FAILED; }, completed);
+    if (status != GGML_STATUS_SUCCESS || completed != 0) return 1;
+    std::printf("[mmid-grouped-test] benchmark iteration accounting: PASS (5 cases)\n");
+    return 0;
+}
+
 static bool run_case(
         ggml_backend_t backend,
         ggml_type type,
@@ -158,18 +194,26 @@ static bool run_case(
     if (status == GGML_STATUS_SUCCESS && benchmark_iterations > 0) {
         ggml_backend_synchronize(backend);
         const auto start = std::chrono::steady_clock::now();
-        for (int i = 0; i < benchmark_iterations && status == GGML_STATUS_SUCCESS; ++i) {
-            status = ggml_backend_graph_compute(backend, graph);
-        }
+        int completed = 0;
+        status = run_benchmark_iterations(benchmark_iterations, [&] {
+            return ggml_backend_graph_compute(backend, graph);
+        }, completed);
         ggml_backend_synchronize(backend);
         const auto end = std::chrono::steady_clock::now();
-        const double average_us = std::chrono::duration<double, std::micro>(
-            end - start).count() / benchmark_iterations;
-        std::printf(
-            "[mmid-grouped-test] benchmark type=%s width=%d experts=%d top_k=%d "
-            "k=%d rows=%d iterations=%d average_us=%.3f\n",
-            ggml_type_name(type), width, n_experts, top_k, k_dim, n_rows,
-            benchmark_iterations, average_us);
+        if (status == GGML_STATUS_SUCCESS) {
+            const double average_us = std::chrono::duration<double, std::micro>(
+                end - start).count() / completed;
+            std::printf(
+                "[mmid-grouped-test] benchmark type=%s width=%d experts=%d top_k=%d "
+                "k=%d rows=%d iterations=%d average_us=%.3f\n",
+                ggml_type_name(type), width, n_experts, top_k, k_dim, n_rows,
+                completed, average_us);
+        } else {
+            // The failed dispatch is included in elapsed time; do not report
+            // an average for an incomplete benchmark as a valid speed result.
+            std::fprintf(stderr, "[mmid-grouped-test] benchmark aborted: completed=%d requested=%d status=%d\n",
+                         completed, benchmark_iterations, (int) status);
+        }
     }
     std::vector<float> result_h(ggml_nelements(result));
     if (status == GGML_STATUS_SUCCESS) {
@@ -436,8 +480,11 @@ static CombineRun run_combine_graph(
     ggml_backend_synchronize(backend);
 
     const auto start = std::chrono::steady_clock::now();
-    for (int i = 0; i < iterations && status == GGML_STATUS_SUCCESS; ++i) {
-        status = ggml_backend_graph_compute(backend, graph);
+    int completed = 0;
+    if (status == GGML_STATUS_SUCCESS) {
+        status = run_benchmark_iterations(iterations, [&] {
+            return ggml_backend_graph_compute(backend, graph);
+        }, completed);
     }
     ggml_backend_synchronize(backend);
     const auto end = std::chrono::steady_clock::now();
@@ -447,7 +494,7 @@ static CombineRun run_combine_graph(
         ggml_backend_tensor_get(
             result, run.output.data(), 0, run.output.size() * sizeof(float));
         run.average_us = std::chrono::duration<double, std::micro>(
-            end - start).count() / std::max(iterations, 1);
+            end - start).count() / std::max(completed, 1);
         run.ok = true;
     }
 
@@ -613,6 +660,9 @@ static std::string child_command(
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--test-benchmark-iterations") == 0) {
+        return test_benchmark_iterations();
+    }
     if (argc == 4 && std::strcmp(argv[1], "--child") == 0) {
         return run_child(argv[2], argv[3]);
     }
@@ -622,7 +672,7 @@ int main(int argc, char ** argv) {
         argc == 2 && std::strcmp(argv[1], "--mmid-only") == 0;
     if (argc != 1 && !combine_only && !mmid_only) {
         std::fprintf(stderr,
-                     "usage: %s [--combine-only|--mmid-only|--child legacy|grouped|masked-fused OUTPUT]\n",
+                     "usage: %s [--combine-only|--mmid-only|--test-benchmark-iterations|--child legacy|grouped|masked-fused OUTPUT]\n",
                      argv[0]);
         return 2;
     }

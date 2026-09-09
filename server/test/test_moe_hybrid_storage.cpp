@@ -27,10 +27,13 @@ TEST_CASE(MoeHybridStorageFixture, single_token_cached_graphs_keep_mixed_mmq_pol
     auto * gate = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 4, 8, 2);
     auto * up = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 4, 8, 2);
     auto * down = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 8, 4, 2);
+    MoeLayerDesc desc;
+    desc.ffn_gate_shexp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4, 8);
+    desc.ffn_up_shexp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4, 8);
+    desc.ffn_down_shexp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 8, 4);
     auto weights = std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>(
         ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()), ggml_backend_buffer_free);
     REQUIRE(weights != nullptr);
-    MoeLayerDesc desc;
     for (auto policy : {GGML_MIXED_MMQ_DEFAULT, GGML_MIXED_MMQ_ENABLED, GGML_MIXED_MMQ_DISABLED}) {
         ScopedFfnGraph hot, cold;
         REQUIRE(build_cached_hot_graph(hot, backend.get(), gate, up, down, nullptr,
@@ -39,14 +42,19 @@ TEST_CASE(MoeHybridStorageFixture, single_token_cached_graphs_keep_mixed_mmq_pol
             1, 1, 1, 1, 4, 8, 1, 0, policy));
         for (auto * graph : {hot.gf, cold.gf}) {
             int routed = 0;
+            int shared = 0;
             for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
                 auto * op = ggml_graph_node(graph, i);
                 if (op->op == GGML_OP_MUL_MAT_ID) {
                     CHECK(ggml_mul_mat_get_mixed_mmq(op) == policy);
                     ++routed;
+                } else if (op->op == GGML_OP_MUL_MAT) {
+                    CHECK(ggml_mul_mat_get_mixed_mmq(op) == GGML_MIXED_MMQ_DEFAULT);
+                    ++shared;
                 }
             }
             CHECK(routed == 3);
+            CHECK(shared == (graph == hot.gf ? 3 : 0));
         }
     }
 }

@@ -219,7 +219,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_MMQ_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MODEL_CARDS_DIR` - model_card.cpp
 - `DFLASH_MOE_COLD_BACKEND` - deepseek4_loader.cpp
-- `DFLASH_MOE_COMBINE_VEC4` - opt in to aligned four-lane GPU route reduction; scalar fallback remains available
+- `DFLASH_MOE_COMBINE_VEC4` - ggml-cuda/moe-fused.cu
 - `DFLASH_MOE_COMPACT_MATERIALIZED` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_DUPLICATE_HOT_ON_COLD` - moe_hybrid_storage.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_DAEMON_TOKEN_LOOP` - moe_expert_compute_ipc.cpp
@@ -237,7 +237,6 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_MOE_FIXED_SLOT_MAX` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FULL_COLD_PARALLEL` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_FUSED_COMBINE` - moe_hybrid_ffn_eval.cpp
-- `DFLASH_MOE_COMBINE_VEC4` - ggml-cuda/moe-fused.cu
 - `DFLASH_MOE_PREFILL_DEVICE_INPUT` - deepseek4_graph.cpp
 - `DFLASH_MOE_PREFILL_HOT_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_PREFILL_MASKED_COLD` - moe_hybrid_ffn_eval.cpp

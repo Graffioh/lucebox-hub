@@ -25,13 +25,13 @@ static ggml_tensor * mixed_mmq(ggml_tensor * op, ggml_mixed_mmq_policy policy) {
     return op;
 }
 
-// Single-token fallbacks build a complete local graph. Set the policy before
-// allocation/admission, including matmuls hidden inside helper subgraphs.
-static void set_graph_mixed_mmq_policy(ggml_cgraph * graph, ggml_mixed_mmq_policy policy) {
+// These single-token builders express routed projections as MUL_MAT_ID.
+// Set their policy before allocation/admission, leaving the shared expert's
+// ordinary matmuls on their existing dispatch policy.
+static void set_routed_graph_mixed_mmq_policy(ggml_cgraph * graph, ggml_mixed_mmq_policy policy) {
     for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
         ggml_tensor * op = ggml_graph_node(graph, i);
-        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID ||
-            op->op == GGML_OP_MUL_MAT_GROUPED_SRC) {
+        if (op->op == GGML_OP_MUL_MAT_ID) {
             ggml_mul_mat_set_mixed_mmq(op, policy);
         }
     }
@@ -529,7 +529,7 @@ static bool run_routed_subset(ggml_backend_t backend,
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
     ggml_set_output(routed);
     ggml_build_forward_expand(gf, routed);
-    set_graph_mixed_mmq_policy(gf, mixed_mmq_policy);
+    set_routed_graph_mixed_mmq_policy(gf, mixed_mmq_policy);
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!ggml_gallocr_alloc_graph(alloc, gf)) {
         if (err) *err = "ggml_gallocr_alloc_graph failed";
@@ -713,7 +713,7 @@ static bool run_hot_and_shared_ffn_gpu(
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 2048, false);
     ggml_set_output(combined);
     ggml_build_forward_expand(gf, combined);
-    set_graph_mixed_mmq_policy(gf, mixed_mmq_policy);
+    set_routed_graph_mixed_mmq_policy(gf, mixed_mmq_policy);
     ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!ggml_gallocr_alloc_graph(alloc, gf)) {
         if (err) *err = "fused hot+shared gallocr failed";
@@ -1443,7 +1443,7 @@ bool build_cached_hot_graph(
     out.gf = ggml_new_graph_custom(out.ctx, 2048, false);
     ggml_set_output(out.output);
     ggml_build_forward_expand(out.gf, out.output);
-    set_graph_mixed_mmq_policy(out.gf, options.mixed_mmq_policy);
+    set_routed_graph_mixed_mmq_policy(out.gf, options.mixed_mmq_policy);
     out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
         out.free();
@@ -1525,7 +1525,7 @@ bool build_cached_cold_graph(
     out.gf = ggml_new_graph_custom(out.ctx, 1024, false);
     ggml_set_output(out.output);
     ggml_build_forward_expand(out.gf, out.output);
-    set_graph_mixed_mmq_policy(out.gf, mixed_mmq_policy);
+    set_routed_graph_mixed_mmq_policy(out.gf, mixed_mmq_policy);
     out.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
     if (!ggml_gallocr_alloc_graph(out.alloc, out.gf)) {
         out.free();
