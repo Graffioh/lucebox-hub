@@ -371,6 +371,7 @@ struct ParsedRequest {
     std::vector<std::string>  stop_sequences;
     // Bandit: per-session adaptive keep_ratio opt-in
     std::string               session_id;
+    std::string               pflash_query;   // explicit scorer query text (optional request field)
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
@@ -712,6 +713,23 @@ struct ServerJob {
 // ─── Parse session_id from a chat-completion JSON body ──────────────────
 // Returns empty string when session_id is absent or not a string (int/null/array).
 // Checks extra_body.session_id first, then top-level session_id.
+// PFlash: an explicit scorer query. The compressor scores context against
+// this text instead of the last user message's tail, so a caller that knows
+// its question (a benchmark, a RAG layer) can hand it over. Accepted at the top
+// level or under extra_body, like session_id.
+inline std::string parse_pflash_query_from_body(const json & body) {
+    if (body.contains("extra_body")) {
+        const auto & eb = body["extra_body"];
+        if (eb.is_object() && eb.contains("pflash_query") && eb["pflash_query"].is_string()) {
+            return eb["pflash_query"].get<std::string>();
+        }
+    }
+    if (body.contains("pflash_query") && body["pflash_query"].is_string()) {
+        return body["pflash_query"].get<std::string>();
+    }
+    return {};
+}
+
 inline std::string parse_session_id_from_body(const json & body) {
     if (body.contains("extra_body")) {
         const auto & eb = body["extra_body"];

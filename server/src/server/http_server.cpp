@@ -2341,6 +2341,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         apply_request_reasoning(body, config_, req);
         // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
         req.session_id = parse_session_id_from_body(body);
+        req.pflash_query = parse_pflash_query_from_body(body);
 
         // PPP rearrange (optional): peel ephemeral system banners into a
         // following system message so the first chat boundary is stable.
@@ -3261,6 +3262,12 @@ std::string HttpServer::apply_pflash_compression(
     std::vector<int32_t> semantic_query_ids;
     std::vector<int32_t> expected_query_ids;
     http_detail::PflashQueryWindow query_window;
+    if (!req.pflash_query.empty()) {
+        // An explicit query replaces the message-tail heuristic; it must occur
+        // inside the latest user content so the window maps onto real tokens.
+        last_user_text = req.pflash_query;
+        parser_selection_rule = "explicit_query";
+    }
     if (!last_user_text.empty()) {
         semantic_query_ids = drafter_tokenizer_->encode(last_user_text);
     }
