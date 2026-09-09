@@ -159,12 +159,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - job_name: GPU tests (self-hosted RTX 3090, sm_86)
-            runner: lucebox-rtx3090
-            arch: "86"
-            compute_cap: "8.6"
-            concurrency_group: lucebox-rtx3090-gpu-runner
-            sparse_attention: "true"
+          # TEMPORARY (2026-09-09): the lucebox-rtx3090 runner is offline
+          # (NVIDIA driver not responding since 2026-09-07), so every run of
+          # this entry fails before the checkout step. Restore the entry once
+          # the runner is back. The sparse-attention smoke is 3090-only and
+          # does not run while this is commented out.
+          # - job_name: GPU tests (self-hosted RTX 3090, sm_86)
+          #   runner: lucebox-rtx3090
+          #   arch: "86"
+          #   compute_cap: "8.6"
+          #   concurrency_group: lucebox-rtx3090-gpu-runner
+          #   sparse_attention: "true"
           - job_name: GPU tests (self-hosted DGX GB10, sm_121 verifier)
             runner: dgx-gb10
             arch: "121"
