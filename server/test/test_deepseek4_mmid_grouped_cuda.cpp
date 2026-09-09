@@ -35,6 +35,12 @@ static constexpr ggml_type k_test_types[] = {
 };
 static constexpr int k_test_widths[] = {2, 4, 8, 9, 16, 32, 48, 64};
 
+static int env_positive(const char * name, int fallback) {
+    const char * raw = std::getenv(name);
+    const int parsed = raw ? std::atoi(raw) : 0;
+    return parsed > 0 ? parsed : fallback;
+}
+
 template <typename Compute>
 static ggml_status run_benchmark_iterations(int requested, Compute compute, int & completed) {
     completed = 0;
@@ -82,11 +88,6 @@ static bool run_case(
     int n_rows = 128;
     int n_experts = 32;
     int top_k = 8;
-    const auto env_positive = [](const char * name, int fallback) {
-        const char * raw = std::getenv(name);
-        const int parsed = raw ? std::atoi(raw) : 0;
-        return parsed > 0 ? parsed : fallback;
-    };
     const int benchmark_iterations = env_positive("DFLASH_MMID_BENCH_ITERS", 0);
     const bool benchmark = benchmark_iterations > 0;
     if (benchmark) {
@@ -268,11 +269,17 @@ static bool run_case(
     return status == GGML_STATUS_SUCCESS && output.good();
 }
 
+static bool grouped_supported_device();
+
 static int run_child(const char * mode, const char * output_path) {
     const bool grouped = std::strcmp(mode, "grouped") == 0;
     const bool masked_fused = std::strcmp(mode, "masked-fused") == 0;
     if (!grouped && !masked_fused && std::strcmp(mode, "legacy") != 0) {
         return 2;
+    }
+    if (!grouped_supported_device()) {
+        std::printf("[mmid-grouped-test] SKIP: no supported GPU for grouped MMID\n");
+        return 77;
     }
 #if defined(_WIN32)
     if (!grouped && !masked_fused) {
@@ -512,6 +519,11 @@ static CombineRun run_combine_graph(
 }
 
 static bool run_combine_parity_and_benchmark(ggml_backend_t backend) {
+    const char * vec4 = std::getenv("DFLASH_MOE_COMBINE_VEC4");
+    if (!vec4 || std::strcmp(vec4, "1") != 0) {
+        std::fprintf(stderr, "combine parity requires DFLASH_MOE_COMBINE_VEC4=1\n");
+        return false;
+    }
     const char * bench_raw = std::getenv("DFLASH_MOE_COMBINE_BENCH");
     const bool benchmark = bench_raw && *bench_raw && std::strcmp(bench_raw, "0") != 0;
     const int n_embd = benchmark ? 4096 : 260;
@@ -691,6 +703,12 @@ int main(int argc, char ** argv) {
                      "the parent validates the complete dispatch matrix\n");
         return 2;
     }
+    if (!combine_only && env_positive("DFLASH_MMID_BENCH_ITERS", 0) > 0) {
+        std::fprintf(stderr,
+                     "DFLASH_MMID_BENCH_ITERS is supported only with --child; "
+                     "the parent validates randomized weights at fixed dimensions\n");
+        return 2;
+    }
 
     if (!grouped_supported_device()) {
         std::printf("[mmid-grouped-test] SKIP: grouped MMID requires NVIDIA Turing+ or AMD RDNA3/RDNA4\n");
@@ -698,12 +716,14 @@ int main(int argc, char ** argv) {
     }
 
 #if defined(_WIN32)
-    if (!std::getenv("DFLASH_MOE_COMBINE_VEC4")) {
-        _putenv_s("DFLASH_MOE_COMBINE_VEC4", "1");
-    }
+    const int vec4_status = _putenv_s("DFLASH_MOE_COMBINE_VEC4", "1");
 #else
-    setenv("DFLASH_MOE_COMBINE_VEC4", "1", 0);
+    const int vec4_status = setenv("DFLASH_MOE_COMBINE_VEC4", "1", 1);
 #endif
+    if (vec4_status != 0) {
+        std::fprintf(stderr, "failed to enable DFLASH_MOE_COMBINE_VEC4 for parity test\n");
+        return 1;
+    }
 
     if (!mmid_only) {
         ggml_backend_t combine_backend = ggml_backend_cuda_init(0);

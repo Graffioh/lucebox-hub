@@ -1131,6 +1131,23 @@ if(DFLASH27B_TESTS)
                 -DTEST_EXECUTABLE=$<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
                 -DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/mmid_benchmark_config
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmid_benchmark_config.cmake)
+        set_tests_properties(deepseek4_mmid_grouped_cuda_benchmark_config
+            PROPERTIES SKIP_REGULAR_EXPRESSION "mmid-benchmark-config.*SKIP: no supported GPU")
+        foreach(_mmid_cli_case IN ITEMS parent_benchmark no_gpu)
+            add_test(NAME deepseek4_mmid_grouped_cuda_${_mmid_cli_case}
+                COMMAND ${CMAKE_COMMAND}
+                    -DTEST_EXECUTABLE=$<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
+                    -DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/mmid_cli_${_mmid_cli_case}
+                    -DTEST_CASE=${_mmid_cli_case}
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmid_cli.cmake)
+        endforeach()
+        unset(_mmid_cli_case)
+        add_test(NAME deepseek4_mmid_grouped_cuda_combine_override
+            COMMAND ${CMAKE_COMMAND} -E env DFLASH_MOE_COMBINE_VEC4=0
+                DFLASH_MOE_COMBINE_BENCH=0 --unset=DFLASH_MOE_COMBINE_BENCH_TOKENS
+                $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda> --combine-only)
+        set_tests_properties(deepseek4_mmid_grouped_cuda_combine_override
+            PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_moe_combine_cuda.cpp")
         add_executable(test_ds4_moe_combine_cuda test/test_ds4_moe_combine_cuda.cpp)

@@ -25,6 +25,12 @@ foreach(mode IN ITEMS unset zero negative invalid positive)
             "${TEST_EXECUTABLE}" --child masked-fused "${output}"
         RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr
         TIMEOUT 60)
+    if(status STREQUAL "77" AND mode STREQUAL "unset")
+        # cmake -P has no portable exit(77). Preserve the child's skip through
+        # the marker registered with CTest's SKIP_REGULAR_EXPRESSION instead.
+        message(STATUS "[mmid-benchmark-config] SKIP: no supported GPU")
+        return()
+    endif()
     if(NOT status STREQUAL "0")
         message(FATAL_ERROR "${mode} failed (${status}):\n${stdout}\n${stderr}")
     endif()
