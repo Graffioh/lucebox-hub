@@ -1751,6 +1751,7 @@ if(DFLASH27B_TESTS)
         set(_server_unit_sources
             test/test_unit_main.cpp
             test/test_server_unit.cpp
+            test/test_model_routing.cpp
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_spec_width.cpp
@@ -1931,7 +1932,8 @@ if(DFLASH27B_TESTS)
             src/placement/placement_config.cpp)
         target_include_directories(test_feature_gate PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include)
         # compiled_placement_backend() is decided by these defines, so the
         # gate must be tested with the same ones the server is built with.
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
@@ -2344,6 +2346,18 @@ if(DFLASH27B_SERVER)
             src/server/prompt_normalize.cpp
         )
         target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        # This script executes the server directly on the build host.
+        if(DFLASH27B_TESTS AND NOT CMAKE_CROSSCOMPILING)
+            add_dependencies(check dflash_server)
+            if(TARGET coverage)
+                add_dependencies(coverage dflash_server)
+            endif()
+            add_test(NAME server_cli_model_names
+                COMMAND ${CMAKE_COMMAND}
+                    -DSERVER=$<TARGET_FILE:dflash_server>
+                    -DBACKEND=${DFLASH27B_GPU_BACKEND}
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_model_names.cmake)
+        endif()
         if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
             target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
             if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)

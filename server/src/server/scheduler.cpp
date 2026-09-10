@@ -417,22 +417,46 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 req.max_output, live_slots);
         }
 
-        // Commit the SSE preamble BEFORE the (multi-second) prefill so
-        // streaming clients see the 200 immediately — and so a dead client
-        // is detected before its prefill is paid for. The socket is fresh
-        // (nothing sent yet), so these few hundred bytes cannot stall.
-        // sse_started survives a busy deferral: retries do not resend.
-        if (!job->emitter) {
-            job->emitter = std::make_unique<SseEmitter>(
-                req.format, req.response_id, req.model,
-                (int)req.prompt_tokens.size(), req.tools, &tool_memory_,
-                req.stop_sequences, req.started_in_thinking);
+        // Admission only claims the slot and queues the prompt. Prefill
+        // advances one chunk per engine step alongside live decode.
+        auto ar = engine.admit(next_request_id, req.prompt_tokens,
+                               req.sampler);
+        if (ar.status == SeqEngine::AdmitResult::Status::capacity_exceeded) {
+            if (job->report_admission) {
+                job->admission = RoutingAdmission::unfit;
+            } else {
+                send_error(job->fd, 400, "admission failed: " + ar.error);
+            }
+            finish_job(job);
+            return AdmissionDisposition::Retired;
         }
-        if (req.stream && !job->sse_started) {
-            job->sse_started = true;
+        if (ar.status == SeqEngine::AdmitResult::Status::busy) {
+            if (job->report_admission) {
+                job->admission = RoutingAdmission::busy;
+                finish_job(job);
+                return AdmissionDisposition::Retired;
+            }
+            return AdmissionDisposition::Deferred;
+        }
+        if (ar.status != SeqEngine::AdmitResult::Status::admitted) {
+            std::fprintf(stderr, "[server] admit failed: %s\n",
+                         ar.error.c_str());
+            send_error(job->fd, 500, "admission failed: " + ar.error);
+            finish_job(job);
+            return AdmissionDisposition::Retired;
+        }
+        next_request_id++;
+
+        // Commit response bytes only after admission. A busy routed request
+        // can still try another model; no tokenizer/model identity is on wire.
+        auto emitter = std::make_unique<SseEmitter>(
+            req.format, req.response_id, req.model,
+            (int)req.prompt_tokens.size(), req.tools, &tool_memory_,
+            req.stop_sequences, req.started_in_thinking);
+        if (req.stream) {
             bool ok = send_sse_headers(job);
             if (ok) {
-                for (const auto & c : job->emitter->emit_start()) {
+                for (const auto & c : emitter->emit_start()) {
                     if (!send_job_bytes(job, c.data(), c.size())) {
                         ok = false;
                         break;
@@ -440,36 +464,13 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 }
             }
             if (!ok) {
+                engine.retire(ar.slot);
                 finish_job(job);
                 return AdmissionDisposition::Retired;
             }
             start_job_stream(job);
         }
 
-        // Admission only claims the slot and queues the prompt. Prefill
-        // advances one chunk per engine step alongside live decode.
-        auto ar = engine.admit(next_request_id, req.prompt_tokens,
-                               req.sampler);
-        if (ar.status == SeqEngine::AdmitResult::Status::busy)
-            return AdmissionDisposition::Deferred;
-        if (ar.status != SeqEngine::AdmitResult::Status::admitted) {
-            std::fprintf(stderr, "[server] admit failed: %s\n",
-                         ar.error.c_str());
-            if (req.stream && job->sse_started) {
-                stop_job_stream(job);
-                // Headers are already on the wire: report in-stream, like
-                // the classic worker's fail_request after SSE start.
-                for (const std::string & chunk : sse_error_close_chunks(
-                         "admission failed: " + ar.error)) {
-                    send_job_bytes(job, chunk.data(), chunk.size());
-                }
-            } else {
-                send_error(job->fd, 500, "admission failed: " + ar.error);
-            }
-            finish_job(job);
-            return AdmissionDisposition::Retired;
-        }
-        next_request_id++;
 
         SchedSlot & s = slots[(size_t)ar.slot];
         s = SchedSlot{};
@@ -482,7 +483,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.n_gen_cap = std::min(
             n_gen_cap,
             engine.max_context() - (int)req.prompt_tokens.size() + 1);
-        s.emitter = std::move(job->emitter);
+        s.emitter = std::move(emitter);
         s.send_buffer.mark_progress(std::chrono::steady_clock::now());
         if (budget_active && !config_.think_close_token_ids.empty() &&
             config_.hard_limit_reply_budget > 0) {
@@ -749,19 +750,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     for (DrainJob & d : drains) finish_job(d.job);
     drains.clear();
     if (deferred) {
-        // admit_job() sends the SSE headers and opening event before asking
-        // the engine for a slot, so a pool-full deferred stream is already
-        // live on the wire. Close that protocol cleanly on shutdown instead
-        // of waking the client thread and letting it truncate the response.
-        const ParsedRequest & req = deferred->req;
-        if (req.stream && deferred->sse_started) {
-            for (const std::string & chunk :
-                 sse_error_close_chunks("server shutting down")) {
-                send_all(deferred->fd, chunk.data(), chunk.size());
-            }
-        } else {
-            send_error(deferred->fd, 503, "server shutting down");
-        }
+        // No response has been committed for a deferred admission.
+        send_error(deferred->fd, 503, "server shutting down");
         finish_job(deferred);
     }
     // Jobs that never reached admission are still parked in their client
