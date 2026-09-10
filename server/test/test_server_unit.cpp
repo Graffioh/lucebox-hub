@@ -120,6 +120,19 @@ struct ServerUnitFixture {};
     } \
 } while (0)
 
+// Device ordinals must not wrap when matching routing priority to placement.
+TEST_CASE(ServerUnitFixture, test_placement_device_rejects_gpu_index_overflow) {
+    DevicePlacement device;
+    TEST_ASSERT(parse_placement_device("hip:0", device));
+    TEST_ASSERT(parse_placement_device(
+        "hip:" + std::to_string(std::numeric_limits<int>::max()), device));
+    for (const char * value : {"hip:2147483648", "hip:4294967296",
+                              "hip:999999999999999999999999999999", "hip:-1"}) {
+        TEST_ASSERT(!parse_placement_device(value, device));
+    }
+    TEST_ASSERT(!parse_placement_device_list("hip:0,hip:4294967296", device));
+}
+
 TEST_CASE(ServerUnitFixture, test_api_format_names_are_total) {
     CHECK(std::string(api_format_name(ApiFormat::OPENAI_CHAT)) == "chat");
     CHECK(std::string(api_format_name(ApiFormat::ANTHROPIC)) == "anthropic");

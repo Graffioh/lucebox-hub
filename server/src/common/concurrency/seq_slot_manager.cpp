@@ -108,6 +108,7 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
         return r;
     }
     if (prompt.size() > static_cast<size_t>(max_ctx_)) {
+        r.status = AdmitStatus::capacity_exceeded;
         r.error = "prompt exceeds max_ctx";
         return r;
     }
@@ -119,6 +120,7 @@ SeqEngine::AdmitResult SeqSlotManager::admit(
     const uint64_t pool_capacity =
         (uint64_t)pool_.physical_block_count() * pool_.block_size();
     if ((uint64_t)prompt_len > pool_capacity) {
+        r.status = AdmitStatus::capacity_exceeded;
         r.error = "prompt needs " + std::to_string(prompt_len) +
                   " KV tokens but the pool holds " +
                   std::to_string(pool_capacity) +
