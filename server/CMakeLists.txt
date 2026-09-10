@@ -1166,10 +1166,16 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_ds4_maskless_prefill PRIVATE
             ggml ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
         list(APPEND _raw_unit_test_targets test_ds4_maskless_prefill)
-        foreach(_maskless_mode IN ITEMS defaults disabled)
+        foreach(_maskless_mode IN ITEMS defaults disabled f32)
             add_test(NAME ds4_maskless_prefill_${_maskless_mode}
                 COMMAND test_ds4_maskless_prefill --${_maskless_mode})
             set_tests_properties(ds4_maskless_prefill_${_maskless_mode}
+                PROPERTIES SKIP_RETURN_CODE 77)
+        endforeach()
+        foreach(_maskless_mode IN ITEMS defaults disabled)
+            add_test(NAME ds4_maskless_prefill_${_maskless_mode}_f32
+                COMMAND test_ds4_maskless_prefill --${_maskless_mode} --f32)
+            set_tests_properties(ds4_maskless_prefill_${_maskless_mode}_f32
                 PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
         unset(_maskless_mode)

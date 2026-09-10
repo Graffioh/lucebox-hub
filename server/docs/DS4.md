@@ -89,15 +89,19 @@ Sparse layer-major prefill accepts scheduling chunks up to 10,240 tokens
 reduce the chunk size when a resident drafter or longer history leaves
 insufficient scratch headroom. Dense attention within that schedule retains independent
 2,048-token numerical bands and the cache-rounding boundary between them.
-Eligible ratio-4 sparse layers pass their learned top-k rows directly, keep
-KV transport in F16, and derive causal visibility without uploading a dense
+Eligible ratio-4 sparse layers pass their learned top-k rows directly, retain
+the existing F32 current-row precision, and derive causal visibility without uploading a dense
 score mask. This does not change the expert count or enable sparse prefill
 for an exact-mode request.
 
 The wave32 streaming attention path is automatic for eligible maskless
 prefill shapes. `GGML_CUDA_MLA_STREAM_TOPK=0` restores compact attention for
-diagnosis; it does not restore F32 KV transport or reference-exact prefill.
+diagnosis; it does not turn sparse prefill into reference-exact prefill.
 Decode and speculative verification retain their separate dispatch policies.
+Byte-identical immutable host masks share storage within the layer-major graph
+cache, rather than retaining a separate quadratic array for every layer.
+The mask values and per-layer tensor identities are unchanged; the shared
+storage is released when that cache is replaced or its model is released.
 Sparse prefill remains approximate: kernel differential tests alone do not
 qualify full-model output quality or establish parity with another runtime.
 
@@ -622,22 +626,25 @@ keeps its existing dispatch. `DFLASH_DS4_MIX_MMQ_PREFILL=0` at model load is
 the kill switch. Other model integrations can reuse the graph-local
 `ggml_mul_mat_set_mixed_mmq` policy after qualifying their model and device.
 
-For experimental long sparse prefill, set both
-`DFLASH_DS4_DIRECT_INDEXER_TOPK=1` and `GGML_CUDA_MLA_STREAM_TOPK=1`. This
-enables a reusable D512 K-equals-V streaming attention path that shares each
-selected latent row across wave32 heads and avoids materializing scores. It is
-currently limited to F16 caches on native wave32 devices and otherwise falls
-back to the existing path. Because its online softmax changes floating-point
-association, keep it opt-in until the target model passes a matched output and
-throughput A/B. `GGML_DS4_FA_STREAM_TOPK` remains a compatibility alias. Add
+The reusable D512 K-equals-V streaming attention path shares each selected
+latent row across wave32 heads and avoids materializing scores. It supports
+F16 and F32 KV on native wave32 devices. Maskless ratio-4 prefill selects it
+automatically; other indexed shapes remain opt-in with
+`DFLASH_DS4_DIRECT_INDEXER_TOPK=1` and `GGML_CUDA_MLA_STREAM_TOPK=1` and require
+a matched model output and throughput A/B. Online softmax changes floating-point
+association even when its input precision is preserved.
+`GGML_DS4_FA_STREAM_TOPK` remains a compatibility alias. Add
 `GGML_CUDA_MLA_STREAM_F32_STAGE=1` to convert each selected F16 latent once
 while staging aligned pairs in shared memory instead of repeating conversion
 for every head. The isolated gfx1151 qualification is byte-identical to F16
-staging and reduced alternating-run kernel time by about 9%. Add
+staging and reduced alternating-run kernel time by about 9%. That historical
+F16 staging result is not an F32-input speed claim. F32 inputs always retain
+F32 staging. Add
 `GGML_CUDA_MLA_STREAM_FAST_EXP=1` to use the HIP hardware exponential in that
 FP32-staged online softmax. It reduced the remaining kernel time by another
-7–9% in isolation; keep it opt-in with the streaming path because it uses an
-approximate hardware exponential instead of the default implementation.
+7–9% in the historical F16-input isolation test. This control defaults on only
+for maskless ratio-4 prefill and remains opt-in for other indexed shapes;
+it uses an approximate hardware exponential instead of `expf`.
 
 Indexed verifier attention with at most eight query rows also uses a two-way
 split-KV schedule on gfx1151. Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` to restore the

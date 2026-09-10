@@ -12,7 +12,8 @@
 
 // Differential correctness only. This emits no throughput measurements.
 static bool check(ggml_backend_t backend, int start, int tokens,
-                  int expected_launches, bool require_byte_identity) {
+                  int expected_launches, bool require_byte_identity,
+                  bool f32_kv = false) {
     constexpr int dim = 512, heads = 16, window = 128, selected = 512;
     const int prior = std::min(start, window);
     const int raw = prior + tokens;
@@ -22,7 +23,7 @@ static bool check(ggml_backend_t backend, int start, int tokens,
     ggml_context * ctx = ggml_init(params);
     if (!ctx) return false;
     auto * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim, tokens, heads);
-    auto * kv = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, dim, rows, 1);
+    auto * kv = ggml_new_tensor_3d(ctx, f32_kv ? GGML_TYPE_F32 : GGML_TYPE_F16, dim, rows, 1);
     auto * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, rows, tokens);
     auto * topk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, selected, tokens);
     auto * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads);
@@ -78,12 +79,17 @@ static bool check(ggml_backend_t backend, int start, int tokens,
             return 1.5f * ((int32_t)(rng >> 8) - 8388608) / 8388608.0f;
         };
         std::vector<float> qv(ggml_nelements(q));
-        std::vector<ggml_fp16_t> kvv(ggml_nelements(kv));
+        std::vector<ggml_fp16_t> kvv(f32_kv ? 0 : ggml_nelements(kv));
+        std::vector<float> kvv_f32(f32_kv ? ggml_nelements(kv) : 0);
         std::vector<ggml_fp16_t> mv(ggml_nelements(mask), ggml_fp32_to_fp16(-1e30f));
         std::vector<int32_t> tv(ggml_nelements(topk));
         std::vector<float> sv(heads);
         for (auto & value : qv) value = sample();
-        for (auto & value : kvv) value = ggml_fp32_to_fp16(sample());
+        for (size_t i = 0; i < size_t(ggml_nelements(kv)); ++i) {
+            const float value = sample();
+            if (f32_kv) kvv_f32[i] = value;
+            else        kvv[i] = ggml_fp32_to_fp16(value);
+        }
         for (auto & value : sv) value = sample();
         for (int t = 0; t < tokens; ++t) {
             auto * col = mv.data() + size_t(t) * rows;
@@ -96,7 +102,9 @@ static bool check(ggml_backend_t backend, int start, int tokens,
             }
         }
         ggml_backend_tensor_set(q, qv.data(), 0, ggml_nbytes(q));
-        ggml_backend_tensor_set(kv, kvv.data(), 0, ggml_nbytes(kv));
+        ggml_backend_tensor_set(kv, f32_kv ? static_cast<const void *>(kvv_f32.data())
+                                          : static_cast<const void *>(kvv.data()),
+                                0, ggml_nbytes(kv));
         ggml_backend_tensor_set(mask, mv.data(), 0, ggml_nbytes(mask));
         ggml_backend_tensor_set(topk, tv.data(), 0, ggml_nbytes(topk));
         ggml_backend_tensor_set(sinks, sv.data(), 0, ggml_nbytes(sinks));
@@ -129,8 +137,8 @@ static bool check(ggml_backend_t backend, int start, int tokens,
             }
             const bool identical = std::memcmp(masked.data(), analytic.data(), ggml_nbytes(ref)) == 0;
             ok = ok && outside == 0 && (!require_byte_identity || identical);
-            std::printf("start=%d tokens=%d replay=%d compact_vs_stream_max_abs=%.8g outside=%zu masked_vs_analytic_bytes_equal=%d\n",
-                        start, tokens, replay, max_abs, outside, identical);
+            std::printf("start=%d tokens=%d replay=%d compact_vs_stream_max_abs=%.8g outside=%zu masked_vs_analytic_bytes_equal=%d kv_type=%s\n",
+                        start, tokens, replay, max_abs, outside, identical, f32_kv ? "f32" : "f16");
             std::fflush(stdout);
         }
     }
@@ -150,9 +158,14 @@ static bool set_flag(const char * name, const char * value) {
 }
 
 int main(int argc, char ** argv) {
-    const bool defaults = argc == 2 && std::strcmp(argv[1], "--defaults") == 0;
-    const bool disabled = argc == 2 && std::strcmp(argv[1], "--disabled") == 0;
-    if (argc > 2 || (argc == 2 && !defaults && !disabled)) return 2;
+    bool defaults = false, disabled = false, f32_kv = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--defaults") == 0) defaults = true;
+        else if (std::strcmp(argv[i], "--disabled") == 0) disabled = true;
+        else if (std::strcmp(argv[i], "--f32") == 0) f32_kv = true;
+        else return 2;
+    }
+    if (defaults && disabled) return 2;
     const char * stream_flag = defaults ? nullptr : disabled ? "0" : "1";
     bool configured = set_flag("GGML_CUDA_MLA_STREAM_TOPK", stream_flag);
     configured = set_flag("GGML_DS4_FA_STREAM_TOPK", nullptr) && configured;
@@ -170,9 +183,9 @@ int main(int argc, char ** argv) {
     const int expected_launches = defaults ? 1 : disabled ? 0 : 2;
     bool ok = true;
     if (!defaults && !disabled) {
-        ok = check(backend, 0, 10240, expected_launches, true);
+        ok = check(backend, 0, 10240, expected_launches, true, f32_kv);
     }
-    ok = check(backend, 122880, 129, expected_launches, !defaults) && ok;
+    ok = check(backend, 122880, 129, expected_launches, !defaults, f32_kv) && ok;
     ggml_backend_free(backend);
     std::printf("wide/tail maskless differential: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

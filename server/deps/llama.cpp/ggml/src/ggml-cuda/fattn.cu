@@ -16,8 +16,6 @@ extern "C" size_t ggml_backend_cuda_get_mla_stream_topk_launch_count(void) {
     return g_mla_stream_topk_launch_count;
 }
 
-#include <type_traits>
-
 #if defined(GGML_USE_HIP)
 
 __device__ static float ds4_fa_block_sum(float v) {
@@ -2768,7 +2766,7 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         const int device_warp_size =
             ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
         if (streaming_topk_enabled && indexed_mask && indexer_topk &&
-            kv_f16 && (ratio4_causal || mask->type == GGML_TYPE_F16) &&
+            (ratio4_causal || mask->type == GGML_TYPE_F16) &&
             K->data == V->data && n_heads % 16 == 0 &&
             device_warp_size == 32 && n_tokens >= streaming_min_tokens &&
             active_row_upper_bound > 0 &&
@@ -2787,16 +2785,17 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             const dim3 streaming_grid(
                 (unsigned) n_tokens,
                 (unsigned) (n_heads / streaming_heads), 1);
-            const auto launch_streaming = [&](auto stage_f32, auto use_fast_exp,
+            const auto launch_streaming = [&](auto kv_type, auto stage_f32, auto use_fast_exp,
                                               auto maskless) {
+                using KV = decltype(kv_type);
                 ds4_flash_attn_d512_streaming_topk_kernel<
-                    half, half, streaming_heads, 16,
+                    KV, half, streaming_heads, 16,
                     decltype(stage_f32)::value, decltype(use_fast_exp)::value,
                     decltype(maskless)::value>
                     <<<streaming_grid, streaming_heads * 32, 0, stream>>>(
                         (float *) dst->data, (const float *) Q->data,
                         q_stride_token, q_stride_head,
-                        (const half *) K->data,
+                        (const KV *) K->data,
                         mask ? (const half *) mask->data : nullptr,
                         sinks ? (const float *) sinks->data : nullptr,
                         n_tokens, n_heads, n_kv, scale,
@@ -2805,19 +2804,21 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
                         inverse_rope_coefficients,
                         forward_rope_coefficients);
             };
-            const auto dispatch_streaming = [&](auto maskless) {
+            const auto dispatch_streaming = [&](auto kv_type, auto maskless) {
                 if (f32_stage && fast_exp) {
-                    launch_streaming(std::true_type{}, std::true_type{}, maskless);
+                    launch_streaming(kv_type, std::true_type{}, std::true_type{}, maskless);
                 } else if (f32_stage) {
-                    launch_streaming(std::true_type{}, std::false_type{}, maskless);
+                    launch_streaming(kv_type, std::true_type{}, std::false_type{}, maskless);
                 } else {
-                    launch_streaming(std::false_type{}, std::false_type{}, maskless);
+                    launch_streaming(kv_type, std::false_type{}, std::false_type{}, maskless);
                 }
             };
             if (ratio4_causal) {
-                dispatch_streaming(std::true_type{});
+                if (kv_f16) dispatch_streaming(half{}, std::true_type{});
+                else        dispatch_streaming(float{}, std::true_type{});
             } else {
-                dispatch_streaming(std::false_type{});
+                if (kv_f16) dispatch_streaming(half{}, std::false_type{});
+                else        dispatch_streaming(float{}, std::false_type{});
             }
             CUDA_CHECK(cudaGetLastError());
             ++g_mla_stream_topk_launch_count;
