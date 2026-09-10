@@ -155,6 +155,7 @@ public:
         enum class Status {
             admitted,
             busy,
+            capacity_exceeded, // prompt cannot fit even in an otherwise idle pool
             failed,
         };
 

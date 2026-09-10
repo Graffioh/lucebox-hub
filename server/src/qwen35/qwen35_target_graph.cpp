@@ -108,13 +108,14 @@ bool create_target_cache(const TargetWeights & w,
                          int ctx_alloc,
                          bool paged_attention,
                          int n_seq_slots,
-                         bool concurrent_tree) {
+                         bool concurrent_tree,
+                         ggml_type cache_type_k, ggml_type cache_type_v) {
     return create_target_cache_partial(w, max_ctx, max_verify_tokens, backend,
                                        out, prefill_only,
                                        0, w.n_layer, true, ctx_alloc,
                                        /*f32_ssm_intermediates=*/false,
                                        paged_attention, n_seq_slots,
-                                       concurrent_tree);
+                                       concurrent_tree, cache_type_k, cache_type_v);
 }
 
 // concurrent_fixed_cache_bytes() in qwen35_backend.cpp mirrors this
@@ -133,7 +134,8 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool f32_ssm_intermediates,
                                  bool paged_attention,
                                  int n_seq_slots,
-                                 bool concurrent_tree) {
+                                 bool concurrent_tree,
+                         ggml_type cache_type_k, ggml_type cache_type_v) {
     if (layer_begin < 0) layer_begin = 0;
     if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
     if (layer_begin > layer_end) {
@@ -176,7 +178,7 @@ bool create_target_cache_partial(const TargetWeights & w,
     // KV cache element types (resolved from env; aborts on unsupported pair).
     ggml_type kv_k_type = GGML_TYPE_Q8_0;
     ggml_type kv_v_type = GGML_TYPE_Q8_0;
-    dflash::resolve_kv_types(kv_k_type, kv_v_type);
+    dflash::resolve_kv_types(kv_k_type, kv_v_type, cache_type_k, cache_type_v);
     out.kv_k_type = kv_k_type;
     out.kv_v_type = kv_v_type;
 

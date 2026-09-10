@@ -192,7 +192,7 @@ int main() {
         PagedKvPool pool(4, 2, /*block_size=*/16);
         Qwen35SlotManager mgr(pool, /*max_ctx=*/128);
         auto never = admit(mgr, 1, prompt_tokens(100), greedy_sampler());
-        CHECK(!is_admitted(never) && !is_busy(never));   // prompt 100 > pool 64
+        CHECK(never.status == SeqEngine::AdmitResult::Status::capacity_exceeded); // prompt 100 > pool 64
         CHECK(pool.active_sequence_count() == 0);
 
         // Impossibility wins over temporary slot pressure: do not queue an

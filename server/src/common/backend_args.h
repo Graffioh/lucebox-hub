@@ -6,6 +6,7 @@
 #pragma once
 
 #include <limits>
+#include "ggml.h"
 
 #include "placement/draft_residency.h"
 #include "placement/placement_config.h"
@@ -67,6 +68,9 @@ struct BackendArgs {
 
     // Attention and speculative-decode options. Individual backends consume
     // only the fields they support.
+    // Explicit per-model overrides; COUNT preserves environment/family defaults.
+    ggml_type    cache_type_k = GGML_TYPE_COUNT;
+    ggml_type    cache_type_v = GGML_TYPE_COUNT;
     int             fa_window        = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     bool            paged_attention  = false;  // model-specific paged K/V blocks for AR decode
     // Concurrent decode slots (--max-concurrency). > 1 requires paged_attention;

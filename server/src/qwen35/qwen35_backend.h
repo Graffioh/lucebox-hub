@@ -54,6 +54,9 @@ struct Qwen35Config {
     int          stream_fd   = -1;
 
     // FA/KV
+    // Explicit per-model overrides; COUNT preserves environment/family defaults.
+    ggml_type    cache_type_k = GGML_TYPE_COUNT;
+    ggml_type    cache_type_v = GGML_TYPE_COUNT;
     int          fa_window       = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     bool         paged_attention = false;
     int          kq_stride_pad   = 32;   // KQ_MASK_PAD or 256 for TBQ
