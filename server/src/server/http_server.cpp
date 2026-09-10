@@ -226,15 +226,25 @@ PflashQueryWindow find_pflash_query_window(
     // Unanchored: the latest occurrence of the (suffix-trimmed) query inside
     // [search_begin, limit). An explicit query may sit before trailing
     // instructions, so it is not required to end at the content boundary.
+    // Its last token may also merge with what follows it in the prompt
+    // (trailing whitespace before a newline), so up to two trailing query
+    // tokens may be dropped; the untrimmed query is always preferred.
     const int floor = (std::max)(0, search_begin);
-    for (int width = widest; width >= narrowest; --width) {
-        const auto query_begin = query.end() - width;
-        for (int end = limit; end - width >= floor; --end) {
-            if (std::equal(query_begin, query.end(),
-                           prompt.begin() + end - width)) {
-                result.end = end;
-                result.tokens = width;
-                return result;
+    const int max_trailing = (std::min)(2, (int) query.size() - narrowest);
+    for (int drop = 0; drop <= max_trailing; ++drop) {
+        const auto query_end = query.end() - drop;
+        const int available = (int) query.size() - drop;
+        const int drop_widest = (std::min)(max_tokens, available);
+        for (int width = drop_widest; width >= narrowest; --width) {
+            const auto query_begin = query_end - width;
+            for (int end = limit; end - width >= floor; --end) {
+                if (std::equal(query_begin, query_end,
+                               prompt.begin() + end - width)) {
+                    result.end = end;
+                    result.tokens = width;
+                    result.trailing_trimmed = drop;
+                    return result;
+                }
             }
         }
     }
@@ -3296,9 +3306,10 @@ std::string HttpServer::apply_pflash_compression(
             experiment.configured ? query_content_begin : 0,
             /*anchored=*/ req.pflash_query.empty());
         if (experiment.configured && query_window.valid()) {
+            const auto matched_end =
+                semantic_query_ids.end() - query_window.trailing_trimmed;
             expected_query_ids.assign(
-                semantic_query_ids.end() - query_window.tokens,
-                semantic_query_ids.end());
+                matched_end - query_window.tokens, matched_end);
         }
     }
 

@@ -265,6 +265,7 @@ bool canonical_assistant_content(
 struct PflashQueryWindow {
     int end = -1;       // exclusive token offset in the rendered prompt
     int tokens = 0;     // width of the matching query suffix
+    int trailing_trimmed = 0;  // query tokens dropped from its end to match
 
     bool valid() const { return end >= tokens && tokens > 0; }
 };

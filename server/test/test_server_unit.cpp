@@ -218,6 +218,33 @@ TEST_CASE(ServerUnitFixture, test_pflash_explicit_query_matches_before_trailing_
     TEST_ASSERT(!out_of_window.valid());
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_explicit_query_tolerates_merged_trailing_token) {
+    // The query's last token merges with the prompt's following newline
+    // ("  " alone vs "  \n" in context): the unanchored match drops that
+    // trailing token, the untrimmed match still wins when it exists, and
+    // anchored (message tail) matching keeps its exact-suffix contract.
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 77};   // 77 = "  "
+    const std::vector<int32_t> rendered{
+        1, 2, 3, 10, 11, 12, 13, 14, 78, 300, 301, 302,   // 78 = "  \n"
+    };
+    const auto trimmed = http_detail::find_pflash_query_window(rendered, query, 8, 12, 1, false);
+    TEST_ASSERT(trimmed.valid());
+    TEST_ASSERT(trimmed.end == 8);
+    TEST_ASSERT(trimmed.tokens == 5);
+    TEST_ASSERT(trimmed.trailing_trimmed == 1);
+    const std::vector<int32_t> exact{1, 10, 11, 12, 13, 14, 77, 2, 10, 11, 12, 13, 14, 78};
+    const auto untrimmed = http_detail::find_pflash_query_window(exact, query, 8, 14, 0, false);
+    TEST_ASSERT(untrimmed.valid());
+    TEST_ASSERT(untrimmed.end == 7);
+    TEST_ASSERT(untrimmed.tokens == 6);
+    TEST_ASSERT(untrimmed.trailing_trimmed == 0);
+    const auto anchored = http_detail::find_pflash_query_window(rendered, query, 8, 12, 1);
+    TEST_ASSERT(!anchored.valid());
+    const std::vector<int32_t> short_query{10, 11, 12, 77};
+    const auto too_short = http_detail::find_pflash_query_window(rendered, short_query, 8, 12, 1, false);
+    TEST_ASSERT(!too_short.valid());
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_bounded_mapping_prefers_latest_shortened_suffix) {
     const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
     const std::vector<int32_t> rendered{
