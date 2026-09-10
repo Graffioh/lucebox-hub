@@ -337,6 +337,18 @@ restores the previous all-layer running-max scorer. The Qwen3.5 attention
 runs dense (`ggml_flash_attn_ext`); the block-sparse FlashPrefill kernels
 still dispatch head dimension 128 only.
 
+The per-session adaptive keep ratio applies to this path unchanged: a request
+carrying a `session_id` retains the session's ratio, the strict selector fills
+its token budget from it, and the ratio is updated from the smoothed DFlash
+acceptance rate after every turn where speculative decoding ran (below 75%
+acceptance retain more, above 85% retain less, 0.5-1 point per turn, bounded
+to 2.5-20%; `server/src/server/adaptive_keep_ratio.h`). A new session starts
+from the configured ratio for its prompt length (`--prefill-keep-ratio` or
+`--prefill-curve`), so the controller adapts around the real-use budget
+instead of a fixed 10%. Acceptance is a proxy for compression quality: it
+does not detect a dropped answer document directly, so the ratio curve and
+the retention benchmarks remain the quality reference.
+
 ### Reasoning and MoE controls
 
 | Option | Default | Purpose |

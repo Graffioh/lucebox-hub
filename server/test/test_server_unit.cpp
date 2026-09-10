@@ -7048,6 +7048,19 @@ TEST_CASE(ServerUnitFixture, test_flowkv_session_keep_ratio_override) {
 
     TEST_ASSERT(std::fabs(static_ratio - configured_ratio) < 1e-6f);
     TEST_ASSERT(std::fabs(adaptive_ratio - 0.09f) < 1e-6f);
+
+    // A session without feedback keeps the configured (curve) ratio, and its
+    // first feedback adapts from that ratio rather than the fixed default:
+    // 0.1875 (the 16K real-use budget) minus one small step at high acceptance.
+    const float curve_ratio = 0.1875f;
+    TEST_ASSERT(std::fabs(http_detail::resolve_pflash_keep_ratio(
+        curve_ratio, "fresh", sessions) - curve_ratio) < 1e-6f);
+    sessions.update("fresh", 0.95f, curve_ratio);
+    TEST_ASSERT(std::fabs(http_detail::resolve_pflash_keep_ratio(
+        curve_ratio, "fresh", sessions) - (curve_ratio - 0.01f)) < 1e-6f);
+    // Seeds are clamped to the controller's range like every later step.
+    sessions.update("wide", 0.50f, 0.30f);
+    TEST_ASSERT(std::fabs(sessions.get_keep_ratio("wide") - 0.20f) < 1e-6f);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

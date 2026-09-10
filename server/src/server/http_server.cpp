@@ -453,9 +453,11 @@ bool flowkv_should_activate(const ServerConfig & config,
 float resolve_pflash_keep_ratio(float configured_ratio,
                                 const std::string & session_id,
                                 const HttpServerSessions & sessions) {
+    // A session adapts from the configured (curve) ratio: until its first
+    // acceptance feedback it keeps that ratio, afterwards the controller's.
     return session_id.empty()
         ? configured_ratio
-        : sessions.get_keep_ratio(session_id);
+        : sessions.get_keep_ratio(session_id, configured_ratio);
 }
 
 bool should_clamp_flowkv_disk_cache(
@@ -4636,9 +4638,11 @@ void HttpServer::process_job(ServerJob * job) {
     // Bandit: update when spec decode actually ran — including 0-accept case,
     // which signals the current keep_ratio is too low.
     if (!req.session_id.empty() && result.spec_decode_ran) {
-        float old_keep = sessions_.get_keep_ratio(req.session_id);
+        const float configured_keep =
+            pflash_keep_ratio(config_, (int) req.prompt_tokens.size());
+        float old_keep = sessions_.get_keep_ratio(req.session_id, configured_keep);
         int   old_turn = sessions_.turn_count(req.session_id);
-        sessions_.update(req.session_id, result.accept_rate);
+        sessions_.update(req.session_id, result.accept_rate, configured_keep);
         float new_keep = sessions_.get_keep_ratio(req.session_id);
         float ema      = sessions_.get_ema(req.session_id);
         std::fprintf(stderr,
