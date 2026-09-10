@@ -43,6 +43,17 @@ int deepseek4_hybrid_prefill_step_tokens(
     int configured_chunk,
     int position,
     int remaining_tokens);
+
+// Mixed ROCmFP MMQ changes the reduction/quantization topology, so only the
+// already-approximate prefill modes may select it automatically. The policy is
+// kept separate from the qtype kernels so future model backends can reuse the
+// same generic MMQ path after device-level qualification.
+bool deepseek4_mix_mmq_prefill_default(
+    PrefillAttentionMode mode,
+    const char * gcn_arch);
+ggml_mixed_mmq_policy deepseek4_mix_mmq_prefill_policy(
+    PrefillAttentionMode mode, const char * gcn_arch, const char * explicit_value);
+
 class DeepSeek4Backend : public ModelBackend {
 public:
     explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);

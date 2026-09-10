@@ -273,6 +273,23 @@ static void configure_gfx1151_paged_mmvq_default(int gpu, bool paged_attention) 
 #endif
 }
 
+static ggml_mixed_mmq_policy gfx1151_mix_mmq_prefill_policy(
+        int gpu, PrefillAttentionMode mode) {
+    // Read explicit policy without changing the process environment. The
+    // returned value is carried by this model's graph operations.
+    const char * value = std::getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, gpu) == cudaSuccess) {
+        return deepseek4_mix_mmq_prefill_policy(mode, prop.gcnArchName, value);
+    }
+#else
+    (void) gpu;
+    (void) mode;
+#endif
+    return deepseek4_mix_mmq_prefill_policy(mode, nullptr, value);
+}
+
 static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
 #if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (std::getenv("DFLASH_MMQ_SUB_BATCH") != nullptr) {
@@ -724,6 +741,7 @@ static MoeHybridConfig make_ds4_parent_worker_cfg(const DeepSeek4Weights & w) {
     cfg.n_layer = w.n_layer;
     cfg.first_moe_layer = 0;
     cfg.swiglu_clamp = w.swiglu_clamp_exp;
+    cfg.mixed_mmq_policy = w.mixed_mmq_policy;
     cfg.materialize_cold_experts = false;
     return cfg;
 }
@@ -748,6 +766,25 @@ static MoeLayerDesc make_ds4_expert_layer_desc(const DeepSeek4Layer & layer) {
 }
 
 }  // namespace
+
+bool deepseek4_mix_mmq_prefill_default(
+        PrefillAttentionMode mode, const char * gcn_arch) {
+    if (!prefill_attention_mode_is_approximate(mode) || gcn_arch == nullptr ||
+        std::strncmp(gcn_arch, "gfx1151", 7) != 0) {
+        return false;
+    }
+    return gcn_arch[7] == '\0' || gcn_arch[7] == ':';
+}
+
+ggml_mixed_mmq_policy deepseek4_mix_mmq_prefill_policy(
+        PrefillAttentionMode mode, const char * gcn_arch, const char * explicit_value) {
+    if (explicit_value) {
+        return std::strcmp(explicit_value, "0") == 0
+            ? GGML_MIXED_MMQ_DISABLED : GGML_MIXED_MMQ_ENABLED;
+    }
+    return deepseek4_mix_mmq_prefill_default(mode, gcn_arch)
+        ? GGML_MIXED_MMQ_ENABLED : GGML_MIXED_MMQ_DEFAULT;
+}
 
 void log_deepseek4_step_telemetry(const char * phase,
                          int tokens,
@@ -883,6 +920,14 @@ bool DeepSeek4Backend::load_model() {
         return false;
     }
     w_.routed_expert_top_k = cfg_.expert_top_k;
+    if (!moe_hybrid_) {
+        w_.mixed_mmq_policy = gfx1151_mix_mmq_prefill_policy(
+            cfg_.device.gpu, cfg_.prefill_mode);
+    }
+    std::fprintf(stderr, "[deepseek4] model-local mixed ROCmFP MMQ: %s\n",
+                 w_.mixed_mmq_policy == GGML_MIXED_MMQ_ENABLED ? "enabled" :
+                 w_.mixed_mmq_policy == GGML_MIXED_MMQ_DISABLED ? "disabled" :
+                 "backend default");
     w_.fused_decode = cfg_.fused_decode && !moe_hybrid_;
     w_.fused_verify_f16_kv = cfg_.fused_verify_f16_kv && !moe_hybrid_;
     if (cfg_.fused_decode && moe_hybrid_) {
@@ -1658,12 +1703,6 @@ bool DeepSeek4Backend::init_hybrid_model() {
                          "DFLASH_DS4_MIX_MMQ_PREFILL=1\n");
             return false;
         }
-        if ((!mix_mmq || !mix_mmq[0]) &&
-            set_environment_variable("DFLASH_DS4_MIX_MMQ_PREFILL", "1", true) != 0) {
-            std::fprintf(stderr,
-                         "[deepseek4] failed to enable mixed-expert MMQ prefill\n");
-            return false;
-        }
     }
 #endif
 
@@ -1678,6 +1717,10 @@ bool DeepSeek4Backend::init_hybrid_model() {
         return false;
     };
     MoeHybridConfig hybrid_cfg = make_ds4_parent_worker_cfg(w_);
+    hybrid_cfg.mixed_mmq_policy = same_runtime_tp && has_mix_experts
+        ? GGML_MIXED_MMQ_ENABLED
+        : gfx1151_mix_mmq_prefill_policy(cfg_.device.gpu, cfg_.prefill_mode);
+    w_.mixed_mmq_policy = hybrid_cfg.mixed_mmq_policy;
     if (inprocess_tp) {
         const int expert_gpu = tp.secondary_gpu;
         const PlacementBackend expert_kind = tp.secondary_backend;

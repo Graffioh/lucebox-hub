@@ -3464,6 +3464,23 @@ void ggml_mul_mat_set_prec(
     ggml_set_op_params_i32(a, 0, prec_i32);
 }
 
+void ggml_mul_mat_set_mixed_mmq(
+        struct ggml_tensor * op, enum ggml_mixed_mmq_policy policy) {
+    GGML_ASSERT(op->op == GGML_OP_MUL_MAT ||
+                op->op == GGML_OP_MUL_MAT_ID ||
+                op->op == GGML_OP_MUL_MAT_GROUPED_SRC);
+    GGML_ASSERT(policy >= GGML_MIXED_MMQ_DEFAULT && policy <= GGML_MIXED_MMQ_ENABLED);
+    // Word 0 is precision; word 14 is the grouped-source group count.
+    ggml_set_op_params_i32(op, 15, (int32_t) policy);
+}
+
+enum ggml_mixed_mmq_policy ggml_mul_mat_get_mixed_mmq(const struct ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_MUL_MAT ||
+                op->op == GGML_OP_MUL_MAT_ID ||
+                op->op == GGML_OP_MUL_MAT_GROUPED_SRC);
+    return (enum ggml_mixed_mmq_policy) ggml_get_op_params_i32(op, 15);
+}
+
 // ggml_mul_mat_id
 
 /*

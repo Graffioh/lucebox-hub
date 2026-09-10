@@ -36,6 +36,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_TP_SCHEDULE_BRANCHES` | unset | BURN-IN: expose independent mixed-vendor expert branches to the common multi-backend scheduler. |
 | `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` / `DFLASH_MOE_TP_TARGETED_JOIN_SPLIT` | unset | BURN-IN: start a main-GPU split only at each peer-result join, avoiding an extra peer fence per MoE layer. |
 | `DFLASH_DS4_COMP_PAD_STRIDE` | 16 | BURN-IN: compressed-KV padding bucket (`16`, `32`, `64`, or `128`); wider exact-masked buckets reduce verifier graph recapture churn. |
+| `DFLASH_DS4_MIX_MMQ_PREFILL` | enabled for DS4 approximate prefill on gfx1151 | BURN-IN KILL SWITCH: =0 disables registry-aware mixed ROCmFP MMQ; =1 explicitly enables it on supported HIP devices. Automatic selection is model/graph-local and never writes the process environment. Exact prefill retains its existing dispatch defaults, including the specialized paired FP2 path. |
 | `DFLASH_DS4_INCREMENTAL_VERIFY_MASK` | 1 for masks at least 4 MiB | BURN-IN KILL SWITCH: =0 rebuilds and transfers the complete fused-verifier attention mask from the host on every step. |
 | `DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES` | 4194304 | DEBUG/A-B: minimum fused-verifier mask size for GPU zeroing plus negative-range updates. |
 | `DFLASH_DS4_SPARSE_DECODE_FLASH` | 0 | Experimental single-HIP-target verifier attention. Opt in with =1; may change generated tokens. Uses model sparse top-k only when it removes more than half of the compressed rows. |
@@ -53,6 +54,13 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | unset | OPT-IN: bypass graph property scans only after warmup; scheduler-generation checks remain mandatory. |
 | `DFLASH_DS4_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and emit semantic DS4 prefill, speculative-decode, and layer-range markers for external rocprof traces. No events, timing, or device synchronization are added. |
 | `DFLASH_QWEN35_ROCTX` | unset | DEBUG: on HIP builds, dynamically load ROCTX and mark Qwen concurrent steps, graph compute, and argmax readback with live, padded, and packed-prefill shape metadata. |
+| `DFLASH_CUDA_MMVF_NARROW_F16` | enabled on qualified gfx1151 narrow F16 matmuls | BURN-IN KILL SWITCH: =0 restores the generic dispatch decision for the narrow F16 projection optimization, unless an explicit `LUCE_MMVF_MAX_NCOLS_F16` ceiling overrides it. |
+| `GGML_CUDA_MMQ_X` | unset | DEBUG: force a supported MMQ output-column tile width (8–128) for architecture tuning; invalid or over-budget values fall back to automatic selection. |
+| `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` | unset | BURN-IN: on sparse-route gfx1151 grouped MoE MMQ, choose the measured ROCmFP2/3/4 output tile from routed rows per expert; ordinary matmuls, unmeasured formats, and other devices are unchanged. |
+| `GGML_CUDA_MMQ_MOE_PERSISTENT` | unset | EXPERIMENTAL: on prefill-sized (at least 256-token) sparse grouped ROCmFP2/3/4 MMQ on gfx1151, build a compact device-side expert-tile queue and consume it with bounded persistent workers. Short batches, ordinary matmuls, unmeasured formats, and other devices are unchanged. |
+| `GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU` | 32 | DEBUG: set the compact grouped-MoE worker budget per gfx1151 CU from 1–32. Invalid values use 32. |
+| `GGML_CUDA_MLA_STREAM_F32_STAGE` | unset | EXPERIMENTAL: with streaming D512 indexed attention, convert aligned F16 pairs once while staging them in shared memory instead of repeating conversion for every head. |
+| `GGML_CUDA_MLA_STREAM_FAST_EXP` | unset | EXPERIMENTAL: with FP32-staged streaming D512 indexed attention, use the HIP hardware exponential intrinsic for online softmax. Other attention paths are unchanged. |
 | `GGML_CUDA_MLA_SPLIT_KV` / `GGML_DS4_FA_SPLIT_KV` | 1 on gfx1151 indexed decode; unset elsewhere | BURN-IN: =1 forces the reusable split-KV MLA schedule. Unset, empty, or =0 does not force it (the device default still applies). Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` (or legacy `GGML_DS4_FA_NO_SPLIT_KV=1`) to disable it; either kill switch overrides either force flag, while empty/=0 kill switches have no effect. |
 | `GGML_DS4_TOPK_BLOCK_RADIX` | 1 on gfx1151 | BURN-IN KILL SWITCH: =0 restores hipCUB full sort for DS4-shaped 512-row top-k selection. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | unset | DEBUG/A-B: restore the serial indexed-attention mask scan instead of the long-context HIP parallel scan. |
@@ -90,6 +98,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_ADAPTIVE_WIDTH_THETA` - adaptive_verify_width.h
 - `DFLASH_COLD_THREADS` - moe_expert_compute_cpu.cpp
 - `DFLASH_CUDA_BACKEND_PATH` - dynamic_backend.cpp
+- `DFLASH_CUDA_MMVF_NARROW_F16` - ggml-cuda/mmvf.cu
 - `DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_CUDA_MMVQ_MOE_KERNEL` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_DISABLE_DRAFT_ATTN` - draft_graph.cpp
@@ -110,6 +119,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_DENSE_TP_MASK` - deepseek4_loader.cpp
 - `DFLASH_DS4_DENSE_TP_STRIX_FRACTION` - deepseek4_loader.cpp
 - `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` - deepseek4_graph.cpp
+- `DFLASH_DS4_DIRECT_INDEXER_TOPK` - deepseek4_graph.cpp
 - `DFLASH_DS4_DRAFT` - deepseek4_backend.cpp
 - `DFLASH_DS4_DRAFT_BACKEND` - deepseek4_backend.cpp
 - `DFLASH_DS4_DRAFT_GPU` - deepseek4_backend.cpp
@@ -118,6 +128,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_DS4_HOTNESS_CSV` - deepseek4_backend.cpp
 - `DFLASH_DS4_INCREMENTAL_VERIFY_MASK` - deepseek4_fused_verify.inc
 - `DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES` - deepseek4_fused_verify.inc
+- `DFLASH_DS4_MIX_MMQ_PREFILL` - deepseek4_backend.cpp, ggml-cuda/mmq.cu
 - `DFLASH_DS4_MOE_TP` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_BACKEND` - deepseek4_backend.cpp
 - `DFLASH_DS4_MOE_TP_CONCENTRATE_COLD` - deepseek4_backend.cpp
@@ -208,6 +219,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_MMQ_SUB_BATCH` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MODEL_CARDS_DIR` - model_card.cpp
 - `DFLASH_MOE_COLD_BACKEND` - deepseek4_loader.cpp
+- `DFLASH_MOE_COMBINE_VEC4` - ggml-cuda/moe-fused.cu
 - `DFLASH_MOE_COMPACT_MATERIALIZED` - moe_hybrid_ffn_eval.cpp
 - `DFLASH_MOE_DUPLICATE_HOT_ON_COLD` - moe_hybrid_storage.cpp
 - `DFLASH_MOE_EXPERT_COMPUTE_DAEMON_TOKEN_LOOP` - moe_expert_compute_ipc.cpp
@@ -277,6 +289,14 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_VERIFY_WIDTH` - qwen35moe_backend.cpp
 - `FAST_ROLLBACK_DIAG` - qwen35_dflash_target.cpp
 - `GGML_CUDA_MLA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
+- `GGML_CUDA_MMQ_X` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MMQ_MOE_ADAPTIVE_X` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MMQ_MOE_PERSISTENT` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MMQ_MOE_PERSISTENT_BLOCKS_PER_CU` - ggml-cuda/mmq.cuh
+- `GGML_CUDA_MLA_STREAM_TOPK` - ggml-cuda/fattn.cu
+- `GGML_DS4_FA_STREAM_TOPK` - ggml-cuda/fattn.cu (compatibility alias)
+- `GGML_CUDA_MLA_STREAM_F32_STAGE` - ggml-cuda/fattn.cu
+- `GGML_CUDA_MLA_STREAM_FAST_EXP` - ggml-cuda/fattn.cu
 - `GGML_CUDA_MLA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
 - `GGML_DS4_FA_NO_SPLIT_KV` - ds4-env.cuh (fattn.cu)
 - `GGML_DS4_FA_SPLIT_KV` - ds4-env.cuh (fattn.cu)
