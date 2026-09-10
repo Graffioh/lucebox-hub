@@ -1156,7 +1156,7 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_kernel(
 // every visible row keeps its original owner thread, dot-product order,
 // reduction tree, softmax order, and value-accumulation position.
 template <typename KV, typename Mask, int HEADS_PER_BLOCK, bool INDEXED_MASK,
-          bool MASKLESS_CAUSAL, int VALUES_PER_THREAD>
+          bool MASKLESS_CAUSAL, int VALUES_PER_THREAD, bool QUAD_DOT = false>
 __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
         float       * dst,
         const float * q,
@@ -1319,16 +1319,35 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
         float dot[HEADS_PER_BLOCK] = {};
         if (visible) {
             const KV * kr = k + (size_t) r * D;
+            if constexpr (QUAD_DOT) {
 #pragma unroll
-            for (int d = 0; d < D; ++d) {
-                const float kv = ds4_fa_load<KV, Mask>(kr + d);
+                for (int d = 0; d < D; d += 4) {
+                    float k0, k1, k2, k3;
+                    ds4_fa_load_quad<KV>(kr + d, k0, k1, k2, k3);
 #pragma unroll
-                for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
-                    const float qv =
-                        inverse_rope.forward_q_enabled && d >= D - 64
-                            ? q_rope_tail[(size_t) j * 64 + d - (D - 64)]
-                            : qh[j][d];
-                    dot[j] += qv * kv;
+                    for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+                        const float * qr = inverse_rope.forward_q_enabled && d >= D - 64
+                            ? q_rope_tail + (size_t) j * 64 + d - (D - 64)
+                            : qh[j] + d;
+                        // Keep the four FMAs in the original dimension order.
+                        dot[j] += qr[0] * k0;
+                        dot[j] += qr[1] * k1;
+                        dot[j] += qr[2] * k2;
+                        dot[j] += qr[3] * k3;
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int d = 0; d < D; ++d) {
+                    const float kv = ds4_fa_load<KV, Mask>(kr + d);
+#pragma unroll
+                    for (int j = 0; j < HEADS_PER_BLOCK; ++j) {
+                        const float qv =
+                            inverse_rope.forward_q_enabled && d >= D - 64
+                                ? q_rope_tail[(size_t) j * 64 + d - (D - 64)]
+                                : qh[j][d];
+                        dot[j] += qv * kv;
+                    }
                 }
             }
         }
@@ -2751,7 +2770,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         CUDA_CHECK(cudaGetLastError());
         // Long ratio-4 prefill selects this path structurally. Preserve the
         // existing overrides and the opt-in policy for other indexed shapes.
-        // Sixteen wave32 heads share each staged K == V row.
+        // HIP F32 preserves compact arithmetic with eight-head grouping;
+        // F16 and CUDA keep the existing wave32 online-softmax policy.
         const char * streaming_topk_env =
             getenv("GGML_CUDA_MLA_STREAM_TOPK");
         if (!streaming_topk_env) {
@@ -2771,6 +2791,35 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
             device_warp_size == 32 && n_tokens >= streaming_min_tokens &&
             active_row_upper_bound > 0 &&
             n_kv >= 3 * active_row_upper_bound) {
+#if defined(GGML_USE_HIP)
+            if (kv_f32) {
+                // Eight heads reuse each K/V load. Four adjacent values per
+                // thread share score loads and row-loop control while each
+                // dimension retains its original accumulation order.
+                const auto launch_group8 = [&](auto maskless) {
+                    ds4_flash_attn_d512_shared_kv_grouped_compact_kernel<
+                        float, half, 8, true, decltype(maskless)::value, 4, true>
+                        <<<dim3(n_tokens, n_heads / 8), 256,
+                           2 * compact_group4_shmem, stream>>>(
+                        (float *) dst->data, (const float *) Q->data,
+                        q_stride_token, q_stride_head, (const float *) K->data,
+                        (const float *) V->data,
+                        mask ? (const half *) mask->data : nullptr,
+                        sinks ? (const float *) sinks->data : nullptr,
+                        n_tokens, n_heads, n_kv, scale,
+                        raw_rows, raw_window, compact_score_stride,
+                        visibility_bounds, indexed_rows, indexed_counts,
+                        indexed_owner_offsets, indexed_owner_ranks,
+                        indexed_capacity, inverse_rope,
+                        inverse_rope_coefficients, forward_rope_coefficients);
+                };
+                if (ratio4_causal) launch_group8(std::true_type{});
+                else              launch_group8(std::false_type{});
+                CUDA_CHECK(cudaGetLastError());
+                ++g_mla_stream_topk_launch_count;
+                return true;
+            }
+#endif
             const char * f32_stage_env =
                 getenv("GGML_CUDA_MLA_STREAM_F32_STAGE");
             const bool f32_stage = f32_stage_env

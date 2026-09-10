@@ -13,8 +13,8 @@
 // Differential correctness only. This emits no throughput measurements.
 static bool check(ggml_backend_t backend, int start, int tokens,
                   int expected_launches, bool require_byte_identity,
-                  bool f32_kv = false) {
-    constexpr int dim = 512, heads = 16, window = 128, selected = 512;
+                  bool f32_kv = false, int heads = 16) {
+    constexpr int dim = 512, window = 128, selected = 512;
     const int prior = std::min(start, window);
     const int raw = prior + tokens;
     const int compressed = (start + tokens) / 4;
@@ -121,7 +121,7 @@ static bool check(ggml_backend_t backend, int start, int tokens,
             ggml_backend_tensor_get(analytic_stream, analytic.data(), 0, ggml_nbytes(analytic_stream));
             const size_t launches = ggml_backend_cuda_get_mla_stream_topk_launch_count() - launches_before;
             if (replay == 0 && launches != size_t(expected_launches)) {
-                std::fprintf(stderr, "wrong streaming dispatch count: expected=%d actual=%zu\n", expected_launches, launches);
+                std::fprintf(stderr, "wrong selected-row dispatch count: expected=%d actual=%zu\n", expected_launches, launches);
                 ok = false;
             }
             float max_abs = 0;
@@ -136,9 +136,17 @@ static bool check(ggml_backend_t backend, int start, int tokens,
                                5e-4f + 5e-4f * std::max(std::abs(expected[i]), std::abs(analytic[i]));
             }
             const bool identical = std::memcmp(masked.data(), analytic.data(), ggml_nbytes(ref)) == 0;
-            ok = ok && outside == 0 && (!require_byte_identity || identical);
-            std::printf("start=%d tokens=%d replay=%d compact_vs_stream_max_abs=%.8g outside=%zu masked_vs_analytic_bytes_equal=%d kv_type=%s\n",
-                        start, tokens, replay, max_abs, outside, identical, f32_kv ? "f32" : "f16");
+            // F32 prefill feeds the drafter's features as well as the target.
+            // A loose attention tolerance can hide a lost accepted draft token.
+            // Its optimized schedule must preserve the compact arithmetic.
+            const bool reference_identical =
+                std::memcmp(expected.data(), masked.data(), ggml_nbytes(ref)) == 0 &&
+                std::memcmp(expected.data(), analytic.data(), ggml_nbytes(ref)) == 0;
+            ok = ok && outside == 0 && (!require_byte_identity || identical) &&
+                 (!f32_kv || reference_identical);
+            std::printf("start=%d tokens=%d heads=%d replay=%d compact_vs_stream_max_abs=%.8g outside=%zu masked_vs_analytic_bytes_equal=%d reference_bytes_equal=%d kv_type=%s\n",
+                        start, tokens, heads, replay, max_abs, outside, identical,
+                        reference_identical, f32_kv ? "f32" : "f16");
             std::fflush(stdout);
         }
     }
@@ -186,6 +194,10 @@ int main(int argc, char ** argv) {
         ok = check(backend, 0, 10240, expected_launches, true, f32_kv);
     }
     ok = check(backend, 122880, 129, expected_launches, !defaults, f32_kv) && ok;
+    if (f32_kv && !defaults && !disabled) {
+        // Exercise all model head groups, beyond the smaller 16-head fixture.
+        ok = check(backend, 122880, 129, expected_launches, true, true, 64) && ok;
+    }
     ggml_backend_free(backend);
     std::printf("wide/tail maskless differential: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
