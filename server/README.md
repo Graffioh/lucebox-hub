@@ -42,6 +42,9 @@ This repo provides the GGUF target path and runtime pieces needed to run that st
 
 The default setup fits on a 24 GB RTX 3090: ~16 GB Q4_K_M target, 1.84 GB GGUF draft, DDTree verify state, and KV cache.
 
+For one listener with Qwen on R9700 and DS4 on Strix Halo, see
+[model load balancing](docs/MODEL_LOAD_BALANCING.md).
+
 ## Results
 
 Qwen3.5-27B Q4_K_M, concurrency=1, n_gen=256, 10 prompts/dataset:
