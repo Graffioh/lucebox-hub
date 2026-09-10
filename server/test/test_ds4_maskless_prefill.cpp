@@ -52,7 +52,7 @@ static bool check(ggml_backend_t backend, int start, int tokens,
     // The analytical contract is only for fixed-position ratio-4 prefill.
     // Masked verification supports wider row sets and runtime positions, but
     // those shapes must never reach the fixed-width maskless sorter.
-    auto * too_wide = make_attention(true, true);
+    auto * too_wide = make_attention(false, true);
     ggml_flash_attn_ext_set_ds4_sparse(too_wide, raw, window, -(selected + 1), 32);
     ggml_flash_attn_ext_set_ds4_indexer_topk(
         too_wide, ggml_new_tensor_2d(ctx, GGML_TYPE_I32, selected + 1, tokens));
