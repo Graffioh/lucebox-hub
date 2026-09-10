@@ -14,6 +14,7 @@
 #include "deepseek4_page_layout.h"
 #include "internal.h"
 #include "../common/step_graph.h"
+#include "../common/immutable_graph_input_pool.h"
 #include "../common/cuda_graph_overrides.h"
 #include "../common/dynamic_backend.h"
 #include "../common/moe_expert_compute.h"
@@ -6661,6 +6662,11 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
 // SWA tail is committed to the persistent ring. The compressor publishes every
 // ratio-4/ratio-128 boundary crossed by the ubatch.
 //
+struct Ds4LayerMajorF32Input {
+    ggml_tensor * tensor = nullptr;
+    ImmutableGraphInputPool<float>::Values values;
+};
+
 struct Ds4LayerMajorCachedLayer {
     void * meta_buffer = nullptr;
     size_t meta_size = 0;
@@ -6669,7 +6675,7 @@ struct Ds4LayerMajorCachedLayer {
     std::vector<DeepSeek4I32InputBinding> i32_inputs;
     std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
     std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
-    std::vector<DeepSeek4F32ArrayBinding> f32_array_inputs;
+    std::vector<Ds4LayerMajorF32Input> f32_array_inputs;
     std::vector<ggml_tensor *> allocated_tensors;
     ggml_tensor * hash_ids = nullptr;
     ggml_tensor * logits = nullptr;
@@ -6707,6 +6713,7 @@ struct Ds4LayerMajorGraphCache {
     ggml_tensor * state_a = nullptr;
     ggml_tensor * state_b = nullptr;
     std::vector<Ds4LayerMajorCachedLayer> layers;
+    ImmutableGraphInputPool<float> f32_input_values;
 
     bool matches(const DeepSeek4Weights & w, ggml_backend_t b,
                  PrefillAttentionMode m, int tokens, int start) const {
@@ -6718,6 +6725,7 @@ struct Ds4LayerMajorGraphCache {
     void destroy() {
         for (auto & layer : layers) layer.destroy();
         layers.clear();
+        f32_input_values.clear();
         if (state_buf) {
             ggml_backend_buffer_free(state_buf);
             state_buf = nullptr;
@@ -7063,8 +7071,8 @@ static int ds4_try_layer_major_prefill(
                                         sizeof(int64_t) * b.values.size());
             }
             for (const auto & b : layer.f32_array_inputs) {
-                ggml_backend_tensor_set(b.tensor, b.values.data(), 0,
-                                        sizeof(float) * b.values.size());
+                ggml_backend_tensor_set(b.tensor, b.values->data(), 0,
+                                        sizeof(float) * b.values->size());
             }
             if (layer.hash_ids) {
                 const int n_used = w.n_expert_used;
@@ -7337,7 +7345,14 @@ static int ds4_try_layer_major_prefill(
             cached_layer->i32_inputs = std::move(i32_inputs);
             cached_layer->i32_array_inputs = std::move(i32_array_inputs);
             cached_layer->i64_array_inputs = std::move(i64_array_inputs);
-            cached_layer->f32_array_inputs = std::move(f32_array_inputs);
+            // Dense/ratio-128 layers often have byte-identical causal masks.
+            // Retaining one quadratic host array per layer costs several GiB
+            // at wide chunks, even though GPU scratch is already shared.
+            // Share only identical immutable values; tensors remain per-layer.
+            for (auto & b : f32_array_inputs) {
+                cached_layer->f32_array_inputs.push_back({
+                    b.tensor, graph_cache->f32_input_values.intern(std::move(b.values))});
+            }
             cached_layer->hash_ids = hash_ids;
             cached_layer->logits = logits;
         } else {

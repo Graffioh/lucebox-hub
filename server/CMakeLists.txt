@@ -1801,6 +1801,7 @@ if(DFLASH27B_TESTS)
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_spec_width.cpp
+            test/test_immutable_graph_input_pool.cpp
             test/test_mmq_tile_selection.cpp
             test/test_mixed_mmq_policy.cpp
             test/test_spec_acceptance.cpp
