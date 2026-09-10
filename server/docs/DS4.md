@@ -85,7 +85,9 @@ does not use the retired per-expert IPC worker.
 ### Monolithic HIP
 
 Sparse layer-major prefill accepts scheduling chunks up to 10,240 tokens
-(`--chunk 10240`). Dense attention within that schedule retains independent
+(`--chunk 10240`). This is a graph-shape limit, not a memory-fit guarantee;
+reduce the chunk size when a resident drafter or longer history leaves
+insufficient scratch headroom. Dense attention within that schedule retains independent
 2,048-token numerical bands and the cache-rounding boundary between them.
 Eligible ratio-4 sparse layers pass their learned top-k rows directly, keep
 KV transport in F16, and derive causal visibility without uploading a dense
