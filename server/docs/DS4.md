@@ -98,7 +98,10 @@ The wave32 selected-row attention path is automatic for eligible maskless
 prefill shapes. On HIP, F32 inputs share key/value loads across eight heads while retaining the
 compact kernel's dot-product order, softmax reduction tree and value-sum order.
 Four adjacent key values are loaded together, but each dot product still
-accumulates dimensions sequentially. This adds no global temporary buffer.
+accumulates dimensions sequentially with bounded loop unrolling. Each wave
+derives one head's nonzero value bounds from the completed weights using
+integer min/max, avoiding contended per-weight atomic updates. Neither change
+alters floating-point association or adds a global temporary buffer.
 F16 inputs and CUDA keep their existing streaming policies.
 `GGML_CUDA_MLA_STREAM_TOPK=0` restores compact attention for
 diagnosis; it does not turn sparse prefill into reference-exact prefill.

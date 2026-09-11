@@ -13,7 +13,8 @@
 // Differential correctness only. This emits no throughput measurements.
 static bool check(ggml_backend_t backend, int start, int tokens,
                   int expected_launches, bool require_byte_identity,
-                  bool f32_kv = false, int heads = 16) {
+                  bool f32_kv = false, int heads = 16,
+                  bool stress_weight_bounds = false) {
     constexpr int dim = 512, window = 128, selected = 512;
     const int prior = std::min(start, window);
     const int raw = prior + tokens;
@@ -91,6 +92,21 @@ static bool check(ggml_backend_t backend, int start, int tokens,
             else        kvv[i] = ggml_fp32_to_fp16(value);
         }
         for (auto & value : sv) value = sample();
+        if (stress_weight_bounds) {
+            // Include an empty value envelope (all mass at the sink), along
+            // with head-dependent holes and endpoints from exp underflow.
+            // All inputs remain finite; skipping a zero weight must not
+            // change another head's value-accumulation interval or order.
+            for (int h = 0; h < heads; ++h) {
+                for (int t = 0; t < tokens; ++t) {
+                    for (int d = 0; d < dim; ++d) {
+                        auto & value = qv[(size_t(h) * tokens + t) * dim + d];
+                        value = h % 4 == 0 ? 0.0f : value * 128.0f;
+                    }
+                }
+                sv[h] = h % 4 == 0 ? 1000.0f : -1000.0f;
+            }
+        }
         for (int t = 0; t < tokens; ++t) {
             auto * col = mv.data() + size_t(t) * rows;
             for (int row = std::max(0, prior + t - window + 1); row <= prior + t; ++row)
@@ -144,9 +160,9 @@ static bool check(ggml_backend_t backend, int start, int tokens,
                 std::memcmp(expected.data(), analytic.data(), ggml_nbytes(ref)) == 0;
             ok = ok && outside == 0 && (!require_byte_identity || identical) &&
                  (!f32_kv || reference_identical);
-            std::printf("start=%d tokens=%d heads=%d replay=%d compact_vs_stream_max_abs=%.8g outside=%zu masked_vs_analytic_bytes_equal=%d reference_bytes_equal=%d kv_type=%s\n",
+            std::printf("start=%d tokens=%d heads=%d replay=%d compact_vs_stream_max_abs=%.8g outside=%zu masked_vs_analytic_bytes_equal=%d reference_bytes_equal=%d kv_type=%s stress_weight_bounds=%d\n",
                         start, tokens, heads, replay, max_abs, outside, identical,
-                        reference_identical, f32_kv ? "f32" : "f16");
+                        reference_identical, f32_kv ? "f32" : "f16", stress_weight_bounds);
             std::fflush(stdout);
         }
     }
@@ -197,6 +213,9 @@ int main(int argc, char ** argv) {
     if (f32_kv && !defaults && !disabled) {
         // Exercise all model head groups, beyond the smaller 16-head fixture.
         ok = check(backend, 122880, 129, expected_launches, true, true, 64) && ok;
+        // A distinct supported shape forces dispatch rather than a graph-cache
+        // hit, so the first-submission launch-count assertion stays meaningful.
+        ok = check(backend, 122880, 133, expected_launches, true, true, 64, true) && ok;
     }
     ggml_backend_free(backend);
     std::printf("wide/tail maskless differential: %s\n", ok ? "PASS" : "FAIL");

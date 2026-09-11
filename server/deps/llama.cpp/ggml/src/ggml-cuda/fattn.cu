@@ -1250,9 +1250,9 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
         local_max[j] = h < n_heads && sinks
             ? sinks[h] : -3.402823466e38f;
     }
-    // Build the full kernel's exact per-head non-zero envelope while the
-    // softmax weights are emitted. This avoids rescanning every context row
-    // after softmax without changing the subsequent V accumulation interval.
+    // Reserve the exact per-head nonzero envelopes. Scalar paths update them
+    // while emitting weights; the eight-head path scans bounded scores later.
+    // Both preserve the full kernel's value-accumulation interval and order.
     if (tid < HEADS_PER_BLOCK * 4) {
         const int slot = tid & 3;
         value_bounds[tid] = slot == 0
@@ -1320,7 +1320,9 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
         if (visible) {
             const KV * kr = k + (size_t) r * D;
             if constexpr (QUAD_DOT) {
-#pragma unroll
+                // Bound code expansion for the eight-head HIP path while
+                // preserving the original sequential FMAs in each head.
+#pragma unroll 4
                 for (int d = 0; d < D; d += 4) {
                     float k0, k1, k2, k3;
                     ds4_fa_load_quad<KV>(kr + d, k0, k1, k2, k3);
@@ -1418,10 +1420,12 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
             const float weight = expf(*score - max_score[j]);
             *score = weight;
             local_sum[j] += weight;
-            if (weight != 0.0f) {
-                int * bounds = value_bounds + 4 * j + (raw_value ? 0 : 2);
-                atomicMin(bounds + 0, bound_value);
-                atomicMax(bounds + 1, bound_value);
+            if constexpr (!QUAD_DOT) {
+                if (weight != 0.0f) {
+                    int * bounds = value_bounds + 4 * j + (raw_value ? 0 : 2);
+                    atomicMin(bounds + 0, bound_value);
+                    atomicMax(bounds + 1, bound_value);
+                }
             }
         }
     }
@@ -1446,6 +1450,45 @@ __global__ static void ds4_flash_attn_d512_shared_kv_grouped_compact_kernel(
             }
         }
         __syncthreads();
+    }
+
+    if constexpr (QUAD_DOT) {
+        static_assert(INDEXED_MASK && HEADS_PER_BLOCK == 8);
+        // One wave scans each head's completed weights. Integer min/max
+        // replaces contended per-weight atomics without touching the score,
+        // softmax, or value arithmetic. The sum reduction above has already
+        // made every weight visible to every wave in the block.
+        constexpr int WAVE = 32;
+        const int head = tid / WAVE;
+        const int lane = tid % WAVE;
+        const float * head_scores = scores + (size_t) head * score_stride;
+        int first_raw = raw_rows, last_raw = -1;
+        int first_comp = indexed_count, last_comp = -1;
+        for (int r = mask_raw_first + lane; r <= mask_raw_last; r += WAVE) {
+            if (head_scores[r - mask_raw_first] != 0.0f) {
+                first_raw = min(first_raw, r);
+                last_raw = max(last_raw, r);
+            }
+        }
+        for (int rank = lane; rank < indexed_count; rank += WAVE) {
+            if (head_scores[raw_score_capacity + rank] != 0.0f) {
+                first_comp = min(first_comp, rank);
+                last_comp = max(last_comp, rank);
+            }
+        }
+#pragma unroll
+        for (int delta = WAVE / 2; delta > 0; delta >>= 1) {
+            first_raw = min(first_raw, __shfl_xor_sync(0xffffffffu, first_raw, delta, WAVE));
+            last_raw = max(last_raw, __shfl_xor_sync(0xffffffffu, last_raw, delta, WAVE));
+            first_comp = min(first_comp, __shfl_xor_sync(0xffffffffu, first_comp, delta, WAVE));
+            last_comp = max(last_comp, __shfl_xor_sync(0xffffffffu, last_comp, delta, WAVE));
+        }
+        if (lane == 0) {
+            value_bounds[4 * head + 0] = first_raw;
+            value_bounds[4 * head + 1] = last_raw;
+            value_bounds[4 * head + 2] = first_comp;
+            value_bounds[4 * head + 3] = last_comp;
+        }
     }
 
     float inv_denom[HEADS_PER_BLOCK];
