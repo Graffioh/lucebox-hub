@@ -1,5 +1,5 @@
 <p align="left">
-  <a href="../README.md">← lucebox-hub</a>
+  <a href="../README.md">← lucebox</a>
 </p>
 
 <p align="center">
@@ -558,10 +558,10 @@ tokens) is the path to bring code recall to the same ratio as prose.
 ## Quick start
 
 ```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
-cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git
+cd lucebox/server
 
-# Build (CUDA 12+, CMake 3.18+, sm_60+ GPU including Pascal; CUDA 13+ required for Jetson AGX Thor sm_110)
+# Build (CUDA 12+, CMake 3.21+, sm_60+ GPU including Pascal; CUDA 13+ required for Jetson AGX Thor sm_110)
 # Pass -DCMAKE_CUDA_ARCHITECTURES matching your GPU. Common values:
 #   60;61 = Pascal P100/P40 (scalar flashprefill fallback, no WMMA)
 #   70 = V100 (F16 WMMA kernels, BF16 draft → FP16 at load)
@@ -575,7 +575,7 @@ cd lucebox-hub/dflash
 # which compiles Pascal (scalar), Volta/Turing (F16 WMMA), and Ampere+ (BF16 WMMA)
 # flashprefill paths.
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build build --target test_dflash -j
+cmake --build build --target test_dflash dflash_server -j
 
 # Fetch models: ~16 GB target + 0.98 GB Lucebox Q4_K_M GGUF DFlash draft.
 # Quickstart pins to Qwen3.6-27B (latest release). For Qwen3.5-27B swap in
@@ -621,7 +621,7 @@ nvcc --version
 
 ```bash
 nvcc --version  # must show >= 12.9
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds sm_121
 cmake --build build --target test_dflash dflash_server -j
 ```
@@ -632,7 +632,7 @@ On GB10 (128 GB unified), re-sweep `--ddtree-budget` (larger tree = more verify 
 
 ```bash
 nvcc --version  # must show >= 13.0
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds Thor arch
 cmake --build build --target test_dflash dflash_server -j
 ```
@@ -670,7 +670,7 @@ HumanEval runs (+3.1%), HumanEval+ pass@1 145/164 versus 143/164, with all ten
 short A/B replies and 133/164 full-suite replies byte-identical.
 
 ```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 
 # Ubuntu/ROCm build dependencies used by ggml's HIP backend.
 sudo apt-get update
@@ -743,7 +743,7 @@ Correctness: `test_vs_oracle` validates the draft graph at cos sim 0.999812 vs t
 
 ## Contributing
 
-Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
+Open an issue or PR against `Luce-Org/lucebox`. Good first picks:
 
 - **Leviathan-style rejection sampling** on each DDTree branch (the current implementation samples only the committed token; full prob-matching across the tree is the next step)
 - **Full llama.cpp integration**: new arch, `llama-speculative-dflash.cpp`, `llama-cli` / `llama-server` wiring
@@ -754,7 +754,7 @@ Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
 @software{luce_dflash_2026,
   title  = {Luce DFlash: GGUF port of block-diffusion speculative decoding for Qwen3.5-27B on consumer GPUs},
   author = {Lucebox},
-  url    = {https://github.com/Luce-Org/lucebox-hub/tree/main/dflash},
+  url    = {https://github.com/Luce-Org/lucebox/tree/main/server},
   year   = {2026}
 }
 
