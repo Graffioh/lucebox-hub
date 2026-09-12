@@ -1,5 +1,5 @@
 <p align="left">
-  <a href="../README.md">← lucebox-hub</a>
+  <a href="../README.md">← lucebox</a>
 </p>
 
 <p align="center">
@@ -743,7 +743,7 @@ Correctness: `test_vs_oracle` validates the draft graph at cos sim 0.999812 vs t
 
 ## Contributing
 
-Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
+Open an issue or PR against `Luce-Org/lucebox`. Good first picks:
 
 - **Leviathan-style rejection sampling** on each DDTree branch (the current implementation samples only the committed token; full prob-matching across the tree is the next step)
 - **Full llama.cpp integration**: new arch, `llama-speculative-dflash.cpp`, `llama-cli` / `llama-server` wiring
@@ -754,7 +754,7 @@ Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
 @software{luce_dflash_2026,
   title  = {Luce DFlash: GGUF port of block-diffusion speculative decoding for Qwen3.5-27B on consumer GPUs},
   author = {Lucebox},
-  url    = {https://github.com/Luce-Org/lucebox-hub/tree/main/dflash},
+  url    = {https://github.com/Luce-Org/lucebox/tree/main/server},
   year   = {2026}
 }
 
