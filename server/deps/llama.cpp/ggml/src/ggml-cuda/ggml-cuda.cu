@@ -2518,6 +2518,16 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+static int ggml_cuda_mmvq_max_ncols() {
+    static const int configured = []() {
+        const char * e = getenv("LUCE_MMVQ_MAX_NCOLS");
+        const int v = e ? atoi(e) : 3;
+        return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
+    }();
+    return ggml_cuda_mmvq_max_ncols_override > 0
+        ? ggml_cuda_mmvq_max_ncols_override : configured;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -2772,6 +2782,12 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         }
 
         const int64_t ncols = ids ? src1->ne[2] : src1->ne[1];
+        // Sharing activation quantization must not change the ordinary
+        // dispatch's arithmetic. Dense multi-column MMVQ takes precedence
+        // over MMQ even though direct GLU fusion only supports one column.
+        if (!ids && ncols <= ggml_cuda_mmvq_max_ncols()) {
+            return false;
+        }
 #ifdef GGML_CUDA_FORCE_CUBLAS
         // The global force-cuBLAS policy is authoritative over this RDNA 3.5 default.
         constexpr bool default_ds4_mix_gate_up_mmq = false;
@@ -2819,14 +2835,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // measured crossover on sm_86 (RTX 3090, Q4_K_M/Q6_K dense GEMVs) — MMVQ
     // wins at ncols<=3, MMQ wins at 4-8 (laguna w6 chain 199->237 tok/s,
     // qwen3.6 chain 127->137). Override via env for other hardware.
-    static const int luce_mmvq_max_ncols_env = []() {
-        const char * e = getenv("LUCE_MMVQ_MAX_NCOLS");
-        const int v = e ? atoi(e) : 3;
-        return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
-    }();
-    const int luce_mmvq_max_ncols = ggml_cuda_mmvq_max_ncols_override > 0
-        ? ggml_cuda_mmvq_max_ncols_override
-        : luce_mmvq_max_ncols_env;
+    const int luce_mmvq_max_ncols = ggml_cuda_mmvq_max_ncols();
     // The mix qtypes have no generic MMVQ path because their per-expert
     // codebooks live in an out-of-band registry. Decode uses the dedicated
     // fused kernels below. Approximate prefill modes can select their
