@@ -9,6 +9,7 @@
 //   6. MoE FFN (hash routing + top-k + shared expert + clamped SwiGLU)
 
 #include "deepseek4_internal.h"
+#include "common/blocking_row_pool.h"
 #include "deepseek4_hc_cuda.h"
 #include "deepseek4_roctx.h"
 #include "deepseek4_page_layout.h"
@@ -4040,142 +4041,7 @@ static void cpu_matvec_f16(float * out, const uint16_t * mat, const float * x, i
 // are bit-identical to the serial path; only wall time changes. Decode issues
 // ~86 of these 24x16384 matvecs per token, so workers spin briefly to catch
 // adjacent jobs, then park on a condition variable while the server is idle.
-struct Ds4HcMatvecPool {
-    struct Job {
-        const uint16_t * mat;
-        const float * x;
-        float * out;
-        int rows;
-        int cols;
-        int active_workers;
-    };
-    std::mutex client_mu;
-    std::mutex wait_mu;
-    std::condition_variable wait_cv;
-    std::atomic<uint64_t> seq{0};
-    std::atomic<int> remaining{0};
-    Job job{};
-    std::vector<std::thread> workers;
-    std::atomic<bool> stop{false};
-    int nth = 0;
-
-    static void cpu_relax() {
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-        __builtin_ia32_pause();
-#endif
-    }
-
-    Ds4HcMatvecPool() {
-        unsigned hw = std::thread::hardware_concurrency();
-        nth = hw == 0 ? 4 : (int)(hw < 8 ? hw : 8);
-        for (int i = 0; i < nth; ++i) {
-            workers.emplace_back([this, i]() {
-                uint64_t last = 0;
-                for (;;) {
-                    uint64_t s = last;
-                    for (int spins = 0; spins < 65536; ++spins) {
-                        s = seq.load(std::memory_order_acquire);
-                        if (s != last || stop.load(std::memory_order_relaxed)) {
-                            break;
-                        }
-                        cpu_relax();
-                    }
-                    if (s == last && !stop.load(std::memory_order_relaxed)) {
-                        std::unique_lock<std::mutex> lk(wait_mu);
-                        wait_cv.wait(lk, [&]() {
-                            return stop.load(std::memory_order_relaxed) ||
-                                   seq.load(std::memory_order_acquire) != last;
-                        });
-                        s = seq.load(std::memory_order_acquire);
-                    }
-                    if (stop.load(std::memory_order_relaxed)) return;
-                    last = s;
-                    const Job j = job;
-                    if (i >= j.active_workers) continue;
-                    const int chunk = (j.rows + j.active_workers - 1) / j.active_workers;
-                    const int r0 = i * chunk;
-                    const int r1 = j.rows < r0 + chunk ? j.rows : r0 + chunk;
-                    if (row_fn) {
-                        for (int r = r0; r < r1; ++r) row_fn(r);
-                    } else {
-                        int r = r0;
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-                        if (ds4_cpu_has_f16c()) {
-                            for (; r + 2 < r1; r += 3) {
-                                cpu_dot_f16_rows3_f16c(
-                                    j.mat + (size_t) (r + 0) * j.cols,
-                                    j.mat + (size_t) (r + 1) * j.cols,
-                                    j.mat + (size_t) (r + 2) * j.cols,
-                                    j.x, j.cols,
-                                    &j.out[r + 0], &j.out[r + 1], &j.out[r + 2]);
-                            }
-                        }
-#endif
-                        for (; r < r1; ++r) {
-                            j.out[r] = cpu_dot_f16_row(j.mat + (size_t) r * j.cols, j.x, j.cols);
-                        }
-                    }
-                    remaining.fetch_sub(1, std::memory_order_acq_rel);
-                }
-            });
-        }
-    }
-    ~Ds4HcMatvecPool() {
-        {
-            // Protect predicate changes with the same mutex used by wait().
-            // Otherwise a worker can test the predicate, miss notify_all(),
-            // and sleep forever between the test and the wait.
-            std::lock_guard<std::mutex> lk(wait_mu);
-            stop.store(true, std::memory_order_release);
-        }
-        wait_cv.notify_all();
-        for (auto & t : workers) t.join();
-    }
-    void run(const uint16_t * mat, const float * x, float * out, int rows, int cols) {
-        if (rows <= 0) return;
-        std::lock_guard<std::mutex> lk(client_mu);
-        row_fn = nullptr;
-        const int active_workers = std::min(nth, rows);
-        job = {mat, x, out, rows, cols, active_workers};
-        remaining.store(active_workers, std::memory_order_release);
-        {
-            // Publish the new generation while holding wait_mu so a worker
-            // cannot miss the transition between its predicate check and
-            // blocking in wait().
-            std::lock_guard<std::mutex> wake_lk(wait_mu);
-            seq.fetch_add(1, std::memory_order_release);
-        }
-        wait_cv.notify_all();
-        int spins = 0;
-        while (remaining.load(std::memory_order_acquire) != 0) {
-            if (++spins < 65536) { cpu_relax(); }
-            else { std::this_thread::yield(); spins = 0; }
-        }
-    }
-
-    // Generic variant: invoke fn(row) for each row in [0, rows), rows split
-    // across workers with the same static chunking as run().
-    std::function<void(int)> row_fn;
-    void run_custom(int rows, std::function<void(int)> fn) {
-        if (rows <= 0) return;
-        std::lock_guard<std::mutex> lk(client_mu);
-        row_fn = std::move(fn);
-        const int active_workers = std::min(nth, rows);
-        job = {nullptr, nullptr, nullptr, rows, 0, active_workers};
-        remaining.store(active_workers, std::memory_order_release);
-        {
-            std::lock_guard<std::mutex> wake_lk(wait_mu);
-            seq.fetch_add(1, std::memory_order_release);
-        }
-        wait_cv.notify_all();
-        int spins = 0;
-        while (remaining.load(std::memory_order_acquire) != 0) {
-            if (++spins < 65536) { cpu_relax(); }
-            else { std::this_thread::yield(); spins = 0; }
-        }
-        row_fn = nullptr;
-    }
-};
+using Ds4HcMatvecPool = BlockingRowPool;
 
 static Ds4HcMatvecPool & ds4_hc_matvec_pool() {
     static Ds4HcMatvecPool pool;
@@ -4183,7 +4049,23 @@ static Ds4HcMatvecPool & ds4_hc_matvec_pool() {
 }
 
 static void cpu_matvec_f16_pooled(float * out, const uint16_t * mat, const float * x, int rows, int cols) {
-    ds4_hc_matvec_pool().run(mat, x, out, rows, cols);
+    ds4_hc_matvec_pool().run_chunks(rows, [=](int begin, int end) {
+        int row = begin;
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+        if (ds4_cpu_has_f16c()) {
+            for (; row + 2 < end; row += 3) {
+                cpu_dot_f16_rows3_f16c(
+                    mat + (size_t) (row + 0) * cols,
+                    mat + (size_t) (row + 1) * cols,
+                    mat + (size_t) (row + 2) * cols,
+                    x, cols, &out[row + 0], &out[row + 1], &out[row + 2]);
+            }
+        }
+#endif
+        for (; row < end; ++row) {
+            out[row] = cpu_dot_f16_row(mat + (size_t) row * cols, x, cols);
+        }
+    });
 }
 
 // Token-level persistent-pool parallel-for: same splitting semantics as
