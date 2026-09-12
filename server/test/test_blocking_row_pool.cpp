@@ -76,10 +76,15 @@ static void boundaries_and_idle() {
         total.fetch_add((int64_t) end - begin);
     });
     check(total == INT_MAX, "large row partition overflowed");
+    std::atomic<bool> wrong_row{false};
     for (int step = 0; step < 4; ++step) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        pool.run_custom(1, [&](int row) { check(row == 0, "wrong row"); ++calls; });
+        pool.run_custom(1, [&](int row) {
+            if (row != 0) wrong_row.store(true, std::memory_order_relaxed);
+            ++calls;
+        });
     }
+    check(!wrong_row.load(), "wrong row");
     check(calls == 4, "idle workers missed wakeup");
 }
 

@@ -948,6 +948,9 @@ if(DFLASH27B_TESTS)
     endif()
 
     # Host-only lifetime/concurrency regression; no model or accelerator needed.
+    # Keep the hook-enabled class out of test_server_unit: that target links
+    # dflash_common's production (hook-free) definition, which has a different
+    # layout. Mixing both in one binary violates the one-definition rule.
     find_package(Threads REQUIRED)
     add_executable(test_blocking_row_pool test/test_blocking_row_pool.cpp)
     target_include_directories(test_blocking_row_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
