@@ -84,7 +84,7 @@ jobs:
             test_dflash test_generate test_flash_attn_sparse test_server_unit \
             test_deepseek4_unit test_feature_gate test_seq_slot_manager \
             test_seq_engine_contract test_seq_batch_plan test_client_send_buffer \
-            test_paged_kv_pool test_rope_tail \
+            test_paged_kv_pool test_rope_tail test_blocking_row_pool \
             test_model_smoke test_batched_gdn test_concat_transpose \
             test_kernel_qualification_core test_kernel_qualification_gdn \
             test_kernel_qualification_moe_ds4 -j$(nproc)
@@ -93,7 +93,7 @@ jobs:
         run: |
           cd server/build
           ctest --output-on-failure \
-            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|paged_kv_pool|rope_tail|batched_gdn_cpu|test_kernel_qualification_core" \
+            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|paged_kv_pool|blocking_row_pool|rope_tail|batched_gdn_cpu|test_kernel_qualification_core" \
             --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
@@ -371,6 +371,7 @@ jobs:
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
             --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail test_rocmfpx_mmq \
               test_deepseek4_mmid_grouped_cuda test_deepseek4_unit \
+              test_ds4_moe_combine_cuda test_ds4_maskless_prefill \
               test_recurrent_snapshot test_server_unit test_draft_topk_cuda test_rocmfp3_mix_registry \
               test_rocmfp_mix_slice_matvec test_rocmfp_mix_gateup_glu \
               test_ds4_mix_registry_teardown test_ds4_load_transactional \
@@ -381,7 +382,7 @@ jobs:
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|recurrent_snapshot|ChainRollbackPolicy|MmqTileSelection|MixedMmqPolicy|MoeHybridStorageFixture|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$'
+            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|ds4_moe_combine_cuda|ds4_maskless_prefill|recurrent_snapshot|ChainRollbackPolicy|MmqTileSelection|MixedMmqPolicy|MoeHybridStorageFixture|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$'
 
       - name: Run GPU draft top-K tests
         run: |

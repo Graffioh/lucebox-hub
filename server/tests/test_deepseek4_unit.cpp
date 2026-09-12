@@ -2,6 +2,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "../deps/llama.cpp/ggml/src/ggml-cuda/ds4-causal.h"
 #if defined(GGML_USE_HIP)
 #include <hip/hip_runtime_api.h>
 #endif
@@ -68,6 +69,60 @@ static bool nearly_equal(float a, float b, float atol = 1.0e-5f, float rtol = 1.
     const float diff = std::fabs(a - b);
     const float scale = std::max(std::fabs(a), std::fabs(b));
     return diff <= atol + rtol * scale;
+}
+
+static void test_ds4_ratio4_causal_visibility_formula() {
+    std::fprintf(stderr, "  test_ds4_ratio4_causal_visibility_formula ...");
+    constexpr int raw_window = 128;
+    const auto check_chunk = [&](int kv_start, int n_tokens) {
+        const int prior_rows = std::min(kv_start, raw_window);
+        const int raw_rows = prior_rows + n_tokens;
+        const int n_comp_rows = (kv_start + n_tokens) / 4;
+        const int probes[] = {
+            0, 1, 2, 3, 127, 128, 2050, 2051, 8191, 8192, 8193,
+            kv_start, kv_start + 1, kv_start + 2, kv_start + 3,
+            kv_start + 127, kv_start + 128,
+            kv_start + n_tokens - 1,
+        };
+        for (int position : probes) {
+            if (position < kv_start || position >= kv_start + n_tokens) {
+                continue;
+            }
+            const int token = position - kv_start;
+            int reference_first = raw_rows;
+            int reference_last = -1;
+            for (int row = 0; row < raw_rows; ++row) {
+                const int row_position = kv_start - prior_rows + row;
+                if (row_position >= position - raw_window + 1 &&
+                    row_position <= position) {
+                    reference_first = std::min(reference_first, row);
+                    reference_last = row;
+                }
+            }
+            // Truncated/empty histories exercise the capacity bound as well
+            // as the usual complete ratio-4 history used by prefill.
+            for (int capacity : {0, 1, n_comp_rows / 2, n_comp_rows}) {
+                const auto actual = ds4_ratio4_causal_visibility(
+                    token, n_tokens, raw_rows, capacity, raw_window, kv_start);
+                int reference_comp = 0;
+                for (int row = 0; row < capacity; ++row) {
+                    reference_comp += 4 * (row + 1) - 1 <= position;
+                }
+                TEST_ASSERT(reference_first == actual.raw_first);
+                TEST_ASSERT(reference_last == actual.raw_last);
+                TEST_ASSERT(actual.comp_first ==
+                    (reference_comp ? raw_rows : raw_rows + capacity));
+                TEST_ASSERT(actual.comp_last ==
+                    (reference_comp ? raw_rows + reference_comp - 1 : -1));
+            }
+        }
+    };
+    check_chunk(0, 8192);
+    check_chunk(0, 10240);
+    check_chunk(8192, 941);
+    check_chunk(122880, 129);
+    check_chunk(122883, 129);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
 static ggml_tensor * test_hc_row_normalize(ggml_context * ctx, ggml_tensor * x) {
@@ -5776,6 +5831,7 @@ int main() {
     test_indexer_qat_cpu(backend);
     test_indexer_score_cpu(backend);
     test_indexer_mask_cpu(backend);
+    test_ds4_ratio4_causal_visibility_formula();
     test_hash_routing_lookup();
     test_raw_ring_spans_after_wrap();
     test_verify_raw_mask_spans();

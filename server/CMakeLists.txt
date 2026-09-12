@@ -947,6 +947,16 @@ if(DFLASH27B_TESTS)
         add_test(NAME mixed_cuda_hip COMMAND test_mixed_cuda_hip)
     endif()
 
+    # Host-only lifetime/concurrency regression; no model or accelerator needed.
+    # Keep the hook-enabled class out of test_server_unit: that target links
+    # dflash_common's production (hook-free) definition, which has a different
+    # layout. Mixing both in one binary violates the one-definition rule.
+    find_package(Threads REQUIRED)
+    add_executable(test_blocking_row_pool test/test_blocking_row_pool.cpp)
+    target_include_directories(test_blocking_row_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(test_blocking_row_pool PRIVATE DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS=1)
+    target_link_libraries(test_blocking_row_pool PRIVATE Threads::Threads)
+
     add_executable(test_rocmfp4 deps/llama.cpp/ggml/rocmfp4/test_rocmfp4.c)
     target_link_libraries(test_rocmfp4 PRIVATE ggml-base)
     if(UNIX)
@@ -1158,6 +1168,27 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_ds4_moe_combine_cuda PRIVATE
             ggml-cpu ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_ds4_moe_combine_cuda)
+    endif()
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+        add_executable(test_ds4_maskless_prefill test/test_ds4_maskless_prefill.cpp)
+        set_source_files_properties(test/test_ds4_maskless_prefill.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_ds4_maskless_prefill PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_link_libraries(test_ds4_maskless_prefill PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
+        list(APPEND _raw_unit_test_targets test_ds4_maskless_prefill)
+        foreach(_maskless_mode IN ITEMS defaults disabled f32 short)
+            add_test(NAME ds4_maskless_prefill_${_maskless_mode}
+                COMMAND test_ds4_maskless_prefill --${_maskless_mode})
+            set_tests_properties(ds4_maskless_prefill_${_maskless_mode}
+                PROPERTIES SKIP_RETURN_CODE 77)
+        endforeach()
+        foreach(_maskless_mode IN ITEMS defaults disabled short)
+            add_test(NAME ds4_maskless_prefill_${_maskless_mode}_f32
+                COMMAND test_ds4_maskless_prefill --${_maskless_mode} --f32)
+            set_tests_properties(ds4_maskless_prefill_${_maskless_mode}_f32
+                PROPERTIES SKIP_RETURN_CODE 77)
+        endforeach()
+        unset(_maskless_mode)
     endif()
     # HIP-only standalone build; CUDA backend is covered by aggregated test_server_unit.
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
@@ -1786,6 +1817,7 @@ if(DFLASH27B_TESTS)
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_spec_width.cpp
+            test/test_immutable_graph_input_pool.cpp
             test/test_mmq_tile_selection.cpp
             test/test_mixed_mmq_policy.cpp
             test/test_spec_acceptance.cpp
@@ -2008,6 +2040,7 @@ if(DFLASH27B_TESTS)
         test_server_unit
         test_model_smoke)
     set(_new_cppunit_test_targets
+        test_blocking_row_pool
         test_kernel_qualification_core
         test_platform_compat
         test_draft_swa

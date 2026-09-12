@@ -9,11 +9,13 @@
 //   6. MoE FFN (hash routing + top-k + shared expert + clamped SwiGLU)
 
 #include "deepseek4_internal.h"
+#include "common/blocking_row_pool.h"
 #include "deepseek4_hc_cuda.h"
 #include "deepseek4_roctx.h"
 #include "deepseek4_page_layout.h"
 #include "internal.h"
 #include "../common/step_graph.h"
+#include "../common/immutable_graph_input_pool.h"
 #include "../common/cuda_graph_overrides.h"
 #include "../common/dynamic_backend.h"
 #include "../common/moe_expert_compute.h"
@@ -2327,6 +2329,10 @@ static ggml_tensor * build_mla_attention_lane_core(
             index_visibility_mask,
             i32_array_inputs);
     }
+    const bool maskless_sparse_prefill =
+        attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
+        layer_major_batch && !gathered_history &&
+        indexer_topk && n_tokens > w.n_swa;
     // Stable path reads the full physical ring (masking not-yet-written slots)
     // and a padded compressed-row span; the plain path reads only valid rows.
     const int n_raw = gathered_history ? lane.n_raw_history + n_tokens
@@ -2371,6 +2377,8 @@ static ggml_tensor * build_mla_attention_lane_core(
             ctx, raw_kv_source, head_dim, w.n_swa, raw_kv_source->nb[1], 0);
         kv_attn = ds4_cast_if_needed(ctx, ring, GGML_TYPE_F32);
     } else if (layer_major_batch) {
+        // Preserve current-row F32 precision. Rounding the whole prefill KV
+        // to F16 also changes target features consumed by the DSpark draft.
         ggml_tensor * current = ds4_cast_if_needed(ctx, kv, GGML_TYPE_F32);
         kv_attn = prior_rows_scratch
             ? ggml_concat(ctx, prior_rows_scratch, current, 1)
@@ -2465,19 +2473,26 @@ static ggml_tensor * build_mla_attention_lane_core(
     // [n_kv,n_query] F16; the explicit path broadcasts the same values over
     // heads in F32.
     ggml_tensor * score_mask = nullptr;
-    const bool exact_two_band =
+    // Ratio-4 sparse prefill already carries the authoritative compressed
+    // row IDs. The CUDA/HIP kernel can derive the raw causal window and the
+    // completed compressed-row frontier from kv_start and the query index.
+    // Keep every other attention shape on the explicit mask contract.
+    const bool direct_indexer_topk = indexer_topk &&
+        (maskless_sparse_prefill ||
+         ds4_env_flag("DFLASH_DS4_DIRECT_INDEXER_TOPK"));
+    const bool exact_numerical_bands =
         attention_impl == DeepSeek4AttentionImpl::DenseFlash &&
         causal_batch &&
         n_tokens > DS4_NUMERICAL_PREFILL_BAND &&
-        n_tokens <= 2 * DS4_NUMERICAL_PREFILL_BAND;
-    if (!exact_two_band) {
+        n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS;
+    if (!exact_numerical_bands) {
         if (masked_kv && n_tokens > 1) {
             score_mask = ggml_reshape_2d(ctx, cached_inputs->attn_row_mask,
                                          n_attn, n_tokens);
         } else if (masked_kv) {
             score_mask = ggml_reshape_2d(ctx, cached_inputs->attn_row_mask,
                                          n_attn, 1);
-        } else if (layer_major_batch) {
+        } else if (layer_major_batch && !maskless_sparse_prefill) {
             // Per-token causal mask over [prior rows | current rows | comp rows].
             ggml_tensor * cmask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_attn, 1, n_tokens);
             ggml_set_input(cmask);
@@ -2505,7 +2520,7 @@ static ggml_tensor * build_mla_attention_lane_core(
             }
             f32_array_inputs->push_back({cmask, std::move(mvals)});
             score_mask = ggml_reshape_2d(ctx, cmask, n_attn, n_tokens);
-        } else if (causal_batch) {
+        } else if (causal_batch && !layer_major_batch) {
             // Speculative verification keeps the physical ring order and
             // appends snapshots of rows overwritten by later batch tokens.
             ggml_tensor * cmask = ggml_new_tensor_3d(
@@ -2547,10 +2562,9 @@ static ggml_tensor * build_mla_attention_lane_core(
         indexer_topk = deepseek4_indexed_attention_rows(
             ctx, indexer_topk, n_comp_attn, n_old_rows);
     }
-    const bool direct_indexer_topk = indexer_topk &&
-        ds4_env_flag("DFLASH_DS4_DIRECT_INDEXER_TOPK");
+    // Preserve appended raw verifier rows as well as the learned top-k set.
     if (indexer_topk) {
-        if (!score_mask) {
+        if (!score_mask && !direct_indexer_topk) {
             score_mask = ggml_new_tensor_2d(
                 ctx, GGML_TYPE_F32, n_attn, n_tokens);
             ggml_set_input(score_mask);
@@ -2572,21 +2586,12 @@ static ggml_tensor * build_mla_attention_lane_core(
     const bool use_flash = attention_impl != DeepSeek4AttentionImpl::Explicit &&
                            (n_tokens > 1 || indexer_topk != nullptr);
     if (use_flash) {
-        if (exact_two_band) {
-            // A larger scheduling band must retain the numerical topology of
-            // two 2K requests. Prefix queries use the first band's F32 raw KV;
-            // suffix queries see its final SWA tail after the same F16 cache
-            // round-trip. HC, projections and MoE still run once over the full
-            // token batch, avoiding a second expert-weight sweep.
-            const int first_count = DS4_NUMERICAL_PREFILL_BAND;
-            const int second_count = n_tokens - first_count;
-            const int first_comp = ratio > 0
-                ? ds4_comp_rows_used(lane.comp_kv, lane.n_comp_committed, ratio,
-                                     kv_start + first_count - 1)
-                : 0;
-            const int second_comp = n_comp_live;
-            const int second_prior_count = std::min(first_count, w.n_swa);
-
+        if (exact_numerical_bands) {
+            // A larger scheduling batch retains the numerical topology of
+            // sequential 2K requests. Each later band sees the previous
+            // band's final SWA tail after the same F16 cache round-trip. HC,
+            // projections and MoE still run once over the full token batch,
+            // avoiding another expert-weight sweep.
             auto view_kv = [&](int first, int count) {
                 return ggml_view_2d(
                     ctx, kv, head_dim, count, kv->nb[1],
@@ -2668,36 +2673,53 @@ static ggml_tensor * build_mla_attention_lane_core(
                     (size_t) first * q_fa->nb[1]);
             };
 
-            ggml_tensor * first_raw = ds4_cast_if_needed(
-                ctx, view_kv(0, first_count), GGML_TYPE_F32);
-            if (prior_rows_scratch) {
-                first_raw = ggml_concat(
-                    ctx, prior_rows_scratch, first_raw, 1);
+            for (int band_start = 0; band_start < n_tokens;
+                 band_start += DS4_NUMERICAL_PREFILL_BAND) {
+                const int band_count = std::min(
+                    DS4_NUMERICAL_PREFILL_BAND, n_tokens - band_start);
+                const int band_pos = kv_start + band_start;
+                const int band_prior_count = band_start == 0
+                    ? n_prior_rows
+                    : std::min(band_start, w.n_swa);
+                const int band_comp_count = ratio > 0
+                    ? ds4_comp_rows_used(
+                          lane.comp_kv, lane.n_comp_committed, ratio,
+                          band_pos + band_count - 1)
+                    : 0;
+
+                ggml_tensor * band_raw = nullptr;
+                if (band_start == 0) {
+                    band_raw = ds4_cast_if_needed(
+                        ctx, view_kv(0, band_count), GGML_TYPE_F32);
+                    if (prior_rows_scratch) {
+                        band_raw = ggml_concat(
+                            ctx, prior_rows_scratch, band_raw, 1);
+                    }
+                } else {
+                    ggml_tensor * rounded_prior = ggml_cast(
+                        ctx,
+                        view_kv(band_start - band_prior_count,
+                                band_prior_count),
+                        GGML_TYPE_F16);
+                    rounded_prior = ggml_cast(
+                        ctx, rounded_prior, GGML_TYPE_F32);
+                    band_raw = ggml_concat(
+                        ctx, rounded_prior,
+                        view_kv(band_start, band_count), 1);
+                }
+
+                ggml_tensor * band_kv = append_comp(
+                    band_raw, band_comp_count);
+                ggml_tensor * band_mask = make_band_mask(
+                    band_pos, band_count, band_prior_count,
+                    band_comp_count);
+                ggml_tensor * band_context = make_flash(
+                    view_q(band_start, band_count), band_kv, band_mask,
+                    band_prior_count + band_count, band_pos);
+                context = context
+                    ? ggml_concat(ctx, context, band_context, 2)
+                    : band_context;
             }
-            ggml_tensor * first_kv = append_comp(first_raw, first_comp);
-            ggml_tensor * first_mask = make_band_mask(
-                kv_start, first_count, n_prior_rows, first_comp);
-            ggml_tensor * first_context = make_flash(
-                view_q(0, first_count), first_kv, first_mask,
-                n_prior_rows + first_count, kv_start);
-
-            ggml_tensor * rounded_prior = ggml_cast(
-                ctx, view_kv(first_count - second_prior_count,
-                             second_prior_count),
-                GGML_TYPE_F16);
-            rounded_prior = ggml_cast(ctx, rounded_prior, GGML_TYPE_F32);
-            ggml_tensor * second_raw = ggml_concat(
-                ctx, rounded_prior, view_kv(first_count, second_count), 1);
-            ggml_tensor * second_kv = append_comp(second_raw, second_comp);
-            ggml_tensor * second_mask = make_band_mask(
-                kv_start + first_count, second_count,
-                second_prior_count, second_comp);
-            ggml_tensor * second_context = make_flash(
-                view_q(first_count, second_count), second_kv, second_mask,
-                second_prior_count + second_count,
-                kv_start + first_count);
-
-            context = ggml_concat(ctx, first_context, second_context, 2);
             inverse_rope_fused = true;
         } else {
             // ggml FA convention: Q[D,T,H], K/V[D,K,Hkv]. DS4 MLA has one shared
@@ -2705,9 +2727,8 @@ static ggml_tensor * build_mla_attention_lane_core(
             // The DS4 D=512 kernel consumes Q strides directly, avoiding a full
             // [D,H,T] -> [D,T,H] materialization for every layer.
             ggml_tensor * q_fa = ggml_permute(ctx, q, 0, 2, 1, 3);
-            // The DS4 D=512 kernel has native F16 K/V specializations. Keep
-            // fused verifier caches in their persistent representation and
-            // avoid a full long-context F16 -> F32 conversion every step.
+            // The verifier retains its independently qualified F16 transport.
+            // Long prefill streams F32 rows without an extra rounding step.
             ggml_tensor * kv_fa = fused_sparse_f16_kv
                 ? kv_attn
                 : ds4_cast_if_needed(ctx, kv_attn, GGML_TYPE_F32);
@@ -4020,142 +4041,7 @@ static void cpu_matvec_f16(float * out, const uint16_t * mat, const float * x, i
 // are bit-identical to the serial path; only wall time changes. Decode issues
 // ~86 of these 24x16384 matvecs per token, so workers spin briefly to catch
 // adjacent jobs, then park on a condition variable while the server is idle.
-struct Ds4HcMatvecPool {
-    struct Job {
-        const uint16_t * mat;
-        const float * x;
-        float * out;
-        int rows;
-        int cols;
-        int active_workers;
-    };
-    std::mutex client_mu;
-    std::mutex wait_mu;
-    std::condition_variable wait_cv;
-    std::atomic<uint64_t> seq{0};
-    std::atomic<int> remaining{0};
-    Job job{};
-    std::vector<std::thread> workers;
-    std::atomic<bool> stop{false};
-    int nth = 0;
-
-    static void cpu_relax() {
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-        __builtin_ia32_pause();
-#endif
-    }
-
-    Ds4HcMatvecPool() {
-        unsigned hw = std::thread::hardware_concurrency();
-        nth = hw == 0 ? 4 : (int)(hw < 8 ? hw : 8);
-        for (int i = 0; i < nth; ++i) {
-            workers.emplace_back([this, i]() {
-                uint64_t last = 0;
-                for (;;) {
-                    uint64_t s = last;
-                    for (int spins = 0; spins < 65536; ++spins) {
-                        s = seq.load(std::memory_order_acquire);
-                        if (s != last || stop.load(std::memory_order_relaxed)) {
-                            break;
-                        }
-                        cpu_relax();
-                    }
-                    if (s == last && !stop.load(std::memory_order_relaxed)) {
-                        std::unique_lock<std::mutex> lk(wait_mu);
-                        wait_cv.wait(lk, [&]() {
-                            return stop.load(std::memory_order_relaxed) ||
-                                   seq.load(std::memory_order_acquire) != last;
-                        });
-                        s = seq.load(std::memory_order_acquire);
-                    }
-                    if (stop.load(std::memory_order_relaxed)) return;
-                    last = s;
-                    const Job j = job;
-                    if (i >= j.active_workers) continue;
-                    const int chunk = (j.rows + j.active_workers - 1) / j.active_workers;
-                    const int r0 = i * chunk;
-                    const int r1 = j.rows < r0 + chunk ? j.rows : r0 + chunk;
-                    if (row_fn) {
-                        for (int r = r0; r < r1; ++r) row_fn(r);
-                    } else {
-                        int r = r0;
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-                        if (ds4_cpu_has_f16c()) {
-                            for (; r + 2 < r1; r += 3) {
-                                cpu_dot_f16_rows3_f16c(
-                                    j.mat + (size_t) (r + 0) * j.cols,
-                                    j.mat + (size_t) (r + 1) * j.cols,
-                                    j.mat + (size_t) (r + 2) * j.cols,
-                                    j.x, j.cols,
-                                    &j.out[r + 0], &j.out[r + 1], &j.out[r + 2]);
-                            }
-                        }
-#endif
-                        for (; r < r1; ++r) {
-                            j.out[r] = cpu_dot_f16_row(j.mat + (size_t) r * j.cols, j.x, j.cols);
-                        }
-                    }
-                    remaining.fetch_sub(1, std::memory_order_acq_rel);
-                }
-            });
-        }
-    }
-    ~Ds4HcMatvecPool() {
-        {
-            // Protect predicate changes with the same mutex used by wait().
-            // Otherwise a worker can test the predicate, miss notify_all(),
-            // and sleep forever between the test and the wait.
-            std::lock_guard<std::mutex> lk(wait_mu);
-            stop.store(true, std::memory_order_release);
-        }
-        wait_cv.notify_all();
-        for (auto & t : workers) t.join();
-    }
-    void run(const uint16_t * mat, const float * x, float * out, int rows, int cols) {
-        if (rows <= 0) return;
-        std::lock_guard<std::mutex> lk(client_mu);
-        row_fn = nullptr;
-        const int active_workers = std::min(nth, rows);
-        job = {mat, x, out, rows, cols, active_workers};
-        remaining.store(active_workers, std::memory_order_release);
-        {
-            // Publish the new generation while holding wait_mu so a worker
-            // cannot miss the transition between its predicate check and
-            // blocking in wait().
-            std::lock_guard<std::mutex> wake_lk(wait_mu);
-            seq.fetch_add(1, std::memory_order_release);
-        }
-        wait_cv.notify_all();
-        int spins = 0;
-        while (remaining.load(std::memory_order_acquire) != 0) {
-            if (++spins < 65536) { cpu_relax(); }
-            else { std::this_thread::yield(); spins = 0; }
-        }
-    }
-
-    // Generic variant: invoke fn(row) for each row in [0, rows), rows split
-    // across workers with the same static chunking as run().
-    std::function<void(int)> row_fn;
-    void run_custom(int rows, std::function<void(int)> fn) {
-        if (rows <= 0) return;
-        std::lock_guard<std::mutex> lk(client_mu);
-        row_fn = std::move(fn);
-        const int active_workers = std::min(nth, rows);
-        job = {nullptr, nullptr, nullptr, rows, 0, active_workers};
-        remaining.store(active_workers, std::memory_order_release);
-        {
-            std::lock_guard<std::mutex> wake_lk(wait_mu);
-            seq.fetch_add(1, std::memory_order_release);
-        }
-        wait_cv.notify_all();
-        int spins = 0;
-        while (remaining.load(std::memory_order_acquire) != 0) {
-            if (++spins < 65536) { cpu_relax(); }
-            else { std::this_thread::yield(); spins = 0; }
-        }
-        row_fn = nullptr;
-    }
-};
+using Ds4HcMatvecPool = BlockingRowPool;
 
 static Ds4HcMatvecPool & ds4_hc_matvec_pool() {
     static Ds4HcMatvecPool pool;
@@ -4163,7 +4049,23 @@ static Ds4HcMatvecPool & ds4_hc_matvec_pool() {
 }
 
 static void cpu_matvec_f16_pooled(float * out, const uint16_t * mat, const float * x, int rows, int cols) {
-    ds4_hc_matvec_pool().run(mat, x, out, rows, cols);
+    ds4_hc_matvec_pool().run_chunks(rows, [=](int begin, int end) {
+        int row = begin;
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+        if (ds4_cpu_has_f16c()) {
+            for (; row + 2 < end; row += 3) {
+                cpu_dot_f16_rows3_f16c(
+                    mat + (size_t) (row + 0) * cols,
+                    mat + (size_t) (row + 1) * cols,
+                    mat + (size_t) (row + 2) * cols,
+                    x, cols, &out[row + 0], &out[row + 1], &out[row + 2]);
+            }
+        }
+#endif
+        for (; row < end; ++row) {
+            out[row] = cpu_dot_f16_row(mat + (size_t) row * cols, x, cols);
+        }
+    });
 }
 
 // Token-level persistent-pool parallel-for: same splitting semantics as
@@ -6636,6 +6538,11 @@ static bool ds4_run_exact_tokenwise_prefill_attention(
 // SWA tail is committed to the persistent ring. The compressor publishes every
 // ratio-4/ratio-128 boundary crossed by the ubatch.
 //
+struct Ds4LayerMajorF32Input {
+    ggml_tensor * tensor = nullptr;
+    ImmutableGraphInputPool<float>::Values values;
+};
+
 struct Ds4LayerMajorCachedLayer {
     void * meta_buffer = nullptr;
     size_t meta_size = 0;
@@ -6644,7 +6551,7 @@ struct Ds4LayerMajorCachedLayer {
     std::vector<DeepSeek4I32InputBinding> i32_inputs;
     std::vector<DeepSeek4I32ArrayBinding> i32_array_inputs;
     std::vector<DeepSeek4I64ArrayBinding> i64_array_inputs;
-    std::vector<DeepSeek4F32ArrayBinding> f32_array_inputs;
+    std::vector<Ds4LayerMajorF32Input> f32_array_inputs;
     std::vector<ggml_tensor *> allocated_tensors;
     ggml_tensor * hash_ids = nullptr;
     ggml_tensor * logits = nullptr;
@@ -6682,6 +6589,7 @@ struct Ds4LayerMajorGraphCache {
     ggml_tensor * state_a = nullptr;
     ggml_tensor * state_b = nullptr;
     std::vector<Ds4LayerMajorCachedLayer> layers;
+    ImmutableGraphInputPool<float> f32_input_values;
 
     bool matches(const DeepSeek4Weights & w, ggml_backend_t b,
                  PrefillAttentionMode m, int tokens, int start) const {
@@ -6693,6 +6601,7 @@ struct Ds4LayerMajorGraphCache {
     void destroy() {
         for (auto & layer : layers) layer.destroy();
         layers.clear();
+        f32_input_values.clear();
         if (state_buf) {
             ggml_backend_buffer_free(state_buf);
             state_buf = nullptr;
@@ -7038,8 +6947,8 @@ static int ds4_try_layer_major_prefill(
                                         sizeof(int64_t) * b.values.size());
             }
             for (const auto & b : layer.f32_array_inputs) {
-                ggml_backend_tensor_set(b.tensor, b.values.data(), 0,
-                                        sizeof(float) * b.values.size());
+                ggml_backend_tensor_set(b.tensor, b.values->data(), 0,
+                                        sizeof(float) * b.values->size());
             }
             if (layer.hash_ids) {
                 const int n_used = w.n_expert_used;
@@ -7312,7 +7221,14 @@ static int ds4_try_layer_major_prefill(
             cached_layer->i32_inputs = std::move(i32_inputs);
             cached_layer->i32_array_inputs = std::move(i32_array_inputs);
             cached_layer->i64_array_inputs = std::move(i64_array_inputs);
-            cached_layer->f32_array_inputs = std::move(f32_array_inputs);
+            // Dense/ratio-128 layers often have byte-identical causal masks.
+            // Retaining one quadratic host array per layer costs several GiB
+            // at wide chunks, even though GPU scratch is already shared.
+            // Share only identical immutable values; tensors remain per-layer.
+            for (auto & b : f32_array_inputs) {
+                cached_layer->f32_array_inputs.push_back({
+                    b.tensor, graph_cache->f32_input_values.intern(std::move(b.values))});
+            }
             cached_layer->hash_ids = hash_ids;
             cached_layer->logits = logits;
         } else {
