@@ -67,10 +67,20 @@ public:
 
     int slot_count() const override { return slots_.slot_count(); }
     int max_context() const override { return slots_.max_context(); }
+    bool supports_prefix_store() const override { return true; }
+    size_t estimate_prefix_store_bytes(int tokens) const override;
+
+    void discard_prefix_store(PrefixStoreRef checkpoint) override;
 
     AdmitResult admit(uint64_t request_id,
                       const std::vector<int32_t> & prompt,
                       const SamplerCfg & sampler) override;
+
+    AdmitResult admit_with_prefix(
+        uint64_t request_id,
+        const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler,
+        const PrefixStorePlan & plan) override;
 
     StepResult step(const StepPlan & plan) override;
     StepPlanLimits step_plan_limits(int decode_rows) const override {
@@ -141,7 +151,13 @@ private:
     StepResult step_chain_spec(
         const StepPlan & plan, const std::vector<uint8_t> & selected,
         PreparedChainRound && prepared);
+    PrefixStoreEvent capture_prefix(
+        int slot, PrefixCaptureTicket ticket);
+    bool arm_capture(
+        int slot, PrefixCaptureTicket ticket, int restored_tokens);
+    int checkpoint_index(PrefixStoreRef checkpoint) const;
 
+    PagedKvPool & pool_;
     Qwen35Backend & b_;
     Qwen35SlotManager  slots_;
     int64_t         scratch_row_ = 0;

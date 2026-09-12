@@ -917,10 +917,25 @@ json build_props_body(const ServerConfig & config,
         }},
         {"pflash", pflash},
         {"prefix_cache", {
-            {"capacity",      pcs.capacity},
-            {"in_use",        pcs.in_use},
-            {"lifetime_hits", pcs.lifetime_hits},
+            {"capacity",           pcs.capacity},
+            {"in_use",             pcs.in_use},
+            {"lifetime_hits",      pcs.lifetime_hits},
             {"agent_turn_enabled", config.agent_turn_cache},
+            {"max_resident_bytes", pcs.max_resident_bytes},
+            {"resident_bytes",     pcs.resident_bytes},
+            {"budget_skips",        pcs.budget_skips},
+            {"capture_attempts",    pcs.capture_attempts},
+            {"capture_failures",    pcs.capture_failures},
+            {"capture_stall_ms_total",
+                (double)pcs.capture_stall_us_total / 1000.0},
+            {"capture_stall_ms_max",
+                (double)pcs.capture_stall_us_max / 1000.0},
+            {"restore_attempts",    pcs.restore_attempts},
+            {"restore_invalidations", pcs.restore_invalidations},
+            {"restore_stall_ms_total",
+                (double)pcs.restore_stall_us_total / 1000.0},
+            {"restore_stall_ms_max",
+                (double)pcs.restore_stall_us_max / 1000.0},
         }},
         {"full_cache", {
             {"enabled",       pcfs.enabled},
@@ -1217,7 +1232,9 @@ HttpServer::HttpServer(ModelBackend & backend,
     , tokenizer_(tokenizer)
     , config_(config)
     , chat_format_(ChatFormat::QWEN3)  // default, overridden by arch
-    , prefix_cache_(config.prefix_cache_cap, tokenizer)
+    , prefix_cache_(config.prefix_cache_cap, tokenizer,
+          config.concurrent_paged_prefix_cache
+              ? config.concurrent_prefix_cache_max_bytes : 0)
     , disk_cache_({config.disk_cache_dir,
                    config.disk_cache_budget_mb * (size_t)(1024 * 1024),
                    config.disk_cache_min_tokens,
@@ -3604,7 +3621,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
                 // invalidating both ownership tables is unambiguous.
                 forget_inline_slot_metadata(cache.cache_slot);
                 backend_.snapshot_free(cache.cache_slot);
-                prefix_cache_.abort_inline_snap(cache.cache_slot);
+                prefix_cache_.invalidate_inline_snap(cache.cache_slot);
                 prefix_cache_.abort_full_snap(cache.cache_slot);
             }
             cache.cache_slot = -1;
@@ -3671,14 +3688,14 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         // the deepest slot on linearly-growing conversations.
         const int restore_source_slot =
             cache.using_restore ? cache.cache_slot : -1;
-        const auto prepared_snapshot = prefix_cache_.prepare_inline_snap(
+        cache.snap_reservation = prefix_cache_.reserve_inline_snap(
             effective_prompt,
             cache.using_restore ? logical_prefix_len : 0,
             prefer_tools_boundary,
             forced_cut,
             restore_source_slot);
-        cache.snap_slot = prepared_snapshot.first;
-        cache.snap_cut = prepared_snapshot.second;
+        cache.snap_slot = cache.snap_reservation.slot();
+        cache.snap_cut = cache.snap_reservation.target_cut();
     };
     auto prepare_full = [&]() {
         const auto & full_key = cache.full_snap_key_effective
@@ -3710,7 +3727,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     // checkpoint; preserving the current hit is better than invalidating
     // it before restore starts.
     if (cache.using_restore && cache.snap_slot == cache.cache_slot) {
-        prefix_cache_.cancel_inline_snap(cache.snap_slot);
+        cache.snap_reservation.cancel();
         cache.snap_slot = -1;
         cache.snap_cut = 0;
     }
@@ -3747,7 +3764,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
 
 void HttpServer::finalize_generation_cache(
         const ParsedRequest & req, const PreparedPrompt & prepared,
-        const GenerationCacheState & cache, const GenerateResult & result,
+        GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected) {
     const auto & effective_prompt = prepared.tokens;
@@ -3784,27 +3801,28 @@ void HttpServer::finalize_generation_cache(
                 std::fprintf(stderr,
                     "[pc] inline snapshot requested=%d saved=%d slot=%d\n",
                     cache.snap_cut, saved_position, cache.snap_slot);
-                prefix_cache_.confirm_inline_snap(
-                    cache.snap_slot, cache.snap_cut, effective_prompt);
-                // Track for shutdown save. The key may be stricter than a
-                // Qwen chunk-aligned snapshot, which is safe: matching the
-                // longer token prefix necessarily matches saved KV rows.
+                cache.snap_reservation.commit_at(
+                    effective_prompt, saved_position);
+                // Track the same prefix published by the in-memory cache.
+                // Some backends may save short of the requested cut, so the
+                // shutdown key must not claim rows the snapshot lacks.
                 slot_tokens_[cache.snap_slot] = std::vector<int32_t>(
                     effective_prompt.begin(),
-                    effective_prompt.begin() + cache.snap_cut);
+                    effective_prompt.begin() + saved_position);
                 if (!disk_cache_.disabled()) {
                     disk_cache_.learn_layout(cache.snap_slot);
                     if (cache.disk_policy.mode == DiskPrefixCacheMode::Full) {
-                        disk_cache_.save(cache.snap_slot, effective_prompt);
+                        disk_cache_.save(
+                            cache.snap_slot, slot_tokens_[cache.snap_slot]);
                     }
                 }
             } else {
                 backend_.snapshot_free(cache.snap_slot);
-                prefix_cache_.abort_inline_snap(cache.snap_slot);
+                cache.snap_reservation.abort();
             }
         } else {
             backend_.snapshot_free(cache.snap_slot);
-            prefix_cache_.abort_inline_snap(cache.snap_slot);
+            cache.snap_reservation.abort();
         }
     }
 
@@ -3939,15 +3957,16 @@ void HttpServer::remember_agent_turn(
     }
 
     const int canonical_end = (int) canonical_tokens.size();
-    const auto pending = prefix_cache_.prepare_inline_snap(
+    auto reservation = prefix_cache_.reserve_inline_snap(
         canonical_tokens, source_pos, false, canonical_end, source_slot);
     // No safe victim (only the restore source and/or protected pins remain)
     // or no useful boundary: nothing to replay into.
-    if (pending.first < 0 || pending.second != canonical_end) return;
+    if (!reservation.active() ||
+        reservation.target_cut() != canonical_end) return;
 
-    const int slot = pending.first;
+    const int slot = reservation.slot();
     if (slot == source_slot) {
-        prefix_cache_.cancel_inline_snap(slot);
+        reservation.cancel();
         return;
     }
     forget_inline_slot_metadata(slot);
@@ -3966,7 +3985,7 @@ void HttpServer::remember_agent_turn(
     const int saved_pos = replay_result.ok() && backend_.snapshot_used(slot)
         ? backend_.snapshot_cur_pos(slot) : 0;
     if (saved_pos > source_pos && saved_pos <= canonical_end) {
-        prefix_cache_.confirm_inline_snap(slot, saved_pos, canonical_tokens);
+        reservation.commit_at(canonical_tokens, saved_pos);
         canonical_tokens.resize((size_t) saved_pos);
         slot_tokens_[slot] = std::move(canonical_tokens);
         agent_turn_cache_slots_.insert(slot);
@@ -3977,7 +3996,7 @@ void HttpServer::remember_agent_turn(
             canonical_end - source_pos);
     } else {
         backend_.snapshot_free(slot);
-        prefix_cache_.abort_inline_snap(slot);
+        reservation.abort();
     }
 }
 

@@ -300,6 +300,7 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--kvflash-policy drafter\|lru\|qk` | `drafter` | Choose the KVFlash residency policy. |
 | `--kvflash-tau <N>` | `64` | Drafter-policy reselect interval. |
 | `--prefix-cache-slots <N>` | `32` | In-memory prefix-cache slots; `0` disables. |
+| `--concurrent-prefix-cache-max-mib <MiB>` | `4096` | Resident RAM limit for copied concurrent paged prefix checkpoints; `0` is unlimited. |
 | `--agent-turn-cache` | off | Extend prefix caching through generated tool calls. |
 | `--prefill-cache-slots <N>` | `0` | Full-prompt cache slots. |
 | `--paged-attention` | off | Enable paged KV for supported Qwen targets (16-token blocks) or DeepSeek4 on Strix Halo and R9700 plus Strix Halo (128-token pages). DeepSeek4 paged serving is AR-only. |

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "common/concurrency/prefix_store.h"
 #include "common/concurrency/paged_kv_pool.h"
 #include "common/sampler.h"
 #include "common/concurrency/seq_engine.h"
@@ -41,6 +42,9 @@ struct SeqSlot {
     int prompt_len = 0;
     int cur_pos = 0;
     SamplerCfg sampler;
+    // Capture armed by the engine at admission; consumed at the matching
+    // prefill boundary. Cleared on retire.
+    PrefixCaptureTicket pending_capture;
     std::mt19937_64 rng{0x9E3779B97F4A7C15ull};
     // Penalty history is recorded as fed rather than sampled: the scheduler
     // may override a sample before the model consumes it.
@@ -95,6 +99,13 @@ public:
     PrefillChunk append_prefill(int slot, int n_tokens);
 
     // Record a finished prefill and expose the slot to decode.
+    // Materialize a copied checkpoint into this request's freshly-reserved
+    // physical pages. Valid only before ordinary prefill has advanced. The
+    // returned rows and block-table delta are the destinations into which the
+    // engine scatters the checkpoint's logical K/V rows. The slot remains in
+    // prefill so the uncached suffix can continue normally.
+    PrefillChunk seed_restored_prefix(int slot, int restored_tokens);
+
     void commit_prefill(int slot);
 
     struct StepAppend {
