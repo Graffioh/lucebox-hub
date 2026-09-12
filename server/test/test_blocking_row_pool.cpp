@@ -1,20 +1,34 @@
 #include "common/blocking_row_pool.h"
+#include "CppUnitTestFramework.hpp"
 #include <array>
 #include <chrono>
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 using dflash::common::BlockingRowPool;
+using namespace CppUnitTestFramework;
+struct BlockingRowPoolFixture : CommonFixture {
+    using CommonFixture::CommonFixture;
+};
 static void check(bool ok, const char * message) {
     if (!ok) throw std::runtime_error(message);
+}
+
+static int iterations(int normal, int stress) {
+    // CI may expose only two CPUs: oversubscribed spinning workers make a
+    // 100k-job soak exceed its timeout. The deterministic generation test
+    // below proves the race independently of iteration count. Keep the full
+    // soak available for sanitizer runs and dedicated hosts.
+    return std::getenv("DFLASH_ROW_POOL_STRESS") ? stress : normal;
 }
 
 static void mixed_widths(unsigned workers) {
     BlockingRowPool pool(workers);
     // Changing the active set exposes late inactive workers: they must not
     // execute a new callback under a stale generation or acknowledge it twice.
-    for (int step = 0; step < 25000; ++step) {
+    for (int step = 0; step < iterations(256, 25000); ++step) {
         const int rows = step % 3 == 0 ? 4 : step % 3 == 1 ? 24 : 1;
         std::array<std::atomic<int>, 24> hits{};
         pool.run_custom(rows, [&](int row) {
@@ -33,7 +47,7 @@ static void concurrent_clients() {
     std::vector<std::thread> clients;
     for (int client = 0; client < 4; ++client) {
         clients.emplace_back([&, client] {
-            for (int step = 0; step < 1000; ++step) {
+            for (int step = 0; step < iterations(128, 1000); ++step) {
                 std::array<int, 24> output{};
                 pool.run_chunks(24, [&](int begin, int end) {
                     for (int row = begin; row < end; ++row) output[row] = row + client + step;
@@ -69,15 +83,67 @@ static void boundaries_and_idle() {
     check(calls == 4, "idle workers missed wakeup");
 }
 
-int main() {
-    try {
-        for (unsigned workers : {1u, 2u, 4u, 8u}) mixed_widths(workers);
-        concurrent_clients();
-        boundaries_and_idle();
-        std::puts("blocking row pool: 100000 mixed-width jobs, 4000 concurrent jobs, boundaries/idle passed");
-        return 0;
-    } catch (const std::exception & e) {
-        std::fprintf(stderr, "FAIL: %s\n", e.what());
-        return 1;
+TEST_CASE(BlockingRowPoolFixture, mixed_widths_complete_exactly_once) {
+    for (unsigned workers : {1u, 2u, 4u, 8u}) mixed_widths(workers);
+}
+
+TEST_CASE(BlockingRowPoolFixture, concurrent_clients_do_not_mix_jobs) {
+    concurrent_clients();
+}
+
+TEST_CASE(BlockingRowPoolFixture, boundaries_and_idle_wakeup) {
+    boundaries_and_idle();
+}
+
+TEST_CASE(BlockingRowPoolFixture, worker_count_preserves_unknown_hardware_fallback) {
+    CHECK(BlockingRowPool::default_worker_count(0) == 4);
+    CHECK(BlockingRowPool::default_worker_count(1) == 1);
+    CHECK(BlockingRowPool::default_worker_count(4) == 4);
+    CHECK(BlockingRowPool::default_worker_count(32) == 8);
+}
+
+TEST_CASE(BlockingRowPoolFixture, delayed_inactive_worker_holds_generation_open) {
+    struct Gate {
+        std::mutex mutex;
+        std::condition_variable cv;
+        unsigned acknowledged = 0;
+        bool stalled = false;
+        bool release = false;
+    } gate;
+    const auto hook = [](void * context, unsigned worker, bool after_ack) {
+        auto & gate = *static_cast<Gate *>(context);
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        if (after_ack) {
+            ++gate.acknowledged;
+            gate.cv.notify_all();
+        } else if (worker == 7) {
+            gate.stalled = true;
+            gate.cv.notify_all();
+            gate.cv.wait(lock, [&] { return gate.release; });
+        }
+    };
+    BlockingRowPool pool(8, hook, &gate);
+    std::atomic<int> rows{0};
+    std::atomic<bool> returned{false};
+    std::thread client([&] {
+        pool.run_custom(1, [&](int) { ++rows; });
+        returned = true;
+    });
+    bool reached = false, held = false;
+    {
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        reached = gate.cv.wait_for(lock, std::chrono::seconds(5), [&] {
+            return gate.stalled && gate.acknowledged == 7;
+        });
+        // All other workers finished. This inactive worker has observed the
+        // generation but has not read its borrowed job: completion is unsafe.
+        held = pool.pending_workers_for_test() == 1 && !returned.load();
+        gate.release = true;
     }
+    gate.cv.notify_all();
+    client.join();
+    CHECK(reached);
+    CHECK(held);
+    CHECK(rows == 1);
+    CHECK(returned);
 }

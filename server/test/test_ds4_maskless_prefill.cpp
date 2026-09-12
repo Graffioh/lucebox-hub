@@ -14,8 +14,9 @@
 static bool check(ggml_backend_t backend, int start, int tokens,
                   int expected_launches, bool require_byte_identity,
                   bool f32_kv = false, int heads = 16,
-                  bool stress_weight_bounds = false) {
-    constexpr int dim = 512, window = 128, selected = 512;
+                  bool stress_weight_bounds = false, int window = 128,
+                  bool require_compact_identity = true) {
+    constexpr int dim = 512, selected = 512;
     const int prior = std::min(start, window);
     const int raw = prior + tokens;
     const int compressed = (start + tokens) / 4;
@@ -159,7 +160,7 @@ static bool check(ggml_backend_t backend, int start, int tokens,
                 std::memcmp(expected.data(), masked.data(), ggml_nbytes(ref)) == 0 &&
                 std::memcmp(expected.data(), analytic.data(), ggml_nbytes(ref)) == 0;
             ok = ok && outside == 0 && (!require_byte_identity || identical) &&
-                 (!f32_kv || reference_identical);
+                 (!f32_kv || !require_compact_identity || reference_identical);
             std::printf("start=%d tokens=%d heads=%d replay=%d compact_vs_stream_max_abs=%.8g outside=%zu masked_vs_analytic_bytes_equal=%d reference_bytes_equal=%d kv_type=%s stress_weight_bounds=%d\n",
                         start, tokens, heads, replay, max_abs, outside, identical,
                         reference_identical, f32_kv ? "f32" : "f16", stress_weight_bounds);
@@ -182,11 +183,12 @@ static bool set_flag(const char * name, const char * value) {
 }
 
 int main(int argc, char ** argv) {
-    bool defaults = false, disabled = false, f32_kv = false;
+    bool defaults = false, disabled = false, f32_kv = false, short_maskless = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--defaults") == 0) defaults = true;
         else if (std::strcmp(argv[i], "--disabled") == 0) disabled = true;
         else if (std::strcmp(argv[i], "--f32") == 0) f32_kv = true;
+        else if (std::strcmp(argv[i], "--short") == 0) short_maskless = true;
         else return 2;
     }
     if (defaults && disabled) return 2;
@@ -196,6 +198,11 @@ int main(int argc, char ** argv) {
     configured = set_flag("GGML_CUDA_MLA_STREAM_F32_STAGE", defaults ? nullptr : "1") && configured;
     configured = set_flag("GGML_CUDA_MLA_STREAM_FAST_EXP", defaults ? nullptr : "1") && configured;
     configured = set_flag("GGML_CUDA_DISABLE_GRAPHS_DEVICES", nullptr) && configured;
+    if (short_maskless) {
+        configured = set_flag("GGML_CUDA_MLA_SPLIT_KV", "1") && configured;
+        configured = set_flag("GGML_CUDA_MLA_NO_SPLIT_KV", nullptr) && configured;
+        configured = set_flag("GGML_DS4_FA_NO_SPLIT_KV", nullptr) && configured;
+    }
     if (!configured) return 2;
     hipDeviceProp_t properties{};
     if (hipGetDeviceProperties(&properties, 0) != hipSuccess || properties.warpSize != 32) {
@@ -206,6 +213,15 @@ int main(int argc, char ** argv) {
     if (!backend) return 1;
     const int expected_launches = defaults ? 1 : disabled ? 0 : 2;
     bool ok = true;
+    if (short_maskless) {
+        // This valid small-window contract reaches the decode-width selector.
+        // Split-KV needs an explicit mask; the analytic request must use its
+        // compact fallback. The three schedules need numerical, not byte,
+        // parity here (the normal F32 compact-order tests stay byte-exact).
+        ok = check(backend, 4096, 8, 0, false, f32_kv, 16, false, 4, false);
+        ggml_backend_free(backend);
+        return ok ? 0 : 1;
+    }
     if (!defaults && !disabled) {
         ok = check(backend, 0, 10240, expected_launches, true, f32_kv);
     }

@@ -7,6 +7,7 @@
 #include "fattn-chunked.cuh"
 #include "fattn.cuh"
 #include "ds4-env.cuh"
+#include "ds4-causal.h"
 
 #include <type_traits>
 
@@ -324,15 +325,13 @@ __global__ static void ds4_fa_ratio4_causal_bounds_kernel(
                   (int) threadIdx.x;
     if (t >= n_tokens) return;
 
-    const int prior_rows = raw_rows - n_tokens;
-    const int n_comp_rows = n_kv - raw_rows;
-    const int visible_comp = min(n_comp_rows, (kv_start + t + 1) / 4);
+    const auto visible = ds4_ratio4_causal_visibility(
+        t, n_tokens, raw_rows, n_kv - raw_rows, raw_window, kv_start);
     int * token_bounds = bounds + (size_t) t * 4;
-    token_bounds[0] = max(0, prior_rows + t - raw_window + 1);
-    token_bounds[1] = prior_rows + t;
-    token_bounds[2] = visible_comp > 0 ? raw_rows : n_kv;
-    token_bounds[3] = visible_comp > 0
-        ? raw_rows + visible_comp - 1 : -1;
+    token_bounds[0] = visible.raw_first;
+    token_bounds[1] = visible.raw_last;
+    token_bounds[2] = visible.comp_first;
+    token_bounds[3] = visible.comp_last;
 }
 
 // Convert an externally selected compressed-row mask into exact lookup tables.
@@ -2924,7 +2923,8 @@ static bool ggml_cuda_ds4_flash_attn_d512_f32(
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const bool split_kv_default =
             cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
-        if (indexed_mask && n_tokens <= split_kv_max_decode_tokens &&
+        if (indexed_mask && !ratio4_causal &&
+            n_tokens <= split_kv_max_decode_tokens &&
             ds4_mla_split_kv_enabled(split_kv_default)) {
             constexpr int split_count = 2;
             const int split_stride =

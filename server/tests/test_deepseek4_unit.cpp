@@ -2,6 +2,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "../deps/llama.cpp/ggml/src/ggml-cuda/ds4-causal.h"
 #if defined(GGML_USE_HIP)
 #include <hip/hip_runtime_api.h>
 #endif
@@ -98,18 +99,22 @@ static void test_ds4_ratio4_causal_visibility_formula() {
                     reference_last = row;
                 }
             }
-            const int analytic_first = std::max(
-                0, prior_rows + token - raw_window + 1);
-            const int analytic_last = prior_rows + token;
-            const int analytic_comp = std::min(
-                n_comp_rows, (position + 1) / 4);
-            int reference_comp = 0;
-            for (int row = 0; row < n_comp_rows; ++row) {
-                reference_comp += row < (position + 1) / 4;
+            // Truncated/empty histories exercise the capacity bound as well
+            // as the usual complete ratio-4 history used by prefill.
+            for (int capacity : {0, 1, n_comp_rows / 2, n_comp_rows}) {
+                const auto actual = ds4_ratio4_causal_visibility(
+                    token, n_tokens, raw_rows, capacity, raw_window, kv_start);
+                int reference_comp = 0;
+                for (int row = 0; row < capacity; ++row) {
+                    reference_comp += 4 * (row + 1) - 1 <= position;
+                }
+                TEST_ASSERT(reference_first == actual.raw_first);
+                TEST_ASSERT(reference_last == actual.raw_last);
+                TEST_ASSERT(actual.comp_first ==
+                    (reference_comp ? raw_rows : raw_rows + capacity));
+                TEST_ASSERT(actual.comp_last ==
+                    (reference_comp ? raw_rows + reference_comp - 1 : -1));
             }
-            TEST_ASSERT(reference_first == analytic_first);
-            TEST_ASSERT(reference_last == analytic_last);
-            TEST_ASSERT(reference_comp == analytic_comp);
         }
     };
     check_chunk(0, 8192);

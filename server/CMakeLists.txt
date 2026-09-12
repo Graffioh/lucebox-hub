@@ -951,8 +951,8 @@ if(DFLASH27B_TESTS)
     find_package(Threads REQUIRED)
     add_executable(test_blocking_row_pool test/test_blocking_row_pool.cpp)
     target_include_directories(test_blocking_row_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(test_blocking_row_pool PRIVATE DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS=1)
     target_link_libraries(test_blocking_row_pool PRIVATE Threads::Threads)
-    list(APPEND _raw_unit_test_targets test_blocking_row_pool)
 
     add_executable(test_rocmfp4 deps/llama.cpp/ggml/rocmfp4/test_rocmfp4.c)
     target_link_libraries(test_rocmfp4 PRIVATE ggml-base)
@@ -1173,13 +1173,13 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_ds4_maskless_prefill PRIVATE
             ggml ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
         list(APPEND _raw_unit_test_targets test_ds4_maskless_prefill)
-        foreach(_maskless_mode IN ITEMS defaults disabled f32)
+        foreach(_maskless_mode IN ITEMS defaults disabled f32 short)
             add_test(NAME ds4_maskless_prefill_${_maskless_mode}
                 COMMAND test_ds4_maskless_prefill --${_maskless_mode})
             set_tests_properties(ds4_maskless_prefill_${_maskless_mode}
                 PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
-        foreach(_maskless_mode IN ITEMS defaults disabled)
+        foreach(_maskless_mode IN ITEMS defaults disabled short)
             add_test(NAME ds4_maskless_prefill_${_maskless_mode}_f32
                 COMMAND test_ds4_maskless_prefill --${_maskless_mode} --f32)
             set_tests_properties(ds4_maskless_prefill_${_maskless_mode}_f32
@@ -2037,6 +2037,7 @@ if(DFLASH27B_TESTS)
         test_server_unit
         test_model_smoke)
     set(_new_cppunit_test_targets
+        test_blocking_row_pool
         test_kernel_qualification_core
         test_platform_compat
         test_draft_swa
@@ -2098,14 +2099,9 @@ if(DFLASH27B_TESTS)
                     set(_unit_ctest_name recurrent_snapshot)
                 elseif(_unit_target STREQUAL "test_paged_kv_pool")
                     set(_unit_ctest_name paged_kv_pool)
-                elseif(_unit_target STREQUAL "test_blocking_row_pool")
-                    set(_unit_ctest_name blocking_row_pool)
                 endif()
                 add_test(NAME "${_unit_ctest_name}" COMMAND ${_unit_target})
                 set_tests_properties("${_unit_ctest_name}" PROPERTIES SKIP_RETURN_CODE 77)
-                if(_unit_target STREQUAL "test_blocking_row_pool")
-                    set_tests_properties("${_unit_ctest_name}" PROPERTIES TIMEOUT 120 LABELS "cpu;unit")
-                endif()
                 if(_unit_target STREQUAL "test_direct_zero_uid_graph_aba")
                     set_tests_properties("${_unit_ctest_name}" PROPERTIES TIMEOUT 60)
                 endif()

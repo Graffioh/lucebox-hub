@@ -18,8 +18,25 @@ namespace dflash::common {
 // job under an older generation and execute it twice, outliving its caller.
 class BlockingRowPool {
 public:
-    explicit BlockingRowPool(unsigned count = std::min(8u,
-            std::max(1u, std::thread::hardware_concurrency()))) : nth_(count) {
+#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+    using TestHook = void (*)(void *, unsigned, bool);
+    unsigned pending_workers_for_test() const {
+        return remaining_.load(std::memory_order_acquire);
+    }
+#endif
+    static constexpr unsigned default_worker_count(unsigned reported) {
+        return reported ? std::min(8u, reported) : 4u;
+    }
+    explicit BlockingRowPool(unsigned count = default_worker_count(
+            std::thread::hardware_concurrency())
+#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+            , TestHook hook = nullptr, void * hook_context = nullptr
+#endif
+            ) : nth_(count)
+#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+              , test_hook_(hook), test_hook_context_(hook_context)
+#endif
+    {
         if (count == 0) throw std::invalid_argument("row pool needs a worker");
         try {
             for (unsigned i = 0; i < count; ++i) {
@@ -92,6 +109,9 @@ private:
             }
             if (stop_.load(std::memory_order_relaxed)) return;
             last = generation;
+#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+            if (test_hook_) test_hook_(test_hook_context_, index, false);
+#endif
             const Job job = job_;
             if (index < job.active) {
                 const int chunk = (job.rows - 1) / (int) job.active + 1;
@@ -100,6 +120,9 @@ private:
                 if (begin < end) job.invoke(job.context, (int) begin, (int) end);
             }
             remaining_.fetch_sub(1, std::memory_order_acq_rel);
+#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+            if (test_hook_) test_hook_(test_hook_context_, index, true);
+#endif
         }
     }
     void shutdown() {
@@ -111,6 +134,11 @@ private:
         for (auto & worker : workers_) worker.join();
     }
     const unsigned nth_;
+#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+    // Host test target only; production contains neither hooks nor branches.
+    const TestHook test_hook_;
+    void * const test_hook_context_;
+#endif
     std::mutex client_mu_, wait_mu_;
     std::condition_variable wait_cv_;
     std::atomic<uint64_t> seq_{0};
