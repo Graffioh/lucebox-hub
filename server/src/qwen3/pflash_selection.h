@@ -38,6 +38,10 @@ struct PFlashSelectionCandidate {
 struct PFlashSelectionPolicy {
     int token_budget = 0;
     double top_p = 0.95;
+    // Variable-length segments: a candidate that does not fit the remaining
+    // budget is skipped instead of ending the fill, so smaller segments
+    // ranked below it can still be kept.
+    bool skip_oversized = false;
 };
 
 struct PFlashSelectionResult {
@@ -72,15 +76,41 @@ const char * pflash_selection_mode_name(PFlashSelectionMode mode) noexcept;
 const char * pflash_selection_stop_name(PFlashSelectionStop stop) noexcept;
 const char * pflash_query_parser_name(PFlashQueryParser parser) noexcept;
 
+// How the context is cut into candidates and how a candidate is scored.
+// ``Auto`` resolves at scoring time: probe segments when a segment probe is
+// loaded, fixed chunks otherwise; density with probe segments, sum otherwise.
+enum class PFlashSegmentation { Auto, Fixed, Probe };
+enum class PFlashCandidateScore { Auto, Sum, Density };
+
 struct PFlashLongAttnCompConfig {
     PFlashSelectionMode mode = PFlashSelectionMode::Legacy;
     PFlashQueryParser query_parser = PFlashQueryParser::SemanticUser;
     int chunk_size = 0;
     int query_tokens = 8;
     double top_p = 0.95;
+    PFlashSegmentation segmentation = PFlashSegmentation::Auto;
+    PFlashCandidateScore candidate_score = PFlashCandidateScore::Auto;
     bool configured = false;
     bool selection_active = false;
 };
+
+// Segment probe: cut the context before every token whose boundary score is
+// above ``threshold``; ``forced_cuts`` (query start, instruction span edges)
+// are always cut; a cut closer than ``min_segment`` tokens to the previous
+// accepted cut is dropped unless forced; a span longer than ``max_segment``
+// is split at its best-scoring interior token, or evenly when no interior
+// token scores above zero. Returns contiguous spans covering
+// [0, input_tokens), or an empty vector on invalid input.
+std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
+    const std::vector<float> & boundary_scores,
+    int input_tokens,
+    float threshold,
+    int min_segment,
+    int max_segment,
+    const std::vector<int> & forced_cuts);
+
+const char * pflash_segmentation_name(PFlashSegmentation segmentation) noexcept;
+const char * pflash_candidate_score_name(PFlashCandidateScore score) noexcept;
 
 // Presence, rather than validity, gates cache and continuation policy so an
 // empty or invalid experiment variable cannot silently fall back to legacy.

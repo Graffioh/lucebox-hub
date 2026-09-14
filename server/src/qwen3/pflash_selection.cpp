@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -19,6 +20,8 @@ constexpr const char * kChunkEnv = "PFLASH_LONGATTNCOMP_CHUNK_SIZE";
 constexpr const char * kQueryEnv = "PFLASH_LONGATTNCOMP_QUERY_TOKENS";
 constexpr const char * kQueryParserEnv = "PFLASH_LONGATTNCOMP_QUERY_PARSER";
 constexpr const char * kTopPEnv = "PFLASH_LONGATTNCOMP_TOP_P";
+constexpr const char * kSegmentsEnv = "PFLASH_LONGATTNCOMP_SEGMENTS";
+constexpr const char * kSelectEnv = "PFLASH_LONGATTNCOMP_SELECT";
 
 PFlashSelectionResult invalid_result(std::string error) {
     PFlashSelectionResult result;
@@ -65,7 +68,9 @@ bool has_pflash_longattncomp_environment() noexcept {
            std::getenv(kChunkEnv) != nullptr ||
            std::getenv(kQueryEnv) != nullptr ||
            std::getenv(kQueryParserEnv) != nullptr ||
-           std::getenv(kTopPEnv) != nullptr;
+           std::getenv(kTopPEnv) != nullptr ||
+           std::getenv(kSegmentsEnv) != nullptr ||
+           std::getenv(kSelectEnv) != nullptr;
 }
 
 bool pflash_chunk_is_structurally_required(
@@ -217,6 +222,7 @@ PFlashSelectionResult select_pflash_candidates(
         const int length = candidate->end - candidate->begin;
         if (length > policy.token_budget - result.retained_tokens) {
             result.stop = PFlashSelectionStop::BudgetReached;
+            if (policy.skip_oversized) continue;
             break;
         }
 
@@ -290,10 +296,32 @@ bool resolve_pflash_longattncomp(
     const char * query_raw = std::getenv(kQueryEnv);
     const char * query_parser_raw = std::getenv(kQueryParserEnv);
     const char * top_p_raw = std::getenv(kTopPEnv);
+    const char * segments_raw = std::getenv(kSegmentsEnv);
+    const char * select_raw = std::getenv(kSelectEnv);
 
     PFlashLongAttnCompConfig config;
     config.configured = mode_raw || chunk_raw || query_raw ||
-        query_parser_raw || top_p_raw;
+        query_parser_raw || top_p_raw || segments_raw || select_raw;
+    if (segments_raw) {
+        if (std::strcmp(segments_raw, "fixed") == 0) {
+            config.segmentation = PFlashSegmentation::Fixed;
+        } else if (std::strcmp(segments_raw, "probe") == 0) {
+            config.segmentation = PFlashSegmentation::Probe;
+        } else if (std::strcmp(segments_raw, "auto") != 0) {
+            error = std::string(kSegmentsEnv) + " must be auto, fixed or probe";
+            return false;
+        }
+    }
+    if (select_raw) {
+        if (std::strcmp(select_raw, "sum") == 0) {
+            config.candidate_score = PFlashCandidateScore::Sum;
+        } else if (std::strcmp(select_raw, "density") == 0) {
+            config.candidate_score = PFlashCandidateScore::Density;
+        } else if (std::strcmp(select_raw, "auto") != 0) {
+            error = std::string(kSelectEnv) + " must be auto, sum or density";
+            return false;
+        }
+    }
     config.chunk_size = legacy_chunk_size;
 
     if (mode_raw) {
@@ -345,6 +373,76 @@ bool resolve_pflash_longattncomp(
 
     out = config;
     return true;
+}
+
+std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
+        const std::vector<float> & boundary_scores,
+        int input_tokens,
+        float threshold,
+        int min_segment,
+        int max_segment,
+        const std::vector<int> & forced_cuts) {
+    using dflash::common::PFlashTokenSpan;
+    std::vector<PFlashTokenSpan> spans;
+    if (input_tokens <= 0 || (int) boundary_scores.size() < input_tokens ||
+        min_segment < 1 || max_segment < min_segment) {
+        return spans;
+    }
+    std::vector<uint8_t> forced((size_t) input_tokens + 1, 0);
+    for (int cut : forced_cuts) {
+        if (cut > 0 && cut < input_tokens) forced[(size_t) cut] = 1;
+    }
+    std::vector<int> cuts;
+    cuts.push_back(0);
+    for (int token = 1; token < input_tokens; ++token) {
+        const bool wanted = forced[(size_t) token] ||
+            (std::isfinite(boundary_scores[(size_t) token]) &&
+             boundary_scores[(size_t) token] > threshold);
+        if (!wanted) continue;
+        if (!forced[(size_t) token] && token - cuts.back() < min_segment) continue;
+        cuts.push_back(token);
+    }
+    cuts.push_back(input_tokens);
+    for (size_t index = 1; index < cuts.size(); ++index) {
+        int begin = cuts[index - 1];
+        const int end = cuts[index];
+        while (end - begin > max_segment) {
+            // Split at the best-scoring interior token at least min_segment
+            // from both edges, else on a fixed grid.
+            int best = -1;
+            float best_score = 0.0f;
+            for (int token = begin + min_segment; token <= end - min_segment; ++token) {
+                const float score = boundary_scores[(size_t) token];
+                if (std::isfinite(score) && score > best_score) {
+                    best_score = score;
+                    best = token;
+                }
+            }
+            if (best < 0) best = begin + max_segment;
+            spans.push_back({begin, best});
+            begin = best;
+        }
+        spans.push_back({begin, end});
+    }
+    return spans;
+}
+
+const char * pflash_segmentation_name(PFlashSegmentation segmentation) noexcept {
+    switch (segmentation) {
+        case PFlashSegmentation::Auto: return "auto";
+        case PFlashSegmentation::Fixed: return "fixed";
+        case PFlashSegmentation::Probe: return "probe";
+    }
+    return "unknown";
+}
+
+const char * pflash_candidate_score_name(PFlashCandidateScore score) noexcept {
+    switch (score) {
+        case PFlashCandidateScore::Auto: return "auto";
+        case PFlashCandidateScore::Sum: return "sum";
+        case PFlashCandidateScore::Density: return "density";
+    }
+    return "unknown";
 }
 
 } // namespace dflash::qwen3
