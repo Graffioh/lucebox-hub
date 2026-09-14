@@ -110,23 +110,6 @@ struct Qwen35DrafterState {
     ggml_tensor *         head_wq  = nullptr;  // [hidden, n_head * head_dim], query rows only
     ggml_tensor *         head_wk  = nullptr;  // [hidden, n_head_kv * head_dim]
     bool                  head_loaded = false;
-    // Segment probe: per-token boundary scores from the same block-14 tap.
-    ggml_context *        probe_ctx = nullptr;
-    ggml_backend_buffer_t probe_buf = nullptr;
-    ggml_tensor *         probe_norm_w = nullptr;  // [hidden]
-    ggml_tensor *         probe_norm_b = nullptr;  // [hidden]
-    ggml_tensor *         probe_fc1_w  = nullptr;  // [hidden, probe_width]
-    ggml_tensor *         probe_fc1_b  = nullptr;  // [probe_width]
-    ggml_tensor *         probe_fc2_w  = nullptr;  // [probe_width, 1]
-    ggml_tensor *         probe_fc2_b  = nullptr;  // [1]
-    std::vector<float>    probe_conv_w;            // 5 taps, applied on the CPU
-    float                 probe_conv_b = 0.0f;
-    float                 probe_norm_eps = 1e-5f;
-    float                 probe_threshold = 0.9f;
-    int                   probe_min_segment = 1;
-    int                   probe_max_segment = 2048;
-    int                   probe_width = 0;
-    bool                  probe_loaded = false;
 };
 
 static void free_qwen35_head(Qwen35DrafterState & st) {
@@ -134,15 +117,6 @@ static void free_qwen35_head(Qwen35DrafterState & st) {
     if (st.head_ctx) { ggml_free(st.head_ctx); st.head_ctx = nullptr; }
     st.head_wq = st.head_wk = nullptr;
     st.head_loaded = false;
-}
-
-static void free_qwen35_segment_probe(Qwen35DrafterState & st) {
-    if (st.probe_buf) { ggml_backend_buffer_free(st.probe_buf); st.probe_buf = nullptr; }
-    if (st.probe_ctx) { ggml_free(st.probe_ctx); st.probe_ctx = nullptr; }
-    st.probe_norm_w = st.probe_norm_b = st.probe_fc1_w = st.probe_fc1_b =
-        st.probe_fc2_w = st.probe_fc2_b = nullptr;
-    st.probe_conv_w.clear();
-    st.probe_loaded = false;
 }
 
 static bool qwen35_metadata_equals(gguf_context * g, const char * key,
@@ -243,127 +217,6 @@ static bool load_qwen35_longattncomp_head(const std::string & path,
     return true;
 }
 
-static constexpr const char * kQwen35ProbeSchema = "qwen3_5_0_8b_segment_probe_v1";
-
-static bool qwen35_metadata_f32(gguf_context * g, const char * key, float & out) {
-    const int id = gguf_find_key(g, key);
-    if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_FLOAT32) return false;
-    out = gguf_get_val_f32(g, id);
-    return true;
-}
-
-static bool qwen35_metadata_u32(gguf_context * g, const char * key, int & out) {
-    const int id = gguf_find_key(g, key);
-    if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_UINT32) return false;
-    out = (int) gguf_get_val_u32(g, id);
-    return true;
-}
-
-// Optional segment probe for the block-14 tap: LayerNorm -> Linear -> GELU ->
-// Linear on the GPU, a 5-tap smoothing on the CPU, sigmoid, cut above the
-// threshold. Fails closed on any contract mismatch, like the head loader.
-static bool load_qwen35_segment_probe(const std::string & path,
-                                      Qwen35DrafterState & st) {
-    const TargetWeights & w = st.weights;
-    if (st.gguf_sha256.empty()) {
-        set_last_error("segment probe requires the drafter GGUF identity hash");
-        return false;
-    }
-    ggml_context * data_ctx = nullptr;
-    gguf_init_params params{ /*no_alloc=*/ false, /*ctx=*/ &data_ctx };
-    gguf_context * g = gguf_init_from_file(path.c_str(), params);
-    if (!g) {
-        set_last_error("segment probe GGUF could not be opened: " + path);
-        return false;
-    }
-    auto fail = [&](const std::string & message) {
-        free_qwen35_segment_probe(st);
-        gguf_free(g);
-        if (data_ctx) ggml_free(data_ctx);
-        set_last_error(message);
-        return false;
-    };
-    if (!qwen35_metadata_equals(g, "general.architecture", "segmentprobe") ||
-        !qwen35_metadata_equals(g, "segmentprobe.schema", kQwen35ProbeSchema) ||
-        !qwen35_metadata_equals(g, "segmentprobe.base_model", kQwen35HeadBaseModel) ||
-        !qwen35_metadata_equals(g, "segmentprobe.runtime_gguf_sha256", st.gguf_sha256) ||
-        !qwen35_metadata_equals(g, "segmentprobe.feature_tap", kQwen35HeadFeatureTap)) {
-        return fail("segment probe metadata does not match the loaded Qwen3.5-0.8B drafter");
-    }
-    if (!qwen35_metadata_f32(g, "segmentprobe.threshold", st.probe_threshold) ||
-        !qwen35_metadata_f32(g, "segmentprobe.norm_eps", st.probe_norm_eps) ||
-        !qwen35_metadata_u32(g, "segmentprobe.min_segment", st.probe_min_segment) ||
-        !qwen35_metadata_u32(g, "segmentprobe.max_segment", st.probe_max_segment) ||
-        !(st.probe_threshold > 0.0f && st.probe_threshold < 1.0f) ||
-        st.probe_min_segment < 1 || st.probe_max_segment < st.probe_min_segment) {
-        return fail("segment probe parameters are missing or out of range");
-    }
-    ggml_tensor * fc1 = data_ctx ? ggml_get_tensor(data_ctx, "segmentprobe.fc1.weight") : nullptr;
-    if (!fc1 || fc1->type != GGML_TYPE_F32 || ggml_n_dims(fc1) != 2 ||
-        fc1->ne[0] != w.n_embd || fc1->ne[1] < 1) {
-        return fail("segment probe tensor contract mismatch: segmentprobe.fc1.weight");
-    }
-    st.probe_width = (int) fc1->ne[1];
-    struct Contract {
-        const char * name;
-        int n_dims;
-        int64_t ne0;
-        int64_t ne1;
-        ggml_tensor ** destination;
-    };
-    const Contract contracts[] = {
-        {"segmentprobe.norm.weight", 1, (int64_t) w.n_embd, 1, &st.probe_norm_w},
-        {"segmentprobe.norm.bias", 1, (int64_t) w.n_embd, 1, &st.probe_norm_b},
-        {"segmentprobe.fc1.weight", 2, (int64_t) w.n_embd, (int64_t) st.probe_width, &st.probe_fc1_w},
-        {"segmentprobe.fc1.bias", 1, (int64_t) st.probe_width, 1, &st.probe_fc1_b},
-        // ggml drops trailing unit dimensions: the [width, 1] output row is 1-D.
-        {"segmentprobe.fc2.weight", 1, (int64_t) st.probe_width, 1, &st.probe_fc2_w},
-        {"segmentprobe.fc2.bias", 1, 1, 1, &st.probe_fc2_b},
-    };
-    ggml_init_params probe_params{};
-    probe_params.mem_size = 8 * ggml_tensor_overhead();
-    probe_params.no_alloc = true;
-    st.probe_ctx = ggml_init(probe_params);
-    if (!st.probe_ctx) return fail("segment probe context allocation failed");
-    for (const auto & contract : contracts) {
-        ggml_tensor * source = ggml_get_tensor(data_ctx, contract.name);
-        if (!source || source->type != GGML_TYPE_F32 ||
-            ggml_n_dims(source) != contract.n_dims ||
-            source->ne[0] != contract.ne0 ||
-            (contract.n_dims == 2 && source->ne[1] != contract.ne1)) {
-            return fail(std::string("segment probe tensor contract mismatch: ") + contract.name);
-        }
-        *contract.destination = contract.n_dims == 1
-            ? ggml_new_tensor_1d(st.probe_ctx, GGML_TYPE_F32, contract.ne0)
-            : ggml_new_tensor_2d(st.probe_ctx, GGML_TYPE_F32, contract.ne0, contract.ne1);
-        ggml_set_name(*contract.destination, contract.name);
-    }
-    ggml_tensor * conv_w = ggml_get_tensor(data_ctx, "segmentprobe.conv.weight");
-    ggml_tensor * conv_b = ggml_get_tensor(data_ctx, "segmentprobe.conv.bias");
-    if (!conv_w || conv_w->type != GGML_TYPE_F32 || ggml_n_dims(conv_w) != 1 || conv_w->ne[0] != 5 ||
-        !conv_b || conv_b->type != GGML_TYPE_F32 || ggml_n_dims(conv_b) != 1 || conv_b->ne[0] != 1) {
-        return fail("segment probe tensor contract mismatch: segmentprobe.conv");
-    }
-    st.probe_conv_w.assign((const float *) conv_w->data, (const float *) conv_w->data + 5);
-    st.probe_conv_b = ((const float *) conv_b->data)[0];
-    st.probe_buf = ggml_backend_alloc_ctx_tensors(st.probe_ctx, w.backend);
-    if (!st.probe_buf) return fail("segment probe buffer allocation failed");
-    for (const auto & contract : contracts) {
-        ggml_tensor * source = ggml_get_tensor(data_ctx, contract.name);
-        ggml_backend_tensor_set(*contract.destination, source->data, 0, ggml_nbytes(source));
-    }
-    gguf_free(g);
-    ggml_free(data_ctx);
-    st.probe_loaded = true;
-    std::fprintf(stderr,
-        "[qwen35-drafter] loaded segment probe: %s (width %d, threshold %.3f, "
-        "segments %d-%d tokens)\n",
-        path.c_str(), st.probe_width, st.probe_threshold,
-        st.probe_min_segment, st.probe_max_segment);
-    std::fflush(stderr);
-    return true;
-}
-
 static int env_int(const char * name, int fallback) {
     if (const char * v = std::getenv(name)) {
         int x = std::atoi(v);
@@ -401,10 +254,6 @@ struct PFlashTraceFields {
     double retained_mass = 0.0;
     const std::vector<double> * exact_chunk_scores = nullptr;
     const std::vector<PFlashTokenSpan> * required_instruction_spans = nullptr;
-    // Variable-length candidates (segment probe): spans in candidate order.
-    const std::vector<PFlashTokenSpan> * segments = nullptr;
-    const char * segmentation = "fixed";
-    const char * candidate_score = "sum";
 };
 
 static void write_compression_trace(
@@ -485,18 +334,6 @@ static void write_compression_trace(
                 trace_fields->retained_mass);
         }
     }
-    if (trace_fields) {
-        std::fprintf(file, ",\"segmentation\":\"%s\",\"candidate_score\":\"%s\"",
-                     trace_fields->segmentation, trace_fields->candidate_score);
-        if (trace_fields->segments) {
-            std::fputs(",\"segments\":[", file);
-            for (size_t index = 0; index < trace_fields->segments->size(); ++index) {
-                const auto & span = (*trace_fields->segments)[index];
-                std::fprintf(file, "%s[%d,%d]", index ? "," : "", span.begin, span.end);
-            }
-            std::fputc(']', file);
-        }
-    }
     std::fprintf(file,
         ",\"chunk_size\":%d,\"n_lookahead\":%d,\"pool_kernel\":%d,"
         "\"n_keep\":%d,\"chunk_scores\":[",
@@ -547,19 +384,15 @@ static std::vector<int32_t> select_longattncomp_chunks(
         const dflash::qwen3::PFlashLongAttnCompConfig & config,
         const std::vector<PFlashTokenSpan> & required_instruction_spans,
         bool direct_mass,
-        bool write_trace,
-        const std::vector<PFlashTokenSpan> * segments = nullptr,
-        bool density = false) {
+        bool write_trace) {
     const int input_tokens = (int) ids.size();
     const int query_end = score_query_end < 0 ? input_tokens : score_query_end;
     const int query_tokens = std::min(n_lookahead, query_end);
     const int query_begin = query_end - query_tokens;
     const int selector_budget = (int) std::floor(
         (double) input_tokens * (double) keep_ratio);
-    // Fixed grid unless the caller provides variable-length segments.
-    const int n_chunks = segments
-        ? (int) segments->size()
-        : (input_tokens + config.chunk_size - 1) / config.chunk_size;
+    const int n_chunks =
+        (input_tokens + config.chunk_size - 1) / config.chunk_size;
 
     std::vector<dflash::qwen3::PFlashSelectionCandidate> candidates;
     std::vector<std::pair<float, int>> chunk_means;
@@ -568,14 +401,13 @@ static std::vector<int32_t> select_longattncomp_chunks(
     chunk_means.reserve((size_t) n_chunks);
     exact_chunk_scores.reserve((size_t) n_chunks);
     for (int chunk = 0; chunk < n_chunks; ++chunk) {
-        const int begin = segments ? (*segments)[(size_t) chunk].begin : chunk * config.chunk_size;
-        const int end = segments ? (*segments)[(size_t) chunk].end
-                                 : std::min(input_tokens, begin + config.chunk_size);
+        const int begin = chunk * config.chunk_size;
+        const int end = std::min(input_tokens, begin + config.chunk_size);
         double score = 0.0;
         for (int token = begin; token < end; ++token) {
             score += token_scores[(size_t) token];
         }
-        if (!direct_mass || density) {
+        if (!direct_mass) {
             score /= (double) std::max(1, end - begin);
         }
         const bool mandatory =
@@ -589,8 +421,7 @@ static std::vector<int32_t> select_longattncomp_chunks(
 
     const auto selected = dflash::qwen3::select_pflash_candidates(
         candidates,
-        dflash::qwen3::PFlashSelectionPolicy{selector_budget, config.top_p,
-                                             /*skip_oversized=*/ segments != nullptr},
+        dflash::qwen3::PFlashSelectionPolicy{selector_budget, config.top_p},
         config.mode);
     if (!selected.ok) {
         set_last_error("PFlash LongAttnComp selection failed: " + selected.error);
@@ -627,31 +458,25 @@ static std::vector<int32_t> select_longattncomp_chunks(
     }
 
     std::fprintf(stderr,
-        "[pflash-longattncomp] selected mode=%s segments=%s score=%s chunk=%d query=%d "
+        "[pflash-longattncomp] selected mode=%s chunk=%d query=%d "
         "budget=%d selected_tokens=%zu chunks=%zu/%d stop=%s mass=%.9g\n",
         dflash::qwen3::pflash_selection_mode_name(config.mode),
-        segments ? "probe" : "fixed", density ? "density" : "sum",
-        segments ? 0 : config.chunk_size, query_tokens, selector_budget, output.size(),
+        config.chunk_size, query_tokens, selector_budget, output.size(),
         selected.ordinals.size(), n_chunks,
         dflash::qwen3::pflash_selection_stop_name(selected.stop),
         selected.retained_mass);
     std::fflush(stderr);
 
     if (write_trace) {
-        const int trace_chunk = segments ? 0 : config.chunk_size;
-        const int n_keep_approx = segments
-            ? (int) selected.ordinals.size()
-            : std::max(1, (selector_budget + config.chunk_size - 1) / config.chunk_size);
-        PFlashTraceFields strict_fields{
+        const int n_keep_approx = std::max(
+            1, (selector_budget + config.chunk_size - 1) / config.chunk_size);
+        const PFlashTraceFields strict_fields{
             &ids, query_begin, query_end, config.mode, config.query_parser,
             selector_budget,
             selected.stop, selected.retained_tokens, selected.retained_mass,
             &exact_chunk_scores, &required_instruction_spans};
-        strict_fields.segments = segments;
-        strict_fields.segmentation = segments ? "probe" : "fixed";
-        strict_fields.candidate_score = density ? "density" : "sum";
         write_compression_trace(
-            input_tokens, keep_ratio, trace_chunk, query_tokens,
+            input_tokens, keep_ratio, config.chunk_size, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,
             mandatory_mask, output, &strict_fields);
     }
@@ -782,27 +607,9 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
             delete st;
             return false;
         }
-        const char * head_path = std::getenv("PFLASH_LONGATTNCOMP_HEAD_GGUF");
-        const char * probe_path = std::getenv("PFLASH_SEGMENT_PROBE_GGUF");
-        if (head_path || probe_path) {
+        if (const char * head_path = std::getenv("PFLASH_LONGATTNCOMP_HEAD_GGUF")) {
             const auto identity = read_gguf_metadata(gguf_path, /*compute_sha256=*/ true);
             st->gguf_sha256 = identity.ok ? identity.sha256 : std::string();
-        }
-        if (probe_path) {
-            if (!*probe_path || !load_qwen35_segment_probe(probe_path, *st)) {
-                if (!*probe_path) {
-                    set_last_error("PFLASH_SEGMENT_PROBE_GGUF is empty");
-                }
-                std::fprintf(stderr,
-                    "[qwen35-drafter] ERROR: segment probe load failed, "
-                    "refusing to serve without it\n");
-                std::fflush(stderr);
-                free_target_weights(st->weights);
-                delete st;
-                return false;
-            }
-        }
-        if (head_path) {
             if (!*head_path || !load_qwen35_longattncomp_head(head_path, *st)) {
                 if (!*head_path) {
                     set_last_error("PFLASH_LONGATTNCOMP_HEAD_GGUF is empty");
@@ -871,7 +678,6 @@ void free_drafter_weights(DrafterContext & ctx) {
     if (ctx.arch == DrafterArch::Qwen35_0p8b && ctx.arch_state) {
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
         free_qwen35_head(*st);
-        free_qwen35_segment_probe(*st);
         free_target_weights(st->weights);
         delete st;
         ctx.arch_state = nullptr;
@@ -1477,10 +1283,6 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
     }
     ggml_tensor * logits = ggml_new_tensor_3d(lctx, GGML_TYPE_F32, S, n_lookahead, H);
     ggml_tensor * mask = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, S, n_lookahead);
-    const bool use_probe = st.probe_loaded &&
-        experiment.segmentation != dflash::qwen3::PFlashSegmentation::Fixed;
-    ggml_tensor * probe_logits = use_probe
-        ? ggml_new_tensor_1d(lctx, GGML_TYPE_F32, S) : nullptr;
     ggml_backend_buffer_t lbuf = ggml_backend_alloc_ctx_tensors(lctx, w.backend);
     if (!lbuf) {
         ggml_free(lctx); cleanup();
@@ -1542,17 +1344,6 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
                                          logits->nb[1], logits->nb[2],
                                          (size_t)b * logits->nb[0]);
         ggml_build_forward_expand(sgf, ggml_cpy(sctx, part, dst));
-        if (use_probe) {
-            // Segment probe on the same tap: LayerNorm -> fc1 -> GELU -> fc2.
-            ggml_tensor * p = ggml_norm(sctx, x_c, st.probe_norm_eps);
-            p = ggml_add(sctx, ggml_mul(sctx, p, st.probe_norm_w), st.probe_norm_b);
-            p = ggml_gelu(sctx, ggml_add(sctx, ggml_mul_mat(sctx, st.probe_fc1_w, p),
-                                         st.probe_fc1_b));                      // [width, n]
-            p = ggml_add(sctx, ggml_mul_mat(sctx, st.probe_fc2_w, p), st.probe_fc2_b);  // [1, n]
-            ggml_tensor * p_dst = ggml_view_1d(sctx, probe_logits, n,
-                                               (size_t)b * ggml_element_size(probe_logits));
-            ggml_build_forward_expand(sgf, ggml_cpy(sctx, ggml_reshape_1d(sctx, p, n), p_dst));
-        }
     }
     ggml_tensor * probs = ggml_soft_max_ext(sctx, logits, mask,
                                             1.0f / std::sqrt((float)D), 0.0f);
@@ -1574,11 +1365,6 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
     }
     std::vector<float> probs_h((size_t)S * n_lookahead * H);
     ggml_backend_tensor_get(probs, probs_h.data(), 0, probs_h.size() * sizeof(float));
-    std::vector<float> probe_raw;
-    if (use_probe) {
-        probe_raw.resize((size_t) S);
-        ggml_backend_tensor_get(probe_logits, probe_raw.data(), 0, probe_raw.size() * sizeof(float));
-    }
     ggml_gallocr_free(salloc);
     ggml_free(sctx);
     ggml_backend_buffer_free(lbuf);
@@ -1606,62 +1392,10 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
         st.head_loaded ? "trained" : "native-block15");
     std::fflush(stderr);
 
-    std::vector<PFlashTokenSpan> segments;
-    bool density = experiment.candidate_score == dflash::qwen3::PFlashCandidateScore::Density;
-    if (use_probe) {
-        // 5-tap smoothing over the raw logits (torch Conv1d, padding 2) plus
-        // the residual logit, then sigmoid: the boundary score per token.
-        std::vector<float> boundary((size_t) S, 0.0f);
-        for (int t = 0; t < S; ++t) {
-            float acc = probe_raw[(size_t) t] + st.probe_conv_b;
-            for (int k = 0; k < 5; ++k) {
-                const int u = t + k - 2;
-                if (u >= 0 && u < S) acc += st.probe_conv_w[(size_t) k] * probe_raw[(size_t) u];
-            }
-            boundary[(size_t) t] = 1.0f / (1.0f + std::exp(-acc));
-        }
-        const int query_end = score_query_end < 0 ? S : score_query_end;
-        const int query_begin = query_end - std::min(n_lookahead, query_end);
-        std::vector<int> forced{query_begin, query_end};
-        for (const auto & span : required_instruction_spans) {
-            forced.push_back(span.begin);
-            forced.push_back(span.end);
-        }
-        int boundaries_in_context = 0;
-        for (int t = 1; t < query_begin; ++t) {
-            if (boundary[(size_t) t] > st.probe_threshold) ++boundaries_in_context;
-        }
-        const bool forced_probe =
-            experiment.segmentation == dflash::qwen3::PFlashSegmentation::Probe;
-        if (boundaries_in_context >= 4 || forced_probe) {
-            segments = dflash::qwen3::pflash_probe_segments(
-                boundary, S, st.probe_threshold, st.probe_min_segment,
-                st.probe_max_segment, forced);
-        }
-        if (segments.empty()) {
-            std::fprintf(stderr,
-                "[qwen35-segment-probe] %d boundaries in the context, "
-                "falling back to fixed %d-token chunks\n",
-                boundaries_in_context, experiment.chunk_size);
-        } else {
-            if (experiment.candidate_score == dflash::qwen3::PFlashCandidateScore::Auto) {
-                density = true;
-            }
-            std::fprintf(stderr,
-                "[qwen35-segment-probe] %d boundaries in the context -> %zu segments "
-                "(threshold %.2f, %d-%d tokens), score=%s\n",
-                boundaries_in_context, segments.size(), st.probe_threshold,
-                st.probe_min_segment, st.probe_max_segment,
-                density ? "density" : "sum");
-        }
-        std::fflush(stderr);
-    }
-
     return select_longattncomp_chunks(
         ids, token_mass, keep_ratio, n_lookahead, score_query_end,
         /*pool_kernel=*/1, experiment, required_instruction_spans,
-        /*direct_mass=*/true, /*write_trace=*/true,
-        segments.empty() ? nullptr : &segments, density);
+        /*direct_mass=*/true, /*write_trace=*/true);
 }
 
 std::vector<int32_t> drafter_score_and_compress(
