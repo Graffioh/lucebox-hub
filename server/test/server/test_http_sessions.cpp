@@ -62,7 +62,7 @@ TEST_CASE(BanditIntegrationFixture, multi_turn_reaches_lower_bound) {
         sessions.update("s_hi", 1.0f);
     }
     float k = sessions.get_keep_ratio("s_hi");
-    CHECK(k >= kBanditKeepMin - 1e-5f);
+    CHECK(approx_eq(k, kBanditKeepMin));
 }
 
 TEST_CASE(BanditIntegrationFixture, multi_turn_reaches_upper_bound) {
@@ -71,7 +71,7 @@ TEST_CASE(BanditIntegrationFixture, multi_turn_reaches_upper_bound) {
         sessions.update("s_lo", 0.0f);
     }
     float k = sessions.get_keep_ratio("s_lo");
-    CHECK(k <= kBanditKeepMax + 1e-5f);
+    CHECK(approx_eq(k, kBanditKeepMax));
 }
 
 TEST_CASE(BanditIntegrationFixture, zero_accept_drives_keep_up) {
@@ -128,8 +128,7 @@ TEST_CASE(AdaptiveKeepRatioFixture, get_ema_reflects_post_update_value) {
     mgr.update("s1", 0.80f);
     CHECK(approx_eq(mgr.get_ema("s1"), 0.80f));
     mgr.update("s1", 0.60f);
-    float expected = kBanditEmaAlpha * 0.80f + (1.0f - kBanditEmaAlpha) * 0.60f;
-    CHECK(approx_eq(mgr.get_ema("s1"), expected));
+    CHECK(approx_eq(mgr.get_ema("s1"), 0.74f));
 }
 
 TEST_CASE(AdaptiveKeepRatioFixture, lru_eviction_bounds_map_size) {
@@ -139,11 +138,12 @@ TEST_CASE(AdaptiveKeepRatioFixture, lru_eviction_bounds_map_size) {
     for (std::size_t i = 0; i < over; ++i) {
         mgr.update("sess-" + std::to_string(i), 0.80f);
     }
-    CHECK(mgr.size() <= kMaxSessions);
+    CHECK(mgr.size() == kMaxSessions);
 
     float k0 = mgr.get_keep_ratio("sess-0");
-    CHECK(mgr.size() <= kMaxSessions);
-    (void) k0;
+    CHECK(mgr.size() == kMaxSessions);
+    CHECK(approx_eq(k0, AdaptiveKeepRatioState{}.last_keep));
+    CHECK(mgr.turn_count("sess-0") == 0);
 
     const std::string pinned = "sess-" + std::to_string(over - 1);
     for (int t = 0; t < 3; ++t) {
@@ -153,6 +153,33 @@ TEST_CASE(AdaptiveKeepRatioFixture, lru_eviction_bounds_map_size) {
         mgr.update("wave2-" + std::to_string(i), 0.80f);
     }
 
-    CHECK(mgr.size() <= kMaxSessions);
-    CHECK(mgr.turn_count(pinned) >= 3);
+    CHECK(mgr.size() == kMaxSessions);
+    CHECK(mgr.turn_count(pinned) == 4);
+}
+
+TEST_CASE(AdaptiveKeepRatioFixture, each_read_accessor_refreshes_lru) {
+    for (int accessor = 0; accessor < 3; ++accessor) {
+        HttpServerSessions sessions;
+        for (size_t i = 0; i < kMaxSessions; ++i) {
+            sessions.update(std::to_string(i), 0.8f);
+        }
+        // Touch the oldest entry through each public read path, then force
+        // eviction. The next-oldest entry must go, not the one just read.
+        if (accessor == 0) sessions.get_keep_ratio("0");
+        if (accessor == 1) sessions.get_ema("0");
+        if (accessor == 2) sessions.turn_count("0");
+        sessions.update("new", 0.8f);
+        CHECK(sessions.size() == kMaxSessions);
+        CHECK(sessions.turn_count("0") == 1);
+        CHECK(sessions.turn_count("1") == 0);
+        CHECK(sessions.turn_count("new") == 1);
+    }
+}
+
+TEST_CASE(AdaptiveKeepRatioFixture, missing_reads_do_not_allocate_sessions) {
+    HttpServerSessions sessions;
+    CHECK(approx_eq(sessions.get_keep_ratio("missing"), AdaptiveKeepRatioState{}.last_keep));
+    CHECK(sessions.get_ema("missing") == 0.0f);
+    CHECK(sessions.turn_count("missing") == 0);
+    CHECK(sessions.size() == 0);
 }

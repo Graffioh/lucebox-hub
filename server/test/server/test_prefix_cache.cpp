@@ -354,7 +354,8 @@ TEST_CASE(ServerUnitFixture, test_hash_prefix_different_lengths) {
 }
 
 TEST_CASE(ServerUnitFixture, test_hash_prefix_empty) {
-    auto h = hash_prefix(nullptr, 0);
+    const int32_t unused_token = 0;
+    auto h = hash_prefix(&unused_token, 0);
     // Should not crash, just return a hash of empty input
     TEST_ASSERT(h.size() == 16);
 }
