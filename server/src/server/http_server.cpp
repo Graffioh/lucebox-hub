@@ -269,6 +269,39 @@ PflashQueryWindow pflash_tail_query_window(
     return result;
 }
 
+PFlashTokenSpan pflash_decoded_text_span(
+        const Tokenizer & tokenizer,
+        const std::vector<int32_t> & prompt,
+        int begin,
+        int end,
+        const std::string & needle) {
+    if (needle.empty() || begin < 0 || end <= begin ||
+        end > (int) prompt.size()) {
+        return {-1, -1};
+    }
+    std::string decoded;
+    std::vector<size_t> offsets;
+    offsets.reserve((size_t)(end - begin));
+    for (int index = begin; index < end; ++index) {
+        offsets.push_back(decoded.size());
+        decoded += tokenizer.token_text(prompt[(size_t) index]);
+    }
+    const size_t pos = decoded.rfind(needle);
+    if (pos == std::string::npos) {
+        return {-1, -1};
+    }
+    const size_t needle_end = pos + needle.size();
+    int first = begin;
+    while (first + 1 < end && offsets[(size_t)(first + 1 - begin)] <= pos) {
+        ++first;
+    }
+    int after = first;
+    while (after < end && offsets[(size_t)(after - begin)] < needle_end) {
+        ++after;
+    }
+    return {first, after};
+}
+
 int pflash_query_search_end_from_sentinel(
         const std::vector<int32_t> & original,
         const std::vector<int32_t> & sentinel) noexcept {
@@ -2359,6 +2392,7 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         // Bandit: parse session_id from extra_body (opt-in adaptive keep_ratio).
         req.session_id = parse_session_id_from_body(body);
         req.pflash_query = parse_pflash_query_from_body(body);
+        req.pflash_required = parse_pflash_required_from_body(body);
 
         // PPP rearrange (optional): peel ephemeral system banners into a
         // following system message so the first chat boundary is stable.
@@ -3062,6 +3096,9 @@ std::string HttpServer::apply_pflash_compression(
             (int) drafter_ids.size(), 32, experiment, experiment_error)) {
         return "invalid PFlash LongAttnComp config: " + experiment_error;
     }
+    if (!experiment.selection_active && !req.pflash_required.empty()) {
+        return "PFlash pflash_required needs strict LongAttnComp selection";
+    }
 
     const bool messages_input =
         req.messages.is_array() && !req.messages.empty();
@@ -3072,6 +3109,10 @@ std::string HttpServer::apply_pflash_compression(
     std::string last_user_text;
     int query_content_begin = -1;
     int query_content_end = -1;
+    // Complete token span of an explicit pflash_query inside the boundary
+    // content, when it was mapped against the decoded token text. The strict
+    // selector keeps the whole span mandatory; the scorer window is its tail.
+    PFlashTokenSpan explicit_query_span{-1, -1};
     std::vector<PFlashTokenSpan> required_instruction_spans;
     if (experiment.configured) {
         if (!messages_input && !raw_text_input) {
@@ -3240,6 +3281,44 @@ std::string HttpServer::apply_pflash_compression(
                     required_instruction_spans.push_back(tool_span);
                 }
 
+                // Client-declared literal text that must survive compression
+                // (e.g. an answer-format directive embedded in the user
+                // message). Each string maps to its last occurrence inside
+                // the boundary content; mapping failure fails the request
+                // rather than silently keeping a shorter span.
+                for (const auto & required : req.pflash_required) {
+                    if (required.empty()) continue;
+                    const PFlashTokenSpan required_span =
+                        http_detail::pflash_decoded_text_span(
+                            *drafter_tokenizer_, drafter_ids,
+                            query_content_begin, query_content_end, required);
+                    if (required_span.begin < 0) {
+                        return "PFlash LongAttnComp required-text mapping "
+                            "failed: a pflash_required string does not occur "
+                            "in the latest user content";
+                    }
+                    required_instruction_spans.push_back(required_span);
+                }
+                // An explicit scorer query also pins its complete span: the
+                // whole question is mandatory even though the scorer only
+                // consumes its bounded tail. Mapping against the decoded
+                // content text (not a standalone encoding) keeps BPE boundary
+                // merges like " What" inside the span.
+                if (!req.pflash_query.empty() &&
+                    experiment.query_parser ==
+                        dflash::qwen3::PFlashQueryParser::SemanticUser) {
+                    explicit_query_span =
+                        http_detail::pflash_decoded_text_span(
+                            *drafter_tokenizer_, drafter_ids,
+                            query_content_begin, query_content_end,
+                            req.pflash_query);
+                    if (explicit_query_span.begin < 0) {
+                        return "PFlash LongAttnComp explicit query mapping "
+                            "failed: pflash_query does not occur in the "
+                            "latest user content";
+                    }
+                    required_instruction_spans.push_back(explicit_query_span);
+                }
                 required_instruction_spans =
                     http_detail::canonicalize_pflash_token_spans(
                         std::move(required_instruction_spans));
@@ -3299,6 +3378,18 @@ std::string HttpServer::apply_pflash_compression(
         parser_selection_rule = "prompt_tail";
         query_window = http_detail::pflash_tail_query_window(
             drafter_ids, experiment.query_tokens, query_content_end);
+    } else if (explicit_query_span.begin >= 0) {
+        // The explicit query was already mapped against the decoded content
+        // text and pinned as a mandatory span. The scorer consumes the span's
+        // bounded tail window; the complete span stays in the target prompt.
+        parser_selection_rule = "explicit_query_span";
+        query_window.end = explicit_query_span.end;
+        query_window.tokens = (std::min)(
+            experiment.query_tokens,
+            explicit_query_span.end - explicit_query_span.begin);
+        expected_query_ids.assign(
+            drafter_ids.begin() + (query_window.end - query_window.tokens),
+            drafter_ids.begin() + query_window.end);
     } else if (!semantic_query_ids.empty()) {
         if (experiment.configured) parser_selection_rule = "semantic_suffix";
         query_window = http_detail::find_pflash_query_window(
@@ -3346,7 +3437,10 @@ std::string HttpServer::apply_pflash_compression(
                 {"content_end", query_content_end},
                 {"query_begin", query_begin},
                 {"query_end", query_window.end},
+                {"query_span_begin", explicit_query_span.begin},
+                {"query_span_end", explicit_query_span.end},
                 {"requested_query_tokens", experiment.query_tokens},
+                {"required_text_count", req.pflash_required.size()},
                 {"expected_query_ids", expected_query_ids},
                 {"required_instruction_spans", instruction_spans},
             };

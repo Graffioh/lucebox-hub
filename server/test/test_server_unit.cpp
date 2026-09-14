@@ -311,6 +311,188 @@ TEST_CASE(ServerUnitFixture, test_pflash_maps_content_start_from_leading_sentine
         rendered, rendered) < 0);
 }
 
+// ─── Explicit query / required-text span mapping ────────────────────────
+// A minimal GPT-2 byte-BPE tokenizer whose vocab reproduces the runtime
+// failure shape: " What" and "What" are distinct tokens, so a standalone
+// query encoding cannot match a prompt where the question's first character
+// merges with the preceding space.
+
+static std::string test_gpt2_encode(const std::string & text) {
+    static const auto fwd = []() {
+        std::array<uint32_t, 256> table{};
+        int n = 0;
+        for (int b = 0; b < 256; ++b) {
+            const bool printable =
+                (b >= 33 && b <= 126) || (b >= 161 && b <= 172) ||
+                (b >= 174 && b <= 255);
+            table[b] = printable ? (uint32_t) b : (uint32_t) (256 + n++);
+        }
+        return table;
+    }();
+    std::string out;
+    for (char ch : text) {
+        const uint32_t cp = fwd[(uint8_t) ch];
+        if (cp < 0x80) {
+            out.push_back((char) cp);
+        } else {
+            out.push_back((char) (0xC0 | (cp >> 6)));
+            out.push_back((char) (0x80 | (cp & 0x3F)));
+        }
+    }
+    return out;
+}
+
+static std::string write_pflash_bpe_tokenizer_fixture(
+        const std::vector<std::string> & raw_tokens,
+        const std::string & byte_cover) {
+    std::vector<std::string> tokens{"<|im_start|>", "<|im_end|>"};
+    std::vector<uint32_t> types{3, 3};
+    const auto add = [&](const std::string & encoded, uint32_t type) {
+        if (std::find(tokens.begin(), tokens.end(), encoded) == tokens.end()) {
+            tokens.push_back(encoded);
+            types.push_back(type);
+        }
+    };
+    for (const auto & raw : raw_tokens) add(test_gpt2_encode(raw), 1);
+    for (char ch : byte_cover) add(test_gpt2_encode(std::string(1, ch)), 1);
+
+    std::vector<const char *> token_ptrs;
+    for (const auto & token : tokens) token_ptrs.push_back(token.c_str());
+    gguf_context * g = gguf_init_empty();
+    gguf_set_arr_str(g, "tokenizer.ggml.tokens", token_ptrs.data(),
+                     (int32_t) tokens.size());
+    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
+                      types.data(), (int32_t) types.size());
+    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
+    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
+    gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 0);
+    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 1);
+    static int fixture_serial = 0;
+    const std::string path = "/tmp/dflash_test_pflash_bpe_" +
+        std::to_string(++fixture_serial) + ".gguf";
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    return path;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_decoded_span_covers_bpe_merged_first_token) {
+    const std::string content =
+        "See docs.\n\nQuestion: What is the answer?\n Answer:";
+    const std::string rendered = "<|im_start|>user\n" + content +
+        "<|im_end|>\n<|im_start|>assistant\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"Question", ":", " What", "What", " is", " the", " answer", "?",
+         "\n", "\n\n", " Answer", "user", "assistant", "See", " docs", "."},
+        rendered + "What is the answer?");
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    const std::string needle = "What is the answer?";
+    // The standalone query encoding starts with a bare "What" token; the
+    // prompt merged the preceding space into " What". The id-suffix matcher
+    // therefore accepts a shortened window that misses the first word — the
+    // regression this span mapping fixes.
+    const auto query_ids = tok.encode(needle);
+    const auto legacy = http_detail::find_pflash_query_window(
+        prompt, query_ids, 64, -1, 0, /*anchored=*/false);
+    TEST_ASSERT(legacy.valid());
+    TEST_ASSERT(tok.decode({prompt.begin() + (legacy.end - legacy.tokens),
+                            prompt.begin() + legacy.end}) != needle);
+
+    const auto span = http_detail::pflash_decoded_text_span(
+        tok, prompt, 0, (int) prompt.size(), needle);
+    TEST_ASSERT(span.begin >= 0);
+    const std::string covered = tok.decode(
+        {prompt.begin() + span.begin, prompt.begin() + span.end});
+    TEST_ASSERT(covered.find(needle) != std::string::npos);
+    TEST_ASSERT(span.end == legacy.end);
+    TEST_ASSERT(span.begin == legacy.end - legacy.tokens - 1);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_decoded_span_prefers_last_occurrence) {
+    const std::string content =
+        "Ask: What is up? Then again: What is up?";
+    const std::string rendered = "<|im_start|>user\n" + content +
+        "<|im_end|>\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"Ask", ":", " What", " is", " up", "?", " Then", " again",
+         "user", "\n"},
+        rendered + "What is up?");
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    const std::string needle = "What is up?";
+    const auto span = http_detail::pflash_decoded_text_span(
+        tok, prompt, 0, (int) prompt.size(), needle);
+    TEST_ASSERT(span.begin >= 0);
+    const size_t last = rendered.rfind(needle);
+    const auto tail = tok.encode(rendered.substr(0, last));
+    // The needle's leading space merges into " What" in the prompt, but the
+    // standalone-encoded prefix keeps it as its own " " token, so the merged
+    // token sits at tail.size() - 1.
+    TEST_ASSERT(span.begin == (int) tail.size() - 1);
+    TEST_ASSERT(tok.decode({prompt.begin() + span.begin,
+                            prompt.begin() + span.end})
+                .find(needle) != std::string::npos);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_decoded_span_handles_unicode_and_content_end) {
+    const std::string content = "Discuss the café Über Alles? now";
+    const std::string rendered = "<|im_start|>user\n" + content + "<|im_end|>\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"Discuss", " the", " café", "café", " Über", " Alles", "?", " now",
+         "user", "\n"},
+        rendered + "café Über Alles?");
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    const std::string needle = "café Über Alles?";
+    const auto span = http_detail::pflash_decoded_text_span(
+        tok, prompt, 0, (int) prompt.size(), needle);
+    TEST_ASSERT(span.begin >= 0);
+    TEST_ASSERT(tok.decode({prompt.begin() + span.begin,
+                            prompt.begin() + span.end})
+                .find(needle) != std::string::npos);
+    // A needle that never occurs maps to no span — callers must fail closed.
+    const auto missing = http_detail::pflash_decoded_text_span(
+        tok, prompt, 0, (int) prompt.size(), "never-present question");
+    TEST_ASSERT(missing.begin < 0);
+    // An empty needle and an empty range are invalid rather than a
+    // degenerate zero-width span.
+    TEST_ASSERT(http_detail::pflash_decoded_text_span(
+        tok, prompt, 0, (int) prompt.size(), "").begin < 0);
+    TEST_ASSERT(http_detail::pflash_decoded_text_span(
+        tok, prompt, 4, 4, needle).begin < 0);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_required_parses_string_arrays) {
+    TEST_ASSERT(parse_pflash_required_from_body({}).empty());
+    TEST_ASSERT(parse_pflash_required_from_body(
+        {{"pflash_required", "not-an-array"}}).empty());
+    const auto top = parse_pflash_required_from_body(
+        {{"pflash_required",
+          {"answer briefly.", "Question:", 7, nullptr}}});
+    TEST_ASSERT(top.size() == 2);
+    TEST_ASSERT(top[0] == "answer briefly.");
+    const auto nested = parse_pflash_required_from_body(
+        {{"extra_body", {{"pflash_required", {"keep me"}}}}});
+    TEST_ASSERT(nested.size() == 1 && nested[0] == "keep me");
+    // extra_body wins over the top-level field, like session_id.
+    const auto both = parse_pflash_required_from_body(
+        {{"pflash_required", {"outer"}},
+         {"extra_body", {{"pflash_required", {"inner"}}}}});
+    TEST_ASSERT(both.size() == 1 && both[0] == "inner");
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_instruction_plan_covers_tools_and_late_developer_roles) {
     const std::vector<ChatMessage> messages{
         {"system", "system instruction", ""},

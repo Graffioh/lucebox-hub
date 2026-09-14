@@ -304,6 +304,19 @@ PflashQueryWindow pflash_tail_query_window(
     int query_end = -1,
     int query_begin = 0) noexcept;
 
+// Map the last occurrence of `needle` inside the decoded token text of
+// `prompt[begin, end)` to the token span covering it. Searching the joined
+// per-token text (not a standalone encoding of `needle`) keeps the mapping
+// correct at BPE boundary merges: a token that spans the needle's first or
+// last character (e.g. " What" after "Question:") is included in the span.
+// Returns {-1, -1} when the needle is absent or the range is invalid.
+PFlashTokenSpan pflash_decoded_text_span(
+    const Tokenizer & tokenizer,
+    const std::vector<int32_t> & prompt,
+    int begin,
+    int end,
+    const std::string & needle);
+
 // Return the original prompt offset immediately before the stable trailing
 // suffix shared with a version whose latest user message carries a sentinel.
 // Invalid when no such bounded suffix can establish the semantic boundary.
@@ -374,6 +387,10 @@ struct ParsedRequest {
     // Bandit: per-session adaptive keep_ratio opt-in
     std::string               session_id;
     std::string               pflash_query;   // explicit scorer query text (optional request field)
+    // Literal strings inside the boundary message that must survive
+    // compression (e.g. an answer-format directive embedded in a user
+    // message). Each occurrence is mapped and retained as a mandatory span.
+    std::vector<std::string>  pflash_required;
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
@@ -730,6 +747,29 @@ inline std::string parse_pflash_query_from_body(const json & body) {
         return body["pflash_query"].get<std::string>();
     }
     return {};
+}
+
+// PFlash: literal strings that must survive compression. Each string must
+// occur inside the boundary message's content; the compressor marks its last
+// occurrence there as a mandatory retention span. Accepted at the top level
+// or under extra_body, like pflash_query.
+inline std::vector<std::string> parse_pflash_required_from_body(const json & body) {
+    const json * field = nullptr;
+    if (body.contains("extra_body")) {
+        const auto & eb = body["extra_body"];
+        if (eb.is_object() && eb.contains("pflash_required") && eb["pflash_required"].is_array()) {
+            field = &eb["pflash_required"];
+        }
+    }
+    if (!field && body.contains("pflash_required") && body["pflash_required"].is_array()) {
+        field = &body["pflash_required"];
+    }
+    std::vector<std::string> result;
+    if (!field) return result;
+    for (const auto & entry : *field) {
+        if (entry.is_string()) result.push_back(entry.get<std::string>());
+    }
+    return result;
 }
 
 inline std::string parse_session_id_from_body(const json & body) {
