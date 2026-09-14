@@ -95,6 +95,25 @@ TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_rejects_weak_punctuation_
     TEST_ASSERT(short_window.end == 4);
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_query_mapping_rejects_earlier_turn_suffix) {
+    const std::vector<int32_t> query{10, 11, 12, 13, 14, 15, 16, 17};
+    // The generic four-token suffix occurs in an earlier turn. The real user
+    // message diverges before its suffix, so it cannot safely supply a window.
+    std::vector<int32_t> rendered{1, 14, 15, 16, 17};
+    rendered.insert(rendered.end(), 24, 200);
+    rendered.insert(rendered.end(), {10, 11, 12, 999});
+    TEST_ASSERT(!http_detail::find_pflash_query_window(
+        rendered, query, (int) rendered.size()).valid());
+
+    // The same narrowed suffix at the actual query boundary remains usable.
+    rendered.insert(rendered.end(), {14, 15, 16, 17, 201, 202});
+    const auto window = http_detail::find_pflash_query_window(
+        rendered, query, (int) rendered.size());
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.tokens == 4);
+    TEST_ASSERT(window.end == (int) rendered.size() - 2);
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_score_validation_counts_nan_and_inf) {
     const float values[]{
         0.0f,

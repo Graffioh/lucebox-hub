@@ -134,7 +134,8 @@ TEST_CASE(ServerUnitFixture, test_reasoning_disabled) {
     // (the caller decides whether to use the reasoning field).
     auto r = parse_reasoning("<think>ignored</think>content",
                              false, false);
-    // Tags are still parsed — has_reasoning is true because reasoning text is non-empty
+    TEST_ASSERT(r.has_reasoning);
+    TEST_ASSERT(r.reasoning == "ignored");
     TEST_ASSERT(r.content == "content");
 }
 

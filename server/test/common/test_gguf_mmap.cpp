@@ -45,7 +45,7 @@ struct GgufMmapFixture {};
 }
 
 // Create a small temp file with known content; returns its path.
-static std::string make_temp_file() {
+static std::string make_temp_file(const std::string & payload = "GGUF_TEST_PAYLOAD_1234") {
 #if defined(_WIN32)
     char tmpl[] = "gguf_mmap_test_XXXXXX";
     int fd = MKSTEMP_FN(tmpl);
@@ -54,8 +54,8 @@ static std::string make_temp_file() {
     int fd = mkstemp(tmpl);
 #endif
     assert(fd >= 0);
-    const char payload[] = "GGUF_TEST_PAYLOAD_1234";
-    WRITE_FN(fd, payload, static_cast<unsigned>(sizeof(payload) - 1));
+    const auto written = WRITE_FN(fd, payload.data(), static_cast<unsigned>(payload.size()));
+    assert(written == static_cast<decltype(written)>(payload.size()));
     CLOSE_FN(fd);
     return std::string(tmpl);
 }
@@ -85,19 +85,20 @@ static void t1_open_and_read() {
 
 static void t2_idempotent_open() {
     std::string path1 = make_temp_file();
-    std::string path2 = make_temp_file();
+    const std::string replacement = "SECOND_FILE_DIFFERENT_CONTENT_AND_SIZE";
+    std::string path2 = make_temp_file(replacement);
 
     dflash::common::GgufMmap m;
     std::string err;
 
     assert(m.open(path1, err));
     assert(m.is_open());
-    size_t size1 = m.size();
 
     // Second open on the same object must release the first mapping cleanly.
     assert(m.open(path2, err));
     assert(m.is_open());
-    assert(m.size() == size1);  // both temp files have same payload length
+    assert(m.size() == replacement.size());
+    assert(std::memcmp(m.data(), replacement.data(), replacement.size()) == 0);
     assert(err.empty()); // no error expected after successful open
 
     std::remove(path1.c_str());
@@ -177,3 +178,42 @@ TEST_CASE(GgufMmapFixture, gguf_mmap_suite) {
     std::puts("ALL TESTS PASS");
 }
 
+TEST_CASE(GgufMmapFixture, failed_reopen_clears_previous_mapping) {
+    const std::string path = make_temp_file();
+    dflash::common::GgufMmap mapping;
+    std::string error;
+    REQUIRE(mapping.open(path, error));
+    // A child of a regular file cannot exist; avoid a fixed supposedly-missing path.
+    CHECK(!mapping.open(path + "/missing", error));
+    CHECK(!mapping.is_open());
+    CHECK(mapping.data() == nullptr);
+    CHECK(mapping.size() == 0);
+    CHECK(!error.empty());
+    std::remove(path.c_str());
+}
+
+TEST_CASE(GgufMmapFixture, move_transfers_mapping_and_empties_source) {
+    const std::string path = make_temp_file("moved mapping");
+    const std::string old_path = make_temp_file("replaced mapping");
+    {
+        dflash::common::GgufMmap source, destination;
+        std::string error;
+        REQUIRE(source.open(path, error));
+        const void * data = source.data();
+        const size_t size = source.size();
+        dflash::common::GgufMmap moved(std::move(source));
+        CHECK(!source.is_open());
+        CHECK(source.data() == nullptr);
+        CHECK(source.size() == 0);
+        REQUIRE(destination.open(old_path, error));
+        destination = std::move(moved);
+        CHECK(!moved.is_open());
+        CHECK(moved.data() == nullptr);
+        CHECK(moved.size() == 0);
+        CHECK(destination.data() == data);
+        CHECK(destination.size() == size);
+        CHECK(std::memcmp(destination.data(), "moved mapping", size) == 0);
+    }
+    std::remove(path.c_str());
+    std::remove(old_path.c_str());
+}

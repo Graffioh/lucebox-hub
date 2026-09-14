@@ -28,3 +28,13 @@ TEST_CASE(RestoreDeltaFixture, restore_delta_rejects_long_prefix) {
     CHECK_THROW(std::out_of_range, UNUSED_RETURN(restore_prompt_delta(prompt, 6)));
 }
 
+TEST_CASE(RestoreDeltaFixture, restore_delta_rejects_negative_prefix) {
+    CHECK_THROW(std::invalid_argument,
+                UNUSED_RETURN(dflash::common::restore_prompt_delta({10, 11}, -1)));
+}
+
+TEST_CASE(RestoreDeltaFixture, zero_prefix_preserves_prompt_and_accepts_empty_prompt) {
+    const std::vector<int32_t> prompt{10, 11};
+    CHECK(dflash::common::restore_prompt_delta(prompt, 0) == prompt);
+    CHECK(dflash::common::restore_prompt_delta({}, 0).empty());
+}

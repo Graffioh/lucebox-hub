@@ -1,90 +1,42 @@
-// Unit tests for dflash::common::compute_score_range().
-// SCORE_LAYERS is relative to fwd_layer_limit: ee7+sl7 → [0,7), not phantom-empty [7,7).
-
 #include "CppUnitTestFramework.hpp"
 #include "score_range.h"
 
-#include <cstdio>
-#include <cstdlib>
-
-using dflash::common::ScoreRange;
 using dflash::common::compute_score_range;
 
 namespace {
-struct DrafterEarlyExitScoreRangeFixture : CppUnitTestFramework::CommonFixture {
-    using CppUnitTestFramework::CommonFixture::CommonFixture;
-
-    void t1_bug_scenario() {
-        ScoreRange r = compute_score_range(/*n_layer=*/28,
-                                           /*score_layers=*/7,
-                                           /*fwd_layer_limit=*/7);
-        REQUIRE(r.start == 0 && "score_layer_start must be 0");
-        REQUIRE(r.end   == 7 && "score_layer_end must equal fwd_layer_limit");
-        REQUIRE(!r.empty()   && "range must be non-empty");
-        REQUIRE(r.count() == 7);
-        printf("T1 pass: early_exit_n=7 score_layers=7 n_layer=28 -> [%d,%d)\n",
-               r.start, r.end);
-    }
-
-    void t2_no_early_exit() {
-        ScoreRange r = compute_score_range(28, 7, 28);
-        REQUIRE(r.start == 21);
-        REQUIRE(r.end   == 28);
-        REQUIRE(!r.empty());
-        REQUIRE(r.count() == 7);
-        printf("T2 pass: no early exit score_layers=7 -> [%d,%d)\n", r.start, r.end);
-    }
-
-    void t3_all_layers_no_exit() {
-        ScoreRange r = compute_score_range(28, -1, 28);
-        REQUIRE(r.start == 0);
-        REQUIRE(r.end   == 28);
-        REQUIRE(!r.empty());
-        printf("T3 pass: score_layers=-1 no exit -> [%d,%d)\n", r.start, r.end);
-    }
-
-    void t4_all_layers_with_exit() {
-        ScoreRange r = compute_score_range(28, -1, 14);
-        REQUIRE(r.start == 0);
-        REQUIRE(r.end   == 14);
-        REQUIRE(!r.empty());
-        printf("T4 pass: score_layers=-1 early_exit=14 -> [%d,%d)\n", r.start, r.end);
-    }
-
-    void t5_score_layers_exceeds_exit() {
-        ScoreRange r = compute_score_range(28, 14, 7);
-        REQUIRE(r.start == 0);
-        REQUIRE(r.end   == 7);
-        REQUIRE(!r.empty());
-        printf("T5 pass: score_layers=14 early_exit=7 -> [%d,%d)\n", r.start, r.end);
-    }
-
-    void t6_score_layers_equals_n_layer() {
-        ScoreRange r = compute_score_range(28, 28, 28);
-        REQUIRE(r.start == 0);
-        REQUIRE(r.end   == 28);
-        REQUIRE(!r.empty());
-        printf("T6 pass: score_layers=n_layer=28 -> [%d,%d)\n", r.start, r.end);
-    }
-
-    void t7_partial_exit_partial_score() {
-        ScoreRange r = compute_score_range(28, 7, 14);
-        REQUIRE(r.start == 7);
-        REQUIRE(r.end   == 14);
-        REQUIRE(!r.empty());
-        REQUIRE(r.count() == 7);
-        printf("T7 pass: early_exit=14 score_layers=7 -> [%d,%d)\n", r.start, r.end);
-    }
-};
+struct ScoreRangeFixture {};
 }
 
-TEST_CASE(DrafterEarlyExitScoreRangeFixture, score_range_suite) {
-    t1_bug_scenario();
-    t2_no_early_exit();
-    t3_all_layers_no_exit();
-    t4_all_layers_with_exit();
-    t5_score_layers_exceeds_exit();
-    t6_score_layers_equals_n_layer();
-    t7_partial_exit_partial_score();
-    printf("\nAll score_range tests passed.\n");
+TEST_CASE(ScoreRangeFixture, scoring_uses_last_layers_actually_forwarded) {
+    // Includes ee7+sl7: scoring must not become the phantom-empty [7,7).
+    const struct { int layers, score, forwarded, start, end; } cases[] = {
+        {28, 7, 7, 0, 7},
+        {28, 7, 28, 21, 28},
+        {28, 7, 14, 7, 14},
+        {28, 14, 7, 0, 7},
+        {28, -1, 28, 0, 28},
+        {28, -1, 14, 0, 14},
+        {28, 28, 28, 0, 28},
+        {28, 29, 14, 0, 14},
+        {28, 0, 14, 0, 14},
+        {1, 1, 1, 0, 1},
+    };
+    for (const auto & c : cases) {
+        const auto range = compute_score_range(c.layers, c.score, c.forwarded);
+        CHECK(range.start == c.start);
+        CHECK(range.end == c.end);
+        CHECK(range.count() == c.end - c.start);
+        CHECK(!range.empty());
+    }
+}
+
+TEST_CASE(ScoreRangeFixture, no_forwarded_layers_has_no_scores) {
+    for (int score : {-1, 0, 7, 28}) {
+        const auto range = compute_score_range(28, score, 0);
+        CHECK(range.start == 0);
+        CHECK(range.end == 0);
+        CHECK(range.count() == 0);
+        CHECK(range.empty());
+    }
+    CHECK(compute_score_range(0, -1, 0).empty());
 }

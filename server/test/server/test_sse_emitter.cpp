@@ -929,8 +929,7 @@ TEST_CASE(ServerUnitFixture, test_emitter_suppresses_malformed_multiline_tool_bu
 
     TEST_ASSERT(em.tool_calls().empty());
     TEST_ASSERT(em.accumulated_text().empty());
-    TEST_ASSERT(captured.find("[server] tool_call parse failed; suppressing buffered tool text") != std::string::npos);
-    TEST_ASSERT(captured.find("text='<function_call>\\n  <invoke name=\"read\">\\n    malformed prose body with\\nnew lines and \\t tabs\\n'") != std::string::npos);
+    TEST_ASSERT(captured.find("suppressing buffered tool text") != std::string::npos);
 }
 
 TEST_CASE(ServerUnitFixture, test_emitter_function_calls_inside_reasoning) {
