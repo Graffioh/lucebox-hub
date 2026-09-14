@@ -337,23 +337,6 @@ restores the previous all-layer running-max scorer. The Qwen3.5 attention
 runs dense (`ggml_flash_attn_ext`); the block-sparse FlashPrefill kernels
 still dispatch head dimension 128 only.
 
-`PFLASH_SEGMENT_PROBE_GGUF` loads a segment probe (schema
-`qwen3_5_0_8b_segment_probe_v1`, exported by `pflash-scorer
-qwen35-segment-probe-export`): a 264K-parameter network on the same block-14
-tap that scores every token for "a new unit of text starts here". With it
-loaded, the context is cut at every boundary above the probe's threshold
-(the query start and instruction-span edges are always cut; minimum and
-maximum segment lengths come from the GGUF metadata) and the strict selector
-ranks the resulting whole functions, classes, files or paragraphs by mass
-density, skipping segments that do not fit the remaining budget, so a kept
-piece is never a definition cut in half. It falls back to fixed chunks when
-the probe finds fewer than four boundaries in a context.
-`PFLASH_LONGATTNCOMP_SEGMENTS=auto|fixed|probe` and
-`PFLASH_LONGATTNCOMP_SELECT=auto|sum|density` override the defaults (auto =
-probe segments and density when a probe is loaded, fixed chunks and mass sum
-otherwise); the compression trace records `segmentation`, `candidate_score`
-and the segment spans.
-
 The per-session adaptive keep ratio applies to this path unchanged: a request
 carrying a `session_id` retains the session's ratio, the strict selector fills
 its token budget from it, and the ratio is updated from the smoothed DFlash
