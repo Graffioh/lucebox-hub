@@ -4,7 +4,7 @@
 // Architecture:
 //   - Main thread: listen + accept
 //   - Per-client thread: parse HTTP request, enqueue job, wait for completion
-//   - Single worker thread: dequeue jobs, call ModelBackend::generate()
+//   - LuceEngine execution thread: run the selected backend serving loop
 //
 // Client disconnect detection: the client thread watches the socket while the
 // worker generates, and streaming writes provide a second failure signal.
@@ -16,6 +16,7 @@
 #include "socket_handle.h"
 #include "client_send_buffer.h"
 #include "common/model_backend.h"
+#include "common/concurrency/paged_kv_offload.h"
 #include "tokenizer.h"
 #include "chat_template.h"
 #include "tool_memory.h"
@@ -48,6 +49,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace dflash::engine {
+class LuceEngine;
+}
 
 namespace dflash::common {
 
@@ -96,6 +101,11 @@ struct ServerConfig {
     bool        enable_cors = true;
     std::string model_name  = "dflash";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
+    // Resident system-memory budget for copied paged checkpoints. The
+    // scheduler enforces it only when concurrent paged prefix storage is
+    // active. Zero means unlimited.
+    size_t      concurrent_prefix_cache_max_bytes = (size_t)4 * 1024 * 1024 * 1024;
+    bool        concurrent_paged_prefix_cache = false;
     int         prefill_cache_cap = 0;  // full-prompt/prefill cache slots (0 disables)
     // Extend the existing prefix cache through generated tool-call turns.
     bool        agent_turn_cache = false;
@@ -198,6 +208,8 @@ struct ServerConfig {
     // Idle-to-busy batching window. It is ignored by single-slot engines and
     // never delays an already decoding request.
     int admission_coalesce_ms = 20;
+    // Auto resolves after all models load, before workers start. Zero disables.
+    size_t decode_kv_offload_bytes = dflash::common::kAutoKvOffloadBytes;
 
     // PFlash (speculative prefill compression)
     enum class PflashMode { OFF, AUTO, ALWAYS };
@@ -265,6 +277,26 @@ bool canonical_assistant_content(
     const std::string & sentinel,
     const std::string & generated_text,
     std::string & content);
+
+struct PflashQueryWindow {
+    int end = -1;       // exclusive token offset in the rendered prompt
+    int tokens = 0;     // width of the matching query suffix
+
+    bool valid() const { return end >= tokens && tokens > 0; }
+};
+
+// Select the final normalized user message as the scorer query. Public for
+// model-free coverage of every request shape accepted by prompt rendering.
+std::string pflash_user_query_text(
+    const std::vector<ChatMessage> & messages);
+
+// Find the last sufficiently-specific suffix of the user query before the
+// assistant-generation suffix. Public for model-free regression tests.
+PflashQueryWindow find_pflash_query_window(
+    const std::vector<int32_t> & prompt,
+    const std::vector<int32_t> & query,
+    int search_end,
+    int max_tokens = 8);
 
 }  // namespace http_detail
 
@@ -350,7 +382,7 @@ json build_props_body(const ServerConfig & config,
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {
 public:
-    HttpServer(ModelBackend & backend,
+    HttpServer(dflash::engine::LuceEngine & engine,
                Tokenizer & tokenizer,
                const ServerConfig & config);
     ~HttpServer();
@@ -383,11 +415,13 @@ public:
     }
 
 private:
+    friend struct SchedulerTestHarness;
+
     // Client thread: read HTTP request, parse, enqueue job, wait.
     void handle_client(SocketHandle fd);
 
     struct HttpRequest;
-    void start_worker();
+    bool start_worker();
     bool route_model_request(SocketHandle fd, ParsedRequest & req, bool count_only);
     bool handle_model_request(SocketHandle fd, ParsedRequest & req, bool count_only,
                               RoutingAdmission * admission = nullptr);
@@ -431,6 +465,7 @@ private:
         // When DiffPin rewrote tokens, full-cache keys must use
         // prepared.tokens (effective), not req.prompt_tokens.
         bool full_snap_key_effective = false;
+        PrefixCache::InlineReservation snap_reservation;
         int snap_slot = -1;
         int snap_cut = 0;
         bool snap_prepared = false;
@@ -441,7 +476,7 @@ private:
         GenerateRequest & generate_request);
     void finalize_generation_cache(
         const ParsedRequest & req, const PreparedPrompt & prepared,
-        const GenerationCacheState & cache, const GenerateResult & result,
+        GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected);
     void remember_agent_turn(
@@ -455,10 +490,6 @@ private:
     struct GenerationInputs {
         GenerateRequest request;
         int generation_cap = 0;
-        std::vector<int32_t> hint_tokens;
-        std::vector<int32_t> stall_tool_prefix_tokens;
-        std::vector<int32_t> stall_action_suffix_tokens;
-        std::vector<int32_t> stall_skip_tokens;
     };
 
     struct GenerationOutputState {
@@ -501,9 +532,6 @@ private:
     std::string format_http_response(
         int status, const std::string & content_type,
         const std::string & body);
-    static std::array<std::string, 2> sse_error_close_chunks(
-        const std::string & message);
-
     // Parse HTTP request from socket.
     struct HttpRequest {
         std::string method;
@@ -556,6 +584,7 @@ private:
     bool has_pending_jobs();
 
     // Members.
+    dflash::engine::LuceEngine & engine_;
     ModelBackend &   backend_;
     Tokenizer &      tokenizer_;
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
@@ -628,8 +657,7 @@ private:
     std::condition_variable routing_cv_;
     int routing_waiters_ = 0;
 
-    // Worker thread.
-    std::thread                     worker_thread_;
+    // Request queue consumed by the serving loop owned by LuceEngine.
     std::mutex                      queue_mu_;
     std::condition_variable         queue_cv_;
     ServerJob *                     queue_head_ = nullptr;

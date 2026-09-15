@@ -98,7 +98,15 @@
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 static thread_local int ggml_cuda_mmvq_max_ncols_override = 0;
+static thread_local int ggml_cuda_ds4_mix_mmv_max_tokens = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
 static thread_local bool ggml_cuda_graphs_disabled_override = false;
+
+extern "C" int ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(int max_tokens) {
+    GGML_ASSERT(max_tokens >= 0 && max_tokens <= GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS);
+    const int previous = ggml_cuda_ds4_mix_mmv_max_tokens;
+    ggml_cuda_ds4_mix_mmv_max_tokens = max_tokens ? max_tokens : GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
+    return previous;
+}
 
 extern "C" int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols) {
     const int previous = ggml_cuda_mmvq_max_ncols_override;
@@ -2518,6 +2526,16 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+static int ggml_cuda_mmvq_max_ncols() {
+    static const int configured = []() {
+        const char * e = getenv("LUCE_MMVQ_MAX_NCOLS");
+        const int v = e ? atoi(e) : 3;
+        return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
+    }();
+    return ggml_cuda_mmvq_max_ncols_override > 0
+        ? ggml_cuda_mmvq_max_ncols_override : configured;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -2703,7 +2721,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     // fusing across two different mul_mat_ids would read one expert's rows with the other's
     // routing. Each launcher additionally returns false unless BOTH halves are registered,
     // so a partial registration keeps the correct unfused path.
-    if (src1->ne[2] <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS &&
+    if (src1->ne[2] <= ggml_cuda_ds4_mix_mmv_max_tokens &&
             ggml_cuda_ds4_mix_glu_fusable(gate, up, glu, direct_vector_layout)) {
         const float limit = ggml_get_op_params_f32(glu, 2);
         // dst is the GLU tensor: the fused kernel writes the SwiGLU result straight there and
@@ -2772,21 +2790,28 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         }
 
         const int64_t ncols = ids ? src1->ne[2] : src1->ne[1];
+        // Sharing activation quantization must not change the ordinary
+        // dispatch's arithmetic. Dense multi-column MMVQ takes precedence
+        // over MMQ even though direct GLU fusion only supports one column.
+        if (!ids && ncols <= ggml_cuda_mmvq_max_ncols()) {
+            return false;
+        }
 #ifdef GGML_CUDA_FORCE_CUBLAS
         // The global force-cuBLAS policy is authoritative over this RDNA 3.5 default.
         constexpr bool default_ds4_mix_gate_up_mmq = false;
 #else
-        const char * mix_mmq = std::getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
         const bool default_ds4_mix_gate_up_mmq =
             src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX &&
             ids != nullptr &&
             GGML_CUDA_CC_IS_RDNA3_5(cc) &&
-            (!mix_mmq || !(mix_mmq[0] == '0' && mix_mmq[1] == '\0'));
+            ggml_cuda_mixed_mmq_enabled(up, true) &&
+            ggml_cuda_mixed_mmq_enabled(gate, true);
 #endif
         if ((default_ds4_mix_gate_up_mmq ||
              ggml_cuda_should_use_mmq(
-                 src0->type, cc, ncols,
+                 up, cc, ncols,
                  ids ? src0->ne[2] : /*n_experts=*/0)) &&
+            ggml_mul_mat_get_mixed_mmq(up) == ggml_mul_mat_get_mixed_mmq(gate) &&
             !(ggml_cuda_mmvq_max_ncols_override > 0 &&
               ncols <= ggml_cuda_mmvq_max_ncols_override)) {
             ggml_cuda_mul_mat_q_pair(
@@ -2818,19 +2843,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // measured crossover on sm_86 (RTX 3090, Q4_K_M/Q6_K dense GEMVs) — MMVQ
     // wins at ncols<=3, MMQ wins at 4-8 (laguna w6 chain 199->237 tok/s,
     // qwen3.6 chain 127->137). Override via env for other hardware.
-    static const int luce_mmvq_max_ncols_env = []() {
-        const char * e = getenv("LUCE_MMVQ_MAX_NCOLS");
-        const int v = e ? atoi(e) : 3;
-        return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
-    }();
-    const int luce_mmvq_max_ncols = ggml_cuda_mmvq_max_ncols_override > 0
-        ? ggml_cuda_mmvq_max_ncols_override
-        : luce_mmvq_max_ncols_env;
+    const int luce_mmvq_max_ncols = ggml_cuda_mmvq_max_ncols();
     // The mix qtypes have no generic MMVQ path because their per-expert
     // codebooks live in an out-of-band registry. Decode uses the dedicated
-    // fused kernels below. Sparse prefill can opt into their registry-aware
-    // MMQ loaders; otherwise should_use_mmq rejects them and they retain the
-    // exact dequantize->cuBLAS fallback.
+    // fused kernels below. Approximate prefill modes can select their
+    // registry-aware MMQ loaders; otherwise should_use_mmq rejects them and
+    // they retain the exact dequantize->cuBLAS fallback.
     const bool is_rocmfp3_mix = src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX;
     const bool is_rocmfp2_mix = src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX;
     const bool is_mix_qtype    = is_rocmfp3_mix || is_rocmfp2_mix;
@@ -2870,7 +2888,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
             const int cc            = ggml_cuda_info().devices[id].cc;
             const int warp_size     = ggml_cuda_info().devices[id].warp_size;
-            use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+            use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(dst, cc, src1->ne[1], /*n_experts=*/0);
             use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
             use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
             any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -2878,7 +2896,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else {
         const int cc            = ggml_cuda_info().devices[ctx.device].cc;
         const int warp_size     = ggml_cuda_info().devices[ctx.device].warp_size;
-        use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+        use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(dst, cc, src1->ne[1], /*n_experts=*/0);
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -3046,7 +3064,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // Kept in sync with the [TAG_MUL_MAT_ID_CUDA_GRAPHS] usability check below.
     if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-            && ne12 <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS
+            && ne12 <= ggml_cuda_ds4_mix_mmv_max_tokens
             && ggml_cuda_rocmfp3_mix_mul_mat_id(
                 src0->data, (const float *) src1->data, (const int32_t *) ids->data,
                 (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
@@ -3060,7 +3078,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-            && ne12 <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS
+            && ne12 <= ggml_cuda_ds4_mix_mmv_max_tokens
             && ggml_cuda_rocmfp2_mix_mul_mat_id(
                 src0->data, (const float *) src1->data, (const int32_t *) ids->data,
                 (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
@@ -3091,7 +3109,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (ggml_cuda_should_use_mmq(dst, cc, ne12, /*n_experts=*/ne02)) {
             log_dispatch("mmq");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
@@ -3230,6 +3248,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
         dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
         dst_slice.data   = dst_data_cur;
+
+        // The sorted expert fallback re-enters the ordinary matmul
+        // dispatcher. Preserve the parent operation's model-local policy.
+        dst_slice.op = GGML_OP_MUL_MAT;
+        dst_slice.src[0] = &src0_slice;
+        dst_slice.src[1] = &src1_slice;
+        ggml_mul_mat_set_mixed_mmq(
+            &dst_slice, ggml_mul_mat_get_mixed_mmq(dst));
 
         ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
         CUDA_CHECK(cudaGetLastError());
@@ -3885,7 +3911,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 node->ne[2] <= MMVQ_MAX_MOE_BATCH_SIZE &&
                 node->ne[2] <= mmvq_mmid_max;
             const bool mmid_mmq_ok = ggml_is_quantized(node->src[0]->type) &&
-                ggml_cuda_should_use_mmq(node->src[0]->type, cc,
+                ggml_cuda_should_use_mmq(node, cc,
                                          node->src[1]->ne[2], node->src[0]->ne[2]);
             // qtype-105 takes the stream-sync-free MoE path above (no host
             // synchronize), so it is safe to capture. Mirror that path's gate
@@ -3901,7 +3927,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             const bool mmid_rocmfp3_ok =
                 (is_mmid_105 || is_mmid_106) &&
                 node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
-                node->src[1]->ne[2] <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS &&
+                node->src[1]->ne[2] <= ggml_cuda_ds4_mix_mmv_max_tokens &&
                 (is_mmid_105 ? ggml_cuda_rocmfp3_mix_registered(node->src[0]->data)
                              : ggml_cuda_rocmfp2_mix_registered(node->src[0]->data));
             if (mmid_telemetry) {
@@ -6051,7 +6077,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[0]->ne[0] == 128 &&
                    ggml_is_contiguous(op->src[0]);
         case GGML_OP_DS4_INDEXER_SCORE:
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return (op->src[0]->type == GGML_TYPE_F32 ||
+                    op->src[0]->type == GGML_TYPE_F16) &&
                    op->src[0]->ne[0] == 128 &&
                    op->src[0]->ne[3] == 1 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
@@ -6119,7 +6146,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            b->ne[0] % (4 * QK8_1) == 0 &&
                            ggml_is_contiguous(physical) &&
                            ggml_cuda_should_use_mmq(
-                               a->type, cc, b->ne[1], /*n_experts=*/0);
+                               op, cc, b->ne[1], /*n_experts=*/0);
                 }
                 if (a->buffer && ggml_backend_buft_is_cuda_split(a->buffer->buft)) {
                     if (a->ne[2] > 1 || a->ne[3] > 1) {

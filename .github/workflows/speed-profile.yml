@@ -29,6 +29,10 @@ concurrency:
 jobs:
   speed-profile:
     name: Speed profile (self-hosted RTX 3090, sm_86)
+    # TEMPORARY (2026-09-09): the lucebox-rtx3090 runner is offline, so PR
+    # runs fail at the GPU-info step. Only manual dispatch runs until the
+    # runner is back; drop this condition to restore automatic PR profiling.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, lucebox-rtx3090]
     timeout-minutes: 30
     # Keep automatic PR profiling advisory, but make a manual promotion check honest:

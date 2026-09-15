@@ -84,6 +84,35 @@ does not use the retired per-expert IPC worker.
 
 ### Monolithic HIP
 
+Sparse layer-major prefill accepts scheduling chunks up to 10,240 tokens
+(`--chunk 10240`). This is a graph-shape limit, not a memory-fit guarantee;
+reduce the chunk size when a resident drafter or longer history leaves
+insufficient scratch headroom. Dense attention within that schedule retains independent
+2,048-token numerical bands and the cache-rounding boundary between them.
+Eligible ratio-4 sparse layers pass their learned top-k rows directly, retain
+the existing F32 current-row precision, and derive causal visibility without uploading a dense
+score mask. This does not change the expert count or enable sparse prefill
+for an exact-mode request.
+
+The wave32 selected-row attention path is automatic for eligible maskless
+prefill shapes. On HIP, F32 inputs share key/value loads across eight heads while retaining the
+compact kernel's dot-product order, softmax reduction tree and value-sum order.
+Four adjacent key values are loaded together, but each dot product still
+accumulates dimensions sequentially with bounded loop unrolling. Each wave
+derives one head's nonzero value bounds from the completed weights using
+integer min/max, avoiding contended per-weight atomic updates. Neither change
+alters floating-point association or adds a global temporary buffer.
+F16 inputs and CUDA keep their existing streaming policies.
+`GGML_CUDA_MLA_STREAM_TOPK=0` restores compact attention for
+diagnosis; it does not turn sparse prefill into reference-exact prefill.
+Decode and speculative verification retain their separate dispatch policies.
+Byte-identical immutable host masks share storage within the layer-major graph
+cache, rather than retaining a separate quadratic array for every layer.
+The mask values and per-layer tensor identities are unchanged; the shared
+storage is released when that cache is replaced or its model is released.
+Sparse prefill remains approximate: kernel differential tests alone do not
+qualify full-model output quality or establish parity with another runtime.
+
 Single-device HIP launches use `DeepSeek4Backend`. Two explicit serving
 options are available:
 
@@ -144,7 +173,6 @@ Halo machine:
 cmake -S server -B server/build-hip-dual \
   -DDFLASH27B_GPU_BACKEND=hip \
   -DDFLASH27B_HIP_ARCHITECTURES='gfx1151;gfx1201' \
-  -DGGML_HIP_GRAPHS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build-hip-dual -j
 ```
@@ -192,7 +220,6 @@ cmake -S server -B server/build-hip-dual \
   -DDFLASH27B_GPU_BACKEND=hip \
   -DDFLASH27B_HIP_ARCHITECTURES='gfx1100;gfx1151' \
   -DDFLASH27B_ROCMFP2_AFFINE=ON \
-  -DGGML_HIP_GRAPHS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build-hip-dual -j
 ```
@@ -331,9 +358,23 @@ The backend keeps raw MLA rows, compressed rows, and indexer state in a
 persistent 128-token paged cache. The shared
 HTTP scheduler performs admission, cancellation, slow-client isolation, and
 fair continuous batching. DeepSeek4 lowers each scheduler plan into one exact
-gathered graph with up to 6 independent lanes. Decode rows share the weight
-pass; each selected prompt advances by one exact token because the graph must
-not contain two rows from the same sequence.
+gathered graph with up to 6 independent sequences and sixteen total rows.
+Decode rows share the weight pass. Monolithic prefill packs up to four
+chronological rows per concurrent prompt, or sixteen for a lone prompt.
+
+Monolithic paged prefill and decode use the same registry-aware mixed FP2/FP3
+vector arithmetic through the sixteen-row graph limit. The override is scoped
+to graph computation on the calling thread; other serving paths retain their
+five-row cutoff. This avoids switching prefill to activation-quantized MMQ
+while decoding uses MMV, which can change the next token for the same prefix.
+
+`test_ds4_paged_prefill_model` checks this regression with the real model and
+four clients: it generates 140 tokens per client, reconstructs their prefixes
+through chunked prefill, and compares the next token at indices 53 and 129.
+Build the optional target and run with `DFLASH_DS4_SPEC=0` and the matching
+`DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf` path. The ordinary GPU test
+`test_rocmfp_mix_gateup_glu` covers FP2/FP3 widths 1–16, actual graph dispatch,
+and restoration of the default dispatch policy.
 
 ```bash
 hf download Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3 \
@@ -344,7 +385,6 @@ cmake -S server -B server/build-hip \
   -DDFLASH27B_GPU_BACKEND=hip \
   -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
   -DDFLASH27B_SERVER=ON \
-  -DGGML_HIP_GRAPHS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build-hip -j
 
@@ -478,11 +518,24 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 | `DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT` | Use the routing profile and measured owner-rate ratio to minimize the predicted two-owner MoE critical path instead of maximizing aggregate hot-hit rate. Requires `DFLASH_DS4_HOTNESS_CSV`. |
 | `DFLASH_DS4_TP_MAIN_TO_PEER_RATE` | Relative main/peer routed-expert rate used by critical-path placement. It must be finite and greater than zero; the default is `3.4`. |
 | `DFLASH_DS4_TP_BALANCE_MIN_HOT` | Minimum hot experts retained on every routed layer by critical-path placement. Defaults to `0`. |
-| `DFLASH_DS4_Q5_VERIFY` | Opt in to the AMD q=5 fused verifier. This also selects the qualified MMVQ width and verifier-cache defaults when they are not explicitly overridden. |
+| `DFLASH_DS4_Q5_VERIFY` | AMD q=5 fused verifier. Defaults to `1` on `gfx1151` when `DFLASH_DS4_SPEC` is set, together with `DFLASH_DS4_FUSED_VERIFY=1` and `DFLASH_DS4_ADAPTIVE_WIDTH=1`; set `0` to restore the q<=4 verifier. It also selects the qualified MMVQ width and verifier-cache defaults when they are not explicitly overridden. |
+| `DFLASH_DS4_ADAPTIVE_WIDTH` | Acceptance-and-cost verify-width controller. Defaults to `1` on `gfx1151` with `DFLASH_DS4_SPEC`; chooses q2 to q5 per step (q5 is the cap) from measured acceptance and per-width cost. Set `0` for a fixed width. |
+| `DFLASH_DS4_CONFIDENCE_WIDTH` | With the adaptive width and a drafter that carries a confidence head, the width of every step is chosen from the head's per-candidate scores (three depths on the q5 verifier; the fourth is learned from target feedback), calibrated online per depth against the target's actual acceptance. Defaults on; set `0` to fall back to the learned-acceptance policy. `DFLASH_DS4_TIMING=1` prints the per-depth calibration (predicted, actual, applied scale) after every request. |
+| `DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL` | Analytic causal window for layer-major sliding-window layers instead of the quadratic mask upload. Part of the `gfx1151` sparse-prefill defaults (measured +10% prefill, identical output); set `0` to restore the explicit mask. |
+| `DFLASH_DS4_INDEXER_F16_Q` / `DFLASH_DS4_PREFILL_F16_KV_ALL` | F16 indexer queries and F16 selected-KV transport for sparse prefill. Part of the `gfx1151` sparse-prefill defaults; set `0` to restore F32. |
+| `GGML_CUDA_MLA_SEGMENTED_KV` | Segmented compressed/preserved-tail KV operands for the D512 flash-attention path. Defaults on for HIP backends; set `0` to disable. |
+| `GGML_CUDA_MLA_STREAM_WMMA` / `GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS` / `GGML_CUDA_MLA_DENSE_WMMA` / `GGML_CUDA_MLA_DENSE_HIGH_RATIO` | rocWMMA streaming and dense high-ratio D512 attention paths, part of the `gfx1151` sparse-prefill defaults (removing them costs about 28% prefill at 8K). `GGML_CUDA_MLA_STREAM_WMMA=0` restores scalar streaming; `GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS` selects one or two head groups (the profile sets `2`; it does not disable the path); either dense switch at `0` disables the dense high-ratio path. |
+| `DFLASH_ROCMFP3_WIDE_TWO_PASS` / `GGML_CUDA_MLA_SPARSE_VALUE_SKIP` | `gfx1151` kernel defaults (wide two-pass ROCmFP3 MMQ, skipping zero-weight value rows in sparse attention). Set `0` to disable either. |
+| `DFLASH_ROCMFP3_ROW3` | Three-row ROCmFP3 MMQ tiles for the q3 to q5 verifier shapes. Defaults on for `gfx1151`; set `0` to fall back to two rows. |
+| `GGML_DS4_INDEXER_M32` / `GGML_DS4_INDEXER_M32_CACHE_B` | rocWMMA m32 indexer score kernel and its cached B operand. The kernel defaults on for RDNA 3.5; the cached operand is part of the `gfx1151` sparse-prefill defaults. Set `0` to disable either. |
+| `GGML_DS4_INDEXER_M32_PREFILL` / `GGML_DS4_INDEXER_M32_DIRECT_B` | Diagnostics: override the measured m32 crossovers (prefill from 256 scored tokens, direct B from 6144 rows) so tests can reach every specialization. |
+| `DFLASH_DSPARK_NO_CHAIN_GRAPH_CACHE` | Kill switch: rebuild the DSpark Markov chain graph on every call instead of reusing it. The cache keys on the drafter lifecycle generation, so a reloaded drafter never reuses a stale graph. |
+| `DFLASH_DS4_DISABLE_BOUNDARY_CHECKPOINT` | Kill switch for the boundary checkpoint that lets a q5 rejection spanning two ratio-4 flushes restore and replay only the accepted prefix. |
+| `DFLASH_DS4_TOKEN_TRACE` / `DFLASH_DS4_VERIFY_BUILD_TIMING` | Diagnostics: per-token speculative trace and fused-verify graph build timing. |
 | `DFLASH_CUDA_MMVQ_FP4_X4` | Enable the four-column ROCmFP4 dense x4 kernel and permit the five-column x4+1 kernel. Defaults to `1` for monolithic `gfx1151` paged serving and opt-in HIP q=5 verification; set `0` to restore generic four- and five-column dispatch. |
 | `DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1` | Enable five-column ROCmFP4 dense x4+1 dispatch when `DFLASH_CUDA_MMVQ_FP4_X4=1`. Defaults to `1` for monolithic `gfx1151` paged serving and the opt-in q=5 verifier on `gfx1201`; set `0` to restore the generic five-column kernel. |
 | `DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24` | Enable packed 24-bit ROCmFP3 expert dispatch. Defaults to `1` for monolithic `gfx1151` paged serving; set `0` to restore generic ROCmFP3 expert dispatch. Other configurations require explicit opt-in. |
-| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of heterogeneous verifier graph slots. Defaults to `2` for q<=4 and `9` for the opt-in q=5 verifier; each slot retains scheduler scratch on both GPUs. |
+| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of verifier graph slots. Defaults to `8` for q<=4 and `24` for the q=5 verifier so every adaptive width stays resident across the ratio-4 phases; slots share scratch (about 0.8 MiB each). |
 | `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | Skip the expensive property scan only for a warmed verifier graph. Rebuilt scheduler generations are always validated. Leave unset for the conservative production profile. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | Restore the serial compressed-row mask scan for an indexed-attention A/B. By default, HIP scans contexts above 512 compressed rows in parallel. |
 | `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Long-prefill arena kill switch; set `0` to restore per-layer owner allocation. |
@@ -598,6 +651,41 @@ On gfx1151, the exact block-radix selector is also the default for the DS4
 hipCUB full-sort path. `test_deepseek4_unit` checks selected-set parity across
 tile boundaries; `bench_ds4_topk` separately measures selector timing.
 
+On gfx1151, dense/sparse approximate prefill also enables registry-aware
+mixed-ROCmFP MMQ automatically. The decision belongs to the model and its
+matmul operations, not the process environment, so a later exact-mode model
+keeps its existing dispatch. `DFLASH_DS4_MIX_MMQ_PREFILL=0` at model load is
+the kill switch. Other model integrations can reuse the graph-local
+`ggml_mul_mat_set_mixed_mmq` policy after qualifying their model and device.
+
+The reusable D512 K-equals-V selected-row attention path shares each selected
+latent row across wave32 heads. It supports F16 and F32 KV on native wave32
+devices. The compact-order F32 schedule below is HIP-only; CUDA retains its
+existing streaming policy. Maskless ratio-4 prefill selects the eligible path
+automatically; other indexed shapes remain opt-in with
+`DFLASH_DS4_DIRECT_INDEXER_TOPK=1` and `GGML_CUDA_MLA_STREAM_TOPK=1` and require
+a matched model output and throughput A/B. F16 uses online softmax without
+materializing scores; this changes floating-point association. HIP F32 instead
+groups eight heads to reuse key/value loads, computes each dot product in its
+original dimension order, and reuses the compact softmax/value accumulation.
+It uses bounded block-local score storage, not a full prompt-by-history score array. The F32
+regression test requires byte-identical attention outputs against the compact
+reference; this is not a full-model exact-inference guarantee.
+`GGML_DS4_FA_STREAM_TOPK` remains a compatibility alias. Add
+`GGML_CUDA_MLA_STREAM_F32_STAGE=1` to convert each selected F16 latent once
+while staging aligned pairs in shared memory instead of repeating conversion
+for every head. The isolated gfx1151 qualification is byte-identical to F16
+staging and reduced alternating-run kernel time by about 9%. That historical
+F16 staging result is not an F32-input speed claim. The HIP F32 path does not use
+this staging override. Add
+`GGML_CUDA_MLA_STREAM_FAST_EXP=1` to use the HIP hardware exponential in that
+FP32-staged online softmax. It reduced the remaining kernel time by another
+7–9% in the historical F16-input isolation test. This control defaults on only
+for maskless ratio-4 prefill and remains opt-in for other indexed shapes;
+it uses an approximate hardware exponential instead of `expf` on the F16
+streaming path (and CUDA's existing F32 streaming path). It does not alter
+the HIP F32 compact-order calculation.
+
 Indexed verifier attention with at most eight query rows also uses a two-way
 split-KV schedule on gfx1151. Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` to restore the
 single-block schedule. For fused-verifier masks of at least 4 MiB, the runtime
@@ -608,7 +696,7 @@ ROCmFP2 matvecs with three or more query rows reuse each activation across
 four output rows on gfx1151. Set `DFLASH_ROCMFP2_ROW4=0` to restore the two-row
 schedule. Narrow F16 projections retain the shared MMVF dispatch policy.
 
-`DFLASH_DS4_FUSED_VERIFY=1` is the opt-in throughput profile. Its persistent
+`DFLASH_DS4_FUSED_VERIFY=1` is the throughput profile; it is the default on `gfx1151` when `DFLASH_DS4_SPEC` is set and opt-in elsewhere. Its persistent
 whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
 logits can select a different token than the normal causal verifier even at
 temperature 0. Leave it unset when comparing against the normal verifier, or
@@ -669,6 +757,12 @@ Every heterogeneous verifier slot owns a scheduler and its per-backend scratch
 buffers. The production default is therefore two slots. Do not copy the old
 12-slot benchmark override into a long-lived service without measuring free
 VRAM across every intended context shape.
+
+HIP graph replay (`-DGGML_HIP_GRAPHS=ON`) is measured as a loss on gfx1151 and
+stays off, as the CMake default is: a bare HIP replay saves about 0.2 us per
+kernel on ROCm 7.2, the cached verifier graphs already skip every rebuild, and
+capturing a 7,000-node graph costs 25 to 30 ms per shape, so short replies ran
+8 to 10 percent slower with it on and long ones gained nothing.
 
 Native CUDA/HIP graph executables are cached below the ggml scheduler. Before a
 DS4 slot is rebuilt, the runtime now synchronizes its backends and retires every
@@ -795,11 +889,14 @@ split/copy dispatches or parallelizing work outside the routed-expert fork;
 adding the two devices' headline bandwidths is not a valid throughput model
 because attention, routing, HC boundaries, and every layer join remain ordered.
 
-On HIP `gfx1151`, enabling DSpark defaults `LUCE_MMVQ_MAX_NCOLS` to `4` when
-the variable is unset. This keeps the four-row verifier on MMVQ. On a 128 GiB
-Strix Halo Radeon 8060S using ROCm 7.2.4, the rebased candidate measured 32.12
-tok/s weighted at fixed q=4 and 31.94 tok/s with confidence-adaptive width,
-versus 25.31 tok/s autoregressive. All three configurations scored 10/10 on the
+On HIP `gfx1151`, enabling DSpark installs the five-row fused verifier
+(`DFLASH_DS4_Q5_VERIFY=1`) and `LUCE_MMVQ_MAX_NCOLS=5` when the variables are
+unset, so the q5 verifier runs its projections on MMVQ; the plain launch below
+measures 39 tok/s at q5 on the code and math suites. The earlier four-row
+qualification is kept here for reference: with `LUCE_MMVQ_MAX_NCOLS=4` on a
+128 GiB Strix Halo Radeon 8060S using ROCm 7.2.4, the rebased candidate
+measured 32.12 tok/s weighted at fixed q=4 and 31.94 tok/s with
+confidence-adaptive width, versus 25.31 tok/s autoregressive. All three configurations scored 10/10 on the
 same five GSM and five Math prompts. The run used `--ds4-expert-top-k 4`, the
 platform `performance` profile, and the GPU `high` performance level; fixed
 q=4 with the model-default six routed experts measured 28.26 tok/s. Those
@@ -811,14 +908,24 @@ DSpark alone therefore does not guarantee 30 tok/s. Set
 `LUCE_MMVQ_MAX_NCOLS` explicitly to override the platform default. AR, NVIDIA,
 and other HIP architectures retain the shared dispatch default.
 
-Adaptive width is available but opt-in. Set
-`DFLASH_ADAPTIVE_SPEC_WIDTH=1`, or `DFLASH_DS4_ADAPTIVE_WIDTH=1` to enable it
-only for DS4. A compatible confidence projection selects q=2, q=3, or q=4
-from cumulative proposal confidence; artifacts without one use target
-acceptance feedback. Fixed width remains the production default because
-switching q=3/q=4 did not reduce verifier time on the qualified gfx1151
-kernels. Re-run workload-level speed and quality checks before enabling it on
-another target or drafter.
+Adaptive width defaults on for `gfx1151` DSpark serving and is opt-in
+elsewhere (`DFLASH_ADAPTIVE_SPEC_WIDTH=1`, or `DFLASH_DS4_ADAPTIVE_WIDTH=1`
+for DS4 only). The width of every step, q2 to q5 on the q5 verifier, comes
+from the drafter's confidence head where the artifact carries one (three
+depths from the head, the fourth from target feedback, each depth calibrated
+online against the target's acceptance); artifacts without a head use the
+learned acceptance-and-cost policy. `DFLASH_DS4_CONFIDENCE_WIDTH=0` forces
+that fallback and `DFLASH_DS4_ADAPTIVE_WIDTH=0` restores a fixed width.
+Re-run workload-level speed and quality checks before enabling it on another
+target or drafter.
+
+The qualified `gfx1151` launch is the plain one: `DFLASH_DS4_SPEC=1`,
+`DFLASH_DS4_DRAFT=<DSpark draft GGUF>`, the release CLI with `--chunk 8192`
+and a 128K context. Every kernel and policy default above is installed by the
+device profile at start, and the published Strix Halo numbers (8K 320 / 42
+prefill / decode tok/s, 123K 284 / 36, code and math suites 39 tok/s at q5,
+prose 25 at q2) are measured exactly that way. Use `--chunk 8192` on the
+128 GB Strix Halo part; smaller chunks cost prefill and change nothing else.
 
 ## PFlash prompt compression
 

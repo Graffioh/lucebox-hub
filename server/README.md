@@ -1,5 +1,5 @@
 <p align="left">
-  <a href="../README.md">← lucebox-hub</a>
+  <a href="../README.md">← lucebox</a>
 </p>
 
 <p align="center">
@@ -300,12 +300,14 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--kvflash-policy drafter\|lru\|qk` | `drafter` | Choose the KVFlash residency policy. |
 | `--kvflash-tau <N>` | `64` | Drafter-policy reselect interval. |
 | `--prefix-cache-slots <N>` | `32` | In-memory prefix-cache slots; `0` disables. |
+| `--concurrent-prefix-cache-max-mib <MiB>` | `4096` | Resident RAM limit for copied concurrent paged prefix checkpoints; `0` is unlimited. |
 | `--agent-turn-cache` | off | Extend prefix caching through generated tool calls. |
 | `--prefill-cache-slots <N>` | `0` | Full-prompt cache slots. |
 | `--paged-attention` | off | Enable paged KV for supported Qwen targets (16-token blocks) or DeepSeek4 on Strix Halo and R9700 plus Strix Halo (128-token pages). DeepSeek4 paged serving is AR-only. |
 | `--max-concurrency <N>` | `1` | Maximum concurrent decode sequences. Qwen supports up to 64; DeepSeek4 supports up to 6. Values above 1 enable paged attention. |
 | `--admission-coalesce-ms <N>` | `20` | Idle-to-busy batching window from 0 through 1000 ms. |
 | `--kv-pool-tokens <N>` | auto | Shared physical K/V capacity for concurrent serving, rounded to the backend page size. |
+| `--decode-kv-offload-mb <auto\|N>` | `auto` | Automatically size the RAM budget for active KV suspension; `N` sets a per-model cap in MiB, `0` disables. Applies to concurrent serving. |
 | `--kv-cache-dir <path>` | none | Enable persistent disk KV cache in this directory. |
 | `--kv-cache-budget <MB>` | `4096` | Disk KV-cache size cap. |
 | `--kv-cache-min-tokens <N>` | `512` | Minimum prefix length to persist. |
@@ -313,6 +315,53 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--kv-cache-cold-max <N>` | `10240` | Cold-prefix limit for long prompts. |
 | `--disk-prefix-cache off\|full\|auto\|auto:N\|N` | `full` | Default disk prefix policy. |
 | `--disk-prefix-cache-compress` | off | Clamp FlowKV snapshots to the stable system prefix. Requires a prefill drafter. |
+
+Decode-pressure suspension defaults to `auto`. After all models load, the
+server shares 25% of available host RAM across eligible models, subtracting
+explicit offload caps first. Each model's automatic cap is also bounded by
+the payload needed to preserve up to `max_concurrency - 1` contexts at their
+individual context/pool limit. Repeated suspensions may save more than one
+pool's payload as resident requests reuse pages and continue growing. These
+are allocation caps; no RAM is reserved until a request is suspended.
+
+Linux uses `MemAvailable`, bounded by the current cgroup v2 and its visible
+ancestors' remaining memory limits. Windows uses available physical RAM.
+Unknown memory reporting (including cgroup v1 memory control) disables
+automatic offload; an explicit MiB cap remains available. The resolved byte
+cap is logged at startup and exposed in `/props` under
+`runtime.continuous_batching.decode_kv_offload_bytes`. Available memory is
+checked again before each checkpoint allocation when reporting is available.
+This is conservative sizing, not a reservation against other processes.
+
+Use `--decode-kv-offload-mb 1024` to override the automatic value with a 1 GiB
+per-model cap, or `--decode-kv-offload-mb 0` to disable it. Explicit nonzero
+caps require concurrency greater than one. Automatic mode resolves to zero
+for single-request or unsupported engines. Disabling recovery still checks
+decode capacity and reduces speculation when necessary; if one-token decode
+cannot fit, only the selected request fails, before model execution.
+
+Before a decode step, the scheduler reserves its growth; if necessary it
+first reduces speculation to one token, then suspends a newer request.
+Copies finish before its blocks are released. The same slot retains
+recurrent/compressor/draft state, sampler, pending token, and response
+connection; existing SSE heartbeats continue during the pause. Parked
+requests resume in admission order once resident requests drain, or earlier
+when the pool has room for the checkpoint plus the cohort's next step; new
+admissions wait while any request is parked.
+
+A request that cannot be checkpointed within the RAM budget — or whose
+checkpoint cannot be copied back — is not terminated: it parks without a
+payload and resumes through ordinary chunked prefill over its retained
+token history, which rebuilds paged KV and slot-local state together.
+Requests whose context cannot fit the pool even alone, and unrecoverable
+engine failures, still produce an error.
+
+This is an in-process checkpoint: it neither survives a server restart nor
+moves a request between models. RAM avoids disk I/O and checkpoint files.
+Slot-local state remains on the device, so this recovers pool blocks, not
+the whole request's device footprint. `/status/json` reports
+`parked_requests` (suspended plus recompute-parked) and
+`offloaded_kv_bytes` per model.
 
 ### PFlash
 
@@ -558,10 +607,10 @@ tokens) is the path to bring code recall to the same ratio as prose.
 ## Quick start
 
 ```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub
-cd lucebox-hub/dflash
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git
+cd lucebox/server
 
-# Build (CUDA 12+, CMake 3.18+, sm_60+ GPU including Pascal; CUDA 13+ required for Jetson AGX Thor sm_110)
+# Build (CUDA 12+, CMake 3.21+, sm_60+ GPU including Pascal; CUDA 13+ required for Jetson AGX Thor sm_110)
 # Pass -DCMAKE_CUDA_ARCHITECTURES matching your GPU. Common values:
 #   60;61 = Pascal P100/P40 (scalar flashprefill fallback, no WMMA)
 #   70 = V100 (F16 WMMA kernels, BF16 draft → FP16 at load)
@@ -575,7 +624,7 @@ cd lucebox-hub/dflash
 # which compiles Pascal (scalar), Volta/Turing (F16 WMMA), and Ampere+ (BF16 WMMA)
 # flashprefill paths.
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build build --target test_dflash -j
+cmake --build build --target test_dflash dflash_server -j
 
 # Fetch models: ~16 GB target + 0.98 GB Lucebox Q4_K_M GGUF DFlash draft.
 # Quickstart pins to Qwen3.6-27B (latest release). For Qwen3.5-27B swap in
@@ -621,7 +670,7 @@ nvcc --version
 
 ```bash
 nvcc --version  # must show >= 12.9
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds sm_121
 cmake --build build --target test_dflash dflash_server -j
 ```
@@ -632,7 +681,7 @@ On GB10 (128 GB unified), re-sweep `--ddtree-budget` (larger tree = more verify 
 
 ```bash
 nvcc --version  # must show >= 13.0
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release   # CMake auto-adds Thor arch
 cmake --build build --target test_dflash dflash_server -j
 ```
@@ -670,7 +719,7 @@ HumanEval runs (+3.1%), HumanEval+ pass@1 145/164 versus 143/164, with all ten
 short A/B replies and 133/164 full-suite replies byte-identical.
 
 ```bash
-git clone --recurse-submodules https://github.com/Luce-Org/lucebox-hub && cd lucebox-hub/server
+git clone --recurse-submodules https://github.com/Luce-Org/lucebox.git && cd lucebox/server
 
 # Ubuntu/ROCm build dependencies used by ggml's HIP backend.
 sudo apt-get update
@@ -743,7 +792,7 @@ Correctness: `test_vs_oracle` validates the draft graph at cos sim 0.999812 vs t
 
 ## Contributing
 
-Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
+Open an issue or PR against `Luce-Org/lucebox`. Good first picks:
 
 - **Leviathan-style rejection sampling** on each DDTree branch (the current implementation samples only the committed token; full prob-matching across the tree is the next step)
 - **Full llama.cpp integration**: new arch, `llama-speculative-dflash.cpp`, `llama-cli` / `llama-server` wiring
@@ -754,7 +803,7 @@ Open an issue or PR against `Luce-Org/lucebox-hub`. Good first picks:
 @software{luce_dflash_2026,
   title  = {Luce DFlash: GGUF port of block-diffusion speculative decoding for Qwen3.5-27B on consumer GPUs},
   author = {Lucebox},
-  url    = {https://github.com/Luce-Org/lucebox-hub/tree/main/dflash},
+  url    = {https://github.com/Luce-Org/lucebox/tree/main/server},
   year   = {2026}
 }
 

@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cmath>
 #include <sstream>
+#include <utility>
 
 namespace dflash::common {
 
@@ -76,7 +77,8 @@ void free_qwen3_snapshot(Qwen3Snapshot & s) {
 
 // ── Construction / destruction ─────────────────────────────────────────
 
-Qwen3Backend::Qwen3Backend(const Qwen3BackendConfig & cfg) : cfg_(cfg) {}
+Qwen3Backend::Qwen3Backend(Qwen3BackendConfig cfg)
+    : cfg_(std::move(cfg)) {}
 
 Qwen3Backend::~Qwen3Backend() { shutdown(); }
 
@@ -94,7 +96,7 @@ bool Qwen3Backend::init() {
         return false;
     }
     std::printf("[qwen3] loaded %s (%d layers, hidden=%d, vocab=%d)\n",
-                cfg_.model_path, w_.n_layer, w_.n_embd, w_.n_vocab);
+                cfg_.model_path.c_str(), w_.n_layer, w_.n_embd, w_.n_vocab);
 
     if (!create_qwen3_cache(backend_, w_, cfg_.device.max_ctx, cache_)) {
         std::fprintf(stderr, "[qwen3] cache creation failed\n");
@@ -968,8 +970,10 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
     }
 
     result.compressed_ids = drafter_score_and_compress(
-        drafter_ctx_, req.input_ids, req.keep_ratio);
-    result.ok = true;
+        drafter_ctx_, req.input_ids, req.keep_ratio,
+        /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
+        req.score_query_end);
+    result.ok = !result.compressed_ids.empty();
 
     if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
         free_drafter();

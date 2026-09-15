@@ -1489,6 +1489,21 @@ extern "C" {
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
+    // Per-operation policy for learned mixed-ROCmFP MMQ. DEFAULT preserves
+    // backend/user policy; ENABLED and DISABLED are graph-local overrides.
+    // Other qtypes and non-MMQ backends are unaffected. Stored in op_params
+    // so scheduler copies and graph replay retain the model's decision.
+    enum ggml_mixed_mmq_policy {
+        GGML_MIXED_MMQ_DEFAULT = 0,
+        GGML_MIXED_MMQ_DISABLED = 1,
+        GGML_MIXED_MMQ_ENABLED = 2,
+    };
+
+    GGML_API void ggml_mul_mat_set_mixed_mmq(
+            struct ggml_tensor * op, enum ggml_mixed_mmq_policy policy);
+    GGML_API enum ggml_mixed_mmq_policy ggml_mul_mat_get_mixed_mmq(
+            const struct ggml_tensor * op);
+
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
@@ -2453,6 +2468,28 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_ds4_indexer_topk(
             struct ggml_tensor * a,
             struct ggml_tensor * selected);
+
+    // Present a logical DS4 KV sequence as three contiguous row segments
+    // without materializing their concatenation. Requires K and V to be the
+    // same tensor (MLA latent KV); only the split-KV decode kernel consumes it. `a` keeps the raw segment in
+    // src[1]/src[2]; `compressed` and `preserved_tail` (K's type and D,
+    // contiguous [D, rows]) are appended in that order and stored in
+    // src[7]/src[8]. Row indices, the mask width and the raw-row count in
+    // op_params address the concatenated sequence. Only the native D=512
+    // CUDA/HIP split-KV decode kernel (indexed mask, n_tokens <= 8) consumes
+    // the segments; no other backend or shape implements them.
+    GGML_API void ggml_flash_attn_ext_set_ds4_kv_segments(
+            struct ggml_tensor * a,
+            struct ggml_tensor * compressed,
+            struct ggml_tensor * preserved_tail);
+
+    // Mark a maskless DS4 layer-major attention op whose raw and compressed
+    // rows have monotonic causal frontiers. A value of 1 denotes raw-only
+    // sliding-window attention; values greater than 1 are the compression
+    // ratio of the contiguous compressed interval.
+    GGML_API void ggml_flash_attn_ext_set_ds4_causal_ratio(
+            struct ggml_tensor * a,
+            int                  ratio);
 
     // Fuse DS4's inverse 64-d tail RoPE into the D=512 flash-attention
     // writeback. q_unrotated additionally asks the kernel to apply the forward

@@ -44,6 +44,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -259,7 +260,7 @@ static void apply_drafter_capture_layer_ids(const DraftWeights & dw, TargetWeigh
 
 // ── Construction / destruction ──────────────────────────────────────────
 
-Qwen35Backend::Qwen35Backend(const Qwen35Config & cfg) : cfg_(cfg) {}
+Qwen35Backend::Qwen35Backend(Qwen35Config cfg) : cfg_(std::move(cfg)) {}
 
 Qwen35Backend::~Qwen35Backend() { shutdown(); }
 
@@ -342,7 +343,7 @@ bool Qwen35Backend::init() {
         const int cap = cfg_.remote_draft.ring_cap > 0
             ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
             : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
-        if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, cfg_.draft_path,
+        if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                  cfg_.draft_gpu, cap,
                                  cfg_.remote_draft.work_dir)) {
             std::fprintf(stderr, "remote draft start failed\n");
@@ -354,10 +355,10 @@ bool Qwen35Backend::init() {
         std::printf("[draft]  remote ipc ready gpu=%d cap=%d\n",
                     cfg_.draft_gpu, cap);
     } else if (cfg_.draft_path) {
-        std::string dp(cfg_.draft_path);
+        const std::string & dp = *cfg_.draft_path;
         bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-            ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
-            : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_, &w_);
+            ? load_draft_gguf(*cfg_.draft_path, draft_backend_, dw_, &w_)
+            : load_draft_safetensors(*cfg_.draft_path, draft_backend_, dw_, &w_);
         if (!draft_ok) {
             std::fprintf(stderr, "draft load: %s\n", dflash27b_last_error());
             return false;
@@ -422,7 +423,8 @@ bool Qwen35Backend::init() {
     // (or the explicit choice via --kvflash-policy lru).
     kvflash_qk_policy_ = kvflash_policy_is_qk();
     if (std::getenv("DFLASH_KVFLASH") && !kvflash_qk_policy_) {
-        kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
+        kvflash_drafter_path_ = kvflash_find_drafter(
+            cfg_.target_path.c_str());
     }
     // "auto" sizes the pool from the GPU: weights are resident at this
     // point and the cache is not yet allocated, so device-free minus a
@@ -917,17 +919,19 @@ bool Qwen35Backend::unpark(ParkTarget target) {
             const int cap = cfg_.remote_draft.ring_cap > 0
                 ? std::min(cfg_.remote_draft.ring_cap, cfg_.device.max_ctx)
                 : std::min(cfg_.device.max_ctx, cfg_.draft_ctx_max);
-            if (!remote_draft_.start(cfg_.remote_draft.ipc_bin, cfg_.draft_path,
+            if (!remote_draft_.start(
+                    cfg_.remote_draft.ipc_bin, *cfg_.draft_path,
                                      cfg_.draft_gpu, cap,
                                      cfg_.remote_draft.work_dir)) {
                 std::fprintf(stderr, "[unpark] remote draft failed\n");
                 return false;
             }
         } else {
-            std::string dp(cfg_.draft_path);
+            const std::string & dp = *cfg_.draft_path;
             bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-                ? load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, &w_)
-                : load_draft_safetensors(cfg_.draft_path, draft_backend_, dw_, &w_);
+                ? load_draft_gguf(*cfg_.draft_path, draft_backend_, dw_, &w_)
+                : load_draft_safetensors(
+                      *cfg_.draft_path, draft_backend_, dw_, &w_);
             if (!draft_ok) {
                 std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
                 return false;
@@ -976,8 +980,9 @@ bool Qwen35Backend::snapshot_save(int slot) {
         static bool warned = false;
         if (!warned) {
             std::fprintf(stderr,
-                "[paged-attention] prefix snapshots are disabled until the "
-                "snapshot format stores block tables\n");
+                "[paged-attention] the classic single-sequence snapshot API "
+                "is unavailable; continuous batching uses copied paged "
+                "checkpoints\n");
             warned = true;
         }
         return false;
@@ -1190,7 +1195,9 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
 
         auto & result = results[index];
         result.compressed_ids = drafter_score_and_compress(
-            drafter_ctx_, request.input_ids, request.keep_ratio);
+            drafter_ctx_, request.input_ids, request.keep_ratio,
+            /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
+            request.score_query_end);
         result.ok = !result.compressed_ids.empty();
         if (result.ok) {
             std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
@@ -1487,12 +1494,18 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                      &result.degenerate_decode_close);
             out_io.emit(-1);
         } else {
+            const auto * hint_tokens =
+                req.hint_tokens.empty() ? nullptr : &req.hint_tokens;
+            const auto * stall_prefix = req.stall_tool_prefix_tokens.empty()
+                ? nullptr : &req.stall_tool_prefix_tokens;
+            const auto * stall_suffix = req.stall_action_suffix_tokens.empty()
+                ? nullptr : &req.stall_action_suffix_tokens;
+            const auto * stall_skip = req.stall_skip_tokens.empty()
+                ? nullptr : &req.stall_skip_tokens;
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
-                                       req.hint_tokens,
-                                       req.stall_tool_prefix_tokens,
-                                       req.stall_action_suffix_tokens,
-                                       req.stall_skip_tokens,
+                                       hint_tokens, stall_prefix, stall_suffix,
+                                       stall_skip,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
@@ -1655,12 +1668,18 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                      &result.degenerate_decode_close);
             out_io.emit(-1);
         } else {
+            const auto * hint_tokens =
+                req.hint_tokens.empty() ? nullptr : &req.hint_tokens;
+            const auto * stall_prefix = req.stall_tool_prefix_tokens.empty()
+                ? nullptr : &req.stall_tool_prefix_tokens;
+            const auto * stall_suffix = req.stall_action_suffix_tokens.empty()
+                ? nullptr : &req.stall_action_suffix_tokens;
+            const auto * stall_skip = req.stall_skip_tokens.empty()
+                ? nullptr : &req.stall_skip_tokens;
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
-                                       req.hint_tokens,
-                                       req.stall_tool_prefix_tokens,
-                                       req.stall_action_suffix_tokens,
-                                       req.stall_skip_tokens,
+                                       hint_tokens, stall_prefix, stall_suffix,
+                                       stall_skip,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
@@ -1775,7 +1794,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         const int max_verify_tokens = cfg_.ddtree_mode
             ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
             : dw_.block_size;
-        const bool enable_specla = cfg_.fast_rollback &&
+        const bool enable_specla = cfg_.specla_mode && cfg_.fast_rollback &&
             !cfg_.device.is_tensor_parallel() && !kvflash_active();
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
@@ -2833,7 +2852,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
     if ((cfg_.fast_rollback || cfg_.ddtree_mode) && !cache_.rollback_ctx) {
-        const bool enable_specla = cfg_.fast_rollback &&
+        const bool enable_specla = cfg_.specla_mode && cfg_.fast_rollback &&
             !cfg_.device.is_tensor_parallel() && !kvflash_active();
         if (!migrate_prefill_cache(w_, cfg_.device.max_ctx,
                                    max_verify_tokens,
@@ -3258,7 +3277,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             // keep the legacy width only outside SpecLA.
             const int K = (cfg_.ddtree_budget > L)
                 ? (target->exact_fast_rollback()
-                    ? std::min(specla_tree_topk(), w_.n_vocab)
+                    ? std::min(cfg_.specla_top_k, w_.n_vocab)
                     : 8)
                 : 1;
             DDTree tree;

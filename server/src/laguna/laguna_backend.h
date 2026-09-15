@@ -56,7 +56,7 @@ struct LagunaDraftVariant {
 
 class LagunaBackend : public ModelBackend {
 public:
-    explicit LagunaBackend(const LagunaBackendArgs & args);
+    explicit LagunaBackend(LagunaBackendArgs args);
     ~LagunaBackend() override;
 
     // Initialise CUDA backend, load weights, create cache.
@@ -188,7 +188,8 @@ private:
     GenerateResult generate_hybrid(const GenerateRequest & req, const DaemonIO & io);
     bool hybrid_forward_one_token(int32_t tok, int kv_pos,
                                   std::vector<float> & act_cur,
-                                  int32_t & argmax_out);
+                                  int32_t & argmax_out,
+                                  std::vector<float> * out_logits = nullptr);
     void maybe_post_request_swap();
 
     bool load_decode_draft();

@@ -509,6 +509,7 @@ add_library(dflash_common STATIC
     src/common/dflash_spec_decode.cpp
     src/common/concurrency/paged_kv_pool.cpp
     src/common/concurrency/seq_slot_manager.cpp
+    src/common/concurrency/paged_kv_offload.cpp
     src/common/layer_split_backend.cpp
     src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
@@ -544,12 +545,14 @@ add_library(dflash_common STATIC
     src/common/backend_precision.cpp
     src/common/daemon_loop.cpp
     src/common/gguf_inspect.cpp
+    src/common/backend_plan.cpp
     src/common/backend_factory.cpp
     src/common/feature_gate.cpp
     src/placement/placement_config.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
     src/common/peer_access.cpp
+    src/engine/luce_engine.cpp
     # ── Server components (tokenizer, chat template) ──
     src/server/tokenizer.cpp
     src/server/chat_template.cpp
@@ -557,6 +560,7 @@ add_library(dflash_common STATIC
     src/server/tool_hint.cpp
     src/server/reasoning.cpp
     src/server/tool_memory.cpp
+    src/server/response_error.cpp
     src/server/sse_emitter.cpp
     src/server/prefix_cache.cpp
     src/server/pin_friendly_prompt.cpp
@@ -947,6 +951,16 @@ if(DFLASH27B_TESTS)
         add_test(NAME mixed_cuda_hip COMMAND test_mixed_cuda_hip)
     endif()
 
+    # Host-only lifetime/concurrency regression; no model or accelerator needed.
+    # Keep the hook-enabled class out of test_server_unit: that target links
+    # dflash_common's production (hook-free) definition, which has a different
+    # layout. Mixing both in one binary violates the one-definition rule.
+    find_package(Threads REQUIRED)
+    add_executable(test_blocking_row_pool test/test_blocking_row_pool.cpp)
+    target_include_directories(test_blocking_row_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(test_blocking_row_pool PRIVATE DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS=1)
+    target_link_libraries(test_blocking_row_pool PRIVATE Threads::Threads)
+
     add_executable(test_rocmfp4 deps/llama.cpp/ggml/rocmfp4/test_rocmfp4.c)
     target_link_libraries(test_rocmfp4 PRIVATE ggml-base)
     if(UNIX)
@@ -1109,14 +1123,45 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE CUDA::cudart)
         endif()
-        # The grouped test includes rocmfpx.h unconditionally; expose it to both
+        # The grouped test includes the ROCm quantizers; expose them to both
         # backends (previously only HIP resolved it, so the default CUDA build
         # could not compile this target).
         target_include_directories(test_deepseek4_mmid_grouped_cuda PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfp4
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
         target_link_libraries(test_deepseek4_mmid_grouped_cuda PRIVATE
             ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_deepseek4_mmid_grouped_cuda)
+        add_test(NAME deepseek4_mmid_grouped_cuda_reject_parent_width
+            COMMAND ${CMAKE_COMMAND} -E env DFLASH_MMID_TEST_WIDTH=16
+                $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda> --mmid-only)
+        set_tests_properties(deepseek4_mmid_grouped_cuda_reject_parent_width
+            PROPERTIES WILL_FAIL TRUE)
+        add_test(NAME deepseek4_mmid_grouped_cuda_benchmark_accounting
+            COMMAND $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
+                --test-benchmark-iterations)
+        add_test(NAME deepseek4_mmid_grouped_cuda_benchmark_config
+            COMMAND ${CMAKE_COMMAND}
+                -DTEST_EXECUTABLE=$<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
+                -DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/mmid_benchmark_config
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmid_benchmark_config.cmake)
+        set_tests_properties(deepseek4_mmid_grouped_cuda_benchmark_config
+            PROPERTIES SKIP_REGULAR_EXPRESSION "mmid-benchmark-config.*SKIP: no supported GPU")
+        foreach(_mmid_cli_case IN ITEMS parent_benchmark no_gpu)
+            add_test(NAME deepseek4_mmid_grouped_cuda_${_mmid_cli_case}
+                COMMAND ${CMAKE_COMMAND}
+                    -DTEST_EXECUTABLE=$<TARGET_FILE:test_deepseek4_mmid_grouped_cuda>
+                    -DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/mmid_cli_${_mmid_cli_case}
+                    -DTEST_CASE=${_mmid_cli_case}
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mmid_cli.cmake)
+        endforeach()
+        unset(_mmid_cli_case)
+        add_test(NAME deepseek4_mmid_grouped_cuda_combine_override
+            COMMAND ${CMAKE_COMMAND} -E env DFLASH_MOE_COMBINE_VEC4=0
+                DFLASH_MOE_COMBINE_BENCH=0 --unset=DFLASH_MOE_COMBINE_BENCH_TOKENS
+                $<TARGET_FILE:test_deepseek4_mmid_grouped_cuda> --combine-only)
+        set_tests_properties(deepseek4_mmid_grouped_cuda_combine_override
+            PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_moe_combine_cuda.cpp")
         add_executable(test_ds4_moe_combine_cuda test/test_ds4_moe_combine_cuda.cpp)
@@ -1127,6 +1172,27 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_ds4_moe_combine_cuda PRIVATE
             ggml-cpu ggml ${DFLASH27B_GGML_BACKEND_TARGET})
         list(APPEND _raw_unit_test_targets test_ds4_moe_combine_cuda)
+    endif()
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+        add_executable(test_ds4_maskless_prefill test/test_ds4_maskless_prefill.cpp)
+        set_source_files_properties(test/test_ds4_maskless_prefill.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_ds4_maskless_prefill PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_link_libraries(test_ds4_maskless_prefill PRIVATE
+            ggml ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
+        list(APPEND _raw_unit_test_targets test_ds4_maskless_prefill)
+        foreach(_maskless_mode IN ITEMS defaults disabled f32 short)
+            add_test(NAME ds4_maskless_prefill_${_maskless_mode}
+                COMMAND test_ds4_maskless_prefill --${_maskless_mode})
+            set_tests_properties(ds4_maskless_prefill_${_maskless_mode}
+                PROPERTIES SKIP_RETURN_CODE 77)
+        endforeach()
+        foreach(_maskless_mode IN ITEMS defaults disabled short)
+            add_test(NAME ds4_maskless_prefill_${_maskless_mode}_f32
+                COMMAND test_ds4_maskless_prefill --${_maskless_mode} --f32)
+            set_tests_properties(ds4_maskless_prefill_${_maskless_mode}_f32
+                PROPERTIES SKIP_RETURN_CODE 77)
+        endforeach()
+        unset(_maskless_mode)
     endif()
     # HIP-only standalone build; CUDA backend is covered by aggregated test_server_unit.
     if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_draft_topk_cuda.cpp")
@@ -1349,6 +1415,7 @@ if(DFLASH27B_TESTS)
             set_target_properties(test_rocmfp_mix_gateup_glu PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
         endif()
         target_include_directories(test_rocmfp_mix_gateup_glu PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src/ggml-cuda)
@@ -1428,6 +1495,16 @@ if(DFLASH27B_TESTS)
         else()
             target_link_libraries(test_ds4_dmix_entry_validation PRIVATE hip::host)
         endif()
+    endif()
+    # Optional Strix Halo regression; reuse the tokenizer in dflash_common.
+    if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_paged_prefill_model.cpp")
+        add_executable(test_ds4_paged_prefill_model test/test_ds4_paged_prefill_model.cpp)
+        target_include_directories(test_ds4_paged_prefill_model PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_ds4_paged_prefill_model PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        target_link_libraries(test_ds4_paged_prefill_model PRIVATE
+            dflash_common ggml ggml-cpu ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base hip::host)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ds4_dspark_load.cpp")
         add_executable(test_ds4_dspark_load test/test_ds4_dspark_load.cpp)
@@ -1564,6 +1641,15 @@ if(DFLASH27B_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/test)
         list(APPEND _raw_unit_test_targets test_seq_engine_contract)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_parallel_prefix_txn.cpp")
+        # Host-only ownership tests for the scheduler/cache capture ticket.
+        add_executable(test_parallel_prefix_txn
+            test/test_parallel_prefix_txn.cpp)
+        target_include_directories(test_parallel_prefix_txn PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        list(APPEND _raw_unit_test_targets test_parallel_prefix_txn)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ddtree_path.cpp")
         # Pure host-side accepted-path/pending-token contract tests.
@@ -1752,9 +1838,14 @@ if(DFLASH27B_TESTS)
             test/test_unit_main.cpp
             test/test_server_unit.cpp
             test/test_model_routing.cpp
+            test/test_luce_engine.cpp
+            test/test_paged_kv_offload.cpp
             test/test_anchor_params.cpp
             test/test_derived_scalars.cpp
             test/test_adaptive_spec_width.cpp
+            test/test_immutable_graph_input_pool.cpp
+            test/test_mmq_tile_selection.cpp
+            test/test_mixed_mmq_policy.cpp
             test/test_spec_acceptance.cpp
             test/test_ds4_env.cpp
             test/test_adaptive_keep_ratio.cpp
@@ -1819,6 +1910,9 @@ if(DFLASH27B_TESTS)
         if(WIN32)
             target_link_libraries(test_server_unit PRIVATE ws2_32)
         endif()
+        if(UNIX)
+            target_link_libraries(test_server_unit PRIVATE pthread)
+        endif()
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             find_package(CUDAToolkit REQUIRED)
             target_link_libraries(test_server_unit PRIVATE CUDA::cudart)
@@ -1866,7 +1960,8 @@ if(DFLASH27B_TESTS)
             test/smoke_load_draft.cpp
             test/smoke_load_target.cpp
             test/smoke_load_target_laguna.cpp
-            test/test_paged_attention.cpp)
+            test/test_paged_attention.cpp
+            test/test_decode_kv_offload_gpu.cpp)
         target_include_directories(test_model_smoke PRIVATE
             ${DFLASH27B_SRC_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
@@ -1918,17 +2013,20 @@ if(DFLASH27B_TESTS)
         list(APPEND _raw_unit_test_targets test_model_smoke)
     endif()
 
-    # Feature/architecture gate tests. check_feature_compatibility(),
-    # collect_feature_warnings() and the capability table are pure functions,
-    # so this target deliberately compiles only feature_gate.cpp and
-    # placement_config.cpp — no dflash_common, no ggml, no GPU toolkit. That
-    # keeps a gate rule testable in seconds instead of behind a full backend
-    # build, which is the whole reason these tests do not live in
+    # Backend planning and feature/architecture gate tests. The plan builder,
+    # check_feature_compatibility(), collect_feature_warnings(), and the
+    # capability table are pure policy, so this target compiles only their
+    # sources and placement_config.cpp. It needs no dflash_common, ggml, or GPU
+    # toolkit. This keeps policy rules testable in seconds instead of behind a
+    # full backend build, which is why these tests do not live in
     # test_server_unit.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_feature_gate.cpp")
         add_executable(test_feature_gate test/test_feature_gate.cpp)
         target_sources(test_feature_gate PRIVATE
+            test/test_backend_plan.cpp
+            src/common/backend_plan.cpp
             src/common/feature_gate.cpp
+            src/kv_quant.cpp
             src/placement/placement_config.cpp)
         target_include_directories(test_feature_gate PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -1975,6 +2073,7 @@ if(DFLASH27B_TESTS)
         test_server_unit
         test_model_smoke)
     set(_new_cppunit_test_targets
+        test_blocking_row_pool
         test_kernel_qualification_core
         test_platform_compat
         test_draft_swa
