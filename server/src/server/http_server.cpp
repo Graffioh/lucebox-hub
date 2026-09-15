@@ -864,6 +864,13 @@ static bool env_flag_enabled(const char * name) {
            value != "off";
 }
 
+static int env_int_value(const char * name, int fallback) {
+    const char * raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+    const int value = std::atoi(raw);
+    return value > 0 ? value : fallback;
+}
+
 static const json * find_tool_function(const json & tools,
                                        const std::string & name) {
     if (!tools.is_array() || name.empty()) return nullptr;
@@ -2393,6 +2400,8 @@ bool HttpServer::route_request(SocketHandle fd, const HttpRequest & hr) {
         req.session_id = parse_session_id_from_body(body);
         req.pflash_query = parse_pflash_query_from_body(body);
         req.pflash_required = parse_pflash_required_from_body(body);
+        parse_pflash_evidence_from_body(
+            body, req.pflash_evidence, req.pflash_evidence_source);
 
         // PPP rearrange (optional): peel ephemeral system banners into a
         // following system message so the first chat boundary is stable.
@@ -2806,6 +2815,29 @@ json build_non_streaming_response(
         req, result, generation_cap, timings, counts, emitter, &tokenizer);
 }
 
+// Extract the text content of a chat message, tolerating both plain-string
+// content and multipart content arrays (text/input_text/output_text parts).
+std::string json_message_text(const json & message) {
+    std::string content;
+    if (!message.is_object() || !message.contains("content")) {
+        return content;
+    }
+    const auto & value = message["content"];
+    if (value.is_string()) {
+        content = value.get<std::string>();
+    } else if (value.is_array()) {
+        for (const auto & part : value) {
+            if (!part.is_object()) continue;
+            const std::string type = part.value("type", "");
+            if (type == "text" || type == "input_text" ||
+                type == "output_text") {
+                content += part.value("text", "");
+            }
+        }
+    }
+    return content;
+}
+
 // Prompt preparation applies exactly one compression policy: FlowKV for
 // continuations, a verbatim turn-one anchor, or whole-prompt PFlash.
 bool is_continuation_request(const json & messages) {
@@ -2870,26 +2902,7 @@ void HttpServer::apply_flowkv_compression(
         pflash_keep_ratio(config_, (int) req.prompt_tokens.size()),
         req.session_id, sessions_);
 
-    auto message_text = [](const json & message) {
-        std::string content;
-        if (!message.is_object() || !message.contains("content")) {
-            return content;
-        }
-        const auto & value = message["content"];
-        if (value.is_string()) {
-            content = value.get<std::string>();
-        } else if (value.is_array()) {
-            for (const auto & part : value) {
-                if (!part.is_object()) continue;
-                const std::string type = part.value("type", "");
-                if (type == "text" || type == "input_text" ||
-                    type == "output_text") {
-                    content += part.value("text", "");
-                }
-            }
-        }
-        return content;
-    };
+    auto message_text = json_message_text;
 
     // AUTO is based on the aggregate aged history, matching the total-prompt
     // threshold users configure. Once active, avoid tiny per-message scoring
@@ -3592,12 +3605,294 @@ std::string HttpServer::apply_pflash_compression(
     return {};
 }
 
+// Multi-turn evidence management. The session's first user message is an
+// immutable long source; each turn rescores it against the current question
+// (explicit `pflash_query` when present, else the last user message) and
+// serves only the selected evidence. The per-session ledger remembers which
+// chunks are already resident in the served prompt: turns append only the
+// missing chunks inside the current user message, so the inline prefix
+// cache diff-prefills just the new turn. When capacity requires it (or the
+// source revision / request stream desyncs), the prompt is rebuilt with all
+// retained evidence consolidated into the first user message.
+//
+// Managed sessions bypass both FlowKV and the turn-1-verbatim rule; the
+// rescore is the mechanism, not optional compression. Fail closed: a
+// contract violation returns a 400 and a scorer or render error a 500,
+// rather than silently serving an unmanaged prompt mid-session.
+std::string HttpServer::apply_evidence_management(
+        const ParsedRequest & req, PreparedPrompt & prepared) {
+    const auto bad_request = [&prepared](const std::string & message) {
+        prepared.error_status = 400;
+        return message;
+    };
+    if (!req.messages.is_array() || req.messages.empty()) {
+        return bad_request("pflash_evidence requires a messages array");
+    }
+    if (req.session_id.empty()) {
+        return bad_request("pflash_evidence requires session_id");
+    }
+
+    // The chunk ledger recovers selections from whole-chunk output; only the
+    // strict LongAttnComp selector provides that contract.
+    dflash::qwen3::PFlashLongAttnCompConfig experiment;
+    std::string experiment_error;
+    if (!dflash::qwen3::resolve_pflash_longattncomp(
+            0, 32, experiment, experiment_error)) {
+        return "invalid PFlash LongAttnComp config: " + experiment_error;
+    }
+    if (!experiment.selection_active || experiment.chunk_size <= 0) {
+        return bad_request(
+            "pflash_evidence requires PFlash LongAttnComp selection "
+            "(DFLASH_PFLASH_LONGATTNCOMP)");
+    }
+
+    const auto & messages = req.messages;
+    const int message_count = (int) messages.size();
+
+    // The source is the first user message unless pinned explicitly.
+    int source_index = req.pflash_evidence_source;
+    if (source_index < 0) {
+        for (int index = 0; index < message_count; ++index) {
+            if (messages[index].is_object() &&
+                messages[index].value("role", "") == "user") {
+                source_index = index;
+                break;
+            }
+        }
+    }
+    if (source_index < 0 || source_index >= message_count ||
+        !messages[source_index].is_object() ||
+        messages[source_index].value("role", "") != "user") {
+        return bad_request(
+            "pflash_evidence source message is not a user message");
+    }
+    const std::string source_text = json_message_text(messages[source_index]);
+    if (source_text.empty()) {
+        return bad_request("pflash_evidence source message is empty");
+    }
+
+    // Every user message after the source is a question; the last one is
+    // the current turn's.
+    std::vector<std::string> question_texts;
+    for (int index = source_index + 1; index < message_count; ++index) {
+        if (messages[index].is_object() &&
+            messages[index].value("role", "") == "user") {
+            question_texts.push_back(json_message_text(messages[index]));
+        }
+    }
+    if (question_texts.empty()) {
+        return bad_request(
+            "pflash_evidence requires a question after the source");
+    }
+    const std::string & current_question = question_texts.back();
+    const std::string query_text =
+        req.pflash_query.empty() ? current_question : req.pflash_query;
+
+    // Rescore the source against the current question. The query rides at
+    // the tail of the scorer input so the scorer's trailing query window
+    // picks it up exactly like the single-turn path's mapped span.
+    auto source_ids = drafter_tokenizer_->encode(source_text);
+    if (source_ids.empty()) {
+        return "pflash_evidence drafter tokenizer produced an empty source";
+    }
+    auto separator_ids = drafter_tokenizer_->encode("\n\n");
+    auto query_ids = drafter_tokenizer_->encode(query_text);
+    if (query_ids.empty()) {
+        return bad_request(
+            "pflash_evidence drafter tokenizer produced an empty query");
+    }
+    std::vector<int32_t> scorer_input = source_ids;
+    scorer_input.insert(scorer_input.end(),
+                        separator_ids.begin(), separator_ids.end());
+    scorer_input.insert(scorer_input.end(),
+                        query_ids.begin(), query_ids.end());
+
+    const PrefixHash source_revision =
+        hash_prefix(source_ids.data(), (int) source_ids.size());
+
+    ModelBackend::CompressRequest compress_request;
+    compress_request.input_ids = std::move(scorer_input);
+    compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
+        pflash_keep_ratio(config_, (int) req.prompt_tokens.size()),
+        req.session_id, sessions_);
+    compress_request.score_query_end = -1;  // trailing window
+    compress_request.score_query_tokens = (int) query_ids.size();
+    compress_request.drafter_path = config_.pflash_drafter_path;
+    compress_request.drafter_gpu = config_.pflash_drafter_gpu;
+    compress_request.skip_park = config_.pflash_skip_park;
+    const auto residency = resolve_draft_residency_action(
+        config_.draft_residency,
+        DraftResidencyContext{
+            DraftResidencyUse::PFlashCompress,
+            config_.lazy_draft,
+            !config_.draft_path.empty(),
+        });
+    compress_request.residency_action = residency;
+
+    ModelBackend::CompressResult result;
+    if (config_.pflash_remote_drafter) {
+        if (!pflash_remote_.active() &&
+            !pflash_remote_.start(config_.pflash_remote.ipc_bin,
+                                  config_.pflash_drafter_path,
+                                  config_.pflash_drafter_gpu,
+                                  config_.pflash_remote.work_dir)) {
+            return "remote PFlash drafter start failed";
+        }
+        result.ok = pflash_remote_.compress(
+            compress_request.input_ids, compress_request.keep_ratio,
+            result.compressed_ids,
+            compress_request.score_query_end,
+            compress_request.score_query_tokens,
+            compress_request.required_instruction_spans);
+        if (residency == DraftResidencyAction::ReleaseAfterUse) {
+            pflash_remote_.close();
+        }
+    } else {
+        result = backend_.compress(compress_request);
+    }
+    if (!result.ok || result.compressed_ids.empty()) {
+        return "PFlash evidence rescore failed";
+    }
+
+    const std::vector<int> fresh = recover_selected_chunks(
+        compress_request.input_ids, result.compressed_ids,
+        experiment.chunk_size, (int) source_ids.size());
+
+    // Capacity accounting in drafter tokens: all non-source content plus
+    // the generation reserve.
+    int dialogue_tokens = req.max_output;
+    for (int index = 0; index < message_count; ++index) {
+        if (index == source_index) continue;
+        dialogue_tokens +=
+            (int) drafter_tokenizer_->encode(
+                json_message_text(messages[index])).size();
+    }
+
+    if (evidence_ledgers_.size() >= kEvidenceLedgerMax &&
+        evidence_ledgers_.count(req.session_id) == 0) {
+        std::fprintf(stderr,
+            "[evidence] ledger map full (%zu sessions) — clearing\n",
+            evidence_ledgers_.size());
+        evidence_ledgers_.clear();
+    }
+    EvidenceLedger & ledger = evidence_ledgers_[req.session_id];
+
+    EvidenceConfig evidence_config;
+    evidence_config.chunk_size = experiment.chunk_size;
+    evidence_config.context_budget =
+        env_int_value("DFLASH_EVIDENCE_BUDGET_TOKENS", config_.max_ctx);
+    evidence_config.rebuild_window =
+        env_int_value("DFLASH_EVIDENCE_REBUILD_WINDOW", 3);
+    const char * placement_env = std::getenv("DFLASH_EVIDENCE_PLACEMENT");
+    evidence_config.anchor_every_turn =
+        placement_env && std::string(placement_env) == "anchor";
+
+    const EvidencePlan plan = plan_evidence_turn(
+        ledger, source_revision, fresh, (int) source_ids.size(),
+        dialogue_tokens, (int) question_texts.size(), evidence_config);
+
+    const auto decode_source = [&](int begin, int end) {
+        return drafter_tokenizer_->decode(std::vector<int32_t>(
+            source_ids.begin() + begin, source_ids.begin() + end));
+    };
+    const std::string block = render_evidence_block(plan.emit, decode_source);
+
+    // Rewrite the request messages into the managed layout.
+    //   Append:  [pre-source msgs] + committed users + current question
+    //            carrying the new evidence block.
+    //   Rebuild: [pre-source msgs] + anchor block (source slot) + bare
+    //            question/answer history.
+    json managed_messages = json::array();
+    for (int index = 0; index < source_index; ++index) {
+        managed_messages.push_back(messages[index]);
+    }
+    if (plan.placement == EvidencePlacement::Anchor) {
+        managed_messages.push_back(
+            {{"role", "user"}, {"content", block}});
+    }
+    int question_index = 0;
+    for (int index = source_index + 1; index < message_count; ++index) {
+        json message = messages[index];
+        if (message.is_object() && message.value("role", "") == "user") {
+            if (plan.mode == EvidenceMode::Append && !plan.ledger_reset &&
+                question_index < (int) ledger.committed_users.size()) {
+                message["content"] =
+                    ledger.committed_users[(size_t) question_index];
+            } else if (plan.mode == EvidenceMode::Append &&
+                       question_index == (int) question_texts.size() - 1) {
+                message["content"] = compose_evidence_message(
+                    block, question_texts[(size_t) question_index]);
+            } else {
+                message["content"] = question_texts[(size_t) question_index];
+            }
+            ++question_index;
+        }
+        managed_messages.push_back(std::move(message));
+    }
+
+    const std::vector<ChatMessage> chat_messages = normalize_chat_messages(
+        managed_messages, req.format, tool_memory_);
+    std::string rendered;
+    std::string render_error;
+    if (!render_messages_to_text(
+            chat_messages, req, /*add_generation_prompt=*/true,
+            rendered, render_error)) {
+        return "pflash_evidence re-render failed: " + render_error;
+    }
+
+    prepared.tokens = tokenizer_.encode(rendered);
+    prepared.compressed = true;
+
+    commit_evidence_turn(
+        ledger, plan, question_texts, block, source_revision,
+        (int) source_ids.size(), evidence_config.rebuild_window);
+
+    std::string emit_chunks_str;
+    for (int chunk : plan.emit_chunks) {
+        if (!emit_chunks_str.empty()) emit_chunks_str += ",";
+        emit_chunks_str += std::to_string(chunk);
+    }
+    std::string fresh_chunks_str;
+    for (int chunk : plan.fresh) {
+        if (!fresh_chunks_str.empty()) fresh_chunks_str += ",";
+        fresh_chunks_str += std::to_string(chunk);
+    }
+    std::fprintf(stderr,
+        "[evidence] session=%s turn=%d mode=%s src=%zu drafter toks "
+        "fresh=%zu emit=%zu spans (%d toks) resident=%d projected=%d "
+        "prompt=%zu target toks reset=%d emit_chunks=%s fresh_chunks=%s\n",
+        req.session_id.c_str(), plan.question_turns,
+        plan.mode == EvidenceMode::Rebuild ? "rebuild" : "append",
+        source_ids.size(), plan.fresh.size(), plan.emit.size(),
+        plan.emit_tokens, plan.resident_tokens, plan.projected_total,
+        prepared.tokens.size(), (int) plan.ledger_reset,
+        emit_chunks_str.c_str(), fresh_chunks_str.c_str());
+    std::fflush(stderr);
+    return {};
+}
+
 HttpServer::PreparedPrompt HttpServer::prepare_prompt(
         const ParsedRequest & req) {
     PreparedPrompt prepared;
     prepared.tokens = req.prompt_tokens;
 
-    if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+    // Evidence-managed sessions own their prompt layout across turns;
+    // bypass FlowKV, the turn-1 anchor rule, and whole-prompt PFlash.
+    if (req.pflash_evidence) {
+        if (config_.pflash_mode == ServerConfig::PflashMode::OFF ||
+            drafter_tokenizer_ == nullptr) {
+            prepared.error_status = 400;
+            prepared.error =
+                "pflash_evidence requires PFlash compression "
+                "(--prefill-compression) with a drafter tokenizer";
+            return prepared;
+        }
+        prepared.error = apply_evidence_management(req, prepared);
+        if (!prepared.error.empty()) {
+            if (prepared.error_status == 0) prepared.error_status = 500;
+            return prepared;
+        }
+    } else if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
         drafter_tokenizer_ != nullptr) {
         const int prompt_tokens = (int) req.prompt_tokens.size();
         bool should_compress =
