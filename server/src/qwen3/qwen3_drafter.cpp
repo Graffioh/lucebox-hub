@@ -405,6 +405,10 @@ struct PFlashTraceFields {
     const std::vector<PFlashTokenSpan> * segments = nullptr;
     const char * segmentation = "fixed";
     const char * candidate_score = "sum";
+    // Two-scorer selection: the other scorer's candidate scores, same order.
+    const char * scorer = "head";
+    double split_fraction = 0.0;
+    const std::vector<double> * other_chunk_scores = nullptr;
 };
 
 static void write_compression_trace(
@@ -486,8 +490,18 @@ static void write_compression_trace(
         }
     }
     if (trace_fields) {
-        std::fprintf(file, ",\"segmentation\":\"%s\",\"candidate_score\":\"%s\"",
-                     trace_fields->segmentation, trace_fields->candidate_score);
+        std::fprintf(file, ",\"segmentation\":\"%s\",\"candidate_score\":\"%s\",\"scorer\":\"%s\",\"split_fraction\":%.4f",
+                     trace_fields->segmentation, trace_fields->candidate_score,
+                     trace_fields->scorer, trace_fields->split_fraction);
+        if (trace_fields->other_chunk_scores) {
+            std::fputs(",\"other_chunk_scores\":[", file);
+            for (size_t index = 0; index < trace_fields->other_chunk_scores->size(); ++index) {
+                const double score = (*trace_fields->other_chunk_scores)[index];
+                if (index) std::fputc(',', file);
+                if (std::isfinite(score)) std::fprintf(file, "%.9g", score); else std::fputs("null", file);
+            }
+            std::fputc(']', file);
+        }
         if (trace_fields->segments) {
             std::fputs(",\"segments\":[", file);
             for (size_t index = 0; index < trace_fields->segments->size(); ++index) {
@@ -549,7 +563,9 @@ static std::vector<int32_t> select_longattncomp_chunks(
         bool direct_mass,
         bool write_trace,
         const std::vector<PFlashTokenSpan> * segments = nullptr,
-        bool density = false) {
+        bool density = false,
+        const std::vector<float> * other_token_scores = nullptr,
+        double split_fraction = 0.0) {
     const int input_tokens = (int) ids.size();
     const int query_end = score_query_end < 0 ? input_tokens : score_query_end;
     const int query_tokens = std::min(n_lookahead, query_end);
@@ -586,12 +602,28 @@ static std::vector<int32_t> select_longattncomp_chunks(
         chunk_means.push_back({(float) score, chunk});
         exact_chunk_scores.push_back(score);
     }
+    // Two-scorer selection: the other scorer's mean per-token score over the
+    // same spans (its native ranking rule).
+    std::vector<dflash::qwen3::PFlashSelectionCandidate> other_candidates;
+    std::vector<double> other_scores;
+    const bool split = other_token_scores != nullptr && split_fraction > 0.0;
+    if (split) {
+        for (const auto & candidate : candidates) {
+            double score = 0.0;
+            for (int token = candidate.begin; token < candidate.end; ++token) {
+                score += (*other_token_scores)[(size_t) token];
+            }
+            score /= (double) std::max(1, candidate.end - candidate.begin);
+            other_candidates.push_back({candidate.ordinal, candidate.begin, candidate.end, score, candidate.mandatory});
+            other_scores.push_back(score);
+        }
+    }
 
-    const auto selected = dflash::qwen3::select_pflash_candidates(
-        candidates,
-        dflash::qwen3::PFlashSelectionPolicy{selector_budget, config.top_p,
-                                             /*skip_oversized=*/ segments != nullptr},
-        config.mode);
+    const dflash::qwen3::PFlashSelectionPolicy policy{selector_budget, config.top_p,
+                                                      /*skip_oversized=*/ segments != nullptr};
+    const auto selected = split
+        ? dflash::qwen3::select_pflash_split(candidates, other_candidates, policy, split_fraction, config.mode)
+        : dflash::qwen3::select_pflash_candidates(candidates, policy, config.mode);
     if (!selected.ok) {
         set_last_error("PFlash LongAttnComp selection failed: " + selected.error);
         std::fprintf(stderr,
@@ -627,9 +659,10 @@ static std::vector<int32_t> select_longattncomp_chunks(
     }
 
     std::fprintf(stderr,
-        "[pflash-longattncomp] selected mode=%s segments=%s score=%s chunk=%d query=%d "
+        "[pflash-longattncomp] selected mode=%s scorer=%s segments=%s score=%s chunk=%d query=%d "
         "budget=%d selected_tokens=%zu chunks=%zu/%d stop=%s mass=%.9g\n",
         dflash::qwen3::pflash_selection_mode_name(config.mode),
+        split ? "split" : "single",
         segments ? "probe" : "fixed", density ? "density" : "sum",
         segments ? 0 : config.chunk_size, query_tokens, selector_budget, output.size(),
         selected.ordinals.size(), n_chunks,
@@ -650,6 +683,9 @@ static std::vector<int32_t> select_longattncomp_chunks(
         strict_fields.segments = segments;
         strict_fields.segmentation = segments ? "probe" : "fixed";
         strict_fields.candidate_score = density ? "density" : "sum";
+        strict_fields.scorer = split ? "split" : dflash::qwen3::pflash_scorer_name(config.scorer);
+        strict_fields.split_fraction = split ? split_fraction : 0.0;
+        strict_fields.other_chunk_scores = split ? &other_scores : nullptr;
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,
@@ -893,7 +929,8 @@ static std::vector<int32_t> qwen35_score_and_compress(
     int pool_kernel,
     int score_query_end,
     const dflash::qwen3::PFlashLongAttnCompConfig & experiment,
-    const std::vector<PFlashTokenSpan> & required_instruction_spans) {
+    const std::vector<PFlashTokenSpan> & required_instruction_spans,
+    std::vector<float> * token_scores_out = nullptr) {
 
     const int S = (int)ids.size();
     const int hidden = w.n_embd;
@@ -1162,6 +1199,13 @@ static std::vector<int32_t> qwen35_score_and_compress(
     }
     smooth_score.swap(smoothed);
 
+    if (token_scores_out) {
+        // Scoring only (two-scorer selection): hand the smoothed per-token
+        // scores back and let the caller select.
+        *token_scores_out = smooth_score;
+        return ids;
+    }
+
     if (experiment.selection_active) {
         return select_longattncomp_chunks(
             ids, smooth_score, keep_ratio, n_lookahead, score_query_end,
@@ -1316,7 +1360,10 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
     int n_lookahead,
     int score_query_end,
     const dflash::qwen3::PFlashLongAttnCompConfig & experiment,
-    const std::vector<PFlashTokenSpan> & required_instruction_spans) {
+    const std::vector<PFlashTokenSpan> & required_instruction_spans,
+    std::vector<float> * token_mass_out = nullptr,
+    std::vector<PFlashTokenSpan> * segments_out = nullptr,
+    bool * density_out = nullptr) {
 
     TargetWeights & w = st.weights;
     const int S = (int)ids.size();
@@ -1657,6 +1704,15 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
         std::fflush(stderr);
     }
 
+    if (token_mass_out) {
+        // Scoring only (two-scorer selection): return the per-token mass,
+        // the probe segments and the ranking rule; the caller selects.
+        *token_mass_out = token_mass;
+        if (segments_out) *segments_out = segments;
+        if (density_out) *density_out = density;
+        return ids;
+    }
+
     return select_longattncomp_chunks(
         ids, token_mass, keep_ratio, n_lookahead, score_query_end,
         /*pool_kernel=*/1, experiment, required_instruction_spans,
@@ -1730,13 +1786,50 @@ std::vector<int32_t> drafter_score_and_compress(
         // legacy all-layer running-max scorer stays available for legacy
         // selection or when PFLASH_QWEN35_LEGACY_SCORER=1 forces it.
         const char * legacy_scorer = std::getenv("PFLASH_QWEN35_LEGACY_SCORER");
-        const bool force_legacy = legacy_scorer && std::string(legacy_scorer) == "1";
+        const bool force_legacy = (legacy_scorer && std::string(legacy_scorer) == "1") ||
+            experiment.scorer == dflash::qwen3::PFlashScorer::Legacy;
+        if (experiment.selection_active &&
+            experiment.scorer == dflash::qwen3::PFlashScorer::Split) {
+            // Two scorers, one budget: the block-15 head ranks (and segments)
+            // first, the all-layer running-max scorer fills the remainder.
+            std::vector<float> head_mass;
+            std::vector<PFlashTokenSpan> head_segments;
+            bool head_density = false;
+            if (qwen35_longattncomp_score_and_compress(
+                    *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
+                    required_instruction_spans, &head_mass, &head_segments,
+                    &head_density).empty()) {
+                return {};
+            }
+            std::vector<float> other_scores;
+            if (qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
+                                          n_lookahead, pool_kernel, score_query_end,
+                                          experiment, required_instruction_spans,
+                                          &other_scores).empty()) {
+                return {};
+            }
+            if (other_scores.size() != head_mass.size()) {
+                set_last_error("two-scorer selection: score lengths differ");
+                return {};
+            }
+            std::fprintf(stderr,
+                "[pflash-longattncomp] two-scorer selection: head fraction %.2f, "
+                "segments=%s\n", experiment.split_fraction,
+                head_segments.empty() ? "fixed" : "probe");
+            std::fflush(stderr);
+            return select_longattncomp_chunks(
+                ids, head_mass, keep_ratio, n_lookahead, score_query_end,
+                /*pool_kernel=*/1, experiment, required_instruction_spans,
+                /*direct_mass=*/true, /*write_trace=*/true,
+                head_segments.empty() ? nullptr : &head_segments, head_density,
+                &other_scores, experiment.split_fraction);
+        }
         if (experiment.selection_active && !force_legacy) {
             return qwen35_longattncomp_score_and_compress(
                 *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
                 required_instruction_spans);
         }
-        if (st->head_loaded) {
+        if (st->head_loaded && !experiment.selection_active) {
             set_last_error("Qwen3.5 LongAttnComp head requires strict selection");
             return {};
         }

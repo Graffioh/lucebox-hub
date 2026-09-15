@@ -81,6 +81,10 @@ const char * pflash_query_parser_name(PFlashQueryParser parser) noexcept;
 // loaded, fixed chunks otherwise; density with probe segments, sum otherwise.
 enum class PFlashSegmentation { Auto, Fixed, Probe };
 enum class PFlashCandidateScore { Auto, Sum, Density };
+// Which scorer ranks the candidates: the block-15 attention-mass head, the
+// original all-layer running-max scorer, or both with a split budget (the
+// head fills ``split_fraction`` of the budget first, the other scorer the rest).
+enum class PFlashScorer { Head, Legacy, Split };
 
 struct PFlashLongAttnCompConfig {
     PFlashSelectionMode mode = PFlashSelectionMode::Legacy;
@@ -90,6 +94,8 @@ struct PFlashLongAttnCompConfig {
     double top_p = 0.95;
     PFlashSegmentation segmentation = PFlashSegmentation::Auto;
     PFlashCandidateScore candidate_score = PFlashCandidateScore::Auto;
+    PFlashScorer scorer = PFlashScorer::Head;
+    double split_fraction = 0.5;
     bool configured = false;
     bool selection_active = false;
 };
@@ -109,6 +115,19 @@ std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
     int max_segment,
     const std::vector<int> & forced_cuts);
 
+// Two-scorer selection: ``head`` candidates fill ``head_fraction`` of the
+// budget (mandatory candidates first, charged once), then ``other``
+// candidates (same spans and ordinals, scored by the other scorer) fill what
+// remains, skipping ordinals already selected. Both lists must describe the
+// same spans in the same order.
+PFlashSelectionResult select_pflash_split(
+    const std::vector<PFlashSelectionCandidate> & head,
+    const std::vector<PFlashSelectionCandidate> & other,
+    const PFlashSelectionPolicy & policy,
+    double head_fraction,
+    PFlashSelectionMode mode);
+
+const char * pflash_scorer_name(PFlashScorer scorer) noexcept;
 const char * pflash_segmentation_name(PFlashSegmentation segmentation) noexcept;
 const char * pflash_candidate_score_name(PFlashCandidateScore score) noexcept;
 

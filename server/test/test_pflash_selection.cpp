@@ -569,3 +569,51 @@ TEST_CASE(PFlashSelectionFixture, segmentation_and_score_environment_resolve_or_
     REQUIRE(!resolve_pflash_longattncomp(4096, 1024, invalid, error));
     REQUIRE(error.find("PFLASH_LONGATTNCOMP_SEGMENTS") != std::string::npos);
 }
+
+// ═════════════════════════════════════════════════
+// Two-scorer split selection
+// ═════════════════════════════════════════════════
+
+TEST_CASE(PFlashSelectionFixture, split_selection_fills_head_share_then_other_scorer_without_duplicates) {
+    // Six 100-token chunks; the head ranks 0 > 1 > 2 ..., the other scorer ranks 5 > 4 > 3 ...; chunk 2 mandatory.
+    std::vector<PFlashSelectionCandidate> head, other;
+    for (size_t i = 0; i < 6; ++i) {
+        const int begin = (int) i * 100;
+        head.push_back(candidate(i, begin, begin + 100, 6.0 - (double) i, i == 2));
+        other.push_back(candidate(i, begin, begin + 100, (double) i, i == 2));
+    }
+    // Budget 400, head fraction 0.5: pass 1 keeps mandatory 2 and the head's top 0 (200 tokens);
+    // pass 2 fills 200 tokens from the other scorer's order skipping 2 and 0 -> 5, 4.
+    const auto result = select_pflash_split(head, other, PFlashSelectionPolicy{400, 0.95, false}, 0.5, PFlashSelectionMode::BudgetOnly);
+    REQUIRE(result.ok);
+    require_ordinals(result, {0, 2, 4, 5});
+    REQUIRE(result.retained_tokens == 400);
+    // Mismatched lists fail closed.
+    std::vector<PFlashSelectionCandidate> shifted = other;
+    shifted[1].begin += 1;
+    REQUIRE(!select_pflash_split(head, shifted, PFlashSelectionPolicy{400, 0.95, false}, 0.5, PFlashSelectionMode::BudgetOnly).ok);
+    REQUIRE(!select_pflash_split(head, other, PFlashSelectionPolicy{400, 0.95, false}, 1.5, PFlashSelectionMode::BudgetOnly).ok);
+    // A tiny head share still charges the mandatory span once and the other scorer gets the rest.
+    const auto tiny = select_pflash_split(head, other, PFlashSelectionPolicy{300, 0.95, false}, 0.01, PFlashSelectionMode::BudgetOnly);
+    REQUIRE(tiny.ok);
+    require_ordinals(tiny, {2, 4, 5});
+}
+
+TEST_CASE(PFlashSelectionFixture, scorer_and_split_environment_resolve_or_fail) {
+    CleanPFlashEnv clean;
+    luce_test::ScopedEnvVar scorer{"PFLASH_LONGATTNCOMP_SCORER", nullptr};
+    luce_test::ScopedEnvVar split{"PFLASH_LONGATTNCOMP_SPLIT", nullptr};
+    set_env(kModeEnv, "budget_only");
+    auto config = resolve_or_fail(4096, 1024);
+    REQUIRE(config.scorer == PFlashScorer::Head);
+    set_env("PFLASH_LONGATTNCOMP_SCORER", "split");
+    set_env("PFLASH_LONGATTNCOMP_SPLIT", "0.6");
+    config = resolve_or_fail(4096, 1024);
+    REQUIRE(config.scorer == PFlashScorer::Split);
+    REQUIRE(std::fabs(config.split_fraction - 0.6) < 1e-9);
+    set_env("PFLASH_LONGATTNCOMP_SPLIT", "1.0");
+    PFlashLongAttnCompConfig invalid;
+    std::string error;
+    REQUIRE(!resolve_pflash_longattncomp(4096, 1024, invalid, error));
+    REQUIRE(error.find("PFLASH_LONGATTNCOMP_SPLIT") != std::string::npos);
+}

@@ -22,6 +22,8 @@ constexpr const char * kQueryParserEnv = "PFLASH_LONGATTNCOMP_QUERY_PARSER";
 constexpr const char * kTopPEnv = "PFLASH_LONGATTNCOMP_TOP_P";
 constexpr const char * kSegmentsEnv = "PFLASH_LONGATTNCOMP_SEGMENTS";
 constexpr const char * kSelectEnv = "PFLASH_LONGATTNCOMP_SELECT";
+constexpr const char * kScorerEnv = "PFLASH_LONGATTNCOMP_SCORER";
+constexpr const char * kSplitEnv = "PFLASH_LONGATTNCOMP_SPLIT";
 
 PFlashSelectionResult invalid_result(std::string error) {
     PFlashSelectionResult result;
@@ -70,7 +72,9 @@ bool has_pflash_longattncomp_environment() noexcept {
            std::getenv(kQueryParserEnv) != nullptr ||
            std::getenv(kTopPEnv) != nullptr ||
            std::getenv(kSegmentsEnv) != nullptr ||
-           std::getenv(kSelectEnv) != nullptr;
+           std::getenv(kSelectEnv) != nullptr ||
+           std::getenv(kScorerEnv) != nullptr ||
+           std::getenv(kSplitEnv) != nullptr;
 }
 
 bool pflash_chunk_is_structurally_required(
@@ -298,10 +302,35 @@ bool resolve_pflash_longattncomp(
     const char * top_p_raw = std::getenv(kTopPEnv);
     const char * segments_raw = std::getenv(kSegmentsEnv);
     const char * select_raw = std::getenv(kSelectEnv);
+    const char * scorer_raw = std::getenv(kScorerEnv);
+    const char * split_raw = std::getenv(kSplitEnv);
 
     PFlashLongAttnCompConfig config;
     config.configured = mode_raw || chunk_raw || query_raw ||
-        query_parser_raw || top_p_raw || segments_raw || select_raw;
+        query_parser_raw || top_p_raw || segments_raw || select_raw ||
+        scorer_raw || split_raw;
+    if (scorer_raw) {
+        if (std::strcmp(scorer_raw, "head") == 0) {
+            config.scorer = PFlashScorer::Head;
+        } else if (std::strcmp(scorer_raw, "legacy") == 0) {
+            config.scorer = PFlashScorer::Legacy;
+        } else if (std::strcmp(scorer_raw, "split") == 0) {
+            config.scorer = PFlashScorer::Split;
+        } else {
+            error = std::string(kScorerEnv) + " must be head, legacy or split";
+            return false;
+        }
+    }
+    if (split_raw) {
+        char * end = nullptr;
+        errno = 0;
+        const double value = std::strtod(split_raw, &end);
+        if (errno != 0 || end == split_raw || *end != '\0' || !(value > 0.0 && value < 1.0)) {
+            error = std::string(kSplitEnv) + " must be a fraction in (0, 1)";
+            return false;
+        }
+        config.split_fraction = value;
+    }
     if (segments_raw) {
         if (std::strcmp(segments_raw, "fixed") == 0) {
             config.segmentation = PFlashSegmentation::Fixed;
@@ -425,6 +454,69 @@ std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
         spans.push_back({begin, end});
     }
     return spans;
+}
+
+PFlashSelectionResult select_pflash_split(
+        const std::vector<PFlashSelectionCandidate> & head,
+        const std::vector<PFlashSelectionCandidate> & other,
+        const PFlashSelectionPolicy & policy,
+        double head_fraction,
+        PFlashSelectionMode mode) {
+    PFlashSelectionResult result;
+    if (head.size() != other.size() || !(head_fraction > 0.0 && head_fraction < 1.0)) {
+        result.stop = PFlashSelectionStop::InvalidInput;
+        result.error = "split selection needs matching candidate lists and a fraction in (0, 1)";
+        return result;
+    }
+    for (size_t i = 0; i < head.size(); ++i) {
+        if (head[i].ordinal != other[i].ordinal || head[i].begin != other[i].begin ||
+            head[i].end != other[i].end || head[i].mandatory != other[i].mandatory) {
+            result.stop = PFlashSelectionStop::InvalidInput;
+            result.error = "split selection candidate lists describe different spans";
+            return result;
+        }
+    }
+    PFlashSelectionPolicy first = policy;
+    first.token_budget = static_cast<int>(policy.token_budget * head_fraction);
+    // Mandatory spans must fit even when the head's share is small.
+    int mandatory = 0;
+    for (const auto & c : head) if (c.mandatory) mandatory += c.end - c.begin;
+    first.token_budget = (std::max)(first.token_budget, (std::min)(mandatory, policy.token_budget));
+    const PFlashSelectionResult pass1 = select_pflash_candidates(head, first, mode);
+    if (!pass1.ok) return pass1;
+    std::vector<uint8_t> taken(head.size(), 0);
+    for (size_t ordinal : pass1.ordinals) {
+        for (size_t i = 0; i < head.size(); ++i) if (head[i].ordinal == ordinal) taken[i] = 1;
+    }
+    std::vector<PFlashSelectionCandidate> rest;
+    for (size_t i = 0; i < other.size(); ++i) {
+        if (taken[i]) continue;
+        PFlashSelectionCandidate c = other[i];
+        c.mandatory = false;  // mandatory spans were charged in pass 1
+        rest.push_back(c);
+    }
+    PFlashSelectionPolicy second = policy;
+    second.token_budget = policy.token_budget - pass1.retained_tokens;
+    const PFlashSelectionResult pass2 = second.token_budget > 0
+        ? select_pflash_candidates(rest, second, mode)
+        : PFlashSelectionResult{};
+    result.ok = true;
+    result.ordinals = pass1.ordinals;
+    result.ordinals.insert(result.ordinals.end(), pass2.ordinals.begin(), pass2.ordinals.end());
+    std::sort(result.ordinals.begin(), result.ordinals.end());
+    result.retained_tokens = pass1.retained_tokens + pass2.retained_tokens;
+    result.retained_mass = pass1.retained_mass;  // the head's normalised mass share
+    result.stop = second.token_budget > 0 ? pass2.stop : pass1.stop;
+    return result;
+}
+
+const char * pflash_scorer_name(PFlashScorer scorer) noexcept {
+    switch (scorer) {
+        case PFlashScorer::Head: return "head";
+        case PFlashScorer::Legacy: return "legacy";
+        case PFlashScorer::Split: return "split";
+    }
+    return "unknown";
 }
 
 const char * pflash_segmentation_name(PFlashSegmentation segmentation) noexcept {
