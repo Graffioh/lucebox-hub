@@ -3470,75 +3470,108 @@ std::string HttpServer::apply_pflash_compression(
         });
     compress_request.residency_action = residency;
 
+    // The selector budget is counted in drafter tokens, but the ceiling is
+    // enforced on the re-encoded target-token prompt. Vocabulary mismatches
+    // between the two tokenizers can inflate the re-encode past the ceiling,
+    // so retry with a tightened keep ratio; fail closed if it persists.
+    const int target_ceiling = experiment.selection_active
+        ? http_detail::pflash_target_token_ceiling(
+            prompt_tokens, compress_request.keep_ratio)
+        : -1;
+    if (experiment.selection_active && target_ceiling < 0) {
+        return "PFlash LongAttnComp target-token ceiling is invalid";
+    }
+    const float requested_keep_ratio = compress_request.keep_ratio;
+
     ModelBackend::CompressResult result;
-    if (config_.pflash_remote_drafter) {
-        if (!pflash_remote_.active() &&
-            !pflash_remote_.start(config_.pflash_remote.ipc_bin,
-                                  config_.pflash_drafter_path,
-                                  config_.pflash_drafter_gpu,
-                                  config_.pflash_remote.work_dir)) {
-            return "remote PFlash drafter start failed";
+    std::vector<int32_t> final_tokens;
+    for (int attempt = 0; ; ++attempt) {
+        result = {};
+        if (config_.pflash_remote_drafter) {
+            if (!pflash_remote_.active() &&
+                !pflash_remote_.start(config_.pflash_remote.ipc_bin,
+                                      config_.pflash_drafter_path,
+                                      config_.pflash_drafter_gpu,
+                                      config_.pflash_remote.work_dir)) {
+                return "remote PFlash drafter start failed";
+            }
+            result.ok = pflash_remote_.compress(
+                compress_request.input_ids, compress_request.keep_ratio,
+                result.compressed_ids,
+                compress_request.score_query_end,
+                compress_request.score_query_tokens,
+                compress_request.required_instruction_spans);
+            if (residency == DraftResidencyAction::ReleaseAfterUse) {
+                pflash_remote_.close();
+            }
+        } else {
+            result = backend_.compress(compress_request);
         }
-        result.ok = pflash_remote_.compress(
-            compress_request.input_ids, compress_request.keep_ratio,
-            result.compressed_ids,
-            compress_request.score_query_end,
-            compress_request.score_query_tokens,
-            compress_request.required_instruction_spans);
-        if (residency == DraftResidencyAction::ReleaseAfterUse) {
-            pflash_remote_.close();
+
+        if (!result.ok || result.compressed_ids.empty()) {
+            return config_.pflash_remote_drafter
+                ? "remote PFlash drafter compression failed"
+                : "PFlash compression failed";
         }
-    } else {
-        result = backend_.compress(compress_request);
-    }
 
-    if (!result.ok || result.compressed_ids.empty()) {
-        return config_.pflash_remote_drafter
-            ? "remote PFlash drafter compression failed"
-            : "PFlash compression failed";
-    }
+        std::string compressed_text =
+            drafter_tokenizer_->decode(result.compressed_ids);
 
-    std::string compressed_text =
-        drafter_tokenizer_->decode(result.compressed_ids);
-
-    // Compression is allowed to be lossy, but the active user query must
-    // survive. Re-append short queries when fewer than 80% of their tokens do.
-    if (!experiment.selection_active && !last_user_text.empty()) {
-        int query_kept = 0;
-        if (!semantic_query_ids.empty()) {
-            int query_index = (int) semantic_query_ids.size() - 1;
-            for (int kept_index = (int) result.compressed_ids.size() - 1;
-                 kept_index >= 0 && query_index >= 0; --kept_index) {
-                if (result.compressed_ids[kept_index] == semantic_query_ids[query_index]) {
-                    ++query_kept;
-                    --query_index;
+        // Compression is allowed to be lossy, but the active user query must
+        // survive. Re-append short queries when fewer than 80% of their tokens do.
+        if (!experiment.selection_active && !last_user_text.empty()) {
+            int query_kept = 0;
+            if (!semantic_query_ids.empty()) {
+                int query_index = (int) semantic_query_ids.size() - 1;
+                for (int kept_index = (int) result.compressed_ids.size() - 1;
+                     kept_index >= 0 && query_index >= 0; --kept_index) {
+                    if (result.compressed_ids[kept_index] == semantic_query_ids[query_index]) {
+                        ++query_kept;
+                        --query_index;
+                    }
                 }
             }
-        }
-        const float survival = (float) query_kept /
-            (std::max)(1, (int) semantic_query_ids.size());
-        std::fprintf(stderr,
-            "[pflash] query survival: %d/%d (%.0f%%)\n",
-            query_kept, (int) semantic_query_ids.size(), survival * 100.0f);
-        if (survival < 0.80f && (int) semantic_query_ids.size() < 1000) {
-            compressed_text += "\n" + last_user_text;
+            const float survival = (float) query_kept /
+                (std::max)(1, (int) semantic_query_ids.size());
             std::fprintf(stderr,
-                "[pflash] query below 80%% — re-appended full query (%d tokens)\n",
-                (int) semantic_query_ids.size());
-        } else if (survival < 0.80f) {
-            std::fprintf(stderr,
-                "[pflash] query below 80%% but too large to re-append (%d tokens)\n",
-                (int) semantic_query_ids.size());
+                "[pflash] query survival: %d/%d (%.0f%%)\n",
+                query_kept, (int) semantic_query_ids.size(), survival * 100.0f);
+            if (survival < 0.80f && (int) semantic_query_ids.size() < 1000) {
+                compressed_text += "\n" + last_user_text;
+                std::fprintf(stderr,
+                    "[pflash] query below 80%% — re-appended full query (%d tokens)\n",
+                    (int) semantic_query_ids.size());
+            } else if (survival < 0.80f) {
+                std::fprintf(stderr,
+                    "[pflash] query below 80%% but too large to re-append (%d tokens)\n",
+                    (int) semantic_query_ids.size());
+            }
         }
-    }
 
-    auto final_tokens = tokenizer_.encode(compressed_text);
-    if (experiment.selection_active) {
-        const int target_ceiling = http_detail::pflash_target_token_ceiling(
-            prompt_tokens, compress_request.keep_ratio);
-        if (target_ceiling < 0) {
-            return "PFlash LongAttnComp target-token ceiling is invalid";
+        final_tokens = tokenizer_.encode(compressed_text);
+        if (!experiment.selection_active ||
+            (int) final_tokens.size() <= target_ceiling) {
+            break;
         }
+        const int overflow = (int) final_tokens.size() - target_ceiling;
+        const int tightened = target_ceiling - overflow - 1;
+        if (attempt >= 2 || tightened <= 0) {
+            break;
+        }
+        compress_request.keep_ratio =
+            requested_keep_ratio * (float) tightened /
+            (float) std::max(1, target_ceiling);
+        if (compress_request.keep_ratio <= 0.0f) {
+            break;
+        }
+        std::fprintf(stderr,
+            "[pflash-longattncomp] final prompt %zu exceeds ceiling %d "
+            "(re-encode overshoot); retrying with keep_ratio %.6f\n",
+            final_tokens.size(), target_ceiling,
+            (double) compress_request.keep_ratio);
+        std::fflush(stderr);
+    }
+    if (experiment.selection_active) {
         std::fprintf(stderr,
             "[pflash-longattncomp] final target tokens=%zu ceiling=%d\n",
             final_tokens.size(), target_ceiling);
