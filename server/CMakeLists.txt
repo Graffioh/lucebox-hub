@@ -1674,6 +1674,7 @@ if(DFLASH27B_TESTS)
             test/test_qwen3_buffer_plan.cpp
             test/test_pflash_drafter_ipc.cpp
             test/test_pflash_selection.cpp
+            test/test_evidence_manager.cpp
             test/test_model_test_paths.cpp
             test/test_gguf_mmap.cpp
             test/test_kv_quant.cpp
@@ -1694,6 +1695,7 @@ if(DFLASH27B_TESTS)
         add_executable(test_server_unit ${_server_unit_sources})
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
+            src/server/evidence_manager.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp
@@ -2169,6 +2171,7 @@ if(DFLASH27B_SERVER)
         add_executable(dflash_server
             src/server/server_main.cpp
             src/server/http_server.cpp
+            src/server/evidence_manager.cpp
             src/server/scheduler.cpp
             src/server/model_card.cpp
             src/server/prompt_normalize.cpp

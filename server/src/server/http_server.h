@@ -28,6 +28,7 @@
 #include "common/pflash_drafter_ipc.h"
 #include "model_card.h"
 #include "adaptive_keep_ratio.h"
+#include "evidence_manager.h"
 #include "server_status.h"
 #include "sse_emitter.h"
 #include <nlohmann/json.hpp>
@@ -391,6 +392,11 @@ struct ParsedRequest {
     // compression (e.g. an answer-format directive embedded in a user
     // message). Each occurrence is mapped and retained as a mandatory span.
     std::vector<std::string>  pflash_required;
+    // Multi-turn evidence management opt-in (requires session_id). The
+    // first user message is the session source; `pflash_evidence_source`
+    // overrides its message index.
+    bool                      pflash_evidence = false;
+    int                       pflash_evidence_source = -1;
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
@@ -488,6 +494,8 @@ private:
                                   PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,
                                          PreparedPrompt & prepared);
+    std::string apply_evidence_management(const ParsedRequest & req,
+                                          PreparedPrompt & prepared);
     bool forward_upstream(ServerJob * job, const ParsedRequest & req,
                           const PreparedPrompt & prepared);
 
@@ -685,6 +693,11 @@ private:
     std::unordered_map<PrefixHash, std::string,
                        PrefixHashHasher, PrefixHashEqual> frozen_content_cache_;
 
+    // Multi-turn evidence management: per-session ledgers keyed by
+    // session_id. Bounded; overflow clears (a dropped ledger just rebuilds).
+    static constexpr size_t kEvidenceLedgerMax = 256;
+    std::unordered_map<std::string, EvidenceLedger> evidence_ledgers_;
+
     // Worker thread.
     std::thread                     worker_thread_;
     std::mutex                      queue_mu_;
@@ -783,6 +796,38 @@ inline std::string parse_session_id_from_body(const json & body) {
         return body["session_id"].get<std::string>();
     }
     return {};
+}
+
+// Multi-turn evidence management opt-in. Accepted at the top level or under
+// extra_body, like session_id. `pflash_evidence` may be a bool or an object:
+//   "pflash_evidence": true
+//   "pflash_evidence": {"enabled": true, "source_index": 1}
+// `source_index` (optional) pins which message carries the session source;
+// the default is the first user message.
+inline void parse_pflash_evidence_from_body(
+        const json & body, bool & enabled, int & source_index) {
+    enabled = false;
+    source_index = -1;
+    const json * field = nullptr;
+    if (body.contains("extra_body")) {
+        const auto & eb = body["extra_body"];
+        if (eb.is_object() && eb.contains("pflash_evidence")) {
+            field = &eb["pflash_evidence"];
+        }
+    }
+    if (!field && body.contains("pflash_evidence")) {
+        field = &body["pflash_evidence"];
+    }
+    if (!field) return;
+    if (field->is_boolean()) {
+        enabled = field->get<bool>();
+    } else if (field->is_object()) {
+        enabled = field->value("enabled", true);
+        if (field->contains("source_index") &&
+            (*field)["source_index"].is_number_integer()) {
+            source_index = (*field)["source_index"].get<int>();
+        }
+    }
 }
 
 }  // namespace dflash::common

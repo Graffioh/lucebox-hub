@@ -112,3 +112,38 @@ TEST_CASE(BanditIntegrationFixture, pflash_query_top_level_and_extra_body) {
     json wrong_type = {{"pflash_query", 7}};
     CHECK(parse_pflash_query_from_body(wrong_type).empty());
 }
+
+TEST_CASE(BanditIntegrationFixture, pflash_evidence_bool_and_object) {
+    bool enabled = false;
+    int src = -1;
+    parse_pflash_evidence_from_body({{"pflash_evidence", true}}, enabled, src);
+    CHECK(enabled);
+    CHECK(src == -1);
+    enabled = false;
+    parse_pflash_evidence_from_body(
+        {{"extra_body", {{"pflash_evidence", true}}}}, enabled, src);
+    CHECK(enabled);
+    enabled = false;
+    parse_pflash_evidence_from_body(
+        {{"pflash_evidence", {{"enabled", true}, {"source_index", 2}}}},
+        enabled, src);
+    CHECK(enabled);
+    CHECK(src == 2);
+    enabled = false;
+    src = -1;
+    parse_pflash_evidence_from_body(
+        {{"pflash_evidence", {{"enabled", true}}}}, enabled, src);
+    CHECK(enabled);
+    CHECK(src == -1);
+    enabled = false;
+    src = 9;
+    parse_pflash_evidence_from_body({{"pflash_evidence", false}}, enabled, src);
+    CHECK(!enabled);
+    CHECK(src == -1);
+    parse_pflash_evidence_from_body({{"messages", json::array()}}, enabled, src);
+    CHECK(!enabled);
+    src = 5;
+    parse_pflash_evidence_from_body({{"pflash_evidence", 1}}, enabled, src);
+    CHECK(!enabled);
+    CHECK(src == -1);
+}
