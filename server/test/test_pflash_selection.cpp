@@ -560,6 +560,34 @@ TEST_CASE(PFlashSelectionFixture, probe_segments_oversize_split_keeps_off_the_ne
     }
 }
 
+TEST_CASE(PFlashSelectionFixture, probe_segments_split_scores_feed_only_the_interior_argmax) {
+    // The sub-unit score vector steers the oversize interior split without
+    // touching the boundary threshold or merge floor (recipe 0.8).
+    std::vector<float> boundary(30, 0.0f);
+    boundary[10] = 0.5f;    // unit score in the window — must NOT be used
+    std::vector<float> subunit(30, 0.0f);
+    subunit[8] = 0.6f;      // sub-unit score wins the argmax instead
+    const auto spans = pflash_probe_segments(
+        boundary, 30, 0.9f, 2, 12, {}, subunit);
+    REQUIRE(spans.size() == 3);
+    REQUIRE(spans[0].begin == 0 && spans[0].end == 8);
+    REQUIRE(spans[1].begin == 8 && spans[1].end == 20);
+    REQUIRE(spans[2].begin == 20 && spans[2].end == 30);
+    // An empty split vector falls back to unit scores (v1 artifacts).
+    const auto fallback = pflash_probe_segments(boundary, 30, 0.9f, 2, 12, {}, {});
+    REQUIRE(fallback.size() == 3);
+    REQUIRE(fallback[0].end == 10);
+    // Sub-unit scores never create boundaries below the unit threshold.
+    std::vector<float> flat(30, 0.0f);
+    std::vector<float> hot(30, 0.0f);
+    hot[5] = 1.0f;         // inside max/2: only reachable via the argmax
+    const auto no_new_cuts = pflash_probe_segments(flat, 30, 0.9f, 2, 12, {}, hot);
+    REQUIRE(no_new_cuts.size() == 3);
+    for (const auto & span : no_new_cuts) {
+        REQUIRE(span.end - span.begin <= 12);
+    }
+}
+
 TEST_CASE(PFlashSelectionFixture, skip_oversized_keeps_filling_with_smaller_segments) {
     // Ranked by score: a 600-token segment first, then two 200-token ones. Budget 500.
     const std::vector<PFlashSelectionCandidate> candidates = {

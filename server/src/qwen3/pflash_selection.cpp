@@ -410,13 +410,18 @@ std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
         float threshold,
         int min_segment,
         int max_segment,
-        const std::vector<int> & forced_cuts) {
+        const std::vector<int> & forced_cuts,
+        const std::vector<float> & split_scores) {
     using dflash::common::PFlashTokenSpan;
     std::vector<PFlashTokenSpan> spans;
     if (input_tokens <= 0 || (int) boundary_scores.size() < input_tokens ||
         min_segment < 1 || max_segment < min_segment) {
         return spans;
     }
+    // Sub-unit scores feed only the oversize interior argmax (recipe 0.8);
+    // the boundary threshold and merge floor always read the unit scores.
+    const std::vector<float> & interior =
+        (int) split_scores.size() >= input_tokens ? split_scores : boundary_scores;
     std::vector<uint8_t> forced((size_t) input_tokens + 1, 0);
     for (int cut : forced_cuts) {
         if (cut > 0 && cut < input_tokens) forced[(size_t) cut] = 1;
@@ -445,7 +450,7 @@ std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
             int best = -1;
             float best_score = 0.0f;
             for (int token = lo; token <= hi; ++token) {
-                const float score = boundary_scores[(size_t) token];
+                const float score = interior[(size_t) token];
                 if (std::isfinite(score) && score > best_score) {
                     best_score = score;
                     best = token;

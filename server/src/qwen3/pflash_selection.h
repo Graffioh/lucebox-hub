@@ -105,7 +105,9 @@ struct PFlashLongAttnCompConfig {
 // are always cut; a cut closer than ``min_segment`` tokens to the previous
 // accepted cut is dropped unless forced; a span longer than ``max_segment``
 // is split at its best-scoring interior token, or evenly when no interior
-// token scores above zero. Returns contiguous spans covering
+// token scores above zero. ``split_scores`` (the sub-unit logit when the
+// probe artifact carries one) feeds only the oversize interior argmax; when
+// empty the unit boundary scores are used. Returns contiguous spans covering
 // [0, input_tokens), or an empty vector on invalid input.
 std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
     const std::vector<float> & boundary_scores,
@@ -113,7 +115,8 @@ std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
     float threshold,
     int min_segment,
     int max_segment,
-    const std::vector<int> & forced_cuts);
+    const std::vector<int> & forced_cuts,
+    const std::vector<float> & split_scores = {});
 
 // Two-scorer selection: ``head`` candidates fill ``head_fraction`` of the
 // budget (mandatory candidates first, charged once), then ``other``

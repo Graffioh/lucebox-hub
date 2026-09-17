@@ -119,8 +119,12 @@ struct Qwen35DrafterState {
     ggml_tensor *         probe_fc1_b  = nullptr;  // [probe_width]
     ggml_tensor *         probe_fc2_w  = nullptr;  // [probe_width, 1]
     ggml_tensor *         probe_fc2_b  = nullptr;  // [1]
+    ggml_tensor *         probe_sub_fc2_w = nullptr; // optional sub-unit head (oversize split only)
+    ggml_tensor *         probe_sub_fc2_b = nullptr;
     std::vector<float>    probe_conv_w;            // taps from the GGUF tensor, applied on the CPU
     float                 probe_conv_b = 0.0f;
+    std::vector<float>    probe_sub_conv_w;
+    float                 probe_sub_conv_b = 0.0f;
     float                 probe_norm_eps = 1e-5f;
     float                 probe_threshold = 0.9f;
     int                   probe_min_segment = 1;
@@ -140,8 +144,10 @@ static void free_qwen35_segment_probe(Qwen35DrafterState & st) {
     if (st.probe_buf) { ggml_backend_buffer_free(st.probe_buf); st.probe_buf = nullptr; }
     if (st.probe_ctx) { ggml_free(st.probe_ctx); st.probe_ctx = nullptr; }
     st.probe_norm_w = st.probe_norm_b = st.probe_fc1_w = st.probe_fc1_b =
-        st.probe_fc2_w = st.probe_fc2_b = nullptr;
+        st.probe_fc2_w = st.probe_fc2_b =
+        st.probe_sub_fc2_w = st.probe_sub_fc2_b = nullptr;
     st.probe_conv_w.clear();
+    st.probe_sub_conv_w.clear();
     st.probe_loaded = false;
 }
 
@@ -244,6 +250,7 @@ static bool load_qwen35_longattncomp_head(const std::string & path,
 }
 
 static constexpr const char * kQwen35ProbeSchema = "qwen3_5_0_8b_segment_probe_v1";
+static constexpr const char * kQwen35ProbeSchemaV2 = "qwen3_5_0_8b_segment_probe_v2";
 
 static bool qwen35_metadata_f32(gguf_context * g, const char * key, float & out) {
     const int id = gguf_find_key(g, key);
@@ -284,7 +291,8 @@ static bool load_qwen35_segment_probe(const std::string & path,
         return false;
     };
     if (!qwen35_metadata_equals(g, "general.architecture", "segmentprobe") ||
-        !qwen35_metadata_equals(g, "segmentprobe.schema", kQwen35ProbeSchema) ||
+        (!qwen35_metadata_equals(g, "segmentprobe.schema", kQwen35ProbeSchema) &&
+         !qwen35_metadata_equals(g, "segmentprobe.schema", kQwen35ProbeSchemaV2)) ||
         !qwen35_metadata_equals(g, "segmentprobe.base_model", kQwen35HeadBaseModel) ||
         !qwen35_metadata_equals(g, "segmentprobe.runtime_gguf_sha256", st.gguf_sha256) ||
         !qwen35_metadata_equals(g, "segmentprobe.feature_tap", kQwen35HeadFeatureTap)) {
@@ -348,20 +356,51 @@ static bool load_qwen35_segment_probe(const std::string & path,
     st.probe_conv_w.assign((const float *) conv_w->data,
                            (const float *) conv_w->data + conv_w->ne[0]);
     st.probe_conv_b = ((const float *) conv_b->data)[0];
+    // Optional sub-unit head (schema v2): scores feed only the oversize
+    // split rule's interior argmax. All four tensors ship together or none.
+    ggml_tensor * sub_src = ggml_get_tensor(data_ctx, "segmentprobe.subunit.fc2.weight");
+    ggml_tensor * sub_b_src = nullptr;
+    if (sub_src) {
+        sub_b_src = ggml_get_tensor(data_ctx, "segmentprobe.subunit.fc2.bias");
+        ggml_tensor * sub_cw_src = ggml_get_tensor(data_ctx, "segmentprobe.subunit.conv.weight");
+        ggml_tensor * sub_cb_src = ggml_get_tensor(data_ctx, "segmentprobe.subunit.conv.bias");
+        if (sub_src->type != GGML_TYPE_F32 || ggml_n_dims(sub_src) != 1 ||
+            sub_src->ne[0] != (int64_t) st.probe_width ||
+            !sub_b_src || sub_b_src->type != GGML_TYPE_F32 ||
+            ggml_n_dims(sub_b_src) != 1 || sub_b_src->ne[0] != 1 ||
+            !sub_cw_src || sub_cw_src->type != GGML_TYPE_F32 ||
+            ggml_n_dims(sub_cw_src) != 1 || sub_cw_src->ne[0] != conv_w->ne[0] ||
+            !sub_cb_src || sub_cb_src->type != GGML_TYPE_F32 ||
+            ggml_n_dims(sub_cb_src) != 1 || sub_cb_src->ne[0] != 1) {
+            return fail("segment probe tensor contract mismatch: segmentprobe.subunit");
+        }
+        st.probe_sub_fc2_w = ggml_new_tensor_1d(st.probe_ctx, GGML_TYPE_F32, st.probe_width);
+        ggml_set_name(st.probe_sub_fc2_w, "segmentprobe.subunit.fc2.weight");
+        st.probe_sub_fc2_b = ggml_new_tensor_1d(st.probe_ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(st.probe_sub_fc2_b, "segmentprobe.subunit.fc2.bias");
+        st.probe_sub_conv_w.assign((const float *) sub_cw_src->data,
+                                   (const float *) sub_cw_src->data + sub_cw_src->ne[0]);
+        st.probe_sub_conv_b = ((const float *) sub_cb_src->data)[0];
+    }
     st.probe_buf = ggml_backend_alloc_ctx_tensors(st.probe_ctx, w.backend);
     if (!st.probe_buf) return fail("segment probe buffer allocation failed");
     for (const auto & contract : contracts) {
         ggml_tensor * source = ggml_get_tensor(data_ctx, contract.name);
         ggml_backend_tensor_set(*contract.destination, source->data, 0, ggml_nbytes(source));
     }
+    if (st.probe_sub_fc2_w) {
+        ggml_backend_tensor_set(st.probe_sub_fc2_w, sub_src->data, 0, ggml_nbytes(sub_src));
+        ggml_backend_tensor_set(st.probe_sub_fc2_b, sub_b_src->data, 0, ggml_nbytes(sub_b_src));
+    }
     gguf_free(g);
     ggml_free(data_ctx);
     st.probe_loaded = true;
     std::fprintf(stderr,
         "[qwen35-drafter] loaded segment probe: %s (width %d, threshold %.3f, "
-        "segments %d-%d tokens, %zu conv taps)\n",
+        "segments %d-%d tokens, %zu conv taps%s)\n",
         path.c_str(), st.probe_width, st.probe_threshold,
-        st.probe_min_segment, st.probe_max_segment, st.probe_conv_w.size());
+        st.probe_min_segment, st.probe_max_segment, st.probe_conv_w.size(),
+        st.probe_sub_fc2_w ? ", sub-unit head" : "");
     std::fflush(stderr);
     return true;
 }
@@ -1530,6 +1569,8 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
         experiment.segmentation != dflash::qwen3::PFlashSegmentation::Fixed;
     ggml_tensor * probe_logits = use_probe
         ? ggml_new_tensor_1d(lctx, GGML_TYPE_F32, S) : nullptr;
+    ggml_tensor * subunit_logits = use_probe && st.probe_sub_fc2_w
+        ? ggml_new_tensor_1d(lctx, GGML_TYPE_F32, S) : nullptr;
     ggml_backend_buffer_t lbuf = ggml_backend_alloc_ctx_tensors(lctx, w.backend);
     if (!lbuf) {
         ggml_free(lctx); cleanup();
@@ -1592,15 +1633,25 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
                                          (size_t)b * logits->nb[0]);
         ggml_build_forward_expand(sgf, ggml_cpy(sctx, part, dst));
         if (use_probe) {
-            // Segment probe on the same tap: LayerNorm -> fc1 -> GELU -> fc2.
+            // Segment probe on the same tap: LayerNorm -> fc1 -> GELU trunk,
+            // then one fc2 row per head (unit always; sub-unit when shipped).
             ggml_tensor * p = ggml_norm(sctx, x_c, st.probe_norm_eps);
             p = ggml_add(sctx, ggml_mul(sctx, p, st.probe_norm_w), st.probe_norm_b);
             p = ggml_gelu(sctx, ggml_add(sctx, ggml_mul_mat(sctx, st.probe_fc1_w, p),
                                          st.probe_fc1_b));                      // [width, n]
-            p = ggml_add(sctx, ggml_mul_mat(sctx, st.probe_fc2_w, p), st.probe_fc2_b);  // [1, n]
+            ggml_tensor * unit = ggml_add(sctx, ggml_mul_mat(sctx, st.probe_fc2_w, p),
+                                          st.probe_fc2_b);                      // [1, n]
             ggml_tensor * p_dst = ggml_view_1d(sctx, probe_logits, n,
                                                (size_t)b * ggml_element_size(probe_logits));
-            ggml_build_forward_expand(sgf, ggml_cpy(sctx, ggml_reshape_1d(sctx, p, n), p_dst));
+            ggml_build_forward_expand(sgf, ggml_cpy(sctx, ggml_reshape_1d(sctx, unit, n), p_dst));
+            if (subunit_logits) {
+                ggml_tensor * sub = ggml_add(sctx,
+                    ggml_mul_mat(sctx, st.probe_sub_fc2_w, p), st.probe_sub_fc2_b);
+                ggml_tensor * s_dst = ggml_view_1d(sctx, subunit_logits, n,
+                    (size_t)b * ggml_element_size(subunit_logits));
+                ggml_build_forward_expand(sgf,
+                    ggml_cpy(sctx, ggml_reshape_1d(sctx, sub, n), s_dst));
+            }
         }
     }
     ggml_tensor * probs = ggml_soft_max_ext(sctx, logits, mask,
@@ -1624,9 +1675,15 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
     std::vector<float> probs_h((size_t)S * n_lookahead * H);
     ggml_backend_tensor_get(probs, probs_h.data(), 0, probs_h.size() * sizeof(float));
     std::vector<float> probe_raw;
+    std::vector<float> subunit_raw;
     if (use_probe) {
         probe_raw.resize((size_t) S);
         ggml_backend_tensor_get(probe_logits, probe_raw.data(), 0, probe_raw.size() * sizeof(float));
+        if (subunit_logits) {
+            subunit_raw.resize((size_t) S);
+            ggml_backend_tensor_get(subunit_logits, subunit_raw.data(), 0,
+                                    subunit_raw.size() * sizeof(float));
+        }
     }
     ggml_gallocr_free(salloc);
     ggml_free(sctx);
@@ -1661,16 +1718,27 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
         // Tap-count smoothing over the raw logits (torch Conv1d, symmetric
         // padding) plus the residual logit, then sigmoid: the boundary score
         // per token.
-        const int conv_taps = (int) st.probe_conv_w.size();
-        const int conv_radius = conv_taps / 2;
-        std::vector<float> boundary((size_t) S, 0.0f);
-        for (int t = 0; t < S; ++t) {
-            float acc = probe_raw[(size_t) t] + st.probe_conv_b;
-            for (int k = 0; k < conv_taps; ++k) {
-                const int u = t + k - conv_radius;
-                if (u >= 0 && u < S) acc += st.probe_conv_w[(size_t) k] * probe_raw[(size_t) u];
+        const auto smooth = [&](const std::vector<float> & raw,
+                                const std::vector<float> & conv_w, float conv_b,
+                                std::vector<float> & out) {
+            const int taps = (int) conv_w.size();
+            const int radius = taps / 2;
+            out.assign((size_t) S, 0.0f);
+            for (int t = 0; t < S; ++t) {
+                float acc = raw[(size_t) t] + conv_b;
+                for (int k = 0; k < taps; ++k) {
+                    const int u = t + k - radius;
+                    if (u >= 0 && u < S) acc += conv_w[(size_t) k] * raw[(size_t) u];
+                }
+                out[(size_t) t] = 1.0f / (1.0f + std::exp(-acc));
             }
-            boundary[(size_t) t] = 1.0f / (1.0f + std::exp(-acc));
+        };
+        std::vector<float> boundary;
+        smooth(probe_raw, st.probe_conv_w, st.probe_conv_b, boundary);
+        // Sub-unit scores feed only the oversize interior argmax below.
+        std::vector<float> split_scores;
+        if (!subunit_raw.empty()) {
+            smooth(subunit_raw, st.probe_sub_conv_w, st.probe_sub_conv_b, split_scores);
         }
         const int query_end = score_query_end < 0 ? S : score_query_end;
         const int query_begin = query_end - std::min(n_lookahead, query_end);
@@ -1688,7 +1756,7 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
         if (boundaries_in_context >= 4 || forced_probe) {
             segments = dflash::qwen3::pflash_probe_segments(
                 boundary, S, st.probe_threshold, st.probe_min_segment,
-                st.probe_max_segment, forced);
+                st.probe_max_segment, forced, split_scores);
         }
         if (segments.empty()) {
             std::fprintf(stderr,
