@@ -436,11 +436,15 @@ std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
         int begin = cuts[index - 1];
         const int end = cuts[index];
         while (end - begin > max_segment) {
-            // Split at the best-scoring interior token at least min_segment
-            // from both edges, else on a fixed grid.
+            // Split at the best-scoring interior token in the second half of
+            // the next max_segment piece (the distance guard keeps the split
+            // off the near edge), honoring the min_segment margins on both
+            // sides; else on a fixed grid.
+            const int lo = std::max(begin + min_segment, begin + max_segment / 2);
+            const int hi = std::min(end - min_segment, begin + max_segment);
             int best = -1;
             float best_score = 0.0f;
-            for (int token = begin + min_segment; token <= end - min_segment; ++token) {
+            for (int token = lo; token <= hi; ++token) {
                 const float score = boundary_scores[(size_t) token];
                 if (std::isfinite(score) && score > best_score) {
                     best_score = score;

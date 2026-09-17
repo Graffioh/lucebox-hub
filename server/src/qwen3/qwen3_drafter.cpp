@@ -119,7 +119,7 @@ struct Qwen35DrafterState {
     ggml_tensor *         probe_fc1_b  = nullptr;  // [probe_width]
     ggml_tensor *         probe_fc2_w  = nullptr;  // [probe_width, 1]
     ggml_tensor *         probe_fc2_b  = nullptr;  // [1]
-    std::vector<float>    probe_conv_w;            // 5 taps, applied on the CPU
+    std::vector<float>    probe_conv_w;            // taps from the GGUF tensor, applied on the CPU
     float                 probe_conv_b = 0.0f;
     float                 probe_norm_eps = 1e-5f;
     float                 probe_threshold = 0.9f;
@@ -340,11 +340,13 @@ static bool load_qwen35_segment_probe(const std::string & path,
     }
     ggml_tensor * conv_w = ggml_get_tensor(data_ctx, "segmentprobe.conv.weight");
     ggml_tensor * conv_b = ggml_get_tensor(data_ctx, "segmentprobe.conv.bias");
-    if (!conv_w || conv_w->type != GGML_TYPE_F32 || ggml_n_dims(conv_w) != 1 || conv_w->ne[0] != 5 ||
+    if (!conv_w || conv_w->type != GGML_TYPE_F32 || ggml_n_dims(conv_w) != 1 ||
+        conv_w->ne[0] < 1 || conv_w->ne[0] % 2 != 1 ||
         !conv_b || conv_b->type != GGML_TYPE_F32 || ggml_n_dims(conv_b) != 1 || conv_b->ne[0] != 1) {
         return fail("segment probe tensor contract mismatch: segmentprobe.conv");
     }
-    st.probe_conv_w.assign((const float *) conv_w->data, (const float *) conv_w->data + 5);
+    st.probe_conv_w.assign((const float *) conv_w->data,
+                           (const float *) conv_w->data + conv_w->ne[0]);
     st.probe_conv_b = ((const float *) conv_b->data)[0];
     st.probe_buf = ggml_backend_alloc_ctx_tensors(st.probe_ctx, w.backend);
     if (!st.probe_buf) return fail("segment probe buffer allocation failed");
@@ -357,9 +359,9 @@ static bool load_qwen35_segment_probe(const std::string & path,
     st.probe_loaded = true;
     std::fprintf(stderr,
         "[qwen35-drafter] loaded segment probe: %s (width %d, threshold %.3f, "
-        "segments %d-%d tokens)\n",
+        "segments %d-%d tokens, %zu conv taps)\n",
         path.c_str(), st.probe_width, st.probe_threshold,
-        st.probe_min_segment, st.probe_max_segment);
+        st.probe_min_segment, st.probe_max_segment, st.probe_conv_w.size());
     std::fflush(stderr);
     return true;
 }
@@ -1656,13 +1658,16 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
     std::vector<PFlashTokenSpan> segments;
     bool density = experiment.candidate_score == dflash::qwen3::PFlashCandidateScore::Density;
     if (use_probe) {
-        // 5-tap smoothing over the raw logits (torch Conv1d, padding 2) plus
-        // the residual logit, then sigmoid: the boundary score per token.
+        // Tap-count smoothing over the raw logits (torch Conv1d, symmetric
+        // padding) plus the residual logit, then sigmoid: the boundary score
+        // per token.
+        const int conv_taps = (int) st.probe_conv_w.size();
+        const int conv_radius = conv_taps / 2;
         std::vector<float> boundary((size_t) S, 0.0f);
         for (int t = 0; t < S; ++t) {
             float acc = probe_raw[(size_t) t] + st.probe_conv_b;
-            for (int k = 0; k < 5; ++k) {
-                const int u = t + k - 2;
+            for (int k = 0; k < conv_taps; ++k) {
+                const int u = t + k - conv_radius;
                 if (u >= 0 && u < S) acc += st.probe_conv_w[(size_t) k] * probe_raw[(size_t) u];
             }
             boundary[(size_t) t] = 1.0f / (1.0f + std::exp(-acc));

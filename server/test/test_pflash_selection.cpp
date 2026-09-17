@@ -532,6 +532,34 @@ TEST_CASE(PFlashSelectionFixture, probe_segments_split_oversized_spans_at_best_i
     REQUIRE(pflash_probe_segments(scores, 30, 0.9f, 0, 12, {}).empty());
 }
 
+TEST_CASE(PFlashSelectionFixture, probe_segments_oversize_split_keeps_off_the_near_edge) {
+    // The distance guard searches [begin + max/2, begin + max]: a score near
+    // the span start cannot produce a tiny leading fragment.
+    std::vector<float> scores(30, 0.0f);
+    scores[3] = 0.5f;    // below threshold and inside max_segment/2: ignored
+    const auto spans = pflash_probe_segments(scores, 30, 0.9f, 2, 12, {});
+    REQUIRE(spans.size() == 3);
+    REQUIRE(spans[0].begin == 0 && spans[0].end == 12);
+    REQUIRE(spans[1].begin == 12 && spans[1].end == 24);
+    REQUIRE(spans[2].begin == 24 && spans[2].end == 30);
+    // An interior score in the guarded window still wins over the grid.
+    std::vector<float> interior(30, 0.0f);
+    interior[10] = 0.5f;
+    const auto guarded = pflash_probe_segments(interior, 30, 0.9f, 2, 12, {});
+    REQUIRE(guarded.size() == 3);
+    REQUIRE(guarded[0].end == 10);
+    // The emitted piece never exceeds max_segment even when the best score
+    // sits at the window edge.
+    std::vector<float> edge(40, 0.0f);
+    edge[11] = 0.7f;     // at begin + max_segment - 1: still inside the window
+    edge[30] = 0.9f;
+    const auto capped = pflash_probe_segments(edge, 40, 0.9f, 2, 12, {30});
+    REQUIRE(!capped.empty());
+    for (const auto & span : capped) {
+        REQUIRE(span.end - span.begin <= 12);
+    }
+}
+
 TEST_CASE(PFlashSelectionFixture, skip_oversized_keeps_filling_with_smaller_segments) {
     // Ranked by score: a 600-token segment first, then two 200-token ones. Budget 500.
     const std::vector<PFlashSelectionCandidate> candidates = {
