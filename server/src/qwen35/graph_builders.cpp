@@ -859,8 +859,7 @@ bool build_target_step_paged_tree(
     int n_prefill_tokens,
     const QwenPrefillSegment * prefill_segments,
     int n_prefill_segments,
-    int n_logits_rows,
-    int direct_attn_rows) {
+    int n_logits_rows) {
     (void)kq_stride_pad;
 
     int n_direct_rows = 0;
@@ -896,14 +895,6 @@ bool build_target_step_paged_tree(
     }
     const int tree_rows = static_cast<int>(tree_rows64);
     const int n_tokens = n_direct_rows + tree_rows;
-    if (direct_attn_rows < 0 ||
-        (direct_attn_rows > 0 &&
-         (n_direct_rows == 0 || direct_attn_rows < n_direct_rows ||
-          (int64_t)direct_attn_rows > (int64_t)n_prefill_tokens + 64))) {
-        step_graph_free(sg);
-        return false;
-    }
-    const int query_rows = std::max(n_tokens, direct_attn_rows);
     const int fixed_logits_rows = mapped_ar_seqs + tree_rows;
     if (n_logits_rows < 0 || n_logits_rows > n_tokens ||
         (n_logits_rows > 0 &&
@@ -922,7 +913,7 @@ bool build_target_step_paged_tree(
     const TargetPagedTreeGraphKey graph_key{
         &w, &cache, backend, tree_width, n_tree_seqs,
         paged_launch_kv_len, tree_scratch_base, tree_scratch_stride,
-        mapped_ar_seqs, n_logits_rows, direct_attn_rows, prefill_shape,
+        mapped_ar_seqs, n_logits_rows, prefill_shape,
     };
     if (sg.paged_tree_key && *sg.paged_tree_key == graph_key) {
         return true;
@@ -963,7 +954,6 @@ bool build_target_step_paged_tree(
             shape_hash *= 1099511628211ull;
         };
         hash_shape(n_logits_rows);
-        hash_shape(direct_attn_rows);
         for (int value : prefill_shape) hash_shape(value);
         shape_salt = static_cast<int>(shape_hash % 64);
     }
@@ -985,10 +975,10 @@ bool build_target_step_paged_tree(
     sg.state_slot_ids =
         ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_mapped_seqs);
     sg.paged_query_seq_ids =
-        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, query_rows);
+        ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
     if (n_direct_rows > 0) {
         sg.paged_query_positions =
-            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, query_rows);
+            ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
     }
     sg.kv_write_rows = ggml_new_tensor_2d(
         sg.ctx, GGML_TYPE_I64, n_tokens, w.n_head_kv);
@@ -1048,7 +1038,6 @@ bool build_target_step_paged_tree(
     gi.n_prefill_tokens = n_prefill_tokens;
     gi.n_seqs = n_tree_seqs;
     gi.mapped_ar_seqs = mapped_ar_seqs;
-    gi.direct_attn_rows = direct_attn_rows;
     gi.paged_max_kv_len = paged_launch_kv_len;
     gi.tree_width = tree_width;
     gi.tree_scratch_base = tree_scratch_base;

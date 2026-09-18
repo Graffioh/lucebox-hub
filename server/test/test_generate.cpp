@@ -135,37 +135,195 @@ static bool write_generate_tokens(const std::string & path,
     return (bool)f;
 }
 
+static bool capture_recurrent_state(
+        const TargetCache & cache, int slot, std::vector<uint8_t> & bytes) {
+    if (slot < 0 || slot >= cache.n_seq_slots) return false;
+    bytes.clear();
+    const auto append_slot = [&](ggml_tensor * tensor) {
+        if (!tensor || ggml_nbytes(tensor) % cache.n_seq_slots != 0) {
+            return false;
+        }
+        const size_t slab = ggml_nbytes(tensor) / cache.n_seq_slots;
+        const size_t old_size = bytes.size();
+        bytes.resize(old_size + slab);
+        ggml_backend_tensor_get(
+            tensor, bytes.data() + old_size,
+            static_cast<size_t>(slot) * slab, slab);
+        return true;
+    };
+    for (ggml_tensor * tensor : cache.conv_state) {
+        if (!append_slot(tensor)) return false;
+    }
+    for (ggml_tensor * tensor : cache.ssm_state) {
+        if (!append_slot(tensor)) return false;
+    }
+    return !bytes.empty();
+}
+
+// Seed every case at C4 before retiring peers. This exposes a request's
+// MMVQ/MMQ or float matvec/matrix transition without changing its input state.
+static std::vector<std::string> check_decode_batch_invariance(
+        ContractQwen35Backend & backend, SeqEngine & engine, bool with_draft) {
+    std::vector<std::string> violations;
+    const char * wmma = std::getenv("DFLASH27B_PAGED_WMMA");
+    if (wmma && std::atoi(wmma) != 0) {
+        std::printf("decode batch invariance skipped: opt-in WMMA uses a separate numerical policy\n");
+        return violations;
+    }
+    const auto require = [&](bool ok, const char * message) {
+        if (!ok) violations.emplace_back(message);
+        return ok;
+    };
+    struct CaseResult {
+        std::vector<int32_t> pending, emitted;
+        std::vector<uint8_t> before, after, logits;
+    };
+    uint64_t next_request_id = 10000;
+    const auto run_case = [&](int cohort, bool speculate, CaseResult & output) {
+        std::vector<int> slots;
+        std::vector<int32_t> pending(4, -1);
+        const auto finish = [&](bool ok) {
+            for (int slot : slots) if (slot >= 0) engine.retire(slot);
+            return ok;
+        };
+        for (int i = 0; i < 4; ++i) {
+            std::vector<int32_t> prompt(i == 3 ? 33 : 2);
+            for (size_t j = 0; j < prompt.size(); ++j) {
+                prompt[j] = 31 + 10 * i + static_cast<int32_t>(j % 4);
+            }
+            const auto admitted = engine.admit(next_request_id++, prompt, SamplerCfg{});
+            if (!require(admitted.status == SeqEngine::AdmitResult::Status::admitted,
+                         "decode invariance fixture could not admit C4")) {
+                return finish(false);
+            }
+            slots.push_back(admitted.slot);
+        }
+        int step_index = 0;
+        const auto execute = [&](const SeqEngine::StepPlan & plan,
+                                  SeqEngine::StepResult & result) {
+            ++step_index;
+            result = engine.step(plan);
+            const std::string protocol_error =
+                validate_step_result(plan, result, engine.slot_count());
+            if (!result.ok() || !protocol_error.empty()) {
+                violations.emplace_back(
+                    "decode invariance C" + std::to_string(cohort) +
+                    " speculate=" + std::to_string(speculate) +
+                    " step=" + std::to_string(step_index) +
+                    " engine='" + result.error + "' protocol='" + protocol_error + "'");
+                return false;
+            }
+            for (const auto & row : result.prefills) {
+                if (!require(row.status == SeqEngine::PrefillOutput::Status::completed &&
+                                 row.token >= 0,
+                             "decode invariance fixture prefill failed")) return false;
+                const auto it = std::find(slots.begin(), slots.end(), row.slot);
+                if (it != slots.end()) pending[it - slots.begin()] = row.token;
+            }
+            for (const auto & row : result.decode) {
+                if (!require(!row.failed && row.token >= 0,
+                             "decode invariance fixture decode failed")) return false;
+                const auto it = std::find(slots.begin(), slots.end(), row.slot);
+                if (it != slots.end()) pending[it - slots.begin()] = row.token;
+            }
+            return true;
+        };
+        SeqEngine::StepResult result;
+        // Include every already-decoding peer while prefilling the next pair.
+        for (int begin : {0, 2}) {
+            SeqEngine::StepPlan plan;
+            for (int i = 0; i < begin; ++i) {
+                plan.decode.push_back({slots[i], pending[i], false});
+            }
+            for (int i = begin; i < begin + 2; ++i) {
+                plan.prefills.push_back({slots[i], i == 3 ? 33 : 2});
+            }
+            if (!execute(plan, result)) return finish(false);
+        }
+        SeqEngine::StepPlan seed;
+        for (int i = 0; i < 4; ++i) seed.decode.push_back({slots[i], pending[i], false});
+        if (!execute(seed, result) ||
+            !require(!backend.step_graph().parent_ids &&
+                         std::all_of(result.decode.begin(), result.decode.end(),
+                             [](const auto & row) { return row.committed_tokens.empty(); }),
+                     "decode invariance common seed attempted speculation")) {
+            return finish(false);
+        }
+        output.pending = pending;
+        for (int i = cohort - 1; i < 3; ++i) {
+            engine.retire(slots[i]);
+            slots[i] = -1;
+        }
+        if (!require(capture_recurrent_state(backend.cache(), slots[3], output.before),
+                     "decode invariance pre-step state capture failed")) return finish(false);
+        SeqEngine::StepPlan plan;
+        for (int i = 0; i < 4; ++i) {
+            if (slots[i] >= 0) plan.decode.push_back({slots[i], pending[i], speculate});
+        }
+        if (!execute(plan, result)) return finish(false);
+        const StepGraph & graph = backend.step_graph();
+        const bool expected_shape = speculate
+            ? graph.parent_ids && graph.parent_ids->ne[0] == 8 &&
+                graph.parent_ids->ne[1] == cohort
+            : !graph.parent_ids;
+        const int root_row = (cohort - 1) * (speculate ? 8 : 1);
+        if (!require(expected_shape && graph.logits &&
+                         graph.logits->type == GGML_TYPE_F32 &&
+                         root_row < graph.logits->ne[1],
+                     "decode invariance fixture used an unexpected target graph")) {
+            return finish(false);
+        }
+        output.logits.resize(graph.logits->ne[0] * sizeof(float));
+        ggml_backend_tensor_get(graph.logits, output.logits.data(),
+                                root_row * graph.logits->nb[1], output.logits.size());
+        for (const auto & row : result.decode) {
+            if (!speculate && !require(row.committed_tokens.empty(),
+                    "ordinary decode invariance fixture returned a speculative burst")) {
+                return finish(false);
+            }
+            if (row.slot == slots[3]) {
+                output.emitted = row.committed_tokens;
+                output.emitted.push_back(row.token);
+            }
+        }
+        if (!require(!output.emitted.empty() &&
+                         capture_recurrent_state(backend.cache(), slots[3], output.after),
+                     "decode invariance post-step state capture failed")) return finish(false);
+        return finish(true);
+    };
+    for (bool speculate : {false, true}) {
+        if (speculate && !with_draft) continue;
+        CaseResult reference;
+        if (!run_case(4, speculate, reference)) continue;
+        for (int cohort : {1, 2, 3}) {
+            if (speculate && cohort != 3) continue;
+            CaseResult other;
+            if (!run_case(cohort, speculate, other)) continue;
+            if (!require(reference.pending == other.pending && reference.before == other.before,
+                         "decode invariance fixture did not reproduce its C4 seed")) continue;
+            require(reference.logits == other.logits,
+                    "changing the decode cohort changed the request's root logits");
+            const size_t common = std::min(reference.emitted.size(), other.emitted.size());
+            require(std::equal(reference.emitted.begin(), reference.emitted.begin() + common,
+                               other.emitted.begin()),
+                    "changing the decode cohort changed the request's emitted tokens");
+            // Different accepted counts end at different positions. Root logits
+            // remain comparable; durable state is comparable at equal positions.
+            if (reference.emitted.size() == other.emitted.size()) {
+                require(reference.after == other.after,
+                        "changing the decode cohort changed durable recurrent state");
+            }
+        }
+    }
+    return violations;
+}
+
 static std::vector<std::string> check_mixed_spec_prompt_tail(
         ContractQwen35Backend & backend, SeqEngine & engine) {
     std::vector<std::string> violations;
     const auto require = [&](bool ok, const char * message) {
         if (!ok) violations.emplace_back(message);
         return ok;
-    };
-    const auto capture_recurrent_state = [&](int slot,
-                                             std::vector<uint8_t> & bytes) {
-        const TargetCache & cache = backend.cache();
-        if (slot < 0 || slot >= cache.n_seq_slots) return false;
-        bytes.clear();
-        const auto append_slot = [&](ggml_tensor * tensor) {
-            if (!tensor || ggml_nbytes(tensor) % cache.n_seq_slots != 0) {
-                return false;
-            }
-            const size_t slab = ggml_nbytes(tensor) / cache.n_seq_slots;
-            const size_t old_size = bytes.size();
-            bytes.resize(old_size + slab);
-            ggml_backend_tensor_get(
-                tensor, bytes.data() + old_size,
-                static_cast<size_t>(slot) * slab, slab);
-            return true;
-        };
-        for (ggml_tensor * tensor : cache.conv_state) {
-            if (!append_slot(tensor)) return false;
-        }
-        for (ggml_tensor * tensor : cache.ssm_state) {
-            if (!append_slot(tensor)) return false;
-        }
-        return !bytes.empty();
     };
 
     std::vector<int32_t> completing_prompt(1024);
@@ -358,16 +516,15 @@ static std::vector<std::string> check_mixed_spec_prompt_tail(
         output.decoder_token = token_a;
         output.peer_token = token_b;
         if (!require(capture_recurrent_state(
-                         completing, output.recurrent_state),
+                         backend.cache(), completing, output.recurrent_state),
                      "mixed-spec boundary recurrent-state capture failed")) {
             retire_all();
             return false;
         }
 
-        // Keeping up to eight ordinary rows preserves the quantized/floating
-        // matvec routes (MMVQ/MMVF). Opt-in WMMA also retains its ordinary graph.
-        const bool expect_tree = allow_speculation &&
-            2 * tail_tokens + 2 > 8 && !paged_wmma;
+        // The canonical projection and attention policies also cover tiny
+        // tails. Opt-in WMMA retains its separate ordinary graph.
+        const bool expect_tree = allow_speculation && !paged_wmma;
         const StepGraph & graph = backend.step_graph();
         if (!expect_tree) {
             require(!graph.parent_ids,
@@ -438,8 +595,8 @@ static std::vector<std::string> check_mixed_spec_prompt_tail(
     for (int tail_tokens : {512, 9, 3, 1}) {
         CaseResult ordinary;
         if (!run_case(tail_tokens, false, false, ordinary)) continue;
-        // Tail nine stays above the protected matvec range and checks compact
-        // AR rows beside a speculative lane with identical seed history.
+        // Tail nine also checks compact AR rows beside a speculative lane
+        // with identical seed history.
         const int variants = tail_tokens == 9 ? 2 : 1;
         for (int variant = 0; variant < variants; ++variant) {
             CaseResult speculative;
@@ -448,7 +605,7 @@ static std::vector<std::string> check_mixed_spec_prompt_tail(
                     "mixed speculation changed the 1024-token prompt-tail result");
             require(speculative.recurrent_state == ordinary.recurrent_state,
                     "mixed speculation changed durable convolution/Gated DeltaNet state");
-            const bool ordinary_route = paged_wmma || 2 * tail_tokens + 2 <= 8;
+            const bool ordinary_route = paged_wmma;
             if (ordinary_route) {
                 require(speculative.decoder_token == ordinary.decoder_token,
                         "mixed-prefill fallback changed the decoder's next token");
@@ -460,8 +617,8 @@ static std::vector<std::string> check_mixed_spec_prompt_tail(
         }
     }
     // The first pending token is at position 249, so a width-eight proposal
-    // crosses the ordinary 256-token attention launch window. Keep this
-    // round ordinary even though its twenty rows exceed the matvec fallback.
+    // crosses the ordinary 256-token attention launch window. The tree
+    // launch must cover the proposal beyond that boundary.
     std::vector<int> boundary_slots;
     const auto admit_boundary = [&](int count, int32_t token) {
         const auto admitted = engine.admit(
@@ -493,12 +650,16 @@ static std::vector<std::string> check_mixed_spec_prompt_tail(
                 require(result.ok() &&
                             validate_step_result(crossing, result,
                                                  engine.slot_count()).empty(),
-                        "launch-boundary fallback returned invalid results");
-                require(!backend.step_graph().parent_ids,
-                        "mixed chain crossed the ordinary attention launch window");
+                        "launch-boundary step returned invalid results");
+                require(bool(backend.step_graph().parent_ids) == !paged_wmma,
+                        "launch-boundary step selected the wrong target graph");
                 for (const auto & row : result.decode) {
-                    require(!row.failed && row.committed_tokens.empty(),
-                            "launch-boundary fallback attempted speculation");
+                    require(!row.failed && row.token >= 0,
+                            "launch-boundary decode failed");
+                    if (paged_wmma) {
+                        require(row.committed_tokens.empty(),
+                                "WMMA fallback attempted speculation");
+                    }
                 }
             }
         }
@@ -551,6 +712,11 @@ static int run_seq_engine_contract(
     }
 
     std::vector<std::string> violations = check_seq_engine_contract(*engine);
+    if (violations.empty() && slots >= 4) {
+        const auto batch_violations =
+            check_decode_batch_invariance(backend, *engine, draft_path != nullptr);
+        violations.insert(violations.end(), batch_violations.begin(), batch_violations.end());
+    }
     if (violations.empty() && draft_path) {
         std::vector<std::string> mixed_violations =
             check_mixed_spec_prompt_tail(backend, *engine);

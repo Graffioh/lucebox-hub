@@ -362,7 +362,7 @@ bool run_case(ggml_backend_t backend,
         ? ggml_paged_attn_ext_tree(
             ctx, q, k, v, table, kv_seq_lens, active,
             positions, scale, BLOCK_SIZE, max_kv_seq_len, parents, sizes,
-            tree_scratch_base, tree->scratch_stride, 0)
+            tree_scratch_base, tree->scratch_stride)
         : ggml_paged_attn_ext(
             ctx, q, k, v, table, kv_seq_lens, active, positions,
             scale, BLOCK_SIZE, max_kv_seq_len);
@@ -482,10 +482,13 @@ bool run_case(ggml_backend_t backend,
 // though its W8 verification graph has far fewer query rows. Keep the visible
 // Q/K/V identical and vary only their durable-versus-scratch representation.
 bool mixed_tree_roots_match_ordinary(ggml_backend_t backend, int prefix,
-                                    int max_kv_len, ggml_type type) {
-    constexpr int ordinary_rows = 1026;
+                                    int max_kv_len, ggml_type type,
+                                    int ordinary_rows = 1026,
+                                    std::vector<float> * cohort_reference = nullptr) {
     constexpr int width = 8;
     constexpr int lanes = 2;
+    GGML_ASSERT(ordinary_rows >= lanes);
+    const int root_row = ordinary_rows - lanes;
     constexpr int tree_rows = width * lanes;
     const TestCase layout{"root-parity", max_kv_len / BLOCK_SIZE,
                           {prefix + 1, prefix + 1}, false};
@@ -521,7 +524,7 @@ bool mixed_tree_roots_match_ordinary(ggml_backend_t backend, int prefix,
     ggml_tensor * tree = ggml_paged_attn_ext_tree(
         ctx, tree_q, k, v, table, tree_lens, tree_slots, nullptr,
         scale, BLOCK_SIZE, max_kv_len, parents, sizes, scratch_base,
-        BLOCK_SIZE, ordinary_rows);
+        BLOCK_SIZE);
     ggml_set_output(ordinary);
     ggml_set_output(tree);
     ggml_cgraph * graph = ggml_new_graph(ctx);
@@ -538,8 +541,8 @@ bool mixed_tree_roots_match_ordinary(ggml_backend_t backend, int prefix,
     std::vector<int32_t> ordinary_ids(ordinary_rows, -1), ordinary_positions(ordinary_rows, -1);
     std::vector<int32_t> tree_ids(tree_rows), parent_ids(tree_rows);
     for (int lane = 0; lane < lanes; ++lane) {
-        ordinary_ids[1024 + lane] = lane;
-        ordinary_positions[1024 + lane] = prefix;
+        ordinary_ids[root_row + lane] = lane;
+        ordinary_positions[root_row + lane] = prefix;
         for (int node = 0; node < width; ++node) {
             tree_ids[lane * width + node] = lane;
             parent_ids[lane * width + node] = node - 1;
@@ -547,21 +550,13 @@ bool mixed_tree_roots_match_ordinary(ggml_backend_t backend, int prefix,
         for (int head = 0; head < N_HEAD; ++head) {
             for (int d = 0; d < D; ++d) {
                 const float value = std::sin(float((head * lanes + lane) * D + d) * 0.013f) * 0.25f;
-                ordinary_queries[(static_cast<size_t>(head) * ordinary_rows + 1024 + lane) * D + d] = value;
+                ordinary_queries[(static_cast<size_t>(head) * ordinary_rows + root_row + lane) * D + d] = value;
                 tree_queries[(static_cast<size_t>(head) * tree_rows + lane * width) * D + d] = value;
             }
         }
     }
     const int32_t prefix_lens[] = {prefix, prefix};
-    ggml_backend_tensor_set(ordinary_q, ordinary_queries.data(), 0, ggml_nbytes(ordinary_q));
-    ggml_backend_tensor_set(tree_q, tree_queries.data(), 0, ggml_nbytes(tree_q));
-    ggml_backend_tensor_set(table, block_table.data(), 0, ggml_nbytes(table));
-    ggml_backend_tensor_set(ordinary_lens, layout.kv_seq_lens.data(), 0, ggml_nbytes(ordinary_lens));
-    ggml_backend_tensor_set(tree_lens, prefix_lens, 0, sizeof(prefix_lens));
-    ggml_backend_tensor_set(ordinary_slots, ordinary_ids.data(), 0, ggml_nbytes(ordinary_slots));
-    ggml_backend_tensor_set(positions, ordinary_positions.data(), 0, ggml_nbytes(positions));
-    ggml_backend_tensor_set(tree_slots, tree_ids.data(), 0, ggml_nbytes(tree_slots));
-    ggml_backend_tensor_set(parents, parent_ids.data(), 0, ggml_nbytes(parents));
+
     std::vector<float> k_source(static_cast<size_t>(D) * pool_tokens * N_HEAD_KV);
     std::vector<float> v_source(k_source.size());
     for (size_t i = 0; i < k_source.size(); ++i) {
@@ -578,7 +573,8 @@ bool mixed_tree_roots_match_ordinary(ggml_backend_t backend, int prefix,
         }
     }
     bool ok = true;
-    std::vector<float> reference_roots;
+    std::vector<float> reference_roots = cohort_reference
+        ? *cohort_reference : std::vector<float>{};
     // Future children are invisible to node zero. Changing them into masked
     // padding, with different payloads, must not change its reduction or output.
     for (int live_nodes : {width, 1}) {
@@ -591,6 +587,17 @@ bool mixed_tree_roots_match_ordinary(ggml_backend_t backend, int prefix,
                 }
             }
         }
+        // Inputs may be reused after their last graph consumer: the tree
+        // output can overwrite ordinary_q. Restore every input for each run.
+        ggml_backend_tensor_set(ordinary_q, ordinary_queries.data(), 0, ggml_nbytes(ordinary_q));
+        ggml_backend_tensor_set(tree_q, tree_queries.data(), 0, ggml_nbytes(tree_q));
+        ggml_backend_tensor_set(table, block_table.data(), 0, ggml_nbytes(table));
+        ggml_backend_tensor_set(ordinary_lens, layout.kv_seq_lens.data(), 0, ggml_nbytes(ordinary_lens));
+        ggml_backend_tensor_set(tree_lens, prefix_lens, 0, sizeof(prefix_lens));
+        ggml_backend_tensor_set(ordinary_slots, ordinary_ids.data(), 0, ggml_nbytes(ordinary_slots));
+        ggml_backend_tensor_set(positions, ordinary_positions.data(), 0, ggml_nbytes(positions));
+        ggml_backend_tensor_set(tree_slots, tree_ids.data(), 0, ggml_nbytes(tree_slots));
+        ggml_backend_tensor_set(parents, parent_ids.data(), 0, ggml_nbytes(parents));
         const auto k_data = quantize_rows(type, k_source, pool_tokens * N_HEAD_KV);
         const auto v_data = quantize_rows(type, v_source, pool_tokens * N_HEAD_KV);
         if (k_data.empty() || v_data.empty()) { ok = false; break; }
@@ -605,20 +612,24 @@ bool mixed_tree_roots_match_ordinary(ggml_backend_t backend, int prefix,
         std::vector<float> actual_roots, expected_roots;
         for (int head = 0; head < N_HEAD; ++head) {
             for (int lane = 0; lane < lanes; ++lane) {
-                const float * expected = ordinary_result.data() + (static_cast<size_t>(head) * ordinary_rows + 1024 + lane) * D;
+                const float * expected = ordinary_result.data() + (static_cast<size_t>(head) * ordinary_rows + root_row + lane) * D;
                 const float * actual = tree_result.data() + (static_cast<size_t>(head) * tree_rows + lane * width) * D;
                 expected_roots.insert(expected_roots.end(), expected, expected + D);
                 actual_roots.insert(actual_roots.end(), actual, actual + D);
             }
         }
-        if (reference_roots.empty()) reference_roots = expected_roots;
+        if (reference_roots.empty()) {
+            reference_roots = expected_roots;
+            if (cohort_reference) *cohort_reference = reference_roots;
+        }
         const auto finite = [](float value) { return std::isfinite(value); };
         const bool equal = std::all_of(actual_roots.begin(), actual_roots.end(), finite) &&
             std::all_of(expected_roots.begin(), expected_roots.end(), finite) &&
             std::memcmp(actual_roots.data(), reference_roots.data(), actual_roots.size() * sizeof(float)) == 0 &&
             std::memcmp(expected_roots.data(), reference_roots.data(), expected_roots.size() * sizeof(float)) == 0;
-        std::printf("paged attention root parity prefix=%d bound=%d type=%s nodes=%d %s\n",
-                    prefix, max_kv_len, ggml_type_name(type), live_nodes, equal ? "PASS" : "FAIL");
+        std::printf("paged attention root parity prefix=%d bound=%d rows=%d type=%s nodes=%d %s\n",
+                    prefix, max_kv_len, ordinary_rows,
+                    ggml_type_name(type), live_nodes, equal ? "PASS" : "FAIL");
         ok = ok && equal;
     }
     ggml_gallocr_free(allocator);
@@ -746,6 +757,28 @@ void run_reference_tree_case() {
     ggml_backend_free(backend);
 }
 
+void run_invariant_tree_case() {
+    luce_test::ScopedEnvVar disable_wmma("DFLASH27B_PAGED_WMMA", "0");
+    ggml_backend_t backend = ggml_backend_cuda_init(0);
+    REQUIRE_NOT_NULL(backend);
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int prefix : {265, 1309}) {
+            std::vector<float> reference;
+            const int short_bound = ((prefix + 1 + 255) / 256) * 256;
+            // A longer peer expands the host launch window while this row's
+            // visible Q/K/V stays identical. Also change the ordinary cohort
+            // width and compare against W8 roots.
+            for (int bound : {short_bound, 8192}) {
+                for (int rows : {2, 3, 4, 16, 24, 32, 1026}) {
+                    CHECK(mixed_tree_roots_match_ordinary(
+                        backend, prefix, bound, type, rows, &reference));
+                }
+            }
+        }
+    }
+    ggml_backend_free(backend);
+}
+
 void run_cyclic_tree_case() {
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     REQUIRE_NOT_NULL(backend);
@@ -836,9 +869,19 @@ TEST_CASE(PagedAttention, MixedTreeRootsPreserveOrdinaryReduction) {
     run_reference_tree_case();
 }
 
-TEST_CASE(PagedAttention, MixedTreeRootsPreserveForcedDirectReduction) {
+TEST_CASE(PagedAttention, MixedTreeRootsPreserveSinglePartitionReduction) {
     luce_test::ScopedEnvVar partitions("GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS", "1");
     run_reference_tree_case();
+}
+
+TEST_CASE(PagedAttention, RootsIgnoreCohortAndLaunchBound) {
+    luce_test::ScopedEnvVar partitions("GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS", "0");
+    run_invariant_tree_case();
+}
+
+TEST_CASE(PagedAttention, TreeRootsPreserveForcedPartitionReduction) {
+    luce_test::ScopedEnvVar partitions("GGML_CUDA_PAGED_ATTN_FORCE_PARTITIONS", "9");
+    run_invariant_tree_case();
 }
 
 TEST_CASE(PagedAttention, CyclicParentMetadataIsMasked) {

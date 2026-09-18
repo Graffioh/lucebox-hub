@@ -175,18 +175,14 @@ TEST_CASE(RecurrentSnapshotFixture, invalidates_paged_tree_graph_cache_key) {
     graph.paged_tree_meta_arena.reset(
         new uint8_t[1], std::default_delete<uint8_t[]>());
     graph.paged_tree_key = TargetPagedTreeGraphKey{
-        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0, 18, 9,
+        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0, 18,
         {1, 3, 0, 2}};
     const TargetPagedTreeGraphKey other_slot{
-        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0, 18, 9,
+        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0, 18,
         {0, 3, 1, 2}};
     const TargetPagedTreeGraphKey other_logits{
-        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0, 19, 9,
+        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0, 19,
         {1, 3, 0, 2}};
-    const TargetPagedTreeGraphKey other_attention{
-        nullptr, nullptr, nullptr, 8, 4, 256, 4096, 16, 0, 18, 11,
-        {1, 3, 0, 2}};
-    CHECK(*graph.paged_tree_key != other_attention);
     CHECK(*graph.paged_tree_key != other_slot);
     CHECK(*graph.paged_tree_key != other_logits);
     step_graph_free(graph);

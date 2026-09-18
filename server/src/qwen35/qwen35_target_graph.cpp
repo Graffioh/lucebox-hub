@@ -1092,22 +1092,39 @@ bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
+// Keep learned projections on the matrix path at small batch sizes too.
+// Matvec and matrix kernels quantize/reduce differently; changing the live
+// request count must not change a token's projected value. Padding belongs
+// to the projection, so it adds no recurrent or KV lanes and also covers
+// compact LM-head rows and short prefill tails.
+static ggml_tensor * build_linear(
+        ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input) {
+    constexpr int64_t min_columns = 16;
+    const int64_t columns = input->ne[1];
+    GGML_ASSERT(input->ne[2] == 1 && input->ne[3] == 1);
+    if (columns >= min_columns) {
+        return ggml_mul_mat(ctx, weight, input);
+    }
+    ggml_tensor * padded = ggml_pad(
+        ctx, input, 0, min_columns - columns, 0, 0);
+    ggml_tensor * projected = ggml_mul_mat(ctx, weight, padded);
+    return ggml_view_2d(
+        ctx, projected, projected->ne[0], columns, projected->nb[1], 0);
+}
+
 static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       const TargetLayer & L) {
-    ggml_tensor * gate = ggml_mul_mat(ctx, L.w_gate, cur);   // [inter, n_tokens]
-    ggml_tensor * up   = ggml_mul_mat(ctx, L.w_up, cur);
+    ggml_tensor * gate = build_linear(ctx, L.w_gate, cur);   // [inter, n_tokens]
+    ggml_tensor * up   = build_linear(ctx, L.w_up, cur);
     ggml_tensor * gu;
     if (L.w_gate_s == 1.0f && L.w_up_s == 1.0f) {
-        // GLU node right after the two matmuls: the CUDA/HIP backend fuses
-        // mul_mat(gate) + mul_mat(up) + swiglu into a single vector kernel
-        // for single-token decode.
         gu = ggml_swiglu_split(ctx, gate, up);
     } else {
         gate = ggml_silu(ctx, apply_scale2(ctx, gate, L.w_gate_s));
         up   = apply_scale2(ctx, up, L.w_up_s);
         gu   = ggml_mul(ctx, gate, up);
     }
-    return apply_scale2(ctx, ggml_mul_mat(ctx, L.w_down, gu), L.w_down_s);                  // [hidden, n_tokens]
+    return apply_scale2(ctx, build_linear(ctx, L.w_down, gu), L.w_down_s);                  // [hidden, n_tokens]
 }
 
 // Full-attention block (matches llama.cpp's build_layer_attn for qwen35)
@@ -1161,15 +1178,14 @@ static ggml_tensor * build_full_attn_block(
     int tree_width = 0,
     int tree_scratch_base = 0,
     int tree_scratch_stride = 0,
-    int paged_logical_max_ctx = 0,
-    int direct_attn_rows = 0
+    int paged_logical_max_ctx = 0
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
     const int n_head_kv = w.n_head_kv;
     const int q_dim = head_dim * n_head;
     // ── Q projection (packed Q || gate), shape [2*q_dim, n_tokens]
-    ggml_tensor * QG = apply_scale2(ctx, ggml_mul_mat(ctx, L.wq, cur), L.wq_s);
+    ggml_tensor * QG = apply_scale2(ctx, build_linear(ctx, L.wq, cur), L.wq_s);
     // Reshape to [head_dim*2, n_head, n_tokens] so we can view the Q and gate halves
     QG = ggml_reshape_3d(ctx, QG, head_dim * 2, n_head, n_tokens);
 
@@ -1191,8 +1207,8 @@ static ggml_tensor * build_full_attn_block(
     gate = ggml_cont_2d(ctx, gate, q_dim, n_tokens);  // [q_dim, n_tokens]
 
     // ── K and V projections
-    ggml_tensor * Kcur = apply_scale2(ctx, ggml_mul_mat(ctx, L.wk, cur), L.wk_s);
-    ggml_tensor * Vcur = apply_scale2(ctx, ggml_mul_mat(ctx, L.wv, cur), L.wv_s);
+    ggml_tensor * Kcur = apply_scale2(ctx, build_linear(ctx, L.wk, cur), L.wk_s);
+    ggml_tensor * Vcur = apply_scale2(ctx, build_linear(ctx, L.wv, cur), L.wv_s);
 
     Kcur = ggml_reshape_3d(ctx, Kcur, head_dim, n_head_kv, n_tokens);
     Kcur = rms_norm_mul(ctx, Kcur, L.k_norm, w.rms_eps);
@@ -1348,7 +1364,7 @@ static ggml_tensor * build_full_attn_block(
                 paged_kv_seq_lens, row_seq_ids, row_positions, kq_scale,
                 PAGED_BLOCK_SIZE, launch_len,
                 paged_tree_parent_ids, paged_tree_sizes,
-                tree_scratch_base, tree_scratch_stride, direct_attn_rows)
+                tree_scratch_base, tree_scratch_stride)
             : ggml_paged_attn_ext(
                 ctx, q, cache_k, cache_v, paged_block_table,
                 paged_kv_seq_lens, row_seq_ids, row_positions, kq_scale,
@@ -1366,61 +1382,13 @@ static ggml_tensor * build_full_attn_block(
         // committed block-table prefix with only this node's ancestor chain.
         const int launch_kv_len = paged_max_kv_len > 0
             ? paged_max_kv_len : kv_start + n_tokens;
-        const int64_t tree_rows64 =
-            paged_tree_parent_ids->ne[0] * paged_tree_parent_ids->ne[1];
-        GGML_ASSERT(tree_rows64 > 0 && tree_rows64 <= n_tokens);
-        const int tree_rows = static_cast<int>(tree_rows64);
-        const int direct_rows = n_tokens - tree_rows;
-
-        if (direct_rows > 0) {
-            // Keep durable prefill/AR rows on the ordinary positioned-row
-            // operator. Folding them into the tree op lets the virtual tree
-            // tail change its partition topology at context boundaries, which
-            // changes the durable forward before any tree transaction runs.
-            GGML_ASSERT(paged_query_positions);
-            const int attention_rows = std::max(direct_rows, direct_attn_rows);
-            ggml_tensor * direct_seq_ids = ggml_view_1d(
-                ctx, paged_query_seq_ids, attention_rows, 0);
-            ggml_tensor * direct_positions = ggml_view_1d(
-                ctx, paged_query_positions, attention_rows, 0);
-            ggml_tensor * Qdirect = q_segment(0, direct_rows);
-            // Tree rows have position -1. Reusing that metadata for zero
-            // queries keeps padding inert while matching ordinary occupancy.
-            ggml_tensor * Qpadded = attention_rows == direct_rows ? Qdirect
-                : ggml_pad(ctx, Qdirect, 0, attention_rows - direct_rows, 0, 0);
-            ggml_tensor * direct_attn = paged_read(
-                Qpadded, launch_kv_len, direct_seq_ids, direct_positions,
-                /*tree_read=*/false, /*dense_token_layout=*/true);
-            if (attention_rows != direct_rows) {
-                direct_attn = ggml_view_3d(
-                    ctx, direct_attn, head_dim, n_head, direct_rows,
-                    direct_attn->nb[1], direct_attn->nb[2], 0);
-            }
-
-            const size_t tree_row_offset =
-                static_cast<size_t>(direct_rows) *
-                paged_query_seq_ids->nb[0];
-            ggml_tensor * tree_seq_ids = ggml_view_1d(
-                ctx, paged_query_seq_ids, tree_rows, tree_row_offset);
-            ggml_tensor * Qtree = q_segment(direct_rows, tree_rows);
-            ggml_tensor * tree_attn = paged_read(
-                Qtree, launch_kv_len, tree_seq_ids,
-                /*row_positions=*/nullptr,
-                /*tree_read=*/true, /*dense_token_layout=*/true);
-
-            attn = ggml_concat(ctx, direct_attn, tree_attn, 2);
-            if (q_fa_out) {
-                *q_fa_out = ggml_concat(ctx, Qdirect, Qtree, 1);
-            }
-        } else {
-            ggml_tensor * Qfa = q_segment(0, n_tokens);
-            if (q_fa_out) *q_fa_out = Qfa;
-            attn = paged_read(
-                Qfa, launch_kv_len, paged_query_seq_ids,
-                /*row_positions=*/nullptr,
-                /*tree_read=*/true,
-                /*dense_token_layout=*/n_tokens > 1);
-        }
+        // Positioned direct rows and causal tree rows use the same numerical
+        // policy. The operator identifies the tree suffix from parent_ids.
+        ggml_tensor * Qfa = q_segment(0, n_tokens);
+        if (q_fa_out) *q_fa_out = Qfa;
+        attn = paged_read(
+            Qfa, launch_kv_len, paged_query_seq_ids, paged_query_positions,
+            /*tree_read=*/true, /*dense_token_layout=*/n_tokens > 1);
     } else if (ragged) {
         // ── Ragged concurrent step: prefill chunk rows and decode rows all
         // read the pool through one call, each row clamped to its own
@@ -1519,7 +1487,7 @@ static ggml_tensor * build_full_attn_block(
     attn = ggml_mul(ctx, attn, gate_sig);
 
     // ── Output projection
-    attn = apply_scale2(ctx, ggml_mul_mat(ctx, L.wo, attn), L.wo_s);
+    attn = apply_scale2(ctx, build_linear(ctx, L.wo, attn), L.wo_s);
     return attn;
 }
 
@@ -1643,13 +1611,13 @@ static ggml_tensor * build_delta_net_block(
     const bool stacked_qkv_z = L.wqkv_z && L.wqkv_s == 1.0f && L.wqkv_gate_s == 1.0f;
     if (stacked_qkv_z) {
         const int64_t n_z = L.wqkv_gate->ne[1];
-        ggml_tensor * qkvz = ggml_mul_mat(ctx, L.wqkv_z, cur);   // [n_z + conv_channels, n_tokens]
+        ggml_tensor * qkvz = build_linear(ctx, L.wqkv_z, cur);   // [n_z + conv_channels, n_tokens]
         const size_t e = ggml_element_size(qkvz);
         z      = ggml_view_2d(ctx, qkvz, n_z, n_tokens, qkvz->nb[1], 0);
         qkv_2d = ggml_view_2d(ctx, qkvz, conv_channels, n_tokens, qkvz->nb[1], (size_t)n_z * e);
     } else {
-        qkv_2d = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv, cur), L.wqkv_s);
-        z      = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv_gate, cur), L.wqkv_gate_s);
+        qkv_2d = apply_scale2(ctx, build_linear(ctx, L.wqkv, cur), L.wqkv_s);
+        z      = apply_scale2(ctx, build_linear(ctx, L.wqkv_gate, cur), L.wqkv_gate_s);
     }
 
     // beta  = ssm_beta @ cur           [dt_rank, n_tokens]
@@ -1660,13 +1628,13 @@ static ggml_tensor * build_delta_net_block(
     ggml_tensor * ba = nullptr;
     const bool stacked_ba = L.ssm_ba && L.ssm_beta_s == 1.0f && L.ssm_alpha_s == 1.0f;
     if (stacked_ba) {
-        ba = ggml_mul_mat(ctx, L.ssm_ba, cur);     // [2 * dt_rank, n_tokens]
+        ba = build_linear(ctx, L.ssm_ba, cur);     // [2 * dt_rank, n_tokens]
         const size_t e = ggml_element_size(ba);
         beta_2d = contig(ggml_view_2d(ctx, ba, num_v_heads, n_tokens, ba->nb[1], 0));
         alpha_2d = contig(ggml_view_2d(ctx, ba, num_v_heads, n_tokens, ba->nb[1], (size_t)num_v_heads * e));
     } else {
-        beta_2d = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_beta, cur), L.ssm_beta_s);
-        alpha_2d = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_alpha, cur), L.ssm_alpha_s);
+        beta_2d = apply_scale2(ctx, build_linear(ctx, L.ssm_beta, cur), L.ssm_beta_s);
+        alpha_2d = apply_scale2(ctx, build_linear(ctx, L.ssm_alpha, cur), L.ssm_alpha_s);
     }
 
     // Fused kernels (single-sequence chain path only): the conv step and the
@@ -2283,7 +2251,7 @@ after_delta_net:
     for (int si = 1; si < n_segs; si++) {
         flat_all = ggml_concat(ctx, flat_all, flat[(size_t)si], 1);
     }
-    ggml_tensor * out = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_out, flat_all), L.ssm_out_s);
+    ggml_tensor * out = apply_scale2(ctx, build_linear(ctx, L.ssm_out, flat_all), L.ssm_out_s);
     out = ggml_reshape_2d(ctx, out, w.n_embd, n_tokens);
     return out;
 }
@@ -2505,8 +2473,7 @@ QwenGraphOutputs build_qwen35_graph(
                                             in.tree_width,
                                             in.tree_scratch_base,
                                             in.tree_scratch_stride,
-                                            cache.max_ctx,
-                                            in.direct_attn_rows);
+                                            cache.max_ctx);
             }
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
@@ -2744,7 +2711,7 @@ QwenGraphOutputs build_qwen35_graph(
                                (size_t)(n_tokens - in.logits_tail_rows) *
                                    out->nb[1]);
         }
-        logits = ggml_mul_mat(ctx, w.output, out);
+        logits = build_linear(ctx, w.output, out);
         ggml_set_name(logits, "logits");
         ggml_build_forward_expand(gf, logits);
     } else {

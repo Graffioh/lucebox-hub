@@ -21,7 +21,7 @@ namespace dflash::common {
 
 using TargetPagedTreeGraphKey = std::tuple<
     const TargetWeights *, const TargetCache *, ggml_backend_t,
-    int, int, int, int, int, int, int, int, std::vector<int>>;
+    int, int, int, int, int, int, int, std::vector<int>>;
 
 struct StepGraph {
     ggml_context *  ctx = nullptr;

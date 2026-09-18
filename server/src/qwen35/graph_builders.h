@@ -243,8 +243,7 @@ bool build_target_step_paged_tree(
     int n_prefill_tokens = 0,
     const QwenPrefillSegment * prefill_segments = nullptr,
     int n_prefill_segments = 0,
-    int n_logits_rows = 0,
-    int direct_attn_rows = 0);
+    int n_logits_rows = 0);
 
 // LM-head projection: project draft hidden states through the target output matrix.
 bool build_lm_head_projection_step(

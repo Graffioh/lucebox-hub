@@ -2591,11 +2591,8 @@ extern "C" {
     // at or beyond tree_sizes[s] are excluded. query_positions may describe
     // compact autoregressive rows in a mixed AR/tree batch; tree rows ignore
     // it and read the full committed prefix. Pure tree batches pass NULL.
-    // tree_width is derived from parent_ids. reference_query_rows == 0 keeps
-    // the ordinary tree launch policy. A positive value gives fixed-chain
-    // verification the partition policy of that many ordinary query rows:
-    // each node uses its causal prefix, and max_kv_seq_len already covers
-    // every candidate (the launcher does not add a virtual tree tail).
+    // tree_width is derived from parent_ids. Each node partitions only
+    // its causal extent; masked future nodes do not affect the reduction.
     GGML_API struct ggml_tensor * ggml_paged_attn_ext_tree(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2611,8 +2608,7 @@ extern "C" {
             struct ggml_tensor  * parent_ids,
             struct ggml_tensor  * tree_sizes,
             int                   tree_scratch_base,
-            int                   tree_scratch_stride,
-            int                   reference_query_rows);
+            int                   tree_scratch_stride);
 
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).

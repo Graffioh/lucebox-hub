@@ -208,43 +208,13 @@ std::vector<uint8_t>
 Qwen35SeqEngine::select_chain_lanes(const StepPlan & plan) const {
     std::vector<uint8_t> selected(plan.decode.size(), 0);
     if (!plan.prefills.empty()) {
-        int64_t ordinary_rows =
-            chain_decode_bucket_width(static_cast<int>(plan.decode.size()));
-        int64_t ordinary_max_kv = 1;
-        for (const PrefillSlice & slice : plan.prefills) {
-            const int chunk = prefill_chunk_size(slice.slot, slice.max_tokens);
-            ordinary_rows += chunk;
-            if (chunk > 0) {
-                ordinary_max_kv = std::max<int64_t>(ordinary_max_kv,
-                    (int64_t)slots_.slot(slice.slot).cur_pos + chunk);
-            }
-        }
-        // MMVQ/MMVF support up to eight columns. Crossing that dispatch
-        // boundary changes the direct forward before attention can be padded.
-        // WMMA attention also groups four live rows when choosing partitions;
-        // dead query padding cannot preserve that group's context extent.
+        // WMMA groups four rows when choosing their reduction extent.
+        // Its ordinary and tree paths do not share the canonical policy.
         const char * wmma = std::getenv("DFLASH27B_PAGED_WMMA");
-        if (ordinary_rows <= 8 || (wmma && std::atoi(wmma) != 0) ||
-            !fixed_chain_ready_ || !b_.cache_.paged_block_table) {
+        if ((wmma && std::atoi(wmma) != 0) || !fixed_chain_ready_ ||
+            !b_.cache_.paged_block_table) {
             return selected;
         }
-        int64_t verify_end = 0;
-        for (const StepInput & input : plan.decode) {
-            if (input.slot < 0 || input.slot >= slots_.slot_count()) continue;
-            const int64_t position = slots_.slot(input.slot).cur_pos;
-            ordinary_max_kv = std::max(ordinary_max_kv, position + 1);
-            if (chain_spec_input_capable(input)) {
-                verify_end = std::max(verify_end, position + fixed_chain_.width);
-            }
-        }
-        const int64_t logical_capacity = std::min<int64_t>(
-            b_.cache_.max_ctx,
-            b_.cache_.paged_block_table->ne[0] * PAGED_BLOCK_SIZE);
-        const int64_t launch_bound = std::min(
-            ((ordinary_max_kv + 255) / 256) * 256, logical_capacity);
-        // Every candidate must fit the ordinary launch window. Crossing it
-        // could switch a float direct result to rounded half partials.
-        if (verify_end > launch_bound) return selected;
     }
     for (size_t i = 0; i < plan.decode.size(); ++i) {
         selected[i] = chain_spec_input_capable(plan.decode[i]) ? 1 : 0;
@@ -881,9 +851,6 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     const int direct_row0 = n_prefill;
     const int tree_row0 = direct_row0 + ar_count;
     const int total_rows = tree_row0 + tree_rows_count;
-    const int direct_attn_rows = n_prefill > 0
-        ? n_prefill + chain_decode_bucket_width(static_cast<int>(inputs.size()))
-        : 0;
     const int posterior_ar_row0 = n_prefill_commits;
     const int posterior_tree_row0 = posterior_ar_row0 + ar_count;
     const int logits_rows_count = n_prefill > 0
@@ -894,8 +861,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
 
     for (const Proposal & proposal : proposals) {
         max_prefix = std::max(
-            max_prefix, slots_.slot(proposal.slot).cur_pos +
-                            (n_prefill > 0 ? 1 : 0));
+            max_prefix, slots_.slot(proposal.slot).cur_pos);
     }
     for (const ArLane & lane : ar_lanes) {
         max_prefix = std::max(max_prefix, lane.position + 1);
@@ -909,7 +875,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
             b_.cfg_.kq_stride_pad, ar_count, n_prefill,
             prefill_segments.data(),
             static_cast<int>(prefill_segments.size()),
-            logits_rows_count, direct_attn_rows)) {
+            logits_rows_count)) {
         result.error = "fixed chain target graph build failed";
         return result;
     }
@@ -929,11 +895,10 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
         static_cast<size_t>(ar_count + tree_bucket), -1);
     std::vector<int32_t> state_slots(
         static_cast<size_t>(ar_count + tree_bucket), 0);
-    const int query_rows = std::max(total_rows, direct_attn_rows);
     std::vector<int32_t> query_slots(
-        static_cast<size_t>(query_rows), -1);
+        static_cast<size_t>(total_rows), -1);
     std::vector<int32_t> query_positions(
-        static_cast<size_t>(query_rows), -1);
+        static_cast<size_t>(total_rows), -1);
     std::vector<int64_t> write_rows(
         static_cast<size_t>(total_rows) * n_head_kv, scratch_row_);
     std::vector<int32_t> positions(

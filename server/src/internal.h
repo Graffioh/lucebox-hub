@@ -940,9 +940,6 @@ struct QwenGraphInputs {
     // speculative tree suffix. Their slot IDs share active_slot_ids/
     // state_slot_ids with the tree lanes; prefills own direct slab views.
     int  mapped_ar_seqs = 0;
-    // Ordinary packed row count for the direct attention prefix. Extra rows
-    // are dead positioned queries, preserving its partition selection.
-    int  direct_attn_rows = 0;
     int  seq_slot = 0;
     int  paged_max_kv_len = 0;
     int  n_prefill_tokens = 0;
