@@ -1099,7 +1099,9 @@ bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
 // compact LM-head rows and short prefill tails.
 static ggml_tensor * build_linear(
         ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input) {
-    constexpr int64_t min_columns = 16;
+    // Default quantized matvec dispatch ends at three columns. Floating
+    // matvec kernels cover wider batches, so keep their larger floor.
+    const int64_t min_columns = ggml_is_quantized(weight->type) ? 4 : 16;
     const int64_t columns = input->ne[1];
     GGML_ASSERT(input->ne[2] == 1 && input->ne[3] == 1);
     if (columns >= min_columns) {
