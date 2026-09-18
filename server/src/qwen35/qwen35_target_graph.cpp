@@ -1092,19 +1092,18 @@ bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-// Keep learned projections on the matrix path at small batch sizes too.
-// Matvec and matrix kernels quantize/reduce differently; changing the live
-// request count must not change a token's projected value. Padding belongs
-// to the projection, so it adds no recurrent or KV lanes and also covers
-// compact LM-head rows and short prefill tails.
+// Avoid the default three-column quantized matvec transition in learned
+// projections. Matvec and matrix kernels quantize/reduce differently. Padding
+// belongs to the projection, so it adds no recurrent or KV lanes and also
+// covers compact LM-head rows and short prefill tails. Batch-invariant results
+// are qualified with default RDNA4 dispatch; other backends and overrides can
+// choose different matrix kernels.
 static ggml_tensor * build_linear(
         ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input) {
-    // Default quantized matvec dispatch ends at three columns. Floating
-    // matvec kernels cover wider batches, so keep their larger floor.
-    const int64_t min_columns = ggml_is_quantized(weight->type) ? 4 : 16;
+    constexpr int64_t min_columns = 4;
     const int64_t columns = input->ne[1];
     GGML_ASSERT(input->ne[2] == 1 && input->ne[3] == 1);
-    if (columns >= min_columns) {
+    if (!ggml_is_quantized(weight->type) || columns >= min_columns) {
         return ggml_mul_mat(ctx, weight, input);
     }
     ggml_tensor * padded = ggml_pad(
