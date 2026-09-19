@@ -335,9 +335,9 @@ std::string pflash_token_fingerprint(
     const std::vector<int32_t> & ids);
 
 bool pflash_full_cache_restore_allowed(
-    bool longattncomp_environment_present) noexcept;
+    bool selection_environment_present) noexcept;
 bool pflash_continuation_must_fail_closed(
-    bool longattncomp_environment_present) noexcept;
+    bool selection_environment_present) noexcept;
 int pflash_target_token_ceiling(
     int original_target_tokens, double keep_ratio) noexcept;
 

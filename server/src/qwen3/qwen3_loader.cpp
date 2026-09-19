@@ -128,7 +128,7 @@ bool metadata_equals(gguf_context * g, const char * key, const char * expected) 
     return id >= 0 && std::string(gguf_get_val_str(g, id)) == expected;
 }
 
-bool load_longattncomp_head(
+bool load_scoring_head(
         const std::string & path,
         const std::string & drafter_sha256,
         Qwen3DrafterWeights & out) {
@@ -136,7 +136,7 @@ bool load_longattncomp_head(
     gguf_init_params iparams{ /*no_alloc=*/ true, /*ctx=*/ &tensor_ctx };
     gguf_context * gctx = gguf_init_from_file(path.c_str(), iparams);
     if (!gctx) {
-        set_last_error("LongAttnComp head GGUF could not be opened: " + path);
+        set_last_error("scoring head GGUF could not be opened: " + path);
         return false;
     }
     auto fail = [&](const std::string & message) {
@@ -145,6 +145,9 @@ bool load_longattncomp_head(
         set_last_error(message);
         return false;
     };
+    // The GGUF metadata keys, tensor names and architecture value below are
+    // the on-disk GGUF contract written by the offline trainer, not runtime
+    // vocabulary: renaming them here would reject every published head file.
     const bool metadata_ok =
         metadata_equals(gctx, "general.architecture", "longattncomp") &&
         metadata_equals(gctx, "longattncomp.schema", "qwen3_0_6b_nope_qk_mass_v1") &&
@@ -158,7 +161,7 @@ bool load_longattncomp_head(
             "longattncomp.feature_tap",
             "post_block12_residual_before_block13");
     if (!metadata_ok) {
-        return fail("LongAttnComp head metadata does not match the loaded Qwen3-0.6B drafter");
+        return fail("scoring head metadata does not match the loaded Qwen3-0.6B drafter");
     }
     struct TensorContract {
         const char * name;
@@ -177,7 +180,7 @@ bool load_longattncomp_head(
             !source || !ggml_are_same_shape(source, contract.destination) ||
             gguf_get_tensor_size(gctx, id) !=
                 (size_t)ggml_nelements(contract.destination) * sizeof(float)) {
-            return fail(std::string("LongAttnComp head tensor contract mismatch: ") +
+            return fail(std::string("scoring head tensor contract mismatch: ") +
                         contract.name);
         }
     }
@@ -195,14 +198,14 @@ bool load_longattncomp_head(
             size > mmap.size() - data_offset - offset ||
             !copy_tensor_from_file(
                 gctx, contract.name, mmap.data(), data_offset, contract.destination)) {
-            return fail(std::string("LongAttnComp head tensor load failed: ") +
+            return fail(std::string("scoring head tensor load failed: ") +
                         contract.name);
         }
     }
     gguf_free(gctx);
     if (tensor_ctx) ggml_free(tensor_ctx);
-    out.longattncomp_head_loaded = true;
-    std::fprintf(stderr, "[qwen3-0.6b] loaded LongAttnComp head: %s\n", path.c_str());
+    out.scoring_head_loaded = true;
+    std::fprintf(stderr, "[qwen3-0.6b] loaded scoring head: %s\n", path.c_str());
     return true;
 }
 
@@ -385,15 +388,15 @@ bool load_qwen3_drafter_model(const std::string & path,
         out.ctx = nullptr;
         return false;
     }
-    if (const char * head_path = std::getenv("PFLASH_LONGATTNCOMP_HEAD_GGUF")) {
+    if (const char * head_path = std::getenv("PFLASH_SCORING_HEAD_GGUF")) {
         constexpr const char * expected_drafter_sha256 =
             "f9c9f1d3c1e21755b82d4e165f88dbbbd4355646d632fb5d6cef7c66ed4ee04e";
         const auto drafter_identity = read_gguf_metadata(path, true);
         if (!*head_path || out.n_layer < 14 || !drafter_identity.ok ||
             drafter_identity.sha256 != expected_drafter_sha256 ||
-            !load_longattncomp_head(head_path, drafter_identity.sha256, out)) {
+            !load_scoring_head(head_path, drafter_identity.sha256, out)) {
             if (drafter_identity.sha256 != expected_drafter_sha256) {
-                set_last_error("LongAttnComp head requires the pinned Qwen3-0.6B drafter GGUF");
+                set_last_error("scoring head requires the pinned Qwen3-0.6B drafter GGUF");
             }
             ggml_backend_buffer_free(out.buf);
             ggml_free(out.ctx);
@@ -409,7 +412,7 @@ void free_qwen3_drafter_model(Qwen3DrafterWeights & w) {
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
     w.layers.clear();
-    w.longattncomp_head_loaded = false;
+    w.scoring_head_loaded = false;
     w.tok_embd = w.out_norm = w.output = nullptr;
     w.backend = nullptr;
 }

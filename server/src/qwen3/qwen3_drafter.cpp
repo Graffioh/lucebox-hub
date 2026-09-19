@@ -59,7 +59,7 @@ static void build_causal_mask_f16(std::vector<uint16_t> & out, int kv_len, int n
     }
 }
 
-// Qwen3.5-0.8B LongAttnComp scorer. Features are the residual entering
+// Qwen3.5-0.8B scoring head. Features are the residual entering
 // full-attention block 15 after the first 15 blocks (twelve GatedDeltaNet and
 // three full-attention blocks). Block 15's own Q/K projections score the
 // context without RoPE, exactly like the Qwen3-0.6B block-13 head; an
@@ -160,13 +160,13 @@ static bool qwen35_metadata_equals(gguf_context * g, const char * key,
 
 static bool qwen35_head_block_available(const TargetWeights & w, std::string & error) {
     if (w.n_layer <= kQwen35HeadBlock || (size_t)kQwen35HeadBlock >= w.layers.size()) {
-        error = "qwen35 LongAttnComp scorer needs at least 16 blocks";
+        error = "qwen35 scoring head needs at least 16 blocks";
         return false;
     }
     const TargetLayer & L = w.layers[(size_t)kQwen35HeadBlock];
     if (((kQwen35HeadBlock + 1) % w.full_attention_interval) != 0 ||
         !L.wq || !L.wk || !L.attn_norm || !L.q_norm || !L.k_norm) {
-        error = "qwen35 LongAttnComp scorer block 15 is not a full-attention block";
+        error = "qwen35 scoring head block 15 is not a full-attention block";
         return false;
     }
     return true;
@@ -174,8 +174,8 @@ static bool qwen35_head_block_available(const TargetWeights & w, std::string & e
 
 // Optional trained head for the block-15 tap. Fails closed on any contract
 // mismatch, mirroring the Qwen3-0.6B head loader.
-static bool load_qwen35_longattncomp_head(const std::string & path,
-                                          Qwen35DrafterState & st) {
+static bool load_qwen35_scoring_head(const std::string & path,
+                                     Qwen35DrafterState & st) {
     const TargetWeights & w = st.weights;
     std::string block_error;
     if (!qwen35_head_block_available(w, block_error)) {
@@ -183,14 +183,14 @@ static bool load_qwen35_longattncomp_head(const std::string & path,
         return false;
     }
     if (st.gguf_sha256.empty()) {
-        set_last_error("LongAttnComp head requires the drafter GGUF identity hash");
+        set_last_error("scoring head requires the drafter GGUF identity hash");
         return false;
     }
     ggml_context * data_ctx = nullptr;
     gguf_init_params params{ /*no_alloc=*/ false, /*ctx=*/ &data_ctx };
     gguf_context * g = gguf_init_from_file(path.c_str(), params);
     if (!g) {
-        set_last_error("LongAttnComp head GGUF could not be opened: " + path);
+        set_last_error("scoring head GGUF could not be opened: " + path);
         return false;
     }
     auto fail = [&](const std::string & message) {
@@ -200,12 +200,15 @@ static bool load_qwen35_longattncomp_head(const std::string & path,
         set_last_error(message);
         return false;
     };
+    // The GGUF metadata keys, tensor names and architecture value below are
+    // the on-disk GGUF contract written by the offline trainer, not runtime
+    // vocabulary: renaming them here would reject every published head file.
     if (!qwen35_metadata_equals(g, "general.architecture", "longattncomp") ||
         !qwen35_metadata_equals(g, "longattncomp.schema", kQwen35HeadSchema) ||
         !qwen35_metadata_equals(g, "longattncomp.base_model", kQwen35HeadBaseModel) ||
         !qwen35_metadata_equals(g, "longattncomp.runtime_gguf_sha256", st.gguf_sha256) ||
         !qwen35_metadata_equals(g, "longattncomp.feature_tap", kQwen35HeadFeatureTap)) {
-        return fail("LongAttnComp head metadata does not match the loaded Qwen3.5-0.8B drafter");
+        return fail("scoring head metadata does not match the loaded Qwen3.5-0.8B drafter");
     }
     struct Contract {
         const char * name;
@@ -223,12 +226,12 @@ static bool load_qwen35_longattncomp_head(const std::string & path,
     head_params.mem_size = 4 * ggml_tensor_overhead();
     head_params.no_alloc = true;
     st.head_ctx = ggml_init(head_params);
-    if (!st.head_ctx) return fail("LongAttnComp head context allocation failed");
+    if (!st.head_ctx) return fail("scoring head context allocation failed");
     for (const auto & contract : contracts) {
         ggml_tensor * source = data_ctx ? ggml_get_tensor(data_ctx, contract.name) : nullptr;
         if (!source || source->type != GGML_TYPE_F32 || ggml_n_dims(source) != 2 ||
             source->ne[0] != contract.ne0 || source->ne[1] != contract.ne1) {
-            return fail(std::string("LongAttnComp head tensor contract mismatch: ") +
+            return fail(std::string("scoring head tensor contract mismatch: ") +
                         contract.name);
         }
         *contract.destination =
@@ -236,7 +239,7 @@ static bool load_qwen35_longattncomp_head(const std::string & path,
         ggml_set_name(*contract.destination, contract.name);
     }
     st.head_buf = ggml_backend_alloc_ctx_tensors(st.head_ctx, w.backend);
-    if (!st.head_buf) return fail("LongAttnComp head buffer allocation failed");
+    if (!st.head_buf) return fail("scoring head buffer allocation failed");
     for (const auto & contract : contracts) {
         ggml_tensor * source = ggml_get_tensor(data_ctx, contract.name);
         ggml_backend_tensor_set(*contract.destination, source->data, 0, ggml_nbytes(source));
@@ -244,7 +247,7 @@ static bool load_qwen35_longattncomp_head(const std::string & path,
     gguf_free(g);
     ggml_free(data_ctx);
     st.head_loaded = true;
-    std::fprintf(stderr, "[qwen35-drafter] loaded LongAttnComp head: %s\n", path.c_str());
+    std::fprintf(stderr, "[qwen35-drafter] loaded scoring head: %s\n", path.c_str());
     std::fflush(stderr);
     return true;
 }
@@ -592,14 +595,14 @@ static void write_compression_trace(
     std::fclose(file);
 }
 
-static std::vector<int32_t> select_longattncomp_chunks(
+static std::vector<int32_t> select_pflash_chunks(
         const std::vector<int32_t> & ids,
         const std::vector<float> & token_scores,
         float keep_ratio,
         int n_lookahead,
         int score_query_end,
         int pool_kernel,
-        const dflash::qwen3::PFlashLongAttnCompConfig & config,
+        const dflash::qwen3::PFlashSelectionConfig & config,
         const std::vector<PFlashTokenSpan> & required_instruction_spans,
         bool direct_mass,
         bool write_trace,
@@ -666,9 +669,9 @@ static std::vector<int32_t> select_longattncomp_chunks(
         ? dflash::qwen3::select_pflash_split(candidates, other_candidates, policy, split_fraction, config.mode)
         : dflash::qwen3::select_pflash_candidates(candidates, policy, config.mode);
     if (!selected.ok) {
-        set_last_error("PFlash LongAttnComp selection failed: " + selected.error);
+        set_last_error("PFlash selection failed: " + selected.error);
         std::fprintf(stderr,
-            "[pflash-longattncomp] ERROR mode=%s budget=%d stop=%s: %s\n",
+            "[pflash-select] ERROR mode=%s budget=%d stop=%s: %s\n",
             dflash::qwen3::pflash_selection_mode_name(config.mode),
             selector_budget,
             dflash::qwen3::pflash_selection_stop_name(selected.stop),
@@ -684,7 +687,7 @@ static std::vector<int32_t> select_longattncomp_chunks(
     }
     for (size_t ordinal : selected.ordinals) {
         if (ordinal >= selected_mask.size()) {
-            set_last_error("PFlash LongAttnComp selector returned an invalid ordinal");
+            set_last_error("PFlash selector returned an invalid ordinal");
             return {};
         }
         selected_mask[ordinal] = 1;
@@ -700,7 +703,7 @@ static std::vector<int32_t> select_longattncomp_chunks(
     }
 
     std::fprintf(stderr,
-        "[pflash-longattncomp] selected mode=%s scorer=%s segments=%s score=%s chunk=%d query=%d "
+        "[pflash-select] selected mode=%s scorer=%s segments=%s score=%s chunk=%d query=%d "
         "budget=%d selected_tokens=%zu chunks=%zu/%d stop=%s mass=%.9g\n",
         dflash::qwen3::pflash_selection_mode_name(config.mode),
         split ? "split" : "single",
@@ -859,7 +862,7 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
             delete st;
             return false;
         }
-        const char * head_path = std::getenv("PFLASH_LONGATTNCOMP_HEAD_GGUF");
+        const char * head_path = std::getenv("PFLASH_SCORING_HEAD_GGUF");
         const char * probe_path = std::getenv("PFLASH_SEGMENT_PROBE_GGUF");
         if (head_path || probe_path) {
             const auto identity = read_gguf_metadata(gguf_path, /*compute_sha256=*/ true);
@@ -880,12 +883,12 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
             }
         }
         if (head_path) {
-            if (!*head_path || !load_qwen35_longattncomp_head(head_path, *st)) {
+            if (!*head_path || !load_qwen35_scoring_head(head_path, *st)) {
                 if (!*head_path) {
-                    set_last_error("PFLASH_LONGATTNCOMP_HEAD_GGUF is empty");
+                    set_last_error("PFLASH_SCORING_HEAD_GGUF is empty");
                 }
                 std::fprintf(stderr,
-                    "[qwen35-drafter] ERROR: LongAttnComp head load failed, "
+                    "[qwen35-drafter] ERROR: scoring head load failed, "
                     "refusing to serve without it\n");
                 std::fflush(stderr);
                 free_target_weights(st->weights);
@@ -969,7 +972,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const dflash::qwen3::PFlashLongAttnCompConfig & experiment,
+    const dflash::qwen3::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_scores_out = nullptr) {
 
@@ -1248,7 +1251,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
     }
 
     if (experiment.selection_active) {
-        return select_longattncomp_chunks(
+        return select_pflash_chunks(
             ids, smooth_score, keep_ratio, n_lookahead, score_query_end,
             pk, experiment, required_instruction_spans, false, true);
     }
@@ -1390,17 +1393,17 @@ static std::vector<int32_t> qwen35_score_and_compress(
     return out_ids;
 }
 
-// LongAttnComp scoring for the Qwen3.5-0.8B drafter: run blocks 0..14, then
+// Scoring-head selection for the Qwen3.5-0.8B drafter: run blocks 0..14, then
 // score every context token against the query window with block 15's NoPE
 // Q/K (or a trained replacement) and select chunks by attention mass. This
 // is the runtime counterpart of the Python retention screen (trial 0075).
-static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
+static std::vector<int32_t> qwen35_strict_score_and_compress(
     Qwen35DrafterState & st,
     const std::vector<int32_t> & ids,
     float keep_ratio,
     int n_lookahead,
     int score_query_end,
-    const dflash::qwen3::PFlashLongAttnCompConfig & experiment,
+    const dflash::qwen3::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_mass_out = nullptr,
     std::vector<PFlashTokenSpan> * segments_out = nullptr,
@@ -1418,12 +1421,12 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
         return {};
     }
     if (n_lookahead < 1 || S < n_lookahead + 1) {
-        set_last_error("qwen35 LongAttnComp scorer input is too short");
+        set_last_error("qwen35 scoring head input is too short");
         return {};
     }
     const int query_end = score_query_end < 0 ? S : score_query_end;
     if (query_end < n_lookahead || query_end > S) {
-        set_last_error("qwen35 LongAttnComp scorer query window out of range");
+        set_last_error("qwen35 scoring head query window out of range");
         return {};
     }
     const int query_start = query_end - n_lookahead;
@@ -1693,7 +1696,7 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
     const size_t nonfinite = count_nonfinite_scores(probs_h.data(), probs_h.size());
     if (nonfinite != 0) {
         const std::string message =
-            "non-finite Qwen3.5 LongAttnComp scores: " + std::to_string(nonfinite) +
+            "non-finite Qwen3.5 scoring-head scores: " + std::to_string(nonfinite) +
             "/" + std::to_string(probs_h.size());
         std::fprintf(stderr, "[pflash] ERROR: %s\n", message.c_str());
         std::fflush(stderr);
@@ -1701,10 +1704,10 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
         return {};
     }
     std::vector<float> token_mass;
-    longattncomp_mean_token_mass(probs_h.data(), S, n_lookahead, H, token_mass);
+    scoring_head_mean_token_mass(probs_h.data(), S, n_lookahead, H, token_mass);
     auto t2 = std::chrono::steady_clock::now();
     std::fprintf(stderr,
-        "[qwen35-longattncomp] forward %.2fs (blocks 0-%d, S=%d) score %.2fs "
+        "[qwen35-scorer] forward %.2fs (blocks 0-%d, S=%d) score %.2fs "
         "total %.2fs head=%s\n",
         std::chrono::duration<double>(t1 - t0).count(), kQwen35HeadBlock - 1, S,
         std::chrono::duration<double>(t2 - t1).count(),
@@ -1786,7 +1789,7 @@ static std::vector<int32_t> qwen35_longattncomp_score_and_compress(
         return ids;
     }
 
-    return select_longattncomp_chunks(
+    return select_pflash_chunks(
         ids, token_mass, keep_ratio, n_lookahead, score_query_end,
         /*pool_kernel=*/1, experiment, required_instruction_spans,
         /*direct_mass=*/true, /*write_trace=*/true,
@@ -1807,12 +1810,12 @@ std::vector<int32_t> drafter_score_and_compress(
         return {};
     }
 
-    dflash::qwen3::PFlashLongAttnCompConfig experiment;
+    dflash::qwen3::PFlashSelectionConfig experiment;
     std::string experiment_error;
-    if (!dflash::qwen3::resolve_pflash_longattncomp(
+    if (!dflash::qwen3::resolve_pflash_selection(
             (int) ids.size(), chunk_size, experiment, experiment_error)) {
-        set_last_error("invalid PFlash LongAttnComp config: " + experiment_error);
-        std::fprintf(stderr, "[pflash-longattncomp] ERROR config: %s\n",
+        set_last_error("invalid PFlash strict selection config: " + experiment_error);
+        std::fprintf(stderr, "[pflash-select] ERROR config: %s\n",
                      experiment_error.c_str());
         std::fflush(stderr);
         return {};
@@ -1820,9 +1823,9 @@ std::vector<int32_t> drafter_score_and_compress(
     chunk_size = experiment.chunk_size;
     if (!experiment.selection_active && !required_instruction_spans.empty()) {
         set_last_error(
-            "PFlash instruction spans require strict LongAttnComp selection");
+            "PFlash instruction spans require strict budget selection");
         std::fprintf(stderr,
-            "[pflash-longattncomp] ERROR instruction spans require strict selection\n");
+            "[pflash-select] ERROR instruction spans require strict selection\n");
         std::fflush(stderr);
         return {};
     }
@@ -1832,7 +1835,7 @@ std::vector<int32_t> drafter_score_and_compress(
                 required_instruction_spans, (int) ids.size(), span_error)) {
             set_last_error("invalid PFlash instruction spans: " + span_error);
             std::fprintf(stderr,
-                "[pflash-longattncomp] ERROR instruction spans: %s\n",
+                "[pflash-select] ERROR instruction spans: %s\n",
                 span_error.c_str());
             std::fflush(stderr);
             return {};
@@ -1840,7 +1843,7 @@ std::vector<int32_t> drafter_score_and_compress(
     }
     if (experiment.configured) {
         std::fprintf(stderr,
-            "[pflash-longattncomp] config mode=%s active=%d chunk=%d "
+            "[pflash-select] config mode=%s active=%d chunk=%d "
             "query_parser=%s query_cap=%d query_actual=%d top_p=%.9g "
             "input=%zu\n",
             dflash::qwen3::pflash_selection_mode_name(experiment.mode),
@@ -1855,7 +1858,7 @@ std::vector<int32_t> drafter_score_and_compress(
             return {};
         }
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
-        // Strict LongAttnComp selection scores with the block-15 head; the
+        // Strict budget selection scores with the block-15 head; the
         // legacy all-layer running-max scorer stays available for legacy
         // selection or when PFLASH_QWEN35_LEGACY_SCORER=1 forces it.
         const char * legacy_scorer = std::getenv("PFLASH_QWEN35_LEGACY_SCORER");
@@ -1868,7 +1871,7 @@ std::vector<int32_t> drafter_score_and_compress(
             std::vector<float> head_mass;
             std::vector<PFlashTokenSpan> head_segments;
             bool head_density = false;
-            if (qwen35_longattncomp_score_and_compress(
+            if (qwen35_strict_score_and_compress(
                     *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
                     required_instruction_spans, &head_mass, &head_segments,
                     &head_density).empty()) {
@@ -1886,11 +1889,11 @@ std::vector<int32_t> drafter_score_and_compress(
                 return {};
             }
             std::fprintf(stderr,
-                "[pflash-longattncomp] two-scorer selection: head fraction %.2f, "
+                "[pflash-select] two-scorer selection: head fraction %.2f, "
                 "segments=%s\n", experiment.split_fraction,
                 head_segments.empty() ? "fixed" : "probe");
             std::fflush(stderr);
-            return select_longattncomp_chunks(
+            return select_pflash_chunks(
                 ids, head_mass, keep_ratio, n_lookahead, score_query_end,
                 /*pool_kernel=*/1, experiment, required_instruction_spans,
                 /*direct_mass=*/true, /*write_trace=*/true,
@@ -1898,12 +1901,12 @@ std::vector<int32_t> drafter_score_and_compress(
                 &other_scores, experiment.split_fraction);
         }
         if (experiment.selection_active && !force_legacy) {
-            return qwen35_longattncomp_score_and_compress(
+            return qwen35_strict_score_and_compress(
                 *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
                 required_instruction_spans);
         }
         if (st->head_loaded && !experiment.selection_active) {
-            set_last_error("Qwen3.5 LongAttnComp head requires strict selection");
+            set_last_error("Qwen3.5 scoring head requires strict selection");
             return {};
         }
         return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
@@ -1952,12 +1955,12 @@ std::vector<int32_t> drafter_score_and_compress(
     }
 
     if (experiment.selection_active) {
-        return select_longattncomp_chunks(
-            ids, ctx.weights.longattncomp_head_loaded ? score : smooth,
+        return select_pflash_chunks(
+            ids, ctx.weights.scoring_head_loaded ? score : smooth,
             keep_ratio, n_lookahead, score_query_end,
-            ctx.weights.longattncomp_head_loaded ? 1 : pool_kernel,
+            ctx.weights.scoring_head_loaded ? 1 : pool_kernel,
             experiment, required_instruction_spans,
-            ctx.weights.longattncomp_head_loaded, true);
+            ctx.weights.scoring_head_loaded, true);
     }
 
     // ── 4. Chunk-top-K + span merge ───────────────────────────────────

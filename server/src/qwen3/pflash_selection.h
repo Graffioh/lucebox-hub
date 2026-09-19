@@ -86,7 +86,7 @@ enum class PFlashCandidateScore { Auto, Sum, Density };
 // head fills ``split_fraction`` of the budget first, the other scorer the rest).
 enum class PFlashScorer { Head, Legacy, Split };
 
-struct PFlashLongAttnCompConfig {
+struct PFlashSelectionConfig {
     PFlashSelectionMode mode = PFlashSelectionMode::Legacy;
     PFlashQueryParser query_parser = PFlashQueryParser::SemanticUser;
     int chunk_size = 0;
@@ -136,12 +136,12 @@ const char * pflash_candidate_score_name(PFlashCandidateScore score) noexcept;
 
 // Presence, rather than validity, gates cache and continuation policy so an
 // empty or invalid experiment variable cannot silently fall back to legacy.
-bool has_pflash_longattncomp_environment() noexcept;
+bool has_pflash_selection_environment() noexcept;
 
-bool resolve_pflash_longattncomp(
+bool resolve_pflash_selection(
     int input_tokens,
     int legacy_chunk_size,
-    PFlashLongAttnCompConfig & out,
+    PFlashSelectionConfig & out,
     std::string & error);
 
 } // namespace dflash::qwen3

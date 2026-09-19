@@ -325,13 +325,13 @@ See the [current six-expert Strix Halo profile](https://www.lucebox.com/blog/dee
 | `--prefill-upstream-key <KEY>` | none | Bearer token for the upstream. |
 | `--prefill-upstream-model <NAME>` | none | Model name forwarded upstream. |
 
-With a Qwen3.5-0.8B drafter and strict LongAttnComp selection
-(`PFLASH_LONGATTNCOMP_MODE=budget_only`, `PFLASH_LONGATTNCOMP_CHUNK_SIZE`,
-`PFLASH_LONGATTNCOMP_QUERY_TOKENS`), the drafter runs only its first fifteen
+With a Qwen3.5-0.8B drafter and strict budget selection
+(`PFLASH_SELECT_MODE=budget_only`, `PFLASH_SELECT_CHUNK_SIZE`,
+`PFLASH_SELECT_QUERY_TOKENS`), the drafter runs only its first fifteen
 blocks and scores the context with block 15's NoPE Q/K projections, the same
 attention-mass scorer the Qwen3-0.6B block-13 head uses. Its 262K native
 context covers inputs the Qwen3-0.6B drafter cannot score within its 32K
-window. `PFLASH_LONGATTNCOMP_HEAD_GGUF` accepts a trained block-15 head
+window. `PFLASH_SCORING_HEAD_GGUF` accepts a trained block-15 head
 (schema `qwen3_5_0_8b_nope_qk_mass_v1`); `PFLASH_QWEN35_LEGACY_SCORER=1`
 restores the previous all-layer running-max scorer. The Qwen3.5 attention
 runs dense (`ggml_flash_attn_ext`); the block-sparse FlashPrefill kernels
@@ -348,8 +348,8 @@ ranks the resulting whole functions, classes, files or paragraphs by mass
 density, skipping segments that do not fit the remaining budget, so a kept
 piece is never a definition cut in half. It falls back to fixed chunks when
 the probe finds fewer than four boundaries in a context.
-`PFLASH_LONGATTNCOMP_SEGMENTS=auto|fixed|probe` and
-`PFLASH_LONGATTNCOMP_SELECT=auto|sum|density` override the defaults (auto =
+`PFLASH_SELECT_SEGMENTS=auto|fixed|probe` and
+`PFLASH_SELECT_SCORE=auto|sum|density` override the defaults (auto =
 probe segments and density when a probe is loaded, fixed chunks and mass sum
 otherwise); the compression trace records `segmentation`, `candidate_score`
 and the segment spans.

@@ -16,11 +16,11 @@ using namespace dflash::qwen3;
 
 namespace {
 
-constexpr const char * kModeEnv = "PFLASH_LONGATTNCOMP_MODE";
-constexpr const char * kChunkEnv = "PFLASH_LONGATTNCOMP_CHUNK_SIZE";
-constexpr const char * kQueryEnv = "PFLASH_LONGATTNCOMP_QUERY_TOKENS";
-constexpr const char * kQueryParserEnv = "PFLASH_LONGATTNCOMP_QUERY_PARSER";
-constexpr const char * kTopPEnv = "PFLASH_LONGATTNCOMP_TOP_P";
+constexpr const char * kModeEnv = "PFLASH_SELECT_MODE";
+constexpr const char * kChunkEnv = "PFLASH_SELECT_CHUNK_SIZE";
+constexpr const char * kQueryEnv = "PFLASH_SELECT_QUERY_TOKENS";
+constexpr const char * kQueryParserEnv = "PFLASH_SELECT_QUERY_PARSER";
+constexpr const char * kTopPEnv = "PFLASH_SELECT_TOP_P";
 
 struct CleanPFlashEnv {
     luce_test::ScopedEnvVar mode{kModeEnv, nullptr};
@@ -64,10 +64,10 @@ void require_ordinals(
     }
 }
 
-PFlashLongAttnCompConfig resolve_or_fail(int input_tokens, int legacy_chunk) {
-    PFlashLongAttnCompConfig config;
+PFlashSelectionConfig resolve_or_fail(int input_tokens, int legacy_chunk) {
+    PFlashSelectionConfig config;
     std::string error;
-    if (!resolve_pflash_longattncomp(
+    if (!resolve_pflash_selection(
             input_tokens, legacy_chunk, config, error)) {
         throw std::runtime_error(error);
     }
@@ -365,9 +365,9 @@ TEST_CASE(PFlashSelectionFixture, resolver_applies_chunk_and_query_without_enabl
     REQUIRE(config.query_tokens == 32);
 }
 
-TEST_CASE(PFlashSelectionFixture, any_longattncomp_environment_is_observable_before_resolution) {
+TEST_CASE(PFlashSelectionFixture, any_selection_environment_is_observable_before_resolution) {
     CleanPFlashEnv env;
-    REQUIRE(!has_pflash_longattncomp_environment());
+    REQUIRE(!has_pflash_selection_environment());
 
     const std::pair<const char *, const char *> values[] = {
         {kModeEnv, "budget_only"},
@@ -378,19 +378,19 @@ TEST_CASE(PFlashSelectionFixture, any_longattncomp_environment_is_observable_bef
     };
     for (const auto & [name, value] : values) {
         set_env(name, value);
-        REQUIRE(has_pflash_longattncomp_environment());
-        PFlashLongAttnCompConfig config;
+        REQUIRE(has_pflash_selection_environment());
+        PFlashSelectionConfig config;
         std::string error;
-        REQUIRE(resolve_pflash_longattncomp(120000, 32, config, error));
+        REQUIRE(resolve_pflash_selection(120000, 32, config, error));
         REQUIRE(config.configured);
         set_env(name, nullptr);
     }
 
     set_env(kQueryEnv, "");
-    REQUIRE(has_pflash_longattncomp_environment());
-    PFlashLongAttnCompConfig config;
+    REQUIRE(has_pflash_selection_environment());
+    PFlashSelectionConfig config;
     std::string error;
-    REQUIRE(!resolve_pflash_longattncomp(120000, 32, config, error));
+    REQUIRE(!resolve_pflash_selection(120000, 32, config, error));
 }
 
 TEST_CASE(PFlashSelectionFixture, resolver_selects_explicit_query_parser) {
@@ -448,9 +448,9 @@ TEST_CASE(PFlashSelectionFixture, resolver_rejects_invalid_environment_values) {
 
     for (const auto & invalid : invalid_values) {
         set_env(invalid.name, invalid.value);
-        PFlashLongAttnCompConfig config;
+        PFlashSelectionConfig config;
         std::string error;
-        REQUIRE(!resolve_pflash_longattncomp(500, 32, config, error));
+        REQUIRE(!resolve_pflash_selection(500, 32, config, error));
         REQUIRE(!error.empty());
         set_env(invalid.name, nullptr);
     }
@@ -473,7 +473,7 @@ TEST_CASE(PFlashSelectionFixture, mode_and_stop_names_are_stable) {
     REQUIRE(std::string(pflash_query_parser_name(PFlashQueryParser::ArbitraryTail)) == "arbitrary_tail");
 }
 
-TEST_CASE(PFlashSelectionFixture, longattncomp_token_mass_averages_heads_and_queries) {
+TEST_CASE(PFlashSelectionFixture, scoring_head_token_mass_averages_heads_and_queries) {
     // ggml layout [n_keys=3, n_queries=2, n_heads=2]: key index fastest.
     const std::vector<float> probs = {
         0.2f, 0.3f, 0.5f,   // head 0, query 0
@@ -482,7 +482,7 @@ TEST_CASE(PFlashSelectionFixture, longattncomp_token_mass_averages_heads_and_que
         1.0f, 0.0f, 0.0f,   // head 1, query 1
     };
     std::vector<float> mass;
-    dflash::common::longattncomp_mean_token_mass(probs.data(), 3, 2, 2, mass);
+    dflash::common::scoring_head_mean_token_mass(probs.data(), 3, 2, 2, mass);
     REQUIRE(mass.size() == 3u);
     CHECK(std::fabs(mass[0] - 0.45f) < 1e-6f);
     CHECK(std::fabs(mass[1] - 0.175f) < 1e-6f);
@@ -491,7 +491,7 @@ TEST_CASE(PFlashSelectionFixture, longattncomp_token_mass_averages_heads_and_que
     for (float value : mass) total += value;
     CHECK(std::fabs(total - 1.0) < 1e-6);
 
-    dflash::common::longattncomp_mean_token_mass(probs.data(), 0, 2, 2, mass);
+    dflash::common::scoring_head_mean_token_mass(probs.data(), 0, 2, 2, mass);
     CHECK(mass.empty());
 }
 
@@ -608,22 +608,22 @@ TEST_CASE(PFlashSelectionFixture, skip_oversized_keeps_filling_with_smaller_segm
 
 TEST_CASE(PFlashSelectionFixture, segmentation_and_score_environment_resolve_or_fail) {
     CleanPFlashEnv clean;
-    luce_test::ScopedEnvVar segments{"PFLASH_LONGATTNCOMP_SEGMENTS", nullptr};
-    luce_test::ScopedEnvVar select{"PFLASH_LONGATTNCOMP_SELECT", nullptr};
+    luce_test::ScopedEnvVar segments{"PFLASH_SELECT_SEGMENTS", nullptr};
+    luce_test::ScopedEnvVar select{"PFLASH_SELECT_SCORE", nullptr};
     set_env(kModeEnv, "budget_only");
     auto config = resolve_or_fail(4096, 1024);
     REQUIRE(config.segmentation == PFlashSegmentation::Auto);
     REQUIRE(config.candidate_score == PFlashCandidateScore::Auto);
-    set_env("PFLASH_LONGATTNCOMP_SEGMENTS", "probe");
-    set_env("PFLASH_LONGATTNCOMP_SELECT", "density");
+    set_env("PFLASH_SELECT_SEGMENTS", "probe");
+    set_env("PFLASH_SELECT_SCORE", "density");
     config = resolve_or_fail(4096, 1024);
     REQUIRE(config.segmentation == PFlashSegmentation::Probe);
     REQUIRE(config.candidate_score == PFlashCandidateScore::Density);
-    set_env("PFLASH_LONGATTNCOMP_SEGMENTS", "sentences");
-    PFlashLongAttnCompConfig invalid;
+    set_env("PFLASH_SELECT_SEGMENTS", "sentences");
+    PFlashSelectionConfig invalid;
     std::string error;
-    REQUIRE(!resolve_pflash_longattncomp(4096, 1024, invalid, error));
-    REQUIRE(error.find("PFLASH_LONGATTNCOMP_SEGMENTS") != std::string::npos);
+    REQUIRE(!resolve_pflash_selection(4096, 1024, invalid, error));
+    REQUIRE(error.find("PFLASH_SELECT_SEGMENTS") != std::string::npos);
 }
 
 // ═════════════════════════════════════════════════
@@ -657,19 +657,19 @@ TEST_CASE(PFlashSelectionFixture, split_selection_fills_head_share_then_other_sc
 
 TEST_CASE(PFlashSelectionFixture, scorer_and_split_environment_resolve_or_fail) {
     CleanPFlashEnv clean;
-    luce_test::ScopedEnvVar scorer{"PFLASH_LONGATTNCOMP_SCORER", nullptr};
-    luce_test::ScopedEnvVar split{"PFLASH_LONGATTNCOMP_SPLIT", nullptr};
+    luce_test::ScopedEnvVar scorer{"PFLASH_SELECT_SCORER", nullptr};
+    luce_test::ScopedEnvVar split{"PFLASH_SELECT_SPLIT", nullptr};
     set_env(kModeEnv, "budget_only");
     auto config = resolve_or_fail(4096, 1024);
     REQUIRE(config.scorer == PFlashScorer::Head);
-    set_env("PFLASH_LONGATTNCOMP_SCORER", "split");
-    set_env("PFLASH_LONGATTNCOMP_SPLIT", "0.6");
+    set_env("PFLASH_SELECT_SCORER", "split");
+    set_env("PFLASH_SELECT_SPLIT", "0.6");
     config = resolve_or_fail(4096, 1024);
     REQUIRE(config.scorer == PFlashScorer::Split);
     REQUIRE(std::fabs(config.split_fraction - 0.6) < 1e-9);
-    set_env("PFLASH_LONGATTNCOMP_SPLIT", "1.0");
-    PFlashLongAttnCompConfig invalid;
+    set_env("PFLASH_SELECT_SPLIT", "1.0");
+    PFlashSelectionConfig invalid;
     std::string error;
-    REQUIRE(!resolve_pflash_longattncomp(4096, 1024, invalid, error));
-    REQUIRE(error.find("PFLASH_LONGATTNCOMP_SPLIT") != std::string::npos);
+    REQUIRE(!resolve_pflash_selection(4096, 1024, invalid, error));
+    REQUIRE(error.find("PFLASH_SELECT_SPLIT") != std::string::npos);
 }

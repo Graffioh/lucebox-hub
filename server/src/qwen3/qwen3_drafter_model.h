@@ -65,7 +65,7 @@ struct Qwen3DrafterWeights {
     int n_vocab    = 151936;
     int n_ctx_max  = 40960;
     float rope_theta = 1000000.0f;
-    bool longattncomp_head_loaded = false;
+    bool scoring_head_loaded = false;
 };
 
 bool load_qwen3_drafter_model(const std::string & gguf_path,
@@ -127,9 +127,9 @@ inline size_t count_nonfinite_scores(const float * values, size_t count) {
     return nonfinite;
 }
 
-// LongAttnComp token mass: mean over heads and query tokens of softmax
+// Scoring-head token mass: mean over heads and query tokens of softmax
 // probabilities laid out as ggml [n_keys, n_queries, n_heads] (ne0 fastest).
-inline void longattncomp_mean_token_mass(
+inline void scoring_head_mean_token_mass(
         const float * probs,
         int n_keys,
         int n_queries,

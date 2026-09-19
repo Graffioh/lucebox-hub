@@ -15,15 +15,15 @@ namespace dflash::qwen3 {
 
 namespace {
 
-constexpr const char * kModeEnv = "PFLASH_LONGATTNCOMP_MODE";
-constexpr const char * kChunkEnv = "PFLASH_LONGATTNCOMP_CHUNK_SIZE";
-constexpr const char * kQueryEnv = "PFLASH_LONGATTNCOMP_QUERY_TOKENS";
-constexpr const char * kQueryParserEnv = "PFLASH_LONGATTNCOMP_QUERY_PARSER";
-constexpr const char * kTopPEnv = "PFLASH_LONGATTNCOMP_TOP_P";
-constexpr const char * kSegmentsEnv = "PFLASH_LONGATTNCOMP_SEGMENTS";
-constexpr const char * kSelectEnv = "PFLASH_LONGATTNCOMP_SELECT";
-constexpr const char * kScorerEnv = "PFLASH_LONGATTNCOMP_SCORER";
-constexpr const char * kSplitEnv = "PFLASH_LONGATTNCOMP_SPLIT";
+constexpr const char * kModeEnv = "PFLASH_SELECT_MODE";
+constexpr const char * kChunkEnv = "PFLASH_SELECT_CHUNK_SIZE";
+constexpr const char * kQueryEnv = "PFLASH_SELECT_QUERY_TOKENS";
+constexpr const char * kQueryParserEnv = "PFLASH_SELECT_QUERY_PARSER";
+constexpr const char * kTopPEnv = "PFLASH_SELECT_TOP_P";
+constexpr const char * kSegmentsEnv = "PFLASH_SELECT_SEGMENTS";
+constexpr const char * kSelectEnv = "PFLASH_SELECT_SCORE";
+constexpr const char * kScorerEnv = "PFLASH_SELECT_SCORER";
+constexpr const char * kSplitEnv = "PFLASH_SELECT_SPLIT";
 
 PFlashSelectionResult invalid_result(std::string error) {
     PFlashSelectionResult result;
@@ -65,7 +65,7 @@ int scheduled_chunk_size(int input_tokens) {
 
 } // namespace
 
-bool has_pflash_longattncomp_environment() noexcept {
+bool has_pflash_selection_environment() noexcept {
     return std::getenv(kModeEnv) != nullptr ||
            std::getenv(kChunkEnv) != nullptr ||
            std::getenv(kQueryEnv) != nullptr ||
@@ -280,10 +280,10 @@ const char * pflash_query_parser_name(PFlashQueryParser parser) noexcept {
     return "unknown";
 }
 
-bool resolve_pflash_longattncomp(
+bool resolve_pflash_selection(
         int input_tokens,
         int legacy_chunk_size,
-        PFlashLongAttnCompConfig & out,
+        PFlashSelectionConfig & out,
         std::string & error) {
     error.clear();
     if (input_tokens < 0) {
@@ -305,7 +305,7 @@ bool resolve_pflash_longattncomp(
     const char * scorer_raw = std::getenv(kScorerEnv);
     const char * split_raw = std::getenv(kSplitEnv);
 
-    PFlashLongAttnCompConfig config;
+    PFlashSelectionConfig config;
     config.configured = mode_raw || chunk_raw || query_raw ||
         query_parser_raw || top_p_raw || segments_raw || select_raw ||
         scorer_raw || split_raw;

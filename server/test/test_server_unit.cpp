@@ -730,7 +730,7 @@ TEST_CASE(ServerUnitFixture, test_pflash_normalizes_multipart_latest_user_for_re
     }
 }
 
-TEST_CASE(ServerUnitFixture, test_pflash_longattncomp_cache_and_continuation_policy) {
+TEST_CASE(ServerUnitFixture, test_pflash_selection_cache_and_continuation_policy) {
     TEST_ASSERT(http_detail::pflash_full_cache_restore_allowed(false));
     TEST_ASSERT(!http_detail::pflash_full_cache_restore_allowed(true));
     TEST_ASSERT(!http_detail::pflash_continuation_must_fail_closed(false));
@@ -5054,11 +5054,11 @@ struct MockPflashCompressBackend : MockBackend {
 };
 
 TEST_CASE(ServerUnitFixture, test_pflash_default_raw_text_maps_user_query) {
-    luce_test::ScopedEnvVar mode{"PFLASH_LONGATTNCOMP_MODE", nullptr};
-    luce_test::ScopedEnvVar chunk{"PFLASH_LONGATTNCOMP_CHUNK_SIZE", nullptr};
-    luce_test::ScopedEnvVar query{"PFLASH_LONGATTNCOMP_QUERY_TOKENS", nullptr};
-    luce_test::ScopedEnvVar parser{"PFLASH_LONGATTNCOMP_QUERY_PARSER", nullptr};
-    luce_test::ScopedEnvVar top_p{"PFLASH_LONGATTNCOMP_TOP_P", nullptr};
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", nullptr};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", nullptr};
+    luce_test::ScopedEnvVar query{"PFLASH_SELECT_QUERY_TOKENS", nullptr};
+    luce_test::ScopedEnvVar parser{"PFLASH_SELECT_QUERY_PARSER", nullptr};
+    luce_test::ScopedEnvVar top_p{"PFLASH_SELECT_TOP_P", nullptr};
 
     const std::string tokenizer_path =
         write_deepseek_marker_tokenizer_fixture();

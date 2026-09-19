@@ -406,13 +406,13 @@ std::string pflash_token_fingerprint(
 
 
 bool pflash_full_cache_restore_allowed(
-        bool longattncomp_environment_present) noexcept {
-    return !longattncomp_environment_present;
+        bool selection_environment_present) noexcept {
+    return !selection_environment_present;
 }
 
 bool pflash_continuation_must_fail_closed(
-        bool longattncomp_environment_present) noexcept {
-    return longattncomp_environment_present;
+        bool selection_environment_present) noexcept {
+    return selection_environment_present;
 }
 
 int pflash_target_token_ceiling(
@@ -3065,11 +3065,11 @@ void HttpServer::apply_flowkv_compression(
 
 std::string HttpServer::apply_pflash_compression(
         const ParsedRequest & req, PreparedPrompt & prepared) {
-    const bool longattncomp_environment =
-        dflash::qwen3::has_pflash_longattncomp_environment();
+    const bool selection_environment =
+        dflash::qwen3::has_pflash_selection_environment();
     auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
     if (http_detail::pflash_full_cache_restore_allowed(
-            longattncomp_environment) && full_slot >= 0) {
+            selection_environment) && full_slot >= 0) {
         std::fprintf(stderr,
             "[pflash] full-cache hit slot=%d — skipping compress\n",
             full_slot);
@@ -3090,14 +3090,14 @@ std::string HttpServer::apply_pflash_compression(
         return "PFlash drafter tokenizer produced an empty prompt";
     }
 
-    dflash::qwen3::PFlashLongAttnCompConfig experiment;
+    dflash::qwen3::PFlashSelectionConfig experiment;
     std::string experiment_error;
-    if (!dflash::qwen3::resolve_pflash_longattncomp(
+    if (!dflash::qwen3::resolve_pflash_selection(
             (int) drafter_ids.size(), 32, experiment, experiment_error)) {
-        return "invalid PFlash LongAttnComp config: " + experiment_error;
+        return "invalid PFlash strict selection config: " + experiment_error;
     }
     if (!experiment.selection_active && !req.pflash_required.empty()) {
-        return "PFlash pflash_required needs strict LongAttnComp selection";
+        return "PFlash pflash_required needs strict budget selection";
     }
 
     const bool messages_input =
@@ -3116,13 +3116,13 @@ std::string HttpServer::apply_pflash_compression(
     std::vector<PFlashTokenSpan> required_instruction_spans;
     if (experiment.configured) {
         if (!messages_input && !raw_text_input) {
-            return "PFlash LongAttnComp input has no parseable text";
+            return "PFlash strict selection input has no parseable text";
         }
         try {
             auto messages =
                 normalize_chat_messages(req.messages, req.format, tool_memory_);
             if (messages.empty()) {
-                return "PFlash LongAttnComp normalized messages are empty";
+                return "PFlash strict selection normalized messages are empty";
             }
 
             int last_user_index = -1;
@@ -3146,7 +3146,7 @@ std::string HttpServer::apply_pflash_compression(
                 (experiment.query_parser ==
                      dflash::qwen3::PFlashQueryParser::SemanticUser &&
                  !raw_text_input && last_user_text.empty())) {
-                return "PFlash LongAttnComp latest-user boundary is unavailable";
+                return "PFlash strict selection latest-user boundary is unavailable";
             }
 
             static constexpr const char * kContentBegin =
@@ -3233,12 +3233,12 @@ std::string HttpServer::apply_pflash_compression(
                     (size_t) boundary_index,
                     query_content_begin, query_content_end,
                     boundary_error)) {
-                return "PFlash LongAttnComp " + boundary_error;
+                return "PFlash strict selection " + boundary_error;
             }
             if (query_content_begin < 0 ||
                 query_content_end <= query_content_begin ||
                 query_content_end >= (int) drafter_ids.size()) {
-                return "PFlash LongAttnComp content boundary mapping failed";
+                return "PFlash strict selection content boundary mapping failed";
             }
 
             if (experiment.selection_active) {
@@ -3251,7 +3251,7 @@ std::string HttpServer::apply_pflash_compression(
                     if (!map_rendered_message(
                             instruction_index, instruction_span,
                             boundary_error)) {
-                        return "PFlash LongAttnComp instruction mapping failed: " +
+                        return "PFlash strict selection instruction mapping failed: " +
                             boundary_error;
                     }
                     required_instruction_spans.push_back(instruction_span);
@@ -3266,7 +3266,7 @@ std::string HttpServer::apply_pflash_compression(
                             messages, tool_free_req,
                             /*add_generation_prompt=*/true,
                             tool_free_rendered, boundary_error)) {
-                        return "PFlash LongAttnComp tool mapping failed: " +
+                        return "PFlash strict selection tool mapping failed: " +
                             boundary_error;
                     }
                     const auto tool_free_ids = drafter_tokenizer_->encode(
@@ -3275,7 +3275,7 @@ std::string HttpServer::apply_pflash_compression(
                         http_detail::pflash_changed_token_span(
                             drafter_ids, tool_free_ids);
                     if (tool_span.begin < 0) {
-                        return "PFlash LongAttnComp tool mapping failed: "
+                        return "PFlash strict selection tool mapping failed: "
                             "tools did not produce a retained prompt span";
                     }
                     required_instruction_spans.push_back(tool_span);
@@ -3293,7 +3293,7 @@ std::string HttpServer::apply_pflash_compression(
                             *drafter_tokenizer_, drafter_ids,
                             query_content_begin, query_content_end, required);
                     if (required_span.begin < 0) {
-                        return "PFlash LongAttnComp required-text mapping "
+                        return "PFlash strict selection required-text mapping "
                             "failed: a pflash_required string does not occur "
                             "in the latest user content";
                     }
@@ -3313,7 +3313,7 @@ std::string HttpServer::apply_pflash_compression(
                             query_content_begin, query_content_end,
                             req.pflash_query);
                     if (explicit_query_span.begin < 0) {
-                        return "PFlash LongAttnComp explicit query mapping "
+                        return "PFlash strict selection explicit query mapping "
                             "failed: pflash_query does not occur in the "
                             "latest user content";
                     }
@@ -3326,7 +3326,7 @@ std::string HttpServer::apply_pflash_compression(
                 if (!dflash::qwen3::validate_pflash_instruction_spans(
                         required_instruction_spans,
                         (int) drafter_ids.size(), instruction_error)) {
-                    return "PFlash LongAttnComp instruction mapping failed: " +
+                    return "PFlash strict selection instruction mapping failed: " +
                         instruction_error;
                 }
             }
@@ -3479,7 +3479,7 @@ std::string HttpServer::apply_pflash_compression(
             prompt_tokens, compress_request.keep_ratio)
         : -1;
     if (experiment.selection_active && target_ceiling < 0) {
-        return "PFlash LongAttnComp target-token ceiling is invalid";
+        return "PFlash strict selection target-token ceiling is invalid";
     }
     const float requested_keep_ratio = compress_request.keep_ratio;
 
@@ -3565,7 +3565,7 @@ std::string HttpServer::apply_pflash_compression(
             break;
         }
         std::fprintf(stderr,
-            "[pflash-longattncomp] final prompt %zu exceeds ceiling %d "
+            "[pflash-select] final prompt %zu exceeds ceiling %d "
             "(re-encode overshoot); retrying with keep_ratio %.6f\n",
             final_tokens.size(), target_ceiling,
             (double) compress_request.keep_ratio);
@@ -3573,11 +3573,11 @@ std::string HttpServer::apply_pflash_compression(
     }
     if (experiment.selection_active) {
         std::fprintf(stderr,
-            "[pflash-longattncomp] final target tokens=%zu ceiling=%d\n",
+            "[pflash-select] final target tokens=%zu ceiling=%d\n",
             final_tokens.size(), target_ceiling);
         std::fflush(stderr);
         if ((int) final_tokens.size() > target_ceiling) {
-            return "PFlash LongAttnComp final prompt exceeds target-token ceiling "
+            return "PFlash strict selection final prompt exceeds target-token ceiling "
                 "(" + std::to_string(final_tokens.size()) + " > " +
                 std::to_string(target_ceiling) + ")";
         }
@@ -3606,24 +3606,24 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
              prompt_tokens >= config_.pflash_threshold);
         const bool continuation = should_compress &&
             is_continuation_request(req.messages);
-        const bool longattncomp_environment =
-            dflash::qwen3::has_pflash_longattncomp_environment();
-        if (should_compress && longattncomp_environment) {
-            dflash::qwen3::PFlashLongAttnCompConfig experiment;
+        const bool selection_environment =
+            dflash::qwen3::has_pflash_selection_environment();
+        if (should_compress && selection_environment) {
+            dflash::qwen3::PFlashSelectionConfig experiment;
             std::string experiment_error;
-            if (!dflash::qwen3::resolve_pflash_longattncomp(
+            if (!dflash::qwen3::resolve_pflash_selection(
                     0, 32, experiment, experiment_error)) {
                 prepared.error_status = 500;
-                prepared.error = "invalid PFlash LongAttnComp config: " +
+                prepared.error = "invalid PFlash strict selection config: " +
                     experiment_error;
                 return prepared;
             }
             if (http_detail::pflash_continuation_must_fail_closed(
-                    longattncomp_environment) &&
+                    selection_environment) &&
                 (continuation || req.disk_cache_policy.compress)) {
                 prepared.error_status = 500;
                 prepared.error =
-                    "PFlash LongAttnComp does not support continuation or FlowKV compression";
+                    "PFlash strict selection does not support continuation or FlowKV compression";
                 return prepared;
             }
         }

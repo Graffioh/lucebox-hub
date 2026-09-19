@@ -266,7 +266,7 @@ bool forward_qwen3_drafter_model(
         const char * e = std::getenv("DFLASH_FP_NOPE_TAIL");
         return e == nullptr || std::string(e) != "0";
     }();
-    const bool nope_tail = w.longattncomp_head_loaded || configured_nope_tail;
+    const bool nope_tail = w.scoring_head_loaded || configured_nope_tail;
 
     if (n_lookahead < 1 || S < n_lookahead + 1) {
         set_last_error("forward_qwen3_drafter_model: S too small");
@@ -292,11 +292,11 @@ bool forward_qwen3_drafter_model(
         if (e) { int v = std::atoi(e); if (v > 0) return v; }
         return -1;
     }();
-    const int fwd_layer_limit_pre = w.longattncomp_head_loaded
+    const int fwd_layer_limit_pre = w.scoring_head_loaded
         ? 14
         : ((early_exit_pre > 0 && early_exit_pre < w.n_layer)
             ? early_exit_pre : w.n_layer);
-    const ScoreRange pre_range = w.longattncomp_head_loaded
+    const ScoreRange pre_range = w.scoring_head_loaded
         ? ScoreRange{13, 14}
         : compute_score_range(w.n_layer, score_layers_pre, fwd_layer_limit_pre);
     const int score_layer_start_pre = pre_range.start;
@@ -382,7 +382,7 @@ bool forward_qwen3_drafter_model(
     {
         std::vector<float> m((size_t)n_lookahead * S, 0.0f);
         for (int t = 0; t < n_lookahead; ++t) {
-            const int visible_end = w.longattncomp_head_loaded
+            const int visible_end = w.scoring_head_loaded
                 ? query_start
                 : query_start + t + 1;
             for (int j = 0; j < S; ++j) {
@@ -610,7 +610,7 @@ bool forward_qwen3_drafter_model(
             ggml_free(gA);
         }
 
-        if (w.longattncomp_head_loaded && il == 13) {
+        if (w.scoring_head_loaded && il == 13) {
             continue;
         }
 
@@ -983,7 +983,7 @@ bool forward_qwen3_drafter_model(
         for (int t = 0; t < n_lookahead; ++t) {
             for (int j = 0; j < S; ++j) {
                 size_t idx = (size_t)t * S + j;
-                if (w.longattncomp_head_loaded) {
+                if (w.scoring_head_loaded) {
                     float sum = 0.0f;
                     for (int h = 0; h < H; ++h) {
                         sum += probs_h[(size_t)j
