@@ -1947,6 +1947,8 @@ if(DFLASH27B_TESTS)
             test/test_drafter_tail_capture_guard.cpp
             test/test_drafter_warm_path_regression.cpp
             test/test_qwen3_buffer_plan.cpp
+            test/test_pflash_drafter_ipc.cpp
+            test/test_pflash_selection.cpp
             test/test_model_test_paths.cpp
             test/test_gguf_mmap.cpp
             test/test_kv_quant.cpp
