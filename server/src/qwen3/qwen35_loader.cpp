@@ -96,9 +96,8 @@ static bool load_qwen35_scoring_head(const std::string & path,
         set_last_error(message);
         return false;
     };
-    // On-disk contract of a scoring-head GGUF as written by `pflash-scorer export`
-    // (architecture `pflash_scoring_head`, keys `scoringhead.*`). Files exported
-    // before 19 September 2026 carry the previous key names and must be re-exported.
+    // GGUF contract of a scoring-head file: architecture `pflash_scoring_head`,
+    // metadata and tensors under `scoringhead.*`.
     if (!qwen35_metadata_equals(g, "general.architecture", "pflash_scoring_head") ||
         !qwen35_metadata_equals(g, "scoringhead.schema", kQwen35HeadSchema) ||
         !qwen35_metadata_equals(g, "scoringhead.base_model", kQwen35HeadBaseModel) ||

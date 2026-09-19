@@ -145,9 +145,8 @@ bool load_scoring_head(
         set_last_error(message);
         return false;
     };
-    // On-disk contract of a scoring-head GGUF as written by `pflash-scorer export`
-    // (architecture `pflash_scoring_head`, keys `scoringhead.*`). Files exported
-    // before 19 September 2026 carry the previous key names and must be re-exported.
+    // GGUF contract of a scoring-head file: architecture `pflash_scoring_head`,
+    // metadata and tensors under `scoringhead.*`.
     const bool metadata_ok =
         metadata_equals(gctx, "general.architecture", "pflash_scoring_head") &&
         metadata_equals(gctx, "scoringhead.schema", "qwen3_0_6b_nope_qk_mass_v1") &&

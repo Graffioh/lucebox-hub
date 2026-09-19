@@ -418,7 +418,7 @@ std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
         min_segment < 1 || max_segment < min_segment) {
         return spans;
     }
-    // Sub-unit scores feed only the oversize interior argmax (recipe 0.8);
+    // Sub-unit scores feed only the oversize interior argmax;
     // the boundary threshold and merge floor always read the unit scores.
     const std::vector<float> & interior =
         (int) split_scores.size() >= input_tokens ? split_scores : boundary_scores;

@@ -562,7 +562,7 @@ TEST_CASE(PFlashSelectionFixture, probe_segments_oversize_split_keeps_off_the_ne
 
 TEST_CASE(PFlashSelectionFixture, probe_segments_split_scores_feed_only_the_interior_argmax) {
     // The sub-unit score vector steers the oversize interior split without
-    // touching the boundary threshold or merge floor (recipe 0.8).
+    // touching the boundary threshold or merge floor.
     std::vector<float> boundary(30, 0.0f);
     boundary[10] = 0.5f;    // unit score in the window — must NOT be used
     std::vector<float> subunit(30, 0.0f);

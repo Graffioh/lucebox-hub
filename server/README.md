@@ -338,8 +338,7 @@ runs dense (`ggml_flash_attn_ext`); the block-sparse FlashPrefill kernels
 still dispatch head dimension 128 only.
 
 `PFLASH_SEGMENT_PROBE_GGUF` loads a segment probe (schema
-`qwen3_5_0_8b_segment_probe_v1`, exported by `pflash-scorer
-qwen35-segment-probe-export`): a 264K-parameter network on the same block-14
+`qwen3_5_0_8b_segment_probe_v1`): a 264K-parameter network on the same block-14
 tap that scores every token for "a new unit of text starts here". With it
 loaded, the context is cut at every boundary above the probe's threshold
 (the query start and instruction-span edges are always cut; minimum and
