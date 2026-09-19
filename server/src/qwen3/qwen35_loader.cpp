@@ -96,14 +96,14 @@ static bool load_qwen35_scoring_head(const std::string & path,
         set_last_error(message);
         return false;
     };
-    // The GGUF metadata keys, tensor names and architecture value below are
-    // the on-disk GGUF contract written by the offline trainer, not runtime
-    // vocabulary: renaming them here would reject every published head file.
-    if (!qwen35_metadata_equals(g, "general.architecture", "longattncomp") ||
-        !qwen35_metadata_equals(g, "longattncomp.schema", kQwen35HeadSchema) ||
-        !qwen35_metadata_equals(g, "longattncomp.base_model", kQwen35HeadBaseModel) ||
-        !qwen35_metadata_equals(g, "longattncomp.runtime_gguf_sha256", st.gguf_sha256) ||
-        !qwen35_metadata_equals(g, "longattncomp.feature_tap", kQwen35HeadFeatureTap)) {
+    // On-disk contract of a scoring-head GGUF as written by `pflash-scorer export`
+    // (architecture `pflash_scoring_head`, keys `scoringhead.*`). Files exported
+    // before 19 September 2026 carry the previous key names and must be re-exported.
+    if (!qwen35_metadata_equals(g, "general.architecture", "pflash_scoring_head") ||
+        !qwen35_metadata_equals(g, "scoringhead.schema", kQwen35HeadSchema) ||
+        !qwen35_metadata_equals(g, "scoringhead.base_model", kQwen35HeadBaseModel) ||
+        !qwen35_metadata_equals(g, "scoringhead.runtime_gguf_sha256", st.gguf_sha256) ||
+        !qwen35_metadata_equals(g, "scoringhead.feature_tap", kQwen35HeadFeatureTap)) {
         return fail("scoring head metadata does not match the loaded Qwen3.5-0.8B drafter");
     }
     struct Contract {
@@ -113,9 +113,9 @@ static bool load_qwen35_scoring_head(const std::string & path,
         ggml_tensor ** destination;
     };
     const Contract contracts[] = {
-        {"longattncomp.attn_q.weight", (int64_t)w.n_embd,
+        {"scoringhead.attn_q.weight", (int64_t)w.n_embd,
          (int64_t)w.n_head * w.n_embd_head_k, &st.head_wq},
-        {"longattncomp.attn_k.weight", (int64_t)w.n_embd,
+        {"scoringhead.attn_k.weight", (int64_t)w.n_embd,
          (int64_t)w.n_head_kv * w.n_embd_head_k, &st.head_wk},
     };
     ggml_init_params head_params{};

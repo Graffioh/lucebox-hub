@@ -145,20 +145,20 @@ bool load_scoring_head(
         set_last_error(message);
         return false;
     };
-    // The GGUF metadata keys, tensor names and architecture value below are
-    // the on-disk GGUF contract written by the offline trainer, not runtime
-    // vocabulary: renaming them here would reject every published head file.
+    // On-disk contract of a scoring-head GGUF as written by `pflash-scorer export`
+    // (architecture `pflash_scoring_head`, keys `scoringhead.*`). Files exported
+    // before 19 September 2026 carry the previous key names and must be re-exported.
     const bool metadata_ok =
-        metadata_equals(gctx, "general.architecture", "longattncomp") &&
-        metadata_equals(gctx, "longattncomp.schema", "qwen3_0_6b_nope_qk_mass_v1") &&
-        metadata_equals(gctx, "longattncomp.base_model", "Qwen/Qwen3-0.6B") &&
+        metadata_equals(gctx, "general.architecture", "pflash_scoring_head") &&
+        metadata_equals(gctx, "scoringhead.schema", "qwen3_0_6b_nope_qk_mass_v1") &&
+        metadata_equals(gctx, "scoringhead.base_model", "Qwen/Qwen3-0.6B") &&
         metadata_equals(
             gctx,
-            "longattncomp.runtime_gguf_sha256",
+            "scoringhead.runtime_gguf_sha256",
             drafter_sha256.c_str()) &&
         metadata_equals(
             gctx,
-            "longattncomp.feature_tap",
+            "scoringhead.feature_tap",
             "post_block12_residual_before_block13");
     if (!metadata_ok) {
         return fail("scoring head metadata does not match the loaded Qwen3-0.6B drafter");
@@ -168,8 +168,8 @@ bool load_scoring_head(
         ggml_tensor * destination;
     };
     const TensorContract contracts[] = {
-        {"longattncomp.attn_q.weight", out.layers[13].wq},
-        {"longattncomp.attn_k.weight", out.layers[13].wk},
+        {"scoringhead.attn_q.weight", out.layers[13].wq},
+        {"scoringhead.attn_k.weight", out.layers[13].wk},
     };
     for (const auto & contract : contracts) {
         const int64_t id = gguf_find_tensor(gctx, contract.name);
