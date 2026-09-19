@@ -455,6 +455,9 @@ add_library(dflash_common STATIC
     src/qwen3/anchor_scan.cpp
     src/qwen3/pflash_selection.cpp
     src/qwen3/qwen3_drafter.cpp
+    src/qwen3/qwen3_drafter_common.cpp
+    src/qwen3/qwen35_drafter.cpp
+    src/qwen3/qwen35_loader.cpp
     src/qwen3/qwen3_kvflash_scorer.cpp
     src/qwen3/qwen3_loader.cpp
     src/qwen3/qwen3_graph.cpp
