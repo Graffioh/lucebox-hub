@@ -144,6 +144,9 @@ private:
     bool                           pflash_drafter_loaded_ = false;
     std::string                    pflash_drafter_path_;
     int                            pflash_drafter_gpu_ = -1;
+    // Fail-safe latch: set when a skip-park window failed and the parked
+    // retry succeeded — later windows park even if the request asks to skip.
+    bool                           pflash_relaxed_ = false;
     // Once a long prompt selects the fragmentation-safe prefill shape, retain
     // it for later requests so the HIP arenas never switch back under load.
     int                            hybrid_prefill_chunk_cap_ = 0;
@@ -151,6 +154,14 @@ private:
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
     void release_pflash_drafter();
+    // One compression window (sync → park → load drafter → score → restore)
+    // with the park step optional. compress_batch calls this once, then
+    // retries with park_window=true if the skip-park attempt failed (OOM
+    // fail-safe).
+    std::vector<CompressResult> run_compress_window(
+        const std::vector<CompressRequest> & requests,
+        const CompressRequest & load_request,
+        bool park_window);
     void keep_spec_feature_tail(std::vector<float> & features,
                                 size_t max_rows) const;
     // True when a wide prefill path returns per-token DSpark features and the

@@ -26,6 +26,7 @@
 #include "api_types.h"
 #include "placement/draft_residency.h"
 #include "placement/remote_draft_config.h"
+#include "placement/skip_park_guard.h"
 #include "common/pflash_drafter_ipc.h"
 #include "model_card.h"
 #include "adaptive_keep_ratio.h"
@@ -220,7 +221,18 @@ struct ServerConfig {
     int         pflash_drafter_gpu = 0;     // backend-local GPU for PFlash drafter
     bool        pflash_remote_drafter = false; // use IPC drafter for mixed backends
     RemoteDraftConfig pflash_remote;        // IPC binary/work-dir for remote PFlash drafter
-    bool        pflash_skip_park = false;   // skip park/unpark for >=32GB GPUs
+    // --prefill-skip-park auto|on|off. `pflash_skip_park` is the RESOLVED
+    // decision, fixed once at startup by resolve_skip_park(): under Auto it
+    // compares the drafter GGUF footprint against measured free VRAM with a
+    // margin; On/Off are explicit overrides (the <32GiB/ctx>64K hardware
+    // guard still applies to On). Remote drafter and upstream-proxy modes
+    // resolve off. See placement/skip_park_guard.h.
+    SkipParkMode pflash_skip_park_mode = SkipParkMode::Auto;
+    bool         pflash_skip_park = false;
+    // Auto estimate (bytes incl. margin) and free VRAM at resolve time —
+    // exposed in logs and /props for forensics. 0 when not estimated.
+    int64_t      pflash_skip_park_required_bytes = 0;
+    int64_t      pflash_skip_park_free_bytes = 0;
     // Passthrough proxy — forward to upstream OpenAI-compatible server
     std::string pflash_upstream_base;      // e.g. "http://localhost:8080/v1"
     std::string pflash_upstream_key;       // Bearer token for upstream

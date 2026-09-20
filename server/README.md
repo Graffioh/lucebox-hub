@@ -372,7 +372,7 @@ the whole request's device footprint. `/status/json` reports
 | `--prefill-keep-ratio <F>` | `0.05` | Fraction of source tokens kept. |
 | `--prefill-curve T:R [T:R ...]` | none | Piecewise keep-ratio curve; overrides the flat ratio. |
 | `--prefill-drafter <path>` | none | PFlash drafter GGUF: Qwen3-0.6B, or Qwen3.5-0.8B when the file name contains `qwen3.5`/`qwen35`. |
-| `--prefill-skip-park` | off | Keep target and decode draft resident while PFlash runs. |
+| `--prefill-skip-park [auto\|on\|off]` | `auto` | Keep target and decode draft resident while PFlash runs. `auto` enables it when the drafter GGUF footprint fits measured free VRAM with margin; bare flag = `on` (explicit override, still bounded by the <32GiB/ctx>64K guard). A skip-park window that OOMs retries once with parking and stays parked. |
 | `--prefill-upstream-base <URL>` | none | Enable compression-proxy mode. |
 | `--prefill-upstream-key <KEY>` | none | Bearer token for the upstream. |
 | `--prefill-upstream-model <NAME>` | none | Model name forwarded upstream. |

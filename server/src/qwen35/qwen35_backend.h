@@ -259,6 +259,14 @@ protected:
     void kvflash_ensure_scorer();
 
 private:
+    // One compression window (park → load drafter → score → restore) with
+    // the park step optional. compress_batch calls this once, then retries
+    // with park_window=true if the skip-park attempt failed (OOM fail-safe).
+    std::vector<CompressResult> run_compress_window(
+        const std::vector<CompressRequest> & requests,
+        const CompressRequest & load_request,
+        bool park_window);
+
     // ── GPU backends ─────────────────────────────────────────────────
     ggml_backend_t target_backend_ = nullptr;
     ggml_backend_t draft_backend_  = nullptr;
@@ -294,6 +302,9 @@ private:
     // ── Pflash drafter (lazy-loaded) ─────────────────────────────────
     DrafterContext drafter_ctx_;
     bool           drafter_loaded_ = false;
+    // Fail-safe latch: set when a skip-park window failed and the parked
+    // retry succeeded — later windows park even if the request asks to skip.
+    bool           pflash_relaxed_ = false;
 
     // ── Sampler state ────────────────────────────────────────────────
     SamplerCfg      sampler_;

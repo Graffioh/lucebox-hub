@@ -117,6 +117,9 @@ private:
     // Pflash drafter (lazy-loaded, reuses the same model for compress)
     DrafterContext         drafter_ctx_;
     bool                  drafter_loaded_ = false;
+    // Fail-safe latch: set when a skip-park compress failed and the parked
+    // retry succeeded — later requests park even when asked to skip.
+    bool                  pflash_relaxed_ = false;
 
     // Sampler
     SamplerCfg            sampler_;

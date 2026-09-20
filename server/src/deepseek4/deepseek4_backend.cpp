@@ -3138,36 +3138,85 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
     }
     if (load_request == nullptr) return results;
 
+    auto window_failed = [&requests, &valid_request](
+            const std::vector<CompressResult> & rs) {
+        for (size_t i = 0; i < requests.size(); ++i) {
+            if (!valid_request(requests[i])) continue;
+            if (i >= rs.size() || !rs[i].ok) return true;
+        }
+        return false;
+    };
+
+    // Once a skip-park window has OOM-failed and the parked retry landed,
+    // pflash_relaxed_ latches: later windows park even when asked to skip.
+    const bool park_window = !load_request->skip_park || pflash_relaxed_;
+    results = run_compress_window(requests, *load_request, park_window);
+
+    // Fail-safe fallback: a no-park window can still OOM when the drafter
+    // load or its scoring scratch outgrows the startup estimate. Drop any
+    // partial drafter state, park the resident target, retry once. The
+    // latch only sets when the parked retry demonstrably fixed it —
+    // deterministic per-request failures don't poison later windows.
+    if (!park_window && window_failed(results)) {
+        std::fprintf(stderr,
+            "[deepseek4-pflash] skip-park window failed — parking target "
+            "and retrying once\n");
+        release_pflash_drafter();
+        auto retry = run_compress_window(requests, *load_request,
+                                         /*park_window=*/true);
+        if (!window_failed(retry)) {
+            pflash_relaxed_ = true;
+            std::fprintf(stderr,
+                "[deepseek4-pflash] parked retry succeeded — latching park "
+                "for later windows\n");
+        }
+        results = std::move(retry);
+    }
+
+    return results;
+}
+
+std::vector<ModelBackend::CompressResult> DeepSeek4Backend::run_compress_window(
+        const std::vector<CompressRequest> & requests,
+        const CompressRequest & load_request,
+        bool park_window) {
+    std::vector<CompressResult> results(requests.size());
+    const auto valid_request = [](const CompressRequest & request) {
+        return !request.input_ids.empty() && !request.drafter_path.empty() &&
+            std::isfinite(request.keep_ratio) &&
+            request.keep_ratio >= 0.0f && request.keep_ratio <= 1.0f;
+    };
+
     // Parking releases target/cache buffers, including the expert backend.
     // Drain their queued work before releasing any of those dependencies.
     if (backend_) ggml_backend_synchronize(backend_);
     if (spec_backend_) ggml_backend_synchronize(spec_backend_);
     if (expert_backend_) ggml_backend_synchronize(expert_backend_);
     const bool was_parked = parked_;
-    if (!load_request->skip_park && !parked_ &&
+    if (park_window && !parked_ &&
         !park(ParkTarget::TargetModel)) {
         return results;
     }
     if (pflash_drafter_loaded_ &&
-        (pflash_drafter_path_ != load_request->drafter_path ||
-         pflash_drafter_gpu_ != load_request->drafter_gpu)) {
+        (pflash_drafter_path_ != load_request.drafter_path ||
+         pflash_drafter_gpu_ != load_request.drafter_gpu)) {
         release_pflash_drafter();
     }
     if (!pflash_drafter_loaded_) {
-        if (!load_drafter(load_request->drafter_path, 999,
-                          load_request->drafter_gpu,
+        if (!load_drafter(load_request.drafter_path, 999,
+                          load_request.drafter_gpu,
                           pflash_drafter_ctx_)) {
             std::fprintf(stderr, "[deepseek4-pflash] load failed: %s\n",
                          dflash27b_last_error());
             release_pflash_drafter();
-            if (!load_request->skip_park && !was_parked) {
+            if (park_window && !was_parked) {
                 unpark(ParkTarget::TargetModel);
             }
             return results;
         }
         pflash_drafter_loaded_ = true;
-        pflash_drafter_path_ = load_request->drafter_path;
-        pflash_drafter_gpu_ = load_request->drafter_gpu;
+        pflash_drafter_path_ = load_request.drafter_path;
+        pflash_drafter_gpu_ = load_request.drafter_gpu;
     }
 
     for (size_t index = 0; index < requests.size(); ++index) {
@@ -3179,11 +3228,11 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
         result.ok = !result.compressed_ids.empty();
     }
 
-    if (load_request->residency_action ==
+    if (load_request.residency_action ==
         DraftResidencyAction::ReleaseAfterUse) {
         release_pflash_drafter();
     }
-    if (!load_request->skip_park && !was_parked &&
+    if (park_window && !was_parked &&
         !unpark(ParkTarget::TargetModel)) {
         std::fill(results.begin(), results.end(), CompressResult{});
     }

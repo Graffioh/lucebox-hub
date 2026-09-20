@@ -957,28 +957,58 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
     CompressResult result;
     if (req.input_ids.empty()) return result;
 
-    const bool was_parked = parked_;
-    if (!req.skip_park && !parked_) park(ParkTarget::TargetModel);
+    auto attempt = [&](bool park_window) {
+        CompressResult r;
+        const bool was_parked = parked_;
+        if (park_window && !parked_) park(ParkTarget::TargetModel);
 
-    if (!drafter_loaded_) {
-        if (!load_drafter(req.drafter_path, 999, req.drafter_gpu, drafter_ctx_)) {
-            std::fprintf(stderr, "[compress] load failed: %s\n", dflash27b_last_error());
-            if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
-            return result;
+        if (!drafter_loaded_) {
+            if (!load_drafter(req.drafter_path, 999, req.drafter_gpu,
+                              drafter_ctx_)) {
+                std::fprintf(stderr, "[compress] load failed: %s\n",
+                             dflash27b_last_error());
+                if (park_window && !was_parked) unpark(ParkTarget::TargetModel);
+                return r;
+            }
+            drafter_loaded_ = true;
         }
-        drafter_loaded_ = true;
+
+        r = CompressResult::from_compressed_ids(drafter_score_and_compress(
+            drafter_ctx_, req.input_ids, req.keep_ratio,
+            /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
+            req.score_query_end, req.required_instruction_spans));
+
+        if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
+            free_drafter();
+        }
+
+        if (park_window && !was_parked) unpark(ParkTarget::TargetModel);
+        return r;
+    };
+
+    // Once a skip-park attempt has OOM-failed and the parked retry landed,
+    // pflash_relaxed_ latches: later requests park even when asked to skip.
+    const bool park_window = !req.skip_park || pflash_relaxed_;
+    result = attempt(park_window);
+
+    // Fail-safe fallback: a no-park attempt can still OOM when the drafter
+    // load or its scoring scratch outgrows the startup estimate. Drop any
+    // partial drafter state, park the resident target, retry once.
+    if (!park_window && !result.ok) {
+        std::fprintf(stderr,
+            "[compress] skip-park attempt failed — parking target and "
+            "retrying once\n");
+        // Unconditional free: a failed load_drafter can leave a live backend
+        // in the ctx even though drafter_loaded_ is still false.
+        dflash::common::free_drafter(drafter_ctx_);
+        drafter_loaded_ = false;
+        result = attempt(true);
+        if (result.ok) {
+            pflash_relaxed_ = true;
+            std::fprintf(stderr,
+                "[compress] parked retry succeeded — latching park\n");
+        }
     }
-
-    result = CompressResult::from_compressed_ids(drafter_score_and_compress(
-        drafter_ctx_, req.input_ids, req.keep_ratio,
-        /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
-        req.score_query_end, req.required_instruction_spans));
-
-    if (req.residency_action == DraftResidencyAction::ReleaseAfterUse) {
-        free_drafter();
-    }
-
-    if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
     return result;
 }
 

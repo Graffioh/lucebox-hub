@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "placement/skip_park_guard.h"
+
 #include <cstdint>
 #include <string>
 
@@ -72,5 +74,19 @@ struct GgufMetadata {
 // in-memory hash still gets returned.
 GgufMetadata read_gguf_metadata(const std::string & path,
                                 bool compute_sha256);
+
+// Read the PFlash drafter dims the skip-park estimator needs from the drafter
+// GGUF header and derive its worst-case resident footprint. `weights_bytes` is
+// the file size (upper bound on device weights); `runtime_bytes_per_token` and
+// `fixed_bytes` mirror the buffers the scorers allocate in
+// qwen35_drafter.cpp (hybrid) and qwen3_graph.cpp (dense). KV cache bytes honor
+// the same DFLASH27B_KV_* env resolution as the runtime cache, with TQ3
+// suppressed like the drafter's ScopedKvTq3Off.
+//
+// Returns false when the file can't be opened or the architecture is unknown
+// and dims are missing — callers must then treat the footprint as unknown
+// (auto skip-park resolves off).
+bool inspect_drafter_footprint(const std::string & path,
+                               SkipParkDrafterInfo & out);
 
 }  // namespace dflash::common

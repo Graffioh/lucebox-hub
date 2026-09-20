@@ -343,6 +343,9 @@ format and resolution order.
   "lm_head_fix": null,
   "mode":        "off",
   "skip_park":   null,
+  "skip_park_mode": null,
+  "skip_park_estimate_bytes": null,
+  "skip_park_free_bytes": null,
   "threshold":   null
 }
 ```
@@ -355,7 +358,10 @@ enabled, fields carry the runtime configuration:
 - `threshold` — token-count threshold for AUTO mode
 - `keep_ratio` — fraction of tokens retained after compression
 - `drafter_gguf` — path to the compression drafter GGUF
-- `skip_park` — whether to skip park/unpark (large-VRAM GPUs)
+- `skip_park` — whether compression actually skips park/unpark (resolved)
+- `skip_park_mode` — `"auto" | "on" | "off"` requested policy
+- `skip_park_estimate_bytes` / `skip_park_free_bytes` — the auto-mode
+  footprint estimate (incl. margin) and the free VRAM measured at startup
 - `bsa_enabled` / `bsa_alpha` / `lm_head_fix` — backend-specific
   PFlash tunables
 

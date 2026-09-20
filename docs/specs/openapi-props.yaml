@@ -136,6 +136,9 @@ paths:
                       lm_head_fix: null
                       mode: "off"
                       skip_park: null
+                      skip_park_mode: null
+                      skip_park_estimate_bytes: null
+                      skip_park_free_bytes: null
                       threshold: null
                     prefix_cache:
                       capacity: 0
@@ -638,6 +641,9 @@ components:
         - lm_head_fix
         - mode
         - skip_park
+        - skip_park_mode
+        - skip_park_estimate_bytes
+        - skip_park_free_bytes
         - threshold
       properties:
         bsa_alpha:
@@ -673,7 +679,21 @@ components:
           example: "off"
         skip_park:
           type: ["boolean", "null"]
-          description: Whether to skip park/unpark (large-VRAM GPUs).
+          description: Resolved skip-park decision — whether compression
+            keeps target+draft resident while the drafter scores.
+          example: null
+        skip_park_mode:
+          type: ["string", "null"]
+          enum: ["auto", "on", "off", null]
+          description: Requested `--prefill-skip-park` policy.
+          example: null
+        skip_park_estimate_bytes:
+          type: ["integer", "null"]
+          description: Auto-mode drafter footprint estimate incl. margin.
+          example: null
+        skip_park_free_bytes:
+          type: ["integer", "null"]
+          description: Free VRAM measured on the drafter GPU at startup.
           example: null
         threshold:
           type: ["integer", "null"]

@@ -1137,9 +1137,58 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
         }
     }
     if (load_request == nullptr) return results;
-    const bool should_park = !load_request->skip_park;
+
+    auto window_failed = [&requests](
+            const std::vector<CompressResult> & rs) {
+        for (size_t i = 0; i < requests.size(); ++i) {
+            const auto & r = requests[i];
+            if (r.input_ids.empty() || r.drafter_path.empty()) continue;
+            if (i >= rs.size() || !rs[i].ok) return true;
+        }
+        return false;
+    };
+
+    // Once a skip-park window has OOM-failed and the parked retry landed,
+    // pflash_relaxed_ latches: later windows park even when asked to skip.
+    const bool park_window = !load_request->skip_park || pflash_relaxed_;
+    results = run_compress_window(requests, *load_request, park_window);
+
+    // Fail-safe fallback: a no-park window can still OOM when the drafter
+    // load or its scoring scratch outgrows the startup estimate. Drop any
+    // partial drafter state, park the resident models, retry once. The
+    // latch only sets when the parked retry demonstrably fixed it —
+    // deterministic per-request failures don't poison later windows.
+    if (!park_window && window_failed(results)) {
+        std::fprintf(stderr,
+            "[compress] skip-park window failed — parking target+draft "
+            "and retrying once\n");
+        // Drop the drafter fully: free_drafter() handles the loaded case and
+        // the kvflash scorer borrow; the unconditional free below clears a
+        // backend/weights half-initialized by a failed load_drafter.
+        free_drafter();
+        dflash::common::free_drafter(drafter_ctx_);
+        drafter_loaded_ = false;
+        auto retry = run_compress_window(requests, *load_request,
+                                         /*park_window=*/true);
+        if (!window_failed(retry)) {
+            pflash_relaxed_ = true;
+            std::fprintf(stderr,
+                "[compress] parked retry succeeded — latching park for "
+                "later windows\n");
+        }
+        results = std::move(retry);
+    }
+
+    return results;
+}
+
+std::vector<ModelBackend::CompressResult> Qwen35Backend::run_compress_window(
+        const std::vector<CompressRequest> & requests,
+        const CompressRequest & load_request,
+        bool park_window) {
+    std::vector<CompressResult> results(requests.size());
     const bool release_after_use =
-        load_request->residency_action == DraftResidencyAction::ReleaseAfterUse;
+        load_request.residency_action == DraftResidencyAction::ReleaseAfterUse;
 
     // Park target+draft to free VRAM for the drafter (unless skip_park).
     // A FlowKV request may contain many aged messages. Keep this residency
@@ -1147,7 +1196,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
     // models independently.
     const bool was_target_parked = target_parked_;
     const bool was_draft_parked  = draft_parked_;
-    if (should_park) {
+    if (park_window) {
         step_graph_destroy(sg_);
         if (!target_parked_) park(ParkTarget::TargetModel);
         if (!draft_parked_)  park(ParkTarget::DraftModel);
@@ -1167,12 +1216,12 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
     if (!drafter_loaded_) {
         // drafter_ctx_.backend == nullptr → load_drafter creates its own
         std::fprintf(stderr, "[compress] loading drafter from %s ...\n",
-                     load_request->drafter_path.c_str());
-        if (!load_drafter(load_request->drafter_path, /*gpu_layers=*/999,
-                          load_request->drafter_gpu, drafter_ctx_)) {
+                     load_request.drafter_path.c_str());
+        if (!load_drafter(load_request.drafter_path, /*gpu_layers=*/999,
+                          load_request.drafter_gpu, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
                          dflash27b_last_error());
-            if (should_park) {
+            if (park_window) {
                 if (!was_target_parked) unpark(ParkTarget::TargetModel);
                 if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
             }
@@ -1210,7 +1259,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
     }
 
     // Restore park state
-    if (should_park) {
+    if (park_window) {
         if (!was_target_parked) unpark(ParkTarget::TargetModel);
         if (!was_draft_parked)  unpark(ParkTarget::DraftModel);
     }

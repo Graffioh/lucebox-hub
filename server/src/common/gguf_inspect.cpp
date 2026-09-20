@@ -1,5 +1,7 @@
 #include "gguf_inspect.h"
+#include "ggml.h"
 #include "gguf.h"
+#include "kv_quant.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -419,6 +421,175 @@ GgufMetadata read_gguf_metadata(const std::string & path,
     }
 
     return m;
+}
+
+// ─── PFlash drafter footprint (skip-park estimator) ─────────────────────
+//
+// Worst-case per-token GPU state while a drafter scores a window, mirroring
+// the persistent buffers the two scorer implementations allocate:
+//
+//   hybrid (arch has full_attention_interval — e.g. Qwen3.5-0.8B,
+//   qwen35_drafter.cpp):
+//     act_in + act_out      [n_embd, S] f32              → 2·n_embd·4
+//     KV cache              create_target_cache           → kv_reservation_*
+//     logits                [S, n_lookahead, n_head] f32  → 8·n_head·4
+//     mask + probe logits   [S, n_lookahead] + [S] f32    → ~40
+//     fixed: SSM/conv state, per-ubatch masks/qkv transients, gallocr slack
+//
+//   dense (no interval — e.g. Qwen3-0.6B, qwen3_graph.cpp):
+//     K_curr or K_norope    [head_dim, n_head_kv, S] bf16, up to n_layer
+//     V_curr                one layer                      → n_head_kv·D·2
+//     Q_buf + attn_out      [head_dim, n_head, S] bf16     → 2·n_head·D·2
+//     hidden + pos + mask   [n_embd, S] f32 + [S] i32 + [S,8] f32
+//     fixed: Q_last/Q_norope f32 tails, gallocr slack
+//
+// n_lookahead is fixed at the drafter's 8-token scoring tail.
+
+namespace {
+
+constexpr int64_t kDrafterLookahead = 8;
+// SSM/conv state + per-1024-token-ubatch transients + gallocr slack.
+constexpr int64_t kHybridFixedBytes = 384ll * 1024 * 1024;
+// Per-layer F32 scoring tails + gallocr slack.
+constexpr int64_t kDenseFixedBytes  = 96ll * 1024 * 1024;
+
+// The drafter cache wraps create_target_cache in ScopedKvTq3Off — TQ3 is never
+// a drafter KV type, so suppress it while resolving the same env overrides.
+struct ScopedKvTq3Suppress {
+    ScopedKvTq3Suppress() {
+        const char * raw = std::getenv("DFLASH27B_KV_TQ3");
+        had_ = raw != nullptr;
+        old_ = had_ ? raw : "";
+#if defined(_WIN32)
+        _putenv_s("DFLASH27B_KV_TQ3", "0");
+#else
+        setenv("DFLASH27B_KV_TQ3", "0", 1);
+#endif
+    }
+    ~ScopedKvTq3Suppress() {
+#if defined(_WIN32)
+        if (had_) _putenv_s("DFLASH27B_KV_TQ3", old_.c_str());
+        else      _putenv_s("DFLASH27B_KV_TQ3", "");
+#else
+        if (had_) setenv("DFLASH27B_KV_TQ3", old_.c_str(), 1);
+        else      unsetenv("DFLASH27B_KV_TQ3");
+#endif
+    }
+    bool        had_ = false;
+    std::string old_;
+};
+
+// Per-architecture defaults so a recognized drafter with a partial header
+// still gets a bounded estimate. Unknown archs need all dims present.
+struct DrafterArchDefaults {
+    int n_layer, n_embd, n_head, n_head_kv, head_dim, fai, ctx;
+};
+bool drafter_arch_defaults(const std::string & arch, DrafterArchDefaults & d) {
+    if (arch == "qwen35" || arch == "qwen35moe") {
+        d = {24, 1024, 8, 2, 256, 4, 262144};   // Qwen3.5-0.8B
+        return true;
+    }
+    if (arch == "qwen3" || arch == "qwen3moe") {
+        d = {28, 1024, 16, 8, 128, 0, 40960};   // Qwen3-0.6B
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+bool inspect_drafter_footprint(const std::string & path,
+                               SkipParkDrafterInfo & out) {
+    out = SkipParkDrafterInfo{};
+
+    struct stat st{};
+    if (::stat(path.c_str(), &st) == 0) out.weights_bytes = int64_t(st.st_size);
+
+    gguf_init_params gip{};
+    gip.no_alloc = true;
+    gip.ctx = nullptr;
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
+    if (!gctx) return false;
+
+    std::string arch;
+    if (int64_t id = gguf_find_key(gctx, "general.architecture"); id >= 0) {
+        if (const char * v = gguf_get_val_str(gctx, id)) arch = v;
+    }
+    if (arch.empty()) { gguf_free(gctx); return false; }
+
+    auto get_i32 = [&](const char * suffix, int32_t & dst) -> bool {
+        const std::string key = arch + "." + suffix;
+        const int64_t id = gguf_find_key(gctx, key.c_str());
+        if (id < 0) return false;
+        dst = int32_t(gguf_get_val_u32(gctx, id));
+        return true;
+    };
+
+    int32_t n_layer = -1, n_embd = -1, n_head = -1, n_head_kv = -1,
+            head_dim = -1, fai = 0, ctx_len = -1;
+    get_i32("block_count",                  n_layer);
+    get_i32("embedding_length",             n_embd);
+    get_i32("attention.head_count",         n_head);
+    get_i32("attention.head_count_kv",      n_head_kv);
+    get_i32("attention.key_length",         head_dim);
+    get_i32("full_attention_interval",      fai);
+    get_i32("context_length",               ctx_len);
+    // Embedded NextN blocks inflate block_count on hybrid checkpoints.
+    int32_t nextn = 0;
+    get_i32("nextn_predict_layers",         nextn);
+    gguf_free(gctx);
+
+    DrafterArchDefaults defs{};
+    const bool has_defaults = drafter_arch_defaults(arch, defs);
+    if (!has_defaults &&
+        (n_layer <= 0 || n_embd <= 0 || n_head <= 0 ||
+         n_head_kv <= 0 || head_dim <= 0 || ctx_len <= 0)) {
+        return false;   // unknown arch with a partial header → can't bound
+    }
+    if (has_defaults) {
+        if (n_layer   <= 0) n_layer   = defs.n_layer;
+        if (n_embd    <= 0) n_embd    = defs.n_embd;
+        if (n_head    <= 0) n_head    = defs.n_head;
+        if (n_head_kv <= 0) n_head_kv = defs.n_head_kv;
+        if (head_dim  <= 0) head_dim  = defs.head_dim;
+        if (ctx_len   <= 0) ctx_len   = defs.ctx;
+        // fai==0 is legitimate (dense qwen3); only hybrid archs default it.
+        if (fai <= 0 && defs.fai > 0) fai = defs.fai;
+    }
+    if (nextn > 0 && nextn < n_layer) n_layer -= nextn;
+
+    ggml_type kv_k = GGML_TYPE_Q4_0, kv_v = GGML_TYPE_Q4_0;
+    {
+        ScopedKvTq3Suppress tq3_off;
+        dflash::resolve_kv_types(kv_k, kv_v);
+    }
+
+    int64_t per_token;
+    int64_t fixed;
+    if (fai > 0) {
+        per_token =
+            int64_t(2) * n_embd * 4 +                                        // act_in/out
+            int64_t(kv_reservation_bytes_per_token(
+                n_layer, fai, n_head_kv, kv_k, head_dim, kv_v, head_dim)) +  // KV
+            kDrafterLookahead * n_head * 4 +                                 // logits
+            (kDrafterLookahead + 2) * 4;                                     // mask+probe
+        fixed = kHybridFixedBytes;
+    } else {
+        const int64_t d2 = int64_t(head_dim) * 2;                            // bf16 elems
+        per_token =
+            int64_t(n_layer) * n_head_kv * d2 +                              // K per layer
+            int64_t(n_head_kv) * d2 +                                        // V_curr
+            int64_t(2) * n_head * d2 +                                       // Q_buf+attn_out
+            int64_t(n_embd) * 4 +                                            // hidden f32
+            4 + kDrafterLookahead * 4;                                       // pos+mask_tail
+        fixed = kDenseFixedBytes;
+    }
+
+    out.recognized = true;
+    out.runtime_bytes_per_token = per_token;
+    out.fixed_bytes = fixed;
+    out.context_length = ctx_len;
+    return true;
 }
 
 }  // namespace dflash::common

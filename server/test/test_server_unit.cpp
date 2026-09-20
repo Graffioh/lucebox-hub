@@ -4768,6 +4768,29 @@ TEST_CASE(ServerUnitFixture, test_draft_residency_pflash_auto) {
             /*has_decode_draft=*/true,
         });
     TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
+
+    // Proven ample VRAM (resolved skip-park) upgrades auto to KeepLoaded —
+    // the drafter stays resident between requests.
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::Auto,
+        DraftResidencyContext{
+            DraftResidencyUse::PFlashCompress,
+            /*low_vram_hint=*/false,
+            /*has_decode_draft=*/false,
+            /*ample_vram=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::KeepLoaded);
+
+    // Explicit policies still override the hint both ways.
+    action = resolve_draft_residency_action(
+        DraftResidencyPolicy::RequestScoped,
+        DraftResidencyContext{
+            DraftResidencyUse::PFlashCompress,
+            /*low_vram_hint=*/false,
+            /*has_decode_draft=*/false,
+            /*ample_vram=*/true,
+        });
+    TEST_ASSERT(action == DraftResidencyAction::ReleaseAfterUse);
 }
 
 TEST_CASE(ServerUnitFixture, test_draft_residency_dflash_auto_and_request_scoped) {
