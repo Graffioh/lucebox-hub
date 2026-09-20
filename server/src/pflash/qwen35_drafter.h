@@ -1,4 +1,4 @@
-// Internal interface of the Qwen3.5-0.8B drafter — the only pflash scorer.
+// Internal interface of the Qwen3.5-0.8B drafter — the current pflash scorer.
 //
 // The scorer runs on the Qwen3.5 target architecture (TargetWeights,
 // build_qwen35_layer): qwen35_loader.cpp loads the GGUF, the optional

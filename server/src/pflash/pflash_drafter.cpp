@@ -1,5 +1,7 @@
-// PFlash drafter entry points: load/free the Qwen3.5-0.8B scorer and run
-// drafter_score_and_compress.
+// PFlash drafter entry points: load/free the scorer and run
+// drafter_score_and_compress. The pflash drafter is Qwen3.5-0.8B for now —
+// this file is the dispatch seam where a different drafter model would
+// slot in.
 //
 // Wires three pieces:
 //   - qwen35_loader.cpp    : mmap GGUF + populate ggml tensors on backend,

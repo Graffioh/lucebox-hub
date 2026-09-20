@@ -1,10 +1,13 @@
 // In-process PFlash drafter for speculative prefill.
 //
-// The drafter is the Qwen3.5-0.8B scorer (qwen35_drafter.cpp +
-// qwen35_loader.cpp): it runs the model's first fifteen blocks and scores
-// the context with block 15's NoPE Q/K attention-mass head, with the
-// all-layer running-max scorer kept as an opt-in alternative
-// (PFLASH_QWEN35_LEGACY_SCORER=1 or the PFLASH scorer config).
+// "PFlash" is the whole compression concept (score -> select -> emit); the
+// pflash drafter is the scorer model behind it — Qwen3.5-0.8B for now
+// (qwen35_drafter.cpp + qwen35_loader.cpp): it runs the model's first
+// fifteen blocks and scores the context with block 15's NoPE Q/K
+// attention-mass head, with the all-layer running-max scorer kept as an
+// opt-in alternative (PFLASH_QWEN35_LEGACY_SCORER=1 or the PFLASH scorer
+// config). This header is the model-agnostic API surface; a future drafter
+// slots in behind load_drafter / drafter_score_and_compress.
 //
 // Hosted in the SAME process / SAME ggml allocator as the dflash target, so
 // we never pay the cross-process VRAM contention that broke the Python
@@ -32,12 +35,15 @@ struct Qwen35DrafterState;
 
 struct DrafterContext {
     ggml_backend_t        backend = nullptr;   // owned (created in load_drafter)
+    // Scorer state for the current drafter (Qwen3.5-0.8B). The public API
+    // below never exposes it; backends that need internals include
+    // qwen35_drafter.h explicitly.
     Qwen35DrafterState *  state   = nullptr;   // owned scorer weights + heads
     int                   gpu     = -1;
     bool                  loaded  = false;
 };
 
-// Load the drafter GGUF (a Qwen3.5-0.8B GGUF).
+// Load the drafter GGUF (a Qwen3.5-0.8B GGUF today).
 // Creates a fresh GPU backend if `backend` is null. Otherwise uses the
 // caller-provided backend (so the drafter shares the daemon's allocator).
 //

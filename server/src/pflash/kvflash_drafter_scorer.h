@@ -1,8 +1,8 @@
 // KvFlashDrafterScorer — pflash drafter as the KV pager's Memory Indexer.
 //
 // Scores 64-token chunks with the same tail-attention scoring that pflash
-// compression uses (the Qwen3.5-0.8B drafter), but returns the per-chunk
-// relevance scores instead of a compressed token list. The DrafterContext
+// compression uses (the pflash drafter — Qwen3.5-0.8B for now), but returns
+// the per-chunk relevance scores instead of a compressed token list. The DrafterContext
 // is borrowed: the daemon shares its pflash drafter; the pager itself never
 // depends on this file (see common/kvflash_scorer.h).
 
