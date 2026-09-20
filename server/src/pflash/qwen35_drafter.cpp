@@ -7,16 +7,16 @@
 //                                        Q/K scoring head, under strict
 //                                        budget selection
 //
-// Loading lives in qwen35_loader.cpp; qwen3_drafter.cpp dispatches into
-// qwen35_drafter_score_and_compress on DrafterArch::Qwen35_0p8b.
+// Loading lives in qwen35_loader.cpp; pflash_drafter.cpp dispatches into
+// qwen35_drafter_score_and_compress.
 
 #include "qwen35_drafter.h"
 
-#include "qwen3_drafter.h"
-#include "qwen3_drafter_common.h"
+#include "pflash_drafter.h"
+#include "pflash_compress.h"
 #include "pflash_selection.h"
 #include "common/gguf_inspect.h"
-#include "qwen3/anchor_params.h"
+#include "anchor_params.h"
 #include "internal.h"
 
 #include "ggml.h"
@@ -98,7 +98,7 @@ std::vector<int32_t> qwen35_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const dflash::qwen3::PFlashSelectionConfig & experiment,
+    const dflash::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_scores_out) {
 
@@ -529,7 +529,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     float keep_ratio,
     int n_lookahead,
     int score_query_end,
-    const dflash::qwen3::PFlashSelectionConfig & experiment,
+    const dflash::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_mass_out,
     std::vector<PFlashTokenSpan> * segments_out,
@@ -695,7 +695,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     ggml_tensor * logits = ggml_new_tensor_3d(lctx, GGML_TYPE_F32, S, n_lookahead, H);
     ggml_tensor * mask = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, S, n_lookahead);
     const bool use_probe = st.probe_loaded &&
-        experiment.segmentation != dflash::qwen3::PFlashSegmentation::Fixed;
+        experiment.segmentation != dflash::pflash::PFlashSegmentation::Fixed;
     ggml_tensor * probe_logits = use_probe
         ? ggml_new_tensor_1d(lctx, GGML_TYPE_F32, S) : nullptr;
     ggml_tensor * subunit_logits = use_probe && st.probe_sub_fc2_w
@@ -842,7 +842,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     std::fflush(stderr);
 
     std::vector<PFlashTokenSpan> segments;
-    bool density = experiment.candidate_score == dflash::qwen3::PFlashCandidateScore::Density;
+    bool density = experiment.candidate_score == dflash::pflash::PFlashCandidateScore::Density;
     if (use_probe) {
         // Tap-count smoothing over the raw logits (torch Conv1d, symmetric
         // padding) plus the residual logit, then sigmoid: the boundary score
@@ -881,9 +881,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             if (boundary[(size_t) t] > st.probe_threshold) ++boundaries_in_context;
         }
         const bool forced_probe =
-            experiment.segmentation == dflash::qwen3::PFlashSegmentation::Probe;
+            experiment.segmentation == dflash::pflash::PFlashSegmentation::Probe;
         if (boundaries_in_context >= 4 || forced_probe) {
-            segments = dflash::qwen3::pflash_probe_segments(
+            segments = dflash::pflash::pflash_probe_segments(
                 boundary, S, st.probe_threshold, st.probe_min_segment,
                 st.probe_max_segment, forced, split_scores);
         }
@@ -893,7 +893,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                 "falling back to fixed %d-token chunks\n",
                 boundaries_in_context, experiment.chunk_size);
         } else {
-            if (experiment.candidate_score == dflash::qwen3::PFlashCandidateScore::Auto) {
+            if (experiment.candidate_score == dflash::pflash::PFlashCandidateScore::Auto) {
                 density = true;
             }
             std::fprintf(stderr,
@@ -930,21 +930,21 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const dflash::qwen3::PFlashSelectionConfig & experiment,
+    const dflash::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans) {
-    if (!ctx.arch_state) {
+    if (!ctx.state) {
         set_last_error("qwen35 drafter state missing");
         return {};
     }
-    auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
+    auto * st = static_cast<Qwen35DrafterState *>(ctx.state);
     // Strict budget selection scores with the block-15 head; the
     // legacy all-layer running-max scorer stays available for legacy
     // selection or when PFLASH_QWEN35_LEGACY_SCORER=1 forces it.
     const char * legacy_scorer = std::getenv("PFLASH_QWEN35_LEGACY_SCORER");
     const bool force_legacy = (legacy_scorer && std::string(legacy_scorer) == "1") ||
-        experiment.scorer == dflash::qwen3::PFlashScorer::Legacy;
+        experiment.scorer == dflash::pflash::PFlashScorer::Legacy;
     if (experiment.selection_active &&
-        experiment.scorer == dflash::qwen3::PFlashScorer::Split) {
+        experiment.scorer == dflash::pflash::PFlashScorer::Split) {
         // Two scorers, one budget: the block-15 head ranks (and segments)
         // first, the all-layer running-max scorer fills the remainder.
         std::vector<float> head_mass;

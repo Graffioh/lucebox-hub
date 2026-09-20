@@ -45,8 +45,9 @@
 #include "qwen35moe/qwen35moe_ffn.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
-#include "qwen3_drafter.h"
-#include "qwen3_drafter_model.h"
+#include "pflash/pflash_drafter.h"
+#include "qwen3_model.h"
+#include "pflash/pflash_compress.h"
 #include "dflash27b.h"
 #include "gguf.h"
 #include <nlohmann/json.hpp>
@@ -855,7 +856,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_score_validation_counts_nan_and_inf) {
 TEST_CASE(ServerUnitFixture, test_qwen35_pflash_rejects_missing_query_window) {
     DrafterContext ctx;
     ctx.loaded = true;
-    ctx.arch = DrafterArch::Qwen35_0p8b;
     const std::vector<int32_t> ids(16, 1);
 
     const auto compressed = drafter_score_and_compress(
@@ -8672,20 +8672,20 @@ TEST_CASE(ServerUnitFixture, test_flowkv_session_keep_ratio_override) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Qwen3-0.6B drafter loader: truncated GGUF guard (bug #438)
+// Qwen3-0.6B model loader: truncated GGUF guard (bug #438)
 // ═══════════════════════════════════════════════════════════════════════
 //
 // Builds a minimal but structurally valid Qwen3-0.6B-style GGUF on disk, then
-// verifies that load_qwen3_drafter_model:
+// verifies that load_qwen3_model:
 //   (1) loads the full, untruncated file successfully (positive control), and
 //   (2) fails cleanly with a "truncated or corrupt" error when the tensor-data
 //       section is truncated — instead of letting the H2D copy read past the
 //       end of the mmap and SIGSEGV inside the device copy.
 
-// Write a tiny valid drafter GGUF and return its path. The loader fixes
-// n_vocab at 151936 (Qwen3DrafterWeights default), so token_embd stays the
+// Write a tiny valid model GGUF and return its path. The loader fixes
+// n_vocab at 151936 (Qwen3Weights default), so token_embd stays the
 // largest tensor (~2.4 MB BF16) while every other tensor is minimal.
-static std::string write_qwen3_drafter_fixture_gguf() {
+static std::string write_qwen3_model_fixture_gguf() {
     const int n_embd    = 8;
     const int n_head    = 2;
     const int head_dim  = 4;
@@ -8741,7 +8741,7 @@ static std::string write_qwen3_drafter_fixture_gguf() {
     add_tensor("blk.0.ffn_down.weight",    GGML_TYPE_BF16, 2, n_ff,     n_embd);
 
     const std::string path = test_tmp_path(
-        "dflash_test_qwen3_drafter_438.gguf").string();
+        "dflash_test_qwen3_model_438.gguf").string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
 
     gguf_free(g);
@@ -8749,18 +8749,18 @@ static std::string write_qwen3_drafter_fixture_gguf() {
     return path;
 }
 
-TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
-    const std::string path = write_qwen3_drafter_fixture_gguf();
+TEST_CASE(ServerUnitFixture, test_qwen3_model_rejects_truncated_gguf) {
+    const std::string path = write_qwen3_model_fixture_gguf();
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     TEST_ASSERT(backend != nullptr);
 
     // Positive control: the full, untruncated file loads cleanly.
     {
-        Qwen3DrafterWeights w;
-        bool ok = load_qwen3_drafter_model(path, backend, w);
+        Qwen3Weights w;
+        bool ok = load_qwen3_model(path, backend, w);
         TEST_ASSERT_MSG(ok, dflash27b_last_error());
-        free_qwen3_drafter_model(w);
+        free_qwen3_model(w);
     }
 
     // Truncate inside the tensor-data section. The header, kv block, and tensor
@@ -8776,13 +8776,13 @@ TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
 
     // The loader must fail cleanly (no SIGSEGV) with a descriptive error.
     {
-        Qwen3DrafterWeights w;
-        bool ok = load_qwen3_drafter_model(path, backend, w);
+        Qwen3Weights w;
+        bool ok = load_qwen3_model(path, backend, w);
         TEST_ASSERT(!ok);
         const std::string err = dflash27b_last_error();
         TEST_ASSERT_MSG(err.find("truncated or corrupt") != std::string::npos,
                         err.c_str());
-        free_qwen3_drafter_model(w);
+        free_qwen3_model(w);
     }
 
     ggml_backend_free(backend);

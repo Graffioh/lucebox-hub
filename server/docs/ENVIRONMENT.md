@@ -96,7 +96,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH27B_KV_F16` - kv_quant.cpp
 - `DFLASH27B_KV_K` - kv_quant.cpp, laguna_backend.cpp
 - `DFLASH27B_KV_Q4` - kv_quant.cpp
-- `DFLASH27B_KV_TQ3` - kv_quant.cpp, qwen3_drafter.cpp
+- `DFLASH27B_KV_TQ3` - kv_quant.cpp, pflash/qwen35_drafter.cpp
 - `DFLASH27B_KV_V` - kv_quant.cpp, laguna_backend.cpp
 - `DFLASH27B_LM_HEAD_FIX` - http_server.cpp
 - `DFLASH27B_PAGED_WMMA` - paged-attn.cu (ggml-cuda) (=1 routes paged full-attention layers to the WMMA kernel; RDNA4 only, F16/Q8_0/Q4_0, non-tree)
@@ -199,14 +199,10 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `DFLASH_FAST_ROLLBACK_THRESHOLD` - chain_rollback_policy.h
 - `DFLASH_FEATURE_DTYPE` - dflash_feature_ring.cpp
 - `DFLASH_KV_ROTATE` - qwen35_target_graph.cpp (set to 1 to force FWHT K rotation on; off by default for f16/q8_0 caches, on for narrower types)
-- `DFLASH_FP_ALPHA` - http_server.cpp, qwen3_graph.cpp, server_main.cpp
-- `DFLASH_FP_CHUNK_S` - qwen3_graph.cpp
-- `DFLASH_FP_DEBUG_LAYER0` - qwen3_graph.cpp
+- `DFLASH_FP_ALPHA` - http_server.cpp, server_main.cpp
 - `DFLASH_FP_DUMP_COUNTS` - flashprefill.cpp
 - `DFLASH_FP_HIP_ROW` - flashprefill_kernels.cu
-- `DFLASH_FP_NOPE_TAIL` - qwen3_graph.cpp
 - `DFLASH_FP_PROFILE` - flashprefill.cpp
-- `DFLASH_FP_SKIP_PREWARM` - qwen3_drafter.cpp
 - `DFLASH_FP_USE_BSA` - flashprefill.cpp, http_server.cpp, server_main.cpp
 - `DFLASH_G4_BSA_CHUNK` - gemma4_graph.cpp
 - `DFLASH_GEMMA4_LAYER_SPLIT_UBATCH` - gemma4_layer_split_adapter.cpp
@@ -369,7 +365,5 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_MMVQ_MAX_NCOLS` - deepseek4_backend.cpp
 - `LUCE_QK_FUSE_LAYERS` - laguna_target_graph.cpp
 - `LUCE_QK_FUSE_MODE` - laguna_target_graph.cpp
-- `PFLASH_DRAFTER_EARLY_EXIT_N` - qwen3_graph.cpp
-- `PFLASH_DRAFTER_SCORE_LAYERS` - qwen3_graph.cpp
 - `PFLASH_FREEZE_HOT_WINDOW` - http_server.cpp
 - `TMPDIR` - backend_ipc.cpp, moe_expert_compute_ipc.cpp

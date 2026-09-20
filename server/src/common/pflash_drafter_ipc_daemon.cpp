@@ -4,7 +4,7 @@
 
 #include "dflash27b.h"
 #include "dflash_draft_ipc.h"
-#include "qwen3/qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -61,10 +61,14 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
                 stream_status(stream_fd, -1);
                 continue;
             }
+            // The IPC protocol uses score_query_end < 0 for "tail"; the
+            // qwen35 scorer requires an explicit end, so translate here.
+            const int score_query_end = request.score_query_end >= 0
+                ? request.score_query_end : (int)input_ids.size();
             auto compressed = drafter_score_and_compress(
                 ctx, input_ids, request.keep_ratio, /*chunk_size=*/32,
                 request.score_query_tokens, /*pool_kernel=*/13,
-                request.score_query_end,
+                score_query_end,
                 request.required_instruction_spans);
             if (compressed.empty()) {
                 std::fprintf(stderr, "[pflash-ipc-daemon] compress returned empty\n");

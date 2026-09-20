@@ -3174,8 +3174,14 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
         const CompressRequest & request = requests[index];
         if (!valid_request(request)) continue;
         CompressResult & result = results[index];
+        // score_query_end < 0 is the legacy "tail window" request value;
+        // the qwen35 scorer requires an explicit end.
+        const int score_query_end = request.score_query_end >= 0
+            ? request.score_query_end : (int)request.input_ids.size();
         result.compressed_ids = drafter_score_and_compress(
-            pflash_drafter_ctx_, request.input_ids, request.keep_ratio);
+            pflash_drafter_ctx_, request.input_ids, request.keep_ratio,
+            /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
+            score_query_end, request.required_instruction_spans);
         result.ok = !result.compressed_ids.empty();
     }
 

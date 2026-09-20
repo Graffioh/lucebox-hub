@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::qwen3 {
+namespace dflash::pflash {
 
 enum class PFlashSelectionMode {
     Legacy,
@@ -144,4 +144,4 @@ bool resolve_pflash_selection(
     PFlashSelectionConfig & out,
     std::string & error);
 
-} // namespace dflash::qwen3
+} // namespace dflash::pflash

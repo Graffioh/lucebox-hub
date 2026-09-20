@@ -1,13 +1,11 @@
 // Qwen3.5-0.8B drafter loading: the drafter GGUF, the optional trained
 // block-15 scoring head and the optional segment probe.
 //
-// The Qwen3-0.6B drafter has qwen3_loader.cpp; this is its counterpart for
-// the Qwen3.5-0.8B scorer, which is built on the Qwen3.5 target weights
-// (load_target_gguf_partial) instead of the Qwen3-0.6B drafter weights.
+// The scorer is built on the Qwen3.5 target weights
+// (load_target_gguf_partial).
 
 #include "qwen35_drafter.h"
 
-#include "qwen3_drafter.h"
 #include "common/gguf_inspect.h"
 #include "internal.h"
 
@@ -69,7 +67,7 @@ static bool qwen35_metadata_equals(gguf_context * g, const char * key,
 }
 
 // Optional trained head for the block-15 tap. Fails closed on any contract
-// mismatch, mirroring the Qwen3-0.6B head loader.
+// mismatch.
 static bool load_qwen35_scoring_head(const std::string & path,
                                      Qwen35DrafterState & st) {
     const TargetWeights & w = st.weights;
@@ -305,7 +303,7 @@ static bool load_qwen35_segment_probe(const std::string & path,
 
 } // namespace
 
-bool load_qwen35_drafter(const std::string & gguf_path, DrafterArch arch,
+bool load_qwen35_drafter(const std::string & gguf_path,
                          DrafterContext & out) {
     auto * st = new Qwen35DrafterState();
     // The scorer never needs logits, and tied-embedding Qwen3.5-0.8B
@@ -350,13 +348,11 @@ bool load_qwen35_drafter(const std::string & gguf_path, DrafterArch arch,
             return false;
         }
     }
-    out.arch_state = st;
+    out.state = st;
     out.loaded = true;
-    out.arch = arch;
     std::fprintf(stderr,
-        "[drafter] loaded %s qwen35: n_layer=%d n_head=%d n_head_kv=%d "
+        "[drafter] loaded qwen35: n_layer=%d n_head=%d n_head_kv=%d "
         "n_embd=%d n_ff=%d head_dim=%d vocab=%d gpu=%d\n",
-        drafter_arch_name(arch),
         st->weights.n_layer, st->weights.n_head, st->weights.n_head_kv,
         st->weights.n_embd, st->weights.n_ff, st->weights.n_embd_head_k,
         st->weights.n_vocab, out.gpu);
@@ -365,12 +361,12 @@ bool load_qwen35_drafter(const std::string & gguf_path, DrafterArch arch,
 }
 
 void free_qwen35_drafter_state(DrafterContext & ctx) {
-    auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
+    auto * st = static_cast<Qwen35DrafterState *>(ctx.state);
     free_qwen35_head(*st);
     free_qwen35_segment_probe(*st);
     free_target_weights(st->weights);
     delete st;
-    ctx.arch_state = nullptr;
+    ctx.state = nullptr;
 }
 
 } // namespace dflash::common

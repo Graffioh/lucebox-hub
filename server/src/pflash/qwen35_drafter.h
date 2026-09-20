@@ -1,14 +1,13 @@
-// Internal interface of the Qwen3.5-0.8B drafter.
+// Internal interface of the Qwen3.5-0.8B drafter — the only pflash scorer.
 //
-// The Qwen3.5-0.8B scorer runs on the Qwen3.5 target architecture
-// (TargetWeights, build_qwen35_layer) rather than the Qwen3-0.6B drafter
-// graph, so it lives in its own translation units: qwen35_loader.cpp loads
-// the GGUF, the scoring head and the segment probe; qwen35_drafter.cpp runs
-// the two scorers. qwen3_drafter.cpp dispatches here on DrafterArch.
+// The scorer runs on the Qwen3.5 target architecture (TargetWeights,
+// build_qwen35_layer): qwen35_loader.cpp loads the GGUF, the optional
+// scoring head and the segment probe; qwen35_drafter.cpp runs the two
+// scorers. pflash_drafter.cpp owns the public entry points.
 
 #pragma once
 
-#include "qwen3_drafter.h"
+#include "pflash_drafter.h"
 #include "pflash_selection.h"
 #include "common/pflash_types.h"
 #include "internal.h"
@@ -24,8 +23,8 @@ namespace dflash::common {
 // Qwen3.5-0.8B scoring head. Features are the residual entering
 // full-attention block 15 after the first 15 blocks (twelve GatedDeltaNet and
 // three full-attention blocks). Block 15's own Q/K projections score the
-// context without RoPE, exactly like the Qwen3-0.6B block-13 head; an
-// optional trained head replaces those two projections.
+// context without RoPE; an optional trained head replaces those two
+// projections.
 static constexpr int kQwen35HeadBlock = 15;
 
 struct Qwen35DrafterState {
@@ -61,8 +60,7 @@ struct Qwen35DrafterState {
 
 // Defined in qwen35_loader.cpp.
 bool qwen35_head_block_available(const TargetWeights & w, std::string & error);
-bool load_qwen35_drafter(const std::string & gguf_path, DrafterArch arch,
-                         DrafterContext & out);
+bool load_qwen35_drafter(const std::string & gguf_path, DrafterContext & out);
 void free_qwen35_drafter_state(DrafterContext & ctx);
 
 // Defined in qwen35_drafter.cpp.
@@ -76,7 +74,7 @@ std::vector<int32_t> qwen35_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const dflash::qwen3::PFlashSelectionConfig & experiment,
+    const dflash::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_scores_out = nullptr);
 
@@ -87,7 +85,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     float keep_ratio,
     int n_lookahead,
     int score_query_end,
-    const dflash::qwen3::PFlashSelectionConfig & experiment,
+    const dflash::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_mass_out = nullptr,
     std::vector<PFlashTokenSpan> * segments_out = nullptr,
@@ -102,7 +100,7 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const dflash::qwen3::PFlashSelectionConfig & experiment,
+    const dflash::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans);
 
 } // namespace dflash::common

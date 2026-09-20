@@ -1,9 +1,7 @@
-// Helpers shared by the Qwen3-0.6B and Qwen3.5-0.8B drafter paths.
-// See qwen3_drafter_common.h.
+// PFlash scoring pipeline glue. See pflash_compress.h.
 
-#include "qwen3_drafter_common.h"
+#include "pflash_compress.h"
 
-#include "qwen3_drafter.h"
 #include "pflash_selection.h"
 #include "internal.h"
 
@@ -70,7 +68,7 @@ void write_compression_trace(
         trace_fields->exact_chunk_scores->size() == scores.size();
     if (trace_fields &&
         trace_fields->selector_mode !=
-            dflash::qwen3::PFlashSelectionMode::Legacy &&
+            dflash::pflash::PFlashSelectionMode::Legacy &&
         !has_exact_scores) {
         std::fclose(file);
         std::fprintf(stderr, "[pflash-trace] exact strict scores unavailable\n");
@@ -92,9 +90,9 @@ void write_compression_trace(
             "\"token_budget\":%d,"
             "\"retained_tokens\":%d",
             trace_fields->query_begin, trace_fields->query_end,
-            dflash::qwen3::pflash_selection_mode_name(
+            dflash::pflash::pflash_selection_mode_name(
                 trace_fields->selector_mode),
-            dflash::qwen3::pflash_query_parser_name(trace_fields->query_parser),
+            dflash::pflash::pflash_query_parser_name(trace_fields->query_parser),
             trace_fields->token_budget, trace_fields->retained_tokens);
         std::fputs(",\"required_instruction_spans\":[", file);
         if (trace_fields->required_instruction_spans) {
@@ -109,12 +107,12 @@ void write_compression_trace(
         }
         std::fputc(']', file);
         if (trace_fields->selector_mode ==
-            dflash::qwen3::PFlashSelectionMode::Legacy) {
+            dflash::pflash::PFlashSelectionMode::Legacy) {
             std::fputs(",\"stop_reason\":null,\"retained_mass\":null", file);
         } else {
             std::fprintf(file,
                 ",\"stop_reason\":\"%s\",\"retained_mass\":%.17g",
-                dflash::qwen3::pflash_selection_stop_name(trace_fields->stop),
+                dflash::pflash::pflash_selection_stop_name(trace_fields->stop),
                 trace_fields->retained_mass);
         }
     }
@@ -187,7 +185,7 @@ std::vector<int32_t> select_pflash_chunks(
         int n_lookahead,
         int score_query_end,
         int pool_kernel,
-        const dflash::qwen3::PFlashSelectionConfig & config,
+        const dflash::pflash::PFlashSelectionConfig & config,
         const std::vector<PFlashTokenSpan> & required_instruction_spans,
         bool direct_mass,
         bool write_trace,
@@ -206,7 +204,7 @@ std::vector<int32_t> select_pflash_chunks(
         ? (int) segments->size()
         : (input_tokens + config.chunk_size - 1) / config.chunk_size;
 
-    std::vector<dflash::qwen3::PFlashSelectionCandidate> candidates;
+    std::vector<dflash::pflash::PFlashSelectionCandidate> candidates;
     std::vector<std::pair<float, int>> chunk_means;
     std::vector<double> exact_chunk_scores;
     candidates.reserve((size_t) n_chunks);
@@ -224,7 +222,7 @@ std::vector<int32_t> select_pflash_chunks(
             score /= (double) std::max(1, end - begin);
         }
         const bool mandatory =
-            dflash::qwen3::pflash_chunk_is_structurally_required(
+            dflash::pflash::pflash_chunk_is_structurally_required(
                 begin, end, query_begin, query_end, input_tokens,
                 required_instruction_spans);
         candidates.push_back({(size_t) chunk, begin, end, score, mandatory});
@@ -233,7 +231,7 @@ std::vector<int32_t> select_pflash_chunks(
     }
     // Two-scorer selection: the other scorer's mean per-token score over the
     // same spans (its native ranking rule).
-    std::vector<dflash::qwen3::PFlashSelectionCandidate> other_candidates;
+    std::vector<dflash::pflash::PFlashSelectionCandidate> other_candidates;
     std::vector<double> other_scores;
     const bool split = other_token_scores != nullptr && split_fraction > 0.0;
     if (split) {
@@ -248,18 +246,18 @@ std::vector<int32_t> select_pflash_chunks(
         }
     }
 
-    const dflash::qwen3::PFlashSelectionPolicy policy{selector_budget, config.top_p,
+    const dflash::pflash::PFlashSelectionPolicy policy{selector_budget, config.top_p,
                                                       /*skip_oversized=*/ segments != nullptr};
     const auto selected = split
-        ? dflash::qwen3::select_pflash_split(candidates, other_candidates, policy, split_fraction, config.mode)
-        : dflash::qwen3::select_pflash_candidates(candidates, policy, config.mode);
+        ? dflash::pflash::select_pflash_split(candidates, other_candidates, policy, split_fraction, config.mode)
+        : dflash::pflash::select_pflash_candidates(candidates, policy, config.mode);
     if (!selected.ok) {
         set_last_error("PFlash selection failed: " + selected.error);
         std::fprintf(stderr,
             "[pflash-select] ERROR mode=%s budget=%d stop=%s: %s\n",
-            dflash::qwen3::pflash_selection_mode_name(config.mode),
+            dflash::pflash::pflash_selection_mode_name(config.mode),
             selector_budget,
-            dflash::qwen3::pflash_selection_stop_name(selected.stop),
+            dflash::pflash::pflash_selection_stop_name(selected.stop),
             selected.error.c_str());
         std::fflush(stderr);
         return {};
@@ -290,12 +288,12 @@ std::vector<int32_t> select_pflash_chunks(
     std::fprintf(stderr,
         "[pflash-select] selected mode=%s scorer=%s segments=%s score=%s chunk=%d query=%d "
         "budget=%d selected_tokens=%zu chunks=%zu/%d stop=%s mass=%.9g\n",
-        dflash::qwen3::pflash_selection_mode_name(config.mode),
+        dflash::pflash::pflash_selection_mode_name(config.mode),
         split ? "split" : "single",
         segments ? "probe" : "fixed", density ? "density" : "sum",
         segments ? 0 : config.chunk_size, query_tokens, selector_budget, output.size(),
         selected.ordinals.size(), n_chunks,
-        dflash::qwen3::pflash_selection_stop_name(selected.stop),
+        dflash::pflash::pflash_selection_stop_name(selected.stop),
         selected.retained_mass);
     std::fflush(stderr);
 
@@ -312,7 +310,7 @@ std::vector<int32_t> select_pflash_chunks(
         strict_fields.segments = segments;
         strict_fields.segmentation = segments ? "probe" : "fixed";
         strict_fields.candidate_score = density ? "density" : "sum";
-        strict_fields.scorer = split ? "split" : dflash::qwen3::pflash_scorer_name(config.scorer);
+        strict_fields.scorer = split ? "split" : dflash::pflash::pflash_scorer_name(config.scorer);
         strict_fields.split_fraction = split ? split_fraction : 0.0;
         strict_fields.other_chunk_scores = split ? &other_scores : nullptr;
         write_compression_trace(

@@ -1,7 +1,7 @@
 #include "CppUnitTestFramework.hpp"
 
-#include "qwen3/pflash_selection.h"
-#include "qwen3/qwen3_drafter_model.h"
+#include "pflash/pflash_selection.h"
+#include "pflash/pflash_compress.h"
 #include "scoped_env.h"
 
 #include <cmath>
@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-using namespace dflash::qwen3;
+using namespace dflash::pflash;
 
 namespace {
 

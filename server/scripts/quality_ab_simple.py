@@ -65,7 +65,7 @@ PORT = 8765
 TARGET = os.environ.get("PFLASH_TARGET", "/home/peppi/models/qwen3.6-27b/Qwen3.6-27B-UD-Q4_K_XL.gguf")
 DRAFT  = os.environ.get("PFLASH_DRAFT",  "/home/peppi/models/qwen3.6-27b-dflash/model.safetensors")
 SERVER_BIN = os.environ.get("DFLASH_SERVER_BIN", "dflash/build/dflash_server")
-DRAFTER = os.environ.get("PFLASH_DRAFTER", str(Path.home() / "models/Qwen3-0.6B-BF16.gguf"))
+DRAFTER = os.environ.get("PFLASH_DRAFTER", str(Path.home() / "models/Qwen3.5-0.8B-BF16.gguf"))
 
 
 def chat_post(payload, timeout=120):

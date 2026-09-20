@@ -27,7 +27,7 @@
 #include "pin_friendly_prompt.h"
 #include "common/kv_rotation.h"
 #include "common/sha1.h"
-#include "qwen3/pflash_selection.h"
+#include "pflash/pflash_selection.h"
 #include "freeze_history.h"
 
 #ifdef DFLASH_HAS_CURL
@@ -3326,7 +3326,7 @@ void HttpServer::apply_flowkv_compression(
 std::string HttpServer::apply_pflash_compression(
         const ParsedRequest & req, PreparedPrompt & prepared) {
     const bool selection_environment =
-        dflash::qwen3::has_pflash_selection_environment();
+        dflash::pflash::has_pflash_selection_environment();
     auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
     if (http_detail::pflash_full_cache_restore_allowed(
             selection_environment) && full_slot >= 0) {
@@ -3350,9 +3350,9 @@ std::string HttpServer::apply_pflash_compression(
         return "PFlash drafter tokenizer produced an empty prompt";
     }
 
-    dflash::qwen3::PFlashSelectionConfig experiment;
+    dflash::pflash::PFlashSelectionConfig experiment;
     std::string experiment_error;
-    if (!dflash::qwen3::resolve_pflash_selection(
+    if (!dflash::pflash::resolve_pflash_selection(
             (int) drafter_ids.size(), 32, experiment, experiment_error)) {
         return "invalid PFlash strict selection config: " + experiment_error;
     }
@@ -3399,12 +3399,12 @@ std::string HttpServer::apply_pflash_compression(
             int boundary_index = (int) messages.size() - 1;
             if (!raw_text_input &&
                 experiment.query_parser ==
-                    dflash::qwen3::PFlashQueryParser::SemanticUser) {
+                    dflash::pflash::PFlashQueryParser::SemanticUser) {
                 boundary_index = last_user_index;
             }
             if (boundary_index < 0 ||
                 (experiment.query_parser ==
-                     dflash::qwen3::PFlashQueryParser::SemanticUser &&
+                     dflash::pflash::PFlashQueryParser::SemanticUser &&
                  !raw_text_input && last_user_text.empty())) {
                 return "PFlash strict selection latest-user boundary is unavailable";
             }
@@ -3566,7 +3566,7 @@ std::string HttpServer::apply_pflash_compression(
                 // merges like " What" inside the span.
                 if (!req.pflash_query.empty() &&
                     experiment.query_parser ==
-                        dflash::qwen3::PFlashQueryParser::SemanticUser) {
+                        dflash::pflash::PFlashQueryParser::SemanticUser) {
                     explicit_query_span =
                         http_detail::pflash_decoded_text_span(
                             *drafter_tokenizer_, drafter_ids,
@@ -3583,7 +3583,7 @@ std::string HttpServer::apply_pflash_compression(
                     http_detail::canonicalize_pflash_token_spans(
                         std::move(required_instruction_spans));
                 std::string instruction_error;
-                if (!dflash::qwen3::validate_pflash_instruction_spans(
+                if (!dflash::pflash::validate_pflash_instruction_spans(
                         required_instruction_spans,
                         (int) drafter_ids.size(), instruction_error)) {
                     return "PFlash strict selection instruction mapping failed: " +
@@ -3634,7 +3634,7 @@ std::string HttpServer::apply_pflash_compression(
             query_content_end, query_content_begin);
     } else if (experiment.configured &&
                experiment.query_parser ==
-                   dflash::qwen3::PFlashQueryParser::ArbitraryTail) {
+                   dflash::pflash::PFlashQueryParser::ArbitraryTail) {
         parser_selection_rule = "prompt_tail";
         query_window = http_detail::pflash_tail_query_window(
             drafter_ids, experiment.query_tokens, query_content_end);
@@ -3687,7 +3687,7 @@ std::string HttpServer::apply_pflash_compression(
                 {"input_kind", parser_input_kind},
                 {"selection_rule", parser_selection_rule},
                 {"query_parser",
-                 dflash::qwen3::pflash_query_parser_name(
+                 dflash::pflash::pflash_query_parser_name(
                      experiment.query_parser)},
                 {"input_tokens", (int) compress_request.input_ids.size()},
                 {"input_fingerprint_fnv1a64",
@@ -3867,11 +3867,11 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
         const bool continuation = should_compress &&
             is_continuation_request(req.messages);
         const bool selection_environment =
-            dflash::qwen3::has_pflash_selection_environment();
+            dflash::pflash::has_pflash_selection_environment();
         if (should_compress && selection_environment) {
-            dflash::qwen3::PFlashSelectionConfig experiment;
+            dflash::pflash::PFlashSelectionConfig experiment;
             std::string experiment_error;
-            if (!dflash::qwen3::resolve_pflash_selection(
+            if (!dflash::pflash::resolve_pflash_selection(
                     0, 32, experiment, experiment_error)) {
                 prepared.error_status = 500;
                 prepared.error = "invalid PFlash strict selection config: " +

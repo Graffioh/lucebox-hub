@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::qwen3 {
+namespace dflash::pflash {
 
 namespace {
 
@@ -546,4 +546,4 @@ const char * pflash_candidate_score_name(PFlashCandidateScore score) noexcept {
     return "unknown";
 }
 
-} // namespace dflash::qwen3
+} // namespace dflash::pflash

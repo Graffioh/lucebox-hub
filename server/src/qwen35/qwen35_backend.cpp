@@ -25,8 +25,8 @@
 #include "common/restore_delta.h"
 #include "common/specla_mode.h"
 #include "qwen35_tensor_parallel.h"
-#include "qwen3/qwen3_drafter.h"
-#include "qwen3/qwen3_kvflash_scorer.h"
+#include "pflash/pflash_drafter.h"
+#include "pflash/kvflash_drafter_scorer.h"
 
 #include "ggml-cuda.h"
 #include "ggml-backend-impl.h"
@@ -649,7 +649,7 @@ bool Qwen35Backend::init() {
                     kvflash_qk_policy_ ? "qk (target pooled-K vs decode query)"
                     : !kvflash_drafter_path_.empty()
                         ? "drafter (attaches on first reselect)"
-                        : "lru (recency-only: no Qwen3-0.6B drafter found "
+                        : "lru (recency-only: no Qwen3.5-0.8B drafter found "
                           "next to the model or in --prefill-drafter)");
         std::fflush(stdout);
     }
@@ -1194,10 +1194,14 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
         if (request.input_ids.empty() || request.drafter_path.empty()) continue;
 
         auto & result = results[index];
+        // score_query_end < 0 is the legacy "tail window" request value;
+        // the qwen35 scorer requires an explicit end.
+        const int score_query_end = request.score_query_end >= 0
+            ? request.score_query_end : (int)request.input_ids.size();
         result.compressed_ids = drafter_score_and_compress(
             drafter_ctx_, request.input_ids, request.keep_ratio,
             /*chunk_size=*/32, request.score_query_tokens, /*pool_kernel=*/13,
-            request.score_query_end, request.required_instruction_spans);
+            score_query_end, request.required_instruction_spans);
         result.ok = !result.compressed_ids.empty();
         if (result.ok) {
             std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
@@ -1240,7 +1244,7 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
     req.keep_ratio = (float)keep_x1000 / 1000.0f;
     req.drafter_path = (n >= 3 && drafter_path[0])
         ? drafter_path
-        : "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+        : "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf";
     {
         size_t total_vram = 0;
         int dev = 0;
