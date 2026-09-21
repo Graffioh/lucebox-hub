@@ -900,14 +900,24 @@ if(DFLASH27B_ENABLE_BSA)
     endif()
 endif()
 
-# JPEG and PNG decoders for image input (common/vision/image_decode).
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ImageCodecs.cmake")
-install(FILES cmake/ImageCodecs.NOTICES.md
-    DESTINATION share/licenses/image-codecs
-    RENAME THIRD_PARTY_NOTICES.md)
-install(FILES "${IMAGE_CODEC_JPEG_SOURCE_DIR}/LICENSE.md"
-              "${IMAGE_CODEC_JPEG_SOURCE_DIR}/README.ijg"
-    DESTINATION share/licenses/image-codecs/libjpeg-turbo)
+# JPEG and PNG decoders for image input (common/vision/image_decode). They are
+# downloaded at build time; an offline or text-only build can turn them off and
+# image requests are then refused.
+option(DFLASH27B_IMAGE_CODECS "Download and build the JPEG/PNG decoders for image input" ON)
+if(DFLASH27B_IMAGE_CODECS)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ImageCodecs.cmake")
+    install(FILES cmake/ImageCodecs.NOTICES.md
+        DESTINATION share/licenses/image-codecs
+        RENAME THIRD_PARTY_NOTICES.md)
+    install(FILES "${IMAGE_CODEC_JPEG_SOURCE_DIR}/LICENSE.md"
+                  "${IMAGE_CODEC_JPEG_SOURCE_DIR}/README.ijg"
+        DESTINATION share/licenses/image-codecs/libjpeg-turbo
+        OPTIONAL)
+    set(_dflash_image_codec_libs image_codec_jpeg image_codec_png)
+else()
+    set(_dflash_image_codec_libs)
+    target_compile_definitions(dflash_common PRIVATE DFLASH_NO_IMAGE_CODECS)
+endif()
 
 target_link_libraries(dflash_common
     PUBLIC
@@ -916,8 +926,7 @@ target_link_libraries(dflash_common
         ggml-base
         nlohmann_json::nlohmann_json
     PRIVATE
-        image_codec_jpeg
-        image_codec_png
+        ${_dflash_image_codec_libs}
         ${CMAKE_DL_LIBS}
 )
 # OpenMP for parallel MoE expert compute kernel (saturate memory bandwidth).
@@ -1892,12 +1901,15 @@ if(DFLASH27B_TESTS)
     add_executable(test_image_input test/test_image_input.cpp src/server/image_input.cpp)
     target_include_directories(test_image_input PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_image_input PRIVATE nlohmann_json::nlohmann_json)
-    add_executable(test_image_decode test/test_image_decode.cpp src/common/vision/image_decode.cpp)
-    target_include_directories(test_image_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(test_image_decode PRIVATE image_codec_jpeg image_codec_png)
+    if(DFLASH27B_IMAGE_CODECS)
+        add_executable(test_image_decode test/test_image_decode.cpp src/common/vision/image_decode.cpp)
+        target_include_directories(test_image_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_image_decode PRIVATE image_codec_jpeg image_codec_png)
+        list(APPEND _raw_unit_test_targets test_image_decode)
+    endif()
     add_executable(test_gpu_page_pool test/test_gpu_page_pool.cpp src/common/gpu_page_pool.cpp)
     target_include_directories(test_gpu_page_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    list(APPEND _raw_unit_test_targets test_image_input test_image_decode test_gpu_page_pool)
+    list(APPEND _raw_unit_test_targets test_image_input test_gpu_page_pool)
 
     # DS4V image units: each test builds only the unit it covers.
     foreach(_ds4v_unit assembly integration policy prompt)

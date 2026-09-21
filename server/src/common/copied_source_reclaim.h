@@ -51,7 +51,7 @@ inline CopiedSourceAdviceResult reclaim_copied_file_source(
     }
     if (result.range_error || result.madvise_error || result.fadvise_error) {
         std::fprintf(stderr, "[source-reclaim] %s layer=%d requested=%zu range_error=%d madvise_error=%d fadvise_error=%d\n",
-                     label, layer, result.requested, result.range_error,
+                     label ? label : "?", layer, result.requested, result.range_error,
                      result.madvise_error, result.fadvise_error);
     }
 #else

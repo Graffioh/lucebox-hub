@@ -12,8 +12,10 @@
 namespace dflash::common {
 
 
+inline constexpr size_t MAX_IMAGE_BYTES = 16 * 1024 * 1024;
+
 struct ImageInputLimits {
-    size_t image_bytes = 16 * 1024 * 1024;
+    size_t image_bytes = MAX_IMAGE_BYTES;
     size_t request_bytes = 32 * 1024 * 1024;
     size_t image_count = 4;
 };
@@ -27,7 +29,7 @@ struct ImageRequestPolicy {
 };
 
 bool parse_image_data_url(std::string_view url, EncodedImage & image,
-                          std::string & error, size_t max_bytes = 16 * 1024 * 1024);
+                          std::string & error, size_t max_bytes = MAX_IMAGE_BYTES);
 bool extract_chat_images(const nlohmann::json & messages,
                          std::string_view placeholder,
                          nlohmann::json & normalized,

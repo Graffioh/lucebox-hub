@@ -24,20 +24,23 @@ constexpr const char * ACCOUNTED[] = {
 };
 
 #if defined(__linux__)
-uint64_t live_gpu_host_bytes() {
-    uint64_t total = 0;
+// False when no amdgpu device reports its GTT use: the pool cannot then be told
+// apart from pages owned by other drivers.
+bool live_gpu_host_bytes(uint64_t & total) {
+    total = 0;
+    bool found = false;
     DIR * dir = opendir("/sys/class/drm");
-    if (!dir) return 0;
+    if (!dir) return false;
     while (const dirent * entry = readdir(dir)) {
         const std::string name = entry->d_name;
         // card0, card1, ... but not the connector entries such as card0-DP-1.
         if (name.rfind("card", 0) != 0 || name.find('-') != std::string::npos) continue;
         std::ifstream used("/sys/class/drm/" + name + "/device/mem_info_gtt_used");
         uint64_t bytes = 0;
-        if (used >> bytes) total += bytes;
+        if (used >> bytes) { total += bytes; found = true; }
     }
     closedir(dir);
-    return total;
+    return found;
 }
 #endif
 
@@ -69,9 +72,11 @@ uint64_t reclaimable_gpu_page_pool_bytes() {
 #if defined(__linux__)
     std::ifstream input("/proc/meminfo");
     if (!input) return 0;
+    uint64_t live = 0;
+    if (!live_gpu_host_bytes(live)) return 0;
     std::stringstream text;
     text << input.rdbuf();
-    return reclaimable_gpu_page_pool_bytes(text.str().c_str(), live_gpu_host_bytes());
+    return reclaimable_gpu_page_pool_bytes(text.str().c_str(), live);
 #else
     return 0;
 #endif

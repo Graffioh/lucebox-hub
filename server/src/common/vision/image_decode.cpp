@@ -1,8 +1,10 @@
 #include "image_decode.h"
 
+#if !defined(DFLASH_NO_IMAGE_CODECS)
 #include <cstdio>
 #include <jpeglib.h>
 #include <lodepng.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -22,6 +24,7 @@ DecodeResult fail(DecodeError code, std::string message) {
     return result;
 }
 
+#if !defined(DFLASH_NO_IMAGE_CODECS)
 DecodeStatus validate_encoded(const EncodedImageView & encoded, const DecodeLimits & limits) {
     if (encoded.data == nullptr || encoded.size == 0) {
         return {DecodeError::EmptyInput, "encoded image is empty"};
@@ -321,10 +324,9 @@ DecodeResult decode_png(const EncodedImageView & encoded, const DecodeLimits & l
             const std::size_t sample_count = static_cast<std::size_t>(width) * height;
             result.image.pixels.resize(output_bytes);
             for (std::size_t sample = 0; sample < sample_count; ++sample) {
-                const std::uint16_t value =
-                    static_cast<std::uint16_t>(output[sample * 2]) << 8 |
-                    output[sample * 2 + 1];
-                const auto channel = static_cast<std::uint8_t>(std::min<std::uint16_t>(value, 255));
+                // Samples are big-endian; the high byte is the 8-bit value.
+                // (Clamping the 16-bit value to 255 turns the image white.)
+                const std::uint8_t channel = output[sample * 2];
                 result.image.pixels[sample * 3] = channel;
                 result.image.pixels[sample * 3 + 1] = channel;
                 result.image.pixels[sample * 3 + 2] = channel;
@@ -341,9 +343,14 @@ DecodeResult decode_png(const EncodedImageView & encoded, const DecodeLimits & l
     return result;
 }
 
+#endif  // !DFLASH_NO_IMAGE_CODECS
 }  // namespace
 
 DecodeResult decode_image(const EncodedImageView & encoded, const DecodeLimits & limits) {
+#if defined(DFLASH_NO_IMAGE_CODECS)
+    (void) encoded; (void) limits;
+    return fail(DecodeError::UnsupportedFormat, "this build has no image codecs (DFLASH27B_IMAGE_CODECS=OFF)");
+#else
     if (const auto status = validate_encoded(encoded, limits); !status) {
         DecodeResult result;
         result.status = status;
@@ -359,6 +366,7 @@ DecodeResult decode_image(const EncodedImageView & encoded, const DecodeLimits &
         return decode_jpeg(encoded, limits);
     }
     return fail(DecodeError::UnsupportedFormat, "encoded image is neither JPEG nor PNG");
+#endif
 }
 
 const char * decode_error_name(DecodeError error) {

@@ -113,7 +113,7 @@ Shared by every model:
 | Reading images out of a request, limits, redaction | `server/src/server/image_input.*` |
 | JPEG and PNG decoding to RGB | `server/src/common/vision/image_decode.*`, codecs in `server/cmake/ImageCodecs.cmake` |
 | Image positions in a prompt, batches that keep an image whole | `server/src/common/vision/image_spans.h` |
-| The backend contract | `supports_images`, `image_placeholder`, `prepare_images` in `server/src/common/model_backend.h`, and `GenerateRequest::images` |
+| The backend contract | `supports_images`, `image_placeholder`, `prepare_images` in `server/src/common/model_backend.h`; `GenerateRequest::images` in `server/src/common/generation_types.h` |
 
 DS4V only, all under `server/src/deepseek4/`: resizing and patching
 (`deepseek4_vision_preprocess`), the vision tower (`deepseek4_vision`), marker

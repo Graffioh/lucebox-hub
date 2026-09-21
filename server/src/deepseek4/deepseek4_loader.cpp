@@ -1489,7 +1489,8 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     if (n_vocab == 0) {
         const int64_t tokens_key = gguf_find_key(gctx, "tokenizer.ggml.tokens");
         if (tokens_key >= 0 && gguf_get_kv_type(gctx, tokens_key) == GGUF_TYPE_ARRAY) {
-            n_vocab = (uint32_t) gguf_get_arr_n(gctx, tokens_key);
+            const int64_t n_tokens = (int64_t) gguf_get_arr_n(gctx, tokens_key);
+            if (n_tokens > 0 && n_tokens <= std::numeric_limits<int32_t>::max()) n_vocab = (uint32_t) n_tokens;
         }
     }
     const uint32_t n_head         = get_u32_or(gctx, "deepseek4.attention.head_count", 64);

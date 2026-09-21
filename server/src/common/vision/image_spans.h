@@ -49,8 +49,10 @@ inline bool valid_image_spans(ImageSpanView spans, uint64_t prompt_size,
     return true;
 }
 
-// Largest batch starting at `position` that does not cut an image in two.
-// Returns 0 when no such batch fits in `capacity`.
+// A batch of about `proposed` tokens starting at `position` that does not cut
+// an image in two: it stops before an image it cannot hold, and grows up to
+// `capacity` to finish an image it starts with. Returns 0 when an image that
+// starts here does not fit in `capacity`.
 inline int atomic_image_chunk(ImageSpanView spans, uint64_t position,
                               int proposed, uint64_t remaining, int capacity) {
     if (proposed <= 0 || capacity <= 0 || uint64_t(proposed) > remaining ||

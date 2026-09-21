@@ -957,11 +957,11 @@ void set_model_metadata(gguf_context * ctx, const SafeTensorSet & source,
     gguf_set_val_f32(ctx, "deepseek4.expert_weights_scale", config_f32(c, "routed_scaling_factor", 1.5f));
     gguf_set_val_f32(ctx, "deepseek4.swiglu_clamp_exp", config_f32(c, "swiglu_limit", 10.0f));
 
+    // An all-zero schedule would load and silently run the wrong attention.
+    if (!c.contains("compress_ratios") || !c["compress_ratios"].is_array()) fail("config.json has no compress_ratios array");
+    if (c["compress_ratios"].size() < layers) fail("config compress_ratios is shorter than selected layers");
     std::vector<uint32_t> ratios(layers, 0);
-    if (c.contains("compress_ratios") && c["compress_ratios"].is_array()) {
-        if (c["compress_ratios"].size() < layers) fail("config compress_ratios is shorter than selected layers");
-        for (uint32_t i = 0; i < layers; ++i) ratios[i] = c["compress_ratios"][i].get<uint32_t>();
-    }
+    for (uint32_t i = 0; i < layers; ++i) ratios[i] = c["compress_ratios"][i].get<uint32_t>();
     gguf_set_arr_data(ctx, "deepseek4.attention.compress_ratios", GGUF_TYPE_UINT32,
                       ratios.data(), ratios.size());
 

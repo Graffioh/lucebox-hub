@@ -2647,13 +2647,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_SPARSE:
         case GGML_OP_PAGED_ATTN:
-        case GGML_OP_MUL_MAT_BIAS_BF16:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             {
                 n_tasks = n_threads;
             } break;
+        case GGML_OP_MUL_MAT_BIAS_BF16:
+            GGML_ABORT("GGML_OP_MUL_MAT_BIAS_BF16 cannot be planned on CPU");
         case GGML_OP_RMS_NORM_VISION_F32:
             GGML_ABORT("GGML_OP_RMS_NORM_VISION_F32 cannot be planned on CPU");
         case GGML_OP_SOFT_MAX_VISION_F32:

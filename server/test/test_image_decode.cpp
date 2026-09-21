@@ -78,6 +78,11 @@ const std::vector<std::uint8_t> JPEG_GREY_8X8 = {
     0, 8, 1, 1, 0, 0, 63, 0, 43, 255, 217,
 };
 
+// 2x1 16-bit greyscale PNG with samples 0x8000 and 0x0100.
+const std::vector<std::uint8_t> PNG_GREY16_2X1 = {
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 1, 16, 0, 0, 0, 0, 129, 217, 252, 21, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 104, 96, 96, 100, 0, 0, 2, 7, 0, 130, 159, 82, 239, 216, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+};
+
 static DecodeResult decode(const std::vector<std::uint8_t> & bytes, const DecodeLimits & limits = {}) {
     return decode_image({bytes.data(), bytes.size()}, limits);
 }
@@ -108,6 +113,11 @@ int main() {
         bool grey = bool(result) && result.image.pixels.size() == 8u * 8u * 3u;
         for (size_t i = 0; grey && i < result.image.pixels.size(); ++i) grey = near(result.image.pixels[i], 128);
         check(grey, "greyscale JPEG expands to RGB");
+    }
+    {
+        const auto result = decode(PNG_GREY16_2X1);
+        const std::vector<std::uint8_t> expected = {128, 128, 128, 1, 1, 1};
+        check(bool(result) && result.image.pixels == expected, "16-bit greyscale keeps its high byte");
     }
     {
         check(decode_image({nullptr, 0}).status.code == DecodeError::EmptyInput, "empty input");

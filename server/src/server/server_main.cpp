@@ -359,7 +359,11 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         }
         if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
             bargs.draft_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--mmproj") == 0 && i + 1 < argc) {
+        } else if (std::strcmp(argv[i], "--mmproj") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "[server] --mmproj needs a projector GGUF path\n");
+                return 2;
+            }
             bargs.mmproj_path = argv[++i];
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             sconfig.port = std::atoi(argv[++i]);

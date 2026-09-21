@@ -8301,7 +8301,7 @@ bool deepseek4_step_layer_range(
     if (!deepseek4_validate_image_batch(w, cache, moe_hybrid, token_ids,
             n_tokens, kv_start, image_spans, image_batch, image_error) ||
         (image_batch && (!embed || layer_begin != 0 || layer_end != w.n_layer ||
-         !out_logits || verify_hooks || expert_runtime ||
+         verify_hooks || expert_runtime ||
          !vision::detail::hip_bias_workspace(backend) ||
          (moe_hybrid && moe_hybrid->cold_backend == backend)))) {
         std::fprintf(stderr, "[deepseek4] image prefill rejected before evaluation: %s\n",
