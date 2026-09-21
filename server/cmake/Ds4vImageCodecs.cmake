@@ -1,7 +1,5 @@
-# Shared decoder dependencies used by production and the accepted preprocessing
-# probe. Keep archive pins and codec options identical to the qualified build.
-# License texts remain in tools/ds4v_preprocess_probe/THIRD_PARTY_NOTICES.md
-# and the unmodified upstream archives.
+# Pinned JPEG and PNG decoders for DS4V image input. License texts are in
+# Ds4vImageCodecs.NOTICES.md and the unmodified upstream archives.
 include_guard(GLOBAL)
 
 include(ExternalProject)
