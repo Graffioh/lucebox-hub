@@ -1208,6 +1208,11 @@ bool DeepSeek4Backend::materialize_images(const DeepSeek4ImagePrompt & images,
 
 bool DeepSeek4Backend::load_vision() {
     if (cfg_.mmproj_path.empty()) return true;
+    if (!vision::detail::hip_bias_workspace(backend_)) {
+        std::fprintf(stderr, "[deepseek4] --mmproj needs the DS4V vision ops, which this build lacks "
+                             "(hipBLASLt was not found when ggml-hip was configured)\n");
+        return false;
+    }
     // The projector checks the decoder's width and vocabulary when it loads.
     // Here: every layer carries a finite F32[n_expert] image router bias.
     std::vector<float> values(size_t(w_.n_expert));
