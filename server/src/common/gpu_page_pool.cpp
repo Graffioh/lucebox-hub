@@ -24,8 +24,9 @@ constexpr const char * ACCOUNTED[] = {
 };
 
 #if defined(__linux__)
-// False when no amdgpu device reports its GTT use: the pool cannot then be told
-// apart from pages owned by other drivers.
+// False when no amdgpu device reports its GTT use, or when one has the counter
+// but it cannot be read: the pool cannot then be told apart from pages that
+// are in use.
 bool live_gpu_host_bytes(uint64_t & total) {
     total = 0;
     bool found = false;
@@ -36,8 +37,11 @@ bool live_gpu_host_bytes(uint64_t & total) {
         // card0, card1, ... but not the connector entries such as card0-DP-1.
         if (name.rfind("card", 0) != 0 || name.find('-') != std::string::npos) continue;
         std::ifstream used("/sys/class/drm/" + name + "/device/mem_info_gtt_used");
+        if (!used.is_open()) continue;  // not an amdgpu device
         uint64_t bytes = 0;
-        if (used >> bytes) { total += bytes; found = true; }
+        if (!(used >> bytes)) { closedir(dir); return false; }
+        total += bytes;
+        found = true;
     }
     closedir(dir);
     return found;

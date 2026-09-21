@@ -154,7 +154,6 @@ public:
         if (!fs::is_directory(root_)) fail("input is not a directory: " + root_.string());
         config_ = read_json(root_ / "config.json");
         tokenizer_ = read_json(root_ / "tokenizer.json");
-        tokenizer_config_ = read_json(root_ / "tokenizer_config.json");
         const json index = read_json(root_ / "model.safetensors.index.json");
         if (!index.contains("weight_map") || !index["weight_map"].is_object()) {
             fail("model.safetensors.index.json has no object weight_map");
@@ -193,7 +192,6 @@ public:
     const std::unordered_map<std::string, StEntry> & entries() const { return entries_; }
     const json & config() const { return config_; }
     const json & tokenizer() const { return tokenizer_; }
-    const json & tokenizer_config() const { return tokenizer_config_; }
 
 private:
     static json read_json(const fs::path & path) {
@@ -236,6 +234,9 @@ private:
             const auto range = info["data_offsets"].get<std::vector<uint64_t>>();
             if (range.size() != 2 || range[1] < range[0]) fail("bad data_offsets for " + entry.name);
             entry.path = path;
+            if (range[0] > std::numeric_limits<uint64_t>::max() - 8 - header_len) {
+                fail("data_offsets overflow for " + entry.name);
+            }
             entry.offset = 8 + header_len + range[0];
             entry.size = range[1] - range[0];
             const uint64_t expected = checked_mul(element_count(entry.shape, entry.name), dtype_size(entry.dtype), "byte size for " + entry.name);
@@ -252,7 +253,6 @@ private:
     fs::path root_;
     json config_;
     json tokenizer_;
-    json tokenizer_config_;
     std::unordered_map<std::string, StEntry> entries_;
 };
 
@@ -558,14 +558,13 @@ struct Options {
     bool experts_only = false;
     bool force = false;
     bool validate_input_only = false;
-    int layer_start = 0;
     int layer_count = -1;
     int expert_limit = -1;
 };
 
 void usage(const char * argv0) {
     std::cerr << "Usage: " << argv0 << " --input DIR --output FILE (--imatrix FILE | --absmax-only)\n"
-              << "       [--layer-start N] [--layer-count N] [--expert-limit N] [--experts-only] [--validate-input-only] [--force]\n";
+              << "       [--layer-count N] [--expert-limit N] [--experts-only] [--validate-input-only] [--force]\n";
 }
 
 int parse_nonnegative(const char * value, const std::string & option, bool allow_zero = true) {
@@ -593,7 +592,6 @@ Options parse_options(int argc, char ** argv) {
         else if (arg == "--experts-only") out.experts_only = true;
         else if (arg == "--force") out.force = true;
         else if (arg == "--validate-input-only") out.validate_input_only = true;
-        else if (arg == "--layer-start") out.layer_start = parse_nonnegative(value(), arg);
         else if (arg == "--layer-count") out.layer_count = parse_nonnegative(value(), arg, false);
         else if (arg == "--expert-limit") out.expert_limit = parse_nonnegative(value(), arg, false);
         else if (arg == "--help" || arg == "-h") { usage(argv[0]); std::exit(0); }
@@ -1081,7 +1079,7 @@ void write_dense_fp8(FILE * out, const StEntry & weight, const StEntry & scale) 
             const uint8_t scale_byte = scales[(row/128)*scale_cols + col/128];
             const float decoded = fp8_e4m3fn(input[col])*fp8_e8m0(scale_byte);
             const uint16_t b = float_to_bf16(decoded);
-            if (bf16_to_float(b) != decoded) {
+            if (!std::isfinite(decoded) || bf16_to_float(b) != decoded) {
                 fail("FP8->BF16 is not exact for " + weight.name + " at row " +
                      std::to_string(row) + " col " + std::to_string(col));
             }
@@ -1361,7 +1359,6 @@ int main(int argc, char ** argv) {
         static_assert(static_cast<int>(GGML_TYPE_Q3_1_ROCMFP3_MIX) == static_cast<int>(kQtypeP4Mix));
         static_assert(static_cast<int>(GGML_TYPE_Q2_1_ROCMFP2_MIX) == static_cast<int>(kQtypeGuMix));
         const Options options = parse_options(argc, argv);
-        if (options.layer_start != 0) fail("loader-compatible partial artifacts must start at layer 0");
         SafeTensorSet source(options.input);
         const uint32_t source_layers = config_u32(source.config(), "num_hidden_layers");
         const uint32_t source_experts = config_u32(source.config(), "n_routed_experts");
