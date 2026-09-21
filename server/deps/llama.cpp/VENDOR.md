@@ -28,34 +28,19 @@ These changes are limited to `ggml/`. Keep their public declarations in
 `ggml/include`, avoid DeepSeek-specific policy in generic kernels, and update
 this provenance when the patch set is moved to `lucebox-ggml`.
 
-## Hub-local DS4V HIP fused-bias linear
+## Hub-local DS4V HIP vision ops
 
-The local `GGML_OP_MUL_MAT_BIAS_BF16` operation is appended after `PAGED_ATTN`;
-all existing op numeric values are preserved, while `GGML_OP_COUNT` grows from
-105 to 106; the existing RPC header contract advances protocol patch 5 to 6.
-The RPC registry does not expose the HIP capability, so vision never sends this
-new operation through RPC; RPC supports_op also rejects it locally. Protocol
-patch mismatches only warn, so this does not rely on a version handshake to
-reject older peers. Rebuild ggml-base, CPU/HIP backends, and consumers together. Do not
-mix old shared libraries with this header or serialize the new operation for
-an older reader. This is an inference-only extension; CPU compute/backward
-reject it, and HIP alone advertises the explicit registry capability. Other
-backends are never selected by a generic unknown-op supports default.
+Four inference-only ops are appended after the existing ones, so every earlier
+op keeps its numeric value: `GGML_OP_MUL_MAT_BIAS_BF16`,
+`GGML_OP_RMS_NORM_VISION_F32`, `GGML_OP_SOFT_MAX_VISION_F32` and
+`GGML_OP_MUL_MAT_VISION_AV_F32`. Only the DS4V vision tower builds them. They
+exist on the HIP backend alone; CPU, CUDA and RPC reject them in `supports_op`,
+and graphs that contain them are not captured.
 
-Only DS4V biased linears opt in. Ordinary text MUL_MAT/ADD fusion, unbiased
-vision linears, and CPU/NVIDIA vision graph construction are unchanged. The
-HIP-only CMake dependency is official hipBLASLt (`roc::hipblaslt`). The Lt
-configuration follows the frozen PyTorch revision
-`3d3aa833db84eed6b7f5595cb5f162c2f78300a4`: BF16 W/X/bias/output, F32 compute and
-scalars, T/N, alpha=1, beta=0, bias epilogue, C=D, one first heuristic with a
-76 MiB workspace maximum. There is no algorithm sweep or arithmetic fallback.
+They are compiled only when CMake finds hipBLASLt (`GGML_HIP_DS4V_VISION`).
+Without it the HIP backend builds as before and the server refuses `--mmproj`.
+The fused BF16 bias matmul keeps one hipBLASLt handle and one 76 MiB workspace
+per backend context that uses it, released when the context is destroyed.
 
-One exact-size 76 MiB workspace and one Lt handle belong to each HIP backend
-context that actually uses the operation. An event orders shared workspace
-reuse on the actual execution stream; destruction waits for its last use.
-The workspace is retained outside the ggml arena and is conservatively
-included in VisionRuntime's scratch reservation/report even after arena
-release. Graphs containing this operation are capture-ineligible; no global
-text graph policy changes. Descriptors are per invocation, not cached.
-Qualification is scoped to the Radeon RX 7900 XT and pinned ROCm/PyTorch
-reference; availability on other HIP devices is not a qualification claim.
+Rebuild ggml-base, the backends and their consumers together; do not mix older
+shared libraries with this header.
