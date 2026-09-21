@@ -12,7 +12,7 @@
 #include <memory>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool detail::target_graph_capacity_for_parallel_segments(
         int n_parallel_segments,
@@ -604,9 +604,9 @@ bool build_target_step(
     sg.gf = ggml_new_graph_custom(sg.ctx, graph_capacity, false);
 
     // Step-invariant KV write: only when topology can't vary per step.
-    // DFLASH_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length
+    // LUCE_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length
     // FA span (per-step node properties -> no CUDA-graph replay).
-    static const bool g_no_kvpad = (std::getenv("DFLASH_QWEN35_NO_KVPAD") != nullptr);
+    static const bool g_no_kvpad = (std::getenv("LUCE_QWEN35_NO_KVPAD") != nullptr);
     // kvflash_mask: kvflash mode. The mask carries pool slot validity
     // (uploaded by the caller before EVERY compute — the input's buffer
     // region is reused by graph execution) and set_rows carries per-token
@@ -1028,4 +1028,4 @@ bool build_lm_head_projection_step(
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

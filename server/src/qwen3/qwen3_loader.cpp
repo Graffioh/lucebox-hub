@@ -20,7 +20,7 @@
 //   blk.<i>.ffn_down.weight           BF16 [ffn, hidden]
 //
 // We mmap the GGUF file and copy each tensor's bytes to the backend buffer
-// (mirrors the dflash gguf_target_loader pattern).
+// (mirrors the luce gguf_target_loader pattern).
 
 #include "qwen3_drafter_model.h"
 #include "common/backend_precision.h"
@@ -45,7 +45,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -298,4 +298,4 @@ void free_qwen3_drafter_model(Qwen3DrafterWeights & w) {
     w.backend = nullptr;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

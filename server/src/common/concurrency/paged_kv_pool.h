@@ -19,7 +19,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Caller-chosen identifier for one inference request (one KV sequence).
 using PagedKvRequestId = uint64_t;
@@ -226,4 +226,4 @@ private:
     std::unordered_map<PagedKvRequestId, uint32_t> request_to_slot_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

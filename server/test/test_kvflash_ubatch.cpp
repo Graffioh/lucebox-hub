@@ -5,7 +5,7 @@ namespace {
 struct KvflashUbatchFixture {};
 }
 
-using dflash::common::kvflash_pooled_ubatch;
+using luce::common::kvflash_pooled_ubatch;
 
 TEST_CASE(KvflashUbatchFixture, rounded_to_chunk_multiple_never_below_one_chunk) {
     CHECK(kvflash_pooled_ubatch(512, 64, 8192) == 512);

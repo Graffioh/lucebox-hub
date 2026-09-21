@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct KvfPlacementDecision {
     uint64_t kv_total       = 0;      // bytes to reserve for the KV cache
@@ -51,4 +51,4 @@ inline KvfPlacementDecision kvflash_placement_decision(
     return d;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

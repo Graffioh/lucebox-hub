@@ -10,7 +10,7 @@
 #include <cstring>
 #include <limits>
 
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
 #include <cuda_runtime_api.h>
 #endif
 
@@ -26,7 +26,7 @@
 #include <windows.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -57,14 +57,14 @@ void MoeHybridStorage::unregister_mix_tensors() {
 
 static bool duplicate_hot_experts_on_cold_gpu() {
     static const bool enabled = []() {
-        const char * raw = std::getenv("DFLASH_MOE_DUPLICATE_HOT_ON_COLD");
+        const char * raw = std::getenv("LUCE_MOE_DUPLICATE_HOT_ON_COLD");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
 }
 
 int query_gpu_compute_sm() {
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
     int device = -1;
     if (cudaGetDevice(&device) != cudaSuccess || device < 0) return 0;
     cudaDeviceProp prop{};
@@ -837,4 +837,4 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

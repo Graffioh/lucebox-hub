@@ -5,8 +5,8 @@
 // ratio-4 boundary can only sit at the batch's LAST token (dynamic q), so the
 // compressor pools at most once per step, exactly like an AR step at the last
 // position. It also serves opt-in q=1 hybrid decode, because the older q=1
-// fused graph is single-backend. Enable with DFLASH_DS4_FUSED_VERIFY=1 and,
-// for q=1 hybrid decode, DFLASH_DS4_FUSED_HYBRID_DECODE=1.
+// fused graph is single-backend. Enable with LUCE_DS4_FUSED_VERIFY=1 and,
+// for q=1 hybrid decode, LUCE_DS4_FUSED_HYBRID_DECODE=1.
 
 // tensor_set that tolerates inputs the graph never consumed (gallocr leaves
 // them unallocated, e.g. comp-emission bundles in non-flush graphs).
@@ -33,34 +33,34 @@ static const Ds4MixedMoePolicy & ds4_mixed_moe_policy() {
     static const Ds4MixedMoePolicy policy = [] {
         Ds4MixedMoePolicy result;
         result.owner_local_reduction =
-            ds4_env_flag("DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS");
+            ds4_env_flag("LUCE_DS4_CROSS_VENDOR_OWNER_SUMS");
         result.direct_device_join =
-            ds4_env_flag("DFLASH_DS4_TP_PEER_FENCE") ||
+            ds4_env_flag("LUCE_DS4_TP_PEER_FENCE") ||
             moe_hybrid_graph_policy().device_join;
         result.schedule_branches =
-            ds4_env_flag("DFLASH_DS4_TP_SCHEDULE_BRANCHES");
+            ds4_env_flag("LUCE_DS4_TP_SCHEDULE_BRANCHES");
         result.native_route_width =
-            ds4_env_flag("DFLASH_DS4_TP_NATIVE_ROUTE_WIDTH");
+            ds4_env_flag("LUCE_DS4_TP_NATIVE_ROUTE_WIDTH");
         result.fused_hc_join =
-            ds4_env_flag("DFLASH_DS4_TP_FUSED_HC_JOIN");
+            ds4_env_flag("LUCE_DS4_TP_FUSED_HC_JOIN");
         result.late_join_split =
-            ds4_env_flag("DFLASH_DS4_TP_LATE_JOIN_SPLIT");
+            ds4_env_flag("LUCE_DS4_TP_LATE_JOIN_SPLIT");
         result.deferred_join_split =
-            ds4_env_flag("DFLASH_DS4_TP_DEVICE_JOIN_SPLIT");
+            ds4_env_flag("LUCE_DS4_TP_DEVICE_JOIN_SPLIT");
         result.batch_peer_copies =
-            ds4_env_flag("DFLASH_DS4_TP_BATCH_SPLIT_COPIES") ||
+            ds4_env_flag("LUCE_DS4_TP_BATCH_SPLIT_COPIES") ||
             ds4_env_flag("GGML_BATCH_PEER_COPIES") ||
             ds4_env_flag("GGML_CUDA_BATCH_PEER_COPIES");
         result.report_split_count =
-            ds4_env_flag("DFLASH_DS4_TP_SPLIT_COUNT");
+            ds4_env_flag("LUCE_DS4_TP_SPLIT_COUNT");
         result.scheduler_trace =
-            ds4_env_flag("DFLASH_DS4_TP_SCHED_TRACE");
+            ds4_env_flag("LUCE_DS4_TP_SCHED_TRACE");
         result.pin_route_weights =
-            ds4_env_flag("DFLASH_DS4_TP_MAIN_ROUTE_WEIGHTS");
+            ds4_env_flag("LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS");
         result.preserve_routes_for_diagnostics =
-            ds4_env_flag("DFLASH_DS4_TP_ROUTE_STATS") ||
-            ds4_env_flag("DFLASH_DS4_ROUTING_STATS_OUT") ||
-            ds4_env_flag("DFLASH_DS4_TP_CACHE_AUDIT");
+            ds4_env_flag("LUCE_DS4_TP_ROUTE_STATS") ||
+            ds4_env_flag("LUCE_DS4_ROUTING_STATS_OUT") ||
+            ds4_env_flag("LUCE_DS4_TP_CACHE_AUDIT");
         return result;
     }();
     return policy;
@@ -82,7 +82,7 @@ static void ds4_fv_set_repeated_rows(
 static bool ds4_fused_verify_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
-        enabled = ds4_env_flag("DFLASH_DS4_FUSED_VERIFY") ? 1 : 0;
+        enabled = ds4_env_flag("LUCE_DS4_FUSED_VERIFY") ? 1 : 0;
     }
     return enabled == 1;
 }
@@ -90,7 +90,7 @@ static bool ds4_fused_verify_enabled() {
 static bool ds4_fused_verify_trace_node(
         ggml_tensor * tensor, bool ask, void *) {
     static const bool trace_all =
-        ds4_env_flag("DFLASH_DS4_TP_SCHED_TRACE_ALL");
+        ds4_env_flag("LUCE_DS4_TP_SCHED_TRACE_ALL");
     const bool routed = tensor &&
         (tensor->op == GGML_OP_MUL_MAT_ID ||
          tensor->op == GGML_OP_GET_ROWS);
@@ -122,7 +122,7 @@ static bool ds4_fused_verify_trace_node(
          (!ask && tensor->op == GGML_OP_GET_ROWS)) &&
         ids && ids->buffer &&
         ids->type == GGML_TYPE_I32 &&
-        ds4_env_flag("DFLASH_DS4_TP_SCHED_TRACE_IDS")) {
+        ds4_env_flag("LUCE_DS4_TP_SCHED_TRACE_IDS")) {
         const size_t count = std::min<size_t>(
             (size_t) ggml_nelements(ids), 32u);
         std::array<int32_t, 32> values{};
@@ -162,7 +162,7 @@ static void ds4_fused_verify_refresh_hybrid_luts(
         DeepSeek4FusedDecodeGraph & fg) {
     if (!hybrid) return;
     const char * masked_routes =
-        std::getenv("DFLASH_DS4_TP_MASKED_ROUTES");
+        std::getenv("LUCE_DS4_TP_MASKED_ROUTES");
     const int32_t invalid_route =
         !masked_routes || !*masked_routes || std::strcmp(masked_routes, "0") != 0
             ? -1
@@ -245,7 +245,7 @@ static void ds4_fused_consume_route_diagnostics(
         MoeHybridRoutingStats * routing_stats,
         const int32_t * active_slots = nullptr) {
     const bool cache_audit =
-        ds4_env_flag("DFLASH_DS4_TP_CACHE_AUDIT");
+        ds4_env_flag("LUCE_DS4_TP_CACHE_AUDIT");
     if (!routing_stats && !cache_audit) return;
 
     uint64_t cache_hot = 0;
@@ -308,11 +308,11 @@ static void ds4_fused_consume_route_diagnostics(
 // Each hybrid cache slot owns a multi-backend scheduler, and each scheduler's
 // gallocr retains its per-backend scratch buffers until the slot is destroyed,
 // so the hybrid profile caps how many of the kSlotCount verifier shapes stay
-// alive. DFLASH_DS4_TP_FUSED_CACHE_SLOTS lowers or raises that cap without
+// alive. LUCE_DS4_TP_FUSED_CACHE_SLOTS lowers or raises that cap without
 // affecting the single-backend verifier cache.
 static size_t ds4_fused_verify_hybrid_slot_limit() {
     static const size_t limit = []() {
-        const char * raw = std::getenv("DFLASH_DS4_TP_FUSED_CACHE_SLOTS");
+        const char * raw = std::getenv("LUCE_DS4_TP_FUSED_CACHE_SLOTS");
         // Every miss is a full rebuild of the whole-model graph, 5.4 ms of an
         // 88.9 ms step doing no arithmetic, while the slots themselves are
         // nearly free: the graphs share their scratch through the allocator,
@@ -327,7 +327,7 @@ static size_t ds4_fused_verify_hybrid_slot_limit() {
         // shapes stays warm. Device scratch is shared (about 0.8 MiB per
         // slot); each built slot also keeps its 32 MiB host metadata arena,
         // so a fully populated q5 cache holds up to 768 MiB of host memory.
-        const long default_slots = ds4_env_flag("DFLASH_DS4_Q5_VERIFY")
+        const long default_slots = ds4_env_flag("LUCE_DS4_Q5_VERIFY")
             ? (long) Ds4FusedVerifyCache::kSlotCount : 8;
         const long requested = raw ? std::strtol(raw, nullptr, 10)
                                    : default_slots;
@@ -340,7 +340,7 @@ static size_t ds4_fused_verify_hybrid_slot_limit() {
 
 static size_t ds4_fused_capture_hybrid_slot_limit() {
     static const size_t limit = []() {
-        const char * raw = std::getenv("DFLASH_DS4_TP_CAPTURE_CACHE_SLOTS");
+        const char * raw = std::getenv("LUCE_DS4_TP_CAPTURE_CACHE_SLOTS");
         const long requested = raw ? std::strtol(raw, nullptr, 10) : 4;
         return (size_t) std::max<long>(
             1, std::min<long>(requested,
@@ -392,7 +392,7 @@ static bool ds4_build_fused_verify_graph(
         const std::vector<std::vector<DeepSeek4GatheredLaneRows>> * paged_rows = nullptr,
         bool paged_history_buckets = false) {
     const bool report_build_timing =
-        ds4_env_flag("DFLASH_DS4_VERIFY_BUILD_TIMING");
+        ds4_env_flag("LUCE_DS4_VERIFY_BUILD_TIMING");
     const auto build_t0 = Ds4TimingClock::now();
     const bool paged_mode = paged_cache && paged_rows;
     if (!paged_mode && !cache) return false;
@@ -908,7 +908,7 @@ static bool ds4_build_fused_verify_graph(
         // rows. This also avoids a transient identity binding at the exact
         // top-k boundary, preserving fused-graph replay.
         const bool sparse_attention =
-            ds4_env_flag("DFLASH_DS4_SPARSE_DECODE_FLASH") && ratio > 0 &&
+            ds4_env_flag("LUCE_DS4_SPARSE_DECODE_FLASH") && ratio > 0 &&
             // The exact indexer carries saved raw rows for batched lanes.
             // Coarse block selection has no saved-row contract; retain the
             // explicit verifier there instead of pruning raw history.
@@ -1166,7 +1166,7 @@ static bool ds4_build_fused_verify_graph(
     fg.logits = ds4_mul_mat_columns(ctx, w.output, out_normed, projection_columns);   // [n_vocab, q]
     ggml_set_output(fg.logits);
     ggml_build_forward_expand(gf, fg.logits);
-    if (paged_mode || ds4_env_flag("DFLASH_DS4_GPU_ARGMAX_VERIFY")) {
+    if (paged_mode || ds4_env_flag("LUCE_DS4_GPU_ARGMAX_VERIFY")) {
         ex.argmax = ggml_argmax(ctx, fg.logits);
         ggml_set_output(ex.argmax);
         ggml_build_forward_expand(gf, ex.argmax);
@@ -1201,7 +1201,7 @@ static bool ds4_build_fused_verify_graph(
     // This is deliberately build-time only: it does not install a scheduler
     // callback or synchronize kernels, so enabling it cannot distort the
     // execution timeline being diagnosed.
-    if (q == 4 && ds4_env_flag("DFLASH_DS4_TP_Q4_INVENTORY")) {
+    if (q == 4 && ds4_env_flag("LUCE_DS4_TP_Q4_INVENTORY")) {
         const int n_nodes = ggml_graph_n_nodes(fg.sg.gf);
         std::fprintf(stderr,
             "[ds4-q4-inventory] graph_nodes=%d q=%d\n", n_nodes, q);
@@ -1716,13 +1716,13 @@ static int ds4_try_fused_verify_step(
 
         static const bool sparse_mask_update = [] {
             const char * value = std::getenv(
-                "DFLASH_DS4_INCREMENTAL_VERIFY_MASK");
+                "LUCE_DS4_INCREMENTAL_VERIFY_MASK");
             return !value || std::atoi(value) != 0;
         }();
         static const size_t sparse_mask_min_bytes = [] {
             constexpr size_t default_bytes = 4u * 1024u * 1024u;
             const char * value = std::getenv(
-                "DFLASH_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES");
+                "LUCE_DS4_INCREMENTAL_VERIFY_MASK_MIN_BYTES");
             if (!value || !*value) return default_bytes;
             const unsigned long long parsed = std::strtoull(value, nullptr, 10);
             return parsed > 0 ? (size_t) parsed : default_bytes;
@@ -1790,7 +1790,7 @@ static int ds4_try_fused_verify_step(
     // while q=1 capture graphs are evaluated/captured. q>=2 verification uses
     // the process ceiling (LUCE_MMVQ_MAX_NCOLS=5 for q=5 verification).
     const bool capture_eager = capture_cache &&
-        ds4_env_flag("DFLASH_DS4_TP_CAPTURE_EAGER");
+        ds4_env_flag("LUCE_DS4_TP_CAPTURE_EAGER");
     // q>=2 verifier graph slots own fixed tensor storage. Position, mask,
     // routing-map, and embedding values are refreshed through stable input
     // buffers above; the graph topology and all allocation addresses remain
@@ -1801,7 +1801,7 @@ static int ds4_try_fused_verify_step(
     // backend additionally checks the scheduler graph uid, so a rebuilt slot
     // can never bypass validation using the previous generation's executable.
     const bool force_verify_graph_replay = q > 1 &&
-        ds4_env_flag("DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY");
+        ds4_env_flag("LUCE_DS4_VERIFY_FORCE_GRAPH_REPLAY");
     ScopedCudaGraphOverrides graph_override_scope(
         /*disable_graphs=*/capture_eager,
         /*mmvq_max_ncols=*/capture_cache && q == 1 ? 3 : 0,

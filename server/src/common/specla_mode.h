@@ -13,7 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Section 6.2 assumes a tiny, trained EAGLE-style draft layer that can roll a
 // beam out prefix by prefix.  Qwen's current DFlash draft is a substantially
@@ -23,7 +23,7 @@ namespace dflash::common {
 // it the production default for this model.
 inline bool specla_conditional_draft_enabled() {
     static const bool on = []() {
-        const char * v = std::getenv("DFLASH_SPECLA_CONDITIONAL_DRAFT");
+        const char * v = std::getenv("LUCE_SPECLA_CONDITIONAL_DRAFT");
         return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
     }();
     return on;
@@ -31,7 +31,7 @@ inline bool specla_conditional_draft_enabled() {
 
 inline int specla_tree_topk() {
     static const int topk = []() {
-        const char * v = std::getenv("DFLASH_SPECLA_TOPK");
+        const char * v = std::getenv("LUCE_SPECLA_TOPK");
         if (!v || v[0] == '\0') return 4;  // paper's end-to-end setting
         char * end = nullptr;
         errno = 0;
@@ -45,4 +45,4 @@ inline int specla_tree_topk() {
     return topk;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

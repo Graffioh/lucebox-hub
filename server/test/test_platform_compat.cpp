@@ -12,7 +12,7 @@
 #endif
 
 using namespace CppUnitTestFramework;
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 
@@ -23,7 +23,7 @@ struct PlatformCompatFixture : CommonFixture {
 }  // namespace
 
 TEST_CASE(PlatformCompatFixture, platform_environment_and_socket_compatibility) {
-    constexpr const char * kEnvName = "DFLASH_PLATFORM_COMPAT_TEST";
+    constexpr const char * kEnvName = "LUCE_PLATFORM_COMPAT_TEST";
 
     if (unset_environment_variable(kEnvName) != 0) {
         CHECK(false);

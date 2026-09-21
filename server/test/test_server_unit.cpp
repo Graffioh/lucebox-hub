@@ -46,7 +46,7 @@
 #include "server/prompt_normalize.h"
 #include "qwen3_drafter.h"
 #include "qwen3_drafter_model.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "gguf.h"
 #include <nlohmann/json.hpp>
 
@@ -73,16 +73,16 @@
 #endif
 
 #if defined(_WIN32)
-#define dflash_setenv(name, value) _putenv_s(name, value)
-#define dflash_unsetenv(name) _putenv_s(name, "")
+#define luce_setenv(name, value) _putenv_s(name, value)
+#define luce_unsetenv(name) _putenv_s(name, "")
 #else
-#define dflash_setenv(name, value) setenv(name, value, 1)
-#define dflash_unsetenv(name) unsetenv(name)
+#define luce_setenv(name, value) setenv(name, value, 1)
+#define luce_unsetenv(name) unsetenv(name)
 #endif
 
 using json = nlohmann::json;
-using namespace dflash::common;
-using dflash::engine::LuceEngine;
+using namespace luce::common;
+using luce::engine::LuceEngine;
 namespace fs = std::filesystem;
 
 static fs::path test_tmp_path(const char * name) {
@@ -100,7 +100,7 @@ static void remove_test_path(const fs::path & path) {
     fs::remove(path, ec);
 }
 
-namespace dflash::common {
+namespace luce::common {
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
@@ -274,7 +274,7 @@ TEST_CASE(ServerUnitFixture, test_qwen35_pflash_rejects_missing_query_window) {
         /*pool_kernel=*/13, /*score_query_end=*/-1);
 
     TEST_ASSERT(compressed.empty());
-    TEST_ASSERT(std::string(dflash27b_last_error()) ==
+    TEST_ASSERT(std::string(luce_last_error()) ==
                 "qwen35 scorer query window out of range");
 }
 
@@ -3102,7 +3102,7 @@ static std::string write_deepseek_marker_tokenizer_fixture() {
     gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 1);
     gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 2);
 
-    const std::string path = test_tmp_path("dflash_test_deepseek_markers.gguf").string();
+    const std::string path = test_tmp_path("luce_test_deepseek_markers.gguf").string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
     gguf_free(g);
     return path;
@@ -5424,7 +5424,7 @@ TEST_CASE(ServerUnitFixture, test_layer_split_backend_cancels_between_prefill_ch
 
 TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_drafter_path) {
     const std::string ids_path = test_tmp_path(
-        "dflash_test_layer_split_compress_ids.bin").string();
+        "luce_test_layer_split_compress_ids.bin").string();
     remove_test_path(ids_path);
     TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
 
@@ -5445,7 +5445,7 @@ TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_draft
 
 TEST_CASE(ServerUnitFixture, test_layer_split_compress_rejects_bad_keep_ratio) {
     const std::string ids_path = test_tmp_path(
-        "dflash_test_layer_split_compress_bad.bin").string();
+        "luce_test_layer_split_compress_bad.bin").string();
     remove_test_path(ids_path);
     TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
 
@@ -6219,7 +6219,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_disabled_when_no_dir) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_disables_memory_only_backend) {
     MockMemoryOnlySnapshotBackend backend;
     DiskCacheConfig cfg;
-    cfg.cache_dir = "/tmp/dflash_test_disk_cache_memory_only";
+    cfg.cache_dir = "/tmp/luce_test_disk_cache_memory_only";
     DiskPrefixCache cache(cfg, backend);
     TEST_ASSERT(!cache.disabled());
 
@@ -6231,7 +6231,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_disables_memory_only_backend) {
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_disk_cache_init").string();
+    std::string dir = test_tmp_path("luce_test_disk_cache_init").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6258,7 +6258,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_size) {
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     // Write and read a header to verify serialization.
-    std::string path = test_tmp_path("dflash_test_header_rt.dkv").string();
+    std::string path = test_tmp_path("luce_test_header_rt.dkv").string();
     remove_test_path(path);
     std::error_code ec;
 
@@ -6323,7 +6323,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_continued_boundary) {
     // Test maybe_store_continued logic: saves at interval boundaries.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_continued").string();
+    std::string dir = test_tmp_path("luce_test_continued").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6398,7 +6398,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_full_lookup_lengths) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {
     // Cold prefix should not trigger for short prompts.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_cold_short").string();
+    std::string dir = test_tmp_path("luce_test_cold_short").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6419,7 +6419,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_no_boundaries) {
     // Cold prefix should not trigger if no boundaries provided.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_cold_nobound").string();
+    std::string dir = test_tmp_path("luce_test_cold_nobound").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6439,7 +6439,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_no_boundaries) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_finds_boundary) {
     // Cold prefix should find the last boundary <= cold_max_tokens.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_cold_finds").string();
+    std::string dir = test_tmp_path("luce_test_cold_finds").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6489,7 +6489,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_budget_enforcement_scoring) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
     // Lookup with no layout known should return false.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_lookup_miss").string();
+    std::string dir = test_tmp_path("luce_test_lookup_miss").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6506,7 +6506,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_save_below_min_tokens) {
     // Save with fewer tokens than min_tokens should be rejected.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_save_below").string();
+    std::string dir = test_tmp_path("luce_test_save_below").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6585,7 +6585,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_snapshot_past_key) {
     // covers at least kMaxPos tokens; shorter keys are refused on save and,
     // for files that already exist, on read.
     MockBackendWithAdopt backend;
-    std::string dir = test_tmp_path("dflash_test_past_key").string();
+    std::string dir = test_tmp_path("luce_test_past_key").string();
     rm_rf(dir);
     DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
     DiskPrefixCache cache(cfg, backend);
@@ -6645,7 +6645,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_continued_keys_full_prefix) {
     // tokens the snapshot really covers, so only a prompt containing all of
     // them can hit.
     MockBackendWithAdopt backend;
-    std::string dir = test_tmp_path("dflash_test_continued_key").string();
+    std::string dir = test_tmp_path("luce_test_continued_key").string();
     rm_rf(dir);
     DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
     cfg.continued_interval = 10;   // 32 positions -> crosses at 30
@@ -6697,7 +6697,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     std::array<uint8_t, 16> salt_a{};
     salt_a[0] = 0x01; salt_a[15] = 0xAB;
 
-    std::string dir_a = test_tmp_path("dflash_test_salt_a").string();
+    std::string dir_a = test_tmp_path("luce_test_salt_a").string();
     rm_rf(dir_a);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_a; cfg.min_tokens = 1;
@@ -6712,7 +6712,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     std::array<uint8_t, 16> salt_b{};
     salt_b[0] = 0x02; salt_b[15] = 0xCD;
 
-    std::string dir_b = test_tmp_path("dflash_test_salt_b").string();
+    std::string dir_b = test_tmp_path("luce_test_salt_b").string();
     rm_rf(dir_b);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_b; cfg.min_tokens = 1;
@@ -6730,7 +6730,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     TEST_ASSERT(id_a != id_b);
 
     // Same salt A applied again → identical layout_id.
-    std::string dir_a2 = test_tmp_path("dflash_test_salt_a2").string();
+    std::string dir_a2 = test_tmp_path("luce_test_salt_a2").string();
     rm_rf(dir_a2);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_a2; cfg.min_tokens = 1;
@@ -6755,7 +6755,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
     std::vector<int32_t> prompt;
     for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) prompt.push_back(i + 1);
 
-    std::string dir1 = test_tmp_path("dflash_test_salt_zero1").string();
+    std::string dir1 = test_tmp_path("luce_test_salt_zero1").string();
     rm_rf(dir1);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir1; cfg.min_tokens = 1;
@@ -6766,7 +6766,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
         TEST_ASSERT(cache.save(0, prompt));
     }
 
-    std::string dir2 = test_tmp_path("dflash_test_salt_zero2").string();
+    std::string dir2 = test_tmp_path("luce_test_salt_zero2").string();
     rm_rf(dir2);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir2; cfg.min_tokens = 1;
@@ -6788,7 +6788,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
 
 TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
     const std::string file_path = test_tmp_path(
-        "dflash_test_backend_ipc_work_dir_file").string();
+        "luce_test_backend_ipc_work_dir_file").string();
     remove_test_path(file_path);
     FILE * file = std::fopen(file_path.c_str(), "wb");
     TEST_ASSERT(file != nullptr);
@@ -6800,7 +6800,7 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
 
     BackendIpcLaunchConfig cfg;
     cfg.bin = "/bin/true";
-    cfg.payload_path = "/tmp/dflash_test_backend_ipc_payload";
+    cfg.payload_path = "/tmp/luce_test_backend_ipc_payload";
     cfg.work_dir = file_path;
 
     BackendIpcProcess proc;
@@ -6923,44 +6923,44 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_shared_payload_segment_contract) {
 }
 
 TEST_CASE(ServerUnitFixture, test_moe_hybrid_expert_compute_batch_default) {
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH");
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH_MAX");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_BATCH");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_BATCH_MAX");
     TEST_ASSERT(moe_hybrid_expert_compute_batch_limit() == 32);
 }
 
 TEST_CASE(ServerUnitFixture, test_moe_hybrid_expert_compute_ipc_mode_batch_limit) {
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE");
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
     TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 1024);
 
-    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "auto");
-    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY", "512");
+    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE", "auto");
+    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY", "512");
     TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 512);
 
-    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "batched");
+    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE", "batched");
     TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 512);
 
-    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "stream");
+    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE", "stream");
     TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 32);
 
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE");
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
 }
 
 TEST_CASE(ServerUnitFixture, test_moe_hybrid_prefill_hot_sub_batch_limit) {
-    dflash_unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
+    luce_unsetenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
 
-    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "0");
+    luce_setenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH", "0");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
 
-    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "3");
+    luce_setenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH", "3");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 3);
 
-    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "8");
+    luce_setenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH", "8");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
 
-    dflash_unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
+    luce_unsetenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH");
 }
 
 TEST_CASE(ServerUnitFixture, test_moe_hybrid_uma_core_memory_is_saturating) {
@@ -6976,8 +6976,8 @@ TEST_CASE(ServerUnitFixture, test_moe_hybrid_canonical_rocmfp2_q2_is_tokenwise) 
     // route-order joins must preserve [hidden, route, token] while appending
     // those token slices; concatenating the route dimension makes the final
     // owner reduction invalid.
-    dflash_unsetenv("DFLASH_MOE_TP_GROUPED_MMVQ");
-    dflash_unsetenv("DFLASH_DS4_TP_GROUPED_MMVQ");
+    luce_unsetenv("LUCE_MOE_TP_GROUPED_MMVQ");
+    luce_unsetenv("LUCE_DS4_TP_GROUPED_MMVQ");
 
     ggml_init_params params{};
     params.mem_size = 16 * 1024 * 1024;
@@ -7391,7 +7391,7 @@ static ServerConfig make_props_config_with_sidecar(const json & sidecar) {
 }
 
 TEST_CASE(ServerUnitFixture, test_model_card_env_override_beats_cwd) {
-    // DFLASH_MODEL_CARDS_DIR used to be the LAST candidate, tried after the cwd-relative
+    // LUCE_MODEL_CARDS_DIR used to be the LAST candidate, tried after the cwd-relative
     // "share/model_cards". Running from a directory that happened to contain one silently
     // ignored the operator's explicit override. An explicit setting must win.
     namespace fs = std::filesystem;
@@ -7409,14 +7409,14 @@ TEST_CASE(ServerUnitFixture, test_model_card_env_override_beats_cwd) {
         std::fclose(f);
     }
 
-    const char * prev = std::getenv("DFLASH_MODEL_CARDS_DIR");
+    const char * prev = std::getenv("LUCE_MODEL_CARDS_DIR");
     const std::string saved = prev ? prev : "";
-    dflash_setenv("DFLASH_MODEL_CARDS_DIR", envdir.string().c_str());
+    luce_setenv("LUCE_MODEL_CARDS_DIR", envdir.string().c_str());
 
-    auto card = dflash::common::resolve_model_card("", "env-probe-model", "deepseek4", "");
+    auto card = luce::common::resolve_model_card("", "env-probe-model", "deepseek4", "");
 
-    if (saved.empty()) dflash_unsetenv("DFLASH_MODEL_CARDS_DIR");
-    else dflash_setenv("DFLASH_MODEL_CARDS_DIR", saved.c_str());
+    if (saved.empty()) luce_unsetenv("LUCE_MODEL_CARDS_DIR");
+    else luce_setenv("LUCE_MODEL_CARDS_DIR", saved.c_str());
     fs::remove_all(root);
 
     // Resolved from the env dir, not the deepseek4 family fallback (which gives 32768).
@@ -7434,19 +7434,19 @@ TEST_CASE(ServerUnitFixture, test_model_card_family_fallback_deepseek4) {
     // sidecar for the real figures, and the fallback is deliberately conservative.
     // What must not regress is that deepseek4 resolves to a FAMILY card at all, and
     // carries the wider reply budget rather than the terse 512 default.
-    auto card = dflash::common::resolve_model_card("", "", "deepseek4", "");
+    auto card = luce::common::resolve_model_card("", "", "deepseek4", "");
     TEST_ASSERT(card.source_label == "family:deepseek4");
     TEST_ASSERT(card.max_tokens == 32768);
     TEST_ASSERT(card.hard_limit_reply_budget == 4096);
 
     // An unknown architecture must still fall through, or the safety net would mask
     // genuinely unsupported models.
-    auto unknown = dflash::common::resolve_model_card("", "", "not-a-real-arch", "");
+    auto unknown = luce::common::resolve_model_card("", "", "not-a-real-arch", "");
     TEST_ASSERT(unknown.source_label != "family:not-a-real-arch");
 }
 
 TEST_CASE(ServerUnitFixture, test_model_card_family_fallback_bailingmoe3) {
-    auto card = dflash::common::resolve_model_card("", "", "bailingmoe3", "");
+    auto card = luce::common::resolve_model_card("", "", "bailingmoe3", "");
     TEST_ASSERT(card.source_label == "family:bailingmoe3");
     TEST_ASSERT(card.max_tokens == 32768);
     TEST_ASSERT(card.sampling.has_temperature);
@@ -8113,7 +8113,7 @@ TEST_CASE(ServerUnitFixture, test_normalize_strips_billing_header_anthropic_arra
         {{"type", "text"},
          {"text", "You are a helpful coding assistant."}}
     });
-    std::string out = dflash::common::normalize_system_for_cache(system_blocks);
+    std::string out = luce::common::normalize_system_for_cache(system_blocks);
     TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
     TEST_ASSERT(out.find("helpful coding assistant") != std::string::npos);
 }
@@ -8125,7 +8125,7 @@ TEST_CASE(ServerUnitFixture, test_normalize_strips_billing_header_openai_message
          {"content", "x-anthropic-billing-header: session=xyz789 turn=12 ts=1749431000\nYou are a code reviewer."}},
         {{"role", "user"}, {"content", "Review this diff."}}
     });
-    std::string out = dflash::common::normalize_system_for_cache(messages);
+    std::string out = luce::common::normalize_system_for_cache(messages);
     TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
     TEST_ASSERT(out.find("code reviewer") != std::string::npos);
 }
@@ -8143,8 +8143,8 @@ TEST_CASE(ServerUnitFixture, test_normalize_idempotent_across_changing_header) {
          {"content", "x-anthropic-billing-header: session=S1 turn=5 ts=1749430060\nYou help with Rust."}},
         {{"role", "user"}, {"content", "What is a lifetime?"}}
     });
-    std::string out4 = dflash::common::normalize_system_for_cache(messages_turn4);
-    std::string out5 = dflash::common::normalize_system_for_cache(messages_turn5);
+    std::string out4 = luce::common::normalize_system_for_cache(messages_turn4);
+    std::string out5 = luce::common::normalize_system_for_cache(messages_turn5);
     TEST_ASSERT(out4 == out5);
 }
 
@@ -8155,7 +8155,7 @@ TEST_CASE(ServerUnitFixture, test_normalize_preserves_legit_system_content) {
          {"content", "You are an expert in C++ performance optimization."}},
         {{"role", "user"}, {"content", "Help me optimize this loop."}}
     });
-    std::string out = dflash::common::normalize_system_for_cache(messages);
+    std::string out = luce::common::normalize_system_for_cache(messages);
     TEST_ASSERT(out == "You are an expert in C++ performance optimization.");
 }
 
@@ -8167,7 +8167,7 @@ TEST_CASE(ServerUnitFixture, test_normalize_handles_leading_whitespace_header) {
         {{"type", "text"},
          {"text", "Be concise."}}
     });
-    std::string out = dflash::common::normalize_system_for_cache(system_blocks);
+    std::string out = luce::common::normalize_system_for_cache(system_blocks);
     TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
     TEST_ASSERT(out.find("Be concise.") != std::string::npos);
 }
@@ -8185,8 +8185,8 @@ TEST_CASE(ServerUnitFixture, test_prefix_key_stable_across_header_change) {
          {"content", "x-anthropic-billing-header: session=S2 turn=7 ts=1749440420\nYou are a senior engineer."}},
         {{"role", "user"}, {"content", "What is RAII?"}}
     });
-    std::string norm_a = dflash::common::normalize_system_for_cache(messages_a);
-    std::string norm_b = dflash::common::normalize_system_for_cache(messages_b);
+    std::string norm_a = luce::common::normalize_system_for_cache(messages_a);
+    std::string norm_b = luce::common::normalize_system_for_cache(messages_b);
     TEST_ASSERT(norm_a == norm_b);
     TEST_ASSERT(norm_a.find("senior engineer") != std::string::npos);
 }
@@ -8457,7 +8457,7 @@ static std::string write_qwen3_drafter_fixture_gguf() {
     add_tensor("blk.0.ffn_down.weight",    GGML_TYPE_BF16, 2, n_ff,     n_embd);
 
     const std::string path = test_tmp_path(
-        "dflash_test_qwen3_drafter_438.gguf").string();
+        "luce_test_qwen3_drafter_438.gguf").string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
 
     gguf_free(g);
@@ -8475,7 +8475,7 @@ TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
     {
         Qwen3DrafterWeights w;
         bool ok = load_qwen3_drafter_model(path, backend, w);
-        TEST_ASSERT_MSG(ok, dflash27b_last_error());
+        TEST_ASSERT_MSG(ok, luce_last_error());
         free_qwen3_drafter_model(w);
     }
 
@@ -8495,7 +8495,7 @@ TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
         Qwen3DrafterWeights w;
         bool ok = load_qwen3_drafter_model(path, backend, w);
         TEST_ASSERT(!ok);
-        const std::string err = dflash27b_last_error();
+        const std::string err = luce_last_error();
         TEST_ASSERT_MSG(err.find("truncated or corrupt") != std::string::npos,
                         err.c_str());
         free_qwen3_drafter_model(w);

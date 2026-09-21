@@ -33,7 +33,7 @@
 #include <optional>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 class Qwen35Backend;
 
@@ -205,4 +205,4 @@ private:
     std::vector<float>       logits_buf_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -5,7 +5,7 @@
 // runtime through this header, while HIP builds map the existing cuda* runtime
 // spellings to hip*.
 
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 
 #include <hip/hip_runtime.h>
 

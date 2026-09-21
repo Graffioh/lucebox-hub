@@ -12,8 +12,8 @@
 #include <type_traits>
 
 using namespace CppUnitTestFramework;
-using namespace dflash::common;
-using namespace dflash::engine;
+using namespace luce::common;
+using namespace luce::engine;
 
 namespace {
 

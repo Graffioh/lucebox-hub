@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace dflash::common {
+namespace luce::common {
 
 enum class InferencePhase : int32_t {
     Unspecified = 0,
@@ -30,4 +30,4 @@ constexpr bool inference_phase_from_wire_value(int32_t value,
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

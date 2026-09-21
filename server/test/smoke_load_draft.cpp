@@ -4,7 +4,7 @@
 //
 // Usage: smoke_load_draft <path/to/model.safetensors>
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "internal.h"
 #include "CppUnitTestFramework.hpp"
 #include "model_test_paths.h"
@@ -19,7 +19,7 @@
 #include <cstring>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 using namespace CppUnitTestFramework;
 
 struct SmokeLoadDraft : CommonFixture {
@@ -37,7 +37,7 @@ TEST_CASE(SmokeLoadDraft, LoadsConfiguredModel) {
     const bool loaded = load_draft_safetensors(path.c_str(), backend, w);
     if (!loaded) {
         std::fprintf(stderr, "load_draft_safetensors failed: %s\n",
-                     dflash27b_last_error());
+                     luce_last_error());
         ggml_backend_free(backend);
         REQUIRE(loaded);
     }

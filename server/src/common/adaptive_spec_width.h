@@ -58,7 +58,7 @@
 // passed to next_width*() is a hard cap: the controller only narrows a
 // proposal, so a proposal below min_width is returned unchanged.
 //
-// Opt in with DFLASH_ADAPTIVE_SPEC_WIDTH=1. Fixed width remains the shared
+// Opt in with LUCE_ADAPTIVE_SPEC_WIDTH=1. Fixed width remains the shared
 // default because narrower verification is not automatically cheaper on every
 // backend; a backend may enable the controller by default on a qualified
 // device. Backend-specific fixed-width overrides still take precedence.
@@ -70,11 +70,11 @@
 #include <limits>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 inline bool adaptive_spec_width_globally_enabled() {
     static const bool enabled = [] {
-        const char * value = std::getenv("DFLASH_ADAPTIVE_SPEC_WIDTH");
+        const char * value = std::getenv("LUCE_ADAPTIVE_SPEC_WIDTH");
         return value != nullptr && value[0] != '\0' &&
                std::strcmp(value, "0") != 0;
     }();
@@ -468,4 +468,4 @@ private:
     bool max_width_active_ = false;
 };
 
-} // namespace dflash::common
+} // namespace luce::common

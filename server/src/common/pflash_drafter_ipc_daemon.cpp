@@ -2,7 +2,7 @@
 
 #include "pflash_drafter_ipc.h"
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "dflash_draft_ipc.h"
 #include "qwen3/qwen3_drafter.h"
 
@@ -11,7 +11,7 @@
 #include <iostream>
 #include <sstream>
 
-namespace dflash::common {
+namespace luce::common {
 
 int run_pflash_drafter_ipc_daemon(const char * drafter_path,
                                   int drafter_gpu,
@@ -31,7 +31,7 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
     DrafterContext ctx;
     if (!load_drafter(drafter_path, /*gpu_layers=*/999, std::max(0, drafter_gpu), ctx)) {
         std::fprintf(stderr, "[pflash-ipc-daemon] drafter load failed: %s\n",
-                     dflash27b_last_error());
+                     luce_last_error());
         stream_status(stream_fd, -1);
         return 1;
     }
@@ -95,4 +95,4 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
 #endif
 }
 
-} // namespace dflash::common
+} // namespace luce::common

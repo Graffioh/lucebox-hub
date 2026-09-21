@@ -5,7 +5,7 @@
 //   - cooperative shared-memory loads instead of cp.async (Volta has no async copy)
 //   - all tensor I/O in F16 (half), no __nv_bfloat16
 //
-// Dispatched from flashprefill.cpp when DFLASH27B_HAVE_VOLTA_FLASHPREFILL is set
+// Dispatched from flashprefill.cpp when LUCE_HAVE_VOLTA_FLASHPREFILL is set
 // and the drafter's persistent buffers are GGML_TYPE_F16.
 //
 // WMMA intrinsics are only available on sm_70+.  In multi-arch fat binaries
@@ -19,7 +19,7 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 
-namespace dflash::common {
+namespace luce::common {
 namespace flashprefill {
 
 // ── Kernel 1: compute_mean_vector (F16) ──────────────────────────────
@@ -673,6 +673,6 @@ extern "C" void launch_block_select_f16(
 }
 
 } // namespace flashprefill
-} // namespace dflash::common
+} // namespace luce::common
 
 #endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700

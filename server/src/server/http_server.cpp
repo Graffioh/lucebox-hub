@@ -29,7 +29,7 @@
 #include "common/sha1.h"
 #include "freeze_history.h"
 
-#ifdef DFLASH_HAS_CURL
+#ifdef LUCE_HAS_CURL
 #include <curl/curl.h>
 #endif
 
@@ -48,7 +48,7 @@
 #include <stdexcept>
 #include <utility>
 
-using dflash::common::SocketHandle;
+using luce::common::SocketHandle;
 
 #if defined(_WIN32)
 #include <io.h>
@@ -98,7 +98,7 @@ static inline bool sock_is_eagain(int e) { return e == EAGAIN || e == EWOULDBLOC
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 constexpr auto kClientMonitorInterval = std::chrono::milliseconds(250);
@@ -322,7 +322,7 @@ bool canonical_assistant_content(
 }  // namespace http_detail
 
 // ─── curl helpers for upstream proxy ─────────────────────────────────────
-#ifdef DFLASH_HAS_CURL
+#ifdef LUCE_HAS_CURL
 
 struct CurlWriteCtx {
     bool streaming;
@@ -531,7 +531,7 @@ static bool curl_forward(const std::string & url,
     curl_easy_cleanup(curl);
     return res == CURLE_OK && response_sent;
 }
-#endif // DFLASH_HAS_CURL
+#endif // LUCE_HAS_CURL
 
 // ─── /props constants ───────────────────────────────────────────────────
 //
@@ -544,8 +544,8 @@ static bool curl_forward(const std::string & url,
 // Do NOT bump for additive changes (new fields, new sections).
 static constexpr int  kPropsSchema  = 2;
 static constexpr char kServerName[] = "luce-dflash";
-#ifndef DFLASH_SERVER_VERSION
-#define DFLASH_SERVER_VERSION "0.0.0+cpp"
+#ifndef LUCE_SERVER_VERSION
+#define LUCE_SERVER_VERSION "0.0.0+cpp"
 #endif
 
 // API endpoint registry served by /props. Keep in sync with the route
@@ -777,7 +777,7 @@ json build_props_body(const ServerConfig & config,
 
     json server = {
         {"name",         kServerName},
-        {"version",      DFLASH_SERVER_VERSION},
+        {"version",      LUCE_SERVER_VERSION},
         {"props_schema", kPropsSchema},
     };
 
@@ -796,9 +796,9 @@ json build_props_body(const ServerConfig & config,
             {"draft_residency", draft_residency_policy_name(config.draft_residency)},
         };
     } else {
-        const char * bsa_env = std::getenv("DFLASH_FP_USE_BSA");
-        const char * alpha_env = std::getenv("DFLASH_FP_ALPHA");
-        const char * lmfix_env = std::getenv("DFLASH27B_LM_HEAD_FIX");
+        const char * bsa_env = std::getenv("LUCE_FP_USE_BSA");
+        const char * alpha_env = std::getenv("LUCE_FP_ALPHA");
+        const char * lmfix_env = std::getenv("LUCE_LM_HEAD_FIX");
         json bsa_alpha = nullptr;
         if (alpha_env && *alpha_env) {
             try { bsa_alpha = std::stod(alpha_env); }
@@ -842,7 +842,7 @@ json build_props_body(const ServerConfig & config,
         }},
         {"model_alias", config.model_name},
         {"model_path",  config.model_path},
-        {"build_info",  std::string(kServerName) + " v" DFLASH_SERVER_VERSION
+        {"build_info",  std::string(kServerName) + " v" LUCE_SERVER_VERSION
                         " props_schema=" + std::to_string(kPropsSchema)},
         {"speculative_mode", speculative_mode},
         {"server", server},
@@ -861,7 +861,7 @@ json build_props_body(const ServerConfig & config,
             {"target_sharding", config.target_sharding},
             // Prefill chunk size (bargs.chunk). Surfaced so snapshot
             // tooling captures the full config — bench consumers
-            // (dflash/scripts/bench_http_capability.py) read
+            // (server/scripts/bench_http_capability.py) read
             // /props.runtime wholesale into result.json.server_info.
             {"chunk",           config.chunk},
             {"continuous_batching", {
@@ -984,7 +984,7 @@ json build_props_body(const ServerConfig & config,
 static void normalize_anthropic_system(const json & body, json & messages) {
     if (!body.contains("system")) return;
     // Delegate strip to the pure fn; insert as system message.
-    std::string text = dflash::common::normalize_system_for_cache(body["system"]);
+    std::string text = luce::common::normalize_system_for_cache(body["system"]);
     if (!text.empty()) {
         json sys_msg = {{"role", "system"}, {"content", text}};
         messages.insert(messages.begin(), sys_msg);
@@ -1123,7 +1123,7 @@ std::vector<ChatMessage> normalize_chat_messages(
 // Compute a 16-byte salt from inputs that affect KV cache validity:
 //   model path + stat(size + mtime)  [covers rope/yarn — GGUF-derived],
 //   max_ctx, sha1(chat_template_src), and the effective K-rotation basis
-//   (DFLASH_KV_ROTATE resolves against the K-cache type; a cache written
+//   (LUCE_KV_ROTATE resolves against the K-cache type; a cache written
 //   rotated must never be adopted by an un-rotated session or vice versa).
 // Returns all-zeroes if model_path is empty (back-compat / disk disabled).
 static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg) {
@@ -1217,7 +1217,7 @@ static json model_list(const ServerConfig & config, bool codex_schema) {
         {"data", json::array({
             {{"id", config.model_name},
              {"object", "model"},
-             {"owned_by", "dflash"},
+             {"owned_by", "luce"},
              {"created", 1700000000},
              {"context_length", config.max_ctx},
              {"max_context_length", config.max_ctx}}
@@ -1228,7 +1228,7 @@ static json model_list(const ServerConfig & config, bool codex_schema) {
 
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
-HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
+HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                        Tokenizer & tokenizer,
                        const ServerConfig & config)
     : engine_(engine)
@@ -1245,7 +1245,7 @@ HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
                    config.disk_cache_continued_interval,
                    config.disk_cache_cold_max_tokens}, backend_)
 {
-    #ifdef DFLASH_HAS_CURL
+    #ifdef LUCE_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
     prefix_cache_.init_full_cache(config.prefill_cache_cap);
@@ -1265,21 +1265,21 @@ HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
         return !(v[0] == '0' && v[1] == '\0') &&
                !(v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
     };
-    if (const char * e = std::getenv("DFLASH_PPP")) {
+    if (const char * e = std::getenv("LUCE_PPP")) {
         config_.ppp_enabled = env_truthy(e);
     }
-    if (const char * e = std::getenv("DFLASH_PPP_REARRANGE")) {
+    if (const char * e = std::getenv("LUCE_PPP_REARRANGE")) {
         config_.ppp_rearrange = env_truthy(e);
     }
-    if (const char * e = std::getenv("DFLASH_PPP_LCP_WINDOW")) {
+    if (const char * e = std::getenv("LUCE_PPP_LCP_WINDOW")) {
         const int n = std::atoi(e);
         if (n > 0) config_.ppp_lcp_window = n;
     }
-    if (const char * e = std::getenv("DFLASH_PPP_MIN_PIN_TOKENS")) {
+    if (const char * e = std::getenv("LUCE_PPP_MIN_PIN_TOKENS")) {
         const int n = std::atoi(e);
         if (n > 0) config_.ppp_min_pin_tokens = n;
     }
-    if (const char * e = std::getenv("DFLASH_PPP_MAX_EPHEMERAL")) {
+    if (const char * e = std::getenv("LUCE_PPP_MAX_EPHEMERAL")) {
         const int n = std::atoi(e);
         if (n > 0) config_.ppp_max_ephemeral_tokens = n;
     }
@@ -1292,8 +1292,8 @@ HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
 
 // Resolve path to share/status.html at startup.
 std::string HttpServer::resolve_status_html() {
-    // 1. DFLASH_SHARE_DIR env var
-    if (const char * dir = std::getenv("DFLASH_SHARE_DIR")) {
+    // 1. LUCE_SHARE_DIR env var
+    if (const char * dir = std::getenv("LUCE_SHARE_DIR")) {
         std::string path = std::string(dir) + "/status.html";
         struct stat st;
         if (::stat(path.c_str(), &st) == 0) return path;
@@ -1434,7 +1434,7 @@ void HttpServer::sse_heartbeat() {
 
 HttpServer::~HttpServer() {
     shutdown();
-    #ifdef DFLASH_HAS_CURL
+    #ifdef LUCE_HAS_CURL
     curl_global_cleanup();
     #endif
 }
@@ -1490,7 +1490,7 @@ bool HttpServer::start_worker() {
     // replaces the one-request worker with the concurrent scheduler.
     // Upstream forwarding stays on the classic path even when the local
     // backend exposes an engine.
-    dflash::engine::LuceEngine::ServingLoops loops;
+    luce::engine::LuceEngine::ServingLoops loops;
     loops.serial = [this]() { worker_loop(); };
     loops.concurrent =
         [this](SeqEngine & engine) { scheduler_loop(engine); };
@@ -1542,21 +1542,21 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
     for (auto * model : budget_models) {
         const size_t requested = model->config_.decode_kv_offload_bytes;
         auto * engine = model->backend_.seq_engine();
-        if (requested == dflash::common::kAutoKvOffloadBytes) {
+        if (requested == luce::common::kAutoKvOffloadBytes) {
             if (engine && engine->slot_count() > 1 && engine->kv_offload_capacity()) ++automatic_models;
         } else {
             explicit_bytes += std::min(requested,
-                dflash::common::kAutoKvOffloadBytes - explicit_bytes);
+                luce::common::kAutoKvOffloadBytes - explicit_bytes);
         }
     }
     const size_t available = automatic_models
-        ? dflash::common::available_kv_offload_memory().value_or(0) : 0;
+        ? luce::common::available_kv_offload_memory().value_or(0) : 0;
     for (auto * model : budget_models) {
         auto & budget = model->config_.decode_kv_offload_bytes;
-        if (budget != dflash::common::kAutoKvOffloadBytes) continue;
+        if (budget != luce::common::kAutoKvOffloadBytes) continue;
         auto * engine = model->backend_.seq_engine();
         budget = engine && engine->slot_count() > 1
-            ? dflash::common::auto_kv_offload_budget(engine->kv_offload_capacity(),
+            ? luce::common::auto_kv_offload_budget(engine->kv_offload_capacity(),
                 available, explicit_bytes, automatic_models) : 0;
         std::fprintf(stderr, "[server] model %s automatic decode KV offload budget: %zu bytes\n",
                      model->config_.model_name.c_str(), budget);
@@ -1770,7 +1770,7 @@ void HttpServer::handle_client(SocketHandle fd) {
     if (hr.method == "GET" && hr.path == "/status") {
         if (status_html_path_.empty()) {
             send_error(fd, 404,
-                "status.html not found. Set DFLASH_SHARE_DIR or place it in share/status.html");
+                "status.html not found. Set LUCE_SHARE_DIR or place it in share/status.html");
             socket_close(fd);
             return;
         }
@@ -3322,7 +3322,7 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
 bool HttpServer::forward_upstream(
         ServerJob * job, const ParsedRequest & req,
         const PreparedPrompt & prepared) {
-#ifdef DFLASH_HAS_CURL
+#ifdef LUCE_HAS_CURL
     if (config_.pflash_upstream_base.empty()) return false;
 
     const std::string & upstream = config_.pflash_upstream_base;
@@ -3406,7 +3406,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
 
     // PPP runs *before* lookup. Default (rearrange=0): annotate a sticky
     // pin_end only — never mutate tokens. Token-level DiffPin rewrite
-    // (prefix|suffix|middle float) is opt-in via DFLASH_PPP_REARRANGE=1;
+    // (prefix|suffix|middle float) is opt-in via LUCE_PPP_REARRANGE=1;
     // unconstrained middle peels can scramble tool-schema JSON and yield
     // empty post-tool completions.
     bool ppp_rewrote = false;
@@ -3919,7 +3919,7 @@ void HttpServer::remember_agent_turn(
     std::vector<ChatMessage> messages =
         normalize_chat_messages(req.messages, req.format, tool_memory_);
     static constexpr const char * kSentinel =
-        "__DFLASH_AGENT_TURN_CONTENT_7A21D9__";
+        "__LUCE_AGENT_TURN_CONTENT_7A21D9__";
     messages.push_back({"assistant", kSentinel});
 
     std::string sentinel_rendered;
@@ -4073,7 +4073,7 @@ void HttpServer::prepare_generation_inputs(
         }
     }
 
-    if (req.tools.empty() || !env_flag_enabled("DFLASH_STALL_TOOL_PREFIX")) {
+    if (req.tools.empty() || !env_flag_enabled("LUCE_STALL_TOOL_PREFIX")) {
         return;
     }
 
@@ -4930,4 +4930,4 @@ bool HttpServer::send_sse_headers(ServerJob * job) {
     return send_job_bytes(job, header.data(), header.size());
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

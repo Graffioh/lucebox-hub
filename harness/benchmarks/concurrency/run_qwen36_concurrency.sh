@@ -9,7 +9,7 @@ GENERATOR="${GENERATOR:-$SCRIPT_DIR/generate_prompts.py}"
 SUMMARIZER="${SUMMARIZER:-$SCRIPT_DIR/summarize_concurrency.py}"
 
 MODEL="${MODEL:-}"
-LUCE_SERVER_BIN="${LUCE_SERVER_BIN:-$REPO/server/build-hip/dflash_server}"
+LUCE_SERVER_BIN="${LUCE_SERVER_BIN:-$REPO/server/build-hip/luce_server}"
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$(command -v llama-server 2>/dev/null || true)}"
 OUT="${OUT:-$REPO/.harness-runs/qwen36-concurrency-$(date -u +%Y%m%dT%H%M%SZ)}"
 REPEATS="${REPEATS:-1}"
@@ -30,7 +30,7 @@ IDLE_PREFILL_TOKENS="${IDLE_PREFILL_TOKENS:-4096}"
 # the blog command, and the WMMA route supports f16/q8_0/q4_0).
 KV_TYPE="${KV_TYPE:-q4_0}"
 # Optional pass-through for the paged-attention kernel route
-# (DFLASH27B_PAGED_WMMA). Empty preserves the default kernel.
+# (LUCE_PAGED_WMMA). Empty preserves the default kernel.
 PAGED_WMMA="${PAGED_WMMA:-}"
 
 usage() {
@@ -78,7 +78,7 @@ if ! [[ "$IDLE_PREFILL_TOKENS" =~ ^[1-9][0-9]{0,4}$ ]] || (( 10#$IDLE_PREFILL_TO
   echo "IDLE_PREFILL_TOKENS must be an integer in range 1..16384" >&2
   exit 2
 fi
-ambient_tuning="$(env | grep -E '^(GGML_|DFLASH_|LUCE_|HIP_|ROCR_|HSA_|LD_PRELOAD=|LD_LIBRARY_PATH=)' \
+ambient_tuning="$(env | grep -E '^(GGML_|LUCE_|LUCE_|HIP_|ROCR_|HSA_|LD_PRELOAD=|LD_LIBRARY_PATH=)' \
   | grep -v '^LUCE_SERVER_BIN=' || true)"
 if [[ -n "$ambient_tuning" ]]; then
   echo "refusing ambient GPU/backend tuning variables:" >&2
@@ -252,12 +252,12 @@ run_case() {
     launch_command=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" "${command[@]}")
   else
     local -a route_env2=()
-    [[ -n "$PAGED_WMMA" ]] && route_env2=(DFLASH27B_PAGED_WMMA="$PAGED_WMMA")
-    launch_command=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" DFLASH_IGNORE_EOS=1
-      DFLASH_MIN_TOKENS="$WARMUP_TOKENS"
-      DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
-      DFLASH_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
-      DFLASH_MAX_CONCURRENT_PREFILLS="$max_prefills"
+    [[ -n "$PAGED_WMMA" ]] && route_env2=(LUCE_PAGED_WMMA="$PAGED_WMMA")
+    launch_command=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" LUCE_IGNORE_EOS=1
+      LUCE_MIN_TOKENS="$WARMUP_TOKENS"
+      LUCE_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
+      LUCE_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
+      LUCE_MAX_CONCURRENT_PREFILLS="$max_prefills"
       "${route_env2[@]}" "${command[@]}")
   fi
   printf '%q ' "${launch_command[@]}" > "$case_dir/server-command.txt"; printf '\n' >> "$case_dir/server-command.txt"

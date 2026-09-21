@@ -9,7 +9,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 FAKE_BIN="$TMP_DIR/bin"
 FAKE_TARGET="$TMP_DIR/model.gguf"
 FAKE_DRAFT="$TMP_DIR/draft.gguf"
-FAKE_SERVER="$TMP_DIR/dflash_server"
+FAKE_SERVER="$TMP_DIR/luce_server"
 FAKE_PI="$TMP_DIR/pi"
 mkdir -p "$FAKE_BIN"
 touch "$FAKE_TARGET" "$FAKE_DRAFT"
@@ -56,7 +56,7 @@ run_harness() {
         TARGET="$FAKE_TARGET" \
         DRAFT="$FAKE_DRAFT" \
         FA_WINDOW=1 \
-        DFLASH_SERVER_BIN="$FAKE_SERVER" \
+        LUCE_SERVER_BIN="$FAKE_SERVER" \
         PI_BIN="$FAKE_PI" \
         AUTO_INSTALL_CLIENTS=0 \
         TIMEOUT_CAPTURE="$capture" \

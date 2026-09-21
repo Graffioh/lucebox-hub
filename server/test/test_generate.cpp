@@ -11,7 +11,7 @@
 //   test_generate <qwen35.gguf> <prompt_ids.bin> <n_gen> <out_ids.bin>
 //   test_generate --seq-engine-contract <qwen35.gguf> [slots]
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "internal.h"
 #include "qwen35/qwen35_backend.h"
 #include "seq_engine_contract.h"
@@ -49,7 +49,7 @@
 #include <unistd.h>
 #endif
 
-using namespace dflash::common;
+using namespace luce::common;
 
 struct GenerateStepGraph {
     ggml_context *    ctx = nullptr;
@@ -81,7 +81,7 @@ static bool build_step_graph(
     if (!sg.ctx) return false;
 
     const int n_tokens = 1;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = LUCE_TARGET_HIDDEN;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
     ggml_set_input(sg.inp_embed);
@@ -135,8 +135,8 @@ static int run_seq_engine_contract(const char * gguf_path, int slots) {
     // attention and KVFlash are intentionally mutually exclusive. Prevent
     // arbitrary raw token IDs from ending the checker before its three
     // batched steps have exercised state carry.
-    unsetenv("DFLASH_KVFLASH");
-    setenv("DFLASH_MIN_TOKENS", "8", 1);
+    unsetenv("LUCE_KVFLASH");
+    setenv("LUCE_MIN_TOKENS", "8", 1);
 
     Qwen35Config cfg;
     cfg.target_path = gguf_path;
@@ -149,7 +149,7 @@ static int run_seq_engine_contract(const char * gguf_path, int slots) {
     Qwen35Backend backend(cfg);
     if (!backend.init()) {
         std::fprintf(stderr, "seq-engine backend init failed: %s\n",
-                     dflash27b_last_error());
+                     luce_last_error());
         return 1;
     }
 
@@ -204,22 +204,22 @@ int main(int argc, char ** argv) {
         // KV cache type flags (mirror llama-cli -ctk / -ctv).
         // Set the env var before resolve_kv_types() reads it inside create_target_cache.
         else if (std::strcmp(argv[i], "--cache-type-k") == 0 || std::strcmp(argv[i], "-ctk") == 0) {
-            if (i + 1 < argc) setenv("DFLASH27B_KV_K", argv[++i], 1);
+            if (i + 1 < argc) setenv("LUCE_KV_K", argv[++i], 1);
         }
         else if (std::strncmp(argv[i], "--cache-type-k=", 15) == 0) {
-            setenv("DFLASH27B_KV_K", argv[i] + 15, 1);
+            setenv("LUCE_KV_K", argv[i] + 15, 1);
         }
         else if (std::strncmp(argv[i], "-ctk=", 5) == 0) {
-            setenv("DFLASH27B_KV_K", argv[i] + 5, 1);
+            setenv("LUCE_KV_K", argv[i] + 5, 1);
         }
         else if (std::strcmp(argv[i], "--cache-type-v") == 0 || std::strcmp(argv[i], "-ctv") == 0) {
-            if (i + 1 < argc) setenv("DFLASH27B_KV_V", argv[++i], 1);
+            if (i + 1 < argc) setenv("LUCE_KV_V", argv[++i], 1);
         }
         else if (std::strncmp(argv[i], "--cache-type-v=", 15) == 0) {
-            setenv("DFLASH27B_KV_V", argv[i] + 15, 1);
+            setenv("LUCE_KV_V", argv[i] + 15, 1);
         }
         else if (std::strncmp(argv[i], "-ctv=", 5) == 0) {
-            setenv("DFLASH27B_KV_V", argv[i] + 5, 1);
+            setenv("LUCE_KV_V", argv[i] + 5, 1);
         }
     }
     auto stream_emit = [&](int32_t tok) {
@@ -240,15 +240,15 @@ int main(int argc, char ** argv) {
 
     TargetWeights w;
     if (!load_target_gguf(gguf_path, backend, w)) {
-        std::fprintf(stderr, "load: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load: %s\n", luce_last_error());
         return 1;
     }
-    std::printf("[target] %s\n", dflash27b_last_error());
+    std::printf("[target] %s\n", luce_last_error());
 
     const int max_ctx = 4096;
     TargetCache cache;
     if (!create_target_cache(w, max_ctx, /*max_verify_tokens=*/0, backend, cache)) {
-        std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "cache: %s\n", luce_last_error());
         return 1;
     }
 
@@ -266,7 +266,7 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> all_tokens = prompt;
     all_tokens.reserve(prompt.size() + n_gen);
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = LUCE_TARGET_HIDDEN;
     std::vector<float> embed_buf(hidden);
 
     GenerateStepGraph sg;
@@ -298,7 +298,7 @@ int main(int argc, char ** argv) {
         }
 
         // argmax on logits
-        const int vocab = DFLASH27B_TARGET_VOCAB;
+        const int vocab = LUCE_TARGET_VOCAB;
         std::vector<float> logits(vocab);
         ggml_backend_tensor_get(sg.logits, logits.data(), 0, sizeof(float) * vocab);
         int best = 0;

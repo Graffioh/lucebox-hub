@@ -9,7 +9,7 @@
 #include <limits>
 #include <string>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 struct Qwen35MoeExpertPlacementFixture {};

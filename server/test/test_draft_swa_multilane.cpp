@@ -14,7 +14,7 @@
 #include <cstdio>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 
@@ -428,7 +428,7 @@ int main(int argc, char ** argv) {
     }
     if (!load_draft_gguf(argv[1], resources.backend, resources.weights)) {
         std::fprintf(stderr, "draft SWA qualification: %s\n",
-                     dflash27b_last_error());
+                     luce_last_error());
         return 1;
     }
     if (dynconv_only &&

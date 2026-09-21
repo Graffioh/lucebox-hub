@@ -8,7 +8,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 enum class DraftResidencyPolicy {
     Auto,
@@ -87,4 +87,4 @@ inline DraftResidencyAction resolve_draft_residency_action(
     return DraftResidencyAction::KeepLoaded;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

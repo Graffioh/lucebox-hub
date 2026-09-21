@@ -13,7 +13,7 @@
 #include <cstdlib>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool run_qwen35_layer_split_request(
         std::vector<Qwen35LayerSplitShard> & shards,
@@ -86,4 +86,4 @@ bool run_qwen35_layer_split_request(
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

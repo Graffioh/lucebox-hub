@@ -1,4 +1,4 @@
-// HTTP server infrastructure for dflash::common native server.
+// HTTP server infrastructure for luce::common native server.
 //
 // Ported from ds4_server.c's socket/threading/HTTP layer, converted to C++.
 // Architecture:
@@ -50,11 +50,11 @@
 #include <unordered_set>
 #include <vector>
 
-namespace dflash::engine {
+namespace luce::engine {
 class LuceEngine;
 }
 
-namespace dflash::common {
+namespace luce::common {
 
 using json = nlohmann::json;
 
@@ -99,7 +99,7 @@ struct ServerConfig {
     int         routing_queue_limit = 32; // waiting auto requests across the listener
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
-    std::string model_name  = "dflash";
+    std::string model_name  = "luce";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
     // Resident system-memory budget for copied paged checkpoints. The
     // scheduler enforces it only when concurrent paged prefix storage is
@@ -111,9 +111,9 @@ struct ServerConfig {
     bool        agent_turn_cache = false;
 
     // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
-    // See docs/PIN_FRIENDLY_PROMPT.md. Env: DFLASH_PPP=0|1,
-    // DFLASH_PPP_REARRANGE=0|1, DFLASH_PPP_LCP_WINDOW=N,
-    // DFLASH_PPP_MIN_PIN_TOKENS=N, DFLASH_PPP_MAX_EPHEMERAL=N.
+    // See docs/PIN_FRIENDLY_PROMPT.md. Env: LUCE_PPP=0|1,
+    // LUCE_PPP_REARRANGE=0|1, LUCE_PPP_LCP_WINDOW=N,
+    // LUCE_PPP_MIN_PIN_TOKENS=N, LUCE_PPP_MAX_EPHEMERAL=N.
     bool        ppp_enabled = true;
     bool        ppp_rearrange = false;
     int         ppp_lcp_window = 8;
@@ -198,7 +198,7 @@ struct ServerConfig {
     // bench/snapshot tooling can capture the full server config — needed
     // because pre-c35a8a4 snapshots had no /props capture and post-hoc
     // forensics on which chunk was used are otherwise impossible. See
-    // dflash/docs/specs/props-endpoint.md §4.5.
+    // docs/specs/props-endpoint.md §4.5.
     int         chunk               = 0;
     // Resolved device placement strings (e.g. "auto:0", "cuda:0"). Sourced
     // from placement_device_name(bargs.device / bargs.draft_device) in
@@ -209,7 +209,7 @@ struct ServerConfig {
     // never delays an already decoding request.
     int admission_coalesce_ms = 20;
     // Auto resolves after all models load, before workers start. Zero disables.
-    size_t decode_kv_offload_bytes = dflash::common::kAutoKvOffloadBytes;
+    size_t decode_kv_offload_bytes = luce::common::kAutoKvOffloadBytes;
 
     // PFlash (speculative prefill compression)
     enum class PflashMode { OFF, AUTO, ALWAYS };
@@ -382,7 +382,7 @@ json build_props_body(const ServerConfig & config,
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {
 public:
-    HttpServer(dflash::engine::LuceEngine & engine,
+    HttpServer(luce::engine::LuceEngine & engine,
                Tokenizer & tokenizer,
                const ServerConfig & config);
     ~HttpServer();
@@ -584,7 +584,7 @@ private:
     bool has_pending_jobs();
 
     // Members.
-    dflash::engine::LuceEngine & engine_;
+    luce::engine::LuceEngine & engine_;
     ModelBackend &   backend_;
     Tokenizer &      tokenizer_;
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
@@ -716,4 +716,4 @@ inline std::string parse_session_id_from_body(const json & body) {
     return {};
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

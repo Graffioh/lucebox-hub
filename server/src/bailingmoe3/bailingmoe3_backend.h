@@ -4,7 +4,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Configuration intentionally exposes only the features the first native
 // Ling backend implements. Speculative decode and expert offload can be added
@@ -27,4 +27,4 @@ protected:
     bool load_target_model(ggml_backend_t backend, TargetWeights & out) override;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

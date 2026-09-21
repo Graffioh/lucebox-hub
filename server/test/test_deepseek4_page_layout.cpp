@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <limits>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace { struct DeepSeek4PageLayoutFixture {}; }
 

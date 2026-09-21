@@ -23,6 +23,6 @@ dequantization, validation, and vector-dot functions. Backend dispatch is
 integrated in ggml's HIP source tree. Vulkan kernels are not implemented in
 this vendored build.
 
-With `DFLASH27B_TESTS=ON`, `test_rocmfpx` checks reference round trips,
+With `LUCE_TESTS=ON`, `test_rocmfpx` checks reference round trips,
 expected error ordering, weighted quantization, validation, and saturation of
 large finite FP6/FP8 inputs.

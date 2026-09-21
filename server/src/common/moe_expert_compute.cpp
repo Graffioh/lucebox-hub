@@ -13,7 +13,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -48,17 +48,17 @@ std::string make_runtime_key(const MoeExpertComputeRuntimeConfig & cfg) {
     key += "|n_embd=" + std::to_string(cfg.n_embd);
     key += "|n_ff=" + std::to_string(cfg.n_ff_exp);
     key += "|require_remote=" + std::to_string(cfg.require_remote ? 1 : 0);
-    if (const char * ipc_bin = nonempty_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_BIN")) {
+    if (const char * ipc_bin = nonempty_env("LUCE_MOE_EXPERT_COMPUTE_IPC_BIN")) {
         key += "|ipc_bin=";
         key += ipc_bin;
         key += "|ipc_gpu=" + std::to_string(
-            parse_nonnegative_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU", 0));
+            parse_nonnegative_env("LUCE_MOE_EXPERT_COMPUTE_IPC_GPU", 0));
         key += "|ipc_work=";
-        if (const char * work_dir = nonempty_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_WORK_DIR")) {
+        if (const char * work_dir = nonempty_env("LUCE_MOE_EXPERT_COMPUTE_IPC_WORK_DIR")) {
             key += work_dir;
         }
         key += "|ipc_required=" + std::to_string(
-            parse_nonnegative_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_REQUIRED", 0));
+            parse_nonnegative_env("LUCE_MOE_EXPERT_COMPUTE_IPC_REQUIRED", 0));
     } else {
         key += "|cpu";
     }
@@ -193,18 +193,18 @@ bool ensure_moe_expert_compute_runtime(
     }
 
     if (!runtime.compute) {
-        if (const char * ipc_bin = nonempty_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_BIN")) {
+        if (const char * ipc_bin = nonempty_env("LUCE_MOE_EXPERT_COMPUTE_IPC_BIN")) {
             if (!validate_executable_file(ipc_bin, err)) {
                 std::fprintf(stderr, "%s %s\n", cfg.log_prefix ? cfg.log_prefix : "[moe-expert-compute]",
                              err ? err->c_str() : "invalid remote IPC binary");
                 runtime.reset();
                 return false;
             }
-            const char * work_dir = nonempty_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_WORK_DIR");
+            const char * work_dir = nonempty_env("LUCE_MOE_EXPERT_COMPUTE_IPC_WORK_DIR");
             const int remote_gpu =
-                parse_nonnegative_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU", 0);
+                parse_nonnegative_env("LUCE_MOE_EXPERT_COMPUTE_IPC_GPU", 0);
             const bool required = cfg.require_remote ||
-                parse_nonnegative_env("DFLASH_MOE_EXPERT_COMPUTE_IPC_REQUIRED", 0) != 0;
+                parse_nonnegative_env("LUCE_MOE_EXPERT_COMPUTE_IPC_REQUIRED", 0) != 0;
             MoeExpertComputeIpcStartResult remote = make_moe_expert_compute_ipc(
                 ipc_bin, cfg.target_path, remote_gpu, hybrid.placement,
                 cfg.n_embd, cfg.n_ff_exp, cfg.n_expert_used,
@@ -237,4 +237,4 @@ bool ensure_moe_expert_compute_runtime(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

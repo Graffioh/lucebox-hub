@@ -99,7 +99,7 @@ static bool mix_device_is_gfx1151(int device) {
 
 static bool mix_gfx1151_row4_enabled() {
     static const bool enabled = [] {
-        const char * value = std::getenv("DFLASH_ROCMFP2_ROW4");
+        const char * value = std::getenv("LUCE_ROCMFP2_ROW4");
         // Qualified on gfx1151 for verifier-width matvecs. Keep an explicit
         // burn-in kill switch while leaving every other architecture and q<=2
         // on the existing two-row kernel.

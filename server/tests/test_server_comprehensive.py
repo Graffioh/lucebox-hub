@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comprehensive server test suite for dflash_server.
+"""Comprehensive server test suite for luce_server.
 
 Exercises: prefix cache (pflash), multi-turn conversations, reasoning extraction,
 non-streaming for all 3 APIs, tool request format, concurrent requests, edge cases,
@@ -7,13 +7,13 @@ and DDTree startup validation.
 
 Usage:
     # Start server first (with 0.6B for quick tests):
-    ./dflash/build/dflash_server dflash/models/Qwen3-0.6B-BF16.gguf --port 9099
+    ./server/build/luce_server server/models/Qwen3-0.6B-BF16.gguf --port 9099
 
     # Then run tests:
-    python3 dflash/tests/test_server_comprehensive.py --base-url http://localhost:9099
+    python3 server/tests/test_server_comprehensive.py --base-url http://localhost:9099
 
     # Or auto-launch:
-    python3 dflash/tests/test_server_comprehensive.py --launch dflash/models/Qwen3-0.6B-BF16.gguf
+    python3 server/tests/test_server_comprehensive.py --launch server/models/Qwen3-0.6B-BF16.gguf
 """
 
 import argparse
@@ -117,7 +117,7 @@ class TestSuite:
         """Send the same prompt twice — second should benefit from prefix cache."""
         print("\n[PC-1] Prefix cache — repeated prompt timing")
         prompt = {
-            "model": "dflash",
+            "model": "luce",
             "messages": [
                 {"role": "system", "content": "You are a helpful math assistant."},
                 {"role": "user", "content": "What is the square root of 144?"}
@@ -164,7 +164,7 @@ class TestSuite:
         """Different user messages with same system prompt should share prefix."""
         print("\n[PC-2] Prefix cache — shared system prompt")
         base = {
-            "model": "dflash",
+            "model": "luce",
             "max_tokens": 1024,
             "temperature": 0.0,
             "stream": False,
@@ -199,7 +199,7 @@ class TestSuite:
         print("\n[MT-1] Multi-turn conversation — OpenAI format")
         try:
             r = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": "My name is Alice."},
@@ -224,7 +224,7 @@ class TestSuite:
         print("\n[MT-2] Multi-turn conversation — Anthropic format")
         try:
             r = self._req("POST", "/v1/messages", {
-                "model": "dflash",
+                "model": "luce",
                 "system": "You are a helpful assistant.",
                 "messages": [
                     {"role": "user", "content": "Remember: the secret word is banana."},
@@ -264,7 +264,7 @@ class TestSuite:
         print("\n[MT-3] Multi-turn conversation — Responses format")
         try:
             r = self._req("POST", "/v1/responses", {
-                "model": "dflash",
+                "model": "luce",
                 "instructions": "You are a helpful assistant.",
                 "input": [
                     {"role": "user", "content": "The color is blue."},
@@ -304,7 +304,7 @@ class TestSuite:
         print("\n[TH-1] Reasoning — non-streaming OpenAI")
         try:
             r = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [{"role": "user", "content": "What is 2 + 3?"}],
                 "max_tokens": 2048,
                 "temperature": 0.0,
@@ -332,7 +332,7 @@ class TestSuite:
         print("\n[TH-2] Reasoning — non-streaming Anthropic")
         try:
             r = self._req("POST", "/v1/messages", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [{"role": "user", "content": "What is 7 * 8?"}],
                 "max_tokens": 1024,
                 "temperature": 0.0,
@@ -362,7 +362,7 @@ class TestSuite:
         print("\n[TH-3] Reasoning — streaming OpenAI")
         try:
             resp = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [{"role": "user", "content": "What is 9 + 6?"}],
                 "max_tokens": 1024,
                 "temperature": 0.0,
@@ -415,7 +415,7 @@ class TestSuite:
         print("\n[NS-1] Non-streaming — Anthropic full validation")
         try:
             r = self._req("POST", "/v1/messages", {
-                "model": "dflash",
+                "model": "luce",
                 "system": "Reply in exactly one word.",
                 "messages": [{"role": "user", "content": "Say yes."}],
                 "max_tokens": 1024,
@@ -425,7 +425,7 @@ class TestSuite:
             self._check("id starts with msg", r.get("id", "").startswith("msg"))
             self._check("type is message", r.get("type") == "message")
             self._check("role is assistant", r.get("role") == "assistant")
-            self._check("model is dflash", r.get("model") == "dflash")
+            self._check("model is luce", r.get("model") == "luce")
             self._check("stop_reason present", r.get("stop_reason") is not None)
             self._check("usage.input_tokens present",
                          r.get("usage", {}).get("input_tokens", 0) > 0)
@@ -439,7 +439,7 @@ class TestSuite:
         print("\n[NS-2] Non-streaming — Responses full validation")
         try:
             r = self._req("POST", "/v1/responses", {
-                "model": "dflash",
+                "model": "luce",
                 "input": "Say hello.",
                 "max_tokens": 1024,
                 "temperature": 0.0,
@@ -448,7 +448,7 @@ class TestSuite:
             self._check("id starts with resp", r.get("id", "").startswith("resp"))
             self._check("object is response", r.get("object") == "response")
             self._check("status is completed", r.get("status") == "completed")
-            self._check("model is dflash", r.get("model") == "dflash")
+            self._check("model is luce", r.get("model") == "luce")
 
             output = r.get("output", [])
             self._check("output has entries", len(output) > 0)
@@ -479,7 +479,7 @@ class TestSuite:
         print("\n[NS-3] Non-streaming — Responses string input")
         try:
             r = self._req("POST", "/v1/responses", {
-                "model": "dflash",
+                "model": "luce",
                 "input": "What is 2+2? Reply with just the number.",
                 "max_tokens": 1024,
                 "temperature": 0.0,
@@ -502,7 +502,7 @@ class TestSuite:
         print("\n[ST-1] Streaming — Anthropic full validation")
         try:
             resp = self._req("POST", "/v1/messages", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [{"role": "user", "content": "Count to 3."}],
                 "max_tokens": 1024,
                 "temperature": 0.0,
@@ -537,7 +537,7 @@ class TestSuite:
         print("\n[ST-2] Streaming — Responses full validation")
         try:
             resp = self._req("POST", "/v1/responses", {
-                "model": "dflash",
+                "model": "luce",
                 "input": "Say hi.",
                 "max_tokens": 1024,
                 "temperature": 0.0,
@@ -571,7 +571,7 @@ class TestSuite:
         print("\n[TL-1] Tool request format — tools in request body")
         try:
             r = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [
                     {"role": "user",
                      "content": "What's the weather in San Francisco?"}
@@ -621,7 +621,7 @@ class TestSuite:
         print("\n[TL-2] Tool request format — Anthropic")
         try:
             r = self._req("POST", "/v1/messages", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [
                     {"role": "user", "content": "Look up the time in Tokyo."}
                 ],
@@ -651,7 +651,7 @@ class TestSuite:
         """Deterministic output at temperature=0."""
         print("\n[SP-1] Sampling — temperature=0 determinism")
         prompt = {
-            "model": "dflash",
+            "model": "luce",
             "messages": [{"role": "user", "content": "Count from 1 to 5."}],
             "max_tokens": 1024,
             "temperature": 0.0,
@@ -673,7 +673,7 @@ class TestSuite:
         print("\n[SP-2] Sampling — max_tokens limit")
         try:
             r = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [
                     {"role": "user",
                      "content": "Write a very long essay about the history of mathematics."}
@@ -696,7 +696,7 @@ class TestSuite:
         print("\n[SP-3] Sampling — top_p parameter")
         try:
             r = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [{"role": "user", "content": "Say hello."}],
                 "max_tokens": 1024,
                 "temperature": 0.8,
@@ -720,7 +720,7 @@ class TestSuite:
         def do_request(idx, prompt):
             try:
                 r = self._req("POST", "/v1/chat/completions", {
-                    "model": "dflash",
+                    "model": "luce",
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 512,
                     "temperature": 0.0,
@@ -746,7 +746,7 @@ class TestSuite:
             t.join(timeout=300)
         elapsed = time.monotonic() - t0
 
-        # Note: dflash_server has a single worker thread, so requests
+        # Note: luce_server has a single worker thread, so requests
         # are serialized. But all should still complete.
         for i in range(3):
             if errors[i]:
@@ -767,7 +767,7 @@ class TestSuite:
         print("\n[EC-1] Edge case — empty user message")
         try:
             r = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [{"role": "user", "content": ""}],
                 "max_tokens": 512,
                 "temperature": 0.0,
@@ -784,7 +784,7 @@ class TestSuite:
         long_system = "You are a helpful assistant. " * 100  # ~2900 chars
         try:
             r = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [
                     {"role": "system", "content": long_system},
                     {"role": "user", "content": "Say OK."}
@@ -804,7 +804,7 @@ class TestSuite:
         print("\n[EC-3] Edge case — Unicode content")
         try:
             r = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [
                     {"role": "user", "content": "Translate 'hello' to Japanese (こんにちは)."}
                 ],
@@ -829,7 +829,7 @@ class TestSuite:
         print("\n[EC-4] Edge case — multi-part content array")
         try:
             r = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [{
                     "role": "user",
                     "content": [
@@ -927,7 +927,7 @@ class TestSuite:
         print("\n[DD-1] DDTree — CLI flag validation")
         try:
             binary = os.path.join(os.path.dirname(__file__),
-                                  "..", "build", "dflash_server")
+                                  "..", "build", "luce_server")
             if not os.path.exists(binary):
                 self._skip("DDTree CLI validation", "binary not found")
                 return
@@ -954,7 +954,7 @@ class TestSuite:
         print("\n[PF-1] PFlash — CLI flag validation")
         try:
             binary = os.path.join(os.path.dirname(__file__),
-                                  "..", "build", "dflash_server")
+                                  "..", "build", "luce_server")
             if not os.path.exists(binary):
                 self._skip("PFlash CLI validation", "binary not found")
                 return
@@ -985,7 +985,7 @@ class TestSuite:
         print("\n[PF-2] PFlash — requires --prefill-drafter")
         try:
             binary = os.path.join(os.path.dirname(__file__),
-                                  "..", "build", "dflash_server")
+                                  "..", "build", "luce_server")
             if not os.path.exists(binary):
                 self._skip("PFlash drafter check", "binary not found")
                 return
@@ -1014,7 +1014,7 @@ class TestSuite:
         print("\n[DC-1] Disconnect — partial stream read")
         try:
             resp = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [
                     {"role": "user",
                      "content": "Write a long story about a dragon."}
@@ -1053,7 +1053,7 @@ class TestSuite:
         print("\n[ID-1] Request IDs — format-specific prefixes")
         try:
             r1 = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [{"role": "user", "content": "hi"}],
                 "max_tokens": 64, "temperature": 0.0, "stream": False,
             })
@@ -1061,7 +1061,7 @@ class TestSuite:
                          r1.get("id", "").startswith("chatcmpl"))
 
             r2 = self._req("POST", "/v1/messages", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [{"role": "user", "content": "hi"}],
                 "max_tokens": 64, "temperature": 0.0, "stream": False,
             })
@@ -1069,7 +1069,7 @@ class TestSuite:
                          r2.get("id", "").startswith("msg"))
 
             r3 = self._req("POST", "/v1/responses", {
-                "model": "dflash",
+                "model": "luce",
                 "input": "hi",
                 "max_tokens": 64, "temperature": 0.0, "stream": False,
             })
@@ -1154,7 +1154,7 @@ class TestSuite:
 # ─── Main ────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Comprehensive dflash_server tests")
+    parser = argparse.ArgumentParser(description="Comprehensive luce_server tests")
     parser.add_argument("--base-url", default="http://localhost:9099",
                         help="Server base URL")
     parser.add_argument("--launch", metavar="MODEL",
@@ -1167,8 +1167,8 @@ def main():
     log_path = args.server_log
 
     if args.launch:
-        log_path = log_path or "/tmp/dflash_server_test.log"
-        binary = os.path.join(os.path.dirname(__file__), "..", "build", "dflash_server")
+        log_path = log_path or "/tmp/luce_server_test.log"
+        binary = os.path.join(os.path.dirname(__file__), "..", "build", "luce_server")
         cmd = [binary, args.launch, "--port", str(args.port)]
         with open(log_path, "w") as log_f:
             server_proc = subprocess.Popen(cmd, stderr=log_f, stdout=log_f)

@@ -9,7 +9,7 @@
 #include <cstring>
 #include <chrono>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── Chat marker resolution ────────────────────────────────────────────
 
@@ -1011,4 +1011,4 @@ PrefixCache::FullStats PrefixCache::full_stats() const {
             full_lifetime_hits_.load(std::memory_order_relaxed)};
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

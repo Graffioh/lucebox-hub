@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Gemma4BackendConfig {
     std::string     model_path;
@@ -157,4 +157,4 @@ private:
     void free_decode_draft();
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

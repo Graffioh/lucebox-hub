@@ -4,10 +4,10 @@ Sends 3 chat completions sharing a 2K-token system prompt, asserts turns 2/3
 have noticeably faster prefill than turn 1.
 
 Run against a running server:
-    python3 dflash/scripts/test_server_prefix_cache.py --url http://localhost:8000
+    python3 server/scripts/test_server_prefix_cache.py --url http://localhost:8000
 
 Or spawn a fresh server (requires model files):
-    python3 dflash/scripts/test_server_prefix_cache.py
+    python3 server/scripts/test_server_prefix_cache.py
 """
 import argparse
 import atexit
@@ -26,15 +26,15 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 def parse_args():
     ap = argparse.ArgumentParser(description="Prefix cache integration test")
     ap.add_argument("--url", type=str, default=None,
-                    help="Base URL of a running dflash_server (skips spawn)")
+                    help="Base URL of a running luce_server (skips spawn)")
     return ap.parse_args()
 
 
 def spawn_server():
-    """Spawn a local dflash_server and return its base URL."""
+    """Spawn a local luce_server and return its base URL."""
     target = Path.home() / "models/qwen3.6-27b/Qwen3.6-27B-UD-Q4_K_XL.gguf"
     draft = Path.home() / "models/qwen3.6-27b-dflash"
-    server_bin = ROOT / "dflash/build/dflash_server"
+    server_bin = ROOT / "server/build/luce_server"
 
     if not target.exists() or not server_bin.exists() or not draft.exists():
         print(f"SKIP: prereqs missing (target={target.exists()} "

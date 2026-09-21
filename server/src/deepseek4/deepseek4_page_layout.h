@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace dflash::common {
+namespace luce::common {
 
 inline constexpr uint32_t DS4_PAGE_TOKENS = 128;
 
@@ -52,4 +52,4 @@ inline bool ds4_compressed_page_row(uint64_t logical_token,
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

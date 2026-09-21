@@ -22,7 +22,7 @@
 #  include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 const char * backend_ipc_mode_name(BackendIpcMode mode) {
     switch (mode) {
@@ -423,4 +423,4 @@ bool BackendIpcProcess::init_work_dir(const std::string & requested) {
 }
 #endif
 
-}  // namespace dflash::common
+}  // namespace luce::common

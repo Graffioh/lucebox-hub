@@ -4,7 +4,7 @@
 #include <cstdio>
 #include <new>
 
-namespace dflash::common {
+namespace luce::common {
 
 SeqSlotManager::SeqSlotManager(PagedKvPool & pool, int max_ctx)
     : pool_(pool), max_ctx_(max_ctx) {
@@ -487,4 +487,4 @@ void SeqSlotManager::retire(int slot) {
     s = SeqSlot{};
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -13,7 +13,7 @@
 #include <variant>
 
 using namespace CppUnitTestFramework;
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 

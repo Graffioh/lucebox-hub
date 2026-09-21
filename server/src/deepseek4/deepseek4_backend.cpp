@@ -4,7 +4,7 @@
 #include "deepseek4_backend.h"
 #include "deepseek4_budget_hook.h"
 #include "deepseek4_internal.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "deepseek4_snapshot.h"
 #include "deepseek4_page_layout.h"
 #include "common/dynamic_backend.h"
@@ -13,7 +13,7 @@
 #include "common/platform_env.h"
 #include "common/sampler.h"
 
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "common/gpu_runtime_compat.h"
 #endif
 
@@ -34,7 +34,7 @@
 #include <sstream>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -62,7 +62,7 @@ struct AffineMmqPrefillScope {
         // the master switch absent at startup and raise it only around the
         // target prefill call.
         static const bool configured =
-            env_flag_enabled("DFLASH_CUDA_MMQ_FP2_AFFINE_PREFILL_ONLY");
+            env_flag_enabled("LUCE_CUDA_MMQ_FP2_AFFINE_PREFILL_ONLY");
         active = speculative_decode && configured;
         set_enabled(true);
     }
@@ -71,13 +71,13 @@ struct AffineMmqPrefillScope {
         if (!active) return;
         if (enabled) {
             set_environment_variable(
-                "DFLASH_CUDA_MMQ_FP2_AFFINE", "1", true);
+                "LUCE_CUDA_MMQ_FP2_AFFINE", "1", true);
             unset_environment_variable(
-                "DFLASH_CUDA_MMQ_FP2_AFFINE_RUNTIME_DISABLE");
+                "LUCE_CUDA_MMQ_FP2_AFFINE_RUNTIME_DISABLE");
         } else {
-            unset_environment_variable("DFLASH_CUDA_MMQ_FP2_AFFINE");
+            unset_environment_variable("LUCE_CUDA_MMQ_FP2_AFFINE");
             set_environment_variable(
-                "DFLASH_CUDA_MMQ_FP2_AFFINE_RUNTIME_DISABLE", "1", true);
+                "LUCE_CUDA_MMQ_FP2_AFFINE_RUNTIME_DISABLE", "1", true);
         }
     }
 
@@ -98,11 +98,11 @@ struct PackedFp3DecodeScope {
         // decoder while selecting the reference FP3 kernel during prefill.
         active = speculative_decode &&
             env_flag_enabled(
-                "DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_DECODE_ONLY") &&
-            env_flag_enabled("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24");
+                "LUCE_CUDA_MMVQ_MOE_FP3_PACKED24_DECODE_ONLY") &&
+            env_flag_enabled("LUCE_CUDA_MMVQ_MOE_FP3_PACKED24");
         if (active) {
             set_environment_variable(
-                "DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE",
+                "LUCE_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE",
                 "1", true);
         }
     }
@@ -110,7 +110,7 @@ struct PackedFp3DecodeScope {
     ~PackedFp3DecodeScope() {
         if (active) {
             unset_environment_variable(
-                "DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE");
+                "LUCE_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE");
         }
     }
 };
@@ -156,7 +156,7 @@ static bool env_int_in_range(const char * name, int fallback,
 }
 
 static bool is_gfx_device(int gpu, const char * arch) {
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     cudaDeviceProp prop{};
     return cudaGetDeviceProperties(&prop, gpu) == cudaSuccess &&
            std::strncmp(prop.gcnArchName, arch, std::strlen(arch)) == 0;
@@ -168,13 +168,13 @@ static bool is_gfx_device(int gpu, const char * arch) {
 }
 
 static bool configure_dspark_mmvq_defaults(int gpu) {
-    if (env_flag_enabled("DFLASH_DS4_Q6_VERIFY")) {
+    if (env_flag_enabled("LUCE_DS4_Q6_VERIFY")) {
         std::fprintf(stderr,
                      "[deepseek4] q=6 verification is unsupported; use q=5\n");
         return false;
     }
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-    if (!env_flag_enabled("DFLASH_DS4_SPEC")) {
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (!env_flag_enabled("LUCE_DS4_SPEC")) {
         return true;
     }
 
@@ -188,14 +188,14 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
     // reusing those expert rows. Scope the default type mask to ROCmFP4-fast;
     // explicit process settings always win.
     if (qualified_wave32) {
-        if (std::getenv("DFLASH_MMID_GROUPED") == nullptr &&
-            set_environment_variable("DFLASH_MMID_GROUPED", "1", false) != 0) {
+        if (std::getenv("LUCE_MMID_GROUPED") == nullptr &&
+            set_environment_variable("LUCE_MMID_GROUPED", "1", false) != 0) {
             std::fprintf(stderr,
                          "[deepseek4] failed to enable grouped ROCmFP4 MMID\n");
             return false;
         }
-        if (std::getenv("DFLASH_MMID_GROUPED_TYPES") == nullptr &&
-            set_environment_variable("DFLASH_MMID_GROUPED_TYPES", "16", false) != 0) {
+        if (std::getenv("LUCE_MMID_GROUPED_TYPES") == nullptr &&
+            set_environment_variable("LUCE_MMID_GROUPED_TYPES", "16", false) != 0) {
             std::fprintf(stderr,
                          "[deepseek4] failed to select grouped ROCmFP4 MMID\n");
             return false;
@@ -206,7 +206,7 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
     // verifier matmuls to stay on MMVQ. The process-wide crossover applies to
     // both owners in the heterogeneous graph, so set it before inspecting the
     // target device (which is gfx1201 in the R9700 + gfx1151 launch).
-    if (env_flag_enabled("DFLASH_DS4_Q5_VERIFY")) {
+    if (env_flag_enabled("LUCE_DS4_Q5_VERIFY")) {
         if (std::getenv("LUCE_MMVQ_MAX_NCOLS") == nullptr &&
             set_environment_variable("LUCE_MMVQ_MAX_NCOLS", "5", false) != 0) {
             std::fprintf(stderr,
@@ -219,26 +219,26 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
                          "LUCE_MMVQ_MAX_NCOLS=5\n");
         }
 
-        const char * fp4_x4 = std::getenv("DFLASH_CUDA_MMVQ_FP4_X4");
-        if (!fp4_x4 && set_environment_variable("DFLASH_CUDA_MMVQ_FP4_X4", "1", false) != 0) {
+        const char * fp4_x4 = std::getenv("LUCE_CUDA_MMVQ_FP4_X4");
+        if (!fp4_x4 && set_environment_variable("LUCE_CUDA_MMVQ_FP4_X4", "1", false) != 0) {
             std::fprintf(stderr,
                          "[deepseek4] failed to enable ROCmFP4 x4 MMVQ\n");
             return false;
         }
-        fp4_x4 = std::getenv("DFLASH_CUDA_MMVQ_FP4_X4");
+        fp4_x4 = std::getenv("LUCE_CUDA_MMVQ_FP4_X4");
         // Zero deliberately selects the generic five-column MMVQ fallback.
         if (!fp4_x4 ||
             (std::strcmp(fp4_x4, "0") != 0 &&
              std::strcmp(fp4_x4, "1") != 0)) {
             std::fprintf(stderr,
-                         "[deepseek4] DFLASH_CUDA_MMVQ_FP4_X4 must be 0 or 1\n");
+                         "[deepseek4] LUCE_CUDA_MMVQ_FP4_X4 must be 0 or 1\n");
             return false;
         }
 
         if (std::strcmp(fp4_x4, "1") == 0 &&
-            std::getenv("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1") == nullptr &&
+            std::getenv("LUCE_CUDA_MMVQ_FP4_Q5_X4_PLUS1") == nullptr &&
             qualified_wave32 &&
-            set_environment_variable("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1", "1", false) == 0) {
+            set_environment_variable("LUCE_CUDA_MMVQ_FP4_Q5_X4_PLUS1", "1", false) == 0) {
             std::fprintf(stderr,
                          "[deepseek4] %s DSpark q5: defaulting "
                          "ROCmFP4 x4+1 MMVQ\n",
@@ -272,8 +272,8 @@ static bool configure_dspark_mmvq_defaults(int gpu) {
 // arithmetic through that width. Keep those projections on MMVQ while
 // honoring an explicit LUCE_MMVQ_MAX_NCOLS setting.
 static void configure_gfx1151_paged_mmvq_default(int gpu, bool paged_attention) {
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-    if (!paged_attention || env_flag_enabled("DFLASH_DS4_SPEC") ||
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (!paged_attention || env_flag_enabled("LUCE_DS4_SPEC") ||
         !is_gfx_device(gpu, "gfx1151")) {
         return;
     }
@@ -283,9 +283,9 @@ static void configure_gfx1151_paged_mmvq_default(int gpu, bool paged_attention) 
                      "[deepseek4] gfx1151 paged serving: defaulting "
                      "LUCE_MMVQ_MAX_NCOLS=16 (ROCmFP4 weight-reuse MMVQ)\n");
     }
-    for (const char * name : {"DFLASH_CUDA_MMVQ_FP4_X4",
-                              "DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1",
-                              "DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24"}) {
+    for (const char * name : {"LUCE_CUDA_MMVQ_FP4_X4",
+                              "LUCE_CUDA_MMVQ_FP4_Q5_X4_PLUS1",
+                              "LUCE_CUDA_MMVQ_MOE_FP3_PACKED24"}) {
         if (set_environment_variable(name, "1", false) != 0) {
             std::fprintf(stderr, "[deepseek4] failed to default %s=1\n", name);
         }
@@ -296,7 +296,7 @@ static void configure_gfx1151_paged_mmvq_default(int gpu, bool paged_attention) 
 #endif
 }
 
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 // One gfx1151 device-profile entry: a process default installed only when
 // the variable is unset. An explicit value, including 0, is an operator
 // override and the per-path kill switch, so it is never overwritten.
@@ -332,16 +332,16 @@ static bool apply_gfx1151_profile_defaults(
 // width controller over q2..q5 (q5 is the cap, not a fixed width), plus the
 // exact-path buffer and padding defaults it was measured with (8K 317/42,
 // 123K 281/36 tok/s, identical output). It runs before the MMVQ crossover
-// defaults, which read DFLASH_DS4_Q5_VERIFY.
+// defaults, which read LUCE_DS4_Q5_VERIFY.
 //
-// DFLASH_DS4_SPARSE_DECODE_FLASH is deliberately not part of the profile:
+// LUCE_DS4_SPARSE_DECODE_FLASH is deliberately not part of the profile:
 // it can change generated tokens and stays an explicit opt-in (64ed6f97a;
 // test_failed_init_preserves_sparse_opt_in asserts init() leaves it alone).
 // Returns false when a default could not be installed, so init() never
 // continues with a partially applied verifier profile.
 static bool configure_gfx1151_dspark_verifier_defaults(int gpu) {
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-    if (!env_flag_enabled("DFLASH_DS4_SPEC") ||
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (!env_flag_enabled("LUCE_DS4_SPEC") ||
         !is_gfx_device(gpu, "gfx1151")) {
         return true;
     }
@@ -350,26 +350,26 @@ static bool configure_gfx1151_dspark_verifier_defaults(int gpu) {
         // Fused verify is part of the qualified configuration: without it
         // the dense full-expert verify path makes q5 cost more than q4 and
         // the controller never promotes.
-        {"DFLASH_DS4_Q5_VERIFY", "1"},
-        {"DFLASH_DS4_ADAPTIVE_WIDTH", "1"},
-        {"DFLASH_DS4_FUSED_VERIFY", "1"},
+        {"LUCE_DS4_Q5_VERIFY", "1"},
+        {"LUCE_DS4_ADAPTIVE_WIDTH", "1"},
+        {"LUCE_DS4_FUSED_VERIFY", "1"},
         // A q5 verifier advances through four ratio-4 phases. Narrow
         // compressed-history buckets create short-lived graph shapes and
         // repeatedly recapture the native HIP graph. A 128-row bucket
         // reduced a 256-token 123K run from ten verifier shapes to six, while
         // the extra masked work stayed below the saved build/recapture cost
         // at both 32K and 123K.
-        {"DFLASH_DS4_COMP_PAD_STRIDE", "128"},
+        {"LUCE_DS4_COMP_PAD_STRIDE", "128"},
         // Compact pinned host buffers remove repeated pageable copies from
         // rollback and from the three-layer drafter context without changing
         // the target graph or accepted tokens.
-        {"DFLASH_DS4_PINNED_ROLLBACK", "1"},
-        {"DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE", "1"},
+        {"LUCE_DS4_PINNED_ROLLBACK", "1"},
+        {"LUCE_DS4_DRAFT_CONTEXT_KV_CACHE", "1"},
         // Greedy speculative verification consumes only the winning token
         // per lane. Reducing the vocabulary logits on-device avoids copying
         // q*n_vocab floats back to the host and selects the same IDs.
         // Callers that explicitly request verifier logits still receive them.
-        {"DFLASH_DS4_GPU_ARGMAX_VERIFY", "1"},
+        {"LUCE_DS4_GPU_ARGMAX_VERIFY", "1"},
     };
     bool changed = false;
     if (!apply_gfx1151_profile_defaults(
@@ -393,8 +393,8 @@ static ggml_mixed_mmq_policy gfx1151_mix_mmq_prefill_policy(
         int gpu, PrefillAttentionMode mode) {
     // Read explicit policy without changing the process environment. The
     // returned value is carried by this model's graph operations.
-    const char * value = std::getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    const char * value = std::getenv("LUCE_DS4_MIX_MMQ_PREFILL");
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     cudaDeviceProp prop{};
     if (cudaGetDeviceProperties(&prop, gpu) == cudaSuccess) {
         return deepseek4_mix_mmq_prefill_policy(mode, prop.gcnArchName, value);
@@ -408,7 +408,7 @@ static ggml_mixed_mmq_policy gfx1151_mix_mmq_prefill_policy(
 
 static bool configure_gfx1151_sparse_prefill_kernel_defaults(
         int gpu, PrefillAttentionMode mode) {
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (mode != PrefillAttentionMode::Sparse) {
         return true;
     }
@@ -430,9 +430,9 @@ static bool configure_gfx1151_sparse_prefill_kernel_defaults(
         {"GGML_CUDA_MLA_DENSE_WMMA", "1"},
         {"GGML_CUDA_MLA_DENSE_HIGH_RATIO", "1"},
         {"GGML_DS4_INDEXER_M32_CACHE_B", "1"},
-        {"DFLASH_DS4_INDEXER_F16_Q", "1"},
-        {"DFLASH_DS4_PREFILL_F16_KV_ALL", "1"},
-        {"DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL", "1"},
+        {"LUCE_DS4_INDEXER_F16_Q", "1"},
+        {"LUCE_DS4_PREFILL_F16_KV_ALL", "1"},
+        {"LUCE_DS4_DIRECT_CONTIGUOUS_CAUSAL", "1"},
     };
     bool changed = false;
     if (!apply_gfx1151_profile_defaults(
@@ -452,8 +452,8 @@ static bool configure_gfx1151_sparse_prefill_kernel_defaults(
 }
 
 static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
-    if (std::getenv("DFLASH_MMQ_SUB_BATCH") != nullptr) {
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
+    if (std::getenv("LUCE_MMQ_SUB_BATCH") != nullptr) {
         return;
     }
 
@@ -467,7 +467,7 @@ static void configure_gfx1201_hybrid_sub_batch_default(int gpu) {
     // older AMD parts.  ROCmFPX MMVQ on gfx1201 is qualified through q=4;
     // using that width removes 75% of hot-owner launches while retaining the
     // stable vector kernel instead of the pathological full-batch MMQ path.
-    if (set_environment_variable("DFLASH_MMQ_SUB_BATCH", "4", false) == 0) {
+    if (set_environment_variable("LUCE_MMQ_SUB_BATCH", "4", false) == 0) {
         std::fprintf(stderr,
                      "[deepseek4] gfx1201 hybrid prefill: defaulting hot "
                      "expert sub-batch to 4\n");
@@ -490,20 +490,20 @@ struct Ds4MoeTpConfig {
 
 static Ds4MoeTpConfig ds4_moe_tp_config(int local_gpu) {
     Ds4MoeTpConfig result;
-    result.requested = env_flag_enabled("DFLASH_DS4_MOE_TP");
+    result.requested = env_flag_enabled("LUCE_DS4_MOE_TP");
     result.in_process = result.requested &&
-        env_flag_enabled("DFLASH_DS4_MOE_TP_INPROC");
+        env_flag_enabled("LUCE_DS4_MOE_TP_INPROC");
     result.all_on_secondary = result.requested &&
-        env_flag_enabled("DFLASH_DS4_MOE_TP_ALL_COLD");
+        env_flag_enabled("LUCE_DS4_MOE_TP_ALL_COLD");
     result.concentrate_secondary = result.requested &&
-        env_flag_enabled("DFLASH_DS4_MOE_TP_CONCENTRATE_COLD");
+        env_flag_enabled("LUCE_DS4_MOE_TP_CONCENTRATE_COLD");
     result.profile_hot_on_secondary = result.in_process &&
-        env_flag_enabled("DFLASH_DS4_MOE_TP_PEER_HOT");
+        env_flag_enabled("LUCE_DS4_MOE_TP_PEER_HOT");
 
-    const char * raw = std::getenv("DFLASH_DS4_MOE_TP_BACKEND");
-    if (!raw || !*raw) raw = std::getenv("DFLASH_MOE_TP_BACKEND");
+    const char * raw = std::getenv("LUCE_DS4_MOE_TP_BACKEND");
+    if (!raw || !*raw) raw = std::getenv("LUCE_MOE_TP_BACKEND");
     if (!raw || !*raw) {
-#if defined(DFLASH27B_BACKEND_MIXED)
+#if defined(LUCE_BACKEND_MIXED)
         result.secondary_backend =
             compiled_placement_backend() == PlacementBackend::Cuda
             ? PlacementBackend::Hip : PlacementBackend::Cuda;
@@ -516,9 +516,9 @@ static Ds4MoeTpConfig ds4_moe_tp_config(int local_gpu) {
             result.secondary_backend != PlacementBackend::Auto;
     }
 
-    const char * gpu_raw = std::getenv("DFLASH_DS4_MOE_TP_GPU");
+    const char * gpu_raw = std::getenv("LUCE_DS4_MOE_TP_GPU");
     if (!gpu_raw || !*gpu_raw) {
-        gpu_raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_GPU");
+        gpu_raw = std::getenv("LUCE_MOE_EXPERT_COMPUTE_IPC_GPU");
     }
     if (gpu_raw && *gpu_raw) {
         result.secondary_gpu = std::max(0, std::atoi(gpu_raw));
@@ -535,7 +535,7 @@ static Ds4MoeTpConfig ds4_moe_tp_config(int local_gpu) {
 }
 
 static bool ds4_draft_backend(PlacementBackend & out) {
-    const char * raw = std::getenv("DFLASH_DS4_DRAFT_BACKEND");
+    const char * raw = std::getenv("LUCE_DS4_DRAFT_BACKEND");
     if (!raw || !*raw) {
         out = compiled_placement_backend();
         return true;
@@ -873,7 +873,7 @@ static bool compute_ds4_hybrid_budget_info(const DeepSeek4Weights & w,
     if (out.expert_budget > out.mem.total_expert_bytes) {
         out.expert_budget = out.mem.total_expert_bytes;
     }
-    if (const char * cap_env = std::getenv("DFLASH_EXPERT_BUDGET_MB")) {
+    if (const char * cap_env = std::getenv("LUCE_EXPERT_BUDGET_MB")) {
         const uint64_t cap_bytes = (uint64_t) std::max(0, std::atoi(cap_env)) * 1024ULL * 1024ULL;
         if (cap_bytes > 0 && cap_bytes < out.expert_budget) {
             out.expert_budget = cap_bytes;
@@ -1032,8 +1032,8 @@ bool DeepSeek4Backend::load_model() {
     // backends, so forcing a full load would disable the requested placement
     // before the TP runtime can initialize. init() has already rejected paged
     // deployments outside the qualified R9700 + Strix Halo topology.
-    const bool force_full = env_flag_enabled("DFLASH_DS4_FORCE_FULL_LOAD");
-    const bool heterogeneous_tp = env_flag_enabled("DFLASH_DS4_MOE_TP");
+    const bool force_full = env_flag_enabled("LUCE_DS4_FORCE_FULL_LOAD");
+    const bool heterogeneous_tp = env_flag_enabled("LUCE_DS4_MOE_TP");
     const bool need_monolithic =
         requires_monolithic_model() && !heterogeneous_tp;
     if (target_backend == PlacementBackend::Hip &&
@@ -1118,15 +1118,15 @@ bool DeepSeek4Backend::load_spec_drafter() {
 
     ggml_backend_t draft_backend = backend_;
     int draft_gpu = cfg_.device.gpu;
-    if (const char * gpu = std::getenv("DFLASH_DS4_DRAFT_GPU")) {
+    if (const char * gpu = std::getenv("LUCE_DS4_DRAFT_GPU")) {
         draft_gpu = std::max(0, std::atoi(gpu));
     }
     const bool separate_draft_stream =
-        env_flag_enabled("DFLASH_DS4_DRAFT_SEPARATE_STREAM");
+        env_flag_enabled("LUCE_DS4_DRAFT_SEPARATE_STREAM");
     PlacementBackend draft_kind = PlacementBackend::Auto;
     if (!ds4_draft_backend(draft_kind)) {
         std::fprintf(stderr,
-                     "[deepseek4] invalid DFLASH_DS4_DRAFT_BACKEND; "
+                     "[deepseek4] invalid LUCE_DS4_DRAFT_BACKEND; "
                      "expected cuda or hip\n");
         return false;
     }
@@ -1145,7 +1145,7 @@ bool DeepSeek4Backend::load_spec_drafter() {
         }
         draft_backend = spec_backend_;
         const bool low_priority = separate_draft_stream &&
-            env_flag_enabled("DFLASH_DS4_DRAFT_LOW_PRIORITY");
+            env_flag_enabled("LUCE_DS4_DRAFT_LOW_PRIORITY");
         const bool priority_configured = low_priority &&
             backend_pair_capabilities(backend_, spec_backend_).same_runtime &&
             ggml_backend_cuda_set_low_priority_stream(spec_backend_);
@@ -1322,7 +1322,7 @@ bool DeepSeek4Backend::init() {
     }
 
     // Install the gfx1151 DSpark verifier profile first: the MMVQ crossover
-    // below reads DFLASH_DS4_Q5_VERIFY.
+    // below reads LUCE_DS4_Q5_VERIFY.
     if (!configure_gfx1151_dspark_verifier_defaults(cfg_.device.gpu)) {
         return false;
     }
@@ -1345,8 +1345,8 @@ bool DeepSeek4Backend::init() {
          cfg_.device.is_layer_split() ||
          cfg_.prefill_mode != PrefillAttentionMode::Exact ||
          cfg_.fused_decode || cfg_.fused_verify_f16_kv ||
-         env_flag_enabled("DFLASH_DS4_FUSED_DECODE") ||
-         env_flag_enabled("DFLASH_DS4_SPEC"))) {
+         env_flag_enabled("LUCE_DS4_FUSED_DECODE") ||
+         env_flag_enabled("LUCE_DS4_SPEC"))) {
         std::fprintf(stderr,
             "[deepseek4] paged serving requires 1..%d local slots, exact "
             "prefill, and autoregressive non-fused decode\n",
@@ -1404,24 +1404,24 @@ bool DeepSeek4Backend::init() {
         cache_.prefill_mode = cfg_.prefill_mode;
     }
 
-    if (env_flag_enabled("DFLASH_DS4_MOE_TP") && !init_moe_tensor_parallel()) {
+    if (env_flag_enabled("LUCE_DS4_MOE_TP") && !init_moe_tensor_parallel()) {
         return false;
     }
     if (cfg_.paged_attention && expert_runtime_.compute) {
         std::fprintf(stderr,
             "[deepseek4] paged serving cannot use the out-of-process expert "
-            "compute callback; select in-process DFLASH_DS4_MOE_TP or disable paged attention\n");
+            "compute callback; select in-process LUCE_DS4_MOE_TP or disable paged attention\n");
         return false;
     }
     if (cfg_.paged_attention && moe_hybrid_ &&
         !moe_hybrid_->materialized_cold_experts) {
         std::fprintf(stderr,
             "[deepseek4] paged serving requires statically materialized "
-            "expert ownership; enable in-process DFLASH_DS4_MOE_TP\n");
+            "expert ownership; enable in-process LUCE_DS4_MOE_TP\n");
         return false;
     }
 
-    if (const char * stats_path = std::getenv("DFLASH_DS4_ROUTING_STATS_OUT")) {
+    if (const char * stats_path = std::getenv("LUCE_DS4_ROUTING_STATS_OUT")) {
         if (*stats_path) {
             routing_stats_ = std::make_shared<MoeHybridRoutingStats>();
             if (!routing_stats_->init(w_.n_layer, w_.n_expert, w_.n_expert_used)) {
@@ -1433,7 +1433,7 @@ bool DeepSeek4Backend::init() {
                          routing_stats_out_path_.c_str());
         }
     }
-    if (env_flag_enabled("DFLASH_DS4_TP_ROUTE_STATS") && !routing_stats_) {
+    if (env_flag_enabled("LUCE_DS4_TP_ROUTE_STATS") && !routing_stats_) {
         routing_stats_ = std::make_shared<MoeHybridRoutingStats>();
         if (!routing_stats_->init(w_.n_layer, w_.n_expert,
                                   w_.n_expert_used)) {
@@ -1469,8 +1469,8 @@ bool DeepSeek4Backend::init() {
                  prefill_attention_mode_name(cfg_.prefill_mode),
                  moe_hybrid_ ? " [hybrid]" : "");
 
-    if (!cfg_.paged_attention && env_flag_enabled("DFLASH_DS4_SPEC")) {
-        const char * dp = std::getenv("DFLASH_DS4_DRAFT");
+    if (!cfg_.paged_attention && env_flag_enabled("LUCE_DS4_SPEC")) {
+        const char * dp = std::getenv("LUCE_DS4_DRAFT");
         if (dp && *dp) {
             spec_draft_path_ = dp;
             if (!load_spec_drafter()) {
@@ -1479,7 +1479,7 @@ bool DeepSeek4Backend::init() {
                              "continuing with autoregressive decode\n");
             }
         } else {
-            std::fprintf(stderr, "[deepseek4] DFLASH_DS4_SPEC set but DFLASH_DS4_DRAFT gguf missing\n");
+            std::fprintf(stderr, "[deepseek4] LUCE_DS4_SPEC set but LUCE_DS4_DRAFT gguf missing\n");
         }
     }
     return true;
@@ -1589,18 +1589,18 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     const bool concentrate_requested = tp.concentrate_secondary;
     bool concentrated = false;
     int retained_local = 0;
-    const char * profile_path = std::getenv("DFLASH_DS4_HOTNESS_CSV");
+    const char * profile_path = std::getenv("LUCE_DS4_HOTNESS_CSV");
     const char * decode_profile_path =
-        std::getenv("DFLASH_DS4_DECODE_HOTNESS_CSV");
+        std::getenv("LUCE_DS4_DECODE_HOTNESS_CSV");
     const bool phase_aware_placement = decode_profile_path &&
         *decode_profile_path;
     const bool critical_path_placement =
         !tp.all_on_secondary && !concentrate_requested &&
-        env_flag_enabled("DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT");
+        env_flag_enabled("LUCE_DS4_TP_CRITICAL_PATH_PLACEMENT");
     if (critical_path_placement && tp.profile_hot_on_secondary) {
         if (err) {
             *err = "critical-path placement is incompatible with "
-                   "DFLASH_DS4_MOE_TP_PEER_HOT";
+                   "LUCE_DS4_MOE_TP_PEER_HOT";
         }
         return false;
     }
@@ -1618,7 +1618,7 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
     } else if (critical_path_placement) {
         if (!profile_path || !*profile_path) {
             if (err) {
-                *err = "critical-path placement requires DFLASH_DS4_HOTNESS_CSV";
+                *err = "critical-path placement requires LUCE_DS4_HOTNESS_CSV";
             }
             return false;
         }
@@ -1639,14 +1639,14 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
         int active_experts = cfg_.expert_top_k > 0
             ? cfg_.expert_top_k : w.n_expert_used;
         if (!env_int_in_range(
-                "DFLASH_DS4_TOPK", active_experts,
+                "LUCE_DS4_TOPK", active_experts,
                 1, w.n_expert_used, active_experts, err)) {
             return false;
         }
 
         double main_to_peer_rate = 3.4;
         if (!positive_env_double(
-                "DFLASH_DS4_TP_MAIN_TO_PEER_RATE", 3.4,
+                "LUCE_DS4_TP_MAIN_TO_PEER_RATE", 3.4,
                 main_to_peer_rate, err)) {
             return false;
         }
@@ -1654,12 +1654,12 @@ bool DeepSeek4Backend::compute_uniform_hybrid_placement(const DeepSeek4Weights &
         balance_cfg.active_experts = active_experts;
         balance_cfg.main_to_peer_rate = main_to_peer_rate;
         if (!env_int_in_range(
-                "DFLASH_DS4_TP_BALANCE_MIN_HOT", 0,
+                "LUCE_DS4_TP_BALANCE_MIN_HOT", 0,
                 0, w.n_expert, balance_cfg.min_hot_per_layer, err)) {
             return false;
         }
         if (!env_int_in_range(
-                "DFLASH_DS4_TP_BALANCE_MAX_HOT", 0,
+                "LUCE_DS4_TP_BALANCE_MAX_HOT", 0,
                 0, w.n_expert, balance_cfg.max_hot_per_layer, err)) {
             return false;
         }
@@ -1826,7 +1826,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
             ? compiled_placement_backend() : cfg_.device.backend;
     if (inprocess_tp && !tp.backend_valid) {
         std::fprintf(stderr,
-                     "[deepseek4-moe-tp] invalid DFLASH_DS4_MOE_TP_BACKEND; "
+                     "[deepseek4-moe-tp] invalid LUCE_DS4_MOE_TP_BACKEND; "
                      "expected cuda or hip\n");
         return false;
     }
@@ -1868,13 +1868,13 @@ bool DeepSeek4Backend::init_hybrid_model() {
         }
     }
 
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (same_runtime_tp && has_mix_experts) {
-        const char * mix_mmq = std::getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+        const char * mix_mmq = std::getenv("LUCE_DS4_MIX_MMQ_PREFILL");
         if (mix_mmq && std::strcmp(mix_mmq, "0") == 0) {
             std::fprintf(stderr,
                          "[deepseek4] heterogeneous mixed experts require "
-                         "DFLASH_DS4_MIX_MMQ_PREFILL=1\n");
+                         "LUCE_DS4_MIX_MMQ_PREFILL=1\n");
             return false;
         }
     }
@@ -1998,7 +1998,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
         }
     }
 
-    if (env_flag_enabled("DFLASH_DS4_DECODE_ALL_COLD")) {
+    if (env_flag_enabled("LUCE_DS4_DECODE_ALL_COLD")) {
         for (int il = 0; il < w_.n_layer; ++il) {
             MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
             if (layer.cold_local_by_global.size() !=
@@ -2149,7 +2149,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
             return false;
         }
 
-        if (env_flag_enabled("DFLASH_DS4_MOE_TP") &&
+        if (env_flag_enabled("LUCE_DS4_MOE_TP") &&
             !init_moe_tensor_parallel()) {
             free_deepseek4_cache(cache_);
             free_deepseek4_weights(w_);
@@ -2199,7 +2199,7 @@ int deepseek4_hybrid_prefill_chunk_tokens(
         int current_cap) {
     constexpr int long_context_begin = 4096;
     static const int long_context_chunk = [] {
-        const char * raw = std::getenv("DFLASH_DS4_LONG_CONTEXT_CHUNK");
+        const char * raw = std::getenv("LUCE_DS4_LONG_CONTEXT_CHUNK");
         if (!raw || !*raw) return 1024;
         char * end = nullptr;
         const long parsed = std::strtol(raw, &end, 10);
@@ -2225,9 +2225,9 @@ int deepseek4_hybrid_prefill_step_tokens(
     // are used; at/above it chunks shrink to late_context_chunk. 32768 is
     // the conservative default (the 2K attention arena needs ~1.19 GiB at
     // ~80K and hits a fragmentation cliff on a 10.2 GB budget); operators
-    // with more headroom may raise it (DFLASH_DS4_LATE_CONTEXT_BEGIN).
+    // with more headroom may raise it (LUCE_DS4_LATE_CONTEXT_BEGIN).
     static const int late_context_begin = [] {
-        const char * raw = std::getenv("DFLASH_DS4_LATE_CONTEXT_BEGIN");
+        const char * raw = std::getenv("LUCE_DS4_LATE_CONTEXT_BEGIN");
         if (!raw || !*raw) return 32768;
         char * end = nullptr;
         const long parsed = std::strtol(raw, &end, 10);
@@ -2243,7 +2243,7 @@ int deepseek4_hybrid_prefill_step_tokens(
     // Lower-residency expert placements have enough primary VRAM to retain a
     // full 2K attention arena even at the context limit. Allow qualification
     // runs for those placements to bypass the conservative pressure bound.
-    if (env_flag_enabled("DFLASH_DS4_DISABLE_ADAPTIVE_PREFILL")) {
+    if (env_flag_enabled("LUCE_DS4_DISABLE_ADAPTIVE_PREFILL")) {
         return bounded;
     }
     // Stop exactly on the boundary so a non-aligned prefix or restored
@@ -2371,7 +2371,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
             }
         }
     }
-    const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
+    const bool timing = env_flag_enabled("LUCE_DS4_TIMING");
     const auto phase_t0 = Clock::now();
     DeepSeek4StepTelemetry tel_acc;
     int steps = 0;
@@ -2487,7 +2487,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         // any feature-capture band through the established affine fallback so
         // an experimental expert kernel cannot poison the speculative handoff.
         static const bool affine_capture_enabled =
-            env_flag_enabled("DFLASH_CUDA_MMQ_FP2_AFFINE_CAPTURE");
+            env_flag_enabled("LUCE_CUDA_MMQ_FP2_AFFINE_CAPTURE");
         affine_mmq_scope.set_enabled(hp == nullptr || affine_capture_enabled);
         if (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)) {
             ok = deepseek4_step_layer_range(
@@ -2613,7 +2613,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                                   bool * forced_close_out) {
     const DeepSeek4RoctxPhaseScope roctx_phase(InferencePhase::Decode);
     if (forced_close_out) *forced_close_out = false;
-    const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
+    const bool timing = env_flag_enabled("LUCE_DS4_TIMING");
     const auto phase_t0 = Clock::now();
     DeepSeek4StepTelemetry tel_acc;
     int steps = 0;
@@ -2715,7 +2715,7 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         // model; see deepseek4_budget_hook.h for why this overrides rather than appends.
         {
             bool hook_forced = false;
-            next_token = dflash::deepseek4::budget_hook_apply(
+            next_token = luce::deepseek4::budget_hook_apply(
                 budget_hook.close_token_ids, n_gen - generated,
                 budget_hook.hard_limit_remaining, next_token,
                 budget_close_started, close_inject_pos, hook_forced);
@@ -2833,7 +2833,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         int seed = 0;
         { float mv = last_logits_[0];
           for (int i = 1; i < w_.n_vocab; i++) if (last_logits_[i] > mv) { mv = last_logits_[i]; seed = i; } }
-        if (env_flag_enabled("DFLASH_DS4_TIMING")) {
+        if (env_flag_enabled("LUCE_DS4_TIMING")) {
             size_t nonfinite_logits = 0;
             for (float value : last_logits_) {
                 nonfinite_logits += !std::isfinite(value);
@@ -3158,7 +3158,7 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
                           load_request->drafter_gpu,
                           pflash_drafter_ctx_)) {
             std::fprintf(stderr, "[deepseek4-pflash] load failed: %s\n",
-                         dflash27b_last_error());
+                         luce_last_error());
             release_pflash_drafter();
             if (!load_request->skip_park && !was_parked) {
                 unpark(ParkTarget::TargetModel);
@@ -3236,7 +3236,7 @@ bool DeepSeek4Backend::handle_compress(const std::string & line,
 
 void DeepSeek4Backend::release_pflash_drafter() {
     // A failed load can own a backend even before the loaded flag is set.
-    dflash::common::free_drafter(pflash_drafter_ctx_);
+    luce::common::free_drafter(pflash_drafter_ctx_);
     pflash_drafter_loaded_ = false;
     pflash_drafter_path_.clear();
     pflash_drafter_gpu_ = -1;
@@ -3283,4 +3283,4 @@ void DeepSeek4Backend::shutdown() {
     if (backend_) { ggml_backend_free(backend_); backend_ = nullptr; }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

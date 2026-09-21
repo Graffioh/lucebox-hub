@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ─── Stage 1: builder ───────────────────────────────────────────────────────
-# CUDA_VERSION / UBUNTU_VERSION / DFLASH_CUDA_ARCHES are build args so the
+# CUDA_VERSION / UBUNTU_VERSION / LUCE_CUDA_ARCHES are build args so the
 # same Dockerfile can be repinned later. The prebuilt image is the
 # CUDA 12.8 path:
 #   • lucebox-hub:cuda12  — CUDA 12.8.1, sm_75;80;86;89;90;120
@@ -25,7 +25,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # BF16/WMMA paths have no fallback below sm_75. Each arch adds ~50-200 MB
 # of fat-binary kernel code and ~3-5 min of nvcc time per .cu translation
 # unit.
-ARG DFLASH_CUDA_ARCHES="75;80;86;89;90;120"
+ARG LUCE_CUDA_ARCHES="75;80;86;89;90;120"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -54,7 +54,7 @@ RUN ln -sf libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 \
 WORKDIR /src
 
 # COPY ordering is structured to keep the CUDA build cached across
-# Python-only edits. The cmake build only depends on dflash/{CMakeLists,
+# Python-only edits. The cmake build only depends on server/{CMakeLists,
 # cmake, include, src, test, hip_compat, deps}. Everything else (Python scripts,
 # workspace pyproject manifests, lockfile, READMEs) is copied later so
 # editing server.py / bench_*.py / lucebox sources doesn't invalidate the
@@ -71,7 +71,7 @@ COPY server/src /src/server/src
 COPY server/test /src/server/test
 COPY server/hip_compat /src/server/hip_compat
 COPY server/deps /src/server/deps
-# status.html: dflash_server's POST_BUILD copies server/share/status.html into
+# status.html: luce_server's POST_BUILD copies server/share/status.html into
 # build/share/ (server/CMakeLists.txt). Without this COPY the build links the
 # server then dies on the missing source file.
 COPY server/share /src/server/share
@@ -85,7 +85,7 @@ RUN test -f /src/server/deps/llama.cpp/ggml/CMakeLists.txt \
     || (echo "ERROR: missing vendored ggml sources at server/deps/llama.cpp/ggml in the docker build context." >&2 \
         && exit 1)
 
-# Configure + build. `DFLASH27B_USER_CUDA_ARCHITECTURES` pins the arch list
+# Configure + build. `LUCE_USER_CUDA_ARCHITECTURES` pins the arch list
 # through dflash's own logic (skips its auto-extend rules that depend on
 # nvcc version inspection); `CMAKE_CUDA_ARCHITECTURES` also gets set so the
 # vendored ggml-cuda subproject picks up the same list.
@@ -98,18 +98,18 @@ RUN cmake -S /src/server -B /src/server/build \
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-        -DDFLASH27B_USER_CUDA_ARCHITECTURES="${DFLASH_CUDA_ARCHES}" \
-        -DCMAKE_CUDA_ARCHITECTURES="${DFLASH_CUDA_ARCHES}" \
-    && cmake --build /src/server/build --target test_dflash dflash_server test_server_unit --parallel
+        -DLUCE_USER_CUDA_ARCHITECTURES="${LUCE_CUDA_ARCHES}" \
+        -DCMAKE_CUDA_ARCHITECTURES="${LUCE_CUDA_ARCHES}" \
+    && cmake --build /src/server/build --target test_dflash luce_server test_server_unit --parallel
 
 # Prune the build tree to only what the runtime stage needs: the native server,
 # test_dflash, test_server_unit, and the ggml shared libs their embedded rpath
 # ($ORIGIN/deps/...) looks up. Drops ~1 GB per image of CMakeFiles/,
-# libdflash27b.a (statically linked into the binaries), ninja state,
+# libluce_common.a (statically linked into the binaries), ninja state,
 # compile_commands.json, and the template-instance .o tree from ggml-cuda.
 RUN cd /src/server/build \
     && find . -mindepth 1 -maxdepth 1 \
-            ! -name test_dflash ! -name dflash_server ! -name test_server_unit ! -name deps -exec rm -rf {} + \
+            ! -name test_dflash ! -name luce_server ! -name test_server_unit ! -name deps -exec rm -rf {} + \
     && find deps -mindepth 1 -type f ! -name 'lib*.so*' -delete \
     && find deps -depth -type d -empty -delete
 
@@ -135,11 +135,11 @@ FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Image identity baked in at build time and read by dflash_server at startup
+# Image identity baked in at build time and read by luce_server at startup
 # to populate /props.build (git_sha / image_tag / build_time). All three are
 # wired from docker-bake.hcl, which sources them from CI metadata or local
 # `git`. Missing args leave the corresponding fields empty in IMAGE_INFO,
-# which dflash_server surfaces as JSON null at /props.build.* — that's the
+# which luce_server surfaces as JSON null at /props.build.* — that's the
 # expected behavior on a `docker build` run without bake.
 ARG GIT_SHA=""
 ARG IMAGE_TAG=""
@@ -153,7 +153,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # uv manages Python 3.12 (required by the workspace) and resolves the
-# lucebox-dflash + pflash members declared in pyproject.toml.
+# luce + pflash members declared in pyproject.toml.
 # uv (pinned) copied from the official image rather than `curl | sh`, so the
 # version is fixed and no remote installer script runs at build time.
 COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /uvx /usr/local/bin/
@@ -196,7 +196,7 @@ COPY --from=builder /src/server/build /opt/lucebox-hub/server/build
 # Model-card sidecars resolved at startup. The server's search path
 # (model_card.cpp) looks at <binary>/../share/model_cards first, so
 # placing them at /opt/lucebox-hub/server/share/model_cards/ makes
-# them discoverable without DFLASH_MODEL_CARDS_DIR. Copied directly
+# them discoverable without LUCE_MODEL_CARDS_DIR. Copied directly
 # from the build context (no builder roundtrip needed — these are
 # static JSON, not compiled).
 # One copy under share/; a symlink wires in the server search path so
@@ -210,14 +210,14 @@ RUN mkdir -p /opt/lucebox-hub/server/share \
              /opt/lucebox-hub/server/share/model_cards
 
 RUN test -x /opt/lucebox-hub/server/build/test_dflash \
-    && test -x /opt/lucebox-hub/server/build/dflash_server \
+    && test -x /opt/lucebox-hub/server/build/luce_server \
     && test -x /opt/lucebox-hub/server/build/test_server_unit \
     && test -f /opt/lucebox-hub/server/share/model_cards/qwen3.6-27b.json \
     && chmod +x /opt/lucebox-hub/server/scripts/entrypoint.sh
 
-# Image identity for /props.build. dflash_server reads this file at startup
+# Image identity for /props.build. luce_server reads this file at startup
 # (path: /opt/lucebox-hub/IMAGE_INFO, three lines: git_sha, image_tag,
-# build_time). Override the path with $DFLASH_IMAGE_INFO_PATH for tests.
+# build_time). Override the path with $LUCE_IMAGE_INFO_PATH for tests.
 # All three args may be empty in non-bake builds — the empty lines that
 # results in are detected at read time and surface as JSON null in /props.
 RUN printf '%s\n%s\n%s\n' "$GIT_SHA" "$IMAGE_TAG" "$BUILD_TIME" \
@@ -244,7 +244,7 @@ RUN printf '%s\n%s\n' \
 ENV UV_LINK_MODE=hardlink \
     UV_NO_CACHE=1
 # --no-editable: install workspace members (pflash, lucebox-hub, and the
-# lucebox-dflash server binding) as proper wheels rather than
+# luce server binding) as proper wheels rather than
 # source-linked editable installs. Without this, hatch-vcs's build hook
 # re-fires at runtime when `uv run` re-checks env consistency and tries
 # to write `_version.py` into the root-owned workspace source dirs, which
@@ -272,10 +272,10 @@ RUN chmod -R a+rX /opt/lucebox-hub/.venv /opt/lucebox-hub /opt/uv
 # bind mount above replaces it with the host directory at run time.
 VOLUME ["/opt/lucebox-hub/server/models"]
 
-ENV DFLASH_HOST=0.0.0.0 \
-    DFLASH_PORT=8080 \
-    DFLASH_BIN=/opt/lucebox-hub/server/build/test_dflash \
-    DFLASH_SERVER_BIN=/opt/lucebox-hub/server/build/dflash_server
+ENV LUCE_HOST=0.0.0.0 \
+    LUCE_PORT=8080 \
+    LUCE_BIN=/opt/lucebox-hub/server/build/test_dflash \
+    LUCE_SERVER_BIN=/opt/lucebox-hub/server/build/luce_server
 
 EXPOSE 8080
 

@@ -34,7 +34,7 @@
 #include <string>
 #include <string_view>
 
-namespace dflash::common {
+namespace luce::common {
 
 class ClientSendBuffer {
 public:
@@ -136,4 +136,4 @@ private:
     std::chrono::steady_clock::time_point last_progress_{};
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

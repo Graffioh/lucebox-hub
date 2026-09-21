@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace dflash::common {
+namespace luce::common {
 
 constexpr int PAGED_BLOCK_SIZE = 16;
 inline constexpr int DEEPSEEK4_MAX_PAGED_SEQUENCES = 6;
@@ -66,4 +66,4 @@ inline int64_t paged_kv_auto_pool_tokens(int max_ctx, int n_slots,
         0, std::min(tokens, std::min(logical_cap, address_cap)));
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

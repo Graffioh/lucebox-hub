@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-namespace dflash {
+namespace luce {
 
 // Parses a KV-cache element type string (case-insensitive).
 // Accepted: "f16", "bf16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "tq3_0".
@@ -16,7 +16,7 @@ const char * kv_type_name(ggml_type t);
 
 // True iff the (K, V) ggml_type pair is supported by the CUDA flash-attention
 // kernels currently compiled in (mirror of fattn.cu type-pair table when
-// GGML_CUDA_FA_ALL_QUANTS=ON, which is now forced ON in dflash/CMakeLists.txt).
+// GGML_CUDA_FA_ALL_QUANTS=ON, which is now forced ON in server/CMakeLists.txt).
 bool is_supported_kv_pair(ggml_type k, ggml_type v);
 
 // Aborts with the supported-pairs listing when (k, v) is not supported by
@@ -26,8 +26,8 @@ void validate_kv_pair_or_abort(ggml_type k, ggml_type v, const char * who);
 // Resolves K and V types with optional per-model overrides.
 // Precedence (high -> low):
 //   0. Explicit k_override / v_override (COUNT means unspecified)
-//   1. DFLASH27B_KV_K=<type> / DFLASH27B_KV_V=<type>  (independent override)
-//   2. DFLASH27B_KV_F16 / _KV_Q4 / _KV_TQ3            (legacy shorthand, K==V)
+//   1. LUCE_KV_K=<type> / LUCE_KV_V=<type>  (independent override)
+//   2. LUCE_KV_F16 / _KV_Q4 / _KV_TQ3            (legacy shorthand, K==V)
 //   3. Default: GGML_TYPE_Q4_0 for both (with FWHT K-rotation)
 // On invalid input or unsupported (K,V) pair, prints an explanatory message
 // and calls std::abort(). Returns the resolved pair via out params.
@@ -52,4 +52,4 @@ inline uint64_t kv_reservation_bytes_per_token(
                    ggml_row_size(kv_v, n_embd_head_v));
 }
 
-}  // namespace dflash
+}  // namespace luce

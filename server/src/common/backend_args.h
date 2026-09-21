@@ -17,7 +17,7 @@
 #include "placement/remote_target_shard_config.h"
 #include "prefill_attention_mode.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 enum class KvFlashRequest {
     Off,
@@ -112,4 +112,4 @@ struct BackendArgs {
     bool            adaptive_experts_requested = false;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

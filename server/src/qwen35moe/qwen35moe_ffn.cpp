@@ -6,7 +6,7 @@
 #include <cstdlib>
 #include <cmath>
 
-namespace dflash::common {
+namespace luce::common {
 
 Qwen35MoeRouterOutputs build_qwen35moe_router(
     ggml_context *        ctx,
@@ -80,8 +80,8 @@ Qwen35MoeRouterOutputs build_qwen35moe_router(
     // softmax->topk->get_rows->norm router into ~1 kernel. ggml_top_k emits
     // GGML_OP_TOP_K, which the fusion does NOT match -> 6-7 separate kernels/layer
     // x30 MoE layers (the launch-bound decode gap vs llama, which uses argsort_top_k).
-    // Same top-k selection -> bit-identical. DFLASH_NO_MOE_ROUTER_FUSE=1 = old path.
-    static const bool router_fuse = (std::getenv("DFLASH_NO_MOE_ROUTER_FUSE") == nullptr);
+    // Same top-k selection -> bit-identical. LUCE_NO_MOE_ROUTER_FUSE=1 = old path.
+    static const bool router_fuse = (std::getenv("LUCE_NO_MOE_ROUTER_FUSE") == nullptr);
     ggml_tensor * selected = (router_fuse && allow_fused_router)
         ? ggml_argsort_top_k(ctx, selection_probs, n_used)
         : ggml_top_k(ctx, selection_probs, n_used);
@@ -133,8 +133,8 @@ ggml_tensor * build_qwen35moe_ffn(
     // [0,nc) and up from [nc,2nc) of the same buffer, so the two ggml_cont copies
     // that materialised the strided halves are eliminated — 2 extra copy kernels
     // per layer x 30 MoE layers that llama's qwen3moe graph never emits.
-    // DFLASH_NO_MOE_SWIGLU_FUSE=1 restores the view+cont+split path (bit-id gate).
-    static const bool moe_swiglu_fuse = (std::getenv("DFLASH_NO_MOE_SWIGLU_FUSE") == nullptr);
+    // LUCE_NO_MOE_SWIGLU_FUSE=1 restores the view+cont+split path (bit-id gate).
+    static const bool moe_swiglu_fuse = (std::getenv("LUCE_NO_MOE_SWIGLU_FUSE") == nullptr);
     if (L.ffn_gate_up_exps) {
         ggml_tensor * gate_up_e = apply_scale2(
             ctx, ggml_mul_mat_id(ctx, L.ffn_gate_up_exps, cur_3d, selected), L.ffn_gate_up_exps_s);
@@ -217,4 +217,4 @@ ggml_tensor * build_qwen35moe_ffn(
     return routed;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

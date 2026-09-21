@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen35TargetCaptureSlice {
     int capture_idx = -1;
@@ -105,4 +105,4 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                                        bool enable_dflash = false,
                                        int kvflash_pool_tokens = 0);
 
-}  // namespace dflash::common
+}  // namespace luce::common

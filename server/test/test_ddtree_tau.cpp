@@ -14,9 +14,9 @@
 #include <limits>
 #include <vector>
 
-using dflash::common::build_ddtree;
-using dflash::common::build_ddtree_conditional;
-using dflash::common::DDTree;
+using luce::common::build_ddtree;
+using luce::common::build_ddtree_conditional;
+using luce::common::DDTree;
 
 namespace {
 struct DdtreeTauFixture {};

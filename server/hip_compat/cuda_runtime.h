@@ -4,7 +4,7 @@
 
 // hip/hip_runtime.h requires exactly one of __HIP_PLATFORM_AMD__ or
 // __HIP_PLATFORM_NVIDIA__ to be defined. hipcc sets it automatically;
-// g++ (used for plain CXX sources in the dflash build) does not.
+// g++ (used for plain CXX sources in the luce build) does not.
 #if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP_PLATFORM_NVIDIA__)
 #  define __HIP_PLATFORM_AMD__
 #endif

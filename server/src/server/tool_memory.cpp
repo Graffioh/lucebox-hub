@@ -4,7 +4,7 @@
 
 #include <algorithm>
 
-namespace dflash::common {
+namespace luce::common {
 
 ToolMemory::ToolMemory(size_t max_entries, size_t max_bytes)
     : max_entries_(max_entries)
@@ -138,4 +138,4 @@ void ToolMemory::prune() {
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

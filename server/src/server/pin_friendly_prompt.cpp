@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 
-namespace dflash::common {
+namespace luce::common {
 
 int PinFriendlyPrompt::longest_common_prefix_len(
         const std::vector<int32_t> & a,
@@ -320,4 +320,4 @@ void PinFriendlyPrompt::remember_tool_prefix(
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

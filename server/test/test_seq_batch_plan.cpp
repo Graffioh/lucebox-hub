@@ -5,7 +5,7 @@
 #include <limits>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static int g_checks = 0;
 

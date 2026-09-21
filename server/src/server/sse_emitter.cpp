@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 static const char THINK_OPEN[]  = "<think>";
 static const char THINK_CLOSE[] = "</think>";
@@ -768,7 +768,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
 
         if (!tool_calls_.empty()) {
             static const bool log_tools = []() {
-                const char * e = std::getenv("DFLASH_LOG_TOOL_CALLS");
+                const char * e = std::getenv("LUCE_LOG_TOOL_CALLS");
                 if (!e || !*e) return false;
                 std::string v(e);
                 std::transform(v.begin(), v.end(), v.begin(),
@@ -1114,4 +1114,4 @@ std::string SseEmitter::finish_reason() const {
     return finish_reason_;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common
