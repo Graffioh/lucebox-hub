@@ -1249,6 +1249,11 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
 {
     config_.image_input_enabled = backend_.supports_images() &&
         config_.pflash_upstream_base.empty() && !backend_.seq_engine();
+    if (backend_.supports_images() && !config_.image_input_enabled) {
+        std::fprintf(stderr,
+            "[server] WARNING: a vision projector is loaded but image input is off: it is "
+            "not available with upstream forwarding or concurrent sequence scheduling\n");
+    }
     #ifdef LUCE_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif

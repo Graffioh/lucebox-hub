@@ -13,7 +13,7 @@
 namespace luce::common {
 
 namespace {
-constexpr size_t MAX_IMAGES_PER_REQUEST = 8;
+constexpr size_t MAX_IMAGES_PER_REQUEST = 4;  // the server's transport limit
 }
 
 bool Qwen35Backend::load_vision() {
@@ -93,10 +93,15 @@ bool Qwen35Backend::encode_images(const Qwen35ImagePrompt & prompt, Qwen35ImageR
         return false;
     }
     rows.prompt = &prompt;
-    rows.rows.resize(prompt.pixels.size());
     bool ok = true;
-    for (size_t i = 0; ok && i < prompt.pixels.size(); ++i) {
-        ok = vision_->encode(prompt.pixels[i], rows.rows[i], error);
+    try {
+        rows.rows.resize(prompt.pixels.size());
+        for (size_t i = 0; ok && i < prompt.pixels.size(); ++i) {
+            ok = vision_->encode(prompt.pixels[i], rows.rows[i], error);
+        }
+    } catch (const std::bad_alloc &) {
+        error = "image encoding allocation failed";
+        ok = false;
     }
     // The attention scratch is large and only needed here; give it back
     // before prefill sizes its own graphs.

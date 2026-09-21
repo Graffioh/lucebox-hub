@@ -86,8 +86,10 @@ bool MmprojFile::f32_array(const char * key, std::vector<float> & out) const {
     const int64_t id = gguf_ ? gguf_find_key(gguf_, key) : -1;
     if (id < 0 || gguf_get_kv_type(gguf_, id) != GGUF_TYPE_ARRAY ||
         gguf_get_arr_type(gguf_, id) != GGUF_TYPE_FLOAT32) return false;
+    const size_t count = gguf_get_arr_n(gguf_, id);
     const auto * values = static_cast<const float *>(gguf_get_arr_data(gguf_, id));
-    out.assign(values, values + gguf_get_arr_n(gguf_, id));
+    out.clear();
+    if (count > 0) out.assign(values, values + count);
     return true;
 }
 

@@ -1126,6 +1126,10 @@ bool DeepSeek4Backend::materialize_images(const DeepSeek4ImagePrompt & images,
     if (expert_backend_) ggml_backend_synchronize(expert_backend_);
     if (spec_backend_) ggml_backend_synchronize(spec_backend_);
     deepseek4_release_image_scratch(cache_, moe_hybrid_.get());
+    // With the whole model on one GPU, text prefill keeps per-layer graph
+    // arenas alive between requests. They are rebuilt on demand, and the
+    // headroom measured below should not have to fit around them.
+    if (!moe_hybrid_) deepseek4_release_runtime_graphs(w_);
     reset_deepseek4_dspark_runtime_cache();
     // Gallocr teardown leaves operator temporaries in legacy CUDA/HIP pools.
     // Retire their captured executables and activation memos through the

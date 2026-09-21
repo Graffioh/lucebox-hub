@@ -913,7 +913,11 @@ bool Qwen35Backend::unpark(ParkTarget target) {
             std::fprintf(stderr, "[unpark] target: %s\n", luce_last_error());
             return false;
         }
-        if (!load_vision()) return false;
+        if (!load_vision()) {
+            // Stay parked, so a retry starts from released weights.
+            free_target_weights(w_);
+            return false;
+        }
         kvflash_drafter_failed_ = false;   // fresh VRAM: allow a retry
         target_parked_ = false;
         std::printf("[unpark] target restored\n"); std::fflush(stdout);
@@ -1564,6 +1568,9 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         out_io.emit(-1);
         return result;
     }
+    // An exact snapshot hit decodes without a prefill, so the offset a
+    // previous image request left behind must not survive into this one.
+    rope_delta_ = 0;
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
         result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);

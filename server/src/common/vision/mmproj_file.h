@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>

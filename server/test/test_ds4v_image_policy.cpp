@@ -1,4 +1,5 @@
 #include "deepseek4/deepseek4_image_policy.h"
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <limits>

@@ -1,6 +1,10 @@
 // Bicubic resize of 8-bit RGB that reproduces Pillow's Image.resize(BICUBIC)
 // byte for byte, including its antialiasing when shrinking. Vision models are
 // trained on images resized this way, so every model's preprocessing uses it.
+// One exception: an image more than 100 times taller than wide that is being
+// shortened goes vertically first to keep the intermediate buffer small, where
+// Pillow always goes horizontally first; the two orders can differ by a
+// rounding step.
 // Reference: Pillow 12.3.0 src/libImaging/Resample.c.
 #pragma once
 

@@ -1,6 +1,7 @@
 #include "deepseek4_image_budget.h"
 #include "deepseek4_image_spans.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <iostream>

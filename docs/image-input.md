@@ -31,8 +31,9 @@ Use `POST /v1/chat/completions` with user-message content parts in display order
 ```
 
 Only base64 JPEG/PNG data URLs are supported. Remote URLs, images outside user
-content arrays, and image parts through other API formats are rejected. An
-image is at most 16 MiB encoded. Decoder pixel and aspect limits also apply. A model's image marker cannot be supplied
+content arrays, and image parts through other API formats are rejected. A
+request carries at most four images, 16 MiB encoded each and 32 MiB combined.
+Decoder pixel and aspect limits also apply. A model's image marker cannot be supplied
 as ordinary text.
 
 The server expands image markers after final rendering and tokenization, and
@@ -58,7 +59,7 @@ The projector is read directly from the published file. Projectors with
 deepstack branches (Qwen3-VL) are refused. An image is resized the way the
 model was trained (bicubic, both sides to a multiple of 32 pixels) and costs
 one token per 32x32 pixels, between 64 and 1,024 tokens; larger images are
-scaled down to the cap. Up to eight images per request.
+scaled down to the cap.
 
 Image tokens take two-dimensional rotary positions, so positions run behind
 token counts after an image. Prefill handles that in its normal chunk loop;
@@ -84,8 +85,11 @@ the published BF16 projector, thinking off:
   tokens). The projector adds 0.9 GiB of VRAM; the peak during image requests
   was 21.6 GiB against 20.8 GiB for text.
 
+- The same requests answer correctly on a Strix Halo alone, where a
+  1,012-token image prompt prefills in 4.6 s and decodes at 14 tok/s.
+
 Not yet established: a comparison against the reference implementation on the
-same questions, other GPUs, and CUDA. The tower uses only standard ggml
+same questions, and CUDA. The tower uses only standard ggml
 operators, so nothing in it is HIP specific.
 
 ## DS4V
@@ -111,8 +115,6 @@ dense prefill do not support images.
 Published llama.cpp conversions of the decoder load directly (image router
 bias named `blk.N.exp_probs_b_vl.bias`, no `deepseek4.vocab_size` key). Split
 GGUF files and llama.cpp's `clip` projector files are not read yet.
-
-Requests permit at most four images and 32 MiB of encoded images combined.
 
 One image request may be outstanding per backend. Its admission lease remains
 with the immutable payload through queueing and generation; another image
