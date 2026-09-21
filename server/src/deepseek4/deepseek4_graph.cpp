@@ -7809,18 +7809,17 @@ bool deepseek4_validate_image_batch(
     if (!hybrid || !w.moe_hybrid || !hybrid->materialized_cold_experts ||
         hybrid->cold_backend_kind != MoeHybridColdBackend::Gpu || !hybrid->cold_backend ||
         cache.prefill_mode != PrefillAttentionMode::Sparse || count <= 4 ||
-        count > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS || w.n_layer != 43 ||
-        w.layers.size() != 43 || cache.layers.size() != 43 ||
-        w.compress_ratios.size() != 43 || hybrid->layers.size() != 43)
+        count > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS ||
+        w.layers.size() != size_t(w.n_layer) || cache.layers.size() != size_t(w.n_layer) ||
+        w.compress_ratios.size() != size_t(w.n_layer) || hybrid->layers.size() != size_t(w.n_layer))
         return fail("image batch requires the heterogeneous sparse decoder path");
     for (int il = 0; il < w.n_layer; ++il) {
         const auto & layer = w.layers[size_t(il)];
         const auto & state = cache.layers[size_t(il)];
         const auto bias = layer.ffn_gate_bias_vl;
         const int ratio = int(w.compress_ratios[size_t(il)]);
-        if (!bias || bias->type != GGML_TYPE_F32 || bias->ne[0] != 256 ||
-            ggml_nelements(bias) != 256 || !state.raw_kv ||
-            ratio != (il < 2 ? 0 : il % 2 == 0 ? 4 : 128))
+        if (!bias || bias->type != GGML_TYPE_F32 || bias->ne[0] != w.n_expert ||
+            ggml_nelements(bias) != w.n_expert || !state.raw_kv)
             return fail("image decoder is missing a validated router bias or attention state");
         if (ratio && (!layer.attn_compressor_ape || !layer.attn_compressor_kv ||
             !layer.attn_compressor_gate || !layer.attn_compressor_norm || !state.comp_kv ||

@@ -1046,10 +1046,15 @@ bool DeepSeek4Backend::prepare_images(
         uint64_t context_capacity, uint64_t output_reserve,
         ImagePromptHandle & payload, std::string & error) const {
     if (images.empty()) {
-        for (int32_t token : tokens) {
-            if (token == 129264 || token < 0 || token >= 129280) {
-                error = "unbound image marker or invalid token in rendered prompt";
-                return false;
+        // With a projector loaded, a marker left in a text prompt would be
+        // embedded as an ordinary token. Text-only backends skip the scan.
+        if (image_capable_) {
+            const int32_t marker = vision::ImageTokenizerContract{}.marker;
+            for (int32_t token : tokens) {
+                if (token == marker || token < 0 || token >= w_.n_vocab) {
+                    error = "unbound image marker or invalid token in rendered prompt";
+                    return false;
+                }
             }
         }
         payload.reset();
@@ -1203,17 +1208,17 @@ bool DeepSeek4Backend::materialize_images(const DeepSeek4ImagePrompt & images,
 
 bool DeepSeek4Backend::load_vision() {
     if (cfg_.mmproj_path.empty()) return true;
-    if (w_.n_layer != 43 || w_.n_embd != 4096 || w_.n_vocab != 129280 ||
-        w_.n_expert != 256 || w_.n_expert_used != 6 || w_.n_hash_layer != 3 || w_.n_swa != 128) {
-        std::fprintf(stderr, "[deepseek4] projector requires the supported DS4V decoder dimensions\n");
-        return false;
-    }
+    // The projector checks the decoder's width and vocabulary when it loads.
+    // Here: every layer carries a finite F32[n_expert] image router bias.
+    std::vector<float> values(size_t(w_.n_expert));
     for (const auto & layer : w_.layers) {
         const auto bias = layer.ffn_gate_bias_vl;
-        if (!bias || bias->type != GGML_TYPE_F32 || bias->ne[0] != 256 ||
-            ggml_nelements(bias) != 256) return false;
-        std::array<float, 256> values;
-        ggml_backend_tensor_get(bias, values.data(), 0, sizeof(values));
+        if (!bias || bias->type != GGML_TYPE_F32 || bias->ne[0] != w_.n_expert ||
+            ggml_nelements(bias) != w_.n_expert) {
+            std::fprintf(stderr, "[deepseek4] --mmproj requires one F32[n_expert] image router bias per layer\n");
+            return false;
+        }
+        ggml_backend_tensor_get(bias, values.data(), 0, values.size() * sizeof(float));
         if (!std::all_of(values.begin(), values.end(), [](float v) { return std::isfinite(v); })) {
             std::fprintf(stderr, "[deepseek4] nonfinite image router bias\n");
             return false;
@@ -3149,8 +3154,10 @@ GenerateResult DeepSeek4Backend::generate_from_state(
             result.fail(GenerateErrorCode::PrefillFailed, error.empty() ? "image materialization failed" : error);
             return result;
         }
-    } else if (std::any_of(req.prompt.begin(), req.prompt.end(), [&](int32_t token) {
-                   return token < 0 || token >= w_.n_vocab || token == 129264;
+    } else if (image_capable_ &&
+               std::any_of(req.prompt.begin(), req.prompt.end(), [&](int32_t token) {
+                   return token < 0 || token >= w_.n_vocab ||
+                          token == vision::ImageTokenizerContract{}.marker;
                })) {
         result.fail(GenerateErrorCode::PrefillFailed, "unbound image marker or invalid prompt token");
         return result;
