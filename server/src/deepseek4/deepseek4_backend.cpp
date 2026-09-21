@@ -1208,11 +1208,6 @@ bool DeepSeek4Backend::materialize_images(const DeepSeek4ImagePrompt & images,
 
 bool DeepSeek4Backend::load_vision() {
     if (cfg_.mmproj_path.empty()) return true;
-    if (!vision::detail::hip_bias_workspace(backend_)) {
-        std::fprintf(stderr, "[deepseek4] --mmproj needs the DS4V vision ops, which this build lacks "
-                             "(hipBLASLt was not found when ggml-hip was configured)\n");
-        return false;
-    }
     // The projector checks the decoder's width and vocabulary when it loads.
     // Here: every layer carries a finite F32[n_expert] image router bias.
     std::vector<float> values(size_t(w_.n_expert));
@@ -2060,9 +2055,14 @@ bool DeepSeek4Backend::init_hybrid_model() {
     TargetLoadPlan plan;
     plan.skip_expert_tensors = true;
     plan.load_ds4_image_bias = !cfg_.mmproj_path.empty();
+    if (plan.load_ds4_image_bias && !vision::detail::hip_bias_workspace(backend_)) {
+        std::fprintf(stderr, "[deepseek4] --mmproj needs the DS4V vision ops, which this build lacks "
+                             "(hipBLASLt was not found when ggml-hip was configured)\n");
+        return false;
+    }
     if (!load_deepseek4_gguf_partial(cfg_.model_path, backend_, plan, w_)) {
-        std::fprintf(stderr, "[deepseek4] failed to partially load model for hybrid mode: %s\n",
-                     cfg_.model_path.c_str());
+        std::fprintf(stderr, "[deepseek4] failed to partially load model for hybrid mode: %s (%s)\n",
+                     cfg_.model_path.c_str(), dflash27b_last_error());
         return false;
     }
 
