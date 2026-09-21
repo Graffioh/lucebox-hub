@@ -46,7 +46,8 @@ ENV PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:${PATH}
 # hipCUB/rocPRIM: ggml's ROCm argsort/top-k kernels use their headers for the
 # large-N device-sort path. rocWMMA is also required by the DS4 indexed
 # prefill kernel. The ROCm apt repository ships these headers separately from
-# the base HIP toolchain.
+# the base HIP toolchain. hipBLASLt is optional for ggml-hip: with its -dev
+# package present the DS4V vision ops are built, without it --mmproj is refused.
 # (deps/llama.cpp/ggml/src/ggml-hip/CMakeLists.txt does find_package(hipblas)
 # for its BLAS matmul path). The rocm/dev-ubuntu base ships the HIP toolchain
 # but NOT the math libs, so they are installed explicitly from the ROCm apt
@@ -59,6 +60,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         git-lfs \
         hipblas-dev \
+        hipblaslt-dev \
         hipcub-dev \
         libcurl4-openssl-dev \
         ninja-build \
@@ -151,6 +153,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         hipblas \
+        hipblaslt \
         libgomp1 \
         pciutils \
         rocblas \

@@ -1743,10 +1743,12 @@ static void test_image_storage_admission_metadata() {
     config.materialize_cold_experts = true;
 
     // Actual wrapper sees the fake device's exhausted snapshot. It cannot pass
-    // regardless of the machine's MemAvailable; no positive case reads /proc.
+    // regardless of the machine's memory; no positive case reads /proc. The
+    // fake is dedicated memory: a host-shared device is also credited with the
+    // GPU driver's page pool, which depends on the machine running the test.
     ImageAdmissionReserves reserves;
     reserves.primary_domain = ImageMemoryDomain::Dedicated;
-    reserves.cold_domain = ImageMemoryDomain::HostShared;
+    reserves.cold_domain = ImageMemoryDomain::Dedicated;
     reserves.cold_runtime_reservation_bytes = 2ULL * 1024 * 1024 * 1024;
     reserves.host_request_bytes = 1024 * 1024;
     reserves.host_loader_overhead_bytes = 1024 * 1024;
