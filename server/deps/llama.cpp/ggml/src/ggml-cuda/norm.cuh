@@ -6,7 +6,7 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
 bool ggml_hip_vision_norm_capable(int device);
 bool ggml_hip_vision_norm_supported(int device, const ggml_tensor * op);
 void ggml_hip_vision_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

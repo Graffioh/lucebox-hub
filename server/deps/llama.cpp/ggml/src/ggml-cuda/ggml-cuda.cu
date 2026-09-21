@@ -733,7 +733,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         luce_q8_memo.pop_back();
     }
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
     if (vision_bias_workspace) {
         ggml_cuda_set_device(device);
         // The latest event follows every use of the shared workspace.
@@ -3612,28 +3612,28 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_flash_attn_sparse(ctx, dst);
             break;
         case GGML_OP_MUL_MAT_BIAS_BF16:
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
             ggml_hip_vision_bias(ctx, dst);
             break;
 #else
             return false;
 #endif
         case GGML_OP_RMS_NORM_VISION_F32:
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
             ggml_hip_vision_norm(ctx, dst);
             break;
 #else
             return false;
 #endif
         case GGML_OP_SOFT_MAX_VISION_F32:
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
             ggml_cuda_op_soft_max_vision_f32(ctx, dst);
             break;
 #else
             return false;
 #endif
         case GGML_OP_MUL_MAT_VISION_AV_F32:
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
             ggml_hip_vision_av_f32(ctx, dst);
             break;
 #else
@@ -6570,25 +6570,25 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_FLASH_ATTN_SPARSE:
             return true;  // Always supported on CUDA
         case GGML_OP_MUL_MAT_BIAS_BF16:
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
             return ggml_hip_vision_bias_supported(op);
 #else
             return false;
 #endif
         case GGML_OP_RMS_NORM_VISION_F32:
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
             return ggml_hip_vision_norm_supported(dev_ctx->device, op);
 #else
             return false;
 #endif
         case GGML_OP_SOFT_MAX_VISION_F32:
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
             return ggml_hip_vision_softmax_f32_supported(dev_ctx->device, op);
 #else
             return false;
 #endif
         case GGML_OP_MUL_MAT_VISION_AV_F32:
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
             return ggml_hip_vision_av_f32_supported(dev_ctx->device, op);
 #else
             return false;
@@ -6770,7 +6770,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
 static size_t ggml_backend_hip_vision_bias_bf16_workspace(ggml_backend_t backend) {
     return backend && ggml_backend_is_cuda(backend) ? 76ULL*1024*1024 : 0;
 }
@@ -6817,7 +6817,7 @@ static size_t ggml_backend_hip_vision_rotary_f32_launches(ggml_backend_t backend
 #endif
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
     if (strcmp(name,"ggml_backend_hip_vision_bias_bf16_workspace")==0) return (void *)ggml_backend_hip_vision_bias_bf16_workspace;
     if (strcmp(name,"ggml_backend_hip_vision_bias_bf16_launches")==0) return (void *)ggml_backend_hip_vision_bias_bf16_launches;
     if (strcmp(name,"ggml_backend_hip_vision_norm_f32_capable")==0) return (void *)ggml_backend_hip_vision_norm_f32_capable;

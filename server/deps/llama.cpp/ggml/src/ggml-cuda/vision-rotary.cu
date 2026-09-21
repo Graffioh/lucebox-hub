@@ -3,7 +3,7 @@
 #include <cmath>
 #include <limits>
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
 // PyTorch 3d3aa833db84eed6b7f5595cb5f162c2f78300a4, aten/src/ATen/native/cuda/:
 // Pow.cuh uses global ::pow on Linux; UnaryFractionKernels.cu uses float 1/a;
 // UnaryGeometric{Cos,Sin}Kernel.cu use global ::cos and ::sin. The five kernels

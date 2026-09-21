@@ -1,5 +1,5 @@
 #include "vision-bias.cuh"
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
 #include <climits>
 
 bool ggml_hip_vision_bias_supported(const ggml_tensor * d) {

@@ -2,7 +2,7 @@
 #include "vision-bias.cuh"
 #include "norm.cuh"
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
 bool ggml_hip_vision_av_f32_supported(int device, const ggml_tensor * op) {
     if (!ggml_hip_vision_norm_capable(device) || !op || op->op != GGML_OP_MUL_MAT_VISION_AV_F32 ||
         !op->src[0] || !op->src[1] || op->type != GGML_TYPE_F32) {

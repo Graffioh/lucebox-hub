@@ -1,6 +1,6 @@
 #include "vision-softmax.cuh"
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
 #include "vision-softmax-kernels.cuh"
 #include <climits>
 

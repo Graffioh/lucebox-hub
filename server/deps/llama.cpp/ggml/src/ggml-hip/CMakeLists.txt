@@ -45,7 +45,7 @@ endif()
 
 find_package(hip     REQUIRED)
 find_package(hipblas REQUIRED)
-find_package(hipblaslt REQUIRED)
+find_package(hipblaslt QUIET)
 find_package(rocblas REQUIRED)
 
 if (GGML_HIP_RCCL)
@@ -173,4 +173,15 @@ get_filename_component(GGML_HIP_RUNTIME_DIR "${hip_DIR}/../.." ABSOLUTE)
 target_link_directories(ggml-hip BEFORE PRIVATE "${GGML_HIP_RUNTIME_DIR}")
 target_link_options(ggml-hip PRIVATE "-L${GGML_HIP_RUNTIME_DIR}")
 
-target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas roc::hipblaslt)
+target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+# The DS4V vision tower ops use a fused hipBLASLt BF16 bias matmul. Without the
+# hipBLASLt development package they are compiled out: the ops report
+# unsupported and the server refuses --mmproj at startup.
+if (hipblaslt_FOUND)
+    message(STATUS "hipBLASLt found: building the DS4V vision ops")
+    target_compile_definitions(ggml-hip PRIVATE GGML_HIP_DS4V_VISION)
+    target_link_libraries(ggml-hip PRIVATE roc::hipblaslt)
+else()
+    message(STATUS "hipBLASLt not found: DS4V vision ops disabled")
+endif()

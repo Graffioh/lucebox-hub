@@ -3,7 +3,7 @@
 #include <cmath>
 #include <cstdint>
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
 bool ggml_hip_vision_norm_capable(int device) {
     const auto & info = ggml_cuda_info();
     return device >= 0 && device < info.device_count && info.devices[device].warp_size == 32;

@@ -1,6 +1,6 @@
 #pragma once
 #include "common.cuh"
-#if defined(GGML_USE_HIP)
+#if defined(GGML_HIP_DS4V_VISION)
 // One workspace/handle/event shared by explicit linear and AV operations.
 constexpr size_t GGML_HIP_VISION_WORKSPACE_BYTES = 76ULL*1024*1024;
 void ggml_hip_vision_workspace_acquire(ggml_backend_cuda_context & ctx);
