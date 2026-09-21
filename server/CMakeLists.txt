@@ -520,6 +520,8 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_vision.cpp
     src/common/gpu_page_pool.cpp
     src/common/vision/image_decode.cpp
+    src/common/vision/image_resize.cpp
+    src/common/vision/mmproj_file.cpp
     src/deepseek4/deepseek4_vision_preprocess.cpp
     src/deepseek4/deepseek4_image_prompt.cpp
     src/deepseek4/deepseek4_image_assembly.cpp
@@ -1907,9 +1909,11 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_image_decode PRIVATE image_codec_jpeg image_codec_png)
         list(APPEND _raw_unit_test_targets test_image_decode)
     endif()
+    add_executable(test_image_resize test/test_image_resize.cpp src/common/vision/image_resize.cpp)
+    target_include_directories(test_image_resize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_executable(test_gpu_page_pool test/test_gpu_page_pool.cpp src/common/gpu_page_pool.cpp)
     target_include_directories(test_gpu_page_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    list(APPEND _raw_unit_test_targets test_image_input test_gpu_page_pool)
+    list(APPEND _raw_unit_test_targets test_image_input test_image_resize test_gpu_page_pool)
 
     # DS4V image units: each test builds only the unit it covers.
     foreach(_ds4v_unit assembly integration policy prompt)
@@ -1922,7 +1926,8 @@ if(DFLASH27B_TESTS)
     target_sources(test_ds4v_image_policy PRIVATE src/deepseek4/deepseek4_image_policy.cpp)
     target_sources(test_ds4v_image_prompt PRIVATE
         src/deepseek4/deepseek4_image_prompt.cpp
-        src/deepseek4/deepseek4_vision_preprocess.cpp)
+        src/deepseek4/deepseek4_vision_preprocess.cpp
+        src/common/vision/image_resize.cpp)
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_source_page_range.cpp")
         add_executable(test_moe_source_page_range test/test_moe_source_page_range.cpp)
