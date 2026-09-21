@@ -189,13 +189,15 @@ bool prepare_request_images(const nlohmann::json & messages,
     normalized = nullptr;
     images.clear();
     error.clear();
+    // A backend without image input keeps its existing handling of image
+    // parts: a client whose history holds an image must not start failing.
+    if (!policy.image_capable) {
+        normalized = messages;
+        return true;
+    }
     const bool has_images = contains_image_content(messages);
     if (has_images && !policy.chat_completions) {
         error = "image input is supported only through /v1/chat/completions image_url parts";
-        return false;
-    }
-    if (has_images && !policy.image_capable) {
-        error = "image input is unavailable for this backend or serving mode; configure a supported --mmproj projector";
         return false;
     }
     if (policy.chat_completions && (has_images || policy.reserve_placeholder)) {

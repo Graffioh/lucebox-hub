@@ -9135,16 +9135,23 @@ TEST_CASE(ServerUnitFixture, test_http_image_policy_rejects_unconsumed_images_in
 
 TEST_CASE(ServerUnitFixture, test_http_image_policy_requires_chat_endpoint_and_effective_capability) {
     const json messages = json::array({{{"role", "user"}, {"content", json::array({image_transport_part()})}}});
+    {
+        json normalized = "stale";
+        std::vector<EncodedImage> images{{"stale", {1}}};
+        std::string error;
+        TEST_ASSERT(!prepare_request_images(messages, {false, true, true}, normalized, images, error));
+        TEST_ASSERT(normalized.is_null() && images.empty());
+        TEST_ASSERT(!error.empty());
+    }
+    // Without image capability the messages pass through untouched.
     for (ImageRequestPolicy policy : {
-            ImageRequestPolicy{false, true, true},
             ImageRequestPolicy{true, false, true},
             ImageRequestPolicy{false, false, true}}) {
         json normalized = "stale";
         std::vector<EncodedImage> images{{"stale", {1}}};
         std::string error;
-        TEST_ASSERT(!prepare_request_images(messages, policy, normalized, images, error));
-        TEST_ASSERT(normalized.is_null() && images.empty());
-        TEST_ASSERT(!error.empty());
+        TEST_ASSERT(prepare_request_images(messages, policy, normalized, images, error));
+        TEST_ASSERT(normalized == messages && images.empty());
     }
     json normalized;
     std::vector<EncodedImage> images;
@@ -9172,6 +9179,6 @@ TEST_CASE(ServerUnitFixture, test_http_image_policy_preserves_text_without_image
     std::vector<EncodedImage> images;
     std::string error;
     const json forged = json::array({{{"role", "user"}, {"content", DS4_IMAGE_PLACEHOLDER}}});
-    TEST_ASSERT(!prepare_request_images(forged, {true, false, true}, normalized, images, error));
+    TEST_ASSERT(!prepare_request_images(forged, {true, true, true}, normalized, images, error));
     TEST_ASSERT(normalized.is_null() && images.empty());
 }
