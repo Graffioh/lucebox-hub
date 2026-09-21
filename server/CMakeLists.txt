@@ -384,7 +384,9 @@ add_subdirectory(deps/llama.cpp/ggml EXCLUDE_FROM_ALL)
 
 option(DFLASH27B_DS4_MIX_CONVERTER
     "Build the CPU-only DeepSeek-V4 safetensors to MIX GGUF converter" ON)
-if(DFLASH27B_DS4_MIX_CONVERTER)
+# The Docker build contexts do not copy server/tools.
+if(DFLASH27B_DS4_MIX_CONVERTER AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4_mix_converter/ds4_mix_converter.cpp")
     add_executable(ds4_mix_converter
         tools/ds4_mix_converter/ds4_mix_converter.cpp)
     target_include_directories(ds4_mix_converter PRIVATE
