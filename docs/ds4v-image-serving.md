@@ -1,10 +1,16 @@
 # DS4V image serving
 
+**Status: experimental.** The request path works end to end, but the vision
+tower has not met its numerical gate and no image-chat acceptance run exists.
+See [Verification status](#verification-status) before relying on image output.
+
 The DS4V integration accepts JPEG and PNG images through OpenAI chat
-completions when the matching projector is supplied with `--mmproj`.
-The current implementation has passed its remote HIP build and CPU integration
-checks. Private paired-model HTTP qualification is still pending; a successful
-projector export or standalone encoder check does not establish that result.
+completions when the matching projector is supplied with `--mmproj`. Without
+`--mmproj` nothing in the text serving path changes.
+
+The server must be built with hipBLASLt available (the `hipblaslt-dev` package
+on ROCm). CMake reports `hipBLASLt found: building the DS4V vision ops`; a build
+without it refuses `--mmproj` at startup.
 
 ## Supported configuration
 
@@ -76,10 +82,18 @@ availability again. KV, saved snapshots, and draft weights remain reflected in
 that live measurement. Reservations are conservative policy, not a guarantee
 against unrelated concurrent allocations.
 
-The remote checks include the server unit suite, decoder loader and image-batch
-admission tests, synthetic allocation/UMA accounting, preprocessing/codec tests,
-and standalone mixed embedding and cancellation tests. Native HIP encoder
-comparisons for corn and carrots pass the unchanged feature/embedding gates;
-corn also matches the source HIP output exactly and repeats byte for byte.
-Full image HTTP behavior, paired runtime resource peaks, and performance require
-their separate private serving proof.
+## Verification status
+
+Covered by unit tests in the main build: image transport and request policy,
+prompt expansion and ownership, embedding assembly and cancellation, image
+spans and the expert budget, plus the decoder loader and image-batch admission
+tests in `test_deepseek4_unit`.
+
+Not yet established:
+
+- The vision tower misses the fixed 0.9995 feature-cosine gate against the
+  reference implementation: 0.99906 on the Radeon RX 7900 XT it was developed
+  on, 0.99823 on CPU. Embeddings pass; features do not.
+- No image-chat quality run, and no measurement of paired-GPU memory peaks or
+  throughput with a projector loaded.
+- No other HIP device has been tried.
