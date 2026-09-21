@@ -28,9 +28,13 @@ bool Qwen35Backend::load_vision() {
         std::fprintf(stderr, "[vision] %s\n", error.c_str());
         return false;
     }
-    vision_config_ = tower->config();
+    // Request threads read these two without a lock, so they are written
+    // once: a reload after unpark finds them already set to the same values.
+    if (!image_input_) {
+        vision_config_ = tower->config();
+        image_input_ = true;
+    }
     vision_ = std::move(tower);
-    image_input_ = true;
     std::printf("[vision] projector loaded: %d layers, %.0f MiB, up to %d tokens per image\n",
                 vision_config_.layers, vision_->weight_bytes() / (1024.0 * 1024.0),
                 vision_config_.max_image_tokens);

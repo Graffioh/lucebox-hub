@@ -1740,6 +1740,12 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         std::fprintf(stderr, "prefill: an image prompt must start at position 0\n");
         return -1;
     }
+    if (images) {
+        // Snapshots are found again by their tokens, and pads say nothing
+        // about which image they stood for.
+        snap_pos = -1;
+        snap_slot = -1;
+    }
     rope_delta_ = images ? images->prompt->positions.next - (int)tokens.size() : 0;
     // A finite --fa-window caps the full-attention layers to a sliding
     // window, so anything earlier than the window is invisible to them. That
