@@ -244,6 +244,7 @@ struct DeepSeek4FixtureOptions {
     int image_bias_width = 256;
     int image_bias_rows = 1;
     bool add_mtp_image_bias = false;
+    bool llama_cpp_image_bias_names = false;  // "blk.N.exp_probs_b_vl.bias"
 };
 
 static std::string make_temp_gguf_path(const char * prefix) {
@@ -324,7 +325,9 @@ static std::string write_deepseek4_loader_fixture(const DeepSeek4FixtureOptions 
                 malformed ? opts.image_bias_type : GGML_TYPE_F32,
                 malformed ? opts.image_bias_width : 256,
                 malformed ? opts.image_bias_rows : 1);
-            const std::string name = "layers." + std::to_string(layer) + ".ffn.gate.bias_vl";
+            const std::string name = opts.llama_cpp_image_bias_names
+                ? "blk." + std::to_string(layer) + ".exp_probs_b_vl.bias"
+                : "layers." + std::to_string(layer) + ".ffn.gate.bias_vl";
             ggml_set_name(bias, name.c_str());
             std::memset(bias->data, 0, ggml_nbytes(bias));
             if (bias->type == GGML_TYPE_F32) {
@@ -2370,6 +2373,9 @@ static void test_image_bias_loader_opt_in_contract(ggml_backend_t backend) {
     valid.vocab_size = 129280;
     valid.image_biases = true;
     valid.add_mtp_image_bias = true;
+    // Both spellings load: the source checkpoint's and llama.cpp's.
+    for (bool llama_cpp_names : {false, true}) {
+    valid.llama_cpp_image_bias_names = llama_cpp_names;
     const std::string path = write_deepseek4_loader_fixture(valid);
     for (bool enabled : {false, true}) {
         TargetLoadPlan plan;
@@ -2391,12 +2397,17 @@ static void test_image_bias_loader_opt_in_contract(ggml_backend_t backend) {
                 }
             }
             if (weights.ctx) {
-                const auto mtp = ggml_get_tensor(weights.ctx, "layers.43.ffn.gate.bias_vl");
+                const auto mtp = ggml_get_tensor(weights.ctx, llama_cpp_names
+                    ? "blk.43.exp_probs_b_vl.bias" : "layers.43.ffn.gate.bias_vl");
                 TEST_ASSERT(mtp == nullptr || (mtp->buffer == nullptr && mtp->data == nullptr));
             }
         }
         free_deepseek4_weights(weights);
     }
+    unlink(path.c_str());
+    }
+    valid.llama_cpp_image_bias_names = false;
+    const std::string path = write_deepseek4_loader_fixture(valid);
     for (int boundary : {0, 1}) {
         TargetLoadPlan plan;
         plan.load_ds4_image_bias = true;

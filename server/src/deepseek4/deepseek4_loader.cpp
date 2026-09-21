@@ -29,6 +29,7 @@
 #include <cstdint>   // SIZE_MAX, used by the portable checked-size helpers below
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <cstdlib>
 #include <limits>
 #include <string>
@@ -236,17 +237,25 @@ static bool is_expert_tensor(const char * name) {
            std::strstr(name, "ffn_down_exps") != nullptr;
 }
 
+// Layer index of an image router bias, or -1. Two spellings exist: the source
+// checkpoint's "layers.N.ffn.gate.bias_vl" (kept by our converter) and
+// llama.cpp's "blk.N.exp_probs_b_vl.bias" (published GGUFs). Leading zeros and
+// trailing text are rejected.
 static int image_bias_layer(const char * name) {
-    constexpr const char * prefix = "layers.";
-    if (std::strncmp(name, prefix, 7) != 0) return -1;
-    const char * number = name + 7;
-    if (*number < '0' || *number > '9') return -1;
-    char * suffix = nullptr;
-    const long layer = std::strtol(number, &suffix, 10);
-    if (layer < 0 || layer > std::numeric_limits<int>::max() ||
-        std::strcmp(suffix, ".ffn.gate.bias_vl") != 0 ||
-        std::string(name) != "layers." + std::to_string(layer) + ".ffn.gate.bias_vl") return -1;
-    return int(layer);
+    for (const auto & [prefix, suffix] : {std::pair<const char *, const char *>
+             {"layers.", ".ffn.gate.bias_vl"}, {"blk.", ".exp_probs_b_vl.bias"}}) {
+        const size_t prefix_len = std::strlen(prefix);
+        if (std::strncmp(name, prefix, prefix_len) != 0) continue;
+        const char * number = name + prefix_len;
+        if (*number < '0' || *number > '9') return -1;
+        char * rest = nullptr;
+        const long layer = std::strtol(number, &rest, 10);
+        if (layer < 0 || layer > std::numeric_limits<int>::max() ||
+            std::strcmp(rest, suffix) != 0 ||
+            std::string(name) != prefix + std::to_string(layer) + suffix) return -1;
+        return int(layer);
+    }
+    return -1;
 }
 
 static bool should_keep_ds4_tensor(const char * name,
