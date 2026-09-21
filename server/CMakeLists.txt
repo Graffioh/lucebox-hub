@@ -518,6 +518,7 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_dspark.cpp
     src/deepseek4/deepseek4_dspark_spec.cpp
     src/deepseek4/deepseek4_vision.cpp
+    src/common/gpu_page_pool.cpp
     src/common/vision/image_decode.cpp
     src/deepseek4/deepseek4_vision_preprocess.cpp
     src/deepseek4/deepseek4_image_prompt.cpp
@@ -1894,7 +1895,9 @@ if(DFLASH27B_TESTS)
     add_executable(test_image_decode test/test_image_decode.cpp src/common/vision/image_decode.cpp)
     target_include_directories(test_image_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_image_decode PRIVATE image_codec_jpeg image_codec_png)
-    list(APPEND _raw_unit_test_targets test_image_input test_image_decode)
+    add_executable(test_gpu_page_pool test/test_gpu_page_pool.cpp src/common/gpu_page_pool.cpp)
+    target_include_directories(test_gpu_page_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    list(APPEND _raw_unit_test_targets test_image_input test_image_decode test_gpu_page_pool)
 
     # DS4V image units: each test builds only the unit it covers.
     foreach(_ds4v_unit assembly integration policy prompt)

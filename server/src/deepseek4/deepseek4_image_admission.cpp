@@ -1,6 +1,7 @@
 #include "deepseek4_image_admission.h"
 
 #include "deepseek4_internal.h"
+#include "common/gpu_page_pool.h"
 #include "common/moe_hybrid_placement.h"
 #include "common/moe_hybrid_types.h"
 #include "ggml-backend.h"
@@ -123,19 +124,26 @@ bool host_available(uint64_t & bytes, std::string & error) {
             !mul(kb, 1024, bytes)) return fail(error, "invalid host MemAvailable");
         found = true;
     }
-    return found || fail(error, "host MemAvailable is missing");
+    if (!found) return fail(error, "host MemAvailable is missing");
+    // MemAvailable leaves out pages the GPU driver holds for reuse.
+    if (!add(bytes, common::reclaimable_gpu_page_pool_bytes())) return fail(error, "host availability overflow");
+    return true;
 #else
     (void) bytes;
     return fail(error, "host admission currently requires Linux MemAvailable");
 #endif
 }
 
-bool device_free(ggml_backend_t backend, uint64_t & available, std::string & error) {
+bool device_free(ggml_backend_t backend, ImageMemoryDomain domain, uint64_t & available, std::string & error) {
     size_t free = 0, total = 0;
     ggml_backend_dev_memory(ggml_backend_get_device(backend), &free, &total);
     if (!total) return fail(error, "device memory query returned no capacity");
     // GGML's UMA query can legitimately report free RAM above dedicated total.
     available = free;
+    // A host-shared device reports MemAvailable, which leaves out the pages the
+    // GPU driver holds for reuse. Dedicated VRAM has no such pool.
+    if (domain == ImageMemoryDomain::HostShared &&
+        !add(available, common::reclaimable_gpu_page_pool_bytes())) return fail(error, "device availability overflow");
     return true;
 }
 } // namespace
@@ -272,8 +280,8 @@ bool check_deepseek4_image_admission(
         reserves.cold_domain == ImageMemoryDomain::Unknown) {
         return fail(error, "actual owner host-memory sharing must be classified before admission");
     }
-    if (!device_free(primary, out.primary_free_bytes, error) ||
-        !device_free(cold, out.cold_free_bytes, error) ||
+    if (!device_free(primary, reserves.primary_domain, out.primary_free_bytes, error) ||
+        !device_free(cold, reserves.cold_domain, out.cold_free_bytes, error) ||
         !host_available(out.host_available_bytes, error)) return false;
     const ImageStorageEstimate storage = out.storage;
     const uint64_t activation_bytes = out.cold_activation_estimate_bytes;
@@ -307,8 +315,8 @@ bool check_deepseek4_image_runtime_admission(
     if (!cold_buft || !owner_activation_estimate(config, reserves.max_chunk_tokens,
             ggml_backend_buft_get_alignment(cold_buft), activation_bytes, error)) return false;
     ImageMemorySnapshot snapshot;
-    if (!device_free(primary, snapshot.primary_free_bytes, error) ||
-        !device_free(cold, snapshot.cold_free_bytes, error) ||
+    if (!device_free(primary, reserves.primary_domain, snapshot.primary_free_bytes, error) ||
+        !device_free(cold, reserves.cold_domain, snapshot.cold_free_bytes, error) ||
         !host_available(snapshot.host_available_bytes, error)) return false;
     ImageAdmissionReserves runtime_reserves = reserves;
     runtime_reserves.host_loader_overhead_bytes = 0;
