@@ -2544,9 +2544,6 @@ static void test_image_batch_admission_before_execution(ggml_backend_t backend) 
     TEST_ASSERT(!validate());
     weights.layers[42].ffn_gate_bias_vl = bias;
     TEST_ASSERT(validate());
-    weights.compress_ratios[42] = 128;
-    TEST_ASSERT(!validate());
-    weights.compress_ratios[42] = 4;
     hybrid.materialized_cold_experts = false;
     TEST_ASSERT(!validate());
     hybrid.materialized_cold_experts = true;

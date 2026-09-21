@@ -1603,7 +1603,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             const char * name = gguf_get_tensor_name(gctx, ti);
             const int layer = image_bias_layer(name);
             if (layer < 0) continue;
-            if (layer >= int(n_layer)) { valid = false; continue; }
+            if (layer >= int(n_layer)) continue;  // the MTP block's bias is not loaded
             ++counts[size_t(layer)];
             const ggml_tensor * tensor = find_tensor(meta_ctx, name);
             valid = valid && tensor && tensor->type == GGML_TYPE_F32 &&
