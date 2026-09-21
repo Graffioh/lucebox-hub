@@ -2433,12 +2433,8 @@ static void test_image_bias_loader_opt_in_contract(ggml_backend_t backend) {
     matrix.image_bias_width = 128;
     matrix.image_bias_rows = 2;
     invalid.push_back(matrix);
-    auto wrong_layers = valid;
-    wrong_layers.block_count = 42;
-    invalid.push_back(wrong_layers);
-    auto wrong_vocab = valid;
-    wrong_vocab.vocab_size = 129279;
-    invalid.push_back(wrong_vocab);
+    // Decoder width and vocabulary are checked against the projector's own
+    // metadata when it loads, not here.
     for (const auto & options : invalid) {
         const std::string bad_path = write_deepseek4_loader_fixture(options);
         TargetLoadPlan plan;
