@@ -7,7 +7,7 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 TARGET="$TMP_DIR/model.gguf"
-FAKE_SERVER="$TMP_DIR/dflash_server"
+FAKE_SERVER="$TMP_DIR/luce_server"
 touch "$TARGET"
 
 cat >"$FAKE_SERVER" <<'EOF'
@@ -18,10 +18,10 @@ chmod +x "$FAKE_SERVER"
 
 run_entrypoint() {
     env \
-        DFLASH_DIR="$TMP_DIR" \
-        DFLASH_TARGET="$TARGET" \
-        DFLASH_DRAFT="$TMP_DIR/no-draft" \
-        DFLASH_SERVER_BIN="$FAKE_SERVER" \
+        LUCE_DIR="$TMP_DIR" \
+        LUCE_TARGET="$TARGET" \
+        LUCE_DRAFT="$TMP_DIR/no-draft" \
+        LUCE_SERVER_BIN="$FAKE_SERVER" \
         "$@" \
         bash "$ENTRYPOINT" serve 2>/dev/null
 }
@@ -42,7 +42,7 @@ assert_arg_pair() {
 }
 
 default_output="$(
-    unset DFLASH_PREFIX_CACHE_SLOTS DFLASH_PREFILL_CACHE_SLOTS
+    unset LUCE_PREFIX_CACHE_SLOTS LUCE_PREFILL_CACHE_SLOTS
     run_entrypoint
 )"
 for flag in --prefix-cache-slots --prefill-cache-slots; do
@@ -52,13 +52,13 @@ for flag in --prefix-cache-slots --prefill-cache-slots; do
     fi
 done
 
-disabled_output="$(run_entrypoint DFLASH_PREFIX_CACHE_SLOTS=0)"
+disabled_output="$(run_entrypoint LUCE_PREFIX_CACHE_SLOTS=0)"
 assert_arg_pair "$disabled_output" --prefix-cache-slots 0
 
 configured_output="$(
     run_entrypoint \
-        DFLASH_PREFIX_CACHE_SLOTS=4 \
-        DFLASH_PREFILL_CACHE_SLOTS=2
+        LUCE_PREFIX_CACHE_SLOTS=4 \
+        LUCE_PREFILL_CACHE_SLOTS=2
 )"
 assert_arg_pair "$configured_output" --prefix-cache-slots 4
 assert_arg_pair "$configured_output" --prefill-cache-slots 2

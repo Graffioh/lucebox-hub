@@ -153,7 +153,7 @@ options are available:
 For the validated single-device Strix Halo profile:
 
 ```bash
-./server/build-hip/dflash_server /opt/models/DeepSeek-V4-Flash.gguf \
+./server/build-hip/luce_server /opt/models/DeepSeek-V4-Flash.gguf \
   --target-device hip:0 \
   --ds4-fused-decode
 ```
@@ -171,8 +171,8 @@ Halo machine:
 
 ```bash
 cmake -S server -B server/build-hip-dual \
-  -DDFLASH27B_GPU_BACKEND=hip \
-  -DDFLASH27B_HIP_ARCHITECTURES='gfx1151;gfx1201' \
+  -DLUCE_GPU_BACKEND=hip \
+  -DLUCE_HIP_ARCHITECTURES='gfx1151;gfx1201' \
   -DGGML_HIP_GRAPHS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build-hip-dual -j
@@ -185,30 +185,30 @@ tokens per step with the fused verifier, and prefills in batched sparse mode.
 It needs no calibration files.
 
 ```bash
-export DFLASH_DS4_MOE_TP=1 DFLASH_DS4_MOE_TP_INPROC=1 DFLASH_DS4_MOE_TP_GPU=1
-export DFLASH_EXPERT_BUDGET_MB=14350
-export DFLASH_DS4_SPEC=1 DFLASH_DS4_DRAFT=/path/to/deepseek4-dspark-draft.gguf
-export DFLASH_DS4_DRAFT_GPU=0 DFLASH_DS4_SPEC_Q=5 DFLASH_DS4_Q5_VERIFY=1
-export DFLASH_DS4_FUSED_VERIFY=1 DFLASH_DS4_FUSED_HYBRID_DECODE=1
-export DFLASH_DS4_PINNED_ROLLBACK=1 DFLASH_DS4_GPU_ARGMAX_VERIFY=1
-export DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE=1
-export DFLASH_DS4_TP_ROUTE_PREFORK=1 DFLASH_DS4_TP_DEVICE_JOIN=1 DFLASH_DS4_TP_DEVICE_JOIN_SPLIT=1
-export DFLASH_DS4_TP_FUSED_HC_JOIN=1 DFLASH_DS4_TP_MAIN_ROUTE_WEIGHTS=1
-export DFLASH_DS4_TP_COARSE_OWNER=1 DFLASH_DS4_TP_NATIVE_ROUTE_WIDTH=1
-export DFLASH_DS4_TP_MASKED_ROUTES=1 DFLASH_DS4_TP_GROUPED_MMVQ=1
-export DFLASH_DS4_TP_CAPTURE_CACHE_SLOTS=4
-export DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE=1 DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4=13
-export DFLASH_MOE_DUPLICATE_HOT_ON_COLD=1 DFLASH_MOE_FULL_COLD_PARALLEL=1
-export DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC=1
-export DFLASH_DS4_HYBRID_PREFILL_GPU_HC=1 DFLASH_DS4_HYBRID_PREFILL_EAGER=1
+export LUCE_DS4_MOE_TP=1 LUCE_DS4_MOE_TP_INPROC=1 LUCE_DS4_MOE_TP_GPU=1
+export LUCE_EXPERT_BUDGET_MB=14350
+export LUCE_DS4_SPEC=1 LUCE_DS4_DRAFT=/path/to/deepseek4-dspark-draft.gguf
+export LUCE_DS4_DRAFT_GPU=0 LUCE_DS4_SPEC_Q=5 LUCE_DS4_Q5_VERIFY=1
+export LUCE_DS4_FUSED_VERIFY=1 LUCE_DS4_FUSED_HYBRID_DECODE=1
+export LUCE_DS4_PINNED_ROLLBACK=1 LUCE_DS4_GPU_ARGMAX_VERIFY=1
+export LUCE_DS4_DRAFT_CONTEXT_KV_CACHE=1
+export LUCE_DS4_TP_ROUTE_PREFORK=1 LUCE_DS4_TP_DEVICE_JOIN=1 LUCE_DS4_TP_DEVICE_JOIN_SPLIT=1
+export LUCE_DS4_TP_FUSED_HC_JOIN=1 LUCE_DS4_TP_MAIN_ROUTE_WEIGHTS=1
+export LUCE_DS4_TP_COARSE_OWNER=1 LUCE_DS4_TP_NATIVE_ROUTE_WIDTH=1
+export LUCE_DS4_TP_MASKED_ROUTES=1 LUCE_DS4_TP_GROUPED_MMVQ=1
+export LUCE_DS4_TP_CAPTURE_CACHE_SLOTS=4
+export LUCE_MOE_TP_DYNAMIC_ROUTE_BALANCE=1 LUCE_MOE_TP_DYNAMIC_MAIN_SLOTS_X4=13
+export LUCE_MOE_DUPLICATE_HOT_ON_COLD=1 LUCE_MOE_FULL_COLD_PARALLEL=1
+export LUCE_MOE_PREFILL_PERSISTENT_OWNER_ALLOC=1
+export LUCE_DS4_HYBRID_PREFILL_GPU_HC=1 LUCE_DS4_HYBRID_PREFILL_EAGER=1
 export GGML_CUDA_BATCH_PEER_COPIES=1
-export DFLASH_MMID_GROUPED=1 DFLASH_MMID_GROUPED_TYPES=8 DFLASH_MMID_GROUPED_DEVICE=1
-export DFLASH_CUDA_MMVQ_MOE_ROWS_PER_BLOCK=2 DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24=1 DFLASH_CUDA_MMVQ_FP4_X4=1
-export DFLASH_DS4_DIRECT_INDEXER_TOPK=1 GGML_DS4_TOPK_BLOCK_RADIX=1
-export DFLASH_DS4_MIX_MMQ_PREFILL=1 LUCE_CUDA_I32_REPEAT=1
+export LUCE_MMID_GROUPED=1 LUCE_MMID_GROUPED_TYPES=8 LUCE_MMID_GROUPED_DEVICE=1
+export LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK=2 LUCE_CUDA_MMVQ_MOE_FP3_PACKED24=1 LUCE_CUDA_MMVQ_FP4_X4=1
+export LUCE_DS4_DIRECT_INDEXER_TOPK=1 GGML_DS4_TOPK_BLOCK_RADIX=1
+export LUCE_DS4_MIX_MMQ_PREFILL=1 LUCE_CUDA_I32_REPEAT=1
 export ROCBLAS_USE_HIPBLASLT=0
 
-./server/build-hip-dual/dflash_server /path/to/deepseek4-target.gguf \
+./server/build-hip-dual/luce_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 --peer-access \
   --max-ctx 18432 --chunk 2048 \
   --ds4-fused-decode --ds4-expert-top-k 6 \
@@ -225,7 +225,7 @@ across repeats and identical between streaming and non-streaming):
 | `exact` (token-wise) | 334 s (14 tok/s) | 677 s (14 tok/s) | 25-45 tok/s | - |
 
 Decode speed follows the drafter's acceptance (about 0.5 on chat, 0.7 on
-code). `DFLASH_DS4_ADAPTIVE_WIDTH=1` is accepted on this path but measured no
+code). `LUCE_DS4_ADAPTIVE_WIDTH=1` is accepted on this path but measured no
 gain over the fixed q5 verifier here (code 36-42 tok/s either way).
 
 `--ds4-prefill sparse` is the batched prefill and the one to use for prompts
@@ -235,8 +235,8 @@ path exists only for sparse prefill. Top-4 routing (`--ds4-expert-top-k 4`)
 is a further approximation that raises decode speed; omit it when the
 model-default top-6 route is required.
 
-The minimal activation (`DFLASH_DS4_MOE_TP=1`, `DFLASH_DS4_MOE_TP_INPROC=1`,
-`DFLASH_DS4_MOE_TP_GPU=1`, `DFLASH_EXPERT_BUDGET_MB=11700`,
+The minimal activation (`LUCE_DS4_MOE_TP=1`, `LUCE_DS4_MOE_TP_INPROC=1`,
+`LUCE_DS4_MOE_TP_GPU=1`, `LUCE_EXPERT_BUDGET_MB=11700`,
 `LUCE_MMVQ_MAX_NCOLS=4`) runs the same model with the fused decode and verify
 paths off and decodes at 12-15 tok/s; it is only useful to check placement.
 
@@ -255,9 +255,9 @@ Build for both targets with affine qtype-107 support enabled:
 
 ```bash
 cmake -S server -B server/build-hip-dual \
-  -DDFLASH27B_GPU_BACKEND=hip \
-  -DDFLASH27B_HIP_ARCHITECTURES='gfx1100;gfx1151' \
-  -DDFLASH27B_ROCMFP2_AFFINE=ON \
+  -DLUCE_GPU_BACKEND=hip \
+  -DLUCE_HIP_ARCHITECTURES='gfx1100;gfx1151' \
+  -DLUCE_ROCMFP2_AFFINE=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build-hip-dual -j
 ```
@@ -267,11 +267,11 @@ with representative requests, stop the server so it flushes the CSV, then use
 that CSV for serving:
 
 ```bash
-DFLASH_DS4_ROUTING_STATS_OUT=/tmp/ds4-routing.csv \
+LUCE_DS4_ROUTING_STATS_OUT=/tmp/ds4-routing.csv \
   server/scripts/serve_ds4_dual_rocm_128k.sh \
   /path/to/target.gguf /path/to/dspark.gguf
 
-DFLASH_DS4_HOTNESS_CSV=/tmp/ds4-routing.csv \
+LUCE_DS4_HOTNESS_CSV=/tmp/ds4-routing.csv \
   server/scripts/serve_ds4_dual_rocm_128k.sh \
   /path/to/target.gguf /path/to/dspark.gguf
 ```
@@ -291,7 +291,7 @@ checked-in harness against the qualified profile:
 ```bash
 python3 server/scripts/bench_ds4_decode.py \
   --url http://127.0.0.1:8016 \
-  --model dflash \
+  --model luce \
   --warmups 1 \
   --runs 3 \
   --max-tokens 512
@@ -337,38 +337,38 @@ peer access is intentionally not attempted.
 
 ```bash
 cmake -S server -B server/build-cuda-hip \
-  -DDFLASH27B_GPU_BACKEND=hip \
-  -DDFLASH27B_ENABLE_MIXED_CUDA_HIP=ON \
-  -DDFLASH27B_CUDA_ARCHITECTURES=86 \
-  -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
+  -DLUCE_GPU_BACKEND=hip \
+  -DLUCE_ENABLE_MIXED_CUDA_HIP=ON \
+  -DLUCE_CUDA_ARCHITECTURES=86 \
+  -DLUCE_HIP_ARCHITECTURES=gfx1151 \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build-cuda-hip -j
 ctest --test-dir server/build-cuda-hip -R mixed_cuda_hip --output-on-failure
 ```
 
 ```bash
-export DFLASH_DS4_MOE_TP=1
-export DFLASH_DS4_MOE_TP_INPROC=1
-export DFLASH_DS4_MOE_TP_BACKEND=cuda
-export DFLASH_DS4_MOE_TP_GPU=0       # cuda:0 (RTX 3090)
-export DFLASH_DS4_MOE_TP_CONCENTRATE_COLD=1
-export DFLASH_DS4_TP_SCHEDULE_BRANCHES=1
-export DFLASH_DS4_TP_TARGETED_JOIN_SPLIT=1
+export LUCE_DS4_MOE_TP=1
+export LUCE_DS4_MOE_TP_INPROC=1
+export LUCE_DS4_MOE_TP_BACKEND=cuda
+export LUCE_DS4_MOE_TP_GPU=0       # cuda:0 (RTX 3090)
+export LUCE_DS4_MOE_TP_CONCENTRATE_COLD=1
+export LUCE_DS4_TP_SCHEDULE_BRANCHES=1
+export LUCE_DS4_TP_TARGETED_JOIN_SPLIT=1
 export GGML_BATCH_PEER_COPIES=1
 # Start conservatively and tune from the startup placement and memory logs;
 # the usable budget depends on the model, placement policy, and free VRAM.
-export DFLASH_EXPERT_BUDGET_MB=85000
-export DFLASH_DS4_DRAFT=/path/to/dspark-draft.gguf
-export DFLASH_DS4_DRAFT_BACKEND=cuda
-export DFLASH_DS4_DRAFT_GPU=0
+export LUCE_EXPERT_BUDGET_MB=85000
+export LUCE_DS4_DRAFT=/path/to/dspark-draft.gguf
+export LUCE_DS4_DRAFT_BACKEND=cuda
+export LUCE_DS4_DRAFT_GPU=0
 
-./server/build-cuda-hip/dflash_server /path/to/deepseek4-target.gguf \
+./server/build-cuda-hip/luce_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
   --ds4-prefill sparse
 ```
 
 The peer module is normally found beside the executable. Set
-`DFLASH_CUDA_BACKEND_PATH` or `DFLASH_HIP_BACKEND_PATH` only when packaging it
+`LUCE_CUDA_BACKEND_PATH` or `LUCE_HIP_BACKEND_PATH` only when packaging it
 elsewhere. Sparse/approximate DeepSeek4 prefill remains restricted to a HIP
 target; CUDA-primary ROCmFP2 execution is not yet qualified. The mixed path is
 burn-in functionality. On the qualified 3090 + Strix machine, the tuned top-4
@@ -409,7 +409,7 @@ while decoding uses MMV, which can change the next token for the same prefix.
 `test_ds4_paged_prefill_model` checks this regression with the real model and
 four clients: it generates 140 tokens per client, reconstructs their prefixes
 through chunked prefill, and compares the next token at indices 53 and 129.
-Build the optional target and run with `DFLASH_DS4_SPEC=0` and the matching
+Build the optional target and run with `LUCE_DS4_SPEC=0` and the matching
 `DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf` path. The ordinary GPU test
 `test_rocmfp_mix_gateup_glu` covers FP2/FP3 widths 1–16, actual graph dispatch,
 and restoration of the default dispatch policy.
@@ -420,13 +420,13 @@ hf download Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3 \
   --local-dir /path/to/models
 
 cmake -S server -B server/build-hip \
-  -DDFLASH27B_GPU_BACKEND=hip \
-  -DDFLASH27B_HIP_ARCHITECTURES=gfx1151 \
-  -DDFLASH27B_SERVER=ON \
+  -DLUCE_GPU_BACKEND=hip \
+  -DLUCE_HIP_ARCHITECTURES=gfx1151 \
+  -DLUCE_SERVER=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build-hip -j
 
-./server/build-hip/dflash_server \
+./server/build-hip/luce_server \
   /path/to/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf \
   --target-device hip:0 \
   --paged-attention \
@@ -446,14 +446,14 @@ ROCmFP2 gate/up and ROCmFP3 down weights:
 
 ```bash
 export HIP_VISIBLE_DEVICES=<r9700-index>,<strix-index>
-export DFLASH_DS4_MOE_TP=1
-export DFLASH_DS4_MOE_TP_INPROC=1
-export DFLASH_DS4_MOE_TP_GPU=1
-export DFLASH_EXPERT_BUDGET_MB=11700
-export DFLASH_DS4_TP_BATCH_SPLIT_COPIES=1
-export DFLASH_DS4_TP_GROUPED_MMVQ=1
+export LUCE_DS4_MOE_TP=1
+export LUCE_DS4_MOE_TP_INPROC=1
+export LUCE_DS4_MOE_TP_GPU=1
+export LUCE_EXPERT_BUDGET_MB=11700
+export LUCE_DS4_TP_BATCH_SPLIT_COPIES=1
+export LUCE_DS4_TP_GROUPED_MMVQ=1
 
-./server/build-hip-dual/dflash_server \
+./server/build-hip-dual/luce_server \
   /path/to/models/DeepSeek-V4-Flash.gguf \
   --target-device hip:0 \
   --peer-access \
@@ -519,7 +519,7 @@ KV cache tensors remain owned by the shard that owns the corresponding layer ran
 
 If DeepSeek4 is started without an explicit target layer split, `DeepSeek4LayerSplitAdapter` computes the CUDA prefix automatically:
 
-1. Read `DFLASH_DS4_CUDA_LAYERS`. If it is set to a positive value, that value becomes the number of prefix layers kept on CUDA.
+1. Read `LUCE_DS4_CUDA_LAYERS`. If it is set to a positive value, that value becomes the number of prefix layers kept on CUDA.
 2. Otherwise, query CUDA free memory.
 3. Reserve a fixed **2 GiB** overhead for caches and safety margin.
 4. Estimate roughly **1.9 GiB per DeepSeek4 layer**.
@@ -531,66 +531,66 @@ The runtime logs the chosen split with a `[deepseek4-split] auto-split:` banner.
 
 | Variable | Purpose |
 |----------|---------|
-| `DFLASH_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
-| `DFLASH_DS4_TIMING` | Enable DS4 timing logs for local, paged, and layer-split execution. Paged rounds report full-graph build, input upload, compute, and readback time; leave unset for normal runs. |
-| `DFLASH_DS4_ROCTX` | HIP-only, default-off semantic ROCTX ranges for an external rocprof trace. The library is loaded dynamically only when set to `1`, `true`, `yes`, or `on`. |
-| `DFLASH_DS4_SPEC` / `DFLASH_DS4_DRAFT` | Enable DSpark and select its GGUF. |
-| `DFLASH_DS4_DRAFT_BACKEND` / `DFLASH_DS4_DRAFT_GPU` | Backend and device for the in-process drafter. |
-| `DFLASH_DS4_MOE_TP` | Enable routed-expert partitioning. |
-| `DFLASH_DS4_MOE_TP_INPROC` | Use two local GPU backends instead of an expert IPC worker. |
-| `DFLASH_DS4_MOE_TP_BACKEND` | Cold expert backend (`cuda` or `hip`); mixed builds default to the peer runtime. |
-| `DFLASH_DS4_MOE_TP_GPU` | Device index within the cold expert backend. |
-| `DFLASH_DS4_MOE_TP_CONCENTRATE_COLD` | Cross-vendor burn-in mode: place complete cold expert layers on the peer to reduce joins. |
-| `DFLASH_DS4_MOE_TP_PEER_HOT` | With a routing profile, place its hottest experts on the secondary owner. |
-| `DFLASH_DS4_CROSS_VENDOR_OWNER_SUMS` | Reduce each owner's routed outputs locally before the final cross-vendor add. This changes floating-point association and is not the byte-identity mode. |
-| `DFLASH_DS4_TP_SCHEDULE_BRANCHES` | Submit the two owner branches independently through the mixed scheduler. |
-| `DFLASH_DS4_TP_TARGETED_JOIN_SPLIT` | Gather the peer result at the join without an extra peer fence per layer. |
-| `DFLASH_DS4_COMP_PAD_STRIDE` | Exact compressed-KV padding bucket; wider buckets trade small masked work for fewer verifier graph captures. |
-| `DFLASH_DS4_DECODE_ATTN_CACHE_MB` | Byte budget of the per-layer decode attention graph cache used by the heterogeneous and token-wise paths. Defaults to a quarter of the target GPU's free memory when the first graph is cached (256 MiB floor); a positive value is used as given. |
-| `DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` | Diagnostic fallback for runtimes that cannot preserve grouped projection metadata across a scheduler copy. |
-| `DFLASH_CUDA_BACKEND_PATH` / `DFLASH_HIP_BACKEND_PATH` | Optional explicit peer backend module path. |
-| `DFLASH_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
-| `DFLASH_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
-| `DFLASH_DS4_TP_GROUPED_MMVQ` | Opt in to grouped expert MMVQ for `n_tokens > 1`, replacing tokenwise ROCmFP2 gate/up dispatch. The paged R9700 + Strix profile is qualified at concurrency 1–4; the flag itself does not enforce topology or lane limits. `DFLASH_MOE_TP_GROUPED_MMVQ` is the model-neutral name and takes precedence. |
-| `DFLASH_DS4_TP_BATCH_SPLIT_COPIES` | Establish destination readiness once per scheduler split without combining backend copy dependencies. The qualified dual-ROCm launcher enables this exact path. |
+| `LUCE_DS4_CUDA_LAYERS` | Override the auto-split heuristic and pin the first `N` DeepSeek4 layers to CUDA. The remaining `43 - N` layers run on the Halo shard. |
+| `LUCE_DS4_TIMING` | Enable DS4 timing logs for local, paged, and layer-split execution. Paged rounds report full-graph build, input upload, compute, and readback time; leave unset for normal runs. |
+| `LUCE_DS4_ROCTX` | HIP-only, default-off semantic ROCTX ranges for an external rocprof trace. The library is loaded dynamically only when set to `1`, `true`, `yes`, or `on`. |
+| `LUCE_DS4_SPEC` / `LUCE_DS4_DRAFT` | Enable DSpark and select its GGUF. |
+| `LUCE_DS4_DRAFT_BACKEND` / `LUCE_DS4_DRAFT_GPU` | Backend and device for the in-process drafter. |
+| `LUCE_DS4_MOE_TP` | Enable routed-expert partitioning. |
+| `LUCE_DS4_MOE_TP_INPROC` | Use two local GPU backends instead of an expert IPC worker. |
+| `LUCE_DS4_MOE_TP_BACKEND` | Cold expert backend (`cuda` or `hip`); mixed builds default to the peer runtime. |
+| `LUCE_DS4_MOE_TP_GPU` | Device index within the cold expert backend. |
+| `LUCE_DS4_MOE_TP_CONCENTRATE_COLD` | Cross-vendor burn-in mode: place complete cold expert layers on the peer to reduce joins. |
+| `LUCE_DS4_MOE_TP_PEER_HOT` | With a routing profile, place its hottest experts on the secondary owner. |
+| `LUCE_DS4_CROSS_VENDOR_OWNER_SUMS` | Reduce each owner's routed outputs locally before the final cross-vendor add. This changes floating-point association and is not the byte-identity mode. |
+| `LUCE_DS4_TP_SCHEDULE_BRANCHES` | Submit the two owner branches independently through the mixed scheduler. |
+| `LUCE_DS4_TP_TARGETED_JOIN_SPLIT` | Gather the peer result at the join without an extra peer fence per layer. |
+| `LUCE_DS4_COMP_PAD_STRIDE` | Exact compressed-KV padding bucket; wider buckets trade small masked work for fewer verifier graph captures. |
+| `LUCE_DS4_DECODE_ATTN_CACHE_MB` | Byte budget of the per-layer decode attention graph cache used by the heterogeneous and token-wise paths. Defaults to a quarter of the target GPU's free memory when the first graph is cached (256 MiB floor); a positive value is used as given. |
+| `LUCE_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION` | Diagnostic fallback for runtimes that cannot preserve grouped projection metadata across a scheduler copy. |
+| `LUCE_CUDA_BACKEND_PATH` / `LUCE_HIP_BACKEND_PATH` | Optional explicit peer backend module path. |
+| `LUCE_EXPERT_BUDGET_MB` | Main-GPU memory budget for hot experts. |
+| `LUCE_DS4_HOTNESS_CSV` | Optional per-layer routing profile for hot placement. |
+| `LUCE_DS4_TP_GROUPED_MMVQ` | Opt in to grouped expert MMVQ for `n_tokens > 1`, replacing tokenwise ROCmFP2 gate/up dispatch. The paged R9700 + Strix profile is qualified at concurrency 1–4; the flag itself does not enforce topology or lane limits. `LUCE_MOE_TP_GROUPED_MMVQ` is the model-neutral name and takes precedence. |
+| `LUCE_DS4_TP_BATCH_SPLIT_COPIES` | Establish destination readiness once per scheduler split without combining backend copy dependencies. The qualified dual-ROCm launcher enables this exact path. |
 | `GGML_BATCH_PEER_COPIES` | Additionally combine HIP peer-copy dependency publication. The old `GGML_CUDA_BATCH_PEER_COPIES` spelling remains an alias. Keep these event-batching variables unset for the exact qualified profile. |
-| `DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT` | Use the routing profile and measured owner-rate ratio to minimize the predicted two-owner MoE critical path instead of maximizing aggregate hot-hit rate. Requires `DFLASH_DS4_HOTNESS_CSV`. |
-| `DFLASH_DS4_TP_MAIN_TO_PEER_RATE` | Relative main/peer routed-expert rate used by critical-path placement. It must be finite and greater than zero; the default is `3.4`. |
-| `DFLASH_DS4_TP_BALANCE_MIN_HOT` | Minimum hot experts retained on every routed layer by critical-path placement. Defaults to `0`. |
-| `DFLASH_DS4_Q5_VERIFY` | AMD q=5 fused verifier. Defaults to `1` on `gfx1151` when `DFLASH_DS4_SPEC` is set, together with `DFLASH_DS4_FUSED_VERIFY=1` and `DFLASH_DS4_ADAPTIVE_WIDTH=1`; set `0` to restore the q<=4 verifier. It also selects the qualified MMVQ width and verifier-cache defaults when they are not explicitly overridden. |
-| `DFLASH_DS4_ADAPTIVE_WIDTH` | Acceptance-and-cost verify-width controller. Defaults to `1` on `gfx1151` with `DFLASH_DS4_SPEC`; chooses q2 to q5 per step (q5 is the cap) from measured acceptance and per-width cost. Set `0` for a fixed width. |
-| `DFLASH_DS4_CONFIDENCE_WIDTH` | With the adaptive width and a drafter that carries a confidence head, the width of every step is chosen from the head's per-candidate scores (three depths on the q5 verifier; the fourth is learned from target feedback), calibrated online per depth against the target's actual acceptance. Defaults on; set `0` to fall back to the learned-acceptance policy. `DFLASH_DS4_TIMING=1` prints the per-depth calibration (predicted, actual, applied scale) after every request. |
-| `DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL` | Analytic causal window for layer-major sliding-window layers instead of the quadratic mask upload. Part of the `gfx1151` sparse-prefill defaults (measured +10% prefill, identical output); set `0` to restore the explicit mask. |
-| `DFLASH_DS4_INDEXER_F16_Q` / `DFLASH_DS4_PREFILL_F16_KV_ALL` | F16 indexer queries and F16 selected-KV transport for sparse prefill. Part of the `gfx1151` sparse-prefill defaults; set `0` to restore F32. |
+| `LUCE_DS4_TP_CRITICAL_PATH_PLACEMENT` | Use the routing profile and measured owner-rate ratio to minimize the predicted two-owner MoE critical path instead of maximizing aggregate hot-hit rate. Requires `LUCE_DS4_HOTNESS_CSV`. |
+| `LUCE_DS4_TP_MAIN_TO_PEER_RATE` | Relative main/peer routed-expert rate used by critical-path placement. It must be finite and greater than zero; the default is `3.4`. |
+| `LUCE_DS4_TP_BALANCE_MIN_HOT` | Minimum hot experts retained on every routed layer by critical-path placement. Defaults to `0`. |
+| `LUCE_DS4_Q5_VERIFY` | AMD q=5 fused verifier. Defaults to `1` on `gfx1151` when `LUCE_DS4_SPEC` is set, together with `LUCE_DS4_FUSED_VERIFY=1` and `LUCE_DS4_ADAPTIVE_WIDTH=1`; set `0` to restore the q<=4 verifier. It also selects the qualified MMVQ width and verifier-cache defaults when they are not explicitly overridden. |
+| `LUCE_DS4_ADAPTIVE_WIDTH` | Acceptance-and-cost verify-width controller. Defaults to `1` on `gfx1151` with `LUCE_DS4_SPEC`; chooses q2 to q5 per step (q5 is the cap) from measured acceptance and per-width cost. Set `0` for a fixed width. |
+| `LUCE_DS4_CONFIDENCE_WIDTH` | With the adaptive width and a drafter that carries a confidence head, the width of every step is chosen from the head's per-candidate scores (three depths on the q5 verifier; the fourth is learned from target feedback), calibrated online per depth against the target's actual acceptance. Defaults on; set `0` to fall back to the learned-acceptance policy. `LUCE_DS4_TIMING=1` prints the per-depth calibration (predicted, actual, applied scale) after every request. |
+| `LUCE_DS4_DIRECT_CONTIGUOUS_CAUSAL` | Analytic causal window for layer-major sliding-window layers instead of the quadratic mask upload. Part of the `gfx1151` sparse-prefill defaults (measured +10% prefill, identical output); set `0` to restore the explicit mask. |
+| `LUCE_DS4_INDEXER_F16_Q` / `LUCE_DS4_PREFILL_F16_KV_ALL` | F16 indexer queries and F16 selected-KV transport for sparse prefill. Part of the `gfx1151` sparse-prefill defaults; set `0` to restore F32. |
 | `GGML_CUDA_MLA_SEGMENTED_KV` | Segmented compressed/preserved-tail KV operands for the D512 flash-attention path. Defaults on for HIP backends; set `0` to disable. |
 | `GGML_CUDA_MLA_STREAM_WMMA` / `GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS` / `GGML_CUDA_MLA_DENSE_WMMA` / `GGML_CUDA_MLA_DENSE_HIGH_RATIO` | rocWMMA streaming and dense high-ratio D512 attention paths, part of the `gfx1151` sparse-prefill defaults (removing them costs about 28% prefill at 8K). `GGML_CUDA_MLA_STREAM_WMMA=0` restores scalar streaming; `GGML_CUDA_MLA_STREAM_WMMA_HEAD_GROUPS` selects one or two head groups (the profile sets `2`; it does not disable the path); either dense switch at `0` disables the dense high-ratio path. |
-| `DFLASH_ROCMFP3_WIDE_TWO_PASS` / `GGML_CUDA_MLA_SPARSE_VALUE_SKIP` | `gfx1151` kernel defaults (wide two-pass ROCmFP3 MMQ, skipping zero-weight value rows in sparse attention). Set `0` to disable either. |
-| `DFLASH_ROCMFP3_ROW3` | Three-row ROCmFP3 MMQ tiles for the q3 to q5 verifier shapes. Defaults on for `gfx1151`; set `0` to fall back to two rows. |
+| `LUCE_ROCMFP3_WIDE_TWO_PASS` / `GGML_CUDA_MLA_SPARSE_VALUE_SKIP` | `gfx1151` kernel defaults (wide two-pass ROCmFP3 MMQ, skipping zero-weight value rows in sparse attention). Set `0` to disable either. |
+| `LUCE_ROCMFP3_ROW3` | Three-row ROCmFP3 MMQ tiles for the q3 to q5 verifier shapes. Defaults on for `gfx1151`; set `0` to fall back to two rows. |
 | `GGML_DS4_INDEXER_M32` / `GGML_DS4_INDEXER_M32_CACHE_B` | rocWMMA m32 indexer score kernel and its cached B operand. The kernel defaults on for RDNA 3.5; the cached operand is part of the `gfx1151` sparse-prefill defaults. Set `0` to disable either. |
 | `GGML_DS4_INDEXER_M32_PREFILL` / `GGML_DS4_INDEXER_M32_DIRECT_B` | Diagnostics: override the measured m32 crossovers (prefill from 256 scored tokens, direct B from 6144 rows) so tests can reach every specialization. |
-| `DFLASH_DSPARK_NO_CHAIN_GRAPH_CACHE` | Kill switch: rebuild the DSpark Markov chain graph on every call instead of reusing it. The cache keys on the drafter lifecycle generation, so a reloaded drafter never reuses a stale graph. |
-| `DFLASH_DS4_DISABLE_BOUNDARY_CHECKPOINT` | Kill switch for the boundary checkpoint that lets a q5 rejection spanning two ratio-4 flushes restore and replay only the accepted prefix. |
-| `DFLASH_DS4_TOKEN_TRACE` / `DFLASH_DS4_VERIFY_BUILD_TIMING` | Diagnostics: per-token speculative trace and fused-verify graph build timing. |
-| `DFLASH_CUDA_MMVQ_FP4_X4` | Enable the four-column ROCmFP4 dense x4 kernel and permit the five-column x4+1 kernel. Defaults to `1` for monolithic `gfx1151` paged serving and opt-in HIP q=5 verification; set `0` to restore generic four- and five-column dispatch. |
-| `DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1` | Enable five-column ROCmFP4 dense x4+1 dispatch when `DFLASH_CUDA_MMVQ_FP4_X4=1`. Defaults to `1` for monolithic `gfx1151` paged serving and the opt-in q=5 verifier on `gfx1201`; set `0` to restore the generic five-column kernel. |
-| `DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24` | Enable packed 24-bit ROCmFP3 expert dispatch. Defaults to `1` for monolithic `gfx1151` paged serving; set `0` to restore generic ROCmFP3 expert dispatch. Other configurations require explicit opt-in. |
-| `DFLASH_DS4_TP_FUSED_CACHE_SLOTS` | Number of verifier graph slots. Defaults to `8` for q<=4 and `24` for the q=5 verifier so every adaptive width stays resident across the ratio-4 phases; slots share scratch (about 0.8 MiB each). |
-| `DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY` | Skip the expensive property scan only for a warmed verifier graph. Rebuilt scheduler generations are always validated. Leave unset for the conservative production profile. |
+| `LUCE_DSPARK_NO_CHAIN_GRAPH_CACHE` | Kill switch: rebuild the DSpark Markov chain graph on every call instead of reusing it. The cache keys on the drafter lifecycle generation, so a reloaded drafter never reuses a stale graph. |
+| `LUCE_DS4_DISABLE_BOUNDARY_CHECKPOINT` | Kill switch for the boundary checkpoint that lets a q5 rejection spanning two ratio-4 flushes restore and replay only the accepted prefix. |
+| `LUCE_DS4_TOKEN_TRACE` / `LUCE_DS4_VERIFY_BUILD_TIMING` | Diagnostics: per-token speculative trace and fused-verify graph build timing. |
+| `LUCE_CUDA_MMVQ_FP4_X4` | Enable the four-column ROCmFP4 dense x4 kernel and permit the five-column x4+1 kernel. Defaults to `1` for monolithic `gfx1151` paged serving and opt-in HIP q=5 verification; set `0` to restore generic four- and five-column dispatch. |
+| `LUCE_CUDA_MMVQ_FP4_Q5_X4_PLUS1` | Enable five-column ROCmFP4 dense x4+1 dispatch when `LUCE_CUDA_MMVQ_FP4_X4=1`. Defaults to `1` for monolithic `gfx1151` paged serving and the opt-in q=5 verifier on `gfx1201`; set `0` to restore the generic five-column kernel. |
+| `LUCE_CUDA_MMVQ_MOE_FP3_PACKED24` | Enable packed 24-bit ROCmFP3 expert dispatch. Defaults to `1` for monolithic `gfx1151` paged serving; set `0` to restore generic ROCmFP3 expert dispatch. Other configurations require explicit opt-in. |
+| `LUCE_DS4_TP_FUSED_CACHE_SLOTS` | Number of verifier graph slots. Defaults to `8` for q<=4 and `24` for the q=5 verifier so every adaptive width stays resident across the ratio-4 phases; slots share scratch (about 0.8 MiB each). |
+| `LUCE_DS4_VERIFY_FORCE_GRAPH_REPLAY` | Skip the expensive property scan only for a warmed verifier graph. Rebuilt scheduler generations are always validated. Leave unset for the conservative production profile. |
 | `GGML_DS4_FA_SERIAL_INDEX_SCAN` | Restore the serial compressed-row mask scan for an indexed-attention A/B. By default, HIP scans contexts above 512 compressed rows in parallel. |
-| `DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Long-prefill arena kill switch; set `0` to restore per-layer owner allocation. |
+| `LUCE_MOE_PREFILL_PERSISTENT_OWNER_ALLOC` | Long-prefill arena kill switch; set `0` to restore per-layer owner allocation. |
 
-`DFLASH_DS4_TIMING` enables the existing timing banners:
+`LUCE_DS4_TIMING` enables the existing timing banners:
 
 - local and paged serving: `[deepseek4-timing]`. Paged rounds use `paged-prefill`, `paged-decode`, or `paged-mixed` and aggregate all lanes into `full_build`, `full_set`, `full_compute`, and `full_read`.
 - parent / local shard: `[deepseek4-split-timing]`
 - remote Halo shard: `[deepseek4-target-timing]`
 
-The old per-expert IPC worker is retired. The `DFLASH_DS4_MOE_TP*` variables
+The old per-expert IPC worker is retired. The `LUCE_DS4_MOE_TP*` variables
 above configure the in-process route-owner implementation.
 
 ### External ROCm traces
 
-Set `DFLASH_DS4_ROCTX=1` when collecting an external rocprof marker trace.
+Set `LUCE_DS4_ROCTX=1` when collecting an external rocprof marker trace.
 The runtime emits balanced `ds4.prefill`, `ds4.spec_decode`, and
 `ds4.layer_range` ranges with the applicable mode, token count, layer bounds,
 and device. The marker layer does not use HIP events, synchronize a stream, or
@@ -637,14 +637,14 @@ python server/scripts/convert_dflash_to_gguf.py \
 Run the converted drafter against a DeepSeek4 target with:
 
 ```bash
-export DFLASH_DS4_SPEC=1
-export DFLASH_DS4_FUSED_VERIFY=1
+export LUCE_DS4_SPEC=1
+export LUCE_DS4_FUSED_VERIFY=1
 # Experimental, single HIP target only; may change generated tokens:
-# export DFLASH_DS4_SPARSE_DECODE_FLASH=1
-export DFLASH_DS4_DRAFT=/path/to/dflash-draft.gguf
-export DFLASH_DS4_SPEC_Q=4
+# export LUCE_DS4_SPARSE_DECODE_FLASH=1
+export LUCE_DS4_DRAFT=/path/to/dflash-draft.gguf
+export LUCE_DS4_SPEC_Q=4
 
-./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
+./server/build-hip/luce_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
   --ds4-fused-verify-f16-kv \
   --ds4-fused-decode
@@ -653,7 +653,7 @@ export DFLASH_DS4_SPEC_Q=4
 `--ds4-fused-verify-f16-kv` feeds the persistent F16 MLA cache directly to
 batched explicit or sparse verifier attention instead of converting the full
 cache to F32 on every speculative step. With
-`DFLASH_DS4_SPARSE_DECODE_FLASH=1`, the verifier keeps explicit attention for
+`LUCE_DS4_SPARSE_DECODE_FLASH=1`, the verifier keeps explicit attention for
 short histories. Single-lane or ratio-4 layouts switch to sparse attention
 once it removes more than half of the compressed rows. Other batched layouts
 retain explicit attention because coarse block selection does not preserve
@@ -693,7 +693,7 @@ tile boundaries; `bench_ds4_topk` separately measures selector timing.
 On gfx1151, dense/sparse approximate prefill also enables registry-aware
 mixed-ROCmFP MMQ automatically. The decision belongs to the model and its
 matmul operations, not the process environment, so a later exact-mode model
-keeps its existing dispatch. `DFLASH_DS4_MIX_MMQ_PREFILL=0` at model load is
+keeps its existing dispatch. `LUCE_DS4_MIX_MMQ_PREFILL=0` at model load is
 the kill switch. Other model integrations can reuse the graph-local
 `ggml_mul_mat_set_mixed_mmq` policy after qualifying their model and device.
 
@@ -702,7 +702,7 @@ latent row across wave32 heads. It supports F16 and F32 KV on native wave32
 devices. The compact-order F32 schedule below is HIP-only; CUDA retains its
 existing streaming policy. Maskless ratio-4 prefill selects the eligible path
 automatically; other indexed shapes remain opt-in with
-`DFLASH_DS4_DIRECT_INDEXER_TOPK=1` and `GGML_CUDA_MLA_STREAM_TOPK=1` and require
+`LUCE_DS4_DIRECT_INDEXER_TOPK=1` and `GGML_CUDA_MLA_STREAM_TOPK=1` and require
 a matched model output and throughput A/B. F16 uses online softmax without
 materializing scores; this changes floating-point association. HIP F32 instead
 groups eight heads to reuse key/value loads, computes each dot product in its
@@ -729,18 +729,18 @@ Indexed verifier attention with at most eight query rows also uses a two-way
 split-KV schedule on gfx1151. Set `GGML_CUDA_MLA_NO_SPLIT_KV=1` to restore the
 single-block schedule. For fused-verifier masks of at least 4 MiB, the runtime
 zeros the existing device tensor and transfers only its negative ranges; set
-`DFLASH_DS4_INCREMENTAL_VERIFY_MASK=0` to restore the full host transfer.
+`LUCE_DS4_INCREMENTAL_VERIFY_MASK=0` to restore the full host transfer.
 
 ROCmFP2 matvecs with three or more query rows reuse each activation across
-four output rows on gfx1151. Set `DFLASH_ROCMFP2_ROW4=0` to restore the two-row
+four output rows on gfx1151. Set `LUCE_ROCMFP2_ROW4=0` to restore the two-row
 schedule. Narrow F16 projections retain the shared MMVF dispatch policy.
 
-`DFLASH_DS4_FUSED_VERIFY=1` is the throughput profile; it is the default on `gfx1151` when `DFLASH_DS4_SPEC` is set and opt-in elsewhere. Its persistent
+`LUCE_DS4_FUSED_VERIFY=1` is the throughput profile; it is the default on `gfx1151` when `LUCE_DS4_SPEC` is set and opt-in elsewhere. Its persistent
 whole-model GPU graph uses stable padded reduction shapes, so near-tied greedy
 logits can select a different token than the normal causal verifier even at
 temperature 0. Leave it unset when comparing against the normal verifier, or
-set `DFLASH_DS4_SEQ_VERIFY=1` for the slower token-at-a-time verification
-diagnostic. `DFLASH_DS4_SPEC_REFERENCE_EXACT=1` combines sequential target
+set `LUCE_DS4_SEQ_VERIFY=1` for the slower token-at-a-time verification
+diagnostic. `LUCE_DS4_SPEC_REFERENCE_EXACT=1` combines sequential target
 verification with full rollback snapshots for byte-identity checks. Neither
 fused verification nor the separate
 `--ds4-expert-top-k 4` approximation should be presented as byte-identical AR.
@@ -811,12 +811,12 @@ slot rebuilt at the same address cannot replay the previous shape's executable.
 
 The required burn-in sequence is repeated requests at 2K, 4K, 8K, and 16K in
 one process, followed by another 2K request to force additional eviction. Run
-with `DFLASH_DS4_TP_FUSED_CACHE_SLOTS=2`; first qualify with forced replay
+with `LUCE_DS4_TP_FUSED_CACHE_SLOTS=2`; first qualify with forced replay
 unset, then repeat with it enabled as a separate performance A/B.
 
 ### Experimental AMD q=5 verifier
 
-`DFLASH_DS4_Q5_VERIFY=1` enables a five-row fused verifier on HIP. It handles
+`LUCE_DS4_Q5_VERIFY=1` enables a five-row fused verifier on HIP. It handles
 the shape that crosses two ratio-4 compressor boundaries, preserves five raw
 SWA rows for rollback, and restores plus replays only the accepted prefix after
 a partial rejection. q<=4 behavior is unchanged when the flag is absent.
@@ -858,13 +858,13 @@ a necessary prefill-arena growth; persistent HC mirrors remain resident.
 The exact qualification launch used:
 
 ```bash
-export DFLASH_DS4_Q5_VERIFY=1
-export DFLASH_DS4_SPEC_Q=5
-export DFLASH_EXPERT_BUDGET_MB=14350
-export DFLASH_DS4_HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv
-export DFLASH_DS4_TP_CRITICAL_PATH_PLACEMENT=1
-export DFLASH_DS4_TP_MAIN_TO_PEER_RATE=4.4
-export DFLASH_DS4_TP_BALANCE_MIN_HOT=0
+export LUCE_DS4_Q5_VERIFY=1
+export LUCE_DS4_SPEC_Q=5
+export LUCE_EXPERT_BUDGET_MB=14350
+export LUCE_DS4_HOTNESS_CSV=/path/to/ds4_moe_tp_hotness.csv
+export LUCE_DS4_TP_CRITICAL_PATH_PLACEMENT=1
+export LUCE_DS4_TP_MAIN_TO_PEER_RATE=4.4
+export LUCE_DS4_TP_BALANCE_MIN_HOT=0
 ```
 
 The checked-in wrapper reproduces the full exact-context protocol and records
@@ -902,7 +902,7 @@ For an overlap trace, run the same wrapper with the delayed profiler launcher:
 
 ```bash
 SERVER_BIN=harness/qualification/deepseek4/rocprof_server_wrapper.sh \
-PROFILED_SERVER_BIN=/path/to/dflash_server \
+PROFILED_SERVER_BIN=/path/to/luce_server \
 ROCPROF_OUTPUT_DIR=/path/to/trace-output \
 ROCPROF_START_SECONDS=180 \
 ROCPROF_DURATION_SECONDS=90 \
@@ -929,7 +929,7 @@ adding the two devices' headline bandwidths is not a valid throughput model
 because attention, routing, HC boundaries, and every layer join remain ordered.
 
 On HIP `gfx1151`, enabling DSpark installs the five-row fused verifier
-(`DFLASH_DS4_Q5_VERIFY=1`) and `LUCE_MMVQ_MAX_NCOLS=5` when the variables are
+(`LUCE_DS4_Q5_VERIFY=1`) and `LUCE_MMVQ_MAX_NCOLS=5` when the variables are
 unset, so the q5 verifier runs its projections on MMVQ; the plain launch below
 measures 39 tok/s at q5 on the code and math suites. The earlier four-row
 qualification is kept here for reference: with `LUCE_MMVQ_MAX_NCOLS=4` on a
@@ -948,18 +948,18 @@ DSpark alone therefore does not guarantee 30 tok/s. Set
 and other HIP architectures retain the shared dispatch default.
 
 Adaptive width defaults on for `gfx1151` DSpark serving and is opt-in
-elsewhere (`DFLASH_ADAPTIVE_SPEC_WIDTH=1`, or `DFLASH_DS4_ADAPTIVE_WIDTH=1`
+elsewhere (`LUCE_ADAPTIVE_SPEC_WIDTH=1`, or `LUCE_DS4_ADAPTIVE_WIDTH=1`
 for DS4 only). The width of every step, q2 to q5 on the q5 verifier, comes
 from the drafter's confidence head where the artifact carries one (three
 depths from the head, the fourth from target feedback, each depth calibrated
 online against the target's acceptance); artifacts without a head use the
-learned acceptance-and-cost policy. `DFLASH_DS4_CONFIDENCE_WIDTH=0` forces
-that fallback and `DFLASH_DS4_ADAPTIVE_WIDTH=0` restores a fixed width.
+learned acceptance-and-cost policy. `LUCE_DS4_CONFIDENCE_WIDTH=0` forces
+that fallback and `LUCE_DS4_ADAPTIVE_WIDTH=0` restores a fixed width.
 Re-run workload-level speed and quality checks before enabling it on another
 target or drafter.
 
-The qualified `gfx1151` launch is the plain one: `DFLASH_DS4_SPEC=1`,
-`DFLASH_DS4_DRAFT=<DSpark draft GGUF>`, the release CLI with `--chunk 8192`
+The qualified `gfx1151` launch is the plain one: `LUCE_DS4_SPEC=1`,
+`LUCE_DS4_DRAFT=<DSpark draft GGUF>`, the release CLI with `--chunk 8192`
 and a 128K context. Every kernel and policy default above is installed by the
 device profile at start, and the published Strix Halo numbers (8K 320 / 42
 prefill / decode tok/s, 123K 284 / 36, code and math suites 39 tok/s at q5,
@@ -975,7 +975,7 @@ configurations reject prefill compression at startup; paged serving cannot
 park a target while it owns live sequence state.
 
 ```bash
-./server/build-hip/dflash_server /path/to/deepseek4-target.gguf \
+./server/build-hip/luce_server /path/to/deepseek4-target.gguf \
   --target-device hip:0 \
   --prefill-compression auto \
   --prefill-drafter /path/to/Qwen3-0.6B-BF16.gguf \
@@ -1001,12 +1001,12 @@ be finite and in [0,1]; zero requests the scorer's minimum retained chunk.
 
 ## Example: CUDA + Halo Layer Split
 
-Automatic split (CUDA prefix chosen from free memory, optional manual override via `DFLASH_DS4_CUDA_LAYERS`):
+Automatic split (CUDA prefix chosen from free memory, optional manual override via `LUCE_DS4_CUDA_LAYERS`):
 
 ```bash
-export DFLASH_DS4_CUDA_LAYERS=24   # optional
+export LUCE_DS4_CUDA_LAYERS=24   # optional
 
-./server/build-cuda/dflash_server /opt/models/DeepSeek-V4-Flash.gguf \
+./server/build-cuda/luce_server /opt/models/DeepSeek-V4-Flash.gguf \
   --target-device cuda:0 \
   --target-shard-ipc-bin $PWD/server/build-hip/backend_ipc_daemon \
   --target-shard-ipc-work-dir $PWD/server/target_shard_ipc \
@@ -1016,7 +1016,7 @@ export DFLASH_DS4_CUDA_LAYERS=24   # optional
 Explicit mixed-backend split using the generic target-shard flags:
 
 ```bash
-./server/build-cuda/dflash_server /opt/models/DeepSeek-V4-Flash.gguf \
+./server/build-cuda/luce_server /opt/models/DeepSeek-V4-Flash.gguf \
   --target-devices cuda:0,hip:0 \
   --target-layer-split 24,19 \
   --target-shard-ipc-bin $PWD/server/build-hip/backend_ipc_daemon \
@@ -1031,12 +1031,12 @@ Explicit mixed-backend split using the generic target-shard flags:
 - **Decode has backend-specific HC paths**:
   - CUDA decode uses cached backend HC graphs.
   - HIP decode uses the direct HC-pre helper plus host-refreshed HC-post weights.
-- **Auto-split is only a heuristic**: override `DFLASH_DS4_CUDA_LAYERS` when you want a reproducible split or when empirical throughput differs from the simple memory estimate.
+- **Auto-split is only a heuristic**: override `LUCE_DS4_CUDA_LAYERS` when you want a reproducible split or when empirical throughput differs from the simple memory estimate.
 
 ## Build Targets
 
 | Target | Backend | Purpose |
 |--------|---------|---------|
-| `dflash_server` | CUDA or HIP | Production server |
+| `luce_server` | CUDA or HIP | Production server |
 | `backend_ipc_daemon` | HIP | Remote Halo target shard for mixed-backend layer split |
 | `test_deepseek4_unit` | CUDA | Unit tests (no model files needed) |

@@ -180,8 +180,8 @@ int ggml_cuda_get_device() {
 // this APU, so small models that fit stay on the faster hipMalloc path (verified:
 // 16GB model loads 3s / decodes 11.8 tok/s on hipMalloc vs 15s / 10.9 on managed).
 // The cached ggml_cuda_info().devices[].integrated is hard-forced false (#15034
-// dodge), so probe a FRESH cudaDeviceProp. Opt out: DFLASH_HIP_NO_AUTO_UMA=1.
-// Force-all: GGML_CUDA_ENABLE_UNIFIED_MEMORY. Tune gate: DFLASH_HIP_UMA_MIN_FRAC.
+// dodge), so probe a FRESH cudaDeviceProp. Opt out: LUCE_HIP_NO_AUTO_UMA=1.
+// Force-all: GGML_CUDA_ENABLE_UNIFIED_MEMORY. Tune gate: LUCE_HIP_UMA_MIN_FRAC.
 static size_t ggml_cuda_total_ram_bytes() {
     static const size_t cached = []() -> size_t {
         size_t bytes = 0;
@@ -203,7 +203,7 @@ static bool ggml_cuda_device_use_uma(int device, size_t size) {
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         return true;
     }
-    if (getenv("DFLASH_HIP_NO_AUTO_UMA") != nullptr) {
+    if (getenv("LUCE_HIP_NO_AUTO_UMA") != nullptr) {
         return false;
     }
     static const std::array<bool, GGML_CUDA_MAX_DEVICES> integrated = []() {
@@ -224,7 +224,7 @@ static bool ggml_cuda_device_use_uma(int device, size_t size) {
         return false; // unknown RAM: stay conservative on the legacy path
     }
     double frac = 0.45;
-    const char * fenv = getenv("DFLASH_HIP_UMA_MIN_FRAC");
+    const char * fenv = getenv("LUCE_HIP_UMA_MIN_FRAC");
     if (fenv != nullptr) {
         double v = atof(fenv);
         if (v > 0.0 && v < 1.0) { frac = v; }
@@ -233,7 +233,7 @@ static bool ggml_cuda_device_use_uma(int device, size_t size) {
     if (use) {
         GGML_LOG_INFO("ggml_cuda: device %d integrated, alloc %.1f GiB (> %.0f%% of %.1f GiB RAM) "
                       "-> unified (managed) memory; small models stay on hipMalloc "
-                      "(DFLASH_HIP_NO_AUTO_UMA=1 to disable)\n",
+                      "(LUCE_HIP_NO_AUTO_UMA=1 to disable)\n",
                       device, (double) size / 1073741824.0, frac * 100.0,
                       (double) total_ram / 1073741824.0);
     }
@@ -2595,7 +2595,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     // The affine MMVQ dot includes the offset correction in vecdotq.cuh.
     // Keep the conservative dequantize fallback unless explicitly enabled.
     if (src0->type == GGML_TYPE_Q2_0_ROCMFP2 &&
-        std::getenv("DFLASH_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
+        std::getenv("LUCE_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
         use_mul_mat_vec_q = false;
     }
 #endif // ROCMFP2_AFFINE
@@ -2865,11 +2865,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // throughput. The phase-scoped master switch still enables the qualified
     // paired gate/up fusion independently.
     if (src0->type == GGML_TYPE_Q2_0_ROCMFP2) {
-        if (std::getenv("DFLASH_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
+        if (std::getenv("LUCE_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
             use_mul_mat_vec_q = false;
         }
-        if (std::getenv("DFLASH_CUDA_MMQ_FP2_AFFINE") == nullptr ||
-            std::getenv("DFLASH_CUDA_MMQ_FP2_AFFINE_GENERAL") == nullptr) {
+        if (std::getenv("LUCE_CUDA_MMQ_FP2_AFFINE") == nullptr ||
+            std::getenv("LUCE_CUDA_MMQ_FP2_AFFINE_GENERAL") == nullptr) {
             use_mul_mat_q = false;
         }
     }
@@ -2921,10 +2921,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // catches the mul_mat_id per-expert slices (which re-enter here with a 105
     // src0 slice + f32 sorted tokens). Larger batches (prefill) fall through to
     // the dequant fallback. Returns false (=> fall through) if unregistered.
-    // DFLASH_MIX_FUSED=0 forces the dequant->cuBLAS fallback (A/B against the
+    // LUCE_MIX_FUSED=0 forces the dequant->cuBLAS fallback (A/B against the
     // fused path on the same binary). Default on.
     static const bool mix_fused_on = []() {
-        const char * e = getenv("DFLASH_MIX_FUSED");
+        const char * e = getenv("LUCE_MIX_FUSED");
         return e ? atoi(e) != 0 : true;
     }();
     if (mix_fused_on && is_rocmfp3_mix && !split
@@ -3038,7 +3038,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     static const bool mmid_telemetry = []() {
-        const char * value = std::getenv("DFLASH_MMID_TELEMETRY");
+        const char * value = std::getenv("LUCE_MMID_TELEMETRY");
         return value != nullptr && std::strcmp(value, "0") != 0;
     }();
     const int mmvq_mmid_max = ggml_is_quantized(src0->type)
@@ -3878,7 +3878,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
     static const bool mmid_telemetry = []() {
-        const char * value = std::getenv("DFLASH_MMID_TELEMETRY");
+        const char * value = std::getenv("LUCE_MMID_TELEMETRY");
         return value != nullptr && std::strcmp(value, "0") != 0;
     }();
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph

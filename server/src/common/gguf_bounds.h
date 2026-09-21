@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 // True iff the tensor's data region lies fully within the mapped file.
 //   data_off:   byte offset of the GGUF data section (gguf_get_data_offset)
@@ -68,4 +68,4 @@ inline std::string gguf_bounds_error(const std::string & what,
           "does not match the writer.";
 }
 
-} // namespace dflash::common
+} // namespace luce::common

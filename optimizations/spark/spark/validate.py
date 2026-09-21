@@ -61,17 +61,17 @@ def main():
     chunks = [json.loads(l) for l in open(args.corpus)][:args.n_chunks]
 
     env = dict(os.environ)
-    env["DFLASH_LAGUNA_PROFILE"] = "1"
+    env["LUCE_LAGUNA_PROFILE"] = "1"
     if not args.natural:
-        env["DFLASH_IGNORE_EOS"] = "1"
+        env["LUCE_IGNORE_EOS"] = "1"
     if args.budget_pct > 0:
-        env["DFLASH_EXPERT_BUDGET_PCT"] = str(args.budget_pct)
+        env["LUCE_EXPERT_BUDGET_PCT"] = str(args.budget_pct)
     if args.hotness:
-        env["DFLASH_LAGUNA_HOTNESS"] = args.hotness
+        env["LUCE_LAGUNA_HOTNESS"] = args.hotness
     if args.cache_slots > 0:
-        env["DFLASH_LAGUNA_GPU_REMAP"] = "1"
-        env["DFLASH_LAGUNA_EXPERT_CACHE"] = "1"
-        env["DFLASH_LAGUNA_CACHE_SLOTS"] = str(args.cache_slots)
+        env["LUCE_LAGUNA_GPU_REMAP"] = "1"
+        env["LUCE_LAGUNA_EXPERT_CACHE"] = "1"
+        env["LUCE_LAGUNA_CACHE_SLOTS"] = str(args.cache_slots)
 
     placement = []
     daemon = Daemon([args.bin, args.gguf, "--max-ctx", str(args.max_ctx)], env, capture_stderr=True)

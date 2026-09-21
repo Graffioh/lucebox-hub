@@ -20,7 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Consolidated double-bank factor pointers. Bank 0 and bank 1 alternate
 // between "pending" (consumed by the next verify / final flush) and "current"
@@ -118,4 +118,4 @@ bool specla_flush_pending_factors(const SpeclaFactorBanks & banks,
                                   int n_delta, int conv_channels, int d_conv,
                                   void * stream);
 
-}  // namespace dflash::common
+}  // namespace luce::common

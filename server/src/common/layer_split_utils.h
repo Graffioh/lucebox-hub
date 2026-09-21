@@ -12,7 +12,7 @@
 
 #include "ggml-backend.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 struct LayerSplitRange {
     int begin = 0;
@@ -104,4 +104,4 @@ void free_layer_split_snapshot_backends(
     const std::vector<LayerSplitShardMeta *> & shards,
     std::vector<ggml_backend_t> & snapshot_backends);
 
-}  // namespace dflash::common
+}  // namespace luce::common

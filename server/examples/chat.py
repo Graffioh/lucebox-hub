@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TARGET = Path(os.environ.get(
-    "DFLASH_TARGET",
+    "LUCE_TARGET",
     str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
 ))
 DRAFT_ROOT = ROOT / "models" / "draft"

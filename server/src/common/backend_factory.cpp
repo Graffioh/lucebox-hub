@@ -24,7 +24,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -39,23 +39,23 @@ namespace {
 // dispatch below actually *assigns* a field it has — that is what the unit
 // tests and the table's dispatch-matching row order are for.
 
-#define DFLASH_ARCH_FIELD_TRAIT(trait_name, field_name)                  \
+#define LUCE_ARCH_FIELD_TRAIT(trait_name, field_name)                  \
     template <class T, class = void>                                     \
     struct trait_name : std::false_type {};                              \
     template <class T>                                                   \
     struct trait_name<T, std::void_t<decltype(T::field_name)>>           \
         : std::true_type {}
 
-DFLASH_ARCH_FIELD_TRAIT(has_draft_path,        draft_path);
-DFLASH_ARCH_FIELD_TRAIT(has_draft_block_size,  draft_block_size);
-DFLASH_ARCH_FIELD_TRAIT(has_fa_window,         fa_window);
-DFLASH_ARCH_FIELD_TRAIT(has_verify_width,      verify_width);
-DFLASH_ARCH_FIELD_TRAIT(has_draft_swa,         draft_swa_window);
-DFLASH_ARCH_FIELD_TRAIT(has_ddtree_mode,       ddtree_mode);
-DFLASH_ARCH_FIELD_TRAIT(has_max_verify_tokens, max_verify_tokens);
-DFLASH_ARCH_FIELD_TRAIT(has_paged_attention,   paged_attention);
+LUCE_ARCH_FIELD_TRAIT(has_draft_path,        draft_path);
+LUCE_ARCH_FIELD_TRAIT(has_draft_block_size,  draft_block_size);
+LUCE_ARCH_FIELD_TRAIT(has_fa_window,         fa_window);
+LUCE_ARCH_FIELD_TRAIT(has_verify_width,      verify_width);
+LUCE_ARCH_FIELD_TRAIT(has_draft_swa,         draft_swa_window);
+LUCE_ARCH_FIELD_TRAIT(has_ddtree_mode,       ddtree_mode);
+LUCE_ARCH_FIELD_TRAIT(has_max_verify_tokens, max_verify_tokens);
+LUCE_ARCH_FIELD_TRAIT(has_paged_attention,   paged_attention);
 
-#undef DFLASH_ARCH_FIELD_TRAIT
+#undef LUCE_ARCH_FIELD_TRAIT
 
 // DDTree reaches qwen35's layer-split path as a max_verify_tokens budget
 // rather than a ddtree_mode flag, so either field counts as a carrier.
@@ -75,7 +75,7 @@ constexpr bool layer_split_carries(FeatureSupport support) {
     return support == FeatureSupport::Both;
 }
 
-#define DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, trait, field)        \
+#define LUCE_CHECK_ARCH_OPTION(arch_name, Mono, Split, trait, field)        \
     static_assert(                                                            \
         trait<Mono>::value ==                                                 \
             monolithic_carries(arch_capabilities(arch_name).field),           \
@@ -87,35 +87,35 @@ constexpr bool layer_split_carries(FeatureSupport support) {
         arch_name ": layer-split config and capability table disagree on "    \
         #field)
 
-#define DFLASH_CHECK_ARCH(arch_name, Mono, Split)                             \
-    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_draft_path,   decode_draft); \
-    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_ddtree,       ddtree);       \
-    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_verify_width, verify_width); \
-    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_fa_window,    fa_window);    \
-    DFLASH_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_draft_swa,    draft_swa)
+#define LUCE_CHECK_ARCH(arch_name, Mono, Split)                             \
+    LUCE_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_draft_path,   decode_draft); \
+    LUCE_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_ddtree,       ddtree);       \
+    LUCE_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_verify_width, verify_width); \
+    LUCE_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_fa_window,    fa_window);    \
+    LUCE_CHECK_ARCH_OPTION(arch_name, Mono, Split, has_draft_swa,    draft_swa)
 
-DFLASH_CHECK_ARCH("qwen35",    Qwen35Config,          Qwen35LayerSplitAdapterConfig);
-DFLASH_CHECK_ARCH("qwen35moe", Qwen35Config,          NoLayerSplitConfig);
-DFLASH_CHECK_ARCH("bailingmoe3", BailingMoe3Config,   NoLayerSplitConfig);
-DFLASH_CHECK_ARCH("laguna",    LagunaBackendArgs,     LagunaLayerSplitAdapterConfig);
-DFLASH_CHECK_ARCH("qwen3",     Qwen3BackendConfig,    NoLayerSplitConfig);
-DFLASH_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfig);
-DFLASH_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
+LUCE_CHECK_ARCH("qwen35",    Qwen35Config,          Qwen35LayerSplitAdapterConfig);
+LUCE_CHECK_ARCH("qwen35moe", Qwen35Config,          NoLayerSplitConfig);
+LUCE_CHECK_ARCH("bailingmoe3", BailingMoe3Config,   NoLayerSplitConfig);
+LUCE_CHECK_ARCH("laguna",    LagunaBackendArgs,     LagunaLayerSplitAdapterConfig);
+LUCE_CHECK_ARCH("qwen3",     Qwen3BackendConfig,    NoLayerSplitConfig);
+LUCE_CHECK_ARCH("gemma4",    Gemma4BackendConfig,   Gemma4LayerSplitAdapterConfig);
+LUCE_CHECK_ARCH("deepseek4", DeepSeek4BackendConfig, DeepSeek4LayerSplitAdapterConfig);
 
 // These sit outside the bundle because the field-presence trait cannot
 // separate qwen35 from qwen35moe: they share Qwen35Config, while the factory
 // forwards both fields only for dense qwen35. Pairing the MoE Never rows with
 // that shared struct would fail a check that is really about dispatch.
-DFLASH_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
+LUCE_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
                          has_paged_attention, paged_attn);
-DFLASH_CHECK_ARCH_OPTION("deepseek4", DeepSeek4BackendConfig,
+LUCE_CHECK_ARCH_OPTION("deepseek4", DeepSeek4BackendConfig,
                          DeepSeek4LayerSplitAdapterConfig,
                          has_paged_attention, paged_attn);
-DFLASH_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
+LUCE_CHECK_ARCH_OPTION("qwen35", Qwen35Config, Qwen35LayerSplitAdapterConfig,
                          has_draft_block_size, draft_block_size);
 
-#undef DFLASH_CHECK_ARCH
-#undef DFLASH_CHECK_ARCH_OPTION
+#undef LUCE_CHECK_ARCH
+#undef LUCE_CHECK_ARCH_OPTION
 
 // Every config retained by a backend or adapter owns its path storage.
 // Borrowed C strings are confined to immediate loader and C API calls.
@@ -173,8 +173,8 @@ std::unique_ptr<ModelBackend> construct_backend(
             cfg.draft_ctx_max      = cache.draft_ctx_max;
             cfg.chunk              = execution.chunk;
             cfg.max_verify_tokens  = speculation.ddtree_mode
-                ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, speculation.ddtree_budget + 1)
-                : DFLASH27B_DRAFT_BLOCK_SIZE;
+                ? std::max<int>(LUCE_DRAFT_BLOCK_SIZE, speculation.ddtree_budget + 1)
+                : LUCE_DRAFT_BLOCK_SIZE;
             cfg.run_dflash         = speculation.draft_path.has_value();
 
             auto adapter = std::make_unique<Qwen35LayerSplitAdapter>(
@@ -439,4 +439,4 @@ std::unique_ptr<ModelBackend> create_backend(const BackendPlan & plan) {
     return construct_backend(plan);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

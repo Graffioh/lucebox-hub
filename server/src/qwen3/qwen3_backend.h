@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen3BackendConfig {
     std::string     model_path;
@@ -144,4 +144,4 @@ private:
     std::vector<float> last_logits_;  // logits from last prefill chunk
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -25,7 +25,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Host-side decode state persisted next to the cache tensors so an adopted
 // (deserialized) snapshot resumes exactly like an in-memory one.
@@ -113,4 +113,4 @@ bool deepseek4_snapshot_validate(const DeepSeek4Weights & w,
 
 void free_deepseek4_snapshot(DeepSeek4Snapshot & s);
 
-}  // namespace dflash::common
+}  // namespace luce::common

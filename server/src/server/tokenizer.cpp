@@ -16,7 +16,7 @@
 #include <limits>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── Unicode helpers ────────────────────────────────────────────────────
 
@@ -813,4 +813,4 @@ int32_t Tokenizer::token_to_id(const std::string & token) const {
     return it != token_to_id_.end() ? it->second : -1;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

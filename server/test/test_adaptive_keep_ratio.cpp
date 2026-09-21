@@ -6,7 +6,7 @@
 #include <cmath>
 #include <string>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 struct AdaptiveKeepRatioFixture {};

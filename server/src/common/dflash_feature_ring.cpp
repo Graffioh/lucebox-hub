@@ -19,7 +19,7 @@ extern "C++" to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
 #include "gpu_runtime_compat.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 // ── internal helpers ────────────────────────────────────────────
 
@@ -54,7 +54,7 @@ static bool ensure_staging(DraftFeatureMirror & mirror, size_t bytes) {
 }
 
 static ggml_type parse_feature_dtype() {
-    const char * s = std::getenv("DFLASH_FEATURE_DTYPE");
+    const char * s = std::getenv("LUCE_FEATURE_DTYPE");
     if (!s || !s[0] || std::strcmp(s, "f32") == 0 || std::strcmp(s, "F32") == 0) {
         return GGML_TYPE_F32;
     }
@@ -68,7 +68,7 @@ static ggml_type parse_feature_dtype() {
         std::strcmp(s, "q8") == 0 || std::strcmp(s, "Q8") == 0) {
         return GGML_TYPE_Q8_0;
     }
-    std::fprintf(stderr, "[dflash-feature] ignoring unsupported DFLASH_FEATURE_DTYPE=%s\n", s);
+    std::fprintf(stderr, "[dflash-feature] ignoring unsupported LUCE_FEATURE_DTYPE=%s\n", s);
     return GGML_TYPE_F32;
 }
 
@@ -629,4 +629,4 @@ bool copy_host_f32_to_feature_ring_range(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

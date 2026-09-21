@@ -70,7 +70,7 @@ class SyntheticRunnerGpuProofTests(unittest.TestCase):
             key: value
             for key, value in os.environ.items()
             if not re.match(
-                r"^(GGML_|DFLASH_|LUCE_|HIP_|ROCR_|HSA_|LD_PRELOAD$|LD_LIBRARY_PATH$)",
+                r"^(GGML_|LUCE_|LUCE_|HIP_|ROCR_|HSA_|LD_PRELOAD$|LD_LIBRARY_PATH$)",
                 key,
             )
         }

@@ -12,7 +12,7 @@
 //
 // ctx_len defaults to 64 to keep the first run tiny.
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "internal.h"
 #include "draft_graph.h"
 
@@ -30,7 +30,7 @@
 #include <random>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 // Convert fp32 -> bf16 (truncation)
 static uint16_t f32_to_bf16(float f) {
@@ -52,9 +52,9 @@ int main(int argc, char ** argv) {
     }
     const char * path = argv[1];
     const int ctx_len = (argc >= 3) ? std::atoi(argv[2]) : 64;
-    const int q_len   = DFLASH27B_DRAFT_BLOCK_SIZE;      // 16
-    const int hidden  = DFLASH27B_TARGET_HIDDEN;         // 5120
-    const int fc_in   = DFLASH27B_DRAFT_N_TARGET_LAYERS * hidden;  // 25600
+    const int q_len   = LUCE_DRAFT_BLOCK_SIZE;      // 16
+    const int hidden  = LUCE_TARGET_HIDDEN;         // 5120
+    const int fc_in   = LUCE_DRAFT_N_TARGET_LAYERS * hidden;  // 25600
 
     std::printf("ctx_len=%d q_len=%d hidden=%d fc_in=%d\n", ctx_len, q_len, hidden, fc_in);
 
@@ -64,7 +64,7 @@ int main(int argc, char ** argv) {
 
     DraftWeights w;
     if (!load_draft_safetensors(path, backend, w)) {
-        std::fprintf(stderr, "load: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load: %s\n", luce_last_error());
         return 1;
     }
     std::printf("draft loaded\n");

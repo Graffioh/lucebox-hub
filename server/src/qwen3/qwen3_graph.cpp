@@ -7,10 +7,10 @@
 //
 // **Algorithmic note vs blog**:
 //   The blog stack is Liu Q-hook tail scoring + FlashPrefill block-sparse FA.
-//   The Liu Q-hook is implemented with a NoPE fix: by default (DFLASH_FP_NOPE_TAIL=1)
+//   The Liu Q-hook is implemented with a NoPE fix: by default (LUCE_FP_NOPE_TAIL=1)
 //   the tail score uses pre-RoPE K/Q, removing the RoPE distance decay that
 //   buries early-position needle chunks and was causing NIAH failures.
-//   Set DFLASH_FP_NOPE_TAIL=0 to revert to post-RoPE scoring.  The block-sparse FA is replaced
+//   Set LUCE_FP_NOPE_TAIL=0 to revert to post-RoPE scoring.  The block-sparse FA is replaced
 //   with a sliding-window approximation here because (a) ggml-cuda's
 //   `flash_attn_ext` already gives tensor-core speed inside the ubatch
 //   graph, and (b) our own block-sparse CUDA kernel needs a tensor-core
@@ -54,18 +54,18 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
 constexpr int FA_WINDOW  = 512;
 
 int chunk_s_ff() {
-    if (const char * e = std::getenv("DFLASH_FP_CHUNK_S")) {
+    if (const char * e = std::getenv("LUCE_FP_CHUNK_S")) {
         int v = std::atoi(e);
         if (v >= 1024) return v;
     }
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
     return 1024;
 #else
     return 4096;
@@ -126,7 +126,7 @@ void free_hip_chunk_graph_b(HipChunkGraphB & g) {
     g = {};
 }
 
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
 bool build_hip_chunk_graph_b(const Qwen3DrafterLayer & L,
                              ggml_backend_t backend,
                              int hidden,
@@ -213,7 +213,7 @@ inline uint16_t f32_to_f16(float f) {
 
 } // namespace
 
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
 extern "C" void launch_rms_norm_mul_w_f32(
     const float * src, const float * w, float * dst,
     int n_tokens, int hidden, float eps,
@@ -245,9 +245,9 @@ bool forward_qwen3_drafter_model(
     const float scale  = 1.0f / std::sqrt((float)D);
     const float rope_b = w.rope_theta;
     // Pre-RoPE tail scoring: removes RoPE distance decay from the score signal.
-    // Default ON; set DFLASH_FP_NOPE_TAIL=0 to disable (saves ~K_curr_v memory).
+    // Default ON; set LUCE_FP_NOPE_TAIL=0 to disable (saves ~K_curr_v memory).
     static const bool nope_tail = []() -> bool {
-        const char * e = std::getenv("DFLASH_FP_NOPE_TAIL");
+        const char * e = std::getenv("LUCE_FP_NOPE_TAIL");
         return e == nullptr || std::string(e) != "0";
     }();
 
@@ -406,13 +406,13 @@ bool forward_qwen3_drafter_model(
         ggml_backend_get_default_buffer_type(w.backend));
 
     flashprefill::FlashPrefillConfig fp_cfg;
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
     // The HIP sparse-forward kernel is much slower when FlashPrefill keeps a
     // broad set of K blocks. Use a stricter default on ROCm; callers can still
-    // override with DFLASH_FP_ALPHA for quality/speed sweeps.
+    // override with LUCE_FP_ALPHA for quality/speed sweeps.
     fp_cfg.alpha = 0.95f;
 #endif
-    if (const char* a = std::getenv("DFLASH_FP_ALPHA")) {
+    if (const char* a = std::getenv("LUCE_FP_ALPHA")) {
         float v = (float)std::atof(a);
         if (v > 0.0f && v < 1.0f) fp_cfg.alpha = v;
     }
@@ -427,7 +427,7 @@ bool forward_qwen3_drafter_model(
     for (int il = 0; il < fwd_layer_limit; ++il) {
         const auto & L = w.layers[il];
         const size_t layer_cache_idx = buffer_plan.layer_cache_index(il);
-        const bool debug_first_layer = (il == 0 && std::getenv("DFLASH_FP_DEBUG_LAYER0") != nullptr);
+        const bool debug_first_layer = (il == 0 && std::getenv("LUCE_FP_DEBUG_LAYER0") != nullptr);
 
         // ── Graph A (chunked): norm + Q/K/V proj + RoPE + copy to persistent K_curr/V_curr/Q_buf ──
         // ggml-cuda RoPE/element-wise kernels hit `invalid configuration argument` when
@@ -598,7 +598,7 @@ bool forward_qwen3_drafter_model(
         }
 
         // ── Graph B (chunked, reusable): o_proj + residual + ffn + write hidden_buf ──
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
         auto tB_setup0 = std::chrono::steady_clock::now();
         HipChunkGraphB gb{};
         if (!build_hip_chunk_graph_b(L, w.backend, hidden, D * H, chunk_s_ff_v, w.compute_type, eps, gb)) {
@@ -903,4 +903,4 @@ bool forward_qwen3_drafter_model(
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -2083,11 +2083,11 @@ static __global__ void paged_attn_wmma(
         }
     }
 }
-// Launcher for the stage-1 WMMA paged kernel. Env-gated (DFLASH27B_PAGED_WMMA,
+// Launcher for the stage-1 WMMA paged kernel. Env-gated (LUCE_PAGED_WMMA,
 // default off); falls back to the V_DOT2 kernel when disabled or ineligible.
 static bool try_launch_paged_attn_wmma(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     static const bool enabled = []() {
-        const char * e = getenv("DFLASH27B_PAGED_WMMA");
+        const char * e = getenv("LUCE_PAGED_WMMA");
         return e && atoi(e) != 0;
     }();
     if (!enabled) {

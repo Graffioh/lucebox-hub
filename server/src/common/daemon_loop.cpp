@@ -28,7 +28,7 @@
 #define ssize_t long
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 // ── DaemonIO ────────────────────────────────────────────────────────────
 
@@ -470,4 +470,4 @@ int run_daemon(ModelBackend & backend, const DaemonLoopArgs & args) {
     return 0;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

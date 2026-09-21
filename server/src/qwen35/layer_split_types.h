@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ── Per-GPU qwen35 shard for layer-split target ─────────────────────
 
@@ -56,4 +56,4 @@ struct Qwen35SplitCaptureStats {
     }
 };
 
-} // namespace dflash::common
+} // namespace luce::common

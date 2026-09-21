@@ -29,7 +29,7 @@
 #include <regex>
 #include <sstream>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
@@ -1793,4 +1793,4 @@ ToolParseResult parse_tool_calls(const std::string & text, const json & tools) {
     return result;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

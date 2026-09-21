@@ -7,7 +7,7 @@
 #include <cstdlib>
 #include <stdexcept>
 
-using dflash::common::BlockingRowPool;
+using luce::common::BlockingRowPool;
 using namespace CppUnitTestFramework;
 struct BlockingRowPoolFixture : CommonFixture {
     using CommonFixture::CommonFixture;
@@ -21,7 +21,7 @@ static int iterations(int normal, int stress) {
     // 100k-job soak exceed its timeout. The deterministic generation test
     // below proves the race independently of iteration count. Keep the full
     // soak available for sanitizer runs and dedicated hosts.
-    return std::getenv("DFLASH_ROW_POOL_STRESS") ? stress : normal;
+    return std::getenv("LUCE_ROW_POOL_STRESS") ? stress : normal;
 }
 
 static void mixed_widths(unsigned workers) {

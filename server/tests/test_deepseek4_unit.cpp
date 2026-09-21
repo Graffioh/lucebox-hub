@@ -47,7 +47,7 @@
 #include "deepseek4/deepseek4_layer_split_adapter.h"
 #undef private
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static int g_failures = 0;
 
@@ -1571,26 +1571,26 @@ static void test_verify_raw_mask_spans() {
 static void test_failed_init_preserves_sparse_opt_in() {
     std::fprintf(stderr, "  test_failed_init_preserves_sparse_opt_in ...\n");
     if (ggml_backend_cuda_get_device_count() == 0) return;
-    ScopedEnvVar spec("DFLASH_DS4_SPEC");
-    ScopedEnvVar draft("DFLASH_DS4_DRAFT");
-    ScopedEnvVar sparse("DFLASH_DS4_SPARSE_DECODE_FLASH");
+    ScopedEnvVar spec("LUCE_DS4_SPEC");
+    ScopedEnvVar draft("LUCE_DS4_DRAFT");
+    ScopedEnvVar sparse("LUCE_DS4_SPARSE_DECODE_FLASH");
     ScopedEnvVar mmvq("LUCE_MMVQ_MAX_NCOLS");
-    setenv("DFLASH_DS4_SPEC", "1", 1);
-    unsetenv("DFLASH_DS4_DRAFT");
+    setenv("LUCE_DS4_SPEC", "1", 1);
+    unsetenv("LUCE_DS4_DRAFT");
     // The removed gfx1151 auto-enable ran in init() BEFORE load_model().
     // Deliberately fail at model loading: even a failed init with no drafter
     // must not change process-wide sparse-verifier policy for the next model.
     // This tests early-init side effects, not successful verifier construction.
     const std::string missing_model = make_temp_gguf_path("missing");
     for (const char * value : {static_cast<const char *>(nullptr), "0", "1"}) {
-        if (value) setenv("DFLASH_DS4_SPARSE_DECODE_FLASH", value, 1);
-        else unsetenv("DFLASH_DS4_SPARSE_DECODE_FLASH");
+        if (value) setenv("LUCE_DS4_SPARSE_DECODE_FLASH", value, 1);
+        else unsetenv("LUCE_DS4_SPARSE_DECODE_FLASH");
         DeepSeek4BackendConfig cfg;
         cfg.model_path = missing_model.c_str();
         cfg.device.gpu = 0;
         DeepSeek4Backend backend(cfg);
         TEST_ASSERT(!backend.init());
-        const char * actual = std::getenv("DFLASH_DS4_SPARSE_DECODE_FLASH");
+        const char * actual = std::getenv("LUCE_DS4_SPARSE_DECODE_FLASH");
         TEST_ASSERT(value ? actual && std::strcmp(actual, value) == 0 : !actual);
     }
 }
@@ -1598,11 +1598,11 @@ static void test_failed_init_preserves_sparse_opt_in() {
 static void test_failed_init_preserves_mix_mmq_policy() {
     std::fprintf(stderr, "  test_failed_init_preserves_mix_mmq_policy ...\n");
     if (ggml_backend_cuda_get_device_count() == 0) return;
-    ScopedEnvVar saved("DFLASH_DS4_MIX_MMQ_PREFILL");
+    ScopedEnvVar saved("LUCE_DS4_MIX_MMQ_PREFILL");
     const std::string missing_model = make_temp_gguf_path("missing-mix-policy");
     for (const char * value : {static_cast<const char *>(nullptr), "0", "1"}) {
-        if (value) setenv("DFLASH_DS4_MIX_MMQ_PREFILL", value, 1);
-        else unsetenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+        if (value) setenv("LUCE_DS4_MIX_MMQ_PREFILL", value, 1);
+        else unsetenv("LUCE_DS4_MIX_MMQ_PREFILL");
         for (auto mode : {PrefillAttentionMode::Sparse, PrefillAttentionMode::Exact}) {
             DeepSeek4BackendConfig cfg;
             cfg.model_path = missing_model.c_str();
@@ -1610,7 +1610,7 @@ static void test_failed_init_preserves_mix_mmq_policy() {
             cfg.prefill_mode = mode;
             DeepSeek4Backend backend(cfg);
             TEST_ASSERT(!backend.init());
-            const char * actual = std::getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+            const char * actual = std::getenv("LUCE_DS4_MIX_MMQ_PREFILL");
             TEST_ASSERT(value ? actual && std::strcmp(actual, value) == 0 : !actual);
         }
     }
@@ -1671,13 +1671,13 @@ static bool init_snapshot_test_shard(DeepSeek4LayerSplitAdapter & adapter) {
 static void test_auto_split_computation() {
     std::fprintf(stderr, "  test_auto_split_computation ...");
 
-    ScopedEnvVar env_guard("DFLASH_DS4_CUDA_LAYERS");
+    ScopedEnvVar env_guard("LUCE_DS4_CUDA_LAYERS");
     auto adapter = make_test_adapter();
 
-    setenv("DFLASH_DS4_CUDA_LAYERS", "17", 1);
+    setenv("LUCE_DS4_CUDA_LAYERS", "17", 1);
     TEST_ASSERT(adapter.compute_auto_split_layers() == 17);
 
-    unsetenv("DFLASH_DS4_CUDA_LAYERS");
+    unsetenv("LUCE_DS4_CUDA_LAYERS");
     const int estimated =
         DeepSeek4LayerSplitAdapter::estimate_cuda_layers_from_free_bytes(
             20ULL * 1024 * 1024 * 1024);
@@ -1918,9 +1918,9 @@ static void test_loader_rejects_missing_required_metadata(ggml_backend_t backend
     DeepSeek4Weights weights;
     const bool ok = load_deepseek4_gguf(path, backend, weights);
     TEST_ASSERT(!ok);
-    TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
+    TEST_ASSERT_MSG(std::string(luce_last_error()).find(
                         "missing required key: deepseek4.vocab_size") != std::string::npos,
-                    dflash27b_last_error());
+                    luce_last_error());
     free_deepseek4_weights(weights);
     unlink(path.c_str());
 
@@ -1937,9 +1937,9 @@ static void test_loader_rejects_invalid_compress_ratio_type(ggml_backend_t backe
     DeepSeek4Weights weights;
     const bool ok = load_deepseek4_gguf(path, backend, weights);
     TEST_ASSERT(!ok);
-    TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
+    TEST_ASSERT_MSG(std::string(luce_last_error()).find(
                         "deepseek4.attention.compress_ratios array element type must be i32 or u32") != std::string::npos,
-                    dflash27b_last_error());
+                    luce_last_error());
     free_deepseek4_weights(weights);
     unlink(path.c_str());
 
@@ -1955,9 +1955,9 @@ static void test_loader_rejects_zero_vocab_size(ggml_backend_t backend) {
     DeepSeek4Weights weights;
     const bool ok = load_deepseek4_gguf(path, backend, weights);
     TEST_ASSERT(!ok);
-    TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
+    TEST_ASSERT_MSG(std::string(luce_last_error()).find(
                         "deepseek4.vocab_size must be > 0") != std::string::npos,
-                    dflash27b_last_error());
+                    luce_last_error());
     free_deepseek4_weights(weights);
     unlink(path.c_str());
 
@@ -1973,7 +1973,7 @@ static void test_loader_reads_tokenizer_special_ids(ggml_backend_t backend) {
     const std::string path = write_deepseek4_loader_fixture(opts);
     DeepSeek4Weights weights;
     const bool ok = load_deepseek4_gguf(path, backend, weights);
-    TEST_ASSERT_MSG(ok, dflash27b_last_error());
+    TEST_ASSERT_MSG(ok, luce_last_error());
     if (ok) {
         TEST_ASSERT(weights.eos_id == 151645);
         TEST_ASSERT(weights.eos_chat_id == 151643);
@@ -1994,7 +1994,7 @@ static void test_loader_rejects_truncated_tensor_data(ggml_backend_t backend) {
     {
         DeepSeek4Weights weights;
         const bool ok = load_deepseek4_gguf(path, backend, weights);
-        TEST_ASSERT_MSG(ok, dflash27b_last_error());
+        TEST_ASSERT_MSG(ok, luce_last_error());
         free_deepseek4_weights(weights);
     }
 
@@ -2008,9 +2008,9 @@ static void test_loader_rejects_truncated_tensor_data(ggml_backend_t backend) {
         DeepSeek4Weights weights;
         const bool ok = load_deepseek4_gguf(path, backend, weights);
         TEST_ASSERT(!ok);
-        TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
+        TEST_ASSERT_MSG(std::string(luce_last_error()).find(
                             "truncated or corrupt") != std::string::npos,
-                        dflash27b_last_error());
+                        luce_last_error());
         free_deepseek4_weights(weights);
     }
     unlink(path.c_str());
@@ -2216,7 +2216,7 @@ static void test_pflash_failed_load_releases_backend() {
     TEST_ASSERT(backend.pflash_drafter_ctx_.backend == nullptr);
     TEST_ASSERT(backend.pflash_drafter_ctx_.gpu == -1);
     // Also keep a failing baseline run leak-free.
-    dflash::common::free_drafter(backend.pflash_drafter_ctx_);
+    luce::common::free_drafter(backend.pflash_drafter_ctx_);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -2549,7 +2549,7 @@ static void test_dspark_chain_graph_cache_generation(ggml_backend_t backend) {
         return tokens;
     };
     const char * kill_switch =
-        std::getenv("DFLASH_DSPARK_NO_CHAIN_GRAPH_CACHE");
+        std::getenv("LUCE_DSPARK_NO_CHAIN_GRAPH_CACHE");
     const bool cache_enabled = !kill_switch || !*kill_switch ||
                                std::strcmp(kill_switch, "0") == 0;
 
@@ -2838,7 +2838,7 @@ static bool all_snapshot_tensors_named(ggml_context * ctx, size_t * count_out) {
 }
 
 static std::string make_test_disk_cache_dir(const char * tag) {
-    return "/tmp/dflash_test_ds4_disk_" + std::string(tag) + "_" +
+    return "/tmp/luce_test_ds4_disk_" + std::string(tag) + "_" +
            std::to_string((long) getpid());
 }
 

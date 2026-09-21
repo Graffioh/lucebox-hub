@@ -1,7 +1,7 @@
 // Shared types for the server components.
 #pragma once
 
-namespace dflash::common {
+namespace luce::common {
 
 enum class ApiFormat { OPENAI_CHAT, ANTHROPIC, RESPONSES, COMPLETIONS };
 
@@ -17,4 +17,4 @@ inline const char * api_format_name(ApiFormat format) {
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

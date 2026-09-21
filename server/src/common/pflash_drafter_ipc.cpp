@@ -6,7 +6,7 @@
 #include <cmath>
 #include <cstdio>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool PFlashDrafterIpcClient::start(
         const std::string & bin,
@@ -92,4 +92,4 @@ void PFlashDrafterIpcClient::close() {
     active_ = false;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -18,9 +18,9 @@
 #include <unistd.h>
 #endif
 
-using namespace dflash::common;
+using namespace luce::common;
 
-#if !defined(_WIN32) && defined(DFLASH27B_BACKEND_HIP)
+#if !defined(_WIN32) && defined(LUCE_BACKEND_HIP)
 std::vector<std::string> interposed_events;
 
 extern "C" int roctxRangePushA(const char * message) {
@@ -256,7 +256,7 @@ void test_disabled_loader_is_silent_and_unopened() {
     CHECK(loader_diagnostic_calls == 0);
 }
 
-#if !defined(_WIN32) && defined(DFLASH27B_BACKEND_HIP)
+#if !defined(_WIN32) && defined(LUCE_BACKEND_HIP)
 constexpr const char * roctx_interposition_child_arg =
     "--roctx-interposition-child";
 
@@ -280,7 +280,7 @@ void test_runtime_loader_prefers_interposed_roctx_symbols(
     CHECK(child >= 0);
     if (child < 0) return;
     if (child == 0) {
-        if (setenv("DFLASH_DS4_ROCTX", "1", 1) != 0) _exit(125);
+        if (setenv("LUCE_DS4_ROCTX", "1", 1) != 0) _exit(125);
         execlp(executable, executable, roctx_interposition_child_arg,
                static_cast<char *>(nullptr));
         _exit(126);
@@ -415,7 +415,7 @@ void test_missing_callback_is_silent() {
 int main(int argc, char ** argv) {
     (void) argc;
     (void) argv;
-#if !defined(_WIN32) && defined(DFLASH27B_BACKEND_HIP)
+#if !defined(_WIN32) && defined(LUCE_BACKEND_HIP)
     if (argc == 2 &&
         std::string(argv[1]) == roctx_interposition_child_arg) {
         return run_runtime_loader_interposition_child() ? 0 : 1;
@@ -427,7 +427,7 @@ int main(int argc, char ** argv) {
 #if !defined(_WIN32)
     test_malformed_phases_do_not_desynchronize_pipe();
 #endif
-#if !defined(_WIN32) && defined(DFLASH27B_BACKEND_HIP)
+#if !defined(_WIN32) && defined(LUCE_BACKEND_HIP)
     test_runtime_loader_prefers_interposed_roctx_symbols(argv[0]);
 #endif
     test_disabled_loader_is_silent_and_unopened();

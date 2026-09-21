@@ -57,7 +57,7 @@
 #include "common/sampler.h"
 #include "prefix_store.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 // Model-neutral prefill planning for continuous batching. The scheduler owns
 // arrival order and fairness; the engine advertises the useful work envelope
@@ -467,4 +467,4 @@ inline std::string validate_step_result(
     return {};
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

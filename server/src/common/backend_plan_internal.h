@@ -2,7 +2,7 @@
 
 #include "backend_factory.h"
 
-namespace dflash::common::detail {
+namespace luce::common::detail {
 
 // Pure planning seam used by prepare_backend() after GGUF inspection and by
 // model-free tests with supplied model facts.
@@ -15,4 +15,4 @@ public:
         PlacementBackend compiled_backend);
 };
 
-}  // namespace dflash::common::detail
+}  // namespace luce::common::detail

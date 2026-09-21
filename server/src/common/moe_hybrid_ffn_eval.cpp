@@ -18,7 +18,7 @@
 #include <memory>
 #include <mutex>
 
-namespace dflash::common {
+namespace luce::common {
 
 static ggml_tensor * mixed_mmq(ggml_tensor * op, ggml_mixed_mmq_policy policy) {
     ggml_mul_mat_set_mixed_mmq(op, policy);
@@ -70,20 +70,20 @@ static const char * moe_policy_env(const char * name, const char * legacy_name) 
 static bool heterogeneous_prefill_eager_enabled(
         bool persistent_owner_alloc = false) {
     const char * raw = moe_policy_env(
-        "DFLASH_MOE_HYBRID_PREFILL_EAGER", "DFLASH_DS4_HYBRID_PREFILL_EAGER");
+        "LUCE_MOE_HYBRID_PREFILL_EAGER", "LUCE_DS4_HYBRID_PREFILL_EAGER");
     if (!raw || !*raw) return persistent_owner_alloc;
     return std::strcmp(raw, "0") != 0;
 }
 
 static bool heterogeneous_prefill_trace_enabled() {
     const char * raw = moe_policy_env(
-        "DFLASH_MOE_PREFILL_TRACE", "DFLASH_DS4_PREFILL_TRACE");
+        "LUCE_MOE_PREFILL_TRACE", "LUCE_DS4_PREFILL_TRACE");
     return raw && *raw && std::strcmp(raw, "0") != 0;
 }
 
 static bool prefill_masked_cold_routes_enabled() {
     static const bool enabled = []() {
-        const char * raw = std::getenv("DFLASH_MOE_PREFILL_MASKED_COLD");
+        const char * raw = std::getenv("LUCE_MOE_PREFILL_MASKED_COLD");
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -104,7 +104,7 @@ static bool backend_is_gpu(ggml_backend_t backend) {
 
 static bool compact_materialized_experts_enabled() {
     static const bool enabled = [] {
-        const char * raw = std::getenv("DFLASH_MOE_COMPACT_MATERIALIZED");
+        const char * raw = std::getenv("LUCE_MOE_COMPACT_MATERIALIZED");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -119,26 +119,26 @@ const MoeHybridGraphPolicy & moe_hybrid_graph_policy() {
     static const MoeHybridGraphPolicy policy = [] {
         MoeHybridGraphPolicy result;
         result.grouped_mmvq = moe_policy_flag(
-            "DFLASH_MOE_TP_GROUPED_MMVQ", "DFLASH_DS4_TP_GROUPED_MMVQ");
-        result.fused_combine = moe_policy_flag("DFLASH_MOE_FUSED_COMBINE");
+            "LUCE_MOE_TP_GROUPED_MMVQ", "LUCE_DS4_TP_GROUPED_MMVQ");
+        result.fused_combine = moe_policy_flag("LUCE_MOE_FUSED_COMBINE");
         result.fused_gate_up = moe_policy_flag(
-            "DFLASH_MOE_TP_FUSED_GATE_UP", "DFLASH_DS4_TP_FUSED_GATE_UP");
+            "LUCE_MOE_TP_FUSED_GATE_UP", "LUCE_DS4_TP_FUSED_GATE_UP");
         result.coarse_owner = moe_policy_flag(
-            "DFLASH_MOE_TP_COARSE_OWNER", "DFLASH_DS4_TP_COARSE_OWNER");
+            "LUCE_MOE_TP_COARSE_OWNER", "LUCE_DS4_TP_COARSE_OWNER");
         result.coarse_owner_split = moe_policy_flag(
-            "DFLASH_MOE_TP_COARSE_OWNER_SPLIT",
-            "DFLASH_DS4_TP_COARSE_OWNER_SPLIT");
+            "LUCE_MOE_TP_COARSE_OWNER_SPLIT",
+            "LUCE_DS4_TP_COARSE_OWNER_SPLIT");
         result.device_join = moe_policy_flag(
-            "DFLASH_MOE_TP_DEVICE_JOIN", "DFLASH_DS4_TP_DEVICE_JOIN");
+            "LUCE_MOE_TP_DEVICE_JOIN", "LUCE_DS4_TP_DEVICE_JOIN");
         result.route_prefork = moe_policy_flag(
-            "DFLASH_MOE_TP_ROUTE_PREFORK", "DFLASH_DS4_TP_ROUTE_PREFORK");
+            "LUCE_MOE_TP_ROUTE_PREFORK", "LUCE_DS4_TP_ROUTE_PREFORK");
         result.targeted_join_split = moe_policy_flag(
-            "DFLASH_MOE_TP_TARGETED_JOIN_SPLIT",
-            "DFLASH_DS4_TP_TARGETED_JOIN_SPLIT");
+            "LUCE_MOE_TP_TARGETED_JOIN_SPLIT",
+            "LUCE_DS4_TP_TARGETED_JOIN_SPLIT");
 
         const bool align_requested = moe_policy_flag(
-            "DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS");
-        const char * kernel = std::getenv("DFLASH_CUDA_MMVQ_MOE_KERNEL");
+            "LUCE_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS");
+        const char * kernel = std::getenv("LUCE_CUDA_MMVQ_MOE_KERNEL");
         const bool dedicated_kernel = !kernel || !*kernel ||
             std::strcmp(kernel, "0") != 0;
         result.align_shared_ids = align_requested && dedicated_kernel;
@@ -200,21 +200,21 @@ static int dynamic_route_balance_main_slots_x4(
     static const DynamicRouteBalanceConfig config = [] {
         DynamicRouteBalanceConfig result;
         const char * enabled = moe_policy_env(
-            "DFLASH_MOE_TP_DYNAMIC_ROUTE_BALANCE",
-            "DFLASH_DS4_TP_DYNAMIC_ROUTE_BALANCE");
+            "LUCE_MOE_TP_DYNAMIC_ROUTE_BALANCE",
+            "LUCE_DS4_TP_DYNAMIC_ROUTE_BALANCE");
         if (!enabled || !*enabled || std::strcmp(enabled, "0") == 0) {
             return result;
         }
         result.enabled = true;
         const char * raw_slots_x4 = moe_policy_env(
-            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X4",
-            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS_X4");
+            "LUCE_MOE_TP_DYNAMIC_MAIN_SLOTS_X4",
+            "LUCE_DS4_TP_DYNAMIC_MAIN_SLOTS_X4");
         const char * raw_slots_x2 = moe_policy_env(
-            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS_X2",
-            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS_X2");
+            "LUCE_MOE_TP_DYNAMIC_MAIN_SLOTS_X2",
+            "LUCE_DS4_TP_DYNAMIC_MAIN_SLOTS_X2");
         const char * raw_slots = moe_policy_env(
-            "DFLASH_MOE_TP_DYNAMIC_MAIN_SLOTS",
-            "DFLASH_DS4_TP_DYNAMIC_MAIN_SLOTS");
+            "LUCE_MOE_TP_DYNAMIC_MAIN_SLOTS",
+            "LUCE_DS4_TP_DYNAMIC_MAIN_SLOTS");
         const int explicit_count =
             (raw_slots_x4 && *raw_slots_x4 ? 1 : 0) +
             (raw_slots_x2 && *raw_slots_x2 ? 1 : 0) +
@@ -249,8 +249,8 @@ static int dynamic_route_balance_main_slots_x4(
         // Express that as a 3:1 rate so the same policy scales with model top-k.
         result.main_to_peer_rate = 3.0;
         const char * raw_rate = moe_policy_env(
-            "DFLASH_MOE_TP_MAIN_TO_PEER_RATE",
-            "DFLASH_DS4_TP_MAIN_TO_PEER_RATE");
+            "LUCE_MOE_TP_MAIN_TO_PEER_RATE",
+            "LUCE_DS4_TP_MAIN_TO_PEER_RATE");
         if (raw_rate && *raw_rate) {
             errno = 0;
             char * end = nullptr;
@@ -349,7 +349,7 @@ static int env_int_or_default(const char * name, int fallback) {
 }
 
 static int moe_expert_compute_batch_max() {
-    const int raw = env_int_or_default("DFLASH_MOE_EXPERT_COMPUTE_BATCH_MAX", 32);
+    const int raw = env_int_or_default("LUCE_MOE_EXPERT_COMPUTE_BATCH_MAX", 32);
     return raw > 0 ? raw : 32;
 }
 
@@ -359,7 +359,7 @@ enum class MoeExpertComputeIpcMode {
 };
 
 static MoeExpertComputeIpcMode parse_moe_expert_compute_ipc_mode() {
-    const char * raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE");
+    const char * raw = std::getenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE");
     if (!raw || !*raw ||
         std::strcmp(raw, "auto") == 0 ||
         std::strcmp(raw, "AUTO") == 0) {
@@ -375,7 +375,7 @@ static MoeExpertComputeIpcMode parse_moe_expert_compute_ipc_mode() {
     }
     std::fprintf(stderr,
                  "[hybrid-ffn] ignoring unsupported "
-                 "DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE=%s; using auto\n",
+                 "LUCE_MOE_EXPERT_COMPUTE_IPC_MODE=%s; using auto\n",
                  raw);
     return MoeExpertComputeIpcMode::Batched;
 }
@@ -414,7 +414,7 @@ static ggml_tensor * build_shared_expert_subgraph(
 
 static int fixed_slot_graphs_mode() {
     static const int mode = [] {
-        const char * env = std::getenv("DFLASH_MOE_FIXED_SLOT_GRAPHS");
+        const char * env = std::getenv("LUCE_MOE_FIXED_SLOT_GRAPHS");
         if (!env || !env[0] || std::strcmp(env, "0") == 0) return 0;
         if (std::strcmp(env, "adaptive") == 0) return 2;
         return 1;
@@ -424,7 +424,7 @@ static int fixed_slot_graphs_mode() {
 
 static int fixed_slot_max() {
     static const int max_slots = [] {
-        const char * env = std::getenv("DFLASH_MOE_FIXED_SLOT_MAX");
+        const char * env = std::getenv("LUCE_MOE_FIXED_SLOT_MAX");
         return env ? std::max(0, std::atoi(env)) : 0;
     }();
     return max_slots;
@@ -2012,7 +2012,7 @@ bool eval_moe_batched_prefill_ffn(
 // <=4-token MMVQ sub-batch path.
 static bool mmq_full_batch_ok(const MoeHybridConfig & cfg, int n_tokens) {
     static const int min_tokens = [](){
-        const char * v = std::getenv("DFLASH_MMQ_FULL_BATCH_MIN");
+        const char * v = std::getenv("LUCE_MMQ_FULL_BATCH_MIN");
         return v ? std::atoi(v) : 64;
     }();
     return cfg.mmq_safe_full_batch && n_tokens >= min_tokens;
@@ -2030,7 +2030,7 @@ static bool mmq_full_batch_ok(const MoeHybridConfig & cfg, int n_tokens) {
 // env override tunes per arch without a rebuild.
 static int mmq_safe_sub_batch() {
     static const int v = [](){
-        const char * e = std::getenv("DFLASH_MMQ_SUB_BATCH");
+        const char * e = std::getenv("LUCE_MMQ_SUB_BATCH");
         if (e) return std::max(1, std::atoi(e));
         return (query_gpu_compute_sm() >= 80) ? 8 : 1;
     }();
@@ -2039,13 +2039,13 @@ static int mmq_safe_sub_batch() {
 
 int moe_hybrid_expert_compute_batch_limit() {
     static const int value = []() {
-        const int requested = env_int_or_default("DFLASH_MOE_EXPERT_COMPUTE_BATCH", 32);
+        const int requested = env_int_or_default("LUCE_MOE_EXPERT_COMPUTE_BATCH", 32);
         const int max_batch = moe_expert_compute_batch_max();
         const int effective = std::min(requested, max_batch);
         if (effective < requested) {
             std::fprintf(stderr,
                          "[hybrid-ffn] clamped MoE expert compute batch=%d to %d; "
-                         "set DFLASH_MOE_EXPERT_COMPUTE_BATCH_MAX to override\n",
+                         "set LUCE_MOE_EXPERT_COMPUTE_BATCH_MAX to override\n",
                          requested, effective);
         }
         return effective;
@@ -2056,13 +2056,13 @@ int moe_hybrid_expert_compute_batch_limit() {
 int moe_hybrid_expert_compute_ipc_batch_limit(int n_tokens) {
     if (n_tokens <= 0) return 1;
     const int requested = parse_moe_expert_compute_ipc_mode() == MoeExpertComputeIpcMode::Batched
-        ? env_int_or_default("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY", 1024)
+        ? env_int_or_default("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY", 1024)
         : moe_hybrid_expert_compute_batch_limit();
     return std::min(std::max(1, std::min(requested, 4096)), n_tokens);
 }
 
 int moe_hybrid_prefill_hot_sub_batch_limit() {
-    const char * raw = std::getenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
+    const char * raw = std::getenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH");
     int requested = 4;
     if (raw && *raw) {
         char * end = nullptr;
@@ -2684,11 +2684,11 @@ static bool eval_moe_hybrid_remote_cold_batched(
 // reused across all of its prompt rows.
 bool moe_expert_major_prefill_enabled(int n_tokens) {
     static const bool enabled = []() {
-        const char * raw = std::getenv("DFLASH_MOE_EXPERT_MAJOR_PREFILL");
+        const char * raw = std::getenv("LUCE_MOE_EXPERT_MAJOR_PREFILL");
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
     }();
     static const int min_tokens =
-        env_int_or_default("DFLASH_MOE_EXPERT_MAJOR_MIN_TOKENS",
+        env_int_or_default("LUCE_MOE_EXPERT_MAJOR_MIN_TOKENS",
                            kMoeExpertMajorPrefillMinTokens);
     return moe_expert_major_prefill_policy_enabled(
         n_tokens, enabled, min_tokens);
@@ -2702,7 +2702,7 @@ bool moe_expert_major_prefill_enabled(int n_tokens) {
 // result again.  The old host reduction remains as an emergency A/B fallback.
 static bool expert_major_gpu_reduce_enabled() {
     static const bool enabled = []() {
-        const char * raw = std::getenv("DFLASH_MOE_EXPERT_MAJOR_GPU_REDUCE");
+        const char * raw = std::getenv("LUCE_MOE_EXPERT_MAJOR_GPU_REDUCE");
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -2712,7 +2712,7 @@ static bool expert_major_gpu_reduce_enabled() {
 static bool expert_major_pinned_output_enabled() {
     static const bool enabled = []() {
         const char * raw =
-            std::getenv("DFLASH_MOE_EXPERT_MAJOR_PINNED_OUTPUT");
+            std::getenv("LUCE_MOE_EXPERT_MAJOR_PINNED_OUTPUT");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -2722,7 +2722,7 @@ static bool expert_major_pinned_output_enabled() {
 static bool full_cold_parallel_enabled() {
     static const bool enabled = []() {
         const char * raw =
-            std::getenv("DFLASH_MOE_FULL_COLD_PARALLEL");
+            std::getenv("LUCE_MOE_FULL_COLD_PARALLEL");
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -2730,7 +2730,7 @@ static bool full_cold_parallel_enabled() {
 
 static bool cold_input_first_enabled() {
     static const bool enabled = []() {
-        const char * raw = std::getenv("DFLASH_MOE_COLD_INPUT_FIRST");
+        const char * raw = std::getenv("LUCE_MOE_COLD_INPUT_FIRST");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     return enabled;
@@ -2828,7 +2828,7 @@ static bool eval_moe_owner_expert_major_batched(
           gate_up_tensor->type == GGML_TYPE_Q2_0_ROCMFP2)) &&
         down_tensor->type == GGML_TYPE_Q3_0_ROCMFPX;
     const bool use_grouped_mmid = grouped_mmid_types && []() {
-        const char * raw = std::getenv("DFLASH_MOE_GROUPED_MMID_PREFILL");
+        const char * raw = std::getenv("LUCE_MOE_GROUPED_MMID_PREFILL");
         return !raw || !*raw || std::strcmp(raw, "0") != 0;
     }() && n_tokens >= 32 && backend_is_gpu(backend);
 
@@ -4047,12 +4047,12 @@ bool eval_moe_hybrid_ffn_gpu_resident(
     // residual-combine graph_compute and the host hot/cold partition for the GPU
     // path. Cold experts (rare under realistic placement) are added on CPU after.
     // IEEE add is commutative, so this is bit-exact vs the split+combine path.
-    static const bool kLagunaGpuRemap = (std::getenv("DFLASH_LAGUNA_GPU_REMAP") != nullptr);
+    static const bool kLagunaGpuRemap = (std::getenv("LUCE_LAGUNA_GPU_REMAP") != nullptr);
     if (kLagunaGpuRemap) {
         // Reactive bounded expert cache: pull selected cold experts into spare
         // GPU slots (LRU evict) so the unified GPU FFN serves them on-die. After
         // warmup the working set is resident and the CPU cold path is rarely taken.
-        static const bool kCache = (std::getenv("DFLASH_LAGUNA_EXPERT_CACHE") != nullptr);
+        static const bool kCache = (std::getenv("LUCE_LAGUNA_EXPERT_CACHE") != nullptr);
         if (kCache && storage.cache_slots > 0) {
             for (int i = 0; i < n_selected; ++i)
                 moe_hybrid_cache_swap_in(storage, selected_ids[i], gpu_backend);
@@ -4271,4 +4271,4 @@ bool eval_moe_hybrid_ffn_gpu_resident(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

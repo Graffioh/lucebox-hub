@@ -8,10 +8,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BIN="$ROOT/dflash/build/test_gemma4_dflash"
+BIN="$ROOT/server/build/test_gemma4_dflash"
 TARGET="${MTP_TARGET:-$ROOT/models/gemma-4-31B-it-Q4_K_M.gguf}"
 MTP="${MTP_HEAD:-$ROOT/models/gemma4-mtp-31B/gemma-4-31B-it-assistant.Q4_K_M.gguf}"
-PROMPT_FILE="${MTP_PROMPT:-$ROOT/dflash/test/data/chat_2k.txt}"
+PROMPT_FILE="${MTP_PROMPT:-$ROOT/server/test/data/chat_2k.txt}"
 
 # Skip cleanly if any input is missing
 if [ ! -x "$BIN" ]; then

@@ -4,7 +4,7 @@
 
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -132,4 +132,4 @@ nlohmann::json build_error_response(
     }}};
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

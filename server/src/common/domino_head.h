@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Fused variant: one GPU graph = lm_head projection of the candidate hidden
 // states + unrolled GRU correction chain with in-graph argmax -> get_rows
@@ -37,4 +37,4 @@ bool domino_correct_greedy_chain(const DraftWeights & dw,
                                  int32_t last_tok,
                                  std::vector<int32_t> & draft_tok);
 
-}  // namespace dflash::common
+}  // namespace luce::common

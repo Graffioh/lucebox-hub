@@ -1,4 +1,4 @@
-// dflash_server — native C++ HTTP server for dflash::common.
+// luce_server — native C++ HTTP server for luce::common.
 //
 // Owns the target ModelBackend directly, while optional draft/PFlash IPC
 // paths can be used for mixed-backend placement. Benefits:
@@ -7,7 +7,7 @@
 //   - Single binary deployment
 //
 // Usage:
-//   dflash_server <model.gguf> [--draft <draft.gguf>] [--port 8080]
+//   luce_server <model.gguf> [--draft <draft.gguf>] [--port 8080]
 //                              [--host 0.0.0.0] [--max-ctx 131072]
 //                              [--max-tokens 4096] [--target-device auto:0]
 
@@ -45,7 +45,7 @@
 #include <utility>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 // Global server pointer for signal handling.
 static HttpServer * g_server = nullptr;
@@ -101,7 +101,7 @@ static void print_usage(const char * prog) {
         "                                 metadata. e.g. 16 on the block-8 DFlash2)\n"
         "  --draft-swa <N>                Draft sliding-window attention size (0=off; e.g.\n"
         "                                 2048 for unsloth Qwen3.6 targets, per server/README.md.\n"
-        "                                 Env: DFLASH27B_DRAFT_SWA)\n"
+        "                                 Env: LUCE_DRAFT_SWA)\n"
         "  --target-shard-ipc-bin <path>  Remote target shard IPC daemon for mixed target split\n"
         "  --target-shard-ipc-work-dir <path>  Remote target shard IPC scratch directory\n"
         "  --target-devices <list>        Target devices, e.g. cuda:0,cuda:1\n"
@@ -109,7 +109,7 @@ static void print_usage(const char * prog) {
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --target-split-fast-rollback   Opt in to exact F32 checkpoints for local\n"
         "                                 qwen35 layer splits (extra VRAM; env:\n"
-        "                                 DFLASH_SPLIT_FAST_ROLLBACK=1)\n"
+        "                                 LUCE_SPLIT_FAST_ROLLBACK=1)\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
         "  --ds4-fused-decode   Enable DeepSeek4 single-graph GPU decode\n"
@@ -138,7 +138,7 @@ static void print_usage(const char * prog) {
         "                       --max-concurrency slots, in tokens\n"
         "                       By default, Qwen sizes the pool from available device\n"
         "                       memory. DeepSeek4 reserves --max-ctx per slot.\n"
-        "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
+        "  --model-name <name>  Model name for /v1/models (default: luce)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --concurrent-prefix-cache-max-mib <MiB>\n"
         "                       Resident RAM limit for copied concurrent paged\n"
@@ -253,7 +253,7 @@ static void print_usage(const char * prog) {
 struct LoadedModel {
     Tokenizer tokenizer;
     Tokenizer drafter_tokenizer;
-    std::unique_ptr<dflash::engine::LuceEngine> engine;
+    std::unique_ptr<luce::engine::LuceEngine> engine;
     MoeRoutingCollector routing_collector;
     std::unique_ptr<HttpServer> server;
     bool freq_tracking = false;
@@ -815,7 +815,7 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
     }
 
     for (const auto * type : {&cache_type_k, &cache_type_v}) {
-        if (!type->empty() && dflash::parse_kv_type(type->c_str()) == GGML_TYPE_COUNT) {
+        if (!type->empty() && luce::parse_kv_type(type->c_str()) == GGML_TYPE_COUNT) {
             std::fprintf(stderr, "[server] invalid KV cache type '%s' (use f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0 or tq3_0)\n", type->c_str());
             return 2;
         }
@@ -845,16 +845,16 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
 
 static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_model) {
     if (!model.adaptive_experts_tau.empty())
-        set_environment_variable("DFLASH_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
+        set_environment_variable("LUCE_ADAPTIVE_K_TAU", model.adaptive_experts_tau.c_str(), false);
     if (!model.kvflash_pool.empty())
-        set_environment_variable("DFLASH_KVFLASH", model.kvflash_pool.c_str(), true);
+        set_environment_variable("LUCE_KVFLASH", model.kvflash_pool.c_str(), true);
     if (!model.kvflash_policy.empty())
-        set_environment_variable("DFLASH_KVFLASH_POLICY", model.kvflash_policy.c_str(), true);
+        set_environment_variable("LUCE_KVFLASH_POLICY", model.kvflash_policy.c_str(), true);
     if (!model.kvflash_tau.empty())
-        set_environment_variable("DFLASH_KVFLASH_TAU", model.kvflash_tau.c_str(), true);
+        set_environment_variable("LUCE_KVFLASH_TAU", model.kvflash_tau.c_str(), true);
     // KVFlash can use this drafter even when prefill compression is off.
     if (!model.sconfig.pflash_drafter_path.empty())
-        set_environment_variable("DFLASH_KVFLASH_DRAFTER", model.sconfig.pflash_drafter_path.c_str(), true);
+        set_environment_variable("LUCE_KVFLASH_DRAFTER", model.sconfig.pflash_drafter_path.c_str(), true);
     auto & bargs = model.bargs;
     auto & sconfig = model.sconfig;
     auto & spark_autotune = model.spark_autotune;
@@ -872,7 +872,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         target_split_fast_rollback_cli = false;
         // This is the global rollback kill switch, including an externally
         // supplied layer-split opt-in.
-        unset_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK");
+        unset_environment_variable("LUCE_SPLIT_FAST_ROLLBACK");
     } else if (target_split_fast_rollback_cli) {
         if (!bargs.device.is_layer_split()) {
             std::fprintf(stderr,
@@ -887,14 +887,14 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
                 "same-backend target splits\n");
             return 2;
         }
-        set_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK", "1", true);
+        set_environment_variable("LUCE_SPLIT_FAST_ROLLBACK", "1", true);
     }
 
     // Resolve documented environment defaults before factory preparation so
     // compatibility warnings describe the effective backend configuration.
     // An explicit --draft-swa value continues to take precedence.
     if (bargs.draft_swa_window == 0) {
-        if (const char * e = std::getenv("DFLASH27B_DRAFT_SWA")) {
+        if (const char * e = std::getenv("LUCE_DRAFT_SWA")) {
             bargs.draft_swa_window = std::atoi(e);
         }
     }
@@ -903,9 +903,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // env/default resolution runs inside prepare_backend() once the model
     // architecture is known. Other families still consume their env vars.
     if (!cache_type_k.empty())
-        bargs.cache_type_k = dflash::parse_kv_type(cache_type_k.c_str());
+        bargs.cache_type_k = luce::parse_kv_type(cache_type_k.c_str());
     if (!cache_type_v.empty())
-        bargs.cache_type_v = dflash::parse_kv_type(cache_type_v.c_str());
+        bargs.cache_type_v = luce::parse_kv_type(cache_type_v.c_str());
 
     // Ask the factory to resolve model/placement facts and apply its feature
     // admission policy before any setup work. server_main only maps the
@@ -922,7 +922,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // Fixed pools are known incompatibilities before model setup. Automatic
     // sizing needs the backend's real VRAM budget; if it produces a live pool,
     // the backend rejects the pairing after sizing.
-    const char * kvflash_config = std::getenv("DFLASH_KVFLASH");
+    const char * kvflash_config = std::getenv("LUCE_KVFLASH");
     backend_admission.kvflash = kvflash_fixed_pool_requested(kvflash_config)
         ? KvFlashRequest::Fixed
         : kvflash_pool_requested(kvflash_config)
@@ -1046,15 +1046,15 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             const char * cur = std::getenv(name);
             if (!cur || cur[0] == '\0') set_environment_variable(name, val, true);
         };
-        ensure_stats_env("DFLASH_QWEN35MOE_RUNTIME_STATS_OUT", "/dev/null");
-        ensure_stats_env("DFLASH_LAGUNA_NEXT_PLACEMENT_OUT", "/dev/null");
+        ensure_stats_env("LUCE_QWEN35MOE_RUNTIME_STATS_OUT", "/dev/null");
+        ensure_stats_env("LUCE_LAGUNA_NEXT_PLACEMENT_OUT", "/dev/null");
     }
 
     // Monolithic Qwen owns its KV overrides, including allocation/budgeting.
     // DS4 has a family-specific cache layout and never consumed these flags.
     if (arch == "qwen35" && !backend_placement.target.is_multi_device()) {
-        cache_type_k = dflash::kv_type_name(backend_cache.cache_type_k);
-        cache_type_v = dflash::kv_type_name(backend_cache.cache_type_v);
+        cache_type_k = luce::kv_type_name(backend_cache.cache_type_k);
+        cache_type_v = luce::kv_type_name(backend_cache.cache_type_v);
     } else if (arch == "deepseek4") {
         if (!cache_type_k.empty() || !cache_type_v.empty()) {
             std::fprintf(stderr, "[server] model '%s': --cache-type-k/v are ignored by DeepSeek4's fixed cache layout\n", sconfig.model_name.c_str());
@@ -1063,8 +1063,8 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     } else {
         // Preserve existing single-model architectures and remote-shard launches.
         // These paths cannot participate in multi-model paged serving.
-        if (!cache_type_k.empty()) set_environment_variable("DFLASH27B_KV_K", cache_type_k.c_str(), true);
-        if (!cache_type_v.empty()) set_environment_variable("DFLASH27B_KV_V", cache_type_v.c_str(), true);
+        if (!cache_type_k.empty()) set_environment_variable("LUCE_KV_K", cache_type_k.c_str(), true);
+        if (!cache_type_v.empty()) set_environment_variable("LUCE_KV_V", cache_type_v.c_str(), true);
     }
 
     // TQ3_0 KV auto-selection was removed (2026-07): tq3_0 saved ~40% VRAM on
@@ -1075,9 +1075,9 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // PFlash performance defaults: BSA kernel + sparse alpha + full attention window.
     bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
     if (pflash_enabled) {
-        set_environment_variable("DFLASH_FP_USE_BSA", "1", false);
-        set_environment_variable("DFLASH_FP_ALPHA", "0.85", false);
-        set_environment_variable("DFLASH27B_FA_WINDOW", "0", false);
+        set_environment_variable("LUCE_FP_USE_BSA", "1", false);
+        set_environment_variable("LUCE_FP_ALPHA", "0.85", false);
+        set_environment_variable("LUCE_FA_WINDOW", "0", false);
     }
 
     if (sconfig.draft_residency == DraftResidencyPolicy::RequestScoped &&
@@ -1137,25 +1137,25 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         // and qwen35moe.
         const bool is_laguna = (arch == "laguna");
         if (arch_has_expert_offload(arch)) {
-            const std::string pfx = is_laguna ? "DFLASH_LAGUNA_" : "DFLASH_QWEN35MOE_";
+            const std::string pfx = is_laguna ? "LUCE_LAGUNA_" : "LUCE_QWEN35MOE_";
             const std::string profile =
                 backend_model.path + ".spark.csv";
             std::FILE * pf = std::fopen(profile.c_str(), "rb");
             const bool have_profile = (pf != nullptr);
             if (pf) std::fclose(pf);
             // The backend auto-sizes the cache ring from the VRAM target.
-            set_environment_variable("DFLASH_SPARK", "1", true);
+            set_environment_variable("LUCE_SPARK", "1", true);
             if (spark_vram_gib > 0.0)
                 set_environment_variable(
-                    "DFLASH_SPARK_VRAM_MB",
+                    "LUCE_SPARK_VRAM_MB",
                     std::to_string((long long)(spark_vram_gib * 1024.0)).c_str(), true);
             if (spark_slots >= 0)               // explicit --spark-slots overrides auto-sizing
                 set_environment_variable(
                     (pfx + "CACHE_SLOTS").c_str(),
                     std::to_string(spark_slots).c_str(), true);
             if (is_laguna) {
-                set_environment_variable("DFLASH_LAGUNA_EXPERT_CACHE", "1", true);
-                set_environment_variable("DFLASH_LAGUNA_GPU_REMAP", "1", true);
+                set_environment_variable("LUCE_LAGUNA_EXPERT_CACHE", "1", true);
+                set_environment_variable("LUCE_LAGUNA_GPU_REMAP", "1", true);
             }
             if (have_profile) {
                 set_environment_variable(
@@ -1164,8 +1164,8 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
             // Persist the learned routing profile after each request. laguna saves
             // via NEXT_PLACEMENT_OUT; qwen35moe via RUNTIME_STATS_OUT (that var is
             // what allocates its routing-stats accumulator).
-            const char * save_var = is_laguna ? "DFLASH_LAGUNA_NEXT_PLACEMENT_OUT"
-                                              : "DFLASH_QWEN35MOE_RUNTIME_STATS_OUT";
+            const char * save_var = is_laguna ? "LUCE_LAGUNA_NEXT_PLACEMENT_OUT"
+                                              : "LUCE_QWEN35MOE_RUNTIME_STATS_OUT";
             set_environment_variable(save_var, profile.c_str(), true);
             if (spark_vram_gib > 0.0)
                 std::fprintf(stderr, "[spark] autotune ON (%s): vram target %.1f GiB, profile=%s (%s)\n",
@@ -1310,7 +1310,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         const bool spark_have_profile = (spf != nullptr);
         if (spf) std::fclose(spf);
         if (!spark_have_profile) {
-            auto corpus = dflash::common::spark_scrape_corpus(/*max_chunks=*/150,
+            auto corpus = luce::common::spark_scrape_corpus(/*max_chunks=*/150,
                                                               /*chunk_chars=*/2000,
                                                               /*min_chars=*/400);
             if (corpus.empty()) {
@@ -1493,8 +1493,8 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
         std::fprintf(stderr, "[server] │  pflash_drafter_exec= %s\n",
                      sconfig.pflash_remote_drafter ? "remote-ipc" : "local");
         std::fprintf(stderr, "[server] │  pflash_skip_park= %s\n", sconfig.pflash_skip_park ? "ON" : "off");
-        std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
-        std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
+        std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("LUCE_FP_USE_BSA") ? "ON" : "off");
+        std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("LUCE_FP_ALPHA") ? getenv("LUCE_FP_ALPHA") : "0.12 (default)");
     }
     std::fprintf(stderr, "[server] │  draft_residency = %s\n",
                  draft_residency_policy_name(sconfig.draft_residency));
@@ -1546,7 +1546,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     // varied trained pathways; some respond to a directive followed by the
     // marker (Qwen3.x: trained "Considering the limited time..." lead-in),
     // others to just a transition cue after the marker (gemma4: `<channel|>\n\n`
-    // — see dflash/docs/experiments/gemma4-26b-thinking-control-2026-05-25.md
+    // — see docs/experiments/gemma4-26b-thinking-control-2026-05-25.md
     // for the empirical finding that the `\n\n` mirrors Qwen3's no-think
     // template suffix and gives gemma4 the trained "now answer" cue, where
     // a bare `<channel|>` left it mid-derivation). For each arch ship the
@@ -1585,7 +1585,7 @@ static int load_model(ModelOptions & model, LoadedModel & loaded, bool multi_mod
     }
 
     loaded.engine =
-        std::make_unique<dflash::engine::LuceEngine>(std::move(backend_owner));
+        std::make_unique<luce::engine::LuceEngine>(std::move(backend_owner));
     loaded.server =
         std::make_unique<HttpServer>(*loaded.engine, tokenizer, sconfig);
     HttpServer & server = *loaded.server;

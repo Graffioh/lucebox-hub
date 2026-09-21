@@ -35,7 +35,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // The drafter weights. `core` reuses DeepSeek4Weights for the n_layer decoder
 // blocks + per-layer tensors + metadata + out_norm + output_hc_* tail; its
@@ -288,4 +288,4 @@ bool run_deepseek4_dspark_spec_decode(
         MoeExpertComputeRuntime * expert_runtime = nullptr,
         MoeHybridRoutingStats * routing_stats = nullptr);
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -10,7 +10,7 @@
 #include <limits>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Reserved configuration value; resolved before model workers start.
 inline constexpr size_t kAutoKvOffloadBytes = (std::numeric_limits<size_t>::max)();
@@ -57,4 +57,4 @@ private:
     std::vector<std::vector<uint8_t>> saved_;
 };
 
-} // namespace dflash::common
+} // namespace luce::common

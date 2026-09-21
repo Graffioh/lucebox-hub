@@ -3,7 +3,7 @@
 #include <cmath>
 #include <set>
 
-namespace dflash::common {
+namespace luce::common {
 
 std::string validate_device_placement(
     const DevicePlacement & dp,
@@ -83,4 +83,4 @@ std::string validate_device_placement(
     return {};
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

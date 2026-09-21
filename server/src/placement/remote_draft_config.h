@@ -4,7 +4,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct RemoteDraftConfig {
     std::string ipc_bin;
@@ -15,4 +15,4 @@ struct RemoteDraftConfig {
     bool has_aux_options() const { return !work_dir.empty() || ring_cap > 0; }
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

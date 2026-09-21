@@ -414,12 +414,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 // weight traffic toward the union of routed experts. Bit-exact per
 // (row, token) vs mul_mat_vec_q_moe (same vec_dot sequence and reduction).
 // Model-agnostic: applies to any MoE with n_expert_used*n_tokens <= 256.
-//   DFLASH_MMID_GROUPED         1 = enable, 0 = disable
+//   LUCE_MMID_GROUPED         1 = enable, 0 = disable
 //                               (CUDA default on; HIP default off)
-//   DFLASH_MMID_GROUPED_TYPES   bitmask, 1 = Q4_K, 2 = Q6_K,
+//   LUCE_MMID_GROUPED_TYPES   bitmask, 1 = Q4_K, 2 = Q6_K,
 //                               4 = Q4_0/Q8_0/Q5_K, 8 = ROCmFP2/ROCmFP3,
 //                               16 = ROCmFP4-fast, 32 = ROCmFP3 only.
-//   DFLASH_MMID_GROUPED_DEVICE  optional zero-based device index; unset/-1
+//   LUCE_MMID_GROUPED_DEVICE  optional zero-based device index; unset/-1
 //                               applies the path to every eligible device.
 //                               Q6_K stays on its tuned MMQ route above 5
 //                               tokens unless enabled. The ROCmFP formats are
@@ -439,7 +439,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 // low-mass slots (cumulative router weight >= tau keeps), sentinels their ids
 // to -1 and renormalizes the kept weights in place. Idempotent across the
 // gate/up/down calls of one layer (-1 markers). Requires the grouped path for
-// every routed expert type (DFLASH_MMID_GROUPED=1, DFLASH_MMID_GROUPED_TYPES=7).
+// every routed expert type (LUCE_MMID_GROUPED=1, LUCE_MMID_GROUPED_TYPES=7).
 struct mmid_gate_extra {
     uint32_t magic;      // 0x4D474154 "MGAT"
     float tau;
@@ -449,12 +449,12 @@ struct mmid_gate_extra {
 
 static bool mmid_grouped_env() {
     // Bit-exact and measured equal-or-faster on small MoE verify batches, so
-    // enabled by default on CUDA; DFLASH_MMID_GROUPED=0 is the kill switch.
+    // enabled by default on CUDA; LUCE_MMID_GROUPED=0 is the kill switch.
     // HIP (RDNA3/RDNA4) stays opt-in and default-off. Generic quantized types
     // have correctness coverage on gfx1151; ROCmFP2/ROCmFP3 are separately
     // enabled by the type mask after platform-specific qualification.
     static const bool on = []() {
-        const char * e = std::getenv("DFLASH_MMID_GROUPED");
+        const char * e = std::getenv("LUCE_MMID_GROUPED");
         if (e != nullptr) {
             return e[0] == '1' && e[1] == '\0';
         }
@@ -477,10 +477,10 @@ static bool mmid_grouped_type_ok(ggml_type type) {
     // bit0 = Q4_K, bit1 = Q6_K, bit2 = Q4_0/Q8_0/Q5_K,
     // bit3 = Q2_0_ROCMFP2/Q3_0_ROCMFPX, bit4 = ROCmFP4-fast,
     // bit5 = ROCmFP3 only. Default:
-    // previously validated types only (7); DFLASH_MMID_GROUPED_TYPES is an
+    // previously validated types only (7); LUCE_MMID_GROUPED_TYPES is an
     // experimental override.
     static const int mask = []() {
-        const char * e = std::getenv("DFLASH_MMID_GROUPED_TYPES");
+        const char * e = std::getenv("LUCE_MMID_GROUPED_TYPES");
         if (e == nullptr || e[0] == '\0') {
             return 7;
         }
@@ -512,7 +512,7 @@ static bool mmid_grouped_type_ok(ggml_type type) {
 
 static bool mmid_grouped_device_ok() {
     static const int selected = []() {
-        const char * e = std::getenv("DFLASH_MMID_GROUPED_DEVICE");
+        const char * e = std::getenv("LUCE_MMID_GROUPED_DEVICE");
         return e == nullptr || e[0] == '\0' ? -1 : atoi(e);
     }();
     return selected < 0 || selected == ggml_cuda_get_device();
@@ -546,7 +546,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // tokens on NVIDIA Turing+ for types whose base ceiling is already the
     // maximum. Types with tuned lower ceilings (per PR 20905) keep them.
     static const bool moe_kernel_enabled =
-        mmvq_env_flag("DFLASH_CUDA_MMVQ_MOE_KERNEL", true);
+        mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_KERNEL", true);
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -753,7 +753,7 @@ static __device__ __forceinline__ void vec_dot_rocmfp4_fast_q8_1_ncols(
 
 static bool rocmfp3_packed24_enabled() {
     static const bool enabled = []() {
-        const char * value = std::getenv("DFLASH_CUDA_MMVQ_FP3_PACKED24");
+        const char * value = std::getenv("LUCE_CUDA_MMVQ_FP3_PACKED24");
         return value && value[0] == '1' && value[1] == '\0';
     }();
     return enabled;
@@ -761,7 +761,7 @@ static bool rocmfp3_packed24_enabled() {
 
 static bool rocmfp4_x4_enabled() {
     static const bool enabled = []() {
-        const char * value = std::getenv("DFLASH_CUDA_MMVQ_FP4_X4");
+        const char * value = std::getenv("LUCE_CUDA_MMVQ_FP4_X4");
         return value && value[0] == '1' && value[1] == '\0';
     }();
     return enabled;
@@ -769,7 +769,7 @@ static bool rocmfp4_x4_enabled() {
 
 static bool rocmfp4_q5_x4_plus1_enabled() {
     static const bool enabled = []() {
-        const char * value = std::getenv("DFLASH_CUDA_MMVQ_FP4_Q5_X4_PLUS1");
+        const char * value = std::getenv("LUCE_CUDA_MMVQ_FP4_Q5_X4_PLUS1");
         return value && value[0] == '1' && value[1] == '\0';
     }();
     return enabled;
@@ -1773,7 +1773,7 @@ static bool mul_mat_vec_q_grouped_dispatch(
                     max_groups, warp_size, stream);
             return true;
         case GGML_TYPE_Q2_0_ROCMFP2:
-            if (mmvq_env_flag("DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32")) {
+            if (mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_FP2_PACKED32")) {
                 mul_mat_vec_q_moe_grouped_launch<
                     GGML_TYPE_Q2_0_ROCMFP2, false, true>(
                         vx, vy, meta, fusion, dst, ncols_x, nchannels_y_fd,
@@ -1791,9 +1791,9 @@ static bool mul_mat_vec_q_grouped_dispatch(
             return true;
         case GGML_TYPE_Q3_0_ROCMFPX: {
             const bool packed =
-                mmvq_env_flag("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24") &&
+                mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_FP3_PACKED24") &&
                 std::getenv(
-                    "DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE") ==
+                    "LUCE_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE") ==
                     nullptr;
             if (packed) {
                 mul_mat_vec_q_moe_grouped_launch<
@@ -2020,17 +2020,17 @@ static void mul_mat_vec_q_moe_launch(
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
     static const bool sparse_warp_blocks = []() {
-        const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_SPARSE_WARP_BLOCKS");
+        const char * e = std::getenv("LUCE_CUDA_MMVQ_MOE_SPARSE_WARP_BLOCKS");
         return e && e[0] == '1' && e[1] == '\0';
     }();
     static const bool compact_masked_ids = []() {
-        const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_COMPACT_MASKED_IDS");
+        const char * e = std::getenv("LUCE_CUDA_MMVQ_MOE_COMPACT_MASKED_IDS");
         return e && e[0] == '1' && e[1] == '\0';
     }();
     static const bool aligned_shared_ids =
-        mmvq_env_flag("DFLASH_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS");
+        mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_ALIGN_SHARED_IDS");
     static const int configured_rows_per_block = []() {
-        const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_ROWS_PER_BLOCK");
+        const char * e = std::getenv("LUCE_CUDA_MMVQ_MOE_ROWS_PER_BLOCK");
         if (!e || !e[0]) return 0;
         const int value = std::atoi(e);
         return value == 1 || value == 2 || value == 4 || value == 8
@@ -2053,29 +2053,29 @@ static void mul_mat_vec_q_moe_launch(
     }
     static const bool q2_warp_groups = []() {
         const char * e =
-            std::getenv("DFLASH_CUDA_MMVQ_MOE_Q2_WARP_GROUPS");
+            std::getenv("LUCE_CUDA_MMVQ_MOE_Q2_WARP_GROUPS");
         return e && e[0] == '2' && e[1] == '\0';
     }();
     static const bool q4_warp_groups = []() {
         const char * e =
-            std::getenv("DFLASH_CUDA_MMVQ_MOE_Q4_WARP_GROUPS");
+            std::getenv("LUCE_CUDA_MMVQ_MOE_Q4_WARP_GROUPS");
         return e && e[0] == '2' && e[1] == '\0';
     }();
-    // Explicit DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24 wins; unset defaults to the
+    // Explicit LUCE_CUDA_MMVQ_MOE_FP3_PACKED24 wins; unset defaults to the
     // packed kernel on gfx1151 only.
     static const int fp3_packed24_setting = []() {
         const char * e =
-            std::getenv("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24");
+            std::getenv("LUCE_CUDA_MMVQ_MOE_FP3_PACKED24");
         if (e == nullptr) return -1;
         return (e[0] == '1' && e[1] == '\0') ? 1 : 0;
     }();
     const bool fp3_packed24 =
         (fp3_packed24_setting >= 0 ? fp3_packed24_setting == 1
                                    : gfx1151) &&
-        std::getenv("DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE") == nullptr;
+        std::getenv("LUCE_CUDA_MMVQ_MOE_FP3_PACKED24_RUNTIME_DISABLE") == nullptr;
     static const bool fp2_packed32 = []() {
         const char * e =
-            std::getenv("DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32");
+            std::getenv("LUCE_CUDA_MMVQ_MOE_FP2_PACKED32");
         return e && e[0] == '1' && e[1] == '\0';
     }();
 
@@ -2241,12 +2241,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
     };
 
     static const bool use_tokenwise_mmid = []() {
-        const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_TOKENWISE");
+        const char * e = std::getenv("LUCE_CUDA_MMVQ_MOE_TOKENWISE");
         return e && e[0] == '1' && e[1] == '\0';
     }();
 
     static const bool use_tokenwise_mm = []() {
-        const char * e = std::getenv("DFLASH_CUDA_MMVQ_TOKENWISE");
+        const char * e = std::getenv("LUCE_CUDA_MMVQ_TOKENWISE");
         return e && e[0] == '1' && e[1] == '\0';
     }();
 
@@ -2299,7 +2299,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     }
 
     static const bool use_moe_kernel =
-        mmvq_env_flag("DFLASH_CUDA_MMVQ_MOE_KERNEL", true);
+        mmvq_env_flag("LUCE_CUDA_MMVQ_MOE_KERNEL", true);
 
     if (has_ids && ncols_dst > 1 && (use_moe_kernel || ncols_dst > MMVQ_MAX_BATCH_SIZE)) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
@@ -2869,7 +2869,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     static const bool mmid_telemetry = []() {
-        const char * value = std::getenv("DFLASH_MMID_TELEMETRY");
+        const char * value = std::getenv("LUCE_MMID_TELEMETRY");
         return value != nullptr && std::strcmp(value, "0") != 0;
     }();
 
@@ -2941,11 +2941,11 @@ void ggml_cuda_mul_mat_vec_q(
             // ungrouped multi-token batch, so the label is not misreported when the
             // tokenwise or generic MMVQ modes are selected by env.
             static const bool tokenwise_mmid = []() {
-                const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_TOKENWISE");
+                const char * e = std::getenv("LUCE_CUDA_MMVQ_MOE_TOKENWISE");
                 return e && e[0] == '1' && e[1] == '\0';
             }();
             static const bool moe_kernel = []() {
-                const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_KERNEL");
+                const char * e = std::getenv("LUCE_CUDA_MMVQ_MOE_KERNEL");
                 return !(e && e[0] == '0' && e[1] == '\0');
             }();
             const char * variant =

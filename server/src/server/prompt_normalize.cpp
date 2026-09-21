@@ -3,7 +3,7 @@
 #include "prompt_normalize.h"
 #include <algorithm>
 
-namespace dflash::common {
+namespace luce::common {
 
 static constexpr std::string_view kBillingHeader = "x-anthropic-billing-header:";
 
@@ -79,4 +79,4 @@ std::string normalize_system_for_cache(const json & system_or_messages) {
     return "";
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -9,7 +9,7 @@
 #include <thread>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Synchronous, non-reentrant row partitioning. Callbacks must not throw.
 // The callback is borrowed only until run_chunks returns; no per-job allocation.
@@ -18,7 +18,7 @@ namespace dflash::common {
 // job under an older generation and execute it twice, outliving its caller.
 class BlockingRowPool {
 public:
-#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+#ifdef LUCE_BLOCKING_ROW_POOL_TEST_HOOKS
     using TestHook = void (*)(void *, unsigned, bool);
     unsigned pending_workers_for_test() const {
         return remaining_.load(std::memory_order_acquire);
@@ -29,11 +29,11 @@ public:
     }
     explicit BlockingRowPool(unsigned count = default_worker_count(
             std::thread::hardware_concurrency())
-#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+#ifdef LUCE_BLOCKING_ROW_POOL_TEST_HOOKS
             , TestHook hook = nullptr, void * hook_context = nullptr
 #endif
             ) : nth_(count)
-#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+#ifdef LUCE_BLOCKING_ROW_POOL_TEST_HOOKS
               , test_hook_(hook), test_hook_context_(hook_context)
 #endif
     {
@@ -109,7 +109,7 @@ private:
             }
             if (stop_.load(std::memory_order_relaxed)) return;
             last = generation;
-#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+#ifdef LUCE_BLOCKING_ROW_POOL_TEST_HOOKS
             if (test_hook_) test_hook_(test_hook_context_, index, false);
 #endif
             const Job job = job_;
@@ -120,7 +120,7 @@ private:
                 if (begin < end) job.invoke(job.context, (int) begin, (int) end);
             }
             remaining_.fetch_sub(1, std::memory_order_acq_rel);
-#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+#ifdef LUCE_BLOCKING_ROW_POOL_TEST_HOOKS
             if (test_hook_) test_hook_(test_hook_context_, index, true);
 #endif
         }
@@ -134,7 +134,7 @@ private:
         for (auto & worker : workers_) worker.join();
     }
     const unsigned nth_;
-#ifdef DFLASH_BLOCKING_ROW_POOL_TEST_HOOKS
+#ifdef LUCE_BLOCKING_ROW_POOL_TEST_HOOKS
     // Host test target only; production contains neither hooks nor branches.
     const TestHook test_hook_;
     void * const test_hook_context_;
@@ -148,4 +148,4 @@ private:
     std::vector<std::thread> workers_;
 };
 
-} // namespace dflash::common
+} // namespace luce::common

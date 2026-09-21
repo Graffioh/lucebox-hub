@@ -9,9 +9,9 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Stable content-hash of token slice [begin, end); zeroed hash on empty slice.
 PrefixHash frozen_block_key(const int32_t * ids, int begin, int end);
 
-}  // namespace dflash::common
+}  // namespace luce::common

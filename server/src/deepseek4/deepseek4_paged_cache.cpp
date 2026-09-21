@@ -2,7 +2,7 @@
 
 #include "deepseek4_page_layout.h"
 
-#ifndef DFLASH_DS4_PLAN_ONLY
+#ifndef LUCE_DS4_PLAN_ONLY
 #include "deepseek4_internal.h"
 #endif
 
@@ -10,7 +10,7 @@
 #include <limits>
 #include <memory>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 bool add_mul(uint64_t & dst, uint64_t a, uint64_t b) {
     if (a && b > std::numeric_limits<uint64_t>::max() / a) return false;
@@ -147,7 +147,7 @@ bool plan_deepseek4_paged_cache(uint32_t head_dim, uint32_t indexer_head_dim,
     return true;
 }
 
-#ifndef DFLASH_DS4_PLAN_ONLY
+#ifndef LUCE_DS4_PLAN_ONLY
 bool create_deepseek4_paged_cache(ggml_backend_t backend,
                                   const DeepSeek4Weights & w, uint32_t slots,
                                   uint32_t max_ctx, uint32_t physical_blocks,
@@ -229,4 +229,4 @@ void free_deepseek4_paged_cache(DeepSeek4PagedCache & c) {
     c.pool.reset(); c.layers.clear(); c.plan = {};
 }
 #endif
-} // namespace dflash::common
+} // namespace luce::common

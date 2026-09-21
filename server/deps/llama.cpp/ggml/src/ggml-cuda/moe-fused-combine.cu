@@ -87,7 +87,7 @@ void ggml_cuda_op_ds4_moe_combine(ggml_backend_cuda_context & ctx, ggml_tensor *
     const int n_tokens = (int) down_e->ne[2];
 
     static const bool trace_enabled = []() {
-        const char * raw = std::getenv("DFLASH_MOE_FUSED_COMBINE_TRACE");
+        const char * raw = std::getenv("LUCE_MOE_FUSED_COMBINE_TRACE");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     if (trace_enabled) {

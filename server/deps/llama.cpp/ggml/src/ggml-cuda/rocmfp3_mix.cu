@@ -146,7 +146,7 @@ static bool mix_device_is_gfx1151(int device) {
 
 static bool mix_gfx1151_wide_two_pass_enabled() {
     static const bool enabled = [] {
-        const char * value = std::getenv("DFLASH_ROCMFP3_WIDE_TWO_PASS");
+        const char * value = std::getenv("LUCE_ROCMFP3_WIDE_TWO_PASS");
         return value == nullptr || std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -159,10 +159,10 @@ static constexpr int MIX_GFX1151_WARPS_PER_BLOCK = 1;
 
 static bool mix_gfx1151_row3_enabled() {
     static const bool enabled = [] {
-        const char * value = std::getenv("DFLASH_ROCMFP3_ROW3");
+        const char * value = std::getenv("LUCE_ROCMFP3_ROW3");
         // Three rows/wave retains the exact per-row reduction order while
         // sharing activation loads.  It wins across the learned-codebook
-        // q=3..5 verifier shapes on gfx1151. DFLASH_ROCMFP3_ROW3=0 is the
+        // q=3..5 verifier shapes on gfx1151. LUCE_ROCMFP3_ROW3=0 is the
         // burn-in kill switch back to two rows (the rocmfp2 ROW4 analogue).
         return value == nullptr || std::strcmp(value, "0") != 0;
     }();

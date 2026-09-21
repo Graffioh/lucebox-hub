@@ -9,7 +9,7 @@
 #include <memory>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 struct MoeHybridStorageFixture {};

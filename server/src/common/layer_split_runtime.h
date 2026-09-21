@@ -17,7 +17,7 @@
 #include <random>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct LayerSplitRuntimeInit {
     const char * target_path = nullptr;
@@ -93,4 +93,4 @@ bool run_layer_split_ar_decode(
     std::vector<int32_t> & out_tokens,
     const DaemonIO & io);
 
-}  // namespace dflash::common
+}  // namespace luce::common

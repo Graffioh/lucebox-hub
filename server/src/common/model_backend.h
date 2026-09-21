@@ -27,7 +27,7 @@
 #include "concurrency/seq_engine.h"
 #include "placement/draft_residency.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 enum class ParkTarget {
     // NOTE: Empty preserves Qwen3's existing no-target park/unpark behavior.
@@ -262,7 +262,7 @@ struct ModelBackend {
         float                keep_ratio;      // fraction to keep (0.0–1.0)
         // Exclusive end and width of the user-query token window inside
         // input_ids. Negative end preserves the legacy trailing-token window.
-        // Keeping this separate from DFLASH_COMPRESS_QUERY_TOKENS matters:
+        // Keeping this separate from LUCE_COMPRESS_QUERY_TOKENS matters:
         // that knob controls lexical anchors, not neural scorer Q rows.
         int                  score_query_end = -1;
         int                  score_query_tokens = 8;
@@ -369,4 +369,4 @@ struct ModelBackend {
     virtual void shutdown() = 0;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

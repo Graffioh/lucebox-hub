@@ -12,7 +12,7 @@
 
 #include "gemma4_internal.h"
 #include "internal.h"
-#include "dflash27b.h"
+#include "luce.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -31,7 +31,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -684,4 +684,4 @@ void free_gemma4_snapshot(Gemma4Snapshot & s) {
     s.last_tok  = -1;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

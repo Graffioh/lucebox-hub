@@ -23,8 +23,8 @@
 #include <thread>
 
 namespace {
-using namespace dflash::common;
-using dflash::engine::LuceEngine;
+using namespace luce::common;
+using luce::engine::LuceEngine;
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 struct ModelRoutingFixture {};
@@ -954,10 +954,10 @@ TEST_CASE(ModelRoutingFixture, test_reversed_priority_ignores_generation_model_n
 TEST_CASE(ModelRoutingFixture, test_decode_pressure_preserves_stream_and_routes_new_work) {
     // Exercise startup auto resolution through the actual HTTP scheduler,
     // then verify the resulting capacity is sufficient to preserve a stream.
-    if (dflash::common::available_kv_offload_memory().value_or(0) < 512) {
+    if (luce::common::available_kv_offload_memory().value_or(0) < 512) {
         throw CppUnitTestFramework::TestSkippedException("automatic RAM sizing unavailable");
     }
-    RunningModels models(false, false, true, 1, false, dflash::common::kAutoKvOffloadBytes);
+    RunningModels models(false, false, true, 1, false, luce::common::kAutoKvOffloadBytes);
     auto a = models.post(chat("qwen", true));
     models.first.engine.wait_admissions(1);
     auto b = models.post(chat("qwen", true));

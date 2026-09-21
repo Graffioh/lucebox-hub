@@ -36,7 +36,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Returns an empty string when the requested feature set is coherent, or a
 // description of the first violated rule.
@@ -71,4 +71,4 @@ std::vector<std::string> collect_feature_warnings(
     const BackendArgs & args,
     const std::string & arch);
 
-}  // namespace dflash::common
+}  // namespace luce::common

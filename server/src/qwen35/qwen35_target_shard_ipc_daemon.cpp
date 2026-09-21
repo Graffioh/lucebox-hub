@@ -35,7 +35,7 @@
 #  include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -270,7 +270,7 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
                                          kvflash_pool_tokens)) {
             std::fprintf(stderr,
                          "[qwen35-target-shard-daemon] load/cache failed gpu=%d: %s\n",
-                         shard.gpu, dflash27b_last_error());
+                         shard.gpu, luce_last_error());
             stream_status(stream_fd, -1);
             free_qwen35_layer_split_shards(shards);
             if (shared_payload && shared_payload != MAP_FAILED) {
@@ -953,4 +953,4 @@ int run_qwen35_target_shard_ipc_daemon(const char * target_path,
 #endif
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

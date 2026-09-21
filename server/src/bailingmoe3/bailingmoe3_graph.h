@@ -4,7 +4,7 @@ struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
-namespace dflash::common {
+namespace luce::common {
 
 struct TargetLayer;
 struct TargetWeights;
@@ -32,4 +32,4 @@ ggml_tensor * build_bailingmoe3_kda_block(
     ggml_tensor * ssm_state,
     int n_tokens);
 
-}  // namespace dflash::common
+}  // namespace luce::common

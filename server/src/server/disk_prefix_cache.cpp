@@ -18,7 +18,7 @@
 #include <filesystem>
 #include <system_error>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace fs = std::filesystem;
 
@@ -851,4 +851,4 @@ bool DiskPrefixCache::read_header(FILE * f, DiskCacheHeader & hdr) {
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

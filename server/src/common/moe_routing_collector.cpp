@@ -4,7 +4,7 @@
 #include <cstdio>
 #include <cstring>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool MoeRoutingCollector::open(const std::string & path) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -56,4 +56,4 @@ void MoeRoutingCollector::close() {
                  (long long)samples_);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

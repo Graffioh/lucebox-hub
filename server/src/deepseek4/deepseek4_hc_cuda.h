@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace dflash::common {
+namespace luce::common {
 
 // CUDA and HIP select devices per host thread. Call this at worker/shard entry
 // before invoking the direct HC helpers.
@@ -51,4 +51,4 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                          void *        post_device,
                                          void *        comb_device);
 
-} // namespace dflash::common
+} // namespace luce::common

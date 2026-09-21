@@ -321,9 +321,9 @@ PathRun run_path(
         const std::vector<float> & initial_state,
         bool grouped) {
     EnvironmentValue force_grouped(
-        "DFLASH_GDN_FORCE_GROUPED_COLS", grouped ? "1" : nullptr);
+        "LUCE_GDN_FORCE_GROUPED_COLS", grouped ? "1" : nullptr);
     EnvironmentValue disable_grouped(
-        "DFLASH_GDN_NO_GROUPED_COLS", grouped ? nullptr : "1");
+        "LUCE_GDN_NO_GROUPED_COLS", grouped ? nullptr : "1");
     if (!force_grouped.valid() || !disable_grouped.valid()) {
         PathRun result;
         result.reason = "failed to select GDN route";

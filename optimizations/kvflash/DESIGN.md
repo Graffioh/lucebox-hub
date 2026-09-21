@@ -129,8 +129,8 @@ leaks footprint at scale (their §3.3.1); our fixed pool is a hard cap.
 ## Production integration (daemon)
 
 The pool is wired into the qwen35 backend behind `--kvflash <tokens>`
-(env `DFLASH_KVFLASH`; rounded to a 256 multiple) + `--kvflash-tau <N>`
-(env `DFLASH_KVFLASH_TAU`, default 64). Pieces:
+(env `LUCE_KVFLASH`; rounded to a 256 multiple) + `--kvflash-tau <N>`
+(env `LUCE_KVFLASH_TAU`, default 64). Pieces:
 
 - `create_target_cache(..., ctx_alloc)`: attention tensors allocated at
   pool capacity; `cache.max_ctx` stays the logical bound.
@@ -169,9 +169,9 @@ The pool is wired into the qwen35 backend behind `--kvflash <tokens>`
   (pooled snapshots need page-table serialization; prefill-time
   snapshots still work).
 
-## Production smokes (dflash_server on lucebox 3090, 2026-06-11)
+## Production smokes (luce_server on lucebox 3090, 2026-06-11)
 
-1. WITHOUT pflash (agnostic LRU): `dflash_server <27B> --kvflash 1024`.
+1. WITHOUT pflash (agnostic LRU): `luce_server <27B> --kvflash 1024`.
    41-token prompt + 1400 generated = 1441 logical through a 1024-slot
    pool (live LRU eviction mid-request). Coherent story end to end,
    36.9 tok/s, clean finish. Second request (per-request pager reset) ok.

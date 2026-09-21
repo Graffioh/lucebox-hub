@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common { void deepseek4_dspark_dump(const DSparkDrafter &); }
+namespace luce::common { void deepseek4_dspark_dump(const DSparkDrafter &); }
 
 static uint64_t fnv1a64(const std::vector<float> & values) {
     uint64_t hash = 1469598103934665603ull;
@@ -35,7 +35,7 @@ static uint64_t fnv1a64(const std::vector<float> & values) {
 }
 
 int main(int argc, char ** argv) {
-    using namespace dflash::common;
+    using namespace luce::common;
     const char * path = argc > 1 ? argv[1]
         : "/home/lucebox2/models/DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4.gguf";
 

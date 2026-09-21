@@ -25,7 +25,7 @@
 #include <string>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -138,7 +138,7 @@ const float * DeepSeek4LayerSplitAdapter::local_shard_input(
 
 int DeepSeek4LayerSplitAdapter::compute_auto_split_layers() const {
     // Check env override first
-    int override_layers = env_int("DFLASH_DS4_CUDA_LAYERS", -1);
+    int override_layers = env_int("LUCE_DS4_CUDA_LAYERS", -1);
     if (override_layers > 0) {
         return override_layers;
     }
@@ -451,7 +451,7 @@ bool DeepSeek4LayerSplitAdapter::run_forward(
         std::vector<float> * logits_out) {
     if (shards_.empty() || tokens.empty()) return false;
 
-    const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
+    const bool timing = env_flag_enabled("LUCE_DS4_TIMING");
     const auto forward_t0 = SplitClock::now();
     const int n_tokens = (int)tokens.size();
     const int n_embd = shards_[0].weights.n_embd;
@@ -514,7 +514,7 @@ bool DeepSeek4LayerSplitAdapter::run_mixed_forward(
         std::vector<float> * logits_out) {
     if (!use_mixed_target_split() || tokens.empty()) return false;
 
-    const bool timing = env_flag_enabled("DFLASH_DS4_TIMING");
+    const bool timing = env_flag_enabled("LUCE_DS4_TIMING");
     const auto forward_t0 = SplitClock::now();
     const int n_tokens = (int)tokens.size();
     const int n_embd = shards_[0].weights.n_embd;
@@ -914,4 +914,4 @@ void DeepSeek4LayerSplitAdapter::shutdown() {
     shards_.clear();
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

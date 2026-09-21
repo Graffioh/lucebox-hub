@@ -11,17 +11,17 @@
 
 using namespace CppUnitTestFramework;
 
-using dflash::common::PrefixSnapshot;
-using dflash::common::TargetCache;
-using dflash::common::TargetPagedTreeGraphKey;
-using dflash::common::StepGraph;
-using dflash::common::estimate_paged_target_cache_snapshot_bytes;
-using dflash::common::free_prefix_snapshot;
-using dflash::common::replace_paged_target_cache;
-using dflash::common::restore_paged_target_cache;
-using dflash::common::restore_ssm_state;
-using dflash::common::snapshot_paged_target_cache;
-using dflash::common::snapshot_ssm_state;
+using luce::common::PrefixSnapshot;
+using luce::common::TargetCache;
+using luce::common::TargetPagedTreeGraphKey;
+using luce::common::StepGraph;
+using luce::common::estimate_paged_target_cache_snapshot_bytes;
+using luce::common::free_prefix_snapshot;
+using luce::common::replace_paged_target_cache;
+using luce::common::restore_paged_target_cache;
+using luce::common::restore_ssm_state;
+using luce::common::snapshot_paged_target_cache;
+using luce::common::snapshot_ssm_state;
 
 namespace {
 struct RecurrentSnapshotFixture : CommonFixture {
@@ -43,24 +43,24 @@ static std::vector<float> get_tensor(const ggml_tensor * tensor) {
 
 TEST_CASE(RecurrentSnapshotFixture, validates_paged_tree_capacity_and_uploads) {
     size_t graph_capacity = 0;
-    CHECK(dflash::common::detail::
+    CHECK(luce::common::detail::
               target_graph_capacity_for_parallel_segments(
                   0, graph_capacity) && graph_capacity == 16384);
-    CHECK(dflash::common::detail::
+    CHECK(luce::common::detail::
               target_graph_capacity_for_parallel_segments(
                   8, graph_capacity) && graph_capacity == 16384);
-    CHECK(dflash::common::detail::
+    CHECK(luce::common::detail::
               target_graph_capacity_for_parallel_segments(
                   16, graph_capacity) && graph_capacity == 32768);
-    CHECK(dflash::common::detail::
+    CHECK(luce::common::detail::
               target_graph_capacity_for_parallel_segments(
                   64, graph_capacity) && graph_capacity == 131072);
-    CHECK(!dflash::common::detail::
+    CHECK(!luce::common::detail::
                target_graph_capacity_for_parallel_segments(
                    65, graph_capacity));
-    CHECK(dflash::common::detail::target_paged_tree_graph_capacity(
+    CHECK(luce::common::detail::target_paged_tree_graph_capacity(
               16, 16, graph_capacity) && graph_capacity == 32768);
-    CHECK(!dflash::common::detail::target_paged_tree_graph_capacity(
+    CHECK(!luce::common::detail::target_paged_tree_graph_capacity(
                17, 16, graph_capacity));
 
     {
@@ -101,16 +101,16 @@ TEST_CASE(RecurrentSnapshotFixture, validates_paged_tree_capacity_and_uploads) {
             CHECK(live_buffer != nullptr);
             if (live_buffer) {
                 CHECK(tree.active_slot_ids->buffer == nullptr);
-                CHECK(dflash::common::detail::
+                CHECK(luce::common::detail::
                           target_paged_tree_uploads_ready(tree));
-                CHECK(!dflash::common::detail::
+                CHECK(!luce::common::detail::
                            target_paged_tree_active_slots_need_upload(tree));
 
                 const int32_t state_ids[] = {0, 1};
                 ggml_backend_tensor_set(tree.state_slot_ids, state_ids, 0,
                                         sizeof(state_ids));
                 tree.state_slot_ids = unallocated_state_ids;
-                CHECK(!dflash::common::detail::
+                CHECK(!luce::common::detail::
                            target_paged_tree_uploads_ready(tree));
                 ggml_backend_buffer_free(live_buffer);
             }
@@ -139,11 +139,11 @@ TEST_CASE(RecurrentSnapshotFixture, validates_paged_tree_layout) {
             shape_cache.attn_k = {
                 ggml_new_tensor_4d(shape_ctx, GGML_TYPE_F16, 4, 64, 1, 1),
             };
-            CHECK(dflash::common::detail::validate_target_paged_tree_layout(
+            CHECK(luce::common::detail::validate_target_paged_tree_layout(
                 shape_cache, 8, 2, 4096, 32, 16));
-            CHECK(!dflash::common::detail::validate_target_paged_tree_layout(
+            CHECK(!luce::common::detail::validate_target_paged_tree_layout(
                 shape_cache, 8, 2, 4096, 48, 16));
-            CHECK(!dflash::common::detail::validate_target_paged_tree_layout(
+            CHECK(!luce::common::detail::validate_target_paged_tree_layout(
                 shape_cache, 8, 5, 4096, 32, 16));
             ggml_free(shape_ctx);
         }
@@ -171,7 +171,7 @@ TEST_CASE(RecurrentSnapshotFixture, snapshot_and_restore_recurrent_state) {
 
     {
         size_t graph_capacity = 0;
-        CHECK(dflash::common::detail::target_paged_tree_graph_capacity(
+        CHECK(luce::common::detail::target_paged_tree_graph_capacity(
             16, 16, graph_capacity));
         ggml_init_params graph_params{};
         graph_params.mem_size = 32 * 1024 * 1024;

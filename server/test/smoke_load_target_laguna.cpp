@@ -1,10 +1,10 @@
-// Smoke test: load Laguna-XS.2 GGUF via dflash's hand-rolled loader
+// Smoke test: load Laguna-XS.2 GGUF via luce's hand-rolled loader
 // (load_target_gguf with arch dispatch to Laguna), validate hparams + tensor
 // counts, exit. NO forward yet — forward graph is Phase 2.
 //
 // Usage: smoke_load_target_laguna <laguna-xs2-Q4_K_M.gguf>
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "internal.h"
 #include "laguna_internal.h"
 #include "CppUnitTestFramework.hpp"
@@ -17,7 +17,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
-using namespace dflash::common;
+using namespace luce::common;
 using namespace CppUnitTestFramework;
 
 struct SmokeLoadLagunaTarget : CommonFixture {
@@ -32,7 +32,7 @@ TEST_CASE(SmokeLoadLagunaTarget, LoadsConfiguredModel) {
     LagunaTargetWeights w;
     const bool loaded = load_target_gguf_laguna(path, backend, w);
     if (!loaded) {
-        std::fprintf(stderr, "[smoke-laguna] load_target_gguf_laguna failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "[smoke-laguna] load_target_gguf_laguna failed: %s\n", luce_last_error());
         ggml_backend_free(backend);
         REQUIRE(loaded);
     }

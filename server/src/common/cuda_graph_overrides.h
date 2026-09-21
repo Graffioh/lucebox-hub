@@ -2,7 +2,7 @@
 
 #include "ggml-cuda.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 // Thread-local CUDA/HIP graph controls used while executing a graph whose
 // topology or backend metadata requires a temporary policy override. The
@@ -69,4 +69,4 @@ private:
     int previous_ds4_mix_max_tokens_ = 0;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

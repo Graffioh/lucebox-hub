@@ -20,7 +20,7 @@
 #include <optional>
 #include <thread>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -52,10 +52,10 @@ struct SchedSlot {
     // Buffered client output (see client_send_buffer.h): chunks append here and
     // a non-blocking flush runs every scheduler iteration, so one slow
     // reader can never head-of-line-block the shared decode loop.
-    dflash::common::ClientSendBuffer send_buffer;
+    luce::common::ClientSendBuffer send_buffer;
     // Thinking-budget force-close, applied scheduler-side before the token
     // is fed back (mirrors do_ar_decode's maybe_force_close).
-    dflash::common::BudgetHook hook;
+    luce::common::BudgetHook hook;
     bool hook_started = false;
     int  hook_pos = 0;
     bool budget_forced_close = false;
@@ -87,11 +87,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // Degenerate-run guard shared with do_ar_decode: explicit env override,
     // else 32 when the min-tokens floor is active, else off.
     static const int repeat_guard = [] {
-        if (const char * s = std::getenv("DFLASH_DEGENERATE_RUN_TOKENS")) {
+        if (const char * s = std::getenv("LUCE_DEGENERATE_RUN_TOKENS")) {
             const int v = std::atoi(s);
             if (v >= 0) return v;
         }
-        const char * f = std::getenv("DFLASH_MIN_TOKENS");
+        const char * f = std::getenv("LUCE_MIN_TOKENS");
         return (f && std::atoi(f) > 0) ? 32 : 0;
     }();
 
@@ -1102,4 +1102,4 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
 }
 
 
-}  // namespace dflash::common
+}  // namespace luce::common

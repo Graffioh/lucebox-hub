@@ -15,7 +15,7 @@
 #include <memory>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 class Qwen35MoeBackend : public Qwen35Backend {
 public:
@@ -103,4 +103,4 @@ private:
     bool ensure_pipe_state(int kv_start);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

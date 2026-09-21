@@ -4398,12 +4398,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     //
     // TQ3_0 has no MMA kernel support and must always use chunked.
     // For other K/V types MMA is faster, so the threshold-based forcing is
-    // off by default (DFLASH27B_CHUNKED_THRESHOLD=0). Set the env var to a
+    // off by default (LUCE_CHUNKED_THRESHOLD=0). Set the env var to a
     // positive value (e.g. 8192) to opt in when MMA's temp memory becomes
     // the bottleneck on a memory-tight card.
     {
         static const int64_t chunked_threshold = [] {
-            const char * e = getenv("DFLASH27B_CHUNKED_THRESHOLD");
+            const char * e = getenv("LUCE_CHUNKED_THRESHOLD");
             if (e) return (int64_t)atoll(e);
             return (int64_t)0;
         }();
@@ -4520,22 +4520,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // generic tile kernel, which leaves the WMMA units idle and dominates
     // long-context prefill wall time. The raw-MMA kernel is qualified by
     // test_fattn_mma256 (max diff vs the CPU reference enforced at 1e-3
-    // f16 / 2e-3 q8_0 KV) and is the default; DFLASH27B_FA256_MMA=0 opts
-    // out. DFLASH27B_FA256_WMMA=1 additionally enables the unqualified
+    // f16 / 2e-3 q8_0 KV) and is the default; LUCE_FA256_MMA=0 opts
+    // out. LUCE_FA256_WMMA=1 additionally enables the unqualified
     // rocWMMA kernel for A/B work.
     static const auto env_int64 = [](const char * name, int64_t def) -> int64_t {
         const char * e = getenv(name);
         return e ? atoll(e) : def;
     };
-    static const bool fa256_tc          = env_int64("DFLASH27B_FA256_MMA", 1) != 0;
-    static const bool fa256_wmma        = env_int64("DFLASH27B_FA256_WMMA", 0) != 0;
+    static const bool fa256_tc          = env_int64("LUCE_FA256_MMA", 1) != 0;
+    static const bool fa256_wmma        = env_int64("LUCE_FA256_WMMA", 0) != 0;
     // KV length above which the raw-MMA kernel takes over from rocWMMA in
     // flag builds. Measured on gfx1201 (q8_0 KV, nq=512): rocWMMA wins at
     // 8K (4.24 vs 5.32 ms) and 16K (8.55 vs 10.17), raw-MMA wins at 32K
     // (19.45 vs 19.77), 64K (37.87 vs 39.77) and 131K (74.80 vs 79.00).
     // The crossover lies in the unmeasured 16-32K band; override with
-    // DFLASH27B_FA256_WMMA_MAX_KV for A/B.
-    static const int64_t fa256_wmma_max_kv = env_int64("DFLASH27B_FA256_WMMA_MAX_KV", 32768);
+    // LUCE_FA256_WMMA_MAX_KV for A/B.
+    static const int64_t fa256_wmma_max_kv = env_int64("LUCE_FA256_WMMA_MAX_KV", 32768);
     if ((fa256_tc || fa256_wmma) && amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) &&
         gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256) {
         // Same effective-GQA computation as the RDNA4 head<=128 gate above.
@@ -4549,7 +4549,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (fa256_wmma && !ggml_cuda_should_use_wmma_fattn(cc)) {
             static bool wmma_without_build_warned = false;
             if (!wmma_without_build_warned) {
-                fprintf(stderr, "DFLASH27B_FA256_WMMA=1 set but this build has no rocWMMA kernel; using the raw-MMA kernel.\n");
+                fprintf(stderr, "LUCE_FA256_WMMA=1 set but this build has no rocWMMA kernel; using the raw-MMA kernel.\n");
                 wmma_without_build_warned = true;
             }
         }

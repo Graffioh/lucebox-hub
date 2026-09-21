@@ -22,7 +22,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace detail {
 
@@ -234,4 +234,4 @@ bool build_lm_head_projection_step(
     ggml_backend_t backend,
     int n_tokens);
 
-}  // namespace dflash::common
+}  // namespace luce::common

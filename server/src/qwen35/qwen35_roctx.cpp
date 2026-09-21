@@ -6,7 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
 #  if defined(_WIN32)
 #    define WIN32_LEAN_AND_MEAN
 #    include <windows.h>
@@ -15,7 +15,7 @@
 #  endif
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 bool equals_ignore_case(const char * a, const char * b) {
     if (!a || !b) return false;
@@ -26,7 +26,7 @@ bool equals_ignore_case(const char * a, const char * b) {
     return *a == '\0' && *b == '\0';
 }
 
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
 using RoctxPush = int (*)(const char *);
 using RoctxPop = int (*)();
 
@@ -68,9 +68,9 @@ void roctx_close(void * handle) {
 #endif
 
 Qwen35RoctxCallbacks configured_callbacks() {
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
     static const Qwen35RoctxCallbacks callbacks = [] {
-        if (!qwen35_roctx_env_enabled(std::getenv("DFLASH_QWEN35_ROCTX"))) return Qwen35RoctxCallbacks{};
+        if (!qwen35_roctx_env_enabled(std::getenv("LUCE_QWEN35_ROCTX"))) return Qwen35RoctxCallbacks{};
         void * handle = roctx_open();
         auto push = handle ? roctx_find_push(handle) : nullptr;
         auto pop = handle ? roctx_find_pop(handle) : nullptr;
@@ -118,4 +118,4 @@ Qwen35RoctxRange::Qwen35RoctxRange(const char * scope, const Qwen35RoctxMetadata
 }
 
 Qwen35RoctxRange::~Qwen35RoctxRange() { if (pushed_ && pop_) pop_(); }
-} // namespace dflash::common
+} // namespace luce::common

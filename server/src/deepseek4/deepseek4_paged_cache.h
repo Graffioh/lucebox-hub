@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Pure host-side allocation plan. Byte counts describe tensor payloads (ggml
 // alignment/padding is deliberately excluded).
@@ -69,4 +69,4 @@ bool plan_deepseek4_paged_cache(uint32_t head_dim,
                                 const std::vector<uint32_t> & ratios,
                                 DeepSeek4PagedCachePlan & out);
 
-} // namespace dflash::common
+} // namespace luce::common

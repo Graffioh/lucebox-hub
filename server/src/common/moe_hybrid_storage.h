@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct MoeHybridRoutingStats;
 
@@ -302,4 +302,4 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     int cache_slots = 0,
     ggml_backend_t cold_gpu_backend = nullptr);
 
-}  // namespace dflash::common
+}  // namespace luce::common

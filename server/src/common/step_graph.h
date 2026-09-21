@@ -17,7 +17,7 @@
 #include <tuple>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 using TargetPagedTreeGraphKey = std::tuple<
     const TargetWeights *, const TargetCache *, ggml_backend_t,
@@ -166,4 +166,4 @@ inline void step_graph_destroy(StepGraph & sg) {
     sg.alloc_reserved_ctx = 0;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

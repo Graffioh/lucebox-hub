@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── Configuration ──────────────────────────────────────────────────────
 
@@ -230,4 +230,4 @@ private:
     static bool read_header(FILE * f, DiskCacheHeader & hdr);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -1,11 +1,11 @@
-// Unit tests for dflash::common::verify_derived_scalars — no GPU, no model files.
+// Unit tests for luce::common::verify_derived_scalars — no GPU, no model files.
 
 #include "CppUnitTestFramework.hpp"
 #include "common/derived_scalars.h"
 
 #include <string>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 struct DerivedScalarsFixture {};

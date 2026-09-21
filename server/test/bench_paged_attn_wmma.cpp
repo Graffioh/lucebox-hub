@@ -2,7 +2,7 @@
 //
 // Times ggml_paged_attn_ext at a chunked-prefill shape (nq query rows in one
 // block-table slot over a growing paged pool) with the K/V type from argv[2]
-// (f16/q8_0/q4_0, default q8_0). DFLASH27B_PAGED_WMMA=0/1 selects the V_DOT2 decode kernel
+// (f16/q8_0/q4_0, default q8_0). LUCE_PAGED_WMMA=0/1 selects the V_DOT2 decode kernel
 // or the stage-1 WMMA kernel; run the binary once per value to A/B. The
 // launcher reads the env once at static init, hence one route per process.
 // Throughput only; correctness is covered by test_paged_attn_wmma.cpp.
@@ -160,7 +160,7 @@ int main(int argc, char ** argv) {
     ggml_backend_t gpu = ggml_backend_cuda_init(0);
     if (!gpu) return 1;
 
-    const char * env = getenv("DFLASH27B_PAGED_WMMA");
+    const char * env = getenv("LUCE_PAGED_WMMA");
     const int route = env && atoi(env) != 0;
     std::printf("[bench-paged-wmma] route=%s\n", route ? "wmma" : "v_dot2");
 

@@ -2,9 +2,9 @@
 //
 // Times ggml_flash_attn_ext at chunked-prefill shapes (nq=512 query rows
 // over a growing KV) with q8_0 K/V, the Qwen3.8-27B serving config. The
-// default run takes the tensor-core route (DFLASH27B_FA256_MMA defaults
-// to 1 on RDNA4); DFLASH27B_FA256_MMA=0 A/B's the tile kernel,
-// DFLASH27B_FA256_WMMA=1 forces the rocWMMA kernel on flag builds.
+// default run takes the tensor-core route (LUCE_FA256_MMA defaults
+// to 1 on RDNA4); LUCE_FA256_MMA=0 A/B's the tile kernel,
+// LUCE_FA256_WMMA=1 forces the rocWMMA kernel on flag builds.
 // Throughput only; no correctness checks.
 #include "ggml.h"
 #define GGML_COMMON_DECL_CPP
