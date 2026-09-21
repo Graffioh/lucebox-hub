@@ -2433,21 +2433,25 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
     try {
         const json & body = req.raw_body;
         if (!parse_common_request_fields(fd, body, req)) return true;
+        // Image extraction and redaction apply only to an image-capable
+        // backend; every other backend sees the request exactly as before.
         std::vector<EncodedImage> encoded_images;
-        json normalized;
-        std::string extraction_error;
-        const ImageRequestPolicy image_policy{
-            req.format == ApiFormat::OPENAI_CHAT,
-            config_.image_input_enabled,
-            config_.arch == "deepseek4"};
-        if (!prepare_request_images(req.messages, image_policy, normalized,
-                                    encoded_images, extraction_error)) {
-            send_error(fd, 400, extraction_error);
-            return true;
+        if (config_.image_input_enabled) {
+            json normalized;
+            std::string extraction_error;
+            const ImageRequestPolicy image_policy{
+                req.format == ApiFormat::OPENAI_CHAT,
+                config_.image_input_enabled,
+                config_.arch == "deepseek4"};
+            if (!prepare_request_images(req.messages, image_policy, normalized,
+                                        encoded_images, extraction_error)) {
+                send_error(fd, 400, extraction_error);
+                return true;
+            }
+            req.messages = std::move(normalized);
+            redact_image_urls(req.raw_body);
+            redact_image_urls(req.messages);
         }
-        req.messages = std::move(normalized);
-        redact_image_urls(req.raw_body);
-        redact_image_urls(req.messages);
 
         const std::vector<ChatMessage> chat_messages =
             normalize_chat_messages(req.messages, req.format, tool_memory_);
