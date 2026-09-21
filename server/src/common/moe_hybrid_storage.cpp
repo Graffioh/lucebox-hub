@@ -39,32 +39,8 @@ namespace {
 
 void advise_copied_source(const void * mapping, size_t mapping_size,
                           const ExpertTensorFileData & tensor, int layer, int source_fd) {
-    if (source_fd >= 0) {
-        reclaim_copied_file_source(mapping, mapping_size, tensor.data, tensor.size,
-                                   source_fd, "expert", layer);
-        return;
-    }
-#if defined(__linux__) && defined(MADV_PAGEOUT)
-    if (!tensor.data || tensor.size == 0) return;
-    const long page_size = ::sysconf(_SC_PAGESIZE);
-    MoeSourcePageRange range;
-    if (page_size <= 0 || !moe_source_page_range(
-            reinterpret_cast<uintptr_t>(mapping), mapping_size,
-            reinterpret_cast<uintptr_t>(tensor.data), tensor.size,
-            static_cast<size_t>(page_size), range)) {
-        std::fprintf(stderr, "[hybrid-storage] layer %d source pageout rejected: errno=%d requested=%zu bytes\n",
-                     layer, EINVAL, tensor.size);
-        return;
-    }
-    if (range.size == 0) return;
-    errno = 0;
-    const int rc = ::madvise(reinterpret_cast<void *>(range.address), range.size, MADV_PAGEOUT);
-    const int error = rc == 0 ? 0 : errno;
-    std::fprintf(stderr, "[hybrid-storage] layer %d source pageout advisory: requested=%zu bytes rc=%d errno=%d\n",
-                 layer, range.size, rc, error);
-#else
-    (void) mapping; (void) mapping_size; (void) tensor; (void) layer;
-#endif
+    reclaim_copied_file_source(mapping, mapping_size, tensor.data, tensor.size,
+                               source_fd, "expert", layer);
 }
 
 void unregister_mix_tensor(ggml_tensor * tensor) {
@@ -734,7 +710,7 @@ bool build_moe_hybrid_storage_from_file(
         // Only the mmap-retaining wrapper supplies proven file-mapping bounds.
         // All synchronous hot/cold uploads have returned, and both temporary
         // slice buffers are gone. Retain the mapping for future streaming reads.
-        if (readonly_file_mmap && moe_source_pageout_eligible(
+        if (readonly_file_mmap && readonly_file_fd >= 0 && moe_source_pageout_eligible(
                 out.cold_backend_kind == MoeHybridColdBackend::Gpu,
                 cfg.materialize_hot_experts, cfg.materialize_cold_experts,
                 allocate_cold && cold_count > 0 && dst.cold_buf != nullptr)) {

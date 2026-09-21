@@ -7782,6 +7782,7 @@ bool deepseek4_validate_image_batch(
         int count, int position, vision::ImageSpanView spans,
         bool & has_images, std::string & error) {
     has_images = false;
+    if (!spans.size) return true;
     const auto fail = [&](const char * message) { error = message; return false; };
     if (count <= 0 || position < 0 || int64_t(position) + count > cache.max_ctx ||
         !vision::valid_image_spans(spans, uint64_t(std::max(0, cache.max_ctx))))
@@ -8554,17 +8555,12 @@ bool deepseek4_step_layer_range(
         // Gallocr teardown does not return cached operator temporaries to
         // the driver. Retire backend captures/memos and trim free pool blocks
         // before allocating the new bulk-prefill scratch on either owner.
-        const size_t primary_released = ggml_backend_cuda_trim_pool(backend);
-        std::fprintf(stderr,
-                     "[deepseek4] bulk prefill pool trim: owner=primary released=%zu bytes\n",
-                     primary_released);
-        if (moe_hybrid && moe_hybrid->cold_backend &&
-            moe_hybrid->cold_backend != backend) {
-            const size_t cold_released =
+        if (ds4_image_capable(w)) {
+            ggml_backend_cuda_trim_pool(backend);
+            if (moe_hybrid && moe_hybrid->cold_backend &&
+                moe_hybrid->cold_backend != backend) {
                 ggml_backend_cuda_trim_pool(moe_hybrid->cold_backend);
-            std::fprintf(stderr,
-                         "[deepseek4] bulk prefill pool trim: owner=cold released=%zu bytes\n",
-                         cold_released);
+            }
         }
         std::fprintf(stderr,
                      "[deepseek4] released prior decode/tail arenas before "
@@ -9106,6 +9102,7 @@ bool deepseek4_step_layer_range(
                                                i64_array_inputs,
                                                &f32_array_inputs,
                                                attention_impl,
+                                               /*boundary_checkpoint=*/nullptr,
                                                image_batch ? image_spans : vision::ImageSpanView{});
                 if (!attn_out) { ggml_free(ctx); return false; }
                 ggml_set_output(attn_out);

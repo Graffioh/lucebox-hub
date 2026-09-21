@@ -139,7 +139,7 @@ struct DeepSeek4Layer {
     // Router
     ggml_tensor * ffn_gate_inp       = nullptr;  // [n_embd, n_expert] router weights F16
     ggml_tensor * ffn_exp_probs_b    = nullptr;  // [n_expert] optional routing bias
-    ggml_tensor * ffn_gate_bias_vl   = nullptr;
+    ggml_tensor * ffn_gate_bias_vl   = nullptr;  // image router bias, loaded only with --mmproj
 
     // Hash routing table (first n_hash_layer layers only)
     ggml_tensor * ffn_gate_tid2eid   = nullptr;  // [n_expert_used, n_vocab] I32
@@ -248,6 +248,12 @@ struct DeepSeek4Weights {
     bool fused_decode        = false;
     bool fused_verify_f16_kv = false;
 };
+
+// True when the image router biases were loaded, i.e. the backend was started
+// with a vision projector.
+inline bool ds4_image_capable(const DeepSeek4Weights & w) {
+    return !w.layers.empty() && w.layers.front().ffn_gate_bias_vl != nullptr;
+}
 
 inline bool deepseek4_is_eos_tok(int tok, const DeepSeek4Weights & w) {
     return (w.eos_chat_id >= 0 && tok == w.eos_chat_id)

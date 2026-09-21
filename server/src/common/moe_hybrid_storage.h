@@ -264,9 +264,9 @@ int moe_hybrid_cache_swap_in(MoeHybridLayerStorage & st, int global_expert,
                              ggml_backend_t gpu_backend);
 
 // Build hybrid storage by loading expert data directly from file (mmap).
-// Optional readonly_file_mmap metadata is supplied only by the mmap-retaining
-// wrapper for a read-only file-backed mapping. It permits advisory reclamation
-// of completed materialized GPU layers without invalidating source pointers.
+// Optional: a caller that passes readonly_file_fd >= 0 for its read-only
+// file-backed mapping opts in to advisory page-cache reclamation of completed
+// materialized GPU layers. Source pointers stay valid; later reads refault.
 bool build_moe_hybrid_storage_from_file(
     const MoeHybridConfig & cfg,
     ggml_backend_t gpu_backend,
