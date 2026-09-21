@@ -8,7 +8,7 @@
 #include "deepseek4_image_budget.h"
 #include "deepseek4_image_assembly.h"
 #include "deepseek4_image_admission.h"
-#include "deepseek4_vision_decode.h"
+#include "../common/vision/image_decode.h"
 #include "dflash27b.h"
 #include "deepseek4_snapshot.h"
 #include "deepseek4_page_layout.h"

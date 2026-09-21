@@ -73,6 +73,7 @@ public:
     // ModelBackend interface
     void print_ready_banner() const override;
     bool supports_images() const override { return image_capable_; }
+    std::string image_placeholder() const override { return vision::DS4V_IMAGE_PLACEHOLDER; }
     bool prepare_images(std::vector<int32_t> & tokens,
                         std::vector<EncodedImage> images,
                         uint64_t context_capacity,

@@ -1,4 +1,4 @@
-#include "deepseek4_vision_decode.h"
+#include "image_decode.h"
 
 #include <cstdio>
 #include <jpeglib.h>
@@ -37,11 +37,16 @@ DecodeStatus validate_decoded(
     std::uint32_t height,
     const DecodeLimits & limits,
     std::size_t & output_bytes) {
-    const auto status = validate_decoded_dimensions(width, height, limits.decoded);
-    if (!status) {
-        return {DecodeError::DecodedTooLarge, status.message};
+    if (width == 0 || height == 0) {
+        return {DecodeError::MalformedImage, "decoded image dimensions must be positive"};
+    }
+    if (width > limits.max_dimension || height > limits.max_dimension) {
+        return {DecodeError::DecodedTooLarge, "decoded image dimension exceeds the limit"};
     }
     const std::uint64_t pixels = static_cast<std::uint64_t>(width) * height;
+    if (pixels > limits.max_decoded_pixels) {
+        return {DecodeError::DecodedTooLarge, "decoded image pixel count exceeds the limit"};
+    }
     if (pixels > std::numeric_limits<std::size_t>::max() / 3) {
         return {DecodeError::DecodedTooLarge, "decoded RGB byte count overflows size_t"};
     }

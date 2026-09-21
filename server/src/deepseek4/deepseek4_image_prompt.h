@@ -11,6 +11,9 @@ struct PromptImage {
     ImagePatchInput input;
     ImageLayout layout;
 };
+// Text the DS4V chat template renders for one image; it tokenizes to `marker`.
+inline constexpr char DS4V_IMAGE_PLACEHOLDER[] = "<｜deepseek_image｜>";
+
 struct ImageTokenizerContract {
     std::uint32_t vocabulary = 129280;
     std::int32_t marker = 129264;

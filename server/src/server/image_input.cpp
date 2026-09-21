@@ -14,20 +14,20 @@ int base64_value(char c) {
     if (c == '/') return 63;
     return -1;
 }
-bool reserved_placeholder(std::string_view text) {
-    return text.find(DS4_IMAGE_PLACEHOLDER) != std::string_view::npos;
+bool reserved_placeholder(std::string_view text, std::string_view placeholder) {
+    return text.find(placeholder) != std::string_view::npos;
 }
 void require(bool valid, const char * message) {
     if (!valid) throw std::invalid_argument(message);
 }
-void validate_message_structure(const nlohmann::json & messages) {
+void validate_message_structure(const nlohmann::json & messages, std::string_view placeholder) {
     std::vector<std::pair<const nlohmann::json *, size_t>> pending{{&messages, 0}};
     while (!pending.empty()) {
         const auto [value, depth] = pending.back();
         pending.pop_back();
         require(depth <= 64, "image message nesting exceeds 64 levels");
         if (value->is_string()) {
-            require(!reserved_placeholder(value->get_ref<const std::string &>()),
+            require(!reserved_placeholder(value->get_ref<const std::string &>(), placeholder),
                     "text contains the reserved image placeholder");
         } else if (value->is_structured()) {
             for (const auto & child : *value) pending.emplace_back(&child, depth + 1);
@@ -95,15 +95,17 @@ bool parse_image_data_url(std::string_view url, EncodedImage & image,
     }
 }
 
-bool extract_chat_images(const nlohmann::json & messages, nlohmann::json & normalized,
+bool extract_chat_images(const nlohmann::json & messages, std::string_view placeholder,
+                         nlohmann::json & normalized,
                          std::vector<EncodedImage> & images,
                          std::string & error, const ImageInputLimits & limits) {
     normalized = nullptr;
     images.clear();
     error.clear();
     try {
+        require(!placeholder.empty(), "the backend names no image placeholder");
         require(messages.is_array(), "image messages must be an array");
-        validate_message_structure(messages);
+        validate_message_structure(messages, placeholder);
         nlohmann::json result = messages;
         std::vector<EncodedImage> collected;
         size_t total_bytes = 0;
@@ -122,7 +124,7 @@ bool extract_chat_images(const nlohmann::json & messages, nlohmann::json & norma
                 }
                 require(type != "image" && type != "input_image", "use image_url content parts for images");
                 if (type != "image_url") continue;
-                require(!reserved_placeholder(text_segment), "text contains the reserved image placeholder");
+                require(!reserved_placeholder(text_segment, placeholder), "text contains the reserved image placeholder");
                 text_segment.clear();
                 require(message.value("role", std::string("user")) == "user", "images are supported only in user messages");
                 require(collected.size() < limits.image_count, "too many images in request");
@@ -145,9 +147,9 @@ bool extract_chat_images(const nlohmann::json & messages, nlohmann::json & norma
                 }
                 total_bytes += decoded.bytes.size();
                 collected.push_back(std::move(decoded));
-                part = {{"type", "text"}, {"text", DS4_IMAGE_PLACEHOLDER}};
+                part = {{"type", "text"}, {"text", std::string(placeholder)}};
             }
-            require(!reserved_placeholder(text_segment), "text contains the reserved image placeholder");
+            require(!reserved_placeholder(text_segment, placeholder), "text contains the reserved image placeholder");
         }
         normalized = std::move(result);
         images = std::move(collected);
@@ -200,10 +202,10 @@ bool prepare_request_images(const nlohmann::json & messages,
         error = "image input is supported only through /v1/chat/completions image_url parts";
         return false;
     }
-    if (policy.chat_completions && (has_images || policy.reserve_placeholder)) {
+    if (policy.chat_completions) {
         nlohmann::json prepared;
         std::vector<EncodedImage> extracted;
-        if (!extract_chat_images(messages, prepared, extracted, error, limits)) return false;
+        if (!extract_chat_images(messages, policy.placeholder, prepared, extracted, error, limits)) return false;
         if (contains_image_content(prepared)) {
             error = "images must be user content-array image_url parts";
             return false;

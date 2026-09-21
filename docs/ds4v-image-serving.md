@@ -97,3 +97,25 @@ Not yet established:
 - No image-chat quality run, and no measurement of paired-GPU memory peaks or
   throughput with a projector loaded.
 - No other HIP device has been tried.
+
+## Code layout
+
+Shared by every model:
+
+| Piece | Where |
+| --- | --- |
+| Reading images out of a request, limits, redaction | `server/src/server/image_input.*` |
+| JPEG and PNG decoding to RGB | `server/src/common/vision/image_decode.*`, codecs in `server/cmake/ImageCodecs.cmake` |
+| Image positions in a prompt, batches that keep an image whole | `server/src/common/vision/image_spans.h` |
+| The backend contract | `supports_images`, `image_placeholder`, `prepare_images` in `server/src/common/model_backend.h`, and `GenerateRequest::images` |
+
+DS4V only, all under `server/src/deepseek4/`: resizing and patching
+(`deepseek4_vision_preprocess`), the vision tower (`deepseek4_vision`), marker
+expansion and embedding assembly (`deepseek4_image_prompt`,
+`deepseek4_image_assembly`), attention visibility and expert routing for image
+rows (`deepseek4_image_policy`), and memory admission
+(`deepseek4_image_admission`).
+
+Another model needs its own preprocessing, tower and prompt expansion, and its
+backend implements the three contract methods. Nothing in the HTTP server or in
+`common/vision` names a model.

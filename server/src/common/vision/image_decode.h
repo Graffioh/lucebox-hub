@@ -1,6 +1,6 @@
+// JPEG and PNG decoding to 8-bit RGB. Model independent: every vision model
+// starts from these pixels and does its own resizing and patching.
 #pragma once
-
-#include "deepseek4_vision_preprocess.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -14,9 +14,19 @@ struct EncodedImageView {
     std::size_t size = 0;
 };
 
+// Checked before any decoded buffer is allocated.
 struct DecodeLimits {
     std::size_t max_encoded_bytes = 16ULL * 1024ULL * 1024ULL;
-    PreprocessLimits decoded;
+    std::uint64_t max_decoded_pixels = 64ULL * 1024ULL * 1024ULL;
+    std::uint32_t max_dimension = 65'535;
+};
+
+// Borrowed row-major RGB, three bytes per pixel.
+struct DecodedRgbView {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    const std::uint8_t * data = nullptr;
+    std::size_t size = 0;
 };
 
 struct DecodedRgb {

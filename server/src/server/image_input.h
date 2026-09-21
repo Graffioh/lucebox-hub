@@ -11,7 +11,6 @@
 
 namespace dflash::common {
 
-inline constexpr char DS4_IMAGE_PLACEHOLDER[] = "<｜deepseek_image｜>";
 
 struct ImageInputLimits {
     size_t image_bytes = 16 * 1024 * 1024;
@@ -22,12 +21,15 @@ struct ImageInputLimits {
 struct ImageRequestPolicy {
     bool chat_completions = false;
     bool image_capable = false;
-    bool reserve_placeholder = false;
+    // Text that stands for one image in the rendered prompt; the backend's
+    // chat template maps it to the model's image marker. Users may not send it.
+    std::string placeholder;
 };
 
 bool parse_image_data_url(std::string_view url, EncodedImage & image,
                           std::string & error, size_t max_bytes = 16 * 1024 * 1024);
 bool extract_chat_images(const nlohmann::json & messages,
+                         std::string_view placeholder,
                          nlohmann::json & normalized,
                          std::vector<EncodedImage> & images,
                          std::string & error,

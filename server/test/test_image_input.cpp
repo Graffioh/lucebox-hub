@@ -6,6 +6,9 @@
 using namespace dflash::common;
 using json = nlohmann::json;
 
+// Any text works; the transport must not know a model's marker.
+static constexpr char IMAGE_PLACEHOLDER[] = "<image>";
+
 static void check(bool condition, const char * message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -43,40 +46,40 @@ int main() {
             text_part("before"), image_part(jpeg), text_part("between"), image_part(png), text_part("after")})}}});
         json normalized;
         std::vector<EncodedImage> images;
-        check(extract_chat_images(messages, normalized, images, error), "ordered images rejected");
+        check(extract_chat_images(messages, IMAGE_PLACEHOLDER, normalized, images, error), "ordered images rejected");
         check(images.size() == 2 && images[0].mime_type == "image/jpeg" && images[1].mime_type == "image/png", "image order differs");
         std::string text;
         for (const auto & part : normalized[0]["content"]) text += part.at("text").get<std::string>();
-        check(text == "before" + std::string(DS4_IMAGE_PLACEHOLDER) + "between" + DS4_IMAGE_PLACEHOLDER + "after", "text/image placement differs");
+        check(text == "before" + std::string(IMAGE_PLACEHOLDER) + "between" + IMAGE_PLACEHOLDER + "after", "text/image placement differs");
         check(messages[0]["content"][1]["image_url"]["url"] == jpeg, "input JSON mutated");
         check(normalized.dump().find("base64") == std::string::npos, "normalized messages retain bytes");
 
         const json plain = json::array({{{"role", "user"}, {"content", "hello"}},
                                        {{"role", "assistant"}, {"content", "hi"}, {"tool_calls", json::array()}}});
-        check(extract_chat_images(plain, normalized, images, error) && normalized == plain && images.empty(), "text-only request changed");
+        check(extract_chat_images(plain, IMAGE_PLACEHOLDER, normalized, images, error) && normalized == plain && images.empty(), "text-only request changed");
 
         for (const auto & bad : std::vector<json>{
-                json::array({{{"role", "user"}, {"content", DS4_IMAGE_PLACEHOLDER}}}),
-                json::array({{{"role", "user"}, {"content", json::array({text_part("<｜deepseek_"), text_part("image｜>")})}}}),
-                json::array({{{"role", "assistant"}, {"reasoning_content", DS4_IMAGE_PLACEHOLDER}, {"content", "hi"}}}),
-                json::array({{{"type", "function_call_output"}, {"output", DS4_IMAGE_PLACEHOLDER}}}),
-                json::array({{{"type", "function_call"}, {"arguments", DS4_IMAGE_PLACEHOLDER}}}),
-                json::array({{{"role", "assistant"}, {"tool_calls", json::array({{{"function", {{"arguments", DS4_IMAGE_PLACEHOLDER}}}}})}}}),
+                json::array({{{"role", "user"}, {"content", IMAGE_PLACEHOLDER}}}),
+                json::array({{{"role", "user"}, {"content", json::array({text_part("<ima"), text_part("ge>")})}}}),
+                json::array({{{"role", "assistant"}, {"reasoning_content", IMAGE_PLACEHOLDER}, {"content", "hi"}}}),
+                json::array({{{"type", "function_call_output"}, {"output", IMAGE_PLACEHOLDER}}}),
+                json::array({{{"type", "function_call"}, {"arguments", IMAGE_PLACEHOLDER}}}),
+                json::array({{{"role", "assistant"}, {"tool_calls", json::array({{{"function", {{"arguments", IMAGE_PLACEHOLDER}}}}})}}}),
                 json::array({{{"role", "assistant"}, {"content", json::array({image_part(png)})}}}),
                 json::array({{{"role", "user"}, {"content", json::array({{{"type", "image_url"}, {"image_url", 42}}})}}}),
                 json::array({{{"role", "user"}, {"content", json::array({{{"type", "image_url"}, {"image_url", {{"url", 42}}}}})}}}),
                 json::array({{{"role", "user"}, {"content", json::array({{{"type", "image_url"}}})}}})}) {
-            check(!extract_chat_images(bad, normalized, images, error), "invalid image message accepted");
+            check(!extract_chat_images(bad, IMAGE_PLACEHOLDER, normalized, images, error), "invalid image message accepted");
             check(images.empty() && normalized.is_null(), "failed extraction retains partial state");
         }
         ImageInputLimits limits;
         limits.image_count = 1;
-        check(!extract_chat_images(messages, normalized, images, error, limits), "image count cap ignored");
+        check(!extract_chat_images(messages, IMAGE_PLACEHOLDER, normalized, images, error, limits), "image count cap ignored");
         limits.image_count = 4;
         limits.request_bytes = 10;
-        check(!extract_chat_images(messages, normalized, images, error, limits), "aggregate byte cap ignored");
+        check(!extract_chat_images(messages, IMAGE_PLACEHOLDER, normalized, images, error, limits), "aggregate byte cap ignored");
         limits.request_bytes = 11;
-        check(extract_chat_images(messages, normalized, images, error, limits), "exact aggregate cap rejected");
+        check(extract_chat_images(messages, IMAGE_PLACEHOLDER, normalized, images, error, limits), "exact aggregate cap rejected");
 
         json deep = plain;
         json * nested = &deep[0]["metadata"];
@@ -85,7 +88,7 @@ int main() {
             nested = &(*nested)["nested"];
         }
         *nested = image_part(png);
-        check(!extract_chat_images(deep, normalized, images, error), "deep metadata accepted before copy");
+        check(!extract_chat_images(deep, IMAGE_PLACEHOLDER, normalized, images, error), "deep metadata accepted before copy");
         check(error == "image message nesting exceeds 64 levels", "unexpected depth rejection");
         redact_image_urls(deep);
         check((*nested)["image_url"] == "[image omitted]", "deep redaction failed");

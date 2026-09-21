@@ -134,7 +134,10 @@ struct DaemonIO {
 struct ModelBackend {
     virtual ~ModelBackend() = default;
 
+    // Image input. A backend that supports it names the text its chat template
+    // turns into the image marker, and binds decoded images to a rendered prompt.
     virtual bool supports_images() const { return false; }
+    virtual std::string image_placeholder() const { return {}; }
     virtual bool prepare_images(std::vector<int32_t> & tokens,
                                 std::vector<EncodedImage> images,
                                 uint64_t context_capacity,

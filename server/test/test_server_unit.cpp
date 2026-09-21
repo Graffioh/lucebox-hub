@@ -8984,6 +8984,9 @@ TEST_CASE(ServerUnitFixture,
 }
 
 namespace {
+// Any text works; the transport must not know a model's marker.
+constexpr char IMAGE_PLACEHOLDER[] = "<image>";
+
 json image_transport_part(const char * url = "data:image/png;base64,iVBORw0KGgo=") {
     return {{"type", "image_url"}, {"image_url", {{"url", url}}}};
 }
@@ -9021,7 +9024,7 @@ TEST_CASE(ServerUnitFixture, test_image_extraction_normalization_preserves_inter
     json normalized;
     std::vector<EncodedImage> images;
     std::string error;
-    TEST_ASSERT(prepare_request_images(messages, {true, true, true}, normalized, images, error));
+    TEST_ASSERT(prepare_request_images(messages, {true, true, IMAGE_PLACEHOLDER}, normalized, images, error));
     TEST_ASSERT(images.size() == 2);
     TEST_ASSERT(images[0].mime_type == "image/png");
     TEST_ASSERT(images[0].bytes == std::vector<uint8_t>({137, 80, 78, 71, 13, 10, 26, 10}));
@@ -9031,8 +9034,8 @@ TEST_CASE(ServerUnitFixture, test_image_extraction_normalization_preserves_inter
     const auto chat = normalize_chat_messages(normalized, ApiFormat::OPENAI_CHAT, memory);
     TEST_ASSERT(chat.size() == 3);
     TEST_ASSERT(chat[0].role == "user");
-    TEST_ASSERT(chat[0].content == std::string("before ") + DS4_IMAGE_PLACEHOLDER +
-                " between " + DS4_IMAGE_PLACEHOLDER + " after");
+    TEST_ASSERT(chat[0].content == std::string("before ") + IMAGE_PLACEHOLDER +
+                " between " + IMAGE_PLACEHOLDER + " after");
     TEST_ASSERT(chat[1].content == "acknowledged" && chat[2].content == "follow-up");
     json retained = {{"messages", messages}, {"metadata", {{"image_url", "private-url"}, {"label", "keep"}}}};
     redact_image_urls(retained);
@@ -9050,7 +9053,7 @@ TEST_CASE(ServerUnitFixture, test_image_extraction_failure_does_not_publish_part
     json normalized = {{"stale", true}};
     std::vector<EncodedImage> images{{"stale", {1}}};
     std::string error;
-    TEST_ASSERT(!extract_chat_images(messages, normalized, images, error));
+    TEST_ASSERT(!extract_chat_images(messages, IMAGE_PLACEHOLDER, normalized, images, error));
     TEST_ASSERT(normalized.is_null());
     TEST_ASSERT(images.empty());
     TEST_ASSERT(!error.empty());
@@ -9125,7 +9128,7 @@ TEST_CASE(ServerUnitFixture, test_http_image_policy_rejects_unconsumed_images_in
             json normalized = "stale";
             std::vector<EncodedImage> images{{"stale", {1}}};
             std::string error;
-            TEST_ASSERT(!prepare_request_images(messages, {true, true, true}, normalized, images, error));
+            TEST_ASSERT(!prepare_request_images(messages, {true, true, IMAGE_PLACEHOLDER}, normalized, images, error));
             TEST_ASSERT(normalized.is_null() && images.empty());
             TEST_ASSERT(!error.empty());
             TEST_ASSERT(error.find("base64") == std::string::npos);
@@ -9139,14 +9142,14 @@ TEST_CASE(ServerUnitFixture, test_http_image_policy_requires_chat_endpoint_and_e
         json normalized = "stale";
         std::vector<EncodedImage> images{{"stale", {1}}};
         std::string error;
-        TEST_ASSERT(!prepare_request_images(messages, {false, true, true}, normalized, images, error));
+        TEST_ASSERT(!prepare_request_images(messages, {false, true, IMAGE_PLACEHOLDER}, normalized, images, error));
         TEST_ASSERT(normalized.is_null() && images.empty());
         TEST_ASSERT(!error.empty());
     }
     // Without image capability the messages pass through untouched.
     for (ImageRequestPolicy policy : {
-            ImageRequestPolicy{true, false, true},
-            ImageRequestPolicy{false, false, true}}) {
+            ImageRequestPolicy{true, false, IMAGE_PLACEHOLDER},
+            ImageRequestPolicy{false, false, IMAGE_PLACEHOLDER}}) {
         json normalized = "stale";
         std::vector<EncodedImage> images{{"stale", {1}}};
         std::string error;
@@ -9156,7 +9159,7 @@ TEST_CASE(ServerUnitFixture, test_http_image_policy_requires_chat_endpoint_and_e
     json normalized;
     std::vector<EncodedImage> images;
     std::string error;
-    TEST_ASSERT(prepare_request_images(messages, {true, true, true}, normalized, images, error));
+    TEST_ASSERT(prepare_request_images(messages, {true, true, IMAGE_PLACEHOLDER}, normalized, images, error));
     TEST_ASSERT(images.size() == 1);
 }
 
@@ -9166,9 +9169,9 @@ TEST_CASE(ServerUnitFixture, test_http_image_policy_preserves_text_without_image
         {{"role", "user"}, {"content", json::array({{{"type", "text"}, {"text", "ordinary text"}}})}}
     });
     for (ImageRequestPolicy policy : {
-            ImageRequestPolicy{true, false, true},
-            ImageRequestPolicy{false, false, true},
-            ImageRequestPolicy{true, true, true}}) {
+            ImageRequestPolicy{true, false, IMAGE_PLACEHOLDER},
+            ImageRequestPolicy{false, false, IMAGE_PLACEHOLDER},
+            ImageRequestPolicy{true, true, IMAGE_PLACEHOLDER}}) {
         json normalized;
         std::vector<EncodedImage> images;
         std::string error;
@@ -9178,7 +9181,7 @@ TEST_CASE(ServerUnitFixture, test_http_image_policy_preserves_text_without_image
     json normalized;
     std::vector<EncodedImage> images;
     std::string error;
-    const json forged = json::array({{{"role", "user"}, {"content", DS4_IMAGE_PLACEHOLDER}}});
-    TEST_ASSERT(!prepare_request_images(forged, {true, true, true}, normalized, images, error));
+    const json forged = json::array({{{"role", "user"}, {"content", IMAGE_PLACEHOLDER}}});
+    TEST_ASSERT(!prepare_request_images(forged, {true, true, IMAGE_PLACEHOLDER}, normalized, images, error));
     TEST_ASSERT(normalized.is_null() && images.empty());
 }

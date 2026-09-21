@@ -1,5 +1,8 @@
 #pragma once
 
+#include "../common/vision/image_decode.h"
+#include "../common/vision/image_spans.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -28,27 +31,12 @@ struct PreprocessLimits {
     std::uint64_t max_output_pixels = 16ULL * 1024ULL * 1024ULL;
 };
 
-struct DecodedRgbView {
-    std::uint32_t width = 0;
-    std::uint32_t height = 0;
-    const std::uint8_t * data = nullptr;
-    std::size_t size = 0;
-};
-
 enum class ImageTokenType : std::int64_t {
     Start = 0,
     Pad = 1,
     Image = 2,
     Newline = 3,
     End = 4,
-};
-
-struct TokenSpan {
-    // All intervals are half-open absolute token positions.
-    std::uint64_t block_begin = 0;
-    std::uint64_t visible_begin = 0;
-    std::uint64_t visible_end = 0;
-    std::uint64_t block_end = 0;
 };
 
 struct ResizePlan {
