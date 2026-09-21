@@ -349,7 +349,8 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
                                     const DeepSeek4Weights & w,
                                     const DeepSeek4Layer & L,
                                     int layer_idx,
-                                    int n_tokens);
+                                    int n_tokens,
+                                    ggml_tensor * selection_bias = nullptr);
 
 // Every cached per-layer decode/prefill graph below owns a StepGraph whose
 // metadata arena holds the ggml nodes the CUDA/HIP backend keys its captured
@@ -4024,12 +4025,16 @@ static bool eval_ds4_hybrid(
     return true;
 }
 
+// `selection_bias`, when given, is a per-token [n_expert, n_tokens] input that
+// replaces the layer's single selection bias. Image batches use it: image rows
+// select with the image router bias, text rows keep their usual selection.
 static Ds4MoeRouting build_moe_routing(
         ggml_context * ctx,
         ggml_tensor * cur,
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
-        int n_tokens) {
+        int n_tokens,
+        ggml_tensor * selection_bias = nullptr) {
     Ds4MoeRouting out;
     auto track = [&](ggml_tensor * tensor) {
         if (tensor) out.nodes.push_back(tensor);
@@ -4043,7 +4048,9 @@ static Ds4MoeRouting build_moe_routing(
     ggml_tensor * softplus = track(ggml_softplus(ctx, logits));
     ggml_tensor * probs = track(ggml_sqrt(ctx, softplus));
     ggml_tensor * selection = probs;
-    if (L.ffn_exp_probs_b) {
+    if (selection_bias) {
+        selection = track(ggml_add(ctx, selection, selection_bias));
+    } else if (L.ffn_exp_probs_b) {
         selection = track(ggml_add(ctx, selection, L.ffn_exp_probs_b));
     }
 
@@ -4068,7 +4075,8 @@ static ggml_tensor * build_moe_ffn(
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
         int layer_idx,
-        int n_tokens) {
+        int n_tokens,
+        ggml_tensor * selection_bias) {
 
     const int n_embd = w.n_embd;
     int n_used = w.n_expert_used;
@@ -4076,10 +4084,10 @@ static ggml_tensor * build_moe_ffn(
     ggml_tensor * shared_out = build_shared_ffn(ctx, cur, w, L);
     ggml_tensor * routed_out = nullptr;
 
-    if (layer_idx < w.n_hash_layer && L.ffn_gate_tid2eid) {
+    if (!selection_bias && layer_idx < w.n_hash_layer && L.ffn_gate_tid2eid) {
         routed_out = ggml_scale(ctx, cur, 0.0f);
     } else {
-        Ds4MoeRouting routing = build_moe_routing(ctx, cur, w, L, n_tokens);
+        Ds4MoeRouting routing = build_moe_routing(ctx, cur, w, L, n_tokens, selection_bias);
         n_used = (int) routing.selected->ne[0];
         ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
         ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, routing.selected);
@@ -7113,12 +7121,16 @@ static int ds4_try_layer_major_prefill(
         std::vector<float> * out_logits,
         const int32_t * token_ids,
         Ds4VerifyHooks * verify_hooks,
-        DeepSeek4StepTelemetry * telemetry) {
+        DeepSeek4StepTelemetry * telemetry,
+        vision::ImageSpanView image_spans = {}) {
     if (!backend || !embed || n_tokens <= 4 ||
         n_tokens > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS ||
         kv_start < 0 || w.moe_hybrid) {
         return 0;
     }
+    // Image batches carry their own attention mask and per-token expert
+    // selection, so their graphs are built fresh and never cached.
+    const bool image_batch = image_spans.size != 0;
     if (cache.prefill_mode == PrefillAttentionMode::Exact) return 0;
     // Layer-major prefill returns only the final-position logits. DSpark's
     // per-layer feature capture is supported below, but verifier requests for
@@ -7229,9 +7241,10 @@ static int ds4_try_layer_major_prefill(
     // growth costs several GiB without producing a cache hit. Keep the short
     // request win, then retire it before the first chunk beyond 32K.
     constexpr int layer_major_cache_context_limit = 32768;
-    const bool allow_graph_cache =
+    const bool cache_context_ok =
         token_ids && next_pos <= layer_major_cache_context_limit;
-    if (!allow_graph_cache) {
+    const bool allow_graph_cache = cache_context_ok && !image_batch;
+    if (!cache_context_ok) {
         for (auto & candidate : ds4_layer_major_graph_caches) {
             if (candidate.owner_ctx == w.ctx && candidate.backend == backend) {
                 candidate.destroy();
@@ -7498,7 +7511,8 @@ static int ds4_try_layer_major_prefill(
         ggml_tensor * attn_out = build_mla_attention(
             ctx, gf, attn_normed, w, L, lc, il, kv_start, n_tokens,
             nullptr, i32_inputs, i32_array_inputs, i64_array_inputs,
-            &f32_array_inputs, attention_impl);
+            &f32_array_inputs, attention_impl,
+            /*boundary_checkpoint=*/nullptr, image_spans);
         if (!attn_out) {
             if (!cached_layer) ggml_free(ctx);
             return fail("attention graph build failed", il);
@@ -7524,10 +7538,20 @@ static int ds4_try_layer_major_prefill(
         ggml_tensor * ffn_normed = build_rms_norm(ctx, ffn_in,
                                                   L.ffn_norm, w.rms_eps);
         ggml_tensor * hash_ids = nullptr;
+        ggml_tensor * selection_bias = nullptr;
         ggml_tensor * ffn_out = nullptr;
         const bool hash_routed = il < w.n_hash_layer && L.ffn_gate_tid2eid &&
                                  token_ids && hash_tables[(size_t) il].loaded;
-        if (hash_routed) {
+        if (image_batch) {
+            // One mechanism for every layer: top-k over probs + a per-token bias.
+            if (!L.ffn_gate_bias_vl) {
+                if (!cached_layer) ggml_free(ctx);
+                return fail("image batch without an image router bias", il);
+            }
+            selection_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_expert, n_tokens);
+            ggml_set_input(selection_bias);
+            ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, n_tokens, selection_bias);
+        } else if (hash_routed) {
             hash_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32,
                                           w.n_expert_used, n_tokens);
             ggml_set_input(hash_ids);
@@ -7623,6 +7647,33 @@ static int ds4_try_layer_major_prefill(
             }
             ggml_backend_tensor_set(hash_ids, hash_scratch.data(), 0,
                                     sizeof(int32_t) * hash_scratch.size());
+        }
+        if (selection_bias) {
+            // Image rows: the image router bias. Text rows: the layer's usual
+            // bias, or for a hash-routed layer a large bias on exactly the
+            // experts its table names, so top-k returns that set.
+            constexpr float HASH_PICK = 1.0e4f;
+            const size_t n_expert = (size_t) w.n_expert;
+            std::vector<float> image_bias(n_expert), text_bias(n_expert, 0.0f);
+            ggml_backend_tensor_get(L.ffn_gate_bias_vl, image_bias.data(), 0, sizeof(float) * n_expert);
+            if (!hash_routed && L.ffn_exp_probs_b) {
+                ggml_backend_tensor_get(L.ffn_exp_probs_b, text_bias.data(), 0, sizeof(float) * n_expert);
+            }
+            std::vector<float> bias(n_expert * (size_t) n_tokens);
+            for (int t = 0; t < n_tokens; ++t) {
+                float * row = bias.data() + (size_t) t * n_expert;
+                if (vision::image_block_at(image_spans, uint64_t(kv_start) + uint64_t(t))) {
+                    std::copy(image_bias.begin(), image_bias.end(), row);
+                    continue;
+                }
+                std::copy(text_bias.begin(), text_bias.end(), row);
+                if (hash_routed) {
+                    const int32_t * picks = hash_tables[(size_t) il].ids.data() +
+                        (size_t) token_ids[t] * (size_t) w.n_expert_used;
+                    for (int k = 0; k < w.n_expert_used; ++k) row[picks[k]] = HASH_PICK;
+                }
+            }
+            ggml_backend_tensor_set(selection_bias, bias.data(), 0, sizeof(float) * bias.size());
         }
         if (telemetry) {
             telemetry->full_graph_build_us += ds4_elapsed_us(
@@ -7806,13 +7857,18 @@ bool deepseek4_validate_image_batch(
         }
     }
     if (!has_images) return true;
-    if (!hybrid || !w.moe_hybrid || !hybrid->materialized_cold_experts ||
-        hybrid->cold_backend_kind != MoeHybridColdBackend::Gpu || !hybrid->cold_backend ||
-        cache.prefill_mode != PrefillAttentionMode::Sparse || count <= 4 ||
+    // Images run through a batched sparse prefill: the single-GPU layer-major
+    // path, or the two-GPU path with both expert owners materialized on GPUs.
+    if (cache.prefill_mode != PrefillAttentionMode::Sparse || count <= 4 ||
         count > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS ||
         w.layers.size() != size_t(w.n_layer) || cache.layers.size() != size_t(w.n_layer) ||
-        w.compress_ratios.size() != size_t(w.n_layer) || hybrid->layers.size() != size_t(w.n_layer))
-        return fail("image batch requires the heterogeneous sparse decoder path");
+        w.compress_ratios.size() != size_t(w.n_layer))
+        return fail("image batch requires batched sparse prefill");
+    if ((hybrid || w.moe_hybrid) &&
+        (!hybrid || !w.moe_hybrid || !hybrid->materialized_cold_experts ||
+         hybrid->cold_backend_kind != MoeHybridColdBackend::Gpu || !hybrid->cold_backend ||
+         hybrid->layers.size() != size_t(w.n_layer)))
+        return fail("image batch requires both expert owners on GPUs");
     for (int il = 0; il < w.n_layer; ++il) {
         const auto & layer = w.layers[size_t(il)];
         const auto & state = cache.layers[size_t(il)];
@@ -8246,7 +8302,8 @@ bool deepseek4_step_layer_range(
             n_tokens, kv_start, image_spans, image_batch, image_error) ||
         (image_batch && (!embed || layer_begin != 0 || layer_end != w.n_layer ||
          !out_logits || verify_hooks || expert_runtime ||
-         !vision::detail::hip_bias_workspace(backend) || moe_hybrid->cold_backend == backend))) {
+         !vision::detail::hip_bias_workspace(backend) ||
+         (moe_hybrid && moe_hybrid->cold_backend == backend)))) {
         std::fprintf(stderr, "[deepseek4] image prefill rejected before evaluation: %s\n",
                      image_error.empty() ? "unsupported execution path" : image_error.c_str());
         return false;
@@ -8587,7 +8644,7 @@ bool deepseek4_step_layer_range(
             hc_layer_weights_range, hc_output_weights_range,
             hash_routing_tables_range, scratch.hash_expert_ids, embed,
             n_tokens, kv_start, out_logits, token_ids, verify_hooks,
-            telemetry);
+            telemetry, image_batch ? image_spans : vision::ImageSpanView{});
         if (prc < 0) return false;
         if (prc > 0) {
             if (telemetry) {
@@ -8596,6 +8653,11 @@ bool deepseek4_step_layer_range(
             }
             return true;
         }
+    }
+    // Only the two batched prefill paths know about image rows.
+    if (image_batch && !heterogeneous_sparse_prefill) {
+        std::fprintf(stderr, "[deepseek4] image prefill has no batched path for this configuration\n");
+        return false;
     }
 
     // The batched verifier graph is also the only whole-model graph that can

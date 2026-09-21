@@ -194,6 +194,7 @@ private:
                    int kv_offset = 0, int snap_slot = -1, int snap_pos = -1,
                    const DeepSeek4ImagePrompt * images = nullptr);
     bool load_vision();
+    bool init_single_gpu_vision();
     bool materialize_images(const DeepSeek4ImagePrompt & images,
                             const DaemonIO & io, std::string & error);
 

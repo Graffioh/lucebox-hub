@@ -118,6 +118,12 @@ bool check_deepseek4_image_host_preparation(uint64_t required_bytes, std::string
 // Recheck after synchronizing owners and releasing disposable graph caches.
 // Existing experts/tables/core/KV/snapshots are represented only by live free
 // memory. No model-loader or expert-copy charge is added a second time.
+// One GPU holds the whole model: `required_bytes` of image scratch and future
+// KV must fit in what that GPU has free right now.
+bool check_deepseek4_image_single_gpu_admission(
+    ggml_backend * gpu, ImageMemoryDomain domain, uint64_t required_bytes,
+    uint64_t & free_bytes, std::string & error);
+
 bool check_deepseek4_image_runtime_admission(
     const common::MoeHybridConfig & config, ggml_backend * primary, ggml_backend * cold,
     const ImageAdmissionReserves & reserves, ImageAdmissionReport & result, std::string & error);

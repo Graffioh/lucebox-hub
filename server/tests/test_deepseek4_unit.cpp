@@ -2566,6 +2566,20 @@ static void test_image_batch_admission_before_execution(ggml_backend_t backend) 
     const int32_t text[] = {1, 2};
     TEST_ASSERT(deepseek4_validate_image_batch(weights, cache, nullptr, text, 2, 6,
         spans, has_images, error) && !has_images);
+    // One GPU holding the whole model has no second expert owner to check.
+    // (Dense weights here are unset, so the per-layer tensor checks still apply.)
+    weights.moe_hybrid = false;
+    cache.layers.resize(43);
+    for (auto & layer_cache : cache.layers) {
+        layer_cache.raw_kv = layer_cache.comp_kv = layer_cache.index_comp_kv = state;
+        layer_cache.attn_compressor.state_kv = layer_cache.attn_compressor.state_score = state;
+        layer_cache.indexer_compressor.state_kv = layer_cache.indexer_compressor.state_score = state;
+    }
+    TEST_ASSERT(deepseek4_validate_image_batch(weights, cache, nullptr, tokens.data(),
+        int(tokens.size()), 0, spans, has_images, error) && has_images);
+    cache.prefill_mode = PrefillAttentionMode::Exact;
+    TEST_ASSERT(!deepseek4_validate_image_batch(weights, cache, nullptr, tokens.data(),
+        int(tokens.size()), 0, spans, has_images, error));
     ggml_free(ctx);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }

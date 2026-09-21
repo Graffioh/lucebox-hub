@@ -301,6 +301,18 @@ bool check_deepseek4_image_host_preparation(uint64_t required_bytes, std::string
     return true;
 }
 
+bool check_deepseek4_image_single_gpu_admission(
+    ggml_backend_t gpu, ImageMemoryDomain domain, uint64_t required_bytes,
+    uint64_t & free_bytes, std::string & error) {
+    error.clear();
+    free_bytes = 0;
+    if (!gpu_device(gpu)) return fail(error, "image admission requires a GPU owner");
+    if (domain == ImageMemoryDomain::Unknown) return fail(error, "the owner's memory domain must be classified");
+    if (!device_free(gpu, domain, free_bytes, error)) return false;
+    if (required_bytes > free_bytes) return fail(error, "insufficient GPU headroom for image scratch");
+    return true;
+}
+
 bool check_deepseek4_image_runtime_admission(
     const common::MoeHybridConfig & config, ggml_backend_t primary, ggml_backend_t cold,
     const ImageAdmissionReserves & reserves, ImageAdmissionReport & out, std::string & error) {

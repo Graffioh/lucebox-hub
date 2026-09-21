@@ -14,21 +14,27 @@ without it refuses `--mmproj` at startup.
 
 ## Supported configuration
 
-The initial serving path requires Linux HIP, a DeepSeek4 decoder with the
-supported DS4V dimensions, and two distinct local HIP devices. The decoder uses
-sparse prefill with in-process heterogeneous expert ownership:
-`DFLASH_DS4_MOE_TP=1`, `DFLASH_DS4_MOE_TP_INPROC=1`, and
-`DFLASH_DS4_MOE_TP_GPU` selecting the secondary device. Set `--target-device`
-to the primary device, `--ds4-prefill sparse`, and `--mmproj` to the
-[exported projector](ds4v-mmproj.md). Device ordinals must match the host's
-actual topology.
+Image input needs Linux HIP, a DeepSeek4 decoder whose GGUF carries the image
+router biases, `--ds4-prefill sparse`, and `--mmproj` pointing at the
+[exported projector](ds4v-mmproj.md). Two layouts work:
 
-Layer splitting, remote expert IPC, all-on-secondary placement, dense prefill,
-concurrent sequence scheduling, and upstream forwarding do not support images.
-`/props` reports the effective capability in
-`capabilities.image_input_supported` after backend initialization.
-Without `--mmproj`, text serving follows its existing path and image requests
-are rejected.
+- **One GPU holding the whole model** (for example a Strix Halo): nothing else
+  to set. The projector is loaded after the weights and must fit beside them.
+- **Two GPUs splitting the experts in process** (for example R9700 + Strix
+  Halo): `DFLASH_DS4_MOE_TP=1`, `DFLASH_DS4_MOE_TP_INPROC=1`, and
+  `DFLASH_DS4_MOE_TP_GPU` selecting the second device, with `--target-device`
+  on the first. Device ordinals must match the host's actual topology.
+
+Layer splitting, remote expert IPC, all-on-secondary placement, experts kept
+on the CPU, dense prefill, concurrent sequence scheduling, and upstream
+forwarding do not support images. `/props` reports the effective capability in
+`capabilities.image_input_supported` after backend initialization. Without
+`--mmproj`, text serving follows its existing path and image requests are
+passed through as they were before.
+
+Published llama.cpp conversions of the decoder load directly (image router
+bias named `blk.N.exp_probs_b_vl.bias`, no `deepseek4.vocab_size` key). Split
+GGUF files and llama.cpp's `clip` projector files are not read yet.
 
 ## Request contract
 

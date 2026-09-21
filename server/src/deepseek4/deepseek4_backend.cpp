@@ -1155,11 +1155,20 @@ bool DeepSeek4Backend::materialize_images(const DeepSeek4ImagePrompt & images,
     // snapshots and retained backend pools. Charge only upcoming work here.
     reserves.primary_future_bytes = vision::SCRATCH_RESERVATION - resident_workspace +
         128ULL * 1024 * 1024;
+    if (!moe_hybrid_) {
+        uint64_t free_bytes = 0;
+        if (!vision::check_deepseek4_image_single_gpu_admission(backend_, reserves.primary_domain,
+                reserves.primary_future_bytes, free_bytes, error)) {
+            std::fprintf(stderr, "[deepseek4] image runtime admission failed (one GPU): required/free=%.3f/%.3f GiB: %s\n",
+                         gib(reserves.primary_future_bytes), gib(free_bytes), error.c_str());
+            return false;
+        }
+    }
     vision::ImageAdmissionReport report;
     MoeHybridConfig runtime_cfg = make_ds4_parent_worker_cfg(w_);
     runtime_cfg.materialize_cold_experts = true;
     runtime_cfg.cold_expert_backend = MoeHybridColdBackend::Gpu;
-    if (!vision::check_deepseek4_image_runtime_admission(runtime_cfg,
+    if (moe_hybrid_ && !vision::check_deepseek4_image_runtime_admission(runtime_cfg,
             backend_, expert_backend_, reserves, report, error)) {
         std::fprintf(stderr,
             "[deepseek4] image runtime admission failed: primary required/free=%.3f/%.3f GiB "
@@ -1204,6 +1213,36 @@ bool DeepSeek4Backend::materialize_images(const DeepSeek4ImagePrompt & images,
         error = "image materialization allocation failed";
         return false;
     }
+}
+
+// The whole model is already on one GPU: load the projector next to it and
+// check that the image scratch still fits.
+bool DeepSeek4Backend::init_single_gpu_vision() {
+    if (cfg_.mmproj_path.empty()) return true;
+    if (!load_vision()) return false;
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+    hipDeviceProp_t properties{};
+    if (hipGetDeviceProperties(&properties, cfg_.device.gpu) != hipSuccess) {
+        std::fprintf(stderr, "[deepseek4] cannot classify the image owner's memory domain\n");
+        return false;
+    }
+    vision::ImageAdmissionReserves reserves;
+    reserves.primary_domain = properties.integrated || std::getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY")
+        ? vision::ImageMemoryDomain::HostShared : vision::ImageMemoryDomain::Dedicated;
+    reserves.primary_future_bytes = estimate_ds4_cache_bytes(w_, cfg_.max_ctx > 0 ? cfg_.max_ctx : 8192) +
+        vision::SCRATCH_RESERVATION + 256ULL * 1024 * 1024;
+    uint64_t free_bytes = 0;
+    std::string error;
+    const bool admitted = vision::check_deepseek4_image_single_gpu_admission(
+        backend_, reserves.primary_domain, reserves.primary_future_bytes, free_bytes, error);
+    std::fprintf(stderr, "[deepseek4] image memory admission (one GPU): required/free=%.3f/%.3f GiB result=%s\n",
+                 gib(reserves.primary_future_bytes), gib(free_bytes), admitted ? "admitted" : error.c_str());
+    if (!admitted) return false;
+    image_reserves_ = reserves;
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool DeepSeek4Backend::load_vision() {
@@ -1281,14 +1320,23 @@ bool DeepSeek4Backend::load_model() {
     const bool force_full = env_flag_enabled("DFLASH_DS4_FORCE_FULL_LOAD");
     const bool heterogeneous_tp = env_flag_enabled("DFLASH_DS4_MOE_TP");
     if (!cfg_.mmproj_path.empty()) {
+        // Images run on one HIP GPU holding the whole model, or on two HIP GPUs
+        // that split the experts in process. Both need batched sparse prefill.
         const auto tp = ds4_moe_tp_config(cfg_.device.gpu);
+        const bool two_gpu_ok = tp.in_process && tp.backend_valid &&
+            tp.secondary_backend == PlacementBackend::Hip &&
+            tp.secondary_gpu != cfg_.device.gpu && !tp.all_on_secondary && !force_full;
         if (target_backend != PlacementBackend::Hip || cfg_.device.is_layer_split() ||
             cfg_.prefill_mode != PrefillAttentionMode::Sparse ||
-            !tp.requested || !tp.in_process || !tp.backend_valid ||
-            tp.secondary_backend != PlacementBackend::Hip ||
-            tp.secondary_gpu == cfg_.device.gpu || tp.all_on_secondary || force_full ||
+            (tp.requested && !two_gpu_ok) ||
             env_flag_enabled("DFLASH_DS4_DENSE_TP_MASK")) {
-            std::fprintf(stderr, "[deepseek4] --mmproj requires sparse prefill with distinct local HIP expert owners\n");
+            std::fprintf(stderr, "[deepseek4] --mmproj requires a HIP target with --ds4-prefill sparse, "
+                                 "on one GPU or with in-process expert owners on two distinct GPUs\n");
+            return false;
+        }
+        if (!vision::detail::hip_bias_workspace(backend_)) {
+            std::fprintf(stderr, "[deepseek4] --mmproj needs the DS4V vision ops, which this build lacks "
+                                 "(hipBLASLt was not found when ggml-hip was configured)\n");
             return false;
         }
     }
@@ -1305,7 +1353,9 @@ bool DeepSeek4Backend::load_model() {
                      cfg_.fused_decode ? "on" : "off",
                      cfg_.fused_verify_f16_kv ? "on" : "off",
                      prefill_attention_mode_name(cfg_.prefill_mode));
-        if (!load_deepseek4_gguf(cfg_.model_path, backend_, w_)) {
+        TargetLoadPlan full_plan;
+        full_plan.load_ds4_image_bias = !cfg_.mmproj_path.empty();
+        if (!load_deepseek4_gguf_partial(cfg_.model_path, backend_, full_plan, w_)) {
             if (prefill_attention_mode_is_approximate(cfg_.prefill_mode)) {
                 std::fprintf(stderr,
                     "[deepseek4] monolithic HIP load required for %s prefill\n",
@@ -1317,6 +1367,7 @@ bool DeepSeek4Backend::load_model() {
                          cfg_.model_path.c_str());
             return false;
         }
+        if (!init_single_gpu_vision()) return false;
     } else if (target_backend == PlacementBackend::Hip || heterogeneous_tp) {
         std::fprintf(stderr,
                      "[deepseek4] heterogeneous target detected; using hybrid expert load path\n");
@@ -2055,11 +2106,6 @@ bool DeepSeek4Backend::init_hybrid_model() {
     TargetLoadPlan plan;
     plan.skip_expert_tensors = true;
     plan.load_ds4_image_bias = !cfg_.mmproj_path.empty();
-    if (plan.load_ds4_image_bias && !vision::detail::hip_bias_workspace(backend_)) {
-        std::fprintf(stderr, "[deepseek4] --mmproj needs the DS4V vision ops, which this build lacks "
-                             "(hipBLASLt was not found when ggml-hip was configured)\n");
-        return false;
-    }
     if (!load_deepseek4_gguf_partial(cfg_.model_path, backend_, plan, w_)) {
         std::fprintf(stderr, "[deepseek4] failed to partially load model for hybrid mode: %s (%s)\n",
                      cfg_.model_path.c_str(), dflash27b_last_error());
@@ -2878,7 +2924,10 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                             need_logits ? &logits : nullptr,
                                             tokens.data() + i,
                                             timing ? &step_tel : nullptr,
-                                            cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp);
+                                            cfg_.prefill_mode != PrefillAttentionMode::Sparse, hp,
+                                            /*moe_hybrid=*/nullptr, /*expert_runtime=*/nullptr,
+                                            /*routing_stats=*/nullptr,
+                                            images ? images->spans() : vision::ImageSpanView{});
         }
         if (ok && hp && !spec_cap.empty()) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
@@ -3149,7 +3198,8 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         if (!images || images->owner_ != this || !images->matches(req.prompt) ||
             kv_offset != 0 || req.snap_slot >= 0 || req.snap_pos >= 0 ||
             req.prompt.size() + uint64_t(std::max(0, req.n_gen)) > uint64_t(cache_.max_ctx) ||
-            !moe_hybrid_ || !expert_backend_ || expert_runtime_.compute) {
+            // Two-GPU serving needs its in-process second owner; one GPU has neither.
+            (moe_hybrid_ && !expert_backend_) || expert_runtime_.compute) {
             result.fail(GenerateErrorCode::PrefillFailed, "image request binding, context, or execution mode is invalid");
             return result;
         }
