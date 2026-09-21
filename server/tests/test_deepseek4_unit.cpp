@@ -2404,7 +2404,7 @@ static void test_image_bias_loader_opt_in_contract(ggml_backend_t backend) {
         else plan.layer_end = 42;
         DeepSeek4Weights weights;
         TEST_ASSERT(!load_deepseek4_gguf_partial(path, backend, plan, weights));
-        TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find("exactly 43 F32[256]") != std::string::npos,
+        TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find("one F32[n_expert] image router bias per layer") != std::string::npos,
                         dflash27b_last_error());
         TEST_ASSERT(weights.ctx == nullptr && weights.buf == nullptr);
         free_deepseek4_weights(weights);
@@ -2445,7 +2445,7 @@ static void test_image_bias_loader_opt_in_contract(ggml_backend_t backend) {
         plan.load_ds4_image_bias = true;
         DeepSeek4Weights weights;
         TEST_ASSERT(!load_deepseek4_gguf_partial(bad_path, backend, plan, weights));
-        TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find("exactly 43 F32[256]") != std::string::npos,
+        TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find("one F32[n_expert] image router bias per layer") != std::string::npos,
                         dflash27b_last_error());
         TEST_ASSERT(weights.ctx == nullptr && weights.buf == nullptr && weights.dense_split_buf == nullptr);
         free_deepseek4_weights(weights);
