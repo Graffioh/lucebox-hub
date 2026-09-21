@@ -830,7 +830,12 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         return {};
     }
     std::vector<float> token_mass;
-    scoring_head_mean_token_mass(probs_h.data(), S, n_lookahead, H, token_mass);
+    if (st.head_weights.empty()) {
+        scoring_head_mean_token_mass(probs_h.data(), S, n_lookahead, H, token_mass);
+    } else {
+        scoring_head_weighted_token_mass(
+            probs_h.data(), S, n_lookahead, H, st.head_weights, token_mass);
+    }
     auto t2 = std::chrono::steady_clock::now();
     std::fprintf(stderr,
         "[qwen35-scorer] forward %.2fs (blocks 0-%d, S=%d) score %.2fs "

@@ -495,6 +495,53 @@ TEST_CASE(PFlashSelectionFixture, scoring_head_token_mass_averages_heads_and_que
     CHECK(mass.empty());
 }
 
+TEST_CASE(PFlashSelectionFixture, scoring_head_weighted_token_mass_follows_the_head_weights) {
+    // Same layout as above: [n_keys=3, n_queries=2, n_heads=2].
+    const std::vector<float> probs = {
+        0.2f, 0.3f, 0.5f,   // head 0, query 0
+        0.6f, 0.4f, 0.0f,   // head 0, query 1
+        0.0f, 0.0f, 1.0f,   // head 1, query 0
+        1.0f, 0.0f, 0.0f,   // head 1, query 1
+    };
+    std::vector<float> uniform;
+    std::vector<float> plain;
+    dflash::common::scoring_head_weighted_token_mass(
+        probs.data(), 3, 2, 2, {0.5f, 0.5f}, uniform);
+    dflash::common::scoring_head_mean_token_mass(probs.data(), 3, 2, 2, plain);
+    REQUIRE(uniform.size() == plain.size());
+    for (size_t index = 0; index < plain.size(); ++index) {
+        CHECK(std::fabs(uniform[index] - plain[index]) < 1e-6f);
+    }
+
+    // One head only: the mean over that head's query rows.
+    std::vector<float> first;
+    dflash::common::scoring_head_weighted_token_mass(
+        probs.data(), 3, 2, 2, {1.0f, 0.0f}, first);
+    CHECK(std::fabs(first[0] - 0.4f) < 1e-6f);
+    CHECK(std::fabs(first[1] - 0.35f) < 1e-6f);
+    CHECK(std::fabs(first[2] - 0.25f) < 1e-6f);
+
+    std::vector<float> skewed;
+    dflash::common::scoring_head_weighted_token_mass(
+        probs.data(), 3, 2, 2, {0.25f, 0.75f}, skewed);
+    CHECK(std::fabs(skewed[0] - (0.25f * 0.4f + 0.75f * 0.5f)) < 1e-6f);
+    double total = 0.0;
+    for (float value : skewed) total += value;
+    CHECK(std::fabs(total - 1.0) < 1e-6);
+
+    // A weight vector that does not match the head count falls back to the
+    // plain mean rather than reading past its end.
+    std::vector<float> mismatched;
+    dflash::common::scoring_head_weighted_token_mass(
+        probs.data(), 3, 2, 2, {1.0f}, mismatched);
+    for (size_t index = 0; index < plain.size(); ++index) {
+        CHECK(std::fabs(mismatched[index] - plain[index]) < 1e-6f);
+    }
+    dflash::common::scoring_head_weighted_token_mass(
+        probs.data(), 0, 2, 2, {0.5f, 0.5f}, mismatched);
+    CHECK(mismatched.empty());
+}
+
 // ═════════════════════════════════════════════════
 // Segment probe: variable-length candidates from per-token boundary scores
 // ═════════════════════════════════════════════════

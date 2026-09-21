@@ -148,4 +148,34 @@ inline void scoring_head_mean_token_mass(
     for (int j = 0; j < n_keys; ++j) out[(size_t) j] = (float) (sum[(size_t) j] / denominator);
 }
 
+// The same token mass with a weight per head instead of the plain average:
+// sum_h w[h] * mean_t probs[h][t][j]. The weights are assumed non-negative
+// and to sum to 1 (the loader normalises them), so uniform weights reproduce
+// the unweighted reduction. A head file without the weights tensor keeps
+// using the function above, unchanged.
+inline void scoring_head_weighted_token_mass(
+        const float * probs,
+        int n_keys,
+        int n_queries,
+        int n_heads,
+        const std::vector<float> & weights,
+        std::vector<float> & out) {
+    out.assign((size_t) n_keys, 0.0f);
+    if (n_keys <= 0 || n_queries <= 0 || n_heads <= 0) return;
+    if ((int) weights.size() != n_heads) {
+        scoring_head_mean_token_mass(probs, n_keys, n_queries, n_heads, out);
+        return;
+    }
+    std::vector<double> sum((size_t) n_keys, 0.0);
+    for (int h = 0; h < n_heads; ++h) {
+        const double weight = (double) weights[(size_t) h] / (double) n_queries;
+        if (weight == 0.0) continue;
+        for (int t = 0; t < n_queries; ++t) {
+            const float * row = probs + ((size_t) h * n_queries + t) * n_keys;
+            for (int j = 0; j < n_keys; ++j) sum[(size_t) j] += weight * row[j];
+        }
+    }
+    for (int j = 0; j < n_keys; ++j) out[(size_t) j] = (float) sum[(size_t) j];
+}
+
 } // namespace dflash::common

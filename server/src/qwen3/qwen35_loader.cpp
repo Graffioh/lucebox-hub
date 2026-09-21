@@ -15,6 +15,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -47,6 +48,7 @@ static void free_qwen35_head(Qwen35DrafterState & st) {
     if (st.head_buf) { ggml_backend_buffer_free(st.head_buf); st.head_buf = nullptr; }
     if (st.head_ctx) { ggml_free(st.head_ctx); st.head_ctx = nullptr; }
     st.head_wq = st.head_wk = nullptr;
+    st.head_weights.clear();
     st.head_loaded = false;
 }
 
@@ -139,10 +141,36 @@ static bool load_qwen35_scoring_head(const std::string & path,
         ggml_tensor * source = ggml_get_tensor(data_ctx, contract.name);
         ggml_backend_tensor_set(*contract.destination, source->data, 0, ggml_nbytes(source));
     }
+    // Optional head weights: one non-negative float per query head, saying
+    // how much of each head's attention mass reaches the token mass. Absent
+    // is the plain mean; present but malformed fails closed like every other
+    // part of this contract.
+    if (ggml_tensor * weights = data_ctx
+            ? ggml_get_tensor(data_ctx, "scoringhead.head_weights")
+            : nullptr) {
+        if (weights->type != GGML_TYPE_F32 || ggml_n_dims(weights) != 1 ||
+            weights->ne[0] != (int64_t) w.n_head) {
+            return fail("scoring head tensor contract mismatch: scoringhead.head_weights");
+        }
+        const float * values = (const float *) weights->data;
+        double total = 0.0;
+        for (int i = 0; i < (int) w.n_head; ++i) {
+            if (!std::isfinite(values[i]) || values[i] < 0.0f) {
+                return fail("scoring head weights must be finite and non-negative");
+            }
+            total += (double) values[i];
+        }
+        if (!(total > 0.0)) return fail("scoring head weights must not be all zero");
+        st.head_weights.resize((size_t) w.n_head);
+        for (int i = 0; i < (int) w.n_head; ++i) {
+            st.head_weights[(size_t) i] = (float) ((double) values[i] / total);
+        }
+    }
     gguf_free(g);
     ggml_free(data_ctx);
     st.head_loaded = true;
-    std::fprintf(stderr, "[qwen35-drafter] loaded scoring head: %s\n", path.c_str());
+    std::fprintf(stderr, "[qwen35-drafter] loaded scoring head: %s head_weights=%s\n",
+                 path.c_str(), st.head_weights.empty() ? "uniform" : "custom");
     std::fflush(stderr);
     return true;
 }

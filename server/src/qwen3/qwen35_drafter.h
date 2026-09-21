@@ -36,6 +36,10 @@ struct Qwen35DrafterState {
     ggml_tensor *         head_wq  = nullptr;  // [hidden, n_head * head_dim], query rows only
     ggml_tensor *         head_wk  = nullptr;  // [hidden, n_head_kv * head_dim]
     bool                  head_loaded = false;
+    // Optional per-query-head weights of the token-mass average, normalised
+    // at load. Empty is the plain mean over the heads, which is what every
+    // head file written before head-level scoring asks for.
+    std::vector<float>    head_weights;
     // Segment probe: per-token boundary scores from the same block-14 tap.
     ggml_context *        probe_ctx = nullptr;
     ggml_backend_buffer_t probe_buf = nullptr;
