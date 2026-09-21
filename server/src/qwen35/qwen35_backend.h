@@ -14,6 +14,7 @@
 #include "common/model_backend.h"
 #include "common/dflash_target.h"
 #include "common/dflash_draft_ipc.h"
+#include "common/specla_mode.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "step_graph.h"
@@ -46,14 +47,17 @@ class Qwen35TensorParallelContext;
 // ── Configuration passed at construction ────────────────────────────────
 
 struct Qwen35Config {
-    const char * target_path = nullptr;
-    const char * draft_path  = nullptr;
+    std::string target_path;
+    std::optional<std::string> draft_path;
     DevicePlacement device;                // target GPU placement
     int          draft_gpu   = 0;
     RemoteDraftConfig remote_draft;
     int          stream_fd   = -1;
 
     // FA/KV
+    // Explicit per-model overrides; COUNT preserves environment/family defaults.
+    ggml_type    cache_type_k = GGML_TYPE_COUNT;
+    ggml_type    cache_type_v = GGML_TYPE_COUNT;
     int          fa_window       = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     bool         paged_attention = false;
     int          kq_stride_pad   = 32;   // KQ_MASK_PAD or 256 for TBQ
@@ -82,6 +86,12 @@ struct Qwen35Config {
     // Speculative decode strategy
     bool         fast_rollback   = true;
     bool         seq_verify      = false;
+    // SpecLA state-resident verification (--specla). specla_top_k keeps the
+    // DFLASH_SPECLA_TOPK env as its default for non-CLI harnesses
+    // (docs/SPECLA.md); the factory always overwrites both with the
+    // normalized BackendPlan values.
+    bool         specla_mode     = false;
+    int          specla_top_k    = specla_tree_topk();
     bool         ddtree_mode     = false;
     int          ddtree_budget   = 22;
     float        ddtree_temp     = 1.0f;
@@ -95,7 +105,7 @@ struct Qwen35Config {
 
 class Qwen35Backend : public ModelBackend {
 public:
-    explicit Qwen35Backend(const Qwen35Config & cfg);
+    explicit Qwen35Backend(Qwen35Config cfg);
     ~Qwen35Backend() override;
 
     // Non-copyable, non-movable (owns GPU resources).

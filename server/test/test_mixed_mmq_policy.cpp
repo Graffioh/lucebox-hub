@@ -207,3 +207,97 @@ TEST_CASE(MixedMmqPolicy, interleaved_backends_and_replay_preserve_policy) {
     SKIP("HIP mixed-MMQ dispatch qualification");
 #endif
 }
+
+TEST_CASE(MixedMmqPolicy, dense_glu_fusion_preserves_matvec_dispatch) {
+#if defined(GGML_USE_HIP)
+    hipDeviceProp_t props{};
+    if (hipGetDeviceProperties(&props, 0) != hipSuccess ||
+        (std::strncmp(props.gcnArchName, "gfx1151", 7) != 0 &&
+         std::strncmp(props.gcnArchName, "gfx12", 5) != 0)) {
+        SKIP("requires RDNA mixed-precision kernels");
+    }
+    struct Overrides {
+        bool graphs = ggml_backend_cuda_set_graphs_disabled_override(true);
+        int ceiling = ggml_backend_cuda_set_mmvq_max_ncols_override(0);
+        ~Overrides() {
+            ggml_backend_cuda_set_mmvq_max_ncols_override(ceiling);
+            ggml_backend_cuda_set_graphs_disabled_override(graphs);
+        }
+    } saved;
+    // Distinct graph outputs prevent fusion in the reference without changing
+    // matmul precision, kernel policy or the activation tensor's layout.
+    for (auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0_ROCMFP4_FAST}) {
+        for (int ceiling : {0, 4}) {
+            ggml_backend_cuda_set_mmvq_max_ncols_override(ceiling);
+            for (int width : {2, 3, 4, 8}) {
+                auto ctx = std::unique_ptr<ggml_context, decltype(&ggml_free)>(
+                    ggml_init({4u << 20, nullptr, true}), ggml_free);
+                auto backend = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>(
+                    ggml_backend_cuda_init(0), ggml_backend_free);
+                REQUIRE(ctx && backend);
+                constexpr int k = 256, rows = 64;
+                auto * wg = ggml_new_tensor_2d(ctx.get(), type, k, rows);
+                auto * wu = ggml_new_tensor_2d(ctx.get(), type, k, rows);
+                auto * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k, width);
+                ggml_set_input(x);
+                ggml_tensor * outputs[2];
+                ggml_cgraph * graphs[2];
+                for (int ref = 0; ref < 2; ++ref) {
+                    auto * gate = ggml_mul_mat(ctx.get(), wg, x);
+                    auto * up = ggml_mul_mat(ctx.get(), wu, x);
+                    if (ref) {
+                        ggml_set_output(gate);
+                        ggml_set_output(up);
+                    }
+                    outputs[ref] = ggml_swiglu_ds4_split(ctx.get(), gate, up, 7.0f);
+                    ggml_set_output(outputs[ref]);
+                    graphs[ref] = ggml_new_graph_custom(ctx.get(), 16, false);
+                    ggml_build_forward_expand(graphs[ref], outputs[ref]);
+                }
+                auto buffer = std::unique_ptr<ggml_backend_buffer,
+                    decltype(&ggml_backend_buffer_free)>(
+                        ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()),
+                        ggml_backend_buffer_free);
+                REQUIRE(buffer != nullptr);
+                std::vector<float> weights(k * rows), input(k * width);
+                std::vector<uint8_t> quantized(ggml_nbytes(wg));
+                int half = 0;
+                for (auto * w : {wg, wu}) {
+                    ++half;
+                    for (size_t i = 0; i < weights.size(); ++i) {
+                        weights[i] = std::sin(float(i * 13 + half) * 0.071f) * 0.17f;
+                    }
+                    ggml_get_type_traits(type)->from_float_ref(
+                        weights.data(), quantized.data(), weights.size());
+                    ggml_backend_tensor_set(w, quantized.data(), 0, quantized.size());
+                }
+                for (int replay = 0; replay < 4; ++replay) {
+                    ggml_backend_cuda_set_graphs_disabled_override(replay == 0);
+                    for (size_t i = 0; i < input.size(); ++i) {
+                        input[i] = std::cos(float(i * 7 + replay * 11) * 0.013f);
+                    }
+                    ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
+                    std::vector<float> result[2];
+                    size_t launches[2]{};
+                    for (int ref = 0; ref < 2; ++ref) {
+                        const size_t before = ggml_backend_cuda_get_mmq_launch_count();
+                        REQUIRE(ggml_backend_graph_compute(backend.get(), graphs[ref]) == GGML_STATUS_SUCCESS);
+                        launches[ref] = ggml_backend_cuda_get_mmq_launch_count() - before;
+                        result[ref].resize(rows * width);
+                        ggml_backend_tensor_get(outputs[ref], result[ref].data(), 0,
+                            result[ref].size() * sizeof(float));
+                    }
+                    if (replay == 0) {
+                        CHECK((launches[0] == 0) == (launches[1] == 0));
+                    }
+                    for (float v : result[0]) CHECK(std::isfinite(v));
+                    CHECK(std::memcmp(result[0].data(), result[1].data(),
+                        result[0].size() * sizeof(float)) == 0);
+                }
+            }
+        }
+    }
+#else
+    SKIP("HIP dense-GLU dispatch qualification");
+#endif
+}

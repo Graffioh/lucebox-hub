@@ -102,7 +102,15 @@
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 static thread_local int ggml_cuda_mmvq_max_ncols_override = 0;
+static thread_local int ggml_cuda_ds4_mix_mmv_max_tokens = GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
 static thread_local bool ggml_cuda_graphs_disabled_override = false;
+
+extern "C" int ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(int max_tokens) {
+    GGML_ASSERT(max_tokens >= 0 && max_tokens <= GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS);
+    const int previous = ggml_cuda_ds4_mix_mmv_max_tokens;
+    ggml_cuda_ds4_mix_mmv_max_tokens = max_tokens ? max_tokens : GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS;
+    return previous;
+}
 
 extern "C" int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols) {
     const int previous = ggml_cuda_mmvq_max_ncols_override;
@@ -2532,6 +2540,16 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+static int ggml_cuda_mmvq_max_ncols() {
+    static const int configured = []() {
+        const char * e = getenv("LUCE_MMVQ_MAX_NCOLS");
+        const int v = e ? atoi(e) : 3;
+        return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
+    }();
+    return ggml_cuda_mmvq_max_ncols_override > 0
+        ? ggml_cuda_mmvq_max_ncols_override : configured;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -2717,7 +2735,7 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
     // fusing across two different mul_mat_ids would read one expert's rows with the other's
     // routing. Each launcher additionally returns false unless BOTH halves are registered,
     // so a partial registration keeps the correct unfused path.
-    if (src1->ne[2] <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS &&
+    if (src1->ne[2] <= ggml_cuda_ds4_mix_mmv_max_tokens &&
             ggml_cuda_ds4_mix_glu_fusable(gate, up, glu, direct_vector_layout)) {
         const float limit = ggml_get_op_params_f32(glu, 2);
         // dst is the GLU tensor: the fused kernel writes the SwiGLU result straight there and
@@ -2786,6 +2804,12 @@ static bool ggml_cuda_try_fuse_mul_mat_glu(
         }
 
         const int64_t ncols = ids ? src1->ne[2] : src1->ne[1];
+        // Sharing activation quantization must not change the ordinary
+        // dispatch's arithmetic. Dense multi-column MMVQ takes precedence
+        // over MMQ even though direct GLU fusion only supports one column.
+        if (!ids && ncols <= ggml_cuda_mmvq_max_ncols()) {
+            return false;
+        }
 #ifdef GGML_CUDA_FORCE_CUBLAS
         // The global force-cuBLAS policy is authoritative over this RDNA 3.5 default.
         constexpr bool default_ds4_mix_gate_up_mmq = false;
@@ -2833,14 +2857,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // measured crossover on sm_86 (RTX 3090, Q4_K_M/Q6_K dense GEMVs) — MMVQ
     // wins at ncols<=3, MMQ wins at 4-8 (laguna w6 chain 199->237 tok/s,
     // qwen3.6 chain 127->137). Override via env for other hardware.
-    static const int luce_mmvq_max_ncols_env = []() {
-        const char * e = getenv("LUCE_MMVQ_MAX_NCOLS");
-        const int v = e ? atoi(e) : 3;
-        return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
-    }();
-    const int luce_mmvq_max_ncols = ggml_cuda_mmvq_max_ncols_override > 0
-        ? ggml_cuda_mmvq_max_ncols_override
-        : luce_mmvq_max_ncols_env;
+    const int luce_mmvq_max_ncols = ggml_cuda_mmvq_max_ncols();
     // The mix qtypes have no generic MMVQ path because their per-expert
     // codebooks live in an out-of-band registry. Decode uses the dedicated
     // fused kernels below. Approximate prefill modes can select their
@@ -3061,7 +3078,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // Kept in sync with the [TAG_MUL_MAT_ID_CUDA_GRAPHS] usability check below.
     if (src0->type == GGML_TYPE_Q3_1_ROCMFP3_MIX
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-            && ne12 <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS
+            && ne12 <= ggml_cuda_ds4_mix_mmv_max_tokens
             && ggml_cuda_rocmfp3_mix_mul_mat_id(
                 src0->data, (const float *) src1->data, (const int32_t *) ids->data,
                 (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
@@ -3075,7 +3092,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if (src0->type == GGML_TYPE_Q2_1_ROCMFP2_MIX
             && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-            && ne12 <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS
+            && ne12 <= ggml_cuda_ds4_mix_mmv_max_tokens
             && ggml_cuda_rocmfp2_mix_mul_mat_id(
                 src0->data, (const float *) src1->data, (const int32_t *) ids->data,
                 (float *) dst->data, (int) ne00, (int) ne01, (int) ids->ne[0],
@@ -3956,7 +3973,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             const bool mmid_rocmfp3_ok =
                 (is_mmid_105 || is_mmid_106) &&
                 node->src[1]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
-                node->src[1]->ne[2] <= GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS &&
+                node->src[1]->ne[2] <= ggml_cuda_ds4_mix_mmv_max_tokens &&
                 (is_mmid_105 ? ggml_cuda_rocmfp3_mix_registered(node->src[0]->data)
                              : ggml_cuda_rocmfp2_mix_registered(node->src[0]->data));
             if (mmid_telemetry) {
@@ -5391,12 +5408,42 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    graph->replay_streak = 0;
+                    if (++graph->churn >= ggml_cuda_graph::kMaxChurn) {
+                        graph->disable_due_to_churn = true;
+                        // This key evaluates eagerly from now on: release the
+                        // executable and captured graph it would otherwise
+                        // keep resident (its lookups keep it out of the LRU).
+                        if (graph->instance != nullptr || graph->graph != nullptr) {
+                            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                        }
+                        if (graph->instance != nullptr) {
+                            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+                            graph->instance = nullptr;
+                        }
+                        if (graph->graph != nullptr) {
+                            CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                            graph->graph = nullptr;
+                        }
+                        graph->nodes.clear();
+                        graph->nodes.shrink_to_fit();
+                        graph->node_props.clear();
+                        graph->node_props.shrink_to_fit();
+                        if (log_graph_warmup) {
+                            GGML_LOG_DEBUG("%s: CUDA graph disabled for key %p after %d warmup resets\n",
+                                           __func__, graph_key, graph->churn);
+                        }
+                    }
                     if (log_graph_warmup) {
                         GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                     }
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
+                    if (!cuda_graph_update_required &&
+                        ++graph->replay_streak >= ggml_cuda_graph::kStableReplays) {
+                        graph->churn = 0;
+                    }
                 }
             }
         }
@@ -6106,7 +6153,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    op->src[0]->ne[0] == 128 &&
                    ggml_is_contiguous(op->src[0]);
         case GGML_OP_DS4_INDEXER_SCORE:
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return (op->src[0]->type == GGML_TYPE_F32 ||
+                    op->src[0]->type == GGML_TYPE_F16) &&
                    op->src[0]->ne[0] == 128 &&
                    op->src[0]->ne[3] == 1 &&
                    op->src[1]->type == GGML_TYPE_F32 &&

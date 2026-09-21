@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <utility>
 #include <sstream>
 #include "common/gguf_mmap.h"
 
@@ -138,8 +139,8 @@ static float laguna_dspark_confidence_threshold() {
 
 // ── Construction / initialisation ───────────────────────────────────────
 
-LagunaBackend::LagunaBackend(const LagunaBackendArgs & args)
-    : args_(args) {}
+LagunaBackend::LagunaBackend(LagunaBackendArgs args)
+    : args_(std::move(args)) {}
 
 LagunaBackend::~LagunaBackend() { shutdown(); }
 
@@ -451,6 +452,12 @@ bool LagunaBackend::ensure_slot(int slot) {
 }
 
 bool LagunaBackend::snapshot_save(int slot) {
+    // hybrid MoE-offload mode never loads expert tensors into w_ (see the
+    // hybrid_mode_ check in restore_and_generate_impl below), so a snapshot
+    // saved here could never be restored correctly. Skip the save instead of
+    // paying for a CPU-resident copy that restore_and_generate_impl will
+    // just refuse later.
+    if (hybrid_mode_) return false;
     // kvflash: snapshots copy rows assuming identity layout, which breaks
     // after the first page-out relocates a chunk. [TAG_SWA_RING] ring-cached
     // SWA layers hold only the trailing window, so prefix snapshots are
@@ -1574,6 +1581,22 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         result.succeed();
         return result;
     }
+    // Prefix-cache restore always decodes through laguna_step(), which builds
+    // its graph with gi.hybrid = nullptr and so reads expert weights straight
+    // out of `w_`. In hybrid MoE-offload mode w_ never has them: init_hybrid_mode()
+    // loads with skip_expert_tensors=true and keeps experts only in moe_hybrid_'s
+    // hot/cold storage (see laguna_target_loader.cpp). generate_impl() avoids this
+    // by routing hybrid-mode requests to generate_hybrid() instead, but the
+    // generic HTTP/prefix-cache path (finalize_generation_cache -> snapshot_save,
+    // later restore_and_generate -> here) has no knowledge of hybrid_mode_ and
+    // will call this path for any backend. Fail clearly instead of building a
+    // graph against missing expert tensors.
+    if (hybrid_mode_) {
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "snapshot restore is not supported for a Laguna model "
+                    "loaded in hybrid MoE-offload mode");
+        return result;
+    }
     sampler_ = req.sampler;
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
@@ -1602,7 +1625,7 @@ GenerateResult LagunaBackend::restore_and_generate_impl(int slot,
         N > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
         std::fprintf(stderr, "[kvflash] restore prompt (%d) exceeds pool %d; "
                              "raise --kvflash\n", N, kvflash_tokens_);
-        result.fail(GenerateErrorCode::ContextOverflow);
+        result.fail(GenerateErrorCode::ResourceExhausted);
         return result;
     }
     if (kvflash_active()) {
@@ -2423,7 +2446,8 @@ static bool build_laguna_layer_prefn_step(
 
 bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
                                               std::vector<float> & act_cur,
-                                              int32_t & argmax_out) {
+                                              int32_t & argmax_out,
+                                              std::vector<float> * out_logits) {
     const int hidden = w_.n_embd;
     const int vocab = w_.embedder.n_vocab;
     using _pclk = std::chrono::steady_clock;
@@ -2486,6 +2510,7 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
         for (size_t i = 1; i < _sg_logits.size(); ++i)
             if (_sg_logits[i] > _bv) { _bv = _sg_logits[i]; _best = (int)i; }
         argmax_out = _best;
+        if (out_logits) *out_logits = _sg_logits;
         return true;
     }
 
@@ -2701,6 +2726,7 @@ bool LagunaBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
                 argmax_out = j;
             }
         }
+        if (out_logits) *out_logits = std::move(logits_buf);
     }
     if (_prof) {
         g_logits += _pus(_t_logits, _pnow());
@@ -2748,6 +2774,9 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
     DaemonIO out_io = io.with_token_callback(req.on_token);
     const bool should_emit = req.stream || (bool)out_io.on_token;
     const int N = (int)req.prompt.size();
+    if (req.do_sample && req.sampler.seed != 0) {
+        sampler_rng_.seed(req.sampler.seed);
+    }
 
     if (N + req.n_gen > args_.max_ctx) {
         result.fail(GenerateErrorCode::ContextOverflow);
@@ -2761,7 +2790,7 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
         N > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
         std::fprintf(stderr, "[kvflash] hybrid prompt (%d) exceeds pool %d; "
                              "raise --kvflash\n", N, kvflash_tokens_);
-        result.fail(GenerateErrorCode::ContextOverflow);
+        result.fail(GenerateErrorCode::ResourceExhausted);
         return result;
     }
 
@@ -3110,21 +3139,16 @@ GenerateResult LagunaBackend::generate_hybrid(const GenerateRequest & req,
 
         // Hybrid forward: one token through all layers
         int32_t argmax_tok = 0;
-        if (!hybrid_forward_one_token(next_tok, cache_.cur_pos, act_cur, argmax_tok)) {
+        std::vector<float> step_logits;
+        if (!hybrid_forward_one_token(next_tok, cache_.cur_pos, act_cur, argmax_tok,
+                                      req.do_sample ? &step_logits : nullptr)) {
             result.fail(GenerateErrorCode::DecodeFailed);
             break;
         }
         cache_.cur_pos++;
         kvflash_maybe_reselect(history, s + 1);
 
-        if (req.do_sample) {
-            // For sampling, we need full logits — project from act_cur
-            // (hybrid_forward_one_token already computed argmax; for sampling
-            // we re-project — FIXME: return logits from forward to avoid double projection)
-            next_tok = argmax_tok;  // For now, use argmax even in sample mode as fallback
-        } else {
-            next_tok = argmax_tok;
-        }
+        next_tok = req.do_sample ? pick(step_logits) : argmax_tok;
     }
     auto t_g1 = std::chrono::steady_clock::now();
     result.decode_s = std::chrono::duration<double>(t_g1 - t_g0).count();

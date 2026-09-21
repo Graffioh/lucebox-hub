@@ -55,6 +55,7 @@
 #include <vector>
 
 #include "common/sampler.h"
+#include "prefix_store.h"
 
 namespace dflash::common {
 
@@ -155,12 +156,14 @@ public:
         enum class Status {
             admitted,
             busy,
+            capacity_exceeded, // prompt cannot fit even in an otherwise idle pool
             failed,
         };
 
         Status status = Status::failed;
         int slot = -1;
         std::string error;
+        PrefixStoreAdmission prefix_store;
     };
 
     // Admit one request into a free slot and queue its prompt for chunked
@@ -177,6 +180,23 @@ public:
     virtual AdmitResult admit(uint64_t request_id,
                               const std::vector<int32_t> & prompt,
                               const SamplerCfg & sampler) = 0;
+
+    // Optional prefix-checkpoint admission. Unsupported engines remain on
+    // cold admission and never receive a plan from the scheduler.
+    virtual bool supports_prefix_store() const { return false; }
+    // Conservative resident-byte estimate for one checkpoint. Returning zero
+    // means the engine cannot safely participate in a configured byte budget.
+    virtual size_t estimate_prefix_store_bytes(int) const { return 0; }
+    virtual AdmitResult admit_with_prefix(
+            uint64_t request_id,
+            const std::vector<int32_t> & prompt,
+            const SamplerCfg & sampler,
+            const PrefixStorePlan &) {
+        return admit(request_id, prompt, sampler);
+    }
+
+    // Release engine-owned payload without touching server policy metadata.
+    virtual void discard_prefix_store(PrefixStoreRef) {}
 
     struct StepInput {
         int     slot  = -1;
@@ -211,6 +231,10 @@ public:
         int32_t token = -1;
         // Present only for failed.
         std::string error;
+        // A capture ending on this successfully-computed prefill boundary.
+        // Capture failure does not fail generation: the scheduler invalidates
+        // the reserved cache entry and continues the request cold.
+        PrefixStoreEvent prefix_store;
     };
 
     // One scheduler iteration owns both kinds of logical work. `decode` must
@@ -248,6 +272,57 @@ public:
     // Runtime failures are terminal for the live cohort and may follow partial
     // backend mutation, but expose no consumable payload.
     virtual StepResult step(const StepPlan & plan) = 0;
+
+    // Optional decode-growth protection. Reserve the whole next decode step
+    // before any model computation or sampling. False means there is not
+    // enough capacity; no partial reservation may be taken on that path.
+    virtual bool reserve_decode(const StepPlan &) { return true; }
+
+    // Maximum useful payload for up to slot_count()-1 suspended contexts.
+    virtual size_t kv_offload_capacity() const { return 0; }
+
+    struct KvOffloadState {
+        bool parked = false;     // no paged KV, request state retained
+        bool recompute = false;  // parked without a checkpoint; resume re-prefills
+        size_t bytes = 0;        // checkpoint payload bytes (0 when recompute)
+    };
+    virtual KvOffloadState kv_offload_state(int) const { return {}; }
+
+    // Suspend in place: retain the slot, sampler, recurrent/draft state and
+    // request identity, but save paged KV to bounded host RAM and release its
+    // physical blocks. Failure leaves the resident request unchanged.
+    virtual bool offload_kv(int, size_t, std::string & error) {
+        error = "engine does not support decode KV offload";
+        return false;
+    }
+    // Restore into the same slot, possibly with different physical blocks.
+    // False with an empty error means insufficient pool capacity. The host
+    // checkpoint must survive a failed restore until retirement or retry.
+    // A slot parked for recompute resumes through chunked prefill instead of
+    // a copy; its retained history is replayed as the new prompt.
+    virtual bool restore_kv(int, std::string & error) {
+        error = "engine does not support decode KV restore";
+        return false;
+    }
+
+    // Park a resident or suspended slot without a RAM checkpoint: release its
+    // paged KV, fold pending_token into the retained history, and wait for
+    // capacity like a suspended slot. restore_kv() resumes it through ordinary
+    // chunked prefill, which rebuilds every layer of model state including
+    // slot-local recurrent and draft tensors — implementations must reset
+    // that state the way admit() does. False means the caller must retire
+    // the slot; it may be left detached.
+    virtual bool evict_kv(int, int32_t, std::string & error) {
+        error = "engine does not support KV eviction";
+        return false;
+    }
+
+    // True when a parked slot's resume reservation fits current free pool
+    // capacity with headroom for the resident cohort's next step — the
+    // scheduler's early-resume probe ahead of a full drain. A conservative
+    // false simply restores on drain only. This is a hint, not a reservation:
+    // restore_kv() may still report insufficient capacity.
+    virtual bool kv_restore_feasible(int) const { return false; }
 
     // Release a slot's KV blocks and mark it free. Safe on failed slots.
     virtual void retire(int slot) = 0;
@@ -349,6 +424,35 @@ inline std::string validate_step_result(
         if (output.status == PrefillStatus::failed &&
             (output.token >= 0 || output.error.empty()))
             return "failed prefill has invalid payload";
+        const PrefixStoreEvent & store = output.prefix_store;
+        if (store.status == PrefixStoreEvent::Status::none) {
+            if (store.ticket.id != 0 ||
+                store.ticket.checkpoint.id != 0 ||
+                store.ticket.checkpoint.tokens != 0 ||
+                !store.error.empty() ||
+                store.bytes != 0 || store.elapsed_us != 0)
+                return "inactive prefix capture carries payload";
+        } else {
+            if (store.status != PrefixStoreEvent::Status::saved &&
+                store.status != PrefixStoreEvent::Status::failed)
+                return "prefix capture has an unknown status";
+            if (!store.ticket.valid())
+                return "prefix capture has an invalid ticket";
+            if (output.status == PrefillStatus::failed)
+                return "failed prefill carries a prefix capture";
+            if (store.status == PrefixStoreEvent::Status::saved &&
+                !store.error.empty())
+                return "saved prefix capture carries an error";
+            if (store.status == PrefixStoreEvent::Status::saved &&
+                store.bytes == 0)
+                return "saved prefix capture omits its byte size";
+            if (store.status == PrefixStoreEvent::Status::failed &&
+                store.error.empty())
+                return "failed prefix capture omits its error";
+            if (store.status == PrefixStoreEvent::Status::failed &&
+                store.bytes != 0)
+                return "failed prefix capture carries committed bytes";
+        }
         prefill_seen[(size_t)output.slot] = 1;
     }
 

@@ -18,12 +18,29 @@
 #include "ggml-cuda.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
 #include <vector>
 
 namespace dflash::common {
+
+namespace {
+std::vector<PagedKvTensor> qwen_paged_kv_planes(const TargetCache & cache,
+                                               uint32_t block_size) {
+    std::vector<PagedKvTensor> planes;
+    for (const auto * tensors : {&cache.attn_k, &cache.attn_v}) {
+        for (ggml_tensor * tensor : *tensors) {
+            for (int64_t head = 0; head < tensor->ne[2]; ++head) {
+                planes.push_back({tensor, static_cast<size_t>(head) * tensor->nb[2],
+                                   block_size * tensor->nb[1]});
+            }
+        }
+    }
+    return planes;
+}
+} // namespace
 
 Qwen35SeqEngine::Qwen35SeqEngine(
         Qwen35Backend & backend, PagedKvPool & pool, int max_ctx,
@@ -37,12 +54,16 @@ Qwen35SeqEngine::Qwen35SeqEngine(
       long_mixed_prefill_tokens_(std::max(1, long_mixed_prefill_tokens)),
       long_prefill_threshold_(std::max(1, long_prefill_threshold)),
       idle_prefill_tokens_(std::max(1, idle_prefill_tokens)),
-      prefill_quantum_(std::max(1, prefill_quantum)), b_(backend),
-      slots_(pool, max_ctx), scratch_row_(scratch_row),
+      prefill_quantum_(std::max(1, prefill_quantum)), pool_(pool),
+      b_(backend), slots_(pool, max_ctx),
+      offload_(slots_, pool, backend.target_backend_,
+               qwen_paged_kv_planes(backend.cache_, pool.block_size())),
+      scratch_row_(scratch_row),
       fixed_chain_(fixed_chain) {
     const int n_slots = slots_.slot_count();
     slot_draft_kv_.resize(static_cast<size_t>(n_slots));
     seq_lens_.assign(static_cast<size_t>(n_slots), 0);
+    reserve_growth_.assign(static_cast<size_t>(n_slots), 0);
 
     fixed_chain_ready_ = fixed_chain_.enabled && fixed_chain_.width > 1 &&
         fixed_chain_.width <= 16 &&
@@ -368,6 +389,158 @@ SeqEngine::AdmitResult Qwen35SeqEngine::admit(
     return result;
 }
 
+size_t Qwen35SeqEngine::estimate_prefix_store_bytes(int tokens) const {
+    return estimate_paged_target_cache_snapshot_bytes(b_.cache_, tokens);
+}
+
+int Qwen35SeqEngine::checkpoint_index(PrefixStoreRef checkpoint) const {
+    if (!checkpoint.valid() ||
+        checkpoint.id > (uint64_t)Qwen35Backend::PREFIX_SLOTS) return -1;
+    return (int)checkpoint.id - 1;
+}
+
+void Qwen35SeqEngine::discard_prefix_store(PrefixStoreRef checkpoint) {
+    const int index = checkpoint_index(checkpoint);
+    if (index >= 0 &&
+        b_.prefix_snapshots_[index].cur_pos == checkpoint.tokens) {
+        free_prefix_snapshot(b_.prefix_snapshots_[index]);
+    }
+}
+
+bool Qwen35SeqEngine::arm_capture(
+        int slot, PrefixCaptureTicket ticket, int restored_tokens) {
+    if (slot < 0 || slot >= slots_.slot_count()) return false;
+    const Qwen35Slot & sequence = slots_.slot(slot);
+    if (!ticket.valid() || checkpoint_index(ticket.checkpoint) < 0 ||
+        ticket.checkpoint.tokens <= restored_tokens ||
+        ticket.checkpoint.tokens > sequence.prompt_len) return false;
+    slots_.slot(slot).pending_capture = ticket;
+    return true;
+}
+
+SeqEngine::AdmitResult Qwen35SeqEngine::admit_with_prefix(
+        uint64_t request_id,
+        const std::vector<int32_t> & prompt,
+        const SamplerCfg & sampler,
+        const PrefixStorePlan & plan) {
+    AdmitResult result = slots_.admit(request_id, prompt, sampler);
+    if (result.status != AdmitResult::Status::admitted) return result;
+
+    const int slot = result.slot;
+    slots_.slot(slot).pending_capture = {};
+    bool restored = false;
+    if (plan.restore.valid()) {
+        const int restore_index = checkpoint_index(plan.restore);
+        const bool metadata_valid =
+            restore_index >= 0 &&
+            plan.restore.tokens < (int)prompt.size();
+        PrefixSnapshot * snap = metadata_valid
+            ? &b_.prefix_snapshots_[restore_index] : nullptr;
+        const auto restore_started = std::chrono::steady_clock::now();
+        if (snap && snap->ctx &&
+            snap->layout == PrefixSnapshot::Layout::paged &&
+            snap->cur_pos == plan.restore.tokens) {
+            Qwen35SlotManager::PrefillChunk seeded =
+                slots_.seed_restored_prefix(slot, plan.restore.tokens);
+            PagedKvSequenceSnapshot sequence;
+            const bool pool_ok = seeded.ok &&
+                pool_.sequence(slots_.slot(slot).handle, sequence) ==
+                    PagedKvStatus::Ok;
+            const bool table_ok = pool_ok && upload_block_table_delta(
+                slot, seeded.first_new_block, seeded.new_blocks.data(),
+                seeded.new_blocks.size());
+            restored = table_ok && restore_paged_target_cache(
+                *snap, b_.cache_, slot, sequence.block_table,
+                (int)pool_.block_size());
+        }
+        const uint64_t restore_elapsed_us =
+            (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - restore_started).count();
+
+        if (!restored) {
+            discard_prefix_store(plan.restore);
+            slots_.retire(slot);
+            result = slots_.admit(request_id, prompt, sampler);
+            result.prefix_store.invalidated = plan.restore;
+            if (result.status == AdmitResult::Status::admitted) {
+                reset_recurrent_slot(b_.cache_, result.slot);
+            } else {
+                result.error =
+                    "cold admission failed after stale prefix restore";
+            }
+        } else {
+            result.prefix_store.restored = plan.restore;
+            std::fprintf(stderr,
+                "[parallel-pc] restored checkpoint=%llu seq_slot=%d "
+                "tokens=%d time_ms=%.1f\n",
+                (unsigned long long)plan.restore.id, slot,
+                plan.restore.tokens, (double)restore_elapsed_us / 1000.0);
+        }
+        result.prefix_store.restore_attempted = true;
+        result.prefix_store.restore_elapsed_us = restore_elapsed_us;
+        if (result.status != AdmitResult::Status::admitted) return result;
+    } else {
+        reset_recurrent_slot(b_.cache_, slot);
+    }
+
+    const int admitted_slot = result.slot;
+    if (!result.prefix_store.invalidated.valid() &&
+        arm_capture(
+            admitted_slot, plan.capture,
+            result.prefix_store.restored.tokens)) {
+        result.prefix_store.capture = plan.capture;
+    }
+    return result;
+}
+
+PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
+        int slot, PrefixCaptureTicket ticket) {
+    PrefixStoreEvent event;
+    event.ticket = ticket;
+    event.status = PrefixStoreEvent::Status::failed;
+    const int checkpoint = checkpoint_index(ticket.checkpoint);
+    if (!ticket.valid() || checkpoint < 0 ||
+        !slots_.is_prefilling(slot) ||
+        slots_.slot(slot).cur_pos != ticket.checkpoint.tokens) {
+        event.error = "invalid prefix capture boundary";
+        return event;
+    }
+    PagedKvSequenceSnapshot sequence;
+    if (pool_.sequence(slots_.slot(slot).handle, sequence) !=
+            PagedKvStatus::Ok ||
+        sequence.kv_seq_len != (uint32_t)ticket.checkpoint.tokens) {
+        event.error = "prefix capture page table is incomplete";
+        return event;
+    }
+    const auto capture_started = std::chrono::steady_clock::now();
+    PrefixSnapshot & snapshot = b_.prefix_snapshots_[checkpoint];
+    if (!replace_paged_target_cache(
+            b_.cache_, slot, sequence.block_table,
+            (int)pool_.block_size(), ticket.checkpoint.tokens, snapshot)) {
+        event.elapsed_us =
+            (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - capture_started).count();
+        event.error = dflash27b_last_error();
+        if (event.error.empty()) {
+            event.error = "paged prefix capture failed";
+        }
+        return event;
+    }
+    event.status = PrefixStoreEvent::Status::saved;
+    event.elapsed_us =
+        (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - capture_started).count();
+    event.bytes = snapshot.buf
+        ? ggml_backend_buffer_get_size(snapshot.buf) : 0;
+    std::fprintf(stderr,
+        "[parallel-pc] saved checkpoint=%llu seq_slot=%d tokens=%d "
+        "bytes=%zu time_ms=%.1f\n",
+        (unsigned long long)ticket.checkpoint.id, slot,
+        ticket.checkpoint.tokens, event.bytes,
+        (double)event.elapsed_us / 1000.0);
+    return event;
+}
+
 int32_t Qwen35SeqEngine::sample_graph_row(
         int slot, int logits_row, const int32_t * cached_argmax,
         std::vector<float> * logits_scratch) {
@@ -443,6 +616,14 @@ Qwen35SeqEngine::PrefillStage Qwen35SeqEngine::stage_prefill_chunk(
     stage.kv_pos = seq.cur_pos;
     stage.chunk = std::min(
         max_tokens, seq.prompt_len - stage.kv_pos);
+    const PrefixCaptureTicket capture = slots_.slot(slot).pending_capture;
+    if (capture.valid() &&
+        stage.kv_pos < capture.checkpoint.tokens) {
+        // Recurrent state is only checkpoint-consistent after compute, so a
+        // selected capture boundary must be the exact end of this graph slice.
+        stage.chunk = std::min(
+            stage.chunk, capture.checkpoint.tokens - stage.kv_pos);
+    }
     if (stage.chunk <= 0) return PrefillStage{};
     stage.commit = stage.kv_pos + stage.chunk >= seq.prompt_len;
 
@@ -1007,7 +1188,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     for (const StepInput & in : inputs) {
         if (in.slot < 0 || in.slot >= n_slots || in.token < 0 ||
             decode_seen[(size_t)in.slot] ||
-            !slots_.is_active(in.slot) || slots_.is_prefilling(in.slot)) {
+            !slots_.slot(in.slot).decoding()) {
             return fail_step("invalid or duplicate decode row in step plan");
         }
         decode_seen[(size_t)in.slot] = 1;
@@ -1403,6 +1584,12 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
         const int slot = plan.prefills[i].slot;
         PrefillOutput out;
         out.slot = slot;
+        const PrefixCaptureTicket capture = slots_.slot(slot).pending_capture;
+        if (capture.valid() &&
+            slots_.slot(slot).cur_pos == capture.checkpoint.tokens) {
+            out.prefix_store = capture_prefix(slot, capture);
+            slots_.slot(slot).pending_capture = {};
+        }
         if (prefills[i].commit) {
             out.status = PrefillOutput::Status::completed;
             out.token = sample_graph_row(
@@ -1416,7 +1603,53 @@ SeqEngine::StepResult Qwen35SeqEngine::step(const StepPlan & plan) {
     return result;
 }
 
+bool Qwen35SeqEngine::reserve_decode(const StepPlan & plan) {
+    std::fill(reserve_growth_.begin(), reserve_growth_.end(), 0);
+    const auto chains = select_chain_lanes(plan);
+    for (size_t i = 0; i < plan.decode.size(); ++i) {
+        const int slot = plan.decode[i].slot;
+        if (slot < 0 || slot >= slots_.slot_count() ||
+            reserve_growth_[(size_t)slot]) return false;
+        reserve_growth_[(size_t)slot] = chains[i] ? fixed_chain_.width : 1;
+    }
+    return slots_.reserve_decode(reserve_growth_);
+}
+
+bool Qwen35SeqEngine::restore_kv(int slot, std::string & error) {
+    if (slots_.is_active(slot) && slots_.slot(slot).recomputing()) {
+        // Parked without a checkpoint: resume as an ordinary chunked prefill
+        // over the folded history, which rebuilds paged KV and slot-local
+        // state together — so it must be reset exactly as at admission.
+        if (!slots_.resume_recompute(slot)) return false;
+        reset_recurrent_slot(b_.cache_, slot);
+        if (slot < static_cast<int>(slot_draft_kv_.size()) &&
+            slot_draft_kv_[static_cast<size_t>(slot)]) {
+            draft_kv_reset(*slot_draft_kv_[static_cast<size_t>(slot)]);
+        }
+        return true;
+    }
+    std::vector<int32_t> blocks;
+    if (!offload_.restore(slot, blocks, error)) return false;
+    if (!upload_block_table_delta(slot, 0, blocks.data(), blocks.size())) {
+        error = "restored Qwen KV block table exceeds device capacity";
+        return false;
+    }
+    // step() uploads current per-slot lengths from the preserved host state.
+    return true;
+}
+
+bool Qwen35SeqEngine::evict_kv(int slot, int32_t pending_token,
+                               std::string & error) {
+    if (!slots_.evict_for_recompute(slot, pending_token)) {
+        error = "slot history cannot be re-prefilled within the paged KV pool";
+        return false;
+    }
+    offload_.discard(slot);
+    return true;
+}
+
 void Qwen35SeqEngine::retire(int slot) {
+    offload_.discard(slot);
     if (!slots_.is_active(slot)) return;
     if (slot >= 0 && slot < static_cast<int>(slot_draft_kv_.size()) &&
         slot_draft_kv_[static_cast<size_t>(slot)]) {

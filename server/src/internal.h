@@ -507,8 +507,8 @@ struct TargetCache {
     ggml_tensor * conv_factor_all = nullptr;
     ggml_tensor * conv_factor_all_alt = nullptr;
 
-    // SpecLA factor buffers (allocated instead of ssm_intermediate when
-    // DFLASH_SPECLA=1 on the single-target path). Two token-major banks let a
+    // SpecLA factor buffers (allocated instead of ssm_intermediate on the
+    // single-target SpecLA path). Two token-major banks let a
     // verify consume the preceding accepted path while writing its own raw
     // factors without aliasing:
     //   factor_k_all:     [S_k, H_v, n_delta, max_q_len] f32
@@ -614,11 +614,12 @@ struct PrefixSnapshot {
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 
-    // Phase B: thin-mode snapshots cover only a KV-position range.
-    bool is_thin  = false;
-    int  kv_start = 0;     // inclusive (only meaningful when is_thin)
-    int  kv_end   = 0;     // exclusive (only meaningful when is_thin)
-    // When is_thin == true:
+    // Snapshot payload shape; one value avoids impossible flag combinations.
+    enum class Layout { empty, dense, thin, paged };
+    Layout layout = Layout::empty;
+    int  kv_start = 0;  // inclusive (only meaningful for Layout::thin)
+    int  kv_end   = 0;  // exclusive (only meaningful for Layout::thin)
+    // For Layout::thin:
     //   - attn_k_snap[i] / attn_v_snap[i] are sized
     //     [HEAD_DIM, kv_end-kv_start, N_HEAD_KV] (smaller than cache).
     //   - ssm_state_snap, conv_state_snap, target_feat_snap are NOT
@@ -643,6 +644,45 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache);
 
 // Free the snapshot's GPU buffers.
 void free_prefix_snapshot(PrefixSnapshot & snap);
+
+// Exact CPU-buffer allocation size for the dense checkpoint layout used by
+// snapshot_paged_target_cache(). Returns zero when the cache topology or token
+// count is invalid. This lets the scheduler enforce a resident-memory budget
+// before allocating or copying a checkpoint.
+size_t estimate_paged_target_cache_snapshot_bytes(
+    const TargetCache & cache, int token_count);
+
+// Capture one live sequence from a multi-slot paged cache. Attention rows are
+// gathered through `block_table` into dense logical order in the copied
+// snapshot; recurrent state is copied only from `seq_slot`'s slab. The page
+// table itself is intentionally not retained: every restore owns fresh pages.
+bool snapshot_paged_target_cache(
+    const TargetCache & cache,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size,
+    int token_count,
+    PrefixSnapshot & snap);
+
+// Atomically replace a paged snapshot. The incumbent remains valid when
+// allocation, layout validation, or any staged copy fails.
+bool replace_paged_target_cache(
+    const TargetCache & cache,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size,
+    int token_count,
+    PrefixSnapshot & destination);
+
+// Restore a copied paged snapshot into fresh destination pages and one
+// recurrent-state slab. `block_table` describes the destination sequence and
+// must cover snap.cur_pos logical tokens.
+bool restore_paged_target_cache(
+    const PrefixSnapshot & snap,
+    TargetCache & cache,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size);
 
 // Thin snapshot: capture only KV slice [kv_start, kv_end).
 // SSM/conv/target_feat are not preserved (caller chains thin entries
@@ -698,7 +738,9 @@ bool create_target_cache(const TargetWeights & w,
                          int ctx_alloc = 0,
                          bool paged_attention = false,
                          int n_seq_slots = 1,
-                         bool concurrent_tree = false);
+                         bool concurrent_tree = false,
+                         ggml_type cache_type_k = GGML_TYPE_COUNT,
+                         ggml_type cache_type_v = GGML_TYPE_COUNT);
 
 // `f32_ssm_intermediates` enables exact per-token checkpoints for the opt-in
 // layer-split fast rollback path. The default preserves the established Q8_0
@@ -716,7 +758,9 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool f32_ssm_intermediates = false,
                                  bool paged_attention = false,
                                  int n_seq_slots = 1,
-                                 bool concurrent_tree = false);
+                                 bool concurrent_tree = false,
+                         ggml_type cache_type_k = GGML_TYPE_COUNT,
+                         ggml_type cache_type_v = GGML_TYPE_COUNT);
 
 void free_target_cache(TargetCache & c);
 
@@ -739,12 +783,15 @@ void reset_recurrent_slot(TargetCache & c, int slot);
 
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
 // state (KV, SSM, conv, target_feat) device-to-device. Frees the old cache.
+// enable_specla is the caller's effective SpecLA decision (config-driven);
+// the factor buffers exist iff it is true, and downstream graph code keys
+// SpecLA off their presence.
 bool migrate_prefill_cache(const TargetWeights & w,
                            int max_ctx,
                            int max_verify_tokens,
                            ggml_backend_t backend,
                            TargetCache & cache,
-                           bool enable_specla = true);
+                           bool enable_specla);
 
 // Compatibility commit for the fully factorized §4.2 fallback. The production
 // HLD route instead keeps raw accepted factors pending and consumes them in
@@ -782,7 +829,7 @@ struct DeltaNetCapture {
     // second target-model forward. These are graph-owned outputs.
     ggml_tensor * replay_log              = nullptr;
 
-    // SpecLA factor capture (DFLASH_SPECLA=1, docs/SPECLA.md). Persistent F32
+    // SpecLA factor capture (docs/SPECLA.md). Persistent F32
     // aliases into the bank written by this verify. In the HLD path the
     // historical field names hold raw serial-recurrence terms:
     //   factor_k:     [S_k, H_v, max_verify_tokens] — post-l2norm keys
