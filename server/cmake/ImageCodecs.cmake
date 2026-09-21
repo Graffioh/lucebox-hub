@@ -1,9 +1,9 @@
-# Pinned JPEG and PNG decoders behind common/vision/image_decode. License texts
-# are in ImageCodecs.NOTICES.md and the unmodified upstream archives.
+# JPEG and PNG decoders behind common/vision/image_decode: libjpeg-turbo from
+# its pinned release archive, lodepng vendored. License texts are in
+# ImageCodecs.NOTICES.md, deps/lodepng/LICENSE and the libjpeg-turbo archive.
 include_guard(GLOBAL)
 
 include(ExternalProject)
-include(FetchContent)
 
 # DOWNLOAD_EXTRACT_TIMESTAMP exists from CMake 3.24; older releases would read
 # it as part of URL_HASH.
@@ -42,13 +42,10 @@ set_target_properties(image_codec_jpeg PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES ${IMAGE_CODEC_JPEG_PREFIX}/include)
 add_dependencies(image_codec_jpeg libjpeg_turbo_external)
 
-FetchContent_Declare(lodepng
-    URL https://github.com/lvandeve/lodepng/archive/ed6fe5825c6a4fbb7f58ab35a4231c7543cd452a.tar.gz
-    URL_HASH SHA256=c2459a3f9145258f901d262576f7a56ca08087d3b3efeee3ae033c0952120803
-    ${IMAGE_CODEC_EXTRACT_TIMESTAMP})
-FetchContent_MakeAvailable(lodepng)
-add_library(image_codec_png STATIC ${lodepng_SOURCE_DIR}/lodepng.cpp)
-target_include_directories(image_codec_png PUBLIC ${lodepng_SOURCE_DIR})
+# lodepng is vendored (server/deps/lodepng): two source files, no release archives upstream.
+set(IMAGE_CODEC_PNG_DIR "${CMAKE_CURRENT_LIST_DIR}/../deps/lodepng")
+add_library(image_codec_png STATIC ${IMAGE_CODEC_PNG_DIR}/lodepng.cpp)
+target_include_directories(image_codec_png PUBLIC ${IMAGE_CODEC_PNG_DIR})
 
 # Expose the original JPEG notices for production installation after the
 # dependency build has downloaded its hash-verified source archive.
