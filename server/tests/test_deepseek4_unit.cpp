@@ -2266,8 +2266,9 @@ static void test_loader_rejects_missing_required_metadata(ggml_backend_t backend
     DeepSeek4Weights weights;
     const bool ok = load_deepseek4_gguf(path, backend, weights);
     TEST_ASSERT(!ok);
+    // The fixture has no tokenizer token list either, so no size can be derived.
     TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
-                        "missing required key: deepseek4.vocab_size") != std::string::npos,
+                        "no vocabulary size") != std::string::npos,
                     dflash27b_last_error());
     free_deepseek4_weights(weights);
     unlink(path.c_str());
@@ -2304,7 +2305,7 @@ static void test_loader_rejects_zero_vocab_size(ggml_backend_t backend) {
     const bool ok = load_deepseek4_gguf(path, backend, weights);
     TEST_ASSERT(!ok);
     TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
-                        "deepseek4.vocab_size must be > 0") != std::string::npos,
+                        "no vocabulary size") != std::string::npos,
                     dflash27b_last_error());
     free_deepseek4_weights(weights);
     unlink(path.c_str());

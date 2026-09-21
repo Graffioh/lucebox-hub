@@ -1453,7 +1453,6 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     static const char * kRequiredU32Keys[] = {
         "deepseek4.block_count",
         "deepseek4.embedding_length",
-        "deepseek4.vocab_size",
         "deepseek4.attention.head_count",
         "deepseek4.attention.head_count_kv",
         "deepseek4.attention.key_length",
@@ -1485,7 +1484,14 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     // ── Read hyperparameters ────────────────────────────────────────────
     const uint32_t n_layer        = get_u32_or(gctx, "deepseek4.block_count", 43);
     const uint32_t n_embd         = get_u32_or(gctx, "deepseek4.embedding_length", 4096);
-    const uint32_t n_vocab        = get_u32_or(gctx, "deepseek4.vocab_size", 129280);
+    // llama.cpp conversions carry no vocab_size key; the token list has the size.
+    uint32_t n_vocab = get_u32_or(gctx, "deepseek4.vocab_size", 0);
+    if (n_vocab == 0) {
+        const int64_t tokens_key = gguf_find_key(gctx, "tokenizer.ggml.tokens");
+        if (tokens_key >= 0 && gguf_get_kv_type(gctx, tokens_key) == GGUF_TYPE_ARRAY) {
+            n_vocab = (uint32_t) gguf_get_arr_n(gctx, tokens_key);
+        }
+    }
     const uint32_t n_head         = get_u32_or(gctx, "deepseek4.attention.head_count", 64);
     const uint32_t n_head_kv      = get_u32_or(gctx, "deepseek4.attention.head_count_kv", 1);
     const uint32_t head_dim       = get_u32_or(gctx, "deepseek4.attention.key_length", 512);
@@ -1520,7 +1526,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     const float swiglu_clamp      = get_f32_or(gctx, "deepseek4.swiglu_clamp_exp", 10.0f);
 
     if (n_vocab == 0) {
-        set_last_error("deepseek4.vocab_size must be > 0");
+        set_last_error("no vocabulary size: need deepseek4.vocab_size or tokenizer.ggml.tokens");
         gguf_free(gctx);
         if (meta_ctx) ggml_free(meta_ctx);
         return false;
