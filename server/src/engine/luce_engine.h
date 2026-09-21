@@ -5,12 +5,12 @@
 #include <mutex>
 #include <thread>
 
-namespace dflash::common {
+namespace luce::common {
 struct ModelBackend;
 class SeqEngine;
-} // namespace dflash::common
+} // namespace luce::common
 
-namespace dflash::engine {
+namespace luce::engine {
 
 // Owns the model backend and the single execution thread used to serve it.
 // Transport-specific request handling remains outside this class; callers
@@ -49,4 +49,4 @@ private:
     mutable std::mutex lifecycle_mu_;
 };
 
-} // namespace dflash::engine
+} // namespace luce::engine

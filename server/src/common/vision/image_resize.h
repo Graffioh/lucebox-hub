@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::vision {
+namespace luce::vision {
 
 // `input` is row-major RGB, three bytes per pixel. Returns false and sets
 // `error` on invalid sizes or allocation failure; `output` is then unspecified.
@@ -16,4 +16,4 @@ bool resize_rgb_bicubic(const std::vector<std::uint8_t> & input, int input_width
                         int output_width, int output_height,
                         std::vector<std::uint8_t> & output, std::string & error);
 
-}  // namespace dflash::vision
+}  // namespace luce::vision

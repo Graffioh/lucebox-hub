@@ -49,7 +49,7 @@ support images. `/props` reports the effective capability in
 ## Qwen3.5 / Qwen3.8
 
 ```
-dflash_server Qwen3.8-27B-UD-IQ4_XS.gguf --target-device hip:0 \
+luce_server Qwen3.8-27B-UD-IQ4_XS.gguf --target-device hip:0 \
   --draft qwen38-dflash2-q8_0.gguf --draft-device hip:0 \
   --mmproj mmproj-Qwen3.8-27B-BF16.gguf
 ```
@@ -101,8 +101,8 @@ router biases, `--ds4-prefill sparse`, and `--mmproj` pointing at the
 - **One GPU holding the whole model** (for example a Strix Halo): nothing else
   to set. The projector is loaded after the weights and must fit beside them.
 - **Two GPUs splitting the experts in process** (for example R9700 + Strix
-  Halo): `DFLASH_DS4_MOE_TP=1`, `DFLASH_DS4_MOE_TP_INPROC=1`, and
-  `DFLASH_DS4_MOE_TP_GPU` selecting the second device, with `--target-device`
+  Halo): `LUCE_DS4_MOE_TP=1`, `LUCE_DS4_MOE_TP_INPROC=1`, and
+  `LUCE_DS4_MOE_TP_GPU` selecting the second device, with `--target-device`
   on the first. Device ordinals must match the host's actual topology.
 
 Remote expert IPC, all-on-secondary placement, experts kept on the CPU and

@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 class Qwen35ImagePrompt final : public ImagePromptPayload {
 public:
@@ -36,4 +36,4 @@ struct Qwen35ImageRows {
     }
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

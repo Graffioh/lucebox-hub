@@ -1,4 +1,4 @@
-"""pflash, speculative-prefill harness around the dflash C++/CUDA daemon.
+"""pflash, speculative-prefill harness around the luce C++/CUDA daemon.
 
 The daemon does the work — drafter forward, FlashPrefill scoring (BSA), and
 spec-decode generation are all in-process C++/CUDA. This Python package is

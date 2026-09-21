@@ -17,7 +17,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 constexpr const char * kArch = "bailingmoe3";
@@ -494,4 +494,4 @@ bool load_bailingmoe3_gguf(const std::string & path,
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

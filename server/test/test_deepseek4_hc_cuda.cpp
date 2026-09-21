@@ -38,7 +38,7 @@
 
 #include "deepseek4/deepseek4_hc_cuda.h"
 
-using dflash::common::deepseek4_cuda_hc_pre;
+using luce::common::deepseek4_cuda_hc_pre;
 using namespace CppUnitTestFramework;
 
 #define CK(call) do { \

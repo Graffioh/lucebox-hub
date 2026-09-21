@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::vision {
+namespace luce::vision {
 
 struct VisionConfig {
     int layers = 32, dimension = 1024, heads = 16, intermediate = 2816;
@@ -77,4 +77,4 @@ ggml_tensor * attention(ggml_context *, ggml_tensor * q, ggml_tensor * k, ggml_t
                         ggml_backend_t backend = nullptr);
 ggml_tensor * unfold(ggml_context *, ggml_tensor *, PatchGrid, int channels);
 }
-} // namespace dflash::vision
+} // namespace luce::vision

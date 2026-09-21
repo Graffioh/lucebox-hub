@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct EncodedImage {
     std::string mime_type;
@@ -20,4 +20,4 @@ public:
 
 using ImagePromptHandle = std::shared_ptr<const ImagePromptPayload>;
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cstring>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool qwen35_expand_image_tokens(std::vector<int32_t> & tokens, int32_t image_pad,
                                 std::vector<Qwen35ImageSlot> & slots, uint64_t max_tokens,
@@ -81,4 +81,4 @@ void Qwen35RopePositions::fill(int32_t * out, int first, int count) const {
     std::fill_n(out + 3 * count, count, 0);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

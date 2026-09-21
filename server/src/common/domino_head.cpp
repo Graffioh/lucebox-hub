@@ -8,7 +8,7 @@
 #include <cstring>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -145,7 +145,7 @@ bool domino_correct_greedy_chain(const DraftWeights & dw,
     }
 
     std::vector<float> state((size_t)H, 0.0f);
-    if (std::getenv("DFLASH_DOMINO_ZERO_START") == nullptr) {
+    if (std::getenv("LUCE_DOMINO_ZERO_START") == nullptr) {
         ggml_backend_tensor_get(dw.domino.start, state.data(), 0,
                                 sizeof(float) * (size_t)H);
     }
@@ -217,7 +217,7 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
         return false;
     }
 
-    static const bool zero_start = std::getenv("DFLASH_DOMINO_ZERO_START") != nullptr;
+    static const bool zero_start = std::getenv("LUCE_DOMINO_ZERO_START") != nullptr;
 
     const size_t arena_size = ggml_tensor_overhead() * (size_t)(96 + 52 * n_cand) +
                               ggml_graph_overhead_custom(1024, false) + 4 * 1024 * 1024;
@@ -362,4 +362,4 @@ bool domino_correct_greedy_chain_fused(const DraftWeights & dw,
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

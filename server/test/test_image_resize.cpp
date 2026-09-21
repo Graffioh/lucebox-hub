@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-using dflash::vision::resize_rgb_bicubic;
+using luce::vision::resize_rgb_bicubic;
 
 static int failures = 0;
 static void check(bool condition, const char * message) {

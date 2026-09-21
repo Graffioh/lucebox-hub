@@ -7,7 +7,7 @@
 #include <limits>
 #include <utility>
 
-namespace dflash::common::detail {
+namespace luce::common::detail {
 
 namespace {
 
@@ -59,7 +59,7 @@ BackendPreparation BackendPlanBuilder::resolve(
     // explicit --cache-type overrides first, then env, then the family
     // default. Other families keep their own env-driven resolution.
     if (model.arch == "qwen35" && !args.device.is_multi_device()) {
-        dflash::resolve_kv_types(args.cache_type_k, args.cache_type_v,
+        luce::resolve_kv_types(args.cache_type_k, args.cache_type_v,
                                  args.cache_type_k, args.cache_type_v);
     }
 
@@ -175,4 +175,4 @@ BackendPreparation BackendPlanBuilder::resolve(
     return plan;
 }
 
-}  // namespace dflash::common::detail
+}  // namespace luce::common::detail

@@ -2,7 +2,7 @@
 #include "deepseek4/deepseek4_page_layout.h"
 #include "CppUnitTestFramework.hpp"
 #include <limits>
-using namespace dflash::common;
+using namespace luce::common;
 namespace { struct DeepSeek4PagedCacheFixture {}; }
 
 TEST_CASE(DeepSeek4PagedCacheFixture, pool_capacity) {

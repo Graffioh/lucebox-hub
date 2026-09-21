@@ -12,7 +12,7 @@
 #include <memory>
 #include <stdexcept>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Qwen3.5 tool preamble — matches the official Jinja template exactly.
 static const char QWEN3_TOOL_PREAMBLE[] =
@@ -649,4 +649,4 @@ std::string render_chat_template_jinja(
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

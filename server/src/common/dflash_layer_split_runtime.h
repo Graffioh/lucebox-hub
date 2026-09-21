@@ -15,7 +15,7 @@
 
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ── Runtime configuration (replaces globals) ────────────────────────
 
@@ -155,4 +155,4 @@ inline bool activation_buffer_init(ActivationBuffer & b,
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

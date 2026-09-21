@@ -9,7 +9,7 @@ GENERATOR="${GENERATOR:-$SCRIPT_DIR/generate_prompts.py}"
 SUMMARIZER="${SUMMARIZER:-$SCRIPT_DIR/summarize_concurrency.py}"
 MODEL="${MODEL:-}"
 DRAFT_MODEL="${DRAFT_MODEL:-}"
-SERVER_BIN="${SERVER_BIN:-$REPO/server/build-hip/dflash_server}"
+SERVER_BIN="${SERVER_BIN:-$REPO/server/build-hip/luce_server}"
 OUT="${OUT:-$REPO/.harness-runs/qwen36-canonical-$(date -u +%Y%m%dT%H%M%SZ)}"
 SUITES="${SUITES:-he-raw,he,gsm,math,agent}"
 VARIANTS="${VARIANTS:-ar}"
@@ -30,7 +30,7 @@ IDLE_PREFILL_TOKENS="${IDLE_PREFILL_TOKENS:-4096}"
 # q8_0 matches the published blog command and the WMMA route's types.
 KV_TYPE="${KV_TYPE:-q4_0}"
 # Optional A/B pass-through for the paged-attention kernel route
-# (DFLASH27B_PAGED_WMMA). Empty preserves the default kernel.
+# (LUCE_PAGED_WMMA). Empty preserves the default kernel.
 PAGED_WMMA="${PAGED_WMMA:-}"
 
 usage() {
@@ -53,7 +53,7 @@ variant (draft on the same device, no DDTree: --ddtree is rejected with
 --paged-attention, and the server requires exactly this shape for a
 same-device draft). KV_TYPE selects the paged pool K/V quantisation (q4_0
 default, q8_0 to match the blog command); PAGED_WMMA forwards
-DFLASH27B_PAGED_WMMA to A/B the paged-attention kernel route.
+LUCE_PAGED_WMMA to A/B the paged-attention kernel route.
 GPU_DEVICE is the physical ROCr device exposed exclusively to the server and
 defaults to device 0. Pass GPU_DEVICE=1 for Strix Halo on this dual-GPU
 benchmark host. The resolved value is stored in each case's command and metadata.
@@ -92,7 +92,7 @@ if ! [[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] || (( SLOTS < 16 )); then
   exit 2
 fi
 [[ ! -e "$OUT" ]] || { echo "refusing to overwrite $OUT" >&2; exit 2; }
-ambient_tuning="$(env | grep -E '^(GGML_|DFLASH_|LUCE_|HIP_|ROCR_|HSA_|LD_PRELOAD=|LD_LIBRARY_PATH=)' || true)"
+ambient_tuning="$(env | grep -E '^(GGML_|LUCE_|LUCE_|HIP_|ROCR_|HSA_|LD_PRELOAD=|LD_LIBRARY_PATH=)' || true)"
 if [[ -n "$ambient_tuning" ]]; then
   echo "refusing ambient GPU/backend tuning variables:" >&2
   echo "$ambient_tuning" >&2
@@ -162,17 +162,17 @@ run_case() {
     command+=(--chat-template-file "$SCRIPT_DIR/raw_prompt_identity.jinja")
   fi
   local -a route_env=()
-  [[ -n "$PAGED_WMMA" ]] && route_env=(DFLASH27B_PAGED_WMMA="$PAGED_WMMA")
+  [[ -n "$PAGED_WMMA" ]] && route_env=(LUCE_PAGED_WMMA="$PAGED_WMMA")
   if [[ "$variant" == dflash2 ]]; then
     # Concurrent local same-device DFlash2 chains: a draft on the same device
     # with paged attention and no DDTree (the server rejects --ddtree with
     # --paged-attention and requires this exact shape otherwise).
     command+=(--draft "$DRAFT_MODEL" --draft-device hip:0)
-    launch=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" DFLASH_IGNORE_EOS=1
-      DFLASH_MIN_TOKENS="$WARMUP_TOKENS"
-      DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
-      DFLASH_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
-      DFLASH_MAX_CONCURRENT_PREFILLS=8
+    launch=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" LUCE_IGNORE_EOS=1
+      LUCE_MIN_TOKENS="$WARMUP_TOKENS"
+      LUCE_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
+      LUCE_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
+      LUCE_MAX_CONCURRENT_PREFILLS=8
       "${route_env[@]}"
       stdbuf -oL -eL "${command[@]}")
   elif [[ "$variant" == *ddtree ]]; then
@@ -180,15 +180,15 @@ run_case() {
     [[ "$variant" == adaptive-ddtree ]] && adaptive=1
     command+=(--draft "$DRAFT_MODEL" --draft-device hip:0 --ddtree
       --ddtree-budget 22 --fast-rollback --draft-residency persistent)
-    launch=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" DFLASH_IGNORE_EOS=1 DFLASH27B_DRAFT_SWA=2048 DFLASH_DDTREE_ADAPTIVE="$adaptive"
-      DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
-      DFLASH_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
+    launch=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" LUCE_IGNORE_EOS=1 LUCE_DRAFT_SWA=2048 LUCE_DDTREE_ADAPTIVE="$adaptive"
+      LUCE_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
+      LUCE_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
       "${route_env[@]}"
-      DFLASH_MIN_TOKENS="$WARMUP_TOKENS" stdbuf -oL -eL "${command[@]}")
+      LUCE_MIN_TOKENS="$WARMUP_TOKENS" stdbuf -oL -eL "${command[@]}")
   else
-    launch=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" DFLASH_IGNORE_EOS=1 DFLASH_MIN_TOKENS="$WARMUP_TOKENS"
-      DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
-      DFLASH_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
+    launch=(env ROCR_VISIBLE_DEVICES="$GPU_DEVICE" LUCE_IGNORE_EOS=1 LUCE_MIN_TOKENS="$WARMUP_TOKENS"
+      LUCE_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"
+      LUCE_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"
       "${route_env[@]}"
       stdbuf -oL -eL "${command[@]}")
   fi

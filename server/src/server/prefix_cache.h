@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── Chat marker detection ──────────────────────────────────────────────
 
@@ -353,4 +353,4 @@ private:
     void move_full_to_end(int idx);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

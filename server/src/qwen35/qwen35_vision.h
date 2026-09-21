@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::vision {
+namespace luce::vision {
 
 struct Qwen35VisionConfig {
     int layers = 0, dimension = 0, heads = 0, intermediate = 0;
@@ -89,4 +89,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace dflash::vision
+}  // namespace luce::vision

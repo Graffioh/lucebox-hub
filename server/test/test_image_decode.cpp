@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <vector>
 
-using namespace dflash::vision;
+using namespace luce::vision;
 
 static int failures = 0;
 static void check(bool condition, const char * message) {

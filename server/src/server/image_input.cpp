@@ -4,7 +4,7 @@
 #include <array>
 #include <stdexcept>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 int base64_value(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -233,4 +233,4 @@ void redact_image_urls(nlohmann::json & value) {
         }
     }
 }
-} // namespace dflash::common
+} // namespace luce::common

@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── GPU SM version query ───────────────────────────────────────────────
 // Returns the compute capability as major*10+minor (e.g. 86 for sm_86).
@@ -80,4 +80,4 @@ struct MoeLayerDesc {
     bool has_shared_expert() const { return ffn_up_shexp != nullptr; }
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

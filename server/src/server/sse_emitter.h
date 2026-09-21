@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 using json = nlohmann::json;
 
@@ -223,4 +223,4 @@ private:
 
 std::string escape_for_logging(const std::string & s);
 
-}  // namespace dflash::common
+}  // namespace luce::common

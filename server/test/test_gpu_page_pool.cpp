@@ -3,7 +3,7 @@
 
 #include <cstdio>
 
-using dflash::common::reclaimable_gpu_page_pool_bytes;
+using luce::common::reclaimable_gpu_page_pool_bytes;
 
 static int failures = 0;
 static void check(bool condition, const char * message) {

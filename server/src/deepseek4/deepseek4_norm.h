@@ -1,7 +1,7 @@
 #pragma once
 #include "ggml.h"
 
-namespace dflash::common::detail {
+namespace luce::common::detail {
 inline ggml_tensor * build_rms_norm(ggml_context * ctx, ggml_tensor * x,
                                     ggml_tensor * weight, float eps) {
     // HIP binary broadcast does not accept BF16 affine operands. Widen only

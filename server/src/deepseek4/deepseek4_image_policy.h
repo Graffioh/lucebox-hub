@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <string>
 
-namespace dflash::vision {
+namespace luce::vision {
 
 constexpr size_t MAX_IMAGE_EXPERTS = 256;
 struct ImageExpertSelection {
@@ -29,4 +29,4 @@ bool select_image_experts(const float * scores, const float * bias, size_t exper
 bool raw_key_visible(int64_t query, int64_t key, int64_t window,
                      int64_t image_begin, int64_t image_end, bool & visible);
 
-} // namespace dflash::vision
+} // namespace luce::vision

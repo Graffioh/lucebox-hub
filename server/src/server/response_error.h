@@ -7,7 +7,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct GenerateError;
 
@@ -45,4 +45,4 @@ nlohmann::json build_error_response(
     ApiFormat format, const ResponseError & error,
     const std::string & request_id = {});
 
-}  // namespace dflash::common
+}  // namespace luce::common

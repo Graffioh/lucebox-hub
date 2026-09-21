@@ -6,22 +6,22 @@ endif()
 file(MAKE_DIRECTORY "${TEST_OUTPUT_DIR}")
 
 foreach(mode IN ITEMS unset zero negative invalid positive)
-    set(benchmark_env "--unset=DFLASH_MMID_BENCH_ITERS")
+    set(benchmark_env "--unset=LUCE_MMID_BENCH_ITERS")
     if(mode STREQUAL "zero")
-        set(benchmark_env "DFLASH_MMID_BENCH_ITERS=0")
+        set(benchmark_env "LUCE_MMID_BENCH_ITERS=0")
     elseif(mode STREQUAL "negative")
-        set(benchmark_env "DFLASH_MMID_BENCH_ITERS=-1")
+        set(benchmark_env "LUCE_MMID_BENCH_ITERS=-1")
     elseif(mode STREQUAL "invalid")
-        set(benchmark_env "DFLASH_MMID_BENCH_ITERS=invalid")
+        set(benchmark_env "LUCE_MMID_BENCH_ITERS=invalid")
     elseif(mode STREQUAL "positive")
-        set(benchmark_env "DFLASH_MMID_BENCH_ITERS=1")
+        set(benchmark_env "LUCE_MMID_BENCH_ITERS=1")
     endif()
     set(output "${TEST_OUTPUT_DIR}/${mode}.bin")
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env "${benchmark_env}"
-            DFLASH_MMID_BENCH_K=512 DFLASH_MMID_BENCH_ROWS=64
-            DFLASH_MMID_BENCH_EXPERTS=16 DFLASH_MMID_BENCH_TOP_K=4
-            --unset=DFLASH_MMID_TEST_WIDTH
+            LUCE_MMID_BENCH_K=512 LUCE_MMID_BENCH_ROWS=64
+            LUCE_MMID_BENCH_EXPERTS=16 LUCE_MMID_BENCH_TOP_K=4
+            --unset=LUCE_MMID_TEST_WIDTH
             "${TEST_EXECUTABLE}" --child masked-fused "${output}"
         RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr
         TIMEOUT 60)

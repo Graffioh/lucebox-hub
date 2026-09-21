@@ -13,7 +13,7 @@
 
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 class LagunaDFlashTarget : public DFlashTarget {
 public:
@@ -104,4 +104,4 @@ private:
     std::vector<float> verify_logits_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

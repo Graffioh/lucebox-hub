@@ -88,13 +88,13 @@ static bool run_case(
     int n_rows = 128;
     int n_experts = 32;
     int top_k = 8;
-    const int benchmark_iterations = env_positive("DFLASH_MMID_BENCH_ITERS", 0);
+    const int benchmark_iterations = env_positive("LUCE_MMID_BENCH_ITERS", 0);
     const bool benchmark = benchmark_iterations > 0;
     if (benchmark) {
-        k_dim = env_positive("DFLASH_MMID_BENCH_K", k_dim);
-        n_rows = env_positive("DFLASH_MMID_BENCH_ROWS", n_rows);
-        n_experts = env_positive("DFLASH_MMID_BENCH_EXPERTS", n_experts);
-        top_k = env_positive("DFLASH_MMID_BENCH_TOP_K", top_k);
+        k_dim = env_positive("LUCE_MMID_BENCH_K", k_dim);
+        n_rows = env_positive("LUCE_MMID_BENCH_ROWS", n_rows);
+        n_experts = env_positive("LUCE_MMID_BENCH_EXPERTS", n_experts);
+        top_k = env_positive("LUCE_MMID_BENCH_TOP_K", top_k);
     }
     if (top_k > n_experts) {
         std::fprintf(stderr, "top_k=%d exceeds n_experts=%d\n", top_k, n_experts);
@@ -190,7 +190,7 @@ static bool run_case(
     int route_period = 0;
     if (benchmark) {
         route_period = env_positive(
-            "DFLASH_MMID_BENCH_ROUTE_PERIOD", n_experts);
+            "LUCE_MMID_BENCH_ROUTE_PERIOD", n_experts);
         route_period = std::min(route_period, n_experts);
     }
     for (int token = 0; token < width; ++token) {
@@ -298,7 +298,7 @@ static int run_child(const char * mode, const char * output_path) {
         _putenv_s("GGML_CUDA_DISABLE_FUSION", "");
     }
     if (direct) {
-        _putenv_s("DFLASH_MMID_GROUPED", "0");
+        _putenv_s("LUCE_MMID_GROUPED", "0");
     }
 #else
     if (!grouped && !masked_fused && !direct) {
@@ -307,7 +307,7 @@ static int run_child(const char * mode, const char * output_path) {
         unsetenv("GGML_CUDA_DISABLE_FUSION");
     }
     if (direct) {
-        setenv("DFLASH_MMID_GROUPED", "0", 1);
+        setenv("LUCE_MMID_GROUPED", "0", 1);
     }
 #endif
 
@@ -326,16 +326,16 @@ static int run_child(const char * mode, const char * output_path) {
         return ok ? 0 : 1;
     }
     int width_filter = 0;
-    if (const char * raw = std::getenv("DFLASH_MMID_TEST_WIDTH")) {
+    if (const char * raw = std::getenv("LUCE_MMID_TEST_WIDTH")) {
         width_filter = std::max(0, std::atoi(raw));
     }
     int type_filter = -1;
-    if (const char * raw = std::getenv("DFLASH_MMID_TEST_TYPE")) {
+    if (const char * raw = std::getenv("LUCE_MMID_TEST_TYPE")) {
         type_filter = std::atoi(raw);
         if (std::find(std::begin(k_test_types), std::end(k_test_types),
                       (ggml_type) type_filter) == std::end(k_test_types)) {
             std::fprintf(stderr,
-                         "DFLASH_MMID_TEST_TYPE %d matches no test type\n",
+                         "LUCE_MMID_TEST_TYPE %d matches no test type\n",
                          type_filter);
             return 2;
         }
@@ -360,7 +360,7 @@ static int run_child(const char * mode, const char * output_path) {
             ++cases_run;
             ok = run_case(backend, type, width, false, true, output) && ok;
             const bool force_fused_width =
-                std::getenv("DFLASH_MMID_TEST_FUSED_WIDTH") != nullptr;
+                std::getenv("LUCE_MMID_TEST_FUSED_WIDTH") != nullptr;
             if (width < 32 && (width_filter == 0 || force_fused_width)) {
                 ok = run_case(backend, type, width, true, true, output) && ok;
             }
@@ -368,7 +368,7 @@ static int run_child(const char * mode, const char * output_path) {
     }
     if ((type_filter >= 0 || width_filter > 0) && cases_run == 0) {
         std::fprintf(stderr,
-                     "DFLASH_MMID_TEST_TYPE/DFLASH_MMID_TEST_WIDTH selected no runnable case\n");
+                     "LUCE_MMID_TEST_TYPE/LUCE_MMID_TEST_WIDTH selected no runnable case\n");
         ok = false;
     }
     output.close();
@@ -558,17 +558,17 @@ static CombineRun run_combine_graph(
 }
 
 static bool run_combine_parity_and_benchmark(ggml_backend_t backend) {
-    const char * vec4 = std::getenv("DFLASH_MOE_COMBINE_VEC4");
+    const char * vec4 = std::getenv("LUCE_MOE_COMBINE_VEC4");
     if (!vec4 || std::strcmp(vec4, "1") != 0) {
-        std::fprintf(stderr, "combine parity requires DFLASH_MOE_COMBINE_VEC4=1\n");
+        std::fprintf(stderr, "combine parity requires LUCE_MOE_COMBINE_VEC4=1\n");
         return false;
     }
-    const char * bench_raw = std::getenv("DFLASH_MOE_COMBINE_BENCH");
+    const char * bench_raw = std::getenv("LUCE_MOE_COMBINE_BENCH");
     const bool benchmark = bench_raw && *bench_raw && std::strcmp(bench_raw, "0") != 0;
     const int n_embd = benchmark ? 4096 : 260;
     const int n_used = 6;
     int n_tokens = benchmark ? 3072 : 33;
-    if (const char * raw = std::getenv("DFLASH_MOE_COMBINE_BENCH_TOKENS")) {
+    if (const char * raw = std::getenv("LUCE_MOE_COMBINE_BENCH_TOKENS")) {
         const int requested = std::atoi(raw);
         if (requested > 0) n_tokens = requested;
     }
@@ -701,17 +701,17 @@ static std::string child_command(
         const std::string & output_path,
         const std::string & log_path) {
 #if defined(_WIN32)
-    return "set \"DFLASH_MMID_TELEMETRY=1\" && set \"DFLASH_MMID_GROUPED_TYPES=15\" && "
-        "set \"DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32=1\" && "
-        "set \"DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24=1\" && "
-        "set \"DFLASH_MMID_GROUPED=" +
+    return "set \"LUCE_MMID_TELEMETRY=1\" && set \"LUCE_MMID_GROUPED_TYPES=15\" && "
+        "set \"LUCE_CUDA_MMVQ_MOE_FP2_PACKED32=1\" && "
+        "set \"LUCE_CUDA_MMVQ_MOE_FP3_PACKED24=1\" && "
+        "set \"LUCE_MMID_GROUPED=" +
         std::string(std::strcmp(mode, "grouped") == 0 ? "1" : "0") + "\" && " +
         shell_quote(executable) + " --child " + mode + " " + shell_quote(output_path) +
         " 2>" + shell_quote(log_path);
 #else
-    return "DFLASH_MMID_TELEMETRY=1 DFLASH_MMID_GROUPED_TYPES=15 "
-        "DFLASH_CUDA_MMVQ_MOE_FP2_PACKED32=1 DFLASH_CUDA_MMVQ_MOE_FP3_PACKED24=1 "
-        "DFLASH_MMID_GROUPED=" +
+    return "LUCE_MMID_TELEMETRY=1 LUCE_MMID_GROUPED_TYPES=15 "
+        "LUCE_CUDA_MMVQ_MOE_FP2_PACKED32=1 LUCE_CUDA_MMVQ_MOE_FP3_PACKED24=1 "
+        "LUCE_MMID_GROUPED=" +
         std::string(std::strcmp(mode, "grouped") == 0 ? "1" : "0") + " " +
         shell_quote(executable) + " --child " + mode + " " + shell_quote(output_path) +
         " 2>" + shell_quote(log_path);
@@ -735,22 +735,22 @@ int main(int argc, char ** argv) {
                      argv[0]);
         return 2;
     }
-    const char * width_filter = std::getenv("DFLASH_MMID_TEST_WIDTH");
+    const char * width_filter = std::getenv("LUCE_MMID_TEST_WIDTH");
     if (!combine_only && width_filter && std::atoi(width_filter) > 0) {
         std::fprintf(stderr,
-                     "DFLASH_MMID_TEST_WIDTH is supported only with --child; "
+                     "LUCE_MMID_TEST_WIDTH is supported only with --child; "
                      "the parent validates the complete dispatch matrix\n");
         return 2;
     }
-    if (!combine_only && std::getenv("DFLASH_MMID_TEST_TYPE")) {
+    if (!combine_only && std::getenv("LUCE_MMID_TEST_TYPE")) {
         std::fprintf(stderr,
-                     "DFLASH_MMID_TEST_TYPE is supported only with --child; "
+                     "LUCE_MMID_TEST_TYPE is supported only with --child; "
                      "the parent validates the complete dispatch matrix\n");
         return 2;
     }
-    if (!combine_only && env_positive("DFLASH_MMID_BENCH_ITERS", 0) > 0) {
+    if (!combine_only && env_positive("LUCE_MMID_BENCH_ITERS", 0) > 0) {
         std::fprintf(stderr,
-                     "DFLASH_MMID_BENCH_ITERS is supported only with --child; "
+                     "LUCE_MMID_BENCH_ITERS is supported only with --child; "
                      "the parent validates randomized weights at fixed dimensions\n");
         return 2;
     }
@@ -761,12 +761,12 @@ int main(int argc, char ** argv) {
     }
 
 #if defined(_WIN32)
-    const int vec4_status = _putenv_s("DFLASH_MOE_COMBINE_VEC4", "1");
+    const int vec4_status = _putenv_s("LUCE_MOE_COMBINE_VEC4", "1");
 #else
-    const int vec4_status = setenv("DFLASH_MOE_COMBINE_VEC4", "1", 1);
+    const int vec4_status = setenv("LUCE_MOE_COMBINE_VEC4", "1", 1);
 #endif
     if (vec4_status != 0) {
-        std::fprintf(stderr, "failed to enable DFLASH_MOE_COMBINE_VEC4 for parity test\n");
+        std::fprintf(stderr, "failed to enable LUCE_MOE_COMBINE_VEC4 for parity test\n");
         return 1;
     }
 

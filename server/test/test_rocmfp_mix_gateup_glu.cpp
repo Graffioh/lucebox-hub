@@ -259,7 +259,7 @@ void RocmfpMixGateupGluFixture::check_fused_gateup_glu(bool fp3) {
     REQUIRE_TRUE(register_mix(weight->data, rows_bytes, n_experts, out, in, books_up.data(), modes_up.data()));
     const int prior = ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(0);
     {
-        dflash::common::ScopedCudaGraphOverrides scope(true, 0, false, ntok);
+        luce::common::ScopedCudaGraphOverrides scope(true, 0, false, ntok);
         REQUIRE_TRUE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
     }
     CHECK(ggml_backend_cuda_set_ds4_mix_mmv_max_tokens_override(prior) == GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS);

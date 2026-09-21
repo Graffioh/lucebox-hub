@@ -8,7 +8,7 @@
 // the single-head 2D shape the compressor uses.
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
-#ifdef DFLASH_ROPE_TEST_GPU
+#ifdef LUCE_ROPE_TEST_GPU
 #include "ggml-cuda.h"
 #endif
 #include "CppUnitTestFramework.hpp"
@@ -177,7 +177,7 @@ TEST_CASE(RopeTailFixture, cpu_matches_split_rotate_concat) {
     compare();
 }
 
-#ifdef DFLASH_ROPE_TEST_GPU
+#ifdef LUCE_ROPE_TEST_GPU
 TEST_CASE(RopeTailFixture, gpu_matches_split_rotate_concat) {
     if (ggml_backend_cuda_get_device_count() == 0) SKIP("no CUDA/HIP device available");
     backend = ggml_backend_cuda_init(0);

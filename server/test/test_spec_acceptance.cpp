@@ -1,7 +1,7 @@
 #include "CppUnitTestFramework.hpp"
 #include "common/spec_acceptance.h"
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 struct SpecAcceptanceFixture {};

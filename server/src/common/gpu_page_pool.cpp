@@ -11,7 +11,7 @@
 #include <dirent.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -82,4 +82,4 @@ uint64_t reclaimable_gpu_page_pool_bytes() {
 #endif
 }
 
-} // namespace dflash::common
+} // namespace luce::common

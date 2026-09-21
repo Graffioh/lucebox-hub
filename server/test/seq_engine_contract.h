@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
     std::vector<std::string> violations;
@@ -346,4 +346,4 @@ inline std::vector<std::string> check_seq_engine_contract(SeqEngine & engine) {
     return violations;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

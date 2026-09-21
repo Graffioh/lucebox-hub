@@ -11,7 +11,7 @@
 #include <mutex>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 constexpr int kMixDim = 24;
@@ -353,7 +353,7 @@ bool hc_pre_device_locked(HcCudaScratch & scratch,
     if (err != cudaSuccess) {
         return fail("finish kernel", err);
     }
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         return fail("device sync", err);
@@ -628,4 +628,4 @@ bool deepseek4_cuda_hc_pre_device_params(const void * hc_state_device,
                                 true);
 }
 
-} // namespace dflash::common
+} // namespace luce::common

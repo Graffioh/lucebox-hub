@@ -4,13 +4,13 @@
 #include <string>
 
 struct ggml_backend;
-namespace dflash::common {
+namespace luce::common {
 struct DeepSeek4Weights;
 struct MoeHybridPlacement;
 struct MoeHybridConfig;
 }
 
-namespace dflash::vision {
+namespace luce::vision {
 
 enum class ImageMemoryDomain { Unknown, Dedicated, HostShared };
 
@@ -128,4 +128,4 @@ bool check_deepseek4_image_runtime_admission(
     const common::MoeHybridConfig & config, ggml_backend * primary, ggml_backend * cold,
     const ImageAdmissionReserves & reserves, ImageAdmissionReport & result, std::string & error);
 
-} // namespace dflash::vision
+} // namespace luce::vision

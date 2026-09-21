@@ -2,8 +2,8 @@
 # In-container ENTRYPOINT for lucebox-hub.
 #
 # Normal path: the host-side `lucebox` CLI has already populated every
-# DFLASH_* env var from its detection / autotune sweep, so this script
-# just resolves paths and execs the native dflash_server binary.
+# LUCE_* env var from its detection / autotune sweep, so this script
+# just resolves paths and execs the native luce_server binary.
 #
 # Fallback path: a user runs the image directly (`docker run --gpus all
 # ghcr.io/luce-org/lucebox-hub:cuda12`) with no env-var prep. We then do a
@@ -13,10 +13,10 @@
 
 set -euo pipefail
 
-# Honor a pre-set DFLASH_DIR (used by the host-side smoke tests to drive
+# Honor a pre-set LUCE_DIR (used by the host-side smoke tests to drive
 # the entrypoint with a synthetic models/draft layout). In the shipped
 # image this var is unset, so the fallback is the normal install prefix.
-DFLASH_DIR="${DFLASH_DIR:-/opt/lucebox-hub/server}"
+LUCE_DIR="${LUCE_DIR:-/opt/lucebox-hub/server}"
 
 info()  { printf '\033[1;34m[INFO]\033[0m  %s\n' "$*"; }
 warn()  { printf '\033[1;33m[WARN]\033[0m  %s\n' "$*"; }
@@ -57,7 +57,7 @@ case "$SUBCMD" in
 esac
 
 # ── HOST_INFO (host-identity capture) ──────────────────────────────────────
-# Write /opt/lucebox-hub/HOST_INFO as JSON before exec'ing dflash_server.
+# Write /opt/lucebox-hub/HOST_INFO as JSON before exec'ing luce_server.
 # The C++ server reads this file at startup and surfaces the parsed JSON
 # under /props.host. Mirrors the IMAGE_INFO pattern (server_main.cpp
 # read_image_info) but in JSON instead of KEY=VALUE — host facts have
@@ -250,53 +250,53 @@ if [ "$GPU_VRAM_GB" -gt 0 ]; then
         IS_WSL=1
     fi
     if [ "$GPU_VRAM_GB" -lt 12 ]; then
-        : "${DFLASH_LAZY:=1}"
-        : "${DFLASH_MAX_CTX:=4096}"
+        : "${LUCE_LAZY:=1}"
+        : "${LUCE_MAX_CTX:=4096}"
         warn "VRAM ${GPU_VRAM_GB} GB < 12 GB — 27B target unlikely to fit"
     elif [ "$GPU_VRAM_GB" -lt 22 ]; then
-        : "${DFLASH_LAZY:=1}"
-        : "${DFLASH_MAX_CTX:=32768}"
+        : "${LUCE_LAZY:=1}"
+        : "${LUCE_MAX_CTX:=32768}"
     elif [ "$GPU_VRAM_GB" -lt 32 ]; then
-        : "${DFLASH_LAZY:=1}"
+        : "${LUCE_LAZY:=1}"
         if [ "$IS_WSL" = "1" ]; then
-            : "${DFLASH_BUDGET:=16}"
-            : "${DFLASH_MAX_CTX:=65536}"
+            : "${LUCE_BUDGET:=16}"
+            : "${LUCE_MAX_CTX:=65536}"
         else
-            : "${DFLASH_MAX_CTX:=98304}"
+            : "${LUCE_MAX_CTX:=98304}"
         fi
     else
-        : "${DFLASH_MAX_CTX:=131072}"
+        : "${LUCE_MAX_CTX:=131072}"
     fi
 fi
 
-: "${DFLASH_BIN:=$DFLASH_DIR/build/test_dflash}"
-: "${DFLASH_SERVER_BIN:=$DFLASH_DIR/build/dflash_server}"
-: "${DFLASH_HOST:=0.0.0.0}"
-: "${DFLASH_PORT:=8080}"
-: "${DFLASH_BUDGET:=22}"
-: "${DFLASH_MAX_CTX:=16384}"
-: "${DFLASH_LAZY:=0}"
-: "${DFLASH_CACHE_TYPE_K:=}"
-: "${DFLASH_CACHE_TYPE_V:=}"
-: "${DFLASH_VERBOSE:=0}"
-: "${DFLASH_TARGET:=}"
-: "${DFLASH_DRAFT:=$DFLASH_DIR/models/draft}"
-: "${DFLASH_PREFILL_MODE:=off}"
-: "${DFLASH_PREFILL_KEEP:=0.05}"
-: "${DFLASH_PREFILL_THRESHOLD:=32000}"
-: "${DFLASH_PREFILL_DRAFTER:=}"
+: "${LUCE_BIN:=$LUCE_DIR/build/test_dflash}"
+: "${LUCE_SERVER_BIN:=$LUCE_DIR/build/luce_server}"
+: "${LUCE_HOST:=0.0.0.0}"
+: "${LUCE_PORT:=8080}"
+: "${LUCE_BUDGET:=22}"
+: "${LUCE_MAX_CTX:=16384}"
+: "${LUCE_LAZY:=0}"
+: "${LUCE_CACHE_TYPE_K:=}"
+: "${LUCE_CACHE_TYPE_V:=}"
+: "${LUCE_VERBOSE:=0}"
+: "${LUCE_TARGET:=}"
+: "${LUCE_DRAFT:=$LUCE_DIR/models/draft}"
+: "${LUCE_PREFILL_MODE:=off}"
+: "${LUCE_PREFILL_KEEP:=0.05}"
+: "${LUCE_PREFILL_THRESHOLD:=32000}"
+: "${LUCE_PREFILL_DRAFTER:=}"
 # Optional server default for requests that omit max_tokens. When unset,
 # the C++ server uses the model-card default.
-: "${DFLASH_DEFAULT_MAX_TOKENS:=}"
+: "${LUCE_DEFAULT_MAX_TOKENS:=}"
 # Optional advertised model name for /v1/models (also selects the matching
 # share/model_cards/<name>.json). When unset, the C++ server uses its default
-# ("dflash"). Lets an operator surface the real model id without a wrapper.
-: "${DFLASH_MODEL_NAME:=}"
+# ("luce"). Lets an operator surface the real model id without a wrapper.
+: "${LUCE_MODEL_NAME:=}"
 # Phase-1 (thinking) cap when a request opts into thinking. Default mirrors
 # antirez/ds4 ds4_eval.c: think_max_tokens = max_tokens(16000) - hard_limit
 # reply budget(512) = 15488. The server's own hardcoded default is 10000;
 # overriding here aligns ds4-eval and similar reasoning benches with upstream.
-: "${DFLASH_THINK_MAX:=15488}"
+: "${LUCE_THINK_MAX:=15488}"
 # Soft-close thinking termination dial (PR #326). Lets the AR loop force
 # </think> early when the close-token logit comes within this probability
 # ratio of the chosen-token logit. Range [0.0, 1.0]; 0.0 = disabled (server
@@ -304,17 +304,17 @@ fi
 # is within 2× of chosen; 0.9 = aggressive (close when close is within
 # ~10% of chosen). Only emitted to the server CLI when nonzero so unset
 # reproduces the server's own default. Qwen3.5/3.6 AR path only in v1.
-: "${DFLASH_THINK_SOFT_CLOSE_MIN_RATIO:=0.0}"
+: "${LUCE_THINK_SOFT_CLOSE_MIN_RATIO:=0.0}"
 # Diagnostic: when "1", forward --debug-thinking-logits to the server so
 # the AR loop emits per-step [soft-trace] lines for fitting a sliding-
 # ratio curve. Heavy stderr; operator-only. Default off.
-: "${DFLASH_DEBUG_THINKING_LOGITS:=0}"
+: "${LUCE_DEBUG_THINKING_LOGITS:=0}"
 # Flash-attention sliding-window on full-attention layers. 0 = server's
 # stock full attention. Sparse decode windows (e.g. 2048-8192) bound
 # the compute on long prompts for gemma4's hybrid iSWA without changing
 # the KV footprint. Only emitted to the server CLI when nonzero so
 # unset reproduces the server's own default unchanged.
-: "${DFLASH_FA_WINDOW:=0}"
+: "${LUCE_FA_WINDOW:=0}"
 
 # ── auto-detect target ─────────────────────────────────────────────────────
 # Target .gguf is typically 10-30 GB (Q4_K_M). Drafts are 1-2 GB (Q8_0 / Q4)
@@ -326,12 +326,12 @@ fi
 # bench — a hardcoded Qwen3.6 preference made the container run the wrong
 # model when both gemma4 and qwen3.6 GGUFs were present, and the operator
 # only noticed when the bench numbers came out wrong. Either set
-# DFLASH_TARGET=... explicitly, or have exactly one .gguf in models/.
-if [ -z "$DFLASH_TARGET" ] && [ -d "$DFLASH_DIR/models" ]; then
+# LUCE_TARGET=... explicitly, or have exactly one .gguf in models/.
+if [ -z "$LUCE_TARGET" ] && [ -d "$LUCE_DIR/models" ]; then
     # Collect candidates: .gguf files ≥5 GB (target-sized), excluding
     # anything under models/draft/. Sort alphabetically for determinism.
     mapfile -t TARGET_CANDIDATES < <(
-        find -L "$DFLASH_DIR/models" -maxdepth 4 -type f -name '*.gguf' \
+        find -L "$LUCE_DIR/models" -maxdepth 4 -type f -name '*.gguf' \
             -size +5G \
             -not -path '*/draft/*' \
             -printf '%p\n' 2>/dev/null \
@@ -342,36 +342,36 @@ if [ -z "$DFLASH_TARGET" ] && [ -d "$DFLASH_DIR/models" ]; then
             : # fall through to the missing-target die below
             ;;
         1)
-            DFLASH_TARGET="${TARGET_CANDIDATES[0]}"
-            info "Auto-detected target: $(basename "$DFLASH_TARGET")"
+            LUCE_TARGET="${TARGET_CANDIDATES[0]}"
+            info "Auto-detected target: $(basename "$LUCE_TARGET")"
             ;;
         *)
             # Refuse to guess: silently picking the wrong target has burned
             # us before (bench numbers come out wrong, only noticed after the
-            # fact). Force the operator to disambiguate via DFLASH_TARGET.
-            warn "Multiple candidate target GGUFs in $DFLASH_DIR/models. Refusing to auto-select."
-            warn "Set DFLASH_TARGET=<path> to choose one. Candidates:"
+            # fact). Force the operator to disambiguate via LUCE_TARGET.
+            warn "Multiple candidate target GGUFs in $LUCE_DIR/models. Refusing to auto-select."
+            warn "Set LUCE_TARGET=<path> to choose one. Candidates:"
             for c in "${TARGET_CANDIDATES[@]}"; do
                 warn "    $c"
             done
-            die "Ambiguous target: set DFLASH_TARGET=<path> from the candidates above."
+            die "Ambiguous target: set LUCE_TARGET=<path> from the candidates above."
             ;;
     esac
 fi
 
-if [ -z "$DFLASH_TARGET" ] || [ ! -f "$DFLASH_TARGET" ]; then
-    die "No target GGUF found. Mount a model dir: -v /host/models:/opt/lucebox-hub/server/models, or set DFLASH_TARGET=<path-inside-container>."
+if [ -z "$LUCE_TARGET" ] || [ ! -f "$LUCE_TARGET" ]; then
+    die "No target GGUF found. Mount a model dir: -v /host/models:/opt/lucebox-hub/server/models, or set LUCE_TARGET=<path-inside-container>."
 fi
-[ -x "$DFLASH_SERVER_BIN" ] || die "dflash_server binary missing at $DFLASH_SERVER_BIN (image build failed?)"
+[ -x "$LUCE_SERVER_BIN" ] || die "luce_server binary missing at $LUCE_SERVER_BIN (image build failed?)"
 
 # Qwen3.6 DFlash drafters use sliding-window attention in the draft. Some GGUFs
 # carry this metadata directly; keep the documented env override as the startup
 # default so older drafts behave like the autotune-sweep path.
-case "$(basename "$DFLASH_TARGET")" in
+case "$(basename "$LUCE_TARGET")" in
     *Qwen3.6*|*qwen3.6*)
-        if [ -z "${DFLASH27B_DRAFT_SWA:-}" ]; then
-            export DFLASH27B_DRAFT_SWA=2048
-            info "Autotune: DFLASH27B_DRAFT_SWA=2048 (Qwen3.6 draft SWA)"
+        if [ -z "${LUCE_DRAFT_SWA:-}" ]; then
+            export LUCE_DRAFT_SWA=2048
+            info "Autotune: LUCE_DRAFT_SWA=2048 (Qwen3.6 draft SWA)"
         fi
         ;;
 esac
@@ -379,20 +379,20 @@ esac
 # Common host layouts use ~/models/qwen3.6-27b-dflash as an absolute symlink
 # rather than a literal models/draft directory. If the default is absent, find
 # that draft before deciding to run without DFlash.
-if [ "$DFLASH_DRAFT" = "$DFLASH_DIR/models/draft" ] && [ ! -e "$DFLASH_DRAFT" ]; then
-    for cand in "$DFLASH_DIR/models/qwen3.6-27b-dflash" \
-                "$DFLASH_DIR/models/Qwen3.6-27B-DFlash" \
-                "$DFLASH_DIR/models/dflash"; do
+if [ "$LUCE_DRAFT" = "$LUCE_DIR/models/draft" ] && [ ! -e "$LUCE_DRAFT" ]; then
+    for cand in "$LUCE_DIR/models/qwen3.6-27b-dflash" \
+                "$LUCE_DIR/models/Qwen3.6-27B-DFlash" \
+                "$LUCE_DIR/models/dflash"; do
         if [ -e "$cand" ]; then
-            DFLASH_DRAFT="$cand"
+            LUCE_DRAFT="$cand"
             break
         fi
     done
 fi
 
 # Draft: directory holding GGUF/safetensors, or a direct draft file.
-# The native dflash_server expects --draft to be a FILE path (not a dir).
-# If DFLASH_DRAFT points at a directory, resolve it to a draft GGUF inside.
+# The native luce_server expects --draft to be a FILE path (not a dir).
+# If LUCE_DRAFT points at a directory, resolve it to a draft GGUF inside.
 #
 # Draft files are arch-specific: a draft trained for qwen3.6 has a fc
 # weight shape that only divides evenly into the qwen3.6 target's hidden
@@ -402,13 +402,13 @@ fi
 # gemma4 drafts pre-downloaded), pick the one whose filename matches the
 # target's family. Falls back to the generic dflash-draft-*.gguf pattern
 # (legacy qwen3.6-only behavior) when the target family is unknown.
-DRAFT_ARG="$DFLASH_DRAFT"
-if [ -d "$DFLASH_DRAFT" ]; then
+DRAFT_ARG="$LUCE_DRAFT"
+if [ -d "$LUCE_DRAFT" ]; then
     # Derive a target-family hint from the target filename. Matching the
     # GGUF arch metadata would be cleaner but requires parsing the header
     # in shell; the filename convention is enforced upstream by the
     # publish-side dflash quantize scripts.
-    TARGET_BASENAME="$(basename "$DFLASH_TARGET" .gguf 2>/dev/null)"
+    TARGET_BASENAME="$(basename "$LUCE_TARGET" .gguf 2>/dev/null)"
     # Use -iname (case-insensitive) throughout so both naming conventions
     # work: legacy "dflash-gemma-4-31b-*.gguf" and the Lucebox HF repo's
     # "gemma-4-31B-it-DFlash-q8_0.gguf". Glob list is family-specific first,
@@ -445,7 +445,7 @@ if [ -d "$DFLASH_DRAFT" ]; then
         # Sort matches lexicographically so the pick is deterministic across
         # filesystems (find's traversal order is filesystem-dependent without
         # an explicit sort). First lexicographic match wins.
-        DRAFT_FILE="$(find -L "$DFLASH_DRAFT" -maxdepth 4 -type f -iname "$pattern" -print 2>/dev/null | sort | head -n 1)"
+        DRAFT_FILE="$(find -L "$LUCE_DRAFT" -maxdepth 4 -type f -iname "$pattern" -print 2>/dev/null | sort | head -n 1)"
         if [ -n "$DRAFT_FILE" ]; then
             # Mark the family-specific match so the log line below can
             # distinguish "matched on family hint" from "generic fallback".
@@ -468,75 +468,75 @@ if [ -d "$DFLASH_DRAFT" ]; then
     if [ -n "$DRAFT_FILE" ] && [ -f "$DRAFT_FILE" ]; then
         DRAFT_ARG="$DRAFT_FILE"
         if [ -n "$DRAFT_FAMILY_GLOB" ]; then
-            info "Resolved draft dir $DFLASH_DRAFT → $DRAFT_ARG (target family: $DRAFT_FAMILY_GLOB)"
+            info "Resolved draft dir $LUCE_DRAFT → $DRAFT_ARG (target family: $DRAFT_FAMILY_GLOB)"
         else
-            info "Resolved draft dir $DFLASH_DRAFT → $DRAFT_ARG"
+            info "Resolved draft dir $LUCE_DRAFT → $DRAFT_ARG"
         fi
     else
-        warn "No DFlash draft GGUF/safetensors in draft dir $DFLASH_DRAFT — running without draft"
+        warn "No DFlash draft GGUF/safetensors in draft dir $LUCE_DRAFT — running without draft"
         DRAFT_ARG=""
     fi
-elif [ -n "$DFLASH_DRAFT" ] && [ ! -f "$DFLASH_DRAFT" ]; then
-    warn "Draft path $DFLASH_DRAFT not found — running without draft"
+elif [ -n "$LUCE_DRAFT" ] && [ ! -f "$LUCE_DRAFT" ]; then
+    warn "Draft path $LUCE_DRAFT not found — running without draft"
     DRAFT_ARG=""
 fi
 
 [ "$GPU_COUNT" -gt 1 ] && warn "${GPU_COUNT} GPUs detected — native server layer sharding is not auto-enabled"
 
 # ── build + exec native server ────────────────────────────────────────────
-CMD=("$DFLASH_SERVER_BIN" "$DFLASH_TARGET"
-     --host "$DFLASH_HOST"
-     --port "$DFLASH_PORT"
-     --max-ctx "$DFLASH_MAX_CTX"
-     --think-max-tokens "$DFLASH_THINK_MAX")
+CMD=("$LUCE_SERVER_BIN" "$LUCE_TARGET"
+     --host "$LUCE_HOST"
+     --port "$LUCE_PORT"
+     --max-ctx "$LUCE_MAX_CTX"
+     --think-max-tokens "$LUCE_THINK_MAX")
 
-# Keep cache defaults owned by dflash_server. In particular, omitting
-# DFLASH_PREFIX_CACHE_SLOTS preserves the native nonzero default instead of
+# Keep cache defaults owned by luce_server. In particular, omitting
+# LUCE_PREFIX_CACHE_SLOTS preserves the native nonzero default instead of
 # silently disabling multi-turn prefix reuse in the container. Explicit
 # values, including 0 as an operator opt-out, are forwarded unchanged.
-[ -n "${DFLASH_PREFIX_CACHE_SLOTS:-}" ] && CMD+=(--prefix-cache-slots "$DFLASH_PREFIX_CACHE_SLOTS")
-[ -n "${DFLASH_PREFILL_CACHE_SLOTS:-}" ] && CMD+=(--prefill-cache-slots "$DFLASH_PREFILL_CACHE_SLOTS")
+[ -n "${LUCE_PREFIX_CACHE_SLOTS:-}" ] && CMD+=(--prefix-cache-slots "$LUCE_PREFIX_CACHE_SLOTS")
+[ -n "${LUCE_PREFILL_CACHE_SLOTS:-}" ] && CMD+=(--prefill-cache-slots "$LUCE_PREFILL_CACHE_SLOTS")
 
 [ -n "$DRAFT_ARG" ]                && CMD+=(--draft "$DRAFT_ARG")
-[ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$DFLASH_BUDGET")
-[ -n "$DFLASH_DEFAULT_MAX_TOKENS" ] && CMD+=(--default-max-tokens "$DFLASH_DEFAULT_MAX_TOKENS")
-[ -n "$DFLASH_MODEL_NAME" ]         && CMD+=(--model-name "$DFLASH_MODEL_NAME")
+[ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$LUCE_BUDGET")
+[ -n "$LUCE_DEFAULT_MAX_TOKENS" ] && CMD+=(--default-max-tokens "$LUCE_DEFAULT_MAX_TOKENS")
+[ -n "$LUCE_MODEL_NAME" ]         && CMD+=(--model-name "$LUCE_MODEL_NAME")
 # `--lazy-draft` is silently dropped by the C++ server unless both
 # `--prefill-drafter` and `--draft` are present (look for the runtime
 # warning `--lazy-draft ignored: requires both --prefill-drafter and
 # --draft`). Warn loudly here when the operator's config asked for lazy
 # but we're about to drop it — sweeping past the silent no-op was the
 # fingerprint left in every sindri decode-tuning docker.stderr.
-if [ "$DFLASH_LAZY" = "1" ]; then
-    if [ -z "$DRAFT_ARG" ] || [ -z "$DFLASH_PREFILL_DRAFTER" ]; then
-        warn "DFLASH_LAZY=1 ignored: requires both DFLASH_DRAFT and DFLASH_PREFILL_DRAFTER (see entrypoint.sh comment). Continuing without --lazy-draft."
+if [ "$LUCE_LAZY" = "1" ]; then
+    if [ -z "$DRAFT_ARG" ] || [ -z "$LUCE_PREFILL_DRAFTER" ]; then
+        warn "LUCE_LAZY=1 ignored: requires both LUCE_DRAFT and LUCE_PREFILL_DRAFTER (see entrypoint.sh comment). Continuing without --lazy-draft."
     else
         CMD+=(--lazy-draft)
     fi
 fi
-[ -n "$DFLASH_CACHE_TYPE_K" ]      && CMD+=(--cache-type-k "$DFLASH_CACHE_TYPE_K")
-[ -n "$DFLASH_CACHE_TYPE_V" ]      && CMD+=(--cache-type-v "$DFLASH_CACHE_TYPE_V")
-[ "$DFLASH_FA_WINDOW" -gt 0 ] 2>/dev/null && CMD+=(--fa-window "$DFLASH_FA_WINDOW")
+[ -n "$LUCE_CACHE_TYPE_K" ]      && CMD+=(--cache-type-k "$LUCE_CACHE_TYPE_K")
+[ -n "$LUCE_CACHE_TYPE_V" ]      && CMD+=(--cache-type-v "$LUCE_CACHE_TYPE_V")
+[ "$LUCE_FA_WINDOW" -gt 0 ] 2>/dev/null && CMD+=(--fa-window "$LUCE_FA_WINDOW")
 # Soft-close ratio: emit only when nonzero. The default-string compare
 # guards against the floating-point quirks of `[` numeric tests for
 # values like 0.0/0/0.00 — anything non-"0.0" passes through to the
 # server, which clamps to [0,1] itself.
-case "$DFLASH_THINK_SOFT_CLOSE_MIN_RATIO" in
+case "$LUCE_THINK_SOFT_CLOSE_MIN_RATIO" in
     0|0.0|0.00|0.000) ;;  # disabled — don't emit
-    *) CMD+=(--think-soft-close-min-ratio "$DFLASH_THINK_SOFT_CLOSE_MIN_RATIO") ;;
+    *) CMD+=(--think-soft-close-min-ratio "$LUCE_THINK_SOFT_CLOSE_MIN_RATIO") ;;
 esac
-[ "$DFLASH_DEBUG_THINKING_LOGITS" = "1" ] && CMD+=(--debug-thinking-logits)
+[ "$LUCE_DEBUG_THINKING_LOGITS" = "1" ] && CMD+=(--debug-thinking-logits)
 
-if [ "$DFLASH_PREFILL_MODE" != "off" ]; then
-    [ -n "$DFLASH_PREFILL_DRAFTER" ] || die "DFLASH_PREFILL_MODE=$DFLASH_PREFILL_MODE requires DFLASH_PREFILL_DRAFTER"
-    [ -f "$DFLASH_PREFILL_DRAFTER" ] || die "Prefill drafter not found at $DFLASH_PREFILL_DRAFTER"
-    CMD+=(--prefill-compression "$DFLASH_PREFILL_MODE"
-          --prefill-keep-ratio "$DFLASH_PREFILL_KEEP"
-          --prefill-threshold "$DFLASH_PREFILL_THRESHOLD"
-          --prefill-drafter "$DFLASH_PREFILL_DRAFTER")
+if [ "$LUCE_PREFILL_MODE" != "off" ]; then
+    [ -n "$LUCE_PREFILL_DRAFTER" ] || die "LUCE_PREFILL_MODE=$LUCE_PREFILL_MODE requires LUCE_PREFILL_DRAFTER"
+    [ -f "$LUCE_PREFILL_DRAFTER" ] || die "Prefill drafter not found at $LUCE_PREFILL_DRAFTER"
+    CMD+=(--prefill-compression "$LUCE_PREFILL_MODE"
+          --prefill-keep-ratio "$LUCE_PREFILL_KEEP"
+          --prefill-threshold "$LUCE_PREFILL_THRESHOLD"
+          --prefill-drafter "$LUCE_PREFILL_DRAFTER")
 fi
 
-info "lucebox-hub container starting (target=$(basename "$DFLASH_TARGET"), max_ctx=$DFLASH_MAX_CTX, budget=$DFLASH_BUDGET, lazy=$DFLASH_LAZY)"
+info "lucebox-hub container starting (target=$(basename "$LUCE_TARGET"), max_ctx=$LUCE_MAX_CTX, budget=$LUCE_BUDGET, lazy=$LUCE_LAZY)"
 
-cd "$DFLASH_DIR"
+cd "$LUCE_DIR"
 exec "${CMD[@]}"

@@ -9,7 +9,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct BackendPairCapabilities {
     // Backends built by the same runtime implementation have compatible
@@ -35,4 +35,4 @@ PlacementBackend placement_backend_of(ggml_backend_t backend);
 BackendPairCapabilities backend_pair_capabilities(ggml_backend_t first,
                                                   ggml_backend_t second);
 
-}  // namespace dflash::common
+}  // namespace luce::common

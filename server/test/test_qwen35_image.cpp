@@ -7,8 +7,8 @@
 #include <string>
 #include <vector>
 
-using namespace dflash::common;
-using namespace dflash::vision;
+using namespace luce::common;
+using namespace luce::vision;
 
 static int failures = 0;
 static void check(bool condition, const char * message) {

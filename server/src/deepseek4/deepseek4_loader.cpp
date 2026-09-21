@@ -15,7 +15,7 @@
 
 #include "deepseek4_internal.h"
 #include "internal.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "common/gguf_bounds.h"
 #include "../common/moe_hybrid_storage.h"
 #include "../common/copied_source_reclaim.h"
@@ -48,7 +48,7 @@ extern "C" bool ggml_backend_cuda_buffer_is_managed(ggml_backend_buffer_t buffer
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -298,7 +298,7 @@ static bool should_upload_ds4_tensor(const char * name,
 }
 
 static int ds4_dense_tp_mask() {
-    const char * value = std::getenv("DFLASH_DS4_DENSE_TP_MASK");
+    const char * value = std::getenv("LUCE_DS4_DENSE_TP_MASK");
     if (!value || !value[0]) return 0;
     return std::max(0, std::atoi(value));
 }
@@ -1642,7 +1642,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
     int dense_tp_mask = ds4_dense_tp_mask();
     if (dense_tp_mask != 0) {
-        const char * fused_verify = std::getenv("DFLASH_DS4_FUSED_VERIFY");
+        const char * fused_verify = std::getenv("LUCE_DS4_FUSED_VERIFY");
         if (fused_verify && fused_verify[0] &&
             std::strcmp(fused_verify, "0") != 0) {
             std::fprintf(stderr,
@@ -1657,7 +1657,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     if (dense_tp_mask != 0 && ggml_backend_is_cuda(backend) &&
         ggml_backend_cuda_get_device_count() >= 2) {
         float strix_fraction = 0.28f;
-        if (const char * value = std::getenv("DFLASH_DS4_DENSE_TP_STRIX_FRACTION")) {
+        if (const char * value = std::getenv("LUCE_DS4_DENSE_TP_STRIX_FRACTION")) {
             const float parsed = std::strtof(value, nullptr);
             if (parsed > 0.0f && parsed < 1.0f) strix_fraction = parsed;
         }
@@ -1794,7 +1794,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     }
 
 #if !defined(_WIN32)
-    bool fast_managed = (buf != nullptr) && ggml_backend_cuda_buffer_is_managed(buf) && (getenv("DFLASH_NO_PREAD") == nullptr);
+    bool fast_managed = (buf != nullptr) && ggml_backend_cuda_buffer_is_managed(buf) && (getenv("LUCE_NO_PREAD") == nullptr);
 #else
     // pread/posix_fadvise not available on Windows; fall back to mmap path.
     bool fast_managed = false;
@@ -1858,13 +1858,13 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             return false;
         }
     } else {
-#if defined(__linux__) && (defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP))
+#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
         std::vector<uint8_t> upload_scratch;
 #endif
         for (auto & a : allocs) {
             if (!a.upload_to_backend) continue;
             const void * src_data = (const char *)mmap.addr + a.file_offset;
-#if defined(__linux__) && (defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP))
+#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
             if (reclaim_sources && !a.dense_split && ggml_backend_is_cuda(backend) &&
                 !ggml_backend_cuda_buffer_is_managed(buf)) {
                 // HIP may pin pageable upload sources. Keep file-backed pages
@@ -2062,7 +2062,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 namespace {
 
 static MoeHybridColdBackend ds4_cold_backend_from_env() {
-    const char * value = std::getenv("DFLASH_MOE_COLD_BACKEND");
+    const char * value = std::getenv("LUCE_MOE_COLD_BACKEND");
     if (!value || !value[0]) return MoeHybridColdBackend::Cpu;
     if (std::strcmp(value, "gpu") == 0 || std::strcmp(value, "hip") == 0 ||
         std::strcmp(value, "rocm") == 0) {
@@ -2335,4 +2335,4 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
     w.moe_hybrid = false;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

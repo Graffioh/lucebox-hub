@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace dflash::vision {
+namespace luce::vision {
 namespace {
 void require(bool valid, const char * message) {
     if (!valid) throw std::runtime_error(message);
@@ -200,4 +200,4 @@ bool embed_image_prompt_chunk(const PreparedImagePrompt & prompt, const ImageRow
       catch (...) { error = "text embedding callback failed"; return false; }
 }
 
-} // namespace dflash::vision
+} // namespace luce::vision

@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // What the chat template carries for one image. The middle token is repeated
 // once per image token by qwen35_expand_image_tokens().
@@ -48,4 +48,4 @@ Qwen35RopePositions qwen35_image_rope_positions(int prompt_tokens, const std::ve
 void qwen35_overwrite_image_rows(const Qwen35ImageSlot & slot, const float * rows, int hidden,
                                  float * embeddings, int first, int count);
 
-}  // namespace dflash::common
+}  // namespace luce::common

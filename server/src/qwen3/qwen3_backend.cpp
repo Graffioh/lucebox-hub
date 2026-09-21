@@ -7,7 +7,7 @@
 
 #include "qwen3_backend.h"
 #include "qwen3_drafter.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
 
@@ -21,7 +21,7 @@
 #include <sstream>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ── Cache management ───────────────────────────────────────────────────
 
@@ -92,7 +92,7 @@ bool Qwen3Backend::init() {
     }
 
     if (!load_qwen3_drafter_model(cfg_.model_path, backend_, w_)) {
-        std::fprintf(stderr, "[qwen3] model load failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "[qwen3] model load failed: %s\n", luce_last_error());
         return false;
     }
     std::printf("[qwen3] loaded %s (%d layers, hidden=%d, vocab=%d)\n",
@@ -962,7 +962,7 @@ ModelBackend::CompressResult Qwen3Backend::compress(const CompressRequest & req)
 
     if (!drafter_loaded_) {
         if (!load_drafter(req.drafter_path, 999, req.drafter_gpu, drafter_ctx_)) {
-            std::fprintf(stderr, "[compress] load failed: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "[compress] load failed: %s\n", luce_last_error());
             if (!req.skip_park && !was_parked) unpark(ParkTarget::TargetModel);
             return result;
         }
@@ -1021,7 +1021,7 @@ bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io
 
     if (!drafter_loaded_) {
         if (!load_drafter(drafter_path, 999, drafter_ctx_)) {
-            std::fprintf(stderr, "[compress] load failed: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "[compress] load failed: %s\n", luce_last_error());
             if (!skip_park && !was_parked) unpark(ParkTarget::TargetModel);
             io.emit(-1);
             return false;
@@ -1043,7 +1043,7 @@ bool Qwen3Backend::handle_compress(const std::string & line, const DaemonIO & io
 
 void Qwen3Backend::free_drafter() {
     if (drafter_loaded_) {
-        dflash::common::free_drafter(drafter_ctx_);
+        luce::common::free_drafter(drafter_ctx_);
         drafter_loaded_ = false;
     }
 }
@@ -1072,4 +1072,4 @@ void Qwen3Backend::shutdown() {
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

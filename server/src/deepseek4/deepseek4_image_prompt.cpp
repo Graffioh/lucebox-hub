@@ -3,7 +3,7 @@
 #include <new>
 #include <utility>
 
-namespace dflash::vision {
+namespace luce::vision {
 namespace {
 PreparedImagePrompt fail(ImagePromptError error,const std::string & message) {
     PreparedImagePrompt result;

@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <new>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 constexpr size_t MAX_IMAGES_PER_REQUEST = 8;
@@ -100,4 +100,4 @@ bool Qwen35Backend::encode_images(const Qwen35ImagePrompt & prompt, Qwen35ImageR
     return ok;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

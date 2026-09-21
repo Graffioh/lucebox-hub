@@ -165,7 +165,7 @@ def main() -> int:
         for value in os.environ.get("CONTEXT_SWEEP_TARGETS", "2048 4096 8192 16384").split()
     ]
     parser.add_argument("--url", default="http://127.0.0.1:18109")
-    parser.add_argument("--model", default="dflash")
+    parser.add_argument("--model", default="luce")
     parser.add_argument("--model-gguf", type=Path, required=True)
     parser.add_argument("--tokenizer-harness", type=Path, required=True)
     parser.add_argument("--targets", type=int, nargs="+", default=default_targets)

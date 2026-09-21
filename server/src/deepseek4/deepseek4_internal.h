@@ -1,4 +1,4 @@
-// DeepSeek V4 Flash target structs for dflash daemon.
+// DeepSeek V4 Flash target structs for luce daemon.
 //
 // Architecture summary (from DeepSeek V4 Flash):
 //   - MLA: Multi-head Latent Attention with low-rank Q projection and single
@@ -31,7 +31,7 @@
 #include "common/concurrency/paged_kv_pool.h"
 #include "deepseek4_paged_cache.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 // Layer-major prefill may schedule five 2K numerical bands while preserving
 // the raw-cache rounding boundary between them.
@@ -636,4 +636,4 @@ struct DeepSeek4Snapshot {
 };
 
 
-}  // namespace dflash::common
+}  // namespace luce::common

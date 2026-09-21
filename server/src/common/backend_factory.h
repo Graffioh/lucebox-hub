@@ -16,7 +16,7 @@
 #include <variant>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace detail {
 class BackendPlanBuilder;
@@ -135,4 +135,4 @@ BackendPreparation prepare_backend(
     BackendArgs args,
     BackendAdmissionContext admission = {});
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -1,6 +1,6 @@
 #pragma once
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen35RoctxMetadata {
     int live = -1;
@@ -33,4 +33,4 @@ private:
     bool pushed_ = false;
 };
 
-} // namespace dflash::common
+} // namespace luce::common

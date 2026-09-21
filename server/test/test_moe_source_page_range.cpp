@@ -13,7 +13,7 @@
 #include <unistd.h>
 #endif
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static void check(bool ok, const char * message) {
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }

@@ -20,7 +20,7 @@
 #include <cstdio>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 // verify_derived_scalars
 //   wq_ne1         : weight_q->ne[1]  (output dim of Q projection)
@@ -64,4 +64,4 @@ inline bool verify_derived_scalars(
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

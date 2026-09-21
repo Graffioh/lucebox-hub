@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -446,4 +446,4 @@ void Qwen35TargetShardIpcClient::close() {
     vocab_ = 0;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

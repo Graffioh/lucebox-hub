@@ -1,8 +1,8 @@
-// Internal-only shared header for dflash::common library sources.
+// Internal-only shared header for luce::common library sources.
 // Not installed, not exposed in the public API.
 
 #pragma once
-#define DFLASH_INTERNAL_H_INCLUDED
+#define LUCE_INTERNAL_H_INCLUDED
 
 #include <cstddef>
 #include <cstdint>
@@ -24,10 +24,10 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "common/paged_attention_config.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 struct MoeHybridStorage;
 
@@ -213,7 +213,7 @@ struct TargetWeights {
     int n_expert_used           = 0;
     int n_expert_groups         = 1;
     int n_expert_groups_used    = 1;
-    int n_vocab                 = DFLASH27B_TARGET_VOCAB;
+    int n_vocab                 = LUCE_TARGET_VOCAB;
     int rope_dimension_count    = 64;
     float rope_theta            = 10000000.0f;
     float rms_eps               = 1e-6f;
@@ -249,13 +249,13 @@ struct TargetWeights {
 
     // DFlash noise mask token ID (from target tokenizer, used by draft model).
     // Default: Qwen tokenizer's mask token. Overridden by GGUF metadata if available.
-    int32_t mask_token_id = DFLASH27B_DRAFT_MASK_TOKEN_ID;
+    int32_t mask_token_id = LUCE_DRAFT_MASK_TOKEN_ID;
 
     // Target layer IDs captured for the DFlash draft model.
     // Computed from n_layer at load time: step = (n_layer - 2) / (N - 1),
     // ids[k] = 1 + k * step.  E.g. 27B→{1,16,31,46,61}, 9B→{1,8,15,22,29}.
-    int n_capture_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
-    int capture_layer_ids[DFLASH27B_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
+    int n_capture_layers = LUCE_DRAFT_N_TARGET_LAYERS;
+    int capture_layer_ids[LUCE_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
 };
 
 // Check if a token is an end-of-sequence marker for the given target weights.
@@ -380,12 +380,12 @@ struct DraftWeights {
     ggml_tensor *          out_norm    = nullptr;   // [hidden]
 
     // Architecture metadata (populated by loader).
-    int n_layer   = DFLASH27B_DRAFT_LAYERS;           // 5
-    int n_head    = DFLASH27B_TARGET_N_HEADS;          // 32
-    int n_head_kv = DFLASH27B_TARGET_N_KV_HEADS;       // 8
-    int head_dim  = DFLASH27B_TARGET_HEAD_DIM;         // 128
-    int n_embd    = DFLASH27B_TARGET_HIDDEN;           // 5120
-    int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
+    int n_layer   = LUCE_DRAFT_LAYERS;           // 5
+    int n_head    = LUCE_TARGET_N_HEADS;          // 32
+    int n_head_kv = LUCE_TARGET_N_KV_HEADS;       // 8
+    int head_dim  = LUCE_TARGET_HEAD_DIM;         // 128
+    int n_embd    = LUCE_TARGET_HIDDEN;           // 5120
+    int n_ff      = LUCE_TARGET_INTERMEDIATE;     // 17408
     int swa_window = 0;                 // sliding window size (0 = disabled)
     bool swa_pattern_loaded = false;    // GGUF supplied sliding_window_pattern
     float rope_theta = 0.0f;  // RoPE frequency base (must come from GGUF)
@@ -399,10 +399,10 @@ struct DraftWeights {
     int   rope_n_ctx_orig = 0;      // original_max_position_embeddings
 
     // DFlash draft-specific config (populated by loader or set by caller).
-    int block_size      = DFLASH27B_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)
-    int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
+    int block_size      = LUCE_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)
+    int n_target_layers = LUCE_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
     std::vector<int> capture_layer_ids;                     // explicit captured target-layer ids (GGUF dflash.target_layer_ids); empty = derive from count
-    int mask_token_id   = DFLASH27B_DRAFT_MASK_TOKEN_ID;    // noise mask token
+    int mask_token_id   = LUCE_DRAFT_MASK_TOKEN_ID;    // noise mask token
 
     // Optional Domino causal correction head. When present, greedy chain
     // speculative decode corrects each draft token with a lightweight GRU
@@ -710,7 +710,7 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
                                  TargetCache & cache);
 
 // max_verify_tokens controls the per-layer ssm_intermediate and conv_input_cache
-// sizes. Default is DFLASH27B_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
+// sizes. Default is LUCE_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
 // mode requires max(chain, 1 + tree_budget) to hold the flat tree + root.
 // Pass 0 to use the default.
 // When prefill_only is true, rollback tensors (snapshots, intermediates) are
@@ -1054,7 +1054,7 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     ggml_tensor *         kv_write_rows = nullptr,
     bool                  skip_gdn_intermediate = true);
 
-} // namespace dflash::common
+} // namespace luce::common
 
 #if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
 #include <cuda_runtime.h>

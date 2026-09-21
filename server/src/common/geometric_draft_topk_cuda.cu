@@ -9,7 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -53,7 +53,7 @@ __device__ __forceinline__ void merge_topk(const float * av, const int * ai,
 // enters at slot K-1 and bubbles up only past strictly-smaller entries, so on
 // ties the earlier (lower-id, since ids ascend within a thread) entry wins —
 // matching the CPU heap's first-wins behaviour.
-#define DFLASH_TOPK_CONSUME(LRAW, ID)                                          \
+#define LUCE_TOPK_CONSUME(LRAW, ID)                                          \
     do {                                                                       \
         const float _l = (LRAW) * inv_t;                                       \
         if (_l > lmax) { lsum = lsum * __expf(lmax - _l) + 1.0f; lmax = _l; }  \
@@ -108,23 +108,23 @@ __global__ void geometric_draft_topk_partial(const float * __restrict__ logits,
         for (int j4 = b4 + tid; j4 < e4; j4 += kBlock) {
             const float4 f = li4[j4];
             const int base = j4 << 2;
-            DFLASH_TOPK_CONSUME(f.x, base + 0);
-            DFLASH_TOPK_CONSUME(f.y, base + 1);
-            DFLASH_TOPK_CONSUME(f.z, base + 2);
-            DFLASH_TOPK_CONSUME(f.w, base + 3);
+            LUCE_TOPK_CONSUME(f.x, base + 0);
+            LUCE_TOPK_CONSUME(f.y, base + 1);
+            LUCE_TOPK_CONSUME(f.z, base + 2);
+            LUCE_TOPK_CONSUME(f.w, base + 3);
         }
         // Tail elements past the last full float4 (only when vocab % 4 != 0);
         // the last split owns them so no id is scanned twice.
         if (s == split - 1) {
             for (int j = (vocab4 << 2) + tid; j < vocab; j += kBlock)
-                DFLASH_TOPK_CONSUME(li[j], j);
+                LUCE_TOPK_CONSUME(li[j], j);
         }
     } else {
         const int chunk = (vocab + split - 1) / split;
         const int begin = s * chunk;
         const int end   = min(begin + chunk, vocab);
         for (int j = begin + tid; j < end; j += kBlock)
-            DFLASH_TOPK_CONSUME(li[j], j);
+            LUCE_TOPK_CONSUME(li[j], j);
     }
 
     // ---- block reduction over kBlock threads ------------------------------
@@ -175,7 +175,7 @@ __global__ void geometric_draft_topk_partial(const float * __restrict__ logits,
     }
 }
 
-#undef DFLASH_TOPK_CONSUME
+#undef LUCE_TOPK_CONSUME
 
 // ---- pass 2: merge the `split` partials per position into the final top-K --
 // Grid: n_positions blocks of blockDim = pow2_ceil(split) threads. Thread t
@@ -325,7 +325,7 @@ inline int pow2_ceil(int x) {
 // saturate the device while keeping each chunk large enough that the strided
 // reads stay coalesced and per-block overhead stays amortized.
 int pick_split(int vocab, int n_positions) {
-    if (const char * v = std::getenv("DFLASH_TOPK_SPLIT")) {
+    if (const char * v = std::getenv("LUCE_TOPK_SPLIT")) {
         int s = std::atoi(v);
         if (s >= 1 && s <= kMaxSplit) return s;
     }
@@ -364,7 +364,7 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
     const int dev = attr.device;
     if (dev != prev) cudaSetDevice(dev);
 
-    static const bool kProfile = std::getenv("DFLASH_TOPK_PROFILE") != nullptr;
+    static const bool kProfile = std::getenv("LUCE_TOPK_PROFILE") != nullptr;
     bool ok = false;
     const int    split   = pick_split(vocab, n_positions);
     const size_t n       = (size_t)n_positions * K;
@@ -381,30 +381,30 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
         // the tensor base aligned and a vocab stride that is a multiple of 4.
         const bool use_vec = (vocab % 4 == 0) &&
                              (reinterpret_cast<uintptr_t>(lp_in) % 16 == 0);
-#define DFLASH_TOPK_LAUNCH(KV, VEC)                                                             \
+#define LUCE_TOPK_LAUNCH(KV, VEC)                                                             \
             geometric_draft_topk_partial<KV, VEC><<<grid1, kBlock>>>(                                     \
                 lp_in, vocab, inv_t, split,                                                     \
                 scratch.d_pmax, scratch.d_psum, scratch.d_pv, scratch.d_pi);           \
             geometric_draft_topk_combine<KV><<<n_positions, comb_block>>>(                                \
                 scratch.d_pmax, scratch.d_psum, scratch.d_pv, scratch.d_pi,            \
                 split, scratch.d_lp, scratch.d_ids);
-#define DFLASH_TOPK_CASE(KV)                                                                    \
+#define LUCE_TOPK_CASE(KV)                                                                    \
             case KV:                                                                            \
-                if (use_vec) { DFLASH_TOPK_LAUNCH(KV, true) }                                   \
-                else         { DFLASH_TOPK_LAUNCH(KV, false) }                                  \
+                if (use_vec) { LUCE_TOPK_LAUNCH(KV, true) }                                   \
+                else         { LUCE_TOPK_LAUNCH(KV, false) }                                  \
                 break;
         // K values without an instantiated kernel must fail loud so the
         // caller falls back to the CPU path; the old silent default returned
         // success with uninitialized scratch as token ids.
         bool launched = true;
         switch (K) {
-            DFLASH_TOPK_CASE(1) DFLASH_TOPK_CASE(2) DFLASH_TOPK_CASE(3) DFLASH_TOPK_CASE(4)
-            DFLASH_TOPK_CASE(5) DFLASH_TOPK_CASE(6) DFLASH_TOPK_CASE(7) DFLASH_TOPK_CASE(8)
-            DFLASH_TOPK_CASE(12) DFLASH_TOPK_CASE(16)
+            LUCE_TOPK_CASE(1) LUCE_TOPK_CASE(2) LUCE_TOPK_CASE(3) LUCE_TOPK_CASE(4)
+            LUCE_TOPK_CASE(5) LUCE_TOPK_CASE(6) LUCE_TOPK_CASE(7) LUCE_TOPK_CASE(8)
+            LUCE_TOPK_CASE(12) LUCE_TOPK_CASE(16)
             default: launched = false; break;
         }
-#undef DFLASH_TOPK_CASE
-#undef DFLASH_TOPK_LAUNCH
+#undef LUCE_TOPK_CASE
+#undef LUCE_TOPK_LAUNCH
 
         if (kProfile) cudaEventRecord(e_k1);
         if (launched && cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess) {
@@ -429,4 +429,4 @@ bool geometric_extract_draft_topk_cuda(const void * d_logits,
     return ok;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

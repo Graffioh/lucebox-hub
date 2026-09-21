@@ -24,7 +24,7 @@
 #include <sys/stat.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 using json = nlohmann::json;
 
@@ -82,7 +82,7 @@ static std::string self_bin_dir() {
 //   (b) <binary's parent dir>/../share/model_cards/  (install layout)
 //   (c) <binary's parent dir>/share/model_cards/     (build layout)
 //   (d) ./share/model_cards/                          (cwd, dev runs)
-//   (e) $DFLASH_MODEL_CARDS_DIR                       (explicit override)
+//   (e) $LUCE_MODEL_CARDS_DIR                       (explicit override)
 //
 // Returns first hit or empty string. Each candidate is logged to stderr so
 // operators can see which path was probed.
@@ -93,15 +93,15 @@ static std::string find_model_cards_dir(const std::string & repo_root_hint) {
     }
     // An explicit override has to beat implicit discovery. This used to be tried LAST,
     // after the cwd-relative path, so running from any directory that happened to contain
-    // share/model_cards silently ignored the operator's DFLASH_MODEL_CARDS_DIR.
-    if (const char * envp = std::getenv("DFLASH_MODEL_CARDS_DIR")) {
+    // share/model_cards silently ignored the operator's LUCE_MODEL_CARDS_DIR.
+    if (const char * envp = std::getenv("LUCE_MODEL_CARDS_DIR")) {
         candidates.push_back(envp);
     }
     std::string bd = self_bin_dir();
     if (!bd.empty()) {
         candidates.push_back(bd + "/../share/model_cards");
         candidates.push_back(bd + "/share/model_cards");
-        // CMake build tree: the binary is at <repo>/server/build-*/dflash_server while
+        // CMake build tree: the binary is at <repo>/server/build-*/luce_server while
         // share/ sits at the repo root, two levels up. That is the layout every developer
         // run and both eval boxes use, and without this the shipped cards resolve to
         // nothing -- observed on the H200 as "no share/model_cards/ directory found;
@@ -424,4 +424,4 @@ ModelCard resolve_model_card(const std::string & gguf_path,
     return card;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

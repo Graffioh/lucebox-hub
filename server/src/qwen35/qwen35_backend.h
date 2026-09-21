@@ -41,7 +41,7 @@
 #include <string>
 #include <cstddef>
 
-namespace dflash::common {
+namespace luce::common {
 
 class Qwen35TensorParallelContext;
 class Qwen35ImagePrompt;
@@ -91,7 +91,7 @@ struct Qwen35Config {
     bool         fast_rollback   = true;
     bool         seq_verify      = false;
     // SpecLA state-resident verification (--specla). specla_top_k keeps the
-    // DFLASH_SPECLA_TOPK env as its default for non-CLI harnesses
+    // LUCE_SPECLA_TOPK env as its default for non-CLI harnesses
     // (docs/SPECLA.md); the factory always overwrites both with the
     // normalized BackendPlan values.
     bool         specla_mode     = false;
@@ -118,7 +118,7 @@ public:
 
     // ── Initialization ───────────────────────────────────────────────
     // Load target + draft models, create KV caches.
-    // Returns false on failure (check dflash27b_last_error()).
+    // Returns false on failure (check luce_last_error()).
     virtual bool init();
 
     // ── ModelBackend interface ────────────────────────────────────────
@@ -225,7 +225,7 @@ protected:
     Qwen35Config cfg_;
 
     // ── kvflash (bounded KV residency, FlashMemory-style) ────────────
-    // Active when kvflash_tokens_ > 0 (env DFLASH_KVFLASH / --kvflash):
+    // Active when kvflash_tokens_ > 0 (env LUCE_KVFLASH / --kvflash):
     // attention KV tensors are allocated at pool capacity, logical
     // positions map to pool slots via kvflash_pager_, cold chunks page to
     // host. Policy-agnostic: with no scorer the pager is LRU; when the
@@ -238,7 +238,7 @@ protected:
     std::vector<int32_t>           kvflash_history_;     // prompt + generated ids
     std::vector<float>             kvflash_scores_;      // latest chunk scores
     std::vector<uint16_t>          kvflash_mask_buf_;    // host mirror of slot mask
-    std::string                    kvflash_drafter_path_; // DFLASH_KVFLASH_DRAFTER
+    std::string                    kvflash_drafter_path_; // LUCE_KVFLASH_DRAFTER
     uint64_t                       kvflash_mask_epoch_ = (uint64_t)-1;
     int  kvflash_tokens_ = 0;                       // 0 = off
     int  kvflash_tau_    = 64;
@@ -295,7 +295,7 @@ private:
     // ── Draft feature mirror (cross-GPU feature transfer) ────────────
     DraftFeatureMirror feature_mirror_;
     // [TAG_DRAFT_KV] drafter context-KV ring cache (lazy-init; kill with
-    // DFLASH_DRAFT_KV=0). Shared module: common/dflash_draft_kv.h.
+    // LUCE_DRAFT_KV=0). Shared module: common/dflash_draft_kv.h.
     DraftKvState draft_kv_;
     DFlashDraftIpcClient remote_draft_;
 
@@ -358,7 +358,7 @@ private:
     std::unique_ptr<Qwen35SeqEngine> seq_engine_;
     friend class Qwen35SeqEngine;
 
-    // DFLASH_MIN_TOKENS floor for the slot paths (mirrors do_ar_decode's
+    // LUCE_MIN_TOKENS floor for the slot paths (mirrors do_ar_decode's
     // EOS suppression); fetches the slot's logits row on demand.
     int32_t apply_min_tokens_floor(int32_t tok, int generated,
                                    size_t logits_row_offset);
@@ -437,4 +437,4 @@ private:
     int verify_tree(int committed, const DDTree & tree);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

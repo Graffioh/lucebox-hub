@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace dflash::vision {
+namespace luce::vision {
 namespace {
 using Tensor = ggml_tensor;
 constexpr size_t MAX_SCRATCH = size_t(2) * 1024 * 1024 * 1024;
@@ -472,4 +472,4 @@ size_t VisionRuntime::scratch_bytes() const {
     return detail::hip_bias_workspace(impl_->backend) +
         (impl_->allocator ? ggml_gallocr_get_buffer_size(impl_->allocator,0) : 0);
 }
-} // namespace dflash::vision
+} // namespace luce::vision

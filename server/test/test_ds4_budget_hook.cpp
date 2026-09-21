@@ -18,7 +18,7 @@ namespace {
 
 struct BudgetHookFixture {};
 
-using dflash::deepseek4::budget_hook_apply;
+using luce::deepseek4::budget_hook_apply;
 
 struct HookState {
     bool        started = false;

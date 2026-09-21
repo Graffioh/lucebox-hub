@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct MoeSourcePageRange {
     uintptr_t address = 0;
@@ -37,4 +37,4 @@ inline bool moe_source_pageout_eligible(bool cold_gpu, bool hot_materialized,
     return cold_gpu && hot_materialized && cold_materialized && cold_allocated;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

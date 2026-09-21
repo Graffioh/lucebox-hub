@@ -3,7 +3,7 @@
 
 #include "../common/vision/image_spans.h"
 
-namespace dflash::vision {
+namespace luce::vision {
 
 inline constexpr size_t DS4V_MAX_IMAGES = 4;
 inline constexpr uint64_t DS4V_MAX_IMAGE_BLOCK_TOKENS = 384;
@@ -12,4 +12,4 @@ inline bool valid_image_spans(ImageSpanView spans, uint64_t prompt_size) {
     return valid_image_spans(spans, prompt_size, DS4V_MAX_IMAGES, DS4V_MAX_IMAGE_BLOCK_TOKENS);
 }
 
-} // namespace dflash::vision
+} // namespace luce::vision

@@ -22,7 +22,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct DraftWeights;  // forward-decl from internal.h
 
@@ -73,4 +73,4 @@ bool run_dflash_spec_decode(
         int base_pos = 0,
         double * accept_rate_out = nullptr);
 
-} // namespace dflash::common
+} // namespace luce::common

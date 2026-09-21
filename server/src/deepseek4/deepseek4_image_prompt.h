@@ -1,7 +1,7 @@
 #pragma once
 #include "deepseek4_vision_preprocess.h"
 
-namespace dflash::vision {
+namespace luce::vision {
 
 struct ImagePatchInput {
     ResizePlan plan;
@@ -45,4 +45,4 @@ PreparedImagePrompt prepare_image_prompt(
     const ImagePromptLimits & limits = {},
     const ImageTokenizerContract & tokenizer = {});
 
-} // namespace dflash::vision
+} // namespace luce::vision

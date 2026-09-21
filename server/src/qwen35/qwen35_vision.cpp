@@ -10,7 +10,7 @@
 #include <cmath>
 #include <initializer_list>
 
-namespace dflash::vision {
+namespace luce::vision {
 
 namespace {
 
@@ -376,4 +376,4 @@ void Qwen35VisionTower::release_scratch() {
     }
 }
 
-}  // namespace dflash::vision
+}  // namespace luce::vision

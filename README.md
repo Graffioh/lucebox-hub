@@ -127,9 +127,9 @@ for exact-retrieval and matched true-context benchmarks.
 Set the server binary and model paths, then run a launcher:
 
 ```bash
-DFLASH_SERVER_BIN=server/build/dflash_server \
-DFLASH_TARGET=server/models/Qwen3.8-27B-UD-IQ4_XS.gguf \
-DFLASH_DRAFT=server/models/draft/qwen38-dflash2-q8_0.gguf \
+LUCE_SERVER_BIN=server/build/luce_server \
+LUCE_TARGET=server/models/Qwen3.8-27B-UD-IQ4_XS.gguf \
+LUCE_DRAFT=server/models/draft/qwen38-dflash2-q8_0.gguf \
 MAX_CTX=32768 \
 harness/clients/run_codex.sh
 ```
@@ -186,11 +186,11 @@ cd lucebox
 cmake -S server -B server/build-hip -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
-  -DDFLASH27B_GPU_BACKEND=hip \
-  -DDFLASH27B_HIP_ARCHITECTURES=gfx1201 \
+  -DLUCE_GPU_BACKEND=hip \
+  -DLUCE_HIP_ARCHITECTURES=gfx1201 \
   -DGGML_HIP_MMQ_MFMA=ON \
   -DGGML_HIP_NO_VMM=ON
-cmake --build server/build-hip --target dflash_server -j"$(nproc)"
+cmake --build server/build-hip --target luce_server -j"$(nproc)"
 
 # target and DFlash2 drafter
 mkdir -p models
@@ -203,7 +203,7 @@ python server/scripts/quantize_dflash_draft.py \
   models/qwen38-dflash2-f16.gguf models/qwen38-dflash2-q8_0.gguf --scheme q8_0
 
 # launch the measured profile
-./server/build-hip/dflash_server models/Qwen3.8-27B-UD-IQ4_XS.gguf \
+./server/build-hip/luce_server models/Qwen3.8-27B-UD-IQ4_XS.gguf \
   --draft models/qwen38-dflash2-q8_0.gguf \
   --draft-block-size 16 --max-ctx 131072 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
@@ -219,7 +219,7 @@ To serve up to `N` concurrent requests, use this launch command with the same Qw
 
 ```bash
 N=5
-./server/build-hip/dflash_server models/Qwen3.8-27B-UD-IQ4_XS.gguf \
+./server/build-hip/luce_server models/Qwen3.8-27B-UD-IQ4_XS.gguf \
   --draft models/qwen38-dflash2-q8_0.gguf \
   --draft-block-size 16 --max-ctx 16384 \
   --paged-attention --max-concurrency "$N" \

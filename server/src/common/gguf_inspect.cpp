@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool derive_effective_target_layer_count(const std::string & arch,
                                          uint32_t block_count,
@@ -421,4 +421,4 @@ GgufMetadata read_gguf_metadata(const std::string & path,
     return m;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

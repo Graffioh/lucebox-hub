@@ -13,7 +13,7 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 
-namespace dflash::common {
+namespace luce::common {
 
 using json = nlohmann::json;
 
@@ -114,4 +114,4 @@ private:
     const Tokenizer & tok_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

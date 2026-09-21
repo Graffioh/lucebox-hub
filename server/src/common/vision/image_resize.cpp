@@ -7,7 +7,7 @@
 #include <new>
 #include <utility>
 
-namespace dflash::vision {
+namespace luce::vision {
 namespace {
 
 struct Status {
@@ -254,4 +254,4 @@ bool resize_rgb_bicubic(const std::vector<std::uint8_t> & input, int input_width
     }
 }
 
-}  // namespace dflash::vision
+}  // namespace luce::vision

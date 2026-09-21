@@ -21,7 +21,7 @@
 #include <vector>
 
 using namespace CppUnitTestFramework;
-using namespace dflash::common;
+using namespace luce::common;
 
 // ── Backend compatibility gate ──────────────────────────────────────────
 // One case per rule cluster in check_feature_compatibility(). All resolved

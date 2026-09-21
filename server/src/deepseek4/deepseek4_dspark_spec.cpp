@@ -19,7 +19,7 @@
 //   - the ratio-4 prev-half is also restored when a rejected boundary flushed
 //     current rows into it. Accepted boundaries and current rows are kept.
 // The legacy full-snapshot + double-verify path is kept behind
-// DFLASH_DS4_FULL_SNAP=1 for A/B validation.
+// LUCE_DS4_FULL_SNAP=1 for A/B validation.
 
 #include "deepseek4_dspark.h"
 #include "deepseek4_internal.h"
@@ -42,7 +42,7 @@
 #include <cmath>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ── DFlashTarget adapter over the DS4 target ────────────────────────────
 class DeepSeek4DFlashTarget : public DFlashTarget {
@@ -74,13 +74,13 @@ public:
         // Sequential verify: q single-token forwards through the same cached
         // graph as ordinary AR decode. This preserves target arithmetic; exact
         // rollback still requires a full snapshot and replay after rejection.
-        // DFLASH_DS4_SEQ_VERIFY is a diagnostic. The supported reference mode,
-        // DFLASH_DS4_SPEC_REFERENCE_EXACT, enables both requirements together.
+        // LUCE_DS4_SEQ_VERIFY is a diagnostic. The supported reference mode,
+        // LUCE_DS4_SPEC_REFERENCE_EXACT, enables both requirements together.
         static const bool seq_verify = [] {
             const char * exact =
-                std::getenv("DFLASH_DS4_SPEC_REFERENCE_EXACT");
+                std::getenv("LUCE_DS4_SPEC_REFERENCE_EXACT");
             const char * sequential =
-                std::getenv("DFLASH_DS4_SEQ_VERIFY");
+                std::getenv("LUCE_DS4_SEQ_VERIFY");
             return (exact && *exact && *exact != '0') ||
                    (sequential && *sequential && *sequential != '0');
         }();
@@ -311,7 +311,7 @@ constexpr int kDs4AdaptiveMinWidth = 2;
 // calibrated on q<=4 traffic (three candidates); the fourth candidate of a q5
 // verify is decided by the learned conditional acceptance until its own
 // score is shown calibrated (see the per-depth calibration line under
-// DFLASH_DS4_TIMING).
+// LUCE_DS4_TIMING).
 constexpr int kDs4ConfidenceDepths = 3;
 constexpr float kDs4VerifyWidthCostMs[DS4_Q5_VERIFY_TOKENS + 1] = {
     0.0f, 0.0f, 75.0f, 100.0f, 122.0f, 123.0f};
@@ -709,7 +709,7 @@ bool deepseek4_dspark_verify_forward(ggml_backend_t backend,
     if (boundary_checkpoint_out) boundary_checkpoint_out->clear();
     hooks.boundary_checkpoint_out = boundary_checkpoint_out;
     hooks.prefer_argmax_only =
-        spec_env_flag("DFLASH_DS4_GPU_ARGMAX_VERIFY") && logits_out == nullptr;
+        spec_env_flag("LUCE_DS4_GPU_ARGMAX_VERIFY") && logits_out == nullptr;
     if (!deepseek4_step_layer_range(backend, device, w, cache, hc_state, embed, n_tokens, kv_start,
                                     0, w.n_layer, &last_logits, token_ids,
                                     telemetry, allow_graph_reuse,
@@ -770,39 +770,39 @@ bool run_deepseek4_dspark_spec_decode(
     const int n_swa = target_w.n_swa;
     const int feat_row = n_tgt * n_embd;
 
-    const bool debug = spec_env_flag("DFLASH_DS4_DSPARK_DEBUG");
-    const bool timing = spec_env_flag("DFLASH_DS4_TIMING");
+    const bool debug = spec_env_flag("LUCE_DS4_DSPARK_DEBUG");
+    const bool timing = spec_env_flag("LUCE_DS4_TIMING");
     const bool reference_exact =
-        spec_env_flag("DFLASH_DS4_SPEC_REFERENCE_EXACT");
+        spec_env_flag("LUCE_DS4_SPEC_REFERENCE_EXACT");
     const bool full_snap = reference_exact ||
-        spec_env_flag("DFLASH_DS4_FULL_SNAP");
+        spec_env_flag("LUCE_DS4_FULL_SNAP");
     const bool seq_verify_mode = reference_exact ||
-        spec_env_flag("DFLASH_DS4_SEQ_VERIFY");
+        spec_env_flag("LUCE_DS4_SEQ_VERIFY");
     const InferencePhase roctx_phase = reference_exact
         ? InferencePhase::ReferenceExact
         : (seq_verify_mode ? InferencePhase::Sequential : InferencePhase::Batched);
     const DeepSeek4RoctxRange roctx_range(
         "ds4.spec_decode",
         {roctx_phase, n_gen, 0, target_w.n_layer, device});
-    const bool async_rollback = spec_env_flag("DFLASH_DS4_ASYNC_ROLLBACK");
-    const bool pinned_rollback = spec_env_flag("DFLASH_DS4_PINNED_ROLLBACK");
+    const bool async_rollback = spec_env_flag("LUCE_DS4_ASYNC_ROLLBACK");
+    const bool pinned_rollback = spec_env_flag("LUCE_DS4_PINNED_ROLLBACK");
     // Kill switch for the q5 two-boundary checkpoint restore (falls back to
     // restore-and-replay) and the per-token diagnostic trace.
     const bool boundary_checkpoint_enabled =
-        !spec_env_flag("DFLASH_DS4_DISABLE_BOUNDARY_CHECKPOINT");
-    const bool token_trace = spec_env_flag("DFLASH_DS4_TOKEN_TRACE");
-    if (spec_env_flag("DFLASH_DS4_Q6_VERIFY")) {
+        !spec_env_flag("LUCE_DS4_DISABLE_BOUNDARY_CHECKPOINT");
+    const bool token_trace = spec_env_flag("LUCE_DS4_TOKEN_TRACE");
+    if (spec_env_flag("LUCE_DS4_Q6_VERIFY")) {
         std::fprintf(stderr,
             "[ds4-spec] q=6 verification is unsupported; use q=5\n");
         return false;
     }
     const bool q5_verify =
-        spec_env_flag("DFLASH_DS4_Q5_VERIFY") && block >= 4;
+        spec_env_flag("LUCE_DS4_Q5_VERIFY") && block >= 4;
     const bool wide_verify = q5_verify;
     const bool draft_overlap_probe =
-        spec_env_flag("DFLASH_DS4_DRAFT_OVERLAP_PROBE");
+        spec_env_flag("LUCE_DS4_DRAFT_OVERLAP_PROBE");
     const bool draft_overlap_reuse_context =
-        spec_env_flag("DFLASH_DS4_DRAFT_OVERLAP_REUSE_CONTEXT");
+        spec_env_flag("LUCE_DS4_DRAFT_OVERLAP_REUSE_CONTEXT");
     if (reference_exact) {
         std::fprintf(stderr,
             "[ds4-spec] reference-exact verifier: sequential target replay "
@@ -821,7 +821,7 @@ bool run_deepseek4_dspark_spec_decode(
     // Shared adaptive verify width is opt-in. The DS4-specific setting wins
     // over the global setting so one backend can be qualified in isolation.
     bool adaptive_width = adaptive_spec_width_globally_enabled();
-    if (const char * raw = std::getenv("DFLASH_DS4_ADAPTIVE_WIDTH")) {
+    if (const char * raw = std::getenv("LUCE_DS4_ADAPTIVE_WIDTH")) {
         adaptive_width = raw[0] && std::strcmp(raw, "0") != 0;
     }
     // A drafter confidence head scores every candidate of this very step, so
@@ -830,10 +830,10 @@ bool run_deepseek4_dspark_spec_decode(
     // depths than the q5 verifier with the learned conditional acceptance of
     // the remaining depth, and target feedback keeps refining that estimate
     // (kDs4ConfidenceDepths bounds the depths taken from the head).
-    // DFLASH_DS4_CONFIDENCE_WIDTH=0 is the kill switch back to the learned
+    // LUCE_DS4_CONFIDENCE_WIDTH=0 is the kill switch back to the learned
     // acceptance policy for A/B runs and drafters with a miscalibrated head.
     const bool use_confidence_width = adaptive_width && !seq_verify_mode &&
-        spec_env_default_on("DFLASH_DS4_CONFIDENCE_WIDTH") &&
+        spec_env_default_on("LUCE_DS4_CONFIDENCE_WIDTH") &&
         drafter.confidence_w != nullptr && drafter.confidence_b != nullptr &&
         (drafter.confidence_dim == n_embd ||
          drafter.confidence_dim == n_embd + drafter.markov_rank);
@@ -847,7 +847,7 @@ bool run_deepseek4_dspark_spec_decode(
         q5_verify ? DS4_Q5_VERIFY_TOKENS
                   : DS4_CONSERVATIVE_VERIFY_MAX_TOKENS);
     int q_cap = full_snap ? block + 1 : fast_cap;
-    if (const char * qs = std::getenv("DFLASH_DS4_SPEC_Q")) {
+    if (const char * qs = std::getenv("LUCE_DS4_SPEC_Q")) {
         const int v = std::atoi(qs);
         if (v >= 2 && v <= block + 1) {
             q_cap = full_snap ? v : std::min(v, fast_cap);
@@ -1015,7 +1015,7 @@ bool run_deepseek4_dspark_spec_decode(
         // the dynamic batched path; otherwise "fixed q3" degenerates into q1
         // whenever pos % 4 == 3 and pays a full target verify for one token.
         static const bool fused_verify_mode = [] {
-            const char * v = std::getenv("DFLASH_DS4_FUSED_VERIFY");
+            const char * v = std::getenv("LUCE_DS4_FUSED_VERIFY");
             return v && *v && *v != '0';
         }();
         int q_step_cap = (seq_verify_mode || fused_verify_mode)
@@ -1415,4 +1415,4 @@ bool run_deepseek4_dspark_spec_decode(
     return ok;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

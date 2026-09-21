@@ -9,7 +9,7 @@
 #include <cstring>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -248,7 +248,7 @@ struct MarkovChainGraphCache {
 
 bool dspark_chain_graph_cache_disabled() {
     static const bool disabled = [] {
-        const char * value = std::getenv("DFLASH_DSPARK_NO_CHAIN_GRAPH_CACHE");
+        const char * value = std::getenv("LUCE_DSPARK_NO_CHAIN_GRAPH_CACHE");
         return value && value[0] && std::strcmp(value, "0") != 0;
     }();
     return disabled;
@@ -575,4 +575,4 @@ bool dspark_markov_project_topk(const DraftWeights & dw,
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

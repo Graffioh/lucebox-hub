@@ -2,7 +2,7 @@
 //
 // Qwen3.5/3.6/3.8 dense-hybrid targets attend at head_dim=256. The RDNA4
 // dispatch historically capped the MMA fattn path at head 128, so prefill
-// fell through to the generic tile kernel. DFLASH27B_FA256_MMA=1 routes
+// fell through to the generic tile kernel. LUCE_FA256_MMA=1 routes
 // head-256 through a tensor-core kernel (rocWMMA when the build has it,
 // raw MMA otherwise); this test pins that route via the launch counters and
 // checks the output against ggml's own CPU flash_attn_ext reference over
@@ -27,10 +27,10 @@
 
 namespace {
 
-// Head dim; DFLASH27B_FA256_TEST_D=128 runs a diagnostic baseline for
+// Head dim; LUCE_FA256_TEST_D=128 runs a diagnostic baseline for
 // the rocWMMA kernel's already-dispatchable heads (route check will fail).
 static int head_dim() {
-    const char * e = getenv("DFLASH27B_FA256_TEST_D");
+    const char * e = getenv("LUCE_FA256_TEST_D");
     return e ? atoi(e) : 256;
 }
 constexpr int Hq = 24;  // query heads
@@ -92,7 +92,7 @@ bool run_case(ggml_backend_t gpu, ggml_backend_t cpu, const Case & c, int D) {
         ggml_set_input(t);
     }
     ggml_tensor * out = ggml_flash_attn_ext(gctx, Q, K, V, mask, scale, 0.0f, c.softcap);
-    if (getenv("DFLASH27B_FA256_TEST_F32ACC") != nullptr) {
+    if (getenv("LUCE_FA256_TEST_F32ACC") != nullptr) {
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
     }
     if (c.sinks) {
@@ -220,7 +220,7 @@ bool run_case(ggml_backend_t gpu, ggml_backend_t cpu, const Case & c, int D) {
 
     // Debug dump: profile the worst column against the reference to tell a
     // rowsum/scaling error (constant ratio across d) from a layout scramble.
-    if (getenv("DFLASH27B_FA256_DUMP") != nullptr && max_diff >= c.tolerance) {
+    if (getenv("LUCE_FA256_DUMP") != nullptr && max_diff >= c.tolerance) {
         const size_t wq = (worst_i / D) % (size_t) c.nq;
         const size_t wh = worst_i / (D * (size_t) c.nq);
         std::printf("[dump] S=%d q=%zu h=%zu\n", c.S, wq, wh);
@@ -261,15 +261,15 @@ int main() {
     }
     // Must precede the first GPU fattn dispatch: fattn.cu reads the opt-in
     // once per process on the first dispatch call. An explicit value in the
-    // environment wins. DFLASH27B_FA256_MMA=0 opts the tensor-core route
+    // environment wins. LUCE_FA256_MMA=0 opts the tensor-core route
     // out; the test then verifies the tile/vec fallback instead (correct
     // results, zero tensor-core launches) rather than skipping.
     const bool kill_switch = [] {
-        const char * e = getenv("DFLASH27B_FA256_MMA");
-        return e && atoi(e) == 0 && getenv("DFLASH27B_FA256_WMMA") == nullptr;
+        const char * e = getenv("LUCE_FA256_MMA");
+        return e && atoi(e) == 0 && getenv("LUCE_FA256_WMMA") == nullptr;
     }();
-    if (getenv("DFLASH27B_FA256_MMA") == nullptr &&
-        setenv("DFLASH27B_FA256_MMA", "1", 1) != 0) {
+    if (getenv("LUCE_FA256_MMA") == nullptr &&
+        setenv("LUCE_FA256_MMA", "1", 1) != 0) {
         std::fprintf(stderr, "[fattn-mma256] setenv failed\n");
         return 1;
     }
@@ -283,7 +283,7 @@ int main() {
     // The nq=16 case only routes through a tensor-core kernel when the
     // forced-WMMA A/B mode is on; otherwise it dispatches to the vector
     // kernel and would fail the route pin.
-    const bool wmma_force = getenv("DFLASH27B_FA256_WMMA") != nullptr;
+    const bool wmma_force = getenv("LUCE_FA256_WMMA") != nullptr;
     // Ragged KV length (not a multiple of FATTN_KQ_STRIDE): gqa_opt does
     // not apply, so the tensor-core route must NOT fire and the generic
     // fallback must still produce correct results.

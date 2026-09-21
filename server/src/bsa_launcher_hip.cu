@@ -1,7 +1,7 @@
 // HIP Phase 3: BSA-compatible launcher wrapping our rocWMMA sparse FA kernel.
 //
 // Provides the same extern "C" symbol as bsa_launcher.cu (CUDA) so that
-// flashprefill.cpp can call it when DFLASH_FP_USE_BSA=1 is set at runtime.
+// flashprefill.cpp can call it when LUCE_FP_USE_BSA=1 is set at runtime.
 //
 // The CUDA version converts indices/counts → BSA blockmask, then dispatches
 // the CUTLASS SM80 FA-2 kernel. Here we skip the conversion entirely and
@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <cstdlib>          // size_t
 
-namespace dflash::common {
+namespace luce::common {
 namespace flashprefill {
 
 // Defined in flashprefill_kernels.hip.cu.
@@ -108,4 +108,4 @@ extern "C" int launch_bsa_sparse_flash_forward_bf16(
 }
 
 }  // namespace flashprefill
-}  // namespace dflash::common
+}  // namespace luce::common

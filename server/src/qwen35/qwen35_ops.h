@@ -5,7 +5,7 @@
 #include "common/ggml_graph_precision.h"
 #include "ggml.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 inline ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
                                   ggml_tensor * weight, float eps) {
@@ -23,4 +23,4 @@ inline ggml_tensor * apply_scale2(ggml_context * ctx, ggml_tensor * mm_result,
     return ggml_scale(ctx, mm_result, scale);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

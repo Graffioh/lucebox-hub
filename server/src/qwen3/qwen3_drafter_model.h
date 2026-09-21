@@ -26,7 +26,7 @@ typedef struct ggml_backend * ggml_backend_t;
 struct ggml_backend_buffer;
 typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen3DrafterLayer {
     ggml_tensor * attn_norm   = nullptr;  // [hidden]
@@ -126,4 +126,4 @@ inline size_t count_nonfinite_scores(const float * values, size_t count) {
     return nonfinite;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

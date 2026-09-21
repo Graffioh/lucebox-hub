@@ -9,7 +9,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 struct CopiedSourceAdviceResult {
     size_t requested = 0;
@@ -61,4 +61,4 @@ inline CopiedSourceAdviceResult reclaim_copied_file_source(
     return result;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

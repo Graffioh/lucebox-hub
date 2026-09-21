@@ -12,8 +12,8 @@
 // slots changes, every committed token is still target-verified.
 //
 // On by default (theta 0.20). Debug overrides:
-//   DFLASH_ADAPTIVE_WIDTH_THETA=<0..1>  0 disables (legacy fixed/EWMA width)
-//   DFLASH_ADAPTIVE_WIDTH_MIN=<n>       minimum kept rows incl. seed (default 4)
+//   LUCE_ADAPTIVE_WIDTH_THETA=<0..1>  0 disables (legacy fixed/EWMA width)
+//   LUCE_ADAPTIVE_WIDTH_MIN=<n>       minimum kept rows incl. seed (default 4)
 //
 // Model-agnostic: any family loop that has per-slot drafter top-1
 // probabilities (e.g. from ggml_backend_cuda_topk_rows over the draft-head
@@ -23,13 +23,13 @@
 
 inline float adaptive_verify_width_theta() {
     static const float theta = []() {
-        const char * e = std::getenv("DFLASH_ADAPTIVE_WIDTH_THETA");
+        const char * e = std::getenv("LUCE_ADAPTIVE_WIDTH_THETA");
         if (!e) return 0.20f;
         char * end = nullptr;
         const float v = std::strtof(e, &end);
         if (end == e || *end != '\0' || v < 0.0f || v > 1.0f) {
             std::fprintf(stderr, "[adaptive-width] ignoring "
-                                 "DFLASH_ADAPTIVE_WIDTH_THETA=\"%s\" "
+                                 "LUCE_ADAPTIVE_WIDTH_THETA=\"%s\" "
                                  "(want a float in [0,1]); using 0.20\n", e);
             return 0.20f;
         }
@@ -40,12 +40,12 @@ inline float adaptive_verify_width_theta() {
 
 inline int adaptive_verify_width_min() {
     static const int mn = []() {
-        const char * e = std::getenv("DFLASH_ADAPTIVE_WIDTH_MIN");
+        const char * e = std::getenv("LUCE_ADAPTIVE_WIDTH_MIN");
         if (!e) return 4;
         const int v = std::atoi(e);
         if (v <= 0) {
             std::fprintf(stderr, "[adaptive-width] ignoring "
-                                 "DFLASH_ADAPTIVE_WIDTH_MIN=\"%s\" "
+                                 "LUCE_ADAPTIVE_WIDTH_MIN=\"%s\" "
                                  "(want a positive int); using 4\n", e);
             return 4;
         }

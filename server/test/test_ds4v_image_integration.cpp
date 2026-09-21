@@ -10,12 +10,12 @@
 #include <vector>
 
 namespace {
-using dflash::vision::ImageSpanView;
-using dflash::vision::TokenSpan;
-using dflash::vision::atomic_image_chunk;
-using dflash::vision::image_block_at;
-using dflash::vision::remaining_expert_budget;
-using dflash::vision::valid_image_spans;
+using luce::vision::ImageSpanView;
+using luce::vision::TokenSpan;
+using luce::vision::atomic_image_chunk;
+using luce::vision::image_block_at;
+using luce::vision::remaining_expert_budget;
+using luce::vision::valid_image_spans;
 constexpr uint64_t MAX = std::numeric_limits<uint64_t>::max();
 size_t checks = 0;
 
@@ -166,7 +166,7 @@ void exhaustive_endpoints() {
 void memory_budget() {
     constexpr uint64_t MiB = 1024 * 1024;
     constexpr uint64_t GiB = 1024 * MiB;
-    constexpr uint64_t vision = dflash::vision::SCRATCH_RESERVATION;
+    constexpr uint64_t vision = luce::vision::SCRATCH_RESERVATION;
     constexpr uint64_t workspace = 76 * MiB;
     require(vision == 2 * GiB, "retain qualified two-GiB vision reservation");
     const uint64_t initial = remaining_expert_budget(24 * GiB, 4 * GiB, GiB, 256 * MiB, 512 * MiB, vision);

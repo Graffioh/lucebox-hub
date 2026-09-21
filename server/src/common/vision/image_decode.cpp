@@ -1,6 +1,6 @@
 #include "image_decode.h"
 
-#if !defined(DFLASH_NO_IMAGE_CODECS)
+#if !defined(LUCE_NO_IMAGE_CODECS)
 #include <cstdio>
 #include <jpeglib.h>
 #include <lodepng.h>
@@ -15,7 +15,7 @@
 #include <string>
 #include <utility>
 
-namespace dflash::vision {
+namespace luce::vision {
 namespace {
 
 DecodeResult fail(DecodeError code, std::string message) {
@@ -24,7 +24,7 @@ DecodeResult fail(DecodeError code, std::string message) {
     return result;
 }
 
-#if !defined(DFLASH_NO_IMAGE_CODECS)
+#if !defined(LUCE_NO_IMAGE_CODECS)
 DecodeStatus validate_encoded(const EncodedImageView & encoded, const DecodeLimits & limits) {
     if (encoded.data == nullptr || encoded.size == 0) {
         return {DecodeError::EmptyInput, "encoded image is empty"};
@@ -343,13 +343,13 @@ DecodeResult decode_png(const EncodedImageView & encoded, const DecodeLimits & l
     return result;
 }
 
-#endif  // !DFLASH_NO_IMAGE_CODECS
+#endif  // !LUCE_NO_IMAGE_CODECS
 }  // namespace
 
 DecodeResult decode_image(const EncodedImageView & encoded, const DecodeLimits & limits) {
-#if defined(DFLASH_NO_IMAGE_CODECS)
+#if defined(LUCE_NO_IMAGE_CODECS)
     (void) encoded; (void) limits;
-    return fail(DecodeError::UnsupportedFormat, "this build has no image codecs (DFLASH27B_IMAGE_CODECS=OFF)");
+    return fail(DecodeError::UnsupportedFormat, "this build has no image codecs (LUCE_IMAGE_CODECS=OFF)");
 #else
     if (const auto status = validate_encoded(encoded, limits); !status) {
         DecodeResult result;
@@ -382,4 +382,4 @@ const char * decode_error_name(DecodeError error) {
     return "unknown";
 }
 
-}  // namespace dflash::vision
+}  // namespace luce::vision

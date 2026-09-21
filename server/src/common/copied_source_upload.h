@@ -7,7 +7,7 @@
 #include <limits>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 inline constexpr size_t COPIED_SOURCE_UPLOAD_CHUNK = 16 * 1024 * 1024;
 
@@ -35,4 +35,4 @@ inline bool upload_copied_file_chunks(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::vision {
+namespace luce::vision {
 
 struct EncodedImageView {
     const std::uint8_t * data = nullptr;
@@ -69,4 +69,4 @@ DecodeResult decode_image(
 
 const char * decode_error_name(DecodeError error);
 
-}  // namespace dflash::vision
+}  // namespace luce::vision

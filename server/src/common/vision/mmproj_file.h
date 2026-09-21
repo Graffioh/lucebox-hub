@@ -12,7 +12,7 @@
 
 struct gguf_context;
 
-namespace dflash::vision {
+namespace luce::vision {
 
 class MmprojFile {
 public:
@@ -46,4 +46,4 @@ private:
     size_t weight_bytes_ = 0;
 };
 
-} // namespace dflash::vision
+} // namespace luce::vision

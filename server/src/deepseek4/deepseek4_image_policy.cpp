@@ -2,7 +2,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace dflash::vision {
+namespace luce::vision {
 bool select_image_experts(const float * scores, const float * bias, size_t experts,
                           size_t topk, ImageExpertSelection & output, std::string & error,
                           float route_scale) {

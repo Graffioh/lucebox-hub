@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::vision {
+namespace luce::vision {
 
 struct PreprocessConfig {
     std::uint32_t patch_size = 14;
@@ -119,4 +119,4 @@ PreprocessResult preprocess_rgb(
 
 const char * preprocess_error_name(PreprocessError error);
 
-}  // namespace dflash::vision
+}  // namespace luce::vision

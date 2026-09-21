@@ -14,7 +14,7 @@
 #include <limits>
 #include <sstream>
 
-namespace dflash::vision {
+namespace luce::vision {
 namespace {
 constexpr uint64_t MAX = std::numeric_limits<uint64_t>::max();
 
@@ -167,7 +167,7 @@ bool estimate_deepseek4_image_storage(
         !placement.valid(&error)) {
         return fail(error, "image storage admission requires valid materialized DS4 placement");
     }
-    if (duplicate != enabled("DFLASH_MOE_DUPLICATE_HOT_ON_COLD")) {
+    if (duplicate != enabled("LUCE_MOE_DUPLICATE_HOT_ON_COLD")) {
         return fail(error, "image admission duplicate mode differs from storage environment");
     }
     const auto hot_buft = ggml_backend_get_default_buffer_type(primary);
@@ -177,7 +177,7 @@ bool estimate_deepseek4_image_storage(
         const auto & layer = w.layers[size_t(layer_index)];
         const uint64_t hot_count = uint64_t(placement.hot_counts[size_t(layer_index)]);
         const uint64_t cold_count = duplicate ? uint64_t(w.n_expert) : uint64_t(w.n_expert) - hot_count;
-        if (enabled("DFLASH_DS4_DECODE_ALL_COLD") && cold_count != uint64_t(w.n_expert)) {
+        if (enabled("LUCE_DS4_DECODE_ALL_COLD") && cold_count != uint64_t(w.n_expert)) {
             return fail(error, "decode-all-cold requires a full physical cold stack before allocation");
         }
         if ((layer.ffn_gate_shexp && layer.ffn_gate_shexp->ne[1] > config.n_ff_shexp) ||
@@ -393,4 +393,4 @@ bool assess_deepseek4_image_admission(
     }
     return true;
 }
-} // namespace dflash::vision
+} // namespace luce::vision

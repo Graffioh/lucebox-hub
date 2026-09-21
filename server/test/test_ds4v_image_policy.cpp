@@ -4,7 +4,7 @@
 #include <limits>
 #include <stdexcept>
 
-using namespace dflash::vision;
+using namespace luce::vision;
 static void check(bool ok, const char * reason) { if (!ok) throw std::runtime_error(reason); }
 static bool visible(int64_t q, int64_t k, int64_t w, int64_t begin=-1, int64_t end=-1) {
     bool result = false;

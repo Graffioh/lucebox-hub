@@ -1,6 +1,6 @@
 # Model load balancing
 
-Model load balancing lets one `dflash_server` process serve requests across
+Model load balancing lets one `luce_server` process serve requests across
 models on different GPUs through one HTTP listener. It prefers the configured
 primary and sends new requests to a secondary when the primary cannot accept
 them. If all eligible models are busy, requests enter a bounded waiting queue.
@@ -34,7 +34,7 @@ original order after the primary. The old `--load-balancing-next-model` and
 `--next-model` flags are removed.
 
 ```bash
-dflash_server --load-balancing --load-balancing-primary-gpu hip:0 \
+luce_server --load-balancing --load-balancing-primary-gpu hip:0 \
   --model /models/qwen38-27b.gguf \
   --model-name qwen --target-device hip:0 \
   --draft /models/qwen38-dflash2.gguf --draft-device hip:0 \

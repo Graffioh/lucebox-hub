@@ -17,7 +17,7 @@
 
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 class Qwen35DFlashTarget : public DFlashTarget {
 public:
@@ -123,4 +123,4 @@ private:
     StepGraph proj_sg_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

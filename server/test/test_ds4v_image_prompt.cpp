@@ -3,7 +3,7 @@
 #include <limits>
 #include <stdexcept>
 
-using namespace dflash::vision;
+using namespace luce::vision;
 constexpr int32_t marker=129264,vocab=129280;
 static void check(bool value,const char * why) { if (!value) throw std::runtime_error(why); }
 static ImagePatchInput small_image(uint16_t pixel=0) {

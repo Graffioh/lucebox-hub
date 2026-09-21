@@ -3,7 +3,7 @@
 #include <iostream>
 #include <stdexcept>
 
-using namespace dflash::common;
+using namespace luce::common;
 using json = nlohmann::json;
 
 // Any text works; the transport must not know a model's marker.

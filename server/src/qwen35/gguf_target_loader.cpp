@@ -66,7 +66,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 // CpuEmbedder destructor + embed() method
 CpuEmbedder::~CpuEmbedder() {
@@ -314,7 +314,7 @@ bool verify_target_derived_scalars(const TargetWeights & out, std::string & err)
     const int64_t exp_n_embd = (int64_t)out.n_embd;
     char tag[16];
     std::snprintf(tag, sizeof(tag), "blk.%d", fa_il);
-    return dflash::common::verify_derived_scalars(
+    return luce::common::verify_derived_scalars(
         fa.wq->ne[1], fa.wk->ne[1], fa.wq->ne[0],
         exp_q_dim, exp_kv_dim, exp_n_embd,
         tag, err);
@@ -706,7 +706,7 @@ bool load_target_gguf_partial(const std::string & path,
     // places tensors itself) and only when the pair shares type/ne0 and the
     // first tensor's byte size keeps the second one aligned.
     const bool can_stack = !plan.metadata_only && !ggml_backend_buft_is_meta(buft) &&
-                           std::getenv("DFLASH_QWEN35_NO_STACK") == nullptr;
+                           std::getenv("LUCE_QWEN35_NO_STACK") == nullptr;
     if (can_stack) {
         auto find_alloc = [&](const std::string & name) -> int {
             for (size_t i = 0; i < allocs.size(); i++) {
@@ -1142,4 +1142,4 @@ void free_target_weights(TargetWeights & w) {
     w.output   = nullptr;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

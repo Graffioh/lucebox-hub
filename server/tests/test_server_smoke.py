@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Smoke test for dflash_server — exercises health, models, and generation endpoints.
+"""Smoke test for luce_server — exercises health, models, and generation endpoints.
 
 Usage:
   # Start the server first, then run:
-  python3 dflash/tests/test_server_smoke.py [--base-url http://localhost:8080]
+  python3 server/tests/test_server_smoke.py [--base-url http://localhost:8080]
 
   # Or use --launch to start the server automatically:
-  python3 dflash/tests/test_server_smoke.py --launch <model.gguf> [--port 9099]
+  python3 server/tests/test_server_smoke.py --launch <model.gguf> [--port 9099]
 """
 
 import argparse
@@ -88,7 +88,7 @@ class SmokeTest:
         print("\n[4] OpenAI chat/completions (streaming)")
         try:
             resp = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [
                     {"role": "user", "content": "Say hello in one word."}
                 ],
@@ -129,7 +129,7 @@ class SmokeTest:
         print("\n[5] OpenAI chat/completions (non-streaming)")
         try:
             r = self._req("POST", "/v1/chat/completions", {
-                "model": "dflash",
+                "model": "luce",
                 "messages": [
                     {"role": "user", "content": "What is 2+2? Reply with just the number."}
                 ],
@@ -164,7 +164,7 @@ class SmokeTest:
         print("\n[6] Anthropic /v1/messages (streaming)")
         try:
             resp = self._req("POST", "/v1/messages", {
-                "model": "dflash",
+                "model": "luce",
                 "system": "You are a helpful assistant.",
                 "messages": [
                     {"role": "user", "content": "Say hi in one word."}
@@ -206,7 +206,7 @@ class SmokeTest:
         print("\n[7] Responses /v1/responses (streaming)")
         try:
             resp = self._req("POST", "/v1/responses", {
-                "model": "dflash",
+                "model": "luce",
                 "input": "What is 1+1? Reply with just the number.",
                 "max_tokens": 256,
                 "temperature": 0.0,
@@ -307,15 +307,15 @@ def wait_for_server(base_url: str, timeout: float = 120.0):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="dflash_server smoke test")
+    parser = argparse.ArgumentParser(description="luce_server smoke test")
     parser.add_argument("--base-url", default="http://localhost:8080",
                         help="Server base URL")
     parser.add_argument("--launch", metavar="MODEL_PATH",
-                        help="Launch dflash_server with this model before testing")
+                        help="Launch luce_server with this model before testing")
     parser.add_argument("--port", type=int, default=9099,
                         help="Port to use when --launch is specified")
     parser.add_argument("--server-bin", default=None,
-                        help="Path to dflash_server binary")
+                        help="Path to luce_server binary")
     args = parser.parse_args()
 
     server_proc = None
@@ -328,15 +328,15 @@ def main():
             bin_path = args.server_bin
             if not bin_path:
                 candidates = [
-                    "dflash/build/dflash_server",
-                    "build/dflash_server",
+                    "server/build/luce_server",
+                    "build/luce_server",
                 ]
                 for c in candidates:
                     if os.path.isfile(c):
                         bin_path = c
                         break
             if not bin_path:
-                print("ERROR: Could not find dflash_server binary")
+                print("ERROR: Could not find luce_server binary")
                 sys.exit(1)
 
             print(f"Launching: {bin_path} {args.launch} --port {port}")

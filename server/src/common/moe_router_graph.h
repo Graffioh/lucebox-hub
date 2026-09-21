@@ -4,7 +4,7 @@
 
 #include <cmath>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct TopKMoeRouterResult {
     ggml_tensor * selected   = nullptr; // [n_used, n_tokens] i32
@@ -62,4 +62,4 @@ static inline TopKMoeRouterResult build_sigmoid_topk_moe_router(
     return out;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -4,7 +4,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct RemoteTargetShardConfig {
     std::string ipc_bin;
@@ -14,4 +14,4 @@ struct RemoteTargetShardConfig {
     bool has_aux_options() const { return !work_dir.empty(); }
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

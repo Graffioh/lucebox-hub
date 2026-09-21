@@ -22,8 +22,8 @@ cmake -S . -B build-coverage \
   -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
-  -DDFLASH27B_COVERAGE=ON \
-  -DDFLASH27B_TESTS=ON
+  -DLUCE_COVERAGE=ON \
+  -DLUCE_TESTS=ON
 cmake --build build-coverage --target coverage -j
 ```
 

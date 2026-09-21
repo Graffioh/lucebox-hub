@@ -16,7 +16,7 @@
 
 #include <cstdint>
 
-namespace dflash::common {
+namespace luce::common {
 
 // 0 when nothing can be read (non-Linux, no amdgpu). The result already has a
 // 1 GiB margin taken off for pages owned by other drivers.
@@ -25,4 +25,4 @@ uint64_t reclaimable_gpu_page_pool_bytes();
 // Same estimate from caller-supplied text, for tests.
 uint64_t reclaimable_gpu_page_pool_bytes(const char * meminfo_text, uint64_t live_gpu_host_bytes);
 
-} // namespace dflash::common
+} // namespace luce::common

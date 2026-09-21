@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 
 inline constexpr size_t MAX_IMAGE_BYTES = 16 * 1024 * 1024;
@@ -44,4 +44,4 @@ bool prepare_request_images(const nlohmann::json & messages,
                             const ImageInputLimits & limits = {});
 void redact_image_urls(nlohmann::json & value);
 
-} // namespace dflash::common
+} // namespace luce::common

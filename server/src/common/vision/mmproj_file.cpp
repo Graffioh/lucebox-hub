@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <memory>
 
-namespace dflash::vision {
+namespace luce::vision {
 
 MmprojFile::~MmprojFile() {
     if (buffer_) ggml_backend_buffer_free(buffer_);
@@ -103,4 +103,4 @@ bool MmprojFile::has_tensor_prefix(const std::string & prefix) const {
     return false;
 }
 
-} // namespace dflash::vision
+} // namespace luce::vision

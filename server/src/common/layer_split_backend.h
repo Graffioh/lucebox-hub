@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 class LayerSplitAdapter {
 public:
@@ -135,4 +135,4 @@ private:
     bool shutdown_done_ = false;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

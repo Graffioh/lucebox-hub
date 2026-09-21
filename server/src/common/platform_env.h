@@ -4,7 +4,7 @@
 
 #include <cstdlib>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Match POSIX setenv() semantics on every platform. In particular,
 // overwrite=false must preserve an existing value; _putenv_s() does not
@@ -29,4 +29,4 @@ inline int unset_environment_variable(const char * name) {
 #endif
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

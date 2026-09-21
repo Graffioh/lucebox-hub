@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <initializer_list>
 
-namespace dflash::vision {
+namespace luce::vision {
 
 inline constexpr uint64_t SCRATCH_RESERVATION = 2ULL * 1024 * 1024 * 1024;
 
@@ -20,4 +20,4 @@ inline uint64_t remaining_expert_budget(uint64_t total, uint64_t core,
     return total;
 }
 
-} // namespace dflash::vision
+} // namespace luce::vision

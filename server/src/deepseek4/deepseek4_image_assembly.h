@@ -5,7 +5,7 @@
 #include <functional>
 #include <memory>
 
-namespace dflash::vision {
+namespace luce::vision {
 
 // Bound decoded/prepared image memory to one outstanding request. The lease
 // travels with the immutable payload and may be released by another thread.
@@ -47,4 +47,4 @@ bool embed_image_prompt_chunk(const PreparedImagePrompt &, const ImageRows &,
                                size_t position, size_t count, const TextEmbed &,
                                std::vector<float> & output, std::string & error);
 
-} // namespace dflash::vision
+} // namespace luce::vision

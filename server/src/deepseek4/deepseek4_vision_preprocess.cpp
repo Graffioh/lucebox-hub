@@ -8,7 +8,7 @@
 #include <sstream>
 #include <utility>
 
-namespace dflash::vision {
+namespace luce::vision {
 namespace {
 
 
@@ -579,4 +579,4 @@ const char * preprocess_error_name(PreprocessError error) {
     return "unknown";
 }
 
-}  // namespace dflash::vision
+}  // namespace luce::vision

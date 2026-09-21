@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace dflash::vision {
+namespace luce::vision {
 
 // Half-open absolute token positions. `block` covers every token the image
 // expanded to; `visible` is the part that attends bidirectionally.
@@ -72,4 +72,4 @@ inline int atomic_image_chunk(ImageSpanView spans, uint64_t position,
     return count && count <= remaining && count <= uint64_t(capacity) ? int(count) : 0;
 }
 
-} // namespace dflash::vision
+} // namespace luce::vision

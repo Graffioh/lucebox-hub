@@ -3,7 +3,7 @@
 #include <limits>
 #include <stdexcept>
 
-using namespace dflash::vision;
+using namespace luce::vision;
 static void check(bool ok, const char * message) {
     if (!ok) throw std::runtime_error(message);
 }

@@ -34,7 +34,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -81,10 +81,10 @@ static void force_chunk_neighborhood(std::vector<uint8_t> & forced, int n_chunks
     for (int c = lo; c <= hi; ++c) forced[(size_t)c] = 1;
 }
 
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
 bool prewarm_drafter_once(const Qwen3DrafterWeights & w) {
     static bool warmed = false;
-    if (warmed || std::getenv("DFLASH_FP_SKIP_PREWARM")) {
+    if (warmed || std::getenv("LUCE_FP_SKIP_PREWARM")) {
         return true;
     }
 
@@ -233,7 +233,7 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
         out.weights.n_vocab, out.gpu);
     std::fflush(stderr);
 
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
     if (!prewarm_drafter_once(out.weights)) {
         free_drafter(out);
         return false;
@@ -294,23 +294,23 @@ static std::vector<int32_t> qwen35_score_and_compress(
 #if defined(_WIN32)
     char *  old_tq3_raw = nullptr;
     size_t  old_tq3_len = 0;
-    _dupenv_s(&old_tq3_raw, &old_tq3_len, "DFLASH27B_KV_TQ3");
+    _dupenv_s(&old_tq3_raw, &old_tq3_len, "LUCE_KV_TQ3");
     const bool had_old_tq3 = (old_tq3_raw != nullptr);
     std::string old_tq3_s  = had_old_tq3 ? old_tq3_raw : "";
     free(old_tq3_raw);
-    _putenv_s("DFLASH27B_KV_TQ3", "0");
+    _putenv_s("LUCE_KV_TQ3", "0");
     auto restore_tq3 = [&]() {
         // _putenv_s with empty value removes the variable on MSVCRT.
-        _putenv_s("DFLASH27B_KV_TQ3", had_old_tq3 ? old_tq3_s.c_str() : "");
+        _putenv_s("LUCE_KV_TQ3", had_old_tq3 ? old_tq3_s.c_str() : "");
     };
 #else
-    const char * old_tq3 = std::getenv("DFLASH27B_KV_TQ3");
+    const char * old_tq3 = std::getenv("LUCE_KV_TQ3");
     std::string old_tq3_s = old_tq3 ? old_tq3 : "";
     const bool had_old_tq3 = (old_tq3 != nullptr);
-    setenv("DFLASH27B_KV_TQ3", "0", 1);
+    setenv("LUCE_KV_TQ3", "0", 1);
     auto restore_tq3 = [&]() {
-        if (had_old_tq3) setenv("DFLASH27B_KV_TQ3", old_tq3_s.c_str(), 1);
-        else unsetenv("DFLASH27B_KV_TQ3");
+        if (had_old_tq3) setenv("LUCE_KV_TQ3", old_tq3_s.c_str(), 1);
+        else unsetenv("LUCE_KV_TQ3");
     };
 #endif
     if (!create_target_cache(w, S, 0, w.backend, cache, true)) {
@@ -552,7 +552,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
     // Caller pool_kernel takes precedence; if zero/negative, fall back to env or 5.
     const int pk = (pool_kernel > 0)
         ? pool_kernel
-        : std::max(3, env_int("DFLASH_COMPRESS_POOL_KERNEL", 5));
+        : std::max(3, env_int("LUCE_COMPRESS_POOL_KERNEL", 5));
     std::vector<float> smoothed((size_t)S, 0.0f);
     int half = pk / 2;
     for (int j = 0; j < S; ++j) {
@@ -578,8 +578,8 @@ static std::vector<int32_t> qwen35_score_and_compress(
     int count = 0;
     // Scale head/tail forced chunks so they don't crowd out top-K scoring.
     {
-        const int h_raw = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
-        const int t_raw = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
+        const int h_raw = env_int("LUCE_COMPRESS_HEAD_CHUNKS", 8);
+        const int t_raw = env_int("LUCE_COMPRESS_TAIL_CHUNKS", 24);
         int h_n = h_raw, t_n = t_raw;
         if (h_n + t_n >= n_keep) {
             const int budget = std::max(1, n_keep - 1);
@@ -590,12 +590,12 @@ static std::vector<int32_t> qwen35_score_and_compress(
         for (int c = std::max(0, n_chunks - t_n); c < n_chunks; ++c) if (!selected[(size_t)c]) { selected[(size_t)c] = 1; ++count; }
     }
 
-    const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
+    const int query_tokens = env_int("LUCE_COMPRESS_QUERY_TOKENS", 96);
     const auto ap = resolve_anchor_params(n_chunks,
         env_int("PFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
         env_int("PFLASH_COMPRESS_MAX_ANCHOR_HITS", -1),
-        env_int("DFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
-        env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", -1));
+        env_int("LUCE_COMPRESS_ANCHOR_RADIUS",   -1),
+        env_int("LUCE_COMPRESS_MAX_ANCHOR_HITS", -1));
     const int anchor_radius   = ap.radius;
     const int max_anchor_hits = ap.max_hits;
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
@@ -633,9 +633,9 @@ static std::vector<int32_t> qwen35_score_and_compress(
     // Global aggregation tasks often depend on repeated rare tokens that do
     // not appear in the final query. Preserve high-frequency-but-not-filler
     // token chunks before filling with model-score top-K.
-    const int repeat_min = env_int("DFLASH_COMPRESS_REPEAT_MIN", 4);
-    const int repeat_max = env_int("DFLASH_COMPRESS_REPEAT_MAX", 32);
-    const int repeat_limit = env_int("DFLASH_COMPRESS_REPEAT_CHUNKS", n_keep);
+    const int repeat_min = env_int("LUCE_COMPRESS_REPEAT_MIN", 4);
+    const int repeat_max = env_int("LUCE_COMPRESS_REPEAT_MAX", 32);
+    const int repeat_limit = env_int("LUCE_COMPRESS_REPEAT_CHUNKS", n_keep);
     if (repeat_min > 1 && count < repeat_limit) {
         std::unordered_map<int32_t, int> freq;
         freq.reserve((size_t)S);
@@ -787,20 +787,20 @@ std::vector<int32_t> drafter_score_and_compress(
     // needle span. Exact scores alone can keep the query while dropping the
     // neighboring answer chunk, so force a small token-only anchor neighborhood.
     // Head/tail forced chunks scale with n_keep so top-K scoring always gets slots.
-    const int h_raw = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
-    const int t_raw = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
+    const int h_raw = env_int("LUCE_COMPRESS_HEAD_CHUNKS", 8);
+    const int t_raw = env_int("LUCE_COMPRESS_TAIL_CHUNKS", 24);
     int head_chunks = h_raw, tail_chunks = t_raw;
     if (head_chunks + tail_chunks >= n_keep) {
         const int budget = std::max(1, n_keep - 1);
         head_chunks = std::max(0, h_raw * budget / (h_raw + t_raw));
         tail_chunks = std::max(0, budget - head_chunks);
     }
-    const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
+    const int query_tokens = env_int("LUCE_COMPRESS_QUERY_TOKENS", 96);
     const auto ap = resolve_anchor_params(n_chunks,
         env_int("PFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
         env_int("PFLASH_COMPRESS_MAX_ANCHOR_HITS", -1),
-        env_int("DFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
-        env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", -1));
+        env_int("LUCE_COMPRESS_ANCHOR_RADIUS",   -1),
+        env_int("LUCE_COMPRESS_MAX_ANCHOR_HITS", -1));
     const int anchor_radius   = ap.radius;
     const int max_anchor_hits = ap.max_hits;
     std::vector<uint8_t> selected_mask((size_t)n_chunks, 0);
@@ -884,4 +884,4 @@ std::vector<int32_t> drafter_score_and_compress(
     return out;
 }
 
-} // namespace dflash::common
+} // namespace luce::common
