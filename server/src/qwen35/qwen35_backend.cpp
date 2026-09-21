@@ -1345,6 +1345,7 @@ void Qwen35Backend::shutdown() {
         free_prefix_snapshot(prefix_snapshots_[i]);
     }
     if (!target_parked_) free_target_weights(w_);
+    vision_.reset();  // its buffers belong to target_backend_, freed below
     if (!use_remote_draft && !draft_parked_) free_draft_weights(dw_);
     free_target_cache(cache_);
     if (split_gpus_ && draft_backend_) {

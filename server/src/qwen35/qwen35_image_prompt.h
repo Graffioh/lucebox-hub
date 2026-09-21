@@ -9,8 +9,9 @@
 
 namespace luce::common {
 
-// What the chat template carries for one image. The middle token is repeated
-// once per image token by qwen35_expand_image_tokens().
+// What the chat template carries for one image. The middle token is the pad
+// token, repeated once per image token by qwen35_expand_image_tokens().
+inline constexpr const char * QWEN35_IMAGE_PAD_TOKEN = "<|image_pad|>";
 inline constexpr const char * QWEN35_IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>";
 
 struct Qwen35ImageSlot {

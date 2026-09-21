@@ -369,17 +369,4 @@ DecodeResult decode_image(const EncodedImageView & encoded, const DecodeLimits &
 #endif
 }
 
-const char * decode_error_name(DecodeError error) {
-    switch (error) {
-        case DecodeError::None: return "none";
-        case DecodeError::EmptyInput: return "empty_input";
-        case DecodeError::EncodedTooLarge: return "encoded_too_large";
-        case DecodeError::UnsupportedFormat: return "unsupported_format";
-        case DecodeError::MalformedImage: return "malformed_image";
-        case DecodeError::DecodedTooLarge: return "decoded_too_large";
-        case DecodeError::AllocationFailed: return "allocation_failed";
-    }
-    return "unknown";
-}
-
 }  // namespace luce::vision

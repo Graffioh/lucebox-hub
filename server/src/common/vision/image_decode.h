@@ -67,6 +67,4 @@ DecodeResult decode_image(
     const EncodedImageView & encoded,
     const DecodeLimits & limits = {});
 
-const char * decode_error_name(DecodeError error);
-
 }  // namespace luce::vision

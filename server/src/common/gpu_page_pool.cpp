@@ -52,7 +52,8 @@ bool live_gpu_host_bytes(uint64_t & total) {
 
 uint64_t reclaimable_gpu_page_pool_bytes(const char * meminfo_text, uint64_t live_gpu_host_bytes) {
     if (!meminfo_text) return 0;
-    uint64_t total = 0, accounted = 0, huge_pages = 0, huge_page_kb = 0;
+    uint64_t total = 0, accounted = 0, huge_pages = 0, huge_page_kb = 0, hugetlb_kb = 0;
+    bool has_hugetlb = false;
     std::istringstream lines(meminfo_text);
     std::string line;
     while (std::getline(lines, line)) {
@@ -63,9 +64,12 @@ uint64_t reclaimable_gpu_page_pool_bytes(const char * meminfo_text, uint64_t liv
         if (key == "MemTotal") total = value;
         else if (key == "HugePages_Total") huge_pages = value;
         else if (key == "Hugepagesize") huge_page_kb = value;
+        else if (key == "Hugetlb") { hugetlb_kb = value; has_hugetlb = true; }
         else for (const char * field : ACCOUNTED) if (key == field) accounted += value;
     }
-    accounted += huge_pages * huge_page_kb;
+    // Hugetlb covers pools of every page size; older kernels only report the
+    // default pool's page count.
+    accounted += has_hugetlb ? hugetlb_kb : huge_pages * huge_page_kb;
     if (total <= accounted) return 0;
     const uint64_t unattributed = (total - accounted) * 1024;
     const uint64_t in_use = live_gpu_host_bytes + OTHER_DRIVERS_MARGIN;

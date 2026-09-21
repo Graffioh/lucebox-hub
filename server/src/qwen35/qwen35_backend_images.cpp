@@ -29,10 +29,13 @@ bool Qwen35Backend::load_vision() {
         return false;
     }
     // Request threads read these two without a lock, so they are written
-    // once: a reload after unpark finds them already set to the same values.
+    // once. A reload after unpark must bring back the same projector.
     if (!image_input_) {
         vision_config_ = tower->config();
         image_input_ = true;
+    } else if (!tower->config().same_geometry(vision_config_)) {
+        std::fprintf(stderr, "[vision] the projector file changed while the model was parked\n");
+        return false;
     }
     vision_ = std::move(tower);
     std::printf("[vision] projector loaded: %d layers, %.0f MiB, up to %d tokens per image\n",

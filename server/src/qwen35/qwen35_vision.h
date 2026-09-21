@@ -31,6 +31,16 @@ struct Qwen35VisionConfig {
     // bound keeps the tower's attention scratch near 1 GiB.
     int min_image_tokens = 64;
     int max_image_tokens = 1024;
+
+    // Everything preprocessing and prompt expansion depend on.
+    bool same_geometry(const Qwen35VisionConfig & o) const {
+        return patch_size == o.patch_size && merge == o.merge &&
+               language_dimension == o.language_dimension &&
+               min_image_tokens == o.min_image_tokens && max_image_tokens == o.max_image_tokens &&
+               mean[0] == o.mean[0] && mean[1] == o.mean[1] && mean[2] == o.mean[2] &&
+               deviation[0] == o.deviation[0] && deviation[1] == o.deviation[1] &&
+               deviation[2] == o.deviation[2];
+    }
 };
 
 // A resized, normalised image. `planar` is channel major ([3, height, width]).

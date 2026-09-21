@@ -23,6 +23,7 @@ public:
     MmprojFile & operator=(const MmprojFile &) = delete;
 
     // Loads every tensor onto `backend`, which must outlive this object.
+    // One attempt per object: after a failure, discard it.
     bool load(const std::string & path, ggml_backend_t backend, std::string & error);
 
     // "clip.projector_type", for example "qwen3vl_merger". Empty when absent.

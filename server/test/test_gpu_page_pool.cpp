@@ -42,6 +42,15 @@ int main() {
     check(reclaimable_gpu_page_pool_bytes(huge, 0) == (100000000ULL - 10000000 - 40960000) * 1024 - GiB,
           "huge pages count as attributed");
 
+    const char * mixed_huge =
+        "MemTotal:       100000000 kB\n"
+        "MemFree:         10000000 kB\n"
+        "HugePages_Total:    20000\n"
+        "Hugepagesize:        2048 kB\n"
+        "Hugetlb:         50000000 kB\n";  // includes a pool of another page size
+    check(reclaimable_gpu_page_pool_bytes(mixed_huge, 0) == (100000000ULL - 10000000 - 50000000) * 1024 - GiB,
+          "Hugetlb covers huge page pools of every size");
+
     check(reclaimable_gpu_page_pool_bytes("MemFree: 5 kB\n", 0) == 0, "no MemTotal, no estimate");
     check(reclaimable_gpu_page_pool_bytes("", 0) == 0 && reclaimable_gpu_page_pool_bytes(nullptr, 0) == 0,
           "empty input");
