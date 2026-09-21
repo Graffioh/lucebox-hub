@@ -584,6 +584,9 @@ add_library(dflash_common STATIC
     src/qwen35/qwen35_target_shard_ipc_daemon.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
+    src/qwen35/qwen35_backend_images.cpp
+    src/qwen35/qwen35_image_prompt.cpp
+    src/qwen35/qwen35_vision.cpp
     src/qwen35/qwen35_tensor_parallel.cpp
     src/qwen35/concurrency/qwen35_seq_engine.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
@@ -1913,7 +1916,13 @@ if(DFLASH27B_TESTS)
     target_include_directories(test_image_resize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_executable(test_gpu_page_pool test/test_gpu_page_pool.cpp src/common/gpu_page_pool.cpp)
     target_include_directories(test_gpu_page_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    list(APPEND _raw_unit_test_targets test_image_input test_image_resize test_gpu_page_pool)
+    add_executable(test_qwen35_image test/test_qwen35_image.cpp
+        src/qwen35/qwen35_image_prompt.cpp src/qwen35/qwen35_vision.cpp
+        src/common/vision/mmproj_file.cpp src/common/vision/image_resize.cpp)
+    target_include_directories(test_qwen35_image PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_qwen35_image PRIVATE ggml ggml-base)
+    list(APPEND _raw_unit_test_targets test_image_input test_image_resize test_gpu_page_pool
+        test_qwen35_image)
 
     # DS4V image units: each test builds only the unit it covers.
     foreach(_ds4v_unit assembly integration policy prompt)

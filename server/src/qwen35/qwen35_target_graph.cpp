@@ -1204,12 +1204,15 @@ static ggml_tensor * build_full_attn_block(
     int sections[4];
     for (int i = 0; i < 4; i++) sections[i] = rope_sections[i];
 
+    // Interleaved M-RoPE, as the model is defined. For text the three axes
+    // carry the same position and the layout makes no difference; image
+    // tokens give each axis its own value, and then it does.
     Q = ggml_rope_multi(ctx, Q, positions, /*freq_factors=*/nullptr,
-                        n_rot, sections, GGML_ROPE_TYPE_MROPE,
+                        n_rot, sections, GGML_ROPE_TYPE_IMROPE,
                         /*n_ctx_orig=*/0, w.rope_theta, 1.0f,
                         0.0f, 1.0f, 0.0f, 0.0f);
     Kcur = ggml_rope_multi(ctx, Kcur, positions, nullptr,
-                           n_rot, sections, GGML_ROPE_TYPE_MROPE,
+                           n_rot, sections, GGML_ROPE_TYPE_IMROPE,
                            0, w.rope_theta, 1.0f,
                            0.0f, 1.0f, 0.0f, 0.0f);
 

@@ -243,6 +243,9 @@ struct TargetWeights {
     // comparands with `>= 0` so the sentinel never matches a real token.
     int32_t eos_id      = -1;
     int32_t eos_chat_id = -1;
+    // Token the chat template repeats once per image token; -1 when the
+    // vocabulary has none (a model without image input).
+    int32_t image_pad_id = -1;
 
     // DFlash noise mask token ID (from target tokenizer, used by draft model).
     // Default: Qwen tokenizer's mask token. Overridden by GGUF metadata if available.

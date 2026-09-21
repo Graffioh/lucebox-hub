@@ -85,7 +85,7 @@ static void print_usage(const char * prog) {
         "                      Defaults to the first block; request model names\n"
         "                      do not change generation routing.\n"
         "  --draft <path>       Draft model for speculative decode\n"
-        "  --mmproj <path>      DS4V image projector GGUF (heterogeneous HIP sparse mode)\n"
+        "  --mmproj <path>      Vision projector GGUF: enables image input (Qwen3.5/3.8, DS4V)\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"

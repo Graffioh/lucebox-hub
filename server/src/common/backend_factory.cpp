@@ -190,6 +190,7 @@ std::unique_ptr<ModelBackend> construct_backend(
         Qwen35Config cfg;
         cfg.target_path        = model.path;
         cfg.draft_path         = speculation.draft_path;
+        cfg.mmproj_path        = model.mmproj_path.value_or("");
         cfg.device             = placement.target;
         cfg.draft_gpu          = placement.draft.gpu;
         cfg.remote_draft       = placement.remote_draft;

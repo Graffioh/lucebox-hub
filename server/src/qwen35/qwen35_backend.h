@@ -26,6 +26,7 @@
 #include "common/concurrency/paged_kv_pool.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
+#include "qwen35_vision.h"
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
 #include "kvflash_scorer.h"        // chunk-relevance policy interface
@@ -43,12 +44,15 @@
 namespace dflash::common {
 
 class Qwen35TensorParallelContext;
+class Qwen35ImagePrompt;
+struct Qwen35ImageRows;
 
 // ── Configuration passed at construction ────────────────────────────────
 
 struct Qwen35Config {
     std::string target_path;
     std::optional<std::string> draft_path;
+    std::string  mmproj_path;              // vision projector; empty = text only
     DevicePlacement device;                // target GPU placement
     int          draft_gpu   = 0;
     RemoteDraftConfig remote_draft;
@@ -153,6 +157,18 @@ public:
 
     bool supports_dflash_spec_decode() const override { return !cfg_.paged_attention; }
     DFlashTarget * dflash_target() override;
+
+    // Image input (--mmproj). Requests with images prefill through the normal
+    // chunk loop with the image rows written over the pad embeddings, and
+    // decode one token at a time.
+    bool supports_images() const override { return image_input_; }
+    std::string image_placeholder() const override;
+    bool prepare_images(std::vector<int32_t> & tokens,
+                        std::vector<EncodedImage> images,
+                        uint64_t context_capacity,
+                        uint64_t output_reserve,
+                        ImagePromptHandle & payload,
+                        std::string & error) const override;
     bool supports_remote_draft() const override { return true; }
 
     // ── Concurrent slot serving (paged AR decode over N sequences) ────
@@ -291,6 +307,19 @@ private:
     bool target_parked_ = false;
     bool draft_parked_  = false;
 
+    // Vision projector, loaded next to the target weights when --mmproj is set.
+    bool load_vision();
+    bool encode_images(const Qwen35ImagePrompt & prompt, Qwen35ImageRows & rows,
+                       std::string & error);
+    std::unique_ptr<vision::Qwen35VisionTower> vision_;  // released while parked
+    // Fixed after init(); read by prepare_images() on request threads.
+    bool image_input_ = false;
+    vision::Qwen35VisionConfig vision_config_;
+    // Rotary position minus KV position for the sequence being decoded.
+    // Negative after an image prompt (an image spans fewer positions than
+    // tokens); zero for text.
+    int rope_delta_ = 0;
+
     // ── Pflash drafter (lazy-loaded) ─────────────────────────────────
     DrafterContext drafter_ctx_;
     bool           drafter_loaded_ = false;
@@ -341,10 +370,12 @@ private:
     // Prefill a prompt and return the number of tokens committed to KV.
     // kv_offset > 0 resumes from a restored snapshot: tokens are placed at
     // KV positions [kv_offset, kv_offset + tokens.size()) instead of [0, N).
+    // `images` carries the encoded rows of an image prompt (kv_offset 0 only).
     int do_prefill(const std::vector<int32_t> & tokens,
                    const DaemonIO & io,
                    int snap_pos = -1, int snap_slot = -1,
-                   int kv_offset = 0);
+                   int kv_offset = 0,
+                   const Qwen35ImageRows * images = nullptr);
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
     // When budget_hook is non-null and (n_gen - generated) drops to the
