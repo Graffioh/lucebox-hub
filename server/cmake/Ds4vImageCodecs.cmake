@@ -5,6 +5,13 @@ include_guard(GLOBAL)
 include(ExternalProject)
 include(FetchContent)
 
+# DOWNLOAD_EXTRACT_TIMESTAMP exists from CMake 3.24; older releases would read
+# it as part of URL_HASH.
+set(DS4V_EXTRACT_TIMESTAMP)
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+    set(DS4V_EXTRACT_TIMESTAMP DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+endif()
+
 set(DS4V_JPEG_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/libjpeg-turbo-prefix)
 set(DS4V_JPEG_ARCHIVE_NAME jpeg)
 if(MSVC OR CMAKE_C_SIMULATE_ID STREQUAL "MSVC")
@@ -16,7 +23,7 @@ file(MAKE_DIRECTORY ${DS4V_JPEG_PREFIX}/include)
 ExternalProject_Add(libjpeg_turbo_external
     URL https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.1.4.1/libjpeg-turbo-3.1.4.1.tar.gz
     URL_HASH SHA256=ecae8008e2cc9ade2f2c1bb9d5e6d4fb73e7c433866a056bd82980741571a022
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    ${DS4V_EXTRACT_TIMESTAMP}
     CMAKE_ARGS
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_INSTALL_PREFIX=${DS4V_JPEG_PREFIX}
@@ -38,7 +45,7 @@ add_dependencies(ds4v_libjpeg libjpeg_turbo_external)
 FetchContent_Declare(lodepng
     URL https://github.com/lvandeve/lodepng/archive/ed6fe5825c6a4fbb7f58ab35a4231c7543cd452a.tar.gz
     URL_HASH SHA256=c2459a3f9145258f901d262576f7a56ca08087d3b3efeee3ae033c0952120803
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    ${DS4V_EXTRACT_TIMESTAMP})
 FetchContent_MakeAvailable(lodepng)
 add_library(ds4v_lodepng STATIC ${lodepng_SOURCE_DIR}/lodepng.cpp)
 target_include_directories(ds4v_lodepng PUBLIC ${lodepng_SOURCE_DIR})
