@@ -364,16 +364,22 @@ Imatrix load_imatrix(const fs::path & path) {
     return result;
 }
 
-const std::vector<float> * require_imatrix(
-        const std::optional<Imatrix> & imatrix, const std::string & name, size_t in) {
+// Importance of each input column of one expert. An entry holds either one
+// vector shared by all experts (`in` values) or one per expert (expert-major,
+// as llama.cpp's imatrix collects them, at least `experts` of them); per-expert
+// is better, since experts see different tokens.
+const float * require_imatrix(
+        const std::optional<Imatrix> & imatrix, const std::string & name, size_t in,
+        uint32_t expert, uint32_t experts) {
     if (!imatrix) return nullptr;
     const auto it = imatrix->find(name);
     if (it == imatrix->end()) fail("imatrix is missing required entry " + name);
-    if (it->second.values.size() != in) {
-        fail("imatrix entry " + name + " has " + std::to_string(it->second.values.size()) +
-             " values, expected " + std::to_string(in));
-    }
-    return &it->second.values;
+    const std::vector<float> & values = it->second.values;
+    if (values.size() == in) return values.data();
+    if (values.size() % in == 0 && values.size() / in >= experts) return values.data() + static_cast<size_t>(expert) * in;
+    fail("imatrix entry " + name + " has " + std::to_string(values.size()) + " values, expected " +
+         std::to_string(in) + " or one " + std::to_string(in) + "-wide vector for each of " +
+         std::to_string(experts) + " experts");
 }
 
 enum class Surface : uint32_t { Gate = 0, Up = 1, Down = 2 };
@@ -616,7 +622,7 @@ void decode_expert_row(
 
 void add_expert_to_fitter(
         const SafeTensorSet & source, int layer, int expert,
-        const ExpertRecipe & recipe, const std::vector<float> * importance,
+        const ExpertRecipe & recipe, const float * importance,
         HistogramFitter & fitter) {
     const TensorShape shape = validate_expert_source(source, layer, expert, recipe);
     const StEntry & w = source.at(source_expert_name(layer, expert, recipe, "weight"));
@@ -628,7 +634,7 @@ void add_expert_to_fitter(
         decode_expert_row(input, row, shape.in, packed, scales, values);
         for (uint32_t col = 0; col < shape.in; col += 16) {
             fitter.add_half(values.data() + col,
-                            importance ? importance->data() + col : nullptr);
+                            importance ? importance + col : nullptr);
         }
     }
 }
@@ -809,19 +815,6 @@ std::vector<uint8_t> make_gumix_blob(const std::vector<LayerCalibration> & layer
         }
     }
     return out;
-}
-
-void write_atomic_bytes(const fs::path & path, const std::vector<uint8_t> & bytes, bool force) {
-    if (!force && fs::exists(path)) fail("output exists: " + path.string());
-    const fs::path temporary = path.string() + ".partial";
-    if (fs::exists(temporary)) fs::remove(temporary);
-    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-    if (!out) fail("cannot create " + temporary.string());
-    out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    out.close();
-    if (!out) fail("failed writing " + temporary.string());
-    if (force && fs::exists(path)) fs::remove(path);
-    fs::rename(temporary, path);
 }
 
 enum class Producer { Raw, Dense, Int64ToInt32, Expert };
@@ -1061,14 +1054,15 @@ std::string model_name(const SafeTensorSet & source) {
 
 void set_model_metadata(gguf_context * ctx, const SafeTensorSet & source,
                         uint32_t layers, uint32_t experts, bool absmax_only,
-                        bool smoke_artifact, const std::vector<uint8_t> & p4_blob) {
+                        bool smoke_artifact, const std::vector<uint8_t> & p4_blob,
+                        const std::vector<uint8_t> & gumix_blob, const std::string & calibration) {
     const json & c = source.config();
     gguf_set_val_str(ctx, "general.architecture", "deepseek4");
     gguf_set_val_str(ctx, "general.name", model_name(source).c_str());
     gguf_set_val_u32(ctx, "general.alignment", kAlignment);
     gguf_set_val_u32(ctx, "general.file_type", 119);
     gguf_set_val_str(ctx, "deepseek4.mix.calibration",
-                     absmax_only ? "absmax-only (LOWER QUALITY; no imatrix)" : "importance-matrix weighted");
+                     absmax_only ? "absmax-only (LOWER QUALITY; no imatrix)" : calibration.c_str());
     gguf_set_val_bool(ctx, "deepseek4.mix.lower_quality_absmax_only", absmax_only);
     gguf_set_val_bool(ctx, "deepseek4.mix.experts_only_smoke_artifact", smoke_artifact);
 
@@ -1164,6 +1158,8 @@ void set_model_metadata(gguf_context * ctx, const SafeTensorSet & source,
         gguf_set_arr_data(ctx, "deepseek4.p4mix.sidecar", GGUF_TYPE_UINT8,
                           p4_blob.data(), p4_blob.size());
     }
+    gguf_set_arr_data(ctx, "deepseek4.gumix.sidecar", GGUF_TYPE_UINT8,
+                      gumix_blob.data(), gumix_blob.size());
 }
 
 std::unique_ptr<ggml_tensor> make_tensor_descriptor(const TensorSpec & spec) {
@@ -1274,7 +1270,6 @@ void write_expert_tensor(FILE * out, const SafeTensorSet & source,
     const CodebookRegistry & registry = recipe.books == BookSource::GateUpJoint
         ? calibration.gate_up : calibration.down;
     const std::string target = target_expert_name(calibration.layer, recipe);
-    const std::vector<float> * importance = require_imatrix(imatrix, target, expected.in);
     if (recipe.qtype != GGML_TYPE_Q2_1_ROCMFP2_MIX && recipe.qtype != GGML_TYPE_Q3_1_ROCMFP3_MIX) {
         fail("recipe table contains unsupported qtype");
     }
@@ -1285,6 +1280,7 @@ void write_expert_tensor(FILE * out, const SafeTensorSet & source,
         const StEntry & s = source.at(source_expert_name(calibration.layer, expert, recipe, "scale"));
         OpenTensorPair input(w, s);
         const auto & books = registry.experts.at(expert);
+        const float * importance = require_imatrix(imatrix, target, expected.in, expert, experts);
         std::vector<uint8_t> packed, scales;
         std::vector<float> values;
         std::vector<block_rocmfp2> q2(expected.in/kBlock);
@@ -1298,13 +1294,13 @@ void write_expert_tensor(FILE * out, const SafeTensorSet & source,
             const uint8_t * encoded = nullptr;
             if (recipe.qtype == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
                 if (!rocmfpx_quantize_row_fp2_mix_ref(values.data(), q2.data(), shape.in,
-                                                       books.data(), importance ? importance->data() : nullptr)) {
+                                                       books.data(), importance)) {
                     fail("qtype-106 reference encoder rejected " + w.name);
                 }
                 encoded = reinterpret_cast<const uint8_t *>(q2.data());
             } else {
                 if (!rocmfpx_quantize_row_fp3_mix_ref(values.data(), q3.data(), shape.in,
-                                                       books.data(), importance ? importance->data() : nullptr)) {
+                                                       books.data(), importance)) {
                     fail("qtype-105 reference encoder rejected " + w.name);
                 }
                 encoded = reinterpret_cast<const uint8_t *>(q3.data());
@@ -1370,14 +1366,14 @@ std::vector<LayerCalibration> calibrate(
                     fail("qtype-106 gate/up shape mismatch at layer " + std::to_string(layer));
                 }
                 const std::string target = target_expert_name(layer, recipe);
-                const auto * importance = require_imatrix(imatrix, target, shape.in);
+                const float * importance = require_imatrix(imatrix, target, shape.in, expert, experts);
                 add_expert_to_fitter(source, layer, expert, recipe, importance, gate_up_fitter);
             }
             HistogramFitter down_fitter;
             const ExpertRecipe & down = down_recipe(static_cast<int>(layer));
             fit.down_shape = validate_expert_source(source, layer, expert, down);
-            const auto * down_importance = require_imatrix(
-                imatrix, target_expert_name(layer, down), fit.down_shape.in);
+            const float * down_importance = require_imatrix(
+                imatrix, target_expert_name(layer, down), fit.down_shape.in, expert, experts);
             add_expert_to_fitter(source, layer, expert, down, down_importance, down_fitter);
             const std::string label = "layer=" + std::to_string(layer) + " expert=" + std::to_string(expert);
             fit.gate_up = gate_up_fitter.fit(kGuLevels, label + " gate_up", &fit.repairs);
@@ -1428,7 +1424,7 @@ std::vector<uint8_t> read_file(const fs::path & path) {
     return out;
 }
 
-void verify_artifact(const fs::path & output, const fs::path & gumix_path,
+void verify_artifact(const fs::path & output,
                      const std::vector<TensorSpec> & plan,
                      const std::vector<uint8_t> & expected_p4,
                      const std::vector<uint8_t> & expected_gumix) {
@@ -1448,7 +1444,13 @@ void verify_artifact(const fs::path & output, const fs::path & gumix_path,
         std::memcmp(gguf_get_arr_data(ctx, p4_key), expected_p4.data(), expected_p4.size()) != 0) {
         fail("embedded deepseek4.p4mix.sidecar verification failed");
     }
-    if (read_file(gumix_path) != expected_gumix) fail("qtype-106 gumix sidecar verification failed");
+    const int64_t gu_key = gguf_find_key(ctx, "deepseek4.gumix.sidecar");
+    if (gu_key < 0 || gguf_get_kv_type(ctx, gu_key) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(ctx, gu_key) != GGUF_TYPE_UINT8 ||
+        gguf_get_arr_n(ctx, gu_key) != expected_gumix.size() ||
+        std::memcmp(gguf_get_arr_data(ctx, gu_key), expected_gumix.data(), expected_gumix.size()) != 0) {
+        fail("embedded deepseek4.gumix.sidecar verification failed");
+    }
 
     FileDescriptor output_fd(output);
     for (const TensorSpec & spec : plan) {
@@ -1469,10 +1471,11 @@ void verify_artifact(const fs::path & output, const fs::path & gumix_path,
 void write_gguf(const Options & options, const SafeTensorSet & source,
                 const std::vector<LayerCalibration> & calibration,
                 uint32_t layers, uint32_t experts, const std::optional<Imatrix> & imatrix) {
-    const fs::path gumix_path = options.output.string() + ".gumix.bin";
-    if (!options.force && (fs::exists(options.output) || fs::exists(gumix_path))) {
-        fail("output or qtype-106 sidecar exists: " + options.output.string());
-    }
+    if (!options.force && fs::exists(options.output)) fail("output exists: " + options.output.string());
+    // A loose sidecar beside the file would be read instead of nothing, but
+    // the embedded copy is preferred; remove a stale one so there is one source.
+    const fs::path stale_gumix = options.output.string() + ".gumix.bin";
+    if (fs::exists(stale_gumix)) fs::remove(stale_gumix);
     if (!options.output.parent_path().empty()) fs::create_directories(options.output.parent_path());
     const fs::path temporary = options.output.string() + ".partial";
     if (fs::exists(temporary)) fs::remove(temporary);
@@ -1483,8 +1486,10 @@ void write_gguf(const Options & options, const SafeTensorSet & source,
 
     gguf_context * ctx = gguf_init_empty();
     if (!ctx) fail("gguf_init_empty failed");
+    const std::string calibration_note = options.imatrix
+        ? "importance-matrix weighted: " + options.imatrix->filename().string() : std::string();
     set_model_metadata(ctx, source, layers, experts, options.absmax_only,
-                       options.experts_only, p4);
+                       options.experts_only, p4, gumix, calibration_note);
     std::vector<const char *> repair_stamps;
     for (const auto & layer : calibration)
         for (const auto & stamp : layer.repairs) repair_stamps.push_back(stamp.c_str());
@@ -1542,10 +1547,9 @@ void write_gguf(const Options & options, const SafeTensorSet & source,
     }
     gguf_free(ctx);
 
-    write_atomic_bytes(gumix_path, gumix, options.force);
     if (options.force && fs::exists(options.output)) fs::remove(options.output);
     fs::rename(temporary, options.output);
-    verify_artifact(options.output, gumix_path, plan, p4, gumix);
+    verify_artifact(options.output, plan, p4, gumix);
 }
 
 } // namespace
