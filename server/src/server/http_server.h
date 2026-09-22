@@ -304,6 +304,17 @@ PFlashTokenSpan pflash_changed_token_span(
 std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
     std::vector<PFlashTokenSpan> spans);
 
+// Content length (drafter tokens) up to which a user turn or assistant
+// answer of a multi-turn chat is kept whole: PFLASH_CHAT_SKELETON_TOKENS,
+// default 256; 0 keeps only role headers.
+int pflash_chat_skeleton_tokens() noexcept;
+
+// Earlier user questions of a multi-turn chat that score alongside the
+// current one, most recent first at weights 1/2, 1/4, ...:
+// PFLASH_CHAT_HISTORY_QUERIES, default 3, at most 8; 0 scores the current
+// question alone.
+int pflash_chat_history_queries() noexcept;
+
 // The parts of ``spans`` that ``minus`` does not cover. Both canonical.
 std::vector<PFlashTokenSpan> pflash_subtract_token_spans(
     const std::vector<PFlashTokenSpan> & spans,
@@ -397,6 +408,14 @@ PFlashTokenSpan pflash_decoded_text_span(
 // are searched in the decoded prompt text, so a drafter whose vocabulary
 // lacks the control tokens still maps correctly. Invalid when the prompt
 // carries no chat markers.
+struct PflashChatTurn {
+    int role_begin = -1;
+    int content_begin = -1;
+    int content_end = -1;
+    int turn_end = -1;
+    std::string role;       // "user", "assistant", "system", "tool", ...
+};
+
 struct PflashChatTurnSpan {
     int role_begin = -1;
     int content_begin = -1;
@@ -404,6 +423,11 @@ struct PflashChatTurnSpan {
     int turn_end = -1;
     int generation_begin = -1;
     bool later_turns = false;
+    // Every turn before the generation prompt, in order; ``query_turn``
+    // indexes the one above. Tool output wrapped in a user turn has role
+    // "tool".
+    std::vector<PflashChatTurn> turns;
+    int query_turn = -1;
 
     bool valid() const {
         return content_begin >= 0 && content_end > content_begin;

@@ -106,7 +106,8 @@ std::vector<int32_t> drafter_score_and_compress(
     int pool_kernel,
     int score_query_end,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
-    bool query_suffix_candidates) {
+    bool query_suffix_candidates,
+    const std::vector<PFlashTokenSpan> & history_queries) {
     pflash_clear_kept_spans();
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
@@ -126,6 +127,14 @@ std::vector<int32_t> drafter_score_and_compress(
     chunk_size = experiment.chunk_size;
     experiment.query_suffix_candidates =
         query_suffix_candidates && experiment.selection_active;
+    if (experiment.selection_active) {
+        for (const auto & window : history_queries) {
+            if (window.begin >= 0 && window.end > window.begin &&
+                window.end <= (int) ids.size()) {
+                experiment.history_queries.push_back(window);
+            }
+        }
+    }
     if (!experiment.selection_active && !required_instruction_spans.empty()) {
         set_last_error(
             "PFlash instruction spans require strict budget selection");

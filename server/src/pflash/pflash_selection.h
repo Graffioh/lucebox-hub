@@ -117,6 +117,10 @@ struct PFlashSelectionConfig {
     // chat whose latest user turn is followed by assistant and tool turns).
     // The caller pins whatever of that suffix must stay.
     bool query_suffix_candidates = false;
+    // Per request: earlier user questions' scorer windows, most recent
+    // first. The head scores the context against each and mixes the masses
+    // with the query's at weights 1/2, 1/4, ... (multi-turn chats).
+    std::vector<luce::common::PFlashTokenSpan> history_queries;
 };
 
 // Segment probe: cut the context before every token whose boundary score is

@@ -840,6 +840,7 @@ struct PflashRenderedQueryTurn {
     std::string after;
     std::string closing;      // content end .. turn end
     std::string generation;   // generation prompt .. prompt end
+    std::vector<std::string> roles;
 };
 
 static PflashRenderedQueryTurn pflash_rendered_query_turn(
@@ -878,6 +879,7 @@ static PflashRenderedQueryTurn pflash_rendered_query_turn(
             out.generation = tok.decode(
                 {prompt.begin() + turn.generation_begin, prompt.end()});
             out.later_turns = turn.later_turns;
+            for (const auto & each : turn.turns) out.roles.push_back(each.role);
         }
     }
     unlink(path.c_str());
@@ -950,6 +952,7 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT_MSG(qwen.content == "What is the answer?", qwen.content);
     TEST_ASSERT(qwen.header == "<|im_start|>user\n");
     TEST_ASSERT(qwen.later_turns);
+    TEST_ASSERT(qwen.roles == std::vector<std::string>({"user", "assistant", "tool"}));
     TEST_ASSERT_MSG(qwen.closing == "<|im_end|>", qwen.closing);
     TEST_ASSERT_MSG(qwen.generation == "<|im_start|>assistant\n<think>\n\n</think>\n\n",
                     qwen.generation);
@@ -7045,14 +7048,14 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(tokenizer.decode({ids.begin() + query_begin,
                                   ids.begin() + query_end})
                 == "What is the answer?");
-    // The generation prompt is pinned; the assistant and tool turns between
-    // the query and it are not.
+    // The generation prompt is pinned, and the short assistant turn stays as
+    // part of the conversation's skeleton; the tool output between the query
+    // and the generation prompt is scored, not pinned.
     bool generation_pinned = false;
     for (const auto & span : request.required_instruction_spans) {
         const std::string text = tokenizer.decode(
             {ids.begin() + span.begin, ids.begin() + span.end});
         TEST_ASSERT_MSG(text.find("tool output") == std::string::npos, text);
-        TEST_ASSERT_MSG(text.find("Sure") == std::string::npos, text);
         if (span.end == (int) ids.size() &&
             text.find("<|im_start|>assistant\n<think>\n") != std::string::npos) {
             generation_pinned = true;
@@ -7089,8 +7092,9 @@ static PflashSystemPromptCase pflash_long_system_prompt_case(
         const std::string & instruction_role = "system") {
     std::string system;
     for (int i = 0; i < 30; ++i) system += "You are helpful. ";
+    // Longer than the multi-turn skeleton keeps whole: droppable material.
     std::string history;
-    for (int i = 0; i < 30; ++i) history += "Sure. ";
+    for (int i = 0; i < 120; ++i) history += "Sure. ";
     PflashSystemPromptCase out;
     out.rendered = render_chat_template(
         {{instruction_role, system, ""},
@@ -7408,6 +7412,77 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(text2.find("beta facts", recall) != std::string::npos);
     TEST_ASSERT(question != std::string::npos && question > recall);
     TEST_ASSERT(served3 == served2);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_multi_turn_keeps_skeleton_and_history_queries) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", nullptr};
+
+    std::string material;
+    for (int i = 0; i < 80; ++i) material += "filler words here. ";
+    const std::vector<ChatMessage> messages{
+        {"system", "You are helpful.", ""},
+        {"user", "Here is text: " + material + "What is the first answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"user", "What is the answer?", ""},
+    };
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", " first", "?", "user", "assistant",
+         "system", "\n", "Sure", ".", " filler", " words", " here"},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 1.0f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        json wire = json::array();
+        for (const auto & message : messages) {
+            wire.push_back({{"role", message.role}, {"content", message.content}});
+        }
+        request.messages = wire;
+        request.prompt_tokens = tokenizer.encode(rendered);
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & request = backend.last_request;
+    const auto & ids = request.input_ids;
+    const auto text_of = [&] (const PFlashTokenSpan & span) {
+        return tokenizer.decode({ids.begin() + span.begin, ids.begin() + span.end});
+    };
+    // The short assistant answer stays whole; the long first user turn keeps
+    // only its header, its material competes for the budget.
+    bool answer_kept = false;
+    bool material_kept = false;
+    for (const auto & span : request.required_instruction_spans) {
+        const std::string text = text_of(span);
+        answer_kept = answer_kept || text.find("Sure.") != std::string::npos;
+        material_kept = material_kept ||
+            text.find("filler words") != std::string::npos;
+    }
+    TEST_ASSERT(answer_kept);
+    TEST_ASSERT(!material_kept);
+    // The earlier question scores alongside the current one.
+    TEST_ASSERT(request.history_query_spans.size() == 1);
+    TEST_ASSERT_MSG(text_of(request.history_query_spans[0]).find("first answer?") !=
+                        std::string::npos,
+                    text_of(request.history_query_spans[0]));
     unlink(path.c_str());
 }
 

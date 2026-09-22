@@ -417,6 +417,15 @@ view grows past twice the fresh prompt, or past the context, the fresh prompt
 starts a new view. `PFLASH_CHAT_VIEW=0` serves the fresh compression every
 turn.
 
+Every other turn of a multi-turn chat keeps its role header, and user
+turns and assistant answers up to `PFLASH_CHAT_SKELETON_TOKENS` (default 256
+drafter tokens; 0 keeps headers only) stay whole: the conversation's
+skeleton, as opposed to the material it quotes. Like instructions, the
+skeleton is scored as context when it alone would not fit. The last
+`PFLASH_CHAT_HISTORY_QUERIES` (default 3) earlier user questions score the
+context alongside the current one, their masses mixed in at weights 1/2,
+1/4, 1/8, so what the conversation keeps coming back to stays selected.
+
 The drafter keeps a scoring session per conversation
 (`PFLASH_DRAFTER_SESSIONS`, default 2, least recently used evicted; 0 scores
 every prompt from scratch): the cache of blocks 0-14, the block-15 keys and

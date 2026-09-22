@@ -532,8 +532,7 @@ void free_qwen35_scoring_session(Qwen35ScoringSession & session) {
     session.checkpoint = 0;
     session.probe_raw.clear();
     session.subunit_raw.clear();
-    session.query_begin = session.query_end = -1;
-    session.query_rows.clear();
+    session.query_windows.clear();
 }
 
 namespace {
@@ -605,15 +604,18 @@ Qwen35ScoringSession * acquire_scoring_session(
         bool need_probe,
         bool need_subunit,
         int & resume,
+        int & shared_prefix,
         std::unique_ptr<Qwen35ScoringSession> & scratch) {
     TargetWeights & w = st.weights;
     const int S = (int) ids.size();
     const int limit = scoring_session_limit();
     const size_t row_floats = (size_t) w.n_embd * (size_t) (query_end - query_start);
     resume = 0;
+    shared_prefix = 0;
 
     Qwen35ScoringSession * best = nullptr;
     bool best_restore = false;
+    int best_shared = 0;
     for (auto & owned : st.sessions) {
         Qwen35ScoringSession * session = owned.get();
         if (!session || session->capacity < S || session->ids.empty() ||
@@ -633,9 +635,12 @@ Qwen35ScoringSession * acquire_scoring_session(
             restore = true;
         }
         if (r > query_start) {
-            const bool rows = session->query_begin == query_start &&
-                session->query_end == query_end && query_end <= shared &&
-                session->query_rows.size() == row_floats;
+            bool rows = false;
+            for (const auto & window : session->query_windows) {
+                rows = rows || (window.begin == query_start &&
+                    window.end == query_end && query_end <= shared &&
+                    window.rows.size() == row_floats);
+            }
             if (!rows) {
                 r = session->checkpoint > 0 && session->checkpoint <= query_start &&
                         session->checkpoint <= shared
@@ -651,12 +656,14 @@ Qwen35ScoringSession * acquire_scoring_session(
             resume = r;
             best = session;
             best_restore = restore;
+            best_shared = shared;
         }
     }
     if (best) {
         if (best_restore && !restore_ssm_state(best->cache, w.backend)) {
             resume = 0;
         } else {
+            shared_prefix = best_shared;
             return best;
         }
     }
@@ -690,8 +697,7 @@ Qwen35ScoringSession * acquire_scoring_session(
     target->checkpoint = 0;
     target->probe_raw.clear();
     target->subunit_raw.clear();
-    target->query_begin = target->query_end = -1;
-    target->query_rows.clear();
+    target->query_windows.clear();
     return target;
 }
 
@@ -740,10 +746,12 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
 
     auto t0 = std::chrono::steady_clock::now();
     int resume = 0;
+    int shared_prefix = 0;
     std::unique_ptr<Qwen35ScoringSession> scratch;
     Qwen35ScoringSession * session = acquire_scoring_session(
         st, ids, query_start, query_end, use_probe,
-        use_probe && st.probe_sub_fc2_w != nullptr, resume, scratch);
+        use_probe && st.probe_sub_fc2_w != nullptr, resume, shared_prefix,
+        scratch);
     if (!session) return {};
     // A session is released (freed or kept) on every exit below.
     struct SessionExit {
@@ -892,15 +900,55 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     ggml_gallocr_free(alloc);
     auto t1 = std::chrono::steady_clock::now();
 
-    // The query window's block-14 rows: this call's when it computed them,
-    // else the session's from the turn that did.
-    std::vector<float> query_rows((size_t)hidden * n_lookahead);
-    if (query_start >= resume) {
-        ggml_backend_tensor_get(act_in, query_rows.data(),
-                                (size_t)(query_start - resume) * act_in->nb[1],
-                                query_rows.size() * sizeof(float));
-    } else {
-        query_rows = session->query_rows;
+    // Block-14 rows of each query window -- the query, then earlier
+    // questions -- from this call when it computed them, else from the
+    // session while they sit in the shared prefix. The query's are always
+    // available (the session was chosen for them); a history window whose
+    // rows are gone is skipped.
+    struct ScoredWindow {
+        int begin = 0;
+        int end = 0;
+        double weight = 1.0;
+        std::vector<float> rows;
+    };
+    std::vector<ScoredWindow> windows;
+    const auto rows_for = [&](int begin, int end, std::vector<float> & rows) {
+        rows.assign((size_t)hidden * (size_t)(end - begin), 0.0f);
+        if (begin >= resume) {
+            ggml_backend_tensor_get(act_in, rows.data(),
+                                    (size_t)(begin - resume) * act_in->nb[1],
+                                    rows.size() * sizeof(float));
+            return true;
+        }
+        for (const auto & stored : session->query_windows) {
+            if (stored.begin == begin && stored.end == end &&
+                end <= shared_prefix && stored.rows.size() == rows.size()) {
+                rows = stored.rows;
+                return true;
+            }
+        }
+        return false;
+    };
+    {
+        ScoredWindow query;
+        query.begin = query_start;
+        query.end = query_end;
+        if (!rows_for(query_start, query_end, query.rows)) {
+            return fail("qwen35 scorer query rows unavailable");
+        }
+        windows.push_back(std::move(query));
+        double weight = 1.0;
+        for (const auto & span : experiment.history_queries) {
+            weight *= 0.5;
+            if (span.end > query_start || span.end - span.begin < 1) continue;
+            ScoredWindow history;
+            history.begin = span.begin;
+            history.end = span.end;
+            history.weight = weight;
+            if (rows_for(span.begin, span.end, history.rows)) {
+                windows.push_back(std::move(history));
+            }
+        }
     }
 
     ggml_tensor * wk_src = st.head_loaded ? st.head_wk : L.wk;
@@ -991,138 +1039,165 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     // while the query stays put, reusing its rows.
     session->ids = ids;
     session->checkpoint = checkpoint;
-    session->query_begin = query_start;
-    session->query_end = query_end;
-    session->query_rows = query_rows;
+    for (const auto & window : windows) {
+        auto & stored = session->query_windows;
+        stored.erase(std::remove_if(stored.begin(), stored.end(),
+            [&window] (const Qwen35ScoringSession::QueryRows & old) {
+                return old.begin == window.begin && old.end == window.end;
+            }), stored.end());
+        stored.push_back({window.begin, window.end, window.rows});
+        if (stored.size() > 8) stored.erase(stored.begin());
+    }
     session->last_used = ++st.session_clock;
 
-    // Block-15 NoPE Q/K scoring: softmax over the keys outside the query
-    // window (before it, and after it when those tokens are candidates),
-    // then mean over heads and query tokens. The query never scores itself.
-    // The logits land in one [S, n_lookahead, H] buffer for a single softmax.
+    // Block-15 NoPE Q/K scoring, once per query window: softmax over the
+    // keys outside the query window (before it, and after it when those
+    // tokens are candidates), then mean over heads and window tokens. No
+    // window scores itself. The logits land in one [S, rows, H] buffer for
+    // a single softmax. History windows share the query's key set and mix
+    // into its mass at their weights.
     const int n_key_chunks = (S + key_chunk - 1) / key_chunk;
-    ggml_init_params lip{};
-    lip.mem_size = (size_t)8 * ggml_tensor_overhead() + 4096;
-    lip.no_alloc = true;
-    ggml_context * lctx = ggml_init(lip);
-    if (!lctx) {
-        set_last_error("qwen35 score buffer ctx allocation failed");
-        return {};
-    }
-    ggml_tensor * logits = ggml_new_tensor_3d(lctx, GGML_TYPE_F32, S, n_lookahead, H);
-    ggml_tensor * mask = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, S, n_lookahead);
-    ggml_tensor * x_q = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, hidden, n_lookahead);
-    ggml_backend_buffer_t lbuf = ggml_backend_alloc_ctx_tensors(lctx, w.backend);
-    if (!lbuf) {
-        ggml_free(lctx);
-        set_last_error("qwen35 score buffer allocation failed");
-        return {};
-    }
-    ggml_backend_tensor_set(x_q, query_rows.data(), 0, query_rows.size() * sizeof(float));
-    {
-        // Keys are the context before the query window and, when the tokens
-        // after it are candidates too, the context after it. NoPE scoring has
-        // no position term, so a later key scores like an earlier one.
-        std::vector<float> m((size_t)n_lookahead * S, -INFINITY);
-        for (int t = 0; t < n_lookahead; ++t) {
-            std::fill_n(m.begin() + (size_t)t * S, (size_t)query_start, 0.0f);
-            if (experiment.query_suffix_candidates) {
-                std::fill_n(m.begin() + (size_t)t * S + query_end,
-                            (size_t)(S - query_end), 0.0f);
+    const auto score_window = [&](const ScoredWindow & window,
+                                  std::vector<float> & mass) -> bool {
+        const int nq = window.end - window.begin;
+        ggml_init_params lip{};
+        lip.mem_size = (size_t)8 * ggml_tensor_overhead() + 4096;
+        lip.no_alloc = true;
+        ggml_context * lctx = ggml_init(lip);
+        if (!lctx) {
+            set_last_error("qwen35 score buffer ctx allocation failed");
+            return false;
+        }
+        ggml_tensor * logits = ggml_new_tensor_3d(lctx, GGML_TYPE_F32, S, nq, H);
+        ggml_tensor * mask = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, S, nq);
+        ggml_tensor * x_q = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, hidden, nq);
+        ggml_backend_buffer_t lbuf = ggml_backend_alloc_ctx_tensors(lctx, w.backend);
+        if (!lbuf) {
+            ggml_free(lctx);
+            set_last_error("qwen35 score buffer allocation failed");
+            return false;
+        }
+        ggml_backend_tensor_set(x_q, window.rows.data(), 0,
+                                window.rows.size() * sizeof(float));
+        {
+            // Keys are the context before the query window and, when the
+            // tokens after it are candidates too, the context after it. NoPE
+            // scoring has no position term, so a later key scores like an
+            // earlier one.
+            std::vector<float> m((size_t)nq * S, -INFINITY);
+            for (int t = 0; t < nq; ++t) {
+                float * row = m.data() + (size_t)t * S;
+                std::fill_n(row, (size_t)query_start, 0.0f);
+                if (experiment.query_suffix_candidates) {
+                    std::fill_n(row + query_end, (size_t)(S - query_end), 0.0f);
+                }
+                if (window.end <= query_start) {
+                    std::fill_n(row + window.begin, (size_t)nq, -INFINITY);
+                }
             }
+            ggml_backend_tensor_set(mask, m.data(), 0, m.size() * sizeof(float));
         }
-        ggml_backend_tensor_set(mask, m.data(), 0, m.size() * sizeof(float));
-    }
-    ggml_init_params sip{};
-    sip.mem_size = ggml_tensor_overhead() * (size_t)(64 + 24 * n_key_chunks) +
-                   ggml_graph_overhead_custom(4096, false) + 64 * 1024;
-    sip.no_alloc = true;
-    ggml_context * sctx = ggml_init(sip);
-    if (!sctx) {
-        ggml_backend_buffer_free(lbuf); ggml_free(lctx);
-        set_last_error("qwen35 score graph ctx allocation failed");
-        return {};
-    }
-    ggml_cgraph * sgf = ggml_new_graph_custom(sctx, 4096, false);
-    ggml_tensor * q_in = ggml_mul(sctx, ggml_rms_norm(sctx, x_q, w.rms_eps), L.attn_norm);
-    ggml_tensor * Q = nullptr;
-    if (st.head_loaded) {
-        Q = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, st.head_wq, q_in), D, H, n_lookahead);
-    } else {
-        // Native block 15 packs query and gate rows per head; keep the query half.
-        ggml_tensor * QG = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, L.wq, q_in),
-                                           D * 2, H, n_lookahead);
-        Q = ggml_view_3d(sctx, QG, D, H, n_lookahead,
-                         ggml_element_size(QG) * D * 2,
-                         ggml_element_size(QG) * D * 2 * H, 0);
-    }
-    Q = ggml_mul(sctx, ggml_rms_norm(sctx, Q, w.rms_eps), L.q_norm);
-    ggml_tensor * Q_perm = ggml_cont(sctx, ggml_permute(sctx, Q, 0, 2, 1, 3));  // [D, n_lookahead, H]
-    for (int b = 0; b < S; b += key_chunk) {
-        const int n = std::min(key_chunk, S - b);
-        ggml_tensor * K = ggml_view_3d(sctx, session->keys, D, Hk, n,
-                                       session->keys->nb[1], session->keys->nb[2],
-                                       (size_t)b * session->keys->nb[2]);
-        K = ggml_cont(sctx, ggml_permute(sctx, K, 0, 2, 1, 3));  // [D, n, Hk]
-        ggml_tensor * K_score = K;
-        if (H != Hk) {
-            const int gqa = H / Hk;
-            ggml_tensor * K_4d = ggml_reshape_4d(sctx, K, D, n, 1, Hk);
-            ggml_tensor * K_tpl = ggml_new_tensor_4d(sctx, GGML_TYPE_F32, D, n, gqa, Hk);
-            K_score = ggml_reshape_3d(sctx, ggml_repeat(sctx, K_4d, K_tpl), D, n, H);
+        ggml_init_params sip{};
+        sip.mem_size = ggml_tensor_overhead() * (size_t)(64 + 24 * n_key_chunks) +
+                       ggml_graph_overhead_custom(4096, false) + 64 * 1024;
+        sip.no_alloc = true;
+        ggml_context * sctx = ggml_init(sip);
+        if (!sctx) {
+            ggml_backend_buffer_free(lbuf); ggml_free(lctx);
+            set_last_error("qwen35 score graph ctx allocation failed");
+            return false;
         }
-        ggml_tensor * part = ggml_mul_mat(sctx, K_score, Q_perm);  // [n, n_lookahead, H]
-        ggml_tensor * dst = ggml_view_3d(sctx, logits, n, n_lookahead, H,
-                                         logits->nb[1], logits->nb[2],
-                                         (size_t)b * logits->nb[0]);
-        ggml_build_forward_expand(sgf, ggml_cpy(sctx, part, dst));
+        ggml_cgraph * sgf = ggml_new_graph_custom(sctx, 4096, false);
+        ggml_tensor * q_in = ggml_mul(sctx, ggml_rms_norm(sctx, x_q, w.rms_eps), L.attn_norm);
+        ggml_tensor * Q = nullptr;
+        if (st.head_loaded) {
+            Q = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, st.head_wq, q_in), D, H, nq);
+        } else {
+            // Native block 15 packs query and gate rows per head; keep the query half.
+            ggml_tensor * QG = ggml_reshape_3d(sctx, ggml_mul_mat(sctx, L.wq, q_in),
+                                               D * 2, H, nq);
+            Q = ggml_view_3d(sctx, QG, D, H, nq,
+                             ggml_element_size(QG) * D * 2,
+                             ggml_element_size(QG) * D * 2 * H, 0);
+        }
+        Q = ggml_mul(sctx, ggml_rms_norm(sctx, Q, w.rms_eps), L.q_norm);
+        ggml_tensor * Q_perm = ggml_cont(sctx, ggml_permute(sctx, Q, 0, 2, 1, 3));  // [D, nq, H]
+        for (int b = 0; b < S; b += key_chunk) {
+            const int n = std::min(key_chunk, S - b);
+            ggml_tensor * K = ggml_view_3d(sctx, session->keys, D, Hk, n,
+                                           session->keys->nb[1], session->keys->nb[2],
+                                           (size_t)b * session->keys->nb[2]);
+            K = ggml_cont(sctx, ggml_permute(sctx, K, 0, 2, 1, 3));  // [D, n, Hk]
+            ggml_tensor * K_score = K;
+            if (H != Hk) {
+                const int gqa = H / Hk;
+                ggml_tensor * K_4d = ggml_reshape_4d(sctx, K, D, n, 1, Hk);
+                ggml_tensor * K_tpl = ggml_new_tensor_4d(sctx, GGML_TYPE_F32, D, n, gqa, Hk);
+                K_score = ggml_reshape_3d(sctx, ggml_repeat(sctx, K_4d, K_tpl), D, n, H);
+            }
+            ggml_tensor * part = ggml_mul_mat(sctx, K_score, Q_perm);  // [n, nq, H]
+            ggml_tensor * dst = ggml_view_3d(sctx, logits, n, nq, H,
+                                             logits->nb[1], logits->nb[2],
+                                             (size_t)b * logits->nb[0]);
+            ggml_build_forward_expand(sgf, ggml_cpy(sctx, part, dst));
+        }
+        ggml_tensor * probs = ggml_soft_max_ext(sctx, logits, mask,
+                                                1.0f / std::sqrt((float)D), 0.0f);
+        ggml_set_output(probs);
+        ggml_build_forward_expand(sgf, probs);
+        ggml_gallocr_t salloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
+        const bool ok = ggml_gallocr_alloc_graph(salloc, sgf) &&
+            ggml_backend_graph_compute(w.backend, sgf) == GGML_STATUS_SUCCESS;
+        std::vector<float> probs_h;
+        if (ok) {
+            probs_h.resize((size_t)S * nq * H);
+            ggml_backend_tensor_get(probs, probs_h.data(), 0, probs_h.size() * sizeof(float));
+        }
+        ggml_gallocr_free(salloc);
+        ggml_free(sctx);
+        ggml_backend_buffer_free(lbuf);
+        ggml_free(lctx);
+        if (!ok) {
+            set_last_error("qwen35 score graph compute failed");
+            return false;
+        }
+        const size_t nonfinite = count_nonfinite_scores(probs_h.data(), probs_h.size());
+        if (nonfinite != 0) {
+            const std::string message =
+                "non-finite Qwen3.5 scoring-head scores: " + std::to_string(nonfinite) +
+                "/" + std::to_string(probs_h.size());
+            std::fprintf(stderr, "[pflash] ERROR: %s\n", message.c_str());
+            std::fflush(stderr);
+            set_last_error(message);
+            return false;
+        }
+        scoring_head_mean_token_mass(probs_h.data(), S, nq, H, mass);
+        return true;
+    };
+    std::vector<float> token_mass;
+    double total_weight = 0.0;
+    for (const auto & window : windows) {
+        std::vector<float> mass;
+        if (!score_window(window, mass)) {
+            session->ids.clear();
+            return {};
+        }
+        if (token_mass.empty()) token_mass.assign(mass.size(), 0.0f);
+        for (size_t i = 0; i < mass.size(); ++i) {
+            token_mass[i] += (float) window.weight * mass[i];
+        }
+        total_weight += window.weight;
     }
-    ggml_tensor * probs = ggml_soft_max_ext(sctx, logits, mask,
-                                            1.0f / std::sqrt((float)D), 0.0f);
-    ggml_set_output(probs);
-    ggml_build_forward_expand(sgf, probs);
-    ggml_gallocr_t salloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
-    if (!ggml_gallocr_alloc_graph(salloc, sgf)) {
-        ggml_gallocr_free(salloc); ggml_free(sctx);
-        ggml_backend_buffer_free(lbuf); ggml_free(lctx);
-        set_last_error("qwen35 score graph allocation failed");
-        return {};
-    }
-    const auto score_status = ggml_backend_graph_compute(w.backend, sgf);
-    if (score_status != GGML_STATUS_SUCCESS) {
-        ggml_gallocr_free(salloc); ggml_free(sctx);
-        ggml_backend_buffer_free(lbuf); ggml_free(lctx);
-        set_last_error("qwen35 score graph compute failed");
-        return {};
-    }
-    std::vector<float> probs_h((size_t)S * n_lookahead * H);
-    ggml_backend_tensor_get(probs, probs_h.data(), 0, probs_h.size() * sizeof(float));
+    for (auto & value : token_mass) value = (float) (value / total_weight);
     const std::vector<float> & probe_raw = session->probe_raw;
     const std::vector<float> & subunit_raw = session->subunit_raw;
-    ggml_gallocr_free(salloc);
-    ggml_free(sctx);
-    ggml_backend_buffer_free(lbuf);
-    ggml_free(lctx);
-    const size_t nonfinite = count_nonfinite_scores(probs_h.data(), probs_h.size());
-    if (nonfinite != 0) {
-        const std::string message =
-            "non-finite Qwen3.5 scoring-head scores: " + std::to_string(nonfinite) +
-            "/" + std::to_string(probs_h.size());
-        std::fprintf(stderr, "[pflash] ERROR: %s\n", message.c_str());
-        std::fflush(stderr);
-        session->ids.clear();
-        set_last_error(message);
-        return {};
-    }
-    std::vector<float> token_mass;
-    scoring_head_mean_token_mass(probs_h.data(), S, n_lookahead, H, token_mass);
     auto t2 = std::chrono::steady_clock::now();
     std::fprintf(stderr,
         "[qwen35-scorer] forward %.2fs (blocks 0-%d, S=%d, resumed at %d, "
-        "%d new) score %.2fs total %.2fs head=%s\n",
+        "%d new) score %.2fs (%zu query windows) total %.2fs head=%s\n",
         std::chrono::duration<double>(t1 - t0).count(), kQwen35HeadBlock - 1, S,
         resume, n_new,
-        std::chrono::duration<double>(t2 - t1).count(),
+        std::chrono::duration<double>(t2 - t1).count(), windows.size(),
         std::chrono::duration<double>(t2 - t0).count(),
         st.head_loaded ? "trained" : "native-block15");
     std::fflush(stderr);

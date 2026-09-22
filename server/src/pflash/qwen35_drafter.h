@@ -44,11 +44,16 @@ struct Qwen35ScoringSession {
     bool                  keys_trained = false;
     std::vector<float>    probe_raw;        // per token, unit logit
     std::vector<float>    subunit_raw;      // per token, when the probe has one
-    // Block-14 output of the last query window, reused while the query stays
-    // put (an agent step appends tool output after the same user turn).
-    int                   query_begin = -1;
-    int                   query_end = -1;
-    std::vector<float>    query_rows;       // [hidden, query_end - query_begin]
+    // Block-14 output of recent query windows (the query and earlier
+    // questions), reused while they sit in the shared prefix: an agent step
+    // appends tool output after the same user turn, and a new turn's history
+    // queries are earlier turns' queries. Most recent last, at most 8.
+    struct QueryRows {
+        int begin = -1;
+        int end = -1;
+        std::vector<float> rows;            // [hidden, end - begin]
+    };
+    std::vector<QueryRows> query_windows;
     uint64_t              last_used = 0;
 };
 

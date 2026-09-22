@@ -275,6 +275,9 @@ struct ModelBackend {
         // window are scored candidates rather than a kept suffix. The caller
         // pins what of that suffix must stay (the generation prompt).
         bool                 query_suffix_candidates = false;
+        // Earlier user questions (their scorer windows), most recent first:
+        // they score the context alongside the query at halving weights.
+        std::vector<PFlashTokenSpan> history_query_spans;
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs

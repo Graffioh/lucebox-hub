@@ -603,7 +603,37 @@ PflashChatTurnSpan pflash_chat_query_turn(
     if (chosen.role_begin > chosen.content_begin) {
         chosen.role_begin = chosen.content_begin;
     }
+    for (size_t index = 0; index < usable; ++index) {
+        const Turn & turn = turns[index];
+        PflashChatTurn out;
+        out.role_begin = token_at_offset(decoded, turn.role_at);
+        out.content_begin = token_from(turn.content_at);
+        out.content_end = token_from(turn.content_end);
+        out.turn_end = token_from(turn.close_end);
+        out.role_begin = (std::min)(out.role_begin, out.content_begin);
+        out.role = turn.role;
+        chosen.turns.push_back(std::move(out));
+    }
+    chosen.query_turn = (int) query_index;
     return chosen;
+}
+
+int pflash_chat_skeleton_tokens() noexcept {
+    const char * raw = std::getenv("PFLASH_CHAT_SKELETON_TOKENS");
+    if (!raw || !*raw) return 256;
+    char * end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || value < 0) return 256;
+    return (int) (std::min)(value, 1L << 20);
+}
+
+int pflash_chat_history_queries() noexcept {
+    const char * raw = std::getenv("PFLASH_CHAT_HISTORY_QUERIES");
+    if (!raw || !*raw) return 3;
+    char * end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || value < 0) return 3;
+    return (int) (std::min)(value, 8L);
 }
 
 std::vector<PFlashTokenSpan> pflash_subtract_token_spans(
@@ -3721,6 +3751,9 @@ std::string HttpServer::apply_pflash_compression(
     // Assistant and tool turns after the query's turn are context the query
     // scores, not a kept suffix (strict selection only).
     bool query_suffix_candidates = false;
+    // Earlier user questions of a multi-turn chat, most recent first: they
+    // score the context alongside the current query at halving weights.
+    std::vector<PFlashTokenSpan> history_query_spans;
     // Header ("<|im_start|>user\n") opening the query's turn, when the chat
     // markers resolved it — pinned mandatory so a compressed prompt keeps
     // the current turn's role envelope.
@@ -4011,6 +4044,50 @@ std::string HttpServer::apply_pflash_compression(
                              (int) drafter_ids.size()});
                     }
                 }
+                // Multi-turn skeleton: every other turn keeps its role
+                // header, and short user turns and assistant answers stay
+                // whole -- what the conversation said rather than the
+                // material it quoted. Like instructions, they are scored as
+                // context when they alone would not fit.
+                if (chat_turn.valid()) {
+                    const int skeleton_tokens =
+                        http_detail::pflash_chat_skeleton_tokens();
+                    for (size_t index = 0; index < chat_turn.turns.size();
+                         ++index) {
+                        if ((int) index == chat_turn.query_turn) continue;
+                        const auto & turn = chat_turn.turns[index];
+                        if (turn.role == "system") continue;
+                        if (turn.content_begin > turn.role_begin) {
+                            instruction_role_spans.push_back(
+                                {turn.role_begin, turn.content_begin});
+                        }
+                        const bool conversational = turn.role == "user" ||
+                            turn.role == "assistant" || turn.role == "model";
+                        if (conversational && skeleton_tokens > 0 &&
+                            turn.content_end - turn.content_begin <=
+                                skeleton_tokens &&
+                            turn.turn_end > turn.role_begin) {
+                            instruction_role_spans.push_back(
+                                {turn.role_begin, turn.turn_end});
+                        }
+                    }
+                    const size_t history_queries =
+                        (size_t) http_detail::pflash_chat_history_queries();
+                    for (int index = chat_turn.query_turn - 1;
+                         index >= 0 &&
+                             history_query_spans.size() < history_queries;
+                         --index) {
+                        const auto & turn = chat_turn.turns[(size_t) index];
+                        if (turn.role != "user") continue;
+                        const auto window = http_detail::pflash_tail_query_window(
+                            drafter_ids, experiment.query_tokens,
+                            turn.content_end, turn.content_begin);
+                        if (window.valid()) {
+                            history_query_spans.push_back(
+                                {window.end - window.tokens, window.end});
+                        }
+                    }
+                }
                 required_instruction_spans =
                     http_detail::canonicalize_pflash_token_spans(
                         std::move(required_instruction_spans));
@@ -4197,6 +4274,7 @@ std::string HttpServer::apply_pflash_compression(
     compress_request.required_instruction_spans =
         std::move(required_instruction_spans);
     compress_request.query_suffix_candidates = query_suffix_candidates;
+    compress_request.history_query_spans = history_query_spans;
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
     if (experiment.selection_active && query_window.valid()) {
@@ -4239,6 +4317,7 @@ std::string HttpServer::apply_pflash_compression(
                 {"query_span_begin", query_span.begin},
                 {"query_span_end", query_span.end},
                 {"query_suffix_candidates", query_suffix_candidates},
+                {"history_queries", history_query_spans.size()},
                 {"requested_query_tokens", experiment.query_tokens},
                 {"required_text_count", req.pflash_required.size()},
                 {"expected_query_ids", expected_query_ids},

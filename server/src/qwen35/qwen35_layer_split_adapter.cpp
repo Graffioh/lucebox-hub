@@ -1394,7 +1394,7 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
         pflash_drafter_, req.input_ids, req.keep_ratio,
         /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
         score_query_end, req.required_instruction_spans,
-        req.query_suffix_candidates);
+        req.query_suffix_candidates, req.history_query_spans);
     result.ok = !result.compressed_ids.empty();
     if (result.ok) result.kept_spans = pflash_last_kept_spans();
     if (result.ok) {

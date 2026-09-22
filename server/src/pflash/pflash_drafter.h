@@ -73,6 +73,8 @@ void free_drafter_weights(DrafterContext & ctx);
 //                    required (negative values are rejected)
 //   query_suffix_candidates  strict selection only: tokens after the query
 //                    window are scored candidates, not a kept suffix
+//   history_queries  strict selection only: earlier questions' windows, most
+//                    recent first, mixed into the scores at halving weights
 //
 // On failure returns empty vector + sets last_error.
 std::vector<int32_t> drafter_score_and_compress(
@@ -85,6 +87,7 @@ std::vector<int32_t> drafter_score_and_compress(
     int    score_query_end = -1,
     const std::vector<PFlashTokenSpan> &
         required_instruction_spans = {},
-    bool   query_suffix_candidates = false);
+    bool   query_suffix_candidates = false,
+    const std::vector<PFlashTokenSpan> & history_queries = {});
 
 } // namespace luce::common
