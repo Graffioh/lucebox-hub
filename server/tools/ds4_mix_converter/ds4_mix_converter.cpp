@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "gguf.h"
+#include "rocmfp4.h"
 #include "rocmfpx.h"
 
 #include <nlohmann/json.hpp>
@@ -29,6 +30,7 @@
 #include <optional>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
@@ -254,6 +256,7 @@ public:
     bool contains(const std::string & name) const { return entries_.count(name) != 0; }
     const std::unordered_map<std::string, StEntry> & entries() const { return entries_; }
     const json & config() const { return config_; }
+    const fs::path & root() const { return root_; }
     const json & tokenizer() const { return tokenizer_; }
 
 private:
@@ -390,6 +393,37 @@ constexpr std::array<ExpertRecipe, 3> kExpertRecipes{{
     {"w3", "ffn_up_exps.weight",   Surface::Up,   GGML_TYPE_Q2_1_ROCMFP2_MIX, BookSource::GateUpJoint, kGuLevels},
     {"w2", "ffn_down_exps.weight", Surface::Down, GGML_TYPE_Q3_1_ROCMFP3_MIX, BookSource::DownOnly,   kP4Levels},
 }};
+
+// The shipped DeepSeek-V4-Flash recipe keeps fp2 for the down experts of a
+// few layers and fp3 elsewhere. --down-fp2-layers sets the fp2 layers.
+constexpr ExpertRecipe kDownFp2{"w2", "ffn_down_exps.weight", Surface::Down, GGML_TYPE_Q2_1_ROCMFP2_MIX,
+                                BookSource::DownOnly, kGuLevels};
+constexpr const char * kDefaultDownFp2Layers = "0,2-4,6,10,11,17-20,39-42";
+std::set<int> g_fp2_down_layers;
+
+const ExpertRecipe & down_recipe(int layer) {
+    return g_fp2_down_layers.count(layer) ? kDownFp2 : kExpertRecipes[2];
+}
+
+std::array<const ExpertRecipe *, 3> layer_recipes(int layer) {
+    return {&kExpertRecipes[0], &kExpertRecipes[1], &down_recipe(layer)};
+}
+
+// "0,2-4,39-42" -> {0, 2, 3, 4, 39, 40, 41, 42}
+std::set<int> parse_layer_set(const std::string & text) {
+    std::set<int> out;
+    std::string item;
+    std::stringstream in(text);
+    while (std::getline(in, item, ',')) {
+        if (item.empty()) continue;
+        const auto dash = item.find('-');
+        const int lo = std::stoi(item.substr(0, dash));
+        const int hi = dash == std::string::npos ? lo : std::stoi(item.substr(dash + 1));
+        if (lo < 0 || hi < lo) fail("bad layer range: " + item);
+        for (int layer = lo; layer <= hi; ++layer) out.insert(layer);
+    }
+    return out;
+}
 
 std::string source_expert_name(int layer, int expert, const ExpertRecipe & recipe, const char * suffix) {
     return "layers." + std::to_string(layer) + ".ffn.experts." + std::to_string(expert) +
@@ -624,11 +658,14 @@ struct Options {
     int layer_count = -1;
     int expert_limit = -1;
     int threads = 0;  // 0 = every core
+    std::string down_fp2_layers = kDefaultDownFp2Layers;
 };
 
 void usage(const char * argv0) {
     std::cerr << "Usage: " << argv0 << " --input DIR --output FILE (--imatrix FILE | --absmax-only)\n"
-              << "       [--layer-count N] [--expert-limit N] [--experts-only] [--validate-input-only] [--force] [--threads N]\n";
+              << "       [--layer-count N] [--expert-limit N] [--experts-only] [--validate-input-only] [--force] [--threads N]\n"
+              << "       [--down-fp2-layers LIST]   fp2 instead of fp3 for the down experts of these layers (default "
+              << kDefaultDownFp2Layers << ")\n";
 }
 
 int parse_nonnegative(const char * value, const std::string & option, bool allow_zero = true) {
@@ -659,6 +696,7 @@ Options parse_options(int argc, char ** argv) {
         else if (arg == "--layer-count") out.layer_count = parse_nonnegative(value(), arg, false);
         else if (arg == "--expert-limit") out.expert_limit = parse_nonnegative(value(), arg, false);
         else if (arg == "--threads") out.threads = parse_nonnegative(value(), arg, false);
+        else if (arg == "--down-fp2-layers") out.down_fp2_layers = value();
         else if (arg == "--help" || arg == "-h") { usage(argv[0]); std::exit(0); }
         else fail("unknown option " + arg);
     }
@@ -697,12 +735,18 @@ void append_le(std::vector<uint8_t> & out, T value) {
 
 std::vector<uint8_t> make_p4_blob(const std::vector<LayerCalibration> & layers, uint32_t experts) {
     std::vector<uint8_t> out;
+    std::vector<const LayerCalibration *> fp3;
+    for (const LayerCalibration & layer : layers) {
+        if (layer.down.levels == kP4Levels) fp3.push_back(&layer);
+    }
+    if (fp3.empty()) return out;
     const char magic[8] = {'P','4','M','I','X','v','1','\0'};
     out.insert(out.end(), magic, magic + 8);
-    append_le<uint32_t>(out, static_cast<uint32_t>(layers.size()));
+    append_le<uint32_t>(out, static_cast<uint32_t>(fp3.size()));
     append_le<uint32_t>(out, 0);
-    for (const LayerCalibration & layer : layers) {
-        if (layer.down.levels != kP4Levels || layer.down.experts.size() != experts) {
+    for (const LayerCalibration * layer_ptr : fp3) {
+        const LayerCalibration & layer = *layer_ptr;
+        if (layer.down.experts.size() != experts) {
             fail("incomplete qtype-105 codebook registry at layer " + std::to_string(layer.layer));
         }
         append_le<uint32_t>(out, static_cast<uint32_t>(layer.layer));
@@ -725,7 +769,9 @@ std::vector<uint8_t> make_gumix_blob(const std::vector<LayerCalibration> & layer
     std::vector<uint8_t> out;
     const char magic[8] = {'G','U','M','I','X','s','1','\0'};
     out.insert(out.end(), magic, magic + 8);
-    append_le<uint32_t>(out, static_cast<uint32_t>(layers.size()*2));
+    uint32_t entries = 0;
+    for (const LayerCalibration & layer : layers) entries += layer.down.levels == kGuLevels ? 3 : 2;
+    append_le<uint32_t>(out, entries);
     append_le<uint32_t>(out, 0);
     for (const LayerCalibration & layer : layers) {
         if (layer.gate_up.levels != kGuLevels || layer.gate_up.experts.size() != experts) {
@@ -745,6 +791,22 @@ std::vector<uint8_t> make_gumix_blob(const std::vector<LayerCalibration> & layer
                 for (uint16_t value : book) append_le<uint16_t>(out, value);
             }
         }
+        if (layer.down.levels != kGuLevels) continue;
+        if (layer.down.experts.size() != experts) {
+            fail("incomplete qtype-106 down codebook registry at layer " + std::to_string(layer.layer));
+        }
+        append_le<uint32_t>(out, static_cast<uint32_t>(layer.layer));
+        append_le<uint32_t>(out, static_cast<uint32_t>(Surface::Down));
+        append_le<uint32_t>(out, experts);
+        append_le<uint32_t>(out, layer.down_shape.out);
+        append_le<uint32_t>(out, layer.down_shape.in);
+        append_le<uint32_t>(out, kCodebooks);
+        append_le<uint32_t>(out, kGuLevels);
+        out.insert(out.end(), experts, 1u);
+        for (const auto & book : layer.down.experts) {
+            if (book.size() != kCodebooks*kGuLevels) fail("bad qtype-106 down codebook length");
+            for (uint16_t value : book) append_le<uint16_t>(out, value);
+        }
     }
     return out;
 }
@@ -762,7 +824,7 @@ void write_atomic_bytes(const fs::path & path, const std::vector<uint8_t> & byte
     fs::rename(temporary, path);
 }
 
-enum class Producer { Raw, DenseFp8, Int64ToInt32, Expert };
+enum class Producer { Raw, Dense, Int64ToInt32, Expert };
 
 struct TensorSpec {
     std::string name;
@@ -871,12 +933,22 @@ TensorSpec mapped_source_spec(const std::string & target, const StEntry & source
             (source.shape[0] + 127)/128, (source.shape[1] + 127)/128,
         };
         if (scale.shape != expected) fail("FP8 scale shape mismatch for " + source.name);
-        spec.type = GGML_TYPE_BF16;
-        spec.producer = Producer::DenseFp8;
+        spec.type = GGML_TYPE_Q4_0_ROCMFP4_FAST;
+        spec.producer = Producer::Dense;
         spec.scale = &scale;
+    } else if (source.dtype == "BF16" && source.shape.size() == 2 &&
+               (target == "token_embd.weight" || target == "output.weight")) {
+        spec.type = target == "token_embd.weight" ? GGML_TYPE_Q6_K : GGML_TYPE_Q4_0_ROCMFP4_FAST;
+        spec.producer = Producer::Dense;
     } else {
         spec.type = direct_ggml_type(source.dtype);
         spec.producer = Producer::Raw;
+    }
+    if (spec.producer == Producer::Dense) {
+        const int64_t block = ggml_blck_size(spec.type);
+        if (source.shape[1] % block != 0) {
+            fail("row of " + source.name + " is not a multiple of " + std::to_string(block));
+        }
     }
     spec.ne = reverse_shape(source);
     if (spec.name.size() >= GGML_MAX_NAME) fail("GGUF tensor name too long: " + spec.name);
@@ -910,7 +982,8 @@ std::vector<TensorSpec> make_plan(
                                        source.at(src), source));
             }
         }
-        for (const ExpertRecipe & recipe : kExpertRecipes) {
+        for (const ExpertRecipe * recipe_ptr : layer_recipes(layer.layer)) {
+            const ExpertRecipe & recipe = *recipe_ptr;
             const TensorShape shape = recipe.books == BookSource::GateUpJoint
                 ? layer.gate_up_shape : layer.down_shape;
             TensorSpec spec;
@@ -1087,8 +1160,10 @@ void set_model_metadata(gguf_context * ctx, const SafeTensorSet & source,
     for (const std::string & merge : merges) merge_ptrs.push_back(merge.c_str());
     gguf_set_arr_str(ctx, "tokenizer.ggml.merges", merge_ptrs.data(), merge_ptrs.size());
 
-    gguf_set_arr_data(ctx, "deepseek4.p4mix.sidecar", GGUF_TYPE_UINT8,
-                      p4_blob.data(), p4_blob.size());
+    if (!p4_blob.empty()) {
+        gguf_set_arr_data(ctx, "deepseek4.p4mix.sidecar", GGUF_TYPE_UINT8,
+                          p4_blob.data(), p4_blob.size());
+    }
 }
 
 std::unique_ptr<ggml_tensor> make_tensor_descriptor(const TensorSpec & spec) {
@@ -1141,28 +1216,47 @@ void write_int64_to_int32(FILE * out, const StEntry & source) {
     }
 }
 
-void write_dense_fp8(FILE * out, const StEntry & weight, const StEntry & scale) {
+// A dense matrix (FP8 with block scales, or BF16) quantized row by row to
+// spec.type: ROCmFP4 for the projections, Q6_K for the token embedding.
+void write_dense(FILE * out, const TensorSpec & spec) {
+    const StEntry & weight = *spec.source;
     const uint32_t rows = static_cast<uint32_t>(weight.shape[0]);
     const uint32_t cols = static_cast<uint32_t>(weight.shape[1]);
-    FileDescriptor wf(weight.path), sf(scale.path);
-    std::vector<uint8_t> scales(scale.size);
-    pread_exact(sf.fd, scales.data(), scales.size(), scale.offset, scale.name);
-    std::vector<uint8_t> input(cols);
-    std::vector<uint16_t> output(cols);
-    const uint32_t scale_cols = static_cast<uint32_t>(scale.shape[1]);
+    FileDescriptor wf(weight.path);
+    std::vector<uint8_t> scales;
+    std::unique_ptr<FileDescriptor> sf;
+    uint32_t scale_cols = 0;
+    if (spec.scale) {
+        sf = std::make_unique<FileDescriptor>(spec.scale->path);
+        scales.resize(spec.scale->size);
+        pread_exact(sf->fd, scales.data(), scales.size(), spec.scale->offset, spec.scale->name);
+        scale_cols = static_cast<uint32_t>(spec.scale->shape[1]);
+    }
+    const size_t in_bytes = spec.scale ? cols : cols * 2;
+    std::vector<uint8_t> input(in_bytes);
+    std::vector<float> values(cols);
+    const size_t row_bytes = ggml_row_size(spec.type, cols);
+    std::vector<uint8_t> output(row_bytes);
     for (uint32_t row = 0; row < rows; ++row) {
-        pread_exact(wf.fd, input.data(), input.size(), weight.offset + static_cast<uint64_t>(row)*cols, weight.name);
+        pread_exact(wf.fd, input.data(), input.size(), weight.offset + static_cast<uint64_t>(row)*in_bytes, weight.name);
         for (uint32_t col = 0; col < cols; ++col) {
-            const uint8_t scale_byte = scales[(row/128)*scale_cols + col/128];
-            const float decoded = fp8_e4m3fn(input[col])*fp8_e8m0(scale_byte);
-            const uint16_t b = float_to_bf16(decoded);
-            if (!std::isfinite(decoded) || bf16_to_float(b) != decoded) {
-                fail("FP8->BF16 is not exact for " + weight.name + " at row " +
-                     std::to_string(row) + " col " + std::to_string(col));
+            float decoded;
+            if (spec.scale) {
+                decoded = fp8_e4m3fn(input[col])*fp8_e8m0(scales[(row/128)*scale_cols + col/128]);
+            } else {
+                decoded = bf16_to_float(static_cast<uint16_t>(input[2*col] | (input[2*col + 1] << 8)));
             }
-            output[col] = b;
+            if (!std::isfinite(decoded)) {
+                fail("non-finite weight in " + weight.name + " at row " + std::to_string(row) + " col " + std::to_string(col));
+            }
+            values[col] = decoded;
         }
-        fwrite_exact(out, output.data(), output.size()*sizeof(uint16_t), weight.name);
+        if (spec.type == GGML_TYPE_Q4_0_ROCMFP4_FAST) {
+            rocmfp4_quantize_row_q4_0_fast_ref(values.data(), reinterpret_cast<block_rocmfp4_fast *>(output.data()), cols);
+        } else if (ggml_quantize_chunk(spec.type, values.data(), output.data(), 0, 1, cols, nullptr) != row_bytes) {
+            fail("quantizer wrote an unexpected row size for " + weight.name);
+        }
+        fwrite_exact(out, output.data(), output.size(), weight.name);
     }
 }
 
@@ -1234,7 +1328,8 @@ std::vector<LayerCalibration> validate_input_layout(
         LayerCalibration current;
         current.layer = static_cast<int>(layer);
         for (uint32_t expert = 0; expert < experts; ++expert) {
-            for (const ExpertRecipe & recipe : kExpertRecipes) {
+            for (const ExpertRecipe * recipe_ptr : layer_recipes(static_cast<int>(layer))) {
+                const ExpertRecipe & recipe = *recipe_ptr;
                 const TensorShape shape = validate_expert_source(source, layer, expert, recipe);
                 TensorShape & expected = recipe.books == BookSource::GateUpJoint
                     ? current.gate_up_shape : current.down_shape;
@@ -1258,7 +1353,7 @@ std::vector<LayerCalibration> calibrate(
         LayerCalibration current;
         current.layer = static_cast<int>(layer);
         current.gate_up.levels = kGuLevels;
-        current.down.levels = kP4Levels;
+        current.down.levels = down_recipe(static_cast<int>(layer)).levels;
         struct ExpertFit {
             TensorShape gate_shape, down_shape;
             std::vector<uint16_t> gate_up, down;
@@ -1279,14 +1374,14 @@ std::vector<LayerCalibration> calibrate(
                 add_expert_to_fitter(source, layer, expert, recipe, importance, gate_up_fitter);
             }
             HistogramFitter down_fitter;
-            const ExpertRecipe & down_recipe = kExpertRecipes[2];
-            fit.down_shape = validate_expert_source(source, layer, expert, down_recipe);
+            const ExpertRecipe & down = down_recipe(static_cast<int>(layer));
+            fit.down_shape = validate_expert_source(source, layer, expert, down);
             const auto * down_importance = require_imatrix(
-                imatrix, target_expert_name(layer, down_recipe), fit.down_shape.in);
-            add_expert_to_fitter(source, layer, expert, down_recipe, down_importance, down_fitter);
+                imatrix, target_expert_name(layer, down), fit.down_shape.in);
+            add_expert_to_fitter(source, layer, expert, down, down_importance, down_fitter);
             const std::string label = "layer=" + std::to_string(layer) + " expert=" + std::to_string(expert);
             fit.gate_up = gate_up_fitter.fit(kGuLevels, label + " gate_up", &fit.repairs);
-            fit.down = down_fitter.fit(kP4Levels, label + " down", &fit.repairs);
+            fit.down = down_fitter.fit(static_cast<int>(down.levels), label + " down", &fit.repairs);
             return fit;
         };
         const std::function<void(uint32_t, ExpertFit &)> keep = [&](uint32_t expert, ExpertFit & fit) {
@@ -1346,7 +1441,8 @@ void verify_artifact(const fs::path & output, const fs::path & gumix_path,
     const uint64_t file_size = fs::file_size(output);
     const uint64_t data_offset = gguf_get_data_offset(ctx);
     const int64_t p4_key = gguf_find_key(ctx, "deepseek4.p4mix.sidecar");
-    if (p4_key < 0 || gguf_get_kv_type(ctx, p4_key) != GGUF_TYPE_ARRAY ||
+    if (expected_p4.empty() ? p4_key >= 0 :
+        p4_key < 0 || gguf_get_kv_type(ctx, p4_key) != GGUF_TYPE_ARRAY ||
         gguf_get_arr_type(ctx, p4_key) != GGUF_TYPE_UINT8 ||
         gguf_get_arr_n(ctx, p4_key) != expected_p4.size() ||
         std::memcmp(gguf_get_arr_data(ctx, p4_key), expected_p4.data(), expected_p4.size()) != 0) {
@@ -1425,8 +1521,8 @@ void write_gguf(const Options & options, const SafeTensorSet & source,
         const off_t before = ::ftello(out);
         if (spec.producer == Producer::Raw) {
             copy_raw(out, *spec.source);
-        } else if (spec.producer == Producer::DenseFp8) {
-            write_dense_fp8(out, *spec.source, *spec.scale);
+        } else if (spec.producer == Producer::Dense) {
+            write_dense(out, spec);
         } else if (spec.producer == Producer::Int64ToInt32) {
             write_int64_to_int32(out, *spec.source);
         } else {
@@ -1459,6 +1555,7 @@ int main(int argc, char ** argv) {
         static_assert(static_cast<int>(GGML_TYPE_Q3_1_ROCMFP3_MIX) == static_cast<int>(kQtypeP4Mix));
         static_assert(static_cast<int>(GGML_TYPE_Q2_1_ROCMFP2_MIX) == static_cast<int>(kQtypeGuMix));
         const Options options = parse_options(argc, argv);
+        g_fp2_down_layers = parse_layer_set(options.down_fp2_layers);
         g_threads = options.threads > 0 ? static_cast<unsigned>(options.threads)
                                         : std::max(1u, std::thread::hardware_concurrency());
         SafeTensorSet source(options.input);

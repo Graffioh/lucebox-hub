@@ -391,7 +391,8 @@ if(LUCE_DS4_MIX_CONVERTER AND
         tools/ds4_mix_converter/ds4_mix_converter.cpp)
     target_include_directories(ds4_mix_converter PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfp4)
     target_link_libraries(ds4_mix_converter PRIVATE
         ggml-base nlohmann_json::nlohmann_json)
     if(UNIX)
