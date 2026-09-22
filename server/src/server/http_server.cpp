@@ -440,144 +440,161 @@ std::string pflash_token_fingerprint(
     return encoded;
 }
 
-PflashChatTailSpan pflash_last_message_content_span(
+PflashChatTurnSpan pflash_chat_query_turn(
         const Tokenizer & marker_tokenizer,
         const ChatMarkers & markers,
         const Tokenizer & tokenizer,
         const std::vector<int32_t> & prompt) {
-    PflashChatTailSpan tail;
-    if (prompt.empty()) return tail;
+    PflashChatTurnSpan chosen;
+    if (prompt.empty()) return chosen;
 
+    // Marker strings, searched in the decoded prompt text so a drafter whose
+    // vocabulary spells the control tokens differently still maps.
+    struct Mark {
+        size_t at = 0;
+        size_t len = 0;
+        bool role = false;
+        std::string text;
+    };
     const auto seq_text = [&marker_tokenizer](
             const std::vector<int32_t> & seq) {
         std::string text;
         for (const int32_t id : seq) text += marker_tokenizer.token_text(id);
         return text;
     };
-    std::vector<std::string> role_marks;
+    std::vector<std::pair<std::string, bool>> needles;
     for (const auto & seq : markers.next_role_starts) {
         std::string text = seq_text(seq);
-        if (!text.empty()) role_marks.push_back(std::move(text));
+        if (!text.empty()) needles.emplace_back(std::move(text), true);
     }
-    std::vector<std::string> end_marks;
     for (const auto & seq : markers.end_msg_seqs) {
         std::string text = seq_text(seq);
-        if (!text.empty()) end_marks.push_back(std::move(text));
+        if (!text.empty()) needles.emplace_back(std::move(text), false);
     }
-    if (role_marks.empty() && end_marks.empty()) return tail;
+    if (needles.empty()) return chosen;
 
     const DecodedPrompt decoded =
         decode_prompt_with_offsets(tokenizer, prompt);
     const std::string & text = decoded.text;
-
-    // Last occurrence strictly before `before` (npos: anywhere), as
-    // (offset, length). Marker strings never overlap themselves, so the
-    // rightmost start across all needles is the answer.
-    const auto last_before = [&text](
-            const std::vector<std::string> & needles, size_t before)
-            -> std::pair<size_t, size_t> {
-        size_t best = std::string::npos, len = 0;
-        for (const auto & needle : needles) {
-            const size_t at = before == std::string::npos
-                ? text.rfind(needle)
-                : before == 0
-                    ? std::string::npos
-                    : text.rfind(needle, before - 1);
-            if (at != std::string::npos &&
-                (best == std::string::npos || at > best)) {
-                best = at;
-                len = needle.size();
-            }
+    std::vector<Mark> marks;
+    for (const auto & [needle, role] : needles) {
+        for (size_t at = text.find(needle); at != std::string::npos;
+             at = text.find(needle, at + needle.size())) {
+            marks.push_back({at, needle.size(), role, needle});
         }
-        return {best, len};
-    };
-
-    const auto last_role = last_before(role_marks, std::string::npos);
-    const auto last_end = last_before(end_marks, std::string::npos);
-    if (last_role.first == std::string::npos &&
-        last_end.first == std::string::npos) {
-        return tail;
     }
+    if (marks.empty()) return chosen;
+    std::sort(marks.begin(), marks.end(),
+              [] (const Mark & a, const Mark & b) { return a.at < b.at; });
 
-    // Families whose markers already name the role (DeepSeek "<｜User｜>",
-    // Laguna "<user>") delimit content at the marker itself. Generic markers
-    // (Qwen "<|im_start|>", Gemma "<|turn>") are followed by a "name\n"
-    // header line.
+    // Families whose markers name the role (DeepSeek "<｜User｜>", Laguna
+    // "<user>") start content at the marker; generic markers (Qwen
+    // "<|im_start|>", Gemma "<|turn>") are followed by a "name\n" line.
     const bool marker_carries_role =
         markers.role_starts_delimit || markers.family == "laguna";
+    const auto role_from_marker = [] (const std::string & marker) {
+        std::string role;
+        for (const char c : marker) {
+            if (std::isalpha((unsigned char) c)) {
+                role += (char) std::tolower((unsigned char) c);
+            }
+        }
+        return role;
+    };
+    const auto is_space = [] (char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    };
+    const auto starts_with = [&text] (size_t at, const char * prefix) {
+        return text.compare(at, std::strlen(prefix), prefix) == 0;
+    };
 
-    // The character offset where the final message's content stops. The
-    // prompt's last marker is either the message's own end marker, the
-    // assistant generation marker (a role marker followed only by a
-    // role-name header), or a role marker that opened an unterminated
-    // message — in which case content runs to the prompt end.
-    size_t content_end_text;
-    if (last_role.first != std::string::npos &&
-        (last_end.first == std::string::npos ||
-         last_role.first > last_end.first)) {
-        const size_t after = last_role.first + last_role.second;
-        bool generation;
+    struct Turn {
+        size_t role_at = 0;
+        size_t content_at = 0;
+        size_t content_end = 0;
+        std::string role;
+        bool closed = false;
+    };
+    std::vector<Turn> turns;
+    for (size_t index = 0; index < marks.size(); ++index) {
+        const Mark & mark = marks[index];
+        if (!mark.role) continue;
+        Turn turn;
+        turn.role_at = mark.at;
+        size_t content_at = mark.at + mark.len;
         if (marker_carries_role) {
-            generation = text.find_first_not_of(" \t\n\r", after) ==
-                std::string::npos;
+            turn.role = role_from_marker(mark.text);
         } else {
-            size_t i = after;
-            while (i < text.size() && i - after < 16 &&
-                   std::isalpha((unsigned char) text[i])) ++i;
-            generation = i > after && i < text.size() && text[i] == '\n' &&
-                text.find_first_not_of(" \t\n\r", i + 1) ==
-                    std::string::npos;
-        }
-        if (generation) {
-            if (marker_carries_role) {
-                content_end_text = last_role.first;
-            } else {
-                // Content ends at this message's end marker — the last one
-                // after the role marker that opened it, not an earlier
-                // turn's.
-                const auto prev_role = last_before(role_marks, last_role.first);
-                content_end_text =
-                    (last_end.first != std::string::npos &&
-                     (prev_role.first == std::string::npos ||
-                          last_end.first > prev_role.first))
-                        ? last_end.first : last_role.first;
+            size_t name_end = content_at;
+            while (name_end < text.size() && name_end - content_at < 16 &&
+                   std::isalpha((unsigned char) text[name_end])) {
+                ++name_end;
             }
-        } else {
-            content_end_text = text.size();
-        }
-    } else {
-        content_end_text = last_end.first;
-    }
-
-    // The marker that opened the message containing content_end.
-    const auto role = last_before(role_marks, content_end_text);
-    size_t content_begin_text = 0;
-    if (role.first != std::string::npos) {
-        tail.role_begin = token_at_offset(decoded, role.first);
-        size_t begin = role.first + role.second;
-        if (!marker_carries_role) {
-            size_t i = begin;
-            while (i < content_end_text && i - begin < 16 &&
-                   std::isalpha((unsigned char) text[i])) ++i;
-            if (i > begin && i < content_end_text && text[i] == '\n') {
-                begin = i + 1;
+            turn.role = text.substr(content_at, name_end - content_at);
+            if (name_end < text.size() && text[name_end] == '\n') {
+                content_at = name_end + 1;
             }
         }
-        content_begin_text = begin;
+        // A turn ends at its end marker, or -- when role markers delimit
+        // (DeepSeek user turns) -- at the next role marker. Nothing after
+        // it leaves the turn open to the prompt end.
+        size_t content_end = text.size();
+        if (index + 1 < marks.size()) {
+            const Mark & next = marks[index + 1];
+            content_end = next.at;
+            turn.closed = !next.role || markers.role_starts_delimit;
+        }
+        // Content ignores the whitespace the template wraps it in.
+        while (content_at < content_end && is_space(text[content_at])) {
+            ++content_at;
+        }
+        while (content_end > content_at && is_space(text[content_end - 1])) {
+            --content_end;
+        }
+        turn.content_at = content_at;
+        turn.content_end = content_end;
+        // Tool output travels in user turns on some templates.
+        if (starts_with(content_at, "<tool_response>") ||
+            starts_with(content_at, "<tool_result>")) {
+            turn.role = "tool";
+        }
+        turns.push_back(std::move(turn));
     }
+    if (turns.empty()) return chosen;
 
-    tail.content_end = content_end_text >= text.size()
-        ? (int) prompt.size()
-        : token_at_offset(decoded, content_end_text);
-    // First token whose text starts at-or-after the content offset — a token
-    // merged across the header/content boundary stays with the header.
-    tail.content_begin = (int) (std::lower_bound(
-        decoded.token_begin.begin(), decoded.token_begin.end(),
-        content_begin_text) - decoded.token_begin.begin());
-    if (tail.role_begin > tail.content_begin) {
-        tail.role_begin = tail.content_begin;
+    // An assistant turn left open at the prompt end is the generation prompt
+    // ("<|im_start|>assistant\n<think>\n"): template machinery, never query.
+    size_t usable = turns.size();
+    const Turn & last = turns.back();
+    if (!last.closed && (last.role == "assistant" || last.role == "model")) {
+        --usable;
     }
-    return tail;
+    // The query comes from the latest user turn; a conversation without one
+    // falls back to its latest turn with content.
+    const Turn * query = nullptr;
+    for (size_t index = usable; index-- > 0;) {
+        const Turn & turn = turns[index];
+        if (turn.content_end <= turn.content_at) continue;
+        if (turn.role == "user") { query = &turn; break; }
+        if (!query) query = &turn;
+    }
+    if (!query) return chosen;
+
+    // Content bounds in tokens: the first token starting at-or-after each
+    // character offset, so a token merged across a boundary stays with the
+    // content it ends.
+    const auto token_from = [&decoded] (size_t at) {
+        return (int) (std::lower_bound(
+            decoded.token_begin.begin(), decoded.token_begin.end(), at) -
+            decoded.token_begin.begin());
+    };
+    chosen.role_begin = token_at_offset(decoded, query->role_at);
+    chosen.content_begin = token_from(query->content_at);
+    chosen.content_end = token_from(query->content_end);
+    if (chosen.role_begin > chosen.content_begin) {
+        chosen.role_begin = chosen.content_begin;
+    }
+    return chosen;
 }
 
 bool pflash_full_cache_restore_allowed(
@@ -3538,24 +3555,26 @@ std::string HttpServer::apply_pflash_compression(
     std::string last_user_text;
     int query_content_begin = -1;
     int query_content_end = -1;
-    // Complete token span of an explicit pflash_query inside the boundary
-    // content, when it was mapped against the decoded token text. The strict
-    // selector keeps the whole span mandatory; the scorer window is its tail.
-    PFlashTokenSpan explicit_query_span{-1, -1};
-    // Header ("<|im_start|>user\n") opening the last message, when the chat
+    // Complete token span of the scorer query: an explicit pflash_query
+    // (benchmark override) mapped against the decoded token text, or the
+    // tail of the latest user turn (chat default). The strict selector keeps
+    // the whole span mandatory; the scorer window is its tail.
+    PFlashTokenSpan query_span{-1, -1};
+    std::string query_span_rule;
+    // Header ("<|im_start|>user\n") opening the query's turn, when the chat
     // markers resolved it — pinned mandatory so a compressed prompt keeps
     // the current turn's role envelope.
-    PFlashTokenSpan last_role_header{-1, -1};
+    PFlashTokenSpan query_role_header{-1, -1};
     std::vector<PFlashTokenSpan> required_instruction_spans;
-    // Chat-first scorer query: the last message's content span, located by
-    // the rendered prompt's own control markers. Feeds the strict tail
+    // Chat-first scorer query: the latest user turn's content span, located
+    // by the rendered prompt's own control markers. Feeds the strict tail
     // parser and the legacy window; unused when a benchmark parser
     // (latest_user) or a marker-less prompt needs the sentinel mapping.
-    http_detail::PflashChatTailSpan chat_tail;
+    http_detail::PflashChatTurnSpan chat_turn;
     if (!experiment.configured || tail_parser) {
         ChatMarkers chat_markers;
         if (resolve_chat_markers(tokenizer_, chat_markers)) {
-            chat_tail = http_detail::pflash_last_message_content_span(
+            chat_turn = http_detail::pflash_chat_query_turn(
                 tokenizer_, chat_markers, *drafter_tokenizer_, drafter_ids);
         }
     }
@@ -3583,8 +3602,10 @@ std::string HttpServer::apply_pflash_compression(
 
             const bool semantic_parser = experiment.query_parser ==
                 luce::pflash::PFlashQueryParser::SemanticUser;
+            // The latest user message bounds the query; the chat parser
+            // falls back to the last message when there is none.
             int boundary_index = (int) messages.size() - 1;
-            if (!raw_text_input && semantic_parser) {
+            if (!raw_text_input && (semantic_parser || last_user_index >= 0)) {
                 boundary_index = last_user_index;
             }
 
@@ -3668,15 +3689,15 @@ std::string HttpServer::apply_pflash_compression(
             };
 
             std::string boundary_error;
-            // Chat default: the last message's content bounds come from the
-            // rendered prompt's control markers — no sentinel re-renders.
-            if (tail_parser && chat_tail.valid()) {
-                query_content_begin = chat_tail.content_begin;
-                query_content_end = chat_tail.content_end;
-                if (chat_tail.role_begin >= 0 &&
-                    chat_tail.role_begin < chat_tail.content_begin) {
-                    last_role_header = {chat_tail.role_begin,
-                                        chat_tail.content_begin};
+            // Chat default: the latest user turn's content bounds come from
+            // the rendered prompt's control markers — no sentinel re-renders.
+            if (tail_parser && chat_turn.valid()) {
+                query_content_begin = chat_turn.content_begin;
+                query_content_end = chat_turn.content_end;
+                if (chat_turn.role_begin >= 0 &&
+                    chat_turn.role_begin < chat_turn.content_begin) {
+                    query_role_header = {chat_turn.role_begin,
+                                         chat_turn.content_begin};
                 }
             }
             if (query_content_begin < 0) {
@@ -3699,6 +3720,19 @@ std::string HttpServer::apply_pflash_compression(
                 query_content_end <= query_content_begin ||
                 query_content_end > (int) drafter_ids.size()) {
                 return "PFlash strict selection content boundary mapping failed";
+            }
+            // Chat default: without an explicit pflash_query the scorer
+            // query is the tail of the boundary content, and it takes the
+            // explicit query's path from here on.
+            if (tail_parser && req.pflash_query.empty()) {
+                const auto window = http_detail::pflash_tail_query_window(
+                    drafter_ids, experiment.query_tokens,
+                    query_content_end, query_content_begin);
+                if (window.valid()) {
+                    query_span = {window.end - window.tokens, window.end};
+                    query_span_rule = chat_turn.valid() ? "chat_user_tail"
+                        : (raw_text_input ? "content_tail" : "prompt_tail");
+                }
             }
 
             if (experiment.selection_active) {
@@ -3759,27 +3793,23 @@ std::string HttpServer::apply_pflash_compression(
                     }
                     required_instruction_spans.push_back(required_span);
                 }
-                // An explicit scorer query also pins its complete span: the
-                // whole question is mandatory even though the scorer only
-                // consumes its bounded tail. Mapping against the decoded
-                // content text (not a standalone encoding) keeps BPE boundary
-                // merges like " What" inside the span. Benchmark-only: under
-                // the chat tail parser the query may sit anywhere before the
-                // closing markers; latest_user still scopes it to the user
-                // message.
+                // An explicit scorer query replaces the chat-derived one and
+                // pins its complete span: the whole question is mandatory
+                // even though the scorer only consumes its bounded tail.
+                // Mapping against the decoded content text (not a standalone
+                // encoding) keeps BPE boundary merges like " What" inside the
+                // span. Benchmark-only: under the chat tail parser the query
+                // may sit anywhere before the user turn's closing marker;
+                // latest_user still scopes it to the user message.
                 if (!req.pflash_query.empty()) {
                     const int query_search_begin =
                         semantic_parser ? query_content_begin : 0;
-                    const int query_search_end = semantic_parser
-                        ? query_content_end
-                        : (query_content_end > 0
-                               ? query_content_end : (int) drafter_ids.size());
-                    explicit_query_span =
-                        http_detail::pflash_decoded_text_span(
-                            *drafter_tokenizer_, drafter_ids,
-                            query_search_begin, query_search_end,
-                            req.pflash_query);
-                    if (explicit_query_span.begin < 0) {
+                    query_span = http_detail::pflash_decoded_text_span(
+                        *drafter_tokenizer_, drafter_ids,
+                        query_search_begin, query_content_end,
+                        req.pflash_query);
+                    query_span_rule = "explicit_query_span";
+                    if (query_span.begin < 0) {
                         return semantic_parser
                             ? "PFlash strict selection explicit query mapping "
                               "failed: pflash_query does not occur in the "
@@ -3788,10 +3818,12 @@ std::string HttpServer::apply_pflash_compression(
                               "failed: pflash_query does not occur in the "
                               "prompt";
                     }
-                    required_instruction_spans.push_back(explicit_query_span);
                 }
-                if (last_role_header.begin >= 0) {
-                    required_instruction_spans.push_back(last_role_header);
+                if (query_span.begin >= 0) {
+                    required_instruction_spans.push_back(query_span);
+                }
+                if (query_role_header.begin >= 0) {
+                    required_instruction_spans.push_back(query_role_header);
                 }
                 required_instruction_spans =
                     http_detail::canonicalize_pflash_token_spans(
@@ -3841,30 +3873,37 @@ std::string HttpServer::apply_pflash_compression(
     if (!last_user_text.empty()) {
         semantic_query_ids = drafter_tokenizer_->encode(last_user_text);
     }
-    if (explicit_query_span.begin >= 0) {
-        // The explicit query was already mapped against the decoded content
-        // text and pinned as a mandatory span. The scorer consumes the span's
-        // bounded tail window; the complete span stays in the target prompt.
-        parser_selection_rule = "explicit_query_span";
-        query_window.end = explicit_query_span.end;
+    // Unconfigured (legacy) chat mode derives the query the same way, from
+    // the latest user turn's tail.
+    if (!experiment.configured && req.pflash_query.empty() &&
+        chat_turn.valid()) {
+        const auto window = http_detail::pflash_tail_query_window(
+            drafter_ids, experiment.query_tokens,
+            chat_turn.content_end, chat_turn.content_begin);
+        if (window.valid()) {
+            query_span = {window.end - window.tokens, window.end};
+            query_span_rule = "chat_user_tail";
+        }
+    }
+    if (query_span.begin >= 0) {
+        // The query span — explicit or chat-derived — was mapped onto the
+        // prompt's own tokens and, under strict selection, pinned mandatory.
+        // The scorer consumes the span's bounded tail window; the complete
+        // span stays in the target prompt.
+        parser_selection_rule = query_span_rule;
+        query_window.end = query_span.end;
         query_window.tokens = (std::min)(
-            experiment.query_tokens,
-            explicit_query_span.end - explicit_query_span.begin);
+            experiment.query_tokens, query_span.end - query_span.begin);
         expected_query_ids.assign(
             drafter_ids.begin() + (query_window.end - query_window.tokens),
             drafter_ids.begin() + query_window.end);
     } else if (experiment.configured && (raw_text_input || tail_parser)) {
-        // Chat default: the scorer query is the tail of the last message's
-        // content — the prompt region before the closing/generation markers,
-        // clamped so it never swallows the role header.
+        // Content located, but no query span (a parser without a derived
+        // query, or selection inactive): score the content's tail.
         parser_selection_rule = raw_text_input ? "content_tail" : "prompt_tail";
         query_window = http_detail::pflash_tail_query_window(
             drafter_ids, experiment.query_tokens,
             query_content_end, query_content_begin);
-    } else if (!experiment.configured && chat_tail.valid()) {
-        // Legacy (unconfigured) chat mode uses the same marker-derived tail.
-        query_window = http_detail::pflash_tail_query_window(
-            drafter_ids, 8, chat_tail.content_end, chat_tail.content_begin);
     } else if (!semantic_query_ids.empty()) {
         if (experiment.configured) parser_selection_rule = "semantic_suffix";
         query_window = http_detail::find_pflash_query_window(
@@ -3912,8 +3951,8 @@ std::string HttpServer::apply_pflash_compression(
                 {"content_end", query_content_end},
                 {"query_begin", query_begin},
                 {"query_end", query_window.end},
-                {"query_span_begin", explicit_query_span.begin},
-                {"query_span_end", explicit_query_span.end},
+                {"query_span_begin", query_span.begin},
+                {"query_span_end", query_span.end},
                 {"requested_query_tokens", experiment.query_tokens},
                 {"required_text_count", req.pflash_required.size()},
                 {"expected_query_ids", expected_query_ids},

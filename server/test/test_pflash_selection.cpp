@@ -348,7 +348,7 @@ TEST_CASE(PFlashSelectionFixture, resolver_defaults_to_legacy_arguments) {
     REQUIRE(!config.configured);
     REQUIRE(!config.selection_active);
     REQUIRE(config.mode == PFlashSelectionMode::Legacy);
-    REQUIRE(config.query_parser == PFlashQueryParser::SemanticUser);
+    REQUIRE(config.query_parser == PFlashQueryParser::ArbitraryTail);
     REQUIRE(config.chunk_size == 32);
     REQUIRE(config.query_tokens == 8);
     REQUIRE(std::abs(config.top_p - 0.95) < 1e-12);
@@ -397,11 +397,6 @@ TEST_CASE(PFlashSelectionFixture, any_selection_environment_is_observable_before
 
 TEST_CASE(PFlashSelectionFixture, resolver_selects_explicit_query_parser) {
     CleanPFlashEnv env;
-    // Chat-first default: no override selects the rendered tail parser.
-    const auto fallback = resolve_or_fail(120000, 32);
-    REQUIRE(fallback.configured == false);
-    REQUIRE(fallback.query_parser == PFlashQueryParser::ArbitraryTail);
-
     set_env(kQueryParserEnv, "arbitrary_tail");
     const auto arbitrary = resolve_or_fail(120000, 32);
     REQUIRE(arbitrary.configured);

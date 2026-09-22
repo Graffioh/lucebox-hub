@@ -388,6 +388,16 @@ restores the previous all-layer running-max scorer. The Qwen3.5 attention
 runs dense (`ggml_flash_attn_ext`); the block-sparse FlashPrefill kernels
 still dispatch head dimension 128 only.
 
+The scorer query is the tail (`PFLASH_SELECT_QUERY_TOKENS`, default 8) of the
+latest user turn, located by the model's own chat markers in the rendered
+prompt. Tool output wrapped in a user turn and the generation prompt, with
+its think prefix, never count as that turn. Strict selection keeps the query
+and its turn's role header, and it runs on every turn of a multi-turn chat.
+A request's `pflash_query` string replaces the derived query and keeps its
+whole span; it is meant for benchmarks. `PFLASH_SELECT_QUERY_PARSER=latest_user`
+selects the benchmark parser, which finds the latest user message through
+sentinel renders.
+
 `PFLASH_SEGMENT_PROBE_GGUF` loads a segment probe (schema
 `qwen3_5_0_8b_segment_probe_v1`): a 264K-parameter network on the same block-14
 tap that scores every token for "a new unit of text starts here". With it

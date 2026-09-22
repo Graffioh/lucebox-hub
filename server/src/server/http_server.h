@@ -333,17 +333,22 @@ PFlashTokenSpan pflash_decoded_text_span(
     int end,
     const std::string & needle);
 
-// The last chat message's content span inside a rendered prompt, located by
-// the model's own chat control markers rather than message bookkeeping.
-// ``role_begin`` is the marker opening that message (the header to pin);
+// The chat turn the scorer query comes from, located by the model's own
+// chat control markers in the rendered prompt rather than message
+// bookkeeping: the latest user turn (tool output wrapped in a user turn does
+// not count), else the latest turn with content. An assistant turn left open
+// at the prompt end is the generation prompt -- whatever think or channel
+// prefix the template adds to it -- and never a candidate.
+// ``role_begin`` is the marker opening the turn (the header to pin);
 // ``content_begin`` skips the role-name line ("<|im_start|>user\n") when the
-// family uses generic role markers; ``content_end`` sits before the closing
-// or generation marker. Offsets are token indices in ``prompt``'s own
-// vocabulary. ``markers`` were resolved on ``marker_tokenizer`` (the target
-// model's); its marker strings are searched in the decoded prompt text, so
-// a drafter whose vocabulary lacks the control tokens still maps correctly.
-// Invalid when the prompt carries no chat markers.
-struct PflashChatTailSpan {
+// family uses generic role markers; ``content_end`` sits before the turn's
+// closing marker. Both trim the whitespace the template wraps content in.
+// Offsets are token indices in ``prompt``'s own vocabulary. ``markers`` were
+// resolved on ``marker_tokenizer`` (the target model's); its marker strings
+// are searched in the decoded prompt text, so a drafter whose vocabulary
+// lacks the control tokens still maps correctly. Invalid when the prompt
+// carries no chat markers.
+struct PflashChatTurnSpan {
     int role_begin = -1;
     int content_begin = -1;
     int content_end = -1;
@@ -353,7 +358,7 @@ struct PflashChatTailSpan {
     }
 };
 
-PflashChatTailSpan pflash_last_message_content_span(
+PflashChatTurnSpan pflash_chat_query_turn(
     const Tokenizer & marker_tokenizer,
     const ChatMarkers & markers,
     const Tokenizer & tokenizer,
