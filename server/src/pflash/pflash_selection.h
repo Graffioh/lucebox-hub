@@ -37,9 +37,6 @@ struct PFlashSelectionCandidate {
     int end = 0;
     double score = 0.0;
     bool mandatory = false;
-    // Which document this candidate falls in, for the document prior below.
-    // All-zero (one document) leaves the prior a no-op.
-    size_t document = 0;
 };
 
 struct PFlashSelectionPolicy {
@@ -52,25 +49,7 @@ struct PFlashSelectionPolicy {
     // TopK mode only: how many optional candidates to keep. Must be positive
     // in that mode and is ignored in the others.
     int top_k = 0;
-    // Document prior: an optional candidate is ranked by
-    // ``max(0, score) * document_mass_share ^ doc_prior_exponent``, where a
-    // document's mass is the sum over its candidates of
-    // ``max(0, score) * tokens`` normalised by the prompt total. 0 disables
-    // it and leaves the ranking byte-identical. It applies in every mode, so
-    // it composes with TopK. Fewer than ``kPFlashMinPriorDocuments`` distinct
-    // documents makes it a no-op: with one or two documents the shares carry
-    // no ranking information worth a reweight.
-    double doc_prior_exponent = 0.0;
-    // Attribution: force the first candidate of each of the D highest-mass
-    // documents into the mandatory set before the fill, so a compressed
-    // context never drops the header that identifies a document it quotes.
-    // 0 disables it. It composes with the prior and with TopK, and the forced
-    // headers are charged against the budget like any mandatory candidate.
-    int force_doc_heads = 0;
 };
-
-// Below this many distinct documents the document prior is a no-op.
-constexpr size_t kPFlashMinPriorDocuments = 3;
 
 struct PFlashSelectionResult {
     bool ok = false;
@@ -79,13 +58,6 @@ struct PFlashSelectionResult {
     double retained_mass = 0.0;
     PFlashSelectionStop stop = PFlashSelectionStop::InvalidInput;
     std::string error;
-    // Distinct documents seen among the candidates, and whether the document
-    // prior actually reweighted the ranking (exponent > 0 and enough
-    // documents). Both are recorded in the compression trace.
-    size_t documents = 0;
-    bool doc_prior_applied = false;
-    // Document headers promoted to mandatory by ``force_doc_heads``.
-    int forced_doc_heads = 0;
 };
 
 bool pflash_chunk_is_structurally_required(
@@ -130,8 +102,6 @@ struct PFlashSelectionConfig {
     int query_tokens = 8;
     double top_p = 0.95;
     int top_k = 0;
-    double doc_prior_exponent = 0.0;
-    int force_doc_heads = 0;
     PFlashSegmentation segmentation = PFlashSegmentation::Auto;
     PFlashCandidateScore candidate_score = PFlashCandidateScore::Auto;
     PFlashScorer scorer = PFlashScorer::Head;

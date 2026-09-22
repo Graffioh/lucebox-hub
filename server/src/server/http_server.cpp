@@ -402,101 +402,7 @@ int token_at_offset(const DecodedPrompt & decoded, size_t at) {
     return (int) (upper - decoded.token_begin.begin() - 1);
 }
 
-bool is_digit_run(const std::string & text, size_t at, size_t & after) {
-    after = at;
-    while (after < text.size() && text[after] >= '0' && text[after] <= '9') ++after;
-    return after > at;
-}
-
-// Character offsets where a document marker opens: a line beginning
-// "Document <n>:" or a "[DOC-<n>]" tag anywhere in the line.
-std::vector<size_t> document_marker_offsets(const std::string & text) {
-    static const std::string kLabel = "Document ";
-    static const std::string kTag = "[DOC-";
-    std::vector<size_t> offsets;
-    for (size_t at = text.find(kLabel); at != std::string::npos;
-         at = text.find(kLabel, at + 1)) {
-        if (at != 0 && text[at - 1] != '\n') continue;
-        size_t after = 0;
-        if (!is_digit_run(text, at + kLabel.size(), after)) continue;
-        if (after >= text.size() || text[after] != ':') continue;
-        offsets.push_back(at);
-    }
-    for (size_t at = text.find(kTag); at != std::string::npos;
-         at = text.find(kTag, at + 1)) {
-        size_t after = 0;
-        if (!is_digit_run(text, at + kTag.size(), after)) continue;
-        if (after >= text.size() || text[after] != ']') continue;
-        offsets.push_back(at);
-    }
-    std::sort(offsets.begin(), offsets.end());
-    offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
-    return offsets;
-}
-
-// Tile [0, tokens) from ascending document start tokens. Starts before the
-// first marker stay with the first document, so every token has a document.
-std::vector<PFlashTokenSpan> tile_document_starts(
-        std::vector<int> starts, int tokens) {
-    std::vector<PFlashTokenSpan> spans;
-    std::sort(starts.begin(), starts.end());
-    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
-    while (!starts.empty() && starts.back() >= tokens) starts.pop_back();
-    if ((size_t) starts.size() < luce::pflash::kPFlashMinPriorDocuments) {
-        return spans;
-    }
-    if (starts.front() != 0) starts.insert(starts.begin(), 0);
-    for (size_t index = 0; index < starts.size(); ++index) {
-        const int end = index + 1 < starts.size() ? starts[index + 1] : tokens;
-        spans.push_back({starts[index], end});
-    }
-    return spans;
-}
-
 } // namespace
-
-std::vector<PFlashTokenSpan> pflash_detect_document_spans(
-        const Tokenizer & tokenizer,
-        const std::vector<int32_t> & prompt) {
-    if (prompt.empty()) return {};
-    const DecodedPrompt decoded = decode_prompt_with_offsets(tokenizer, prompt);
-    const auto offsets = document_marker_offsets(decoded.text);
-    if (offsets.size() < luce::pflash::kPFlashMinPriorDocuments) return {};
-    std::vector<int> starts;
-    starts.reserve(offsets.size());
-    for (size_t offset : offsets) {
-        starts.push_back(token_at_offset(decoded, offset));
-    }
-    return tile_document_starts(std::move(starts), (int) prompt.size());
-}
-
-std::vector<PFlashTokenSpan> pflash_document_spans_from_ranges(
-        const Tokenizer & tokenizer,
-        const std::vector<int32_t> & prompt,
-        const std::vector<std::pair<int, int>> & ranges) {
-    if (prompt.empty() ||
-        ranges.size() < luce::pflash::kPFlashMinPriorDocuments) {
-        return {};
-    }
-    const int tokens = (int) prompt.size();
-    bool token_coordinates = true;
-    for (const auto & range : ranges) {
-        if (range.second > tokens) { token_coordinates = false; break; }
-    }
-    std::vector<int> starts;
-    starts.reserve(ranges.size());
-    if (token_coordinates) {
-        for (const auto & range : ranges) starts.push_back(range.first);
-    } else {
-        const DecodedPrompt decoded =
-            decode_prompt_with_offsets(tokenizer, prompt);
-        for (const auto & range : ranges) {
-            if ((size_t) range.first >= decoded.text.size()) continue;
-            starts.push_back(token_at_offset(decoded, (size_t) range.first));
-        }
-    }
-    return tile_document_starts(std::move(starts), tokens);
-}
 
 std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
         std::vector<PFlashTokenSpan> spans) {
@@ -2910,7 +2816,6 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         req.session_id = parse_session_id_from_body(body);
         req.pflash_query = parse_pflash_query_from_body(body);
         req.pflash_required = parse_pflash_required_from_body(body);
-        req.pflash_documents = parse_pflash_documents_from_body(body);
 
         // PPP rearrange (optional): peel ephemeral system banners into a
         // following system message so the first chat boundary is stable.
@@ -3976,30 +3881,10 @@ std::string HttpServer::apply_pflash_compression(
         }
     }
 
-    // Document prior input: client-declared ranges when the request carries
-    // them, otherwise the served prompt's own document markers. Either way
-    // fewer than three documents yields no spans and the prior stays off.
-    std::vector<PFlashTokenSpan> document_spans;
-    if ((experiment.doc_prior_exponent > 0.0 ||
-         experiment.force_doc_heads > 0) && drafter_tokenizer_) {
-        document_spans = req.pflash_documents.empty()
-            ? http_detail::pflash_detect_document_spans(
-                  *drafter_tokenizer_, drafter_ids)
-            : http_detail::pflash_document_spans_from_ranges(
-                  *drafter_tokenizer_, drafter_ids, req.pflash_documents);
-        std::fprintf(stderr,
-            "[pflash-docs] source=%s documents=%zu exponent=%.9g heads=%d\n",
-            req.pflash_documents.empty() ? "detected" : "request",
-            document_spans.size(), experiment.doc_prior_exponent,
-            experiment.force_doc_heads);
-        std::fflush(stderr);
-    }
-
     ModelBackend::CompressRequest compress_request;
     compress_request.input_ids = std::move(drafter_ids);
     compress_request.required_instruction_spans =
         std::move(required_instruction_spans);
-    compress_request.document_spans = std::move(document_spans);
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
     if (query_window.valid()) {

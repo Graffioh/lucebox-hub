@@ -271,9 +271,6 @@ struct ModelBackend {
         // Role-derived instruction structure in drafter-token coordinates.
         // Empty is a valid instruction-free or legacy request.
         std::vector<PFlashTokenSpan> required_instruction_spans;
-        // Document starts in drafter-token coordinates, for the document
-        // prior. Empty is a valid single-document or prior-free request.
-        std::vector<PFlashTokenSpan> document_spans;
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs

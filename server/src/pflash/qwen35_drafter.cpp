@@ -100,8 +100,7 @@ std::vector<int32_t> qwen35_score_and_compress(
     int score_query_end,
     const luce::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
-    std::vector<float> * token_scores_out,
-    const std::vector<PFlashTokenSpan> * document_spans) {
+    std::vector<float> * token_scores_out) {
 
     const int S = (int)ids.size();
     const int hidden = w.n_embd;
@@ -380,10 +379,7 @@ std::vector<int32_t> qwen35_score_and_compress(
     if (experiment.selection_active) {
         return select_pflash_chunks(
             ids, smooth_score, keep_ratio, n_lookahead, score_query_end,
-            pk, experiment, required_instruction_spans, false, true,
-            /*segments=*/nullptr, /*density=*/false,
-            /*other_token_scores=*/nullptr, /*split_fraction=*/0.0,
-            document_spans);
+            pk, experiment, required_instruction_spans, false, true);
     }
     
     std::vector<std::pair<float, int>> chunk_means;
@@ -537,8 +533,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_mass_out,
     std::vector<PFlashTokenSpan> * segments_out,
-    bool * density_out,
-    const std::vector<PFlashTokenSpan> * document_spans) {
+    bool * density_out) {
 
     TargetWeights & w = st.weights;
     const int S = (int)ids.size();
@@ -924,9 +919,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         ids, token_mass, keep_ratio, n_lookahead, score_query_end,
         /*pool_kernel=*/1, experiment, required_instruction_spans,
         /*direct_mass=*/true, /*write_trace=*/true,
-        segments.empty() ? nullptr : &segments, density,
-        /*other_token_scores=*/nullptr, /*split_fraction=*/0.0,
-        document_spans);
+        segments.empty() ? nullptr : &segments, density);
 }
 
 std::vector<int32_t> qwen35_drafter_score_and_compress(
@@ -938,8 +931,7 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     int pool_kernel,
     int score_query_end,
     const luce::pflash::PFlashSelectionConfig & experiment,
-    const std::vector<PFlashTokenSpan> & required_instruction_spans,
-    const std::vector<PFlashTokenSpan> & document_spans) {
+    const std::vector<PFlashTokenSpan> & required_instruction_spans) {
     if (!ctx.state) {
         set_last_error("qwen35 drafter state missing");
         return {};
@@ -961,14 +953,14 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
         if (qwen35_strict_score_and_compress(
                 *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
                 required_instruction_spans, &head_mass, &head_segments,
-                &head_density, &document_spans).empty()) {
+                &head_density).empty()) {
             return {};
         }
         std::vector<float> other_scores;
         if (qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
                                       n_lookahead, pool_kernel, score_query_end,
                                       experiment, required_instruction_spans,
-                                      &other_scores, &document_spans).empty()) {
+                                      &other_scores).empty()) {
             return {};
         }
         if (other_scores.size() != head_mass.size()) {
@@ -985,14 +977,12 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
             /*pool_kernel=*/1, experiment, required_instruction_spans,
             /*direct_mass=*/true, /*write_trace=*/true,
             head_segments.empty() ? nullptr : &head_segments, head_density,
-            &other_scores, experiment.split_fraction, &document_spans);
+            &other_scores, experiment.split_fraction);
     }
     if (experiment.selection_active && !force_legacy) {
         return qwen35_strict_score_and_compress(
             *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
-            required_instruction_spans, /*token_mass_out=*/nullptr,
-            /*segments_out=*/nullptr, /*density_out=*/nullptr,
-            &document_spans);
+            required_instruction_spans);
     }
     if (st->head_loaded && !experiment.selection_active) {
         set_last_error("Qwen3.5 scoring head requires strict selection");
@@ -1001,9 +991,7 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
                                      n_lookahead, pool_kernel, score_query_end,
                                      experiment,
-                                     required_instruction_spans,
-                                     /*token_scores_out=*/nullptr,
-                                     &document_spans);
+                                     required_instruction_spans);
 }
 
 } // namespace luce::common

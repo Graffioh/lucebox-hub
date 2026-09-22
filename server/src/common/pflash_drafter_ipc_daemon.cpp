@@ -70,9 +70,6 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
                 request.score_query_tokens, /*pool_kernel=*/13,
                 score_query_end,
                 request.required_instruction_spans);
-            // The IPC compress protocol carries no document spans, so the
-            // document prior (PFLASH_SELECT_DOC_PRIOR) is inert on this path
-            // until the wire format gains them.
             if (compressed.empty()) {
                 std::fprintf(stderr, "[pflash-ipc-daemon] compress returned empty\n");
                 stream_status(stream_fd, -1);

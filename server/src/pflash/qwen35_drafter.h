@@ -76,8 +76,7 @@ std::vector<int32_t> qwen35_score_and_compress(
     int score_query_end,
     const luce::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
-    std::vector<float> * token_scores_out = nullptr,
-    const std::vector<PFlashTokenSpan> * document_spans = nullptr);
+    std::vector<float> * token_scores_out = nullptr);
 
 // The block-15 scoring head under strict budget selection.
 std::vector<int32_t> qwen35_strict_score_and_compress(
@@ -90,8 +89,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_mass_out = nullptr,
     std::vector<PFlashTokenSpan> * segments_out = nullptr,
-    bool * density_out = nullptr,
-    const std::vector<PFlashTokenSpan> * document_spans = nullptr);
+    bool * density_out = nullptr);
 
 // Arch dispatch target of drafter_score_and_compress.
 std::vector<int32_t> qwen35_drafter_score_and_compress(
@@ -103,7 +101,6 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     int pool_kernel,
     int score_query_end,
     const luce::pflash::PFlashSelectionConfig & experiment,
-    const std::vector<PFlashTokenSpan> & required_instruction_spans,
-    const std::vector<PFlashTokenSpan> & document_spans = {});
+    const std::vector<PFlashTokenSpan> & required_instruction_spans);
 
 } // namespace luce::common

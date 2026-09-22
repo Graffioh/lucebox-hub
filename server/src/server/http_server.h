@@ -376,27 +376,6 @@ int pflash_query_search_begin_from_sentinel(
 std::string pflash_token_fingerprint(
     const std::vector<int32_t> & ids);
 
-// Document starts detected in the served prompt, in prompt-token
-// coordinates. A line matching ``Document <n>:`` or a ``[DOC-<n>]`` tag opens
-// a document; the returned spans tile [0, prompt.size()) so every token
-// belongs to exactly one document. Fewer than
-// ``luce::pflash::kPFlashMinPriorDocuments`` starts returns empty, which
-// leaves the document prior a no-op -- with one or two documents the mass
-// shares carry no ranking information worth a reweight.
-std::vector<PFlashTokenSpan> pflash_detect_document_spans(
-    const Tokenizer & tokenizer,
-    const std::vector<int32_t> & prompt);
-
-// Turn client-declared ``pflash_documents`` ranges into document spans.
-// Ranges are token indices when every value fits inside the prompt's token
-// count, and character offsets into the decoded prompt text otherwise. The
-// result tiles [0, prompt.size()) from the range starts, exactly like the
-// detected form. Returns empty when the ranges are unusable or too few.
-std::vector<PFlashTokenSpan> pflash_document_spans_from_ranges(
-    const Tokenizer & tokenizer,
-    const std::vector<int32_t> & prompt,
-    const std::vector<std::pair<int, int>> & ranges);
-
 bool pflash_full_cache_restore_allowed(
     bool selection_environment_present) noexcept;
 int pflash_target_token_ceiling(
@@ -452,9 +431,6 @@ struct ParsedRequest {
     // compression (e.g. an answer-format directive embedded in a user
     // message). Each occurrence is mapped and retained as a mandatory span.
     std::vector<std::string>  pflash_required;
-    // Client-declared document ranges for the document prior. Empty falls
-    // back to detecting the served prompt's document markers.
-    std::vector<std::pair<int, int>> pflash_documents;
     DiskPrefixCachePolicy     disk_cache_policy;
     // PPP: stable pin cut for tool-heavy requests (0 = use default boundary).
     int                       pin_end_token = 0;
@@ -852,37 +828,6 @@ inline std::vector<std::string> parse_pflash_required_from_body(const json & bod
     if (!field) return result;
     for (const auto & entry : *field) {
         if (entry.is_string()) result.push_back(entry.get<std::string>());
-    }
-    return result;
-}
-
-// PFlash: client-declared document ranges for the document prior, as a list
-// of two-element [begin, end] arrays. Accepted at the top level or under
-// extra_body, like pflash_query. Absent means the runtime detects documents
-// from the served prompt's markers instead.
-inline std::vector<std::pair<int, int>> parse_pflash_documents_from_body(
-        const json & body) {
-    const json * field = nullptr;
-    if (body.contains("extra_body")) {
-        const auto & eb = body["extra_body"];
-        if (eb.is_object() && eb.contains("pflash_documents") &&
-            eb["pflash_documents"].is_array()) {
-            field = &eb["pflash_documents"];
-        }
-    }
-    if (!field && body.contains("pflash_documents") &&
-        body["pflash_documents"].is_array()) {
-        field = &body["pflash_documents"];
-    }
-    std::vector<std::pair<int, int>> result;
-    if (!field) return result;
-    for (const auto & entry : *field) {
-        if (!entry.is_array() || entry.size() != 2) continue;
-        if (!entry[0].is_number_integer() || !entry[1].is_number_integer()) continue;
-        const int begin = entry[0].get<int>();
-        const int end = entry[1].get<int>();
-        if (begin < 0 || end <= begin) continue;
-        result.push_back({begin, end});
     }
     return result;
 }
