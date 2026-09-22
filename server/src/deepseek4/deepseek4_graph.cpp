@@ -2067,8 +2067,11 @@ static ggml_tensor * build_mla_output_projection(
         ctx, L.attn_output_a, group_dim, w.n_lora_o, w.n_out_group);
     ggml_tensor * attn_low = ds4_mul_mat_columns(ctx, out_a_3d, attn_out, projection_columns);
 
+    // The grouped source layout is read by MMQ's activation quantizer and by
+    // nothing else, so a projection stored unquantized (BF16 attention from a
+    // converter that leaves dense tensors alone) takes the plain path.
     const bool grouped_output_projection =
-        allow_grouped && n_tokens > 1 &&
+        allow_grouped && n_tokens > 1 && ggml_is_quantized(L.attn_output_b->type) &&
         !ds4_env_flag("LUCE_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
     if (grouped_output_projection) {
         return ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);
