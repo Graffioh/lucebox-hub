@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstdio>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -21,7 +21,7 @@ constexpr int kMinSegment = 4096;
 bool score_tokens_direct(DrafterContext & ctx, const std::vector<int32_t> & ids,
                          std::vector<float> & out) {
     if (!ctx.state) return false;
-    const dflash::pflash::PFlashSelectionConfig experiment;
+    const luce::pflash::PFlashSelectionConfig experiment;
     std::vector<float> scores;
     if (qwen35_score_and_compress(ctx.state->weights, ids,
                                   /*keep_ratio=*/1.0f, /*chunk_size=*/64,
@@ -202,4 +202,4 @@ bool KvFlashCrossTokScorer::score_chunks(const std::vector<int32_t> & ids,
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

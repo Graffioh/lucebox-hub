@@ -8,7 +8,7 @@ non-streaming completions, and non-pausing admission.
 
 Usage:
     # Start server first with concurrent serving enabled:
-    ./server/build/dflash_server <qwen36-model.gguf> --port 9099 \
+    ./server/build/luce_server <qwen36-model.gguf> --port 9099 \
         --paged-attention --max-concurrency 3
 
     # Then run tests:
@@ -109,7 +109,7 @@ class ParallelTestSuite:
 
     def _chat_body(self, prompt: str, max_tokens: int, stream: bool) -> dict:
         return {
-            "model": "dflash",
+            "model": "luce",
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": 0.0,
@@ -573,7 +573,7 @@ class ParallelTestSuite:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Concurrent serving tests for dflash_server "
+        description="Concurrent serving tests for luce_server "
                     "(run against a server started with "
                     "--paged-attention --max-concurrency N)")
     parser.add_argument("--base-url", default="http://127.0.0.1:9099",
@@ -598,7 +598,7 @@ def main():
     except Exception as e:
         print(f"ERROR: server not reachable at {base}: {e}")
         print("Start it first, e.g.:")
-        print(f"  ./server/build/dflash_server <model.gguf> --port 9099 "
+        print(f"  ./server/build/luce_server <model.gguf> --port 9099 "
               f"--paged-attention --max-concurrency {args.max_concurrency}")
         sys.exit(2)
 

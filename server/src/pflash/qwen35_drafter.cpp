@@ -34,7 +34,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -56,32 +56,32 @@ static void build_causal_mask_f16(std::vector<uint16_t> & out, int kv_len, int n
     }
 }
 
-// create_target_cache honours DFLASH27B_KV_TQ3; the drafter cache never wants
+// create_target_cache honours LUCE_KV_TQ3; the drafter cache never wants
 // the TurboQuant rotation, so force it off while the cache is created.
 struct ScopedKvTq3Off {
     ScopedKvTq3Off() {
 #if defined(_WIN32)
         char * raw = nullptr;
         size_t len = 0;
-        _dupenv_s(&raw, &len, "DFLASH27B_KV_TQ3");
+        _dupenv_s(&raw, &len, "LUCE_KV_TQ3");
         had_ = raw != nullptr;
         old_ = had_ ? raw : "";
         free(raw);
-        _putenv_s("DFLASH27B_KV_TQ3", "0");
+        _putenv_s("LUCE_KV_TQ3", "0");
 #else
-        const char * raw = std::getenv("DFLASH27B_KV_TQ3");
+        const char * raw = std::getenv("LUCE_KV_TQ3");
         had_ = raw != nullptr;
         old_ = had_ ? raw : "";
-        setenv("DFLASH27B_KV_TQ3", "0", 1);
+        setenv("LUCE_KV_TQ3", "0", 1);
 #endif
     }
     ~ScopedKvTq3Off() {
 #if defined(_WIN32)
         // _putenv_s with empty value removes the variable on MSVCRT.
-        _putenv_s("DFLASH27B_KV_TQ3", had_ ? old_.c_str() : "");
+        _putenv_s("LUCE_KV_TQ3", had_ ? old_.c_str() : "");
 #else
-        if (had_) setenv("DFLASH27B_KV_TQ3", old_.c_str(), 1);
-        else unsetenv("DFLASH27B_KV_TQ3");
+        if (had_) setenv("LUCE_KV_TQ3", old_.c_str(), 1);
+        else unsetenv("LUCE_KV_TQ3");
 #endif
     }
     bool had_ = false;
@@ -98,7 +98,7 @@ std::vector<int32_t> qwen35_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const dflash::pflash::PFlashSelectionConfig & experiment,
+    const luce::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_scores_out,
     const std::vector<PFlashTokenSpan> * document_spans) {
@@ -357,7 +357,7 @@ std::vector<int32_t> qwen35_score_and_compress(
     // Caller pool_kernel takes precedence; if zero/negative, fall back to env or 5.
     const int pk = (pool_kernel > 0)
         ? pool_kernel
-        : std::max(3, env_int("DFLASH_COMPRESS_POOL_KERNEL", 5));
+        : std::max(3, env_int("LUCE_COMPRESS_POOL_KERNEL", 5));
     std::vector<float> smoothed((size_t)S, 0.0f);
     int half = pk / 2;
     for (int j = 0; j < S; ++j) {
@@ -399,8 +399,8 @@ std::vector<int32_t> qwen35_score_and_compress(
     int count = 0;
     // Scale head/tail forced chunks so they don't crowd out top-K scoring.
     {
-        const int h_raw = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
-        const int t_raw = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
+        const int h_raw = env_int("LUCE_COMPRESS_HEAD_CHUNKS", 8);
+        const int t_raw = env_int("LUCE_COMPRESS_TAIL_CHUNKS", 24);
         int h_n = h_raw, t_n = t_raw;
         if (h_n + t_n >= n_keep) {
             const int budget = std::max(1, n_keep - 1);
@@ -411,12 +411,12 @@ std::vector<int32_t> qwen35_score_and_compress(
         for (int c = std::max(0, n_chunks - t_n); c < n_chunks; ++c) if (!selected[(size_t)c]) { selected[(size_t)c] = 1; ++count; }
     }
 
-    const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
+    const int query_tokens = env_int("LUCE_COMPRESS_QUERY_TOKENS", 96);
     const auto ap = resolve_anchor_params(n_chunks,
         env_int("PFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
         env_int("PFLASH_COMPRESS_MAX_ANCHOR_HITS", -1),
-        env_int("DFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
-        env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", -1));
+        env_int("LUCE_COMPRESS_ANCHOR_RADIUS",   -1),
+        env_int("LUCE_COMPRESS_MAX_ANCHOR_HITS", -1));
     const int anchor_radius   = ap.radius;
     const int max_anchor_hits = ap.max_hits;
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
@@ -454,9 +454,9 @@ std::vector<int32_t> qwen35_score_and_compress(
     // Global aggregation tasks often depend on repeated rare tokens that do
     // not appear in the final query. Preserve high-frequency-but-not-filler
     // token chunks before filling with model-score top-K.
-    const int repeat_min = env_int("DFLASH_COMPRESS_REPEAT_MIN", 4);
-    const int repeat_max = env_int("DFLASH_COMPRESS_REPEAT_MAX", 32);
-    const int repeat_limit = env_int("DFLASH_COMPRESS_REPEAT_CHUNKS", n_keep);
+    const int repeat_min = env_int("LUCE_COMPRESS_REPEAT_MIN", 4);
+    const int repeat_max = env_int("LUCE_COMPRESS_REPEAT_MAX", 32);
+    const int repeat_limit = env_int("LUCE_COMPRESS_REPEAT_CHUNKS", n_keep);
     if (repeat_min > 1 && count < repeat_limit) {
         std::unordered_map<int32_t, int> freq;
         freq.reserve((size_t)S);
@@ -533,7 +533,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     float keep_ratio,
     int n_lookahead,
     int score_query_end,
-    const dflash::pflash::PFlashSelectionConfig & experiment,
+    const luce::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_mass_out,
     std::vector<PFlashTokenSpan> * segments_out,
@@ -700,7 +700,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     ggml_tensor * logits = ggml_new_tensor_3d(lctx, GGML_TYPE_F32, S, n_lookahead, H);
     ggml_tensor * mask = ggml_new_tensor_2d(lctx, GGML_TYPE_F32, S, n_lookahead);
     const bool use_probe = st.probe_loaded &&
-        experiment.segmentation != dflash::pflash::PFlashSegmentation::Fixed;
+        experiment.segmentation != luce::pflash::PFlashSegmentation::Fixed;
     ggml_tensor * probe_logits = use_probe
         ? ggml_new_tensor_1d(lctx, GGML_TYPE_F32, S) : nullptr;
     ggml_tensor * subunit_logits = use_probe && st.probe_sub_fc2_w
@@ -847,7 +847,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     std::fflush(stderr);
 
     std::vector<PFlashTokenSpan> segments;
-    bool density = experiment.candidate_score == dflash::pflash::PFlashCandidateScore::Density;
+    bool density = experiment.candidate_score == luce::pflash::PFlashCandidateScore::Density;
     if (use_probe) {
         // Tap-count smoothing over the raw logits (torch Conv1d, symmetric
         // padding) plus the residual logit, then sigmoid: the boundary score
@@ -886,9 +886,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             if (boundary[(size_t) t] > st.probe_threshold) ++boundaries_in_context;
         }
         const bool forced_probe =
-            experiment.segmentation == dflash::pflash::PFlashSegmentation::Probe;
+            experiment.segmentation == luce::pflash::PFlashSegmentation::Probe;
         if (boundaries_in_context >= 4 || forced_probe) {
-            segments = dflash::pflash::pflash_probe_segments(
+            segments = luce::pflash::pflash_probe_segments(
                 boundary, S, st.probe_threshold, st.probe_min_segment,
                 st.probe_max_segment, forced, split_scores);
         }
@@ -898,7 +898,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                 "falling back to fixed %d-token chunks\n",
                 boundaries_in_context, experiment.chunk_size);
         } else {
-            if (experiment.candidate_score == dflash::pflash::PFlashCandidateScore::Auto) {
+            if (experiment.candidate_score == luce::pflash::PFlashCandidateScore::Auto) {
                 density = true;
             }
             std::fprintf(stderr,
@@ -937,7 +937,7 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const dflash::pflash::PFlashSelectionConfig & experiment,
+    const luce::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     const std::vector<PFlashTokenSpan> & document_spans) {
     if (!ctx.state) {
@@ -950,9 +950,9 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     // selection or when PFLASH_QWEN35_LEGACY_SCORER=1 forces it.
     const char * legacy_scorer = std::getenv("PFLASH_QWEN35_LEGACY_SCORER");
     const bool force_legacy = (legacy_scorer && std::string(legacy_scorer) == "1") ||
-        experiment.scorer == dflash::pflash::PFlashScorer::Legacy;
+        experiment.scorer == luce::pflash::PFlashScorer::Legacy;
     if (experiment.selection_active &&
-        experiment.scorer == dflash::pflash::PFlashScorer::Split) {
+        experiment.scorer == luce::pflash::PFlashScorer::Split) {
         // Two scorers, one budget: the block-15 head ranks (and segments)
         // first, the all-layer running-max scorer fills the remainder.
         std::vector<float> head_mass;
@@ -1006,4 +1006,4 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
                                      &document_spans);
 }
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -17,7 +17,7 @@
 //   - conv_state[48]             : 1D conv recurrence state, f32
 //   - ssm_state[48]              : delta-net recurrent state (head_v^2 × H_v), f32
 //
-// Key dimensions (all hardcoded via DFLASH27B_* macros):
+// Key dimensions (all hardcoded via LUCE_* macros):
 //   n_embd           = 5120
 //   n_head           = 24    head_dim = 256   q_dim = n_head * head_dim = 6144
 //   n_head_kv        = 4     kv_dim = 4 * 256 = 1024
@@ -50,10 +50,10 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── Local qwen35 constants (from the GGUF, hardcoded for this model) ─
-// These complement the DFLASH27B_* macros in dflash27b.h with qwen35-specific
+// These complement the LUCE_* macros in luce.h with qwen35-specific
 // hparams that differ from the draft (which uses plain Qwen3 dims).
 namespace q35 {
 constexpr int N_HEAD        = 24;
@@ -156,7 +156,7 @@ bool create_target_cache_partial(const TargetWeights & w,
     out.cur_pos = 0;
     out.n_seq_slots = n_seq_slots;
     if (max_verify_tokens <= 0) {
-        max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
+        max_verify_tokens = LUCE_DRAFT_BLOCK_SIZE;
     }
 
     const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
@@ -177,7 +177,7 @@ bool create_target_cache_partial(const TargetWeights & w,
     // KV cache element types (resolved from env; aborts on unsupported pair).
     ggml_type kv_k_type = GGML_TYPE_Q8_0;
     ggml_type kv_v_type = GGML_TYPE_Q8_0;
-    dflash::resolve_kv_types(kv_k_type, kv_v_type, cache_type_k, cache_type_v);
+    luce::resolve_kv_types(kv_k_type, kv_v_type, cache_type_k, cache_type_v);
     out.kv_k_type = kv_k_type;
     out.kv_v_type = kv_v_type;
 
@@ -366,7 +366,7 @@ bool create_target_cache_partial(const TargetWeights & w,
         }
 
         out.rollback_buf = ggml_backend_alloc_ctx_tensors(out.rollback_ctx, backend);
-        if (std::getenv("DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG")) {
+        if (std::getenv("LUCE_SPLIT_CHAIN_ROLLBACK_DIAG")) {
             int owned_delta_layers = 0;
             for (int il = 0; il < w.n_layer; ++il) {
                 if (((il + 1) % w.full_attention_interval) != 0 && il >= layer_begin && il < layer_end) {
@@ -590,7 +590,7 @@ bool migrate_prefill_cache(const TargetWeights & w,
     const int head_v_dim = w.ssm_d_inner / w.ssm_dt_rank;
     const int conv_ch = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
     if (max_verify_tokens <= 0) {
-        max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
+        max_verify_tokens = LUCE_DRAFT_BLOCK_SIZE;
     }
 
     cache.ssm_state_snap.assign(n_delta, nullptr);
@@ -622,7 +622,7 @@ bool migrate_prefill_cache(const TargetWeights & w,
 
     // F32 checkpoints are the default: the rollback-from-first-accepted-token
     // path depends on them and is the tuned decode path. They cost VRAM
-    // (+1.11 GiB on Qwen3.8-27B at 128K), so DFLASH_SINGLE_CHAIN_CHECKPOINT_F32=0
+    // (+1.11 GiB on Qwen3.8-27B at 128K), so LUCE_SINGLE_CHAIN_CHECKPOINT_F32=0
     // restores the F16 representation and its rollback threshold of 5.
     const ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
     const ggml_type checkpoint_type = rollback_policy.checkpoint_f32
@@ -859,10 +859,10 @@ bool specla_commit_accepted(TargetCache & cache,
     const int64_t HL  = H * n_delta;
 
     // Fast path: one fused kernel updates every layer's state in place.
-    // Escape hatch DFLASH_SPECLA_FUSED_COMMIT=0 falls back to the ggml-graph
+    // Escape hatch LUCE_SPECLA_FUSED_COMMIT=0 falls back to the ggml-graph
     // implementation below (also the fallback on any launch failure).
     static const bool kFusedCommit = []() {
-        const char * v = std::getenv("DFLASH_SPECLA_FUSED_COMMIT");
+        const char * v = std::getenv("LUCE_SPECLA_FUSED_COMMIT");
         return v == nullptr || v[0] != '0';
     }();
     bool ok = false;
@@ -1618,10 +1618,10 @@ static ggml_tensor * build_delta_net_block(
 
     // Fused kernels (single-sequence chain path only): the conv step and the
     // gate prep are folded into the ssm_conv_step / gated_delta_net kernels
-    // instead of 6-8 tiny graph ops per layer. DFLASH_QWEN35_NO_FUSED_KERNELS=1
+    // instead of 6-8 tiny graph ops per layer. LUCE_QWEN35_NO_FUSED_KERNELS=1
     // keeps the op-by-op graph for A/B checks. The chunked delta-net path
     // (opt-in) needs the materialized gates, so it is decided here too.
-    static const bool fused_kernels_env = std::getenv("DFLASH_QWEN35_NO_FUSED_KERNELS") == nullptr;
+    static const bool fused_kernels_env = std::getenv("LUCE_QWEN35_NO_FUSED_KERNELS") == nullptr;
     // Chunked delta-net (llama.cpp build_delta_net_chunking port, verified
     // ~1e-6 vs the sequential kernel): re-expresses the recurrence as
     // chunk-parallel matmuls. Prefill-shaped calls only; decode, verify
@@ -1629,10 +1629,10 @@ static ggml_tensor * build_delta_net_block(
     // sequential fused kernel. OFF by default: on gfx1201 the sequential
     // kernel wins at a 512-token ubatch (514 ms vs 667 ms per forward; the
     // ~20k-node chunk graph costs more in launches than it saves in GDN
-    // serialization). DFLASH27B_CHUNKED=1 opts in for A/B on other
+    // serialization). LUCE_CHUNKED=1 opts in for A/B on other
     // hardware.
     static const bool chunked_env_on = []() {
-        const char * s_env = std::getenv("DFLASH27B_CHUNKED");
+        const char * s_env = std::getenv("LUCE_CHUNKED");
         return s_env && std::atoi(s_env) == 1;
     }();
 
@@ -1757,7 +1757,7 @@ static ggml_tensor * build_delta_net_block(
     // state nor per-token intermediates (the commit replays the log); the
     // gates are derived in the kernel from strided views of the stacked
     // projection. Every kernel keeps the op-by-op arithmetic, so the outputs
-    // are bit-identical. DFLASH_QWEN35_NO_FUSED_KERNELS=1 restores the
+    // are bit-identical. LUCE_QWEN35_NO_FUSED_KERNELS=1 restores the
     // op-by-op graph.
     const bool verify_fused = fused_kernels_env && fused_kernel_backend &&
         seg_active && seg_tree && capture_chain_commit && seg_parent_ids &&
@@ -2059,7 +2059,7 @@ static ggml_tensor * build_delta_net_block(
     // and 48 delta-net layers it eliminates the serial per-token loop that
     // dominates target-verify compute at long ctx. Currently OFF by
     // default — port produces correct shape but slightly wrong final state,
-    // causing AL degradation and loopy output. Set DFLASH27B_CHUNKED=1 to
+    // causing AL degradation and loopy output. Set LUCE_CHUNKED=1 to
     // opt in for A/B testing while debugging.
     ggml_tensor * output = nullptr;
 
@@ -3574,4 +3574,4 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
 }
 
 
-} // namespace dflash::common
+} // namespace luce::common

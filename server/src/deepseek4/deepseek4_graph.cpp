@@ -49,7 +49,7 @@
 #include <immintrin.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 ggml_tensor * deepseek4_preserve_raw_rows(
         ggml_context * ctx, ggml_tensor * raw_kv, ggml_tensor * rows) {
@@ -107,7 +107,7 @@ static constexpr int DS4_FUSED_VERIFY_F16_F32_KV_MAX_ATTN = 512;
 
 static int ds4_effective_expert_count(const DeepSeek4Weights & w) {
     int requested = w.routed_expert_top_k;
-    if (const char * value = std::getenv("DFLASH_DS4_TOPK")) {
+    if (const char * value = std::getenv("LUCE_DS4_TOPK")) {
         const int env_requested = std::atoi(value);
         if (env_requested > 0) requested = env_requested;
     }
@@ -498,7 +498,7 @@ struct DeepSeek4CachedDecodeAttnGraph {
 
 static bool ds4_moe_fused_combine_enabled() {
     static const bool enabled = []() {
-        const char * val = getenv("DFLASH_MOE_FUSED_COMBINE");
+        const char * val = getenv("LUCE_MOE_FUSED_COMBINE");
         if (!val) return true; // Default ON in production
         return atoi(val) != 0;
     }();
@@ -1721,7 +1721,7 @@ static int ds4_comp_rows_used(const ggml_tensor * comp_cache, int n_cached, int 
 static int ds4_comp_pad_stride() {
     static const int stride = [] {
         constexpr int default_stride = 16;
-        const char * raw = std::getenv("DFLASH_DS4_COMP_PAD_STRIDE");
+        const char * raw = std::getenv("LUCE_DS4_COMP_PAD_STRIDE");
         if (!raw || !*raw) return default_stride;
         const int requested = std::atoi(raw);
         switch (requested) {
@@ -1732,7 +1732,7 @@ static int ds4_comp_pad_stride() {
                 return requested;
             default:
                 std::fprintf(stderr,
-                    "[deepseek4] invalid DFLASH_DS4_COMP_PAD_STRIDE=%s; "
+                    "[deepseek4] invalid LUCE_DS4_COMP_PAD_STRIDE=%s; "
                     "using %d\n",
                     raw, default_stride);
                 return default_stride;
@@ -1841,10 +1841,10 @@ static ggml_tensor * build_indexer_topk(
     // once avoids converting the same query again in every compressed-row
     // tile; decode and verify batches keep the F32 query, where the cast would
     // be pure overhead. Part of the gfx1151 sparse-prefill profile;
-    // DFLASH_DS4_INDEXER_F16_Q=0 is the kill switch.
+    // LUCE_DS4_INDEXER_F16_Q=0 is the kill switch.
     constexpr int indexer_f16_query_min_scored = 256;
     if (n_scored >= indexer_f16_query_min_scored &&
-        ds4_env_flag("DFLASH_DS4_INDEXER_F16_Q")) {
+        ds4_env_flag("LUCE_DS4_INDEXER_F16_Q")) {
         index_q = ggml_cast(ctx, index_q, GGML_TYPE_F16);
     }
 
@@ -2066,7 +2066,7 @@ static ggml_tensor * build_mla_output_projection(
 
     const bool grouped_output_projection =
         allow_grouped && n_tokens > 1 &&
-        !ds4_env_flag("DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
+        !ds4_env_flag("LUCE_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
     if (grouped_output_projection) {
         return ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);
     }
@@ -2206,10 +2206,10 @@ static ggml_tensor * build_mla_attention_lane_core(
     // j > i, must see the compressed-row count as of its own position, and —
     // once the ring has wrapped — must still see the OLD contents of ring
     // slots that later batch tokens overwrite. Default ON for multi-token
-    // steps on this path; DFLASH_DS4_NO_CAUSAL_VERIFY=1 restores the legacy
+    // steps on this path; LUCE_DS4_NO_CAUSAL_VERIFY=1 restores the legacy
     // (bidirectional) behavior for A/B comparison.
     const bool causal_batch = (n_tokens > 1) && !cached_inputs && f32_array_inputs &&
-                              !ds4_env_flag("DFLASH_DS4_NO_CAUSAL_VERIFY");
+                              !ds4_env_flag("LUCE_DS4_NO_CAUSAL_VERIFY");
     const bool layer_major_batch =
         causal_batch && attention_impl != DeepSeek4AttentionImpl::Explicit;
     ggml_tensor * old_rows_scratch = nullptr;
@@ -2471,13 +2471,13 @@ static ggml_tensor * build_mla_attention_lane_core(
     // F16 K/V transport for long sparse prefill. F16 rounding of the prefill
     // rows changes the DSpark target features, so it is only used where it
     // was qualified: the gfx1151 sparse-prefill profile defaults it on and
-    // DFLASH_DS4_PREFILL_F16_KV_ALL=0 is the kill switch; everywhere else
+    // LUCE_DS4_PREFILL_F16_KV_ALL=0 is the kill switch; everywhere else
     // prefill keeps the F32 rows.
     const bool f16_sparse_prefill =
         attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
         layer_major_batch && !gathered_history &&
         n_tokens > w.n_swa &&
-        ds4_env_flag("DFLASH_DS4_PREFILL_F16_KV_ALL");
+        ds4_env_flag("LUCE_DS4_PREFILL_F16_KV_ALL");
     // Stable path reads the full physical ring (masking not-yet-written slots)
     // and a padded compressed-row span; the plain path reads only valid rows.
     const int n_raw = gathered_history ? lane.n_raw_history + n_tokens
@@ -2666,12 +2666,12 @@ static ggml_tensor * build_mla_attention_lane_core(
     // Keep every other attention shape on the explicit mask contract.
     const bool direct_indexer_topk = indexer_topk &&
         (maskless_sparse_prefill ||
-         ds4_env_flag("DFLASH_DS4_DIRECT_INDEXER_TOPK"));
+         ds4_env_flag("LUCE_DS4_DIRECT_INDEXER_TOPK"));
     // Layer-major, non-indexed layers can skip the quadratic causal mask:
     // their KV layout is [prior chronological window | current batch], so
     // the kernel derives the exact causal window from kv_start and the query
     // index (ggml_flash_attn_ext_set_ds4_causal_ratio). Part of the gfx1151
-    // sparse-prefill profile (DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL=0 is the
+    // sparse-prefill profile (LUCE_DS4_DIRECT_CONTIGUOUS_CAUSAL=0 is the
     // kill switch); measured +10% prefill at 8K with identical output.
     //
     // Admission repeats the kernel's own checks so the graph never emits an
@@ -2705,7 +2705,7 @@ static ggml_tensor * build_mla_attention_lane_core(
         (ratio == 0 || ratio > 1) &&
         (analytic_causal_shmem <= analytic_causal_lds_limit ||
          streaming_dense_high_ratio) &&
-        ds4_env_flag("DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL");
+        ds4_env_flag("LUCE_DS4_DIRECT_CONTIGUOUS_CAUSAL");
     const bool exact_numerical_bands =
         attention_impl == DeepSeek4AttentionImpl::DenseFlash &&
         causal_batch &&
@@ -3543,7 +3543,7 @@ static bool ds4_try_gpu_hc_pre(float * working,
                                int n_hc,
                                int sinkhorn_iters,
                                float hc_eps) {
-#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (!fn_tensor || !fn_tensor->data) {
         return false;
     }
@@ -3591,7 +3591,7 @@ static bool ds4_try_gpu_hc_pre_device(ggml_tensor * working,
                                       int n_hc,
                                       int sinkhorn_iters,
                                       float hc_eps) {
-#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     const void * fn_device = fn_device_override ? fn_device_override : (fn_tensor ? fn_tensor->data : nullptr);
     if (!working || !post || !comb || !hc_state || !fn_device || !scale_data || !base_data ||
         !working->data || !post->data || !comb->data || !hc_state->data) {
@@ -4477,7 +4477,7 @@ static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
 }
 
 static bool ds4_hc_cuda_enabled() {
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
     return true;
 #else
     return false;
@@ -4491,7 +4491,7 @@ static HcPreResult hc_pre_auto(const float * hc_state,
                                int n_hc,
                                int sinkhorn_iters,
                                float hc_eps) {
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
     if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data) {
         float mix[24];
         if (deepseek4_cuda_hc_pre_mix(hc_state, fn_tensor->data,
@@ -4523,7 +4523,7 @@ static void hc_pre_auto_into(float * working,
                              float * flat,
                              float * mix_scratch,
                              bool serial_fn) {
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
     if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data) {
         float mix[24];
         if (deepseek4_cuda_hc_pre_mix(hc_state, fn_tensor->data,
@@ -5344,7 +5344,7 @@ static bool ds4_fused_decode_enabled(const DeepSeek4Weights & w) {
     // loaded weights. Keep the old environment spelling as a compatibility
     // fallback for existing launch scripts.
     static const bool legacy_env_enabled =
-        ds4_env_flag("DFLASH_DS4_FUSED_DECODE");
+        ds4_env_flag("LUCE_DS4_FUSED_DECODE");
     return w.fused_decode || legacy_env_enabled;
 }
 
@@ -5729,7 +5729,7 @@ struct DeepSeek4LayerRangeCache {
 // layout, and the out-of-memory retry in the attention path then discards
 // every warm graph on the device. Bound the cache by bytes instead: a quarter
 // of the target GPU's free memory when the first graph is cached
-// (DFLASH_DS4_DECODE_ATTN_CACHE_MB overrides), evicting the least recently
+// (LUCE_DS4_DECODE_ATTN_CACHE_MB overrides), evicting the least recently
 // used shape across all layers. A quarter, not half: the captured graph
 // executables, the verify slots and the prefill scratch share that headroom,
 // and half of it still left a 9.5k-token exact prefill at 370 MiB free.
@@ -5738,7 +5738,7 @@ static size_t ds4_decode_attn_cache_budget(DeepSeek4LayerRangeCache & rc) {
         return rc.decode_attn_cache_budget;
     }
     static const long override_mb = [] {
-        const char * raw = std::getenv("DFLASH_DS4_DECODE_ATTN_CACHE_MB");
+        const char * raw = std::getenv("LUCE_DS4_DECODE_ATTN_CACHE_MB");
         return raw && *raw ? std::strtol(raw, nullptr, 10) : 0L;
     }();
     if (override_mb > 0) {
@@ -6217,7 +6217,7 @@ static bool ds4_build_fused_decode_graph(
         std::vector<DeepSeek4I64ArrayBinding> i64ab;
         std::vector<DeepSeek4F32ArrayBinding> f32ab;
         const bool sparse_decode_flash =
-            ds4_env_flag("DFLASH_DS4_SPARSE_DECODE_FLASH");
+            ds4_env_flag("LUCE_DS4_SPARSE_DECODE_FLASH");
         const DeepSeek4AttentionImpl attention_impl = sparse_decode_flash
             ? DeepSeek4AttentionImpl::SparseFlash
             : DeepSeek4AttentionImpl::Explicit;
@@ -6516,7 +6516,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         std::vector<float> & out,
         DeepSeek4StepTelemetry * telemetry,
         const MoeHybridDeviceOutputs * device_outputs = nullptr) {
-    const bool trace_prefill = ds4_env_flag("DFLASH_DS4_PREFILL_TRACE");
+    const bool trace_prefill = ds4_env_flag("LUCE_DS4_PREFILL_TRACE");
     if (trace_prefill) {
         std::fprintf(stderr,
                      "[deepseek4-prefill-trace] layer=%d ffn route begin tokens=%d\n",
@@ -6538,7 +6538,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     ggml_tensor * cold_stack_ref = layer_storage.gate_up_cold
         ? layer_storage.gate_up_cold : layer_storage.gate_cold;
     const char * device_input_env =
-        std::getenv("DFLASH_MOE_PREFILL_DEVICE_INPUT");
+        std::getenv("LUCE_MOE_PREFILL_DEVICE_INPUT");
     const bool device_input_enabled =
         !device_input_env || !*device_input_env ||
         std::strcmp(device_input_env, "0") != 0;
@@ -6550,7 +6550,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         hot_stack_ref && hot_stack_ref->ne[2] > 0 &&
         cold_stack_ref && cold_stack_ref->ne[2] > 0;
     const char * persistent_owner_env =
-        std::getenv("DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC");
+        std::getenv("LUCE_MOE_PREFILL_PERSISTENT_OWNER_ALLOC");
     const bool persistent_owner_requested =
         !persistent_owner_env || !*persistent_owner_env ||
         std::strcmp(persistent_owner_env, "0") != 0;
@@ -8159,7 +8159,7 @@ bool deepseek4_step_layer_range(
         moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
     const bool wide_verify_candidate =
         n_tokens == DS4_Q5_VERIFY_TOKENS &&
-        ds4_env_flag("DFLASH_DS4_Q5_VERIFY");
+        ds4_env_flag("LUCE_DS4_Q5_VERIFY");
     const bool fused_verify_candidate =
         (!moe_hybrid || fused_hybrid_ready) &&
         n_tokens >= 2 &&
@@ -8179,7 +8179,7 @@ bool deepseek4_step_layer_range(
         if (!warned) {
             warned = true;
             std::fprintf(stderr,
-                "[deepseek4] DFLASH_DS4_FUSED_VERIFY=1 but fused verify is "
+                "[deepseek4] LUCE_DS4_FUSED_VERIFY=1 but fused verify is "
                 "inactive: n_tokens=%d (cap %d) verify_hooks=%d out_logits=%d "
                 "backend_gpu=%d moe_hybrid=%d expert_runtime=%d "
                 "materialized_cold=%d cold_backend_kind_gpu=%d "
@@ -8230,7 +8230,7 @@ bool deepseek4_step_layer_range(
     // to this forward call; decode graph replay is restored on every return.
     ScopedCudaGraphOverrides heterogeneous_prefill_eager_scope(
         heterogeneous_sparse_prefill &&
-        ds4_env_flag("DFLASH_DS4_HYBRID_PREFILL_EAGER"));
+        ds4_env_flag("LUCE_DS4_HYBRID_PREFILL_EAGER"));
 
     // A dynamic batch may be supplied by callers other than the DSpark
     // verifier. Split it whenever it spans a learned-compressor boundary:
@@ -8450,7 +8450,7 @@ bool deepseek4_step_layer_range(
     scratch.ensure(w.ctx, n_tokens, n_embd, n_hc, n_expert_used);
     const bool trace_prefill =
         heterogeneous_sparse_prefill &&
-        ds4_env_flag("DFLASH_DS4_PREFILL_TRACE");
+        ds4_env_flag("LUCE_DS4_PREFILL_TRACE");
     if (trace_prefill) {
         std::fprintf(stderr,
                      "[deepseek4-prefill-trace] step begin pos=%d tokens=%d\n",
@@ -8485,7 +8485,7 @@ bool deepseek4_step_layer_range(
     // native AR before the drafter has run at all.
     const bool fused_hybrid_decode =
         fused_hybrid_ready && n_tokens == 1 && allow_decode_graph_reuse &&
-        ds4_env_flag("DFLASH_DS4_FUSED_HYBRID_DECODE");
+        ds4_env_flag("LUCE_DS4_FUSED_HYBRID_DECODE");
     std::vector<int> fused_hybrid_decode_capture_ids;
     Ds4VerifyHooks fused_hybrid_decode_hooks;
     if (fused_hybrid_decode && !verify_hooks) {
@@ -8605,7 +8605,7 @@ bool deepseek4_step_layer_range(
         use_backend_decode_hc && !use_backend_decode_hc_direct;
     const bool use_backend_prefill_hc =
         heterogeneous_sparse_prefill &&
-        ds4_env_flag("DFLASH_DS4_HYBRID_PREFILL_GPU_HC");
+        ds4_env_flag("LUCE_DS4_HYBRID_PREFILL_GPU_HC");
     ggml_tensor * hc_state_backend = nullptr;
     if (use_backend_prefill_hc) {
         if (!ds4_fused_ensure_fn_mirrors(
@@ -9262,7 +9262,7 @@ bool deepseek4_step_layer_range(
         constexpr size_t k_long_context_attn_release_bytes =
             384u * 1024u * 1024u;
         if (!ds4_env_flag(
-                "DFLASH_DS4_DISABLE_LONG_CONTEXT_ARENA_HANDOFF") &&
+                "LUCE_DS4_DISABLE_LONG_CONTEXT_ARENA_HANDOFF") &&
             heterogeneous_sparse_prefill &&
             kv_start >= k_long_context_attn_release_pos &&
             shared_prefill_attn_alloc.alloc &&
@@ -9419,7 +9419,7 @@ bool deepseek4_step_layer_range(
                     ? layer_storage.gate_up_hot
                     : layer_storage.gate_hot;
                 const char * device_input_env =
-                    std::getenv("DFLASH_MOE_PREFILL_DEVICE_INPUT");
+                    std::getenv("LUCE_MOE_PREFILL_DEVICE_INPUT");
                 const bool device_input_enabled =
                     !device_input_env || !*device_input_env ||
                     std::strcmp(device_input_env, "0") != 0;
@@ -9928,7 +9928,7 @@ void deepseek4_release_prefill_scratch(
     }
 
     static const bool report_release = [] {
-        const char * value = std::getenv("DFLASH_DS4_TIMING");
+        const char * value = std::getenv("LUCE_DS4_TIMING");
         return value != nullptr && value[0] != '\0' &&
                std::strcmp(value, "0") != 0;
     }();
@@ -9944,7 +9944,7 @@ void deepseek4_release_prefill_scratch(
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common
 
 // ══════════════════════════════════════════════════════════════════════
 //  DSpark drafter forward graph (appended to deepseek4_graph.cpp so it can
@@ -9969,7 +9969,7 @@ void deepseek4_release_prefill_scratch(
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -10352,9 +10352,9 @@ static bool deepseek4_dspark_draft_forward_impl(
     if (ctx_len < 0) ctx_len = 0;
     const int valid_ctx_len = ctx_len;
     const bool context_kv_cache =
-        ds4_env_flag("DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE");
+        ds4_env_flag("LUCE_DS4_DRAFT_CONTEXT_KV_CACHE");
     const bool fixed_context = context_kv_cache ||
-        ds4_env_flag("DFLASH_DS4_DRAFT_FIXED_CONTEXT");
+        ds4_env_flag("LUCE_DS4_DRAFT_FIXED_CONTEXT");
     const int graph_ctx_len = fixed_context
         ? std::max(valid_ctx_len, w.n_swa)
         : valid_ctx_len;
@@ -10368,7 +10368,7 @@ static bool deepseek4_dspark_draft_forward_impl(
     }
 
     DsparkDraftCache & C = g_dspark_draft_cache;
-    const bool DS4_DBG = std::getenv("DFLASH_DS4_DSPARK_DEBUG") != nullptr;
+    const bool DS4_DBG = std::getenv("LUCE_DS4_DSPARK_DEBUG") != nullptr;
 
     // Context reuse is deliberately strict: never submit a graph with an
     // uninitialized or differently-shaped context tensor.  The normal warm
@@ -10588,7 +10588,7 @@ static bool deepseek4_dspark_draft_forward_impl(
             ggml_free(C.ctx); C.ctx = nullptr; C.gf = nullptr;
             return false;
         }
-        if (ds4_env_flag("DFLASH_DS4_DRAFT_GRAPH_STATS")) {
+        if (ds4_env_flag("LUCE_DS4_DRAFT_GRAPH_STATS")) {
             std::fprintf(stderr,
                 "[ds4-draft-graph] ctx=%d valid=%d nodes=%d scratch=%.2f MiB\n",
                 graph_ctx_len, valid_ctx_len, ggml_graph_n_nodes(gf),
@@ -10682,7 +10682,7 @@ static bool deepseek4_dspark_draft_forward_impl(
     // can take effect.  Keep this opt-in until exact output and replay stats
     // have both been qualified on the deployment GPUs.
     const bool force_graph_replay =
-        ds4_env_flag("DFLASH_DS4_DRAFT_FORCE_GRAPH_REPLAY");
+        ds4_env_flag("LUCE_DS4_DRAFT_FORCE_GRAPH_REPLAY");
     ScopedCudaGraphOverrides graph_replay_scope(
         /*disable_graphs=*/false,
         /*mmvq_max_ncols=*/0,
@@ -10788,4 +10788,4 @@ void deepseek4_dspark_draft_wait(ggml_backend_t backend) {
     ggml_backend_synchronize(backend);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

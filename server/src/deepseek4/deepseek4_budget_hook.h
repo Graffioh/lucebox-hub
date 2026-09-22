@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash {
+namespace luce {
 namespace deepseek4 {
 
 // Level-2 thinking-budget force-close, as applied to one sampled token.
@@ -67,4 +67,4 @@ inline int32_t budget_hook_apply(const std::vector<int32_t> & close_ids,
 }
 
 }  // namespace deepseek4
-}  // namespace dflash
+}  // namespace luce

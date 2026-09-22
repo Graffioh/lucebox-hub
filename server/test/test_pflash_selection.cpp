@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-using namespace dflash::pflash;
+using namespace luce::pflash;
 
 namespace {
 
@@ -116,7 +116,7 @@ TEST_CASE(PFlashSelectionFixture, instruction_overlap_is_mandatory_without_chang
     constexpr int input_tokens = 120000;
     constexpr int query_begin = 119872;
     constexpr int query_end = 120000;
-    const std::vector<dflash::common::PFlashTokenSpan> instructions{
+    const std::vector<luce::common::PFlashTokenSpan> instructions{
         {0, 384},
         {4096, 4352},
     };
@@ -149,7 +149,7 @@ TEST_CASE(PFlashSelectionFixture, instruction_overlap_is_mandatory_without_chang
 
 TEST_CASE(PFlashSelectionFixture, invalid_instruction_spans_fail_closed) {
     constexpr int input_tokens = 32;
-    const std::vector<std::vector<dflash::common::PFlashTokenSpan>> invalid{
+    const std::vector<std::vector<luce::common::PFlashTokenSpan>> invalid{
         {{-1, 2}},
         {{4, 4}},
         {{4, 3}},
@@ -163,7 +163,7 @@ TEST_CASE(PFlashSelectionFixture, invalid_instruction_spans_fail_closed) {
             spans, input_tokens, error));
         REQUIRE(!error.empty());
     }
-    std::vector<dflash::common::PFlashTokenSpan> too_many(65, {0, 1});
+    std::vector<luce::common::PFlashTokenSpan> too_many(65, {0, 1});
     std::string error;
     REQUIRE(!validate_pflash_instruction_spans(
         too_many, input_tokens, error));
@@ -484,7 +484,7 @@ TEST_CASE(PFlashSelectionFixture, scoring_head_token_mass_averages_heads_and_que
         1.0f, 0.0f, 0.0f,   // head 1, query 1
     };
     std::vector<float> mass;
-    dflash::common::scoring_head_mean_token_mass(probs.data(), 3, 2, 2, mass);
+    luce::common::scoring_head_mean_token_mass(probs.data(), 3, 2, 2, mass);
     REQUIRE(mass.size() == 3u);
     CHECK(std::fabs(mass[0] - 0.45f) < 1e-6f);
     CHECK(std::fabs(mass[1] - 0.175f) < 1e-6f);
@@ -493,7 +493,7 @@ TEST_CASE(PFlashSelectionFixture, scoring_head_token_mass_averages_heads_and_que
     for (float value : mass) total += value;
     CHECK(std::fabs(total - 1.0) < 1e-6);
 
-    dflash::common::scoring_head_mean_token_mass(probs.data(), 0, 2, 2, mass);
+    luce::common::scoring_head_mean_token_mass(probs.data(), 0, 2, 2, mass);
     CHECK(mass.empty());
 }
 

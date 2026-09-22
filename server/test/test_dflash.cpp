@@ -18,7 +18,7 @@
 // Usage: test_dflash <target.gguf> <draft.safetensors> <prompt_ids.bin>
 //                    <n_gen> <out_ids.bin>
 
-#include "dflash27b.h"
+#include "luce.h"
 #include <limits>
 #include "internal.h"
 #include "delta_net_specla.h"
@@ -31,7 +31,7 @@
 #include "draft_swa.h"
 #include "platform_env.h"
 #include "laguna_daemon.h"  // arch dispatch - laguna targets are served by
-                            // dflash::common::run_laguna_daemon() instead of the
+                            // luce::common::run_laguna_daemon() instead of the
                             // qwen35 + DFlash + DDTree pipeline below.
 #include "qwen35_daemon.h"   // arch dispatch - single-GPU qwen35 daemon mode
 #include "qwen35moe_daemon.h"
@@ -110,7 +110,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 #include <random>
 #include <unordered_set>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static SamplerCfg      g_sampler;
 static std::mt19937_64 g_sampler_rng{std::random_device{}()};
@@ -128,16 +128,16 @@ static std::mt19937_64 g_sampler_rng{std::random_device{}()};
 
 // ─── Small utilities — extracted to src/common/io_utils.h ──────────
 #include "io_utils.h"
-using dflash::common::read_int32_file;
-using dflash::common::write_int32_file;
-using dflash::common::stream_emit_fd;
-using dflash::common::argmax_f32;
-using dflash::common::write_binary_file;
-using dflash::common::read_binary_file_exact;
-using dflash::common::read_line_tail;
+using luce::common::read_int32_file;
+using luce::common::write_int32_file;
+using luce::common::stream_emit_fd;
+using luce::common::argmax_f32;
+using luce::common::write_binary_file;
+using luce::common::read_binary_file_exact;
+using luce::common::read_line_tail;
 #if !defined(_WIN32)
-using dflash::common::read_exact_fd;
-using dflash::common::write_exact_fd;
+using luce::common::read_exact_fd;
+using luce::common::write_exact_fd;
 #endif
 
 // CPU sampler chain (SamplerCfg / sample_logits / parse_sampler_token) lives
@@ -152,15 +152,15 @@ using dflash::common::write_exact_fd;
 // The global `g_kq_stride_pad` below is set at init time and forwarded to
 // build_causal_mask / build_tree_mask (now in src/qwen35/attn_masks.h).
 #include "attn_masks.h"
-using dflash::common::KQ_MASK_PAD;
-using dflash::common::F16_ZERO;
-using dflash::common::F16_NEG_INF;
-using dflash::common::align_up;
-using dflash::common::build_causal_mask;
-using dflash::common::build_tree_mask;
+using luce::common::KQ_MASK_PAD;
+using luce::common::F16_ZERO;
+using luce::common::F16_NEG_INF;
+using luce::common::align_up;
+using luce::common::build_causal_mask;
+using luce::common::build_tree_mask;
 static int g_kq_stride_pad = KQ_MASK_PAD;   // overridden to 256 when TBQ KV is active
 static int g_max_ctx_override = 0;           // overridden by --max-ctx=N (default 4096)
-static int g_fa_window       = 2048;         // overridden by DFLASH27B_FA_WINDOW=N
+static int g_fa_window       = 2048;         // overridden by LUCE_FA_WINDOW=N
 static int g_draft_swa_window = 0;           // draft SWA window (0 = disabled); --draft-swa=N
 static int g_draft_ctx_max   = 4096;        // draft context cap; --draft-ctx-max=N
 
@@ -168,53 +168,53 @@ static int g_draft_ctx_max   = 4096;        // draft context cap; --draft-ctx-ma
 // Extracted to src/qwen35/ddtree.{h,cpp}. Provides DDTree struct,
 // extract_draft_topk(), build_ddtree(), follow_verified_tree().
 #include "ddtree.h"
-using dflash::common::DDTree;
-using dflash::common::extract_draft_topk;
-using dflash::common::build_ddtree;
-using dflash::common::follow_verified_tree;
+using luce::common::DDTree;
+using luce::common::extract_draft_topk;
+using luce::common::build_ddtree;
+using luce::common::follow_verified_tree;
 
 // ─── StepGraph — extracted to src/qwen35/step_graph.h ──
 #include "step_graph.h"
-using dflash::common::StepGraph;
-using dflash::common::step_graph_free;
-using dflash::common::step_graph_destroy;
+using luce::common::StepGraph;
+using luce::common::step_graph_free;
+using luce::common::step_graph_destroy;
 
 // ─── Peer access + DraftFeatureMirror — extracted to src/qwen35/ ──
 #include "peer_access.h"
 #include "dflash_feature_ring.h"
-using dflash::common::g_peer_access_opt_in;
-using dflash::common::g_peer_pair_ok_cache;
-using dflash::common::enable_peer_access_one_way;
-using dflash::common::enable_peer_access_pair;
-using dflash::common::enable_layer_split_peer_access;
-using dflash::common::cross_device_peer_memcpy_ok;
-using dflash::common::copy_peer_async;
-using dflash::common::init_layer_split_shard_metas;
-using dflash::common::layer_split_shard_metas;
-using dflash::common::DraftFeatureMirror;
-using dflash::common::draft_feature_mirror_free;
-using dflash::common::draft_feature_mirror_init;
-using dflash::common::draft_feature_mirror_can_view;
-using dflash::common::draft_feature_mirror_sync_range;
-using dflash::common::draft_feature_mirror_sync_tail;
+using luce::common::g_peer_access_opt_in;
+using luce::common::g_peer_pair_ok_cache;
+using luce::common::enable_peer_access_one_way;
+using luce::common::enable_peer_access_pair;
+using luce::common::enable_layer_split_peer_access;
+using luce::common::cross_device_peer_memcpy_ok;
+using luce::common::copy_peer_async;
+using luce::common::init_layer_split_shard_metas;
+using luce::common::layer_split_shard_metas;
+using luce::common::DraftFeatureMirror;
+using luce::common::draft_feature_mirror_free;
+using luce::common::draft_feature_mirror_init;
+using luce::common::draft_feature_mirror_can_view;
+using luce::common::draft_feature_mirror_sync_range;
+using luce::common::draft_feature_mirror_sync_tail;
 
 // ─── Graph builders — extracted to src/qwen35/graph_builders.{h,cpp} ──
 #include "graph_builders.h"
 #include "dflash_draft_graph.h"
-using dflash::common::build_layer_step;
-using dflash::common::build_target_step;
-using dflash::common::build_target_step_tree;
-using dflash::common::build_draft_step;
-using dflash::common::build_lm_head_projection_step;
+using luce::common::build_layer_step;
+using luce::common::build_target_step;
+using luce::common::build_target_step_tree;
+using luce::common::build_draft_step;
+using luce::common::build_lm_head_projection_step;
 
 // ─── Layer split types — extracted to src/qwen35/layer_split_types.h ──
 #include "layer_split_types.h"
-using dflash::common::LayerSplitRuntimeConfig;
-using dflash::common::Qwen35LayerSplitShard;
-using dflash::common::ActivationPair;
-using dflash::common::activation_pair_free;
-using dflash::common::activation_pair_init;
-using dflash::common::find_layer_split_shard;
+using luce::common::LayerSplitRuntimeConfig;
+using luce::common::Qwen35LayerSplitShard;
+using luce::common::ActivationPair;
+using luce::common::activation_pair_free;
+using luce::common::activation_pair_init;
+using luce::common::find_layer_split_shard;
 
 static bool parse_int_list(const char * text, std::vector<int> & out) {
     out.clear();
@@ -250,29 +250,29 @@ static bool parse_float_list(const char * text, std::vector<double> & out) {
 
 // ─── Draft IPC — extracted to src/qwen35/draft_ipc.{h,cpp} ──
 #include "dflash_draft_ipc.h"
-using dflash::common::DFlashDraftIpcClient;
-using dflash::common::copy_capture_slice_to_remote_draft;
-using dflash::common::stream_status;
-using dflash::common::run_dflash_draft_ipc_daemon;
+using luce::common::DFlashDraftIpcClient;
+using luce::common::copy_capture_slice_to_remote_draft;
+using luce::common::stream_status;
+using luce::common::run_dflash_draft_ipc_daemon;
 
 // ─── GGUF inspection — extracted to src/common/gguf_inspect.{h,cpp} ──
 #include "gguf_inspect.h"
 
 // ─── Layer ranges — extracted to src/common/layer_split_utils.{h,cpp} ──
 #include "layer_split_utils.h"
-using dflash::common::compute_layer_ranges;
+using luce::common::compute_layer_ranges;
 
 // ─── Feature copy helpers — extracted to src/qwen35/feature_copy.{h,cpp} ──
 #include "dflash_capture.h"
-using dflash::common::target_capture_index;
-using dflash::common::copy_capture_slice_to_draft_ring;
-using dflash::common::copy_feature_ring_range_to_tensor;
+using luce::common::target_capture_index;
+using luce::common::copy_capture_slice_to_draft_ring;
+using luce::common::copy_feature_ring_range_to_tensor;
 
 // ─── Layer-split forward — extracted to src/qwen35/layer_split_forward.{h,cpp} ──
 #include "layer_split_forward.h"
-using dflash::common::compute_target_split_argmax;
-using dflash::common::run_qwen35_layer_split_forward;
-using dflash::common::free_qwen35_layer_split_shards;
+using luce::common::compute_target_split_argmax;
+using luce::common::run_qwen35_layer_split_forward;
+using luce::common::free_qwen35_layer_split_shards;
 
 
 // ─── Speculative decode — generic loop in common/, qwen35 layer-split adapter.
@@ -280,11 +280,11 @@ using dflash::common::free_qwen35_layer_split_shards;
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_mmap.h"
 #include "common/geometric_draft_topk_cuda.h"
-using dflash::common::is_eos_tok;
+using luce::common::is_eos_tok;
 
 // ─── Layer-split daemon — extracted to src/qwen35/layer_split_daemon.{h,cpp} ─
 #include "layer_split_daemon.h"
-using dflash::common::run_qwen35_layer_split_request;
+using luce::common::run_qwen35_layer_split_request;
 
 static int run_target_layer_split_daemon(
         const char * target_path,
@@ -341,7 +341,7 @@ static int run_target_layer_split_harness(
         std::fprintf(stderr, "target layer split requires prompt/n_gen/out positional args\n");
         return 2;
     }
-    const int n_layer = dflash::common::inspect_gguf_model_info(target_path).n_layer;
+    const int n_layer = luce::common::inspect_gguf_model_info(target_path).n_layer;
     if (n_layer <= 0) {
         std::fprintf(stderr, "target-split could not read qwen35.block_count\n");
         return 1;
@@ -366,13 +366,13 @@ static int run_target_layer_split_harness(
             make_layer_split_load_plan<TargetLoadPlan>(shard, &shard == &shards.back());
         if (!load_target_gguf_partial(target_path, shard.backend, plan, shard.weights)) {
             std::fprintf(stderr, "target-split load gpu=%d: %s\n",
-                         shard.gpu, dflash27b_last_error());
+                         shard.gpu, luce_last_error());
             free_qwen35_layer_split_shards(shards);
             return 1;
         }
         std::printf("[target-split] gpu=%d layers=[%d,%d) %s\n",
                     shard.gpu, shard.layer_begin, shard.layer_end,
-                    dflash27b_last_error());
+                    luce_last_error());
         const bool allocate_target_feat = false;
         if (!create_target_cache_partial(shard.weights, max_ctx, max_verify_tokens,
                                          shard.backend, shard.cache,
@@ -384,7 +384,7 @@ static int run_target_layer_split_harness(
                                              run_dflash &&
                                              split_chain_fast_rollback_enabled())) {
             std::fprintf(stderr, "target-split cache gpu=%d: %s\n",
-                         shard.gpu, dflash27b_last_error());
+                         shard.gpu, luce_last_error());
             free_qwen35_layer_split_shards(shards);
             return 1;
         }
@@ -432,7 +432,7 @@ static int run_target_layer_split_harness(
             }
             if (!draft_ok) {
                 std::fprintf(stderr, "target-split draft load gpu=%d: %s\n",
-                             draft_gpu, dflash27b_last_error());
+                             draft_gpu, luce_last_error());
                 free_draft_weights(draft_weights);
                 if (draft_backend_owned) ggml_backend_free(draft_backend);
                 free_qwen35_layer_split_shards(shards);
@@ -483,7 +483,7 @@ static int run_target_layer_split_harness(
     }
 
     int ubatch = (prompt.size() > 2048) ? 384 : 16;
-    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
+    if (const char * s = std::getenv("LUCE_PREFILL_UBATCH")) {
         ubatch = std::max(1, std::atoi(s));
     }
     std::printf("[target-split] n_gpus=%zu n_layer=%d ubatch=%d max_ctx=%d\n",
@@ -510,12 +510,12 @@ static int run_target_layer_split_harness(
                 prompt.size(), prefill_s, prompt.size() / prefill_s, last_tok);
 
     if (run_draft_smoke) {
-        const int hidden = DFLASH27B_TARGET_HIDDEN;
-        const int q_len = DFLASH27B_DRAFT_BLOCK_SIZE;
+        const int hidden = LUCE_TARGET_HIDDEN;
+        const int q_len = LUCE_DRAFT_BLOCK_SIZE;
         const int ring_cap = use_remote_draft ? remote_draft.ring_cap() : feature_ring.cap;
         const int draft_ctx = std::min((int)prompt.size(), ring_cap);
         const int draft_start = (int)prompt.size() - draft_ctx;
-        std::vector<int32_t> noise_ids(q_len, DFLASH27B_DRAFT_MASK_TOKEN_ID);
+        std::vector<int32_t> noise_ids(q_len, LUCE_DRAFT_MASK_TOKEN_ID);
         noise_ids[0] = last_tok;
         std::vector<float> noise_embed((size_t)hidden * q_len);
         if (!shards.front().weights.embedder.embed(noise_ids.data(), q_len, noise_embed.data())) {
@@ -697,19 +697,19 @@ int main(int argc, char ** argv) {
     }
     // TurboQuant FA kernel requires kv_len aligned to FATTN_KQ_STRIDE=256.
     // Bump the mask stride accordingly so the mask dim matches the kv view.
-    if (const char * s = std::getenv("DFLASH27B_KV_TBQ")) {
+    if (const char * s = std::getenv("LUCE_KV_TBQ")) {
         if (std::atoi(s) != 0) g_kq_stride_pad = 256;
     }
-    if (const char * s = std::getenv("DFLASH27B_KV_TQ3")) {
+    if (const char * s = std::getenv("LUCE_KV_TQ3")) {
         if (std::atoi(s) != 0) g_kq_stride_pad = 256;
     }
-    if (const char * s = std::getenv("DFLASH27B_FA_WINDOW")) {
+    if (const char * s = std::getenv("LUCE_FA_WINDOW")) {
         g_fa_window = std::max(0, std::atoi(s));
     }
-    if (const char * s = std::getenv("DFLASH27B_DRAFT_SWA")) {
+    if (const char * s = std::getenv("LUCE_DRAFT_SWA")) {
         g_draft_swa_window = std::max(0, std::atoi(s));
     }
-    if (const char * s = std::getenv("DFLASH27B_DRAFT_CTX_MAX")) {
+    if (const char * s = std::getenv("LUCE_DRAFT_CTX_MAX")) {
         g_draft_ctx_max = std::max(0, std::atoi(s));
     }
     const char * target_path = argv[1];
@@ -719,14 +719,14 @@ int main(int argc, char ** argv) {
     // shape so we can route laguna requests to run_laguna_daemon() and
     // accept the no-draft argv layout used for that arch.
     #include "gguf_inspect.h"
-    const auto model_info   = dflash::common::inspect_gguf_model_info(target_path);
+    const auto model_info   = luce::common::inspect_gguf_model_info(target_path);
     const std::string detected_arch = model_info.arch;
     const bool is_laguna = (detected_arch == "laguna");
     const bool is_qwen3  = (detected_arch == "qwen3");
     const bool is_gemma4 = (detected_arch == "gemma4");
 
     // When arch == laguna there is no DFlash draft model (Poolside hasn't
-    // released one); dflash_server omits --draft for laguna. Accept the
+    // released one); luce_server omits --draft for laguna. Accept the
     // shorter argv layout: argv[1] = target, argv[2..] = flags. Same fall-
     // back applies if the user manually drops the draft (argv[2] starts with
     // a dash) on any arch — keeps the binary friendly to ad-hoc invocation.
@@ -762,7 +762,7 @@ int main(int argc, char ** argv) {
     bool  ddtree_tau_set = false;
     bool  specla_mode   = false;
     bool  specla_top_k_set = false;
-    int   specla_top_k  = dflash::common::specla_tree_topk();
+    int   specla_top_k  = luce::common::specla_tree_topk();
     bool  profile_scaling = false;  // microbench: time target forward at varying N
     bool  time_breakdown  = false;  // one-token time breakdown: prefill/decode/verify × ctx size
     bool  hybrid_bench_only = false; // skip monolithic scenarios, run only hybrid/pipelined
@@ -778,33 +778,33 @@ int main(int argc, char ** argv) {
     int   draft_ipc_ring_cap = 0;
     std::vector<int> target_gpus;
     std::vector<double> target_split_weights;
-    if (const char * s = std::getenv("DFLASH_TARGET_GPU")) {
+    if (const char * s = std::getenv("LUCE_TARGET_GPU")) {
         target_gpu = std::max(0, std::atoi(s));
     }
-    if (const char * s = std::getenv("DFLASH_DRAFT_GPU")) {
+    if (const char * s = std::getenv("LUCE_DRAFT_GPU")) {
         draft_gpu = std::max(0, std::atoi(s));
     }
-    if (const char * s = std::getenv("DFLASH_DRAFT_IPC_BIN")) {
+    if (const char * s = std::getenv("LUCE_DRAFT_IPC_BIN")) {
         draft_ipc_bin = s;
     }
-    if (const char * s = std::getenv("DFLASH_DRAFT_IPC_GPU")) {
+    if (const char * s = std::getenv("LUCE_DRAFT_IPC_GPU")) {
         draft_ipc_gpu = std::max(0, std::atoi(s));
     }
-    if (const char * s = std::getenv("DFLASH_DRAFT_IPC_WORK_DIR")) {
+    if (const char * s = std::getenv("LUCE_DRAFT_IPC_WORK_DIR")) {
         draft_ipc_work_dir = s;
     }
-    if (const char * s = std::getenv("DFLASH_DRAFT_IPC_RING_CAP")) {
+    if (const char * s = std::getenv("LUCE_DRAFT_IPC_RING_CAP")) {
         draft_ipc_ring_cap = std::max(0, std::atoi(s));
     }
-    if (const char * s = std::getenv("DFLASH_TARGET_GPUS")) {
+    if (const char * s = std::getenv("LUCE_TARGET_GPUS")) {
         if (!parse_int_list(s, target_gpus)) {
-            std::fprintf(stderr, "bad DFLASH_TARGET_GPUS=%s\n", s);
+            std::fprintf(stderr, "bad LUCE_TARGET_GPUS=%s\n", s);
             return 2;
         }
     }
-    if (const char * s = std::getenv("DFLASH_TARGET_LAYER_SPLIT")) {
+    if (const char * s = std::getenv("LUCE_TARGET_LAYER_SPLIT")) {
         if (!parse_float_list(s, target_split_weights)) {
-            std::fprintf(stderr, "bad DFLASH_TARGET_LAYER_SPLIT=%s\n", s);
+            std::fprintf(stderr, "bad LUCE_TARGET_LAYER_SPLIT=%s\n", s);
             return 2;
         }
     }
@@ -960,22 +960,22 @@ int main(int argc, char ** argv) {
         // KV cache type flags (mirror llama-cli -ctk / -ctv).
         // Set the env var before resolve_kv_types() reads it inside create_target_cache.
         else if (std::strcmp(argv[i], "--cache-type-k") == 0 || std::strcmp(argv[i], "-ctk") == 0) {
-            if (i + 1 < argc) setenv("DFLASH27B_KV_K", argv[++i], 1);
+            if (i + 1 < argc) setenv("LUCE_KV_K", argv[++i], 1);
         }
         else if (std::strncmp(argv[i], "--cache-type-k=", 15) == 0) {
-            setenv("DFLASH27B_KV_K", argv[i] + 15, 1);
+            setenv("LUCE_KV_K", argv[i] + 15, 1);
         }
         else if (std::strncmp(argv[i], "-ctk=", 5) == 0) {
-            setenv("DFLASH27B_KV_K", argv[i] + 5, 1);
+            setenv("LUCE_KV_K", argv[i] + 5, 1);
         }
         else if (std::strcmp(argv[i], "--cache-type-v") == 0 || std::strcmp(argv[i], "-ctv") == 0) {
-            if (i + 1 < argc) setenv("DFLASH27B_KV_V", argv[++i], 1);
+            if (i + 1 < argc) setenv("LUCE_KV_V", argv[++i], 1);
         }
         else if (std::strncmp(argv[i], "--cache-type-v=", 15) == 0) {
-            setenv("DFLASH27B_KV_V", argv[i] + 15, 1);
+            setenv("LUCE_KV_V", argv[i] + 15, 1);
         }
         else if (std::strncmp(argv[i], "-ctv=", 5) == 0) {
-            setenv("DFLASH27B_KV_V", argv[i] + 5, 1);
+            setenv("LUCE_KV_V", argv[i] + 5, 1);
         }
         else if (std::strncmp(argv[i], "--draft-swa=", 12) == 0) {
             g_draft_swa_window = std::max(0, std::atoi(argv[i] + 12));
@@ -986,7 +986,7 @@ int main(int argc, char ** argv) {
     }
 
     // The KV type may also have been chosen via -ctk/-ctv, which sets
-    // DFLASH27B_KV_K / DFLASH27B_KV_V during the argv loop above. Re-check
+    // LUCE_KV_K / LUCE_KV_V during the argv loop above. Re-check
     // for TQ3 here so g_kq_stride_pad matches the chunked-FA driver's
     // align_up(kv_len, 256); otherwise the host-built mask is short and the
     // kernel reads past its end.
@@ -997,7 +997,7 @@ int main(int argc, char ** argv) {
         for (const char * p = s; *p; ++p) lc += (char)std::tolower((unsigned char)*p);
         return lc.rfind("tq3", 0) == 0;
     };
-    if (kv_env_is_tq3("DFLASH27B_KV_K") || kv_env_is_tq3("DFLASH27B_KV_V")) {
+    if (kv_env_is_tq3("LUCE_KV_K") || kv_env_is_tq3("LUCE_KV_V")) {
         g_kq_stride_pad = 256;
     }
 
@@ -1012,12 +1012,12 @@ int main(int argc, char ** argv) {
     // exists. Laguna is a pure-attention MoE arch with no published draft,
     // so dispatch to run_laguna_daemon() before any qwen35-specific init.
     // The daemon protocol it speaks (bare prompt, samp= tail, generate cmd)
-    // matches what dflash_server emits, so the OpenAI HTTP path is
+    // matches what luce_server emits, so the OpenAI HTTP path is
     // byte-identical for the two arches — only the binary'́s internal
     // forward kernels differ.
     if (is_laguna) {
         ggml_type kv = GGML_TYPE_Q8_0;
-        if (const char * kvs = std::getenv("DFLASH27B_KV_K")) {
+        if (const char * kvs = std::getenv("LUCE_KV_K")) {
             std::string s = kvs;
             if      (s == "q4_0") kv = GGML_TYPE_Q4_0;
             else if (s == "q5_0") kv = GGML_TYPE_Q5_0;
@@ -1026,7 +1026,7 @@ int main(int argc, char ** argv) {
         }
         const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
         int chunk = 2048;
-        if (const char * ck = std::getenv("DFLASH27B_LAGUNA_CHUNK")) {
+        if (const char * ck = std::getenv("LUCE_LAGUNA_CHUNK")) {
             const int v = std::atoi(ck);
             if (v > 0) chunk = v;
         }
@@ -1034,13 +1034,13 @@ int main(int argc, char ** argv) {
             "[test_dflash] arch=laguna -> dispatching to run_laguna_daemon "
             "(max_ctx=%d kv=%s chunk=%d stream_fd=%d). DFlash + DDTree disabled.\n",
             max_ctx_eff, ggml_type_name(kv), chunk, stream_fd);
-        dflash::common::LagunaDaemonArgs largs;
+        luce::common::LagunaDaemonArgs largs;
         largs.target_path     = target_path;
         largs.device.max_ctx  = max_ctx_eff;
         largs.chunk           = chunk;
         largs.kv_type         = kv;
         largs.stream_fd       = stream_fd;
-        return dflash::common::run_laguna_daemon(largs);
+        return luce::common::run_laguna_daemon(largs);
     }
 
     // ---- Arch dispatch: qwen3 targets to the dedicated daemon -----
@@ -1049,13 +1049,13 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr,
             "[test_dflash] arch=qwen3 -> dispatching to run_qwen3_daemon "
             "(max_ctx=%d stream_fd=%d)\n", max_ctx_eff, stream_fd);
-        dflash::common::Qwen3DaemonArgs q3args;
+        luce::common::Qwen3DaemonArgs q3args;
         q3args.model_path     = target_path;
         q3args.device.gpu     = target_gpu;
         q3args.device.max_ctx = max_ctx_eff;
         q3args.stream_fd      = stream_fd;
         q3args.chunk          = 512;
-        return dflash::common::run_qwen3_daemon(q3args);
+        return luce::common::run_qwen3_daemon(q3args);
     }
 
     // ---- Arch dispatch: gemma4 targets to the dedicated daemon -----
@@ -1064,13 +1064,13 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr,
             "[test_dflash] arch=gemma4 -> dispatching to run_gemma4_daemon "
             "(max_ctx=%d stream_fd=%d)\n", max_ctx_eff, stream_fd);
-        dflash::common::Gemma4DaemonArgs g4args;
+        luce::common::Gemma4DaemonArgs g4args;
         g4args.model_path     = target_path;
         g4args.device.gpu     = target_gpu;
         g4args.device.max_ctx = max_ctx_eff;
         g4args.stream_fd      = stream_fd;
         g4args.chunk          = 512;
-        return dflash::common::run_gemma4_daemon(g4args);
+        return luce::common::run_gemma4_daemon(g4args);
     }
 
     // Helper: write a committed token to the stream fd immediately (int32 LE).
@@ -1145,7 +1145,7 @@ int main(int argc, char ** argv) {
             return 2;
         }
         if (daemon_mode) {
-            dflash::common::Qwen35LayerSplitDaemonArgs lsargs;
+            luce::common::Qwen35LayerSplitDaemonArgs lsargs;
             lsargs.target_path = target_path;
             lsargs.draft_path  = draft_path;
             lsargs.device.layer_split_gpus    = target_gpus;
@@ -1156,8 +1156,8 @@ int main(int argc, char ** argv) {
             lsargs.load_draft  = target_split_load_draft;
             lsargs.run_dflash  = target_split_dflash;
             lsargs.max_verify_tokens = ddtree_mode
-                ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
-                : DFLASH27B_DRAFT_BLOCK_SIZE;
+                ? std::max<int>(LUCE_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
+                : LUCE_DRAFT_BLOCK_SIZE;
             lsargs.stream_fd   = stream_fd;
             // TODO: migrate to run_qwen35_layer_split_daemon() once helpers
             // are extracted to src/qwen35/. For now, call the local function.
@@ -1185,8 +1185,8 @@ int main(int argc, char ** argv) {
                                              target_split_dflash,
                                              g_max_ctx_override > 0 ? g_max_ctx_override : 4096,
                                              ddtree_mode
-                                                 ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
-                                                 : DFLASH27B_DRAFT_BLOCK_SIZE,
+                                                 ? std::max<int>(LUCE_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
+                                                 : LUCE_DRAFT_BLOCK_SIZE,
                                              g_peer_access_opt_in,
                                              draft_ipc_bin,
                                              draft_ipc_gpu,
@@ -1199,7 +1199,7 @@ int main(int argc, char ** argv) {
     // loop remains for one-shot, test-window, and profile-scaling modes.
     if (daemon_mode && target_gpus.size() <= 1) {
         const int max_ctx_eff = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
-        dflash::common::Qwen35DaemonArgs qargs;
+        luce::common::Qwen35DaemonArgs qargs;
         qargs.target_path       = target_path;
         qargs.draft_path        = draft_path;
         qargs.device.gpu        = target_gpu;
@@ -1222,12 +1222,12 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr,
                 "[test_dflash] arch=qwen35moe daemon -> dispatching to run_qwen35moe_daemon "
                 "(max_ctx=%d stream_fd=%d)\n", max_ctx_eff, stream_fd);
-            return dflash::common::run_qwen35moe_daemon(qargs);
+            return luce::common::run_qwen35moe_daemon(qargs);
         }
         std::fprintf(stderr,
             "[test_dflash] arch=qwen35 daemon -> dispatching to run_qwen35_daemon "
             "(max_ctx=%d stream_fd=%d)\n", max_ctx_eff, stream_fd);
-        return dflash::common::run_qwen35_daemon(qargs);
+        return luce::common::run_qwen35_daemon(qargs);
     }
 
     const bool split_gpus = target_gpu != draft_gpu;
@@ -1250,10 +1250,10 @@ int main(int argc, char ** argv) {
 
     TargetWeights w;
     if (!load_target_gguf(target_path, target_backend, w)) {
-        std::fprintf(stderr, "target load: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "target load: %s\n", luce_last_error());
         return 1;
     }
-    std::printf("[target] %s\n", dflash27b_last_error());
+    std::printf("[target] %s\n", luce_last_error());
 
     DraftWeights dw;
     if (draft_path) {
@@ -1266,7 +1266,7 @@ int main(int argc, char ** argv) {
             draft_ok = load_draft_safetensors(draft_path, draft_backend, dw);
         }
         if (!draft_ok) {
-            std::fprintf(stderr, "draft load: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "draft load: %s\n", luce_last_error());
             return 1;
         }
         std::printf("[draft]  loaded\n");
@@ -1291,20 +1291,20 @@ int main(int argc, char ** argv) {
     // Profile mode intentionally keeps the intermediate cache tiny (no capture)
     // so we can go up to n_tokens=128 without OOM.
     const int max_verify_tokens = (profile_scaling || time_breakdown)
-        ? DFLASH27B_DRAFT_BLOCK_SIZE
+        ? LUCE_DRAFT_BLOCK_SIZE
         : (ddtree_mode
-            ? std::max<int>(DFLASH27B_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
-            : DFLASH27B_DRAFT_BLOCK_SIZE);
+            ? std::max<int>(LUCE_DRAFT_BLOCK_SIZE, ddtree_budget + 1)
+            : LUCE_DRAFT_BLOCK_SIZE);
     TargetCache cache;
     if (!create_target_cache(w, max_ctx, max_verify_tokens, target_backend, cache,
                              /*prefill_only=*/!time_breakdown)) {
-        std::fprintf(stderr, "cache: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "cache: %s\n", luce_last_error());
         return 1;
     }
 
     // ── Profile mode: microbench target forward at varying N ───────────
     if (profile_scaling) {
-        const int hidden_p = DFLASH27B_TARGET_HIDDEN;
+        const int hidden_p = LUCE_TARGET_HIDDEN;
         StepGraph psg;
         const int n_values[] = { 1, 4, 8, 12, 16, 20, 24, 32, 48, 64, 96, 128 };
         std::printf("[profile] target forward ms at varying N (kv_start=0, no capture)\n");
@@ -1490,7 +1490,7 @@ int main(int argc, char ** argv) {
                     "------------------------------", "----------", "----------", "----------");
 
         const int verify_ctx_sizes[] = { 2048, 20000 };
-        const int verify_n = DFLASH27B_DRAFT_BLOCK_SIZE;  // 16
+        const int verify_n = LUCE_DRAFT_BLOCK_SIZE;  // 16
 
         for (int ctx : verify_ctx_sizes) {
             if (ctx + verify_n > max_ctx) {
@@ -1579,7 +1579,7 @@ int main(int argc, char ** argv) {
                 plan.skip_expert_tensors = true;
                 if (!load_target_gguf_partial(target_path, backend, plan, w)) {
                     std::fprintf(stderr, "[hybrid-bench] partial reload failed: %s\n",
-                                 dflash27b_last_error());
+                                 luce_last_error());
                     ggml_backend_free(target_backend);
                     return 1;
                 }
@@ -1599,12 +1599,12 @@ int main(int argc, char ** argv) {
 
             // Hot percentage: 60% for hybrid_bench_only (VRAM freed), 10% otherwise
             double hot_pct = hybrid_bench_only ? 0.60 : 0.10;
-            if (const char * s = std::getenv("DFLASH_HYBRID_HOT_PCT")) {
+            if (const char * s = std::getenv("LUCE_HYBRID_HOT_PCT")) {
                 hot_pct = std::max(0.05, std::min(0.95, std::atof(s) / 100.0));
             }
             const int hot_per_layer = std::max(w.n_expert_used, (int)(w.n_expert * hot_pct));
             const int total_hot_budget = hot_per_layer * w.n_layer;
-            std::printf("  hot_pct=%.0f%% (set DFLASH_HYBRID_HOT_PCT=N to override)\n", hot_pct * 100);
+            std::printf("  hot_pct=%.0f%% (set LUCE_HYBRID_HOT_PCT=N to override)\n", hot_pct * 100);
 
             // Pre-discover which experts the router picks on zero input, so we can
             // build a "worst-case" placement that forces cold hits (for benchmarking).
@@ -1691,7 +1691,7 @@ int main(int argc, char ** argv) {
                 if (!gctx) {
                     std::fprintf(stderr, "[time-breakdown] failed to re-open GGUF for hybrid\n");
                 } else {
-                    dflash::common::GgufMmap _mf;
+                    luce::common::GgufMmap _mf;
                     std::string _mferr;
                     if (!_mf.open(target_path, _mferr)) {
                         std::fprintf(stderr, "[time-breakdown] mmap failed for hybrid: %s\n", _mferr.c_str());
@@ -2108,8 +2108,8 @@ int main(int argc, char ** argv) {
         }
 
         // ── Tests 2 & 3: GPU regression tests ───────────────────────────
-        const int hidden_t = DFLASH27B_TARGET_HIDDEN;
-        const int vocab_t  = DFLASH27B_TARGET_VOCAB;
+        const int hidden_t = LUCE_TARGET_HIDDEN;
+        const int vocab_t  = LUCE_TARGET_VOCAB;
         auto do_prefill = [&](StepGraph & psg, int n_tokens) -> int32_t {
             const int pf_ub = 384;
             int32_t lt = -1;
@@ -2268,10 +2268,10 @@ int main(int argc, char ** argv) {
         return n_fail > 0 ? 1 : 0;
     }
 
-    const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int vocab  = DFLASH27B_TARGET_VOCAB;
-    const int mask_tok = DFLASH27B_DRAFT_MASK_TOKEN_ID;
+    const int q_len  = LUCE_DRAFT_BLOCK_SIZE;
+    const int hidden = LUCE_TARGET_HIDDEN;
+    const int vocab  = LUCE_TARGET_VOCAB;
+    const int mask_tok = LUCE_DRAFT_MASK_TOKEN_ID;
 
     if (daemon_mode) {
         std::printf("[daemon] ready\n");
@@ -2289,7 +2289,7 @@ int main(int argc, char ** argv) {
     bool target_parked = false;
     bool draft_parked  = false;
     // pflash drafter (lazy-loaded on first `compress` command)
-    dflash::common::DrafterContext drafter_ctx;
+    luce::common::DrafterContext drafter_ctx;
     bool drafter_loaded = false;
 
     while (true) {
@@ -2338,7 +2338,7 @@ int main(int argc, char ** argv) {
             }
             if (line == "free drafter" || line == "drafter free") {
                 if (drafter_loaded) {
-                    dflash::common::free_drafter(drafter_ctx);
+                    luce::common::free_drafter(drafter_ctx);
                     drafter_loaded = false;
                     std::printf("[drafter] freed\n"); std::fflush(stdout);
                 }
@@ -2350,7 +2350,7 @@ int main(int argc, char ** argv) {
                 bool want_target = (line == "unpark" || line == "unpark all" || line == "unpark target");
                 if (want_target && target_parked) {
                     if (!load_target_gguf(target_path, target_backend, w)) {
-                        std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
+                        std::fprintf(stderr, "[unpark] target: %s\n", luce_last_error());
                         stream_emit(-1); continue;
                     }
                     target_parked = false;
@@ -2362,7 +2362,7 @@ int main(int argc, char ** argv) {
                         ? load_draft_gguf(draft_path, draft_backend, dw)
                         : load_draft_safetensors(draft_path, draft_backend, dw);
                     if (!draft_ok) {
-                        std::fprintf(stderr, "[unpark] draft: %s\n", dflash27b_last_error());
+                        std::fprintf(stderr, "[unpark] draft: %s\n", luce_last_error());
                         stream_emit(-1); continue;
                     }
                     if (g_draft_swa_window > 0) {
@@ -2396,6 +2396,7 @@ int main(int argc, char ** argv) {
                                  "[compress] bad args, need: <bin> <keep_x1000> <drafter_gguf> [drafter_arch]\n");
                     stream_emit(-1); continue;
                 }
+
                 auto src_ids = read_int32_file(ppath);
                 if (src_ids.empty()) {
                     std::fprintf(stderr, "[compress] empty input\n");
@@ -2405,10 +2406,10 @@ int main(int argc, char ** argv) {
                 // Park target + draft before allocating drafter context so
                 // the drafter's KV (~1.3 GB Q4_0) + scratch (~600 MB) have
                 // headroom on a 24 GB card. Restore after scoring.
-                // On >=32 GB GPUs, DFLASH_COMPRESS_NO_PARK=1 skips parking
+                // On >=32 GB GPUs, LUCE_COMPRESS_NO_PARK=1 skips parking
                 // so the scorer stays co-resident with target+draft.
-                const bool no_park = (std::getenv("DFLASH_COMPRESS_NO_PARK") &&
-                                      std::atoi(std::getenv("DFLASH_COMPRESS_NO_PARK")) != 0);
+                const bool no_park = (std::getenv("LUCE_COMPRESS_NO_PARK") &&
+                                      std::atoi(std::getenv("LUCE_COMPRESS_NO_PARK")) != 0);
                 bool restore_target = !target_parked && !no_park;
                 bool restore_draft  = !draft_parked && !no_park;
                 if (restore_target) {
@@ -2424,9 +2425,9 @@ int main(int argc, char ** argv) {
                 }
 
                 if (!drafter_loaded) {
-                    if (!dflash::common::load_drafter(drafter_path, /*gpu_layers=*/999, drafter_ctx)) {
+                    if (!luce::common::load_drafter(drafter_path, /*gpu_layers=*/999, drafter_ctx)) {
                         std::fprintf(stderr, "[compress] load_drafter failed: %s\n",
-                                     dflash27b_last_error());
+                                     luce_last_error());
                         stream_emit(-1); continue;
                     }
                     drafter_loaded = true;
@@ -2435,7 +2436,7 @@ int main(int argc, char ** argv) {
                 }
 
                 float keep = (float)keep_x1000 / 1000.0f;
-                auto compressed = dflash::common::drafter_score_and_compress(
+                auto compressed = luce::common::drafter_score_and_compress(
                     drafter_ctx, src_ids, keep,
                     /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13,
                     (int)src_ids.size());
@@ -2448,7 +2449,7 @@ int main(int argc, char ** argv) {
                 if (restore_target) {
                     if (!load_target_gguf(target_path, target_backend, w)) {
                         std::fprintf(stderr, "[compress] target restore: %s\n",
-                                     dflash27b_last_error());
+                                     luce_last_error());
                         stream_emit(-1); continue;
                     }
                     target_parked = false;
@@ -2457,7 +2458,7 @@ int main(int argc, char ** argv) {
                 if (restore_draft) {
                     if (!load_draft_safetensors(draft_path, draft_backend, dw)) {
                         std::fprintf(stderr, "[compress] draft restore: %s\n",
-                                     dflash27b_last_error());
+                                     luce_last_error());
                         stream_emit(-1); continue;
                     }
                     if (g_draft_swa_window > 0) {
@@ -2485,7 +2486,7 @@ int main(int argc, char ** argv) {
                 if (!snapshot_target_cache_thin(w, cache, backend, kv_start, kv_end,
                                                  prefix_snapshots[slot])) {
                     std::fprintf(stderr, "[snap] thin failed slot=%d: %s\n", slot,
-                                 dflash27b_last_error());
+                                 luce_last_error());
                     continue;
                 }
                 std::printf("[snap] thin slot=%d kv=%d,%d\n", slot, kv_start, kv_end);
@@ -2500,7 +2501,7 @@ int main(int argc, char ** argv) {
                     continue;
                 }
                 if (!snapshot_target_cache(w, cache, backend, prefix_snapshots[slot])) {
-                    std::fprintf(stderr, "[snap] failed slot=%d: %s\n", slot, dflash27b_last_error());
+                    std::fprintf(stderr, "[snap] failed slot=%d: %s\n", slot, luce_last_error());
                     continue;
                 }
                 std::printf("[snap] slot=%d cur_pos=%d\n", slot, prefix_snapshots[slot].cur_pos);
@@ -2655,7 +2656,7 @@ int main(int argc, char ** argv) {
             // After cache is fresh, optionally restore from snapshot.
             if (restore_from_slot) {
                 if (!restore_target_cache(prefix_snapshots[restore_slot_id], cache)) {
-                    std::fprintf(stderr, "[snap] restore failed: %s\n", dflash27b_last_error());
+                    std::fprintf(stderr, "[snap] restore failed: %s\n", luce_last_error());
                     stream_emit(-1);
                     continue;
                 }
@@ -2674,7 +2675,7 @@ int main(int argc, char ** argv) {
                                                  thin_ptrs.empty() ? nullptr : thin_ptrs.data(),
                                                  (int)thin_ptrs.size(),
                                                  cache)) {
-                    std::fprintf(stderr, "[snap] RESTORE_CHAIN failed: %s\n", dflash27b_last_error());
+                    std::fprintf(stderr, "[snap] RESTORE_CHAIN failed: %s\n", luce_last_error());
                     stream_emit(-1);
                     continue;
                 }
@@ -2708,19 +2709,19 @@ int main(int argc, char ** argv) {
     //   forward. Better L2 cache warmth on weights across token chunks.
     // Token-segmented (legacy): iterate token chunks (outer) × layers (inner).
     //   Matches llama.cpp's n_ubatch behavior.
-    // Controlled by DFLASH27B_LAYER_PREFILL=1 env var (default: off).
+    // Controlled by LUCE_LAYER_PREFILL=1 env var (default: off).
     // Currently faster only at short contexts (<8K); at longer contexts the
     // graph rebuild overhead per layer dominates.
     const int prompt_len_auto = (int)prompt.size();
     bool layer_prefill = false;
-    if (const char * s = std::getenv("DFLASH27B_LAYER_PREFILL")) {
+    if (const char * s = std::getenv("LUCE_LAYER_PREFILL")) {
         layer_prefill = (std::atoi(s) != 0);
     }
 
     // ── Layer-segmented prefill ─────────────────────────────────────────
     if (layer_prefill) {
         int layer_ubatch_env = 384;
-        if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
+        if (const char * s = std::getenv("LUCE_PREFILL_UBATCH")) {
             layer_ubatch_env = std::max(1, std::atoi(s));
         }
         const int LAYER_UBATCH = layer_ubatch_env;
@@ -2818,7 +2819,7 @@ int main(int argc, char ** argv) {
 
             ggml_tensor * last_row = ggml_view_1d(lsg.ctx, act_in,
                 hidden, (size_t)(prompt_len - 1) * act_in->nb[1]);
-            ggml_tensor * normed   = ggml_rms_norm(lsg.ctx, last_row, DFLASH27B_RMS_EPS);
+            ggml_tensor * normed   = ggml_rms_norm(lsg.ctx, last_row, LUCE_RMS_EPS);
             normed = ggml_mul(lsg.ctx, normed, w.out_norm);
             ggml_tensor * logits   = ggml_mul_mat(lsg.ctx, w.output, normed);
             ggml_set_name(logits, "logits");
@@ -2862,7 +2863,7 @@ int main(int argc, char ** argv) {
         auto t_mig0 = std::chrono::steady_clock::now();
         step_graph_destroy(sg);
         if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache, specla_mode)) {
-            std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "cache migration: %s\n", luce_last_error());
             return 1;
         }
         auto t_mig1 = std::chrono::steady_clock::now();
@@ -2881,7 +2882,7 @@ int main(int argc, char ** argv) {
     // both branches: large prompts already amortise launch overhead, small
     // prompts (compressed) need a meaningful tile to keep the GPU busy.
     int prefill_ubatch_env = (prompt_len_auto > 2048) ? 512 : 256;
-    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
+    if (const char * s = std::getenv("LUCE_PREFILL_UBATCH")) {
         prefill_ubatch_env = std::max(1, std::atoi(s));
     }
     const int PREFILL_UBATCH = prefill_ubatch_env;
@@ -2933,7 +2934,7 @@ int main(int argc, char ** argv) {
                     std::fflush(stdout);
                 } else {
                     std::fprintf(stderr, "[snap] inline snap failed slot=%d: %s\n",
-                                 snap_slot, dflash27b_last_error());
+                                 snap_slot, luce_last_error());
                 }
             }
             snap_pos = -1; snap_slot = -1;   // consume
@@ -3030,7 +3031,7 @@ int main(int argc, char ** argv) {
                     std::fflush(stdout);
                 } else {
                     std::fprintf(stderr, "[snap] inline snap failed slot=%d: %s\n",
-                                 snap_slot, dflash27b_last_error());
+                                 snap_slot, luce_last_error());
                 }
             }
             snap_pos = -1; snap_slot = -1;   // consume
@@ -3065,7 +3066,7 @@ int main(int argc, char ** argv) {
     auto t_mig0 = std::chrono::steady_clock::now();
     step_graph_destroy(sg);
     if (!migrate_prefill_cache(w, max_ctx, max_verify_tokens, target_backend, cache, specla_mode)) {
-        std::fprintf(stderr, "cache migration: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "cache migration: %s\n", luce_last_error());
         return 1;
     }
     auto t_mig1 = std::chrono::steady_clock::now();
@@ -3078,8 +3079,8 @@ int main(int argc, char ** argv) {
             if (!draft_feature_mirror_init(feature_mirror, draft_backend,
                                            draft_gpu, target_gpu,
                                            cache.target_feat_cap,
-                                           DFLASH27B_DRAFT_N_TARGET_LAYERS,
-                                           DFLASH27B_TARGET_HIDDEN)) {
+                                           LUCE_DRAFT_N_TARGET_LAYERS,
+                                           LUCE_TARGET_HIDDEN)) {
                 std::fprintf(stderr, "draft feature mirror init failed\n");
                 return 1;
             }
@@ -3338,15 +3339,15 @@ int main(int argc, char ** argv) {
             } else {
                 // DDTree K>1: need real log-probs for best-first tree scoring.
                 bool topk_done = false;
-#ifdef DFLASH27B_HAVE_DRAFT_TOPK
+#ifdef LUCE_HAVE_DRAFT_TOPK
                 // GPU path: top-K + logsumexp on the draft logits device buffer
-                // (positions 1..q_len-1), no full-vocab D2H. Escape: DFLASH_GPU_DRAFT_TOPK=0.
+                // (positions 1..q_len-1), no full-vocab D2H. Escape: LUCE_GPU_DRAFT_TOPK=0.
                 static const bool kGpuDraftTopk = [](){
-                    const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
+                    const char * v = std::getenv("LUCE_GPU_DRAFT_TOPK");
                     return v == nullptr || v[0] != '0';
                 }();
                 if (kGpuDraftTopk && !draft_hidden_bridge) {
-                    topk_done = dflash::common::geometric_extract_draft_topk_cuda(
+                    topk_done = luce::common::geometric_extract_draft_topk_cuda(
                         (const float *)draft_sg.logits->data + (size_t)vocab,
                         L, vocab, ddtree_K,
                         ddtree_top_log_probs.data(),
@@ -3548,7 +3549,7 @@ int main(int argc, char ** argv) {
             //   GPU_VERIFY_ARGMAX=2: run BOTH and report per-step mismatches
             //                        (validates the historical "-1 / tie" concern).
             static const int kGpuVerifyArgmax = [](){
-                const char * v = std::getenv("DFLASH_GPU_VERIFY_ARGMAX");
+                const char * v = std::getenv("LUCE_GPU_VERIFY_ARGMAX");
                 return v ? std::atoi(v) : 0;
             }();
             std::vector<int32_t> posterior(N_actual);
@@ -4383,14 +4384,14 @@ int main(int argc, char ** argv) {
                            + tt_mirror_sync);
     std::printf("  ----- sum     %.2f\n", sum_ms);
 
-    std::printf("\n[dflash] generated %d tokens in %.3f s  ->  %.2f tok/s\n",
+    std::printf("\n[luce] generated %d tokens in %.3f s  ->  %.2f tok/s\n",
                 n_generated, gen_s, tps);
-    std::printf("[dflash] %d draft steps, accepted=%d/%d (%.1f%% per step), "
+    std::printf("[luce] %d draft steps, accepted=%d/%d (%.1f%% per step), "
                 "avg commit/step=%.2f\n",
                 n_draft_steps, n_accept_sum, n_draft_steps * q_len,
                 (n_draft_steps > 0 ? 100.0 * n_accept_sum / (n_draft_steps * q_len) : 0.0),
                 (n_draft_steps > 0 ? (double)n_generated / n_draft_steps : 0.0));
-    std::printf("[dflash] output tail: ");
+    std::printf("[luce] output tail: ");
     int tail_start = std::max(0, (int)out_all.size() - 20);
     for (int i = tail_start; i < (int)out_all.size(); i++) std::printf("%d ", out_all[i]);
     std::printf("\n");

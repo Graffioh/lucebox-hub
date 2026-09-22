@@ -10,7 +10,7 @@
 
 #include "sampler.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 // Called once for each token committed by transitional whole-request
 // executors. Returning false requests cancellation.
@@ -133,4 +133,4 @@ struct GenerateResult {
     }
 };
 
-} // namespace dflash::common
+} // namespace luce::common

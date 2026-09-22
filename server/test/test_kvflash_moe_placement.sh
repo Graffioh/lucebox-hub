@@ -10,7 +10,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO/server/build/dflash_server}"
+SERVER_BIN="${LUCE_SERVER_BIN:-$REPO/server/build/luce_server}"
 TARGET="${TARGET:-/home/peppi/models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf}"
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-/home/peppi/models/qwen3-coder-chat-template.jinja}"
 HOST=127.0.0.1; PORT="${PORT:-18080}"

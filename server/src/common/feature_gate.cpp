@@ -7,7 +7,7 @@
 
 #include <climits>
 
-namespace dflash::common {
+namespace luce::common {
 
 std::string check_feature_compatibility(
     const BackendArgs & args,
@@ -413,8 +413,8 @@ std::vector<std::string> collect_feature_warnings(
                arch_supports_draft_swa(arch, false),
                split, arch, "--draft-swa", "draft sliding-window attention");
 
-    // MoE-only backend requests. These drive the DFLASH_QWEN35MOE_* /
-    // DFLASH_LAGUNA_* env vars, which a dense backend never reads.
+    // MoE-only backend requests. These drive the LUCE_QWEN35MOE_* /
+    // LUCE_LAGUNA_* env vars, which a dense backend never reads.
     if (args.routing_stats_requested && !arch_has_expert_offload(arch)) {
         out.push_back("--freq/--collect-routing ignored: architecture '" +
                       arch + "' has no expert routing to record");
@@ -427,4 +427,4 @@ std::vector<std::string> collect_feature_warnings(
     return out;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -37,8 +37,8 @@ def env_path(name: str, default: Path) -> Path:
 DEFAULT_BUILD = env_path("PFLASH_PHASE_BUILD_DIR", ROOT / "build")
 DEFAULT_DRAFTER = env_path("PFLASH_PHASE_DRAFTER", ROOT / "models" / "Qwen3.5-0.8B-BF16.gguf")
 DEFAULT_TOKENIZER = os.environ.get("PFLASH_PHASE_TOKENIZER", "Qwen/Qwen3.5-0.8B")
-DEFAULT_TARGET = env_path("DFLASH_TARGET", ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf")
-DEFAULT_TARGET_DRAFT = env_path("DFLASH_DRAFT", ROOT / "models" / "draft")
+DEFAULT_TARGET = env_path("LUCE_TARGET", ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf")
+DEFAULT_TARGET_DRAFT = env_path("LUCE_DRAFT", ROOT / "models" / "draft")
 DEFAULT_TARGET_TOKENIZER = os.environ.get("PFLASH_PHASE_TARGET_TOKENIZER", "Qwen/Qwen3.6-27B")
 
 
@@ -476,11 +476,9 @@ def make_niah_text(tokenizer, token_count: int, case_idx: int, needle_fraction: 
 
 
 def make_pflash_env(args) -> dict[str, str]:
-    env = {"DFLASH_FP_ALPHA": str(args.pflash_alpha)}
+    env = {"LUCE_FP_ALPHA": str(args.pflash_alpha)}
     if args.pflash_use_bsa:
-        env["DFLASH_FP_USE_BSA"] = "1"
-    if args.pflash_k_type:
-        env["DFLASH_PFLASH_K_TYPE"] = args.pflash_k_type
+        env["LUCE_FP_USE_BSA"] = "1"
     return env
 
 

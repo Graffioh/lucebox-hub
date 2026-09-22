@@ -8,7 +8,7 @@
 #include <cmath>
 #include <cstdio>
 
-namespace dflash::common {
+namespace luce::common {
 
 std::vector<LayerSplitRange> compute_layer_ranges(
     int n_layer,
@@ -194,4 +194,4 @@ void free_layer_split_snapshot_backends(
     snapshot_backends.clear();
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

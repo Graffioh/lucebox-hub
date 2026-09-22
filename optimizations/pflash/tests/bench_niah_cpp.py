@@ -8,7 +8,7 @@ from pflash.dflash_client import DflashClient
 
 def _alpha_or_die(raw, src):
     """Parse + range-check alpha. The daemon silently ignores values outside
-    (0, 1) (see dflash/src/qwen3_0p6b_graph.cpp), so reject them here loudly."""
+    (0, 1) (see server/src/qwen3_0p6b_graph.cpp), so reject them here loudly."""
     try:
         v = float(raw)
     except (TypeError, ValueError):
@@ -23,11 +23,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", required=True)
     ap.add_argument("--n", type=int, default=1)
-    ap.add_argument("--bin", default="/home/lucebox/lucebox-hub/dflash/build/test_dflash")
+    ap.add_argument("--bin", default="/home/lucebox/lucebox-hub/server/build/test_dflash")
     ap.add_argument("--target", default="/opt/lucebox/models/Qwen3.6-27B-Q4_K_M.gguf")
-    ap.add_argument("--draft-spec", default="/home/lucebox/lucebox-hub/dflash/models/draft/model.safetensors",
+    ap.add_argument("--draft-spec", default="/home/lucebox/lucebox-hub/server/models/draft/model.safetensors",
                     help="draft model used for spec decoding (NOT drafter scorer)")
-    ap.add_argument("--drafter-gguf", default="/home/lucebox/lucebox-hub/dflash/models/Qwen3.5-0.8B-BF16.gguf",
+    ap.add_argument("--drafter-gguf", default="/home/lucebox/lucebox-hub/server/models/Qwen3.5-0.8B-BF16.gguf",
                     help="C++ drafter scorer GGUF (Qwen3.5-0.8B BF16)")
     ap.add_argument("--drafter-arch", default="qwen35-0.8b", choices=["qwen35-0.8b"],
                     help="C++ drafter architecture selector")
@@ -49,11 +49,11 @@ def main():
     ap.add_argument("--bsa", type=int, choices=[0, 1], default=None,
                     help="Enable BSA (Block-Sparse Attention) for the drafter "
                          "scoring forward. Required for valid NIAH validation "
-                         "at long ctx. Falls back to DFLASH_FP_USE_BSA env var "
+                         "at long ctx. Falls back to LUCE_FP_USE_BSA env var "
                          "when unset.")
     ap.add_argument("--alpha", type=float, default=None,
                     help="BSA block-selection threshold. Falls back to "
-                         "DFLASH_FP_ALPHA env var when unset. Validate per "
+                         "LUCE_FP_ALPHA env var when unset. Validate per "
                          "setup; e.g. alpha=0.85 fails 2/10 NIAH at 117K on "
                          "Qwen3.6-27B / RTX 5090.")
     ap.add_argument("--no-thinking", action="store_true",
@@ -68,37 +68,37 @@ def main():
     # CLI flags take priority over inherited env vars.
     #
     # The daemon enables BSA on env-var *presence* (getenv != nullptr in
-    # dflash/src/flashprefill.cpp), not value, so:
-    #   - --bsa 1 or env-var present → ensure DFLASH_FP_USE_BSA is set
-    #   - --bsa 0 (explicit disable) → POP DFLASH_FP_USE_BSA so the daemon
+    # server/src/flashprefill.cpp), not value, so:
+    #   - --bsa 1 or env-var present → ensure LUCE_FP_USE_BSA is set
+    #   - --bsa 0 (explicit disable) → POP LUCE_FP_USE_BSA so the daemon
     #     does not inherit it (otherwise --bsa 0 is a no-op when the user's
-    #     shell has DFLASH_FP_USE_BSA=1, or even =0 — value is ignored)
+    #     shell has LUCE_FP_USE_BSA=1, or even =0 — value is ignored)
     if args.bsa is None:
-        bsa_enabled = "DFLASH_FP_USE_BSA" in os.environ
+        bsa_enabled = "LUCE_FP_USE_BSA" in os.environ
     else:
         bsa_enabled = bool(args.bsa)
 
     if args.alpha is not None:
         alpha = _alpha_or_die(args.alpha, "--alpha")
-    elif "DFLASH_FP_ALPHA" in os.environ:
-        alpha = _alpha_or_die(os.environ["DFLASH_FP_ALPHA"], "DFLASH_FP_ALPHA")
+    elif "LUCE_FP_ALPHA" in os.environ:
+        alpha = _alpha_or_die(os.environ["LUCE_FP_ALPHA"], "LUCE_FP_ALPHA")
     else:
         alpha = None
 
     if bsa_enabled:
-        os.environ["DFLASH_FP_USE_BSA"] = "1"
+        os.environ["LUCE_FP_USE_BSA"] = "1"
     else:
-        os.environ.pop("DFLASH_FP_USE_BSA", None)
+        os.environ.pop("LUCE_FP_USE_BSA", None)
     if alpha is not None:
-        os.environ["DFLASH_FP_ALPHA"] = str(alpha)
+        os.environ["LUCE_FP_ALPHA"] = str(alpha)
 
     if not bsa_enabled:
         print("[warn] BSA disabled. NIAH validation requires BSA enabled "
-              "(--bsa 1 or DFLASH_FP_USE_BSA set in env); the WMMA fallback "
+              "(--bsa 1 or LUCE_FP_USE_BSA set in env); the WMMA fallback "
               "path is ~3.4x slower at long ctx and silently fails NIAH.",
               flush=True)
     elif alpha is None:
-        print("[warn] BSA enabled but neither --alpha nor DFLASH_FP_ALPHA set; "
+        print("[warn] BSA enabled but neither --alpha nor LUCE_FP_ALPHA set; "
               "daemon will use its hardcoded default. For reproducible "
               "benchmarks, set --alpha explicitly.", flush=True)
 

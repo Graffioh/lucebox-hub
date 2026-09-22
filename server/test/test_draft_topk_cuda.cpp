@@ -12,7 +12,7 @@
 // order the tied ids differently; we treat an id swap as OK when the matching
 // log-probs are equal within tolerance.
 //
-// Build: registered in server/CMakeLists.txt under DFLASH27B_TESTS for both the
+// Build: registered in server/CMakeLists.txt under LUCE_TESTS for both the
 //        CUDA and HIP backends (the HIP build compiles this via the hip_compat
 //        <cuda_runtime.h> shim). Run: ./test_draft_topk_cuda (0 = pass).
 
@@ -30,9 +30,9 @@
 #include <random>
 #include <vector>
 
-using dflash::common::extract_draft_topk;
-using dflash::common::geometric_extract_draft_topk_cuda;
-using dflash::common::geometric_draft_topk_cuda_supports_k;
+using luce::common::extract_draft_topk;
+using luce::common::geometric_extract_draft_topk_cuda;
+using luce::common::geometric_draft_topk_cuda_supports_k;
 
 namespace {
 

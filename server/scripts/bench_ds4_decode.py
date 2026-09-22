@@ -83,11 +83,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Run one warm-up and three fresh 512-token BETA requests against "
-            "an OpenAI-compatible dflash_server."
+            "an OpenAI-compatible luce_server."
         )
     )
     parser.add_argument("--url", default="http://127.0.0.1:8016")
-    parser.add_argument("--model", default="dflash")
+    parser.add_argument("--model", default="luce")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--runs", type=int, default=3)

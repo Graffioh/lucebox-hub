@@ -5,7 +5,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -290,4 +290,4 @@ bool specla_flush_pending_factors(const SpeclaFactorBanks & banks,
         pending_count, S_k, S_v, H, n_delta, conv_channels, d_conv, stream);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

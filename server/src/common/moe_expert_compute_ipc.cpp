@@ -45,7 +45,7 @@
 #  include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -58,7 +58,7 @@ uint64_t moe_expert_compute_elapsed_us(MoeExpertClock::time_point start,
 }
 
 bool moe_expert_compute_profile_enabled() {
-    const char * raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_PROFILE");
+    const char * raw = std::getenv("LUCE_MOE_EXPERT_COMPUTE_IPC_PROFILE");
     return raw && *raw && std::strcmp(raw, "0") != 0 &&
         std::strcmp(raw, "false") != 0 && std::strcmp(raw, "off") != 0;
 }
@@ -405,7 +405,7 @@ bool write_temp_remote_placement(const MoeHybridPlacement & main,
 }
 
 BackendIpcPayloadTransport moe_expert_transport_from_env() {
-    const char * raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_TRANSPORT");
+    const char * raw = std::getenv("LUCE_MOE_EXPERT_COMPUTE_IPC_TRANSPORT");
     if (!raw || !*raw) {
         return BackendIpcPayloadTransport::Auto;
     }
@@ -417,7 +417,7 @@ BackendIpcPayloadTransport moe_expert_transport_from_env() {
 }
 
 int moe_expert_ipc_shared_batch_capacity_from_env() {
-    const char * raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
+    const char * raw = std::getenv("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
     if (!raw || !*raw) return 1024;
     char * end = nullptr;
     long value = std::strtol(raw, &end, 10);
@@ -427,7 +427,7 @@ int moe_expert_ipc_shared_batch_capacity_from_env() {
 }
 
 ggml_type moe_expert_ipc_input_type_from_env() {
-    const char * raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_DTYPE");
+    const char * raw = std::getenv("LUCE_MOE_EXPERT_COMPUTE_IPC_DTYPE");
     if (!raw || !*raw || std::strcmp(raw, "f32") == 0 || std::strcmp(raw, "F32") == 0) {
         return GGML_TYPE_F32;
     }
@@ -439,7 +439,7 @@ ggml_type moe_expert_ipc_input_type_from_env() {
     }
     std::fprintf(stderr,
                  "[moe-expert-compute-ipc] ignoring unsupported "
-                 "DFLASH_MOE_EXPERT_COMPUTE_IPC_DTYPE=%s\n",
+                 "LUCE_MOE_EXPERT_COMPUTE_IPC_DTYPE=%s\n",
                  raw);
     return GGML_TYPE_F32;
 }
@@ -518,7 +518,7 @@ size_t moe_expert_required_shared_bytes(int n_embd,
 }
 
 size_t moe_expert_shared_bytes_from_env(size_t required_bytes) {
-    const char * raw = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_SHARED_BYTES");
+    const char * raw = std::getenv("LUCE_MOE_EXPERT_COMPUTE_IPC_SHARED_BYTES");
     if (!raw || !*raw) return required_bytes;
     if (raw[0] == '-') return required_bytes;
     char * end = nullptr;
@@ -704,7 +704,7 @@ bool load_remote_moe_runtime(const char * target_path,
     if (arch == "qwen35moe") {
         TargetWeights weights;
         if (!load_target_gguf_partial(target_path, backend, plan, weights)) {
-            if (err) *err = dflash27b_last_error();
+            if (err) *err = luce_last_error();
             free_target_weights(weights);
             return false;
         }
@@ -715,7 +715,7 @@ bool load_remote_moe_runtime(const char * target_path,
     if (arch == "laguna") {
         LagunaTargetWeights weights;
         if (!load_target_gguf_laguna_partial(target_path, backend, plan, weights)) {
-            if (err) *err = dflash27b_last_error();
+            if (err) *err = luce_last_error();
             free_laguna_target_weights(weights);
             return false;
         }
@@ -1518,7 +1518,7 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
     MoeExpertDaemonStats profile_stats_decode;
     const bool profile = moe_expert_compute_profile_enabled();
     const char * token_loop_env =
-        std::getenv("DFLASH_MOE_EXPERT_COMPUTE_DAEMON_TOKEN_LOOP");
+        std::getenv("LUCE_MOE_EXPERT_COMPUTE_DAEMON_TOKEN_LOOP");
     const bool token_loop_batches =
         token_loop_env && *token_loop_env && *token_loop_env != '0';
     int warmup_builds = 0;
@@ -2069,4 +2069,4 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
 #endif
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

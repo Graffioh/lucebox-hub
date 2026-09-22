@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct PFlashDrafterIpcCompressCommand {
     bool legacy_quantized_ratio = false;
@@ -80,4 +80,4 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
                                   int drafter_gpu,
                                   int stream_fd);
 
-} // namespace dflash::common
+} // namespace luce::common

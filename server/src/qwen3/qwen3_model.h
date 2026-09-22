@@ -24,7 +24,7 @@ typedef struct ggml_backend * ggml_backend_t;
 struct ggml_backend_buffer;
 typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen3Layer {
     ggml_tensor * attn_norm   = nullptr;  // [hidden]
@@ -71,4 +71,4 @@ bool load_qwen3_model(const std::string & gguf_path,
 
 void free_qwen3_model(Qwen3Weights & w);
 
-} // namespace dflash::common
+} // namespace luce::common

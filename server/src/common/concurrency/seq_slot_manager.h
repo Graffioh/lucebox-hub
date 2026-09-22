@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 enum class SeqSlotPhase {
     free,
@@ -195,4 +195,4 @@ private:
     std::vector<SeqSlot> slots_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

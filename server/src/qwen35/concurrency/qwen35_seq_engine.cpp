@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 std::vector<PagedKvTensor> qwen_paged_kv_planes(const TargetCache & cache,
@@ -520,7 +520,7 @@ PrefixStoreEvent Qwen35SeqEngine::capture_prefix(
         event.elapsed_us =
             (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - capture_started).count();
-        event.error = dflash27b_last_error();
+        event.error = luce_last_error();
         if (event.error.empty()) {
             event.error = "paged prefix capture failed";
         }
@@ -689,7 +689,7 @@ SeqEngine::StepResult Qwen35SeqEngine::step_chain_spec(
     const int n_head_kv = b_.w_.n_head_kv;
     const int n_slots = slots_.slot_count();
     const int min_tokens = []() {
-        const char * value = std::getenv("DFLASH_MIN_TOKENS");
+        const char * value = std::getenv("LUCE_MIN_TOKENS");
         return value ? std::max(0, std::atoi(value)) : 0;
     }();
 
@@ -1658,4 +1658,4 @@ void Qwen35SeqEngine::retire(int slot) {
     slots_.retire(slot);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -5,7 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dflash::pflash {
+namespace luce::pflash {
 
 // Force chunk and its radius-neighborhood into `forced`.
 static void force_neighborhood(std::vector<uint8_t>& forced, int n_chunks,
@@ -161,4 +161,4 @@ void scan_and_force_transitive(
     }
 }
 
-} // namespace dflash::pflash
+} // namespace luce::pflash

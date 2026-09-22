@@ -154,7 +154,7 @@ the gfx110x-specific gap.
 
 **The original hypothesis**: extend the MMVQ switch from `ncols_dst ∈
 {1..8}` to also include the real DFlash verify shapes (`ne[1] = 16` for
-chain mode = `DFLASH27B_DRAFT_BLOCK_SIZE`, `ne[1] = 23` for default
+chain mode = `LUCE_DRAFT_BLOCK_SIZE`, `ne[1] = 23` for default
 DDTree `--ddtree-budget=22` = `1 + budget`). Add a per-(type, cc, batch)
 gate `mmvq_is_supported_batch()` at the dispatcher so RDNA3+ q4_K routes
 to the BW-amortised vec_dot kernel instead of MMQ's 32-wide tile that

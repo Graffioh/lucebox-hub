@@ -34,7 +34,7 @@
 #include <cstddef>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Whether an option reaches the backend, as a function of placement.
 enum class FeatureSupport {
@@ -257,4 +257,4 @@ inline bool arch_supports_paged_attention(const std::string & arch,
     return detail::arch_has(arch, &ArchCapabilities::paged_attn, is_layer_split);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -15,7 +15,7 @@
 
 #include "chain_rollback_policy.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 // RAII guard so any early `return false` path frees the per-call draft graph.
@@ -334,4 +334,4 @@ bool run_dflash_spec_decode(
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

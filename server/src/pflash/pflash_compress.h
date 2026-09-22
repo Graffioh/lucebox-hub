@@ -5,7 +5,7 @@
 //   - count_nonfinite_scores / scoring_head_mean_token_mass
 //                              score post-processing helpers
 //   - PFlashTraceFields / write_compression_trace
-//                              JSONL compression trace (DFLASH_PFLASH_TRACE_PATH)
+//                              JSONL compression trace (PFLASH_TRACE_PATH)
 //   - select_pflash_chunks     per-token scores -> candidates -> strict
 //                              selection -> merged output ids (+ trace)
 
@@ -20,7 +20,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 int env_int(const char * name, int fallback);
 float env_float(const char * name, float def);
@@ -84,13 +84,13 @@ struct PFlashTraceFields {
     const std::vector<int32_t> * input_ids = nullptr;
     int query_begin = -1;
     int query_end = -1;
-    dflash::pflash::PFlashSelectionMode selector_mode =
-        dflash::pflash::PFlashSelectionMode::Legacy;
-    dflash::pflash::PFlashQueryParser query_parser =
-        dflash::pflash::PFlashQueryParser::SemanticUser;
+    luce::pflash::PFlashSelectionMode selector_mode =
+        luce::pflash::PFlashSelectionMode::Legacy;
+    luce::pflash::PFlashQueryParser query_parser =
+        luce::pflash::PFlashQueryParser::SemanticUser;
     int token_budget = 0;
-    dflash::pflash::PFlashSelectionStop stop =
-        dflash::pflash::PFlashSelectionStop::InvalidInput;
+    luce::pflash::PFlashSelectionStop stop =
+        luce::pflash::PFlashSelectionStop::InvalidInput;
     int retained_tokens = 0;
     double retained_mass = 0.0;
     const std::vector<double> * exact_chunk_scores = nullptr;
@@ -135,7 +135,7 @@ std::vector<int32_t> select_pflash_chunks(
         int n_lookahead,
         int score_query_end,
         int pool_kernel,
-        const dflash::pflash::PFlashSelectionConfig & config,
+        const luce::pflash::PFlashSelectionConfig & config,
         const std::vector<PFlashTokenSpan> & required_instruction_spans,
         bool direct_mass,
         bool write_trace,
@@ -149,4 +149,4 @@ std::vector<int32_t> select_pflash_chunks(
         // ``kPFlashMinPriorDocuments`` leaves the prior a no-op.
         const std::vector<PFlashTokenSpan> * documents = nullptr);
 
-} // namespace dflash::common
+} // namespace luce::common

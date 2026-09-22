@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct PrefixStoreRef {
     uint64_t id = 0;
@@ -89,4 +89,4 @@ struct PrefixStoreEvent {
     bool attempted() const { return status != Status::none; }
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

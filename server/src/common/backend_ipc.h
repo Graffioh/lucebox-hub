@@ -19,7 +19,7 @@
 #  include <sys/types.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 enum class BackendIpcMode {
     Invalid,
@@ -181,4 +181,4 @@ private:
     bool active_ = false;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 using json = nlohmann::json;
 
@@ -283,4 +283,4 @@ struct StatusGuard {
     ~StatusGuard() { status.set_idle(); }
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

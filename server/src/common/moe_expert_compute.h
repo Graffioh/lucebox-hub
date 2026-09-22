@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Per-layer selected expert weight metadata; raw pointers into shared memory.
 struct MoeExpertLayer {
@@ -204,4 +204,4 @@ int run_moe_expert_compute_ipc_daemon(const char * target_path,
                                       int shared_payload_fd = -1,
                                       size_t shared_payload_bytes = 0);
 
-}  // namespace dflash::common
+}  // namespace luce::common

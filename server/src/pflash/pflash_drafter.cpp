@@ -28,7 +28,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
                   DrafterContext & out) {
@@ -111,9 +111,9 @@ std::vector<int32_t> drafter_score_and_compress(
         return {};
     }
 
-    dflash::pflash::PFlashSelectionConfig experiment;
+    luce::pflash::PFlashSelectionConfig experiment;
     std::string experiment_error;
-    if (!dflash::pflash::resolve_pflash_selection(
+    if (!luce::pflash::resolve_pflash_selection(
             (int) ids.size(), chunk_size, experiment, experiment_error)) {
         set_last_error("invalid PFlash strict selection config: " + experiment_error);
         std::fprintf(stderr, "[pflash-select] ERROR config: %s\n",
@@ -132,7 +132,7 @@ std::vector<int32_t> drafter_score_and_compress(
     }
     if (experiment.selection_active) {
         std::string span_error;
-        if (!dflash::pflash::validate_pflash_instruction_spans(
+        if (!luce::pflash::validate_pflash_instruction_spans(
                 required_instruction_spans, (int) ids.size(), span_error)) {
             set_last_error("invalid PFlash instruction spans: " + span_error);
             std::fprintf(stderr,
@@ -147,9 +147,9 @@ std::vector<int32_t> drafter_score_and_compress(
             "[pflash-select] config mode=%s active=%d chunk=%d "
             "query_parser=%s query_cap=%d query_actual=%d top_p=%.9g "
             "top_k=%d doc_prior=%.9g doc_heads=%d doc_spans=%zu input=%zu\n",
-            dflash::pflash::pflash_selection_mode_name(experiment.mode),
+            luce::pflash::pflash_selection_mode_name(experiment.mode),
             (int) experiment.selection_active, experiment.chunk_size,
-            dflash::pflash::pflash_query_parser_name(experiment.query_parser),
+            luce::pflash::pflash_query_parser_name(experiment.query_parser),
             experiment.query_tokens, n_lookahead, experiment.top_p,
             experiment.top_k, experiment.doc_prior_exponent,
             experiment.force_doc_heads, document_spans.size(), ids.size());
@@ -165,4 +165,4 @@ std::vector<int32_t> drafter_score_and_compress(
         document_spans);
 }
 
-} // namespace dflash::common
+} // namespace luce::common

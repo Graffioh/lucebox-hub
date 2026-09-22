@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 Qwen35Config make_qwen_runtime_config(BailingMoe3Config cfg) {
@@ -45,4 +45,4 @@ void BailingMoe3Backend::print_ready_banner() const {
     std::fflush(stdout);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

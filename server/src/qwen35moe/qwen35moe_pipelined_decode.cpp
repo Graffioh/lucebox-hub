@@ -16,7 +16,7 @@
 #include <cstring>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 using PipelineClock = std::chrono::steady_clock;
 
@@ -288,11 +288,11 @@ bool init_pipelined_decode_state(
     out.capture_host_buf.resize((size_t)w.n_embd);
 
     // Check if routed FFN pipeline is disabled
-    const bool routed_disabled = (std::getenv("DFLASH_QWEN35MOE_NO_ROUTED") != nullptr);
+    const bool routed_disabled = (std::getenv("LUCE_QWEN35MOE_NO_ROUTED") != nullptr);
 
     // Non-local experts are computed through the expert compute path by default.
-    // Set DFLASH_DROP_COLD=1 to skip cold computation (fast but lossy).
-    out.expert_compute = (std::getenv("DFLASH_DROP_COLD") == nullptr);
+    // Set LUCE_DROP_COLD=1 to skip cold computation (fast but lossy).
+    out.expert_compute = (std::getenv("LUCE_DROP_COLD") == nullptr);
 
     // Build cached pre-FFN graphs for all DeltaNet layers.
     out.cached_prefn.resize((size_t)w.n_layer);
@@ -490,7 +490,7 @@ bool pipelined_decode_one_token(
             // (LRU) so the lookup below serves them on-GPU; after warmup cold->0.
             if (storage.cache_slots > 0)
                 for (int i = 0; i < n_expert_used; ++i)
-                    dflash::common::moe_hybrid_cache_swap_in(storage, global_ids[i], backend);
+                    luce::common::moe_hybrid_cache_swap_in(storage, global_ids[i], backend);
             for (int i = 0; i < n_expert_used; ++i) {
                 int32_t gid = global_ids[i];
                 int32_t lid = (gid >= 0 && gid < (int)storage.hot_local_by_global.size())
@@ -617,9 +617,9 @@ bool pipelined_decode_one_token(
         // Attention layers: cached step-invariant graph (set_rows KV write +
         // 256-aligned FA span). Built once per 256-token window, then reused
         // with input-data updates only -> the ggml-cuda CUDA-graph cache
-        // replays it. DFLASH_QWEN35MOE_NO_KVPAD=1 restores per-token rebuild.
+        // replays it. LUCE_QWEN35MOE_NO_KVPAD=1 restores per-token rebuild.
         static const bool g_no_kvpad =
-            (std::getenv("DFLASH_QWEN35MOE_NO_KVPAD") != nullptr);
+            (std::getenv("LUCE_QWEN35MOE_NO_KVPAD") != nullptr);
         bool attn_cached_ok = false;
         if (is_attn && !g_no_kvpad) {
             auto & cpg = state.cached_prefn[(size_t)il];
@@ -765,7 +765,7 @@ bool pipelined_decode_one_token(
             // Spark expert cache: pull selected cold experts into spare GPU slots.
             if (storage.cache_slots > 0)
                 for (int i = 0; i < n_expert_used; ++i)
-                    dflash::common::moe_hybrid_cache_swap_in(storage, state.routing_ids_buf[(size_t)i], backend);
+                    luce::common::moe_hybrid_cache_swap_in(storage, state.routing_ids_buf[(size_t)i], backend);
             for (int i = 0; i < n_expert_used; ++i) {
                 int32_t gid = state.routing_ids_buf[(size_t)i];
                 int32_t lid = (gid >= 0 && gid < (int)storage.hot_local_by_global.size())
@@ -1059,4 +1059,4 @@ bool pipelined_decode_one_token(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

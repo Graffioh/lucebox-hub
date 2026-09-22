@@ -2,7 +2,7 @@
 //
 // Splits the DS4 model's 43 layers across two GPUs by contiguous layer ranges.
 // The split point is auto-computed from CUDA free memory, or manually set via
-// DFLASH_DS4_CUDA_LAYERS env var.
+// LUCE_DS4_CUDA_LAYERS env var.
 
 #pragma once
 
@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct DeepSeek4LayerSplitAdapterConfig {
     std::string target_path;
@@ -139,4 +139,4 @@ int run_deepseek4_target_shard_ipc_daemon(
     int stream_fd,
     int payload_fd = -1);
 
-}  // namespace dflash::common
+}  // namespace luce::common

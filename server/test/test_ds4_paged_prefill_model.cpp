@@ -1,6 +1,6 @@
 // Optional full-model regression for Strix Halo. Requires the matching 0731
 // mixed-weight target; no drafter is loaded. Not registered in ordinary CI.
-// DFLASH_DS4_SPEC=0 ROCR_VISIBLE_DEVICES=1 \
+// LUCE_DS4_SPEC=0 ROCR_VISIBLE_DEVICES=1 \
 //   test_ds4_paged_prefill_model target.gguf
 #include "deepseek4/deepseek4_backend.h"
 #include "seq_engine_contract.h"
@@ -12,7 +12,7 @@
 #include <cstring>
 #include <stdexcept>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static std::vector<std::vector<int32_t>> generate(
         SeqEngine & engine, const std::vector<std::vector<int32_t>> & prompts,
@@ -134,9 +134,9 @@ static void check_prefill_parity(SeqEngine & engine,
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 2 || (std::getenv("DFLASH_DS4_SPEC") &&
-                     std::strcmp(std::getenv("DFLASH_DS4_SPEC"), "0") != 0)) {
-        std::fprintf(stderr, "Usage: DFLASH_DS4_SPEC=0 test_ds4_paged_prefill_model target.gguf\n");
+    if (argc != 2 || (std::getenv("LUCE_DS4_SPEC") &&
+                     std::strcmp(std::getenv("LUCE_DS4_SPEC"), "0") != 0)) {
+        std::fprintf(stderr, "Usage: LUCE_DS4_SPEC=0 test_ds4_paged_prefill_model target.gguf\n");
         return 2;
     }
     DeepSeek4BackendConfig config;

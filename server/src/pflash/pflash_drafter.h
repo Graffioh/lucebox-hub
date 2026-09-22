@@ -29,7 +29,7 @@
 struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen35DrafterState;
 
@@ -87,4 +87,4 @@ std::vector<int32_t> drafter_score_and_compress(
     // (PFLASH_SELECT_DOC_PRIOR). Empty leaves the prior a no-op.
     const std::vector<PFlashTokenSpan> & document_spans = {});
 
-} // namespace dflash::common
+} // namespace luce::common

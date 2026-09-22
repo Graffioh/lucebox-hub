@@ -27,7 +27,7 @@
 #include "common/ggml_graph_precision.h"
 #include "common/prof_env.h"
 #include "internal.h"
-#include "dflash27b.h"
+#include "luce.h"
 
 #include <cmath>
 #include <cstdio>
@@ -41,7 +41,7 @@
 #include "ggml-cuda.h"
 #include "ggml-alloc.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 static constexpr float LAGUNA_EPS = 1e-6f;
 
@@ -83,7 +83,7 @@ bool create_laguna_target_cache_partial(const LagunaTargetWeights & w,
     out.max_ctx  = max_ctx;
     out.cur_pos  = 0;
     out.last_tok = -1;
-    out.kv_head_major = std::getenv("DFLASH_LAGUNA_KV_HEAD_MAJOR") != nullptr;
+    out.kv_head_major = std::getenv("LUCE_LAGUNA_KV_HEAD_MAJOR") != nullptr;
     // KV cache: per-layer, ALL 40 layers (full + SWA). Layout matches qwen35:
     //   legacy:     [head_dim, max_ctx, n_head_kv]
     //   head-major: [head_dim*n_head_kv, max_ctx]
@@ -428,13 +428,13 @@ static ggml_tensor * build_laguna_moe_block_hybrid(ggml_context * ctx, ggml_cgra
 // Numerically wrong (drops routed MoE contribution = ~80% of MLP signal) but
 // graph builds + executes. Routed dispatch (sigmoid router + score-correction
 // bias + sum-norm + ggml_mul_mat_id) is Phase 2.1.
-// DEBUG SWITCH: env DFLASH_LAGUNA_MOE_STUB=1 routes to shared-only stub.
+// DEBUG SWITCH: env LUCE_LAGUNA_MOE_STUB=1 routes to shared-only stub.
 // Default: full MoE.
 static ggml_tensor * build_laguna_moe_block(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * cur,
                                              const LagunaTargetWeights & w,
                                              const LagunaTargetLayer & L,
                                              const LagunaHybridMoe * hyb = nullptr, int il = 0) {
-    static const bool stub = (std::getenv("DFLASH_LAGUNA_MOE_STUB") != nullptr);
+    static const bool stub = (std::getenv("LUCE_LAGUNA_MOE_STUB") != nullptr);
     if (stub) {
         return laguna_shexp_ffn(ctx, L, cur);
     }
@@ -457,7 +457,7 @@ static ggml_tensor * build_laguna_moe_block_full(ggml_context * ctx, ggml_cgraph
     const int n_used   = w.n_expert_used;
     const int n_embd   = w.n_embd;
     static const bool fused_combine = []() {
-        const char * e = std::getenv("DFLASH_LAGUNA_MOE_FUSED_COMBINE");
+        const char * e = std::getenv("LUCE_LAGUNA_MOE_FUSED_COMBINE");
         return !(e && e[0] == '0' && e[1] == '\0');
     }();
 
@@ -1022,7 +1022,7 @@ bool build_laguna_layer_step(
                              "wired for the layer-split path\n");
         return false;
     }
-    if (kvflash && std::getenv("DFLASH_LAGUNA_NO_KVPAD")) return false;
+    if (kvflash && std::getenv("LUCE_LAGUNA_NO_KVPAD")) return false;
 
     ggml_init_params ip{};
     ip.mem_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
@@ -1314,8 +1314,8 @@ bool laguna_step(
     }
 
     const int kv_len = kv_start + n_tok;
-    static const bool g_no_kvpad = (std::getenv("DFLASH_LAGUNA_NO_KVPAD") != nullptr);
-    static const bool g_pad_cpy = (std::getenv("DFLASH_LAGUNA_PAD_CPY") != nullptr);
+    static const bool g_no_kvpad = (std::getenv("LUCE_LAGUNA_NO_KVPAD") != nullptr);
+    static const bool g_pad_cpy = (std::getenv("LUCE_LAGUNA_PAD_CPY") != nullptr);
     int kv_cap = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         // [TAG_SWA_RING] ring-cached SWA tensors are smaller than the pool;
@@ -1475,7 +1475,7 @@ bool laguna_step(
         return true;
     }
 
-    // [TAG_PREFILL_PROF] batch-path sub-phase laps: DFLASH_PROF=prefill.
+    // [TAG_PREFILL_PROF] batch-path sub-phase laps: LUCE_PROF=prefill.
     // build = graph rebuild+alloc, fill = host mask/row fills, up = tensor_set
     // uploads, gpu = graph_compute, read = logit/argmax readback.
     static const bool g_pfprof = dflash_prof_enabled("prefill");
@@ -1723,8 +1723,8 @@ bool laguna_verify_batch(
     if (n_tokens <= 0) return false;
 
     const int kv_len = kv_start + n_tokens;
-    static const bool g_no_kvpad = (std::getenv("DFLASH_LAGUNA_NO_KVPAD") != nullptr);
-    static const bool g_pad_cpy = (std::getenv("DFLASH_LAGUNA_PAD_CPY") != nullptr);
+    static const bool g_no_kvpad = (std::getenv("LUCE_LAGUNA_NO_KVPAD") != nullptr);
+    static const bool g_pad_cpy = (std::getenv("LUCE_LAGUNA_PAD_CPY") != nullptr);
     int kv_cap = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         // [TAG_SWA_RING] ring-cached SWA tensors are smaller than the pool;
@@ -1741,9 +1741,9 @@ bool laguna_verify_batch(
     // input DATA (positions / kv_idx rows / mask contents / feat rows), which
     // is also what makes the ggml-cuda graph cache replay it. Reuse the built
     // graph and skip the per-step host rebuild + allocator pass (~0.5ms/step).
-    // DFLASH_LAGUNA_PERSIST_VERIFY=0 restores the rebuild-every-step path.
+    // LUCE_LAGUNA_PERSIST_VERIFY=0 restores the rebuild-every-step path.
     static const bool g_persist = []() {
-        const char * e = std::getenv("DFLASH_LAGUNA_PERSIST_VERIFY");
+        const char * e = std::getenv("LUCE_LAGUNA_PERSIST_VERIFY");
         return !(e && e[0] == '0' && e[1] == '\0');
     }();
     struct VerifySlot {
@@ -1878,7 +1878,7 @@ bool laguna_verify_batch(
     ggml_tensor * argmax = S.argmax;
     const int swa_ring = cache.swa_ring_rows;
 
-    // [TAG_VERIFY_PROF] sub-phase laps: DFLASH_PROF=verify.
+    // [TAG_VERIFY_PROF] sub-phase laps: LUCE_PROF=verify.
     // prep = stage+embed/pos fills, mask = kvflash rows+mask fill+memcpy,
     // upwait = sync after async uploads (isolates upload cost from compute),
     // gpu = graph_compute, read = argmax/logits readback.
@@ -2152,7 +2152,7 @@ bool laguna_step_hybrid(
     // window the masks gate validity and the K/V append uses ggml_set_rows,
     // so every node's properties are bit-identical step to step.
     const int kv_len = kv_start + n_tok;
-    static const bool g_no_kvpad = (std::getenv("DFLASH_LAGUNA_NO_KVPAD") != nullptr);
+    static const bool g_no_kvpad = (std::getenv("LUCE_LAGUNA_NO_KVPAD") != nullptr);
     int kv_cap = 0;
     for (int il = 0; il < w.n_layer; ++il) {
         // [TAG_SWA_RING] ring-cached SWA tensors are smaller than the pool;
@@ -2166,7 +2166,7 @@ bool laguna_step_hybrid(
 
     // Decomposition knob: pad the FA span but keep the legacy cpy append
     // (kv_idx=null). No CUDA-graph replay; isolates pad-rounding vs set_rows.
-    static const bool g_pad_cpy = (std::getenv("DFLASH_LAGUNA_PAD_CPY") != nullptr);
+    static const bool g_pad_cpy = (std::getenv("LUCE_LAGUNA_PAD_CPY") != nullptr);
     ggml_tensor * kvi = nullptr;
     if (kv_pad > 0 && !g_pad_cpy) {
         kvi = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
@@ -2305,4 +2305,4 @@ bool laguna_step_hybrid(
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

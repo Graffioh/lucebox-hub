@@ -15,7 +15,7 @@
 #endif
 
 namespace {
-using namespace dflash::common;
+using namespace luce::common;
 struct PagedKvOffloadFixture {};
 #define OFFLOAD_CHECK(x) do { if (!(x)) throw std::runtime_error( \
     std::string("KV offload line ") + std::to_string(__LINE__) + ": " #x); } while (false)

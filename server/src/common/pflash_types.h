@@ -2,7 +2,7 @@
 
 #include <cstddef>
 
-namespace dflash::common {
+namespace luce::common {
 
 inline constexpr size_t kPFlashMaxInstructionSpans = 64;
 
@@ -24,4 +24,4 @@ inline bool operator!=(
     return !(left == right);
 }
 
-} // namespace dflash::common
+} // namespace luce::common

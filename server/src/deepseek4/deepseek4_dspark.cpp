@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -627,4 +627,4 @@ void deepseek4_dspark_dump(const DSparkDrafter & d) {
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

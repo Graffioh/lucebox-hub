@@ -30,7 +30,7 @@
 #include "pflash/pflash_selection.h"
 #include "freeze_history.h"
 
-#ifdef DFLASH_HAS_CURL
+#ifdef LUCE_HAS_CURL
 #include <curl/curl.h>
 #endif
 
@@ -50,7 +50,7 @@
 #include <stdexcept>
 #include <utility>
 
-using dflash::common::SocketHandle;
+using luce::common::SocketHandle;
 
 #if defined(_WIN32)
 #include <io.h>
@@ -100,7 +100,7 @@ static inline bool sock_is_eagain(int e) { return e == EAGAIN || e == EWOULDBLOC
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 constexpr auto kClientMonitorInterval = std::chrono::milliseconds(250);
@@ -442,7 +442,7 @@ std::vector<PFlashTokenSpan> tile_document_starts(
     std::sort(starts.begin(), starts.end());
     starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
     while (!starts.empty() && starts.back() >= tokens) starts.pop_back();
-    if ((size_t) starts.size() < dflash::pflash::kPFlashMinPriorDocuments) {
+    if ((size_t) starts.size() < luce::pflash::kPFlashMinPriorDocuments) {
         return spans;
     }
     if (starts.front() != 0) starts.insert(starts.begin(), 0);
@@ -461,7 +461,7 @@ std::vector<PFlashTokenSpan> pflash_detect_document_spans(
     if (prompt.empty()) return {};
     const DecodedPrompt decoded = decode_prompt_with_offsets(tokenizer, prompt);
     const auto offsets = document_marker_offsets(decoded.text);
-    if (offsets.size() < dflash::pflash::kPFlashMinPriorDocuments) return {};
+    if (offsets.size() < luce::pflash::kPFlashMinPriorDocuments) return {};
     std::vector<int> starts;
     starts.reserve(offsets.size());
     for (size_t offset : offsets) {
@@ -475,7 +475,7 @@ std::vector<PFlashTokenSpan> pflash_document_spans_from_ranges(
         const std::vector<int32_t> & prompt,
         const std::vector<std::pair<int, int>> & ranges) {
     if (prompt.empty() ||
-        ranges.size() < dflash::pflash::kPFlashMinPriorDocuments) {
+        ranges.size() < luce::pflash::kPFlashMinPriorDocuments) {
         return {};
     }
     const int tokens = (int) prompt.size();
@@ -660,7 +660,7 @@ bool canonical_assistant_content(
 }  // namespace http_detail
 
 // ─── curl helpers for upstream proxy ─────────────────────────────────────
-#ifdef DFLASH_HAS_CURL
+#ifdef LUCE_HAS_CURL
 
 struct CurlWriteCtx {
     bool streaming;
@@ -869,7 +869,7 @@ static bool curl_forward(const std::string & url,
     curl_easy_cleanup(curl);
     return res == CURLE_OK && response_sent;
 }
-#endif // DFLASH_HAS_CURL
+#endif // LUCE_HAS_CURL
 
 // ─── /props constants ───────────────────────────────────────────────────
 //
@@ -882,8 +882,8 @@ static bool curl_forward(const std::string & url,
 // Do NOT bump for additive changes (new fields, new sections).
 static constexpr int  kPropsSchema  = 2;
 static constexpr char kServerName[] = "luce-dflash";
-#ifndef DFLASH_SERVER_VERSION
-#define DFLASH_SERVER_VERSION "0.0.0+cpp"
+#ifndef LUCE_SERVER_VERSION
+#define LUCE_SERVER_VERSION "0.0.0+cpp"
 #endif
 
 // API endpoint registry served by /props. Keep in sync with the route
@@ -1115,7 +1115,7 @@ json build_props_body(const ServerConfig & config,
 
     json server = {
         {"name",         kServerName},
-        {"version",      DFLASH_SERVER_VERSION},
+        {"version",      LUCE_SERVER_VERSION},
         {"props_schema", kPropsSchema},
     };
 
@@ -1134,9 +1134,9 @@ json build_props_body(const ServerConfig & config,
             {"draft_residency", draft_residency_policy_name(config.draft_residency)},
         };
     } else {
-        const char * bsa_env = std::getenv("DFLASH_FP_USE_BSA");
-        const char * alpha_env = std::getenv("DFLASH_FP_ALPHA");
-        const char * lmfix_env = std::getenv("DFLASH27B_LM_HEAD_FIX");
+        const char * bsa_env = std::getenv("LUCE_FP_USE_BSA");
+        const char * alpha_env = std::getenv("LUCE_FP_ALPHA");
+        const char * lmfix_env = std::getenv("LUCE_LM_HEAD_FIX");
         json bsa_alpha = nullptr;
         if (alpha_env && *alpha_env) {
             try { bsa_alpha = std::stod(alpha_env); }
@@ -1180,7 +1180,7 @@ json build_props_body(const ServerConfig & config,
         }},
         {"model_alias", config.model_name},
         {"model_path",  config.model_path},
-        {"build_info",  std::string(kServerName) + " v" DFLASH_SERVER_VERSION
+        {"build_info",  std::string(kServerName) + " v" LUCE_SERVER_VERSION
                         " props_schema=" + std::to_string(kPropsSchema)},
         {"speculative_mode", speculative_mode},
         {"server", server},
@@ -1199,7 +1199,7 @@ json build_props_body(const ServerConfig & config,
             {"target_sharding", config.target_sharding},
             // Prefill chunk size (bargs.chunk). Surfaced so snapshot
             // tooling captures the full config — bench consumers
-            // (dflash/scripts/bench_http_capability.py) read
+            // (server/scripts/bench_http_capability.py) read
             // /props.runtime wholesale into result.json.server_info.
             {"chunk",           config.chunk},
             {"continuous_batching", {
@@ -1322,7 +1322,7 @@ json build_props_body(const ServerConfig & config,
 static void normalize_anthropic_system(const json & body, json & messages) {
     if (!body.contains("system")) return;
     // Delegate strip to the pure fn; insert as system message.
-    std::string text = dflash::common::normalize_system_for_cache(body["system"]);
+    std::string text = luce::common::normalize_system_for_cache(body["system"]);
     if (!text.empty()) {
         json sys_msg = {{"role", "system"}, {"content", text}};
         messages.insert(messages.begin(), sys_msg);
@@ -1461,7 +1461,7 @@ std::vector<ChatMessage> normalize_chat_messages(
 // Compute a 16-byte salt from inputs that affect KV cache validity:
 //   model path + stat(size + mtime)  [covers rope/yarn — GGUF-derived],
 //   max_ctx, sha1(chat_template_src), and the effective K-rotation basis
-//   (DFLASH_KV_ROTATE resolves against the K-cache type; a cache written
+//   (LUCE_KV_ROTATE resolves against the K-cache type; a cache written
 //   rotated must never be adopted by an un-rotated session or vice versa).
 // Returns all-zeroes if model_path is empty (back-compat / disk disabled).
 static std::array<uint8_t, 16> compute_disk_cache_salt(const ServerConfig & cfg) {
@@ -1555,7 +1555,7 @@ static json model_list(const ServerConfig & config, bool codex_schema) {
         {"data", json::array({
             {{"id", config.model_name},
              {"object", "model"},
-             {"owned_by", "dflash"},
+             {"owned_by", "luce"},
              {"created", 1700000000},
              {"context_length", config.max_ctx},
              {"max_context_length", config.max_ctx}}
@@ -1566,7 +1566,7 @@ static json model_list(const ServerConfig & config, bool codex_schema) {
 
 // ─── HttpServer ─────────────────────────────────────────────────────────
 
-HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
+HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                        Tokenizer & tokenizer,
                        const ServerConfig & config)
     : engine_(engine)
@@ -1583,7 +1583,7 @@ HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
                    config.disk_cache_continued_interval,
                    config.disk_cache_cold_max_tokens}, backend_)
 {
-    #ifdef DFLASH_HAS_CURL
+    #ifdef LUCE_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
     prefix_cache_.init_full_cache(config.prefill_cache_cap);
@@ -1603,21 +1603,21 @@ HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
         return !(v[0] == '0' && v[1] == '\0') &&
                !(v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
     };
-    if (const char * e = std::getenv("DFLASH_PPP")) {
+    if (const char * e = std::getenv("LUCE_PPP")) {
         config_.ppp_enabled = env_truthy(e);
     }
-    if (const char * e = std::getenv("DFLASH_PPP_REARRANGE")) {
+    if (const char * e = std::getenv("LUCE_PPP_REARRANGE")) {
         config_.ppp_rearrange = env_truthy(e);
     }
-    if (const char * e = std::getenv("DFLASH_PPP_LCP_WINDOW")) {
+    if (const char * e = std::getenv("LUCE_PPP_LCP_WINDOW")) {
         const int n = std::atoi(e);
         if (n > 0) config_.ppp_lcp_window = n;
     }
-    if (const char * e = std::getenv("DFLASH_PPP_MIN_PIN_TOKENS")) {
+    if (const char * e = std::getenv("LUCE_PPP_MIN_PIN_TOKENS")) {
         const int n = std::atoi(e);
         if (n > 0) config_.ppp_min_pin_tokens = n;
     }
-    if (const char * e = std::getenv("DFLASH_PPP_MAX_EPHEMERAL")) {
+    if (const char * e = std::getenv("LUCE_PPP_MAX_EPHEMERAL")) {
         const int n = std::atoi(e);
         if (n > 0) config_.ppp_max_ephemeral_tokens = n;
     }
@@ -1630,8 +1630,8 @@ HttpServer::HttpServer(dflash::engine::LuceEngine & engine,
 
 // Resolve path to share/status.html at startup.
 std::string HttpServer::resolve_status_html() {
-    // 1. DFLASH_SHARE_DIR env var
-    if (const char * dir = std::getenv("DFLASH_SHARE_DIR")) {
+    // 1. LUCE_SHARE_DIR env var
+    if (const char * dir = std::getenv("LUCE_SHARE_DIR")) {
         std::string path = std::string(dir) + "/status.html";
         struct stat st;
         if (::stat(path.c_str(), &st) == 0) return path;
@@ -1772,7 +1772,7 @@ void HttpServer::sse_heartbeat() {
 
 HttpServer::~HttpServer() {
     shutdown();
-    #ifdef DFLASH_HAS_CURL
+    #ifdef LUCE_HAS_CURL
     curl_global_cleanup();
     #endif
 }
@@ -1828,7 +1828,7 @@ bool HttpServer::start_worker() {
     // replaces the one-request worker with the concurrent scheduler.
     // Upstream forwarding stays on the classic path even when the local
     // backend exposes an engine.
-    dflash::engine::LuceEngine::ServingLoops loops;
+    luce::engine::LuceEngine::ServingLoops loops;
     loops.serial = [this]() { worker_loop(); };
     loops.concurrent =
         [this](SeqEngine & engine) { scheduler_loop(engine); };
@@ -1880,21 +1880,21 @@ int HttpServer::run(const std::vector<HttpServer *> & models) {
     for (auto * model : budget_models) {
         const size_t requested = model->config_.decode_kv_offload_bytes;
         auto * engine = model->backend_.seq_engine();
-        if (requested == dflash::common::kAutoKvOffloadBytes) {
+        if (requested == luce::common::kAutoKvOffloadBytes) {
             if (engine && engine->slot_count() > 1 && engine->kv_offload_capacity()) ++automatic_models;
         } else {
             explicit_bytes += std::min(requested,
-                dflash::common::kAutoKvOffloadBytes - explicit_bytes);
+                luce::common::kAutoKvOffloadBytes - explicit_bytes);
         }
     }
     const size_t available = automatic_models
-        ? dflash::common::available_kv_offload_memory().value_or(0) : 0;
+        ? luce::common::available_kv_offload_memory().value_or(0) : 0;
     for (auto * model : budget_models) {
         auto & budget = model->config_.decode_kv_offload_bytes;
-        if (budget != dflash::common::kAutoKvOffloadBytes) continue;
+        if (budget != luce::common::kAutoKvOffloadBytes) continue;
         auto * engine = model->backend_.seq_engine();
         budget = engine && engine->slot_count() > 1
-            ? dflash::common::auto_kv_offload_budget(engine->kv_offload_capacity(),
+            ? luce::common::auto_kv_offload_budget(engine->kv_offload_capacity(),
                 available, explicit_bytes, automatic_models) : 0;
         std::fprintf(stderr, "[server] model %s automatic decode KV offload budget: %zu bytes\n",
                      model->config_.model_name.c_str(), budget);
@@ -2108,7 +2108,7 @@ void HttpServer::handle_client(SocketHandle fd) {
     if (hr.method == "GET" && hr.path == "/status") {
         if (status_html_path_.empty()) {
             send_error(fd, 404,
-                "status.html not found. Set DFLASH_SHARE_DIR or place it in share/status.html");
+                "status.html not found. Set LUCE_SHARE_DIR or place it in share/status.html");
             socket_close(fd);
             return;
         }
@@ -3454,7 +3454,7 @@ void HttpServer::apply_flowkv_compression(
 std::string HttpServer::apply_pflash_compression(
         const ParsedRequest & req, PreparedPrompt & prepared) {
     const bool selection_environment =
-        dflash::pflash::has_pflash_selection_environment();
+        luce::pflash::has_pflash_selection_environment();
     auto [full_slot, full_len] = prefix_cache_.lookup_full(req.prompt_tokens);
     if (http_detail::pflash_full_cache_restore_allowed(
             selection_environment) && full_slot >= 0) {
@@ -3478,9 +3478,9 @@ std::string HttpServer::apply_pflash_compression(
         return "PFlash drafter tokenizer produced an empty prompt";
     }
 
-    dflash::pflash::PFlashSelectionConfig experiment;
+    luce::pflash::PFlashSelectionConfig experiment;
     std::string experiment_error;
-    if (!dflash::pflash::resolve_pflash_selection(
+    if (!luce::pflash::resolve_pflash_selection(
             (int) drafter_ids.size(), 32, experiment, experiment_error)) {
         return "invalid PFlash strict selection config: " + experiment_error;
     }
@@ -3527,20 +3527,20 @@ std::string HttpServer::apply_pflash_compression(
             int boundary_index = (int) messages.size() - 1;
             if (!raw_text_input &&
                 experiment.query_parser ==
-                    dflash::pflash::PFlashQueryParser::SemanticUser) {
+                    luce::pflash::PFlashQueryParser::SemanticUser) {
                 boundary_index = last_user_index;
             }
             if (boundary_index < 0 ||
                 (experiment.query_parser ==
-                     dflash::pflash::PFlashQueryParser::SemanticUser &&
+                     luce::pflash::PFlashQueryParser::SemanticUser &&
                  !raw_text_input && last_user_text.empty())) {
                 return "PFlash strict selection latest-user boundary is unavailable";
             }
 
             static constexpr const char * kContentBegin =
-                "__DFLASH_PFLASH_CONTENT_BEGIN_02C47F91__";
+                "__LUCE_PFLASH_CONTENT_BEGIN_02C47F91__";
             static constexpr const char * kContentEnd =
-                "__DFLASH_PFLASH_CONTENT_END_6E6B61A8__";
+                "__LUCE_PFLASH_CONTENT_END_6E6B61A8__";
             const auto map_message_content = [&] (
                     size_t message_index,
                     int & content_begin,
@@ -3694,7 +3694,7 @@ std::string HttpServer::apply_pflash_compression(
                 // merges like " What" inside the span.
                 if (!req.pflash_query.empty() &&
                     experiment.query_parser ==
-                        dflash::pflash::PFlashQueryParser::SemanticUser) {
+                        luce::pflash::PFlashQueryParser::SemanticUser) {
                     explicit_query_span =
                         http_detail::pflash_decoded_text_span(
                             *drafter_tokenizer_, drafter_ids,
@@ -3711,7 +3711,7 @@ std::string HttpServer::apply_pflash_compression(
                     http_detail::canonicalize_pflash_token_spans(
                         std::move(required_instruction_spans));
                 std::string instruction_error;
-                if (!dflash::pflash::validate_pflash_instruction_spans(
+                if (!luce::pflash::validate_pflash_instruction_spans(
                         required_instruction_spans,
                         (int) drafter_ids.size(), instruction_error)) {
                     return "PFlash strict selection instruction mapping failed: " +
@@ -3762,7 +3762,7 @@ std::string HttpServer::apply_pflash_compression(
             query_content_end, query_content_begin);
     } else if (experiment.configured &&
                experiment.query_parser ==
-                   dflash::pflash::PFlashQueryParser::ArbitraryTail) {
+                   luce::pflash::PFlashQueryParser::ArbitraryTail) {
         parser_selection_rule = "prompt_tail";
         query_window = http_detail::pflash_tail_query_window(
             drafter_ids, experiment.query_tokens, query_content_end);
@@ -3835,7 +3835,7 @@ std::string HttpServer::apply_pflash_compression(
                 {"input_kind", parser_input_kind},
                 {"selection_rule", parser_selection_rule},
                 {"query_parser",
-                 dflash::pflash::pflash_query_parser_name(
+                 luce::pflash::pflash_query_parser_name(
                      experiment.query_parser)},
                 {"input_tokens", (int) compress_request.input_ids.size()},
                 {"input_fingerprint_fnv1a64",
@@ -4015,11 +4015,11 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
         const bool continuation = should_compress &&
             is_continuation_request(req.messages);
         const bool selection_environment =
-            dflash::pflash::has_pflash_selection_environment();
+            luce::pflash::has_pflash_selection_environment();
         if (should_compress && selection_environment) {
-            dflash::pflash::PFlashSelectionConfig experiment;
+            luce::pflash::PFlashSelectionConfig experiment;
             std::string experiment_error;
-            if (!dflash::pflash::resolve_pflash_selection(
+            if (!luce::pflash::resolve_pflash_selection(
                     0, 32, experiment, experiment_error)) {
                 prepared.error_status = 500;
                 prepared.error = "invalid PFlash strict selection config: " +
@@ -4081,7 +4081,7 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
 bool HttpServer::forward_upstream(
         ServerJob * job, const ParsedRequest & req,
         const PreparedPrompt & prepared) {
-#ifdef DFLASH_HAS_CURL
+#ifdef LUCE_HAS_CURL
     if (config_.pflash_upstream_base.empty()) return false;
 
     const std::string & upstream = config_.pflash_upstream_base;
@@ -4165,7 +4165,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
 
     // PPP runs *before* lookup. Default (rearrange=0): annotate a sticky
     // pin_end only — never mutate tokens. Token-level DiffPin rewrite
-    // (prefix|suffix|middle float) is opt-in via DFLASH_PPP_REARRANGE=1;
+    // (prefix|suffix|middle float) is opt-in via LUCE_PPP_REARRANGE=1;
     // unconstrained middle peels can scramble tool-schema JSON and yield
     // empty post-tool completions.
     bool ppp_rewrote = false;
@@ -4678,7 +4678,7 @@ void HttpServer::remember_agent_turn(
     std::vector<ChatMessage> messages =
         normalize_chat_messages(req.messages, req.format, tool_memory_);
     static constexpr const char * kSentinel =
-        "__DFLASH_AGENT_TURN_CONTENT_7A21D9__";
+        "__LUCE_AGENT_TURN_CONTENT_7A21D9__";
     messages.push_back({"assistant", kSentinel});
 
     std::string sentinel_rendered;
@@ -4832,7 +4832,7 @@ void HttpServer::prepare_generation_inputs(
         }
     }
 
-    if (req.tools.empty() || !env_flag_enabled("DFLASH_STALL_TOOL_PREFIX")) {
+    if (req.tools.empty() || !env_flag_enabled("LUCE_STALL_TOOL_PREFIX")) {
         return;
     }
 
@@ -5691,4 +5691,4 @@ bool HttpServer::send_sse_headers(ServerJob * job) {
     return send_job_bytes(job, header.data(), header.size());
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

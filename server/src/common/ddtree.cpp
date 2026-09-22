@@ -7,7 +7,7 @@
 #include <cmath>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 void extract_draft_topk(const float * logits,
                         int n_positions, int vocab, int K,
@@ -386,4 +386,4 @@ bool truncate_verified_path(std::vector<int> & accepted,
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -10,7 +10,7 @@
 #include <cstring>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 inline void sha1_hash(const void * data, size_t len, uint8_t out[20]) {
     auto rotl = [](uint32_t x, int n) -> uint32_t {
@@ -66,4 +66,4 @@ inline void sha1_hash(const void * data, size_t len, uint8_t out[20]) {
     store32(out + 16, h4);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

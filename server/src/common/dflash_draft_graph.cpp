@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Minimum alignment required by ggml flash_attn_ext for mask rows.
 static constexpr int MASK_KV_PAD = 32;
@@ -319,4 +319,4 @@ bool build_draft_step(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -16,7 +16,7 @@
 
 #include "laguna_internal.h"
 #include "internal.h"
-#include "dflash27b.h"
+#include "luce.h"
 
 #include <chrono>
 #include <cmath>
@@ -29,7 +29,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static std::vector<int> parse_csv(const std::string & s, std::vector<int> dflt) {
     if (s.empty()) return dflt;
@@ -65,13 +65,13 @@ int main(int argc, char ** argv) {
 
     LagunaTargetWeights w;
     if (!load_target_gguf_laguna(path, backend, w)) {
-        std::fprintf(stderr, "load failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load failed: %s\n", luce_last_error());
         ggml_backend_free(backend); return 1;
     }
 
     LagunaTargetCache cache;
     // Override KV cache dtype via env (Q4_0 fits 128K on a 24 GB GPU; Q8_0 caps near 32K).
-    if (const char * kv_t = std::getenv("DFLASH_KV_TYPE")) {
+    if (const char * kv_t = std::getenv("LUCE_KV_TYPE")) {
         const std::string s = kv_t;
         if      (s == "q4_0" || s == "Q4_0") { cache.kv_k_type = GGML_TYPE_Q4_0; cache.kv_v_type = GGML_TYPE_Q4_0; }
         else if (s == "q5_0" || s == "Q5_0") { cache.kv_k_type = GGML_TYPE_Q5_0; cache.kv_v_type = GGML_TYPE_Q5_0; }
@@ -81,7 +81,7 @@ int main(int argc, char ** argv) {
     std::printf("[bench] KV K=%s V=%s\n",
                 ggml_type_name(cache.kv_k_type), ggml_type_name(cache.kv_v_type));
     if (!create_laguna_target_cache(w, max_len, backend, cache)) {
-        std::fprintf(stderr, "cache failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "cache failed: %s\n", luce_last_error());
         free_laguna_target_weights(w); ggml_backend_free(backend); return 1;
     }
     std::printf("[bench] cache max_ctx=%d  KV bytes/layer ~ %.1f MiB\n",
@@ -93,10 +93,10 @@ int main(int argc, char ** argv) {
     // budget on RTX 3090 (MoE intermediate [n_embd, n_used, n_tokens] = 1 GB at
     // n_tokens=16K). Split N into CHUNK chunks, advance kv_start per chunk.
     int chunk_env = 0;
-    if (const char * c = std::getenv("DFLASH_CHUNK")) chunk_env = std::atoi(c);
+    if (const char * c = std::getenv("LUCE_CHUNK")) chunk_env = std::atoi(c);
     const int CHUNK = chunk_env > 0 ? chunk_env : 4096;
 
-    const bool no_mask = (std::getenv("DFLASH_NO_MASK") != nullptr);
+    const bool no_mask = (std::getenv("LUCE_NO_MASK") != nullptr);
 
     for (int N : ctx_lens) {
         if (N > max_len) { std::printf("[bench] skip N=%d > max_len=%d\n", N, max_len); continue; }

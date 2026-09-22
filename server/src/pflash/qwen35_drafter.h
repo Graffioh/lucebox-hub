@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Qwen3.5-0.8B scoring head. Features are the residual entering
 // full-attention block 15 after the first 15 blocks (twelve GatedDeltaNet and
@@ -74,7 +74,7 @@ std::vector<int32_t> qwen35_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const dflash::pflash::PFlashSelectionConfig & experiment,
+    const luce::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_scores_out = nullptr,
     const std::vector<PFlashTokenSpan> * document_spans = nullptr);
@@ -86,7 +86,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     float keep_ratio,
     int n_lookahead,
     int score_query_end,
-    const dflash::pflash::PFlashSelectionConfig & experiment,
+    const luce::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     std::vector<float> * token_mass_out = nullptr,
     std::vector<PFlashTokenSpan> * segments_out = nullptr,
@@ -102,8 +102,8 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const dflash::pflash::PFlashSelectionConfig & experiment,
+    const luce::pflash::PFlashSelectionConfig & experiment,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     const std::vector<PFlashTokenSpan> & document_spans = {});
 
-} // namespace dflash::common
+} // namespace luce::common

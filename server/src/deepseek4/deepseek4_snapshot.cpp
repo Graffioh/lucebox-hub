@@ -12,7 +12,7 @@
 #include <limits>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 const char * const kDeepSeek4SnapHcName     = "ds4_hc_state_snap";
 const char * const kDeepSeek4SnapMetaName   = "ds4_snap_meta";
@@ -591,4 +591,4 @@ bool deepseek4_snapshot_validate(const DeepSeek4Weights & w,
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

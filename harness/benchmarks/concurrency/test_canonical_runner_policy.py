@@ -88,16 +88,16 @@ class CanonicalRunnerPolicyTests(unittest.TestCase):
         )
         self.assertEqual(len(launch_blocks), 2)
         self.assertEqual(
-            sum("DFLASH_DDTREE_ADAPTIVE" in block for block in launch_blocks), 1
+            sum("LUCE_DDTREE_ADAPTIVE" in block for block in launch_blocks), 1
         )
         assignment = (
-            'DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"'
+            'LUCE_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"'
         )
         idle_assignment = (
-            'DFLASH_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"'
+            'LUCE_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"'
         )
         for block in launch_blocks:
-            with self.subTest(ddtree="DFLASH_DDTREE_ADAPTIVE" in block):
+            with self.subTest(ddtree="LUCE_DDTREE_ADAPTIVE" in block):
                 self.assertIn('ROCR_VISIBLE_DEVICES="$GPU_DEVICE"', block)
                 self.assertIn(assignment, block)
                 self.assertIn(idle_assignment, block)

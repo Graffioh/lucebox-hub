@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct GgufModelInfo {
     std::string arch;       // e.g. "qwen35", "laguna", "qwen3", "gemma4"
@@ -73,4 +73,4 @@ struct GgufMetadata {
 GgufMetadata read_gguf_metadata(const std::string & path,
                                 bool compute_sha256);
 
-}  // namespace dflash::common
+}  // namespace luce::common

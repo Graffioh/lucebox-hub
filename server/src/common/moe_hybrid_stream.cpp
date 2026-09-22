@@ -14,7 +14,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 MoeHybridStreamEngine::~MoeHybridStreamEngine() {
     destroy();
@@ -467,4 +467,4 @@ bool eval_moe_cold_experts_streaming(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

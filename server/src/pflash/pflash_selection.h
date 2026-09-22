@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::pflash {
+namespace luce::pflash {
 
 enum class PFlashSelectionMode {
     Legacy,
@@ -94,11 +94,11 @@ bool pflash_chunk_is_structurally_required(
     int query_begin,
     int query_end,
     int input_tokens,
-    const std::vector<dflash::common::PFlashTokenSpan> &
+    const std::vector<luce::common::PFlashTokenSpan> &
         required_instruction_spans = {}) noexcept;
 
 bool validate_pflash_instruction_spans(
-    const std::vector<dflash::common::PFlashTokenSpan> & spans,
+    const std::vector<luce::common::PFlashTokenSpan> & spans,
     int input_tokens,
     std::string & error) noexcept;
 
@@ -147,7 +147,7 @@ struct PFlashSelectionConfig {
 // probe artifact carries one) feeds only the oversize interior argmax; when
 // empty the unit boundary scores are used. Returns contiguous spans covering
 // [0, input_tokens), or an empty vector on invalid input.
-std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
+std::vector<luce::common::PFlashTokenSpan> pflash_probe_segments(
     const std::vector<float> & boundary_scores,
     int input_tokens,
     float threshold,
@@ -182,4 +182,4 @@ bool resolve_pflash_selection(
     PFlashSelectionConfig & out,
     std::string & error);
 
-} // namespace dflash::pflash
+} // namespace luce::pflash

@@ -32,7 +32,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct LagunaBackendArgs {
     std::string target_path;
@@ -111,7 +111,7 @@ private:
     std::string                                 default_draft_variant_ = "base";
     DraftFeatureMirror                          feature_mirror_{};
     // [TAG_DRAFT_KV] drafter context-KV ring cache (lazy-init on first spec
-    // decode; kill with DFLASH_DRAFT_KV=0). Replaces the per-step full-window
+    // decode; kill with LUCE_DRAFT_KV=0). Replaces the per-step full-window
     // K/V recompute once the feature window fills.
     DraftKvState                                draft_kv_{};
     LagunaDFlashTarget *                        dflash_target_ = nullptr;
@@ -168,7 +168,7 @@ private:
     void kvflash_resolve_drafter();
     bool kvflash_scorer_expected() const { return !kvflash_drafter_path_.empty(); }
     KvFlashAutoBudget make_kvflash_budget(int64_t gpu_free) const;
-    // Read DFLASH_KVFLASH and round/clamp; call before cache creation.
+    // Read LUCE_KVFLASH and round/clamp; call before cache creation.
     void kvflash_read_config();
     // Attach the pager to the freshly created cache (init / unpark).
     bool kvflash_attach();
@@ -204,4 +204,4 @@ private:
                         const std::vector<int32_t> * sample_history_prefix = nullptr);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

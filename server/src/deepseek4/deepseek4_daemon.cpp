@@ -6,7 +6,7 @@
 
 #include <cstdio>
 
-namespace dflash::common {
+namespace luce::common {
 
 int run_deepseek4_daemon(const char * model_path,
                           int gpu,
@@ -33,4 +33,4 @@ int run_deepseek4_daemon(const char * model_path,
     return run_daemon(*backend, loop_args);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

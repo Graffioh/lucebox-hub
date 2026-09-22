@@ -21,12 +21,12 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
 BackendIpcPayloadTransport draft_ipc_transport_from_env() {
-    const char * raw = std::getenv("DFLASH_DRAFT_IPC_TRANSPORT");
+    const char * raw = std::getenv("LUCE_DRAFT_IPC_TRANSPORT");
     if (!raw || !*raw) {
         return BackendIpcPayloadTransport::Stream;
     }
@@ -63,7 +63,7 @@ size_t dflash_draft_ipc_required_shared_bytes(int hidden_size,
 }
 
 size_t draft_ipc_shared_bytes_from_env(size_t required_bytes) {
-    const char * raw = std::getenv("DFLASH_DRAFT_IPC_SHARED_BYTES");
+    const char * raw = std::getenv("LUCE_DRAFT_IPC_SHARED_BYTES");
     if (!raw || !*raw) {
         return required_bytes;
     }
@@ -74,7 +74,7 @@ size_t draft_ipc_shared_bytes_from_env(size_t required_bytes) {
     }
     if (*p == '-') {
         std::fprintf(stderr,
-                     "draft-ipc ignoring negative DFLASH_DRAFT_IPC_SHARED_BYTES=%s\n",
+                     "draft-ipc ignoring negative LUCE_DRAFT_IPC_SHARED_BYTES=%s\n",
                      raw);
         return required_bytes;
     }
@@ -84,7 +84,7 @@ size_t draft_ipc_shared_bytes_from_env(size_t required_bytes) {
     if (errno == ERANGE || end == p || *end != '\0' ||
         parsed > (unsigned long long)std::numeric_limits<size_t>::max()) {
         std::fprintf(stderr,
-                     "draft-ipc ignoring invalid DFLASH_DRAFT_IPC_SHARED_BYTES=%s\n",
+                     "draft-ipc ignoring invalid LUCE_DRAFT_IPC_SHARED_BYTES=%s\n",
                      raw);
         return required_bytes;
     }
@@ -397,4 +397,4 @@ bool copy_capture_slice_to_remote_draft(
     return remote.send_feature_slice(capture_idx, start_pos, n_tokens, host);
 }
 
-} // namespace dflash::common
+} // namespace luce::common

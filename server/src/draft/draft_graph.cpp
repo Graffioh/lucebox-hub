@@ -39,7 +39,7 @@
 #include <cstdio>
 #include <limits>
 
-namespace dflash::common {
+namespace luce::common {
 
 // RoPE with the drafter's scaling config. YaRN-trained drafters (e.g. the
 // Qwen3.8 DSpark release: factor 32, orig ctx 8192) apply the scaled rotary
@@ -64,7 +64,7 @@ static ggml_tensor * draft_fuse_features(
     ggml_tensor *        target_hidden_cat,
     int                  n_rows,
     bool                 disable_aux_hidden_norms) {
-    const float eps = DFLASH27B_RMS_EPS;
+    const float eps = LUCE_RMS_EPS;
     ggml_tensor * thc = target_hidden_cat;
     if (!disable_aux_hidden_norms && !w.aux_hidden_norms.empty()) {
         ggml_tensor * aux_cat = nullptr;
@@ -123,9 +123,9 @@ static ggml_tensor * draft_dyn_conv_apply(ggml_context *           ctx,
     const size_t  e      = ggml_element_size(dc.dyn);
 
     // Fused single-node path (bit-identical to the expansion below);
-    // DFLASH_DYN_CONV_FUSED=0 restores the unfused graph.
+    // LUCE_DYN_CONV_FUSED=0 restores the unfused graph.
     static const bool dyn_conv_fused = []() {
-        const char * env = std::getenv("DFLASH_DYN_CONV_FUSED");
+        const char * env = std::getenv("LUCE_DYN_CONV_FUSED");
         return !(env && env[0] == '0' && env[1] == '\0');
     }();
     if (dyn_conv_fused && x->ne[2] <= 1 && x->ne[3] <= 1 &&
@@ -171,22 +171,22 @@ DraftGraphOutputs build_draft_graph(
     const int n_head   = w.n_head;
     const int n_kv     = w.n_head_kv;
     const int head_dim = w.head_dim;
-    const float eps    = DFLASH27B_RMS_EPS;
+    const float eps    = LUCE_RMS_EPS;
 
     // ── 1. Feature fusion: target_feat = rms_norm(fc @ target_hidden_cat, hidden_norm)
     //    fc:                [5*hidden, hidden]  (ggml: ne[0]=5*hidden, ne[1]=hidden)
     //    target_hidden_cat: [5*hidden, ctx_len, 1]
     //    Result:            [hidden,   ctx_len, 1]
     static const bool disable_aux_hidden_norms =
-        std::getenv("DFLASH_DISABLE_DRAFT_AUX_NORMS") != nullptr;
+        std::getenv("LUCE_DISABLE_DRAFT_AUX_NORMS") != nullptr;
     static const bool disable_attn_gate =
-        std::getenv("DFLASH_DISABLE_DRAFT_ATTN_GATE") != nullptr;
+        std::getenv("LUCE_DISABLE_DRAFT_ATTN_GATE") != nullptr;
     static const bool disable_swa =
-        std::getenv("DFLASH_DISABLE_DRAFT_SWA") != nullptr;
+        std::getenv("LUCE_DISABLE_DRAFT_SWA") != nullptr;
     static const bool disable_attn =
-        std::getenv("DFLASH_DISABLE_DRAFT_ATTN") != nullptr;
+        std::getenv("LUCE_DISABLE_DRAFT_ATTN") != nullptr;
     static const bool disable_ffn =
-        std::getenv("DFLASH_DISABLE_DRAFT_FFN") != nullptr;
+        std::getenv("LUCE_DISABLE_DRAFT_FFN") != nullptr;
 
     ggml_tensor * target_feat = draft_fuse_features(
         ctx, w, in.target_hidden_cat, ctx_len, disable_aux_hidden_norms);
@@ -459,7 +459,7 @@ bool build_draft_kv_appends(
 
     const int width = static_cast<int>(append_width);
     static const bool disable_aux_hidden_norms =
-        std::getenv("DFLASH_DISABLE_DRAFT_AUX_NORMS") != nullptr;
+        std::getenv("LUCE_DISABLE_DRAFT_AUX_NORMS") != nullptr;
     ggml_tensor * packed_features =
         draft_pack_columns(ctx, lane_features);
     ggml_tensor * target_feat = draft_fuse_features(
@@ -467,7 +467,7 @@ bool build_draft_kv_appends(
         disable_aux_hidden_norms);
     ggml_set_name(target_feat, "draft_kv_append_feat");
 
-    const float eps = DFLASH27B_RMS_EPS;
+    const float eps = LUCE_RMS_EPS;
     for (int il = 0; il < w.n_layer; ++il) {
         const DraftLayer & layer = w.layers[il];
         ggml_tensor * tf_kv = target_feat;
@@ -521,11 +521,11 @@ std::vector<DraftGraphOutputs> build_draft_kv_steps(
     const int head_dim = w.head_dim;
     const int64_t q_dim = static_cast<int64_t>(head_dim) * n_head;
     const int64_t kv_dim = static_cast<int64_t>(head_dim) * n_kv;
-    const float eps = DFLASH27B_RMS_EPS;
+    const float eps = LUCE_RMS_EPS;
     static const bool disable_attn_gate =
-        std::getenv("DFLASH_DISABLE_DRAFT_ATTN_GATE") != nullptr;
+        std::getenv("LUCE_DISABLE_DRAFT_ATTN_GATE") != nullptr;
     static const bool disable_swa =
-        std::getenv("DFLASH_DISABLE_DRAFT_SWA") != nullptr;
+        std::getenv("LUCE_DISABLE_DRAFT_SWA") != nullptr;
 
     for (const DraftKvLaneInputs & lane : lanes) {
         const DraftKvCacheRefs * cache = lane.cache;
@@ -690,4 +690,4 @@ std::vector<DraftGraphOutputs> build_draft_kv_steps(
     return outputs;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

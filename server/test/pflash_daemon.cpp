@@ -9,7 +9,7 @@
 // token IDs in the drafter tokenizer. Compressed IDs are emitted as int32 LE
 // values to --stream-fd=<fd>, terminated by -1. Logs go to stdout/stderr.
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "pflash/pflash_drafter.h"
 #include "pflash/qwen35_drafter.h"
 
@@ -31,7 +31,7 @@
 #include <unistd.h>
 #endif
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static std::vector<int32_t> read_counted_i32_file(const std::string & path) {
     std::ifstream f(path, std::ios::binary);
@@ -84,7 +84,7 @@ int main(int argc, char ** argv) {
     DrafterContext ctx;
     auto t_load0 = std::chrono::steady_clock::now();
     if (!load_drafter(gguf, /*gpu_layers=*/-1, ctx)) {
-        std::fprintf(stderr, "[pflash-daemon] load_drafter failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "[pflash-daemon] load_drafter failed: %s\n", luce_last_error());
         return 1;
     }
     auto t_load1 = std::chrono::steady_clock::now();
@@ -145,7 +145,7 @@ int main(int argc, char ** argv) {
 
         const double secs = std::chrono::duration<double>(t1 - t0).count();
         if (out.empty()) {
-            std::fprintf(stderr, "[pflash-daemon] compress failed: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "[pflash-daemon] compress failed: %s\n", luce_last_error());
             stream_emit(stream_fd, -1);
             continue;
         }

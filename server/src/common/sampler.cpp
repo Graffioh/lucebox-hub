@@ -9,11 +9,11 @@
 #include <unordered_set>
 #include <utility>
 
-#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+#ifdef LUCE_HAVE_GPU_SAMPLER
 #include "geometric_sampler_cuda.h"
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -75,7 +75,7 @@ int draw_from_weights(const std::vector<std::pair<float, int>> & cand, double r_
     return cand.back().second;
 }
 
-#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+#ifdef LUCE_HAVE_GPU_SAMPLER
 // Given probabilities the GPU already computed (penalties + softmax(temp)
 // applied, summing to ~1) for a pure top_p (no top_k) config, find the
 // nucleus and draw. Skips all exp()/Z bookkeeping the raw-logit path needs,
@@ -122,8 +122,8 @@ int sample_logits(const float * logits_in,
         r_uniform = u(rng);
     }
 
-#ifdef DFLASH27B_HAVE_GPU_SAMPLER
-    // GPU path (on by default; set DFLASH_GPU_SAMPLE=0 to disable). top_k>0,
+#ifdef LUCE_HAVE_GPU_SAMPLER
+    // GPU path (on by default; set LUCE_GPU_SAMPLE=0 to disable). top_k>0,
     // top_p in (0,1) (both unsupported on the GPU, see geometric_sampler_cuda.h),
     // and any CUDA error return -1 and fall through to the CPU chain below.
     if (gpu_sampler_enabled() && gpu_sampler_supports(cfg)) {
@@ -135,7 +135,7 @@ int sample_logits(const float * logits_in,
     const bool need_top_k = cfg.top_k > 0 && cfg.top_k < vocab;
     const bool need_top_p = cfg.top_p > 0.0f && cfg.top_p < 1.0f;
 
-#ifdef DFLASH27B_HAVE_GPU_SAMPLER
+#ifdef LUCE_HAVE_GPU_SAMPLER
     // Reaching here means the GPU either can't fully handle this config
     // (top_k/top_p above) or is disabled. For pure top_p (no top_k), the GPU
     // can still compute the shared, vocab-wide penalty+softmax prefix and
@@ -278,4 +278,4 @@ bool parse_sampler_token(std::string & line, SamplerCfg & out) {
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

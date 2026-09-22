@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool qwen35_head_block_available(const TargetWeights & w, std::string & error) {
     if (w.n_layer <= kQwen35HeadBlock || (size_t)kQwen35HeadBlock >= w.layers.size()) {
@@ -369,4 +369,4 @@ void free_qwen35_drafter_state(DrafterContext & ctx) {
     ctx.state = nullptr;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

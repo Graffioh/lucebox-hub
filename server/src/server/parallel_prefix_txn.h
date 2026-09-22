@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 template <typename Reservation, typename Engine>
 class BasicPrefixCaptureTxn {
@@ -96,4 +96,4 @@ private:
     PrefixCaptureTicket ticket_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

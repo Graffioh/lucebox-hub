@@ -4,7 +4,7 @@
 // ----------------------------------------
 // The model already produces logits on the GPU. The CPU sampler forces a full
 // ~vocab-wide D2H copy of those logits every token (the existing greedy path
-// already dodges this with DFLASH_GPU_ARGMAX). The vocab-wide work — penalty
+// already dodges this with LUCE_GPU_ARGMAX). The vocab-wide work — penalty
 // application, the softmax max/sum-exp reductions, and the multinomial
 // inverse-CDF draw — is data-parallel and is what geometric_sample_logits_cuda
 // moves to the GPU, entirely, for greedy and plain temperature/penalty
@@ -34,7 +34,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // GPU sample_logits. Returns the chosen token id, or -1 when the caller should
 // fall back to the CPU sample_logits (unsupported config such as cfg.top_k>0
@@ -72,7 +72,7 @@ bool geometric_compute_probs_cuda(const float * logits,
                         float * out_probs,
                         bool logits_on_device);
 
-// True unless the env var DFLASH_GPU_SAMPLE is explicitly set to "0" — the GPU
+// True unless the env var LUCE_GPU_SAMPLE is explicitly set to "0" — the GPU
 // path is enabled by default. Cached after the first call. Lets call sites
 // gate the GPU path at runtime.
 bool gpu_sampler_enabled();
@@ -89,4 +89,4 @@ inline bool gpu_sampler_supports(const SamplerCfg & cfg) {
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

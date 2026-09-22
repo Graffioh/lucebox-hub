@@ -8,7 +8,7 @@
 //   int32[K]  expert_indices (actual routing result)
 //
 // Enable via --collect-routing <path> on the server CLI or via env var
-// DFLASH_COLLECT_ROUTING=<path>.
+// LUCE_COLLECT_ROUTING=<path>.
 
 #pragma once
 
@@ -17,7 +17,7 @@
 #include <mutex>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 class MoeRoutingCollector {
 public:
@@ -47,4 +47,4 @@ private:
     std::mutex mu_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

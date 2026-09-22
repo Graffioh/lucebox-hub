@@ -1,4 +1,4 @@
-// KV-cache quantisation helpers for dflash::common.
+// KV-cache quantisation helpers for luce::common.
 //
 // Centralises the supported (K, V) ggml_type pair table and environment-variable
 // resolution that was previously inlined in qwen35_target_graph.cpp.
@@ -19,7 +19,7 @@
 #include <cstring>
 #include <string>
 
-namespace dflash {
+namespace luce {
 
 // ─── String <-> type helpers ────────────────────────────────────────────────
 
@@ -176,29 +176,29 @@ void resolve_kv_types(ggml_type & k_out, ggml_type & v_out,
     ggml_type v = GGML_TYPE_Q4_0;
 
     // Layer 2: legacy shorthand (last wins, mirrors qwen35_target_graph.cpp:96-108)
-    if (const char * s = std::getenv("DFLASH27B_KV_F16")) {
+    if (const char * s = std::getenv("LUCE_KV_F16")) {
         if (std::atoi(s) != 0) { k = GGML_TYPE_F16;   v = GGML_TYPE_F16;   }
     }
-    if (const char * s = std::getenv("DFLASH27B_KV_Q4")) {
+    if (const char * s = std::getenv("LUCE_KV_Q4")) {
         if (std::atoi(s) != 0) { k = GGML_TYPE_Q4_0;  v = GGML_TYPE_Q4_0;  }
     }
-    if (const char * s = std::getenv("DFLASH27B_KV_TQ3")) {
+    if (const char * s = std::getenv("LUCE_KV_TQ3")) {
         if (std::atoi(s) != 0) { k = GGML_TYPE_TQ3_0; v = GGML_TYPE_TQ3_0; }
     }
 
     // Layer 1: explicit per-axis override (highest precedence)
-    if (const char * s = k_override == GGML_TYPE_COUNT ? std::getenv("DFLASH27B_KV_K") : nullptr) {
+    if (const char * s = k_override == GGML_TYPE_COUNT ? std::getenv("LUCE_KV_K") : nullptr) {
         const ggml_type parsed = parse_kv_type(s);
         if (parsed == GGML_TYPE_COUNT) {
-            std::fprintf(stderr, "[dflash] Unknown KV K type: \"%s\"\n", s);
+            std::fprintf(stderr, "[luce] Unknown KV K type: \"%s\"\n", s);
             std::abort();
         }
         k = parsed;
     }
-    if (const char * s = v_override == GGML_TYPE_COUNT ? std::getenv("DFLASH27B_KV_V") : nullptr) {
+    if (const char * s = v_override == GGML_TYPE_COUNT ? std::getenv("LUCE_KV_V") : nullptr) {
         const ggml_type parsed = parse_kv_type(s);
         if (parsed == GGML_TYPE_COUNT) {
-            std::fprintf(stderr, "[dflash] Unknown KV V type: \"%s\"\n", s);
+            std::fprintf(stderr, "[luce] Unknown KV V type: \"%s\"\n", s);
             std::abort();
         }
         v = parsed;
@@ -208,10 +208,10 @@ void resolve_kv_types(ggml_type & k_out, ggml_type & v_out,
     if (v_override != GGML_TYPE_COUNT) v = v_override;
 
     // Validate the resolved (K, V) pair
-    validate_kv_pair_or_abort(k, v, "[dflash]");
+    validate_kv_pair_or_abort(k, v, "[luce]");
 
     k_out = k;
     v_out = v;
 }
 
-}  // namespace dflash
+}  // namespace luce

@@ -5,9 +5,9 @@
 #include <cstdio>
 #include <vector>
 
-using dflash::common::DDTree;
-using dflash::common::follow_verified_tree;
-using dflash::common::truncate_verified_path;
+using luce::common::DDTree;
+using luce::common::follow_verified_tree;
+using luce::common::truncate_verified_path;
 
 static int g_checks = 0;
 

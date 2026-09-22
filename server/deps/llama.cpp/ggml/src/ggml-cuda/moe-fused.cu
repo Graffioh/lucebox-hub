@@ -387,7 +387,7 @@ static void launch_moe_combine(
         size_t output_nb1,
         float value_scale) {
     static const bool vec4_requested = []() {
-        const char * raw = std::getenv("DFLASH_MOE_COMBINE_VEC4");
+        const char * raw = std::getenv("LUCE_MOE_COMBINE_VEC4");
         return raw && *raw && std::strcmp(raw, "0") != 0;
     }();
     static_assert(sizeof(float4) == 4 * sizeof(float));

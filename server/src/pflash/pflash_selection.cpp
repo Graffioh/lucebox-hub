@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::pflash {
+namespace luce::pflash {
 
 namespace {
 
@@ -89,7 +89,7 @@ bool pflash_chunk_is_structurally_required(
         int query_begin,
         int query_end,
         int input_tokens,
-        const std::vector<dflash::common::PFlashTokenSpan> &
+        const std::vector<luce::common::PFlashTokenSpan> &
             required_instruction_spans) noexcept {
     if (begin < 0 || end <= begin || query_begin < 0 ||
         query_end < query_begin || input_tokens < query_end ||
@@ -107,7 +107,7 @@ bool pflash_chunk_is_structurally_required(
 }
 
 bool validate_pflash_instruction_spans(
-        const std::vector<dflash::common::PFlashTokenSpan> & spans,
+        const std::vector<luce::common::PFlashTokenSpan> & spans,
         int input_tokens,
         std::string & error) noexcept {
     error.clear();
@@ -115,7 +115,7 @@ bool validate_pflash_instruction_spans(
         error = "PFlash input token count must not be negative";
         return false;
     }
-    if (spans.size() > dflash::common::kPFlashMaxInstructionSpans) {
+    if (spans.size() > luce::common::kPFlashMaxInstructionSpans) {
         error = "PFlash has too many instruction spans";
         return false;
     }
@@ -542,7 +542,7 @@ bool resolve_pflash_selection(
     return true;
 }
 
-std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
+std::vector<luce::common::PFlashTokenSpan> pflash_probe_segments(
         const std::vector<float> & boundary_scores,
         int input_tokens,
         float threshold,
@@ -550,7 +550,7 @@ std::vector<dflash::common::PFlashTokenSpan> pflash_probe_segments(
         int max_segment,
         const std::vector<int> & forced_cuts,
         const std::vector<float> & split_scores) {
-    using dflash::common::PFlashTokenSpan;
+    using luce::common::PFlashTokenSpan;
     std::vector<PFlashTokenSpan> spans;
     if (input_tokens <= 0 || (int) boundary_scores.size() < input_tokens ||
         min_segment < 1 || max_segment < min_segment) {
@@ -691,4 +691,4 @@ const char * pflash_candidate_score_name(PFlashCandidateScore score) noexcept {
     return "unknown";
 }
 
-} // namespace dflash::pflash
+} // namespace luce::pflash

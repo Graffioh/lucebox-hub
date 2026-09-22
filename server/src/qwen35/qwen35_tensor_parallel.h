@@ -9,7 +9,7 @@
 #include <memory>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 ggml_backend_meta_split_state qwen35_tensor_parallel_split_state(
     const ggml_tensor * tensor,
@@ -38,4 +38,4 @@ private:
     ggml_backend_dev_t meta_device_ = nullptr;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

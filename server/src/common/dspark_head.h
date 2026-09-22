@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Drafter lifecycle generation. Every drafter free/reload bumps it; the fused
 // chain-graph cache keys on it so a reloaded drafter that lands at the same
@@ -61,4 +61,4 @@ bool dspark_markov_project_topk(const DraftWeights & dw,
                                 std::vector<float> & top_log_probs,
                                 std::vector<int32_t> & top_token_ids);
 
-}  // namespace dflash::common
+}  // namespace luce::common

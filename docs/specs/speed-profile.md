@@ -9,7 +9,7 @@ It runs the engine **binaries directly** — `test_dflash` (the speculative / DF
 decode path) and `test_generate` (the plain autoregressive baseline) — with **no
 HTTP**, so the numbers reflect compute, not server/network noise. Both are CMake
 build targets under `server/build/` and can be overridden with `--df-bin` /
-`--ar-bin` (or the `DFLASH_BIN` / `DFLASH_BIN_AR` environment variables).
+`--ar-bin` (or the `LUCE_BIN` / `LUCE_BIN_AR` environment variables).
 
 ## What it reports
 
@@ -33,7 +33,7 @@ The defaults mirror the **shipping config** so the numbers are production-repres
 and they stay fixed so every run is comparable over time:
 
 - **`--budget 22`** — DDTree speculation budget = how many draft positions are verified
-  per target pass. 22 is the `dflash_server` default. Bigger = a bigger bet (higher
+  per target pass. 22 is the `luce_server` default. Bigger = a bigger bet (higher
   potential acceptance length) but more draft+verify cost; tuning it is a separate sweep,
   not the CI job.
 - **`--n-gen 128`** — requested generated tokens per prompt. This is long enough

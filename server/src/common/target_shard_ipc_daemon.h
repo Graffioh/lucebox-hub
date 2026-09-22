@@ -9,7 +9,7 @@
 #include <functional>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct TargetShardDaemonForwardRequest {
     int base_pos = 0;
@@ -49,4 +49,4 @@ int run_target_shard_ipc_daemon_loop(
     size_t shared_payload_bytes,
     TargetShardDaemonCallbacks callbacks);
 
-}  // namespace dflash::common
+}  // namespace luce::common

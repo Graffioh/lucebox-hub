@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -202,8 +202,8 @@ bool LagunaDFlashTarget::verify_tree(
         return false;
     }
 
-    static const bool g_no_kvpad = (std::getenv("DFLASH_LAGUNA_NO_KVPAD") != nullptr);
-    static const bool g_pad_cpy = (std::getenv("DFLASH_LAGUNA_PAD_CPY") != nullptr);
+    static const bool g_no_kvpad = (std::getenv("LUCE_LAGUNA_NO_KVPAD") != nullptr);
+    static const bool g_pad_cpy = (std::getenv("LUCE_LAGUNA_PAD_CPY") != nullptr);
     const int kv_len = committed + N;
     const int kv_pad = (!g_no_kvpad && kv_cap > 0)
         ? std::min((kv_len + 255) & ~255, kv_cap) : 0;
@@ -727,4 +727,4 @@ const std::vector<int> & LagunaDFlashTarget::capture_layer_ids() const {
     return capture_ids_;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

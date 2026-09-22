@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Bounds the sparse heterogeneous prefill arena once accumulated attention
 // context dominates its memory footprint. Decode batching is unaffected.
@@ -133,7 +133,7 @@ private:
     // safe only when this matches cache_.cur_pos.
     int                    last_logits_pos_ = -1;
 
-    // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
+    // DSpark speculative decode (opt-in: LUCE_DS4_SPEC=1 + LUCE_DS4_DRAFT=<gguf>).
     bool                           spec_enabled_ = false;
     bool                           spec_drafter_parked_ = false;
     std::string                    spec_draft_path_;
@@ -212,4 +212,4 @@ private:
     friend class DeepSeek4SeqEngine;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

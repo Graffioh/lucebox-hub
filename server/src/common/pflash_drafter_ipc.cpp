@@ -10,7 +10,7 @@
 #include <cstdlib>
 #include <sstream>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -306,4 +306,4 @@ void PFlashDrafterIpcClient::close() {
     active_ = false;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

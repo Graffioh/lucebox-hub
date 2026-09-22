@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HumanEval+ A/B for the dflash server. For each config, spawn a fresh server,
+HumanEval+ A/B for the luce server. For each config, spawn a fresh server,
 generate one completion per HumanEval+ task, then grade pass@1 by exec'ing the
 EvalPlus tests in a subprocess sandbox.
 
@@ -11,7 +11,7 @@ both score 1.0 — so cache-induced output drift may or may not hurt this number
 
 Run:
     PFLASH_TARGET=...  PFLASH_DRAFT=...  PFLASH_BIN=...  PFLASH_DRAFTER=... \\
-    python3 dflash/scripts/quality_humaneval_plus.py [--limit N]
+    python3 server/scripts/quality_humaneval_plus.py [--limit N]
 
 Outputs:
     /tmp/hep_results/samples_<config>.jsonl  — one completion per task
@@ -32,35 +32,35 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DATASET = PROJECT_ROOT / "dflash/eval/humaneval_plus/humanevalplus.jsonl"
+DATASET = PROJECT_ROOT / "server/eval/humaneval_plus/humanevalplus.jsonl"
 
 CONFIGS = {
     "baseline": {
         "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "off"],
-        "env":   {"DFLASH_FP_USE_BSA": "0"},
+        "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "prefix_on": {
         "flags": ["--prefix-cache-slots", "4", "--prefill-compression", "off"],
-        "env":   {"DFLASH_FP_USE_BSA": "0"},
+        "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "compression_on": {
         "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "always"],
-        "env":   {"DFLASH_FP_USE_BSA": "0"},
+        "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "compression_auto": {
         "flags": ["--prefix-cache-slots", "0", "--prefill-compression", "auto"],
-        "env":   {"DFLASH_FP_USE_BSA": "0"},
+        "env":   {"LUCE_FP_USE_BSA": "0"},
     },
     "all_on": {
         "flags": ["--prefix-cache-slots", "4", "--prefill-compression", "always"],
-        "env":   {"DFLASH_FP_USE_BSA": "1"},
+        "env":   {"LUCE_FP_USE_BSA": "1"},
     },
 }
 
 PORT     = 8765
 TARGET   = os.environ.get("PFLASH_TARGET", "/home/peppi/models/qwen3.6-27b/Qwen3.6-27B-UD-Q4_K_XL.gguf")
 DRAFT    = os.environ.get("PFLASH_DRAFT",  "/home/peppi/models/qwen3.6-27b-dflash/model.safetensors")
-SERVER_BIN = os.environ.get("DFLASH_SERVER_BIN", str(PROJECT_ROOT / "dflash/build/dflash_server"))
+SERVER_BIN = os.environ.get("LUCE_SERVER_BIN", str(PROJECT_ROOT / "server/build/luce_server"))
 DRAFTER  = os.environ.get("PFLASH_DRAFTER", str(Path.home() / "models/Qwen3.5-0.8B-BF16.gguf"))
 
 # Canonical EvalPlus chat-mode prompt (evalplus/codegen.py:222-223)

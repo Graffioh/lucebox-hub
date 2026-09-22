@@ -3,7 +3,7 @@
 #include "qwen35moe_backend.h"
 #include "common/daemon_loop.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 int run_qwen35moe_daemon(const Qwen35MoeDaemonArgs & args) {
     Qwen35Config cfg;
@@ -35,4 +35,4 @@ int run_qwen35moe_daemon(const Qwen35MoeDaemonArgs & args) {
     return run_daemon(backend, dargs);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

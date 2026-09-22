@@ -12,7 +12,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 namespace fs = std::filesystem;
@@ -34,7 +34,7 @@ static std::string executable_directory() {
 #endif
 }
 
-#if defined(DFLASH27B_BACKEND_MIXED)
+#if defined(LUCE_BACKEND_MIXED)
 static ggml_backend_reg_t load_peer_registry(PlacementBackend backend,
                                              std::string * error) {
     static std::mutex mutex;
@@ -48,7 +48,7 @@ static ggml_backend_reg_t load_peer_registry(PlacementBackend backend,
     const char * registry_name = backend == PlacementBackend::Cuda
         ? "CUDA" : "ROCm";
     const char * path_variable = backend == PlacementBackend::Cuda
-        ? "DFLASH_CUDA_BACKEND_PATH" : "DFLASH_HIP_BACKEND_PATH";
+        ? "LUCE_CUDA_BACKEND_PATH" : "LUCE_HIP_BACKEND_PATH";
     const char * module_name = backend == PlacementBackend::Cuda
         ? "libggml-cuda.so" : "libggml-hip.so";
 
@@ -130,7 +130,7 @@ ggml_backend_t init_placement_backend(PlacementBackend backend,
         return result;
     }
 
-#if defined(DFLASH27B_BACKEND_MIXED)
+#if defined(LUCE_BACKEND_MIXED)
     if (backend == PlacementBackend::Cuda || backend == PlacementBackend::Hip) {
         ggml_backend_reg_t registry = load_peer_registry(backend, error);
         if (!registry) return nullptr;
@@ -196,4 +196,4 @@ BackendPairCapabilities backend_pair_capabilities(ggml_backend_t first,
     return result;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common
