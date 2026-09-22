@@ -333,6 +333,32 @@ PFlashTokenSpan pflash_decoded_text_span(
     int end,
     const std::string & needle);
 
+// The last chat message's content span inside a rendered prompt, located by
+// the model's own chat control markers rather than message bookkeeping.
+// ``role_begin`` is the marker opening that message (the header to pin);
+// ``content_begin`` skips the role-name line ("<|im_start|>user\n") when the
+// family uses generic role markers; ``content_end`` sits before the closing
+// or generation marker. Offsets are token indices in ``prompt``'s own
+// vocabulary. ``markers`` were resolved on ``marker_tokenizer`` (the target
+// model's); its marker strings are searched in the decoded prompt text, so
+// a drafter whose vocabulary lacks the control tokens still maps correctly.
+// Invalid when the prompt carries no chat markers.
+struct PflashChatTailSpan {
+    int role_begin = -1;
+    int content_begin = -1;
+    int content_end = -1;
+
+    bool valid() const {
+        return content_begin >= 0 && content_end > content_begin;
+    }
+};
+
+PflashChatTailSpan pflash_last_message_content_span(
+    const Tokenizer & marker_tokenizer,
+    const ChatMarkers & markers,
+    const Tokenizer & tokenizer,
+    const std::vector<int32_t> & prompt);
+
 // Return the original prompt offset immediately before the stable trailing
 // suffix shared with a version whose latest user message carries a sentinel.
 // Invalid when no such bounded suffix can establish the semantic boundary.
@@ -372,8 +398,6 @@ std::vector<PFlashTokenSpan> pflash_document_spans_from_ranges(
     const std::vector<std::pair<int, int>> & ranges);
 
 bool pflash_full_cache_restore_allowed(
-    bool selection_environment_present) noexcept;
-bool pflash_continuation_must_fail_closed(
     bool selection_environment_present) noexcept;
 int pflash_target_token_ceiling(
     int original_target_tokens, double keep_ratio) noexcept;

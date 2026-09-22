@@ -534,15 +534,149 @@ std::string pflash_token_fingerprint(
     return encoded;
 }
 
+PflashChatTailSpan pflash_last_message_content_span(
+        const Tokenizer & marker_tokenizer,
+        const ChatMarkers & markers,
+        const Tokenizer & tokenizer,
+        const std::vector<int32_t> & prompt) {
+    PflashChatTailSpan tail;
+    if (prompt.empty()) return tail;
+
+    const auto seq_text = [&marker_tokenizer](
+            const std::vector<int32_t> & seq) {
+        std::string text;
+        for (const int32_t id : seq) text += marker_tokenizer.token_text(id);
+        return text;
+    };
+    std::vector<std::string> role_marks;
+    for (const auto & seq : markers.next_role_starts) {
+        std::string text = seq_text(seq);
+        if (!text.empty()) role_marks.push_back(std::move(text));
+    }
+    std::vector<std::string> end_marks;
+    for (const auto & seq : markers.end_msg_seqs) {
+        std::string text = seq_text(seq);
+        if (!text.empty()) end_marks.push_back(std::move(text));
+    }
+    if (role_marks.empty() && end_marks.empty()) return tail;
+
+    const DecodedPrompt decoded =
+        decode_prompt_with_offsets(tokenizer, prompt);
+    const std::string & text = decoded.text;
+
+    // Last occurrence strictly before `before` (npos: anywhere), as
+    // (offset, length). Marker strings never overlap themselves, so the
+    // rightmost start across all needles is the answer.
+    const auto last_before = [&text](
+            const std::vector<std::string> & needles, size_t before)
+            -> std::pair<size_t, size_t> {
+        size_t best = std::string::npos, len = 0;
+        for (const auto & needle : needles) {
+            const size_t at = before == std::string::npos
+                ? text.rfind(needle)
+                : before == 0
+                    ? std::string::npos
+                    : text.rfind(needle, before - 1);
+            if (at != std::string::npos &&
+                (best == std::string::npos || at > best)) {
+                best = at;
+                len = needle.size();
+            }
+        }
+        return {best, len};
+    };
+
+    const auto last_role = last_before(role_marks, std::string::npos);
+    const auto last_end = last_before(end_marks, std::string::npos);
+    if (last_role.first == std::string::npos &&
+        last_end.first == std::string::npos) {
+        return tail;
+    }
+
+    // Families whose markers already name the role (DeepSeek "<｜User｜>",
+    // Laguna "<user>") delimit content at the marker itself. Generic markers
+    // (Qwen "<|im_start|>", Gemma "<|turn>") are followed by a "name\n"
+    // header line.
+    const bool marker_carries_role =
+        markers.role_starts_delimit || markers.family == "laguna";
+
+    // The character offset where the final message's content stops. The
+    // prompt's last marker is either the message's own end marker, the
+    // assistant generation marker (a role marker followed only by a
+    // role-name header), or a role marker that opened an unterminated
+    // message — in which case content runs to the prompt end.
+    size_t content_end_text;
+    if (last_role.first != std::string::npos &&
+        (last_end.first == std::string::npos ||
+         last_role.first > last_end.first)) {
+        const size_t after = last_role.first + last_role.second;
+        bool generation;
+        if (marker_carries_role) {
+            generation = text.find_first_not_of(" \t\n\r", after) ==
+                std::string::npos;
+        } else {
+            size_t i = after;
+            while (i < text.size() && i - after < 16 &&
+                   std::isalpha((unsigned char) text[i])) ++i;
+            generation = i > after && i < text.size() && text[i] == '\n' &&
+                text.find_first_not_of(" \t\n\r", i + 1) ==
+                    std::string::npos;
+        }
+        if (generation) {
+            if (marker_carries_role) {
+                content_end_text = last_role.first;
+            } else {
+                // Content ends at this message's end marker — the last one
+                // after the role marker that opened it, not an earlier
+                // turn's.
+                const auto prev_role = last_before(role_marks, last_role.first);
+                content_end_text =
+                    (last_end.first != std::string::npos &&
+                     (prev_role.first == std::string::npos ||
+                          last_end.first > prev_role.first))
+                        ? last_end.first : last_role.first;
+            }
+        } else {
+            content_end_text = text.size();
+        }
+    } else {
+        content_end_text = last_end.first;
+    }
+
+    // The marker that opened the message containing content_end.
+    const auto role = last_before(role_marks, content_end_text);
+    size_t content_begin_text = 0;
+    if (role.first != std::string::npos) {
+        tail.role_begin = token_at_offset(decoded, role.first);
+        size_t begin = role.first + role.second;
+        if (!marker_carries_role) {
+            size_t i = begin;
+            while (i < content_end_text && i - begin < 16 &&
+                   std::isalpha((unsigned char) text[i])) ++i;
+            if (i > begin && i < content_end_text && text[i] == '\n') {
+                begin = i + 1;
+            }
+        }
+        content_begin_text = begin;
+    }
+
+    tail.content_end = content_end_text >= text.size()
+        ? (int) prompt.size()
+        : token_at_offset(decoded, content_end_text);
+    // First token whose text starts at-or-after the content offset — a token
+    // merged across the header/content boundary stays with the header.
+    tail.content_begin = (int) (std::lower_bound(
+        decoded.token_begin.begin(), decoded.token_begin.end(),
+        content_begin_text) - decoded.token_begin.begin());
+    if (tail.role_begin > tail.content_begin) {
+        tail.role_begin = tail.content_begin;
+    }
+    return tail;
+}
 
 bool pflash_full_cache_restore_allowed(
         bool selection_environment_present) noexcept {
     return !selection_environment_present;
-}
-
-bool pflash_continuation_must_fail_closed(
-        bool selection_environment_present) noexcept {
-    return selection_environment_present;
 }
 
 int pflash_target_token_ceiling(
@@ -3493,6 +3627,8 @@ std::string HttpServer::apply_pflash_compression(
     const bool raw_text_input = req.messages.is_string();
     const char * parser_input_kind = messages_input
         ? "messages" : (raw_text_input ? "raw_text" : "unsupported");
+    const bool tail_parser = experiment.query_parser ==
+        luce::pflash::PFlashQueryParser::ArbitraryTail;
     std::string parser_selection_rule;
     std::string last_user_text;
     int query_content_begin = -1;
@@ -3501,7 +3637,23 @@ std::string HttpServer::apply_pflash_compression(
     // content, when it was mapped against the decoded token text. The strict
     // selector keeps the whole span mandatory; the scorer window is its tail.
     PFlashTokenSpan explicit_query_span{-1, -1};
+    // Header ("<|im_start|>user\n") opening the last message, when the chat
+    // markers resolved it — pinned mandatory so a compressed prompt keeps
+    // the current turn's role envelope.
+    PFlashTokenSpan last_role_header{-1, -1};
     std::vector<PFlashTokenSpan> required_instruction_spans;
+    // Chat-first scorer query: the last message's content span, located by
+    // the rendered prompt's own control markers. Feeds the strict tail
+    // parser and the legacy window; unused when a benchmark parser
+    // (latest_user) or a marker-less prompt needs the sentinel mapping.
+    http_detail::PflashChatTailSpan chat_tail;
+    if (!experiment.configured || tail_parser) {
+        ChatMarkers chat_markers;
+        if (resolve_chat_markers(tokenizer_, chat_markers)) {
+            chat_tail = http_detail::pflash_last_message_content_span(
+                tokenizer_, chat_markers, *drafter_tokenizer_, drafter_ids);
+        }
+    }
     if (experiment.configured) {
         if (!messages_input && !raw_text_input) {
             return "PFlash strict selection input has no parseable text";
@@ -3524,17 +3676,11 @@ std::string HttpServer::apply_pflash_compression(
                 last_user_text = messages[(size_t) last_user_index].content;
             }
 
+            const bool semantic_parser = experiment.query_parser ==
+                luce::pflash::PFlashQueryParser::SemanticUser;
             int boundary_index = (int) messages.size() - 1;
-            if (!raw_text_input &&
-                experiment.query_parser ==
-                    luce::pflash::PFlashQueryParser::SemanticUser) {
+            if (!raw_text_input && semantic_parser) {
                 boundary_index = last_user_index;
-            }
-            if (boundary_index < 0 ||
-                (experiment.query_parser ==
-                     luce::pflash::PFlashQueryParser::SemanticUser &&
-                 !raw_text_input && last_user_text.empty())) {
-                return "PFlash strict selection latest-user boundary is unavailable";
             }
 
             static constexpr const char * kContentBegin =
@@ -3617,15 +3763,36 @@ std::string HttpServer::apply_pflash_compression(
             };
 
             std::string boundary_error;
-            if (!map_message_content(
-                    (size_t) boundary_index,
-                    query_content_begin, query_content_end,
-                    boundary_error)) {
-                return "PFlash strict selection " + boundary_error;
+            // Chat default: the last message's content bounds come from the
+            // rendered prompt's control markers — no sentinel re-renders.
+            if (tail_parser && chat_tail.valid()) {
+                query_content_begin = chat_tail.content_begin;
+                query_content_end = chat_tail.content_end;
+                if (chat_tail.role_begin >= 0 &&
+                    chat_tail.role_begin < chat_tail.content_begin) {
+                    last_role_header = {chat_tail.role_begin,
+                                        chat_tail.content_begin};
+                }
+            }
+            if (query_content_begin < 0) {
+                // Marker-less prompts (and the benchmark's latest_user
+                // parser) still locate the boundary through sentinel
+                // renders of the boundary message.
+                if (boundary_index < 0 ||
+                    (semantic_parser && !raw_text_input &&
+                     last_user_text.empty())) {
+                    return "PFlash strict selection latest-user boundary is unavailable";
+                }
+                if (!map_message_content(
+                        (size_t) boundary_index,
+                        query_content_begin, query_content_end,
+                        boundary_error)) {
+                    return "PFlash strict selection " + boundary_error;
+                }
             }
             if (query_content_begin < 0 ||
                 query_content_end <= query_content_begin ||
-                query_content_end >= (int) drafter_ids.size()) {
+                query_content_end > (int) drafter_ids.size()) {
                 return "PFlash strict selection content boundary mapping failed";
             }
 
@@ -3691,21 +3858,35 @@ std::string HttpServer::apply_pflash_compression(
                 // whole question is mandatory even though the scorer only
                 // consumes its bounded tail. Mapping against the decoded
                 // content text (not a standalone encoding) keeps BPE boundary
-                // merges like " What" inside the span.
-                if (!req.pflash_query.empty() &&
-                    experiment.query_parser ==
-                        luce::pflash::PFlashQueryParser::SemanticUser) {
+                // merges like " What" inside the span. Benchmark-only: under
+                // the chat tail parser the query may sit anywhere before the
+                // closing markers; latest_user still scopes it to the user
+                // message.
+                if (!req.pflash_query.empty()) {
+                    const int query_search_begin =
+                        semantic_parser ? query_content_begin : 0;
+                    const int query_search_end = semantic_parser
+                        ? query_content_end
+                        : (query_content_end > 0
+                               ? query_content_end : (int) drafter_ids.size());
                     explicit_query_span =
                         http_detail::pflash_decoded_text_span(
                             *drafter_tokenizer_, drafter_ids,
-                            query_content_begin, query_content_end,
+                            query_search_begin, query_search_end,
                             req.pflash_query);
                     if (explicit_query_span.begin < 0) {
-                        return "PFlash strict selection explicit query mapping "
-                            "failed: pflash_query does not occur in the "
-                            "latest user content";
+                        return semantic_parser
+                            ? "PFlash strict selection explicit query mapping "
+                              "failed: pflash_query does not occur in the "
+                              "latest user content"
+                            : "PFlash strict selection explicit query mapping "
+                              "failed: pflash_query does not occur in the "
+                              "prompt";
                     }
                     required_instruction_spans.push_back(explicit_query_span);
+                }
+                if (last_role_header.begin >= 0) {
+                    required_instruction_spans.push_back(last_role_header);
                 }
                 required_instruction_spans =
                     http_detail::canonicalize_pflash_token_spans(
@@ -3755,18 +3936,7 @@ std::string HttpServer::apply_pflash_compression(
     if (!last_user_text.empty()) {
         semantic_query_ids = drafter_tokenizer_->encode(last_user_text);
     }
-    if (experiment.configured && raw_text_input) {
-        parser_selection_rule = "content_tail";
-        query_window = http_detail::pflash_tail_query_window(
-            drafter_ids, experiment.query_tokens,
-            query_content_end, query_content_begin);
-    } else if (experiment.configured &&
-               experiment.query_parser ==
-                   luce::pflash::PFlashQueryParser::ArbitraryTail) {
-        parser_selection_rule = "prompt_tail";
-        query_window = http_detail::pflash_tail_query_window(
-            drafter_ids, experiment.query_tokens, query_content_end);
-    } else if (explicit_query_span.begin >= 0) {
+    if (explicit_query_span.begin >= 0) {
         // The explicit query was already mapped against the decoded content
         // text and pinned as a mandatory span. The scorer consumes the span's
         // bounded tail window; the complete span stays in the target prompt.
@@ -3778,6 +3948,18 @@ std::string HttpServer::apply_pflash_compression(
         expected_query_ids.assign(
             drafter_ids.begin() + (query_window.end - query_window.tokens),
             drafter_ids.begin() + query_window.end);
+    } else if (experiment.configured && (raw_text_input || tail_parser)) {
+        // Chat default: the scorer query is the tail of the last message's
+        // content — the prompt region before the closing/generation markers,
+        // clamped so it never swallows the role header.
+        parser_selection_rule = raw_text_input ? "content_tail" : "prompt_tail";
+        query_window = http_detail::pflash_tail_query_window(
+            drafter_ids, experiment.query_tokens,
+            query_content_end, query_content_begin);
+    } else if (!experiment.configured && chat_tail.valid()) {
+        // Legacy (unconfigured) chat mode uses the same marker-derived tail.
+        query_window = http_detail::pflash_tail_query_window(
+            drafter_ids, 8, chat_tail.content_end, chat_tail.content_begin);
     } else if (!semantic_query_ids.empty()) {
         if (experiment.configured) parser_selection_rule = "semantic_suffix";
         query_window = http_detail::find_pflash_query_window(
@@ -4016,7 +4198,13 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
             is_continuation_request(req.messages);
         const bool selection_environment =
             luce::pflash::has_pflash_selection_environment();
-        if (should_compress && selection_environment) {
+        // With a strict-selection environment PFlash owns every turn —
+        // multi-turn chit-chat compresses the whole rendered history plus
+        // the current user turn instead of routing to FlowKV. Only the
+        // per-request FlowKV disk-compression mode still conflicts.
+        const bool selection_owns_compression =
+            should_compress && selection_environment;
+        if (selection_owns_compression) {
             luce::pflash::PFlashSelectionConfig experiment;
             std::string experiment_error;
             if (!luce::pflash::resolve_pflash_selection(
@@ -4026,24 +4214,24 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
                     experiment_error;
                 return prepared;
             }
-            if (http_detail::pflash_continuation_must_fail_closed(
-                    selection_environment) &&
-                (continuation || req.disk_cache_policy.compress)) {
+            if (req.disk_cache_policy.compress) {
                 prepared.error_status = 500;
                 prepared.error =
-                    "PFlash strict selection does not support continuation or FlowKV compression";
+                    "PFlash strict selection does not support FlowKV compression";
                 return prepared;
             }
         }
 
-        if (should_compress && continuation && req.messages.is_array()) {
+        if (should_compress && continuation && req.messages.is_array() &&
+            !selection_owns_compression) {
             // FlowKV owns continuation compression automatically. Falling
             // back to whole-prompt compression would destroy the reusable
             // system/tool prefix anchor, and requiring a separate disk-cache
             // flag made --prefill-compression auto silently do nothing.
             apply_flowkv_compression(req, prepared);
             should_compress = false;
-        } else if (should_compress && continuation) {
+        } else if (should_compress && continuation &&
+                   !selection_owns_compression) {
             should_compress = false;
             std::fprintf(stderr,
                 "[pflash] skip-compress (continuation without messages array)\n");

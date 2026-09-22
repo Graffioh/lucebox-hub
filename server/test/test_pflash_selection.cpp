@@ -397,6 +397,11 @@ TEST_CASE(PFlashSelectionFixture, any_selection_environment_is_observable_before
 
 TEST_CASE(PFlashSelectionFixture, resolver_selects_explicit_query_parser) {
     CleanPFlashEnv env;
+    // Chat-first default: no override selects the rendered tail parser.
+    const auto fallback = resolve_or_fail(120000, 32);
+    REQUIRE(fallback.configured == false);
+    REQUIRE(fallback.query_parser == PFlashQueryParser::ArbitraryTail);
+
     set_env(kQueryParserEnv, "arbitrary_tail");
     const auto arbitrary = resolve_or_fail(120000, 32);
     REQUIRE(arbitrary.configured);

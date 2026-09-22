@@ -123,7 +123,9 @@ enum class PFlashScorer { Head, Legacy, Split };
 
 struct PFlashSelectionConfig {
     PFlashSelectionMode mode = PFlashSelectionMode::Legacy;
-    PFlashQueryParser query_parser = PFlashQueryParser::SemanticUser;
+    // Chat-first default: the scorer query is the tail of the last message's
+    // content. latest_user stays selectable for benchmark experiments.
+    PFlashQueryParser query_parser = PFlashQueryParser::ArbitraryTail;
     int chunk_size = 0;
     int query_tokens = 8;
     double top_p = 0.95;

@@ -161,6 +161,10 @@ struct HttpServerTestAccess {
         HttpServer::PreparedPrompt prepared;
         return server.apply_pflash_compression(req, prepared);
     }
+    static HttpServer::PreparedPrompt prepare_prompt(
+            HttpServer & server, const ParsedRequest & req) {
+        return server.prepare_prompt(req);
+    }
 };
 }
 
@@ -454,6 +458,31 @@ static std::string write_pflash_bpe_tokenizer_fixture(
     static int fixture_serial = 0;
     const std::string path = "/tmp/dflash_test_pflash_bpe_" +
         std::to_string(++fixture_serial) + ".gguf";
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    return path;
+}
+
+static std::string write_deepseek_marker_tokenizer_fixture() {
+    gguf_context * g = gguf_init_empty();
+    const char * tokens[] = {
+        "x",
+        "<｜begin▁of▁sentence｜>",
+        "<｜end▁of▁sentence｜>",
+        "<｜User｜>",
+        "<｜Assistant｜>",
+    };
+    const uint32_t token_types[] = {1, 3, 3, 3, 3};
+    gguf_set_arr_str(g, "tokenizer.ggml.tokens", tokens,
+                     sizeof(tokens) / sizeof(tokens[0]));
+    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
+                      token_types, sizeof(token_types) / sizeof(token_types[0]));
+    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
+    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
+    gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 1);
+    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 2);
+
+    const std::string path = test_tmp_path("luce_test_deepseek_markers.gguf").string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
     gguf_free(g);
     return path;
@@ -789,6 +818,114 @@ TEST_CASE(ServerUnitFixture, test_pflash_tail_query_window) {
     TEST_ASSERT(!http_detail::pflash_tail_query_window(long_prompt, 128, 201).valid());
 }
 
+TEST_CASE(ServerUnitFixture,
+        test_pflash_last_content_span_stops_before_chat_markers) {
+    const std::string rendered =
+        "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+        "<|im_start|>user\nfirst turn<|im_end|>\n"
+        "<|im_start|>assistant\nSure.<|im_end|>\n"
+        "<|im_start|>user\nWhat is the answer?<|im_end|>\n"
+        "<|im_start|>assistant\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant",
+         "system", "\n", "You", " are", " helpful", ".", "first", " turn",
+         "Sure"},
+        rendered);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tok, markers));
+    TEST_ASSERT(markers.family == "qwen");
+
+    const auto span = http_detail::pflash_last_message_content_span(
+        tok, markers, tok, prompt);
+    TEST_ASSERT(span.valid());
+    TEST_ASSERT(tok.decode({prompt.begin() + span.content_begin,
+                            prompt.begin() + span.content_end})
+                == "What is the answer?");
+    // The pinned header is exactly the role envelope of the last turn.
+    TEST_ASSERT(tok.decode({prompt.begin() + span.role_begin,
+                            prompt.begin() + span.content_begin})
+                == "<|im_start|>user\n");
+    // Everything after the content is template machinery — never part of
+    // the scorer query.
+    TEST_ASSERT(tok.decode({prompt.begin() + span.content_end,
+                            prompt.end()})
+                == "<|im_end|>\n<|im_start|>assistant\n");
+
+    const auto window = http_detail::pflash_tail_query_window(
+        prompt, 8, span.content_end, span.content_begin);
+    TEST_ASSERT(window.valid());
+    TEST_ASSERT(window.end == span.content_end);
+    TEST_ASSERT(window.tokens ==
+        std::min(8, span.content_end - span.content_begin));
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_last_content_span_deepseek_delimited_roles) {
+    const std::string path = write_deepseek_marker_tokenizer_fixture();
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tok, markers));
+    TEST_ASSERT(markers.family == "deepseek");
+    TEST_ASSERT(markers.role_starts_delimit);
+
+    // bos + system text + <|User|> + content + <|Assistant|> generation
+    const std::vector<int32_t> prompt = {1, 0, 3, 0, 0, 4};
+    const auto span = http_detail::pflash_last_message_content_span(
+        tok, markers, tok, prompt);
+    TEST_ASSERT(span.valid());
+    TEST_ASSERT(span.role_begin == 2);
+    TEST_ASSERT(span.content_begin == 3);
+    TEST_ASSERT(span.content_end == 5);
+    TEST_ASSERT(tok.decode({prompt.begin() + span.content_begin,
+                            prompt.begin() + span.content_end}) == "xx");
+    remove_test_path(path);
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_last_content_span_open_tail_runs_to_prompt_end) {
+    const std::string rendered = "<|im_start|>user\nhello there";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"hello", " there", "user", "\n"}, rendered);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tok, markers));
+    const auto span = http_detail::pflash_last_message_content_span(
+        tok, markers, tok, prompt);
+    TEST_ASSERT(span.valid());
+    TEST_ASSERT(span.content_end == (int) prompt.size());
+    TEST_ASSERT(tok.decode({prompt.begin() + span.content_begin,
+                            prompt.begin() + span.content_end})
+                == "hello there");
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_last_content_span_rejects_markerless_text) {
+    const std::string rendered = "just some raw text, no chat markers";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"just", " some", " raw", " text"}, rendered);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tok, markers));
+    const auto span = http_detail::pflash_last_message_content_span(
+        tok, markers, tok, prompt);
+    TEST_ASSERT(!span.valid());
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_normalizes_multipart_latest_user_for_reverse_lookup) {
     ToolMemory tool_memory;
     const json messages = json::array({
@@ -817,8 +954,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_normalizes_multipart_latest_user_for_re
 TEST_CASE(ServerUnitFixture, test_pflash_selection_cache_and_continuation_policy) {
     TEST_ASSERT(http_detail::pflash_full_cache_restore_allowed(false));
     TEST_ASSERT(!http_detail::pflash_full_cache_restore_allowed(true));
-    TEST_ASSERT(!http_detail::pflash_continuation_must_fail_closed(false));
-    TEST_ASSERT(http_detail::pflash_continuation_must_fail_closed(true));
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_target_token_ceiling_floors) {
@@ -3682,32 +3817,6 @@ TEST_CASE(ServerUnitFixture, test_stop_sequence_holdback_extends) {
 // ═══════════════════════════════════════════════════════════════════════
 // Prefix cache hash tests (model-free)
 // ═══════════════════════════════════════════════════════════════════════
-
-static std::string write_deepseek_marker_tokenizer_fixture() {
-    gguf_context * g = gguf_init_empty();
-    const char * tokens[] = {
-        "x",
-        "<｜begin▁of▁sentence｜>",
-        "<｜end▁of▁sentence｜>",
-        "<｜User｜>",
-        "<｜Assistant｜>",
-    };
-    const uint32_t token_types[] = {1, 3, 3, 3, 3};
-    gguf_set_arr_str(g, "tokenizer.ggml.tokens", tokens,
-                     sizeof(tokens) / sizeof(tokens[0]));
-    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
-                      token_types,
-                      sizeof(token_types) / sizeof(token_types[0]));
-    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
-    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
-    gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 1);
-    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 2);
-
-    const std::string path = test_tmp_path("luce_test_deepseek_markers.gguf").string();
-    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
-    gguf_free(g);
-    return path;
-}
 
 TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
@@ -6639,6 +6748,182 @@ TEST_CASE(ServerUnitFixture, test_pflash_default_raw_text_maps_user_query) {
     TEST_ASSERT(backend.last_request.score_query_end == 1);
     TEST_ASSERT(backend.last_request.score_query_tokens == 1);
     unlink(tokenizer_path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_chat_tail_query_uses_last_message_content) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
+
+    const std::string rendered =
+        "<|im_start|>system\nYou are helpful.<|im_end|>\n"
+        "<|im_start|>user\nWhat is the answer?<|im_end|>\n"
+        "<|im_start|>assistant\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant",
+         "system", "\n", "You", " are", " helpful", "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 1.0f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "What is the answer?"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & ids = backend.last_request.input_ids;
+    const int im_end = tokenizer.token_to_id("<|im_end|>");
+    int last_im_end = -1;
+    for (int i = 0; i < (int) ids.size(); ++i) {
+        if (ids[i] == im_end) last_im_end = i;
+    }
+    TEST_ASSERT(last_im_end > 0);
+    // The scorer window ends where the user content does — the generation
+    // markers ("<|im_end|>\n<|im_start|>assistant\n") are never scored.
+    TEST_ASSERT(backend.last_request.score_query_end == last_im_end);
+    const int query_begin = backend.last_request.score_query_end -
+        backend.last_request.score_query_tokens;
+    TEST_ASSERT(query_begin >= 0);
+    TEST_ASSERT(tokenizer.decode({ids.begin() + query_begin,
+                                  ids.begin() + last_im_end})
+                == "What is the answer?");
+    // The last turn's role header is pinned mandatory.
+    bool header_pinned = false;
+    for (const auto & span : backend.last_request.required_instruction_spans) {
+        if (tokenizer.decode({ids.begin() + span.begin,
+                              ids.begin() + span.end})
+            == "<|im_start|>user\n") {
+            header_pinned = true;
+        }
+    }
+    TEST_ASSERT(header_pinned);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_selection_owns_chat_continuations) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
+
+    const std::string rendered =
+        "<|im_start|>user\nfirst<|im_end|>\n"
+        "<|im_start|>assistant\nSure.<|im_end|>\n"
+        "<|im_start|>user\nsecond question<|im_end|>\n"
+        "<|im_start|>assistant\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"first", "second", " question", "user", "assistant", "\n", "Sure",
+         "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.pflash_keep_ratio = 1.0f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "first"}},
+            {{"role", "assistant"}, {"content", "Sure."}},
+            {{"role", "user"}, {"content", "second question"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const auto prepared =
+            HttpServerTestAccess::prepare_prompt(server, request);
+        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+        TEST_ASSERT(prepared.compressed);
+        TEST_ASSERT(!prepared.flowkv);
+    }
+
+    // Whole-prompt PFlash ran on the multi-turn prompt and scored against
+    // the last user turn's content tail.
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & ids = backend.last_request.input_ids;
+    const int im_end = tokenizer.token_to_id("<|im_end|>");
+    int last_im_end = -1;
+    for (int i = 0; i < (int) ids.size(); ++i) {
+        if (ids[i] == im_end) last_im_end = i;
+    }
+    TEST_ASSERT(backend.last_request.score_query_end == last_im_end);
+    const int query_begin = backend.last_request.score_query_end -
+        backend.last_request.score_query_tokens;
+    TEST_ASSERT(tokenizer.decode({ids.begin() + query_begin,
+                                  ids.begin() + last_im_end})
+                == "second question");
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_default_continuation_stays_on_flowkv) {
+    const std::string rendered =
+        "<|im_start|>user\nfirst<|im_end|>\n"
+        "<|im_start|>assistant\nSure.<|im_end|>\n"
+        "<|im_start|>user\nsecond<|im_end|>\n"
+        "<|im_start|>assistant\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"first", "second", "user", "assistant", "\n", "Sure", "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "first"}},
+            {{"role", "assistant"}, {"content", "Sure."}},
+            {{"role", "user"}, {"content", "second"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const auto prepared =
+            HttpServerTestAccess::prepare_prompt(server, request);
+        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+    }
+
+    // Without a strict-selection environment FlowKV keeps owning
+    // continuations; whole-prompt PFlash never ran.
+    TEST_ASSERT(backend.compress_calls == 0);
+    unlink(path.c_str());
 }
 
 struct MockBatchCompressBackend : MockBackend {
