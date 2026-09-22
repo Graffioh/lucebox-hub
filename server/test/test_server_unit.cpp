@@ -7035,14 +7035,15 @@ struct PflashSystemPromptCase {
     std::vector<std::string> vocab;
 };
 
-static PflashSystemPromptCase pflash_long_system_prompt_case() {
+static PflashSystemPromptCase pflash_long_system_prompt_case(
+        const std::string & instruction_role = "system") {
     std::string system;
     for (int i = 0; i < 30; ++i) system += "You are helpful. ";
     std::string history;
     for (int i = 0; i < 30; ++i) history += "Sure. ";
     PflashSystemPromptCase out;
     out.rendered = render_chat_template(
-        {{"system", system, ""},
+        {{instruction_role, system, ""},
          {"user", history, ""},
          {"assistant", "Sure.", ""},
          {"user", "What is the answer?", ""}},
@@ -7051,7 +7052,7 @@ static PflashSystemPromptCase pflash_long_system_prompt_case() {
         ChatFormat::QWEN3, /*add_generation_prompt=*/true,
         /*enable_thinking=*/true);
     out.messages = json::array({
-        {{"role", "system"}, {"content", system}},
+        {{"role", instruction_role}, {"content", system}},
         {{"role", "user"}, {"content", history}},
         {{"role", "assistant"}, {"content", "Sure."}},
         {{"role", "user"}, {"content", "What is the answer?"}},
@@ -7111,13 +7112,12 @@ TEST_CASE(ServerUnitFixture,
     unlink(path.c_str());
 }
 
-TEST_CASE(ServerUnitFixture,
-        test_pflash_strict_scores_instructions_that_overflow_context) {
-    // Instructions that alone do not fit the context are data: they lose
-    // their pin and compete for the budget.
+static std::string pflash_overflowing_instruction_error(
+        const std::string & role, bool & compressed,
+        std::vector<std::string> & kept_texts) {
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
     luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
-    const auto prompt = pflash_long_system_prompt_case();
+    const auto prompt = pflash_long_system_prompt_case(role);
     const std::string path =
         write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
     Tokenizer tokenizer;
@@ -7128,7 +7128,7 @@ TEST_CASE(ServerUnitFixture,
     LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
     config.pflash_keep_ratio = 0.3f;
-    config.max_ctx = 200;   // smaller than the system prompt + max_output
+    config.max_ctx = 200;   // smaller than the instructions + max_output
     config.prefix_cache_cap = 0;
     config.prefill_cache_cap = 0;
     std::string error;
@@ -7142,16 +7142,46 @@ TEST_CASE(ServerUnitFixture,
         request.max_output = 16;
         error = HttpServerTestAccess::apply_pflash_compression(server, request);
     }
-    TEST_ASSERT_MSG(error.empty(), error);
-    TEST_ASSERT(backend.compress_calls == 1);
-    const auto & request = backend.last_request;
-    for (const auto & span : request.required_instruction_spans) {
-        const std::string text = tokenizer.decode(
-            {request.input_ids.begin() + span.begin,
-             request.input_ids.begin() + span.end});
-        TEST_ASSERT_MSG(text.find("You are helpful") == std::string::npos, text);
+    compressed = backend.compress_calls == 1;
+    kept_texts.clear();
+    if (compressed) {
+        const auto & request = backend.last_request;
+        for (const auto & span : request.required_instruction_spans) {
+            kept_texts.push_back(tokenizer.decode(
+                {request.input_ids.begin() + span.begin,
+                 request.input_ids.begin() + span.end}));
+        }
     }
     unlink(path.c_str());
+    return error;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_refuses_system_prompt_that_overflows_context) {
+    // The system prompt is never compressed: when it alone does not fit the
+    // context the request fails before the drafter runs.
+    bool compressed = true;
+    std::vector<std::string> kept;
+    const std::string error =
+        pflash_overflowing_instruction_error("system", compressed, kept);
+    TEST_ASSERT_MSG(error.find("system prompt alone does not fit") !=
+                        std::string::npos, error);
+    TEST_ASSERT(!compressed);
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_scores_developer_text_that_overflows_context) {
+    // A developer message too large for the context is data: it loses its
+    // pin and competes for the budget.
+    bool compressed = false;
+    std::vector<std::string> kept;
+    const std::string error =
+        pflash_overflowing_instruction_error("developer", compressed, kept);
+    TEST_ASSERT_MSG(error.empty(), error);
+    TEST_ASSERT(compressed);
+    for (const auto & text : kept) {
+        TEST_ASSERT_MSG(text.find("You are helpful") == std::string::npos, text);
+    }
 }
 
 TEST_CASE(ServerUnitFixture,

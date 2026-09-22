@@ -3610,8 +3610,11 @@ std::string HttpServer::apply_pflash_compression(
     // the current turn's role envelope.
     PFlashTokenSpan query_role_header{-1, -1};
     std::vector<PFlashTokenSpan> required_instruction_spans;
-    // System, developer and tool-definition spans: kept verbatim like the
-    // required spans, except when they alone would not fit the context.
+    // Kept verbatim like the required spans. The system prompt never loses
+    // its pin: when it alone does not fit the context the request fails.
+    // Developer messages and tool definitions that do not fit are scored
+    // like any other context.
+    std::vector<PFlashTokenSpan> system_spans;
     std::vector<PFlashTokenSpan> instruction_role_spans;
     // Chat-first scorer query: the latest user turn's content span, located
     // by the rendered prompt's own control markers. Feeds the strict tail
@@ -3795,7 +3798,9 @@ std::string HttpServer::apply_pflash_compression(
                         return "PFlash strict selection instruction mapping failed: " +
                             boundary_error;
                     }
-                    instruction_role_spans.push_back(instruction_span);
+                    (messages[instruction_index].role == "system"
+                        ? system_spans : instruction_role_spans)
+                        .push_back(instruction_span);
                 }
 
                 if (!req.tools.is_null() && !req.tools.empty()) {
@@ -3896,12 +3901,18 @@ std::string HttpServer::apply_pflash_compression(
                 instruction_role_spans =
                     http_detail::canonicalize_pflash_token_spans(
                         std::move(instruction_role_spans));
+                system_spans =
+                    http_detail::canonicalize_pflash_token_spans(
+                        std::move(system_spans));
                 std::string instruction_error;
                 if (!luce::pflash::validate_pflash_instruction_spans(
                         required_instruction_spans,
                         (int) drafter_ids.size(), instruction_error) ||
                     !luce::pflash::validate_pflash_instruction_spans(
                         instruction_role_spans,
+                        (int) drafter_ids.size(), instruction_error) ||
+                    !luce::pflash::validate_pflash_instruction_spans(
+                        system_spans,
                         (int) drafter_ids.size(), instruction_error)) {
                     return "PFlash strict selection instruction mapping failed: " +
                         instruction_error;
@@ -4010,23 +4021,43 @@ std::string HttpServer::apply_pflash_compression(
             return (int) std::ceil((double) prompt_tokens *
                 (double) drafter_tokens / (double) input_tokens);
         };
-        auto kept_spans = required_instruction_spans;
-        kept_spans.insert(kept_spans.end(), instruction_role_spans.begin(),
-                          instruction_role_spans.end());
-        kept_spans = http_detail::canonicalize_pflash_token_spans(
-            std::move(kept_spans));
+        const auto merged = [&] (bool with_instructions) {
+            auto spans = required_instruction_spans;
+            spans.insert(spans.end(), system_spans.begin(), system_spans.end());
+            if (with_instructions) {
+                spans.insert(spans.end(), instruction_role_spans.begin(),
+                             instruction_role_spans.end());
+            }
+            return http_detail::canonicalize_pflash_token_spans(
+                std::move(spans));
+        };
+        const auto fits = [&] (int drafter_tokens) {
+            return config_.max_ctx <= 0 ||
+                target_estimate(drafter_tokens) + req.max_output <=
+                    config_.max_ctx;
+        };
+        auto kept_spans = merged(/*with_instructions=*/true);
         kept_tokens = kept_with(kept_spans);
-        // Instructions that alone overflow the context are data (a document
-        // pasted into the system prompt), not a preamble: they compete for
-        // the budget against the query like any other context.
-        if (!instruction_role_spans.empty() && config_.max_ctx > 0 &&
-            target_estimate(kept_tokens) + req.max_output > config_.max_ctx) {
+        // Developer messages and tool definitions that alone overflow the
+        // context are data (a document pasted into them), not a preamble:
+        // they compete for the budget against the query like any other
+        // context. The system prompt keeps its pin whatever its size.
+        if (!fits(kept_tokens) && !instruction_role_spans.empty()) {
             std::fprintf(stderr,
                 "[pflash-select] kept instructions do not fit the context "
-                "(~%d + %d > %d target tokens); scoring them as context\n",
+                "(~%d + %d > %d target tokens); scoring developer and tool "
+                "spans as context\n",
                 target_estimate(kept_tokens), req.max_output, config_.max_ctx);
-            kept_spans = required_instruction_spans;
+            kept_spans = merged(/*with_instructions=*/false);
             kept_tokens = kept_with(kept_spans);
+        }
+        if (!fits(kept_with(system_spans))) {
+            return "PFlash strict selection: the system prompt alone does not "
+                "fit the context (~" +
+                std::to_string(target_estimate(kept_with(system_spans))) +
+                " + " + std::to_string(req.max_output) + " > " +
+                std::to_string(config_.max_ctx) +
+                " target tokens); PFlash does not compress system prompts";
         }
         required_instruction_spans = std::move(kept_spans);
         // Auto mode compresses when the droppable part is long enough, not
