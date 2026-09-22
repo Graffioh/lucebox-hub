@@ -78,6 +78,10 @@ the published BF16 projector, thinking off:
   lmms-eval prompts: AI2D 85/100, ChartQA relaxed accuracy 55/60 (augmented)
   and 43/60 (human), no errors. Image prompts average 448 tokens and prefill in
   0.71 s (largest 1,068 tokens, 1.8 s); decode runs at 31 to 35 tok/s.
+- A projector with its weight matrices in Q8_0 (rows that are not a multiple
+  of 32 stay F16) encodes a 975-token image in 443 ms instead of 677 ms with
+  the BF16 file, with the same scores on the 220 questions and 216 identical
+  answers. Prefer one when available.
 - llama.cpp (HIP build, `-fa on`, same GGUF, projector and image cap) answers
   the same on every test image; on a 1,012-token image prompt it prefills in
   1.65 s to our 1.68 s, on a 323-token one in 0.61 s to our 0.50 s.
