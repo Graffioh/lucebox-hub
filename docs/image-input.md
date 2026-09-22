@@ -123,6 +123,14 @@ Published llama.cpp conversions of the decoder load directly (image router
 bias named `blk.N.exp_probs_b_vl.bias`, no `deepseek4.vocab_size` key). Split
 GGUF files and llama.cpp's `clip` projector files are not read yet.
 
+A decoder in our own ROCMFP MIX format comes from `tools/ds4_mix_converter`
+run on the Vision-Exp checkpoint; it keeps the image router biases and writes
+the routed experts in the MIX types (fp2 gate and up, fp3 down), dense tensors
+in BF16. Pass `--imatrix` with an importance matrix (the community publishes
+llama.cpp ones for this model; the converter reads one width-long vector per
+expert tensor) or `--absmax-only`. The converter uses every core; the
+Vision-Exp checkpoint takes about 30 minutes on 32 cores.
+
 One image request may be outstanding per backend. Its admission lease remains
 with the immutable payload through queueing and generation; another image
 request is rejected until that payload is released. This bounds simultaneous
@@ -164,6 +172,14 @@ prompts: AI2D 85/100, ChartQA relaxed accuracy 55/60 (augmented) and 43/60
 (human). Both layouts score the same and give word-identical answers on 213 of
 220 questions. An image request prefills in about 4 s and decodes at about
 23 tok/s.
+
+With our own ROCMFP MIX conversion of the same checkpoint (importance-matrix
+weighted, 114 GB with BF16 dense tensors), on a Strix Halo alone: AI2D 89/100,
+ChartQA 54/60 and 44/60, 185 answers identical to the Q2_K_S run, the same
+prefill time, and the sanity set (an image ahead of a 4,982-token prompt, two
+images in one request) correct. Decode is slower than with the Q2_K_S file
+(10 to 12 tok/s against 15 to 17) because the dense tensors are unquantized;
+quantizing them as the shipped text model does is converter work still to do.
 
 Not yet established:
 
