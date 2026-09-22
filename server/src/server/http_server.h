@@ -343,6 +343,9 @@ PFlashTokenSpan pflash_decoded_text_span(
 // ``content_begin`` skips the role-name line ("<|im_start|>user\n") when the
 // family uses generic role markers; ``content_end`` sits before the turn's
 // closing marker. Both trim the whitespace the template wraps content in.
+// ``turn_end`` sits past that closing marker; ``generation_begin`` is the
+// generation prompt's marker (the prompt end when there is none);
+// ``later_turns`` says assistant or tool turns sit between the two.
 // Offsets are token indices in ``prompt``'s own vocabulary. ``markers`` were
 // resolved on ``marker_tokenizer`` (the target model's); its marker strings
 // are searched in the decoded prompt text, so a drafter whose vocabulary
@@ -352,6 +355,9 @@ struct PflashChatTurnSpan {
     int role_begin = -1;
     int content_begin = -1;
     int content_end = -1;
+    int turn_end = -1;
+    int generation_begin = -1;
+    bool later_turns = false;
 
     bool valid() const {
         return content_begin >= 0 && content_end > content_begin;

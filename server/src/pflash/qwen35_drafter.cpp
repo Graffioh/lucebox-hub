@@ -707,9 +707,16 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         return {};
     }
     {
+        // Keys are the context before the query window and, when the tokens
+        // after it are candidates too, the context after it. NoPE scoring has
+        // no position term, so a later key scores like an earlier one.
         std::vector<float> m((size_t)n_lookahead * S, -INFINITY);
         for (int t = 0; t < n_lookahead; ++t) {
             std::fill_n(m.begin() + (size_t)t * S, (size_t)query_start, 0.0f);
+            if (experiment.query_suffix_candidates) {
+                std::fill_n(m.begin() + (size_t)t * S + query_end,
+                            (size_t)(S - query_end), 0.0f);
+            }
         }
         ggml_backend_tensor_set(mask, m.data(), 0, m.size() * sizeof(float));
     }
@@ -877,7 +884,11 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             forced.push_back(span.end);
         }
         int boundaries_in_context = 0;
-        for (int t = 1; t < query_begin; ++t) {
+        for (int t = 1; t < S; ++t) {
+            if (t >= query_begin &&
+                (t < query_end || !experiment.query_suffix_candidates)) {
+                continue;
+            }
             if (boundary[(size_t) t] > st.probe_threshold) ++boundaries_in_context;
         }
         const bool forced_probe =
@@ -943,6 +954,10 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     const char * legacy_scorer = std::getenv("PFLASH_QWEN35_LEGACY_SCORER");
     const bool force_legacy = (legacy_scorer && std::string(legacy_scorer) == "1") ||
         experiment.scorer == luce::pflash::PFlashScorer::Legacy;
+    // Only the block-15 head scores keys after the query window; the
+    // running-max scorer, alone or in the split, keeps the suffix.
+    luce::pflash::PFlashSelectionConfig suffix_kept = experiment;
+    suffix_kept.query_suffix_candidates = false;
     if (experiment.selection_active &&
         experiment.scorer == luce::pflash::PFlashScorer::Split) {
         // Two scorers, one budget: the block-15 head ranks (and segments)
@@ -951,7 +966,7 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
         std::vector<PFlashTokenSpan> head_segments;
         bool head_density = false;
         if (qwen35_strict_score_and_compress(
-                *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
+                *st, ids, keep_ratio, n_lookahead, score_query_end, suffix_kept,
                 required_instruction_spans, &head_mass, &head_segments,
                 &head_density).empty()) {
             return {};
@@ -959,7 +974,7 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
         std::vector<float> other_scores;
         if (qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
                                       n_lookahead, pool_kernel, score_query_end,
-                                      experiment, required_instruction_spans,
+                                      suffix_kept, required_instruction_spans,
                                       &other_scores).empty()) {
             return {};
         }
@@ -974,7 +989,7 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
         std::fflush(stderr);
         return select_pflash_chunks(
             ids, head_mass, keep_ratio, n_lookahead, score_query_end,
-            /*pool_kernel=*/1, experiment, required_instruction_spans,
+            /*pool_kernel=*/1, suffix_kept, required_instruction_spans,
             /*direct_mass=*/true, /*write_trace=*/true,
             head_segments.empty() ? nullptr : &head_segments, head_density,
             &other_scores, experiment.split_fraction);
@@ -990,7 +1005,7 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     }
     return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
                                      n_lookahead, pool_kernel, score_query_end,
-                                     experiment,
+                                     suffix_kept,
                                      required_instruction_spans);
 }
 

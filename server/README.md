@@ -393,6 +393,9 @@ latest user turn, located by the model's own chat markers in the rendered
 prompt. Tool output wrapped in a user turn and the generation prompt, with
 its think prefix, never count as that turn. Strict selection keeps the query
 and its turn's role header, and it runs on every turn of a multi-turn chat.
+In an agent loop the assistant and tool turns after the user's turn are
+scored against the query like the context before it; only the generation
+prompt is kept with them.
 A request's `pflash_query` string replaces the derived query and keeps its
 whole span; it is meant for benchmarks. `PFLASH_SELECT_QUERY_PARSER=latest_user`
 selects the benchmark parser, which finds the latest user message through

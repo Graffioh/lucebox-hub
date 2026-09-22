@@ -512,6 +512,7 @@ PflashChatTurnSpan pflash_chat_query_turn(
         size_t role_at = 0;
         size_t content_at = 0;
         size_t content_end = 0;
+        size_t close_end = 0;   // past the closing marker, if any
         std::string role;
         bool closed = false;
     };
@@ -539,10 +540,12 @@ PflashChatTurnSpan pflash_chat_query_turn(
         // (DeepSeek user turns) -- at the next role marker. Nothing after
         // it leaves the turn open to the prompt end.
         size_t content_end = text.size();
+        turn.close_end = text.size();
         if (index + 1 < marks.size()) {
             const Mark & next = marks[index + 1];
             content_end = next.at;
             turn.closed = !next.role || markers.role_starts_delimit;
+            turn.close_end = next.role ? next.at : next.at + next.len;
         }
         // Content ignores the whitespace the template wraps it in.
         while (content_at < content_end && is_space(text[content_at])) {
@@ -571,14 +574,15 @@ PflashChatTurnSpan pflash_chat_query_turn(
     }
     // The query comes from the latest user turn; a conversation without one
     // falls back to its latest turn with content.
-    const Turn * query = nullptr;
+    size_t query_index = turns.size();
     for (size_t index = usable; index-- > 0;) {
         const Turn & turn = turns[index];
         if (turn.content_end <= turn.content_at) continue;
-        if (turn.role == "user") { query = &turn; break; }
-        if (!query) query = &turn;
+        if (turn.role == "user") { query_index = index; break; }
+        if (query_index == turns.size()) query_index = index;
     }
-    if (!query) return chosen;
+    if (query_index == turns.size()) return chosen;
+    const Turn * query = &turns[query_index];
 
     // Content bounds in tokens: the first token starting at-or-after each
     // character offset, so a token merged across a boundary stays with the
@@ -591,6 +595,11 @@ PflashChatTurnSpan pflash_chat_query_turn(
     chosen.role_begin = token_at_offset(decoded, query->role_at);
     chosen.content_begin = token_from(query->content_at);
     chosen.content_end = token_from(query->content_end);
+    chosen.turn_end = token_from(query->close_end);
+    chosen.generation_begin = usable < turns.size()
+        ? token_at_offset(decoded, turns.back().role_at)
+        : (int) prompt.size();
+    chosen.later_turns = query_index + 1 < usable;
     if (chosen.role_begin > chosen.content_begin) {
         chosen.role_begin = chosen.content_begin;
     }
@@ -3561,6 +3570,9 @@ std::string HttpServer::apply_pflash_compression(
     // the whole span mandatory; the scorer window is its tail.
     PFlashTokenSpan query_span{-1, -1};
     std::string query_span_rule;
+    // Assistant and tool turns after the query's turn are context the query
+    // scores, not a kept suffix (strict selection only).
+    bool query_suffix_candidates = false;
     // Header ("<|im_start|>user\n") opening the query's turn, when the chat
     // markers resolved it — pinned mandatory so a compressed prompt keeps
     // the current turn's role envelope.
@@ -3825,6 +3837,24 @@ std::string HttpServer::apply_pflash_compression(
                 if (query_role_header.begin >= 0) {
                     required_instruction_spans.push_back(query_role_header);
                 }
+                // An agent loop puts assistant and tool turns after the
+                // user's: they compete for the budget like the context before
+                // the query. What stays is the rest of the query's turn
+                // through its closing marker, and the generation prompt.
+                if (chat_turn.valid() && chat_turn.later_turns &&
+                    query_span.begin >= chat_turn.content_begin &&
+                    query_span.end <= chat_turn.content_end) {
+                    query_suffix_candidates = true;
+                    if (chat_turn.turn_end > query_span.end) {
+                        required_instruction_spans.push_back(
+                            {query_span.end, chat_turn.turn_end});
+                    }
+                    if (chat_turn.generation_begin < (int) drafter_ids.size()) {
+                        required_instruction_spans.push_back(
+                            {chat_turn.generation_begin,
+                             (int) drafter_ids.size()});
+                    }
+                }
                 required_instruction_spans =
                     http_detail::canonicalize_pflash_token_spans(
                         std::move(required_instruction_spans));
@@ -3924,6 +3954,7 @@ std::string HttpServer::apply_pflash_compression(
     compress_request.input_ids = std::move(drafter_ids);
     compress_request.required_instruction_spans =
         std::move(required_instruction_spans);
+    compress_request.query_suffix_candidates = query_suffix_candidates;
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
     if (query_window.valid()) {
@@ -3953,6 +3984,7 @@ std::string HttpServer::apply_pflash_compression(
                 {"query_end", query_window.end},
                 {"query_span_begin", query_span.begin},
                 {"query_span_end", query_span.end},
+                {"query_suffix_candidates", query_suffix_candidates},
                 {"requested_query_tokens", experiment.query_tokens},
                 {"required_text_count", req.pflash_required.size()},
                 {"expected_query_ids", expected_query_ids},

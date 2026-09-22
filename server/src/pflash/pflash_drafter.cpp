@@ -104,7 +104,8 @@ std::vector<int32_t> drafter_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const std::vector<PFlashTokenSpan> & required_instruction_spans) {
+    const std::vector<PFlashTokenSpan> & required_instruction_spans,
+    bool query_suffix_candidates) {
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
         return {};
@@ -121,6 +122,8 @@ std::vector<int32_t> drafter_score_and_compress(
         return {};
     }
     chunk_size = experiment.chunk_size;
+    experiment.query_suffix_candidates =
+        query_suffix_candidates && experiment.selection_active;
     if (!experiment.selection_active && !required_instruction_spans.empty()) {
         set_last_error(
             "PFlash instruction spans require strict budget selection");
@@ -145,12 +148,13 @@ std::vector<int32_t> drafter_score_and_compress(
         std::fprintf(stderr,
             "[pflash-select] config mode=%s active=%d chunk=%d "
             "query_parser=%s query_cap=%d query_actual=%d top_p=%.9g "
-            "top_k=%d input=%zu\n",
+            "top_k=%d suffix_candidates=%d input=%zu\n",
             luce::pflash::pflash_selection_mode_name(experiment.mode),
             (int) experiment.selection_active, experiment.chunk_size,
             luce::pflash::pflash_query_parser_name(experiment.query_parser),
             experiment.query_tokens, n_lookahead, experiment.top_p,
-            experiment.top_k, ids.size());
+            experiment.top_k, (int) experiment.query_suffix_candidates,
+            ids.size());
         std::fflush(stderr);
     }
     if (score_query_end < 0) {

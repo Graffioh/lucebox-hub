@@ -271,6 +271,10 @@ struct ModelBackend {
         // Role-derived instruction structure in drafter-token coordinates.
         // Empty is a valid instruction-free or legacy request.
         std::vector<PFlashTokenSpan> required_instruction_spans;
+        // Strict selection with the block-15 head: the tokens after the query
+        // window are scored candidates rather than a kept suffix. The caller
+        // pins what of that suffix must stay (the generation prompt).
+        bool                 query_suffix_candidates = false;
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs

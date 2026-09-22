@@ -225,7 +225,8 @@ std::vector<int32_t> select_pflash_chunks(
         const bool mandatory =
             luce::pflash::pflash_chunk_is_structurally_required(
                 begin, end, query_begin, query_end, input_tokens,
-                required_instruction_spans);
+                required_instruction_spans,
+                /*query_suffix_structural=*/ !config.query_suffix_candidates);
         candidates.push_back({(size_t) chunk, begin, end, score, mandatory});
         chunk_means.push_back({(float) score, chunk});
         exact_chunk_scores.push_back(score);

@@ -71,6 +71,8 @@ void free_drafter_weights(DrafterContext & ctx);
 //   pool_kernel  AvgPool kernel for score smoothing (default 13)
 //   score_query_end  exclusive end of the scorer query window in ids;
 //                    required (negative values are rejected)
+//   query_suffix_candidates  strict selection only: tokens after the query
+//                    window are scored candidates, not a kept suffix
 //
 // On failure returns empty vector + sets last_error.
 std::vector<int32_t> drafter_score_and_compress(
@@ -82,6 +84,7 @@ std::vector<int32_t> drafter_score_and_compress(
     int    pool_kernel = 13,
     int    score_query_end = -1,
     const std::vector<PFlashTokenSpan> &
-        required_instruction_spans = {});
+        required_instruction_spans = {},
+    bool   query_suffix_candidates = false);
 
 } // namespace luce::common

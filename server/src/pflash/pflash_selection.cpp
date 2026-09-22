@@ -86,14 +86,15 @@ bool pflash_chunk_is_structurally_required(
         int query_end,
         int input_tokens,
         const std::vector<luce::common::PFlashTokenSpan> &
-            required_instruction_spans) noexcept {
+            required_instruction_spans,
+        bool query_suffix_structural) noexcept {
     if (begin < 0 || end <= begin || query_begin < 0 ||
         query_end < query_begin || input_tokens < query_end ||
         end > input_tokens) {
         return false;
     }
     const bool query_chunk = begin < query_end && end > query_begin;
-    const bool structural_suffix_chunk =
+    const bool structural_suffix_chunk = query_suffix_structural &&
         begin < input_tokens && end > query_end;
     if (query_chunk || structural_suffix_chunk) return true;
     for (const auto & span : required_instruction_spans) {

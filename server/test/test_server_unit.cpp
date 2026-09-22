@@ -833,10 +833,13 @@ TEST_CASE(ServerUnitFixture, test_pflash_tail_query_window) {
 // chat-query turn the scorer would use, decoded as {header, content}.
 struct PflashRenderedQueryTurn {
     bool valid = false;
+    bool later_turns = false;
     std::string family;
     std::string header;
     std::string content;
     std::string after;
+    std::string closing;      // content end .. turn end
+    std::string generation;   // generation prompt .. prompt end
 };
 
 static PflashRenderedQueryTurn pflash_rendered_query_turn(
@@ -870,6 +873,11 @@ static PflashRenderedQueryTurn pflash_rendered_query_turn(
                                       prompt.begin() + turn.content_end});
             out.after = tok.decode({prompt.begin() + turn.content_end,
                                     prompt.end()});
+            out.closing = tok.decode({prompt.begin() + turn.content_end,
+                                      prompt.begin() + turn.turn_end});
+            out.generation = tok.decode(
+                {prompt.begin() + turn.generation_begin, prompt.end()});
+            out.later_turns = turn.later_turns;
         }
     }
     unlink(path.c_str());
@@ -922,6 +930,7 @@ TEST_CASE(ServerUnitFixture,
             // The rendered tail after the content is template machinery.
             TEST_ASSERT_MSG(turn.after.find("answer") == std::string::npos,
                             family.name);
+            TEST_ASSERT_MSG(!turn.later_turns, family.name);
         }
     }
 }
@@ -940,6 +949,10 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(qwen.valid);
     TEST_ASSERT_MSG(qwen.content == "What is the answer?", qwen.content);
     TEST_ASSERT(qwen.header == "<|im_start|>user\n");
+    TEST_ASSERT(qwen.later_turns);
+    TEST_ASSERT_MSG(qwen.closing == "<|im_end|>", qwen.closing);
+    TEST_ASSERT_MSG(qwen.generation == "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                    qwen.generation);
 
     const auto deepseek = pflash_rendered_query_turn(
         messages, ChatFormat::DEEPSEEK4, true,
@@ -6897,6 +6910,77 @@ TEST_CASE(ServerUnitFixture,
     }
     TEST_ASSERT(header_pinned);
     TEST_ASSERT(query_pinned);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_agent_turns_after_query_are_candidates) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
+
+    const std::vector<ChatMessage> messages{
+        {"user", "What is the answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"tool", "tool output here", "call-1"},
+    };
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant", "\n",
+         "Sure", "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 1.0f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "What is the answer?"}},
+            {{"role", "assistant"}, {"content", "Sure."}},
+            {{"role", "tool"}, {"content", "tool output here"},
+             {"tool_call_id", "call-1"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & request = backend.last_request;
+    const auto & ids = request.input_ids;
+    TEST_ASSERT(request.query_suffix_candidates);
+    const int query_end = request.score_query_end;
+    const int query_begin = query_end - request.score_query_tokens;
+    TEST_ASSERT(tokenizer.decode({ids.begin() + query_begin,
+                                  ids.begin() + query_end})
+                == "What is the answer?");
+    // The generation prompt is pinned; the assistant and tool turns between
+    // the query and it are not.
+    bool generation_pinned = false;
+    for (const auto & span : request.required_instruction_spans) {
+        const std::string text = tokenizer.decode(
+            {ids.begin() + span.begin, ids.begin() + span.end});
+        TEST_ASSERT_MSG(text.find("tool output") == std::string::npos, text);
+        TEST_ASSERT_MSG(text.find("Sure") == std::string::npos, text);
+        if (span.end == (int) ids.size() &&
+            text.find("<|im_start|>assistant\n<think>\n") != std::string::npos) {
+            generation_pinned = true;
+        }
+    }
+    TEST_ASSERT(generation_pinned);
     unlink(path.c_str());
 }
 

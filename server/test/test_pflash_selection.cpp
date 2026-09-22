@@ -112,6 +112,23 @@ TEST_CASE(PFlashSelectionFixture, structural_suffix_only_chunk_is_mandatory_and_
     require_ordinals(result, {1, 2});
 }
 
+TEST_CASE(PFlashSelectionFixture, query_suffix_candidates_are_optional_unless_pinned) {
+    // Agent loop: turns after the query are scored context. Only the query
+    // window and pinned spans (the generation prompt) stay mandatory.
+    constexpr int input_tokens = 200;
+    constexpr int query_begin = 20;
+    constexpr int query_end = 30;
+    const std::vector<luce::common::PFlashTokenSpan> pinned{{190, 200}};
+    REQUIRE(pflash_chunk_is_structurally_required(
+        0, 32, query_begin, query_end, input_tokens, pinned, false));
+    REQUIRE(!pflash_chunk_is_structurally_required(
+        32, 64, query_begin, query_end, input_tokens, pinned, false));
+    REQUIRE(pflash_chunk_is_structurally_required(
+        32, 64, query_begin, query_end, input_tokens, pinned, true));
+    REQUIRE(pflash_chunk_is_structurally_required(
+        160, 200, query_begin, query_end, input_tokens, pinned, false));
+}
+
 TEST_CASE(PFlashSelectionFixture, instruction_overlap_is_mandatory_without_changing_optional_ranking) {
     constexpr int input_tokens = 120000;
     constexpr int query_begin = 119872;
