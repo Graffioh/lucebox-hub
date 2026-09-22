@@ -1,6 +1,6 @@
 # JPEG and PNG decoders behind common/vision/image_decode: libjpeg-turbo from
-# its pinned release archive, lodepng vendored. License texts are in
-# ImageCodecs.NOTICES.md, deps/lodepng/LICENSE and the libjpeg-turbo archive.
+# its pinned release archive, lodepng from two files at a pinned commit. License
+# texts are in ImageCodecs.NOTICES.md and the libjpeg-turbo archive.
 include_guard(GLOBAL)
 
 include(ExternalProject)
@@ -42,8 +42,38 @@ set_target_properties(image_codec_jpeg PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES ${IMAGE_CODEC_JPEG_PREFIX}/include)
 add_dependencies(image_codec_jpeg libjpeg_turbo_external)
 
-# lodepng is vendored (server/deps/lodepng): two source files, no release archives upstream.
-set(IMAGE_CODEC_PNG_DIR "${CMAKE_CURRENT_LIST_DIR}/../deps/lodepng")
+# lodepng has no release archives and GitHub's commit archives are not
+# byte-stable, so fetch its two files at a pinned commit (raw files are) and
+# check each against its hash. Retried because CI runners drop downloads.
+set(IMAGE_CODEC_PNG_COMMIT ed6fe5825c6a4fbb7f58ab35a4231c7543cd452a)
+set(IMAGE_CODEC_PNG_DIR ${CMAKE_CURRENT_BINARY_DIR}/lodepng-${IMAGE_CODEC_PNG_COMMIT})
+foreach(entry
+        "lodepng.cpp=d98e1f40d303c1038a096ebf93b413a565a91cf2c72b9d2fa5c625c4279c3cb6"
+        "lodepng.h=23c27abb06883ed98184d16d0b20771b526dca1e8e13236c2397316769c0dc8b")
+    string(REPLACE "=" ";" entry "${entry}")
+    list(GET entry 0 file)
+    list(GET entry 1 hash)
+    set(target ${IMAGE_CODEC_PNG_DIR}/${file})
+    set(have "")
+    foreach(attempt RANGE 1 3)
+        if(EXISTS ${target})
+            file(SHA256 ${target} have)
+            if(have STREQUAL hash)
+                break()
+            endif()
+            file(REMOVE ${target})
+        endif()
+        file(DOWNLOAD
+            https://raw.githubusercontent.com/lvandeve/lodepng/${IMAGE_CODEC_PNG_COMMIT}/${file}
+            ${target} TLS_VERIFY ON STATUS status)
+    endforeach()
+    if(EXISTS ${target})
+        file(SHA256 ${target} have)
+    endif()
+    if(NOT have STREQUAL hash)
+        message(FATAL_ERROR "lodepng: could not fetch ${file} with SHA256 ${hash} (${status})")
+    endif()
+endforeach()
 add_library(image_codec_png STATIC ${IMAGE_CODEC_PNG_DIR}/lodepng.cpp)
 target_include_directories(image_codec_png PUBLIC ${IMAGE_CODEC_PNG_DIR})
 
