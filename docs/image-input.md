@@ -124,12 +124,14 @@ bias named `blk.N.exp_probs_b_vl.bias`, no `deepseek4.vocab_size` key). Split
 GGUF files and llama.cpp's `clip` projector files are not read yet.
 
 A decoder in our own ROCMFP MIX format comes from `tools/ds4_mix_converter`
-run on the Vision-Exp checkpoint; it keeps the image router biases and writes
-the routed experts in the MIX types (fp2 gate and up, fp3 down), dense tensors
-in BF16. Pass `--imatrix` with an importance matrix (the community publishes
-llama.cpp ones for this model; the converter reads one width-long vector per
-expert tensor) or `--absmax-only`. The converter uses every core; the
-Vision-Exp checkpoint takes about 30 minutes on 32 cores.
+run on the Vision-Exp checkpoint. It follows the shipped DeepSeek-V4-Flash
+recipe: routed gate and up experts in fp2, down experts in fp2 on the shipped
+layer set and fp3 elsewhere, dense projections in ROCmFP4, the token embedding
+in Q6_K, codebooks embedded in the GGUF (one file, about 100 GB). It keeps the
+image router biases. Pass `--imatrix` with an importance matrix (llama.cpp's
+per-expert layout is used expert by expert; the community publishes one for
+this model) or `--absmax-only`. The converter uses every core: about 40 minutes
+for this checkpoint on 32 cores.
 
 One image request may be outstanding per backend. Its admission lease remains
 with the immutable payload through queueing and generation; another image
@@ -173,13 +175,18 @@ prompts: AI2D 85/100, ChartQA relaxed accuracy 55/60 (augmented) and 43/60
 220 questions. An image request prefills in about 4 s and decodes at about
 23 tok/s.
 
-With our own ROCMFP MIX conversion of the same checkpoint (importance-matrix
-weighted, 114 GB with BF16 dense tensors), on a Strix Halo alone: AI2D 89/100,
-ChartQA 54/60 and 44/60, 185 answers identical to the Q2_K_S run, the same
-prefill time, and the sanity set (an image ahead of a 4,982-token prompt, two
-images in one request) correct. Decode is slower than with the Q2_K_S file
-(10 to 12 tok/s against 15 to 17) because the dense tensors are unquantized;
-quantizing them as the shipped text model does is converter work still to do.
+With our own ROCMFP MIX conversion of the same checkpoint (per-expert
+importance matrix, the shipped recipe above), on a Strix Halo alone at top-k 6:
+
+- Against the MXFP4 reference (native FP4 experts) on 8,176 wikitext-2 tokens:
+  KL 0.464 mean, 0.102 median, top-1 agreement 78.4%, perplexity 4.14 against
+  2.82. The community Q2_K_S scores KL 0.511 in our engine (0.523 in
+  llama.cpp) and perplexity 4.22.
+- AI2D 84/100, ChartQA 54/60 and 40/60 (the Q2_K_S: 85, 55, 43); the sanity
+  and one-to-four-image sets are all correct.
+- With the published DSpark drafter and fused decode and verify, text decodes
+  at 25 to 37 tok/s on 256-token answers (30 mean), as fast as the shipped
+  text model; image requests decode without the drafter at about 22 tok/s.
 
 Not yet established:
 
