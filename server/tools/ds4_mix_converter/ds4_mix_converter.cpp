@@ -974,12 +974,24 @@ std::vector<TensorSpec> make_plan(
     return plan;
 }
 
+// The checkpoint's own name when its config carries one, else the input
+// directory's name; either way marked as a MIX build.
+std::string model_name(const SafeTensorSet & source) {
+    const json & c = source.config();
+    std::string base;
+    if (c.contains("_name_or_path") && c["_name_or_path"].is_string()) base = c["_name_or_path"].get<std::string>();
+    if (base.empty()) base = source.root().filename().string();
+    const auto slash = base.find_last_of('/');
+    if (slash != std::string::npos) base = base.substr(slash + 1);
+    return base.empty() ? "DeepSeek-V4 MIX" : base + " MIX";
+}
+
 void set_model_metadata(gguf_context * ctx, const SafeTensorSet & source,
                         uint32_t layers, uint32_t experts, bool absmax_only,
                         bool smoke_artifact, const std::vector<uint8_t> & p4_blob) {
     const json & c = source.config();
     gguf_set_val_str(ctx, "general.architecture", "deepseek4");
-    gguf_set_val_str(ctx, "general.name", "DeepSeek-V4-Flash-Vision-Uncensored MIX");
+    gguf_set_val_str(ctx, "general.name", model_name(source).c_str());
     gguf_set_val_u32(ctx, "general.alignment", kAlignment);
     gguf_set_val_u32(ctx, "general.file_type", 119);
     gguf_set_val_str(ctx, "deepseek4.mix.calibration",
