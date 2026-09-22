@@ -103,6 +103,8 @@ struct PFlashTraceFields {
     const char * scorer = "head";
     double split_fraction = 0.0;
     const std::vector<double> * other_chunk_scores = nullptr;
+    // Rank-mode ceiling: the K that applied, 0 outside top_k mode.
+    int top_k = 0;
 };
 
 void write_compression_trace(

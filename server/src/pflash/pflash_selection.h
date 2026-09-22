@@ -12,6 +12,9 @@ enum class PFlashSelectionMode {
     Legacy,
     BudgetOnly,
     CumulativeTopP,
+    // Rank rule: keep the K highest-scoring optional candidates, the token
+    // budget still a hard ceiling -- min(K segments, the budget).
+    TopK,
 };
 
 enum class PFlashQueryParser {
@@ -21,6 +24,7 @@ enum class PFlashQueryParser {
 
 enum class PFlashSelectionStop {
     TopPReached,
+    TopKReached,
     BudgetReached,
     CandidatesExhausted,
     InvalidInput,
@@ -42,6 +46,9 @@ struct PFlashSelectionPolicy {
     // budget is skipped instead of ending the fill, so smaller segments
     // ranked below it can still be kept.
     bool skip_oversized = false;
+    // TopK mode only: how many optional candidates to keep. Must be positive
+    // in that mode and is ignored in the others.
+    int top_k = 0;
 };
 
 struct PFlashSelectionResult {
@@ -92,6 +99,7 @@ struct PFlashSelectionConfig {
     int chunk_size = 0;
     int query_tokens = 8;
     double top_p = 0.95;
+    int top_k = 0;
     PFlashSegmentation segmentation = PFlashSegmentation::Auto;
     PFlashCandidateScore candidate_score = PFlashCandidateScore::Auto;
     PFlashScorer scorer = PFlashScorer::Head;

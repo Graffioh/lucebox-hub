@@ -87,13 +87,14 @@ void write_compression_trace(
         std::fprintf(file,
             "],\"query_begin\":%d,\"query_end\":%d,"
             "\"selector_mode\":\"%s\",\"query_parser\":\"%s\","
-            "\"token_budget\":%d,"
+            "\"token_budget\":%d,\"top_k\":%d,"
             "\"retained_tokens\":%d",
             trace_fields->query_begin, trace_fields->query_end,
             dflash::pflash::pflash_selection_mode_name(
                 trace_fields->selector_mode),
             dflash::pflash::pflash_query_parser_name(trace_fields->query_parser),
-            trace_fields->token_budget, trace_fields->retained_tokens);
+            trace_fields->token_budget, trace_fields->top_k,
+            trace_fields->retained_tokens);
         std::fputs(",\"required_instruction_spans\":[", file);
         if (trace_fields->required_instruction_spans) {
             for (size_t index = 0;
@@ -247,7 +248,8 @@ std::vector<int32_t> select_pflash_chunks(
     }
 
     const dflash::pflash::PFlashSelectionPolicy policy{selector_budget, config.top_p,
-                                                      /*skip_oversized=*/ segments != nullptr};
+                                                      /*skip_oversized=*/ segments != nullptr,
+                                                      config.top_k};
     const auto selected = split
         ? dflash::pflash::select_pflash_split(candidates, other_candidates, policy, split_fraction, config.mode)
         : dflash::pflash::select_pflash_candidates(candidates, policy, config.mode);
@@ -313,6 +315,8 @@ std::vector<int32_t> select_pflash_chunks(
         strict_fields.scorer = split ? "split" : dflash::pflash::pflash_scorer_name(config.scorer);
         strict_fields.split_fraction = split ? split_fraction : 0.0;
         strict_fields.other_chunk_scores = split ? &other_scores : nullptr;
+        strict_fields.top_k =
+            config.mode == dflash::pflash::PFlashSelectionMode::TopK ? config.top_k : 0;
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,

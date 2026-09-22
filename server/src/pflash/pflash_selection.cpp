@@ -20,6 +20,7 @@ constexpr const char * kChunkEnv = "PFLASH_SELECT_CHUNK_SIZE";
 constexpr const char * kQueryEnv = "PFLASH_SELECT_QUERY_TOKENS";
 constexpr const char * kQueryParserEnv = "PFLASH_SELECT_QUERY_PARSER";
 constexpr const char * kTopPEnv = "PFLASH_SELECT_TOP_P";
+constexpr const char * kTopKEnv = "PFLASH_SELECT_TOPK";
 constexpr const char * kSegmentsEnv = "PFLASH_SELECT_SEGMENTS";
 constexpr const char * kSelectEnv = "PFLASH_SELECT_SCORE";
 constexpr const char * kScorerEnv = "PFLASH_SELECT_SCORER";
@@ -71,6 +72,7 @@ bool has_pflash_selection_environment() noexcept {
            std::getenv(kQueryEnv) != nullptr ||
            std::getenv(kQueryParserEnv) != nullptr ||
            std::getenv(kTopPEnv) != nullptr ||
+           std::getenv(kTopKEnv) != nullptr ||
            std::getenv(kSegmentsEnv) != nullptr ||
            std::getenv(kSelectEnv) != nullptr ||
            std::getenv(kScorerEnv) != nullptr ||
@@ -141,6 +143,9 @@ PFlashSelectionResult select_pflash_candidates(
     }
     if (!std::isfinite(policy.top_p) || policy.top_p <= 0.0 || policy.top_p > 1.0) {
         return invalid_result("PFlash top_p must be finite and in (0, 1]");
+    }
+    if (mode == PFlashSelectionMode::TopK && policy.top_k <= 0) {
+        return invalid_result("PFlash top_k must be positive");
     }
 
     std::vector<const PFlashSelectionCandidate *> source_ranges;
@@ -216,10 +221,17 @@ PFlashSelectionResult select_pflash_candidates(
         }
     }
 
+    int kept_optional = 0;
     for (const auto * candidate : optional) {
         if (mode == PFlashSelectionMode::CumulativeTopP &&
             result.retained_mass >= policy.top_p) {
             result.stop = PFlashSelectionStop::TopPReached;
+            break;
+        }
+        // Rank rule: K optional candidates in score order, the budget below
+        // still a ceiling. K binding here means the budget never was.
+        if (mode == PFlashSelectionMode::TopK && kept_optional >= policy.top_k) {
+            result.stop = PFlashSelectionStop::TopKReached;
             break;
         }
 
@@ -232,6 +244,7 @@ PFlashSelectionResult select_pflash_candidates(
 
         selected_candidates.push_back(candidate);
         result.retained_tokens += length;
+        ++kept_optional;
         if (!optional.empty()) {
             result.retained_mass += max_score > 0.0
                 ? (std::max(0.0, candidate->score) / max_score) / scaled_total
@@ -256,6 +269,7 @@ const char * pflash_selection_mode_name(PFlashSelectionMode mode) noexcept {
         case PFlashSelectionMode::Legacy: return "legacy";
         case PFlashSelectionMode::BudgetOnly: return "budget_only";
         case PFlashSelectionMode::CumulativeTopP: return "top_p";
+        case PFlashSelectionMode::TopK: return "top_k";
     }
     return "unknown";
 }
@@ -263,6 +277,7 @@ const char * pflash_selection_mode_name(PFlashSelectionMode mode) noexcept {
 const char * pflash_selection_stop_name(PFlashSelectionStop stop) noexcept {
     switch (stop) {
         case PFlashSelectionStop::TopPReached: return "top_p_reached";
+        case PFlashSelectionStop::TopKReached: return "top_k_reached";
         case PFlashSelectionStop::BudgetReached: return "budget_reached";
         case PFlashSelectionStop::CandidatesExhausted: return "candidates_exhausted";
         case PFlashSelectionStop::InvalidInput: return "invalid_input";
@@ -300,6 +315,7 @@ bool resolve_pflash_selection(
     const char * query_raw = std::getenv(kQueryEnv);
     const char * query_parser_raw = std::getenv(kQueryParserEnv);
     const char * top_p_raw = std::getenv(kTopPEnv);
+    const char * top_k_raw = std::getenv(kTopKEnv);
     const char * segments_raw = std::getenv(kSegmentsEnv);
     const char * select_raw = std::getenv(kSelectEnv);
     const char * scorer_raw = std::getenv(kScorerEnv);
@@ -307,8 +323,8 @@ bool resolve_pflash_selection(
 
     PFlashSelectionConfig config;
     config.configured = mode_raw || chunk_raw || query_raw ||
-        query_parser_raw || top_p_raw || segments_raw || select_raw ||
-        scorer_raw || split_raw;
+        query_parser_raw || top_p_raw || top_k_raw || segments_raw ||
+        select_raw || scorer_raw || split_raw;
     if (scorer_raw) {
         if (std::strcmp(scorer_raw, "head") == 0) {
             config.scorer = PFlashScorer::Head;
@@ -358,8 +374,11 @@ bool resolve_pflash_selection(
             config.mode = PFlashSelectionMode::BudgetOnly;
         } else if (std::strcmp(mode_raw, "top_p") == 0) {
             config.mode = PFlashSelectionMode::CumulativeTopP;
+        } else if (std::strcmp(mode_raw, "top_k") == 0) {
+            config.mode = PFlashSelectionMode::TopK;
         } else {
-            error = std::string(kModeEnv) + " must be budget_only or top_p";
+            error = std::string(kModeEnv) +
+                " must be budget_only, top_p or top_k";
             return false;
         }
     }
@@ -397,6 +416,16 @@ bool resolve_pflash_selection(
         (!parse_double(top_p_raw, config.top_p) ||
          config.top_p <= 0.0 || config.top_p > 1.0)) {
         error = std::string(kTopPEnv) + " must be finite and in (0, 1]";
+        return false;
+    }
+
+    if (top_k_raw && (!parse_int(top_k_raw, config.top_k) || config.top_k <= 0)) {
+        error = std::string(kTopKEnv) + " must be a positive integer";
+        return false;
+    }
+    if (config.mode == PFlashSelectionMode::TopK && config.top_k <= 0) {
+        error = std::string(kTopKEnv) + " is required when " +
+            std::string(kModeEnv) + " is top_k";
         return false;
     }
 
@@ -472,6 +501,13 @@ PFlashSelectionResult select_pflash_split(
         double head_fraction,
         PFlashSelectionMode mode) {
     PFlashSelectionResult result;
+    if (mode == PFlashSelectionMode::TopK) {
+        // A per-pass K would keep up to 2K segments, which is not the rule the
+        // mode names; fail closed rather than quietly double it.
+        result.stop = PFlashSelectionStop::InvalidInput;
+        result.error = "split selection does not support top_k";
+        return result;
+    }
     if (head.size() != other.size() || !(head_fraction > 0.0 && head_fraction < 1.0)) {
         result.stop = PFlashSelectionStop::InvalidInput;
         result.error = "split selection needs matching candidate lists and a fraction in (0, 1)";

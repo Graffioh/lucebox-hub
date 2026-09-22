@@ -145,11 +145,12 @@ std::vector<int32_t> drafter_score_and_compress(
         std::fprintf(stderr,
             "[pflash-select] config mode=%s active=%d chunk=%d "
             "query_parser=%s query_cap=%d query_actual=%d top_p=%.9g "
-            "input=%zu\n",
+            "top_k=%d input=%zu\n",
             dflash::pflash::pflash_selection_mode_name(experiment.mode),
             (int) experiment.selection_active, experiment.chunk_size,
             dflash::pflash::pflash_query_parser_name(experiment.query_parser),
-            experiment.query_tokens, n_lookahead, experiment.top_p, ids.size());
+            experiment.query_tokens, n_lookahead, experiment.top_p,
+            experiment.top_k, ids.size());
         std::fflush(stderr);
     }
     if (score_query_end < 0) {
