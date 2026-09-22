@@ -611,6 +611,38 @@ bool pflash_full_cache_restore_allowed(
     return !selection_environment_present;
 }
 
+int pflash_kept_tokens(
+        int input_tokens,
+        int chunk_size,
+        int query_begin,
+        int query_end,
+        const std::vector<PFlashTokenSpan> & kept_spans,
+        bool query_suffix_structural) noexcept {
+    if (input_tokens <= 0 || chunk_size <= 0) return 0;
+    int kept = 0;
+    for (int begin = 0; begin < input_tokens; begin += chunk_size) {
+        const int end = (std::min)(input_tokens, begin + chunk_size);
+        if (luce::pflash::pflash_chunk_is_structurally_required(
+                begin, end, query_begin, query_end, input_tokens,
+                kept_spans, query_suffix_structural)) {
+            kept += end - begin;
+        }
+    }
+    return kept;
+}
+
+double pflash_effective_keep_ratio(
+        int input_tokens, int kept_tokens, double keep_ratio) noexcept {
+    if (input_tokens <= 0 || !std::isfinite(keep_ratio) || keep_ratio <= 0.0) {
+        return keep_ratio;
+    }
+    const int kept = (std::max)(0, (std::min)(kept_tokens, input_tokens));
+    // One token of slack so flooring the budget never lands below `kept`.
+    const double budget =
+        (double) kept + keep_ratio * (double) (input_tokens - kept) + 1.0;
+    return (std::min)(1.0, budget / (double) input_tokens);
+}
+
 int pflash_target_token_ceiling(
         int original_target_tokens, double keep_ratio) noexcept {
     if (original_target_tokens < 0 || !std::isfinite(keep_ratio) ||
@@ -3578,6 +3610,9 @@ std::string HttpServer::apply_pflash_compression(
     // the current turn's role envelope.
     PFlashTokenSpan query_role_header{-1, -1};
     std::vector<PFlashTokenSpan> required_instruction_spans;
+    // System, developer and tool-definition spans: kept verbatim like the
+    // required spans, except when they alone would not fit the context.
+    std::vector<PFlashTokenSpan> instruction_role_spans;
     // Chat-first scorer query: the latest user turn's content span, located
     // by the rendered prompt's own control markers. Feeds the strict tail
     // parser and the legacy window; unused when a benchmark parser
@@ -3760,7 +3795,7 @@ std::string HttpServer::apply_pflash_compression(
                         return "PFlash strict selection instruction mapping failed: " +
                             boundary_error;
                     }
-                    required_instruction_spans.push_back(instruction_span);
+                    instruction_role_spans.push_back(instruction_span);
                 }
 
                 if (!req.tools.is_null() && !req.tools.empty()) {
@@ -3784,7 +3819,7 @@ std::string HttpServer::apply_pflash_compression(
                         return "PFlash strict selection tool mapping failed: "
                             "tools did not produce a retained prompt span";
                     }
-                    required_instruction_spans.push_back(tool_span);
+                    instruction_role_spans.push_back(tool_span);
                 }
 
                 // Client-declared literal text that must survive compression
@@ -3858,9 +3893,15 @@ std::string HttpServer::apply_pflash_compression(
                 required_instruction_spans =
                     http_detail::canonicalize_pflash_token_spans(
                         std::move(required_instruction_spans));
+                instruction_role_spans =
+                    http_detail::canonicalize_pflash_token_spans(
+                        std::move(instruction_role_spans));
                 std::string instruction_error;
                 if (!luce::pflash::validate_pflash_instruction_spans(
                         required_instruction_spans,
+                        (int) drafter_ids.size(), instruction_error) ||
+                    !luce::pflash::validate_pflash_instruction_spans(
+                        instruction_role_spans,
                         (int) drafter_ids.size(), instruction_error)) {
                     return "PFlash strict selection instruction mapping failed: " +
                         instruction_error;
@@ -3950,6 +3991,60 @@ std::string HttpServer::apply_pflash_compression(
         }
     }
 
+    // Strict selection spends the keep ratio on the droppable tokens only:
+    // what it keeps anyway (instructions, tools, the query and its turn's
+    // envelope, the generation prompt) is already cheap -- a stable system
+    // prefix hits the prefix cache from the second turn on -- and must not
+    // exhaust the budget of the history it rides with.
+    int kept_tokens = 0;
+    if (experiment.selection_active && query_window.valid()) {
+        const int input_tokens = (int) drafter_ids.size();
+        const int query_begin = query_window.end - query_window.tokens;
+        const auto kept_with = [&] (
+                const std::vector<PFlashTokenSpan> & spans) {
+            return http_detail::pflash_kept_tokens(
+                input_tokens, experiment.chunk_size, query_begin,
+                query_window.end, spans, !query_suffix_candidates);
+        };
+        const auto target_estimate = [&] (int drafter_tokens) {
+            return (int) std::ceil((double) prompt_tokens *
+                (double) drafter_tokens / (double) input_tokens);
+        };
+        auto kept_spans = required_instruction_spans;
+        kept_spans.insert(kept_spans.end(), instruction_role_spans.begin(),
+                          instruction_role_spans.end());
+        kept_spans = http_detail::canonicalize_pflash_token_spans(
+            std::move(kept_spans));
+        kept_tokens = kept_with(kept_spans);
+        // Instructions that alone overflow the context are data (a document
+        // pasted into the system prompt), not a preamble: they compete for
+        // the budget against the query like any other context.
+        if (!instruction_role_spans.empty() && config_.max_ctx > 0 &&
+            target_estimate(kept_tokens) + req.max_output > config_.max_ctx) {
+            std::fprintf(stderr,
+                "[pflash-select] kept instructions do not fit the context "
+                "(~%d + %d > %d target tokens); scoring them as context\n",
+                target_estimate(kept_tokens), req.max_output, config_.max_ctx);
+            kept_spans = required_instruction_spans;
+            kept_tokens = kept_with(kept_spans);
+        }
+        required_instruction_spans = std::move(kept_spans);
+        // Auto mode compresses when the droppable part is long enough, not
+        // the whole prompt: a large system prompt plus a short chat has
+        // nothing worth selecting.
+        const int droppable_target =
+            prompt_tokens - target_estimate(kept_tokens);
+        if (config_.pflash_mode == ServerConfig::PflashMode::AUTO &&
+            droppable_target < config_.pflash_threshold) {
+            std::fprintf(stderr,
+                "[pflash] skip-compress (droppable ~%d < threshold %d; "
+                "kept %d of %d drafter tokens)\n",
+                droppable_target, config_.pflash_threshold, kept_tokens,
+                input_tokens);
+            return {};
+        }
+    }
+
     ModelBackend::CompressRequest compress_request;
     compress_request.input_ids = std::move(drafter_ids);
     compress_request.required_instruction_spans =
@@ -3957,6 +4052,18 @@ std::string HttpServer::apply_pflash_compression(
     compress_request.query_suffix_candidates = query_suffix_candidates;
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
+    if (experiment.selection_active && query_window.valid()) {
+        const double effective = http_detail::pflash_effective_keep_ratio(
+            (int) compress_request.input_ids.size(), kept_tokens,
+            compress_request.keep_ratio);
+        std::fprintf(stderr,
+            "[pflash-select] kept=%d droppable=%d keep_ratio=%.6f "
+            "effective=%.6f\n",
+            kept_tokens,
+            (int) compress_request.input_ids.size() - kept_tokens,
+            (double) compress_request.keep_ratio, effective);
+        compress_request.keep_ratio = (float) effective;
+    }
     if (query_window.valid()) {
         compress_request.score_query_end = query_window.end;
         compress_request.score_query_tokens = query_window.tokens;

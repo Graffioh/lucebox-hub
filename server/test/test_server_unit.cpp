@@ -1041,6 +1041,34 @@ TEST_CASE(ServerUnitFixture, test_pflash_selection_cache_and_continuation_policy
     TEST_ASSERT(!http_detail::pflash_full_cache_restore_allowed(true));
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_kept_tokens_follow_selector_chunks) {
+    // 100 tokens in chunks of 10; query [80, 85); instruction span [3, 12)
+    // touches chunks 0 and 1.
+    const std::vector<PFlashTokenSpan> kept{{3, 12}};
+    // Suffix structural: chunks 0, 1, 8, 9.
+    TEST_ASSERT(http_detail::pflash_kept_tokens(100, 10, 80, 85, kept, true) == 40);
+    // Suffix scored: only the query's chunk after it.
+    TEST_ASSERT(http_detail::pflash_kept_tokens(100, 10, 80, 85, kept, false) == 30);
+    TEST_ASSERT(http_detail::pflash_kept_tokens(0, 10, 0, 0, kept, true) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_effective_keep_ratio_spends_on_droppable) {
+    // 1000 tokens, 400 kept, 5 %: budget 400 + 30 + 1 slack.
+    TEST_ASSERT(std::abs(http_detail::pflash_effective_keep_ratio(
+        1000, 400, 0.05) - 0.431) < 1e-12);
+    // Nothing kept: the plain ratio plus the slack token.
+    TEST_ASSERT(std::abs(http_detail::pflash_effective_keep_ratio(
+        1000, 0, 0.05) - 0.051) < 1e-12);
+    // Everything kept caps at 1.
+    TEST_ASSERT(http_detail::pflash_effective_keep_ratio(1000, 1000, 0.05) == 1.0);
+    // The floored budget never lands below the kept tokens.
+    for (int kept = 0; kept <= 997; kept += 7) {
+        const double ratio =
+            http_detail::pflash_effective_keep_ratio(997, kept, 0.013);
+        TEST_ASSERT((int) std::floor(997.0 * ratio) >= kept);
+    }
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_target_token_ceiling_floors) {
     TEST_ASSERT(http_detail::pflash_target_token_ceiling(7, 0.5) == 3);
     TEST_ASSERT(http_detail::pflash_target_token_ceiling(120000, 16384.0 / 120000.0) == 16384);
@@ -6981,6 +7009,188 @@ TEST_CASE(ServerUnitFixture,
         }
     }
     TEST_ASSERT(generation_pinned);
+    unlink(path.c_str());
+}
+
+// Keeps a prefix of the input that fits the requested ratio, so the target
+// ceiling check sees a real compression.
+struct MockPflashBudgetBackend : MockBackend {
+    int compress_calls = 0;
+    CompressRequest last_request;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        last_request = request;
+        const size_t keep = (size_t) std::max(1.0, std::floor(
+            (double) request.input_ids.size() * request.keep_ratio) - 2.0);
+        return CompressResult::from_compressed_ids(std::vector<int32_t>(
+            request.input_ids.begin(),
+            request.input_ids.begin() + (long) std::min(keep, request.input_ids.size())));
+    }
+};
+
+struct PflashSystemPromptCase {
+    std::string rendered;
+    json messages;
+    std::vector<std::string> vocab;
+};
+
+static PflashSystemPromptCase pflash_long_system_prompt_case() {
+    std::string system;
+    for (int i = 0; i < 30; ++i) system += "You are helpful. ";
+    std::string history;
+    for (int i = 0; i < 30; ++i) history += "Sure. ";
+    PflashSystemPromptCase out;
+    out.rendered = render_chat_template(
+        {{"system", system, ""},
+         {"user", history, ""},
+         {"assistant", "Sure.", ""},
+         {"user", "What is the answer?", ""}},
+        // As the server renders it: ParsedRequest defaults to thinking on,
+        // and the instruction spans come from re-renders of this prompt.
+        ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true);
+    out.messages = json::array({
+        {{"role", "system"}, {"content", system}},
+        {{"role", "user"}, {"content", history}},
+        {{"role", "assistant"}, {"content", "Sure."}},
+        {{"role", "user"}, {"content", "What is the answer?"}},
+    });
+    out.vocab = {"What", " is", " the", " answer", "?", "user", "assistant",
+                 "system", "\n", "You", " are", " helpful", ".", " ", "Sure"};
+    return out;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_budget_spends_keep_ratio_on_droppable_tokens) {
+    // A system prompt larger than keep_ratio x prompt used to exhaust the
+    // budget (mandatory_query_exceeds_budget). It is kept and the ratio now
+    // applies to the rest.
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    const auto prompt = pflash_long_system_prompt_case();
+    const std::string path =
+        write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
+    MockPflashBudgetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 0.05f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    std::string error;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = prompt.messages;
+        request.prompt_tokens = tokenizer.encode(prompt.rendered);
+        error = HttpServerTestAccess::apply_pflash_compression(server, request);
+    }
+    TEST_ASSERT_MSG(error.empty(), error);
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & request = backend.last_request;
+    const int input = (int) request.input_ids.size();
+    int system_end = -1;
+    for (const auto & span : request.required_instruction_spans) {
+        const std::string text = tokenizer.decode(
+            {request.input_ids.begin() + span.begin,
+             request.input_ids.begin() + span.end});
+        if (text.find("You are helpful") != std::string::npos) {
+            system_end = span.end;
+        }
+    }
+    TEST_ASSERT(system_end > 0);   // the system prompt is still kept
+    // Its tokens are charged on top of 5 % of the droppable rest.
+    TEST_ASSERT(request.keep_ratio > (double) system_end / input);
+    TEST_ASSERT(request.keep_ratio < 1.0f);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_scores_instructions_that_overflow_context) {
+    // Instructions that alone do not fit the context are data: they lose
+    // their pin and compete for the budget.
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    const auto prompt = pflash_long_system_prompt_case();
+    const std::string path =
+        write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
+    MockPflashBudgetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 0.3f;
+    config.max_ctx = 200;   // smaller than the system prompt + max_output
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    std::string error;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = prompt.messages;
+        request.prompt_tokens = tokenizer.encode(prompt.rendered);
+        request.max_output = 16;
+        error = HttpServerTestAccess::apply_pflash_compression(server, request);
+    }
+    TEST_ASSERT_MSG(error.empty(), error);
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & request = backend.last_request;
+    for (const auto & span : request.required_instruction_spans) {
+        const std::string text = tokenizer.decode(
+            {request.input_ids.begin() + span.begin,
+             request.input_ids.begin() + span.end});
+        TEST_ASSERT_MSG(text.find("You are helpful") == std::string::npos, text);
+    }
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_auto_threshold_counts_droppable_tokens) {
+    // Auto mode: the whole prompt clears the threshold, the droppable part
+    // does not -- nothing worth selecting, so the prompt goes through as is.
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    const auto prompt = pflash_long_system_prompt_case();
+    const std::string path =
+        write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const auto ids = tokenizer.encode(prompt.rendered);
+
+    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
+    MockPflashBudgetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::AUTO;
+    config.pflash_threshold = (int) ids.size() - 20;
+    config.pflash_keep_ratio = 0.3f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = prompt.messages;
+        request.prompt_tokens = ids;
+        const auto prepared =
+            HttpServerTestAccess::prepare_prompt(server, request);
+        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+        TEST_ASSERT(!prepared.compressed);
+        TEST_ASSERT(prepared.tokens == ids);
+    }
+    TEST_ASSERT(backend.compress_calls == 0);
     unlink(path.c_str());
 }
 

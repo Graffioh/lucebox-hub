@@ -396,6 +396,14 @@ and its turn's role header, and it runs on every turn of a multi-turn chat.
 In an agent loop the assistant and tool turns after the user's turn are
 scored against the query like the context before it; only the generation
 prompt is kept with them.
+
+The keep ratio applies to the droppable tokens only: what strict selection
+keeps anyway (system and developer messages, tool definitions, the query and
+its turn's envelope, the generation prompt) is added on top, so a long
+system prompt no longer exhausts the budget. Auto mode compares
+`--prefill-threshold` with the droppable tokens too. Instructions that alone
+would not fit the context lose their pin and are scored like any other
+context.
 A request's `pflash_query` string replaces the derived query and keeps its
 whole span; it is meant for benchmarks. `PFLASH_SELECT_QUERY_PARSER=latest_user`
 selects the benchmark parser, which finds the latest user message through

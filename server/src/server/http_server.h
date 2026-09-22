@@ -389,6 +389,21 @@ std::string pflash_token_fingerprint(
 
 bool pflash_full_cache_restore_allowed(
     bool selection_environment_present) noexcept;
+// Tokens the strict selector keeps whatever their score, counted the way it
+// charges them: every fixed chunk overlapping the query window or a kept span
+// and, with ``query_suffix_structural``, every chunk after the query. Probe
+// segments cut exactly at those edges, so this is an upper bound for them.
+int pflash_kept_tokens(
+    int input_tokens,
+    int chunk_size,
+    int query_begin,
+    int query_end,
+    const std::vector<PFlashTokenSpan> & kept_spans,
+    bool query_suffix_structural) noexcept;
+// The keep ratio that spends ``keep_ratio`` on the droppable tokens only:
+// (kept + keep_ratio * (input - kept) + 1) / input, capped at 1.
+double pflash_effective_keep_ratio(
+    int input_tokens, int kept_tokens, double keep_ratio) noexcept;
 int pflash_target_token_ceiling(
     int original_target_tokens, double keep_ratio) noexcept;
 
