@@ -110,6 +110,9 @@ struct PFlashTraceFields {
     double doc_prior_exponent = 0.0;
     size_t documents = 0;
     bool doc_prior_applied = false;
+    // Attribution: the configured D and the headers actually forced.
+    int force_doc_heads = 0;
+    int forced_doc_heads = 0;
 };
 
 void write_compression_trace(

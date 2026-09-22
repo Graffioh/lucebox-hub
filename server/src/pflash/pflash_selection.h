@@ -61,6 +61,12 @@ struct PFlashSelectionPolicy {
     // documents makes it a no-op: with one or two documents the shares carry
     // no ranking information worth a reweight.
     double doc_prior_exponent = 0.0;
+    // Attribution: force the first candidate of each of the D highest-mass
+    // documents into the mandatory set before the fill, so a compressed
+    // context never drops the header that identifies a document it quotes.
+    // 0 disables it. It composes with the prior and with TopK, and the forced
+    // headers are charged against the budget like any mandatory candidate.
+    int force_doc_heads = 0;
 };
 
 // Below this many distinct documents the document prior is a no-op.
@@ -78,6 +84,8 @@ struct PFlashSelectionResult {
     // documents). Both are recorded in the compression trace.
     size_t documents = 0;
     bool doc_prior_applied = false;
+    // Document headers promoted to mandatory by ``force_doc_heads``.
+    int forced_doc_heads = 0;
 };
 
 bool pflash_chunk_is_structurally_required(
@@ -121,6 +129,7 @@ struct PFlashSelectionConfig {
     double top_p = 0.95;
     int top_k = 0;
     double doc_prior_exponent = 0.0;
+    int force_doc_heads = 0;
     PFlashSegmentation segmentation = PFlashSegmentation::Auto;
     PFlashCandidateScore candidate_score = PFlashCandidateScore::Auto;
     PFlashScorer scorer = PFlashScorer::Head;

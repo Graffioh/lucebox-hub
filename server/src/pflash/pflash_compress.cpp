@@ -90,6 +90,7 @@ void write_compression_trace(
             "\"token_budget\":%d,\"top_k\":%d,"
             "\"doc_prior_exponent\":%.9g,\"documents\":%zu,"
             "\"doc_prior_applied\":%s,"
+            "\"force_doc_heads\":%d,\"forced_doc_heads\":%d,"
             "\"retained_tokens\":%d",
             trace_fields->query_begin, trace_fields->query_end,
             dflash::pflash::pflash_selection_mode_name(
@@ -98,6 +99,7 @@ void write_compression_trace(
             trace_fields->token_budget, trace_fields->top_k,
             trace_fields->doc_prior_exponent, trace_fields->documents,
             trace_fields->doc_prior_applied ? "true" : "false",
+            trace_fields->force_doc_heads, trace_fields->forced_doc_heads,
             trace_fields->retained_tokens);
         std::fputs(",\"required_instruction_spans\":[", file);
         if (trace_fields->required_instruction_spans) {
@@ -265,7 +267,8 @@ std::vector<int32_t> select_pflash_chunks(
     const dflash::pflash::PFlashSelectionPolicy policy{selector_budget, config.top_p,
                                                       /*skip_oversized=*/ segments != nullptr,
                                                       config.top_k,
-                                                      config.doc_prior_exponent};
+                                                      config.doc_prior_exponent,
+                                                      config.force_doc_heads};
     const auto selected = split
         ? dflash::pflash::select_pflash_split(candidates, other_candidates, policy, split_fraction, config.mode)
         : dflash::pflash::select_pflash_candidates(candidates, policy, config.mode);
@@ -306,7 +309,7 @@ std::vector<int32_t> select_pflash_chunks(
     std::fprintf(stderr,
         "[pflash-select] selected mode=%s scorer=%s segments=%s score=%s chunk=%d query=%d "
         "budget=%d selected_tokens=%zu chunks=%zu/%d stop=%s mass=%.9g "
-        "docs=%zu doc_prior=%.9g applied=%d\n",
+        "docs=%zu doc_prior=%.9g applied=%d heads=%d/%d\n",
         dflash::pflash::pflash_selection_mode_name(config.mode),
         split ? "split" : "single",
         segments ? "probe" : "fixed", density ? "density" : "sum",
@@ -314,7 +317,8 @@ std::vector<int32_t> select_pflash_chunks(
         selected.ordinals.size(), n_chunks,
         dflash::pflash::pflash_selection_stop_name(selected.stop),
         selected.retained_mass, selected.documents, config.doc_prior_exponent,
-        (int) selected.doc_prior_applied);
+        (int) selected.doc_prior_applied, selected.forced_doc_heads,
+        config.force_doc_heads);
     std::fflush(stderr);
 
     if (write_trace) {
@@ -338,6 +342,8 @@ std::vector<int32_t> select_pflash_chunks(
         strict_fields.doc_prior_exponent = config.doc_prior_exponent;
         strict_fields.documents = selected.documents;
         strict_fields.doc_prior_applied = selected.doc_prior_applied;
+        strict_fields.force_doc_heads = config.force_doc_heads;
+        strict_fields.forced_doc_heads = selected.forced_doc_heads;
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,

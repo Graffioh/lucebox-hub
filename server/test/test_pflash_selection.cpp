@@ -1025,3 +1025,135 @@ TEST_CASE(PFlashSelectionFixture, document_prior_environment_resolves_or_fails) 
         REQUIRE(error.find("PFLASH_SELECT_DOC_PRIOR") != std::string::npos);
     }
 }
+
+TEST_CASE(PFlashSelectionFixture, forced_document_heads_keep_the_best_documents_identifiers) {
+    // Six candidates, three documents, two each. The first candidate of a
+    // document is its header: short and low-scoring, exactly what a score
+    // ranking drops. Masses: doc0 = 10*10 + 9*100 = 1000,
+    // doc1 = 1*10 + 3*100 = 310, doc2 = 10*10 + 5*100 = 600.
+    std::vector<PFlashSelectionCandidate> candidates{
+        candidate(0, 0, 10, 10.0),      // doc0 header
+        candidate(1, 10, 110, 9.0),     // doc0 body
+        candidate(2, 110, 120, 1.0),    // doc1 header
+        candidate(3, 120, 220, 3.0),    // doc1 body
+        candidate(4, 220, 230, 10.0),   // doc2 header
+        candidate(5, 230, 330, 5.0),    // doc2 body
+    };
+    const size_t documents[6] = {0, 0, 1, 1, 2, 2};
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        candidates[index].document = documents[index];
+    }
+
+    // Without forcing, a tight budget spends itself on the best body and
+    // leaves the weakest document with nothing -- not even its identifier.
+    const auto plain = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{130, 0.95, false},
+        PFlashSelectionMode::BudgetOnly);
+    REQUIRE(plain.ok);
+    REQUIRE(plain.forced_doc_heads == 0);
+    require_ordinals(plain, {0, 1, 4});
+
+    // Forcing the headers of the top two documents by mass (doc0, doc2)
+    // charges them first; they are short, so the fill still gets the bodies.
+    const auto heads = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{230, 0.95, false, 0, 0.0, 2},
+        PFlashSelectionMode::BudgetOnly);
+    REQUIRE(heads.ok);
+    REQUIRE(heads.forced_doc_heads == 2);
+    require_ordinals(heads, {0, 1, 4, 5});
+
+    // D above the document count forces every header that fits. At the same
+    // budget that kept no identifier for doc1 above, its header now survives.
+    const auto all_heads = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{130, 0.95, false, 0, 0.0, 9},
+        PFlashSelectionMode::BudgetOnly);
+    REQUIRE(all_heads.ok);
+    REQUIRE(all_heads.forced_doc_heads == 3);
+    REQUIRE(all_heads.retained_tokens <= 130);
+    REQUIRE(all_heads.retained_tokens == 130);
+    // Three headers (30 tokens) plus the single body that still fits.
+    require_ordinals(all_heads, {0, 1, 2, 4});
+}
+
+TEST_CASE(PFlashSelectionFixture, forced_document_heads_compose_with_top_k_and_respect_the_budget) {
+    std::vector<PFlashSelectionCandidate> candidates{
+        candidate(0, 0, 10, 1.0),
+        candidate(1, 10, 110, 9.0),
+        candidate(2, 110, 120, 1.0),
+        candidate(3, 120, 220, 3.0),
+        candidate(4, 220, 230, 1.0),
+        candidate(5, 230, 330, 5.0),
+    };
+    const size_t documents[6] = {0, 0, 1, 1, 2, 2};
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        candidates[index].document = documents[index];
+    }
+    // K counts only the ordinary fill; the forced headers are mandatory and
+    // sit outside it, so top-1 plus heads-of-3 keeps four candidates.
+    const auto composed = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, true, 1, 0.0, 3},
+        PFlashSelectionMode::TopK);
+    REQUIRE(composed.ok);
+    REQUIRE(composed.stop == PFlashSelectionStop::TopKReached);
+    REQUIRE(composed.forced_doc_heads == 3);
+    require_ordinals(composed, {0, 1, 2, 4});
+    REQUIRE(composed.retained_tokens == 130);
+
+    // A budget too small for every header drops the ones that no longer fit
+    // rather than failing, and never exceeds the ceiling.
+    const auto tight = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{25, 0.95, true, 1, 0.0, 3},
+        PFlashSelectionMode::TopK);
+    REQUIRE(tight.ok);
+    REQUIRE(tight.retained_tokens <= 25);
+    REQUIRE(tight.forced_doc_heads == 2);
+
+    // A structurally required span is charged before any header, so forcing
+    // headers can never starve it.
+    std::vector<PFlashSelectionCandidate> with_mandatory = candidates;
+    with_mandatory[5].mandatory = true;
+    const auto safe = select_pflash_candidates(
+        with_mandatory, PFlashSelectionPolicy{110, 0.95, true, 1, 0.0, 3},
+        PFlashSelectionMode::TopK);
+    REQUIRE(safe.ok);
+    REQUIRE(safe.retained_tokens <= 110);
+    // Ordinal 5 (100 tokens, mandatory) plus the headers that still fit.
+    REQUIRE(std::find(safe.ordinals.begin(), safe.ordinals.end(), (size_t) 5) !=
+            safe.ordinals.end());
+}
+
+TEST_CASE(PFlashSelectionFixture, forced_document_heads_need_three_documents_and_a_valid_count) {
+    auto candidates = document_candidates();
+    for (auto & c : candidates) c.document = 0;
+    const auto single = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, 0, 0.0, 5},
+        PFlashSelectionMode::BudgetOnly);
+    REQUIRE(single.ok);
+    REQUIRE(single.forced_doc_heads == 0);
+
+    REQUIRE(!select_pflash_candidates(
+        document_candidates(), PFlashSelectionPolicy{200, 0.95, false, 0, 0.0, -1},
+        PFlashSelectionMode::BudgetOnly).ok);
+}
+
+TEST_CASE(PFlashSelectionFixture, forced_document_heads_environment_resolves_or_fails) {
+    CleanPFlashEnv clean;
+    luce_test::ScopedEnvVar heads{"PFLASH_SELECT_FORCE_DOC_HEADS", nullptr};
+    set_env(kModeEnv, "top_k");
+    set_env(kTopKEnv, "20");
+    REQUIRE(resolve_or_fail(32768, 1024).force_doc_heads == 0);
+
+    set_env("PFLASH_SELECT_FORCE_DOC_HEADS", "5");
+    const auto config = resolve_or_fail(32768, 1024);
+    REQUIRE(config.force_doc_heads == 5);
+    REQUIRE(config.mode == PFlashSelectionMode::TopK);
+    REQUIRE(config.top_k == 20);
+
+    PFlashSelectionConfig invalid;
+    std::string error;
+    for (const char * bad : {"-1", "abc", ""}) {
+        set_env("PFLASH_SELECT_FORCE_DOC_HEADS", bad);
+        REQUIRE(!resolve_pflash_selection(32768, 1024, invalid, error));
+        REQUIRE(error.find("PFLASH_SELECT_FORCE_DOC_HEADS") != std::string::npos);
+    }
+}

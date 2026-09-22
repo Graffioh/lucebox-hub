@@ -3798,16 +3798,18 @@ std::string HttpServer::apply_pflash_compression(
     // them, otherwise the served prompt's own document markers. Either way
     // fewer than three documents yields no spans and the prior stays off.
     std::vector<PFlashTokenSpan> document_spans;
-    if (experiment.doc_prior_exponent > 0.0 && drafter_tokenizer_) {
+    if ((experiment.doc_prior_exponent > 0.0 ||
+         experiment.force_doc_heads > 0) && drafter_tokenizer_) {
         document_spans = req.pflash_documents.empty()
             ? http_detail::pflash_detect_document_spans(
                   *drafter_tokenizer_, drafter_ids)
             : http_detail::pflash_document_spans_from_ranges(
                   *drafter_tokenizer_, drafter_ids, req.pflash_documents);
         std::fprintf(stderr,
-            "[pflash-docs] source=%s documents=%zu exponent=%.9g\n",
+            "[pflash-docs] source=%s documents=%zu exponent=%.9g heads=%d\n",
             req.pflash_documents.empty() ? "detected" : "request",
-            document_spans.size(), experiment.doc_prior_exponent);
+            document_spans.size(), experiment.doc_prior_exponent,
+            experiment.force_doc_heads);
         std::fflush(stderr);
     }
 
