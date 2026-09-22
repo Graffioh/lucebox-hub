@@ -15,6 +15,7 @@
 #include "qwen35/qwen35_layer_split_dflash_target.h"
 #include "qwen35/prefill_helpers.h"
 #include "pflash/pflash_drafter.h"
+#include "pflash/pflash_compress.h"
 #include "pflash/kvflash_drafter_scorer.h"
 #include "kv_quant.h"
 
@@ -1395,6 +1396,7 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
         score_query_end, req.required_instruction_spans,
         req.query_suffix_candidates);
     result.ok = !result.compressed_ids.empty();
+    if (result.ok) result.kept_spans = pflash_last_kept_spans();
     if (result.ok) {
         std::fprintf(stderr, "[target-split][compress] %zu -> %zu tokens\n",
                      req.input_ids.size(), result.compressed_ids.size());

@@ -606,6 +606,122 @@ PflashChatTurnSpan pflash_chat_query_turn(
     return chosen;
 }
 
+std::vector<PFlashTokenSpan> pflash_subtract_token_spans(
+        const std::vector<PFlashTokenSpan> & spans,
+        const std::vector<PFlashTokenSpan> & minus) {
+    std::vector<PFlashTokenSpan> out;
+    size_t cut = 0;
+    for (const auto & span : spans) {
+        int begin = span.begin;
+        while (cut < minus.size() && minus[cut].end <= begin) ++cut;
+        for (size_t index = cut;
+             index < minus.size() && minus[index].begin < span.end; ++index) {
+            if (minus[index].begin > begin) {
+                out.push_back({begin, minus[index].begin});
+            }
+            begin = (std::max)(begin, minus[index].end);
+        }
+        if (begin < span.end) out.push_back({begin, span.end});
+    }
+    return out;
+}
+
+std::string pflash_recall_excerpt(
+        const std::string & text,
+        const std::vector<std::string> & role_markers,
+        const std::vector<std::string> & end_markers,
+        bool generic_role_lines) {
+    std::string out;
+    out.reserve(text.size());
+    size_t at = 0;
+    while (at < text.size()) {
+        bool matched = false;
+        for (const auto & marker : role_markers) {
+            if (marker.empty() || text.compare(at, marker.size(), marker) != 0) {
+                continue;
+            }
+            at += marker.size();
+            if (generic_role_lines) {
+                size_t name_end = at;
+                while (name_end < text.size() && name_end - at < 16 &&
+                       std::isalpha((unsigned char) text[name_end])) {
+                    ++name_end;
+                }
+                if (name_end < text.size() && text[name_end] == '\n') {
+                    at = name_end + 1;
+                }
+            }
+            out += '\n';
+            matched = true;
+            break;
+        }
+        if (matched) continue;
+        for (const auto & marker : end_markers) {
+            if (marker.empty() || text.compare(at, marker.size(), marker) != 0) {
+                continue;
+            }
+            at += marker.size();
+            out += '\n';
+            matched = true;
+            break;
+        }
+        if (matched) continue;
+        out += text[at++];
+    }
+    const size_t first = out.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const size_t last = out.find_last_not_of(" \t\r\n");
+    return out.substr(first, last - first + 1);
+}
+
+bool PflashChatViewStore::find(
+        const std::vector<int32_t> & raw_tokens,
+        const std::vector<int32_t> & drafter_ids,
+        PflashChatView & out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const PflashChatView * best = nullptr;
+    for (const auto & view : views_) {
+        if (view.raw_gen_begin <= 0 || view.drafter_gen_begin <= 0 ||
+            (size_t) view.raw_gen_begin > raw_tokens.size() ||
+            (size_t) view.drafter_gen_begin > drafter_ids.size()) {
+            continue;
+        }
+        if (!std::equal(view.raw_tokens.begin(),
+                        view.raw_tokens.begin() + view.raw_gen_begin,
+                        raw_tokens.begin()) ||
+            !std::equal(view.drafter_ids.begin(),
+                        view.drafter_ids.begin() + view.drafter_gen_begin,
+                        drafter_ids.begin())) {
+            continue;
+        }
+        if (!best || view.raw_gen_begin > best->raw_gen_begin) best = &view;
+    }
+    if (!best) return false;
+    out = *best;
+    return true;
+}
+
+void PflashChatViewStore::remember(PflashChatView view) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Drop the views this one continues: same conversation, older turn.
+    views_.erase(std::remove_if(views_.begin(), views_.end(),
+        [&view] (const PflashChatView & old) {
+            return old.raw_gen_begin > 0 &&
+                old.raw_gen_begin <= view.raw_gen_begin &&
+                (size_t) old.raw_gen_begin <= view.raw_tokens.size() &&
+                std::equal(old.raw_tokens.begin(),
+                           old.raw_tokens.begin() + old.raw_gen_begin,
+                           view.raw_tokens.begin());
+        }), views_.end());
+    views_.push_back(std::move(view));
+    while (views_.size() > capacity_) views_.erase(views_.begin());
+}
+
+size_t PflashChatViewStore::size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return views_.size();
+}
+
 bool pflash_full_cache_restore_allowed(
         bool selection_environment_present) noexcept {
     return !selection_environment_present;
@@ -4266,6 +4382,12 @@ std::string HttpServer::apply_pflash_compression(
                 std::to_string(target_ceiling) + ")";
         }
     }
+    if (experiment.selection_active && messages_input && chat_turn.valid() &&
+        !result.kept_spans.empty()) {
+        final_tokens = continue_pflash_chat_view(
+            req, compress_request.input_ids, chat_turn, result.kept_spans,
+            std::move(final_tokens), prepared.snapshot_cut);
+    }
     prepared.tokens = std::move(final_tokens);
     prepared.compressed = true;
     std::fprintf(stderr,
@@ -4274,6 +4396,168 @@ std::string HttpServer::apply_pflash_compression(
         (int) prepared.tokens.size(),
         100.0 * prepared.tokens.size() / prompt_tokens);
     return {};
+}
+
+std::vector<int32_t> HttpServer::continue_pflash_chat_view(
+        const ParsedRequest & req,
+        const std::vector<int32_t> & drafter_ids,
+        const http_detail::PflashChatTurnSpan & turn,
+        const std::vector<PFlashTokenSpan> & kept_spans,
+        std::vector<int32_t> fresh,
+        int & snapshot_cut) {
+    snapshot_cut = -1;
+    const char * disabled = std::getenv("PFLASH_CHAT_VIEW");
+    if (disabled && std::string(disabled) == "0") return fresh;
+    const int input = (int) drafter_ids.size();
+    if (turn.generation_begin <= 0 || turn.generation_begin >= input) {
+        return fresh;
+    }
+    // The generation prompt, in target tokens: the raw prompt and every
+    // served prompt end with it (strict selection keeps it verbatim).
+    const auto generation = tokenizer_.encode(drafter_tokenizer_->decode(
+        std::vector<int32_t>(drafter_ids.begin() + turn.generation_begin,
+                             drafter_ids.end())));
+    const auto ends_with_generation = [&generation] (
+            const std::vector<int32_t> & tokens) {
+        return !generation.empty() && tokens.size() > generation.size() &&
+            std::equal(generation.begin(), generation.end(),
+                       tokens.end() - (long) generation.size());
+    };
+    if (!ends_with_generation(req.prompt_tokens) ||
+        !ends_with_generation(fresh)) {
+        return fresh;
+    }
+    const int raw_gen_begin =
+        (int) (req.prompt_tokens.size() - generation.size());
+
+    http_detail::PflashChatView next;
+    next.raw_tokens = req.prompt_tokens;
+    next.raw_gen_begin = raw_gen_begin;
+    next.drafter_ids = drafter_ids;
+    next.drafter_gen_begin = turn.generation_begin;
+
+    http_detail::PflashChatView view;
+    const bool continues =
+        pflash_views_.find(req.prompt_tokens, drafter_ids, view);
+    const auto serve_fresh = [&] (const char * why, int turns) {
+        next.view_tokens = fresh;
+        next.view_gen_begin = (int) (fresh.size() - generation.size());
+        next.spans = kept_spans;
+        next.turns = turns;
+        snapshot_cut = next.view_gen_begin;
+        std::fprintf(stderr,
+            "[pflash-view] %s turn=%d served=%zu\n", why, turns, fresh.size());
+        std::fflush(stderr);
+        pflash_views_.remember(std::move(next));
+        return std::move(fresh);
+    };
+    if (!continues) return serve_fresh("fresh", 1);
+    if (view.raw_tokens == req.prompt_tokens) {
+        // The same prompt again (a retry): serve what was served.
+        std::fprintf(stderr, "[pflash-view] repeat turn=%d served=%zu\n",
+                     view.turns, view.view_tokens.size());
+        std::fflush(stderr);
+        snapshot_cut = view.view_gen_begin;
+        return view.view_tokens;
+    }
+    if (view.drafter_gen_begin >= turn.generation_begin ||
+        view.view_gen_begin <= 0 ||
+        (size_t) view.view_gen_begin > view.view_tokens.size()) {
+        return serve_fresh("fresh", 1);
+    }
+
+    // Recall: what the fresh selection keeps for the new query that the view
+    // does not hold. Only a new user turn brings a new query; an agent step
+    // (assistant call plus tool output) appends without recalling.
+    std::vector<PFlashTokenSpan> recalled;
+    if (turn.role_begin >= view.drafter_gen_begin) {
+        auto in_view = view.spans;
+        in_view.push_back({view.drafter_gen_begin, input});
+        recalled = http_detail::pflash_subtract_token_spans(
+            kept_spans,
+            http_detail::canonicalize_pflash_token_spans(std::move(in_view)));
+    }
+    std::string recall_block;
+    int recalled_tokens = 0;
+    if (!recalled.empty()) {
+        ChatMarkers markers;
+        std::vector<std::string> role_markers;
+        std::vector<std::string> end_markers;
+        bool generic_roles = false;
+        if (resolve_chat_markers(tokenizer_, markers)) {
+            const auto seq_text = [this] (const std::vector<int32_t> & seq) {
+                std::string text;
+                for (const int32_t id : seq) text += tokenizer_.token_text(id);
+                return text;
+            };
+            for (const auto & seq : markers.next_role_starts) {
+                role_markers.push_back(seq_text(seq));
+            }
+            for (const auto & seq : markers.end_msg_seqs) {
+                end_markers.push_back(seq_text(seq));
+            }
+            generic_roles = !markers.role_starts_delimit &&
+                markers.family != "laguna";
+        }
+        std::string excerpts;
+        for (const auto & span : recalled) {
+            const std::string excerpt = http_detail::pflash_recall_excerpt(
+                drafter_tokenizer_->decode(std::vector<int32_t>(
+                    drafter_ids.begin() + span.begin,
+                    drafter_ids.begin() + span.end)),
+                role_markers, end_markers, generic_roles);
+            if (excerpt.empty()) continue;
+            if (!excerpts.empty()) excerpts += "\n\n";
+            excerpts += excerpt;
+            recalled_tokens += span.end - span.begin;
+        }
+        if (!excerpts.empty()) {
+            recall_block = "[Earlier in this conversation]\n" + excerpts +
+                "\n[End of earlier excerpts]\n\n";
+        }
+    }
+
+    // The previous view without its generation prompt, then this turn's new
+    // tokens from where that generation prompt started; recalled excerpts
+    // open the new user turn's content, after everything the target cached.
+    const auto decode_range = [&] (int begin, int end) {
+        return drafter_tokenizer_->decode(std::vector<int32_t>(
+            drafter_ids.begin() + begin, drafter_ids.begin() + end));
+    };
+    const std::string delta = recall_block.empty()
+        ? decode_range(view.drafter_gen_begin, input)
+        : decode_range(view.drafter_gen_begin, turn.content_begin) +
+            recall_block + decode_range(turn.content_begin, input);
+    std::vector<int32_t> served(view.view_tokens.begin(),
+                                view.view_tokens.begin() + view.view_gen_begin);
+    const auto delta_tokens = tokenizer_.encode(delta);
+    served.insert(served.end(), delta_tokens.begin(), delta_tokens.end());
+    if (!ends_with_generation(served)) {
+        return serve_fresh("fresh", 1);
+    }
+    // Rebuild when the view outgrew what a fresh selection keeps, or the
+    // context: the fresh prompt starts a new view, prefilled from scratch.
+    const bool outgrown = served.size() > 2 * fresh.size() ||
+        (config_.max_ctx > 0 &&
+         (int) served.size() + req.max_output > config_.max_ctx);
+    if (outgrown) return serve_fresh("rebuild", view.turns + 1);
+
+    auto spans = view.spans;
+    spans.push_back({view.drafter_gen_begin, input});
+    spans.insert(spans.end(), recalled.begin(), recalled.end());
+    next.view_tokens = served;
+    next.view_gen_begin = (int) (served.size() - generation.size());
+    next.spans = http_detail::canonicalize_pflash_token_spans(std::move(spans));
+    next.turns = view.turns + 1;
+    snapshot_cut = next.view_gen_begin;
+    std::fprintf(stderr,
+        "[pflash-view] continue turn=%d served=%zu reused=%d delta=%zu "
+        "recalled=%d fresh=%zu\n",
+        next.turns, served.size(), view.view_gen_begin, delta_tokens.size(),
+        recalled_tokens, fresh.size());
+    std::fflush(stderr);
+    pflash_views_.remember(std::move(next));
+    return served;
 }
 
 HttpServer::PreparedPrompt HttpServer::prepare_prompt(
@@ -4444,6 +4728,7 @@ HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
     const bool prefer_tools_boundary =
         ppp_prefers_tools_boundary(config_.ppp_enabled, prefer_inline_snap);
     int forced_cut = req.pin_end_token;
+    if (forced_cut <= 0) forced_cut = prepared.snapshot_cut;
 
     // PPP runs *before* lookup. Default (rearrange=0): annotate a sticky
     // pin_end only — never mutate tokens. Token-level DiffPin rewrite

@@ -12,6 +12,7 @@
 #include "common/peer_access.h"
 #include "common/platform_env.h"
 #include "common/sampler.h"
+#include "pflash/pflash_compress.h"
 
 #if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "common/gpu_runtime_compat.h"
@@ -3184,6 +3185,7 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
             score_query_end, request.required_instruction_spans,
             request.query_suffix_candidates);
         result.ok = !result.compressed_ids.empty();
+        if (result.ok) result.kept_spans = pflash_last_kept_spans();
     }
 
     if (load_request->residency_action ==

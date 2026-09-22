@@ -284,6 +284,9 @@ struct ModelBackend {
     struct CompressResult {
         bool                 ok = false;
         std::vector<int32_t> compressed_ids;  // surviving token IDs
+        // Strict selection: the input spans behind compressed_ids, ascending.
+        // Empty when the backend does not report them (remote drafter).
+        std::vector<PFlashTokenSpan> kept_spans;
 
         static CompressResult from_compressed_ids(
                 std::vector<int32_t> ids) {

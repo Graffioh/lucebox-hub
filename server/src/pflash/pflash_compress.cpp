@@ -179,6 +179,18 @@ void write_compression_trace(
     std::fclose(file);
 }
 
+namespace {
+thread_local std::vector<PFlashTokenSpan> g_last_kept_spans;
+} // namespace
+
+const std::vector<PFlashTokenSpan> & pflash_last_kept_spans() {
+    return g_last_kept_spans;
+}
+
+void pflash_clear_kept_spans() {
+    g_last_kept_spans.clear();
+}
+
 std::vector<int32_t> select_pflash_chunks(
         const std::vector<int32_t> & ids,
         const std::vector<float> & token_scores,
@@ -281,11 +293,18 @@ std::vector<int32_t> select_pflash_chunks(
 
     std::vector<int32_t> output;
     output.reserve((size_t) selected.retained_tokens);
+    g_last_kept_spans.clear();
     for (const auto & candidate : candidates) {
         if (!selected_mask[candidate.ordinal]) continue;
         output.insert(output.end(),
                       ids.begin() + candidate.begin,
                       ids.begin() + candidate.end);
+        if (!g_last_kept_spans.empty() &&
+            g_last_kept_spans.back().end == candidate.begin) {
+            g_last_kept_spans.back().end = candidate.end;
+        } else {
+            g_last_kept_spans.push_back({candidate.begin, candidate.end});
+        }
     }
 
     std::fprintf(stderr,

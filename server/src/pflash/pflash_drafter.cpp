@@ -18,6 +18,7 @@
 
 #include "qwen35_drafter.h"
 #include "pflash_selection.h"
+#include "pflash_compress.h"
 #include "common/dspark_head.h"
 #include "internal.h"
 
@@ -106,6 +107,7 @@ std::vector<int32_t> drafter_score_and_compress(
     int score_query_end,
     const std::vector<PFlashTokenSpan> & required_instruction_spans,
     bool query_suffix_candidates) {
+    pflash_clear_kept_spans();
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
         return {};

@@ -1041,6 +1041,56 @@ TEST_CASE(ServerUnitFixture, test_pflash_selection_cache_and_continuation_policy
     TEST_ASSERT(!http_detail::pflash_full_cache_restore_allowed(true));
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_subtract_token_spans) {
+    const std::vector<PFlashTokenSpan> spans{{0, 10}, {20, 30}, {40, 50}};
+    const std::vector<PFlashTokenSpan> minus{{5, 22}, {25, 26}, {40, 50}};
+    const auto out = http_detail::pflash_subtract_token_spans(spans, minus);
+    TEST_ASSERT(out.size() == 3);
+    TEST_ASSERT(out[0].begin == 0 && out[0].end == 5);
+    TEST_ASSERT(out[1].begin == 22 && out[1].end == 25);
+    TEST_ASSERT(out[2].begin == 26 && out[2].end == 30);
+    TEST_ASSERT(http_detail::pflash_subtract_token_spans(spans, {}).size() == 3);
+    TEST_ASSERT(http_detail::pflash_subtract_token_spans(spans, {{0, 60}}).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_recall_excerpt_strips_chat_markers) {
+    const std::string text =
+        "tail of a fact<|im_end|>\n<|im_start|>assistant\nSure, noted."
+        "<|im_end|>\n<|im_start|>user\n";
+    const std::string excerpt = http_detail::pflash_recall_excerpt(
+        text, {"<|im_start|>"}, {"<|im_end|>"}, /*generic_role_lines=*/true);
+    TEST_ASSERT_MSG(excerpt == "tail of a fact\n\n\nSure, noted.", excerpt);
+    TEST_ASSERT(http_detail::pflash_recall_excerpt(
+        "<|im_end|>\n", {"<|im_start|>"}, {"<|im_end|>"}, true).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_chat_view_store_matches_prompt_prefix) {
+    http_detail::PflashChatViewStore store(2);
+    http_detail::PflashChatView first;
+    first.raw_tokens = {1, 2, 3, 9, 9};
+    first.raw_gen_begin = 3;
+    first.drafter_ids = {1, 2, 3, 9, 9};
+    first.drafter_gen_begin = 3;
+    store.remember(first);
+
+    http_detail::PflashChatView found;
+    // The next turn keeps the prefix before the old generation prompt.
+    TEST_ASSERT(store.find({1, 2, 3, 4, 5, 9, 9}, {1, 2, 3, 4, 5, 9, 9}, found));
+    TEST_ASSERT(found.raw_gen_begin == 3);
+    // A different conversation does not match.
+    TEST_ASSERT(!store.find({1, 7, 3, 4}, {1, 7, 3, 4}, found));
+    // A continuation replaces the view it continues.
+    http_detail::PflashChatView second = first;
+    second.raw_tokens = {1, 2, 3, 4, 5, 9, 9};
+    second.raw_gen_begin = 5;
+    second.drafter_ids = second.raw_tokens;
+    second.drafter_gen_begin = 5;
+    store.remember(second);
+    TEST_ASSERT(store.size() == 1);
+    TEST_ASSERT(store.find({1, 2, 3, 4, 5, 6, 9}, {1, 2, 3, 4, 5, 6, 9}, found));
+    TEST_ASSERT(found.raw_gen_begin == 5);
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_kept_tokens_follow_selector_chunks) {
     // 100 tokens in chunks of 10; query [80, 85); instruction span [3, 12)
     // touches chunks 0 and 1.
@@ -7221,6 +7271,143 @@ TEST_CASE(ServerUnitFixture,
         TEST_ASSERT(prepared.tokens == ids);
     }
     TEST_ASSERT(backend.compress_calls == 0);
+    unlink(path.c_str());
+}
+
+// Keeps the required spans, the query window through the end, and whatever
+// ``pick`` adds; reports the kept spans like the in-process drafter does.
+struct MockPflashSpanBackend : MockBackend {
+    int compress_calls = 0;
+    CompressRequest last_request;
+    std::function<std::vector<PFlashTokenSpan>(const CompressRequest &)> pick;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        last_request = request;
+        auto spans = request.required_instruction_spans;
+        spans.push_back({request.score_query_end - request.score_query_tokens,
+                         (int) request.input_ids.size()});
+        if (pick) {
+            const auto extra = pick(request);
+            spans.insert(spans.end(), extra.begin(), extra.end());
+        }
+        spans = http_detail::canonicalize_pflash_token_spans(std::move(spans));
+        CompressResult result;
+        for (const auto & span : spans) {
+            result.compressed_ids.insert(result.compressed_ids.end(),
+                request.input_ids.begin() + span.begin,
+                request.input_ids.begin() + span.end);
+        }
+        result.kept_spans = spans;
+        result.ok = !result.compressed_ids.empty();
+        return result;
+    }
+};
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_view_appends_turns_and_recalls_missing_segments) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar view_env{"PFLASH_CHAT_VIEW", nullptr};
+
+    std::string system;
+    for (int i = 0; i < 20; ++i) system += "You are helpful. ";
+    const std::string document =
+        "alpha facts live here. filler filler filler. beta facts live here.";
+    const std::vector<ChatMessage> turn1{
+        {"system", system, ""},
+        {"user", document + " Question one?", ""},
+    };
+    auto turn2 = turn1;
+    turn2.push_back({"assistant", "Answer one.", ""});
+    turn2.push_back({"user", "Question two?", ""});
+    const auto render = [] (const std::vector<ChatMessage> & messages) {
+        return render_chat_template(messages, ChatFormat::QWEN3,
+                                    /*add_generation_prompt=*/true,
+                                    /*enable_thinking=*/true);
+    };
+    const auto to_json = [] (const std::vector<ChatMessage> & messages) {
+        json out = json::array();
+        for (const auto & message : messages) {
+            out.push_back({{"role", message.role}, {"content", message.content}});
+        }
+        return out;
+    };
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"alpha", " facts", "beta", " live", " here", ".", " filler",
+         "Question", " one", " two", "?", "Answer", "user", "assistant",
+         "system", "\n", "You", " are", " helpful"},
+        render(turn2) +
+            "[Earlier in this conversation]\n[End of earlier excerpts]\n");
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashSpanBackend>();
+    MockPflashSpanBackend & backend = *backend_owner;
+    const char * wanted = "alpha facts";
+    backend.pick = [&] (const ModelBackend::CompressRequest & request) {
+        const auto span = http_detail::pflash_decoded_text_span(
+            tokenizer, request.input_ids, 0, (int) request.input_ids.size(),
+            wanted);
+        return span.begin < 0 ? std::vector<PFlashTokenSpan>{}
+                              : std::vector<PFlashTokenSpan>{span};
+    };
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.pflash_keep_ratio = 1.0f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    std::vector<int32_t> served1;
+    std::vector<int32_t> served2;
+    std::vector<int32_t> served3;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        const auto run = [&] (const std::vector<ChatMessage> & messages,
+                              std::vector<int32_t> & served) {
+            ParsedRequest request;
+            request.format = ApiFormat::OPENAI_CHAT;
+            request.messages = to_json(messages);
+            request.prompt_tokens = tokenizer.encode(render(messages));
+            const auto prepared =
+                HttpServerTestAccess::prepare_prompt(server, request);
+            TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+            TEST_ASSERT(prepared.compressed);
+            served = prepared.tokens;
+            // The snapshot lands where the next turn's prompt branches off.
+            const auto generation =
+                tokenizer.encode("<|im_start|>assistant\n<think>\n");
+            TEST_ASSERT(prepared.snapshot_cut ==
+                        (int) (served.size() - generation.size()));
+        };
+        run(turn1, served1);
+        wanted = "beta facts";   // the new query wants what turn 1 dropped
+        run(turn2, served2);
+        run(turn2, served3);     // a retry serves the same view
+    }
+    const std::string text1 = tokenizer.decode(served1);
+    const std::string text2 = tokenizer.decode(served2);
+    TEST_ASSERT(text1.find("alpha facts") != std::string::npos);
+    TEST_ASSERT(text1.find("beta facts") == std::string::npos);
+
+    // Turn 2 extends turn 1's served prompt: everything before its
+    // generation prompt is reused token for token.
+    const auto generation = tokenizer.encode("<|im_start|>assistant\n<think>\n");
+    TEST_ASSERT(served1.size() > generation.size());
+    const size_t reused = served1.size() - generation.size();
+    TEST_ASSERT(served2.size() > reused);
+    TEST_ASSERT(std::equal(served1.begin(), served1.begin() + (long) reused,
+                           served2.begin()));
+    // The recalled segment opens the new user turn, after the answer.
+    const size_t answer = text2.find("Answer one.");
+    const size_t recall = text2.find("[Earlier in this conversation]");
+    const size_t question = text2.find("Question two?");
+    TEST_ASSERT(answer != std::string::npos);
+    TEST_ASSERT(recall != std::string::npos && recall > answer);
+    TEST_ASSERT(text2.find("beta facts", recall) != std::string::npos);
+    TEST_ASSERT(question != std::string::npos && question > recall);
+    TEST_ASSERT(served3 == served2);
     unlink(path.c_str());
 }
 

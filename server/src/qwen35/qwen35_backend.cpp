@@ -26,6 +26,7 @@
 #include "common/specla_mode.h"
 #include "qwen35_tensor_parallel.h"
 #include "pflash/pflash_drafter.h"
+#include "pflash/pflash_compress.h"
 #include "pflash/kvflash_drafter_scorer.h"
 
 #include "ggml-cuda.h"
@@ -1204,6 +1205,7 @@ std::vector<ModelBackend::CompressResult> Qwen35Backend::compress_batch(
             score_query_end, request.required_instruction_spans,
             request.query_suffix_candidates);
         result.ok = !result.compressed_ids.empty();
+        if (result.ok) result.kept_spans = pflash_last_kept_spans();
         if (result.ok) {
             std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
                          request.input_ids.size(), result.compressed_ids.size());

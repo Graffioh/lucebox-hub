@@ -120,6 +120,13 @@ void write_compression_trace(
         const std::vector<int32_t> & compressed_ids,
         const PFlashTraceFields * trace_fields = nullptr);
 
+// The spans the last strict selection on this thread kept, in input
+// coordinates, ascending and merged. Cleared at the start of every
+// drafter_score_and_compress call; empty when the call did not reach a
+// strict selection (legacy selection, errors).
+const std::vector<PFlashTokenSpan> & pflash_last_kept_spans();
+void pflash_clear_kept_spans();
+
 std::vector<int32_t> select_pflash_chunks(
         const std::vector<int32_t> & ids,
         const std::vector<float> & token_scores,

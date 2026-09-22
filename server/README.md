@@ -405,6 +405,17 @@ system prompt no longer exhausts the budget. Auto mode compares
 the system prompt: one that alone would not fit the context fails the
 request. Developer messages and tool definitions that would not fit lose
 their pin and are scored like any other context.
+
+Multi-turn chats keep a view: the prompt served for a turn is remembered,
+and when the next request's prompt continues it (same tokens up to the old
+generation prompt), PFlash serves that view plus the new turns instead of a
+fresh compression, so the target restores its prefix-cache snapshot of the
+view (taken at the start of its generation prompt) and prefills only what is
+new. Segments the fresh selection keeps for the new question that the view
+lacks are recalled as excerpts at the start of the new user turn. When the
+view grows past twice the fresh prompt, or past the context, the fresh prompt
+starts a new view. `PFLASH_CHAT_VIEW=0` serves the fresh compression every
+turn.
 A request's `pflash_query` string replaces the derived query and keeps its
 whole span; it is meant for benchmarks. `PFLASH_SELECT_QUERY_PARSER=latest_user`
 selects the benchmark parser, which finds the latest user message through

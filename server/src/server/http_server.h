@@ -304,6 +304,52 @@ PFlashTokenSpan pflash_changed_token_span(
 std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
     std::vector<PFlashTokenSpan> spans);
 
+// The parts of ``spans`` that ``minus`` does not cover. Both canonical.
+std::vector<PFlashTokenSpan> pflash_subtract_token_spans(
+    const std::vector<PFlashTokenSpan> & spans,
+    const std::vector<PFlashTokenSpan> & minus);
+
+// Text of a recalled segment made safe to quote inside a user turn: chat
+// control markers are removed, with the role-name line that follows a
+// generic role marker ("<|im_start|>assistant\n"), and the result is trimmed.
+std::string pflash_recall_excerpt(
+    const std::string & text,
+    const std::vector<std::string> & role_markers,
+    const std::vector<std::string> & end_markers,
+    bool generic_role_lines);
+
+// A multi-turn PFlash view: what was served for one turn of a conversation,
+// kept so the next turn can append to it instead of recompressing. The next
+// request continues the view when its raw prompt starts with this one's up
+// to the generation prompt, in target and drafter tokens alike.
+struct PflashChatView {
+    std::vector<int32_t> raw_tokens;       // target tokens, raw prompt
+    int raw_gen_begin = -1;                 // its generation prompt
+    std::vector<int32_t> drafter_ids;      // drafter tokens, raw prompt
+    int drafter_gen_begin = -1;
+    std::vector<int32_t> view_tokens;      // target tokens served
+    int view_gen_begin = -1;
+    std::vector<PFlashTokenSpan> spans;    // raw drafter spans in the view
+    int turns = 0;
+};
+
+class PflashChatViewStore {
+public:
+    explicit PflashChatViewStore(size_t capacity = 8) : capacity_(capacity) {}
+    // The stored view the prompt continues (longest match), if any.
+    bool find(const std::vector<int32_t> & raw_tokens,
+              const std::vector<int32_t> & drafter_ids,
+              PflashChatView & out) const;
+    // Store a view, replacing the one it continues.
+    void remember(PflashChatView view);
+    size_t size() const;
+
+private:
+    mutable std::mutex mutex_;
+    size_t capacity_;
+    std::vector<PflashChatView> views_;   // most recent last
+};
+
 // Find the last sufficiently-specific suffix of the user query inside the
 // rendered drafter-tokenized prompt. Public for model-free regression tests.
 PflashQueryWindow find_pflash_query_window(
@@ -554,6 +600,10 @@ private:
         int full_cache_served_tokens = -1;
         int full_cache_hit_slot = -1;
         int full_cache_hit_len = 0;
+        // Where to take this request's prefix-cache snapshot when nothing
+        // else asks for one: a multi-turn PFlash view sets the start of its
+        // generation prompt, where the next turn's prompt branches off.
+        int snapshot_cut = -1;
         int error_status = 0;
         std::string error;
     };
@@ -565,6 +615,16 @@ private:
                                   PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,
                                          PreparedPrompt & prepared);
+    // Multi-turn: serve the conversation's previous view plus this turn's
+    // new tokens (and the segments the fresh selection wants that the view
+    // lacks) when one continues into this prompt; else the fresh prompt.
+    std::vector<int32_t> continue_pflash_chat_view(
+        const ParsedRequest & req,
+        const std::vector<int32_t> & drafter_ids,
+        const http_detail::PflashChatTurnSpan & turn,
+        const std::vector<PFlashTokenSpan> & kept_spans,
+        std::vector<int32_t> fresh,
+        int & snapshot_cut);
     bool forward_upstream(ServerJob * job, const ParsedRequest & req,
                           const PreparedPrompt & prepared);
 
@@ -712,6 +772,9 @@ private:
 
     // Per-session adaptive keep_ratio bandit state.
     HttpServerSessions sessions_;
+
+    // Multi-turn PFlash views, matched by raw prompt prefix.
+    http_detail::PflashChatViewStore pflash_views_;
 
     // Live status tracker (read by /status/json, written by worker thread).
     ServerStatus status_;
