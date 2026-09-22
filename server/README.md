@@ -416,6 +416,18 @@ lacks are recalled as excerpts at the start of the new user turn. When the
 view grows past twice the fresh prompt, or past the context, the fresh prompt
 starts a new view. `PFLASH_CHAT_VIEW=0` serves the fresh compression every
 turn.
+
+The drafter keeps a scoring session per conversation
+(`PFLASH_DRAFTER_SESSIONS`, default 2, least recently used evicted; 0 scores
+every prompt from scratch): the cache of blocks 0-14, the block-15 keys and
+the probe logits of the prompt it last scored, with the recurrent state
+checkpointed 64 tokens before its end. A prompt that shares that prefix runs
+only its new tokens through the drafter, from the end or from the
+checkpoint (the previous turn's generation prompt is replaced), and the new
+query scores against every stored key. Sessions live with the loaded drafter,
+so they pay off with `--draft-residency persistent` (and `--prefill-skip-park`
+where the target and drafter fit together); the default releases the drafter
+after each compression.
 A request's `pflash_query` string replaces the derived query and keeps its
 whole span; it is meant for benchmarks. `PFLASH_SELECT_QUERY_PARSER=latest_user`
 selects the benchmark parser, which finds the latest user message through

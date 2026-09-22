@@ -15,6 +15,8 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -26,6 +28,31 @@ namespace luce::common {
 // context without RoPE; an optional trained head replaces those two
 // projections.
 static constexpr int kQwen35HeadBlock = 15;
+
+// What the scorer computed for one conversation's prompt, kept so the next
+// turn only runs the new tokens. Blocks 0..14 read left to right, so the
+// cache state and block-15 keys of a shared prefix never change; the keys
+// carry no position (NoPE), and the probe's raw logits are per token.
+struct Qwen35ScoringSession {
+    std::vector<int32_t> ids;       // prompt tokens the state covers
+    int checkpoint = 0;             // recurrent-state snapshot position
+    int capacity = 0;               // tokens the cache and keys can hold
+    TargetCache cache;              // blocks 0..14 only
+    ggml_context *        key_ctx = nullptr;
+    ggml_backend_buffer_t key_buf = nullptr;
+    ggml_tensor *         keys = nullptr;   // [head_dim, n_head_kv, capacity] f32
+    bool                  keys_trained = false;
+    std::vector<float>    probe_raw;        // per token, unit logit
+    std::vector<float>    subunit_raw;      // per token, when the probe has one
+    // Block-14 output of the last query window, reused while the query stays
+    // put (an agent step appends tool output after the same user turn).
+    int                   query_begin = -1;
+    int                   query_end = -1;
+    std::vector<float>    query_rows;       // [hidden, query_end - query_begin]
+    uint64_t              last_used = 0;
+};
+
+void free_qwen35_scoring_session(Qwen35ScoringSession & session);
 
 struct Qwen35DrafterState {
     TargetWeights weights;
@@ -56,6 +83,10 @@ struct Qwen35DrafterState {
     int                   probe_max_segment = 2048;
     int                   probe_width = 0;
     bool                  probe_loaded = false;
+    // Strict scorer sessions, least recently used evicted
+    // (PFLASH_DRAFTER_SESSIONS, default 2; 0 scores every prompt from scratch).
+    std::vector<std::unique_ptr<Qwen35ScoringSession>> sessions;
+    uint64_t              session_clock = 0;
 };
 
 // Defined in qwen35_loader.cpp.
