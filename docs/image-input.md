@@ -50,12 +50,13 @@ support images. `/props` reports the effective capability in
 ## Qwen3.5 / Qwen3.8
 
 ```
-luce_server Qwen3.8-27B-UD-IQ4_XS.gguf --target-device hip:0 \
-  --draft qwen38-dflash2-q8_0.gguf --draft-device hip:0 \
-  --mmproj mmproj-Qwen3.8-27B-BF16.gguf
+luce_server Qwen3.8-27B-IQ4_XS-pure.gguf --target-device hip:0 \
+  --draft Qwen3.8-27B-DFlash2-Q8_0.gguf --draft-device hip:0 \
+  --mmproj Qwen3.8-27B-mmproj-Q8_0.gguf
 ```
 
-The projector is read directly from the published file. Projectors with
+The projector is read directly from the published `clip` file, BF16, F16 or
+Q8_0; Q8_0 is recommended (below). Projectors with
 deepstack branches (Qwen3-VL) are refused. An image is resized the way the
 model was trained (bicubic, both sides to a multiple of 32 pixels) and costs
 one token per 32x32 pixels, between 64 and 1,024 tokens; larger images are
@@ -71,8 +72,17 @@ Covered by `test_qwen35_image`: target sizes against the model's reference
 resize rule, the tower's patch order and position table sampling, marker
 expansion, rotary positions, and image rows that straddle prefill chunks.
 
-Measured on an R9700 alone with Qwen3.8-27B UD-IQ4_XS, the DFlash2 drafter and
-the published BF16 projector, thinking off:
+Measured on an R9700 alone with the DFlash2 drafter, thinking off. With the
+Lucebox `Qwen3.8-27B-IQ4_XS-pure` file and a Q8_0 projector:
+
+- 220 seeded questions from `lmms-lab/ai2d` and `lmms-lab/ChartQA` with
+  lmms-eval prompts: AI2D 90/100, ChartQA relaxed accuracy 56/60 (augmented)
+  and 42/60 (human). Image prompts prefill in 0.56 s on average; one to four
+  images per request all answer correctly (four images, 2,495 tokens: 3.2 s).
+- Text decodes at 56 to 117 tok/s on 256-token answers (84 on average); image
+  requests decode without the drafter at about 36 tok/s.
+
+With unsloth's UD-IQ4_XS file and the published BF16 projector:
 
 - 220 seeded questions from `lmms-lab/ai2d` and `lmms-lab/ChartQA` with
   lmms-eval prompts: AI2D 85/100, ChartQA relaxed accuracy 55/60 (augmented)
@@ -91,7 +101,6 @@ the published BF16 projector, thinking off:
   same speed, with or without a projector loaded (five prompts up to 19.6K
   tokens). The projector adds 0.9 GiB of VRAM; the peak during image requests
   was 21.6 GiB against 20.8 GiB for text.
-
 - The same requests answer correctly on a Strix Halo alone, where a
   1,012-token image prompt prefills in 4.6 s and decodes at 14 tok/s.
 
