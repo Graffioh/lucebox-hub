@@ -328,12 +328,15 @@ bool Qwen35VisionTower::encode(const Qwen35Pixels & pixels, std::vector<float> &
             return ggml_rope_multi(ctx, t, rope_positions, nullptr, int(head / 2), sections,
                                    GGML_ROPE_TYPE_VISION, 32768, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         };
+        // Fused attention with half-precision keys and values, as the
+        // reference implementation runs it: the score matrix of a large
+        // image (3,900 patches squared per head) never touches memory.
         ggml_tensor * q = ggml_permute(ctx, rotate(part(0)), 0, 2, 1, 3);
-        ggml_tensor * k = ggml_permute(ctx, rotate(part(1)), 0, 2, 1, 3);
-        ggml_tensor * v = ggml_cont(ctx, ggml_permute(ctx, part(2), 1, 2, 0, 3));
-        ggml_tensor * weights = ggml_soft_max_ext(ctx, ggml_mul_mat(ctx, k, q), nullptr, attention_scale, 0.0f);
-        ggml_tensor * mixed = ggml_permute(ctx, ggml_mul_mat(ctx, v, weights), 0, 2, 1, 3);
-        x = ggml_add(ctx, x, linear(ctx, b.out_w, b.out_b, ggml_cont_2d(ctx, mixed, d, patches)));
+        ggml_tensor * k = ggml_cast(ctx, ggml_permute(ctx, rotate(part(1)), 0, 2, 1, 3), GGML_TYPE_F16);
+        ggml_tensor * v = ggml_cast(ctx, ggml_permute(ctx, part(2), 0, 2, 1, 3), GGML_TYPE_F16);
+        ggml_tensor * mixed = ggml_flash_attn_ext(ctx, q, k, v, nullptr, attention_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(mixed, GGML_PREC_F32);
+        x = ggml_add(ctx, x, linear(ctx, b.out_w, b.out_b, ggml_reshape_2d(ctx, mixed, d, patches)));
 
         ggml_tensor * hidden = linear(ctx, b.up_w, b.up_b, layer_norm(ctx, x, b.ln2_w, b.ln2_b, c.epsilon));
         x = ggml_add(ctx, x, linear(ctx, b.down_w, b.down_b, ggml_gelu(ctx, hidden)));

@@ -7,6 +7,7 @@
 #include "qwen35_image_request.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <new>
 
@@ -97,14 +98,23 @@ bool Qwen35Backend::encode_images(const Qwen35ImagePrompt & prompt, Qwen35ImageR
     }
     rows.prompt = &prompt;
     bool ok = true;
+    int tokens = 0;
+    const auto start = std::chrono::steady_clock::now();
     try {
         rows.rows.resize(prompt.pixels.size());
         for (size_t i = 0; ok && i < prompt.pixels.size(); ++i) {
             ok = vision_->encode(prompt.pixels[i], rows.rows[i], error);
+            tokens += prompt.pixels[i].tokens();
         }
     } catch (const std::bad_alloc &) {
         error = "image encoding allocation failed";
         ok = false;
+    }
+    ggml_backend_synchronize(target_backend_);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (ok) {
+        std::printf("[vision] encoded %zu image(s), %d tokens, in %.0f ms\n", prompt.pixels.size(), tokens, ms);
+        std::fflush(stdout);
     }
     // The attention scratch is large and only needed here; give it back
     // before prefill sizes its own graphs.

@@ -75,9 +75,12 @@ Measured on an R9700 alone with Qwen3.8-27B UD-IQ4_XS, the DFlash2 drafter and
 the published BF16 projector, thinking off:
 
 - 220 seeded questions from `lmms-lab/ai2d` and `lmms-lab/ChartQA` with
-  lmms-eval prompts: AI2D 86/100, ChartQA relaxed accuracy 55/60 (augmented)
-  and 42/60 (human), no errors. Image prompts average 448 tokens and prefill in
-  0.74 s (largest 1,068 tokens, 1.9 s); decode runs at 31 to 35 tok/s.
+  lmms-eval prompts: AI2D 85/100, ChartQA relaxed accuracy 55/60 (augmented)
+  and 43/60 (human), no errors. Image prompts average 448 tokens and prefill in
+  0.71 s (largest 1,068 tokens, 1.8 s); decode runs at 31 to 35 tok/s.
+- llama.cpp (HIP build, `-fa on`, same GGUF, projector and image cap) answers
+  the same on every test image; on a 1,012-token image prompt it prefills in
+  1.65 s to our 1.68 s, on a 323-token one in 0.61 s to our 0.50 s.
 - An image inside a 6,271-token prompt, two images in one request, and a
   follow-up turn after an image all answer correctly.
 - Text requests are byte-identical to a build without image support, at the
