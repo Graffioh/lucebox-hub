@@ -82,6 +82,9 @@ std::vector<int32_t> drafter_score_and_compress(
     int    pool_kernel = 13,
     int    score_query_end = -1,
     const std::vector<PFlashTokenSpan> &
-        required_instruction_spans = {});
+        required_instruction_spans = {},
+    // Document starts in prompt-token coordinates, for the document prior
+    // (PFLASH_SELECT_DOC_PRIOR). Empty leaves the prior a no-op.
+    const std::vector<PFlashTokenSpan> & document_spans = {});
 
 } // namespace dflash::common

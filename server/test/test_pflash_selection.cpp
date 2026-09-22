@@ -858,3 +858,170 @@ TEST_CASE(PFlashSelectionFixture, split_selection_rejects_top_k) {
     REQUIRE(!result.ok);
     REQUIRE(result.stop == PFlashSelectionStop::InvalidInput);
 }
+
+namespace {
+
+// Three documents of two candidates each. Document 2 (ordinals 4,5) has the
+// lowest per-segment scores but the most mass; document 0 holds the single
+// highest-scoring segment. Per-segment ranking prefers ordinal 0, the
+// document prior prefers document 2.
+std::vector<PFlashSelectionCandidate> document_candidates() {
+    const double scores[6] = {9.0, 1.0, 2.0, 2.0, 5.0, 5.0};
+    const size_t documents[6] = {0, 0, 1, 1, 2, 2};
+    std::vector<PFlashSelectionCandidate> candidates;
+    for (size_t index = 0; index < 6; ++index) {
+        const int begin = (int) index * 100;
+        PFlashSelectionCandidate c = candidate(index, begin, begin + 100, scores[index]);
+        c.document = documents[index];
+        candidates.push_back(c);
+    }
+    return candidates;
+}
+
+} // namespace
+
+TEST_CASE(PFlashSelectionFixture, document_prior_reweights_by_document_mass_share) {
+    const auto candidates = document_candidates();
+    // Masses: doc0 = (9+1)*100 = 1000, doc1 = 400, doc2 = 1000; total 2400.
+    // Shares: 0.41667, 0.16667, 0.41667.
+    const auto plain = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{200, 0.95, false},
+        PFlashSelectionMode::BudgetOnly);
+    REQUIRE(plain.ok);
+    REQUIRE(!plain.doc_prior_applied);
+    REQUIRE(plain.documents == 3);
+    // Without the prior the two highest raw scores win: ordinal 0 (9) and
+    // one of the 5s.
+    require_ordinals(plain, {0, 4});
+
+    const auto prior = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{200, 0.95, false, 0, 1.0},
+        PFlashSelectionMode::BudgetOnly);
+    REQUIRE(prior.ok);
+    REQUIRE(prior.doc_prior_applied);
+    REQUIRE(prior.documents == 3);
+    // 9 * 0.41667 = 3.75 still beats 5 * 0.41667 = 2.083? No: 2.083 < 3.75,
+    // so ordinal 0 stays first; ordinal 4 (2.083) beats ordinal 1
+    // (1 * 0.41667 = 0.4167) and ordinal 2 (2 * 0.16667 = 0.333).
+    require_ordinals(prior, {0, 4});
+
+    // A larger exponent sharpens the shares; the weak document falls further
+    // behind, which is the whole point of the knob.
+    const auto sharp = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{400, 0.95, false, 0, 3.0},
+        PFlashSelectionMode::BudgetOnly);
+    REQUIRE(sharp.ok);
+    REQUIRE(sharp.doc_prior_applied);
+    // doc1's segments (share 0.1667^3 = 0.00463) rank below every segment of
+    // doc0 and doc2 (share 0.41667^3 = 0.0723).
+    require_ordinals(sharp, {0, 1, 4, 5});
+}
+
+TEST_CASE(PFlashSelectionFixture, document_prior_exponent_zero_is_todays_ranking) {
+    const auto candidates = document_candidates();
+    const auto off = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{300, 0.95, false, 0, 0.0},
+        PFlashSelectionMode::BudgetOnly);
+    const auto shipped = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{300, 0.95, false},
+        PFlashSelectionMode::BudgetOnly);
+    REQUIRE(off.ok);
+    REQUIRE(!off.doc_prior_applied);
+    REQUIRE(off.ordinals == shipped.ordinals);
+    REQUIRE(off.retained_tokens == shipped.retained_tokens);
+    REQUIRE(off.stop == shipped.stop);
+}
+
+TEST_CASE(PFlashSelectionFixture, document_prior_is_a_no_op_below_three_documents) {
+    // Two documents: the shares are real but the prior stays off by rule.
+    std::vector<PFlashSelectionCandidate> candidates = document_candidates();
+    for (auto & c : candidates) if (c.document == 2) c.document = 1;
+    const auto two = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{200, 0.95, false, 0, 1.0},
+        PFlashSelectionMode::BudgetOnly);
+    REQUIRE(two.ok);
+    REQUIRE(two.documents == 2);
+    REQUIRE(!two.doc_prior_applied);
+
+    // One document (a single book, as NoLiMa serves) is a no-op twice over:
+    // by the rule and because the only share is 1.
+    for (auto & c : candidates) c.document = 0;
+    const auto one = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{200, 0.95, false, 0, 1.0},
+        PFlashSelectionMode::BudgetOnly);
+    REQUIRE(one.ok);
+    REQUIRE(one.documents == 1);
+    REQUIRE(!one.doc_prior_applied);
+    require_ordinals(one, {0, 4});
+}
+
+TEST_CASE(PFlashSelectionFixture, document_prior_composes_with_top_k) {
+    const auto candidates = document_candidates();
+    // K=2 with the prior: the rank order is the prior's, the count is K's.
+    const auto composed = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, 2, 3.0},
+        PFlashSelectionMode::TopK);
+    REQUIRE(composed.ok);
+    REQUIRE(composed.stop == PFlashSelectionStop::TopKReached);
+    REQUIRE(composed.doc_prior_applied);
+    REQUIRE(composed.retained_tokens == 200);
+    // Sharpened shares put doc0's 9 first and doc2's 5 second; doc1 is out.
+    require_ordinals(composed, {0, 4});
+
+    // The same K without the prior keeps the raw top two, which here is the
+    // same pair -- so also check a K that exposes the reordering below them.
+    const auto plain_three = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, 3},
+        PFlashSelectionMode::TopK);
+    const auto prior_three = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, 3, 3.0},
+        PFlashSelectionMode::TopK);
+    REQUIRE(plain_three.ok);
+    REQUIRE(prior_three.ok);
+    require_ordinals(plain_three, {0, 4, 5});
+    require_ordinals(prior_three, {0, 4, 5});
+    // At rank four the orders diverge: raw picks doc1's 2, the prior picks
+    // doc0's 1 because doc1's share is cubed away.
+    const auto plain_four = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, 4},
+        PFlashSelectionMode::TopK);
+    const auto prior_four = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, 4, 3.0},
+        PFlashSelectionMode::TopK);
+    require_ordinals(plain_four, {0, 2, 4, 5});
+    require_ordinals(prior_four, {0, 1, 4, 5});
+}
+
+TEST_CASE(PFlashSelectionFixture, document_prior_rejects_a_negative_exponent) {
+    const auto candidates = document_candidates();
+    REQUIRE(!select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{200, 0.95, false, 0, -1.0},
+        PFlashSelectionMode::BudgetOnly).ok);
+}
+
+TEST_CASE(PFlashSelectionFixture, document_prior_environment_resolves_or_fails) {
+    CleanPFlashEnv clean;
+    luce_test::ScopedEnvVar doc_prior{"PFLASH_SELECT_DOC_PRIOR", nullptr};
+    set_env(kModeEnv, "budget_only");
+    REQUIRE(resolve_or_fail(32768, 1024).doc_prior_exponent == 0.0);
+
+    set_env("PFLASH_SELECT_DOC_PRIOR", "1.0");
+    auto config = resolve_or_fail(32768, 1024);
+    REQUIRE(std::fabs(config.doc_prior_exponent - 1.0) < 1e-12);
+
+    // It composes with top_k in the resolved config too.
+    set_env(kModeEnv, "top_k");
+    set_env(kTopKEnv, "20");
+    config = resolve_or_fail(32768, 1024);
+    REQUIRE(config.mode == PFlashSelectionMode::TopK);
+    REQUIRE(config.top_k == 20);
+    REQUIRE(std::fabs(config.doc_prior_exponent - 1.0) < 1e-12);
+
+    PFlashSelectionConfig invalid;
+    std::string error;
+    for (const char * bad : {"-1", "abc", ""}) {
+        set_env("PFLASH_SELECT_DOC_PRIOR", bad);
+        REQUIRE(!resolve_pflash_selection(32768, 1024, invalid, error));
+        REQUIRE(error.find("PFLASH_SELECT_DOC_PRIOR") != std::string::npos);
+    }
+}

@@ -88,12 +88,16 @@ void write_compression_trace(
             "],\"query_begin\":%d,\"query_end\":%d,"
             "\"selector_mode\":\"%s\",\"query_parser\":\"%s\","
             "\"token_budget\":%d,\"top_k\":%d,"
+            "\"doc_prior_exponent\":%.9g,\"documents\":%zu,"
+            "\"doc_prior_applied\":%s,"
             "\"retained_tokens\":%d",
             trace_fields->query_begin, trace_fields->query_end,
             dflash::pflash::pflash_selection_mode_name(
                 trace_fields->selector_mode),
             dflash::pflash::pflash_query_parser_name(trace_fields->query_parser),
             trace_fields->token_budget, trace_fields->top_k,
+            trace_fields->doc_prior_exponent, trace_fields->documents,
+            trace_fields->doc_prior_applied ? "true" : "false",
             trace_fields->retained_tokens);
         std::fputs(",\"required_instruction_spans\":[", file);
         if (trace_fields->required_instruction_spans) {
@@ -193,7 +197,8 @@ std::vector<int32_t> select_pflash_chunks(
         const std::vector<PFlashTokenSpan> * segments,
         bool density,
         const std::vector<float> * other_token_scores,
-        double split_fraction) {
+        double split_fraction,
+        const std::vector<PFlashTokenSpan> * documents) {
     const int input_tokens = (int) ids.size();
     const int query_end = score_query_end < 0 ? input_tokens : score_query_end;
     const int query_tokens = std::min(n_lookahead, query_end);
@@ -226,7 +231,16 @@ std::vector<int32_t> select_pflash_chunks(
             dflash::pflash::pflash_chunk_is_structurally_required(
                 begin, end, query_begin, query_end, input_tokens,
                 required_instruction_spans);
-        candidates.push_back({(size_t) chunk, begin, end, score, mandatory});
+        // The last document starting at or before this candidate; everything
+        // ahead of the first document start belongs to the first document.
+        size_t document = 0;
+        if (documents) {
+            for (size_t index = 0; index < documents->size(); ++index) {
+                if ((*documents)[index].begin <= begin) document = index;
+                else break;
+            }
+        }
+        candidates.push_back({(size_t) chunk, begin, end, score, mandatory, document});
         chunk_means.push_back({(float) score, chunk});
         exact_chunk_scores.push_back(score);
     }
@@ -242,14 +256,16 @@ std::vector<int32_t> select_pflash_chunks(
                 score += (*other_token_scores)[(size_t) token];
             }
             score /= (double) std::max(1, candidate.end - candidate.begin);
-            other_candidates.push_back({candidate.ordinal, candidate.begin, candidate.end, score, candidate.mandatory});
+            other_candidates.push_back({candidate.ordinal, candidate.begin, candidate.end,
+                                        score, candidate.mandatory, candidate.document});
             other_scores.push_back(score);
         }
     }
 
     const dflash::pflash::PFlashSelectionPolicy policy{selector_budget, config.top_p,
                                                       /*skip_oversized=*/ segments != nullptr,
-                                                      config.top_k};
+                                                      config.top_k,
+                                                      config.doc_prior_exponent};
     const auto selected = split
         ? dflash::pflash::select_pflash_split(candidates, other_candidates, policy, split_fraction, config.mode)
         : dflash::pflash::select_pflash_candidates(candidates, policy, config.mode);
@@ -289,14 +305,16 @@ std::vector<int32_t> select_pflash_chunks(
 
     std::fprintf(stderr,
         "[pflash-select] selected mode=%s scorer=%s segments=%s score=%s chunk=%d query=%d "
-        "budget=%d selected_tokens=%zu chunks=%zu/%d stop=%s mass=%.9g\n",
+        "budget=%d selected_tokens=%zu chunks=%zu/%d stop=%s mass=%.9g "
+        "docs=%zu doc_prior=%.9g applied=%d\n",
         dflash::pflash::pflash_selection_mode_name(config.mode),
         split ? "split" : "single",
         segments ? "probe" : "fixed", density ? "density" : "sum",
         segments ? 0 : config.chunk_size, query_tokens, selector_budget, output.size(),
         selected.ordinals.size(), n_chunks,
         dflash::pflash::pflash_selection_stop_name(selected.stop),
-        selected.retained_mass);
+        selected.retained_mass, selected.documents, config.doc_prior_exponent,
+        (int) selected.doc_prior_applied);
     std::fflush(stderr);
 
     if (write_trace) {
@@ -317,6 +335,9 @@ std::vector<int32_t> select_pflash_chunks(
         strict_fields.other_chunk_scores = split ? &other_scores : nullptr;
         strict_fields.top_k =
             config.mode == dflash::pflash::PFlashSelectionMode::TopK ? config.top_k : 0;
+        strict_fields.doc_prior_exponent = config.doc_prior_exponent;
+        strict_fields.documents = selected.documents;
+        strict_fields.doc_prior_applied = selected.doc_prior_applied;
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,

@@ -105,6 +105,11 @@ struct PFlashTraceFields {
     const std::vector<double> * other_chunk_scores = nullptr;
     // Rank-mode ceiling: the K that applied, 0 outside top_k mode.
     int top_k = 0;
+    // Document prior: the configured exponent, the documents the selector
+    // saw, and whether the prior actually reweighted the ranking.
+    double doc_prior_exponent = 0.0;
+    size_t documents = 0;
+    bool doc_prior_applied = false;
 };
 
 void write_compression_trace(
@@ -134,6 +139,11 @@ std::vector<int32_t> select_pflash_chunks(
         const std::vector<PFlashTokenSpan> * segments = nullptr,
         bool density = false,
         const std::vector<float> * other_token_scores = nullptr,
-        double split_fraction = 0.0);
+        double split_fraction = 0.0,
+        // Document starts in prompt-token coordinates, for the document
+        // prior. A candidate belongs to the last document starting at or
+        // before its first token. Null or shorter than
+        // ``kPFlashMinPriorDocuments`` leaves the prior a no-op.
+        const std::vector<PFlashTokenSpan> * documents = nullptr);
 
 } // namespace dflash::common

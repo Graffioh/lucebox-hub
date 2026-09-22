@@ -1392,7 +1392,8 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
     result.compressed_ids = drafter_score_and_compress(
         pflash_drafter_, req.input_ids, req.keep_ratio,
         /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
-        score_query_end, req.required_instruction_spans);
+        score_query_end, req.required_instruction_spans,
+        req.document_spans);
     result.ok = !result.compressed_ids.empty();
     if (result.ok) {
         std::fprintf(stderr, "[target-split][compress] %zu -> %zu tokens\n",

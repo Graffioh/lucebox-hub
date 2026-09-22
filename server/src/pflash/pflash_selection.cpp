@@ -21,6 +21,7 @@ constexpr const char * kQueryEnv = "PFLASH_SELECT_QUERY_TOKENS";
 constexpr const char * kQueryParserEnv = "PFLASH_SELECT_QUERY_PARSER";
 constexpr const char * kTopPEnv = "PFLASH_SELECT_TOP_P";
 constexpr const char * kTopKEnv = "PFLASH_SELECT_TOPK";
+constexpr const char * kDocPriorEnv = "PFLASH_SELECT_DOC_PRIOR";
 constexpr const char * kSegmentsEnv = "PFLASH_SELECT_SEGMENTS";
 constexpr const char * kSelectEnv = "PFLASH_SELECT_SCORE";
 constexpr const char * kScorerEnv = "PFLASH_SELECT_SCORER";
@@ -73,6 +74,7 @@ bool has_pflash_selection_environment() noexcept {
            std::getenv(kQueryParserEnv) != nullptr ||
            std::getenv(kTopPEnv) != nullptr ||
            std::getenv(kTopKEnv) != nullptr ||
+           std::getenv(kDocPriorEnv) != nullptr ||
            std::getenv(kSegmentsEnv) != nullptr ||
            std::getenv(kSelectEnv) != nullptr ||
            std::getenv(kScorerEnv) != nullptr ||
@@ -147,6 +149,11 @@ PFlashSelectionResult select_pflash_candidates(
     if (mode == PFlashSelectionMode::TopK && policy.top_k <= 0) {
         return invalid_result("PFlash top_k must be positive");
     }
+    if (!std::isfinite(policy.doc_prior_exponent) ||
+        policy.doc_prior_exponent < 0.0) {
+        return invalid_result(
+            "PFlash document prior exponent must be finite and non-negative");
+    }
 
     std::vector<const PFlashSelectionCandidate *> source_ranges;
     source_ranges.reserve(candidates.size());
@@ -202,10 +209,43 @@ PFlashSelectionResult select_pflash_candidates(
         }
     }
 
+    // Document prior. A document's mass is the sum over its candidates --
+    // mandatory ones included, since they are part of the prompt -- of
+    // max(0, score) * tokens, normalised by the prompt total. Ranking by
+    // score * share^exponent lets a document the head likes as a whole lift
+    // its own segments, which per-segment density ranking throws away.
+    std::vector<std::pair<size_t, double>> document_mass;
+    for (const auto & candidate : candidates) {
+        const double mass = std::max(0.0, candidate.score) *
+            (double) (candidate.end - candidate.begin);
+        auto it = std::find_if(document_mass.begin(), document_mass.end(),
+            [&](const auto & entry) { return entry.first == candidate.document; });
+        if (it == document_mass.end()) {
+            document_mass.push_back({candidate.document, mass});
+        } else {
+            it->second += mass;
+        }
+    }
+    double total_mass = 0.0;
+    for (const auto & entry : document_mass) total_mass += entry.second;
+    result.documents = document_mass.size();
+    result.doc_prior_applied = policy.doc_prior_exponent > 0.0 &&
+        document_mass.size() >= kPFlashMinPriorDocuments && total_mass > 0.0;
+
+    const auto rank_score = [&](const PFlashSelectionCandidate * candidate) {
+        const double base = std::max(0.0, candidate->score);
+        if (!result.doc_prior_applied) return base;
+        double share = 0.0;
+        for (const auto & entry : document_mass) {
+            if (entry.first == candidate->document) { share = entry.second; break; }
+        }
+        return base * std::pow(share / total_mass, policy.doc_prior_exponent);
+    };
+
     std::sort(optional.begin(), optional.end(),
-        [](const auto * left, const auto * right) {
-            const double left_score = std::max(0.0, left->score);
-            const double right_score = std::max(0.0, right->score);
+        [&](const auto * left, const auto * right) {
+            const double left_score = rank_score(left);
+            const double right_score = rank_score(right);
             if (left_score != right_score) return left_score > right_score;
             return left->ordinal < right->ordinal;
         });
@@ -316,6 +356,7 @@ bool resolve_pflash_selection(
     const char * query_parser_raw = std::getenv(kQueryParserEnv);
     const char * top_p_raw = std::getenv(kTopPEnv);
     const char * top_k_raw = std::getenv(kTopKEnv);
+    const char * doc_prior_raw = std::getenv(kDocPriorEnv);
     const char * segments_raw = std::getenv(kSegmentsEnv);
     const char * select_raw = std::getenv(kSelectEnv);
     const char * scorer_raw = std::getenv(kScorerEnv);
@@ -323,8 +364,8 @@ bool resolve_pflash_selection(
 
     PFlashSelectionConfig config;
     config.configured = mode_raw || chunk_raw || query_raw ||
-        query_parser_raw || top_p_raw || top_k_raw || segments_raw ||
-        select_raw || scorer_raw || split_raw;
+        query_parser_raw || top_p_raw || top_k_raw || doc_prior_raw ||
+        segments_raw || select_raw || scorer_raw || split_raw;
     if (scorer_raw) {
         if (std::strcmp(scorer_raw, "head") == 0) {
             config.scorer = PFlashScorer::Head;
@@ -421,6 +462,13 @@ bool resolve_pflash_selection(
 
     if (top_k_raw && (!parse_int(top_k_raw, config.top_k) || config.top_k <= 0)) {
         error = std::string(kTopKEnv) + " must be a positive integer";
+        return false;
+    }
+    if (doc_prior_raw &&
+        (!parse_double(doc_prior_raw, config.doc_prior_exponent) ||
+         config.doc_prior_exponent < 0.0)) {
+        error = std::string(kDocPriorEnv) +
+            " must be a non-negative number";
         return false;
     }
     if (config.mode == PFlashSelectionMode::TopK && config.top_k <= 0) {

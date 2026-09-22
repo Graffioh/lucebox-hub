@@ -104,7 +104,8 @@ std::vector<int32_t> drafter_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const std::vector<PFlashTokenSpan> & required_instruction_spans) {
+    const std::vector<PFlashTokenSpan> & required_instruction_spans,
+    const std::vector<PFlashTokenSpan> & document_spans) {
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
         return {};
@@ -145,12 +146,13 @@ std::vector<int32_t> drafter_score_and_compress(
         std::fprintf(stderr,
             "[pflash-select] config mode=%s active=%d chunk=%d "
             "query_parser=%s query_cap=%d query_actual=%d top_p=%.9g "
-            "top_k=%d input=%zu\n",
+            "top_k=%d doc_prior=%.9g doc_spans=%zu input=%zu\n",
             dflash::pflash::pflash_selection_mode_name(experiment.mode),
             (int) experiment.selection_active, experiment.chunk_size,
             dflash::pflash::pflash_query_parser_name(experiment.query_parser),
             experiment.query_tokens, n_lookahead, experiment.top_p,
-            experiment.top_k, ids.size());
+            experiment.top_k, experiment.doc_prior_exponent,
+            document_spans.size(), ids.size());
         std::fflush(stderr);
     }
     if (score_query_end < 0) {
@@ -159,7 +161,8 @@ std::vector<int32_t> drafter_score_and_compress(
     }
     return qwen35_drafter_score_and_compress(
         ctx, ids, keep_ratio, chunk_size, n_lookahead, pool_kernel,
-        score_query_end, experiment, required_instruction_spans);
+        score_query_end, experiment, required_instruction_spans,
+        document_spans);
 }
 
 } // namespace dflash::common
