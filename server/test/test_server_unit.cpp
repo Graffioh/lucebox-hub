@@ -1044,6 +1044,14 @@ TEST_CASE(ServerUnitFixture, test_pflash_selection_cache_and_continuation_policy
     TEST_ASSERT(!http_detail::pflash_full_cache_restore_allowed(true));
 }
 
+TEST_CASE(ServerUnitFixture, test_timings_json_carries_pflash_details) {
+    GenTimings timings;
+    TEST_ASSERT(!build_timings_json(timings, 0).contains("pflash"));
+    timings.pflash = {{"compress_ms", 12.5}, {"view", {{"mode", "continue"}}}};
+    const auto out = build_timings_json(timings, 0);
+    TEST_ASSERT(out["pflash"]["view"]["mode"] == "continue");
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_subtract_token_spans) {
     const std::vector<PFlashTokenSpan> spans{{0, 10}, {20, 30}, {40, 50}};
     const std::vector<PFlashTokenSpan> minus{{5, 22}, {25, 26}, {40, 50}};
@@ -7365,6 +7373,7 @@ TEST_CASE(ServerUnitFixture,
     std::vector<int32_t> served1;
     std::vector<int32_t> served2;
     std::vector<int32_t> served3;
+    std::vector<std::string> modes;
     {
         HttpServer server(engine, tokenizer, config);
         server.set_drafter_tokenizer(&tokenizer);
@@ -7379,6 +7388,11 @@ TEST_CASE(ServerUnitFixture,
             TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
             TEST_ASSERT(prepared.compressed);
             served = prepared.tokens;
+            // usage.timings.pflash reports the view outcome.
+            TEST_ASSERT(prepared.pflash_stats.contains("view"));
+            modes.push_back(prepared.pflash_stats["view"].value("mode", ""));
+            TEST_ASSERT(prepared.pflash_stats["view"].value("served_tokens", 0) ==
+                        (int) served.size());
             // The snapshot lands where the next turn's prompt branches off.
             const auto generation =
                 tokenizer.encode("<|im_start|>assistant\n<think>\n");
@@ -7412,6 +7426,7 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(text2.find("beta facts", recall) != std::string::npos);
     TEST_ASSERT(question != std::string::npos && question > recall);
     TEST_ASSERT(served3 == served2);
+    TEST_ASSERT(modes == std::vector<std::string>({"fresh", "continue", "repeat"}));
     unlink(path.c_str());
 }
 

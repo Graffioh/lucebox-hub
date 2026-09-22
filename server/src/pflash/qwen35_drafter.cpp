@@ -1201,6 +1201,8 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         std::chrono::duration<double>(t2 - t0).count(),
         st.head_loaded ? "trained" : "native-block15");
     std::fflush(stderr);
+    pflash_set_scoring_stats({resume, n_new, (int) windows.size(),
+                              std::chrono::duration<double>(t1 - t0).count()});
 
     std::vector<PFlashTokenSpan> segments;
     bool density = experiment.candidate_score == luce::pflash::PFlashCandidateScore::Density;

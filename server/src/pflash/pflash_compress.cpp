@@ -181,7 +181,16 @@ void write_compression_trace(
 
 namespace {
 thread_local std::vector<PFlashTokenSpan> g_last_kept_spans;
+thread_local PFlashScoringStats g_last_scoring_stats;
 } // namespace
+
+const PFlashScoringStats & pflash_last_scoring_stats() {
+    return g_last_scoring_stats;
+}
+
+void pflash_set_scoring_stats(const PFlashScoringStats & stats) {
+    g_last_scoring_stats = stats;
+}
 
 const std::vector<PFlashTokenSpan> & pflash_last_kept_spans() {
     return g_last_kept_spans;
@@ -189,6 +198,7 @@ const std::vector<PFlashTokenSpan> & pflash_last_kept_spans() {
 
 void pflash_clear_kept_spans() {
     g_last_kept_spans.clear();
+    g_last_scoring_stats = {};
 }
 
 std::vector<int32_t> select_pflash_chunks(

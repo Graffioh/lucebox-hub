@@ -290,6 +290,11 @@ struct ModelBackend {
         // Strict selection: the input spans behind compressed_ids, ascending.
         // Empty when the backend does not report them (remote drafter).
         std::vector<PFlashTokenSpan> kept_spans;
+        // Drafter session reuse: the token scoring resumed from and the
+        // tokens it ran (-1 when unknown), and its forward time.
+        int                  scorer_resume = -1;
+        int                  scorer_new_tokens = -1;
+        double               scorer_forward_s = 0.0;
 
         static CompressResult from_compressed_ids(
                 std::vector<int32_t> ids) {

@@ -127,6 +127,18 @@ void write_compression_trace(
 const std::vector<PFlashTokenSpan> & pflash_last_kept_spans();
 void pflash_clear_kept_spans();
 
+// What the last strict scoring on this thread reused: the token its drafter
+// session resumed from, how many tokens it ran, how many query windows it
+// scored. Cleared with the kept spans.
+struct PFlashScoringStats {
+    int resume = -1;
+    int new_tokens = -1;
+    int query_windows = 0;
+    double forward_s = 0.0;
+};
+const PFlashScoringStats & pflash_last_scoring_stats();
+void pflash_set_scoring_stats(const PFlashScoringStats & stats);
+
 std::vector<int32_t> select_pflash_chunks(
         const std::vector<int32_t> & ids,
         const std::vector<float> & token_scores,

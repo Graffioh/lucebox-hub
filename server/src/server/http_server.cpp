@@ -4364,6 +4364,7 @@ std::string HttpServer::apply_pflash_compression(
 
     ModelBackend::CompressResult result;
     std::vector<int32_t> final_tokens;
+    const auto compress_started = std::chrono::steady_clock::now();
     for (int attempt = 0; ; ++attempt) {
         result = {};
         if (config_.pflash_remote_drafter) {
@@ -4461,11 +4462,25 @@ std::string HttpServer::apply_pflash_compression(
                 std::to_string(target_ceiling) + ")";
         }
     }
+    prepared.pflash_stats = {
+        {"compress_ms", std::round(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - compress_started).count() * 10.0) / 10.0},
+        {"drafter_input_tokens", compress_request.input_ids.size()},
+        {"kept_tokens", kept_tokens},
+        {"keep_ratio", compress_request.keep_ratio},
+        {"compressed_tokens", final_tokens.size()},
+        {"query_rule", parser_selection_rule},
+        {"history_queries", history_query_spans.size()},
+        {"scorer_resume", result.scorer_resume},
+        {"scorer_new_tokens", result.scorer_new_tokens},
+        {"scorer_forward_ms", std::round(result.scorer_forward_s * 10000.0) / 10.0},
+    };
     if (experiment.selection_active && messages_input && chat_turn.valid() &&
         !result.kept_spans.empty()) {
         final_tokens = continue_pflash_chat_view(
             req, compress_request.input_ids, chat_turn, result.kept_spans,
-            std::move(final_tokens), prepared.snapshot_cut);
+            std::move(final_tokens), prepared.snapshot_cut,
+            prepared.pflash_stats["view"]);
     }
     prepared.tokens = std::move(final_tokens);
     prepared.compressed = true;
@@ -4483,8 +4498,10 @@ std::vector<int32_t> HttpServer::continue_pflash_chat_view(
         const http_detail::PflashChatTurnSpan & turn,
         const std::vector<PFlashTokenSpan> & kept_spans,
         std::vector<int32_t> fresh,
-        int & snapshot_cut) {
+        int & snapshot_cut,
+        json & stats) {
     snapshot_cut = -1;
+    stats = nullptr;
     const char * disabled = std::getenv("PFLASH_CHAT_VIEW");
     if (disabled && std::string(disabled) == "0") return fresh;
     const int input = (int) drafter_ids.size();
@@ -4527,6 +4544,8 @@ std::vector<int32_t> HttpServer::continue_pflash_chat_view(
         std::fprintf(stderr,
             "[pflash-view] %s turn=%d served=%zu\n", why, turns, fresh.size());
         std::fflush(stderr);
+        stats = {{"mode", why}, {"turn", turns}, {"served_tokens", fresh.size()},
+                 {"fresh_tokens", fresh.size()}};
         pflash_views_.remember(std::move(next));
         return std::move(fresh);
     };
@@ -4536,6 +4555,9 @@ std::vector<int32_t> HttpServer::continue_pflash_chat_view(
         std::fprintf(stderr, "[pflash-view] repeat turn=%d served=%zu\n",
                      view.turns, view.view_tokens.size());
         std::fflush(stderr);
+        stats = {{"mode", "repeat"}, {"turn", view.turns},
+                 {"served_tokens", view.view_tokens.size()},
+                 {"fresh_tokens", fresh.size()}};
         snapshot_cut = view.view_gen_begin;
         return view.view_tokens;
     }
@@ -4635,6 +4657,10 @@ std::vector<int32_t> HttpServer::continue_pflash_chat_view(
         next.turns, served.size(), view.view_gen_begin, delta_tokens.size(),
         recalled_tokens, fresh.size());
     std::fflush(stderr);
+    stats = {{"mode", "continue"}, {"turn", next.turns},
+             {"served_tokens", served.size()}, {"reused_tokens", view.view_gen_begin},
+             {"delta_tokens", delta_tokens.size()},
+             {"recalled_tokens", recalled_tokens}, {"fresh_tokens", fresh.size()}};
     pflash_views_.remember(std::move(next));
     return served;
 }
@@ -5924,6 +5950,7 @@ void HttpServer::process_job(ServerJob * job) {
         effective_prompt_tokens - cached_prefix_tokens,
         effective_prompt_tokens,
         agent_turn_cache_hit,
+        prepared.pflash_stats,
     };
 
     // Record performance for /status page.

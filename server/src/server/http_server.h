@@ -628,6 +628,8 @@ private:
         // else asks for one: a multi-turn PFlash view sets the start of its
         // generation prompt, where the next turn's prompt branches off.
         int snapshot_cut = -1;
+        // PFlash details for usage.timings.pflash (see build_timings_json).
+        nlohmann::json pflash_stats;
         int error_status = 0;
         std::string error;
     };
@@ -648,7 +650,8 @@ private:
         const http_detail::PflashChatTurnSpan & turn,
         const std::vector<PFlashTokenSpan> & kept_spans,
         std::vector<int32_t> fresh,
-        int & snapshot_cut);
+        int & snapshot_cut,
+        nlohmann::json & stats);
     bool forward_upstream(ServerJob * job, const ParsedRequest & req,
                           const PreparedPrompt & prepared);
 
