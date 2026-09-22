@@ -6,7 +6,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <condition_variable>
+#include <exception>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -48,6 +54,63 @@ constexpr size_t kCopyChunk = 8u * 1024u * 1024u;
 
 [[noreturn]] void fail(const std::string & message) {
     throw std::runtime_error(message);
+}
+
+// Worker threads for the per-expert passes; set once from --threads.
+unsigned g_threads = 1;
+
+// Runs work(i) for i in [0, n) on g_threads threads and hands each result to
+// consume(i, result) in index order, so the output does not depend on the
+// thread count. Workers run at most two batches ahead of the consumer.
+template <typename Result>
+void for_each_expert_ordered(uint32_t n,
+                             const std::function<Result(uint32_t)> & work,
+                             const std::function<void(uint32_t, Result &)> & consume) {
+    const unsigned threads = std::max(1u, std::min<unsigned>(g_threads, n == 0 ? 1 : n));
+    const uint32_t window = threads * 2;
+    std::vector<std::optional<Result>> slots(n);
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::atomic<uint32_t> next{0};
+    std::exception_ptr error;
+    uint32_t consumed = 0;
+    auto worker = [&] {
+        for (;;) {
+            const uint32_t i = next.fetch_add(1);
+            if (i >= n) return;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                ready.wait(lock, [&] { return error || i < consumed + window; });
+                if (error) return;
+            }
+            try {
+                Result result = work(i);
+                std::lock_guard<std::mutex> lock(mutex);
+                slots[i] = std::move(result);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!error) error = std::current_exception();
+            }
+            ready.notify_all();
+        }
+    };
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker);
+    for (uint32_t i = 0; i < n; ++i) {
+        Result result;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            ready.wait(lock, [&] { return error || slots[i].has_value(); });
+            if (error) break;
+            result = std::move(*slots[i]);
+            slots[i].reset();
+            consumed = i + 1;
+        }
+        ready.notify_all();
+        consume(i, result);
+    }
+    for (auto & t : pool) t.join();
+    if (error) std::rethrow_exception(error);
 }
 
 uint64_t checked_mul(uint64_t a, uint64_t b, const std::string & what) {
@@ -560,11 +623,12 @@ struct Options {
     bool validate_input_only = false;
     int layer_count = -1;
     int expert_limit = -1;
+    int threads = 0;  // 0 = every core
 };
 
 void usage(const char * argv0) {
     std::cerr << "Usage: " << argv0 << " --input DIR --output FILE (--imatrix FILE | --absmax-only)\n"
-              << "       [--layer-count N] [--expert-limit N] [--experts-only] [--validate-input-only] [--force]\n";
+              << "       [--layer-count N] [--expert-limit N] [--experts-only] [--validate-input-only] [--force] [--threads N]\n";
 }
 
 int parse_nonnegative(const char * value, const std::string & option, bool allow_zero = true) {
@@ -594,6 +658,7 @@ Options parse_options(int argc, char ** argv) {
         else if (arg == "--validate-input-only") out.validate_input_only = true;
         else if (arg == "--layer-count") out.layer_count = parse_nonnegative(value(), arg, false);
         else if (arg == "--expert-limit") out.expert_limit = parse_nonnegative(value(), arg, false);
+        else if (arg == "--threads") out.threads = parse_nonnegative(value(), arg, false);
         else if (arg == "--help" || arg == "-h") { usage(argv[0]); std::exit(0); }
         else fail("unknown option " + arg);
     }
@@ -1104,37 +1169,49 @@ void write_expert_tensor(FILE * out, const SafeTensorSet & source,
         ? calibration.gate_up : calibration.down;
     const std::string target = target_expert_name(calibration.layer, recipe);
     const std::vector<float> * importance = require_imatrix(imatrix, target, expected.in);
-    std::vector<uint8_t> packed, scales;
-    std::vector<float> values;
-    std::vector<block_rocmfp2> q2(expected.in/kBlock);
-    std::vector<block_rocmfp3> q3(expected.in/kBlock);
-    for (uint32_t expert = 0; expert < experts; ++expert) {
+    if (recipe.qtype != GGML_TYPE_Q2_1_ROCMFP2_MIX && recipe.qtype != GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+        fail("recipe table contains unsupported qtype");
+    }
+    const std::function<std::vector<uint8_t>(uint32_t)> encode_expert = [&](uint32_t expert) {
         const TensorShape shape = validate_expert_source(source, calibration.layer, expert, recipe);
         if (shape.in != expected.in || shape.out != expected.out) fail("expert shape drift in " + target);
         const StEntry & w = source.at(source_expert_name(calibration.layer, expert, recipe, "weight"));
         const StEntry & s = source.at(source_expert_name(calibration.layer, expert, recipe, "scale"));
         OpenTensorPair input(w, s);
         const auto & books = registry.experts.at(expert);
+        std::vector<uint8_t> packed, scales;
+        std::vector<float> values;
+        std::vector<block_rocmfp2> q2(expected.in/kBlock);
+        std::vector<block_rocmfp3> q3(expected.in/kBlock);
+        const size_t row_bytes = recipe.qtype == GGML_TYPE_Q2_1_ROCMFP2_MIX
+            ? q2.size()*sizeof(q2[0]) : q3.size()*sizeof(q3[0]);
+        std::vector<uint8_t> bytes;
+        bytes.reserve(static_cast<size_t>(shape.out) * row_bytes);
         for (uint32_t row = 0; row < shape.out; ++row) {
             decode_expert_row(input, row, shape.in, packed, scales, values);
+            const uint8_t * encoded = nullptr;
             if (recipe.qtype == GGML_TYPE_Q2_1_ROCMFP2_MIX) {
                 if (!rocmfpx_quantize_row_fp2_mix_ref(values.data(), q2.data(), shape.in,
                                                        books.data(), importance ? importance->data() : nullptr)) {
                     fail("qtype-106 reference encoder rejected " + w.name);
                 }
-                fwrite_exact(out, q2.data(), q2.size()*sizeof(q2[0]), target);
-            } else if (recipe.qtype == GGML_TYPE_Q3_1_ROCMFP3_MIX) {
+                encoded = reinterpret_cast<const uint8_t *>(q2.data());
+            } else {
                 if (!rocmfpx_quantize_row_fp3_mix_ref(values.data(), q3.data(), shape.in,
                                                        books.data(), importance ? importance->data() : nullptr)) {
                     fail("qtype-105 reference encoder rejected " + w.name);
                 }
-                fwrite_exact(out, q3.data(), q3.size()*sizeof(q3[0]), target);
-            } else {
-                fail("recipe table contains unsupported qtype");
+                encoded = reinterpret_cast<const uint8_t *>(q3.data());
             }
+            bytes.insert(bytes.end(), encoded, encoded + row_bytes);
         }
+        return bytes;
+    };
+    const std::function<void(uint32_t, std::vector<uint8_t> &)> write = [&](uint32_t expert, std::vector<uint8_t> & bytes) {
+        fwrite_exact(out, bytes.data(), bytes.size(), target);
         std::cerr << "[encode] " << target << " expert " << (expert + 1) << "/" << experts << "\n";
-    }
+    };
+    for_each_expert_ordered<std::vector<uint8_t>>(experts, encode_expert, write);
 }
 
 std::vector<LayerCalibration> validate_input_layout(
@@ -1170,14 +1247,19 @@ std::vector<LayerCalibration> calibrate(
         current.layer = static_cast<int>(layer);
         current.gate_up.levels = kGuLevels;
         current.down.levels = kP4Levels;
-        for (uint32_t expert = 0; expert < experts; ++expert) {
+        struct ExpertFit {
+            TensorShape gate_shape, down_shape;
+            std::vector<uint16_t> gate_up, down;
+            std::vector<std::string> repairs;
+        };
+        const std::function<ExpertFit(uint32_t)> fit_expert = [&](uint32_t expert) {
+            ExpertFit fit;
             HistogramFitter gate_up_fitter;
-            TensorShape gate_shape{};
             for (const ExpertRecipe & recipe : kExpertRecipes) {
                 if (recipe.books != BookSource::GateUpJoint) continue;
                 const TensorShape shape = validate_expert_source(source, layer, expert, recipe);
-                if (gate_shape.in == 0) gate_shape = shape;
-                if (shape.in != gate_shape.in || shape.out != gate_shape.out) {
+                if (fit.gate_shape.in == 0) fit.gate_shape = shape;
+                if (shape.in != fit.gate_shape.in || shape.out != fit.gate_shape.out) {
                     fail("qtype-106 gate/up shape mismatch at layer " + std::to_string(layer));
                 }
                 const std::string target = target_expert_name(layer, recipe);
@@ -1186,23 +1268,29 @@ std::vector<LayerCalibration> calibrate(
             }
             HistogramFitter down_fitter;
             const ExpertRecipe & down_recipe = kExpertRecipes[2];
-            const TensorShape down_shape = validate_expert_source(source, layer, expert, down_recipe);
+            fit.down_shape = validate_expert_source(source, layer, expert, down_recipe);
             const auto * down_importance = require_imatrix(
-                imatrix, target_expert_name(layer, down_recipe), down_shape.in);
+                imatrix, target_expert_name(layer, down_recipe), fit.down_shape.in);
             add_expert_to_fitter(source, layer, expert, down_recipe, down_importance, down_fitter);
-
-            if (current.gate_up_shape.in == 0) current.gate_up_shape = gate_shape;
-            if (current.down_shape.in == 0) current.down_shape = down_shape;
-            if (current.gate_up_shape.in != gate_shape.in || current.gate_up_shape.out != gate_shape.out ||
-                current.down_shape.in != down_shape.in || current.down_shape.out != down_shape.out) {
+            const std::string label = "layer=" + std::to_string(layer) + " expert=" + std::to_string(expert);
+            fit.gate_up = gate_up_fitter.fit(kGuLevels, label + " gate_up", &fit.repairs);
+            fit.down = down_fitter.fit(kP4Levels, label + " down", &fit.repairs);
+            return fit;
+        };
+        const std::function<void(uint32_t, ExpertFit &)> keep = [&](uint32_t expert, ExpertFit & fit) {
+            if (current.gate_up_shape.in == 0) current.gate_up_shape = fit.gate_shape;
+            if (current.down_shape.in == 0) current.down_shape = fit.down_shape;
+            if (current.gate_up_shape.in != fit.gate_shape.in || current.gate_up_shape.out != fit.gate_shape.out ||
+                current.down_shape.in != fit.down_shape.in || current.down_shape.out != fit.down_shape.out) {
                 fail("expert shapes vary within layer " + std::to_string(layer));
             }
-            const std::string label = "layer=" + std::to_string(layer) + " expert=" + std::to_string(expert);
-            current.gate_up.experts.push_back(gate_up_fitter.fit(kGuLevels, label + " gate_up", &current.repairs));
-            current.down.experts.push_back(down_fitter.fit(kP4Levels, label + " down", &current.repairs));
+            current.gate_up.experts.push_back(std::move(fit.gate_up));
+            current.down.experts.push_back(std::move(fit.down));
+            for (auto & stamp : fit.repairs) current.repairs.push_back(std::move(stamp));
             std::cerr << "[calibration] layer " << layer << " expert " << (expert + 1)
                       << "/" << experts << " fitted joint gate/up and down codebooks\n";
-        }
+        };
+        for_each_expert_ordered<ExpertFit>(experts, fit_expert, keep);
         result.push_back(std::move(current));
     }
     return result;
@@ -1359,6 +1447,8 @@ int main(int argc, char ** argv) {
         static_assert(static_cast<int>(GGML_TYPE_Q3_1_ROCMFP3_MIX) == static_cast<int>(kQtypeP4Mix));
         static_assert(static_cast<int>(GGML_TYPE_Q2_1_ROCMFP2_MIX) == static_cast<int>(kQtypeGuMix));
         const Options options = parse_options(argc, argv);
+        g_threads = options.threads > 0 ? static_cast<unsigned>(options.threads)
+                                        : std::max(1u, std::thread::hardware_concurrency());
         SafeTensorSet source(options.input);
         const uint32_t source_layers = config_u32(source.config(), "num_hidden_layers");
         const uint32_t source_experts = config_u32(source.config(), "n_routed_experts");
