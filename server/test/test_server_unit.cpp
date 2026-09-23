@@ -7501,6 +7501,119 @@ TEST_CASE(ServerUnitFixture,
     unlink(path.c_str());
 }
 
+// Two turns over one document through prepare_prompt; returns the served
+// prompts, the view modes and how often the compressor ran.
+struct PflashTwoTurnRun {
+    std::vector<std::vector<int32_t>> served;
+    std::vector<std::string> modes;
+    int compress_calls = 0;
+    std::string text2;
+};
+
+static PflashTwoTurnRun pflash_two_turn_run(const std::string & follow_up) {
+    std::string system;
+    for (int i = 0; i < 20; ++i) system += "You are helpful. ";
+    const std::string document =
+        "alpha facts live here. filler filler filler. beta facts live here.";
+    const std::vector<ChatMessage> turn1{
+        {"system", system, ""},
+        {"user", document + " Question one?", ""},
+    };
+    auto turn2 = turn1;
+    turn2.push_back({"assistant", "Answer one.", ""});
+    turn2.push_back({"user", follow_up + " Question two?", ""});
+    const auto render = [] (const std::vector<ChatMessage> & messages) {
+        return render_chat_template(messages, ChatFormat::QWEN3,
+                                    /*add_generation_prompt=*/true,
+                                    /*enable_thinking=*/true);
+    };
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"alpha", " facts", "beta", " live", " here", ".", " filler",
+         "Question", " one", " two", "?", "Answer", "user", "assistant",
+         "system", "\n", "You", " are", " helpful", " pasted", " notes"},
+        render(turn2) +
+            "[Earlier in this conversation]\n[End of earlier excerpts]\n");
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<MockPflashSpanBackend>();
+    MockPflashSpanBackend & backend = *backend_owner;
+    backend.pick = [&] (const ModelBackend::CompressRequest & request) {
+        const auto span = http_detail::pflash_decoded_text_span(
+            tokenizer, request.input_ids, 0, (int) request.input_ids.size(),
+            "alpha facts");
+        return span.begin < 0 ? std::vector<PFlashTokenSpan>{}
+                              : std::vector<PFlashTokenSpan>{span};
+    };
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.pflash_keep_ratio = 1.0f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    PflashTwoTurnRun run;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        const std::vector<const std::vector<ChatMessage> *> turns{&turn1, &turn2};
+        for (const auto * messages : turns) {
+            ParsedRequest request;
+            request.format = ApiFormat::OPENAI_CHAT;
+            json wire = json::array();
+            for (const auto & message : *messages) {
+                wire.push_back({{"role", message.role}, {"content", message.content}});
+            }
+            request.messages = wire;
+            request.prompt_tokens = tokenizer.encode(render(*messages));
+            const auto prepared = HttpServerTestAccess::prepare_prompt(server, request);
+            TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+            run.served.push_back(prepared.tokens);
+            run.modes.push_back(prepared.pflash_stats["view"].value("mode", ""));
+        }
+    }
+    run.compress_calls = backend.compress_calls;
+    run.text2 = tokenizer.decode(run.served[1]);
+    unlink(path.c_str());
+    return run;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_view_small_follow_up_without_recall_skips_the_drafter) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar recall{"PFLASH_CHAT_RECALL", "0"};
+    const auto run = pflash_two_turn_run("");
+    // Turn 2 is appended exactly as full prefill appends it: no scoring.
+    TEST_ASSERT(run.compress_calls == 1);
+    TEST_ASSERT(run.modes == std::vector<std::string>({"fresh", "continue"}));
+    TEST_ASSERT(run.text2.find("[Earlier in this conversation]") == std::string::npos);
+    TEST_ASSERT(run.text2.find("Answer one.") != std::string::npos);
+    TEST_ASSERT(run.text2.find("Question two?") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_view_compresses_large_follow_ups_only) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar threshold{"PFLASH_CHAT_COMPRESS_NEW_TOKENS", "40"};
+    // Wide enough that the pinned query covers the whole question.
+    luce_test::ScopedEnvVar query{"PFLASH_SELECT_QUERY_TOKENS", "16"};
+    std::string pasted;
+    for (int i = 0; i < 12; ++i) pasted += " pasted notes filler.";
+    const auto run = pflash_two_turn_run(pasted);
+    TEST_ASSERT(run.compress_calls == 2);
+    TEST_ASSERT(run.modes == std::vector<std::string>({"fresh", "continue-compressed"}));
+    // The view before the new material is reused token for token...
+    const auto & first = run.served[0];
+    const auto & second = run.served[1];
+    TEST_ASSERT(second.size() > 0 && first.size() > 16);
+    const size_t prefix = first.size() - 8;
+    TEST_ASSERT(std::equal(first.begin(), first.begin() + (long) (prefix - 8),
+                           second.begin()));
+    // ...and the pasted material is compressed: only the pinned question and
+    // what the selection keeps survive, not the whole paste.
+    TEST_ASSERT_MSG(run.text2.find("Question two?") != std::string::npos, run.text2);
+    TEST_ASSERT(run.text2.find(pasted) == std::string::npos);
+}
+
 TEST_CASE(ServerUnitFixture,
         test_pflash_legacy_chat_query_uses_last_user_turn) {
     // No strict-selection environment: the legacy selector derives the same

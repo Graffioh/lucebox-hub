@@ -417,6 +417,15 @@ view grows past twice the fresh prompt, or past the context, the fresh prompt
 starts a new view. `PFLASH_CHAT_VIEW=0` serves the fresh compression every
 turn.
 
+What a turn adds is appended verbatim while it is small, the way full
+prefill appends a follow-up; from `PFLASH_CHAT_COMPRESS_NEW_TOKENS` (default
+16384) tokens of new material (a pasted document, a large tool output) only
+what the fresh selection keeps of it is appended, and the view before it
+stays cached. `PFLASH_CHAT_RECALL=0` turns recall off: a small follow-up is
+then served without running the drafter at all. `PFLASH_VIEW_TRACE_PATH`
+appends each compressed request's served prompt as JSONL, for evidence
+checks in evaluations.
+
 Every other turn of a multi-turn chat keeps its role header, and user
 turns and assistant answers up to `PFLASH_CHAT_SKELETON_TOKENS` (default 256
 drafter tokens; 0 keeps headers only) stay whole: the conversation's

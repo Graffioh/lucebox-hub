@@ -627,6 +627,20 @@ int pflash_chat_skeleton_tokens() noexcept {
     return (int) (std::min)(value, 1L << 20);
 }
 
+bool pflash_chat_recall() noexcept {
+    const char * raw = std::getenv("PFLASH_CHAT_RECALL");
+    return !(raw && std::string(raw) == "0");
+}
+
+int pflash_chat_compress_new_tokens() noexcept {
+    const char * raw = std::getenv("PFLASH_CHAT_COMPRESS_NEW_TOKENS");
+    if (!raw || !*raw) return 16384;
+    char * end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || value < 1) return 16384;
+    return (int) (std::min)(value, 1L << 30);
+}
+
 int pflash_chat_history_queries() noexcept {
     const char * raw = std::getenv("PFLASH_CHAT_HISTORY_QUERIES");
     if (!raw || !*raw) return 3;
@@ -4362,6 +4376,29 @@ std::string HttpServer::apply_pflash_compression(
     }
     const float requested_keep_ratio = compress_request.keep_ratio;
 
+    // A turn the conversation's view serves without scoring -- the same
+    // prompt again, or a small follow-up appended verbatim with recall off
+    // -- skips the drafter altogether.
+    if (experiment.selection_active && messages_input && chat_turn.valid() &&
+        !config_.pflash_remote_drafter) {
+        std::vector<int32_t> served;
+        json view_stats;
+        if (serve_pflash_chat_view(
+                req, compress_request.input_ids, chat_turn, nullptr, nullptr,
+                served, prepared.snapshot_cut, view_stats)) {
+            prepared.tokens = std::move(served);
+            prepared.compressed = true;
+            prepared.pflash_stats = {
+                {"compress_ms", 0.0},
+                {"drafter_input_tokens", compress_request.input_ids.size()},
+                {"query_rule", parser_selection_rule},
+                {"view", view_stats},
+            };
+            trace_pflash_served(req, prepared);
+            return {};
+        }
+    }
+
     ModelBackend::CompressResult result;
     std::vector<int32_t> final_tokens;
     const auto compress_started = std::chrono::steady_clock::now();
@@ -4477,13 +4514,17 @@ std::string HttpServer::apply_pflash_compression(
     };
     if (experiment.selection_active && messages_input && chat_turn.valid() &&
         !result.kept_spans.empty()) {
-        final_tokens = continue_pflash_chat_view(
-            req, compress_request.input_ids, chat_turn, result.kept_spans,
-            std::move(final_tokens), prepared.snapshot_cut,
-            prepared.pflash_stats["view"]);
+        std::vector<int32_t> served;
+        if (serve_pflash_chat_view(
+                req, compress_request.input_ids, chat_turn, &final_tokens,
+                &result.kept_spans, served, prepared.snapshot_cut,
+                prepared.pflash_stats["view"])) {
+            final_tokens = std::move(served);
+        }
     }
     prepared.tokens = std::move(final_tokens);
     prepared.compressed = true;
+    trace_pflash_served(req, prepared);
     std::fprintf(stderr,
         "[pflash] %d -> %d -> %d tokens (%.1f%% kept)\n",
         prompt_tokens, (int) result.compressed_ids.size(),
@@ -4492,21 +4533,38 @@ std::string HttpServer::apply_pflash_compression(
     return {};
 }
 
-std::vector<int32_t> HttpServer::continue_pflash_chat_view(
+void HttpServer::trace_pflash_served(
+        const ParsedRequest & req, const PreparedPrompt & prepared) {
+    const char * path = std::getenv("PFLASH_VIEW_TRACE_PATH");
+    if (!path || !*path) return;
+    const json record = {
+        {"schema_version", 1},
+        {"prompt_tokens", req.prompt_tokens.size()},
+        {"served_tokens", prepared.tokens.size()},
+        {"pflash", prepared.pflash_stats},
+        {"served_text", tokenizer_.decode(prepared.tokens)},
+    };
+    std::ofstream out(path, std::ios::app);
+    if (out) out << record.dump(-1, ' ', false, json::error_handler_t::replace) << "\n";
+}
+
+bool HttpServer::serve_pflash_chat_view(
         const ParsedRequest & req,
         const std::vector<int32_t> & drafter_ids,
         const http_detail::PflashChatTurnSpan & turn,
-        const std::vector<PFlashTokenSpan> & kept_spans,
-        std::vector<int32_t> fresh,
+        const std::vector<int32_t> * fresh,
+        const std::vector<PFlashTokenSpan> * kept_spans,
+        std::vector<int32_t> & served,
         int & snapshot_cut,
         json & stats) {
     snapshot_cut = -1;
     stats = nullptr;
+    const bool compressed = fresh != nullptr && kept_spans != nullptr;
     const char * disabled = std::getenv("PFLASH_CHAT_VIEW");
-    if (disabled && std::string(disabled) == "0") return fresh;
+    if (disabled && std::string(disabled) == "0") return false;
     const int input = (int) drafter_ids.size();
     if (turn.generation_begin <= 0 || turn.generation_begin >= input) {
-        return fresh;
+        return false;
     }
     // The generation prompt, in target tokens: the raw prompt and every
     // served prompt end with it (strict selection keeps it verbatim).
@@ -4520,8 +4578,8 @@ std::vector<int32_t> HttpServer::continue_pflash_chat_view(
                        tokens.end() - (long) generation.size());
     };
     if (!ends_with_generation(req.prompt_tokens) ||
-        !ends_with_generation(fresh)) {
-        return fresh;
+        (compressed && !ends_with_generation(*fresh))) {
+        return false;
     }
     const int raw_gen_begin =
         (int) (req.prompt_tokens.size() - generation.size());
@@ -4536,46 +4594,60 @@ std::vector<int32_t> HttpServer::continue_pflash_chat_view(
     const bool continues =
         pflash_views_.find(req.prompt_tokens, drafter_ids, view);
     const auto serve_fresh = [&] (const char * why, int turns) {
-        next.view_tokens = fresh;
-        next.view_gen_begin = (int) (fresh.size() - generation.size());
-        next.spans = kept_spans;
+        next.view_tokens = *fresh;
+        next.view_gen_begin = (int) (fresh->size() - generation.size());
+        next.spans = *kept_spans;
         next.turns = turns;
         snapshot_cut = next.view_gen_begin;
         std::fprintf(stderr,
-            "[pflash-view] %s turn=%d served=%zu\n", why, turns, fresh.size());
+            "[pflash-view] %s turn=%d served=%zu\n", why, turns, fresh->size());
         std::fflush(stderr);
-        stats = {{"mode", why}, {"turn", turns}, {"served_tokens", fresh.size()},
-                 {"fresh_tokens", fresh.size()}};
+        stats = {{"mode", why}, {"turn", turns}, {"served_tokens", fresh->size()},
+                 {"fresh_tokens", fresh->size()}};
+        served = *fresh;
         pflash_views_.remember(std::move(next));
-        return std::move(fresh);
+        return true;
     };
-    if (!continues) return serve_fresh("fresh", 1);
-    if (view.raw_tokens == req.prompt_tokens) {
+    if (continues && view.raw_tokens == req.prompt_tokens) {
         // The same prompt again (a retry): serve what was served.
         std::fprintf(stderr, "[pflash-view] repeat turn=%d served=%zu\n",
                      view.turns, view.view_tokens.size());
         std::fflush(stderr);
         stats = {{"mode", "repeat"}, {"turn", view.turns},
-                 {"served_tokens", view.view_tokens.size()},
-                 {"fresh_tokens", fresh.size()}};
+                 {"served_tokens", view.view_tokens.size()}};
+        if (compressed) stats["fresh_tokens"] = fresh->size();
         snapshot_cut = view.view_gen_begin;
-        return view.view_tokens;
+        served = view.view_tokens;
+        return true;
     }
-    if (view.drafter_gen_begin >= turn.generation_begin ||
-        view.view_gen_begin <= 0 ||
-        (size_t) view.view_gen_begin > view.view_tokens.size()) {
-        return serve_fresh("fresh", 1);
-    }
+    const bool usable = continues &&
+        view.drafter_gen_begin < turn.generation_begin &&
+        view.view_gen_begin > 0 &&
+        (size_t) view.view_gen_begin <= view.view_tokens.size();
+    if (!usable) return compressed && serve_fresh("fresh", 1);
+
+    // What this turn adds to the conversation, in target tokens. A small
+    // follow-up is appended verbatim, the way full prefill appends it; one
+    // of PFLASH_CHAT_COMPRESS_NEW_TOKENS or more (a pasted document, a large
+    // tool output) goes through the compressor, and only the new material
+    // is compressed, so the view it extends stays cached.
+    const int new_tokens = raw_gen_begin + (int) generation.size() -
+        view.raw_gen_begin;
+    const bool compress_new =
+        new_tokens >= http_detail::pflash_chat_compress_new_tokens();
+    const bool new_question = turn.role_begin >= view.drafter_gen_begin;
+    const bool recall = new_question && http_detail::pflash_chat_recall();
+    if (!compressed && (compress_new || recall)) return false;
 
     // Recall: what the fresh selection keeps for the new query that the view
     // does not hold. Only a new user turn brings a new query; an agent step
     // (assistant call plus tool output) appends without recalling.
     std::vector<PFlashTokenSpan> recalled;
-    if (turn.role_begin >= view.drafter_gen_begin) {
+    if (compressed && recall) {
         auto in_view = view.spans;
         in_view.push_back({view.drafter_gen_begin, input});
         recalled = http_detail::pflash_subtract_token_spans(
-            kept_spans,
+            *kept_spans,
             http_detail::canonicalize_pflash_token_spans(std::move(in_view)));
     }
     std::string recall_block;
@@ -4618,51 +4690,72 @@ std::vector<int32_t> HttpServer::continue_pflash_chat_view(
         }
     }
 
-    // The previous view without its generation prompt, then this turn's new
-    // tokens from where that generation prompt started; recalled excerpts
-    // open the new user turn's content, after everything the target cached.
+    // This turn's new tokens from where the previous generation prompt
+    // started: all of them, or the parts the fresh selection keeps when they
+    // are compressed. Recalled excerpts open the new user turn's content,
+    // after everything the target cached.
     const auto decode_range = [&] (int begin, int end) {
-        return drafter_tokenizer_->decode(std::vector<int32_t>(
-            drafter_ids.begin() + begin, drafter_ids.begin() + end));
+        return end > begin
+            ? drafter_tokenizer_->decode(std::vector<int32_t>(
+                  drafter_ids.begin() + begin, drafter_ids.begin() + end))
+            : std::string();
     };
-    const std::string delta = recall_block.empty()
-        ? decode_range(view.drafter_gen_begin, input)
-        : decode_range(view.drafter_gen_begin, turn.content_begin) +
-            recall_block + decode_range(turn.content_begin, input);
-    std::vector<int32_t> served(view.view_tokens.begin(),
-                                view.view_tokens.begin() + view.view_gen_begin);
+    std::vector<PFlashTokenSpan> delta_spans;
+    if (compress_new) {
+        delta_spans = http_detail::pflash_subtract_token_spans(
+            *kept_spans, {{0, view.drafter_gen_begin}});
+    } else {
+        delta_spans.push_back({view.drafter_gen_begin, input});
+    }
+    const int split = new_question && !recall_block.empty()
+        ? turn.content_begin : input;
+    std::string delta;
+    for (const auto & span : delta_spans) {
+        delta += decode_range(span.begin, (std::min)(span.end, split));
+    }
+    delta += recall_block;
+    for (const auto & span : delta_spans) {
+        delta += decode_range((std::max)(span.begin, split), span.end);
+    }
+    served.assign(view.view_tokens.begin(),
+                  view.view_tokens.begin() + view.view_gen_begin);
     const auto delta_tokens = tokenizer_.encode(delta);
     served.insert(served.end(), delta_tokens.begin(), delta_tokens.end());
     if (!ends_with_generation(served)) {
-        return serve_fresh("fresh", 1);
+        return compressed && serve_fresh("fresh", 1);
     }
     // Rebuild when the view outgrew what a fresh selection keeps, or the
     // context: the fresh prompt starts a new view, prefilled from scratch.
-    const bool outgrown = served.size() > 2 * fresh.size() ||
-        (config_.max_ctx > 0 &&
-         (int) served.size() + req.max_output > config_.max_ctx);
-    if (outgrown) return serve_fresh("rebuild", view.turns + 1);
+    const bool too_long = config_.max_ctx > 0 &&
+        (int) served.size() + req.max_output > config_.max_ctx;
+    const bool outgrown = compressed && served.size() > 2 * fresh->size();
+    if (too_long || outgrown) {
+        return compressed && serve_fresh("rebuild", view.turns + 1);
+    }
 
     auto spans = view.spans;
-    spans.push_back({view.drafter_gen_begin, input});
+    spans.insert(spans.end(), delta_spans.begin(), delta_spans.end());
     spans.insert(spans.end(), recalled.begin(), recalled.end());
     next.view_tokens = served;
     next.view_gen_begin = (int) (served.size() - generation.size());
     next.spans = http_detail::canonicalize_pflash_token_spans(std::move(spans));
     next.turns = view.turns + 1;
     snapshot_cut = next.view_gen_begin;
+    const char * mode = compress_new ? "continue-compressed" : "continue";
     std::fprintf(stderr,
-        "[pflash-view] continue turn=%d served=%zu reused=%d delta=%zu "
-        "recalled=%d fresh=%zu\n",
-        next.turns, served.size(), view.view_gen_begin, delta_tokens.size(),
-        recalled_tokens, fresh.size());
+        "[pflash-view] %s turn=%d served=%zu reused=%d new=%d delta=%zu "
+        "recalled=%d fresh=%d\n",
+        mode, next.turns, served.size(), view.view_gen_begin, new_tokens,
+        delta_tokens.size(), recalled_tokens,
+        compressed ? (int) fresh->size() : -1);
     std::fflush(stderr);
-    stats = {{"mode", "continue"}, {"turn", next.turns},
+    stats = {{"mode", mode}, {"turn", next.turns},
              {"served_tokens", served.size()}, {"reused_tokens", view.view_gen_begin},
-             {"delta_tokens", delta_tokens.size()},
-             {"recalled_tokens", recalled_tokens}, {"fresh_tokens", fresh.size()}};
+             {"new_tokens", new_tokens}, {"delta_tokens", delta_tokens.size()},
+             {"recalled_tokens", recalled_tokens}};
+    if (compressed) stats["fresh_tokens"] = fresh->size();
     pflash_views_.remember(std::move(next));
-    return served;
+    return true;
 }
 
 HttpServer::PreparedPrompt HttpServer::prepare_prompt(

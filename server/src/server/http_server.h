@@ -315,6 +315,13 @@ int pflash_chat_skeleton_tokens() noexcept;
 // question alone.
 int pflash_chat_history_queries() noexcept;
 
+// Multi-turn follow-ups: PFLASH_CHAT_RECALL=0 turns recall off (a small
+// follow-up is then appended exactly as full prefill appends it, without
+// scoring); PFLASH_CHAT_COMPRESS_NEW_TOKENS (default 16384) is the size of
+// new material in one turn from which it is compressed instead of appended.
+bool pflash_chat_recall() noexcept;
+int pflash_chat_compress_new_tokens() noexcept;
+
 // The parts of ``spans`` that ``minus`` does not cover. Both canonical.
 std::vector<PFlashTokenSpan> pflash_subtract_token_spans(
     const std::vector<PFlashTokenSpan> & spans,
@@ -642,16 +649,26 @@ private:
     std::string apply_pflash_compression(const ParsedRequest & req,
                                          PreparedPrompt & prepared);
     // Multi-turn: serve the conversation's previous view plus this turn's
-    // new tokens (and the segments the fresh selection wants that the view
-    // lacks) when one continues into this prompt; else the fresh prompt.
-    std::vector<int32_t> continue_pflash_chat_view(
+    // new material -- verbatim below PFLASH_CHAT_COMPRESS_NEW_TOKENS, else
+    // the parts the fresh selection keeps -- with the segments the fresh
+    // selection wants that the view lacks recalled at the new user turn.
+    // Without a fresh compression (``fresh`` null) it serves only what needs
+    // no scoring: a repeated prompt, or a small follow-up with recall off;
+    // it returns false for the caller to compress. With one it always
+    // serves: a continued view, or the fresh prompt as a new view.
+    bool serve_pflash_chat_view(
         const ParsedRequest & req,
         const std::vector<int32_t> & drafter_ids,
         const http_detail::PflashChatTurnSpan & turn,
-        const std::vector<PFlashTokenSpan> & kept_spans,
-        std::vector<int32_t> fresh,
+        const std::vector<int32_t> * fresh,
+        const std::vector<PFlashTokenSpan> * kept_spans,
+        std::vector<int32_t> & served,
         int & snapshot_cut,
         nlohmann::json & stats);
+    // PFLASH_VIEW_TRACE_PATH: one JSONL record per compressed request with
+    // the served prompt's text, for evidence checks in evaluations.
+    void trace_pflash_served(const ParsedRequest & req,
+                             const PreparedPrompt & prepared);
     bool forward_upstream(ServerJob * job, const ParsedRequest & req,
                           const PreparedPrompt & prepared);
 
