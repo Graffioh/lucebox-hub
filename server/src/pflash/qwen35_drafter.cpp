@@ -1351,9 +1351,23 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
             &other_scores, experiment.split_fraction);
     }
     if (experiment.selection_active && !force_legacy) {
-        return qwen35_strict_score_and_compress(
+        auto kept = qwen35_strict_score_and_compress(
             *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
             required_instruction_spans);
+        // Non-finite head scores (once in ~500 development requests, not
+        // reproduced) leave the scoring session forgotten: score the prompt
+        // again from scratch, one drafter forward, instead of failing the
+        // request.
+        if (kept.empty() &&
+            std::strncmp(luce_last_error(), "non-finite", 10) == 0) {
+            std::fprintf(stderr,
+                "[qwen35-scorer] non-finite scores; rescoring from scratch\n");
+            std::fflush(stderr);
+            kept = qwen35_strict_score_and_compress(
+                *st, ids, keep_ratio, n_lookahead, score_query_end, experiment,
+                required_instruction_spans);
+        }
+        return kept;
     }
     if (st->head_loaded && !experiment.selection_active) {
         set_last_error("Qwen3.5 scoring head requires strict selection");
