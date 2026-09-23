@@ -630,7 +630,7 @@ int pflash_chat_skeleton_tokens() noexcept {
 
 bool pflash_paragraph_join() noexcept {
     const char * raw = std::getenv("PFLASH_SELECT_PARAGRAPH_JOIN");
-    return raw && std::string(raw) == "1";
+    return !(raw && std::string(raw) == "0");
 }
 
 std::string pflash_join_kept_spans(
@@ -4554,7 +4554,7 @@ std::string HttpServer::apply_pflash_compression(
         std::string compressed_text =
             drafter_tokenizer_->decode(result.compressed_ids);
         join_overhead = 0;
-        // PFLASH_SELECT_PARAGRAPH_JOIN=1: kept pieces that were not adjacent
+        // Kept pieces that were not adjacent
         // in the prompt are joined by a paragraph break when neither side
         // already has one, so a cut does not glue two passages into one
         // run-on line ("...other bands.Document 1:").

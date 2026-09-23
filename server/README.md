@@ -428,8 +428,10 @@ to uniform attention) of at least `PFLASH_CHAT_RECALL_MIN_LIFT` (default 8),
 strongest first, up to `PFLASH_CHAT_RECALL_TOKENS` (default 2048 drafter
 tokens), so a content-free follow-up ("which documents support that?")
 recalls next to nothing instead of filling the budget with noise beside the
-question. `PFLASH_SELECT_PARAGRAPH_JOIN=1` joins kept pieces that were not
-adjacent with a paragraph break (off by default). `PFLASH_VIEW_TRACE_PATH`
+question. Kept pieces that were not adjacent in the prompt are joined by a
+paragraph break when neither side has one (`PFLASH_SELECT_PARAGRAPH_JOIN=0`
+turns it off; the breaks do not count against the token ceiling).
+`PFLASH_VIEW_TRACE_PATH`
 appends each compressed request's served prompt as JSONL, for evidence
 checks in evaluations.
 

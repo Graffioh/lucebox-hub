@@ -322,9 +322,10 @@ int pflash_chat_history_queries() noexcept;
 // new material in one turn from which it is compressed instead of appended.
 bool pflash_chat_recall() noexcept;
 
-// PFLASH_SELECT_PARAGRAPH_JOIN=1: the compressed text is rebuilt from the
-// kept spans with a paragraph break between pieces that were not adjacent
-// in the prompt, unless one side already ends or starts a paragraph.
+// The compressed text is rebuilt from the kept spans with a paragraph break
+// between pieces that were not adjacent in the prompt, unless one side
+// already ends or starts a paragraph (PFLASH_SELECT_PARAGRAPH_JOIN=0 turns
+// it off).
 bool pflash_paragraph_join() noexcept;
 std::string pflash_join_kept_spans(
     const Tokenizer & tokenizer,
