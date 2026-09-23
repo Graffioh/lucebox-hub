@@ -36,6 +36,7 @@ class BackendPlan final {
 public:
     struct Model {
         std::string path;
+        std::optional<std::string> mmproj_path;
         GgufModelInfo metadata;
     };
 

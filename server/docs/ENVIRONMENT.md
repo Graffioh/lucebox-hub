@@ -79,6 +79,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 | `LUCE_KVFLASH` | unset | Prefer the CLI: `--kvflash` (token count or `auto`). |
 | `LUCE_PREFIX_CACHE_SLOTS` | 32 | Container-entrypoint equivalent of `--prefix-cache-slots`; not read directly by the native binary. |
 | `LUCE_PREFILL_CACHE_SLOTS` | 0 | Container-entrypoint equivalent of `--prefill-cache-slots`; not read directly by the native binary. |
+| `LUCE_MMPROJ` | unset | Container-entrypoint equivalent of `--mmproj` (vision projector path, enables image input); not read directly by the native binary. |
 | `LUCE_PREFILL_POOL_TRIM_TOKENS` | unset | OPT-IN: trim cached allocations from legacy CUDA/HIP device pools at completed Qwen3.5 prefill chunk boundaries after each configured token interval. Intended for long, shape-changing prefills on non-VMM devices; each trim synchronizes the target backend and retires captured graphs. |
 | `LUCE_SPLIT_FAST_ROLLBACK` | unset | OPT-IN: exact F32 checkpoints and replay-free rollback for local qwen35 target layer splits. Prefer `--target-split-fast-rollback`; adds checkpoint VRAM (~1.65 GiB for the measured Qwen3.6-27B q=16 split). |
 | `LUCE_STALL_TOOL_PREFIX` | unset | OPT-IN: recover a stalled tool call by injecting the prepared tool prefix when generation stops after an action suffix. |
@@ -293,6 +294,7 @@ consolidation of this list into CLI flags is tracked as follow-up work.
 - `LUCE_NO_MOE_SWIGLU_FUSE` - qwen35moe_ffn.cpp
 - `LUCE_NO_PREAD` - deepseek4_loader.cpp
 - `LUCE_PROF` - prof_env.h
+- `LUCE_MMPROJ` - scripts/entrypoint.sh (maps to `--mmproj`)
 - `LUCE_PREFILL_CACHE_SLOTS` - scripts/entrypoint.sh (maps to `--prefill-cache-slots`)
 - `LUCE_PREFILL_POOL_TRIM_TOKENS` - qwen35_backend.cpp (OPT-IN: trim legacy device pools during long prefills)
 - `LUCE_PREFILL_TIMING` - qwen35_backend.cpp (DEBUG: per-ubatch prefill build/alloc/compute timing)

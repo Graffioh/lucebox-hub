@@ -47,6 +47,19 @@ std::string check_feature_compatibility(
         return "--target-shard-ipc-work-dir requires --target-shard-ipc-bin";
     }
 
+    // ── vision projector × architecture / placement
+    if (args.mmproj_path.has_value()) {
+        if ((arch != "deepseek4" && arch != "qwen35") || args.device.is_layer_split() ||
+            args.device.is_tensor_parallel() || args.remote_target_shard.enabled() ||
+            args.max_concurrency != 1) {
+            return "--mmproj requires a local single-request DeepSeek4 or Qwen3.5 backend "
+                   "that is not split across GPUs by layer or tensor";
+        }
+        if (arch == "deepseek4" && target_backend != PlacementBackend::Hip) {
+            return "--mmproj with DeepSeek4 requires a HIP backend";
+        }
+    }
+
     // ── PFlash enablement × drafter model
     if (admission.pflash_enabled &&
         !admission.pflash_drafter_configured) {

@@ -238,6 +238,7 @@ See [Continuous batching in Lucebox](https://www.lucebox.com/blog/continuous-bat
 | OpenAI Chat Completions, Responses, and Anthropic Messages | [API reference](server/docs/API.md) |
 | CUDA, HIP, and mixed-device placement | [Mixed-backend guide](server/docs/MIXED_BACKEND.md) |
 | DeepSeek V4 single-device and heterogeneous profiles | [DeepSeek V4 guide](server/docs/DS4.md) |
+| Image input (Qwen3.8, DeepSeek V4 Flash Vision) | [Image input guide](docs/image-input.md) |
 | Environment variables | [Environment reference](server/docs/ENVIRONMENT.md) |
 | Server internals | [Architecture](server/docs/ARCHITECTURE.md) |
 | Client integration and qualification | [Harness guide](harness/README.md) |

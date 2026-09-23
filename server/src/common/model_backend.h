@@ -26,6 +26,7 @@
 #include "ggml-backend.h"
 #include "generation_types.h"
 #include "sampler.h"
+#include "image_prompt.h"
 #include "concurrency/seq_engine.h"
 #include "placement/draft_residency.h"
 
@@ -134,6 +135,27 @@ struct DaemonIO {
 // ─── Backend interface ──────────────────────────────────────────────────
 struct ModelBackend {
     virtual ~ModelBackend() = default;
+
+    // Image input. A backend that supports it names the text its chat template
+    // turns into the image marker, and binds decoded images to a rendered prompt.
+    virtual bool supports_images() const { return false; }
+    virtual std::string image_placeholder() const { return {}; }
+    virtual bool prepare_images(std::vector<int32_t> & tokens,
+                                std::vector<EncodedImage> images,
+                                uint64_t context_capacity,
+                                uint64_t output_reserve,
+                                ImagePromptHandle & payload,
+                                std::string & error) const {
+        (void) tokens;
+        (void) context_capacity;
+        (void) output_reserve;
+        if (!images.empty()) {
+            error = "this backend does not support image input";
+            return false;
+        }
+        payload.reset();
+        return true;
+    }
 
     // Print the "[<arch>-daemon] ready ..." banner on stdout.
     virtual void print_ready_banner() const = 0;

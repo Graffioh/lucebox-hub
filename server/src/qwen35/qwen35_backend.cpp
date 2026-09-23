@@ -1,4 +1,5 @@
 #include "qwen35_backend.h"
+#include "qwen35_image_request.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "common/chain_rollback_policy.h"
 #include "common/adaptive_spec_width.h"
@@ -329,6 +330,7 @@ bool Qwen35Backend::init() {
         return false;
     }
     std::printf("[target] %s\n", luce_last_error());
+    if (!load_vision()) return false;
     if (cfg_.paged_attention &&
         (w_.n_embd_head_k != 256 || w_.n_embd_head_v != 256)) {
         std::fprintf(stderr,
@@ -895,6 +897,7 @@ bool Qwen35Backend::park(ParkTarget target) {
         step_graph_destroy(proj_sg_);
         dflash2_selector_graph_invalidate();
         free_target_weights(w_);
+        vision_.reset();
         target_parked_ = true;
         std::printf("[park] target released\n"); std::fflush(stdout);
     }
@@ -909,6 +912,11 @@ bool Qwen35Backend::unpark(ParkTarget target) {
     if (want_target_model && target_parked_) {
         if (!load_target_model(target_backend_, w_)) {
             std::fprintf(stderr, "[unpark] target: %s\n", luce_last_error());
+            return false;
+        }
+        if (!load_vision()) {
+            // Stay parked, so a retry starts from released weights.
+            free_target_weights(w_);
             return false;
         }
         kvflash_drafter_failed_ = false;   // fresh VRAM: allow a retry
@@ -1353,6 +1361,7 @@ void Qwen35Backend::shutdown() {
         free_prefix_snapshot(prefix_snapshots_[i]);
     }
     if (!target_parked_) free_target_weights(w_);
+    vision_.reset();  // its buffers belong to target_backend_, freed below
     if (!use_remote_draft && !draft_parked_) free_draft_weights(dw_);
     free_target_cache(cache_);
     if (split_gpus_ && draft_backend_) {
@@ -1453,7 +1462,19 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
 
     // Prefill
     auto t_prefill_start = std::chrono::steady_clock::now();
-    const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot);
+    Qwen35ImageRows image_rows;
+    if (req.images) {
+        const auto * prompt = dynamic_cast<const Qwen35ImagePrompt *>(req.images.get());
+        std::string image_error = "image binding does not match the prompt";
+        if (!prompt || !prompt->matches(req.prompt) ||
+            !encode_images(*prompt, image_rows, image_error)) {
+            result.fail(GenerateErrorCode::BackendSpecific, image_error);
+            return result;
+        }
+    }
+    const bool has_images = image_rows.prompt != nullptr;
+    const int committed = do_prefill(req.prompt, out_io, req.snap_pos, req.snap_slot,
+                                     /*kv_offset=*/0, has_images ? &image_rows : nullptr);
     if (committed < 0) {
         result.fail(GenerateErrorCode::PrefillFailed);
         return result;
@@ -1503,7 +1524,9 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                     req.n_gen, ar_n_gen, committed, cfg_.device.max_ctx);
             }
         }
-        if (cfg_.paged_attention || req.force_ar_decode) {
+        // Speculative decoding takes rotary positions from KV positions, which
+        // an image prompt pulls apart, so image requests decode one by one.
+        if (cfg_.paged_attention || req.force_ar_decode || has_images) {
             decode_ok = do_ar_decode(committed, ar_n_gen, result.tokens, out_io,
                                      req.budget_hook,
                                      &result.budget_forced_close,
@@ -1555,6 +1578,16 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
         out_io.emit(-1);
         return result;
     }
+    if (req.images) {
+        // A snapshot is keyed by tokens, and pad tokens do not identify an image.
+        result.fail(GenerateErrorCode::BackendSpecific,
+                    "image requests cannot resume from a snapshot");
+        out_io.emit(-1);
+        return result;
+    }
+    // An exact snapshot hit decodes without a prefill, so the offset a
+    // previous image request left behind must not survive into this one.
+    rope_delta_ = 0;
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
         result.fail(GenerateErrorCode::InvalidSnapshotSlot);
         out_io.emit(-1);
@@ -1725,7 +1758,19 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
 int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                                const DaemonIO & io,
                                int snap_pos, int snap_slot,
-                               int kv_offset) {
+                               int kv_offset,
+                               const Qwen35ImageRows * images) {
+    if (images && kv_offset != 0) {
+        std::fprintf(stderr, "prefill: an image prompt must start at position 0\n");
+        return -1;
+    }
+    if (images) {
+        // Snapshots are found again by their tokens, and pads say nothing
+        // about which image they stood for.
+        snap_pos = -1;
+        snap_slot = -1;
+    }
+    rope_delta_ = images ? images->prompt->positions.next - (int)tokens.size() : 0;
     // A finite --fa-window caps the full-attention layers to a sliding
     // window, so anything earlier than the window is invisible to them. That
     // is silent: the model still answers, it just cannot see the head of a
@@ -1917,12 +1962,17 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (!w_.embedder.embed(tokens.data() + start, n_tokens, embed_buf.data())) {
             return -1;
         }
+        if (images) images->overwrite(embed_buf.data(), start, n_tokens, hidden);
         ggml_backend_tensor_set(sg_.inp_embed, embed_buf.data(), 0,
                                 sizeof(float) * (size_t)hidden * n_tokens);
 
         // Positions (M-RoPE)
         std::vector<int32_t> pos_buf((size_t)4 * n_tokens, 0);
-        fill_qwen35_mrope_positions(pos_buf.data(), kv_pos, n_tokens);
+        if (images) {
+            images->prompt->positions.fill(pos_buf.data(), start, n_tokens);
+        } else {
+            fill_qwen35_mrope_positions(pos_buf.data(), kv_pos, n_tokens);
+        }
         ggml_backend_tensor_set(sg_.positions, pos_buf.data(), 0,
                                 sizeof(int32_t) * pos_buf.size());
 
@@ -2326,7 +2376,8 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
 
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
         ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
-        int32_t pos4[4] = {committed, committed, committed, 0};
+        const int32_t rope_pos = committed + rope_delta_;
+        int32_t pos4[4] = {rope_pos, rope_pos, rope_pos, 0};
         ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
 
         // kvflash: graph carries a slot-validity mask alongside the

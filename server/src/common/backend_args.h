@@ -54,6 +54,9 @@ struct BackendArgs {
     // Optional: speculative decode draft model (qwen35 only)
     std::optional<std::string> draft_path;
 
+    // Optional: vision projector .gguf (deepseek4 only)
+    std::optional<std::string> mmproj_path;
+
     // Device placement
     DevicePlacement device;
     DevicePlacement draft_device;

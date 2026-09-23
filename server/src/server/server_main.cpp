@@ -85,6 +85,7 @@ static void print_usage(const char * prog) {
         "                      Defaults to the first block; request model names\n"
         "                      do not change generation routing.\n"
         "  --draft <path>       Draft model for speculative decode\n"
+        "  --mmproj <path>      Vision projector GGUF: enables image input (Qwen3.5/3.8, DS4V)\n"
         "  --port <N>           Listen port (default: 8080)\n"
         "  --host <addr>        Bind address (default: 0.0.0.0)\n"
         "  --max-ctx <N>        Max context length (default: 131072)\n"
@@ -358,6 +359,12 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
         }
         if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
             bargs.draft_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--mmproj") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "[server] --mmproj needs a projector GGUF path\n");
+                return 2;
+            }
+            bargs.mmproj_path = argv[++i];
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             sconfig.port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
