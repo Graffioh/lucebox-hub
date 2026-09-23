@@ -1727,7 +1727,7 @@ bool DeepSeek4Backend::init() {
         return false;
     }
     if (cfg_.paged_attention && moe_hybrid_ &&
-        !moe_hybrid_->materialized_cold_experts) {
+        moe_hybrid_->streams_cold_experts()) {
         std::fprintf(stderr,
             "[deepseek4] paged serving requires statically materialized "
             "expert ownership; enable in-process LUCE_DS4_MOE_TP\n");
@@ -2392,7 +2392,7 @@ bool DeepSeek4Backend::init_hybrid_model() {
                      "[deepseek4] speculative verifier routes all experts "
                      "to the duplicated secondary stack\n");
     }
-    if (hybrid->has_mmap() && !hybrid->materialized_cold_experts) {
+    if (hybrid->has_mmap() && hybrid->streams_cold_experts()) {
         size_t max_expert_bytes = 0;
         for (const auto & layer : hybrid->layers) {
             const size_t per_expert_bytes = layer.fused_gate_up
@@ -2419,7 +2419,9 @@ bool DeepSeek4Backend::init_hybrid_model() {
     w_.moe_hybrid = true;
     const int total_cold = w_.n_layer * w_.n_expert - moe_placement_.total_hot;
     const char * cold_backend =
-        moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu ? "gpu" : "cpu";
+        moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::Gpu  ? "gpu"
+        : moe_hybrid_->cold_backend_kind == MoeHybridColdBackend::None ? "none"
+                                                                       : "cpu";
     std::fprintf(stderr, "[deepseek4] hybrid experts ready: hot=%d cold=%d cold_backend=%s%s\n",
                  moe_placement_.total_hot, total_cold, cold_backend, "");
     return true;
