@@ -4370,6 +4370,10 @@ bool eval_moe_shared_expert_batched(
         if (err) *err = "shared expert requires a host activation";
         return false;
     }
+    if (!gpu_backend) {
+        if (err) *err = "shared expert requires a GPU backend";
+        return false;
+    }
 
     CachedHotBatchedGraph & g = storage.shared_batched_graph;
     if (!g.valid() || g.n_tokens != n_tokens) {

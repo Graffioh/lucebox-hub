@@ -124,7 +124,7 @@ TEST_CASE(MoeHybridStorageFixture, cold_owner_none_refuses_a_shared_expert_in_th
     // caller sums across owners. The evaluator refuses before touching a
     // backend instead of double counting.
     const float cur[8] = {};
-    const int32_t ids[2] = {0, -1};
+    const int32_t ids[2] = {0, 1};
     const float weights[2] = {1.0f, 1.0f};
     std::vector<float> out;
     std::string err;
@@ -140,6 +140,22 @@ TEST_CASE(MoeHybridStorageFixture, cold_owner_none_refuses_a_shared_expert_in_th
     out.assign(3, 1.0f);
     CHECK(eval_moe_shared_expert_batched(nullptr, cfg, desc, storage, cur, -1, out));
     CHECK(out.empty());
+    CHECK(!eval_moe_shared_expert_batched(nullptr, cfg, desc, storage, cur, 2, out, &err));
+    CHECK(err.find("GPU backend") != std::string::npos);
+}
+
+TEST_CASE(MoeHybridStorageFixture, cold_owner_none_does_not_stream_cold_experts) {
+    MoeHybridStorage storage;
+    storage.materialized_cold_experts = false;
+    storage.cold_backend_kind = MoeHybridColdBackend::Gpu;
+    CHECK(storage.streams_cold_experts());
+    storage.cold_backend_kind = MoeHybridColdBackend::Cpu;
+    CHECK(storage.streams_cold_experts());
+    storage.cold_backend_kind = MoeHybridColdBackend::None;
+    CHECK(!storage.streams_cold_experts());
+    storage.materialized_cold_experts = true;
+    storage.cold_backend_kind = MoeHybridColdBackend::Gpu;
+    CHECK(!storage.streams_cold_experts());
 }
 
 TEST_CASE(MoeHybridStorageFixture, expert_residency_tracks_model_sized_expert_sets) {
