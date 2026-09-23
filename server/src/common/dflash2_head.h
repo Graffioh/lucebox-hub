@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Invalidate the cached selector projection graph. MUST be called whenever
 // draft weights are freed (park); the cache is keyed on the DraftWeights
@@ -74,4 +74,4 @@ bool dflash2_score_candidates(const DraftWeights & dw,
                               float temperature,
                               Dflash2TreeScores & out);
 
-}  // namespace dflash::common
+}  // namespace luce::common

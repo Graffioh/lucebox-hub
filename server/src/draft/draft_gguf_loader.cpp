@@ -49,7 +49,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -703,7 +703,7 @@ bool load_draft_gguf(const std::string & path,
         const int64_t exp_kv_dim = (int64_t)out.n_head_kv * out.head_dim;
         const int64_t exp_n_embd = (int64_t)out.n_embd;
         std::string err;
-        if (!dflash::common::verify_derived_scalars(
+        if (!luce::common::verify_derived_scalars(
                 L0.wq->ne[1], L0.wk->ne[1], L0.wq->ne[0],
                 exp_q_dim, exp_kv_dim, exp_n_embd,
                 "blk.0", err)) {
@@ -810,4 +810,4 @@ bool load_draft_gguf(const std::string & path,
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -19,7 +19,7 @@
 
 #include <cmath>
 
-namespace dflash::common {
+namespace luce::common {
 
 static ggml_tensor * get_slice_2d(ggml_context * ctx0, ggml_tensor * t, int64_t c) {
     return ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], 1, t->ne[3],
@@ -245,4 +245,4 @@ DeltaNetChunkedResult build_delta_net_chunked(
     return r;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

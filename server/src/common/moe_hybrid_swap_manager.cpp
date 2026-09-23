@@ -3,7 +3,7 @@
 
 #include <algorithm>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool build_moe_hybrid_swap_plan(const MoeHybridPlacement & current,
                                 const MoeHybridRoutingStats & stats,
@@ -91,4 +91,4 @@ bool build_moe_hybrid_swap_plan(const MoeHybridPlacement & current,
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

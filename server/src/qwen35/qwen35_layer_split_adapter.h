@@ -20,15 +20,16 @@
 #include "ggml-backend.h"
 
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen35LayerSplitAdapterConfig {
-    const char * target_path = nullptr;
-    const char * draft_path  = nullptr;
+    std::string target_path;
+    std::optional<std::string> draft_path;
     DevicePlacement device;
     int draft_gpu = 0;
     RemoteDraftConfig remote_draft;
@@ -38,14 +39,14 @@ struct Qwen35LayerSplitAdapterConfig {
     int kq_stride_pad = 32;
     int draft_ctx_max = 4096;
     int chunk = 512;
-    int max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
+    int max_verify_tokens = LUCE_DRAFT_BLOCK_SIZE;
     bool run_dflash = false;
     int draft_swa_window = 0;
 };
 
 class Qwen35LayerSplitAdapter : public LayerSplitAdapter {
 public:
-    explicit Qwen35LayerSplitAdapter(const Qwen35LayerSplitAdapterConfig & cfg);
+    explicit Qwen35LayerSplitAdapter(Qwen35LayerSplitAdapterConfig cfg);
     ~Qwen35LayerSplitAdapter() override;
 
     Qwen35LayerSplitAdapter(const Qwen35LayerSplitAdapter &) = delete;
@@ -164,4 +165,4 @@ private:
     std::vector<float> prefill_last_logits_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -8,7 +8,7 @@ kept at host-data or process boundaries:
   the target run.
 - DFlash draft split can run the draft model in a separate backend process and
   feed a target process through host IPC.
-- Target layer split can run across two backends: `dflash_server` runs the
+- Target layer split can run across two backends: `luce_server` runs the
   head layer group on its compiled backend and hands the boundary activation
   to a remote `backend_ipc_daemon` (other backend) for the tail group. DFlash
   speculative decode works across this boundary.
@@ -17,12 +17,12 @@ kept at host-data or process boundaries:
 
 ```bash
 cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release \
-  -DDFLASH27B_GPU_BACKEND=cuda
+  -DLUCE_GPU_BACKEND=cuda
 cmake --build build-cuda --target pflash_daemon test_dflash backend_ipc_daemon -j
 
 cmake -S . -B build-hip -DCMAKE_BUILD_TYPE=Release \
-  -DDFLASH27B_GPU_BACKEND=hip \
-  -DDFLASH27B_HIP_ARCHITECTURES=<your-gfx-arch>
+  -DLUCE_GPU_BACKEND=hip \
+  -DLUCE_HIP_ARCHITECTURES=<your-gfx-arch>
 cmake --build build-hip --target pflash_daemon test_dflash backend_ipc_daemon -j
 ```
 
@@ -93,14 +93,14 @@ validation runs.
 
 Supported target architectures: `qwen35`, `gemma4`, `laguna`, and `deepseek4`.
 
-`dflash_server` can split the target across two backends in a single decode:
+`luce_server` can split the target across two backends in a single decode:
 the local process (this binary's compiled backend) runs the first contiguous
 layer group, then hands the boundary activation to a remote `backend_ipc_daemon`
 (built for the other backend) that runs the remaining layers, the final norm,
 and the LM-head projection. DFlash verify, target feature capture, KV
 snapshot/restore, and draft-token projection all work across this boundary.
 
-Use these `dflash_server` flags:
+Use these `luce_server` flags:
 
 | Flag | Purpose |
 |---|---|
@@ -116,7 +116,7 @@ Example: a CUDA-built server running the head layers on an RTX GPU, with the
 tail layers + LM head on a HIP `backend_ipc_daemon` (Strix Halo iGPU):
 
 ```bash
-./build-cuda/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+./build-cuda/luce_server models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft models/draft/dflash-draft-3.6-q4_k_m.gguf \
   --target-devices cuda:0,hip:0 \
   --target-layer-split 0.5,0.5 \

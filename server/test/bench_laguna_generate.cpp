@@ -10,13 +10,13 @@
 //
 // Usage: bench_laguna_generate <laguna.gguf> [prompt_N=128] [n_gen=64]
 //
-// Set DFLASH_LAGUNA_BENCH_NO_LOGITS=1 to match llama-bench tg semantics:
+// Set LUCE_LAGUNA_BENCH_NO_LOGITS=1 to match llama-bench tg semantics:
 // decode one token at a time without computing lm_head/argmax, then feed a
 // fixed synthetic token into the next step.
 
 #include "laguna_internal.h"
 #include "internal.h"
-#include "dflash27b.h"
+#include "luce.h"
 
 #include <chrono>
 #include <cmath>
@@ -28,7 +28,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
-using namespace dflash::common;
+using namespace luce::common;
 
 // Forward step lives in src/laguna_target_graph.cpp::laguna_step(). The
 // bench just times prefill + decode loops on top of it.
@@ -41,20 +41,20 @@ int main(int argc, char ** argv) {
     const std::string path = argv[1];
     const int prompt_N = (argc >= 3) ? std::atoi(argv[2]) : 128;
     const int n_gen    = (argc >= 4) ? std::atoi(argv[3]) : 64;
-    const bool no_mask = (std::getenv("DFLASH_NO_MASK") != nullptr);
-    const bool no_logits = (std::getenv("DFLASH_LAGUNA_BENCH_NO_LOGITS") != nullptr);
+    const bool no_mask = (std::getenv("LUCE_NO_MASK") != nullptr);
+    const bool no_logits = (std::getenv("LUCE_LAGUNA_BENCH_NO_LOGITS") != nullptr);
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
 
     LagunaTargetWeights w;
     if (!load_target_gguf_laguna(path, backend, w)) {
-        std::fprintf(stderr, "load failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load failed: %s\n", luce_last_error());
         ggml_backend_free(backend); return 1;
     }
 
     LagunaTargetCache cache;
-    if (const char * kv_t = std::getenv("DFLASH_KV_TYPE")) {
+    if (const char * kv_t = std::getenv("LUCE_KV_TYPE")) {
         const std::string s = kv_t;
         if      (s == "q4_0") { cache.kv_k_type = GGML_TYPE_Q4_0; cache.kv_v_type = GGML_TYPE_Q4_0; }
         else if (s == "q5_0") { cache.kv_k_type = GGML_TYPE_Q5_0; cache.kv_v_type = GGML_TYPE_Q5_0; }
@@ -63,7 +63,7 @@ int main(int argc, char ** argv) {
     }
     const int max_ctx = prompt_N + n_gen + 16;
     if (!create_laguna_target_cache(w, max_ctx, backend, cache)) {
-        std::fprintf(stderr, "cache failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "cache failed: %s\n", luce_last_error());
         free_laguna_target_weights(w); ggml_backend_free(backend); return 1;
     }
 

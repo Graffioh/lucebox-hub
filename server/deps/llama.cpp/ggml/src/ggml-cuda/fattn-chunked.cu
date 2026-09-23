@@ -31,7 +31,7 @@
 // Override via env. 1024 is way too large — inflates S buffer by 5× with no
 // perf upside, which in turn collapses the adaptive chunk size.
 static int chunked_q_batch_env(int64_t nq) {
-    const char * e = getenv("DFLASH27B_CHUNKED_Q_BATCH");
+    const char * e = getenv("LUCE_CHUNKED_Q_BATCH");
     if (e) {
         int v = atoi(e);
         if (v >= 1) return v;
@@ -44,7 +44,7 @@ static int chunked_q_batch_env(int64_t nq) {
 // under-reports and the formula collapses to CHUNKED_PF_MIN=256 → thousands
 // of chunks per fattn call → pathological. Override via env if needed.
 static int chunked_chunk_env(int fallback_from_vram) {
-    const char * e = getenv("DFLASH27B_CHUNKED_CHUNK");
+    const char * e = getenv("LUCE_CHUNKED_CHUNK");
     if (e) {
         int v = atoi(e);
         if (v >= 1) {
@@ -77,7 +77,7 @@ static float * ensure_buf(float ** p, size_t * cur_bytes, size_t need_bytes) {
 }
 
 // Self-test: round-trip forward→inverse rotation on 128 deterministic floats.
-// Runs once per process when DFLASH_TQ3_VERIFY=1.
+// Runs once per process when LUCE_TQ3_VERIFY=1.
 // Validates that k_tq3_rotate_inplace_f32 is mathematically reversible.
 static void tq3_verify_roundtrip(cudaStream_t stream) {
     static bool done = false;
@@ -128,7 +128,7 @@ void ggml_cuda_flash_attn_ext_chunked(ggml_backend_cuda_context & ctx, ggml_tens
     cudaStream_t stream = ctx.stream();
 
     // TQ3 rotation roundtrip self-test (once per process).
-    if (std::getenv("DFLASH_TQ3_VERIFY")) {
+    if (std::getenv("LUCE_TQ3_VERIFY")) {
         tq3_verify_roundtrip(stream);
     }
 
@@ -157,10 +157,10 @@ void ggml_cuda_flash_attn_ext_chunked(ggml_backend_cuda_context & ctx, ggml_tens
     // Skip the host-blocking cudaMemGetInfo when the chunk size is fixed
     // via env var (the default 4096 path). Saves ~500us * N calls per prefill;
     // on a 60-layer 4-prompt-chunk Dense prefill this dropped 48 -> 918 tok/s.
-    static const bool dflash_chunk_env_set =
-        std::getenv("DFLASH27B_CHUNKED_CHUNK") != nullptr;
+    static const bool luce_chunk_env_set =
+        std::getenv("LUCE_CHUNKED_CHUNK") != nullptr;
     int tbq_chunk;
-    if (!dflash_chunk_env_set) {
+    if (!luce_chunk_env_set) {
         // Default path: chunked_chunk_env(0) returns std::max(0, 4096) = 4096,
         // avoiding the cudaMemGetInfo hop entirely.
         tbq_chunk = chunked_chunk_env(0);

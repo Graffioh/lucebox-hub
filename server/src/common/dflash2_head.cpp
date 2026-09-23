@@ -10,7 +10,7 @@
 #include <cstring>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -268,4 +268,4 @@ bool dflash2_select_chain(const DraftWeights & dw,
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

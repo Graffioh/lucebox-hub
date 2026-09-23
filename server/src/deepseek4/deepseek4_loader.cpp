@@ -15,9 +15,11 @@
 
 #include "deepseek4_internal.h"
 #include "internal.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "common/gguf_bounds.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/copied_source_reclaim.h"
+#include "../common/copied_source_upload.h"
 #include "../common/moe_hybrid_types.h"
 #include "ggml-cuda.h"
 
@@ -27,6 +29,7 @@
 #include <cstdint>   // SIZE_MAX, used by the portable checked-size helpers below
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <cstdlib>
 #include <limits>
 #include <string>
@@ -45,7 +48,7 @@ extern "C" bool ggml_backend_cuda_buffer_is_managed(ggml_backend_buffer_t buffer
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -234,6 +237,27 @@ static bool is_expert_tensor(const char * name) {
            std::strstr(name, "ffn_down_exps") != nullptr;
 }
 
+// Layer index of an image router bias, or -1. Two spellings exist: the source
+// checkpoint's "layers.N.ffn.gate.bias_vl" (kept by our converter) and
+// llama.cpp's "blk.N.exp_probs_b_vl.bias" (published GGUFs). Leading zeros and
+// trailing text are rejected.
+static int image_bias_layer(const char * name) {
+    for (const auto & [prefix, suffix] : {std::pair<const char *, const char *>
+             {"layers.", ".ffn.gate.bias_vl"}, {"blk.", ".exp_probs_b_vl.bias"}}) {
+        const size_t prefix_len = std::strlen(prefix);
+        if (std::strncmp(name, prefix, prefix_len) != 0) continue;
+        const char * number = name + prefix_len;
+        if (*number < '0' || *number > '9') return -1;
+        char * rest = nullptr;
+        const long layer = std::strtol(number, &rest, 10);
+        if (layer < 0 || layer > std::numeric_limits<int>::max() ||
+            std::strcmp(rest, suffix) != 0 ||
+            std::string(name) != prefix + std::to_string(layer) + suffix) return -1;
+        return int(layer);
+    }
+    return -1;
+}
+
 static bool should_keep_ds4_tensor(const char * name,
                                    const TargetLoadPlan & plan) {
     int layer_id = -1;
@@ -242,6 +266,12 @@ static bool should_keep_ds4_tensor(const char * name,
                layer_id >= plan.layer_begin &&
                layer_id < plan.layer_end &&
                is_expert_tensor(name);
+    }
+
+    const int image_layer = image_bias_layer(name);
+    if (image_layer >= 0) {
+        return plan.load_ds4_image_bias && image_layer >= plan.layer_begin &&
+               image_layer < plan.layer_end;
     }
 
     // Global tensors
@@ -268,7 +298,7 @@ static bool should_upload_ds4_tensor(const char * name,
 }
 
 static int ds4_dense_tp_mask() {
-    const char * value = std::getenv("DFLASH_DS4_DENSE_TP_MASK");
+    const char * value = std::getenv("LUCE_DS4_DENSE_TP_MASK");
     if (!value || !value[0]) return 0;
     return std::max(0, std::atoi(value));
 }
@@ -1423,7 +1453,6 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     static const char * kRequiredU32Keys[] = {
         "deepseek4.block_count",
         "deepseek4.embedding_length",
-        "deepseek4.vocab_size",
         "deepseek4.attention.head_count",
         "deepseek4.attention.head_count_kv",
         "deepseek4.attention.key_length",
@@ -1455,7 +1484,15 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     // ── Read hyperparameters ────────────────────────────────────────────
     const uint32_t n_layer        = get_u32_or(gctx, "deepseek4.block_count", 43);
     const uint32_t n_embd         = get_u32_or(gctx, "deepseek4.embedding_length", 4096);
-    const uint32_t n_vocab        = get_u32_or(gctx, "deepseek4.vocab_size", 129280);
+    // llama.cpp conversions carry no vocab_size key; the token list has the size.
+    uint32_t n_vocab = get_u32_or(gctx, "deepseek4.vocab_size", 0);
+    if (n_vocab == 0) {
+        const int64_t tokens_key = gguf_find_key(gctx, "tokenizer.ggml.tokens");
+        if (tokens_key >= 0 && gguf_get_kv_type(gctx, tokens_key) == GGUF_TYPE_ARRAY) {
+            const int64_t n_tokens = (int64_t) gguf_get_arr_n(gctx, tokens_key);
+            if (n_tokens > 0 && n_tokens <= std::numeric_limits<int32_t>::max()) n_vocab = (uint32_t) n_tokens;
+        }
+    }
     const uint32_t n_head         = get_u32_or(gctx, "deepseek4.attention.head_count", 64);
     const uint32_t n_head_kv      = get_u32_or(gctx, "deepseek4.attention.head_count_kv", 1);
     const uint32_t head_dim       = get_u32_or(gctx, "deepseek4.attention.key_length", 512);
@@ -1490,7 +1527,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     const float swiglu_clamp      = get_f32_or(gctx, "deepseek4.swiglu_clamp_exp", 10.0f);
 
     if (n_vocab == 0) {
-        set_last_error("deepseek4.vocab_size must be > 0");
+        set_last_error("no vocabulary size: need deepseek4.vocab_size or tokenizer.ggml.tokens");
         gguf_free(gctx);
         if (meta_ctx) ggml_free(meta_ctx);
         return false;
@@ -1574,12 +1611,38 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 
     // ── Collect tensors for allocation ──────────────────────────────────
     const int n_tensors = gguf_get_n_tensors(gctx);
+    if (plan.load_ds4_image_bias && !plan.expert_metadata_only) {
+        // Image routing needs one F32[n_expert] router bias per decoder layer.
+        bool valid = plan.layer_begin == 0 && plan.layer_end == int(n_layer);
+        std::vector<int> counts(size_t(n_layer), 0);
+        for (int ti = 0; ti < n_tensors; ++ti) {
+            const char * name = gguf_get_tensor_name(gctx, ti);
+            const int layer = image_bias_layer(name);
+            if (layer < 0) continue;
+            if (layer >= int(n_layer)) continue;  // the MTP block's bias is not loaded
+            ++counts[size_t(layer)];
+            const ggml_tensor * tensor = find_tensor(meta_ctx, name);
+            valid = valid && tensor && tensor->type == GGML_TYPE_F32 &&
+                    tensor->ne[0] == int64_t(n_expert) && tensor->ne[1] == 1 &&
+                    tensor->ne[2] == 1 && tensor->ne[3] == 1;
+        }
+        valid = valid && std::all_of(counts.begin(), counts.end(), [](int count) { return count == 1; });
+        if (!valid) {
+            set_last_error("--mmproj requires a full-range load and one F32[n_expert] image router bias per layer");
+            gguf_free(gctx);
+            if (meta_ctx) ggml_free(meta_ctx);
+            return false;
+        }
+    }
+    // A vision load packs the primary GPU tightly: hand file-backed source
+    // pages back to the kernel as soon as each tensor has been copied.
+    const bool reclaim_sources = plan.load_ds4_image_bias;
     const size_t data_offset = gguf_get_data_offset(gctx);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
     int dense_tp_mask = ds4_dense_tp_mask();
     if (dense_tp_mask != 0) {
-        const char * fused_verify = std::getenv("DFLASH_DS4_FUSED_VERIFY");
+        const char * fused_verify = std::getenv("LUCE_DS4_FUSED_VERIFY");
         if (fused_verify && fused_verify[0] &&
             std::strcmp(fused_verify, "0") != 0) {
             std::fprintf(stderr,
@@ -1594,7 +1657,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     if (dense_tp_mask != 0 && ggml_backend_is_cuda(backend) &&
         ggml_backend_cuda_get_device_count() >= 2) {
         float strix_fraction = 0.28f;
-        if (const char * value = std::getenv("DFLASH_DS4_DENSE_TP_STRIX_FRACTION")) {
+        if (const char * value = std::getenv("LUCE_DS4_DENSE_TP_STRIX_FRACTION")) {
             const float parsed = std::strtof(value, nullptr);
             if (parsed > 0.0f && parsed < 1.0f) strix_fraction = parsed;
         }
@@ -1731,7 +1794,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     }
 
 #if !defined(_WIN32)
-    bool fast_managed = (buf != nullptr) && ggml_backend_cuda_buffer_is_managed(buf) && (getenv("DFLASH_NO_PREAD") == nullptr);
+    bool fast_managed = (buf != nullptr) && ggml_backend_cuda_buffer_is_managed(buf) && (getenv("LUCE_NO_PREAD") == nullptr);
 #else
     // pread/posix_fadvise not available on Windows; fall back to mmap path.
     bool fast_managed = false;
@@ -1777,6 +1840,13 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             if (!a.upload_to_backend || !a.dense_split) continue;
             const void * src_data = (const char *)mmap.addr + a.file_offset;
             ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+#if defined(__linux__)
+            // set_tensor has completed its source copy, including split buffers.
+            if (reclaim_sources) {
+                reclaim_copied_file_source(mmap.addr, mmap.len, src_data, a.file_size,
+                                           mmap.fd, ggml_get_name(a.tensor));
+            }
+#endif
         }
         if (!read_ok) {
             set_last_error("parallel weight read failed");
@@ -1788,10 +1858,42 @@ bool load_deepseek4_gguf_partial(const std::string & path,
             return false;
         }
     } else {
+#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
+        std::vector<uint8_t> upload_scratch;
+#endif
         for (auto & a : allocs) {
             if (!a.upload_to_backend) continue;
             const void * src_data = (const char *)mmap.addr + a.file_offset;
-            ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+#if defined(__linux__) && (defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP))
+            if (reclaim_sources && !a.dense_split && ggml_backend_is_cuda(backend) &&
+                !ggml_backend_cuda_buffer_is_managed(buf)) {
+                // HIP may pin pageable upload sources. Keep file-backed pages
+                // out of that path so completed-source cache advice can act.
+                if (!upload_copied_file_chunks(mmap.addr, mmap.len, a.file_offset,
+                        a.file_size, upload_scratch,
+                        [&](const uint8_t * bytes, size_t offset, size_t count) {
+                            ggml_backend_tensor_set(a.tensor, bytes, offset, count);
+                        })) {
+                    set_last_error("invalid dense staged-upload source range");
+                    mmap.close_map();
+                    if (split_buf) ggml_backend_buffer_free(split_buf);
+                    if (buf) ggml_backend_buffer_free(buf);
+                    gguf_free(gctx);
+                    ggml_free(meta_ctx);
+                    return false;
+                }
+            } else
+#endif
+            {
+                ggml_backend_tensor_set(a.tensor, src_data, 0, a.file_size);
+            }
+#if defined(__linux__)
+            // set_tensor has completed its source copy, including split buffers.
+            if (reclaim_sources) {
+                reclaim_copied_file_source(mmap.addr, mmap.len, src_data, a.file_size,
+                                           mmap.fd, ggml_get_name(a.tensor));
+            }
+#endif
         }
     }
     mmap.close_map();
@@ -1809,6 +1911,13 @@ bool load_deepseek4_gguf_partial(const std::string & path,
         if (emb_mmap.open_ro(path, emb_err)) {
             std::memcpy(out.embedder.tok_embd_owned.data(),
                         (const char *)emb_mmap.addr + a.file_offset, a.file_size);
+#if defined(__linux__)
+            if (reclaim_sources) {
+                reclaim_copied_file_source(emb_mmap.addr, emb_mmap.len,
+                    (const char *)emb_mmap.addr + a.file_offset, a.file_size,
+                    emb_mmap.fd, "token_embd.weight");
+            }
+#endif
             emb_mmap.close_map();
         } else {
             set_last_error("embedder mmap: " + emb_err);
@@ -1828,6 +1937,12 @@ bool load_deepseek4_gguf_partial(const std::string & path,
     // ── Bind tensors to weight struct fields ────────────────────────────
     for (auto & a : allocs) {
         const char * name = ggml_get_name(a.tensor);
+
+        const int image_layer = image_bias_layer(name);
+        if (plan.load_ds4_image_bias && image_layer >= 0 && image_layer < int(n_layer)) {
+            out.layers[size_t(image_layer)].ffn_gate_bias_vl = a.tensor;
+            continue;
+        }
 
         // Global tensors
         if (std::strcmp(name, "token_embd.weight") == 0) { out.tok_embd = a.tensor; continue; }
@@ -1947,7 +2062,7 @@ bool load_deepseek4_gguf_partial(const std::string & path,
 namespace {
 
 static MoeHybridColdBackend ds4_cold_backend_from_env() {
-    const char * value = std::getenv("DFLASH_MOE_COLD_BACKEND");
+    const char * value = std::getenv("LUCE_MOE_COLD_BACKEND");
     if (!value || !value[0]) return MoeHybridColdBackend::Cpu;
     if (std::strcmp(value, "gpu") == 0 || std::strcmp(value, "hip") == 0 ||
         std::strcmp(value, "rocm") == 0) {
@@ -1958,6 +2073,7 @@ static MoeHybridColdBackend ds4_cold_backend_from_env() {
 
 static MoeHybridConfig make_ds4_moe_hybrid_config(const DeepSeek4Weights & w) {
     MoeHybridConfig cfg;
+    cfg.mixed_mmq_policy = w.mixed_mmq_policy;
     cfg.n_embd = w.n_embd;
     cfg.n_expert = w.n_expert;
     cfg.n_expert_used = w.n_expert_used;
@@ -2090,7 +2206,9 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
         if (err) *err = mmap_err;
         return false;
     }
+#if !defined(__linux__)
     mmap.close_fd();
+#endif
 
     const size_t data_start = gguf_get_data_offset(gctx);
     const auto * file_bytes = static_cast<const uint8_t *>(mmap.addr);
@@ -2137,7 +2255,13 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
     const MoeHybridConfig cfg = cfg_override ? *cfg_override : make_ds4_moe_hybrid_config(w);
     const bool ok = build_moe_hybrid_storage_from_file_with_mmap(
         cfg, backend, placement, layer_descs, layer_file_data,
-        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend);
+        mmap.addr, mmap.len, out, err, 0, cold_gpu_backend
+#if defined(__linux__)
+        , ds4_image_capable(w) ? mmap.fd : -1
+#endif
+    );
+    // Advice borrows the original fd only while construction is in progress.
+    mmap.close_fd();
 
     if (!ok) {
         mmap.close_map();
@@ -2211,4 +2335,4 @@ void free_deepseek4_weights(DeepSeek4Weights & w) {
     w.moe_hybrid = false;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

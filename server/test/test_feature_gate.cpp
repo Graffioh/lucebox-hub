@@ -1,11 +1,9 @@
-// Unit tests for the backend feature/architecture gate.
+// Unit tests for lightweight backend planning policy.
 //
-// check_feature_compatibility(), collect_feature_warnings() and the
-// model_capabilities.h table are pure functions over resolved facts, so this
-// binary needs no model file, no GPU, and none of the backend stack — it
-// compiles against feature_gate.cpp and placement_config.cpp alone. Keeping
-// it separate from test_server_unit keeps that true: a gate rule stays
-// testable in seconds rather than behind a full CUDA build.
+// The plan builder, feature gate, and model_capabilities.h table operate on
+// resolved facts. This binary needs no model file, GPU, or backend stack.
+// Keeping it separate from test_server_unit keeps policy rules testable in
+// seconds rather than behind a full CUDA build.
 //
 // Build: cmake --build . --target test_feature_gate
 // Run:   ./test_feature_gate
@@ -23,7 +21,7 @@
 #include <vector>
 
 using namespace CppUnitTestFramework;
-using namespace dflash::common;
+using namespace luce::common;
 
 // ── Backend compatibility gate ──────────────────────────────────────────
 // One case per rule cluster in check_feature_compatibility(). All resolved
@@ -45,7 +43,7 @@ static std::string gate_result(
     const BackendArgs & args,
     const std::string & arch,
     PlacementBackend backend,
-    const BackendFeatureConfig & features = {}) {
+    const BackendAdmissionContext & features = {}) {
     return check_feature_compatibility(
         args, features, arch, backend, backend);
 }
@@ -55,7 +53,7 @@ static std::string gate_result_for_binary(
     const std::string & arch,
     PlacementBackend target_backend,
     PlacementBackend compiled_backend,
-    const BackendFeatureConfig & features = {}) {
+    const BackendAdmissionContext & features = {}) {
     return check_feature_compatibility(
         args, features, arch, target_backend, compiled_backend);
 }
@@ -150,7 +148,7 @@ void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
 
-    BackendFeatureConfig features;
+    BackendAdmissionContext features;
     features.pflash_enabled = true;
     CHECK(!gate_result(
         args, "qwen35", PlacementBackend::Cuda, features).empty());
@@ -166,6 +164,27 @@ void test_feature_gate_pflash_requires_drafter_and_supported_arch() {
         args, "gemma4", PlacementBackend::Cuda, features).empty());
     CHECK(gate_result(
         args, "qwen35", PlacementBackend::Cuda, features).empty());
+}
+
+void test_feature_gate_ds4_pflash_rejects_layer_split() {
+    BackendArgs args = gate_args_hip_deepseek4();
+    BackendAdmissionContext features;
+    features.pflash_enabled = true;
+    features.pflash_drafter_configured = true;
+    CHECK(gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
+    args.device.layer_split_gpus = {0, 1};
+    args.device.layer_split_backends = {PlacementBackend::Hip, PlacementBackend::Hip};
+    CHECK(!gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
+    features.pflash_enabled = false;
+    CHECK(gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
+
+    // Current main also supports DS4 paged serving, which cannot park its
+    // live target state for PFlash. Keep that independent admission guard.
+    args = gate_args_hip_deepseek4();
+    args.paged_attention = true;
+    CHECK(gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
+    features.pflash_enabled = true;
+    CHECK(!gate_result(args, "deepseek4", PlacementBackend::Hip, features).empty());
 }
 
 void test_feature_gate_validates_target_split_topology() {
@@ -238,7 +257,7 @@ void test_feature_gate_tensor_parallel_requirements() {
     CHECK(!gate_result(
         remote, "qwen35", PlacementBackend::Cuda).empty());
 
-    BackendFeatureConfig pflash;
+    BackendAdmissionContext pflash;
     pflash.pflash_enabled = true;
     pflash.pflash_drafter_configured = true;
     CHECK(!gate_result(
@@ -350,7 +369,7 @@ void test_feature_gate_remote_draft_requires_supported_arch() {
 
     // Without a draft model or PFlash, remote draft IPC is unnecessary.
     BackendArgs no_draft = args;
-    no_draft.draft_path = nullptr;
+    no_draft.draft_path.reset();
     CHECK(!gate_result(
         no_draft, "gemma4", PlacementBackend::Cuda).empty());
 }
@@ -377,24 +396,25 @@ void test_feature_gate_layer_split_requires_supported_arch() {
     CHECK(gate_result(single, "qwen3", PlacementBackend::Cuda).empty());
 }
 
-void test_feature_gate_paged_attention_requires_qwen35_monolithic() {
+void test_feature_gate_paged_attention_requires_monolithic_backend() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
     args.paged_attention = true;
     CHECK(gate_result(args, "qwen35", PlacementBackend::Cuda).empty());
     CHECK(gate_result(args, "qwen35", PlacementBackend::Hip).empty());
 
-    // Only qwen35 has a paged decode path. qwen35moe shares Qwen35Config, so
-    // its rejection is this gate's job — the factory's field-presence
-    // cross-check cannot tell the two apart.
-    for (const char * arch : {"qwen35moe", "laguna", "qwen3",
-                              "gemma4", "deepseek4"}) {
+    BackendArgs ds4 = gate_args_hip_deepseek4();
+    ds4.paged_attention = true;
+    CHECK(gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Cuda).empty());
+
+    // qwen35moe shares Qwen35Config, so its rejection is this gate's job —
+    // the factory's field-presence cross-check cannot tell the two apart.
+    for (const char * arch : {"qwen35moe", "laguna", "qwen3", "gemma4"}) {
         CHECK(!gate_result(args, arch, PlacementBackend::Cuda).empty());
     }
 
-    // Only the monolithic qwen35 backend owns a paged K/V pool. Both
-    // placements are supported qwen35 launches without the flag, so the
-    // rejection has to come from the paged rule.
+    // Only monolithic Qwen and DeepSeek backends own paged K/V pools.
     BackendArgs split = args;
     CHECK(parse_placement_device_list("cuda:0,cuda:1", split.device));
     CHECK(!gate_result(split, "qwen35", PlacementBackend::Cuda).empty());
@@ -427,13 +447,13 @@ void test_feature_gate_paged_attention_allows_fixed_local_chains() {
     CHECK(gate_result(
         concurrent_chain, "qwen35", PlacementBackend::Hip).empty());
 
-    BackendFeatureConfig request_scoped;
+    BackendAdmissionContext request_scoped;
     request_scoped.draft_residency = DraftResidencyPolicy::RequestScoped;
     CHECK(!gate_result(
         concurrent_chain, "qwen35", PlacementBackend::Cuda,
         request_scoped).empty());
 
-    BackendFeatureConfig persistent;
+    BackendAdmissionContext persistent;
     persistent.draft_residency = DraftResidencyPolicy::Persistent;
     CHECK(gate_result(
         concurrent_chain, "qwen35", PlacementBackend::Cuda,
@@ -453,14 +473,14 @@ void test_feature_gate_paged_attention_allows_fixed_local_chains() {
     CHECK(!gate_result(
         windowed, "qwen35", PlacementBackend::Cuda).empty());
 
-    BackendFeatureConfig pflash;
+    BackendAdmissionContext pflash;
     pflash.pflash_enabled = true;
     pflash.pflash_drafter_configured = true;
     CHECK(!gate_result(
         base, "qwen35", PlacementBackend::Cuda, pflash).empty());
 
-    BackendFeatureConfig kvflash;
-    kvflash.kvflash_enabled = true;
+    BackendAdmissionContext kvflash;
+    kvflash.kvflash = KvFlashRequest::Fixed;
     CHECK(!gate_result(
         base, "qwen35", PlacementBackend::Cuda, kvflash).empty());
 
@@ -506,7 +526,7 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     plain.max_concurrency = 1;
     CHECK(gate_result(plain, "qwen35", PlacementBackend::Cuda).empty());
 
-    // More than one slot exists only in the paged qwen35 backend.
+    // More than one slot requires a model-specific paged backend.
     BackendArgs dense;
     dense.model_path = "/nonexistent/model.gguf";
     dense.max_concurrency = 2;
@@ -526,6 +546,22 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
     CHECK(gate_result(parallel, "qwen35", PlacementBackend::Cuda).empty());
     parallel.max_concurrency = 65;
     CHECK(!gate_result(parallel, "qwen35", PlacementBackend::Cuda).empty());
+
+    BackendArgs ds4 = gate_args_hip_deepseek4();
+    ds4.paged_attention = true;
+    ds4.max_concurrency = DEEPSEEK4_MAX_PAGED_SEQUENCES;
+    CHECK(gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    ds4.max_concurrency = DEEPSEEK4_MAX_PAGED_SEQUENCES + 1;
+    CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    ds4.max_concurrency = 2;
+    ds4.ds4_prefill_mode = PrefillAttentionMode::Sparse;
+    CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    ds4.ds4_prefill_mode = PrefillAttentionMode::Exact;
+    ds4.ds4_fused_decode = true;
+    CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
+    ds4.ds4_fused_decode = false;
+    ds4.ds4_fused_verify_f16_kv = true;
+    CHECK(!gate_result(ds4, "deepseek4", PlacementBackend::Hip).empty());
 
     // --kv-pool-tokens sizes the shared pool, so it needs slots to share.
     BackendArgs pool = paged;
@@ -581,11 +617,11 @@ void test_feature_gate_parallel_and_kv_pool_rules() {
 std::vector<std::string> warn_result(
     const BackendArgs & args,
     const std::string & arch,
-    const BackendFeatureConfig & features = {}) {
+    const BackendAdmissionContext & features = {}) {
     CHECK(check_feature_compatibility(
         args, features, arch, compiled_placement_backend(),
         compiled_placement_backend()).empty());
-    return collect_feature_warnings(args, features, arch);
+    return collect_feature_warnings(args, arch);
 }
 
 static bool warns_about(const std::vector<std::string> & warnings,
@@ -622,7 +658,7 @@ void test_feature_warnings_report_inert_draft() {
 
     BackendArgs split = args;
     CHECK(parse_placement_device_list("cuda:0,cuda:1", split.device));
-    const std::vector<std::string> w = collect_feature_warnings(split, {}, "laguna");
+    const std::vector<std::string> w = collect_feature_warnings(split, "laguna");
     CHECK(warns_about(w, "--draft"));
     CHECK(w[0].find("single-device placement") != std::string::npos);
 }
@@ -666,14 +702,13 @@ void test_feature_warnings_report_inert_moe_options() {
     BackendArgs args;
     args.model_path = "/nonexistent/model.gguf";
 
-    BackendFeatureConfig moe_opts;
-    moe_opts.routing_stats_requested = true;
-    moe_opts.adaptive_experts_requested = true;
+    args.routing_stats_requested = true;
+    args.adaptive_experts_requested = true;
 
-    CHECK(warn_result(args, "laguna", moe_opts).empty());
-    CHECK(warn_result(args, "qwen35moe", moe_opts).empty());
-    CHECK(warn_result(args, "qwen35", moe_opts).size() == 2);
-    CHECK(warn_result(args, "deepseek4", moe_opts).size() == 2);
+    CHECK(warn_result(args, "laguna").empty());
+    CHECK(warn_result(args, "qwen35moe").empty());
+    CHECK(warn_result(args, "qwen35").size() == 2);
+    CHECK(warn_result(args, "deepseek4").size() == 2);
 }
 
 void test_model_capability_tables() {
@@ -697,6 +732,7 @@ void test_model_capability_tables() {
     CHECK(!arch_has_expert_offload("qwen35"));
     // deepseek4 is mixture-of-experts but has no hot/cold offload path.
     CHECK(!arch_has_expert_offload("deepseek4"));
+    CHECK(arch_supports_pflash_compression("deepseek4"));
 
     // Every capability predicate must be false for an architecture the
     // factory cannot build, so no rule can admit an unbuildable model.
@@ -711,9 +747,11 @@ void test_model_capability_tables() {
     CHECK(!arch_supports_draft_swa("qwen36", false));
     CHECK(!arch_supports_paged_attention("qwen36", false));
 
-    // Paged decode lives in the monolithic qwen35 backend alone.
+    // Paged decode lives in the monolithic Qwen and DeepSeek backends.
     CHECK(arch_supports_paged_attention("qwen35", false));
     CHECK(!arch_supports_paged_attention("qwen35", true));
+    CHECK(arch_supports_paged_attention("deepseek4", false));
+    CHECK(!arch_supports_paged_attention("deepseek4", true));
     CHECK(!arch_supports_paged_attention("qwen35moe", false));
     CHECK(arch_supports_draft_block_size("qwen35", false));
     CHECK(!arch_supports_draft_block_size("qwen35", true));
@@ -732,6 +770,7 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_draft_block_size_requires_local_draft();
     test_draft_block_size_override_respects_checkpoint_horizon();
     test_feature_gate_pflash_requires_drafter_and_supported_arch();
+    test_feature_gate_ds4_pflash_rejects_layer_split();
     test_feature_gate_validates_target_split_topology();
     test_feature_gate_tensor_parallel_requirements();
     test_feature_gate_ds4_prefill_requires_deepseek4();
@@ -739,7 +778,7 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_gate_ds4_decode_options_require_monolithic_hip();
     test_feature_gate_remote_draft_requires_supported_arch();
     test_feature_gate_layer_split_requires_supported_arch();
-    test_feature_gate_paged_attention_requires_qwen35_monolithic();
+    test_feature_gate_paged_attention_requires_monolithic_backend();
     test_feature_gate_paged_attention_allows_fixed_local_chains();
     test_feature_gate_parallel_and_kv_pool_rules();
     test_feature_warnings_silent_when_supported();

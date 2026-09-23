@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct PinFriendlyLayout {
     std::vector<ChatMessage> messages;
@@ -108,4 +108,4 @@ public:
                                        const ChatMarkers & markers);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

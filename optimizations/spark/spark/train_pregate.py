@@ -6,7 +6,7 @@ i.e. one step early, which is what you need to prefetch experts and fuse the
 attention+FFN graphs (Pre-gated MoE, arXiv:2308.12066).
 
 Trains a predictor per layer from the trace captured by the engine
-(`DFLASH_LAGUNA_PREGATE_TRACE`, fixed-size records: int16 layer, int16 n_sel,
+(`LUCE_LAGUNA_PREGATE_TRACE`, fixed-size records: int16 layer, int16 n_sel,
 int32[8] selected, float32[n_embd] hidden) and reports recall@K: of the experts
 a layer actually selects, how many are in the predicted top-K. High recall@K at
 small K means prefetch+fusion is viable.

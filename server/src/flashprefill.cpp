@@ -12,7 +12,7 @@
 #include <vector>
 #include "device_runtime.h"
 
-namespace dflash::common {
+namespace luce::common {
 namespace flashprefill {
 
 // Kernel launcher declarations — architecture-specific.
@@ -21,7 +21,7 @@ namespace flashprefill {
 // Each arch-specific source owns its block-select launcher to avoid duplicate
 // CUDA host stubs in multi-arch builds.
 
-#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
+#if defined(LUCE_HAVE_FLASHPREFILL) || defined(LUCE_HAVE_SM80_FLASHPREFILL)
 extern "C" {
 int launch_compute_mean_vector_bf16(
     const void * K, void * mean_K,
@@ -41,7 +41,7 @@ int launch_compute_block_score_bf16(
     int s_M_b, int s_M_m, int s_M_n, int s_M_h,
     cudaStream_t stream);
 
-#ifdef DFLASH27B_BACKEND_HIP
+#ifdef LUCE_BACKEND_HIP
 // Phase 4 (HIP): mean_Q + tiled rocWMMA GEMM replaces the O(M²) scalar
 // block-score kernel. ~5-10× faster on the score step at 8K-32K context.
 int launch_compute_block_score_gemm_bf16(
@@ -65,7 +65,7 @@ void launch_block_select(
     int32_t * idx_out, int32_t * cnt_out,
     cudaStream_t stream);
 
-#ifdef DFLASH27B_HAVE_BSA
+#ifdef LUCE_HAVE_BSA
 int launch_bsa_sparse_flash_forward_bf16(
     const void* Q, const void* K, const void* V, void* O,
     const int32_t* indices, const int32_t* counts,
@@ -91,7 +91,7 @@ void launch_sparse_flash_forward_bf16(
     int s_cnt_b, int s_cnt_m, int s_cnt_h,
     cudaStream_t stream);
 
-#ifdef DFLASH27B_HAVE_BSA
+#ifdef LUCE_HAVE_BSA
 int launch_bsa_sparse_flash_forward_bf16(
     const void* Q, const void* K, const void* V, void* O,
     const int32_t* indices, const int32_t* counts,
@@ -120,7 +120,7 @@ void launch_block_select(
 
 // F16 kernel launchers (Volta/Turing WMMA: sm_70+; Pascal scalar: sm_6x).
 // Volta/Turing uses WMMA tensor cores; Pascal uses scalar F16×F16→F32.
-#ifdef DFLASH27B_HAVE_VOLTA_FLASHPREFILL
+#ifdef LUCE_HAVE_VOLTA_FLASHPREFILL
 extern "C" {
 void launch_compute_mean_vector_f16(
     const void * K, void * mean_K,
@@ -170,7 +170,7 @@ void launch_block_select_f16(
 // Same API as the F16 WMMA launchers but scalar math.
 // Suffix _pascal to avoid linker clash when both Volta and Pascal
 // variants are compiled into the same binary (multi-arch fatbin).
-#ifdef DFLASH27B_HAVE_PASCAL_FLASHPREFILL
+#ifdef LUCE_HAVE_PASCAL_FLASHPREFILL
 extern "C" {
 void launch_compute_mean_vector_f16_pascal(
     const void * K, void * mean_K,
@@ -226,7 +226,7 @@ namespace {
 inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 }
 
-#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
+#if defined(LUCE_HAVE_FLASHPREFILL) || defined(LUCE_HAVE_SM80_FLASHPREFILL)
 // ── BF16 (sm_80+) dispatch: native BF16 WMMA kernels ──
 
 int flash_prefill_forward_bf16(
@@ -252,7 +252,7 @@ int flash_prefill_forward_bf16(
     int s_S_b = M * N * H, s_S_m = N * H, s_S_n = H, s_S_h = 1;
     int s_idx_b = M * N * H, s_idx_m = N * H, s_idx_n = H, s_idx_h = 1;
     int s_cnt_b = M * H, s_cnt_m = H, s_cnt_h = 1;
-#ifdef DFLASH27B_BACKEND_HIP
+#ifdef LUCE_BACKEND_HIP
     // mean_Q layout: [B, M_gemm, H, D] BF16 (batch stride uses M_gemm after padding)
     int s_mQ_b = M * H * D, s_mQ_m = H * D, s_mQ_h = D;  // s_mQ_b fixed below after M_gemm
     // The GEMM kernel (compute_block_score_gemm_bf16) loads 16×16 rocWMMA tiles and
@@ -270,13 +270,13 @@ int flash_prefill_forward_bf16(
     float * dS = nullptr, * dM = nullptr;
     int32_t * dIdx = nullptr, * dCnt = nullptr;
     cudaError_t e;
-#ifdef DFLASH27B_BACKEND_HIP
+#ifdef LUCE_BACKEND_HIP
     if ((e = cudaMalloc(&dmK,  (size_t)B * M_gemm * Hk * D * 2)) != cudaSuccess) goto err;  // bf16, padded
 #else
     if ((e = cudaMalloc(&dmK,  (size_t)B * M * Hk * D * 2)) != cudaSuccess) goto err;  // bf16
 #endif
     if ((e = cudaMalloc(&dS,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
-#ifdef DFLASH27B_BACKEND_HIP
+#ifdef LUCE_BACKEND_HIP
     if ((e = cudaMalloc(&dmQ,  (size_t)B * M_gemm * H  * D * 2)) != cudaSuccess) goto err;  // bf16, padded
 #else
     if ((e = cudaMalloc(&dM,   (size_t)B * M * N * H * sizeof(float))) != cudaSuccess) goto err;
@@ -284,7 +284,7 @@ int flash_prefill_forward_bf16(
     if ((e = cudaMalloc(&dIdx, (size_t)B * M * N * H * sizeof(int32_t))) != cudaSuccess) goto err;
     if ((e = cudaMalloc(&dCnt, (size_t)B * M * H * sizeof(int32_t))) != cudaSuccess) goto err;
 
-    static const bool prof = (std::getenv("DFLASH_FP_PROFILE") != nullptr);
+    static const bool prof = (std::getenv("LUCE_FP_PROFILE") != nullptr);
     cudaEvent_t pE[5];
     if (prof) for (int i=0;i<5;i++) cudaEventCreate(&pE[i]);
     if (prof) cudaEventRecord(pE[0]);
@@ -296,7 +296,7 @@ int flash_prefill_forward_bf16(
 
     if (prof) cudaEventRecord(pE[1]);
     // 2. block scores
-#ifdef DFLASH27B_BACKEND_HIP
+#ifdef LUCE_BACKEND_HIP
     // Phase 4: mean_Q + rocWMMA GEMM replaces the O(M²) scalar kernel.
     if (launch_compute_mean_vector_bf16(
             Q, dmQ, B, S, H, D, BLOCK,
@@ -329,7 +329,7 @@ int flash_prefill_forward_bf16(
         dIdx, dCnt, 0);
 
     if (prof) cudaEventRecord(pE[3]);
-    static const bool dump_cnt = (std::getenv("DFLASH_FP_DUMP_COUNTS") != nullptr);
+    static const bool dump_cnt = (std::getenv("LUCE_FP_DUMP_COUNTS") != nullptr);
     if (dump_cnt) {
         std::vector<int32_t> hcnt((size_t)B * M * H);
         cudaMemcpy(hcnt.data(), dCnt, hcnt.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
@@ -339,8 +339,8 @@ int flash_prefill_forward_bf16(
                      S, M, H, sum, (double)sum/(M*H*B), mn, mx);
     }
     // 4. sparse flash forward (BSA-or-WMMA)
-#ifdef DFLASH27B_HAVE_BSA
-    static const bool use_bsa = (std::getenv("DFLASH_FP_USE_BSA") != nullptr);
+#ifdef LUCE_HAVE_BSA
+    static const bool use_bsa = (std::getenv("LUCE_FP_USE_BSA") != nullptr);
     if (use_bsa && D == 128 && BLOCK == 128) {
         launch_bsa_sparse_flash_forward_bf16(
             Q, K, V, O, dIdx, dCnt, scale,
@@ -391,9 +391,9 @@ err:
     return -1;
 }
 
-#endif // DFLASH27B_HAVE_SM80_FLASHPREFILL
+#endif // LUCE_HAVE_SM80_FLASHPREFILL
 
-#ifdef DFLASH27B_HAVE_VOLTA_FLASHPREFILL
+#ifdef LUCE_HAVE_VOLTA_FLASHPREFILL
 // ── F16 (half) dispatch: same algorithm, F16 WMMA kernels (sm_70) ──
 
 int flash_prefill_forward_f16_volta(
@@ -430,7 +430,7 @@ int flash_prefill_forward_f16_volta(
     if ((e = cudaMalloc(&dIdx, (size_t)B * M * N * H * sizeof(int32_t))) != cudaSuccess) goto err;
     if ((e = cudaMalloc(&dCnt, (size_t)B * M * H * sizeof(int32_t))) != cudaSuccess) goto err;
 
-    static const bool prof = (std::getenv("DFLASH_FP_PROFILE") != nullptr);
+    static const bool prof = (std::getenv("LUCE_FP_PROFILE") != nullptr);
     cudaEvent_t pE[5];
     if (prof) for (int i=0;i<5;i++) cudaEventCreate(&pE[i]);
     if (prof) cudaEventRecord(pE[0]);
@@ -498,9 +498,9 @@ err:
     return -1;
 }
 
-#endif // DFLASH27B_HAVE_VOLTA_FLASHPREFILL
+#endif // LUCE_HAVE_VOLTA_FLASHPREFILL
 
-#ifdef DFLASH27B_HAVE_PASCAL_FLASHPREFILL
+#ifdef LUCE_HAVE_PASCAL_FLASHPREFILL
 // ── F16 (half) scalar dispatch: same algorithm, scalar F16 math (sm_6x) ──
 // No tensor cores on Pascal — all math is F16×F16→F32 scalar.
 
@@ -537,7 +537,7 @@ int flash_prefill_forward_f16_pascal(
     if ((e = cudaMalloc(&dIdx, (size_t)B * M * N * H * sizeof(int32_t))) != cudaSuccess) goto err;
     if ((e = cudaMalloc(&dCnt, (size_t)B * M * H * sizeof(int32_t))) != cudaSuccess) goto err;
 
-    static const bool prof = (std::getenv("DFLASH_FP_PROFILE") != nullptr);
+    static const bool prof = (std::getenv("LUCE_FP_PROFILE") != nullptr);
     cudaEvent_t pE[5];
     if (prof) for (int i=0;i<5;i++) cudaEventCreate(&pE[i]);
     if (prof) cudaEventRecord(pE[0]);
@@ -605,7 +605,7 @@ err:
     return -1;
 }
 
-#endif // DFLASH27B_HAVE_PASCAL_FLASHPREFILL
+#endif // LUCE_HAVE_PASCAL_FLASHPREFILL
 
 // ── Runtime dispatch: selects Volta WMMA or Pascal scalar based on GPU ──
 // Both variants may coexist in a multi-arch fatbin; pick at runtime.
@@ -623,12 +623,12 @@ int flash_prefill_forward_f16(
     cudaGetDeviceProperties(&prop, device);
     const int sm = prop.major * 10 + prop.minor;
 
-#if defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL) && defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
+#if defined(LUCE_HAVE_VOLTA_FLASHPREFILL) && defined(LUCE_HAVE_PASCAL_FLASHPREFILL)
     if (sm >= 70) return flash_prefill_forward_f16_volta(Q, K, V, O, batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
     return flash_prefill_forward_f16_pascal(Q, K, V, O, batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
-#elif defined(DFLASH27B_HAVE_VOLTA_FLASHPREFILL)
+#elif defined(LUCE_HAVE_VOLTA_FLASHPREFILL)
     return flash_prefill_forward_f16_volta(Q, K, V, O, batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
-#elif defined(DFLASH27B_HAVE_PASCAL_FLASHPREFILL)
+#elif defined(LUCE_HAVE_PASCAL_FLASHPREFILL)
     return flash_prefill_forward_f16_pascal(Q, K, V, O, batch, seq_len, n_q_heads, n_k_heads, head_dim, scale, cfg);
 #else
     std::fprintf(stderr, "[flashprefill] no F16 kernel available for sm_%d\n", sm);
@@ -637,4 +637,4 @@ int flash_prefill_forward_f16(
 }
 
 } // namespace flashprefill
-} // namespace dflash::common
+} // namespace luce::common

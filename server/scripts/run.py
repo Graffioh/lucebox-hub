@@ -8,9 +8,9 @@ Tokens print live as they are committed by the spec-decode loop.
 Auto-applies the Qwen3.5/3.6 chat template unless --raw is passed.
 
 Default target is Qwen3.6-27B-Q4_K_M.gguf. Override with `--target` or the
-`DFLASH_TARGET` env var (also honored by bench_he.py / bench_llm.py).
+`LUCE_TARGET` env var (also honored by bench_he.py / bench_llm.py).
 The HF tokenizer repo defaults to `Qwen/Qwen3.6-27B` and can be overridden via
-the `DFLASH_TOKENIZER` env var.
+the `LUCE_TOKENIZER` env var.
 """
 import argparse
 import os
@@ -24,9 +24,9 @@ from pathlib import Path
 
 def default_paths():
     return {
-        "target": os.environ.get("DFLASH_TARGET",
+        "target": os.environ.get("LUCE_TARGET",
                                  "models/Qwen3.6-27B-Q4_K_M.gguf"),
-        "draft":  os.environ.get("DFLASH_DRAFT", "models/draft"),
+        "draft":  os.environ.get("LUCE_DRAFT", "models/draft"),
         "bin":    "build/test_dflash" + (".exe" if sys.platform == "win32" else ""),
     }
 
@@ -68,7 +68,7 @@ def resolve_draft(draft_dir: str, target_path: str | None = None) -> str:
                     sys.stderr.write(
                         f"[run.py] {len(matches)} draft files under {draft_dir}; "
                         f"using {matches[0].name}. Pass --draft or set "
-                        f"DFLASH_DRAFT to select explicitly.\n")
+                        f"LUCE_DRAFT to select explicitly.\n")
             return str(matches[0])
 
     raise FileNotFoundError(
@@ -130,7 +130,7 @@ def main():
         sys.exit("no prompt")
 
     from transformers import AutoTokenizer
-    tok_repo = os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.6-27B")
+    tok_repo = os.environ.get("LUCE_TOKENIZER", "Qwen/Qwen3.6-27B")
     tokenizer = AutoTokenizer.from_pretrained(tok_repo,
                                               trust_remote_code=True)
 
@@ -155,19 +155,19 @@ def main():
     if sys.platform == "win32":
         env["PATH"] = dll_dir + os.pathsep + bin_dir + os.pathsep + env.get("PATH", "")
     if args.cache_type_k:
-        env["DFLASH27B_KV_K"] = args.cache_type_k
+        env["LUCE_KV_K"] = args.cache_type_k
     if args.cache_type_v:
-        env["DFLASH27B_KV_V"] = args.cache_type_v
+        env["LUCE_KV_V"] = args.cache_type_v
     if args.kv_q4:
-        env["DFLASH27B_KV_Q4"] = "1"
+        env["LUCE_KV_Q4"] = "1"
     if args.kv_tq3:
-        env["DFLASH27B_KV_TQ3"] = "1"
+        env["LUCE_KV_TQ3"] = "1"
     if args.fa_window is not None:
-        env["DFLASH27B_FA_WINDOW"] = str(args.fa_window)
+        env["LUCE_FA_WINDOW"] = str(args.fa_window)
     if args.draft_swa is not None:
-        env["DFLASH27B_DRAFT_SWA"] = str(args.draft_swa)
+        env["LUCE_DRAFT_SWA"] = str(args.draft_swa)
     if args.draft_ctx_max is not None:
-        env["DFLASH27B_DRAFT_CTX_MAX"] = str(args.draft_ctx_max)
+        env["LUCE_DRAFT_CTX_MAX"] = str(args.draft_ctx_max)
 
     with tempfile.TemporaryDirectory() as tmp:
         in_bin  = os.path.join(tmp, "prompt.bin")

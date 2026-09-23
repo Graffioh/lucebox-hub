@@ -6,6 +6,7 @@
 
 #include "deepseek4_layer_split_adapter.h"
 #include "deepseek4_internal.h"
+#include "deepseek4_snapshot.h"
 #include "deepseek4_roctx.h"
 #include "common/target_shard_ipc.h"
 #include "common/target_shard_ipc_daemon.h"
@@ -24,7 +25,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 using TargetShardClock = std::chrono::steady_clock;
@@ -78,7 +79,7 @@ static uint64_t target_shard_elapsed_us(TargetShardClock::time_point start,
 }
 
 static bool target_shard_timing_enabled() {
-    const char * value = std::getenv("DFLASH_DS4_TIMING");
+    const char * value = std::getenv("LUCE_DS4_TIMING");
     return value && value[0] && std::strcmp(value, "0") != 0;
 }
 
@@ -355,4 +356,4 @@ int run_deepseek4_target_shard_ipc_daemon(
     return rc;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

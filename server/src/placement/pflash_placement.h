@@ -5,7 +5,7 @@
 #include "placement_config.h"
 #include "remote_draft_config.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 struct PFlashDrafterPlacement {
     PlacementBackend target_backend = PlacementBackend::Auto;
@@ -40,4 +40,4 @@ inline PFlashDrafterPlacement resolve_pflash_drafter_placement(
     return out;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

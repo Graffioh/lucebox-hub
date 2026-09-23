@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-using dflash::common::qwen3_drafter_buffer_plan;
+using luce::common::qwen3_drafter_buffer_plan;
 
 namespace {
 struct Qwen3BufferPlanFixture : CppUnitTestFramework::CommonFixture {

@@ -167,7 +167,7 @@ Adding a compatible MoE architecture requires a thin adapter, not another schedu
 
 Hardware policy remains outside this contract: placement budgets, which GPU is primary, peer-copy mode, verification width, and kernel qualification are Lucebox profile choices. A model adapter must not duplicate owner scheduling, storage, peer transport, or join logic.
 
-Common execution switches use the `DFLASH_MOE_*` namespace. The corresponding `DFLASH_DS4_*` names remain accepted as compatibility aliases for existing DeepSeek V4 profiles.
+Common execution switches use the `LUCE_MOE_*` namespace. The corresponding `LUCE_DS4_*` names remain accepted as compatibility aliases for existing DeepSeek V4 profiles.
 
 Currently integrated with:
 

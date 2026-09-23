@@ -17,7 +17,7 @@
 
 #include <cstdio>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Select or create a backend for prefix cache snapshot storage.
 //
@@ -53,4 +53,4 @@ inline void free_snapshot_backend(ggml_backend_t snap_backend,
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

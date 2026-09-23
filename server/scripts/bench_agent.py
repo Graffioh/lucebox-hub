@@ -22,8 +22,8 @@ Usage:
     python3 scripts/bench_agent.py --bucket 8k          # one bucket
     python3 scripts/bench_agent.py --n-sample 1 --bucket 2k  # smoke
 
-Same env vars as ``bench_llm.py``: ``DFLASH_TARGET``, ``DFLASH_DRAFT``,
-``DFLASH_BIN``, ``DFLASH_BIN_AR``, ``DFLASH_TOKENIZER``.
+Same env vars as ``bench_llm.py``: ``LUCE_TARGET``, ``LUCE_DRAFT``,
+``LUCE_BIN``, ``LUCE_BIN_AR``, ``LUCE_TOKENIZER``.
 """
 import argparse
 import json
@@ -38,15 +38,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BIN_SUFFIX = ".exe" if os.name == "nt" else ""
 TARGET = os.environ.get(
-    "DFLASH_TARGET",
+    "LUCE_TARGET",
     str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
 )
 _LOCAL_DRAFT_FILE = ROOT / "models" / "draft" / "dflash-draft-3.6-q4_k_m.gguf"
 _LOCAL_DRAFT_ROOT = ROOT / "models" / "draft"
 DRAFT = None
-TEST_DFLASH = os.environ.get("DFLASH_BIN", str(ROOT / "build" / f"test_dflash{BIN_SUFFIX}"))
-TEST_GENERATE = os.environ.get("DFLASH_BIN_AR", str(ROOT / "build" / f"test_generate{BIN_SUFFIX}"))
-TOKENIZER = os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.5-27B")
+TEST_DFLASH = os.environ.get("LUCE_BIN", str(ROOT / "build" / f"test_dflash{BIN_SUFFIX}"))
+TEST_GENERATE = os.environ.get("LUCE_BIN_AR", str(ROOT / "build" / f"test_generate{BIN_SUFFIX}"))
+TOKENIZER = os.environ.get("LUCE_TOKENIZER", "Qwen/Qwen3.5-27B")
 TMPDIR = Path(tempfile.gettempdir()) / "dflash_bench"
 TMPDIR.mkdir(parents=True, exist_ok=True)
 
@@ -80,18 +80,18 @@ def _find_draft_model(root: Path):
 
 
 def _resolve_draft() -> str:
-    env = os.environ.get("DFLASH_DRAFT")
+    env = os.environ.get("LUCE_DRAFT")
     if env:
         found = _find_draft_model(Path(env))
         if found:
             return found
-        raise FileNotFoundError(f"DFLASH_DRAFT does not point to a draft GGUF/safetensors: {env}")
+        raise FileNotFoundError(f"LUCE_DRAFT does not point to a draft GGUF/safetensors: {env}")
     for c in (_LOCAL_DRAFT_FILE, _LOCAL_DRAFT_ROOT):
         found = _find_draft_model(c)
         if found:
             return found
     raise FileNotFoundError(
-        f"DFlash draft not found. Set DFLASH_DRAFT or place a file under {_LOCAL_DRAFT_ROOT}"
+        f"DFlash draft not found. Set LUCE_DRAFT or place a file under {_LOCAL_DRAFT_ROOT}"
     )
 
 
@@ -135,7 +135,7 @@ def _parse_dflash(stdout: str) -> dict:
     """Parse test_dflash stdout into {prefill_s, decode_tps, al, stages{}}."""
     m_pf = _RE_DF_PREFILL.search(stdout)
     m_al = _RE_AL.search(stdout)
-    # decode tps line is the LAST tok/s in the file ("[dflash] generated ... -> X tok/s")
+    # decode tps line is the LAST tok/s in the file ("[luce] generated ... -> X tok/s")
     matches = list(_RE_DECODE_TPS.finditer(stdout))
     if not (m_pf and m_al and matches):
         raise RuntimeError(f"test_dflash parse failed:\n{stdout[-1500:]}")
@@ -150,7 +150,7 @@ def _parse_dflash(stdout: str) -> dict:
             continue
         if in_block:
             if line.startswith("[") or line.startswith("---"):
-                # "  ----- sum     132.20" ends block; "[dflash] generated…" too
+                # "  ----- sum     132.20" ends block; "[luce] generated…" too
                 if "----- sum" in line:
                     m = re.search(r"sum\s+(\d+(?:\.\d+)?)", line)
                     if m:

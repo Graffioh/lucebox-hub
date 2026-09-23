@@ -72,29 +72,32 @@ jobs:
           # uv reads .python-version (3.12, matching the previous CI) and downloads the matching
           # interpreter; no separate setup-python step needed.
 
-      - name: Build dflash (smoke + server)
+      - name: Build luce (smoke + server)
         run: |
           cd server
           cmake -B build \
             -DCMAKE_CUDA_ARCHITECTURES="86" \
-            -DDFLASH27B_ENABLE_BSA=OFF \
-            -DDFLASH27B_FA_ALL_QUANTS=OFF \
+            -DLUCE_ENABLE_BSA=OFF \
+            -DLUCE_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
             test_dflash test_generate test_flash_attn_sparse test_server_unit \
             test_deepseek4_unit test_feature_gate test_seq_slot_manager \
             test_seq_engine_contract test_seq_batch_plan test_client_send_buffer \
-            test_model_smoke test_batched_gdn test_concat_transpose -j$(nproc)
+            test_paged_kv_pool test_rope_tail test_blocking_row_pool \
+            test_model_smoke test_batched_gdn test_concat_transpose \
+            test_kernel_qualification_core test_kernel_qualification_gdn \
+            test_kernel_qualification_moe_ds4 -j$(nproc)
 
       - name: Run C++ server unit tests
         run: |
           cd server/build
           ctest --output-on-failure \
-            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|batched_gdn_cpu" \
+            -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer|paged_kv_pool|blocking_row_pool|rope_tail|batched_gdn_cpu|test_kernel_qualification_core" \
             --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
-        # First pass: install the workspace's default deps. dflash declares
+        # First pass: install the workspace's default deps. luce declares
         # torch (which uv pulls from the pytorch-cu128 index per
         # [tool.uv.sources]) and pflash drags in setuptools. Megakernel is
         # in the optional `megakernel` extra so its build does NOT run yet.
@@ -156,12 +159,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - job_name: GPU tests (self-hosted RTX 3090, sm_86)
-            runner: lucebox-rtx3090
-            arch: "86"
-            compute_cap: "8.6"
-            concurrency_group: lucebox-rtx3090-gpu-runner
-            sparse_attention: "true"
+          # TEMPORARY (2026-09-09): the lucebox-rtx3090 runner is offline
+          # (NVIDIA driver not responding since 2026-09-07), so every run of
+          # this entry fails before the checkout step. Restore the entry once
+          # the runner is back. The sparse-attention smoke is 3090-only and
+          # does not run while this is commented out.
+          # - job_name: GPU tests (self-hosted RTX 3090, sm_86)
+          #   runner: lucebox-rtx3090
+          #   arch: "86"
+          #   compute_cap: "8.6"
+          #   concurrency_group: lucebox-rtx3090-gpu-runner
+          #   sparse_attention: "true"
           - job_name: GPU tests (self-hosted DGX GB10, sm_121 verifier)
             runner: dgx-gb10
             arch: "121"
@@ -197,14 +205,15 @@ jobs:
           cmake -B build \
             -DCMAKE_CUDA_COMPILER="$CUDACXX" \
             -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
-            -DDFLASH27B_USER_CUDA_ARCHITECTURES="$CUDA_ARCH" \
-            -DDFLASH27B_ENABLE_BSA=OFF \
-            -DDFLASH27B_FA_ALL_QUANTS=OFF \
+            -DLUCE_USER_CUDA_ARCHITECTURES="$CUDA_ARCH" \
+            -DLUCE_ENABLE_BSA=OFF \
+            -DLUCE_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           if [[ "$CUDA_ARCH" == "121" ]]; then
-            grep -q '^DFLASH27B_EFFECTIVE_BLACKWELL_CONSUMER:INTERNAL=OFF$' build/CMakeCache.txt
+            grep -q '^LUCE_EFFECTIVE_BLACKWELL_CONSUMER:INTERNAL=OFF$' build/CMakeCache.txt
           fi
           targets=(
+            test_server_unit
             test_cuda_pool_shutdown
             test_deepseek4_mmid_grouped_cuda
             test_deepseek4_unit
@@ -216,6 +225,9 @@ jobs:
             test_model_smoke
             test_batched_gdn
             test_gdn_replay_log
+            test_kernel_qualification_core
+            test_kernel_qualification_gdn
+            test_kernel_qualification_moe_ds4
             test_concat_transpose
           )
           if [[ "$RUN_SPARSE_ATTENTION_TEST" == "true" ]]; then
@@ -233,25 +245,30 @@ jobs:
           ctest --test-dir server/build --output-on-failure \
             -R 'cuda_pool_shutdown|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce'
 
+      - name: Run GPU sampler and draft top-K tests
+        run: |
+          ctest --test-dir server/build --output-on-failure \
+            -R '^test_server_unit\.(GpuSamplerCudaFixture|DraftTopkCudaFixture)\.' --no-tests=error
+
       - name: Run concurrent-serving kernel tests
         run: |
           ctest --test-dir server/build --output-on-failure \
-            -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$|gdn_replay_log_preflight$|concat_transpose$)' --no-tests=error
+            -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$|gdn_replay_log_preflight$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$)' --no-tests=error
 
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
-      # disabled by default because it builds dflash_server and lazy-loads the
+      # disabled by default because it builds luce_server and lazy-loads the
       # ~16 GB Qwen3.6-27B target + draft (~1-2 min). The weights are already
       # staged at /opt/models on lucebox-rtx3090 (override with repo var
       # LUCEBOX_MODELS_DIR). Verified working on the runner. To enable, uncomment;
       # continue-on-error keeps a heavy/slow run from ever blocking a PR.
-      # - name: dflash end-to-end smoke (model-backed)
+      # - name: luce end-to-end smoke (model-backed)
       #   continue-on-error: true
       #   env:
       #     MODELS: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
       #   run: |
       #     cd server
-      #     cmake --build build --target dflash_server -j"$(nproc)"
-      #     ./build/dflash_server "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
+      #     cmake --build build --target luce_server -j"$(nproc)"
+      #     ./build/luce_server "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
       #       --draft "$MODELS/draft/dflash-draft-3.6-q4_k_m.gguf" --port 8099 &
       #     SRV=$!; trap 'kill $SRV 2>/dev/null' EXIT
       #     for i in $(seq 1 90); do curl -sf localhost:8099/v1/models >/dev/null && break; sleep 2; done
@@ -288,6 +305,10 @@ jobs:
     env:
       HIP_VISIBLE_DEVICES: ${{ matrix.device_index }}
       EXPECTED_HIP_ARCH: ${{ matrix.arch }}
+      LUCE_TEST_MODEL_QWEN35: /opt/models/Qwen3.6-27B-Q4_K_M.gguf
+      LUCE_TEST_MODEL_QWEN3: /opt/models/Qwen3-0.6B-BF16.gguf
+      LUCE_TEST_MODEL_DEEPSEEK4: /opt/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf
+      DS4_TEST_MODEL: /opt/models/DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf
     concurrency:
       group: lucebox3-${{ matrix.concurrency_key }}-runner
       cancel-in-progress: false
@@ -341,24 +362,43 @@ jobs:
       - name: Build + test ROCm formats and inference core
         run: |
           cmake -S server -B "$RUNNER_TEMP/rocmfp-build" \
-            -DDFLASH27B_GPU_BACKEND=hip \
-            -DDFLASH27B_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
-            -DDFLASH27B_SERVER=OFF \
-            -DDFLASH27B_TESTS=ON \
+            -DLUCE_GPU_BACKEND=hip \
+            -DLUCE_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
+            -DLUCE_SERVER=OFF \
+            -DLUCE_TESTS=ON \
             -DGGML_HIP_GRAPHS=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
+            -DCMAKE_HIP_FLAGS=-DLUCE_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
             --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail test_rocmfpx_mmq \
               test_deepseek4_mmid_grouped_cuda test_deepseek4_unit \
-              test_recurrent_snapshot test_server_unit test_rocmfp3_mix_registry \
+              test_ds4_moe_combine_cuda test_ds4_maskless_prefill \
+              test_recurrent_snapshot test_server_unit test_draft_topk_cuda test_rocmfp3_mix_registry \
               test_rocmfp_mix_slice_matvec test_rocmfp_mix_gateup_glu \
-              test_ds4_mix_registry_teardown test_model_smoke test_batched_gdn \
-              test_concat_transpose test_cuda_pool_shutdown test_ggml_cluster_allreduce \
+              test_ds4_mix_registry_teardown test_ds4_load_transactional \
+              test_model_smoke test_batched_gdn \
+              test_kernel_qualification_core test_kernel_qualification_gdn \
+              test_kernel_qualification_moe_ds4 \
+              test_concat_transpose test_cuda_pool_shutdown test_fattn_mma256 \
+              test_ggml_cluster_allreduce \
+              test_paged_attn_wmma \
             --parallel 8
           ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
             --output-on-failure \
-            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|recurrent_snapshot|ChainRollbackPolicy|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_model_smoke\.PagedAttention\.|batched_gdn$|concat_transpose$'
+            -R 'cuda_pool_shutdown|rocmfp4_reference|rocmfpx_reference|rocmfp4_hip_tail|rocmfpx_mmq|deepseek4_mmid_grouped_cuda|deepseek4_unit|ds4_moe_combine_cuda|ds4_maskless_prefill|recurrent_snapshot|ChainRollbackPolicy|MmqTileSelection|MixedMmqPolicy|MoeHybridStorageFixture|rocmfp3_mix_registry|rocmfp_mix_slice_matvec|rocmfp_mix_gateup_glu|ds4_mix_registry_teardown|ggml_cluster_allreduce|test_model_smoke\.PagedAttention\.|batched_gdn$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$|test_fattn_mma256$|test_paged_attn_wmma$|paged_attn_wmma_route$'
+
+      - name: Run GPU draft top-K tests
+        run: |
+          ctest --test-dir "$RUNNER_TEMP/rocmfp-build" --output-on-failure \
+            -R '^draft_topk_cuda$' --no-tests=error
+
+      - name: Run model-backed ROCm tests
+        if: matrix.arch == 'gfx1151'
+        run: |
+          ctest --test-dir "$RUNNER_TEMP/rocmfp-build" \
+            --output-on-failure \
+            -R '^(ds4_load_transactional|test_model_smoke\.SmokeLoadTarget\.LoadsConfiguredModel)$' \
+            --no-tests=error
 
       - name: Build + test affine ROCmFP2 GPU paths
         # Keep the default wire-format build above and compile the affine layout
@@ -366,14 +406,14 @@ jobs:
         # assert real MMVQ/MMQ dispatch rather than accepting a BLAS fallback.
         run: |
           cmake -S server -B "$RUNNER_TEMP/rocmfp-affine-build" \
-            -DDFLASH27B_GPU_BACKEND=hip \
-            -DDFLASH27B_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
-            -DDFLASH27B_SERVER=OFF \
-            -DDFLASH27B_TESTS=ON \
-            -DDFLASH27B_ROCMFP2_AFFINE=ON \
+            -DLUCE_GPU_BACKEND=hip \
+            -DLUCE_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
+            -DLUCE_SERVER=OFF \
+            -DLUCE_TESTS=ON \
+            -DLUCE_ROCMFP2_AFFINE=ON \
             -DGGML_HIP_GRAPHS=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
+            -DCMAKE_HIP_FLAGS=-DLUCE_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-affine-build" \
             --target test_rocmfpx test_rocmfpx_mmq \
               test_deepseek4_mmid_grouped_cuda \
@@ -413,14 +453,14 @@ jobs:
           cmake -B build -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_CUDA_ARCHITECTURES="75" ^
-            -DDFLASH27B_ENABLE_BSA=OFF ^
-            -DDFLASH27B_FA_ALL_QUANTS=OFF ^
+            -DLUCE_ENABLE_BSA=OFF ^
+            -DLUCE_FA_ALL_QUANTS=OFF ^
             -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe"
 
       - name: Build Windows targets
         working-directory: server
         shell: cmd
-        run: cmake --build build --target dflash_common dflash_server backend_ipc_daemon test_platform_compat -j 4
+        run: cmake --build build --target luce_common luce_server backend_ipc_daemon test_platform_compat -j 4
 
       - name: Run Windows platform smoke test
         working-directory: server
@@ -430,15 +470,15 @@ jobs:
       - name: Verify build outputs
         shell: pwsh
         run: |
-          $lib = Get-ChildItem server/build -Recurse -Filter "dflash_common.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $lib = Get-ChildItem server/build -Recurse -Filter "luce_common.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $lib) {
-            Write-Error "dflash_common.lib not found in build output"
+            Write-Error "luce_common.lib not found in build output"
             exit 1
           }
           Write-Host "Built: $($lib.FullName)"
           Write-Host "Size: $([math]::Round($lib.Length / 1MB, 2)) MB"
 
-          foreach ($binaryName in @("dflash_server.exe", "backend_ipc_daemon.exe")) {
+          foreach ($binaryName in @("luce_server.exe", "backend_ipc_daemon.exe")) {
             $binary = Get-ChildItem server/build -Recurse -Filter $binaryName -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $binary) {
               Write-Error "$binaryName not found in build output"

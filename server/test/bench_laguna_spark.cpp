@@ -1,16 +1,16 @@
 // Laguna Spark decode bench: drives LagunaBackend (the REAL hybrid/spark
-// path used by dflash_server), honoring all DFLASH_* env knobs:
-//   DFLASH_LAGUNA_HOTNESS=<csv>     calibrated placement
-//   DFLASH_EXPERT_BUDGET_PCT=60     pinned-hot fraction
-//   DFLASH_LAGUNA_CACHE_SLOTS=16    cache ring slots/layer
-//   DFLASH_LAGUNA_PROFILE=1         cold-experts/token profiling
-//   DFLASH_LAGUNA_NO_SINGLE_GRAPH=1 per-layer fallback (for trace capture)
-//   DFLASH_LAGUNA_PREGATE_TRACE=<f> pregate trace capture (fallback path)
+// path used by luce_server), honoring all LUCE_* env knobs:
+//   LUCE_LAGUNA_HOTNESS=<csv>     calibrated placement
+//   LUCE_EXPERT_BUDGET_PCT=60     pinned-hot fraction
+//   LUCE_LAGUNA_CACHE_SLOTS=16    cache ring slots/layer
+//   LUCE_LAGUNA_PROFILE=1         cold-experts/token profiling
+//   LUCE_LAGUNA_NO_SINGLE_GRAPH=1 per-layer fallback (for trace capture)
+//   LUCE_LAGUNA_PREGATE_TRACE=<f> pregate trace capture (fallback path)
 //
 // Usage: bench_laguna_spark <laguna.gguf> [prompt_N=128] [n_gen=256]
 
 #include "laguna_backend.h"
-#include "dflash27b.h"
+#include "luce.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
@@ -40,15 +40,15 @@ int main(int argc, char ** argv) {
     be.print_ready_banner();
 
     // BOS + fake tokens (same seeding as bench_laguna_generate so the
-    // routing trajectory is comparable across configs). DFLASH_BENCH_MIX=1
+    // routing trajectory is comparable across configs). LUCE_BENCH_MIX=1
     // uses a deterministic varied prompt instead (non-degenerate continuation,
     // for exactness comparisons between decode paths).
     GenerateRequest req;
     req.prompt.resize((size_t)prompt_N, 1972);
     req.prompt[0] = 2;  // laguna bos
-    if (std::getenv("DFLASH_BENCH_MIX")) {
+    if (std::getenv("LUCE_BENCH_MIX")) {
         int64_t seed = 1;
-        if (const char * s = std::getenv("DFLASH_BENCH_SEED")) seed = std::atoll(s);
+        if (const char * s = std::getenv("LUCE_BENCH_SEED")) seed = std::atoll(s);
         for (int i = 1; i < prompt_N; ++i)
             req.prompt[(size_t)i] = 1000 + (int32_t)((((int64_t)i + seed * 7919) * 2654435761LL) % 50000);
     }

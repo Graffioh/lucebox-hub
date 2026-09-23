@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 inline int chain_decode_bucket_width(int lanes) {
     static constexpr int buckets[] = {
@@ -62,4 +62,4 @@ inline size_t chain_min_tokens_safe_prefix(
     return path_size;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

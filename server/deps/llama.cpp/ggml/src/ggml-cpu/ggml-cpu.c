@@ -156,7 +156,8 @@ static void ggml_compute_forward_ds4_indexer_score(
     const struct ggml_tensor * comp = dst->src[2];
     const struct ggml_tensor * visibility_mask = dst->src[3];
     GGML_ASSERT(q && weights && comp);
-    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->ne[0] == 128);
+    GGML_ASSERT((q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_F16) &&
+                q->ne[0] == 128);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(comp->type == GGML_TYPE_F16 && comp->ne[0] == 128);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
@@ -175,7 +176,10 @@ static void ggml_compute_forward_ds4_indexer_score(
     GGML_ASSERT(dst->ne[0] == n_comp && dst->ne[1] == n_tokens);
     GGML_ASSERT(kv_start >= 0 && ratio > 0);
 
-    const float * q_data = (const float *) q->data;
+    const float * q_f32 = q->type == GGML_TYPE_F32
+        ? (const float *) q->data : NULL;
+    const ggml_fp16_t * q_f16 = q->type == GGML_TYPE_F16
+        ? (const ggml_fp16_t *) q->data : NULL;
     const float * weight_data = (const float *) weights->data;
     const ggml_fp16_t * comp_data = (const ggml_fp16_t *) comp->data;
     const float * mask_data = visibility_mask
@@ -194,11 +198,14 @@ static void ggml_compute_forward_ds4_indexer_score(
             const ggml_fp16_t * k = comp_data + (size_t) c * 128;
             float score = 0.0f;
             for (int h = 0; h < n_head; ++h) {
-                const float * qh = q_data +
+                const size_t q_offset =
                     ((size_t) token * n_head + h) * 128;
                 float dot = 0.0f;
                 for (int d = 0; d < 128; ++d) {
-                    dot += qh[d] * GGML_FP16_TO_FP32(k[d]);
+                    const float q_value = q_f32
+                        ? q_f32[q_offset + d]
+                        : GGML_FP16_TO_FP32(q_f16[q_offset + d]);
+                    dot += q_value * GGML_FP16_TO_FP32(k[d]);
                 }
                 score += fmaxf(dot, 0.0f) *
                          weight_data[(size_t) token * n_head + h];
@@ -245,6 +252,43 @@ static void ggml_compute_forward_ds4_indexer_mask(
             if (comp >= 0 && comp < n_comp) {
                 dst_row[raw_rows + comp] = base_row[raw_rows + comp];
             }
+        }
+    }
+}
+
+static void ggml_compute_forward_ds4_moe_combine(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * down_e     = dst->src[0];
+    const struct ggml_tensor * weights    = dst->src[1];
+    const struct ggml_tensor * shared_out = dst->src[2];
+
+    GGML_ASSERT(down_e && weights);
+    GGML_ASSERT(down_e->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int n_embd   = (int) down_e->ne[0];
+    const int n_used   = (int) down_e->ne[1];
+    const int n_tokens = (int) down_e->ne[2];
+
+    for (int t = params->ith; t < n_tokens; t += params->nth) {
+        const float * w_row = (const float *) ((const char *) weights->data + (size_t) t * weights->nb[1]);
+        const float * sh_row = shared_out ? (const float *) ((const char *) shared_out->data + (size_t) t * shared_out->nb[1]) : NULL;
+        float * dst_row = (float *) ((char *) dst->data + (size_t) t * dst->nb[1]);
+
+        for (int i = 0; i < n_embd; ++i) {
+            float sum = 0.0f;
+            for (int e = 0; e < n_used; ++e) {
+                if (w_row[e] == 0.0f) {
+                    continue;
+                }
+                const float * exp_row = (const float *) ((const char *) down_e->data + (size_t) t * down_e->nb[2] + (size_t) e * down_e->nb[1]);
+                const float prod = exp_row[i] * w_row[e];
+                sum += prod;
+            }
+            if (sh_row) {
+                sum += sh_row[i];
+            }
+            dst_row[i] = sum;
         }
     }
 }
@@ -2036,6 +2080,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ds4_indexer_mask(params, tensor);
             } break;
+        case GGML_OP_DS4_MOE_COMBINE:
+            {
+                ggml_compute_forward_ds4_moe_combine(params, tensor);
+            } break;
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
@@ -2196,6 +2244,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 GGML_ABORT("GGML_OP_FLASH_ATTN_SPARSE is only supported on the CUDA backend");
             }
+        case GGML_OP_MUL_MAT_BIAS_BF16:
+            { GGML_ABORT("GGML_OP_MUL_MAT_BIAS_BF16 requires the HIP Lt backend"); }
+        case GGML_OP_RMS_NORM_VISION_F32:
+            { GGML_ABORT("GGML_OP_RMS_NORM_VISION_F32 requires the HIP wave32 backend"); }
+        case GGML_OP_SOFT_MAX_VISION_F32:
+        case GGML_OP_MUL_MAT_VISION_AV_F32:
+            { GGML_ABORT("explicit vision attention requires the HIP wave32 backend"); }
         case GGML_OP_PAGED_ATTN:
             {
                 GGML_ABORT("GGML_OP_PAGED_ATTN is only supported on the CUDA backend");
@@ -2588,6 +2643,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DS4_INDEXER_QAT:
         case GGML_OP_DS4_INDEXER_SCORE:
         case GGML_OP_DS4_INDEXER_MASK:
+        case GGML_OP_DS4_MOE_COMBINE:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_SPARSE:
         case GGML_OP_PAGED_ATTN:
@@ -2597,6 +2653,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = n_threads;
             } break;
+        case GGML_OP_MUL_MAT_BIAS_BF16:
+            GGML_ABORT("GGML_OP_MUL_MAT_BIAS_BF16 cannot be planned on CPU");
+        case GGML_OP_RMS_NORM_VISION_F32:
+            GGML_ABORT("GGML_OP_RMS_NORM_VISION_F32 cannot be planned on CPU");
+        case GGML_OP_SOFT_MAX_VISION_F32:
+        case GGML_OP_MUL_MAT_VISION_AV_F32:
+            GGML_ABORT("explicit vision attention cannot be planned on CPU");
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:
@@ -3018,7 +3081,7 @@ struct ggml_cplan ggml_graph_plan(
                             // conversion between F32 and I32
                             (node->src[0]->type == GGML_TYPE_F32 && node->src[1] && node->src[1]->type == GGML_TYPE_I32) ||
                             (node->src[0]->type == GGML_TYPE_I32 && node->src[1] && node->src[1]->type == GGML_TYPE_F32)) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
+                            cur = ggml_type_size(GGML_TYPE_F32) * (node->ne[0] + 1) * n_tasks; // +1: sink-column mode
                         }
                     } break;
                 case GGML_OP_ADD:

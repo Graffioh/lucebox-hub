@@ -20,7 +20,7 @@
 #include "common/ggml_graph_precision.h"
 #include "common/gpu_runtime_compat.h"
 #include "../common/kvflash_pager.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "flashprefill.h"
 
 #include <algorithm>
@@ -33,7 +33,7 @@
 #include "ggml-cuda.h"
 #include "ggml-alloc.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 static constexpr float GEMMA4_EPS = 1e-6f;
 
@@ -672,9 +672,9 @@ bool gemma4_step(
     ggml_set_input(pp);
 
     // K/V append row indices (set_rows path; data-only per step -> stable
-    // node properties -> CUDA-graph replay). DFLASH_GEMMA4_NO_KVPAD=1 restores
+    // node properties -> CUDA-graph replay). LUCE_GEMMA4_NO_KVPAD=1 restores
     // the legacy offset-view cpy append.
-    static const bool g_no_kvpad = (std::getenv("DFLASH_GEMMA4_NO_KVPAD") != nullptr);
+    static const bool g_no_kvpad = (std::getenv("LUCE_GEMMA4_NO_KVPAD") != nullptr);
     ggml_tensor * kvi_full = nullptr, * kvi_swa = nullptr;
     if (!g_no_kvpad) {
         kvi_full = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
@@ -808,7 +808,7 @@ bool gemma4_step(
     ggml_backend_tensor_set(pp, pos.data(), 0, ggml_nbytes(pp));
     if (!kvi_full && kvflash) {
         std::fprintf(stderr, "gemma4_step: kvflash requires the set_rows path "
-                             "(DFLASH_GEMMA4_NO_KVPAD is incompatible)\n");
+                             "(LUCE_GEMMA4_NO_KVPAD is incompatible)\n");
         ggml_free(ctx);
         return false;
     }
@@ -1200,7 +1200,7 @@ static void g4_free_pers(G4PersBuf & p) {
 }
 
 static int g4_bsa_chunk_size() {
-    if (const char * e = std::getenv("DFLASH_G4_BSA_CHUNK")) {
+    if (const char * e = std::getenv("LUCE_G4_BSA_CHUNK")) {
         int v = std::atoi(e);
         if (v >= 512) return v;
     }
@@ -1233,7 +1233,7 @@ bool gemma4_prefill_bsa(
     // Use BF16 only for sm_80+ (native BF16 tensor cores). Volta/Turing
     // use F16 with F16 WMMA kernels; other arches use F16 with ggml FA fallback.
     const ggml_type half_type =
-#ifdef DFLASH27B_HAVE_SM80_FLASHPREFILL
+#ifdef LUCE_HAVE_SM80_FLASHPREFILL
         GGML_TYPE_BF16;
 #else
         GGML_TYPE_F16;
@@ -1870,4 +1870,4 @@ bool gemma4_prefill_bsa(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

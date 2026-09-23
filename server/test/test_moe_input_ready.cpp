@@ -10,7 +10,7 @@
 #include <thread>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static constexpr auto kTimeout = std::chrono::seconds(2);
 

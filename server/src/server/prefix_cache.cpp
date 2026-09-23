@@ -4,15 +4,17 @@
 #include "common/sha1.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── Chat marker resolution ────────────────────────────────────────────
 
 bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out) {
+    out.role_starts_delimit = false;
     // DeepSeek V4 uses full-width punctuation in its control tokens. Require
     // each marker to encode as its exact vocabulary token so an unrelated BPE
     // tokenizer cannot be misclassified merely because it can spell the text.
@@ -31,6 +33,7 @@ bool resolve_chat_markers(const Tokenizer & tok, ChatMarkers & out) {
         out.sys_role_prefix = {ds_bos};
         out.end_msg_seqs = {{ds_eos}};
         out.next_role_starts = {{ds_user}, {ds_assistant}};
+        out.role_starts_delimit = true;
         return true;
     }
 
@@ -115,10 +118,40 @@ static std::pair<int, int> find_first_seq_any(
 std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
                                      const ChatMarkers & markers) {
     std::vector<int> out;
-    int sys_idx = find_first_seq(ids, markers.sys_role_prefix);
-    if (sys_idx < 0) return out;
+    // Boundaries normally start after the system role prefix. A prompt with
+    // no system message (common for API clients) still has role boundaries,
+    // so start from the first role marker instead of caching nothing. Take
+    // whichever comes first: a system prefix quoted inside a later message
+    // (literal ChatML in content) must not displace the real leading role.
+    const auto first_start = find_first_seq_any(ids, markers.next_role_starts);
+    int start_idx = find_first_seq(ids, markers.sys_role_prefix);
+    int start_len = (int)markers.sys_role_prefix.size();
+    if (first_start.first >= 0 &&
+        (start_idx < 0 || first_start.first < start_idx)) {
+        start_idx = first_start.first;
+        start_len = first_start.second;
+    }
+    if (start_idx < 0 || start_len <= 0) return out;
 
-    int cursor = sys_idx + (int)markers.sys_role_prefix.size();
+    int cursor = start_idx + start_len;
+    if (markers.role_starts_delimit) {
+        // Each role marker opens a message and closes the previous one, so
+        // the cut after every marker is a reusable prefix: the system text
+        // before the first user marker, each completed turn, and the
+        // generation prompt itself. A marker quoted inside message content
+        // adds a candidate cut too; cuts are reuse hints and exact token
+        // matching decides every restore, so that costs at most a snapshot
+        // taken at a less useful place.
+        while (true) {
+            const auto [idx, len] =
+                find_first_seq_any(ids, markers.next_role_starts, cursor);
+            if (idx < 0) break;
+            cursor = idx + len;
+            out.push_back(cursor);
+        }
+        return out;
+    }
+    int stray_skips = 0;
     while (true) {
         auto [end_idx, end_len] = find_first_seq_any(ids, markers.end_msg_seqs, cursor);
         if (end_idx < 0) break;
@@ -136,10 +169,24 @@ std::vector<int> find_all_boundaries(const std::vector<int32_t> & ids,
             }
         }
         found:
-        if (next_match < 0) break;
+        if (next_match < 0) {
+            // Stray end-of-message marker with no following role start — chatml
+            // tokens embedded in message content (file dumps, terminal output,
+            // model-echoed markers). Skip this marker and keep scanning instead
+            // of truncating the whole boundary list. A lone stray previously cut
+            // the walk off here, hiding every real boundary after it; that pinned
+            // the inline-snapshot deepen target (second-to-last boundary) at the
+            // already-restored prefix length, so no snapshot was ever deepened and
+            // every turn re-prefilled the entire tail. Guard against pathological
+            // input (or a marker-family mismatch) by capping consecutive strays.
+            if (++stray_skips > 8192) break;
+            cursor = after_end;
+            continue;
+        }
         int boundary = next_match + next_len;
         out.push_back(boundary);
         cursor = boundary;
+        stray_skips = 0;
     }
     return out;
 }
@@ -171,35 +218,63 @@ static bool is_strict_prefix(const std::vector<int32_t> & a,
 }
 
 int select_inline_evict_victim(const std::vector<const std::vector<int32_t> *> & ids_lru,
-                               const std::vector<bool> * protected_lru) {
+                               const std::vector<bool> * protected_lru,
+                               int skip_index) {
     const int n = (int)ids_lru.size();
     if (n <= 0) return 0;
     auto is_protected = [&](int i) {
         return protected_lru && i >= 0 && i < (int)protected_lru->size() &&
                (*protected_lru)[(size_t)i];
     };
-    // Oldest-first scan: prefer an unprotected leaf so sticky tools pins survive.
-    int oldest_protected_leaf = -1;
-    for (int i = 0; i < n; i++) {
-        bool is_ancestor = false;
+    auto is_ancestor = [&](int i) {
         for (int j = 0; j < n; j++) {
             if (j == i) continue;
-            if (is_strict_prefix(*ids_lru[i], *ids_lru[j])) { is_ancestor = true; break; }
+            if (is_strict_prefix(*ids_lru[i], *ids_lru[j])) return true;
         }
-        if (is_ancestor) continue;
+        return false;
+    };
+    // Oldest-first scan: prefer an unprotected leaf so sticky tools pins
+    // survive. skip_index (the in-flight restore source) is never a victim.
+    int oldest_protected_leaf = -1;
+    for (int i = 0; i < n; i++) {
+        if (i == skip_index) continue;
+        if (is_ancestor(i)) continue;
         if (!is_protected(i)) return i;  // oldest unprotected leaf
         if (oldest_protected_leaf < 0) oldest_protected_leaf = i;
+    }
+    if (skip_index >= 0) {
+        // No unprotected leaf outside the restore source — e.g. a linearly
+        // growing conversation whose only leaf is the restore source itself.
+        // Evict the shallowest non-protected ancestor (its KV is subsumed by
+        // every deeper entry) so the new snapshot lands in a different slot
+        // and the restore point can slide forward. Never the protected tools
+        // pin, never the restore source.
+        int shallowest_ancestor = -1;
+        for (int i = 0; i < n; i++) {
+            if (i == skip_index || is_protected(i)) continue;
+            if (!is_ancestor(i)) continue;
+            if (shallowest_ancestor < 0 ||
+                ids_lru[i]->size() < ids_lru[(size_t)shallowest_ancestor]->size()) {
+                shallowest_ancestor = i;
+            }
+        }
+        if (shallowest_ancestor >= 0) return shallowest_ancestor;
+        // Only the restore source and/or protected pins remain: destroying
+        // either would throw away the stable tools head or the in-flight
+        // restore, so there is no safe victim.
+        return -1;
     }
     if (oldest_protected_leaf >= 0) return oldest_protected_leaf;
     return 0;  // unreachable (the longest entry is always a leaf); pure-LRU fallback
 }
 
 int select_inline_evict_victim(const std::vector<std::vector<int32_t>> & ids_lru,
-                               const std::vector<bool> * protected_lru) {
+                               const std::vector<bool> * protected_lru,
+                               int skip_index) {
     std::vector<const std::vector<int32_t> *> ptrs;
     ptrs.reserve(ids_lru.size());
     for (const auto & v : ids_lru) ptrs.push_back(&v);
-    return select_inline_evict_victim(ptrs, protected_lru);
+    return select_inline_evict_victim(ptrs, protected_lru, skip_index);
 }
 
 int select_inline_snapshot_boundary(const std::vector<int> & boundaries,
@@ -234,8 +309,10 @@ bool should_force_inline_snapshot_boundary(
 
 // ─── PrefixCache ────────────────────────────────────────────────────────
 
-PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
+PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer,
+                         size_t max_resident_bytes)
     : cap_(std::min(cap, MAX_CACHE_SLOTS))
+    , max_resident_bytes_(max_resident_bytes)
 {
     if (cap_ <= 0) {
         disabled_ = true;
@@ -249,7 +326,13 @@ PrefixCache::PrefixCache(int cap, const Tokenizer & tokenizer)
         return;
     }
     disabled_ = false;
-    std::fprintf(stderr, "[pc] enabled: cap=%d family=%s\n", cap_, markers_.family.c_str());
+    if (max_resident_bytes_ > 0) {
+        std::fprintf(stderr, "[pc] enabled: cap=%d family=%s resident_budget=%zu MiB\n",
+                     cap_, markers_.family.c_str(), max_resident_bytes_ / (1024 * 1024));
+    } else {
+        std::fprintf(stderr, "[pc] enabled: cap=%d family=%s\n",
+                     cap_, markers_.family.c_str());
+    }
 }
 
 // ── LRU helpers ─────────────────────────────────────────────────────────
@@ -259,6 +342,23 @@ int PrefixCache::find_entry(const PrefixHash & h) const {
         if (entries_[i].hash == h) return i;
     }
     return -1;
+}
+
+int PrefixCache::find_slot_entry(int slot) const {
+    for (int i = 0; i < (int)entries_.size(); ++i) {
+        if (entries_[(size_t)i].slot == slot) return i;
+    }
+    return -1;
+}
+
+void PrefixCache::erase_inline_entry(int idx) {
+    if (idx < 0 || idx >= (int)entries_.size()) return;
+    const size_t bytes = entries_[(size_t)idx].resident_bytes;
+    resident_bytes_ = bytes <= resident_bytes_ ? resident_bytes_ - bytes : 0;
+    resident_bytes_count_.store(
+        (uint64_t)resident_bytes_, std::memory_order_relaxed);
+    entries_.erase(entries_.begin() + idx);
+    entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void PrefixCache::move_to_end(int idx) {
@@ -284,14 +384,30 @@ void PrefixCache::move_full_to_end(int idx) {
 
 // ── Inline prefix cache ─────────────────────────────────────────────────
 
-std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids) {
-    if (disabled_) return {-1, 0};
+std::pair<int, int> PrefixCache::lookup(
+        const std::vector<int32_t> & prompt_ids) {
+    return lookup_impl(
+        prompt_ids, (int)prompt_ids.size(), /*record_hit=*/true);
+}
+
+std::pair<int, int> PrefixCache::lookup_candidate(
+        const std::vector<int32_t> & prompt_ids,
+        int max_prefix_tokens) {
+    return lookup_impl(prompt_ids, max_prefix_tokens, /*record_hit=*/false);
+}
+
+std::pair<int, int> PrefixCache::lookup_impl(
+        const std::vector<int32_t> & prompt_ids,
+        int max_prefix_tokens,
+        bool record_hit) {
+    if (disabled_ || max_prefix_tokens <= 0) return {-1, 0};
 
     auto boundaries = find_all_boundaries(prompt_ids, markers_);
     int best_slot = -1, best_len = 0;
     int best_idx = -1;
 
     for (int cut : boundaries) {
+        if (cut > max_prefix_tokens) continue;
         auto key = hash_prefix(prompt_ids.data(), cut);
         int idx = find_entry(key);
         if (idx >= 0) {
@@ -302,8 +418,7 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
                 std::fprintf(stderr,
                     "[pc] lookup stale slot=%d key_cut=%d committed=%d — evicting\n",
                     entries_[idx].slot, cut, committed);
-                entries_.erase(entries_.begin() + idx);
-                entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+                erase_inline_entry(idx);
                 continue;
             }
             if (cut > best_len) {
@@ -319,7 +434,8 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
     for (int i = 0; i < (int)entries_.size(); ++i) {
         const auto & e = entries_[(size_t)i];
         const int len = (int)e.ids.size();
-        if (len <= best_len || len > (int)prompt_ids.size()) continue;
+        if (len <= best_len || len > (int)prompt_ids.size() ||
+            len > max_prefix_tokens) continue;
         if (!std::equal(e.ids.begin(), e.ids.end(), prompt_ids.begin())) {
             continue;
         }
@@ -328,23 +444,126 @@ std::pair<int, int> PrefixCache::lookup(const std::vector<int32_t> & prompt_ids)
         best_idx = i;
     }
 
-    if (best_idx >= 0) {
-        move_to_end(best_idx);
-        lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
-        std::fprintf(stderr, "[pc] lookup hit slot=%d prefix_len=%d (of %zu total)\n",
-                     best_slot, best_len, prompt_ids.size());
-    }
+    if (best_idx >= 0 && record_hit)
+        record_inline_hit(best_slot, best_len, prompt_ids.size());
     return {best_slot, best_len};
 }
 
-std::pair<int, int> PrefixCache::prepare_inline_snap(
+void PrefixCache::record_inline_hit(
+        int slot, int prefix_len, size_t prompt_len) {
+    for (int i = 0; i < (int)entries_.size(); ++i) {
+        if (entries_[(size_t)i].slot != slot ||
+            (int)entries_[(size_t)i].ids.size() != prefix_len) continue;
+        move_to_end(i);
+        lifetime_hits_.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr,
+            "[pc] lookup hit slot=%d prefix_len=%d (of %zu total)\n",
+            slot, prefix_len, prompt_len);
+        return;
+    }
+}
+
+PrefixCache::InlineReservation::InlineReservation(
+        PrefixCache * cache, uint64_t id, int slot, int target_cut,
+        PrefixHash victim, bool has_victim, bool protect)
+    : cache_(cache), id_(id), slot_(slot), target_cut_(target_cut),
+      victim_(victim), has_victim_(has_victim), protect_(protect) {}
+
+PrefixCache::InlineReservation::~InlineReservation() { cancel(); }
+
+PrefixCache::InlineReservation::InlineReservation(
+        InlineReservation && other) noexcept {
+    take(std::move(other));
+}
+
+PrefixCache::InlineReservation &
+PrefixCache::InlineReservation::operator=(
+        InlineReservation && other) noexcept {
+    if (this != &other) {
+        cancel();
+        take(std::move(other));
+    }
+    return *this;
+}
+
+bool PrefixCache::InlineReservation::active() const {
+    return cache_ && cache_->inline_reservation_active(id_);
+}
+
+bool PrefixCache::InlineReservation::commit(
+        const std::vector<int32_t> & prompt_ids,
+        size_t resident_bytes, bool protect) {
+    if (!active()) {
+        clear();
+        return false;
+    }
+    return cache_->commit_inline_reservation(
+        *this, prompt_ids, target_cut_, resident_bytes, protect);
+}
+
+bool PrefixCache::InlineReservation::commit_at(
+        const std::vector<int32_t> & prompt_ids, int committed_cut,
+        size_t resident_bytes, bool protect) {
+    if (!active()) {
+        clear();
+        return false;
+    }
+    return cache_->commit_inline_reservation(
+        *this, prompt_ids, committed_cut, resident_bytes, protect);
+}
+
+void PrefixCache::InlineReservation::cancel() {
+    if (cache_) cache_->release_inline_reservation(id_);
+    clear();
+}
+
+void PrefixCache::InlineReservation::abort() {
+    if (active()) {
+        cache_->abort_inline_reservation(*this);
+    } else {
+        clear();
+    }
+}
+
+void PrefixCache::InlineReservation::clear() {
+    cache_ = nullptr;
+    id_ = 0;
+    slot_ = -1;
+    target_cut_ = 0;
+    victim_ = {};
+    has_victim_ = false;
+    protect_ = false;
+}
+
+void PrefixCache::InlineReservation::take(InlineReservation && other) {
+    cache_ = other.cache_;
+    id_ = other.id_;
+    slot_ = other.slot_;
+    target_cut_ = other.target_cut_;
+    victim_ = other.victim_;
+    has_victim_ = other.has_victim_;
+    protect_ = other.protect_;
+    other.clear();
+}
+
+bool PrefixCache::inline_reservation_active(uint64_t id) const {
+    return id != 0 && active_inline_reservation_ == id;
+}
+
+void PrefixCache::release_inline_reservation(uint64_t id) {
+    if (inline_reservation_active(id)) active_inline_reservation_ = 0;
+}
+
+PrefixCache::InlineReservation PrefixCache::reserve_inline_snap(
         const std::vector<int32_t> & prompt_ids,
         int restored_prefix_len,
         bool prefer_tools_boundary,
-        int forced_cut) {
-    if (disabled_) return {-1, 0};
+        int forced_cut,
+        int restore_source_slot,
+        InlineSnapshotSize estimate_bytes) {
+    if (disabled_ || active_inline_reservation_ != 0) return {};
 
-    auto candidates = find_all_boundaries(prompt_ids, markers_);
+    const auto candidates = find_all_boundaries(prompt_ids, markers_);
     int target_cut = 0;
     bool forced = false;
     if (should_force_inline_snapshot_boundary(
@@ -356,117 +575,273 @@ std::pair<int, int> PrefixCache::prepare_inline_snap(
         target_cut = select_inline_snapshot_boundary(
             candidates, restored_prefix_len, prefer_tools_boundary);
     }
-    if (target_cut <= 0) return {-1, 0};
+    if (target_cut <= 0) {
+        // An expected no-op when the restored prefix already covers the next
+        // boundary (single-turn prompts, or a cache-primed conversation): log
+        // once only, so the diagnostic — a truncated boundary list from stray
+        // chatml in content — stays visible without flooding long runs. The
+        // HTTP layer may retry within a request, so this can otherwise fire
+        // twice per turn.
+        static std::atomic<bool> s_snap_blocked_logged{false};
+        if (!s_snap_blocked_logged.exchange(true)) {
+            std::fprintf(stderr,
+                "[pc] inline snap blocked: boundaries=%zu restored=%d target<=0 "
+                "(deepen target not past restored prefix; logged once)\n",
+                candidates.size(), restored_prefix_len);
+        }
+        return {};
+    }
 
-    auto key = hash_prefix(prompt_ids.data(), target_cut);
-    if (find_entry(key) >= 0) return {-1, 0};  // already cached
+    const auto key = hash_prefix(prompt_ids.data(), target_cut);
+    if (find_entry(key) >= 0) return {};
 
-    // Protect the tools head pin for tool-heavy requests so multi-chat deepen
-    // snaps cannot thrash the ~18k system+tools KV away. PPP forced cuts are
-    // the stable tools/identity span and stay protected as well.
-    pending_protect_ = prefer_tools_boundary &&
-                       (forced ||
-                        (!candidates.empty() && target_cut == candidates.front()));
-
-    int slot;
+    const bool protect = prefer_tools_boundary &&
+        (forced || (!candidates.empty() && target_cut == candidates.front()));
+    PrefixHash victim_key{};
+    bool has_victim = false;
+    int slot = -1;
     if ((int)entries_.size() >= cap_) {
         // At capacity — reserve a slot without evicting yet. Prefix-aware: prefer
         // the oldest leaf so shared ancestor prefixes (reused by later branches)
-        // stay resident. Skip protected tools pins when an unprotected leaf exists.
+        // stay resident. Skip protected tools pins when an unprotected leaf
+        // exists. The in-flight restore source is never a victim, so the new
+        // snapshot lands in a different slot and the restore point can slide
+        // forward past the deepest slot.
         std::vector<const std::vector<int32_t> *> ids_lru;
         std::vector<bool> protected_lru;
         ids_lru.reserve(entries_.size());
         protected_lru.reserve(entries_.size());
-        for (const auto & e : entries_) {
-            ids_lru.push_back(&e.ids);
-            protected_lru.push_back(e.protect);
+        for (const auto & entry : entries_) {
+            ids_lru.push_back(&entry.ids);
+            protected_lru.push_back(entry.protect);
         }
-        int victim = select_inline_evict_victim(ids_lru, &protected_lru);
-        pending_evict_key_ = entries_[victim].hash;
-        has_pending_evict_ = true;
-        slot = entries_[victim].slot;
-        if (victim != 0 || entries_[victim].protect) {
+        int skip_index = -1;
+        if (restore_source_slot >= 0) {
+            for (int i = 0; i < (int)entries_.size(); i++) {
+                if (entries_[(size_t)i].slot == restore_source_slot) {
+                    skip_index = i;
+                    break;
+                }
+            }
+        }
+        const int victim = select_inline_evict_victim(
+            ids_lru, &protected_lru, skip_index);
+        if (victim < 0) {
+            // Nothing safe to evict (only the restore source and/or protected
+            // pins remain). Skip this snapshot; the restore point stays put
+            // rather than being destroyed.
+            return {};
+        }
+        victim_key = entries_[(size_t)victim].hash;
+        has_victim = true;
+        slot = entries_[(size_t)victim].slot;
+        if (victim != 0 || entries_[(size_t)victim].protect) {
             std::fprintf(stderr,
                 "[pc] prefix-aware evict: victim idx=%d protect=%d (len=%zu) "
                 "kept oldest ancestor (len=%zu)\n",
-                victim, (int)entries_[victim].protect,
-                entries_[victim].ids.size(), entries_.front().ids.size());
+                victim, (int)entries_[(size_t)victim].protect,
+                entries_[(size_t)victim].ids.size(),
+                entries_.front().ids.size());
         }
     } else {
+        // Skip the in-flight restore source so the new snapshot lands in a
+        // different slot (the http_server/agent-replay guards would cancel
+        // an unlucky collision, leaving the restore point pinned). With a
+        // vacancy and cap >= 2 there is always a non-restore slot to take;
+        // cap == 1 keeps the old guard behavior.
         slot = next_slot_;
-        next_slot_ = (next_slot_ + 1) % cap_;
-        has_pending_evict_ = false;
+        if (slot == restore_source_slot && cap_ > 1) {
+            slot = (slot + 1) % cap_;
+        }
+        next_slot_ = (slot + 1) % cap_;
     }
 
-    return {slot, target_cut};
+    if (max_resident_bytes_ > 0) {
+        const size_t estimated_bytes = estimate_bytes
+            ? estimate_bytes(target_cut) : 0;
+        const auto fits = [&](int victim_idx) {
+            if (estimated_bytes == 0 ||
+                estimated_bytes > max_resident_bytes_) return false;
+            const size_t freed = victim_idx >= 0
+                ? entries_[(size_t)victim_idx].resident_bytes : 0;
+            const size_t after_free = freed <= resident_bytes_
+                ? resident_bytes_ - freed : 0;
+            return after_free <= max_resident_bytes_ &&
+                estimated_bytes <= max_resident_bytes_ - after_free;
+        };
+
+        const int planned_victim = has_victim
+            ? find_entry(victim_key) : find_slot_entry(slot);
+        if (!fits(planned_victim)) {
+            const auto is_leaf = [&](int candidate) {
+                for (int i = 0; i < (int)entries_.size(); ++i) {
+                    if (i != candidate &&
+                        is_strict_prefix(entries_[(size_t)candidate].ids,
+                                         entries_[(size_t)i].ids)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            int victim = -1;
+            for (int pass = 0; pass < 4 && victim < 0; ++pass) {
+                const bool require_leaf = pass < 2;
+                const bool allow_protected = pass == 1 || pass == 3;
+                for (int i = 0; i < (int)entries_.size(); ++i) {
+                    if (restore_source_slot >= 0 &&
+                        entries_[(size_t)i].slot == restore_source_slot)
+                        continue;
+                    if (!fits(i)) continue;
+                    if (require_leaf && !is_leaf(i)) continue;
+                    if (!allow_protected && entries_[(size_t)i].protect)
+                        continue;
+                    victim = i;
+                    break;
+                }
+            }
+            if (victim >= 0) {
+                victim_key = entries_[(size_t)victim].hash;
+                has_victim = true;
+                const int redirected_slot = entries_[(size_t)victim].slot;
+                std::fprintf(stderr,
+                    "[pc] resident budget redirects capture slot=%d -> %d "
+                    "estimate=%zu resident=%zu budget=%zu\n",
+                    slot, redirected_slot, estimated_bytes, resident_bytes_,
+                    max_resident_bytes_);
+                slot = redirected_slot;
+            } else {
+                const uint64_t skipped =
+                    budget_skips_.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (skipped == 1 || skipped % 64 == 0) {
+                    std::fprintf(stderr,
+                        "[pc] resident budget skips capture estimate=%zu "
+                        "resident=%zu budget=%zu (skips=%llu)\n",
+                        estimated_bytes, resident_bytes_, max_resident_bytes_,
+                        (unsigned long long)skipped);
+                }
+                return {};
+            }
+        }
+    }
+
+    uint64_t id = next_inline_reservation_++;
+    if (id == 0) id = next_inline_reservation_++;
+    active_inline_reservation_ = id;
+    return InlineReservation(
+        this, id, slot, target_cut, victim_key, has_victim, protect);
 }
 
-void PrefixCache::confirm_inline_snap(int slot, int target_cut,
-                                      const std::vector<int32_t> & prompt_ids,
-                                      bool protect) {
-    if (disabled_) return;
-
-    // Evict the reserved entry (if any).
-    if (has_pending_evict_) {
-        int idx = find_entry(pending_evict_key_);
-        if (idx >= 0) {
-            entries_.erase(entries_.begin() + idx);
-            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
-        }
-        has_pending_evict_ = false;
-    }
-
-    // The new snapshot replaces whatever this slot previously held. Drop any
-    // other entries still pointing at the slot: their hashes describe a
-    // different (or shorter) token stream than the new snapshot, and a later
-    // restore through them would attach mismatched KV. Stale entries arise
-    // when an aborted snap burns a round-robin next_slot_ step and a later
-    // confirm wraps onto a slot with a live entry (PR #370 repro).
+void PrefixCache::replace_inline_entry(
+        int slot, int target_cut,
+        const std::vector<int32_t> & prompt_ids,
+        bool protect, size_t resident_bytes) {
     for (int i = (int)entries_.size() - 1; i >= 0; --i) {
         if (entries_[(size_t)i].slot == slot) {
             std::fprintf(stderr,
                 "[pc] dropping stale entry for reused slot=%d\n", slot);
-            entries_.erase(entries_.begin() + i);
-            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+            erase_inline_entry(i);
         }
     }
 
-    const bool protect_entry = protect || pending_protect_;
-    pending_protect_ = false;
-
-    auto key = hash_prefix(prompt_ids.data(), target_cut);
-    std::vector<int32_t> ids(prompt_ids.begin(), prompt_ids.begin() + target_cut);
-    entries_.push_back({key, slot, std::move(ids), protect_entry});
+    const auto key = hash_prefix(prompt_ids.data(), target_cut);
+    std::vector<int32_t> ids(
+        prompt_ids.begin(), prompt_ids.begin() + target_cut);
+    entries_.push_back(
+        {key, slot, std::move(ids), protect, resident_bytes});
     entries_size_count_.fetch_add(1, std::memory_order_relaxed);
+    resident_bytes_ += resident_bytes;
+    resident_bytes_count_.store(
+        (uint64_t)resident_bytes_, std::memory_order_relaxed);
     std::fprintf(stderr,
-                 "[pc] inline-snap committed slot=%d prefix_len=%d protect=%d\n",
-                 slot, target_cut, (int)protect_entry);
+        "[pc] inline-snap committed slot=%d prefix_len=%d protect=%d "
+        "bytes=%zu resident=%zu\n",
+        slot, target_cut, (int)protect, resident_bytes, resident_bytes_);
 }
 
-void PrefixCache::abort_inline_snap(int slot) {
-    if (disabled_) return;
-    // The HTTP layer clears the reserved backend slot before generation. Any
-    // metadata still pointing at it is therefore invalid, whether the slot was
-    // selected through the explicit eviction path or through a round-robin
-    // hole left by an earlier aborted reservation.
+bool PrefixCache::commit_inline_reservation(
+        InlineReservation & reservation,
+        const std::vector<int32_t> & prompt_ids,
+        int committed_cut, size_t resident_bytes, bool protect) {
+    if (!reservation.active() || committed_cut <= 0 ||
+        committed_cut > reservation.target_cut_ ||
+        committed_cut > (int)prompt_ids.size()) {
+        reservation.abort();
+        return false;
+    }
+    if (reservation.has_victim_) {
+        const int victim = find_entry(reservation.victim_);
+        if (victim >= 0) erase_inline_entry(victim);
+    }
+    replace_inline_entry(
+        reservation.slot_, committed_cut, prompt_ids,
+        protect || reservation.protect_, resident_bytes);
+    release_inline_reservation(reservation.id_);
+    reservation.clear();
+    return true;
+}
+
+void PrefixCache::abort_inline_reservation(
+        InlineReservation & reservation) {
+    if (!reservation.active()) {
+        reservation.clear();
+        return;
+    }
     for (int i = (int)entries_.size() - 1; i >= 0; --i) {
-        if (entries_[(size_t)i].slot == slot) {
-            entries_.erase(entries_.begin() + i);
-            entries_size_count_.fetch_sub(1, std::memory_order_relaxed);
+        if (entries_[(size_t)i].slot == reservation.slot_) {
+            erase_inline_entry(i);
         }
     }
-    has_pending_evict_ = false;
-    pending_protect_ = false;
+    release_inline_reservation(reservation.id_);
+    reservation.clear();
 }
 
-void PrefixCache::cancel_inline_snap(int slot) {
-    if (disabled_) return;
-    if (has_pending_evict_) {
-        const int idx = find_entry(pending_evict_key_);
-        if (idx >= 0 && entries_[idx].slot != slot) return;
+void PrefixCache::confirm_inline_snap(
+        int slot, int target_cut,
+        const std::vector<int32_t> & prompt_ids,
+        bool protect, size_t resident_bytes) {
+    if (disabled_ || slot < 0 || target_cut <= 0 ||
+        target_cut > (int)prompt_ids.size()) return;
+    if (active_inline_reservation_ != 0) {
+        std::fprintf(stderr,
+            "[pc] direct commit refused while a reservation is active\n");
+        return;
     }
-    has_pending_evict_ = false;
-    pending_protect_ = false;
+    replace_inline_entry(
+        slot, target_cut, prompt_ids, protect, resident_bytes);
+}
+
+void PrefixCache::invalidate_inline_snap(int slot) {
+    if (disabled_) return;
+    for (int i = (int)entries_.size() - 1; i >= 0; --i) {
+        if (entries_[(size_t)i].slot == slot) erase_inline_entry(i);
+    }
+}
+
+static void update_atomic_max(std::atomic<uint64_t> & value,
+                              uint64_t candidate) {
+    uint64_t current = value.load(std::memory_order_relaxed);
+    while (current < candidate &&
+           !value.compare_exchange_weak(
+               current, candidate, std::memory_order_relaxed)) {
+    }
+}
+
+void PrefixCache::record_capture_attempt(uint64_t elapsed_us, bool success) {
+    capture_attempts_.fetch_add(1, std::memory_order_relaxed);
+    if (!success) {
+        capture_failures_.fetch_add(1, std::memory_order_relaxed);
+    }
+    capture_stall_us_total_.fetch_add(elapsed_us, std::memory_order_relaxed);
+    update_atomic_max(capture_stall_us_max_, elapsed_us);
+}
+
+void PrefixCache::record_restore_attempt(uint64_t elapsed_us, bool restored) {
+    restore_attempts_.fetch_add(1, std::memory_order_relaxed);
+    if (!restored) {
+        restore_invalidations_.fetch_add(1, std::memory_order_relaxed);
+    }
+    restore_stall_us_total_.fetch_add(elapsed_us, std::memory_order_relaxed);
+    update_atomic_max(restore_stall_us_max_, elapsed_us);
 }
 
 void PrefixCache::mark_all_cleared() {
@@ -474,9 +849,10 @@ void PrefixCache::mark_all_cleared() {
     int n = (int)entries_.size();
     entries_.clear();
     entries_size_count_.store(0, std::memory_order_relaxed);
+    resident_bytes_ = 0;
+    resident_bytes_count_.store(0, std::memory_order_relaxed);
     next_slot_ = 0;
-    has_pending_evict_ = false;
-    pending_protect_ = false;
+    active_inline_reservation_ = 0;
     std::fprintf(stderr, "[pc] all-cleared — dropped %d LRU entries\n", n);
 }
 
@@ -601,10 +977,30 @@ void PrefixCache::abort_full_snap(int slot) {
 }
 
 PrefixCache::InlineStats PrefixCache::stats() const {
-    if (disabled_) return {0, 0, 0};
-    return {cap_,
-            (int)entries_size_count_.load(std::memory_order_relaxed),
-            lifetime_hits_.load(std::memory_order_relaxed)};
+    InlineStats out{};
+    if (disabled_) return out;
+    out.capacity = cap_;
+    out.in_use =
+        (int)entries_size_count_.load(std::memory_order_relaxed);
+    out.lifetime_hits = lifetime_hits_.load(std::memory_order_relaxed);
+    out.max_resident_bytes = (uint64_t)max_resident_bytes_;
+    out.resident_bytes =
+        resident_bytes_count_.load(std::memory_order_relaxed);
+    out.budget_skips = budget_skips_.load(std::memory_order_relaxed);
+    out.capture_attempts = capture_attempts_.load(std::memory_order_relaxed);
+    out.capture_failures = capture_failures_.load(std::memory_order_relaxed);
+    out.capture_stall_us_total =
+        capture_stall_us_total_.load(std::memory_order_relaxed);
+    out.capture_stall_us_max =
+        capture_stall_us_max_.load(std::memory_order_relaxed);
+    out.restore_attempts = restore_attempts_.load(std::memory_order_relaxed);
+    out.restore_invalidations =
+        restore_invalidations_.load(std::memory_order_relaxed);
+    out.restore_stall_us_total =
+        restore_stall_us_total_.load(std::memory_order_relaxed);
+    out.restore_stall_us_max =
+        restore_stall_us_max_.load(std::memory_order_relaxed);
+    return out;
 }
 
 PrefixCache::FullStats PrefixCache::full_stats() const {
@@ -615,4 +1011,4 @@ PrefixCache::FullStats PrefixCache::full_stats() const {
             full_lifetime_hits_.load(std::memory_order_relaxed)};
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

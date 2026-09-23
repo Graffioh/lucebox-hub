@@ -2,7 +2,7 @@
 """
 train_predictor.py — Train and evaluate an expert routing predictor.
 
-Reads binary routing data collected by `dflash_server --collect-routing FILE`,
+Reads binary routing data collected by `luce_server --collect-routing FILE`,
 trains a predictor to predict which K experts will be activated from the
 hidden state, and reports prediction accuracy per layer and overall.
 

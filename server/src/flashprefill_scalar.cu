@@ -7,7 +7,7 @@
 //   - Uses full-warp _sync vote/shuffle intrinsics, which CUDA 12 accepts for
 //     Pascal and newer targets.
 //
-// Dispatched from flashprefill.cpp when DFLASH27B_HAVE_PASCAL_FLASHPREFILL is set.
+// Dispatched from flashprefill.cpp when LUCE_HAVE_PASCAL_FLASHPREFILL is set.
 // The drafter's persistent buffers must be GGML_TYPE_F16.
 //
 // CMake's CUDA_ARCHITECTURES is a target property in many supported CMake
@@ -19,7 +19,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-namespace dflash::common {
+namespace luce::common {
 namespace flashprefill {
 
 __device__ inline float scalar_shfl_xor(float v, int lane_mask) {
@@ -519,4 +519,4 @@ extern "C" void launch_block_select_pascal(
 }
 
 } // namespace flashprefill
-} // namespace dflash::common
+} // namespace luce::common

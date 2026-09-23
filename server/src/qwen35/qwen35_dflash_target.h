@@ -17,7 +17,7 @@
 
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 class Qwen35DFlashTarget : public DFlashTarget {
 public:
@@ -103,7 +103,7 @@ private:
     KvFlashPager * pager_ = nullptr;
     bool fast_rollback_ = false;
 
-    // SpecLA (DFLASH_SPECLA=1, docs/SPECLA.md): true when the cache was
+    // SpecLA (docs/SPECLA.md): true when the cache was
     // migrated with factor buffers. Capture-verify then runs the
     // topology-masked factor path, never mutates durable SSM/conv state
     // (snapshot/restore become no-ops), and rollback commits via
@@ -123,4 +123,4 @@ private:
     StepGraph proj_sg_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

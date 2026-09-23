@@ -10,11 +10,27 @@
 #include <cstdlib>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 inline int qwen35_prefill_ubatch(int fallback) {
-    const char * value = std::getenv("DFLASH27B_PREFILL_UBATCH");
+    const char * value = std::getenv("LUCE_PREFILL_UBATCH");
     return value ? std::max(1, std::atoi(value)) : fallback;
+}
+
+// Pooled kvflash prefill ubatch. The pager only needs chunk-aligned batches, so
+// round the configured ubatch down to a chunk multiple and clamp to the pool: a
+// ubatch larger than the pool would allocate its later chunks by evicting its
+// own earlier, not-yet-computed chunks. One chunk is the floor, which wins over
+// the pool clamp if the pool itself were smaller than a chunk (the pager's pool
+// is always a positive chunk multiple, so that precedence is only a contract).
+inline int kvflash_pooled_ubatch(int prefill_ubatch, int chunk_tokens, int pool_tokens) {
+    if (chunk_tokens <= 0) return prefill_ubatch;
+    int ub = std::max(prefill_ubatch, chunk_tokens);
+    ub = (ub / chunk_tokens) * chunk_tokens;
+    if (pool_tokens > 0 && ub > pool_tokens) {
+        ub = std::max(chunk_tokens, (pool_tokens / chunk_tokens) * chunk_tokens);
+    }
+    return ub;
 }
 
 // GGML M-RoPE consumes positions axis-major:
@@ -52,4 +68,4 @@ inline void upload_qwen35_causal_mask(ggml_tensor * mask, int kv_start,
                             sizeof(uint16_t) * data.size());
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

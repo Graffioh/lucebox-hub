@@ -108,7 +108,7 @@ even at ~50% residency, where laguna leans on the fused single-graph decode.
   ┌─ offline, once per traffic profile ───────────────────────────────┐
   │  sessions (*.jsonl) ─ extract ─► corpus ─ calibrate ─► placement.csv │
   └────────────────────────────────────────────────────────────────────┘
-                                    │  DFLASH_LAGUNA_HOTNESS=placement.csv
+                                    │  LUCE_LAGUNA_HOTNESS=placement.csv
                                     ▼
   ┌─ serve time, per layer, per token ──────────────────────────────────┐
   │  router picks 8 experts                                              │
@@ -126,12 +126,12 @@ path. Cold experts that are never cached fall back to the engine's CPU path.
 
 ## Serve it: one self-tuning command
 
-For production, you don't run any of the offline pipeline. `dflash_server`
+For production, you don't run any of the offline pipeline. `luce_server`
 auto-tunes from its own traffic:
 
 ```bash
-dflash_server <model.gguf> --spark                   # use the card, auto-size everything
-dflash_server <model.gguf> --spark --spark-vram 14   # cap total VRAM at 14 GiB
+luce_server <model.gguf> --spark                   # use the card, auto-size everything
+luce_server <model.gguf> --spark --spark-vram 14   # cap total VRAM at 14 GiB
 ```
 
 The only knob is `--spark-vram <GiB>`: the total VRAM Spark may use. From that
@@ -159,7 +159,7 @@ The offline pipeline below is for **bootstrapping** a profile before first serve
 
 ## Bootstrapping / eval pipeline
 
-The tooling here drives the dflash daemon (`test_dflash`); build it from
+The tooling here drives the luce daemon (`test_dflash`); build it from
 [`../../server/`](../../server/) first.
 
 ```bash
@@ -200,11 +200,11 @@ Reports steady-state decode tok/s and asserts the single-graph hybrid path is
 token-for-token identical to all-GPU at full residency. On an RTX 3090,
 laguna-xs2 Q4_K_M: all-GPU 119 tok/s, single-graph @100% 118.8 (128/128 exact),
 Spark offload @~60% residency 99 tok/s (83% of all-GPU). This is the same
-`LagunaBackend` decode path that `dflash_server --spark` runs.
+`LagunaBackend` decode path that `luce_server --spark` runs.
 
-Deploy: run the daemon with `DFLASH_EXPERT_BUDGET_PCT=60
-DFLASH_LAGUNA_HOTNESS=spark_profile.csv` and, for the cache,
-`DFLASH_LAGUNA_EXPERT_CACHE=1 DFLASH_LAGUNA_CACHE_SLOTS=32`.
+Deploy: run the daemon with `LUCE_EXPERT_BUDGET_PCT=60
+LUCE_LAGUNA_HOTNESS=spark_profile.csv` and, for the cache,
+`LUCE_LAGUNA_EXPERT_CACHE=1 LUCE_LAGUNA_CACHE_SLOTS=32`.
 
 ## Engine knobs
 
@@ -213,12 +213,12 @@ engine additions. All on the daemon process.
 
 | Env var | Purpose |
 |---|---|
-| `DFLASH_EXPERT_BUDGET_PCT` | hot-tier VRAM budget (% of experts resident) |
-| `DFLASH_LAGUNA_HOTNESS` | placement profile CSV from `spark.calibrate` |
-| `DFLASH_LAGUNA_NEXT_PLACEMENT_OUT` | accumulate + dump a routing profile (calibration) |
-| `DFLASH_LAGUNA_EXPERT_CACHE` / `_CACHE_SLOTS` | enable the bounded cache + slots/layer |
-| `DFLASH_LAGUNA_GPU_REMAP` | unified GPU FFN the cache serves through |
-| `DFLASH_LAGUNA_PREGATE_TRACE` / `_MAX` | capture `(hidden -> experts)` traces (research) |
+| `LUCE_EXPERT_BUDGET_PCT` | hot-tier VRAM budget (% of experts resident) |
+| `LUCE_LAGUNA_HOTNESS` | placement profile CSV from `spark.calibrate` |
+| `LUCE_LAGUNA_NEXT_PLACEMENT_OUT` | accumulate + dump a routing profile (calibration) |
+| `LUCE_LAGUNA_EXPERT_CACHE` / `_CACHE_SLOTS` | enable the bounded cache + slots/layer |
+| `LUCE_LAGUNA_GPU_REMAP` | unified GPU FFN the cache serves through |
+| `LUCE_LAGUNA_PREGATE_TRACE` / `LUCE_LAGUNA_PREGATE_MAX` | capture `(hidden -> experts)` traces (research) |
 
 ## What's ours, what isn't
 

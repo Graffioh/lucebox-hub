@@ -9,7 +9,7 @@
 #include <limits>
 #include <numeric>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -649,4 +649,4 @@ bool MoeHybridPlacement::build_critical_path_balanced_from_stats(
     out = std::move(tmp);
     return true;
 }
-}  // namespace dflash::common
+}  // namespace luce::common

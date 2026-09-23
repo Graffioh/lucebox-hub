@@ -6,7 +6,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct AdaptiveKeepRatioState {
     float ema        = 0.0f;
@@ -113,4 +113,4 @@ private:
     std::unordered_map<std::string, Entry>          map_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

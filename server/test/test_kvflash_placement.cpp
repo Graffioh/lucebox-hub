@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 struct KvflashPlacementFixture {};

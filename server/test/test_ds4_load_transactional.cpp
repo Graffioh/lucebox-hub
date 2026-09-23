@@ -29,9 +29,9 @@
 #include <unistd.h>
 #include <vector>
 
-using dflash::common::DeepSeek4Weights;
-using dflash::common::load_deepseek4_gguf;
-using dflash::common::free_deepseek4_weights;
+using luce::common::DeepSeek4Weights;
+using luce::common::load_deepseek4_gguf;
+using luce::common::free_deepseek4_weights;
 
 static int g_fails = 0;
 #define CHECK(cond, msg)                                                       \

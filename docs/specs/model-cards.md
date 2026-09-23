@@ -79,12 +79,17 @@ The server probes (in order, matching
 1. `<repo_root_hint>/share/model_cards/` — an optional explicit
    directory passed by the embedding application (e.g. tests). Not
    exposed via a CLI flag today.
-2. `<binary_dir>/../share/model_cards/` (install layout — binary in
+2. `$LUCE_MODEL_CARDS_DIR` if set — an explicit operator override
+   has to beat implicit discovery (it used to be probed last, which
+   let a cwd `share/model_cards/` silently shadow it).
+3. `<binary_dir>/../share/model_cards/` (install layout — binary in
    `bin/`, sidecars in `share/`, resolved via `/proc/self/exe`).
-3. `<binary_dir>/share/model_cards/` (build-tree layout — sidecars
+4. `<binary_dir>/share/model_cards/` (build-tree layout — sidecars
    shipped next to the binary).
-4. `share/model_cards/` in the current working directory (dev runs).
-5. `$DFLASH_MODEL_CARDS_DIR` if set (final override / escape hatch).
+5. `<binary_dir>/../../share/model_cards/` (CMake build tree — the
+   binary is at `server/build-*/luce_server`, two levels below the
+   repo root).
+6. `share/model_cards/` in the current working directory (dev runs).
 
 The first directory that **exists** wins (the implementation does
 *not* re-probe further candidates if the chosen directory lacks a

@@ -27,3 +27,20 @@ the snapshot above for AMD heterogeneous MoE execution:
 These changes are limited to `ggml/`. Keep their public declarations in
 `ggml/include`, avoid DeepSeek-specific policy in generic kernels, and update
 this provenance when the patch set is moved to `lucebox-ggml`.
+
+## Hub-local DS4V HIP vision ops
+
+Four inference-only ops are appended after the existing ones, so every earlier
+op keeps its numeric value: `GGML_OP_MUL_MAT_BIAS_BF16`,
+`GGML_OP_RMS_NORM_VISION_F32`, `GGML_OP_SOFT_MAX_VISION_F32` and
+`GGML_OP_MUL_MAT_VISION_AV_F32`. Only the DS4V vision tower builds them. They
+exist on the HIP backend alone; CPU, CUDA and RPC reject them in `supports_op`,
+and graphs that contain them are not captured.
+
+They are compiled only when CMake finds hipBLASLt (`GGML_HIP_DS4V_VISION`).
+Without it the HIP backend builds as before and the server refuses `--mmproj`.
+The fused BF16 bias matmul keeps one hipBLASLt handle and one 76 MiB workspace
+per backend context that uses it, released when the context is destroyed.
+
+Rebuild ggml-base, the backends and their consumers together; do not mix older
+shared libraries with this header.

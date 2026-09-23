@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 struct Qwen35MoeRoutingStatsFixture {};

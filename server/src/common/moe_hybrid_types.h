@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── GPU SM version query ───────────────────────────────────────────────
 // Returns the compute capability as major*10+minor (e.g. 86 for sm_86).
@@ -26,6 +26,7 @@ enum class MoeHybridColdBackend {
 // ─── MoE architecture config (model-agnostic) ──────────────────────────
 
 struct MoeHybridConfig {
+    ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT;
     int n_embd        = 0;   // hidden dimension
     int n_expert      = 0;   // total experts per layer
     int n_expert_used = 0;   // top-k selected per token
@@ -79,4 +80,4 @@ struct MoeLayerDesc {
     bool has_shared_expert() const { return ffn_up_shexp != nullptr; }
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

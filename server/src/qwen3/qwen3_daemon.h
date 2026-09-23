@@ -5,7 +5,7 @@
 #include "placement/placement_config.h"
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen3DaemonArgs {
     const char *    model_path = nullptr;
@@ -17,4 +17,4 @@ struct Qwen3DaemonArgs {
 
 int run_qwen3_daemon(const Qwen3DaemonArgs & args);
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -14,7 +14,11 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
+
+inline bool valid_pflash_score_query_tokens(int score_query_tokens) {
+    return score_query_tokens >= 1 && score_query_tokens <= 8;
+}
 
 class PFlashDrafterIpcClient {
 public:
@@ -30,7 +34,9 @@ public:
 
     bool compress(const std::vector<int32_t> & input_ids,
                   float keep_ratio,
-                  std::vector<int32_t> & compressed_ids);
+                  std::vector<int32_t> & compressed_ids,
+                  int score_query_end = -1,
+                  int score_query_tokens = 8);
 
     bool active() const { return active_; }
     void close();
@@ -44,4 +50,4 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
                                   int drafter_gpu,
                                   int stream_fd);
 
-} // namespace dflash::common
+} // namespace luce::common

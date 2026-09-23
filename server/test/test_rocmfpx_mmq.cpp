@@ -3,10 +3,12 @@
 #include "ggml.h"
 #include "rocmfp4.h"
 #include "rocmfpx.h"
+#include "../src/common/platform_env.h"
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -49,6 +51,16 @@ static std::vector<float> make_values(size_t count, int stride, float scale) {
     return values;
 }
 
+static uint64_t fnv1a64(const std::vector<float> & values) {
+    uint64_t hash = 1469598103934665603ull;
+    const uint8_t * bytes =
+        reinterpret_cast<const uint8_t *>(values.data());
+    for (size_t i = 0; i < values.size() * sizeof(float); ++i) {
+        hash = (hash ^ bytes[i]) * 1099511628211ull;
+    }
+    return hash;
+}
+
 static void dequantize_fp2(const void * src, float * dst, int64_t size) {
     rocmfpx_dequantize_row_fp2((const block_rocmfp2 *) src, dst, size);
 }
@@ -68,7 +80,9 @@ static bool run_backend(
         const std::vector<uint8_t> & weights_data,
         const std::vector<float> & input_data,
         std::vector<float> & output_data,
-        DispatchPath expected_path) {
+        DispatchPath expected_path,
+        int mmvq_ceiling = -1,
+        double * median_ms = nullptr) {
     ggml_init_params params{};
     params.mem_size = 16 * 1024 * 1024;
     params.no_alloc = true;
@@ -113,10 +127,30 @@ static bool run_backend(
         const size_t mmq_before = ggml_backend_cuda_get_mmq_launch_count();
         const int previous_mmvq_max =
             ggml_backend_cuda_set_mmvq_max_ncols_override(
+                mmvq_ceiling >= 0 ? mmvq_ceiling :
                 expected_path == DispatchPath::MMVQ ? 8 : 1);
         const bool previous_graphs_disabled =
             ggml_backend_cuda_set_graphs_disabled_override(true);
         ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        if (ok && median_ms != nullptr) {
+            constexpr int warmups = 5;
+            constexpr int samples = 31;
+            for (int i = 0; i < warmups; ++i) {
+                ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS && ok;
+            }
+            ggml_backend_synchronize(backend);
+            std::vector<double> timings;
+            timings.reserve(samples);
+            for (int i = 0; i < samples; ++i) {
+                const auto start = std::chrono::steady_clock::now();
+                ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS && ok;
+                ggml_backend_synchronize(backend);
+                const auto end = std::chrono::steady_clock::now();
+                timings.push_back(std::chrono::duration<double, std::milli>(end - start).count());
+            }
+            std::sort(timings.begin(), timings.end());
+            *median_ms = timings[timings.size() / 2];
+        }
         ggml_backend_cuda_set_graphs_disabled_override(previous_graphs_disabled);
         ggml_backend_cuda_set_mmvq_max_ncols_override(previous_mmvq_max);
         const size_t mmvq_delta =
@@ -126,10 +160,11 @@ static bool run_backend(
         if (!ok) {
             std::fprintf(stderr, "backend graph compute failed\n");
         } else {
+            const size_t expected_launches = median_ms == nullptr ? 1 : 37;
             const bool dispatch_matches =
                 expected_path == DispatchPath::MMVQ
-                    ? mmvq_delta == 1 && mmq_delta == 0
-                    : mmvq_delta == 0 && mmq_delta == 1;
+                    ? mmvq_delta == expected_launches && mmq_delta == 0
+                    : mmvq_delta == 0 && mmq_delta == expected_launches;
             if (!dispatch_matches) {
                 std::fprintf(
                     stderr,
@@ -218,7 +253,8 @@ static bool test_case(
         ggml_backend_t hip_backend,
         const QuantCase & quant,
         const Shape & shape,
-        DispatchPath expected_path) {
+        DispatchPath expected_path,
+        int mmvq_ceiling = -1) {
     const std::vector<float> weights_f32 =
         make_values((size_t) shape.k * shape.m, 37, 0.015625f);
     const std::vector<float> input_f32 =
@@ -246,9 +282,11 @@ static bool test_case(
     const std::vector<float> expected =
         reference_mul_mat(quant, shape, weights_quantized, input_f32);
     std::vector<float> actual;
+    double median_ms = 0.0;
+    const bool benchmark = std::getenv("LUCE_TEST_BENCH") != nullptr;
     if (!run_backend(
             hip_backend, quant.type, shape, weights_quantized, input_f32, actual,
-            expected_path)) {
+            expected_path, mmvq_ceiling, benchmark ? &median_ms : nullptr)) {
         std::fprintf(
             stderr,
             "%s/%s: HIP %s run failed\n",
@@ -257,13 +295,20 @@ static bool test_case(
             dispatch_path_name(expected_path));
         return false;
     }
-    return compare_outputs(quant, shape, expected, actual);
+    const bool matches = compare_outputs(quant, shape, expected, actual);
+    if (benchmark) {
+        std::printf("BENCH %s/%s median_ms=%.6f output_fnv1a64=%016llx\n",
+                    quant.label, shape.label, median_ms,
+                    (unsigned long long) fnv1a64(actual));
+    }
+    return matches;
 }
 
 int main() {
-    setenv("DFLASH_CUDA_MMVQ_FP2_AFFINE", "1", 1);
-    setenv("DFLASH_CUDA_MMQ_FP2_AFFINE", "1", 1);
-    setenv("DFLASH_CUDA_MMQ_FP2_AFFINE_GENERAL", "1", 1);
+    luce::common::set_environment_variable("LUCE_MMVQ_MAX_NCOLS", "1", true);
+    luce::common::set_environment_variable("LUCE_CUDA_MMVQ_FP2_AFFINE", "1", true);
+    luce::common::set_environment_variable("LUCE_CUDA_MMQ_FP2_AFFINE", "1", true);
+    luce::common::set_environment_variable("LUCE_CUDA_MMQ_FP2_AFFINE_GENERAL", "1", true);
     hipDeviceProp_t properties{};
     if (hipGetDeviceProperties(&properties, 0) != hipSuccess) {
         std::fprintf(stderr, "failed to query HIP device 0\n");
@@ -301,29 +346,64 @@ int main() {
         {2048, 64, 33, "expert_down_n33"},
         {4096, 4096, 31, "actual_gate_up_n31"},
         {2048, 4096, 31, "actual_down_n31"},
+        {4096, 4096, 1, "actual_dense_n1"},
+        {4096, 4096, 4, "actual_dense_n4"},
+        {4096, 4096, 5, "actual_dense_n5"},
+        {4096, 1024, 4, "actual_dense_q_a_n4"},
+        {1024, 32768, 4, "actual_dense_q_b_n4"},
+        {4096, 512, 4, "actual_dense_kv_n4"},
+        {4096, 8192, 4, "actual_dense_o_a_n4"},
+        {8192, 4096, 4, "actual_dense_o_b_n4"},
+        {12288, 4096, 4, "actual_dense_main_proj_n4"},
     };
-    const char * shape_filter = std::getenv("DFLASH_TEST_SHAPE");
+    const char * shape_filter = std::getenv("LUCE_TEST_SHAPE");
+    const char * quant_filter = std::getenv("LUCE_TEST_QUANT");
     bool matched_shape = false;
+    bool matched_quant = false;
 
     bool ok = true;
     for (const QuantCase & quant : quant_cases) {
+        if (quant_filter && std::strcmp(quant.label, quant_filter) != 0) {
+            continue;
+        }
+        matched_quant = true;
         for (const Shape & shape : shapes) {
             if (shape_filter && std::strcmp(shape.label, shape_filter) != 0) {
                 continue;
             }
             matched_shape = true;
-            if (std::strncmp(shape.label, "actual_", 7) == 0 &&
+            if ((std::strcmp(shape.label, "actual_gate_up_n31") == 0 ||
+                 std::strcmp(shape.label, "actual_down_n31") == 0) &&
                 quant.type != GGML_TYPE_Q2_0_ROCMFP2) {
+                continue;
+            }
+            if (std::strncmp(shape.label, "actual_dense_", 13) == 0 &&
+                quant.type != GGML_TYPE_Q4_0_ROCMFP4_FAST) {
                 continue;
             }
             const DispatchPath expected_path =
                 shape.n <= 8 ? DispatchPath::MMVQ : DispatchPath::MMQ;
             ok = test_case(hip_backend, quant, shape, expected_path) && ok;
+            if (quant.type == GGML_TYPE_Q4_0_ROCMFP4_FAST && shape.n == 16 &&
+                std::strncmp(properties.gcnArchName, "gfx1151", 7) == 0) {
+                // Zero restores the process ceiling; positive overrides win.
+                for (const int ceiling : {0, 8, 16}) {
+                    const DispatchPath path = ceiling == 16 ? DispatchPath::MMVQ : DispatchPath::MMQ;
+                    std::printf("ROCmFP4 n=16 ceiling=%d (environment=1): expect %s\n",
+                                ceiling, dispatch_path_name(path));
+                    ok = test_case(hip_backend, quant, shape, path, ceiling) && ok;
+                }
+            }
         }
     }
     if (shape_filter && !matched_shape) {
-        std::fprintf(stderr, "DFLASH_TEST_SHAPE matched no shape: %s\n",
+        std::fprintf(stderr, "LUCE_TEST_SHAPE matched no shape: %s\n",
                      shape_filter);
+        ok = false;
+    }
+    if (quant_filter && !matched_quant) {
+        std::fprintf(stderr, "LUCE_TEST_QUANT matched no quant: %s\n",
+                     quant_filter);
         ok = false;
     }
 

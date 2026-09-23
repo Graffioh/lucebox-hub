@@ -46,18 +46,18 @@ Long-context prefill is O(S²): vanilla llama.cpp on a single RTX 3090 takes **~
 
 ## Results
 
-NIAH single-needle, RTX 3090 24 GB, Qwen3.6-27B Q4_K_M target, Qwen3-0.6B drafter, `DFLASH_FP_USE_BSA=1`, `DFLASH_FP_ALPHA=0.85`, `keep_ratio=0.05`.
+NIAH single-needle, RTX 3090 24 GB, Qwen3.6-27B Q4_K_M target, Qwen3-0.6B drafter, `LUCE_FP_USE_BSA=1`, `LUCE_FP_ALPHA=0.85`, `keep_ratio=0.05`.
 
 | Source S | dflash TTFT | llama.cpp baseline | Speedup | NIAH |
 |---|:---:|:---:|:---:|:---:|
 | 64K  | **13.5 s** | 134.95 s (FA off, dense) | **10.0×** | ✅ |
 | 128K | **24.8 s** | ~257 s (FA on, Q4_0 KV)  | **~10.4×** | ✅ |
 
-Decode after prefill: ~74 tok/s (dflash spec decode + DDTree). The pipeline is the dflash binary on its own — no Python in the inference loop.
+Decode after prefill: ~74 tok/s (dflash spec decode + DDTree). The pipeline is the luce binary on its own — no Python in the inference loop.
 
 ## Quick start
 
-PFlash is the algorithm. The implementation lives in [`../../server/`](../../server/) as part of the dflash daemon. The `optimizations/pflash/` directory in this repo only contains the Python tooling for **benchmarking** (NIAH case generation, bench harness around the daemon stdin protocol). Production deploys hit the dflash daemon directly.
+PFlash is the algorithm. The implementation lives in [`../../server/`](../../server/) as part of the luce daemon. The `optimizations/pflash/` directory in this repo only contains the Python tooling for **benchmarking** (NIAH case generation, bench harness around the daemon stdin protocol). Production deploys hit the luce daemon directly.
 
 ```bash
 # 1. from the repo root, install Python deps and build dflash with the BSA
@@ -67,7 +67,7 @@ uv sync
 git submodule update --init --recursive
 cmake -B server/build -S dflash -DCMAKE_BUILD_TYPE=Release \
                              -DCMAKE_CUDA_ARCHITECTURES=86 \
-                             -DDFLASH27B_ENABLE_BSA=ON
+                             -DLUCE_ENABLE_BSA=ON
 cmake --build server/build --target test_dflash test_flashprefill_kernels -j
 
 # 2. fetch weights (target + spec-decode draft + drafter scorer)
@@ -92,7 +92,7 @@ uv run --directory pflash python tests/bench_niah_cpp.py \
 
 ## OpenAI server flags
 
-For an OpenAI-compatible server with transparent compression on long prompts, run `dflash_server` with these flags:
+For an OpenAI-compatible server with transparent compression on long prompts, run `luce_server` with these flags:
 
 | Flag | Choices / type | Default | Effect |
 |---|---|:---:|---|
@@ -102,10 +102,10 @@ For an OpenAI-compatible server with transparent compression on long prompts, ru
 | `--prefill-drafter` | path to `.gguf` | required when not `off` | Drafter weights (Qwen3-0.6B BF16 GGUF). |
 | `--prefill-drafter-tokenizer` | HF repo id | `Qwen/Qwen3-0.6B` | HF tokenizer for the drafter vocab. |
 
-When `--prefill-compression != off`, the server auto-sets `DFLASH27B_LM_HEAD_FIX=0` and `DFLASH27B_FA_WINDOW=0` (matching the bench harness — needed so the post-compress draft graph fits on a 24 GB card without OOM).
+When `--prefill-compression != off`, the server auto-sets `LUCE_LM_HEAD_FIX=0` and `LUCE_FA_WINDOW=0` (matching the bench harness — needed so the post-compress draft graph fits on a 24 GB card without OOM).
 
 ```bash
-./build/dflash_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
+./server/build/luce_server server/models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft  server/models/draft/model.safetensors \
   --max-ctx 8192 --fa-window 0 \
   --prefill-compression auto \
@@ -140,12 +140,12 @@ Everything is configured via env vars on the daemon process. Full list in [`../.
 
 | Env var | Default | Purpose |
 |---|:---:|---|
-| `DFLASH_FP_USE_BSA` | `0` | Set to `1` to dispatch the sparse FA forward through the BSA cutlass kernel (sm_80+). Required for the headline 10.4× number; without it the WMMA fallback is used (slower at long ctx). |
-| `DFLASH_FP_ALPHA` | `0.12` | Block-selection threshold. Higher = stricter = fewer K-blocks per Q-row. `0.85` is the bench setting; `0.99` cuts another second at 128K with a small NIAH-margin loss. |
-| `DFLASH_FP_PROFILE` | `0` | Set to `1` to log per-stage timings (`mean_K / score / select / forward`). |
-| `DFLASH_FP_DUMP_COUNTS` | `0` | Set to `1` to dump per-row K-block counts for debugging keep-ratio tuning. |
-| `DFLASH27B_FA_WINDOW` | (auto) | Set to `0` to force full attention on the compressed prompt (recommended). |
-| `DFLASH27B_KV_K` / `DFLASH27B_KV_V` | (auto) | KV-cache quant types. `q4_0` / `q4_0` is the bench setting. `tq3_0` saves another ~4 GB at 128K. |
+| `LUCE_FP_USE_BSA` | `0` | Set to `1` to dispatch the sparse FA forward through the BSA cutlass kernel (sm_80+). Required for the headline 10.4× number; without it the WMMA fallback is used (slower at long ctx). |
+| `LUCE_FP_ALPHA` | `0.12` | Block-selection threshold. Higher = stricter = fewer K-blocks per Q-row. `0.85` is the bench setting; `0.99` cuts another second at 128K with a small NIAH-margin loss. |
+| `LUCE_FP_PROFILE` | `0` | Set to `1` to log per-stage timings (`mean_K / score / select / forward`). |
+| `LUCE_FP_DUMP_COUNTS` | `0` | Set to `1` to dump per-row K-block counts for debugging keep-ratio tuning. |
+| `LUCE_FA_WINDOW` | (auto) | Set to `0` to force full attention on the compressed prompt (recommended). |
+| `LUCE_KV_K` / `LUCE_KV_V` | (auto) | KV-cache quant types. `q4_0` / `q4_0` is the bench setting. `tq3_0` saves another ~4 GB at 128K. |
 
 ## How it works
 
@@ -179,7 +179,7 @@ prompt (≤ 128K tokens)
 
 **Drafter forward.** Custom Qwen3-0.6B graph (`qwen3_0p6b_graph.cpp`) per-layer A/FP/B blocks: dense attention up to ~32K source, FlashPrefill sparse attention at and above. The 4 FP kernels live in `flashprefill_kernels.cu`; BSA dispatch is in `bsa_launcher.cu` + `bsa_fwd_inst.cu`.
 
-**Scoring + selection.** Tail attention `Q[-N:] @ K^T / sqrt(d)` per layer/head, max over (L, H), mean over the tail window. Block-level threshold by `alpha * mean(scores)` selects which K-blocks each Q-block attends to. Configurable via `DFLASH_FP_ALPHA`.
+**Scoring + selection.** Tail attention `Q[-N:] @ K^T / sqrt(d)` per layer/head, max over (L, H), mean over the tail window. Block-level threshold by `alpha * mean(scores)` selects which K-blocks each Q-block attends to. Configurable via `LUCE_FP_ALPHA`.
 
 **Memory budget on 24 GB.** Drafter scoring at 128K needs ~7-10 GB (drafter + KV + BSA scratch). Target + draft idle is ~18 GB. They can't coexist. The daemon's `park` / `unpark` / `free drafter` commands sequence VRAM occupancy across the request:
 
@@ -264,7 +264,7 @@ Reproducible comparison vs Ollama native `/api/chat` on the same
 64K unique-prompt summary task, RTX 6000 Ada sm_89,
 Qwen3.6-27B-Q4_K_M, FA_WINDOW=0. Drafter setup: Qwen3-0.6B BF16
 GGUF for the PFlash compress path (see "Drafter selection" above);
-the larger DFlash drafter on the dflash daemon side ran as FP16
+the larger DFlash drafter on the luce daemon side ran as FP16
 safetensors during decode-after-unpark on this run. Feel free to
 substitute either drafter side with the format you have on disk —
 the speedup comes from the compress path, not the dtype:

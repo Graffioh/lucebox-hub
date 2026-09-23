@@ -1,5 +1,5 @@
 // Per-token RMSNorm + weight multiply kernel — compiled for all HIP builds
-// (not gated on DFLASH27B_HIP_SM80_EQUIV) so that the HIP chunk-B graph
+// (not gated on LUCE_HIP_SM80_EQUIV) so that the HIP chunk-B graph
 // path in qwen3_graph.cpp can call it even in the baseline (q8-fallback) build.
 
 #include <hip/hip_runtime.h>

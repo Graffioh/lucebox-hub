@@ -6,7 +6,7 @@ HuggingFace reference tokenizer for Qwen3-0.6B. Tests encode, decode,
 token_text, special tokens, and edge cases.
 
 Usage:
-  python3 dflash/tests/test_tokenizer.py [--model dflash/models/Qwen3-0.6B-BF16.gguf]
+  python3 server/tests/test_tokenizer.py [--model server/models/Qwen3-0.6B-BF16.gguf]
 """
 
 import argparse
@@ -312,7 +312,7 @@ class TokenizerTest:
 
 def main():
     parser = argparse.ArgumentParser(description="Tokenizer unit test")
-    parser.add_argument("--model", default="dflash/models/Qwen3-0.6B-BF16.gguf",
+    parser.add_argument("--model", default="server/models/Qwen3-0.6B-BF16.gguf",
                         help="GGUF model path")
     parser.add_argument("--harness", default=None,
                         help="Path to test_tokenizer_harness binary")
@@ -322,7 +322,7 @@ def main():
     harness = args.harness
     if not harness:
         candidates = [
-            "dflash/build/test_tokenizer_harness",
+            "server/build/test_tokenizer_harness",
             "build/test_tokenizer_harness",
         ]
         for c in candidates:

@@ -1,8 +1,8 @@
-// Internal-only shared header for dflash::common library sources.
+// Internal-only shared header for luce::common library sources.
 // Not installed, not exposed in the public API.
 
 #pragma once
-#define DFLASH_INTERNAL_H_INCLUDED
+#define LUCE_INTERNAL_H_INCLUDED
 
 #include <cstddef>
 #include <cstdint>
@@ -24,10 +24,10 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "common/paged_attention_config.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 struct MoeHybridStorage;
 
@@ -213,7 +213,7 @@ struct TargetWeights {
     int n_expert_used           = 0;
     int n_expert_groups         = 1;
     int n_expert_groups_used    = 1;
-    int n_vocab                 = DFLASH27B_TARGET_VOCAB;
+    int n_vocab                 = LUCE_TARGET_VOCAB;
     int rope_dimension_count    = 64;
     float rope_theta            = 10000000.0f;
     float rms_eps               = 1e-6f;
@@ -243,16 +243,19 @@ struct TargetWeights {
     // comparands with `>= 0` so the sentinel never matches a real token.
     int32_t eos_id      = -1;
     int32_t eos_chat_id = -1;
+    // Token the chat template repeats once per image token; -1 when the
+    // vocabulary has none (a model without image input).
+    int32_t image_pad_id = -1;
 
     // DFlash noise mask token ID (from target tokenizer, used by draft model).
     // Default: Qwen tokenizer's mask token. Overridden by GGUF metadata if available.
-    int32_t mask_token_id = DFLASH27B_DRAFT_MASK_TOKEN_ID;
+    int32_t mask_token_id = LUCE_DRAFT_MASK_TOKEN_ID;
 
     // Target layer IDs captured for the DFlash draft model.
     // Computed from n_layer at load time: step = (n_layer - 2) / (N - 1),
     // ids[k] = 1 + k * step.  E.g. 27B→{1,16,31,46,61}, 9B→{1,8,15,22,29}.
-    int n_capture_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
-    int capture_layer_ids[DFLASH27B_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
+    int n_capture_layers = LUCE_DRAFT_N_TARGET_LAYERS;
+    int capture_layer_ids[LUCE_DRAFT_N_TARGET_LAYERS] = {1, 16, 31, 46, 61};
 };
 
 // Check if a token is an end-of-sequence marker for the given target weights.
@@ -268,6 +271,7 @@ struct TargetLoadPlan {
     bool skip_expert_tensors = false;  // skip ffn_*_exps from GPU (for hybrid MoE split load)
     bool metadata_only = false;        // parse tensor descriptors/scales without GPU allocation
     bool expert_metadata_only = false; // keep only routed expert tensor metadata; upload nothing
+    bool load_ds4_image_bias = false;
 };
 
 // Load a Q4_K_M target model from a GGUF file on disk.
@@ -376,12 +380,12 @@ struct DraftWeights {
     ggml_tensor *          out_norm    = nullptr;   // [hidden]
 
     // Architecture metadata (populated by loader).
-    int n_layer   = DFLASH27B_DRAFT_LAYERS;           // 5
-    int n_head    = DFLASH27B_TARGET_N_HEADS;          // 32
-    int n_head_kv = DFLASH27B_TARGET_N_KV_HEADS;       // 8
-    int head_dim  = DFLASH27B_TARGET_HEAD_DIM;         // 128
-    int n_embd    = DFLASH27B_TARGET_HIDDEN;           // 5120
-    int n_ff      = DFLASH27B_TARGET_INTERMEDIATE;     // 17408
+    int n_layer   = LUCE_DRAFT_LAYERS;           // 5
+    int n_head    = LUCE_TARGET_N_HEADS;          // 32
+    int n_head_kv = LUCE_TARGET_N_KV_HEADS;       // 8
+    int head_dim  = LUCE_TARGET_HEAD_DIM;         // 128
+    int n_embd    = LUCE_TARGET_HIDDEN;           // 5120
+    int n_ff      = LUCE_TARGET_INTERMEDIATE;     // 17408
     int swa_window = 0;                 // sliding window size (0 = disabled)
     bool swa_pattern_loaded = false;    // GGUF supplied sliding_window_pattern
     float rope_theta = 0.0f;  // RoPE frequency base (must come from GGUF)
@@ -395,10 +399,10 @@ struct DraftWeights {
     int   rope_n_ctx_orig = 0;      // original_max_position_embeddings
 
     // DFlash draft-specific config (populated by loader or set by caller).
-    int block_size      = DFLASH27B_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)
-    int n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
+    int block_size      = LUCE_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)
+    int n_target_layers = LUCE_DRAFT_N_TARGET_LAYERS;  // captured target layers (5)
     std::vector<int> capture_layer_ids;                     // explicit captured target-layer ids (GGUF dflash.target_layer_ids); empty = derive from count
-    int mask_token_id   = DFLASH27B_DRAFT_MASK_TOKEN_ID;    // noise mask token
+    int mask_token_id   = LUCE_DRAFT_MASK_TOKEN_ID;    // noise mask token
 
     // Optional Domino causal correction head. When present, greedy chain
     // speculative decode corrects each draft token with a lightweight GRU
@@ -506,8 +510,8 @@ struct TargetCache {
     ggml_tensor * conv_factor_all = nullptr;
     ggml_tensor * conv_factor_all_alt = nullptr;
 
-    // SpecLA factor buffers (allocated instead of ssm_intermediate when
-    // DFLASH_SPECLA=1 on the single-target path). Two token-major banks let a
+    // SpecLA factor buffers (allocated instead of ssm_intermediate on the
+    // single-target SpecLA path). Two token-major banks let a
     // verify consume the preceding accepted path while writing its own raw
     // factors without aliasing:
     //   factor_k_all:     [S_k, H_v, n_delta, max_q_len] f32
@@ -613,11 +617,12 @@ struct PrefixSnapshot {
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
 
-    // Phase B: thin-mode snapshots cover only a KV-position range.
-    bool is_thin  = false;
-    int  kv_start = 0;     // inclusive (only meaningful when is_thin)
-    int  kv_end   = 0;     // exclusive (only meaningful when is_thin)
-    // When is_thin == true:
+    // Snapshot payload shape; one value avoids impossible flag combinations.
+    enum class Layout { empty, dense, thin, paged };
+    Layout layout = Layout::empty;
+    int  kv_start = 0;  // inclusive (only meaningful for Layout::thin)
+    int  kv_end   = 0;  // exclusive (only meaningful for Layout::thin)
+    // For Layout::thin:
     //   - attn_k_snap[i] / attn_v_snap[i] are sized
     //     [HEAD_DIM, kv_end-kv_start, N_HEAD_KV] (smaller than cache).
     //   - ssm_state_snap, conv_state_snap, target_feat_snap are NOT
@@ -643,6 +648,45 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache);
 // Free the snapshot's GPU buffers.
 void free_prefix_snapshot(PrefixSnapshot & snap);
 
+// Exact CPU-buffer allocation size for the dense checkpoint layout used by
+// snapshot_paged_target_cache(). Returns zero when the cache topology or token
+// count is invalid. This lets the scheduler enforce a resident-memory budget
+// before allocating or copying a checkpoint.
+size_t estimate_paged_target_cache_snapshot_bytes(
+    const TargetCache & cache, int token_count);
+
+// Capture one live sequence from a multi-slot paged cache. Attention rows are
+// gathered through `block_table` into dense logical order in the copied
+// snapshot; recurrent state is copied only from `seq_slot`'s slab. The page
+// table itself is intentionally not retained: every restore owns fresh pages.
+bool snapshot_paged_target_cache(
+    const TargetCache & cache,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size,
+    int token_count,
+    PrefixSnapshot & snap);
+
+// Atomically replace a paged snapshot. The incumbent remains valid when
+// allocation, layout validation, or any staged copy fails.
+bool replace_paged_target_cache(
+    const TargetCache & cache,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size,
+    int token_count,
+    PrefixSnapshot & destination);
+
+// Restore a copied paged snapshot into fresh destination pages and one
+// recurrent-state slab. `block_table` describes the destination sequence and
+// must cover snap.cur_pos logical tokens.
+bool restore_paged_target_cache(
+    const PrefixSnapshot & snap,
+    TargetCache & cache,
+    int seq_slot,
+    const std::vector<uint32_t> & block_table,
+    int block_size);
+
 // Thin snapshot: capture only KV slice [kv_start, kv_end).
 // SSM/conv/target_feat are not preserved (caller chains thin entries
 // onto a thick base via restore_target_cache_chain).
@@ -666,7 +710,7 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
                                  TargetCache & cache);
 
 // max_verify_tokens controls the per-layer ssm_intermediate and conv_input_cache
-// sizes. Default is DFLASH27B_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
+// sizes. Default is LUCE_DRAFT_BLOCK_SIZE (16) for chain verify. DDTree
 // mode requires max(chain, 1 + tree_budget) to hold the flat tree + root.
 // Pass 0 to use the default.
 // When prefill_only is true, rollback tensors (snapshots, intermediates) are
@@ -697,7 +741,9 @@ bool create_target_cache(const TargetWeights & w,
                          int ctx_alloc = 0,
                          bool paged_attention = false,
                          int n_seq_slots = 1,
-                         bool concurrent_tree = false);
+                         bool concurrent_tree = false,
+                         ggml_type cache_type_k = GGML_TYPE_COUNT,
+                         ggml_type cache_type_v = GGML_TYPE_COUNT);
 
 // `f32_ssm_intermediates` enables exact per-token checkpoints for the opt-in
 // layer-split fast rollback path. The default preserves the established Q8_0
@@ -715,7 +761,9 @@ bool create_target_cache_partial(const TargetWeights & w,
                                  bool f32_ssm_intermediates = false,
                                  bool paged_attention = false,
                                  int n_seq_slots = 1,
-                                 bool concurrent_tree = false);
+                                 bool concurrent_tree = false,
+                         ggml_type cache_type_k = GGML_TYPE_COUNT,
+                         ggml_type cache_type_v = GGML_TYPE_COUNT);
 
 void free_target_cache(TargetCache & c);
 
@@ -738,12 +786,15 @@ void reset_recurrent_slot(TargetCache & c, int slot);
 
 // Reallocate a prefill-only cache with full rollback tensors, copying all live
 // state (KV, SSM, conv, target_feat) device-to-device. Frees the old cache.
+// enable_specla is the caller's effective SpecLA decision (config-driven);
+// the factor buffers exist iff it is true, and downstream graph code keys
+// SpecLA off their presence.
 bool migrate_prefill_cache(const TargetWeights & w,
                            int max_ctx,
                            int max_verify_tokens,
                            ggml_backend_t backend,
                            TargetCache & cache,
-                           bool enable_specla = true);
+                           bool enable_specla);
 
 // Compatibility commit for the fully factorized §4.2 fallback. The production
 // HLD route instead keeps raw accepted factors pending and consumes them in
@@ -781,7 +832,7 @@ struct DeltaNetCapture {
     // second target-model forward. These are graph-owned outputs.
     ggml_tensor * replay_log              = nullptr;
 
-    // SpecLA factor capture (DFLASH_SPECLA=1, docs/SPECLA.md). Persistent F32
+    // SpecLA factor capture (docs/SPECLA.md). Persistent F32
     // aliases into the bank written by this verify. In the HLD path the
     // historical field names hold raw serial-recurrence terms:
     //   factor_k:     [S_k, H_v, max_verify_tokens] — post-l2norm keys
@@ -1003,7 +1054,7 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     ggml_tensor *         kv_write_rows = nullptr,
     bool                  skip_gdn_intermediate = true);
 
-} // namespace dflash::common
+} // namespace luce::common
 
 #if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
 #include <cuda_runtime.h>

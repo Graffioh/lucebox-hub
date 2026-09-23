@@ -2,7 +2,7 @@
 
 #include <cstddef>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen3DrafterBufferPlan {
     std::size_t rope_k_buffers;
@@ -26,4 +26,4 @@ inline Qwen3DrafterBufferPlan qwen3_drafter_buffer_plan(
     };
 }
 
-} // namespace dflash::common
+} // namespace luce::common

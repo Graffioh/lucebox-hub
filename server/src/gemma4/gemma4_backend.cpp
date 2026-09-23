@@ -5,12 +5,13 @@
 // KV cache with layer sharing, snapshot/restore.
 
 #include "gemma4_backend.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "../qwen3/qwen3_kvflash_scorer.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
 #include "common/dflash_feature_ring.h"
 #include "common/dflash_draft_graph.h"
+#include "common/adaptive_spec_width.h"
 #include "common/step_graph.h"
 
 #include "ggml-cuda.h"
@@ -20,13 +21,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cmath>
+#include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ── Ctor / dtor ────────────────────────────────────────────────────────
 
-Gemma4Backend::Gemma4Backend(const Gemma4BackendConfig & cfg)
-    : cfg_(cfg) {}
+Gemma4Backend::Gemma4Backend(Gemma4BackendConfig cfg)
+    : cfg_(std::move(cfg)) {}
 
 Gemma4Backend::~Gemma4Backend() { shutdown(); }
 
@@ -46,7 +48,7 @@ bool Gemma4Backend::init() {
 
     if (!load_gemma4_gguf(cfg_.model_path, backend_, w_)) {
         std::fprintf(stderr, "[gemma4] GGUF load failed: %s\n",
-                     dflash27b_last_error());
+                     luce_last_error());
         return false;
     }
 
@@ -154,8 +156,9 @@ bool Gemma4Backend::unpark(ParkTarget target) {
 // ── kvflash helpers ────────────────────────────────────────────────────
 
 void Gemma4Backend::kvflash_read_config() {
-    if (std::getenv("DFLASH_KVFLASH")) {
-        kvflash_drafter_path_ = kvflash_find_drafter(cfg_.model_path);
+    if (std::getenv("LUCE_KVFLASH")) {
+        kvflash_drafter_path_ = kvflash_find_drafter(
+            cfg_.model_path.c_str());
     }
     // "auto" sizes from the GPU (weights resident, cache not yet allocated):
     // gemma4 pools the FULL-attention layers only (F16 cache); SWA rings are
@@ -181,7 +184,7 @@ void Gemma4Backend::kvflash_read_config() {
                                             !kvflash_drafter_path_.empty(),
                                             kvf_budget);
     if (kvflash_tokens_ > 0) {
-        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        const char * tau = std::getenv("LUCE_KVFLASH_TAU");
         kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
     }
 }
@@ -203,7 +206,7 @@ void Gemma4Backend::kvflash_maybe_reselect(int generated) {
             if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
                               cfg_.device.gpu, drafter_ctx_)) {
                 std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
-                                     "LRU residency\n", dflash27b_last_error());
+                                     "LRU residency\n", luce_last_error());
                 kvflash_drafter_failed_ = true;
                 return;
             }
@@ -359,7 +362,7 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
     std::vector<float> logits;
 
     // Budget force-close state — same shape as qwen35's maybe_force_close.
-    // See dflash/src/common/model_backend.h BudgetHook docs for the
+    // See server/src/common/model_backend.h BudgetHook docs for the
     // single- vs multi-token close-tag semantics.
     bool budget_close_started = false;
     int  close_inject_pos     = 0;
@@ -485,6 +488,8 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
 
     DFlashTarget * target = dflash_target_;
     const int q_len = dw_.block_size;
+    AdaptiveSpecWidth width_controller(
+        q_len, 2, adaptive_spec_width_globally_enabled());
 
     StepGraph draft_sg;
 
@@ -499,6 +504,7 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
     int n_generated     = 0;
     int n_draft_steps   = 0;
     int n_accept_sum    = 0;
+    int n_offered_sum   = 0;
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
@@ -545,7 +551,7 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
                                     tail_hook, forced_close_out);
                 auto t_dec1 = std::chrono::steady_clock::now();
                 const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-                const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+                const int total_draft_pos = std::max(1, n_offered_sum);
                 const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
                 std::fprintf(stderr,
                     "[gemma4-spec] tail-off-stats tokens=%d time=%.3f s "
@@ -623,6 +629,10 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
             return false;
         }
         draft_tok[0] = last_tok;
+        const int verify_width = width_controller.next_width(q_len);
+        if ((int)draft_tok.size() > verify_width) {
+            draft_tok.resize((size_t)verify_width);
+        }
 
         // 4. Verify: run target forward over all draft tokens.
         // Gemma4 is a pure transformer — after verify, KV entries at accepted
@@ -638,11 +648,13 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
 
         // 5. Acceptance: longest matching prefix
         int accept_n = 1;
-        for (int i = 0; i < q_len - 1; i++) {
+        for (int i = 0; i < verify_width - 1; i++) {
             if (draft_tok[i + 1] == target_tok[i]) accept_n++;
             else break;
         }
-        int bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
+        width_controller.observe(accept_n, verify_width);
+        n_offered_sum += verify_width;
+        int bonus_tok = (accept_n < verify_width) ? target_tok[accept_n - 1] : -1;
         int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
         if (commit_n > need_commit_budget) {
             commit_n = need_commit_budget;
@@ -700,7 +712,7 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec1 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+    const int total_draft_pos = std::max(1, n_offered_sum);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
     std::fprintf(stderr, "[gemma4-spec] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
@@ -900,7 +912,7 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
         if (snap_pos > kvflash_tokens_ - kvflash_pager_.chunk_tokens()) {
             std::fprintf(stderr, "[kvflash] restored prefix (%d) exceeds pool %d\n",
                          snap_pos, kvflash_tokens_);
-            result.fail(GenerateErrorCode::ContextOverflow);
+            result.fail(GenerateErrorCode::ResourceExhausted);
             return result;
         }
         kvflash_pager_.reset();
@@ -1207,7 +1219,7 @@ bool Gemma4Backend::handle_compress(const std::string & line,
         std::fprintf(stderr, "[compress] loading drafter from %s ...\n", dpath);
         if (!load_drafter(dpath, /*gpu_layers=*/999, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
-                         dflash27b_last_error());
+                         luce_last_error());
             io.emit(-1);
             if (!skip_park && !was_parked) unpark(ParkTarget::TargetModel);
             return false;
@@ -1240,7 +1252,7 @@ bool Gemma4Backend::handle_compress(const std::string & line,
 
 void Gemma4Backend::free_drafter() {
     if (drafter_loaded_) {
-        ::dflash::common::free_drafter(drafter_ctx_);
+        ::luce::common::free_drafter(drafter_ctx_);
         drafter_loaded_ = false;
     }
 }
@@ -1264,8 +1276,8 @@ bool Gemma4Backend::load_decode_draft() {
         std::fprintf(stderr, "[gemma4] draft CUDA init failed (gpu=%d)\n", draft_gpu);
         return false;
     }
-    if (!load_draft_gguf(cfg_.draft_path, draft_backend_, dw_, nullptr)) {
-        std::fprintf(stderr, "[gemma4] draft load failed: %s\n", dflash27b_last_error());
+    if (!load_draft_gguf(*cfg_.draft_path, draft_backend_, dw_, nullptr)) {
+        std::fprintf(stderr, "[gemma4] draft load failed: %s\n", luce_last_error());
         ggml_backend_free(draft_backend_);
         draft_backend_ = nullptr;
         return false;
@@ -1368,4 +1380,4 @@ void Gemma4Backend::shutdown() {
     std::printf("[gemma4] shutdown\n"); std::fflush(stdout);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

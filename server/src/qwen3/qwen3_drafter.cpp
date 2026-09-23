@@ -14,6 +14,7 @@
 // mean-over-lookahead, smoothed with AvgPool, scored per chunk, top-K kept.
 
 #include "qwen3_drafter.h"
+#include "common/dspark_head.h"
 #include "qwen3_drafter_model.h"
 #include "qwen3/anchor_params.h"
 #include "common/backend_precision.h"
@@ -33,7 +34,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -80,10 +81,10 @@ static void force_chunk_neighborhood(std::vector<uint8_t> & forced, int n_chunks
     for (int c = lo; c <= hi; ++c) forced[(size_t)c] = 1;
 }
 
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
 bool prewarm_drafter_once(const Qwen3DrafterWeights & w) {
     static bool warmed = false;
-    if (warmed || std::getenv("DFLASH_FP_SKIP_PREWARM")) {
+    if (warmed || std::getenv("LUCE_FP_SKIP_PREWARM")) {
         return true;
     }
 
@@ -232,7 +233,7 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
         out.weights.n_vocab, out.gpu);
     std::fflush(stderr);
 
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
     if (!prewarm_drafter_once(out.weights)) {
         free_drafter(out);
         return false;
@@ -243,6 +244,7 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
 }
 
 void free_drafter(DrafterContext & ctx) {
+    dspark_note_drafter_lifecycle();
     free_drafter_weights(ctx);
     if (ctx.backend) {
         ggml_backend_free(ctx.backend);
@@ -272,11 +274,18 @@ static std::vector<int32_t> qwen35_score_and_compress(
     float keep_ratio,
     int chunk_size,
     int n_lookahead,
-    int pool_kernel) {
+    int pool_kernel,
+    int score_query_end) {
 
     const int S = (int)ids.size();
     const int hidden = w.n_embd;
     if (S < n_lookahead + 1) return ids;
+    const int query_end = score_query_end;
+    if (n_lookahead < 1 || query_end < n_lookahead || query_end > S) {
+        set_last_error("qwen35 scorer query window out of range");
+        return {};
+    }
+    const int query_start = query_end - n_lookahead;
 
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> running_max((size_t)n_lookahead * S, -INFINITY);
@@ -285,23 +294,23 @@ static std::vector<int32_t> qwen35_score_and_compress(
 #if defined(_WIN32)
     char *  old_tq3_raw = nullptr;
     size_t  old_tq3_len = 0;
-    _dupenv_s(&old_tq3_raw, &old_tq3_len, "DFLASH27B_KV_TQ3");
+    _dupenv_s(&old_tq3_raw, &old_tq3_len, "LUCE_KV_TQ3");
     const bool had_old_tq3 = (old_tq3_raw != nullptr);
     std::string old_tq3_s  = had_old_tq3 ? old_tq3_raw : "";
     free(old_tq3_raw);
-    _putenv_s("DFLASH27B_KV_TQ3", "0");
+    _putenv_s("LUCE_KV_TQ3", "0");
     auto restore_tq3 = [&]() {
         // _putenv_s with empty value removes the variable on MSVCRT.
-        _putenv_s("DFLASH27B_KV_TQ3", had_old_tq3 ? old_tq3_s.c_str() : "");
+        _putenv_s("LUCE_KV_TQ3", had_old_tq3 ? old_tq3_s.c_str() : "");
     };
 #else
-    const char * old_tq3 = std::getenv("DFLASH27B_KV_TQ3");
+    const char * old_tq3 = std::getenv("LUCE_KV_TQ3");
     std::string old_tq3_s = old_tq3 ? old_tq3 : "";
     const bool had_old_tq3 = (old_tq3 != nullptr);
-    setenv("DFLASH27B_KV_TQ3", "0", 1);
+    setenv("LUCE_KV_TQ3", "0", 1);
     auto restore_tq3 = [&]() {
-        if (had_old_tq3) setenv("DFLASH27B_KV_TQ3", old_tq3_s.c_str(), 1);
-        else unsetenv("DFLASH27B_KV_TQ3");
+        if (had_old_tq3) setenv("LUCE_KV_TQ3", old_tq3_s.c_str(), 1);
+        else unsetenv("LUCE_KV_TQ3");
     };
 #endif
     if (!create_target_cache(w, S, 0, w.backend, cache, true)) {
@@ -441,7 +450,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
             }
             const TargetLayer & L = w.layers[il];
             ggml_tensor * inp_tail = ggml_view_2d(sctx, act_in, hidden, n_lookahead,
-                act_in->nb[1], (size_t)(S - n_lookahead) * act_in->nb[1]);
+                act_in->nb[1], (size_t)query_start * act_in->nb[1]);
             ggml_tensor * q_cur = ggml_rms_norm(sctx, inp_tail, w.rms_eps);
             q_cur = ggml_mul(sctx, q_cur, L.attn_norm);
             ggml_tensor * QG = ggml_mul_mat(sctx, L.wq, q_cur);
@@ -473,7 +482,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
             }
             std::vector<int32_t> pos4((size_t)4 * n_lookahead, 0);
             for (int i = 0; i < n_lookahead; ++i) {
-                int p = S - n_lookahead + i;
+                const int p = query_start + i;
                 pos4[(size_t)0 * n_lookahead + i] = p;
                 pos4[(size_t)1 * n_lookahead + i] = p;
                 pos4[(size_t)2 * n_lookahead + i] = p;
@@ -481,7 +490,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
             ggml_backend_tensor_set(pos_tail, pos4.data(), 0, pos4.size() * sizeof(int32_t));
             std::vector<float> mask((size_t)n_lookahead * K_len, 0.0f);
             for (int t = 0; t < n_lookahead; ++t) {
-                const int visible_end = S - n_lookahead + t + 1;
+                const int visible_end = query_start + t + 1;
                 for (int j = 0; j < K_len; ++j) {
                     mask[(size_t)t * K_len + j] = (j < visible_end) ? 0.0f : -INFINITY;
                 }
@@ -495,6 +504,21 @@ static std::vector<int32_t> qwen35_score_and_compress(
             }
             std::vector<float> tmp((size_t)K_len * n_lookahead * w.n_head);
             ggml_backend_tensor_get(probs, tmp.data(), 0, tmp.size() * sizeof(float));
+            const size_t nonfinite =
+                count_nonfinite_scores(tmp.data(), tmp.size());
+            if (nonfinite != 0) {
+                const std::string message =
+                    "non-finite Qwen3.5 PFlash scores at layer " +
+                    std::to_string(il) + ": " + std::to_string(nonfinite) +
+                    "/" + std::to_string(tmp.size());
+                std::fprintf(stderr, "[pflash] ERROR: %s\n", message.c_str());
+                std::fflush(stderr);
+                ggml_gallocr_free(salloc); ggml_free(sctx);
+                ggml_gallocr_free(alloc); ggml_backend_buffer_free(act_buf);
+                ggml_free(act_ctx); free_target_cache(cache);
+                set_last_error(message);
+                return {};
+            }
             for (int h = 0; h < w.n_head; ++h) {
                 for (int t = 0; t < n_lookahead; ++t) {
                     for (int j = 0; j < S; ++j) {
@@ -528,7 +552,7 @@ static std::vector<int32_t> qwen35_score_and_compress(
     // Caller pool_kernel takes precedence; if zero/negative, fall back to env or 5.
     const int pk = (pool_kernel > 0)
         ? pool_kernel
-        : std::max(3, env_int("DFLASH_COMPRESS_POOL_KERNEL", 5));
+        : std::max(3, env_int("LUCE_COMPRESS_POOL_KERNEL", 5));
     std::vector<float> smoothed((size_t)S, 0.0f);
     int half = pk / 2;
     for (int j = 0; j < S; ++j) {
@@ -554,8 +578,8 @@ static std::vector<int32_t> qwen35_score_and_compress(
     int count = 0;
     // Scale head/tail forced chunks so they don't crowd out top-K scoring.
     {
-        const int h_raw = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
-        const int t_raw = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
+        const int h_raw = env_int("LUCE_COMPRESS_HEAD_CHUNKS", 8);
+        const int t_raw = env_int("LUCE_COMPRESS_TAIL_CHUNKS", 24);
         int h_n = h_raw, t_n = t_raw;
         if (h_n + t_n >= n_keep) {
             const int budget = std::max(1, n_keep - 1);
@@ -566,12 +590,12 @@ static std::vector<int32_t> qwen35_score_and_compress(
         for (int c = std::max(0, n_chunks - t_n); c < n_chunks; ++c) if (!selected[(size_t)c]) { selected[(size_t)c] = 1; ++count; }
     }
 
-    const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
+    const int query_tokens = env_int("LUCE_COMPRESS_QUERY_TOKENS", 96);
     const auto ap = resolve_anchor_params(n_chunks,
         env_int("PFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
         env_int("PFLASH_COMPRESS_MAX_ANCHOR_HITS", -1),
-        env_int("DFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
-        env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", -1));
+        env_int("LUCE_COMPRESS_ANCHOR_RADIUS",   -1),
+        env_int("LUCE_COMPRESS_MAX_ANCHOR_HITS", -1));
     const int anchor_radius   = ap.radius;
     const int max_anchor_hits = ap.max_hits;
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
@@ -609,9 +633,9 @@ static std::vector<int32_t> qwen35_score_and_compress(
     // Global aggregation tasks often depend on repeated rare tokens that do
     // not appear in the final query. Preserve high-frequency-but-not-filler
     // token chunks before filling with model-score top-K.
-    const int repeat_min = env_int("DFLASH_COMPRESS_REPEAT_MIN", 4);
-    const int repeat_max = env_int("DFLASH_COMPRESS_REPEAT_MAX", 32);
-    const int repeat_limit = env_int("DFLASH_COMPRESS_REPEAT_CHUNKS", n_keep);
+    const int repeat_min = env_int("LUCE_COMPRESS_REPEAT_MIN", 4);
+    const int repeat_max = env_int("LUCE_COMPRESS_REPEAT_MAX", 32);
+    const int repeat_limit = env_int("LUCE_COMPRESS_REPEAT_CHUNKS", n_keep);
     if (repeat_min > 1 && count < repeat_limit) {
         std::unordered_map<int32_t, int> freq;
         freq.reserve((size_t)S);
@@ -684,18 +708,24 @@ std::vector<int32_t> drafter_score_and_compress(
     float keep_ratio,
     int chunk_size,
     int n_lookahead,
-    int pool_kernel) {
+    int pool_kernel,
+    int score_query_end) {
     if (!ctx.loaded) {
         set_last_error("drafter not loaded");
         return {};
     }
     if (ctx.arch == DrafterArch::Qwen35_0p8b) {
+        if (score_query_end < 0) {
+            set_last_error("qwen35 scorer query window out of range");
+            return {};
+        }
         if (!ctx.arch_state) {
             set_last_error("qwen35 drafter state missing");
             return {};
         }
         auto * st = static_cast<Qwen35DrafterState *>(ctx.arch_state);
-        return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size, n_lookahead, pool_kernel);
+        return qwen35_score_and_compress(st->weights, ids, keep_ratio, chunk_size,
+                                         n_lookahead, pool_kernel, score_query_end);
     }
     const int S = (int)ids.size();
     if (S < n_lookahead + 1) {
@@ -706,7 +736,8 @@ std::vector<int32_t> drafter_score_and_compress(
     // ── 1. Custom forward + GPU tail-attention scoring ────────────────
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> running_max;
-    if (!forward_qwen3_drafter_model(ctx.weights, ids, n_lookahead, running_max)) {
+    if (!forward_qwen3_drafter_model(
+            ctx.weights, ids, n_lookahead, running_max, score_query_end)) {
         return {};
     }
     auto t1 = std::chrono::steady_clock::now();
@@ -756,20 +787,20 @@ std::vector<int32_t> drafter_score_and_compress(
     // needle span. Exact scores alone can keep the query while dropping the
     // neighboring answer chunk, so force a small token-only anchor neighborhood.
     // Head/tail forced chunks scale with n_keep so top-K scoring always gets slots.
-    const int h_raw = env_int("DFLASH_COMPRESS_HEAD_CHUNKS", 8);
-    const int t_raw = env_int("DFLASH_COMPRESS_TAIL_CHUNKS", 24);
+    const int h_raw = env_int("LUCE_COMPRESS_HEAD_CHUNKS", 8);
+    const int t_raw = env_int("LUCE_COMPRESS_TAIL_CHUNKS", 24);
     int head_chunks = h_raw, tail_chunks = t_raw;
     if (head_chunks + tail_chunks >= n_keep) {
         const int budget = std::max(1, n_keep - 1);
         head_chunks = std::max(0, h_raw * budget / (h_raw + t_raw));
         tail_chunks = std::max(0, budget - head_chunks);
     }
-    const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
+    const int query_tokens = env_int("LUCE_COMPRESS_QUERY_TOKENS", 96);
     const auto ap = resolve_anchor_params(n_chunks,
         env_int("PFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
         env_int("PFLASH_COMPRESS_MAX_ANCHOR_HITS", -1),
-        env_int("DFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
-        env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", -1));
+        env_int("LUCE_COMPRESS_ANCHOR_RADIUS",   -1),
+        env_int("LUCE_COMPRESS_MAX_ANCHOR_HITS", -1));
     const int anchor_radius   = ap.radius;
     const int max_anchor_hits = ap.max_hits;
     std::vector<uint8_t> selected_mask((size_t)n_chunks, 0);
@@ -853,4 +884,4 @@ std::vector<int32_t> drafter_score_and_compress(
     return out;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

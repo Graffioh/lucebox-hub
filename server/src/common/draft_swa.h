@@ -1,6 +1,6 @@
 #pragma once
 
-namespace dflash::common {
+namespace luce::common {
 
 struct DraftWeights;
 
@@ -14,4 +14,4 @@ struct DraftSwaOverrideResult {
 DraftSwaOverrideResult apply_draft_swa_window_override(
     DraftWeights & weights, int requested_window);
 
-} // namespace dflash::common
+} // namespace luce::common

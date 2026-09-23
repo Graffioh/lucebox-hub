@@ -6,11 +6,11 @@
 
 #include <cstdio>
 
-namespace dflash::common {
+namespace luce::common {
 
 int run_gemma4_daemon(const Gemma4DaemonArgs & args) {
     Gemma4BackendConfig cfg;
-    cfg.model_path = args.model_path;
+    cfg.model_path = args.model_path ? args.model_path : "";
     cfg.device     = args.device;
     cfg.stream_fd  = args.stream_fd;
     cfg.chunk      = args.chunk;
@@ -26,4 +26,4 @@ int run_gemma4_daemon(const Gemma4DaemonArgs & args) {
     return run_daemon(backend, da);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

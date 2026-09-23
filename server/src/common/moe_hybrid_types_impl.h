@@ -7,11 +7,11 @@
 
 #pragma once
 
-namespace dflash::common {
+namespace luce::common {
 
 // ─── qwen35 conversions ─────────────────────────────────────────────────
 
-#if defined(DFLASH_INTERNAL_H_INCLUDED)
+#if defined(LUCE_INTERNAL_H_INCLUDED)
 
 inline MoeHybridConfig make_moe_hybrid_config(const TargetWeights & w) {
     MoeHybridConfig cfg;
@@ -49,11 +49,11 @@ inline MoeLayerDesc make_moe_layer_desc(const TargetLayer & L) {
     return desc;
 }
 
-#endif  // DFLASH_INTERNAL_H_INCLUDED
+#endif  // LUCE_INTERNAL_H_INCLUDED
 
 // ─── Laguna conversions ─────────────────────────────────────────────────
 
-#if defined(DFLASH_LAGUNA_INTERNAL_H_INCLUDED)
+#if defined(LUCE_LAGUNA_INTERNAL_H_INCLUDED)
 
 inline MoeHybridConfig make_moe_hybrid_config(const LagunaTargetWeights & w) {
     MoeHybridConfig cfg;
@@ -92,6 +92,6 @@ inline MoeLayerDesc make_moe_layer_desc(const LagunaTargetLayer & L) {
     return desc;
 }
 
-#endif  // DFLASH_LAGUNA_INTERNAL_H_INCLUDED
+#endif  // LUCE_LAGUNA_INTERNAL_H_INCLUDED
 
-}  // namespace dflash::common
+}  // namespace luce::common
