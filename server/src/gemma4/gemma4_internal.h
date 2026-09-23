@@ -1,4 +1,4 @@
-// Gemma4 (iSWA + MoE) target structs for dflash daemon.
+// Gemma4 (iSWA + MoE) target structs for luce daemon.
 //
 // Architecture summary (from Google Gemma-4 config):
 //   - Hybrid iSWA: per-layer sliding window pattern (full vs SWA).
@@ -21,7 +21,7 @@
 #include "internal.h"  // CpuEmbedder
 #include "common/layer_split_utils.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Gemma4Layer {
     // Pre-attn norm
@@ -231,7 +231,7 @@ void free_gemma4_snapshot(Gemma4Snapshot & s);
 // the pager's slot mapping and the full mask is built in SLOT space; SWA
 // ring buffers are untouched. The caller must have allocated slots for
 // [kv_start, kv_start + n_tokens) via slot_for() beforehand. Requires the
-// set_rows path (refused under DFLASH_GEMMA4_NO_KVPAD) and fa_window == 0.
+// set_rows path (refused under LUCE_GEMMA4_NO_KVPAD) and fa_window == 0.
 bool gemma4_step(
     ggml_backend_t          backend,
     const Gemma4Weights &   w,
@@ -331,4 +331,4 @@ bool gemma4_prefill_bsa(
     int                     S,           // total prompt length
     std::vector<float> &    out_logits);
 
-}  // namespace dflash::common
+}  // namespace luce::common

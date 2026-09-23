@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HumanEval-style bench through dflash_server HTTP API. Measures end-to-end
+"""HumanEval-style bench through luce_server HTTP API. Measures end-to-end
 decode tok/s on code-completion prompts. Server-internal [gemma4-spec] log
 captures the true decode speed + acceptance rate per request."""
 import json, time, urllib.request, sys
@@ -67,7 +67,7 @@ total_dt  = 0.0
 print(f"[bench] url={URL} max_tokens={MAX_TOKENS} n_prompts={len(PROMPTS)}")
 for name, prompt in PROMPTS:
     body = {
-        "model": "dflash",
+        "model": "luce",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": MAX_TOKENS, "temperature": 0,
     }

@@ -34,7 +34,7 @@
 #include <cstddef>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Whether an option reaches the backend, as a function of placement.
 enum class FeatureSupport {
@@ -77,7 +77,7 @@ inline constexpr ArchCapabilities kArchCapabilities[] = {
     {"laguna",     true,  false, false, true,    kMono, kMono, kMono,  kNever, kNever,kNever, kNever},
     {"qwen3",      false, false, true,  false,   kNever, kNever, kNever, kNever, kNever,kNever, kNever},
     {"gemma4",     true,  false, false, false,   kMono, kNever, kNever, kNever, kBoth,kNever, kNever},
-    {"deepseek4",  true,  false, false, false,   kNever, kNever, kNever, kNever, kNever,kNever, kNever},
+    {"deepseek4",  true,  false, true,  false,   kNever, kNever, kNever, kNever, kNever,kNever, kMono},
 };
 
 inline constexpr std::size_t kArchCount =
@@ -257,4 +257,4 @@ inline bool arch_supports_paged_attention(const std::string & arch,
     return detail::arch_has(arch, &ArchCapabilities::paged_attn, is_layer_split);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

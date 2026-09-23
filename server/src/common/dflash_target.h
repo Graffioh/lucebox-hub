@@ -19,7 +19,7 @@
 struct ggml_tensor;
 struct ggml_backend;
 
-namespace dflash::common {
+namespace luce::common {
 
 struct DFlashTarget {
     virtual ~DFlashTarget() = default;
@@ -199,4 +199,4 @@ struct DFlashTarget {
     virtual const std::vector<int> & capture_layer_ids() const = 0;
 };
 
-} // namespace dflash::common
+} // namespace luce::common

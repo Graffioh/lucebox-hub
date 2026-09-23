@@ -12,7 +12,7 @@
 #include <limits>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 struct ProjectionGraph {
@@ -306,7 +306,7 @@ bool dflash2_select_chains_batched(
     std::vector<int32_t> candidate_ids(
         (size_t) n_positions * (size_t) K);
     bool have_top_k = false;
-#ifdef DFLASH27B_HAVE_DRAFT_TOPK
+#ifdef LUCE_HAVE_DRAFT_TOPK
     if (projection.logits && projection.logits->data) {
         have_top_k = geometric_extract_draft_topk_cuda(
             projection.logits->data, n_positions, vocab, K,
@@ -409,4 +409,4 @@ bool dflash2_select_chains_batched(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

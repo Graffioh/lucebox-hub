@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstdio>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -207,4 +207,4 @@ bool KvFlashCrossTokScorer::score_chunks(const std::vector<int32_t> & ids,
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -20,7 +20,7 @@
 #include <random>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
     const auto info = inspect_gguf_model_info(cfg.target_path);
@@ -62,7 +62,7 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
                                              cfg.run_dflash &&
                                              split_chain_fast_rollback_enabled())) {
             std::fprintf(stderr, "target-split load/cache gpu=%d: %s\n",
-                         shard.gpu, dflash27b_last_error());
+                         shard.gpu, luce_last_error());
             free_qwen35_layer_split_shards(shards);
             return 1;
         }
@@ -92,7 +92,7 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
             : load_draft_safetensors(cfg.draft_path, draft_backend, draft_weights);
         if (!draft_ok) {
             std::fprintf(stderr, "target-split draft load gpu=%d: %s\n",
-                         cfg.draft_gpu, dflash27b_last_error());
+                         cfg.draft_gpu, luce_last_error());
             if (draft_backend_owned) ggml_backend_free(draft_backend);
             free_qwen35_layer_split_shards(shards);
             return 1;
@@ -181,4 +181,4 @@ int run_layer_split_daemon(const LayerSplitDaemonConfig & cfg) {
     return 0;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

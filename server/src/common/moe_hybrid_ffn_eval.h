@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Choose the quarter-route main-owner quota that minimizes the slower owner's
 // estimated completion time. Returns zero for invalid inputs.
@@ -349,6 +349,7 @@ struct CachedHotGraphOptions {
     float swiglu_clamp = 0.0f;
     bool gpu_remap = false;
     int n_expert = 0;
+    ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT;
 };
 
 // Build/rebuild cached hot FFN graph.
@@ -384,7 +385,8 @@ bool build_cached_cold_graph(
     int n_embd,
     int n_ff_exp,
     int n_cold,
-    float swiglu_clamp = 0.0f);
+    float swiglu_clamp = 0.0f,
+    ggml_mixed_mmq_policy mixed_mmq_policy = GGML_MIXED_MMQ_DEFAULT);
 
 // Shared expert only, batched [n_embd, n_tokens] on the GPU backend. Used by
 // the cluster expert-parallel path, which evaluates routed experts without
@@ -411,4 +413,4 @@ bool build_cached_hot_batched_graph(
     const MoeHybridConfig & cfg,
     int n_tokens);
 
-}  // namespace dflash::common
+}  // namespace luce::common

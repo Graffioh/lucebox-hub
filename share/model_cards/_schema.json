@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/lucebox/lucebox-hub/blob/main/share/model_cards/_schema.json",
-  "title": "dflash model card sidecar",
-  "description": "Sidecar JSON carrying per-model defaults transcribed from the upstream model card. Read by dflash_server at startup to set --default-max-tokens, --think-max-tokens, sampler, and reasoning.effort tier values. See docs/specs/thinking-budget.md §3.3 for the full field reference.",
+  "title": "luce model card sidecar",
+  "description": "Sidecar JSON carrying per-model defaults transcribed from the upstream model card. Read by luce_server at startup to set --default-max-tokens, --think-max-tokens, sampler, and reasoning.effort tier values. See docs/specs/thinking-budget.md §3.3 for the full field reference.",
   "type": "object",
   "additionalProperties": false,
   "required": ["name", "source", "verified_at", "max_tokens"],

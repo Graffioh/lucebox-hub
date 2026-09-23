@@ -106,7 +106,7 @@ block-diffusion drafter, however, not the paper's specially trained one-layer
 EAGLE drafter.
 
 The runtime includes exact prefix-conditioned tree construction. Set
-`DFLASH_SPECLA_CONDITIONAL_DRAFT=1` to rerun the draft for every expanded
+`LUCE_SPECLA_CONDITIONAL_DRAFT=1` to rerun the draft for every expanded
 prefix. This is the faithful algorithmic experiment, but it is intentionally
 off by default: per-node reruns of this five-layer draft cost more than a 27B
 target verification. Realizing the paper's §6.2 speedup requires training the
@@ -115,7 +115,7 @@ that model artifact.
 
 SpecLA defaults to the paper's top-k=4 tree width. Use
 `--specla-top-k <K>` when a checkpoint or workload benefits from a different
-width. `DFLASH_SPECLA_TOPK=<K>` remains available for non-CLI harnesses.
+width. `LUCE_SPECLA_TOPK=<K>` remains available for non-CLI harnesses.
 
 ## Running
 
@@ -127,7 +127,7 @@ width. `DFLASH_SPECLA_TOPK=<K>` remains available for non-CLI harnesses.
 build/test_dflash TARGET.gguf DRAFT.gguf prompt.bin 128 out.bin --specla
 
 # Expensive exact branch-conditioned drafting experiment.
-DFLASH_SPECLA=1 DFLASH_SPECLA_CONDITIONAL_DRAFT=1 build/dflash_server ...
+LUCE_SPECLA_CONDITIONAL_DRAFT=1 build/luce_server ... --specla
 ```
 
 Tau 6 was best in the current ten-prompt probe and is the `--specla` default.
@@ -136,8 +136,9 @@ tighter margin changed batching at numerically sensitive logits and was not
 consistently faster. `--ddtree-budget`, `--specla-top-k`, and `--draft-swa`
 remain explicit for the same setup-dependent reason.
 
-`DFLASH_SPECLA=1` remains a compatibility switch for non-CLI integrations.
-`DFLASH_SPECLA_CONDITIONAL_DRAFT=1` and `DFLASH_SPECLA_FUSED_COMMIT=0` are
+SpecLA is requested explicitly: `--specla` on the CLI, or
+`Qwen35Config::specla_mode` for programmatic integrations.
+`LUCE_SPECLA_CONDITIONAL_DRAFT=1` and `LUCE_SPECLA_FUSED_COMMIT=0` are
 advanced algorithm/debug controls, not required for normal use.
 
 KVFlash uses a pager-backed attention cache that cannot migrate SpecLA factor

@@ -20,10 +20,10 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct LagunaLayerSplitAdapterConfig {
-    const char * target_path = nullptr;
+    std::string target_path;
     DevicePlacement device;
     RemoteTargetShardConfig remote_target_shard;
     int chunk = 2048;
@@ -44,7 +44,7 @@ struct LagunaLayerSplitSnapshot {
 
 class LagunaLayerSplitAdapter : public LayerSplitAdapter {
 public:
-    explicit LagunaLayerSplitAdapter(const LagunaLayerSplitAdapterConfig & cfg);
+    explicit LagunaLayerSplitAdapter(LagunaLayerSplitAdapterConfig cfg);
     ~LagunaLayerSplitAdapter() override;
 
     LagunaLayerSplitAdapter(const LagunaLayerSplitAdapter &) = delete;
@@ -144,4 +144,4 @@ int run_laguna_target_shard_ipc_daemon(const char * target_path,
                                        size_t shared_payload_bytes = 0,
                                        int kvflash_pool_tokens = 0);
 
-}  // namespace dflash::common
+}  // namespace luce::common

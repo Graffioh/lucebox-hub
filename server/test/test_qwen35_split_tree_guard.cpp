@@ -6,7 +6,7 @@
 #include <vector>
 
 using namespace CppUnitTestFramework;
-using dflash::common::qwen35_split_run_if_root_inclusive_pure_chain;
+using luce::common::qwen35_split_run_if_root_inclusive_pure_chain;
 
 namespace {
 

@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 class KvFlashPager;
 
@@ -98,4 +98,4 @@ private:
     mutable int      required_tree_slots_ = 1;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

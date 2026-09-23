@@ -19,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -41,7 +41,7 @@ size_t required_shared_bytes(int hidden, int max_tokens) {
 }
 
 size_t shared_bytes_from_env(size_t required_bytes) {
-    const char * raw = std::getenv("DFLASH_TARGET_SHARD_IPC_SHARED_BYTES");
+    const char * raw = std::getenv("LUCE_TARGET_SHARD_IPC_SHARED_BYTES");
     if (!raw || !*raw) return required_bytes;
     if (raw[0] == '-') return required_bytes;
     char * end = nullptr;
@@ -54,7 +54,7 @@ size_t shared_bytes_from_env(size_t required_bytes) {
 }
 
 BackendIpcPayloadTransport target_shard_ipc_transport_from_env() {
-    const char * raw = std::getenv("DFLASH_TARGET_SHARD_IPC_TRANSPORT");
+    const char * raw = std::getenv("LUCE_TARGET_SHARD_IPC_TRANSPORT");
     if (!raw || !*raw) return BackendIpcPayloadTransport::Stream;
     BackendIpcPayloadTransport transport = BackendIpcPayloadTransport::Stream;
     if (!parse_backend_ipc_payload_transport(raw, transport)) {
@@ -375,4 +375,4 @@ void TargetShardIpcSession::close() {
     mode_ = BackendIpcMode::Invalid;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

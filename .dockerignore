@@ -6,10 +6,10 @@
 # Build artefacts.
 **/build/
 **/build-*/
-dflash/build/
+server/build/
 
 # Model weights — bind-mount at runtime instead of baking into the image.
-dflash/models/
+server/models/
 **/*.gguf
 **/*.safetensors
 

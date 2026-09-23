@@ -1,4 +1,4 @@
-// Chat template renderer for dflash::common native server.
+// Chat template renderer for luce::common native server.
 //
 // Renders chat messages (system/user/assistant/tool) into the model-specific
 // token format. Hard-coded for supported architectures:
@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // A single message in a chat conversation.
 struct ChatMessage {
@@ -83,4 +83,4 @@ std::string render_chat_template_jinja(
     bool enable_thinking = false,
     const std::string & tools_json = "");
 
-}  // namespace dflash::common
+}  // namespace luce::common

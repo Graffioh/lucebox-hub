@@ -13,7 +13,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 class KvFlashDrafterScorer : public KvFlashScorer {
 public:
@@ -65,4 +65,4 @@ private:
     bool   toks_failed_ = false;
 };
 
-} // namespace dflash::common
+} // namespace luce::common

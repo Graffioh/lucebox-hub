@@ -10,7 +10,7 @@
 
 #include "laguna_internal.h"
 #include "internal.h"
-#include "dflash27b.h"
+#include "luce.h"
 
 #include <cmath>
 #include <cstdio>
@@ -22,7 +22,7 @@
 #include "ggml-cuda.h"
 #include "ggml-alloc.h"
 
-using namespace dflash::common;
+using namespace luce::common;
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
@@ -37,13 +37,13 @@ int main(int argc, char ** argv) {
 
     LagunaTargetWeights w;
     if (!load_target_gguf_laguna(path, backend, w)) {
-        std::fprintf(stderr, "load failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load failed: %s\n", luce_last_error());
         ggml_backend_free(backend); return 1;
     }
 
     LagunaTargetCache cache;
     if (!create_laguna_target_cache(w, /*max_ctx=*/4096, backend, cache)) {
-        std::fprintf(stderr, "cache failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "cache failed: %s\n", luce_last_error());
         free_laguna_target_weights(w); ggml_backend_free(backend); return 1;
     }
 

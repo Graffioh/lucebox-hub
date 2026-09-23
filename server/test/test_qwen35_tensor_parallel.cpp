@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-using namespace dflash::common;
+using namespace luce::common;
 using namespace CppUnitTestFramework;
 
 namespace {

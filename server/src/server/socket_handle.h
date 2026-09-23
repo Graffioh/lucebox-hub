@@ -13,7 +13,7 @@
 #include <winsock2.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 #if defined(_WIN32)
 using SocketHandle = SOCKET;
@@ -27,4 +27,4 @@ inline constexpr bool socket_is_valid(SocketHandle socket) noexcept {
     return socket != kInvalidSocket;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

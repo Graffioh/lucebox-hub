@@ -1,6 +1,6 @@
 #include "layer_split_runtime.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 bool run_layer_split_ar_decode(
         int last_tok,
@@ -68,4 +68,4 @@ bool run_layer_split_ar_decode(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

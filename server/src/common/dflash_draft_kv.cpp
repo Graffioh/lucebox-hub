@@ -6,7 +6,7 @@
 #include <cstring>
 #include <limits>
 
-namespace dflash::common {
+namespace luce::common {
 
 static constexpr int MASK_KV_PAD = 32;
 static inline int mask_align_up(int x, int a) { return ((x + a - 1) / a) * a; }
@@ -22,7 +22,7 @@ static bool draft_kv_init_impl(DraftKvState & st,
                                bool batched) {
     if (cap <= 0 || dw.block_size <= 0) return false;
     static const bool disable_swa =
-        std::getenv("DFLASH_DISABLE_DRAFT_SWA") != nullptr;
+        std::getenv("LUCE_DISABLE_DRAFT_SWA") != nullptr;
 
     st.cap        = cap;
     st.q_len      = dw.block_size;
@@ -521,4 +521,4 @@ bool draft_kv_batch_compute(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

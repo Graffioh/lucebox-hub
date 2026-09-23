@@ -5,10 +5,10 @@
 // without duplicating the daemon loop. The qwen35 stack stays in test_dflash;
 // laguna requests funnel through run_laguna_daemon().
 //
-// Wire format mirrors what dflash_server's command-line builder emits for
+// Wire format mirrors what luce_server's command-line builder emits for
 // the qwen35 stack — see the body of run_laguna_daemon for the supported
 // commands. SNAPSHOT/RESTORE/FREE_SNAPSHOT and PFlash compress/park/unpark
-// are not yet implemented; dflash_server forces prefix-cache slots to 0 and
+// are not yet implemented; luce_server forces prefix-cache slots to 0 and
 // disables PFlash compression on the laguna path until they land.
 
 #pragma once
@@ -17,7 +17,7 @@
 #include <string>
 #include "ggml.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 struct LagunaDaemonArgs {
     std::string     target_path;       // path to laguna-*.gguf
@@ -25,7 +25,7 @@ struct LagunaDaemonArgs {
     int             max_ctx   = 16384; // K/V cache capacity in tokens
     int             chunk     = 2048;  // chunked-prefill chunk size
     ggml_type       kv_type   = GGML_TYPE_Q8_0;
-    int             stream_fd = -1;    // dflash_server's writable pipe end (int32 LE
+    int             stream_fd = -1;    // luce_server's writable pipe end (int32 LE
                                        // tokens, terminated by -1 sentinel). -1
                                        // means the bare-prompt protocol is
                                        // disabled and only the legacy `generate`
@@ -37,4 +37,4 @@ struct LagunaDaemonArgs {
 // `exit`, or EOF. Returns the process exit code (0 on clean shutdown).
 int run_laguna_daemon(const LagunaDaemonArgs & args);
 
-}  // namespace dflash::common
+}  // namespace luce::common

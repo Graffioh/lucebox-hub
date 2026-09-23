@@ -15,8 +15,9 @@
 #include "daemon_loop.h"
 
 #include <cstdio>
+#include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 int run_laguna_daemon(const LagunaDaemonArgs & args) {
     LagunaBackendArgs bargs;
@@ -26,7 +27,7 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
     bargs.chunk       = args.chunk;
     bargs.kv_type     = args.kv_type;
 
-    LagunaBackend backend(bargs);
+    LagunaBackend backend(std::move(bargs));
     if (!backend.init()) return 1;
 
     DaemonLoopArgs dargs;
@@ -37,4 +38,4 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
     return run_daemon(backend, dargs);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

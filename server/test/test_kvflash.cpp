@@ -21,7 +21,7 @@
 //                 [--prompt=N] [--gen=N] [--skip-profile] [--no-mask]
 //   modes: (default) verification suite A-F | --niah | --niah256 | --longab
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "internal.h"
 #include "kvflash_pager.h"
 #include "kvflash_qk.h"
@@ -43,7 +43,7 @@
 #include <string>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 
@@ -470,7 +470,7 @@ int main(int argc, char ** argv) {
 
     TargetWeights w;
     if (!load_target_gguf(argv[1], backend, w)) {
-        std::fprintf(stderr, "load: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load: %s\n", luce_last_error());
         return 1;
     }
     std::printf("[load] weights ok, vram_used=%.1f MiB\n",
@@ -1005,7 +1005,7 @@ int main(int argc, char ** argv) {
         const size_t v_before = vram_used_now();
         TargetCache cache;
         if (!create_target_cache(w, logical_ctx, 0, backend, cache, /*prefill_only=*/true)) {
-            std::fprintf(stderr, "cache A: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "cache A: %s\n", luce_last_error());
             return 1;
         }
         mem_a_kv = kv_cache_bytes(cache);
@@ -1043,7 +1043,7 @@ int main(int argc, char ** argv) {
     {
         TargetCache cache;
         if (!create_target_cache(w, pool_b, 0, backend, cache, /*prefill_only=*/true)) {
-            std::fprintf(stderr, "cache B: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "cache B: %s\n", luce_last_error());
             return 1;
         }
         KvFlashPager pager;
@@ -1096,7 +1096,7 @@ int main(int argc, char ** argv) {
         const size_t v_before = vram_used_now();
         TargetCache cache;
         if (!create_target_cache(w, pool_c, 0, backend, cache, /*prefill_only=*/true)) {
-            std::fprintf(stderr, "cache C: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "cache C: %s\n", luce_last_error());
             return 1;
         }
         mem_c_kv = kv_cache_bytes(cache);
@@ -1201,7 +1201,7 @@ int main(int argc, char ** argv) {
         const char * drafter_path = "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
         DrafterContext dctx;
         if (!load_drafter(drafter_path, 0, dctx)) {
-            std::printf("FAIL indexer run: drafter load failed (%s)\n", dflash27b_last_error());
+            std::printf("FAIL indexer run: drafter load failed (%s)\n", luce_last_error());
             hard_failures++;
         } else {
             const int n_prompt_f = 2048, n_gen_f = 768, pool_f = 1024, tau = 64;
@@ -1279,7 +1279,7 @@ int main(int argc, char ** argv) {
                            KvFlashPager * pager, int pos_base) {
             TargetCache cache;
             if (!create_target_cache(w, alloc_ctx, 0, backend, cache, true)) {
-                std::fprintf(stderr, "cache E(%s): %s\n", tag, dflash27b_last_error());
+                std::fprintf(stderr, "cache E(%s): %s\n", tag, luce_last_error());
                 std::exit(1);
             }
             KvFlashPager local;

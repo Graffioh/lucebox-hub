@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct DraftFeatureMirror {
     ggml_context * ctx = nullptr;
@@ -112,4 +112,4 @@ bool copy_host_f32_to_feature_ring_range(
     int n_tokens,
     const std::vector<float> & src);
 
-}  // namespace dflash::common
+}  // namespace luce::common

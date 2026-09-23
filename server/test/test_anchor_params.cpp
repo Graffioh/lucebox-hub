@@ -3,7 +3,7 @@
 #include "CppUnitTestFramework.hpp"
 #include "qwen3/anchor_params.h"
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 struct AnchorParamsFixture {};
@@ -23,7 +23,7 @@ TEST_CASE(AnchorParamsFixture, test_tier_boundaries) {
 }
 
 TEST_CASE(AnchorParamsFixture, test_legacy_env_overrides_tier) {
-    // legacy (DFLASH) env wins over tier default
+    // legacy (LUCE) env wins over tier default
     { auto p = resolve_anchor_params(500, -1,-1, 5, 20); CHECK_EQUAL(p.radius, 5); CHECK_EQUAL(p.max_hits, 20); }
     { auto p = resolve_anchor_params(2048, -1,-1, 1, 4); CHECK_EQUAL(p.radius, 1); CHECK_EQUAL(p.max_hits, 4); }
 }

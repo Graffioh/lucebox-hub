@@ -1,6 +1,6 @@
 #pragma once
 
-namespace dflash::common {
+namespace luce::common {
 
 // A checkpoint's declared block size is its published proposal horizon.
 // Greedy chain verification keeps output byte-identical to plain decode at
@@ -16,4 +16,4 @@ constexpr bool draft_block_size_override_supported(
             requested <= 2 * checkpoint_block_size);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

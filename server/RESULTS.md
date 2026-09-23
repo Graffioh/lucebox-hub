@@ -89,7 +89,7 @@ HumanEval prompts are highly regular (function signatures + docstrings), the dra
 
 ## 128K context configuration
 
-`max_ctx = 131072` + `DFLASH27B_KV_Q4=1` (Q4_0 K+V cache, 8× compression vs F16).
+`max_ctx = 131072` + `LUCE_KV_Q4=1` (Q4_0 K+V cache, 8× compression vs F16).
 Sliding `target_feat` ring (4096 slots) keeps captured features at 0.2 GB regardless of context length.
 `--ddtree-budget=16` keeps per-layer `ssm_intermediate` under 1.3 GB.
 
@@ -237,7 +237,7 @@ Target: `unsloth/Qwen3.6-27B-GGUF` (`Qwen3.6-27B-UD-Q5_K_XL.gguf`, ~19 GB).
 Draft:  local Qwen3.6-27B DFlash safetensors (`model.safetensors`, ~3.3 GB).
 Concurrency = 1, greedy decoding, `n_gen=256`.
 
-Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DDFLASH27B_USER_CUDA_ARCHITECTURES=120 -DDFLASH27B_ENABLE_BSA=ON`
+Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DLUCE_USER_CUDA_ARCHITECTURES=120 -DLUCE_ENABLE_BSA=ON`
 Runtime: FP16/FP16 KV, FA window 4096, DDTree budget 22.
 
 These numbers use a newer Qwen3.6 Q5_K_XL target, so they are not an
@@ -463,7 +463,7 @@ cross-mapped to Laguna BPE).
 
 ### Dense TTFT (no PFlash compression, full chunked prefill)
 
-Measured with `bench_laguna_ttft`, `DFLASH_KV_TYPE=q4_0` for ctx > 32K, default
+Measured with `bench_laguna_ttft`, `LUCE_KV_TYPE=q4_0` for ctx > 32K, default
 chunk=4096 except where noted (smaller chunks needed at long ctx to keep the
 activation alloc inside 24 GB):
 
@@ -504,7 +504,7 @@ survive aggressive `keep` ratios.
 | 131 072 | Q4_0 | 0.30 |       11.41 |              26.43 |         37.84 s |  ✅  |
 
 Decode is autoregressive (~96 tok/s @ ctx=4K, ~27 tok/s @ ctx=131K) until a
-matched Laguna spec-decode draft model is published; the dflash daemon's
+matched Laguna spec-decode draft model is published; the luce daemon's
 draft-loaded path is reserved for that future drop-in.
 
 ### Sampler smoke (test_laguna_daemon, prompt = "Tell me a one-line haiku about clouds.")
@@ -537,13 +537,13 @@ spends 1.5 s drafter + 0.4 s target, net 1.92 s vs llama.cpp 1.7 s).
 
 **Reproducing the 11.11 s drafter number requires Block-Sparse Attention
 on the Qwen3-0.6B drafter forward.** The PflashDaemon Python wrapper sets
-these env vars by default; the dflash daemon honours them at runtime but
-does not force them, so any caller (including `dflash_server`) is free
+these env vars by default; the luce daemon honours them at runtime but
+does not force them, so any caller (including `luce_server`) is free
 to opt out:
 
 ```bash
-export DFLASH_FP_USE_BSA=1     # mit-han-lab BSA, FA-2 derived (sm_80+)
-export DFLASH_FP_ALPHA=0.85    # importance-score temperature
+export LUCE_FP_USE_BSA=1     # mit-han-lab BSA, FA-2 derived (sm_80+)
+export LUCE_FP_ALPHA=0.85    # importance-score temperature
 ```
 
 Without BSA the drafter falls back to dense attention and the 131 K
@@ -575,16 +575,16 @@ Q4_K_M (vs Q5_K_XL in the short-context section above) leaves more
 VRAM headroom for the FP16 KV cache at 117K context.
 Draft: local Qwen3.6-27B DFlash safetensors + Qwen3-0.6B-BF16 PFlash drafter.
 
-Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DDFLASH27B_USER_CUDA_ARCHITECTURES=120 -DDFLASH27B_ENABLE_BSA=ON`
+Build: `cmake -B build-luce-sm120 -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 -DLUCE_USER_CUDA_ARCHITECTURES=120 -DLUCE_ENABLE_BSA=ON`
 
 Final ("V4") runtime config — driven via the `optimizations/pflash/tests/bench_niah_cpp.py`
 CLI flags added in #90 plus daemon env vars (each bullet leads with the
 exact interface):
 
 - `--keep-ratio=0.05` (PFlash compression target ratio)
-- `DFLASH_FP_USE_BSA=1` and `DFLASH_FP_ALPHA=0.70` (BSA enabled, block-selection threshold; both are daemon env vars)
+- `LUCE_FP_USE_BSA=1` and `LUCE_FP_ALPHA=0.70` (BSA enabled, block-selection threshold; both are daemon env vars)
 - `--ddtree-budget=22`
-- `--fa-window=4096` (also settable via `DFLASH27B_FA_WINDOW=4096`)
+- `--fa-window=4096` (also settable via `LUCE_FA_WINDOW=4096`)
 - `--kv-tq3=0` (Q8_0 KV cache — the daemon default when TQ3_0 is disabled and no other KV type is set; 5090 has VRAM headroom so TQ3_0 isn't needed)
 - `--n-gen=1024`
 
@@ -611,21 +611,21 @@ values discovered in the prior phase, so the swept-axis throughput numbers
 are not directly comparable to the headline (different keep ratios produce
 different per-step decode rates, see the keep-ratio table below).
 
-### Phase 1 — `DFLASH_FP_ALPHA` sweep (held: `--keep-ratio=0.08`, `--ddtree-budget=28`)
+### Phase 1 — `LUCE_FP_ALPHA` sweep (held: `--keep-ratio=0.08`, `--ddtree-budget=28`)
 
-| `DFLASH_FP_ALPHA` | NIAH    | Decode tok/s |
+| `LUCE_FP_ALPHA` | NIAH    | Decode tok/s |
 |:-----------------:|:-------:|:------------:|
 | 0.60              | 10/10   | 213.7        |
 | **0.70**          | 10/10   | 210.6        |
 | 0.85              | **8/10**| 204.6        |
 
-The docs default of `DFLASH_FP_ALPHA=0.85` fails 2/10 prompts at this
+The docs default of `LUCE_FP_ALPHA=0.85` fails 2/10 prompts at this
 setup. This may be specific to long context, Qwen3.6, or Blackwell — I
 have not isolated which. Validating alpha per setup is recommended. I
 chose 0.70 over 0.60 for reliability margin: 0.60 wins decode by only
 1.5%, below the run-to-run variance, on an n=10 sample.
 
-### Phase 2 — budget sweep (held: `DFLASH_FP_ALPHA=0.70`, `--keep-ratio=0.08`)
+### Phase 2 — budget sweep (held: `LUCE_FP_ALPHA=0.70`, `--keep-ratio=0.08`)
 
 | `--ddtree-budget` | NIAH | Decode tok/s |
 |:-----------------:|:----:|:------------:|
@@ -639,7 +639,7 @@ on budget=22 as throughput-optimal (211.20 mean tok/s at AL 7.25). So
 context regimes**, not a knob that needs per-context-length tuning. This
 is the most useful cross-reference between the two sections.
 
-### Phase 3 — keep-ratio sweep (held: `DFLASH_FP_ALPHA=0.70`, `--ddtree-budget=22`)
+### Phase 3 — keep-ratio sweep (held: `LUCE_FP_ALPHA=0.70`, `--ddtree-budget=22`)
 
 | `--keep-ratio` | NIAH    | Decode tok/s | TTFT    | Compression |
 |:--------------:|:-------:|:------------:|:-------:|:-----------:|
@@ -655,12 +655,12 @@ when sustained throughput on already-compressed prompts dominates.
 ### Note on `--kv-tq3`
 
 I set `--kv-tq3=0`, which leaves the daemon at its Q8_0 KV-cache default
-(no `DFLASH27B_KV_K`/`DFLASH27B_KV_V` overrides). The 3-bit TQ3_0 cache
+(no `LUCE_KV_K`/`LUCE_KV_V` overrides). The 3-bit TQ3_0 cache
 trades VRAM for memory bandwidth; on a 5090 with 32 GB and ~22 GB peak
 usage at 117K, that trade isn't worth taking. Users on 4090 or 3090
 (24 GB) at this context length should likely keep `--kv-tq3=1`. To go
 further than Q8_0 in either direction set the K/V types explicitly via
-`DFLASH27B_KV_K=<type> DFLASH27B_KV_V=<type>`.
+`LUCE_KV_K=<type> LUCE_KV_V=<type>`.
 
 ## RTX 4090 (Ada, sm_89, 24 GB) — CachyOS bare metal (community)
 
@@ -676,7 +676,7 @@ Repository and build:
 - Block-Sparse-Attention commit: `49d6c39e4dc0303442cda3bb758b3925d4399c49`
 - CMake 4.4.2, NVCC 13.3.73
 - CUDA host compiler: GCC 15.3.0 (system GCC 16.1.1 at environment capture)
-- Build: `cmake -S server -B server/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DDFLASH27B_ENABLE_BSA=ON -DGGML_CUDA_CUB_3DOT2=ON`
+- Build: `cmake -S server -B server/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DLUCE_ENABLE_BSA=ON -DGGML_CUDA_CUB_3DOT2=ON`
 - CCCL 3.2.0 compatibility path enabled
 
 Models:
@@ -694,9 +694,9 @@ Protocol:
 - 10 prompts per dataset, shuffled with seed 42
 - `n_gen=256` for HumanEval, `1024` for GSM8K, `2048` for Math500
 - DDTree budget 22, fast rollback
-- `DFLASH_GPU_DRAFT_TOPK=1`
-- `DFLASH_GPU_VERIFY_ARGMAX=1`
-- Command: `DFLASH_N_SAMPLE=10 uv run python -m server.scripts.bench_llm --no-thinking --budget 22`
+- `LUCE_GPU_DRAFT_TOPK=1`
+- `LUCE_GPU_VERIFY_ARGMAX=1`
+- Command: `LUCE_N_SAMPLE=10 uv run python -m server.scripts.bench_llm --no-thinking --budget 22`
 
 ### RTX 4090 CachyOS headline
 
@@ -800,7 +800,7 @@ Q4_K_M draft and the chat-template-aware `bench_llm.py --no-thinking` protocol.
 
 Single RTX 4090 24 GB, CUDA 13.2, driver 596.21, WSL2 (Ubuntu) on Windows 11.
 i7-13700K, 64 GB host RAM (32 GB WSL allocation).
-Build: `cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DDFLASH27B_ENABLE_BSA=ON`
+Build: `cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DLUCE_ENABLE_BSA=ON`
 Models on native ext4 (`/home/`), not NTFS `/mnt/` (9P filesystem bottlenecks model loading).
 
 ### Qwen3.5-27B Q4_K_M — RTX 4090 headline
@@ -905,10 +905,10 @@ Linux 4090 should match or exceed the 3090 numbers.
 
 ### Server-mode reference (not apples-to-apples with bench_he.py)
 
-Running via `dflash_server` (OpenAI-compatible HTTP) with TQ3 KV cache and 128K context:
+Running via `luce_server` (OpenAI-compatible HTTP) with TQ3 KV cache and 128K context:
 
 ```bash
-DFLASH27B_KV_TQ3=1 ./build/dflash_server Qwen3.6-27B-Q4_K_M.gguf \
+LUCE_KV_TQ3=1 ./build/luce_server Qwen3.6-27B-Q4_K_M.gguf \
   --draft dflash-draft-3.6-q8_0.gguf \
   --port 8082 --ddtree --ddtree-budget 28 --max-ctx 131072
 ```

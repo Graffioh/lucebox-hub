@@ -1,4 +1,4 @@
-// Unit tests for dflash::common::compute_score_range().
+// Unit tests for luce::common::compute_score_range().
 // SCORE_LAYERS is relative to fwd_layer_limit: ee7+sl7 → [0,7), not phantom-empty [7,7).
 
 #include "CppUnitTestFramework.hpp"
@@ -7,8 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 
-using dflash::common::ScoreRange;
-using dflash::common::compute_score_range;
+using luce::common::ScoreRange;
+using luce::common::compute_score_range;
 
 namespace {
 struct DrafterEarlyExitScoreRangeFixture : CppUnitTestFramework::CommonFixture {

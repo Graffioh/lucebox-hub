@@ -1,6 +1,6 @@
 #include "dflash_capture.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 int target_capture_index(const int * capture_layer_ids,
                          int n_capture_layers,
@@ -12,4 +12,4 @@ int target_capture_index(const int * capture_layer_ids,
     return -1;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

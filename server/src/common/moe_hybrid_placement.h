@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct MoeHybridRoutingStats;  // forward decl
 
@@ -105,4 +105,4 @@ struct MoeHybridPlacement {
         std::string * err = nullptr);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

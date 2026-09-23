@@ -263,7 +263,7 @@ TEST_CASE(FlashprefillKernelsFixture, flashprefill_kernels) {
         CK(cudaMemcpy(bdK, bK.data(), bK.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(bdV, bV.data(), bV.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
 
-        dflash::common::flashprefill::FlashPrefillConfig cfg;
+        luce::common::flashprefill::FlashPrefillConfig cfg;
         cfg.block_size = BL;
         cfg.attention_sink = 2;
         cfg.window = 4;
@@ -271,7 +271,7 @@ TEST_CASE(FlashprefillKernelsFixture, flashprefill_kernels) {
         cfg.alpha = 0.12f;
 
         // Warm-up
-        dflash::common::flashprefill::flash_prefill_forward_bf16(
+        luce::common::flashprefill::flash_prefill_forward_bf16(
             bdQ, bdK, bdV, bdO, BB, BS, BH, BHk, BD,
             1.0f / std::sqrt((float)BD), cfg);
         CK(cudaDeviceSynchronize());
@@ -281,7 +281,7 @@ TEST_CASE(FlashprefillKernelsFixture, flashprefill_kernels) {
         cudaEventCreate(&e_b);
         cudaEventRecord(e_a);
         for (int it = 0; it < 5; ++it) {
-            dflash::common::flashprefill::flash_prefill_forward_bf16(
+            luce::common::flashprefill::flash_prefill_forward_bf16(
                 bdQ, bdK, bdV, bdO, BB, BS, BH, BHk, BD,
                 1.0f / std::sqrt((float)BD), cfg);
         }

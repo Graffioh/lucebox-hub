@@ -3,7 +3,7 @@
 
 #include <cstdio>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ── global state ────────────────────────────────────────────────
 bool g_peer_access_opt_in = false;
@@ -43,7 +43,7 @@ static void log_staged_cross_gpu_once() {
     if (logged) return;
     logged = true;
     std::fprintf(stderr,
-                 "[dflash] Using safe (slower) cross-GPU copy via host staging "
+                 "[luce] Using safe (slower) cross-GPU copy via host staging "
                  "(--peer-access not set or P2P unavailable for this device pair).\n");
 }
 
@@ -85,7 +85,7 @@ bool copy_peer_async(void * dst, int dst_device,
         return cudaDeviceSynchronize() == cudaSuccess;
     }
     log_staged_cross_gpu_once();
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     err = cudaSetDevice(dst_device);
     if (err != cudaSuccess) return false;
     err = cudaMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, stream);
@@ -100,4 +100,4 @@ bool copy_peer_async(void * dst, int dst_device,
 #endif
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

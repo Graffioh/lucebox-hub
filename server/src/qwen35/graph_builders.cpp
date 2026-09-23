@@ -1,6 +1,5 @@
 #include "graph_builders.h"
 
-#include "common/specla_mode.h"
 #include "delta_net_specla.h"
 
 #include "ggml-alloc.h"
@@ -13,7 +12,7 @@
 #include <memory>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool detail::target_graph_capacity_for_parallel_segments(
         int n_parallel_segments,
@@ -605,9 +604,9 @@ bool build_target_step(
     sg.gf = ggml_new_graph_custom(sg.ctx, graph_capacity, false);
 
     // Step-invariant KV write: only when topology can't vary per step.
-    // DFLASH_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length
+    // LUCE_QWEN35_NO_KVPAD=1 restores the legacy cpy append + exact-length
     // FA span (per-step node properties -> no CUDA-graph replay).
-    static const bool g_no_kvpad = (std::getenv("DFLASH_QWEN35_NO_KVPAD") != nullptr);
+    static const bool g_no_kvpad = (std::getenv("LUCE_QWEN35_NO_KVPAD") != nullptr);
     // kvflash_mask: kvflash mode. The mask carries pool slot validity
     // (uploaded by the caller before EVERY compute — the input's buffer
     // region is reused by graph execution) and set_rows carries per-token
@@ -627,7 +626,9 @@ bool build_target_step(
     }
 
     SpecLAHLDSchedule hld_schedule;
-    if (capture_delta_intermediate && specla_enabled() && !cache.factor_k.empty()) {
+    // factor_k exists only when SpecLA state was allocated at cache
+    // migration — its presence is the mode check.
+    if (capture_delta_intermediate && !cache.factor_k.empty()) {
         std::vector<int32_t> parents((size_t)n_tokens);
         for (int t = 0; t < n_tokens; ++t) parents[(size_t)t] = t - 1;
         hld_schedule = make_specla_hld_schedule(
@@ -742,7 +743,7 @@ bool build_target_step_tree(
     // SpecLA tree verify: ancestor masks over the DFS-ordered nodes replace
     // the sequential kernel's parent_ids state fanout (parent_ids still
     // steers the tree conv). Host-filled by verify_tree from tree.parents.
-    if (specla_enabled() && !cache.factor_k.empty() && hld_schedule) {
+    if (!cache.factor_k.empty() && hld_schedule) {
         if (hld_schedule->n_nodes != n_tokens || hld_schedule->packed.empty()) {
             return false;
         }
@@ -750,7 +751,7 @@ bool build_target_step_tree(
             sg.ctx, GGML_TYPE_I32, hld_schedule->packed.size());
         ggml_set_name(sg.specla_hld, "specla_hld");
         ggml_set_input(sg.specla_hld);
-    } else if (specla_enabled() && !cache.factor_k.empty()) {
+    } else if (!cache.factor_k.empty()) {
         sg.specla_m_strict = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
         sg.specla_m_incl   = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
         sg.specla_m_eye    = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, n_tokens, n_tokens);
@@ -1027,4 +1028,4 @@ bool build_lm_head_projection_step(
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

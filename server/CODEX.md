@@ -22,11 +22,11 @@ codex --version          # should print 0.1xx.x
 > npm install -g @openai/codex
 > ```
 
-## 2. Start the DFlash Server
+## 2. Start the Luce Server
 
 ```bash
-cd dflash
-./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+cd server
+./build/luce_server models/Qwen3.6-27B-Q4_K_M.gguf \
   --draft models/draft/draft-Qwen3.6-27B.gguf \
   --port 8080
 ```
@@ -52,10 +52,10 @@ Create or edit `~/.codex/config.toml`:
 
 ```toml
 model = "luce-dflash"
-model_provider = "dflash"
+model_provider = "luce"
 
-[model_providers.dflash]
-name = "DFlash"
+[model_providers.luce]
+name = "Luce"
 base_url = "http://localhost:8080/v1"
 wire_api = "responses"
 supports_websockets = false
@@ -67,7 +67,7 @@ Key points:
 |---|---|
 | `name` | **Required** — Codex rejects providers with an empty name |
 | `wire_api = "responses"` | Codex only supports the Responses API |
-| `supports_websockets = false` | DFlash serves HTTP only |
+| `supports_websockets = false` | Luce serves HTTP only |
 | No `env_key` | Local server needs no auth token |
 
 ## 4. Using Codex
@@ -115,7 +115,7 @@ codex -c 'model_reasoning_effort="medium"' exec "Refactor this module"
 
 ### "provider name must not be empty"
 
-Add `name = "DFlash"` (or any non-empty string) to `[model_providers.dflash]`.
+Add `name = "Luce"` (or any non-empty string) to `[model_providers.luce]`.
 
 ### "Reconnecting… 1/5" loop
 
@@ -123,7 +123,7 @@ The server is returning an error. Check:
 
 1. **Server is running** — `curl http://localhost:8080/health`
 2. **Port matches config** — `base_url` must match `--port`
-3. **Server logs** — look at the terminal where `dflash_server` is running
+3. **Server logs** — look at the terminal where `luce_server` is running
 
 Common causes:
 
@@ -144,7 +144,7 @@ requests reuse the loaded model and are much faster.
 ## 6. Server CLI Reference
 
 ```
-./build/dflash_server <model.gguf> [OPTIONS]
+./build/luce_server <model.gguf> [OPTIONS]
 
 Options:
   --host HOST           Bind address (default: 0.0.0.0)

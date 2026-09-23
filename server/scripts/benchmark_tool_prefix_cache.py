@@ -2,7 +2,7 @@
 """Benchmark native prefix caching with a large, stable OpenAI tool schema.
 
 The benchmark is deliberately self-contained: it talks to a running
-``dflash_server``, uses ``usage.timings`` for backend-only measurements, and
+``luce_server``, uses ``usage.timings`` for backend-only measurements, and
 checks both sides of the cache identity contract:
 
 * later turns with byte-identical tools must restore the system/tool prefix;
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
         description="Cold/warm native tool-prefix cache benchmark",
     )
     parser.add_argument("--url", default="http://127.0.0.1:8080")
-    parser.add_argument("--model", default="dflash")
+    parser.add_argument("--model", default="luce")
     parser.add_argument("--warm-turns", type=int, default=3)
     parser.add_argument("--tool-count", type=int, default=24)
     parser.add_argument("--params-per-tool", type=int, default=8)
@@ -180,7 +180,7 @@ def extract_result(
     if missing and require_cache_telemetry:
         raise RuntimeError(
             f"{turn}: server lacks cache telemetry {missing}; build this PR's "
-            "dflash_server before running the benchmark"
+            "luce_server before running the benchmark"
         )
     choices = response.get("choices")
     if not isinstance(choices, list) or not choices:

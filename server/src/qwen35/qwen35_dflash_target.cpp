@@ -23,7 +23,7 @@
 using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
 extern "C++" to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 bool is_meta_tensor(const ggml_tensor * tensor) {
@@ -527,9 +527,9 @@ bool Qwen35DFlashTarget::verify_tree(
     // Historically the GPU argmax shortcut has returned -1 for tree-shaped
     // verify graphs on some builds; guard against that by validating every row
     // and falling back to the CPU path for the step if any index is bad.
-    // Escape hatch: DFLASH_GPU_VERIFY_ARGMAX=0 forces the legacy CPU path.
+    // Escape hatch: LUCE_GPU_VERIFY_ARGMAX=0 forces the legacy CPU path.
     static const bool kGpuVerifyArgmax = []() {
-        const char * v = std::getenv("DFLASH_GPU_VERIFY_ARGMAX");
+        const char * v = std::getenv("LUCE_GPU_VERIFY_ARGMAX");
         return v == nullptr || v[0] != '0';
     }();
     const int vocab = (int)sg_.logits->ne[0];
@@ -1241,12 +1241,12 @@ bool Qwen35DFlashTarget::project_hidden_to_topk(
     top_log_probs.assign((size_t)n_tokens * K, 0.0f);
     top_token_ids.assign((size_t)n_tokens * K, 0);
 
-#ifdef DFLASH27B_HAVE_DRAFT_TOPK
+#ifdef LUCE_HAVE_DRAFT_TOPK
     // GPU path: top-K + logsumexp directly on the logits device buffer, skipping
     // the vocab×n_tokens D2H and the CPU heap extract. Falls back to the CPU path
-    // on any failure. Escape hatch: DFLASH_GPU_DRAFT_TOPK=0.
+    // on any failure. Escape hatch: LUCE_GPU_DRAFT_TOPK=0.
     static const bool kGpuDraftTopk = []() {
-        const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
+        const char * v = std::getenv("LUCE_GPU_DRAFT_TOPK");
         return v == nullptr || v[0] != '0';
     }();
     ggml_tensor * local_logits = proj_sg_.logits;
@@ -1277,4 +1277,4 @@ const std::vector<int> & Qwen35DFlashTarget::capture_layer_ids() const {
     return capture_ids_;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

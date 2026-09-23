@@ -9,8 +9,8 @@
 #include <stdexcept>
 #include <string>
 
-using dflash::common::ScoreRange;
-using dflash::common::compute_score_range;
+using luce::common::ScoreRange;
+using luce::common::compute_score_range;
 
 #define TEST_ASSERT(cond) do { \
     if (!(cond)) { \

@@ -23,17 +23,17 @@ from placement.test_dflash_args import TestDflashLaunchArgs
 ROOT = Path(__file__).resolve().parent.parent
 BIN_SUFFIX = ".exe" if os.name == "nt" else ""
 TARGET = os.environ.get(
-    "DFLASH_TARGET",
+    "LUCE_TARGET",
     str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
 )
 _LOCAL_DRAFT_FILE = ROOT / "models" / "draft" / "dflash-draft-3.6-q4_k_m.gguf"
 _LOCAL_DRAFT_ROOT = ROOT / "models" / "draft"
 DRAFT = None
 TEST_DFLASH = os.environ.get(
-    "DFLASH_BIN",
+    "LUCE_BIN",
     str(ROOT / "build" / f"test_dflash{BIN_SUFFIX}"),
 )
-TMPDIR = Path(tempfile.gettempdir()) / "dflash_bench"
+TMPDIR = Path(tempfile.gettempdir()) / "luce_bench"
 TMPDIR.mkdir(parents=True, exist_ok=True)
 
 PROMPTS = [
@@ -194,12 +194,12 @@ def _find_draft_file(root: Path) -> str | None:
 
 
 def _resolve_draft() -> str:
-    env = os.environ.get("DFLASH_DRAFT")
+    env = os.environ.get("LUCE_DRAFT")
     if env:
         found = _find_draft_file(Path(env))
         if found:
             return found
-        raise FileNotFoundError(f"DFLASH_DRAFT does not point to a draft file: {env}")
+        raise FileNotFoundError(f"LUCE_DRAFT does not point to a draft file: {env}")
 
     for candidate in (_LOCAL_DRAFT_FILE, _LOCAL_DRAFT_ROOT):
         found = _find_draft_file(candidate)
@@ -209,7 +209,7 @@ def _resolve_draft() -> str:
     raise FileNotFoundError(
         "draft model file not found. Expected one of:\n"
         f"  - {_LOCAL_DRAFT_FILE}\n"
-        "Download it as documented in the README, or set DFLASH_DRAFT to an explicit .safetensors/.gguf file or directory."
+        "Download it as documented in the README, or set LUCE_DRAFT to an explicit .safetensors/.gguf file or directory."
     )
 
 
@@ -314,6 +314,8 @@ def main():
     DRAFT = _resolve_draft()
     _require_file(TARGET, "target GGUF")
     _require_file(TEST_DFLASH, "test_dflash binary")
+    if not os.access(TEST_DFLASH, os.X_OK):
+        raise PermissionError(f"test_dflash binary is not executable: {TEST_DFLASH}")
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-gen", type=int, default=128)
@@ -356,13 +358,13 @@ def main():
     ap.add_argument("--max-ctx", type=int, default=None,
                     help="Forward --max-ctx=N to test_dflash")
     ap.add_argument("--prefill-ubatch", type=int, default=None,
-                    help="Set DFLASH27B_PREFILL_UBATCH for target split prefill")
+                    help="Set LUCE_PREFILL_UBATCH for target split prefill")
     ap.add_argument("--cuda-visible-devices", default=None,
                     help="Optional CUDA_VISIBLE_DEVICES override for test_dflash")
     ap.add_argument("--target-tokenizer",
-                    default=os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.5-27B"),
+                    default=os.environ.get("LUCE_TOKENIZER", "Qwen/Qwen3.5-27B"),
                     help="HuggingFace tokenizer repo for the target. Defaults to "
-                         "$DFLASH_TOKENIZER, then Qwen/Qwen3.5-27B. Override for "
+                         "$LUCE_TOKENIZER, then Qwen/Qwen3.5-27B. Override for "
                          "Qwen3.6 or other variants, e.g. "
                          "--target-tokenizer Qwen/Qwen3.6-27B")
     args = ap.parse_args()
@@ -425,7 +427,7 @@ def main():
             base_env=extra_env,
         )
     if args.prefill_ubatch is not None:
-        extra_env["DFLASH27B_PREFILL_UBATCH"] = str(args.prefill_ubatch)
+        extra_env["LUCE_PREFILL_UBATCH"] = str(args.prefill_ubatch)
 
     results = []
     for i, (name, _) in enumerate(PROMPTS):

@@ -6,6 +6,7 @@
 // DSpark-specific tensors (dflash.fc / hidden_norm / dspark.*) bind separately.
 
 #include "deepseek4_dspark.h"
+#include "common/dspark_head.h"
 
 #include "common/gguf_bounds.h"
 #include "common/gguf_mmap.h"
@@ -21,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -584,6 +585,7 @@ bool clone_deepseek4_dspark_heads(DSparkDrafter & d,
 }
 
 void free_deepseek4_dspark_drafter(DSparkDrafter & d) {
+    dspark_note_drafter_lifecycle();
     reset_deepseek4_dspark_runtime_cache();
     if (d.head_buf) { ggml_backend_buffer_free(d.head_buf); d.head_buf = nullptr; }
     if (d.head_ctx) { ggml_free(d.head_ctx); d.head_ctx = nullptr; }
@@ -625,4 +627,4 @@ void deepseek4_dspark_dump(const DSparkDrafter & d) {
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

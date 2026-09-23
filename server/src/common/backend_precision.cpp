@@ -1,6 +1,6 @@
 #include "backend_precision.h"
 
-#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "gpu_runtime_compat.h"
 #endif
 
@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 std::string backend_device_description(ggml_backend_t backend) {
@@ -69,7 +69,7 @@ int parse_backend_device_id(const std::string & logical_name) {
 }
 
 int current_device_id() {
-#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     int device = -1;
     if (cudaGetDevice(&device) != cudaSuccess || device < 0) {
         return -1;
@@ -83,7 +83,7 @@ int current_device_id() {
 int device_props_for(int device,
                      std::string * device_name,
                      std::string * arch_name) {
-#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (device < 0) {
         return 0;
     }
@@ -94,7 +94,7 @@ int device_props_for(int device,
     if (device_name && prop.name[0]) {
         *device_name = prop.name;
     }
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (arch_name && prop.gcnArchName[0]) {
         *arch_name = prop.gcnArchName;
     }
@@ -194,7 +194,7 @@ BackendPrecisionPolicy select_drafter_precision_policy(ggml_backend_t backend) {
                             policy.runtime_arch, policy.device_id,
                             policy.cuda_sm);
 
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
     const ggml_type type = select_cuda_backend_precision_type_for_sm(policy.cuda_sm);
     if (type == GGML_TYPE_BF16) {
         policy.weight_type  = GGML_TYPE_BF16;
@@ -213,7 +213,7 @@ BackendPrecisionPolicy select_drafter_precision_policy(ggml_backend_t backend) {
         policy.compute_type = GGML_TYPE_F32;
         policy.reason       = "CUDA legacy compatibility fallback without useful F16/BF16 acceleration";
     }
-#elif defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#elif defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     policy.weight_type  = GGML_TYPE_BF16;
     policy.compute_type = GGML_TYPE_BF16;
     policy.reason       = "HIP ROCm/ggml BF16-compatible path";
@@ -284,7 +284,7 @@ BackendActivationPolicy select_activation_precision_policy(
         return policy;
     }
 
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
     policy.activation_type = select_cuda_backend_precision_type_for_sm(policy.cuda_sm);
     if (policy.activation_type == GGML_TYPE_BF16) {
         policy.reason = "CUDA sm80+ BF16 activation path";
@@ -295,7 +295,7 @@ BackendActivationPolicy select_activation_precision_policy(
     } else {
         policy.reason = "CUDA legacy F32 activation fallback";
     }
-#elif defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#elif defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     policy.activation_type =
         select_hip_activation_precision_type_for_arch(policy.runtime_arch);
     if (policy.activation_type == GGML_TYPE_BF16) {
@@ -312,4 +312,4 @@ BackendActivationPolicy select_activation_precision_policy(
     return policy;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

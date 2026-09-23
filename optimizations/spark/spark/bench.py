@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reproduce the Luce Spark decode-throughput numbers.
 
-Drives the dflash daemon (server/build/test_dflash) over a fixed prompt and
+Drives the luce daemon (server/build/test_dflash) over a fixed prompt and
 reports steady-state decode tok/s for three configs:
 
   1. all-GPU (full residency)              -> the speed ceiling
@@ -13,7 +13,7 @@ reports steady-state decode tok/s for three configs:
 
 `decode_tok_s` is generated_tokens / decode_seconds (prefill excluded), the same
 metric the daemon prints. The single-graph hybrid lives in LagunaBackend, which
-also powers `dflash_server --spark`, so these decode numbers carry over to the
+also powers `luce_server --spark`, so these decode numbers carry over to the
 server.
 
     python -m spark.bench \
@@ -91,17 +91,17 @@ def main():
     write_counted_i32(IN_BIN, ids)
 
     base = dict(os.environ)
-    base["DFLASH_IGNORE_EOS"] = "1"  # fixed-length decode for a stable tok/s
+    base["LUCE_IGNORE_EOS"] = "1"  # fixed-length decode for a stable tok/s
 
     def cfg(**kw):
         e = dict(base)
         e.update(kw)
         return e
 
-    offload = dict(DFLASH_LAGUNA_GPU_REMAP="1", DFLASH_LAGUNA_EXPERT_CACHE="1",
-                   DFLASH_LAGUNA_CACHE_SLOTS=str(args.cache_slots))
+    offload = dict(LUCE_LAGUNA_GPU_REMAP="1", LUCE_LAGUNA_EXPERT_CACHE="1",
+                   LUCE_LAGUNA_CACHE_SLOTS=str(args.cache_slots))
     if args.hotness:
-        offload["DFLASH_LAGUNA_HOTNESS"] = args.hotness
+        offload["LUCE_LAGUNA_HOTNESS"] = args.hotness
 
     total_pct = args.budget_pct + 100.0 * args.cache_slots / args.n_expert
     print(f"prompt={args.prompt!r}  n_gen={args.n_gen}  bos={args.bos}")
@@ -113,7 +113,7 @@ def main():
     print(f"  all-GPU (full residency)            {tps_all:6.1f} tok/s")
 
     tps_100, out_100 = measure(args.bin, args.gguf,
-                               cfg(DFLASH_EXPERT_BUDGET_PCT="100", **offload),
+                               cfg(LUCE_EXPERT_BUDGET_PCT="100", **offload),
                                args.n_gen, args.ready_timeout, args.gen_timeout)
     n = min(len(out_100), len(ref))
     match = sum(1 for x, y in zip(out_100, ref) if x == y)
@@ -121,7 +121,7 @@ def main():
     print(f"  single-graph @100% (vs all-GPU)     {tps_100:6.1f} tok/s   {match}/{n} {exact}")
 
     tps_off, _ = measure(args.bin, args.gguf,
-                         cfg(DFLASH_EXPERT_BUDGET_PCT=str(args.budget_pct), **offload),
+                         cfg(LUCE_EXPERT_BUDGET_PCT=str(args.budget_pct), **offload),
                          args.n_gen, args.ready_timeout, args.gen_timeout)
     pct = 100.0 * tps_off / max(1e-9, tps_all)
     print(f"  Spark offload (single-graph)        {tps_off:6.1f} tok/s   {pct:.0f}% of all-GPU")

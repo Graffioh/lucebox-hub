@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HTTP server benchmark — exercises the C++ dflash_server with the same
+"""HTTP server benchmark — exercises the C++ luce_server with the same
 workloads as bench_llm.py (short LLM prompts) and bench_agent.py (long
 agentic prompts), but over HTTP via /v1/chat/completions streaming.
 
@@ -13,16 +13,16 @@ Workloads:
 
 Usage:
     # Start C++ server first:
-    ./dflash/build/dflash_server dflash/models/Qwen3-0.6B-BF16.gguf --port 9099
+    ./server/build/luce_server server/models/Qwen3-0.6B-BF16.gguf --port 9099
 
     # Run all workloads:
-    python3 dflash/scripts/bench_server.py --url http://localhost:9099
+    python3 server/scripts/bench_server.py --url http://localhost:9099
 
     # Run specific workloads:
-    python3 dflash/scripts/bench_server.py --url http://localhost:9099 --workload he gsm8k
+    python3 server/scripts/bench_server.py --url http://localhost:9099 --workload he gsm8k
 
     # Quick smoke test (1 prompt per workload):
-    python3 dflash/scripts/bench_server.py --url http://localhost:9099 --n-sample 1
+    python3 server/scripts/bench_server.py --url http://localhost:9099 --n-sample 1
 """
 import argparse
 import json
@@ -54,7 +54,7 @@ def stream_chat(url: str, messages: list[dict], max_tokens: int,
       text, usage (if server returns it in final chunk).
     """
     body = {
-        "model": "dflash",
+        "model": "luce",
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -407,7 +407,7 @@ WORKLOADS = {
 
 def main():
     ap = argparse.ArgumentParser(
-        description="HTTP server benchmark — exercises dflash_server with "
+        description="HTTP server benchmark — exercises luce_server with "
                     "bench_llm + bench_agent workloads over /v1/chat/completions")
     ap.add_argument("--url", default="http://localhost:9099",
                     help="Server base URL (default: http://localhost:9099)")

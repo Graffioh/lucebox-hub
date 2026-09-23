@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Thin proxy that injects extra_body.session_id into /v1/messages requests.
 
-Run between the claude CLI and the dflash server when PFLASH_SESSION_ID is set.
+Run between the claude CLI and the luce server when PFLASH_SESSION_ID is set.
 All other paths and methods are forwarded verbatim.
 
 Usage:

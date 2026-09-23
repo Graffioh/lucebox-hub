@@ -213,7 +213,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:18109")
-    parser.add_argument("--model", default="dflash")
+    parser.add_argument("--model", default="luce")
     parser.add_argument("--padding-words", type=int, default=1300)
     parser.add_argument("--max-tokens", type=int, default=510)
     parser.add_argument("--warmup", type=int, default=1)
