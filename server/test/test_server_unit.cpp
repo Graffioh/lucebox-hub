@@ -6975,7 +6975,7 @@ TEST_CASE(ServerUnitFixture, test_pflash_default_raw_text_maps_user_query) {
 }
 
 TEST_CASE(ServerUnitFixture,
-        test_pflash_strict_chat_tail_query_uses_last_user_content) {
+        test_pflash_strict_chat_query_is_the_prompt_end) {
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
 
     // The server's own Qwen rendering, generation prompt and its think
@@ -7024,31 +7024,31 @@ TEST_CASE(ServerUnitFixture,
         if (ids[i] == im_end) last_im_end = i;
     }
     TEST_ASSERT(last_im_end > 0);
-    // The scorer window ends where the user content does — the generation
-    // prompt ("<|im_end|>\n<|im_start|>assistant\n<think>\n") is never
-    // scored.
-    TEST_ASSERT(backend.last_request.score_query_end == last_im_end);
-    const int query_begin = backend.last_request.score_query_end -
-        backend.last_request.score_query_tokens;
-    TEST_ASSERT(query_begin >= 0);
-    TEST_ASSERT(tokenizer.decode({ids.begin() + query_begin,
-                                  ids.begin() + last_im_end})
-                == "What is the answer?");
-    // The query span and its turn's role header are pinned mandatory.
+    // The scorer query is the prompt's last token, where the model starts
+    // answering; nothing is parsed out of the user's text.
+    TEST_ASSERT(backend.last_request.score_query_end == (int) ids.size());
+    TEST_ASSERT(backend.last_request.score_query_tokens == 1);
+    // The generation prompt, the turn's role header and -- a short turn --
+    // the whole question stay.
     bool header_pinned = false;
-    bool query_pinned = false;
+    bool question_pinned = false;
+    bool generation_pinned = false;
     for (const auto & span : backend.last_request.required_instruction_spans) {
         const std::string text = tokenizer.decode(
             {ids.begin() + span.begin, ids.begin() + span.end});
         if (text.find("<|im_start|>user\n") != std::string::npos) {
             header_pinned = true;
         }
-        if (span.begin <= query_begin && span.end >= last_im_end) {
-            query_pinned = true;
+        if (text.find("What is the answer?") != std::string::npos) {
+            question_pinned = true;
+        }
+        if (span.begin <= last_im_end + 2 && span.end == (int) ids.size()) {
+            generation_pinned = true;
         }
     }
     TEST_ASSERT(header_pinned);
-    TEST_ASSERT(query_pinned);
+    TEST_ASSERT(question_pinned);
+    TEST_ASSERT(generation_pinned);
     unlink(path.c_str());
 }
 
@@ -7100,12 +7100,11 @@ TEST_CASE(ServerUnitFixture,
     TEST_ASSERT(backend.compress_calls == 1);
     const auto & request = backend.last_request;
     const auto & ids = request.input_ids;
-    TEST_ASSERT(request.query_suffix_candidates);
-    const int query_end = request.score_query_end;
-    const int query_begin = query_end - request.score_query_tokens;
-    TEST_ASSERT(tokenizer.decode({ids.begin() + query_begin,
-                                  ids.begin() + query_end})
-                == "What is the answer?");
+    // The query is the prompt's end, so nothing follows it: the assistant
+    // and tool turns are ordinary context.
+    TEST_ASSERT(!request.query_suffix_candidates);
+    TEST_ASSERT(request.score_query_end == (int) ids.size());
+    TEST_ASSERT(request.score_query_tokens == 1);
     // The generation prompt is pinned, and the short assistant turn stays as
     // part of the conversation's skeleton; the tool output between the query
     // and the generation prompt is scored, not pinned.
@@ -7370,6 +7369,9 @@ TEST_CASE(ServerUnitFixture,
         test_pflash_chat_view_appends_turns_and_recalls_missing_segments) {
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
     luce_test::ScopedEnvVar view_env{"PFLASH_CHAT_VIEW", nullptr};
+    // Only turns of a few tokens stay whole, so the document turn is
+    // material the selection picks from.
+    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", "4"};
 
     std::string system;
     for (int i = 0; i < 20; ++i) system += "You are helpful. ";
@@ -7543,11 +7545,14 @@ TEST_CASE(ServerUnitFixture,
     }
     TEST_ASSERT(answer_kept);
     TEST_ASSERT(!material_kept);
-    // The earlier question scores alongside the current one.
+    // The earlier question scores alongside the current one, through the
+    // last token of the header of the reply that followed it.
     TEST_ASSERT(request.history_query_spans.size() == 1);
-    TEST_ASSERT_MSG(text_of(request.history_query_spans[0]).find("first answer?") !=
-                        std::string::npos,
-                    text_of(request.history_query_spans[0]));
+    const auto history = request.history_query_spans[0];
+    TEST_ASSERT(history.end - history.begin == 1);
+    TEST_ASSERT_MSG(tokenizer.decode({ids.begin() + history.end,
+                                      ids.begin() + history.end + 2}) == "Sure.",
+                    text_of(history));
     unlink(path.c_str());
 }
 
@@ -7587,12 +7592,17 @@ static PflashTwoTurnRun pflash_two_turn_run(const std::string & follow_up) {
     TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
     auto backend_owner = std::make_unique<MockPflashSpanBackend>();
     MockPflashSpanBackend & backend = *backend_owner;
+    // The fact and the questions: a prompt-end query ranks the user's own
+    // sentences first, so the scorer keeps them.
     backend.pick = [&] (const ModelBackend::CompressRequest & request) {
-        const auto span = http_detail::pflash_decoded_text_span(
-            tokenizer, request.input_ids, 0, (int) request.input_ids.size(),
-            "alpha facts");
-        return span.begin < 0 ? std::vector<PFlashTokenSpan>{}
-                              : std::vector<PFlashTokenSpan>{span};
+        std::vector<PFlashTokenSpan> spans;
+        for (const char * text : {"alpha facts", "Question one?", "Question two?"}) {
+            const auto span = http_detail::pflash_decoded_text_span(
+                tokenizer, request.input_ids, 0, (int) request.input_ids.size(),
+                text);
+            if (span.begin >= 0) spans.push_back(span);
+        }
+        return spans;
     };
     LuceEngine engine(std::move(backend_owner));
     ServerConfig config;
@@ -7644,8 +7654,8 @@ TEST_CASE(ServerUnitFixture,
         test_pflash_chat_view_compresses_large_follow_ups_only) {
     luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
     luce_test::ScopedEnvVar threshold{"PFLASH_CHAT_COMPRESS_NEW_TOKENS", "40"};
-    // Wide enough that the pinned query covers the whole question.
-    luce_test::ScopedEnvVar query{"PFLASH_SELECT_QUERY_TOKENS", "16"};
+    // The pasted turn is material, not a short turn kept whole.
+    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", "8"};
     std::string pasted;
     for (int i = 0; i < 12; ++i) pasted += " pasted notes filler.";
     const auto run = pflash_two_turn_run(pasted);
@@ -7658,8 +7668,8 @@ TEST_CASE(ServerUnitFixture,
     const size_t prefix = first.size() - 8;
     TEST_ASSERT(std::equal(first.begin(), first.begin() + (long) (prefix - 8),
                            second.begin()));
-    // ...and the pasted material is compressed: only the pinned question and
-    // what the selection keeps survive, not the whole paste.
+    // ...and the pasted material is compressed: only what the selection
+    // keeps (the question) survives, not the whole paste.
     TEST_ASSERT_MSG(run.text2.find("Question two?") != std::string::npos, run.text2);
     TEST_ASSERT(run.text2.find(pasted) == std::string::npos);
 }
@@ -7770,20 +7780,11 @@ TEST_CASE(ServerUnitFixture,
     }
 
     // Whole-prompt PFlash ran on the multi-turn prompt and scored against
-    // the last user turn's content tail.
+    // the prompt's last token.
     TEST_ASSERT(backend.compress_calls == 1);
     const auto & ids = backend.last_request.input_ids;
-    const int im_end = tokenizer.token_to_id("<|im_end|>");
-    int last_im_end = -1;
-    for (int i = 0; i < (int) ids.size(); ++i) {
-        if (ids[i] == im_end) last_im_end = i;
-    }
-    TEST_ASSERT(backend.last_request.score_query_end == last_im_end);
-    const int query_begin = backend.last_request.score_query_end -
-        backend.last_request.score_query_tokens;
-    TEST_ASSERT(tokenizer.decode({ids.begin() + query_begin,
-                                  ids.begin() + last_im_end})
-                == "second question");
+    TEST_ASSERT(backend.last_request.score_query_end == (int) ids.size());
+    TEST_ASSERT(backend.last_request.score_query_tokens == 1);
     unlink(path.c_str());
 }
 

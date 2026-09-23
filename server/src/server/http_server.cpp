@@ -4054,18 +4054,30 @@ std::string HttpServer::apply_pflash_compression(
                 return "PFlash strict selection content boundary mapping failed";
             }
             // Chat default: without an explicit pflash_query the scorer
-            // query is the tail of the boundary content, and it takes the
-            // explicit query's path from here on.
+            // query is the prompt's last token -- where the model starts
+            // answering, having read the whole request wherever the question
+            // sits in it. Nothing is parsed out of the user's text: the
+            // latest turn is scored like the rest of the conversation. A
+            // prompt without chat markers falls back to its content's tail.
             if (tail_parser && req.pflash_query.empty()) {
-                const auto window = http_detail::pflash_tail_query_window(
-                    drafter_ids, experiment.query_tokens,
-                    query_content_end, query_content_begin);
-                if (window.valid()) {
-                    query_span = {window.end - window.tokens, window.end};
-                    query_span_rule = chat_turn.valid() ? "chat_user_tail"
-                        : (raw_text_input ? "content_tail" : "prompt_tail");
+                const int prompt_end = (int) drafter_ids.size();
+                if (chat_turn.valid() &&
+                    chat_turn.generation_begin > 0 &&
+                    chat_turn.generation_begin < prompt_end) {
+                    query_span = {prompt_end - 1, prompt_end};
+                    query_span_rule = "prompt_end";
+                } else {
+                    const auto window = http_detail::pflash_tail_query_window(
+                        drafter_ids, experiment.query_tokens,
+                        query_content_end, query_content_begin);
+                    if (window.valid()) {
+                        query_span = {window.end - window.tokens, window.end};
+                        query_span_rule =
+                            raw_text_input ? "content_tail" : "prompt_tail";
+                    }
                 }
             }
+            const bool prompt_end_query = query_span_rule == "prompt_end";
 
             if (experiment.selection_active) {
                 const auto instruction_plan =
@@ -4156,6 +4168,12 @@ std::string HttpServer::apply_pflash_compression(
                 if (query_span.begin >= 0) {
                     required_instruction_spans.push_back(query_span);
                 }
+                if (prompt_end_query) {
+                    // The whole generation prompt stays verbatim; the query
+                    // is its last token.
+                    required_instruction_spans.push_back(
+                        {chat_turn.generation_begin, (int) drafter_ids.size()});
+                }
                 if (query_role_header.begin >= 0) {
                     required_instruction_spans.push_back(query_role_header);
                 }
@@ -4187,7 +4205,13 @@ std::string HttpServer::apply_pflash_compression(
                         http_detail::pflash_chat_skeleton_tokens();
                     for (size_t index = 0; index < chat_turn.turns.size();
                          ++index) {
-                        if ((int) index == chat_turn.query_turn) continue;
+                        // With a prompt-end query the latest user turn is
+                        // no longer pinned as the query: it follows the same
+                        // rule as every other turn.
+                        if ((int) index == chat_turn.query_turn &&
+                            !prompt_end_query) {
+                            continue;
+                        }
                         const auto & turn = chat_turn.turns[index];
                         if (turn.role == "system") continue;
                         if (turn.content_begin > turn.role_begin) {
@@ -4212,6 +4236,20 @@ std::string HttpServer::apply_pflash_compression(
                          --index) {
                         const auto & turn = chat_turn.turns[(size_t) index];
                         if (turn.role != "user") continue;
+                        if (prompt_end_query) {
+                            // The earlier question's counterpart of the
+                            // prompt's last token: the last token of the
+                            // header of the reply that followed it.
+                            const size_t reply = (size_t) index + 1;
+                            if (reply < chat_turn.turns.size() &&
+                                chat_turn.turns[reply].role != "user" &&
+                                chat_turn.turns[reply].content_begin >
+                                    chat_turn.turns[reply].role_begin) {
+                                const int end = chat_turn.turns[reply].content_begin;
+                                history_query_spans.push_back({end - 1, end});
+                            }
+                            continue;
+                        }
                         const auto window = http_detail::pflash_tail_query_window(
                             drafter_ids, experiment.query_tokens,
                             turn.content_end, turn.content_begin);

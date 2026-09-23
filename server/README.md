@@ -388,14 +388,17 @@ restores the previous all-layer running-max scorer. The Qwen3.5 attention
 runs dense (`ggml_flash_attn_ext`); the block-sparse FlashPrefill kernels
 still dispatch head dimension 128 only.
 
-The scorer query is the tail (`PFLASH_SELECT_QUERY_TOKENS`, default 8) of the
-latest user turn, located by the model's own chat markers in the rendered
-prompt. Tool output wrapped in a user turn and the generation prompt, with
-its think prefix, never count as that turn. Strict selection keeps the query
-and its turn's role header, and it runs on every turn of a multi-turn chat.
-In an agent loop the assistant and tool turns after the user's turn are
-scored against the query like the context before it; only the generation
-prompt is kept with them.
+The scorer query of a chat is the prompt's last token: the end of the
+generation prompt, where the model starts answering, having read the whole
+request. Nothing is parsed out of the user's text, so the question can sit
+anywhere in the message -- before a pasted document, in the middle of it, or
+among the user's own sentences -- and the user's own words score far above
+the material they paste. Strict selection keeps the generation prompt and
+the latest user turn's role header, and it runs on every turn of a
+multi-turn chat. In an agent loop the assistant and tool turns after the
+user's turn are scored like the rest of the conversation. A prompt without
+chat markers scores the tail (`PFLASH_SELECT_QUERY_TOKENS`, default 8) of
+its content.
 
 The keep ratio applies to the droppable tokens only: what strict selection
 keeps anyway (system and developer messages, tool definitions, the query and
@@ -435,14 +438,16 @@ turns it off; the breaks do not count against the token ceiling).
 appends each compressed request's served prompt as JSONL, for evidence
 checks in evaluations.
 
-Every other turn of a multi-turn chat keeps its role header, and user
-turns and assistant answers up to `PFLASH_CHAT_SKELETON_TOKENS` (default 256
-drafter tokens; 0 keeps headers only) stay whole: the conversation's
-skeleton, as opposed to the material it quotes. Like instructions, the
-skeleton is scored as context when it alone would not fit. The last
-`PFLASH_CHAT_HISTORY_QUERIES` (default 3) earlier user questions score the
-context alongside the current one, their masses mixed in at weights 1/2,
-1/4, 1/8, so what the conversation keeps coming back to stays selected.
+Every turn of a multi-turn chat keeps its role header, and user turns (the
+latest included) and assistant answers up to `PFLASH_CHAT_SKELETON_TOKENS`
+(default 256 drafter tokens; 0 keeps headers only) stay whole: the
+conversation's skeleton, as opposed to the material it quotes. Like
+instructions, the skeleton is scored as context when it alone would not fit.
+The last `PFLASH_CHAT_HISTORY_QUERIES` (default 3) earlier user turns score
+the context alongside the current query, each through the last token of the
+header of the reply that followed it (that turn's own prompt end), their
+masses mixed in at weights 1/2, 1/4, 1/8, so what the conversation keeps
+coming back to stays selected.
 
 The drafter keeps a scoring session per conversation
 (`PFLASH_DRAFTER_SESSIONS`, default 2, least recently used evicted; 0 scores
