@@ -4,14 +4,83 @@ The server accepts JPEG and PNG images through OpenAI chat completions when a
 model is started with its vision projector, `--mmproj <file>`. Without
 `--mmproj` nothing in the text serving path changes.
 
-| Model | Projector file | Runs on |
-| --- | --- | --- |
-| Qwen3.5 / Qwen3.8 dense | the `mmproj-*.gguf` published next to the model (llama.cpp `clip` format, type `qwen3vl_merger`) | one GPU, any backend |
-| DeepSeek V4 Flash Vision (DS4V) | [exported with our tool](ds4v-mmproj.md) | HIP: one GPU, or two GPUs splitting the experts |
+| Model | Decoder | Projector | Runs on |
+| --- | --- | --- | --- |
+| Qwen3.8-27B | [`Qwen3.8-27B-IQ4_XS-pure.gguf`](https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF) (any Qwen3.5 / Qwen3.8 dense GGUF works) | [`Qwen3.8-27B-mmproj-Q8_0.gguf`](https://huggingface.co/Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF), or any published `qwen3vl_merger` mmproj | one GPU, any backend |
+| DeepSeek V4 Flash Vision (DS4V) | [`DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) | [`DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3) | HIP: a Strix Halo alone, or R9700 + Strix Halo |
 
 **Status: experimental.** Both models answer image questions correctly end to
 end; see each model's verification notes for what has and has not been
 measured.
+
+## Quick start
+
+Build the server as in the [README](../README.md#run-the-server). DS4V also
+needs hipBLASLt at build time (`hipblaslt-dev` on ROCm; CMake prints
+`hipBLASLt found: building the DS4V vision ops`).
+
+### Qwen3.8-27B on one GPU (R9700)
+
+```bash
+hf download Lucebox/Qwen3.8-27B-IQ4_XS-fast-GGUF \
+  Qwen3.8-27B-IQ4_XS-pure.gguf Qwen3.8-27B-mmproj-Q8_0.gguf --local-dir models
+hf download Lucebox/Qwen3.8-27B-DFlash2-GGUF \
+  Qwen3.8-27B-DFlash2-Q8_0.gguf --local-dir models
+
+./server/build-hip/luce_server models/Qwen3.8-27B-IQ4_XS-pure.gguf \
+  --target-device hip:0 \
+  --draft models/Qwen3.8-27B-DFlash2-Q8_0.gguf --draft-device hip:0 \
+  --draft-block-size 16 --max-ctx 32768 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --mmproj models/Qwen3.8-27B-mmproj-Q8_0.gguf \
+  --port 8216
+```
+
+About 21 GiB of VRAM at the peak of an image request. Text requests keep the
+DFlash2 drafter; image requests decode without it.
+
+### DeepSeek V4 Flash Vision on a Strix Halo
+
+```bash
+hf download Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3 \
+  DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf \
+  DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf --local-dir models
+hf download Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF \
+  DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf --local-dir models
+
+LUCE_DS4_SPEC=1 \
+LUCE_DS4_DRAFT=models/DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf \
+LUCE_DS4_SPARSE_DECODE_FLASH=1 \
+./server/build-hip/luce_server models/DeepSeek-V4-Flash-Vision-Exp-ROCMFPX-MIX-STRIX.gguf \
+  --target-device hip:0 --max-ctx 131072 --chunk 8192 \
+  --cache-type-k q4_0 --cache-type-v q4_0 \
+  --ds4-fused-decode --ds4-fused-verify-f16-kv \
+  --ds4-expert-top-k 6 --ds4-prefill sparse \
+  --mmproj models/DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf \
+  --port 8216
+```
+
+`hip:0` must be the Strix Halo; on a host with a discrete GPU too, expose the
+Strix Halo alone with `HIP_VISIBLE_DEVICES`. This is the text model's published
+launch plus `--mmproj`: the Vision file replaces
+`DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf` for text as well and decodes
+at least as fast (numbers below). For R9700 + Strix Halo see [DS4V](#ds4v) below.
+
+### Send an image
+
+```bash
+IMG=$(base64 < photo.png | tr -d '\n')
+curl -s http://127.0.0.1:8216/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":[
+        {"type":"text","text":"What does this chart show?"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,'"$IMG"'"}}]}],
+       "max_tokens":256}'
+```
+
+`GET /props` reports `capabilities.image_input_supported: true` once the
+projector has loaded. In the Docker images, set `LUCE_MMPROJ` to the projector
+path inside the container.
 
 ## Request contract
 
@@ -49,11 +118,7 @@ support images. `/props` reports the effective capability in
 
 ## Qwen3.5 / Qwen3.8
 
-```
-luce_server Qwen3.8-27B-IQ4_XS-pure.gguf --target-device hip:0 \
-  --draft Qwen3.8-27B-DFlash2-Q8_0.gguf --draft-device hip:0 \
-  --mmproj Qwen3.8-27B-mmproj-Q8_0.gguf
-```
+The launch is in the [quick start](#qwen38-27b-on-one-gpu-r9700).
 
 The projector is read directly from the published `clip` file, BF16, F16 or
 Q8_0; Q8_0 is recommended (below). Projectors with
@@ -115,8 +180,8 @@ on ROCm). CMake reports `hipBLASLt found: building the DS4V vision ops`; a build
 without it refuses `--mmproj` for this model at startup.
 
 Image input needs Linux HIP, a DeepSeek4 decoder whose GGUF carries the image
-router biases, `--ds4-prefill sparse`, and `--mmproj` pointing at the
-[exported projector](ds4v-mmproj.md). Two layouts work:
+router biases, `--ds4-prefill sparse`, and `--mmproj` pointing at the published projector (or one [exported with our
+tool](ds4v-mmproj.md)). Two layouts work:
 
 - **One GPU holding the whole model** (for example a Strix Halo): nothing else
   to set. The projector is loaded after the weights and must fit beside them.

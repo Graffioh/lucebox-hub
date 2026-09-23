@@ -501,6 +501,7 @@ CMD=("$LUCE_SERVER_BIN" "$LUCE_TARGET"
 [ -n "$DRAFT_ARG" ]                && CMD+=(--ddtree --ddtree-budget "$LUCE_BUDGET")
 [ -n "$LUCE_DEFAULT_MAX_TOKENS" ] && CMD+=(--default-max-tokens "$LUCE_DEFAULT_MAX_TOKENS")
 [ -n "$LUCE_MODEL_NAME" ]         && CMD+=(--model-name "$LUCE_MODEL_NAME")
+[ -n "${LUCE_MMPROJ:-}" ]        && CMD+=(--mmproj "$LUCE_MMPROJ")
 # `--lazy-draft` is silently dropped by the C++ server unless both
 # `--prefill-drafter` and `--draft` are present (look for the runtime
 # warning `--lazy-draft ignored: requires both --prefill-drafter and

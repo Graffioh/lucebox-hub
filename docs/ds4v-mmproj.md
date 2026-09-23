@@ -2,7 +2,9 @@
 
 `server/tools/export_ds4v_mmproj.py` extracts the vision tower and aligner from
 the verified DeepSeek-V4 parent model without loading or changing tensor values.
-It requires only Python's standard library.
+It requires only Python's standard library. The output is published as
+[`DeepSeek-V4-Flash-Vision-Exp-mmproj-BF16.gguf`](https://huggingface.co/Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3);
+run the exporter only to rebuild it.
 
 ```bash
 python3 server/tools/export_ds4v_mmproj.py \
