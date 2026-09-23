@@ -627,6 +627,41 @@ int pflash_chat_skeleton_tokens() noexcept {
     return (int) (std::min)(value, 1L << 20);
 }
 
+bool pflash_paragraph_join() noexcept {
+    const char * raw = std::getenv("PFLASH_SELECT_PARAGRAPH_JOIN");
+    return raw && std::string(raw) == "1";
+}
+
+std::string pflash_join_kept_spans(
+        const Tokenizer & tokenizer,
+        const std::vector<int32_t> & ids,
+        const std::vector<PFlashTokenSpan> & spans) {
+    std::string out;
+    int previous_end = -1;
+    for (const auto & span : spans) {
+        if (span.begin < 0 || span.end > (int) ids.size() || span.end <= span.begin) {
+            continue;
+        }
+        std::string piece = tokenizer.decode(std::vector<int32_t>(
+            ids.begin() + span.begin, ids.begin() + span.end));
+        if (previous_end >= 0 && span.begin > previous_end && !out.empty() &&
+            !piece.empty()) {
+            const bool left_break = out.back() == '\n';
+            const bool right_break = piece.front() == '\n';
+            if (!left_break && !right_break) {
+                out += "\n\n";
+            } else if (left_break != right_break &&
+                       !(out.size() >= 2 && out[out.size() - 2] == '\n') &&
+                       !(piece.size() >= 2 && piece[1] == '\n')) {
+                out += "\n";
+            }
+        }
+        out += piece;
+        previous_end = span.end;
+    }
+    return out;
+}
+
 bool pflash_chat_recall() noexcept {
     const char * raw = std::getenv("PFLASH_CHAT_RECALL");
     return !(raw && std::string(raw) == "0");
@@ -639,6 +674,50 @@ int pflash_chat_compress_new_tokens() noexcept {
     const long value = std::strtol(raw, &end, 10);
     if (end == raw || *end != '\0' || value < 1) return 16384;
     return (int) (std::min)(value, 1L << 30);
+}
+
+double pflash_chat_recall_min_lift() noexcept {
+    const char * raw = std::getenv("PFLASH_CHAT_RECALL_MIN_LIFT");
+    if (!raw || !*raw) return 8.0;
+    char * end = nullptr;
+    const double value = std::strtod(raw, &end);
+    if (end == raw || *end != '\0' || !std::isfinite(value) || value < 0.0) return 8.0;
+    return value;
+}
+
+int pflash_chat_recall_tokens() noexcept {
+    const char * raw = std::getenv("PFLASH_CHAT_RECALL_TOKENS");
+    if (!raw || !*raw) return 2048;
+    char * end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || value < 0) return 2048;
+    return (int) (std::min)(value, 1L << 24);
+}
+
+std::vector<PFlashTokenSpan> pflash_recall_by_lift(
+        const std::vector<std::pair<PFlashTokenSpan, double>> & lifts,
+        const std::vector<PFlashTokenSpan> & in_view,
+        double min_lift,
+        int max_tokens) {
+    std::vector<std::pair<double, PFlashTokenSpan>> picks;
+    for (const auto & [span, lift] : lifts) {
+        if (!(lift >= min_lift)) continue;
+        for (const auto & part : pflash_subtract_token_spans({span}, in_view)) {
+            picks.push_back({lift, part});
+        }
+    }
+    std::stable_sort(picks.begin(), picks.end(), [] (const auto & a, const auto & b) {
+        return a.first > b.first;
+    });
+    std::vector<PFlashTokenSpan> chosen;
+    int used = 0;
+    for (const auto & [lift, part] : picks) {
+        const int length = part.end - part.begin;
+        if (used + length > max_tokens) continue;
+        chosen.push_back(part);
+        used += length;
+    }
+    return canonicalize_pflash_token_spans(std::move(chosen));
 }
 
 int pflash_chat_history_queries() noexcept {
@@ -4385,7 +4464,7 @@ std::string HttpServer::apply_pflash_compression(
         json view_stats;
         if (serve_pflash_chat_view(
                 req, compress_request.input_ids, chat_turn, nullptr, nullptr,
-                served, prepared.snapshot_cut, view_stats)) {
+                nullptr, served, prepared.snapshot_cut, view_stats)) {
             prepared.tokens = std::move(served);
             prepared.compressed = true;
             prepared.pflash_stats = {
@@ -4402,6 +4481,7 @@ std::string HttpServer::apply_pflash_compression(
     ModelBackend::CompressResult result;
     std::vector<int32_t> final_tokens;
     const auto compress_started = std::chrono::steady_clock::now();
+    int join_overhead = 0;
     for (int attempt = 0; ; ++attempt) {
         result = {};
         if (config_.pflash_remote_drafter) {
@@ -4433,6 +4513,21 @@ std::string HttpServer::apply_pflash_compression(
 
         std::string compressed_text =
             drafter_tokenizer_->decode(result.compressed_ids);
+        join_overhead = 0;
+        // PFLASH_SELECT_PARAGRAPH_JOIN=1: kept pieces that were not adjacent
+        // in the prompt are joined by a paragraph break when neither side
+        // already has one, so a cut does not glue two passages into one
+        // run-on line ("...other bands.Document 1:").
+        if (http_detail::pflash_paragraph_join() && !result.kept_spans.empty()) {
+            const int plain = (int) tokenizer_.encode(compressed_text).size();
+            compressed_text = http_detail::pflash_join_kept_spans(
+                *drafter_tokenizer_, compress_request.input_ids,
+                result.kept_spans);
+            // The breaks are layout, not retained context: the ceiling
+            // bounds what the selection kept.
+            join_overhead = (std::max)(
+                0, (int) tokenizer_.encode(compressed_text).size() - plain);
+        }
 
         // Compression is allowed to be lossy, but the active user query must
         // survive. Re-append short queries when fewer than 80% of their tokens do.
@@ -4467,10 +4562,11 @@ std::string HttpServer::apply_pflash_compression(
 
         final_tokens = tokenizer_.encode(compressed_text);
         if (!experiment.selection_active ||
-            (int) final_tokens.size() <= target_ceiling) {
+            (int) final_tokens.size() - join_overhead <= target_ceiling) {
             break;
         }
-        const int overflow = (int) final_tokens.size() - target_ceiling;
+        const int overflow =
+            (int) final_tokens.size() - join_overhead - target_ceiling;
         const int tightened = target_ceiling - overflow - 1;
         if (attempt >= 2 || tightened <= 0) {
             break;
@@ -4493,7 +4589,7 @@ std::string HttpServer::apply_pflash_compression(
             "[pflash-select] final target tokens=%zu ceiling=%d\n",
             final_tokens.size(), target_ceiling);
         std::fflush(stderr);
-        if ((int) final_tokens.size() > target_ceiling) {
+        if ((int) final_tokens.size() - join_overhead > target_ceiling) {
             return "PFlash strict selection final prompt exceeds target-token ceiling "
                 "(" + std::to_string(final_tokens.size()) + " > " +
                 std::to_string(target_ceiling) + ")";
@@ -4517,8 +4613,8 @@ std::string HttpServer::apply_pflash_compression(
         std::vector<int32_t> served;
         if (serve_pflash_chat_view(
                 req, compress_request.input_ids, chat_turn, &final_tokens,
-                &result.kept_spans, served, prepared.snapshot_cut,
-                prepared.pflash_stats["view"])) {
+                &result.kept_spans, &result.candidate_lifts, served,
+                prepared.snapshot_cut, prepared.pflash_stats["view"])) {
             final_tokens = std::move(served);
         }
     }
@@ -4554,6 +4650,7 @@ bool HttpServer::serve_pflash_chat_view(
         const http_detail::PflashChatTurnSpan & turn,
         const std::vector<int32_t> * fresh,
         const std::vector<PFlashTokenSpan> * kept_spans,
+        const std::vector<std::pair<PFlashTokenSpan, double>> * lifts,
         std::vector<int32_t> & served,
         int & snapshot_cut,
         json & stats) {
@@ -4642,13 +4739,20 @@ bool HttpServer::serve_pflash_chat_view(
     // Recall: what the fresh selection keeps for the new query that the view
     // does not hold. Only a new user turn brings a new query; an agent step
     // (assistant call plus tool output) appends without recalling.
+    // With the head's per-candidate lifts, recall only what the new
+    // question clearly attends to: a content-free question ("which
+    // documents support that?") recalls next to nothing instead of filling
+    // the budget with low-relevance segments beside the question.
     std::vector<PFlashTokenSpan> recalled;
     if (compressed && recall) {
         auto in_view = view.spans;
         in_view.push_back({view.drafter_gen_begin, input});
-        recalled = http_detail::pflash_subtract_token_spans(
-            *kept_spans,
-            http_detail::canonicalize_pflash_token_spans(std::move(in_view)));
+        in_view = http_detail::canonicalize_pflash_token_spans(std::move(in_view));
+        recalled = lifts && !lifts->empty()
+            ? http_detail::pflash_recall_by_lift(
+                  *lifts, in_view, http_detail::pflash_chat_recall_min_lift(),
+                  http_detail::pflash_chat_recall_tokens())
+            : http_detail::pflash_subtract_token_spans(*kept_spans, in_view);
     }
     std::string recall_block;
     int recalled_tokens = 0;
@@ -4709,14 +4813,26 @@ bool HttpServer::serve_pflash_chat_view(
     }
     const int split = new_question && !recall_block.empty()
         ? turn.content_begin : input;
-    std::string delta;
+    std::vector<PFlashTokenSpan> before_split;
+    std::vector<PFlashTokenSpan> after_split;
     for (const auto & span : delta_spans) {
-        delta += decode_range(span.begin, (std::min)(span.end, split));
+        if (span.begin < split) {
+            before_split.push_back({span.begin, (std::min)(span.end, split)});
+        }
+        if (span.end > split) {
+            after_split.push_back({(std::max)(span.begin, split), span.end});
+        }
     }
-    delta += recall_block;
-    for (const auto & span : delta_spans) {
-        delta += decode_range((std::max)(span.begin, split), span.end);
-    }
+    const auto join = [&] (const std::vector<PFlashTokenSpan> & spans) {
+        if (compress_new && http_detail::pflash_paragraph_join()) {
+            return http_detail::pflash_join_kept_spans(
+                *drafter_tokenizer_, drafter_ids, spans);
+        }
+        std::string text;
+        for (const auto & span : spans) text += decode_range(span.begin, span.end);
+        return text;
+    };
+    const std::string delta = join(before_split) + recall_block + join(after_split);
     served.assign(view.view_tokens.begin(),
                   view.view_tokens.begin() + view.view_gen_begin);
     const auto delta_tokens = tokenizer_.encode(delta);

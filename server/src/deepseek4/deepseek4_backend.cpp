@@ -3191,6 +3191,9 @@ std::vector<ModelBackend::CompressResult> DeepSeek4Backend::compress_batch(
             result.scorer_resume = scoring.resume;
             result.scorer_new_tokens = scoring.new_tokens;
             result.scorer_forward_s = scoring.forward_s;
+            for (const auto & candidate : pflash_last_candidate_lifts()) {
+                result.candidate_lifts.push_back({candidate.span, candidate.lift});
+            }
         }
     }
 

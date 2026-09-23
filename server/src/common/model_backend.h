@@ -292,6 +292,9 @@ struct ModelBackend {
         std::vector<PFlashTokenSpan> kept_spans;
         // Drafter session reuse: the token scoring resumed from and the
         // tokens it ran (-1 when unknown), and its forward time.
+        // Strict selection with the head: every candidate's attention lift
+        // (mass per token relative to uniform); empty when unknown.
+        std::vector<std::pair<PFlashTokenSpan, double>> candidate_lifts;
         int                  scorer_resume = -1;
         int                  scorer_new_tokens = -1;
         double               scorer_forward_s = 0.0;

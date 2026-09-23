@@ -1052,6 +1052,54 @@ TEST_CASE(ServerUnitFixture, test_timings_json_carries_pflash_details) {
     TEST_ASSERT(out["pflash"]["view"]["mode"] == "continue");
 }
 
+TEST_CASE(ServerUnitFixture, test_pflash_join_kept_spans_breaks_between_pieces) {
+    const std::string text = "one fact.\ngap text.Two starts.\n\nThree.";
+    const std::string path = write_pflash_bpe_tokenizer_fixture({}, text);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+    const auto ids = tok.encode(text);
+    const auto token_at = [&] (const std::string & needle) {
+        const auto span = http_detail::pflash_decoded_text_span(
+            tok, ids, 0, (int) ids.size(), needle);
+        return span;
+    };
+    const auto one = token_at("one fact.");
+    const auto two = token_at("Two starts.");
+    const auto three = token_at("\n\nThree.");
+    // Non-adjacent pieces without a break get a paragraph break...
+    TEST_ASSERT_MSG(http_detail::pflash_join_kept_spans(tok, ids, {one, two}) ==
+                    "one fact.\n\nTwo starts.",
+                    http_detail::pflash_join_kept_spans(tok, ids, {one, two}));
+    // ...a piece that already opens a paragraph is left alone...
+    TEST_ASSERT(http_detail::pflash_join_kept_spans(tok, ids, {one, three}) ==
+                "one fact.\n\nThree.");
+    // ...and adjacent pieces are joined as they were.
+    TEST_ASSERT(http_detail::pflash_join_kept_spans(tok, ids, {{0, 3}, {3, 5}}) ==
+                tok.decode({ids.begin(), ids.begin() + 5}));
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_recall_by_lift_takes_clear_attention_only) {
+    const std::vector<std::pair<PFlashTokenSpan, double>> lifts{
+        {{0, 10}, 40.0},     // clearly attended, not in view
+        {{10, 20}, 2.0},     // background
+        {{20, 30}, 90.0},    // clearly attended, already in view
+        {{30, 60}, 12.0},    // attended, half in view
+        {{60, 70}, 25.0},
+    };
+    const std::vector<PFlashTokenSpan> in_view{{20, 45}};
+    auto recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 8.0, 1000);
+    TEST_ASSERT(recalled.size() == 2);   // [0,10) and [45,70) merged
+    TEST_ASSERT(recalled[0].begin == 0 && recalled[0].end == 10);
+    TEST_ASSERT(recalled[1].begin == 45 && recalled[1].end == 70);
+    // A tight cap keeps the strongest: 40, then 25.
+    recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 8.0, 20);
+    TEST_ASSERT(recalled.size() == 2);
+    TEST_ASSERT(recalled[0].begin == 0 && recalled[1].begin == 60);
+    // Nothing clears a high bar.
+    TEST_ASSERT(http_detail::pflash_recall_by_lift(lifts, in_view, 100.0, 1000).empty());
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_subtract_token_spans) {
     const std::vector<PFlashTokenSpan> spans{{0, 10}, {20, 30}, {40, 50}};
     const std::vector<PFlashTokenSpan> minus{{5, 22}, {25, 26}, {40, 50}};

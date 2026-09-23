@@ -422,7 +422,14 @@ prefill appends a follow-up; from `PFLASH_CHAT_COMPRESS_NEW_TOKENS` (default
 16384) tokens of new material (a pasted document, a large tool output) only
 what the fresh selection keeps of it is appended, and the view before it
 stays cached. `PFLASH_CHAT_RECALL=0` turns recall off: a small follow-up is
-then served without running the drafter at all. `PFLASH_VIEW_TRACE_PATH`
+then served without running the drafter at all. Recall takes only segments
+the new question clearly attends to: attention lift (mass per token relative
+to uniform attention) of at least `PFLASH_CHAT_RECALL_MIN_LIFT` (default 8),
+strongest first, up to `PFLASH_CHAT_RECALL_TOKENS` (default 2048 drafter
+tokens), so a content-free follow-up ("which documents support that?")
+recalls next to nothing instead of filling the budget with noise beside the
+question. `PFLASH_SELECT_PARAGRAPH_JOIN=1` joins kept pieces that were not
+adjacent with a paragraph break (off by default). `PFLASH_VIEW_TRACE_PATH`
 appends each compressed request's served prompt as JSONL, for evidence
 checks in evaluations.
 

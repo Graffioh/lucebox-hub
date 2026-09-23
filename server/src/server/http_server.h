@@ -320,7 +320,28 @@ int pflash_chat_history_queries() noexcept;
 // scoring); PFLASH_CHAT_COMPRESS_NEW_TOKENS (default 16384) is the size of
 // new material in one turn from which it is compressed instead of appended.
 bool pflash_chat_recall() noexcept;
+
+// PFLASH_SELECT_PARAGRAPH_JOIN=1: the compressed text is rebuilt from the
+// kept spans with a paragraph break between pieces that were not adjacent
+// in the prompt, unless one side already ends or starts a paragraph.
+bool pflash_paragraph_join() noexcept;
+std::string pflash_join_kept_spans(
+    const Tokenizer & tokenizer,
+    const std::vector<int32_t> & ids,
+    const std::vector<PFlashTokenSpan> & spans);
 int pflash_chat_compress_new_tokens() noexcept;
+
+// Recall takes only segments the new question clearly attends to: attention
+// lift (mass per token relative to uniform) of at least
+// PFLASH_CHAT_RECALL_MIN_LIFT (default 8), strongest first, up to
+// PFLASH_CHAT_RECALL_TOKENS (default 2048) drafter tokens.
+double pflash_chat_recall_min_lift() noexcept;
+int pflash_chat_recall_tokens() noexcept;
+std::vector<PFlashTokenSpan> pflash_recall_by_lift(
+    const std::vector<std::pair<PFlashTokenSpan, double>> & lifts,
+    const std::vector<PFlashTokenSpan> & in_view,
+    double min_lift,
+    int max_tokens);
 
 // The parts of ``spans`` that ``minus`` does not cover. Both canonical.
 std::vector<PFlashTokenSpan> pflash_subtract_token_spans(
@@ -662,6 +683,7 @@ private:
         const http_detail::PflashChatTurnSpan & turn,
         const std::vector<int32_t> * fresh,
         const std::vector<PFlashTokenSpan> * kept_spans,
+        const std::vector<std::pair<PFlashTokenSpan, double>> * lifts,
         std::vector<int32_t> & served,
         int & snapshot_cut,
         nlohmann::json & stats);

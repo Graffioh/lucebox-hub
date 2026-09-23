@@ -139,6 +139,16 @@ struct PFlashScoringStats {
 const PFlashScoringStats & pflash_last_scoring_stats();
 void pflash_set_scoring_stats(const PFlashScoringStats & stats);
 
+// Every candidate of the last strict selection on this thread with its
+// attention lift: mean per-token mass relative to uniform attention over
+// the input (1 = average, 20 = twenty times average). Cleared with the
+// kept spans.
+struct PFlashCandidateLift {
+    PFlashTokenSpan span;
+    double lift = 0.0;
+};
+const std::vector<PFlashCandidateLift> & pflash_last_candidate_lifts();
+
 std::vector<int32_t> select_pflash_chunks(
         const std::vector<int32_t> & ids,
         const std::vector<float> & token_scores,

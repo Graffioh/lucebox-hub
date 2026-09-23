@@ -1402,6 +1402,9 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
         result.scorer_resume = scoring.resume;
         result.scorer_new_tokens = scoring.new_tokens;
         result.scorer_forward_s = scoring.forward_s;
+        for (const auto & candidate : pflash_last_candidate_lifts()) {
+            result.candidate_lifts.push_back({candidate.span, candidate.lift});
+        }
     }
     if (result.ok) {
         std::fprintf(stderr, "[target-split][compress] %zu -> %zu tokens\n",
