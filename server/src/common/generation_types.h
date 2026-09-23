@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "image_prompt.h"
 #include "sampler.h"
 
 namespace luce::common {
@@ -26,6 +27,8 @@ struct BudgetHook {
 
 struct GenerateRequest {
     std::vector<int32_t> prompt;
+    // Backend-owned image payload bound to `prompt`; empty for text requests.
+    ImagePromptHandle images;
     int n_gen = 0;
     SamplerCfg sampler;
     bool do_sample = false;

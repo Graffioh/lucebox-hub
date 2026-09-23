@@ -381,6 +381,25 @@ if(LUCE_MIXED_GGML_SHARED)
     set(BUILD_SHARED_LIBS ON)
 endif()
 add_subdirectory(deps/llama.cpp/ggml EXCLUDE_FROM_ALL)
+
+option(LUCE_DS4_MIX_CONVERTER
+    "Build the CPU-only DeepSeek-V4 safetensors to MIX GGUF converter" ON)
+# The Docker build contexts do not copy server/tools.
+if(LUCE_DS4_MIX_CONVERTER AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4_mix_converter/ds4_mix_converter.cpp")
+    add_executable(ds4_mix_converter
+        tools/ds4_mix_converter/ds4_mix_converter.cpp)
+    target_include_directories(ds4_mix_converter PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfp4)
+    target_link_libraries(ds4_mix_converter PRIVATE
+        ggml-base nlohmann_json::nlohmann_json)
+    if(UNIX)
+        target_link_libraries(ds4_mix_converter PRIVATE m)
+    endif()
+endif()
+
 if(LUCE_MIXED_GGML_SHARED)
     if(_luce_build_shared_libs_was_defined)
         set(BUILD_SHARED_LIBS "${_luce_saved_build_shared_libs}")
@@ -499,6 +518,17 @@ add_library(luce_common STATIC
     src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
     src/deepseek4/deepseek4_dspark.cpp
     src/deepseek4/deepseek4_dspark_spec.cpp
+    src/deepseek4/deepseek4_vision.cpp
+    src/common/gpu_page_pool.cpp
+    src/common/vision/image_decode.cpp
+    src/common/vision/image_resize.cpp
+    src/common/vision/mmproj_file.cpp
+    src/deepseek4/deepseek4_vision_preprocess.cpp
+    src/deepseek4/deepseek4_image_prompt.cpp
+    src/deepseek4/deepseek4_image_assembly.cpp
+    src/deepseek4/deepseek4_image_admission.cpp
+    src/deepseek4/deepseek4_image_policy.cpp
+    src/server/image_input.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -555,6 +585,9 @@ add_library(luce_common STATIC
     src/qwen35/qwen35_target_shard_ipc_daemon.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
+    src/qwen35/qwen35_backend_images.cpp
+    src/qwen35/qwen35_image_prompt.cpp
+    src/qwen35/qwen35_vision.cpp
     src/qwen35/qwen35_tensor_parallel.cpp
     src/qwen35/concurrency/qwen35_seq_engine.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
@@ -873,6 +906,25 @@ if(LUCE_ENABLE_BSA)
     endif()
 endif()
 
+# JPEG and PNG decoders for image input (common/vision/image_decode). They are
+# downloaded at build time; an offline or text-only build can turn them off and
+# image requests are then refused.
+option(LUCE_IMAGE_CODECS "Download and build the JPEG/PNG decoders for image input" ON)
+if(LUCE_IMAGE_CODECS)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ImageCodecs.cmake")
+    install(FILES cmake/ImageCodecs.NOTICES.md
+        DESTINATION share/licenses/image-codecs
+        RENAME THIRD_PARTY_NOTICES.md)
+    install(FILES "${IMAGE_CODEC_JPEG_SOURCE_DIR}/LICENSE.md"
+                  "${IMAGE_CODEC_JPEG_SOURCE_DIR}/README.ijg"
+        DESTINATION share/licenses/image-codecs/libjpeg-turbo
+        OPTIONAL)
+    set(_luce_image_codec_libs image_codec_jpeg image_codec_png)
+else()
+    set(_luce_image_codec_libs)
+    target_compile_definitions(luce_common PRIVATE LUCE_NO_IMAGE_CODECS)
+endif()
+
 target_link_libraries(luce_common
     PUBLIC
         ggml
@@ -880,6 +932,7 @@ target_link_libraries(luce_common
         ggml-base
         nlohmann_json::nlohmann_json
     PRIVATE
+        ${_luce_image_codec_libs}
         ${CMAKE_DL_LIBS}
 )
 # OpenMP for parallel MoE expert compute kernel (saturate memory bandwidth).
@@ -1009,6 +1062,16 @@ if(LUCE_TESTS)
         target_link_libraries(test_rocmfpx PRIVATE m)
     endif()
     list(APPEND _raw_unit_test_targets test_rocmfpx)
+
+    add_executable(test_ds4_mix_converter test/test_ds4v_mix_converter.cpp test/test_unit_main.cpp)
+    target_include_directories(test_ds4_mix_converter PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/rocmfpx)
+    target_link_libraries(test_ds4_mix_converter PRIVATE ggml-base)
+    if(UNIX)
+        target_link_libraries(test_ds4_mix_converter PRIVATE m)
+    endif()
+    list(APPEND _raw_unit_test_targets test_ds4_mix_converter)
 
     if(LUCE_GPU_BACKEND STREQUAL "hip")
         add_executable(test_rocmfp4_hip_tail test/test_rocmfp4_hip_tail.cpp)
@@ -1840,6 +1903,46 @@ if(LUCE_TESTS)
     endif()
 
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
+    # Shared image input: request transport and JPEG/PNG decoding.
+    add_executable(test_image_input test/test_image_input.cpp src/server/image_input.cpp)
+    target_include_directories(test_image_input PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_image_input PRIVATE nlohmann_json::nlohmann_json)
+    if(LUCE_IMAGE_CODECS)
+        add_executable(test_image_decode test/test_image_decode.cpp src/common/vision/image_decode.cpp)
+        target_include_directories(test_image_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(test_image_decode PRIVATE image_codec_jpeg image_codec_png)
+        list(APPEND _raw_unit_test_targets test_image_decode)
+    endif()
+    add_executable(test_image_resize test/test_image_resize.cpp src/common/vision/image_resize.cpp)
+    target_include_directories(test_image_resize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_executable(test_gpu_page_pool test/test_gpu_page_pool.cpp src/common/gpu_page_pool.cpp)
+    target_include_directories(test_gpu_page_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_executable(test_qwen35_image test/test_qwen35_image.cpp
+        src/qwen35/qwen35_image_prompt.cpp src/qwen35/qwen35_vision.cpp
+        src/common/vision/mmproj_file.cpp src/common/vision/image_resize.cpp)
+    target_include_directories(test_qwen35_image PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_qwen35_image PRIVATE ggml ggml-base)
+    list(APPEND _raw_unit_test_targets test_image_input test_image_resize test_gpu_page_pool
+        test_qwen35_image)
+
+    # DS4V image units: each test builds only the unit it covers.
+    foreach(_ds4v_unit assembly integration policy prompt)
+        add_executable(test_ds4v_image_${_ds4v_unit} test/test_ds4v_image_${_ds4v_unit}.cpp)
+        target_include_directories(test_ds4v_image_${_ds4v_unit} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/deepseek4)
+        list(APPEND _raw_unit_test_targets test_ds4v_image_${_ds4v_unit})
+    endforeach()
+    target_sources(test_ds4v_image_assembly PRIVATE src/deepseek4/deepseek4_image_assembly.cpp)
+    target_sources(test_ds4v_image_policy PRIVATE src/deepseek4/deepseek4_image_policy.cpp)
+    target_sources(test_ds4v_image_prompt PRIVATE
+        src/deepseek4/deepseek4_image_prompt.cpp
+        src/deepseek4/deepseek4_vision_preprocess.cpp
+        src/common/vision/image_resize.cpp)
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_source_page_range.cpp")
+        add_executable(test_moe_source_page_range test/test_moe_source_page_range.cpp)
+        list(APPEND _raw_unit_test_targets test_moe_source_page_range)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_moe_input_ready.cpp")
         add_executable(test_moe_input_ready test/test_moe_input_ready.cpp)
         target_include_directories(test_moe_input_ready PRIVATE

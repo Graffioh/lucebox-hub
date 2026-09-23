@@ -44,6 +44,7 @@
 // tensor's bytes from the mmap'd file.
 
 #include "internal.h"
+#include "qwen35_image_prompt.h"
 #include "common/derived_scalars.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
@@ -113,6 +114,18 @@ int32_t get_i32_or(const gguf_context * g, const char * key, int32_t fallback) {
     int64_t id = gguf_find_key(g, key);
     if (id < 0) return fallback;
     return gguf_get_val_i32(g, id);
+}
+
+// Id of the vocabulary entry spelled exactly `text`, or -1. Searched from the
+// end, where the added special tokens live.
+static int32_t find_token_id(const gguf_context * g, const char * text) {
+    const int64_t key = gguf_find_key(g, "tokenizer.ggml.tokens");
+    if (key < 0 || gguf_get_kv_type(g, key) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(g, key) != GGUF_TYPE_STRING) return -1;
+    for (size_t i = gguf_get_arr_n(g, key); i-- > 0;) {
+        if (std::strcmp(gguf_get_arr_str(g, key, i), text) == 0) return (int32_t) i;
+    }
+    return -1;
 }
 
 uint32_t get_u32_or(const gguf_context * g, const char * key, uint32_t fallback) {
@@ -544,6 +557,7 @@ bool load_target_gguf_partial(const std::string & path,
         out.eos_chat_id = (raw_eos_chat == kEosKeyMissing) ? -1 : (int32_t)raw_eos_chat;
         std::printf("[loader] eos_id=%d eos_chat_id=%d\n", out.eos_id, out.eos_chat_id);
     }
+    out.image_pad_id = find_token_id(gctx, QWEN35_IMAGE_PAD_TOKEN);
 
     // Compute capture layer IDs: evenly spaced through the target layers.
     // step = (n_layer - 2) / (N - 1), ids[k] = 1 + k * step.

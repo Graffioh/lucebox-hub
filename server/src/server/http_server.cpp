@@ -17,6 +17,7 @@
 #endif
 
 #include "http_server.h"
+#include "image_input.h"
 #include "engine/luce_engine.h"
 #include "admission.h"
 #include "common/concurrency/seq_engine.h"
@@ -965,6 +966,7 @@ json build_props_body(const ServerConfig & config,
             {"reasoning_supported",   reasoning_supported},
             {"speculative_supported", speculative_supported},
             {"tools_supported",       tools_supported},
+            {"image_input_supported", config.image_input_enabled},
         }},
     };
     return body;
@@ -1245,6 +1247,13 @@ HttpServer::HttpServer(luce::engine::LuceEngine & engine,
                    config.disk_cache_continued_interval,
                    config.disk_cache_cold_max_tokens}, backend_)
 {
+    config_.image_input_enabled = backend_.supports_images() &&
+        config_.pflash_upstream_base.empty() && !backend_.seq_engine();
+    if (backend_.supports_images() && !config_.image_input_enabled) {
+        std::fprintf(stderr,
+            "[server] WARNING: a vision projector is loaded but image input is off: it is "
+            "not available with upstream forwarding or concurrent sequence scheduling\n");
+    }
     #ifdef LUCE_HAS_CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
     #endif
@@ -2336,7 +2345,7 @@ bool HttpServer::validate_request_context(
         SocketHandle fd, const ParsedRequest & req, bool send_failure) {
     const int prompt_tokens = (int) req.prompt_tokens.size();
     const bool pflash_will_run =
-        config_.pflash_mode != ServerConfig::PflashMode::OFF &&
+        !req.images && config_.pflash_mode != ServerConfig::PflashMode::OFF &&
         drafter_tokenizer_ != nullptr &&
         (config_.pflash_mode == ServerConfig::PflashMode::ALWAYS ||
          prompt_tokens >= config_.pflash_threshold);
@@ -2429,6 +2438,26 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
     try {
         const json & body = req.raw_body;
         if (!parse_common_request_fields(fd, body, req)) return true;
+        // Image extraction and redaction apply only to an image-capable
+        // backend; every other backend sees the request exactly as before.
+        std::vector<EncodedImage> encoded_images;
+        if (config_.image_input_enabled) {
+            json normalized;
+            std::string extraction_error;
+            const ImageRequestPolicy image_policy{
+                req.format == ApiFormat::OPENAI_CHAT,
+                config_.image_input_enabled,
+                backend_.image_placeholder()};
+            if (!prepare_request_images(req.messages, image_policy, normalized,
+                                        encoded_images, extraction_error)) {
+                send_error(fd, 400, extraction_error);
+                return true;
+            }
+            req.messages = std::move(normalized);
+            redact_image_urls(req.raw_body);
+            redact_image_urls(req.messages);
+        }
+
         const std::vector<ChatMessage> chat_messages =
             normalize_chat_messages(req.messages, req.format, tool_memory_);
         // Reasoning must be applied BEFORE rendering: the template injects
@@ -2440,7 +2469,7 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
         // PPP rearrange (optional): peel ephemeral system banners into a
         // following system message so the first chat boundary is stable.
         std::vector<ChatMessage> render_messages = chat_messages;
-        if (config_.ppp_enabled && config_.ppp_rearrange && !req.tools.empty()) {
+        if (encoded_images.empty() && config_.ppp_enabled && config_.ppp_rearrange && !req.tools.empty()) {
             auto layout = PinFriendlyPrompt::rearrange(chat_messages, true);
             if (layout.rearranged) {
                 render_messages = std::move(layout.messages);
@@ -2463,6 +2492,14 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
 
         if (!render_and_tokenize_request(fd, render_messages, req)) return true;
 
+        std::string image_error;
+        if (!backend_.prepare_images(req.prompt_tokens, std::move(encoded_images),
+                uint64_t(std::max(0, config_.max_ctx)), uint64_t(std::max(0, req.max_output)),
+                req.images, image_error)) {
+            send_error(fd, 400, image_error);
+            return true;
+        }
+
         // count_tokens: short-circuit after tokenization. Skip generation
         // entirely — Anthropic's contract is just {"input_tokens": N}.
         if (count_tokens_only) {
@@ -2472,8 +2509,11 @@ bool HttpServer::handle_model_request(SocketHandle fd, ParsedRequest & req,
             send_response(fd, 200, "application/json", response.dump() + "\n");
             return true;
         }
-    } catch (const std::exception & e) {
+    } catch (const json::parse_error & e) {
         send_error(fd, 400, std::string("JSON parse error: ") + e.what());
+        return true;
+    } catch (const std::exception & e) {
+        send_error(fd, 400, std::string("Invalid request: ") + e.what());
         return true;
     }
 
@@ -3266,6 +3306,15 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
         const ParsedRequest & req) {
     PreparedPrompt prepared;
     prepared.tokens = req.prompt_tokens;
+    if (req.images) {
+        if (!config_.image_input_enabled || !req.images->matches(prepared.tokens)) {
+            prepared.error_status = 400;
+            prepared.error = "image request binding or serving mode is invalid";
+        } else {
+            prepared.images = req.images;
+        }
+        return prepared;
+    }
 
     if (config_.pflash_mode != ServerConfig::PflashMode::OFF &&
         drafter_tokenizer_ != nullptr) {
@@ -3322,6 +3371,7 @@ HttpServer::PreparedPrompt HttpServer::prepare_prompt(
 bool HttpServer::forward_upstream(
         ServerJob * job, const ParsedRequest & req,
         const PreparedPrompt & prepared) {
+    if (req.images) return false;
 #ifdef LUCE_HAS_CURL
     if (config_.pflash_upstream_base.empty()) return false;
 
@@ -3397,6 +3447,7 @@ bool HttpServer::forward_upstream(
 HttpServer::GenerationCacheState HttpServer::prepare_generation_cache(
         const ParsedRequest & req, PreparedPrompt & prepared,
         GenerateRequest & generate_request) {
+    if (req.images) return {};
     auto & effective_prompt = prepared.tokens;
     // Tool-heavy requests prefer the reusable system/tool boundary under eviction.
     const bool prefer_inline_snap = !req.tools.empty();
@@ -3799,6 +3850,7 @@ void HttpServer::finalize_generation_cache(
         GenerationCacheState & cache, const GenerateResult & result,
         int completion_tokens, bool visible_output_seen,
         bool client_disconnected) {
+    if (req.images) return;
     const auto & effective_prompt = prepared.tokens;
     const bool generation_produced_output = result.ok() &&
         completion_tokens > 0 && visible_output_seen && !client_disconnected;
@@ -3949,7 +4001,7 @@ void HttpServer::remember_agent_turn(
     for (const auto & call : emitter.tool_calls()) call_ids.push_back(call.id);
     tool_memory_.remember(call_ids, assistant_content);
 
-    if (!replay_cache) return;
+    if (!replay_cache || req.images) return;
     if (!config_.agent_turn_cache || prefix_cache_.disabled()) return;
     // Cache only stateless-equivalent prompts. Compression and token rewrites
     // need a separate replay contract.
@@ -4049,6 +4101,8 @@ void HttpServer::prepare_generation_inputs(
         : req.max_output;
 
     inputs.request.prompt = prepared.tokens;
+    inputs.request.images = prepared.images;
+    inputs.request.force_ar_decode = bool(prepared.images);
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
     inputs.request.do_sample = req.sampler.needs_logit_processing();
@@ -4241,7 +4295,9 @@ void HttpServer::process_job(ServerJob * job) {
 
     // Track live status for /status page. RAII guard ensures idle on all paths.
     std::string prompt_excerpt;
-    if (!req.prompt_tokens.empty()) {
+    if (req.images) {
+        prompt_excerpt = req.rendered_prompt.substr(0, 200);
+    } else if (!req.prompt_tokens.empty()) {
         // Decode first ~40 tokens as a prompt excerpt (cheap, bounded).
         const int excerpt_len = (std::min)((int)req.prompt_tokens.size(), 40);
         std::vector<int32_t> excerpt_toks(req.prompt_tokens.begin(),
@@ -4521,7 +4577,7 @@ void HttpServer::process_job(ServerJob * job) {
 
     // Record performance for /status page.
     PerfRecord perf;
-    perf.prompt_tokens = (int)req.prompt_tokens.size();
+    perf.prompt_tokens = effective_prompt_tokens;
     perf.completion_tokens = completion_tokens;
     // Use actual prefilled token count: on cache hit the backend only
     // prefills the delta beyond the cached prefix, so dividing the full
