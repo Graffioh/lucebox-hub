@@ -1650,6 +1650,23 @@ static bool build_cached_cold_batched_graph(
     return true;
 }
 
+// Cold owner None evaluates a routed partial that the caller sums across
+// owners. The shared expert is replicated on every owner, so letting it into
+// that partial would count it once per owner. Refuse such a desc instead of
+// silently double counting; see MoeHybridColdBackend::None.
+static bool none_owner_desc_ok(const MoeHybridLayerStorage & storage,
+                               const MoeLayerDesc & desc, std::string * err) {
+    if (storage.cold_backend_kind != MoeHybridColdBackend::None ||
+        !desc.has_shared_expert()) {
+        return true;
+    }
+    if (err) {
+        *err = "cold owner None: pass the routed desc without the shared expert "
+               "and add eval_moe_shared_expert_batched() after the reduction";
+    }
+    return false;
+}
+
 bool eval_moe_hybrid_ffn_single(
     ggml_backend_t                  gpu_backend,
     const MoeHybridConfig &         cfg,
@@ -1665,6 +1682,7 @@ bool eval_moe_hybrid_ffn_single(
     std::string *                   err) {
 
     if (telemetry) *telemetry = {};
+    if (!none_owner_desc_ok(storage, desc, err)) return false;
     const auto ffn_wall_t0 = HybridClock::now();
     const auto partition_t0 = HybridClock::now();
 
@@ -3551,6 +3569,7 @@ bool eval_moe_hybrid_ffn_batched(
     ggml_tensor *                   cur_backend,
     const MoeHybridDeviceOutputs *  device_outputs) {
     if (telemetry) *telemetry = {};
+    if (!none_owner_desc_ok(storage, desc, err)) return false;
     const bool materialized_cold = storage.down_cold || storage.gate_up_cold;
     if (cur_host && compact_materialized_experts_enabled() && materialized_cold &&
         !expert_compute && n_tokens > 0 && n_tokens <= 4) {
@@ -3611,7 +3630,7 @@ bool eval_moe_hybrid_ffn_batched(
             storage.gate_hot, storage.up_hot, storage.down_hot,
             storage.gate_up_hot, storage.hot_local_by_global,
             cur_host, selected_ids, selected_weights, n_tokens,
-            desc.has_shared_expert(), out, &owner_err,
+            /*include_shared=*/false, out, &owner_err,
             cur_backend, gpu_backend,
             /*device_output=*/nullptr, /*device_output_owner=*/nullptr,
             p_hot_alloc);
@@ -4059,6 +4078,7 @@ bool eval_moe_hybrid_ffn_gpu_resident(
     MoeExpertCompute *                expert_compute,
     const MoeExpertLayer *            expert_layer) {
 
+    if (!none_owner_desc_ok(storage, desc, nullptr)) return false;
     const int n_embd = cfg.n_embd;
 
     // ── Partition into hot/cold ──
@@ -4338,8 +4358,11 @@ bool eval_moe_shared_expert_batched(
     std::vector<float> &            out,
     std::string *                   err) {
     const int n_embd = cfg.n_embd;
+    if (n_tokens <= 0) {
+        out.clear();
+        return true;
+    }
     out.assign((size_t)n_embd * (size_t)n_tokens, 0.0f);
-    if (n_tokens <= 0) return true;
     if (!desc.ffn_up_shexp || !desc.ffn_gate_shexp || !desc.ffn_down_shexp) {
         return true;
     }

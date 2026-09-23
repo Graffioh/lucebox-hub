@@ -268,7 +268,7 @@ bool MoeHybridStorage::matches(const MoeHybridConfig & cfg) const {
            (int)layers.size() == cfg.n_layer &&
            cold_backend_kind == cfg.cold_expert_backend &&
            materialized_hot_experts == cfg.materialize_hot_experts &&
-           materialized_cold_experts == cfg.materialize_cold_experts &&
+           materialized_cold_experts == cfg.materializes_cold_experts() &&
            mixed_mmq_policy == cfg.mixed_mmq_policy;
 }
 
@@ -303,16 +303,12 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
     out.cold_backend_kind = cfg.cold_expert_backend;
     out.materialized_hot_experts = cfg.materialize_hot_experts;
     out.mixed_mmq_policy = cfg.mixed_mmq_policy;
-    out.materialized_cold_experts = cfg.materialize_cold_experts;
+    out.materialized_cold_experts = cfg.materializes_cold_experts();
     // Cold owner None (cluster expert-parallel): non-resident routes are
     // reduced by another process, so there is no cold backend, no cold
     // buffer and no cold expert map on this side.
     const bool no_cold_owner =
         cfg.cold_expert_backend == MoeHybridColdBackend::None;
-    if (no_cold_owner && cfg.materialize_cold_experts) {
-        if (err) *err = "cold owner None cannot materialize cold experts";
-        return false;
-    }
     out.cold_backend = no_cold_owner ? nullptr
         : cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
             ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)
@@ -435,7 +431,7 @@ bool build_moe_hybrid_storage(const MoeHybridConfig & cfg,
         }
 
         // Allocate cold expert tensors on the selected cold backend.
-        if (cold_count > 0 && cfg.materialize_cold_experts) {
+        if (cold_count > 0 && cfg.materializes_cold_experts()) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
@@ -533,16 +529,12 @@ bool build_moe_hybrid_storage_from_file(
     out.cold_backend_kind = cfg.cold_expert_backend;
     out.materialized_hot_experts = cfg.materialize_hot_experts;
     out.mixed_mmq_policy = cfg.mixed_mmq_policy;
-    out.materialized_cold_experts = cfg.materialize_cold_experts;
+    out.materialized_cold_experts = cfg.materializes_cold_experts();
     // Cold owner None (cluster expert-parallel): non-resident routes are
     // reduced by another process, so there is no cold backend, no cold
     // buffer and no cold expert map on this side.
     const bool no_cold_owner =
         cfg.cold_expert_backend == MoeHybridColdBackend::None;
-    if (no_cold_owner && cfg.materialize_cold_experts) {
-        if (err) *err = "cold owner None cannot materialize cold experts";
-        return false;
-    }
     out.cold_backend = no_cold_owner ? nullptr
         : cfg.cold_expert_backend == MoeHybridColdBackend::Gpu
             ? (cold_gpu_backend ? cold_gpu_backend : gpu_backend)
@@ -676,7 +668,7 @@ bool build_moe_hybrid_storage_from_file(
         }
 
         // Allocate cold expert tensors on the selected cold backend.
-        if (allocate_cold && cold_count > 0 && cfg.materialize_cold_experts) {
+        if (allocate_cold && cold_count > 0 && cfg.materializes_cold_experts()) {
             ggml_init_params ip{};
             ip.mem_size   = 16 * ggml_tensor_overhead();
             ip.mem_buffer = nullptr;
@@ -734,7 +726,7 @@ bool build_moe_hybrid_storage_from_file(
         // slice buffers are gone. Retain the mapping for future streaming reads.
         if (readonly_file_mmap && readonly_file_fd >= 0 && moe_source_pageout_eligible(
                 out.cold_backend_kind == MoeHybridColdBackend::Gpu,
-                cfg.materialize_hot_experts, cfg.materialize_cold_experts,
+                cfg.materialize_hot_experts, cfg.materializes_cold_experts(),
                 allocate_cold && cold_count > 0 && dst.cold_buf != nullptr)) {
             if (dst.fused_gate_up) {
                 advise_copied_source(readonly_file_mmap, readonly_file_mmap_size, fd.gate_up_exps, il, readonly_file_fd);
