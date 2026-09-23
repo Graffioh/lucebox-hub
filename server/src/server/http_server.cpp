@@ -679,44 +679,23 @@ int pflash_chat_compress_new_tokens() noexcept {
 
 double pflash_chat_recall_min_lift() noexcept {
     const char * raw = std::getenv("PFLASH_CHAT_RECALL_MIN_LIFT");
-    if (!raw || !*raw) return 8.0;
+    if (!raw || !*raw) return 2.0;
     char * end = nullptr;
     const double value = std::strtod(raw, &end);
-    if (end == raw || *end != '\0' || !std::isfinite(value) || value < 0.0) return 8.0;
+    if (end == raw || *end != '\0' || !std::isfinite(value) || value < 0.0) return 2.0;
     return value;
-}
-
-int pflash_chat_recall_tokens() noexcept {
-    const char * raw = std::getenv("PFLASH_CHAT_RECALL_TOKENS");
-    if (!raw || !*raw) return 2048;
-    char * end = nullptr;
-    const long value = std::strtol(raw, &end, 10);
-    if (end == raw || *end != '\0' || value < 0) return 2048;
-    return (int) (std::min)(value, 1L << 24);
 }
 
 std::vector<PFlashTokenSpan> pflash_recall_by_lift(
         const std::vector<std::pair<PFlashTokenSpan, double>> & lifts,
         const std::vector<PFlashTokenSpan> & in_view,
-        double min_lift,
-        int max_tokens) {
-    std::vector<std::pair<double, PFlashTokenSpan>> picks;
+        double min_lift) {
+    std::vector<PFlashTokenSpan> chosen;
     for (const auto & [span, lift] : lifts) {
         if (!(lift >= min_lift)) continue;
         for (const auto & part : pflash_subtract_token_spans({span}, in_view)) {
-            picks.push_back({lift, part});
+            chosen.push_back(part);
         }
-    }
-    std::stable_sort(picks.begin(), picks.end(), [] (const auto & a, const auto & b) {
-        return a.first > b.first;
-    });
-    std::vector<PFlashTokenSpan> chosen;
-    int used = 0;
-    for (const auto & [lift, part] : picks) {
-        const int length = part.end - part.begin;
-        if (used + length > max_tokens) continue;
-        chosen.push_back(part);
-        used += length;
     }
     return canonicalize_pflash_token_spans(std::move(chosen));
 }
@@ -4814,13 +4793,15 @@ bool HttpServer::serve_pflash_chat_view(
     const bool recall = new_question && http_detail::pflash_chat_recall();
     if (!compressed && (compress_new || recall)) return false;
 
-    // Recall: what the fresh selection keeps for the new query that the view
-    // does not hold. Only a new user turn brings a new query; an agent step
-    // (assistant call plus tool output) appends without recalling.
-    // With the head's per-candidate lifts, recall only what the new
-    // question clearly attends to: a content-free question ("which
-    // documents support that?") recalls next to nothing instead of filling
-    // the budget with low-relevance segments beside the question.
+    // Recall: what the new question clearly attends to that the view does
+    // not hold. Only a new user turn brings a new question; an agent step
+    // (assistant call plus tool output) appends without recalling. The head's
+    // per-candidate lifts decide it (the fresh selection minus the view when
+    // a scorer reports none), so a content-free question ("which documents
+    // support that?") recalls next to nothing. A question that needs more
+    // than a third of a fresh selection starts a new view from that
+    // selection instead: past that, prefilling the fresh prompt costs about
+    // the same and serves the material in order.
     std::vector<PFlashTokenSpan> recalled;
     if (compressed && recall) {
         auto in_view = view.spans;
@@ -4828,9 +4809,15 @@ bool HttpServer::serve_pflash_chat_view(
         in_view = http_detail::canonicalize_pflash_token_spans(std::move(in_view));
         recalled = lifts && !lifts->empty()
             ? http_detail::pflash_recall_by_lift(
-                  *lifts, in_view, http_detail::pflash_chat_recall_min_lift(),
-                  http_detail::pflash_chat_recall_tokens())
+                  *lifts, in_view, http_detail::pflash_chat_recall_min_lift())
             : http_detail::pflash_subtract_token_spans(*kept_spans, in_view);
+        size_t recall_size = 0;
+        for (const auto & span : recalled) {
+            recall_size += (size_t) (span.end - span.begin);
+        }
+        if (3 * recall_size > fresh->size()) {
+            return serve_fresh("rebuild", view.turns + 1);
+        }
     }
     std::string recall_block;
     int recalled_tokens = 0;

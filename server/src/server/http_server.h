@@ -333,17 +333,14 @@ std::string pflash_join_kept_spans(
     const std::vector<PFlashTokenSpan> & spans);
 int pflash_chat_compress_new_tokens() noexcept;
 
-// Recall takes only segments the new question clearly attends to: attention
+// Recall takes the segments the new question clearly attends to: attention
 // lift (mass per token relative to uniform) of at least
-// PFLASH_CHAT_RECALL_MIN_LIFT (default 8), strongest first, up to
-// PFLASH_CHAT_RECALL_TOKENS (default 2048) drafter tokens.
+// PFLASH_CHAT_RECALL_MIN_LIFT (default 2), minus what the view holds.
 double pflash_chat_recall_min_lift() noexcept;
-int pflash_chat_recall_tokens() noexcept;
 std::vector<PFlashTokenSpan> pflash_recall_by_lift(
     const std::vector<std::pair<PFlashTokenSpan, double>> & lifts,
     const std::vector<PFlashTokenSpan> & in_view,
-    double min_lift,
-    int max_tokens);
+    double min_lift);
 
 // The parts of ``spans`` that ``minus`` does not cover. Both canonical.
 std::vector<PFlashTokenSpan> pflash_subtract_token_spans(

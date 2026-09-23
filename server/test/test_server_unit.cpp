@@ -1090,16 +1090,17 @@ TEST_CASE(ServerUnitFixture, test_pflash_recall_by_lift_takes_clear_attention_on
         {{60, 70}, 25.0},
     };
     const std::vector<PFlashTokenSpan> in_view{{20, 45}};
-    auto recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 8.0, 1000);
+    auto recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 8.0);
     TEST_ASSERT(recalled.size() == 2);   // [0,10) and [45,70) merged
     TEST_ASSERT(recalled[0].begin == 0 && recalled[0].end == 10);
     TEST_ASSERT(recalled[1].begin == 45 && recalled[1].end == 70);
-    // A tight cap keeps the strongest: 40, then 25.
-    recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 8.0, 20);
-    TEST_ASSERT(recalled.size() == 2);
-    TEST_ASSERT(recalled[0].begin == 0 && recalled[1].begin == 60);
+    // A lower bar takes the background segment too.
+    recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 1.0);
+    TEST_ASSERT(recalled.size() == 2);   // [0,20) and [45,70)
+    TEST_ASSERT(recalled[0].begin == 0 && recalled[0].end == 20);
+    TEST_ASSERT(recalled[1].begin == 45 && recalled[1].end == 70);
     // Nothing clears a high bar.
-    TEST_ASSERT(http_detail::pflash_recall_by_lift(lifts, in_view, 100.0, 1000).empty());
+    TEST_ASSERT(http_detail::pflash_recall_by_lift(lifts, in_view, 100.0).empty());
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_subtract_token_spans) {
