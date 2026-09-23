@@ -412,7 +412,7 @@ cd server/build && cmake .. -DCMAKE_BUILD_TYPE=Release && cmake --build . -j$(np
 ./test_dflash daemon --target ../../models/gemma4.gguf
 
 # With speculative decode
-DFLASH_DRAFT=../../models/draft/draft-Gemma4.safetensors \
+LUCE_DRAFT=../../models/draft/draft-Gemma4.safetensors \
     ./test_dflash daemon --target ../../models/gemma4.gguf
 ```
 

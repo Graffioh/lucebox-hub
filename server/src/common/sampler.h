@@ -1,6 +1,6 @@
 // Shared CPU sampler chain used by both target arches.
 //
-// dflash::common daemon protocol embeds optional sampler params as a tail on each
+// luce::common daemon protocol embeds optional sampler params as a tail on each
 // generate command: ` samp=temp,top_p,top_k,rep_pen,seed[,freq_pen,pres_pen]`.
 // parse_sampler_token strips the tail in place and fills a SamplerCfg;
 // sample_logits applies the chain:
@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct SamplerCfg {
     float    temp       = 0.0f;
@@ -53,4 +53,4 @@ int sample_logits(const float * logits_in,
 // top_k=0, rep_pen=1, seed=0).
 bool parse_sampler_token(std::string & line, SamplerCfg & out);
 
-}  // namespace dflash::common
+}  // namespace luce::common

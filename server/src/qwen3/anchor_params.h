@@ -1,14 +1,14 @@
 // Adaptive anchor_radius / max_anchor_hits resolver — pure, no IO, testable.
 #pragma once
 
-namespace dflash::common {
+namespace luce::common {
 
 struct AnchorParams { int radius; int max_hits; };
 
 // Resolve anchor params for n_chunks (chunk_size=32).
 // Tier: <1024 -> {2,8}; <2048 -> {4,16}; >=2048 -> {8,32}.
 // env_* / legacy_* are the parsed env values; pass -1 when unset.
-// Precedence: PFLASH env >= legacy DFLASH env >= tier default.
+// Precedence: PFLASH env >= LUCE env >= tier default.
 inline AnchorParams resolve_anchor_params(
     int n_chunks,
     int env_radius, int env_hits,
@@ -28,4 +28,4 @@ inline AnchorParams resolve_anchor_params(
     return { r, h };
 }
 
-} // namespace dflash::common
+} // namespace luce::common

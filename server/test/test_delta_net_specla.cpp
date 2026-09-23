@@ -31,9 +31,9 @@
 #include <string>
 #include <vector>
 
-using dflash::common::build_delta_net_specla;
-using dflash::common::fill_specla_masks;
-using dflash::common::make_specla_hld_schedule;
+using luce::common::build_delta_net_specla;
+using luce::common::fill_specla_masks;
+using luce::common::make_specla_hld_schedule;
 
 static int failures = 0;
 
@@ -563,7 +563,7 @@ void run_factorized_conv_commit_case(ggml_backend_t backend) {
                 }
             }
         }
-        const bool committed = dflash::common::specla_commit_conv_raw_fused(
+        const bool committed = luce::common::specla_commit_conv_raw_fused(
             (float * const *)ptr_table->data, (const float *)bank->data,
             accepted, T, L, C, K, /*stream=*/nullptr);
         CHECK_MSG(committed, "factorized conv commit failed A=%d", accepted);
@@ -577,7 +577,7 @@ void run_factorized_conv_commit_case(ggml_backend_t backend) {
             }
         }
     }
-    CHECK_MSG(!dflash::common::specla_commit_conv_raw_fused(
+    CHECK_MSG(!luce::common::specla_commit_conv_raw_fused(
                   (float * const *)ptr_table->data, (const float *)bank->data,
                   T + 1, T, L, C, K, /*stream=*/nullptr),
               "factorized conv commit accepted an out-of-bounds window");
@@ -775,7 +775,7 @@ void test_production_commit_kernel(ggml_backend_t backend) {
                             state_ptr_h.size() * sizeof(int64_t));
 
     bool launched = false;
-    bool ok = dflash::common::specla_commit_fused(
+    bool ok = luce::common::specla_commit_fused(
         (float * const *)state_ptrs->data, (const float *)fk->data,
         (const float *)fv->data, (const float *)fg->data,
         (const int32_t *)idx->data, (int)accepted.size(),

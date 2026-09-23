@@ -21,7 +21,7 @@
 #include <cstdio>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 namespace flashprefill {
 
 namespace {
@@ -166,4 +166,4 @@ int flash_prefill_forward_q8(
 }
 
 } // namespace flashprefill
-} // namespace dflash::common
+} // namespace luce::common

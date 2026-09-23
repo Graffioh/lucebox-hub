@@ -9,7 +9,7 @@
 #include <numeric>
 #include <system_error>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -68,7 +68,7 @@ bool parse_count_row(const std::string & line, std::vector<uint64_t> & row) {
     };
 
     // Commas are the canonical format. Preserve whitespace-separated legacy
-    // profiles so existing DFLASH_*_HOTNESS files remain loadable.
+    // profiles so existing LUCE_*_HOTNESS files remain loadable.
     if (line.find(',') == std::string::npos) {
         size_t begin = line.find_first_not_of(" \t\r");
         while (begin != std::string::npos) {
@@ -473,4 +473,4 @@ bool MoeHybridRoutingStats::load_csv(const std::string & path,
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

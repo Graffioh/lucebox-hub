@@ -44,6 +44,7 @@
 // tensor's bytes from the mmap'd file.
 
 #include "internal.h"
+#include "qwen35_image_prompt.h"
 #include "common/derived_scalars.h"
 #include "common/gguf_inspect.h"
 #include "common/layer_split_utils.h"
@@ -66,7 +67,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 // CpuEmbedder destructor + embed() method
 CpuEmbedder::~CpuEmbedder() {
@@ -113,6 +114,18 @@ int32_t get_i32_or(const gguf_context * g, const char * key, int32_t fallback) {
     int64_t id = gguf_find_key(g, key);
     if (id < 0) return fallback;
     return gguf_get_val_i32(g, id);
+}
+
+// Id of the vocabulary entry spelled exactly `text`, or -1. Searched from the
+// end, where the added special tokens live.
+static int32_t find_token_id(const gguf_context * g, const char * text) {
+    const int64_t key = gguf_find_key(g, "tokenizer.ggml.tokens");
+    if (key < 0 || gguf_get_kv_type(g, key) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(g, key) != GGUF_TYPE_STRING) return -1;
+    for (size_t i = gguf_get_arr_n(g, key); i-- > 0;) {
+        if (std::strcmp(gguf_get_arr_str(g, key, i), text) == 0) return (int32_t) i;
+    }
+    return -1;
 }
 
 uint32_t get_u32_or(const gguf_context * g, const char * key, uint32_t fallback) {
@@ -302,7 +315,7 @@ bool verify_target_derived_scalars(const TargetWeights & out, std::string & err)
     const int64_t exp_n_embd = (int64_t)out.n_embd;
     char tag[16];
     std::snprintf(tag, sizeof(tag), "blk.%d", fa_il);
-    return dflash::common::verify_derived_scalars(
+    return luce::common::verify_derived_scalars(
         fa.wq->ne[1], fa.wk->ne[1], fa.wq->ne[0],
         exp_q_dim, exp_kv_dim, exp_n_embd,
         tag, err);
@@ -544,6 +557,7 @@ bool load_target_gguf_partial(const std::string & path,
         out.eos_chat_id = (raw_eos_chat == kEosKeyMissing) ? -1 : (int32_t)raw_eos_chat;
         std::printf("[loader] eos_id=%d eos_chat_id=%d\n", out.eos_id, out.eos_chat_id);
     }
+    out.image_pad_id = find_token_id(gctx, QWEN35_IMAGE_PAD_TOKEN);
 
     // Compute capture layer IDs: evenly spaced through the target layers.
     // step = (n_layer - 2) / (N - 1), ids[k] = 1 + k * step.
@@ -693,7 +707,7 @@ bool load_target_gguf_partial(const std::string & path,
     // places tensors itself) and only when the pair shares type/ne0 and the
     // first tensor's byte size keeps the second one aligned.
     const bool can_stack = !plan.metadata_only && !ggml_backend_buft_is_meta(buft) &&
-                           std::getenv("DFLASH_QWEN35_NO_STACK") == nullptr;
+                           std::getenv("LUCE_QWEN35_NO_STACK") == nullptr;
     if (can_stack) {
         auto find_alloc = [&](const std::string & name) -> int {
             for (size_t i = 0; i < allocs.size(); i++) {
@@ -1129,4 +1143,4 @@ void free_target_weights(TargetWeights & w) {
     w.output   = nullptr;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

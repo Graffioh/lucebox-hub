@@ -1,7 +1,7 @@
 // HIP compatibility shim for <cuda_bf16.h>
 // Used by the ggml-hip target (vendored llama.cpp) when compiling files that
 // include <cuda_bf16.h> directly (e.g. fattn-sparse.cu). Mirrors
-// dflash/hip_compat/cuda_bf16.h but with two ROCm-7.2-friendly tweaks:
+// server/hip_compat/cuda_bf16.h but with two ROCm-7.2-friendly tweaks:
 //   1. hipcc path delegates to <hip/hip_bf16.h> (native __float2bfloat16/_rn
 //      and __bfloat162float on ROCm 7.2+).  Redefining them here would
 //      conflict with the native overloads that return __hip_bfloat16.

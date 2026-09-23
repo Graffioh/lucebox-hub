@@ -40,7 +40,7 @@
 #  endif
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 namespace flashprefill {
 
 // ---- Kernel 1: compute_mean_vector ----
@@ -86,7 +86,7 @@ extern "C" int launch_compute_mean_vector_bf16(
     hipStream_t stream)
 {
     if (head_dim != 128 || block_size != 128) {
-        fprintf(stderr, "[dflash] launch_compute_mean_vector_bf16: unsupported shape "
+        fprintf(stderr, "[luce] launch_compute_mean_vector_bf16: unsupported shape "
                 "head_dim=%d block_size=%d (only 128×128 supported)\n",
                 head_dim, block_size);
         return -1;
@@ -197,7 +197,7 @@ extern "C" int launch_compute_block_score_bf16(
     hipStream_t stream)
 {
     if (head_dim != 128 || block_size != 128) {
-        fprintf(stderr, "[dflash] launch_compute_block_score_bf16: unsupported shape "
+        fprintf(stderr, "[luce] launch_compute_block_score_bf16: unsupported shape "
                 "head_dim=%d block_size=%d (only 128×128 supported)\n",
                 head_dim, block_size);
         return -1;
@@ -304,7 +304,7 @@ extern "C" int launch_compute_block_score_gemm_bf16(
     hipStream_t stream)
 {
     if (head_dim != 128) {
-        fprintf(stderr, "[dflash] launch_compute_block_score_gemm_bf16: unsupported "
+        fprintf(stderr, "[luce] launch_compute_block_score_gemm_bf16: unsupported "
                 "head_dim=%d (only 128 supported)\n", head_dim);
         return -1;
     }
@@ -684,7 +684,7 @@ extern "C" int launch_transpose_kv_bf16(
     hipStream_t stream)
 {
     if (head_dim != 128) {
-        fprintf(stderr, "[dflash] launch_transpose_kv_bf16: unsupported head_dim=%d "
+        fprintf(stderr, "[luce] launch_transpose_kv_bf16: unsupported head_dim=%d "
                 "(only 128 supported)\n", head_dim);
         return -1;
     }
@@ -778,4 +778,4 @@ extern "C" void launch_block_select(
 // launch_rms_norm_mul_w_f32 is defined in rms_norm_hip.cu (compiled for all HIP builds).
 
 } // namespace flashprefill
-} // namespace dflash::common
+} // namespace luce::common

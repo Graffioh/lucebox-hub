@@ -17,7 +17,7 @@
 #include <cstdlib>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static bool near(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) < eps; }
 

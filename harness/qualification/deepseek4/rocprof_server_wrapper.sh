@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Launch dflash_server under a delayed rocprofv3 collection window. This is a
+# Launch luce_server under a delayed rocprofv3 collection window. This is a
 # diagnostic wrapper for model-load-heavy runs where ptrace attachment is not
 # permitted by the host policy.
 

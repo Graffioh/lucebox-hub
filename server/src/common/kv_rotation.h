@@ -9,12 +9,12 @@
 // disk prefix cache folds it into the identity salt, so a cache written
 // under one rotation basis is never adopted by a session using the other.
 //
-// Unset DFLASH_KV_ROTATE resolves by type: rotation is precision-neutral for
+// Unset LUCE_KV_ROTATE resolves by type: rotation is precision-neutral for
 // f16/q8_0 caches (skipped), kept for narrower types where spreading
 // outliers buys accuracy. tq3_0 already rotates during quantization and
 // never gets the graph-level rotation.
 inline bool dflash_kv_k_rotation_enabled(const std::string & kv_k_type_name) {
-    const char * e = std::getenv("DFLASH_KV_ROTATE");
+    const char * e = std::getenv("LUCE_KV_ROTATE");
     const int env_force = (!e || e[0] == '\0')
                               ? -1
                               : ((e[0] == '0' && e[1] == '\0') ? 0 : 1);

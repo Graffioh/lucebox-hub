@@ -20,7 +20,7 @@
 #include <cmath>
 #include <cstring>
 
-namespace dflash::common {
+namespace luce::common {
 
 SpecLAHLDSchedule make_specla_hld_schedule(const int32_t * parents,
                                            int n,
@@ -272,4 +272,4 @@ void fill_specla_masks(const int32_t * parents, int n,
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

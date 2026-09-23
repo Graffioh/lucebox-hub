@@ -18,7 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -124,7 +124,7 @@ bool compute_target_split_projection(
         sg.ctx, act, hidden, n_tokens, act->nb[1],
         (size_t)token_offset * act->nb[1]);
     ggml_tensor * normed = ggml_rms_norm(
-        sg.ctx, rms_norm_input_f32(sg.ctx, act_view), DFLASH27B_RMS_EPS);
+        sg.ctx, rms_norm_input_f32(sg.ctx, act_view), LUCE_RMS_EPS);
     normed = ggml_mul(sg.ctx, normed, graph_tensor_f32(sg.ctx, w.out_norm));
     ggml_tensor * logits = ggml_mul_mat(sg.ctx, w.output, normed);
     ggml_set_name(logits, "target_split_logits");
@@ -824,4 +824,4 @@ void free_qwen35_layer_split_shards(std::vector<Qwen35LayerSplitShard> & shards)
     shards.clear();
 }
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Configuration for the stream engine.
 struct MoeStreamConfig {
@@ -109,4 +109,4 @@ bool eval_moe_cold_experts_streaming(
     std::vector<float> &            out,
     std::string *                   err = nullptr);
 
-}  // namespace dflash::common
+}  // namespace luce::common

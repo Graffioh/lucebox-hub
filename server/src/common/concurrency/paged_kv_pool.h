@@ -19,7 +19,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Caller-chosen identifier for one inference request (one KV sequence).
 using PagedKvRequestId = uint64_t;
@@ -146,6 +146,11 @@ public:
     PagedKvStatus rollback_append(PagedKvSequenceHandle handle,
                                   uint32_t token_count);
 
+    // Return every block and reset the stored length, retaining the sequence
+    // identity/slot. Used only after an engine has preserved the KV payload.
+    // The same handle may then reserve/append remapped pages for restoration.
+    PagedKvStatus clear(PagedKvSequenceHandle handle);
+
     // Return the sequence's blocks and slot to the pool; the handle (and
     // any copy of it) becomes stale.
     PagedKvStatus release(PagedKvSequenceHandle handle);
@@ -221,4 +226,4 @@ private:
     std::unordered_map<PagedKvRequestId, uint32_t> request_to_slot_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

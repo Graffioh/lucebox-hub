@@ -17,7 +17,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen35LayerSplitDaemonArgs {
     const char * target_path = nullptr;
@@ -35,4 +35,4 @@ struct Qwen35LayerSplitDaemonArgs {
 // Will be fully implemented here once helpers are extracted.
 int run_qwen35_layer_split_daemon(const Qwen35LayerSplitDaemonArgs & args);
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -14,7 +14,7 @@
 // Token file format: little-endian u32 count, then count int32 token IDs.
 
 #include "qwen3_drafter.h"
-#include "dflash27b.h"
+#include "luce.h"
 
 #include <chrono>
 #include <cstdio>
@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
@@ -65,7 +65,7 @@ int main(int argc, char ** argv) {
     DrafterContext ctx;
     auto t_load0 = std::chrono::steady_clock::now();
     if (!load_drafter(gguf, /*gpu_layers=*/-1, ctx)) {
-        std::fprintf(stderr, "load_drafter failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load_drafter failed: %s\n", luce_last_error());
         return 1;
     }
     auto t_load1 = std::chrono::steady_clock::now();
@@ -95,7 +95,7 @@ int main(int argc, char ** argv) {
 
     if (out.empty()) {
         std::fprintf(stderr, "drafter_score_and_compress returned empty: %s\n",
-            dflash27b_last_error());
+            luce_last_error());
         free_drafter(ctx);
         return 1;
     }

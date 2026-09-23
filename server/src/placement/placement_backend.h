@@ -4,7 +4,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 enum class PlacementBackend {
     Auto,
@@ -39,11 +39,11 @@ inline bool parse_placement_backend(const std::string & value,
 }
 
 inline PlacementBackend compiled_placement_backend() {
-#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     return PlacementBackend::Hip;
 #else
     return PlacementBackend::Cuda;
 #endif
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

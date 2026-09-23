@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstddef>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 ggml_tensor * build_causal_conv1d(
@@ -246,4 +246,4 @@ ggml_tensor * build_bailingmoe3_kda_block(
     return ggml_mul_mat(ctx, L.wo, output);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

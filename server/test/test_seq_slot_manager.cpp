@@ -8,10 +8,11 @@
 #include "qwen35/concurrency/qwen35_slot_manager.h"
 #include "host_check.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static int g_checks = 0;
 
@@ -39,6 +40,58 @@ static bool is_busy(const SeqEngine::AdmitResult & result) {
 }
 
 int main() {
+    // Destroying the manager retires any requests still active in its pool.
+    {
+        PagedKvPool pool(/*physical_block_count=*/4, /*max_sequences=*/2,
+                         /*block_size=*/16);
+        {
+            Qwen35SlotManager mgr(pool, /*max_ctx=*/64);
+            auto active = admit(mgr, 1, prompt_tokens(20), greedy_sampler());
+            CHECK(is_admitted(active));
+            CHECK(pool.active_sequence_count() == 1);
+            CHECK(pool.free_block_count() == 1);
+        }
+        CHECK(pool.active_sequence_count() == 0);
+        CHECK(pool.free_block_count() == 4);
+    }
+
+    // A copied prefix checkpoint resumes into freshly-owned pages. The
+    // checkpoint never lends its original physical blocks to the new request:
+    // the slot consumes its own admission reservation, exposes the resulting
+    // block-table delta, and starts the remaining prefill at the restored
+    // logical position.
+    {
+        PagedKvPool pool(/*physical_block_count=*/8, /*max_sequences=*/2,
+                         /*block_size=*/16);
+        Qwen35SlotManager mgr(pool, /*max_ctx=*/64);
+        const std::vector<int32_t> prompt = prompt_tokens(40);
+
+        auto first = admit(mgr, 1, prompt, greedy_sampler());
+        CHECK(is_admitted(first));
+        auto original = mgr.append_prefill(first.slot, 24);
+        CHECK(original.ok && original.rows.front() == 0 &&
+              original.rows.back() == 23);
+
+        auto restored = admit(mgr, 2, prompt, greedy_sampler());
+        CHECK(is_admitted(restored));
+        auto seeded = mgr.seed_restored_prefix(restored.slot, 24);
+        CHECK(seeded.ok && seeded.rows.size() == 24);
+        for (int64_t row : seeded.rows) {
+            CHECK(std::find(original.rows.begin(), original.rows.end(), row) ==
+                  original.rows.end());
+        }
+        CHECK(mgr.slot(restored.slot).cur_pos == 24);
+        CHECK(mgr.slot(restored.slot).prefilling());
+        CHECK(seeded.first_new_block == 0 && seeded.new_blocks.size() == 2);
+        mgr.retire(first.slot);
+
+        auto suffix = mgr.append_prefill(restored.slot, 16);
+        CHECK(suffix.ok && suffix.rows.size() == 16);
+        CHECK(mgr.slot(restored.slot).cur_pos == 40);
+        mgr.commit_prefill(restored.slot);
+        CHECK(mgr.slot(restored.slot).decoding());
+    }
+
     // 8 blocks x 16 tokens = 128 pool tokens, 2 slots, per-seq max_ctx 64.
     {
         PagedKvPool pool(/*physical_block_count=*/8, /*max_sequences=*/2,
@@ -177,7 +230,7 @@ int main() {
         PagedKvPool pool(4, 2, /*block_size=*/16);
         Qwen35SlotManager mgr(pool, /*max_ctx=*/128);
         auto never = admit(mgr, 1, prompt_tokens(100), greedy_sampler());
-        CHECK(!is_admitted(never) && !is_busy(never));   // prompt 100 > pool 64
+        CHECK(never.status == SeqEngine::AdmitResult::Status::capacity_exceeded); // prompt 100 > pool 64
         CHECK(pool.active_sequence_count() == 0);
 
         // Impossibility wins over temporary slot pressure: do not queue an
@@ -483,6 +536,17 @@ int main() {
         auto c = admit(mgr, 3, prompt_tokens(4), cfg);
         CHECK(is_admitted(c));
         CHECK(mgr.slot(0).rng() != first);
+
+        // Zero is a valid deterministic seed, not a request for entropy.
+        mgr.retire(0);
+        cfg.seed = 0;
+        auto zero_a = admit(mgr, 4, prompt_tokens(4), cfg);
+        CHECK(is_admitted(zero_a));
+        const uint64_t zero_first = mgr.slot(0).rng();
+        mgr.retire(0);
+        auto zero_b = admit(mgr, 5, prompt_tokens(4), cfg);
+        CHECK(is_admitted(zero_b));
+        CHECK(mgr.slot(0).rng() == zero_first);
     }
 
     // A greedy sampler never draws, so its seed is irrelevant and admission
@@ -513,6 +577,147 @@ int main() {
         CHECK(mgr.has_prefill_prompt_at_least(768));
         mgr.retire(long_req.slot);
         CHECK(!mgr.has_prefill_prompt_at_least(768));
+    }
+
+    // A decode round either reserves every lane or moves no capacity. This
+    // protects the pre-compute suspension boundary, including chain growth.
+    {
+        PagedKvPool pool(6, 2, 4);
+        Qwen35SlotManager mgr(pool, 32);
+        auto a = admit(mgr, 1, prompt_tokens(4), greedy_sampler());
+        auto b = admit(mgr, 2, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(a) && is_admitted(b));
+        CHECK(mgr.append_prefill(a.slot, 4).ok);
+        CHECK(mgr.append_prefill(b.slot, 4).ok);
+        mgr.commit_prefill(a.slot);
+        mgr.commit_prefill(b.slot);
+        CHECK(pool.free_block_count() == 2);
+        CHECK(!mgr.reserve_decode({9, 9})); // each would need two more pages
+        CHECK(pool.free_block_count() == 2);
+        CHECK(mgr.slot(a.slot).cur_pos == 4 && mgr.slot(b.slot).cur_pos == 4);
+        CHECK(mgr.reserve_decode({5, 5}));
+        CHECK(pool.free_block_count() == 0);
+        const auto saved_rng = mgr.slot(b.slot).rng;
+        CHECK(mgr.detach_kv(b.slot));
+        CHECK(pool.free_block_count() == 3 && pool.active_sequence_count() == 2);
+        CHECK(mgr.slot(b.slot).suspended());
+        CHECK(!mgr.reserve_decode({1, 1})); // suspended rows cannot execute
+        CHECK(mgr.reserve_decode({1, 0}));
+        CHECK(mgr.attach_kv(b.slot));
+        CHECK(mgr.slot(b.slot).decoding() && mgr.slot(b.slot).cur_pos == 4);
+        CHECK(mgr.slot(b.slot).rng == saved_rng);
+    }
+
+    // Eviction without a checkpoint parks the slot like a suspension but
+    // frees every block; resume replays the folded history through prefill.
+    {
+        PagedKvPool pool(6, 2, 4);
+        Qwen35SlotManager mgr(pool, 32);
+        auto a = admit(mgr, 1, prompt_tokens(4), greedy_sampler());
+        auto b = admit(mgr, 2, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(a) && is_admitted(b));
+        CHECK(mgr.append_prefill(a.slot, 4).ok);
+        CHECK(mgr.append_prefill(b.slot, 4).ok);
+        mgr.commit_prefill(a.slot);
+        mgr.commit_prefill(b.slot);
+        CHECK(mgr.append_token(b.slot, 41).ok);
+        mgr.commit_step(b.slot);
+        // Preserve an advanced RNG, not merely its initial seed.
+        mgr.slot(b.slot).rng.discard(17);
+        const auto saved_rng = mgr.slot(b.slot).rng;
+
+        // A staged step boundary forbids eviction, as suspension does.
+        CHECK(mgr.append_token(a.slot, 7).ok);
+        CHECK(!mgr.evict_for_recompute(a.slot, -1));
+        CHECK(mgr.rollback_step(a.slot));
+
+        CHECK(mgr.evict_for_recompute(b.slot, /*pending_token=*/42));
+        CHECK(mgr.slot(b.slot).recomputing() && mgr.slot(b.slot).parked());
+        CHECK(pool.free_block_count() == 4 && pool.active_sequence_count() == 2);
+        CHECK(mgr.slot(b.slot).prompt_len == 6 && mgr.slot(b.slot).cur_pos == 0);
+        CHECK((mgr.slot(b.slot).sample_history ==
+               std::vector<int32_t>{1, 1, 1, 1, 41, 42}));
+        CHECK(mgr.slot(b.slot).rng == saved_rng);
+        CHECK(!mgr.evict_for_recompute(b.slot, -1)); // already parked
+
+        // Parked slots keep admission exclusion and stay out of decode.
+        CHECK(is_busy(admit(mgr, 3, prompt_tokens(4), greedy_sampler())));
+        CHECK(mgr.reserve_decode({1, 0}));
+        CHECK(!mgr.reserve_decode({1, 1}));
+
+        // Resume needs the folded history plus one growth block per resident:
+        // 3 blocks (10 tokens) + 1 (A) + 1 (itself) > 4 free.
+        CHECK(!mgr.kv_restore_feasible(b.slot));
+        mgr.retire(a.slot);
+        CHECK(mgr.kv_restore_feasible(b.slot));
+        CHECK(mgr.resume_recompute(b.slot));
+        CHECK(mgr.slot(b.slot).prefilling());
+        CHECK(mgr.append_prefill(b.slot, 6).ok);
+        mgr.commit_prefill(b.slot);
+        CHECK(mgr.slot(b.slot).decoding() && mgr.slot(b.slot).cur_pos == 6);
+        CHECK(mgr.slot(b.slot).generated_tokens() == 2);
+        CHECK(mgr.append_token(b.slot, 50).ok);
+        mgr.commit_step(b.slot);
+        CHECK(mgr.slot(b.slot).generated_tokens() == 3);
+        // A second replay must still count from the original prompt, including
+        // the newly folded pending token, even while prefill is incomplete.
+        CHECK(mgr.evict_for_recompute(b.slot, 51));
+        CHECK(mgr.slot(b.slot).generated_tokens() == 4);
+        CHECK(mgr.resume_recompute(b.slot));
+        CHECK(mgr.append_prefill(b.slot, 4).ok);
+        CHECK(mgr.slot(b.slot).generated_tokens() == 4);
+        CHECK(mgr.append_prefill(b.slot, 4).ok);
+        mgr.commit_prefill(b.slot);
+        CHECK(mgr.slot(b.slot).generated_tokens() == 4);
+        CHECK(mgr.slot(b.slot).rng == saved_rng);
+        CHECK((mgr.slot(b.slot).sample_history ==
+               std::vector<int32_t>{1, 1, 1, 1, 41, 42, 50, 51}));
+        mgr.retire(b.slot);
+        auto c = admit(mgr, 3, prompt_tokens(2), greedy_sampler());
+        CHECK(is_admitted(c));
+        CHECK(mgr.slot(c.slot).generated_tokens() == 0);
+        CHECK(mgr.append_prefill(c.slot, 2).ok);
+        mgr.commit_prefill(c.slot);
+        CHECK(mgr.append_token(c.slot, 60).ok);
+        mgr.commit_step(c.slot);
+        CHECK(mgr.slot(c.slot).generated_tokens() == 1);
+    }
+
+    // A checkpointed suspension still converts to recompute (e.g. after a
+    // failed copy-back): the history fold is identical.
+    {
+        PagedKvPool pool(6, 2, 4);
+        Qwen35SlotManager mgr(pool, 32);
+        auto a = admit(mgr, 1, prompt_tokens(4), greedy_sampler());
+        CHECK(is_admitted(a));
+        CHECK(mgr.append_prefill(a.slot, 4).ok);
+        mgr.commit_prefill(a.slot);
+        CHECK(mgr.detach_kv(a.slot));
+        CHECK(mgr.slot(a.slot).suspended());
+        CHECK(mgr.evict_for_recompute(a.slot, 42));
+        CHECK(mgr.slot(a.slot).recomputing());
+        CHECK(mgr.slot(a.slot).prompt_len == 5);
+        CHECK(mgr.resume_recompute(a.slot));
+        CHECK(mgr.append_prefill(a.slot, 5).ok);
+        mgr.commit_prefill(a.slot);
+        CHECK(mgr.slot(a.slot).decoding() && mgr.slot(a.slot).cur_pos == 5);
+        CHECK(mgr.slot(a.slot).generated_tokens() == 1);
+    }
+
+    // A history that can never fit the pool alone refuses eviction, so the
+    // caller terminates it instead of parking a request that cannot resume.
+    {
+        PagedKvPool pool(8, 1, 4);
+        Qwen35SlotManager mgr(pool, 32);
+        auto a = admit(mgr, 1, prompt_tokens(32), greedy_sampler());
+        CHECK(is_admitted(a));
+        CHECK(mgr.append_prefill(a.slot, 32).ok);
+        mgr.commit_prefill(a.slot);
+        CHECK(!mgr.evict_for_recompute(a.slot, 42)); // 33 > max_ctx
+        CHECK(mgr.evict_for_recompute(a.slot, -1));  // exactly max_ctx
+        CHECK(mgr.slot(a.slot).recomputing());
+        CHECK(mgr.resume_recompute(a.slot));         // headroom clamps to 32
+        CHECK(mgr.slot(a.slot).prefilling());
     }
 
     std::printf("OK test_seq_slot_manager (%d checks)\n", g_checks);

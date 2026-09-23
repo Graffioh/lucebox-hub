@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 int failures = 0;

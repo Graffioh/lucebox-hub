@@ -18,7 +18,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct DeltaNetSpecLAResult {
     ggml_tensor * output;  // [S_v, H_v, n_tokens, 1] — same layout as the fused op's output slice
@@ -72,4 +72,4 @@ DeltaNetSpecLAResult build_delta_net_specla(
 void fill_specla_masks(const int32_t * parents, int n,
                        float * m_strict, float * m_incl, float * m_eye);
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -20,7 +20,7 @@ static bool run_allreduce_test(int first, int second) {
     if (first < 0 || second < 0 || first >= device_count ||
         second >= device_count || first == second) {
         std::fprintf(stderr,
-            "DFLASH_TP_TEST_DEVICES must name two distinct visible CUDA devices "
+            "LUCE_TP_TEST_DEVICES must name two distinct visible CUDA devices "
             "(got %d,%d; visible=%d)\n",
             first, second, device_count);
         return false;
@@ -142,16 +142,16 @@ TEST_CASE(CudaCommApiFixture, selected_device_nccl_allreduce) {
         SKIP("CUDA device unavailable");
     }
 
-    const char * selected = std::getenv("DFLASH_TP_TEST_DEVICES");
+    const char * selected = std::getenv("LUCE_TP_TEST_DEVICES");
     if (!selected || !selected[0]) {
-        SKIP("DFLASH_TP_TEST_DEVICES is unset");
+        SKIP("LUCE_TP_TEST_DEVICES is unset");
     }
 
     int first = -1;
     int second = -1;
     if (!parse_test_devices(selected, first, second)) {
         std::fprintf(stderr,
-            "bad DFLASH_TP_TEST_DEVICES=%s (expected e.g. 1,2)\n", selected);
+            "bad LUCE_TP_TEST_DEVICES=%s (expected e.g. 1,2)\n", selected);
         REQUIRE_TRUE(false);
     }
     REQUIRE_TRUE(run_allreduce_test(first, second));

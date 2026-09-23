@@ -4,7 +4,7 @@
 #include <optional>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Host-only description of the selector tensors. Keeping validation in terms
 // of dimensions makes it usable both while GGUF tensor descriptors are being
@@ -108,4 +108,4 @@ inline bool validate_dflash2_selector_layout(
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

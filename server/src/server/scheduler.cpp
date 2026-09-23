@@ -4,20 +4,23 @@
 // Split from http_server.cpp: this TU owns non-blocking admission (one
 // prefill chunk per engine step, fused with the live decode batch), FIFO
 // pool-full deferrals, per-slot streaming through ClientSendBuffer, and
-// retirement. SSE emission, error-close chunks, and HTTP response
+// retirement. SSE emission, terminal errors, and HTTP response
 // formatting are shared with the classic worker so both paths emit
 // matching wire formats.
 
 #include "http_server.h"
 #include "common/concurrency/seq_engine.h"
+#include "parallel_prefix_txn.h"
+#include "response_error.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <thread>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -25,6 +28,9 @@ namespace {
 // engine slot id returned from admit(), so scheduler and engine agree on
 // which engine-owned state record a request owns. This remains the one
 // external phase: sockets stay here, prompt/KV/sampler/progress stay in Qwen.
+using PrefixCaptureTxn = BasicPrefixCaptureTxn<
+    PrefixCache::InlineReservation, SeqEngine>;
+
 struct SchedSlot {
     ServerJob * job = nullptr;
     SocketHandle fd = kInvalidSocket;
@@ -34,21 +40,22 @@ struct SchedSlot {
     std::chrono::steady_clock::time_point started_at{};
     std::chrono::steady_clock::time_point decode_started_at{};
     double prefill_s = 0.0;
+    int cached_prefix_tokens = 0;
+    PrefixCaptureTxn cache_capture;
     int n_gen_cap = 0;
     int completion_tokens = 0;
     bool client_disconnected = false;
-    bool failed = false;
-    std::string error;
+    std::optional<ResponseError> error;
     bool finished = false;
     std::vector<int32_t> gen_tokens;   // committed + pending, in order
     int32_t pending_tok = -1;          // sampled, fed back next step
     // Buffered client output (see client_send_buffer.h): chunks append here and
     // a non-blocking flush runs every scheduler iteration, so one slow
     // reader can never head-of-line-block the shared decode loop.
-    dflash::common::ClientSendBuffer send_buffer;
+    luce::common::ClientSendBuffer send_buffer;
     // Thinking-budget force-close, applied scheduler-side before the token
     // is fed back (mirrors do_ar_decode's maybe_force_close).
-    dflash::common::BudgetHook hook;
+    luce::common::BudgetHook hook;
     bool hook_started = false;
     int  hook_pos = 0;
     bool budget_forced_close = false;
@@ -80,11 +87,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // Degenerate-run guard shared with do_ar_decode: explicit env override,
     // else 32 when the min-tokens floor is active, else off.
     static const int repeat_guard = [] {
-        if (const char * s = std::getenv("DFLASH_DEGENERATE_RUN_TOKENS")) {
+        if (const char * s = std::getenv("LUCE_DEGENERATE_RUN_TOKENS")) {
             const int v = std::atoi(s);
             if (v >= 0) return v;
         }
-        const char * f = std::getenv("DFLASH_MIN_TOKENS");
+        const char * f = std::getenv("LUCE_MIN_TOKENS");
         return (f && std::atoi(f) > 0) ? 32 : 0;
     }();
 
@@ -92,19 +99,37 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // Replaces the O(n_slots) scan that was called 2-3× per iteration.
     int live_slots = 0;
 
+    // Capture tickets are never reused during this scheduler run.
+    uint64_t next_prefix_capture_id = 1;
+
     int published_live_count = -1;
-    int published_prefill_count = -1;
+    int published_prefill_count = -1, published_parked_count = -1;
+    size_t published_offloaded_bytes = 0;
+    const size_t offload_budget = config_.decode_kv_offload_bytes;
+    auto parked = [&](int slot) {
+        return offload_budget && engine.kv_offload_state(slot).parked;
+    };
     auto publish_live_count = [&]() {
-        int prefilling = 0;
-        for (const SchedSlot & s : slots) {
-            if (s.job && s.prefilling) ++prefilling;
+        int prefilling = 0, parked_count = 0;
+        size_t bytes = 0;
+        for (int i = 0; i < n_slots; ++i) {
+            const SchedSlot & s = slots[(size_t)i];
+            if (!s.job) continue;
+            const auto state = offload_budget ? engine.kv_offload_state(i)
+                                             : SeqEngine::KvOffloadState{};
+            parked_count += state.parked;
+            bytes += state.bytes;
+            if (s.prefilling && !state.parked) ++prefilling;
         }
         if (live_slots == published_live_count &&
-            prefilling == published_prefill_count) return;
+            prefilling == published_prefill_count &&
+            parked_count == published_parked_count && bytes == published_offloaded_bytes) return;
         published_live_count = live_slots;
         published_prefill_count = prefilling;
+        published_parked_count = parked_count;
+        published_offloaded_bytes = bytes;
         if (live_slots > 0) {
-            status_.set_concurrent_requests(live_slots, prefilling);
+            status_.set_concurrent_requests(live_slots, prefilling, parked_count, bytes);
         } else status_.set_idle();
         broadcast_status();
     };
@@ -236,10 +261,11 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         }
     };
 
-    auto retire_slot = [&](int idx, bool backend_ok) {
+    auto retire_slot = [&](int idx) {
         SchedSlot & s = slots[(size_t)idx];
         if (!s.job) return;
         const ParsedRequest & req = s.job->req;
+        s.cache_capture.cancel();
         // Stop monitor-thread heartbeats before queuing terminal frames.
         stop_job_stream(s.job, &s.send_buffer);
         const double decode_s = std::chrono::duration<double>(
@@ -248,37 +274,38 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         GenTimings gen_timings{
             s.prefill_s,
             decode_s,
-            /*cache_hit=*/false,
-            /*cached_prefix_tokens=*/0,
-            /*prefilled_tokens=*/prompt_tokens,
+            /*cache_hit=*/s.cached_prefix_tokens > 0,
+            /*cached_prefix_tokens=*/s.cached_prefix_tokens,
+            /*prefilled_tokens=*/prompt_tokens - s.cached_prefix_tokens,
             /*effective_prompt_tokens=*/prompt_tokens,
         };
 
-        if (backend_ok && !s.failed) {
+        if (!s.error) {
             PerfRecord perf;
             perf.prompt_tokens = (int)req.prompt_tokens.size();
             perf.completion_tokens = s.completion_tokens;
+            const int computed_prompt_tokens =
+                prompt_tokens - s.cached_prefix_tokens;
             perf.prefill_tok_s = s.prefill_s > 0.0
-                ? (double)req.prompt_tokens.size() / s.prefill_s : 0.0;
+                ? (double)computed_prompt_tokens / s.prefill_s : 0.0;
             perf.decode_tok_s = decode_s > 0.0
                 ? (double)s.completion_tokens / decode_s : 0.0;
             status_.record_perf(perf);
         }
 
-        if (s.failed || !backend_ok) {
-            const std::string message =
-                s.error.empty() ? "generation failed" : s.error;
+        if (s.error) {
             if (!s.client_disconnected) {
                 if (req.stream) {
                     for (const std::string & chunk :
-                         sse_error_close_chunks(message)) {
+                         s.emitter->emit_error(*s.error)) {
                         s.send_buffer.append(chunk);
                     }
                 } else {
-                    json err = {{"error", {{"message", message},
-                                           {"type", "invalid_request_error"}}}};
+                    const json body = build_error_response(
+                        req.format, *s.error, req.response_id);
                     s.send_buffer.append(format_http_response(
-                        500, "application/json", err.dump() + "\n"));
+                        response_error_http_status(*s.error),
+                        "application/json", body.dump() + "\n"));
                 }
             }
         } else if (req.stream && !s.client_disconnected) {
@@ -305,7 +332,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             "[server] chat DONE %s ok=%s in=%zu out=%d %.1fs %.1f tok/s "
             "finish=%s slot=%d prefill=%.1fs decode=%.1fs(%.1ftok/s) parallel\n",
             req.response_id.c_str(),
-            (!s.failed && backend_ok) ? "true" : "false",
+            s.error ? "false" : "true",
             req.prompt_tokens.size(), out_tokens, elapsed_s,
             elapsed_s > 0.0 ? out_tokens / elapsed_s : 0.0,
             s.client_disconnected ? "client_disconnect"
@@ -417,22 +444,194 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 req.max_output, live_slots);
         }
 
-        // Commit the SSE preamble BEFORE the (multi-second) prefill so
-        // streaming clients see the 200 immediately — and so a dead client
-        // is detected before its prefill is paid for. The socket is fresh
-        // (nothing sent yet), so these few hundred bytes cannot stall.
-        // sse_started survives a busy deferral: retries do not resend.
-        if (!job->emitter) {
-            job->emitter = std::make_unique<SseEmitter>(
-                req.format, req.response_id, req.model,
-                (int)req.prompt_tokens.size(), req.tools, &tool_memory_,
-                req.stop_sequences, req.started_in_thinking);
+        // PrefixCache owns token policy; SeqEngine owns checkpoint payloads.
+        // Unsupported engines never receive a plan, so cold fallback cannot
+        // invalidate a valid entry.
+        PrefixStorePlan prefix_plan;
+        PrefixCaptureTxn prepared_capture;
+        PrefixCache::InlineReservation capture_reservation;
+        int restore_policy_slot = -1;
+        const bool prefix_supported =
+            engine.supports_prefix_store() && !prefix_cache_.disabled();
+        if (prefix_supported) {
+            const auto hit = prefix_cache_.lookup_candidate(
+                req.prompt_tokens,
+                (int)req.prompt_tokens.size() - 1);
+            if (hit.first >= 0 && hit.second > 0 &&
+                hit.second < (int)req.prompt_tokens.size()) {
+                restore_policy_slot = hit.first;
+                prefix_plan.restore = {
+                    (uint64_t)hit.first + 1, hit.second};
+            }
+
+            // The restore source is never the capture destination: the new
+            // checkpoint lands in a different slot so the restore point can
+            // slide forward past the deepest slot (same rule as the classic
+            // worker's restore_source_slot).
+            capture_reservation = prefix_cache_.reserve_inline_snap(
+                req.prompt_tokens,
+                prefix_plan.restore.valid()
+                    ? prefix_plan.restore.tokens : 0,
+                /*prefer_tools_boundary=*/!req.tools.empty(),
+                req.pin_end_token,
+                restore_policy_slot,
+                [&engine](int target_cut) {
+                    return engine.estimate_prefix_store_bytes(target_cut);
+                });
+            if (capture_reservation.active()) {
+                const uint64_t capture_id = next_prefix_capture_id++;
+                if (next_prefix_capture_id == 0)
+                    next_prefix_capture_id = 1;
+                prefix_plan.capture.id = capture_id;
+                prefix_plan.capture.checkpoint = {
+                    (uint64_t)capture_reservation.slot() + 1,
+                    capture_reservation.target_cut()};
+                if (prefix_plan.restore.valid() &&
+                    prefix_plan.capture.checkpoint == prefix_plan.restore) {
+                    capture_reservation.cancel();
+                    prefix_plan.capture = {};
+                }
+            }
         }
-        if (req.stream && !job->sse_started) {
-            job->sse_started = true;
+        if (prefix_plan.capture.valid()) {
+            prepared_capture = PrefixCaptureTxn(
+                std::move(capture_reservation), engine,
+                prefix_plan.capture);
+        }
+
+        // Admission only claims the slot and queues the prompt. Prefill
+        // advances one chunk per engine step alongside live decode.
+        const PrefixStorePlan requested_plan = prefix_plan;
+        auto ar = prefix_supported
+            ? engine.admit_with_prefix(
+                  next_request_id, req.prompt_tokens, req.sampler,
+                  requested_plan)
+            : engine.admit(
+                  next_request_id, req.prompt_tokens, req.sampler);
+
+        std::string prefix_protocol_error;
+        const PrefixStoreAdmission & prefix = ar.prefix_store;
+        if (prefix.restore_attempted) {
+            prefix_cache_.record_restore_attempt(
+                prefix.restore_elapsed_us, prefix.restored.valid());
+        }
+        if (prefix.malformed_restore_state()) {
+            prefix_protocol_error =
+                "engine returned malformed prefix restore state";
+            // A malformed outcome does not tell us whether the engine-owned
+            // payload is still usable. Drop both sides of the requested
+            // checkpoint so a later lookup cannot retry stale metadata.
+            prepared_capture.cancel();
+            if (requested_plan.restore.valid() && restore_policy_slot >= 0) {
+                engine.discard_prefix_store(requested_plan.restore);
+                prefix_cache_.invalidate_inline_snap(restore_policy_slot);
+            }
+        }
+        if (prefix.invalidated.valid()) {
+            if (prefix.invalidated != requested_plan.restore ||
+                restore_policy_slot < 0) {
+                prefix_protocol_error =
+                    "engine invalidated an unrequested prefix checkpoint";
+            } else {
+                // Cancel this admission's reservation before removing the
+                // stale restore metadata. The invalidation itself must not
+                // clear a capture reservation owned by another live request.
+                // Qwen already discarded the engine-owned payload.
+                prepared_capture.cancel();
+                prefix_cache_.invalidate_inline_snap(restore_policy_slot);
+            }
+        }
+        if (prefix.restored.valid() &&
+            prefix.restored != requested_plan.restore) {
+            engine.discard_prefix_store(prefix.restored);
+            prefix_protocol_error =
+                "engine restored an unrequested prefix checkpoint";
+        }
+        if (prefix.restored.valid() && prefix.invalidated.valid()) {
+            prefix_protocol_error =
+                "engine both restored and invalidated one checkpoint";
+        }
+        if (prefix.capture.valid() &&
+            prefix.capture != requested_plan.capture) {
+            prefix_protocol_error =
+                "engine accepted an unrequested prefix capture";
+        }
+        if (ar.status != SeqEngine::AdmitResult::Status::admitted &&
+            (prefix.restored.valid() || prefix.capture.valid())) {
+            prefix_protocol_error =
+                "failed admission returned accepted prefix state";
+        }
+        if (!prefix_protocol_error.empty()) {
+            prepared_capture.cancel();
+            if (ar.status == SeqEngine::AdmitResult::Status::admitted)
+                engine.retire(ar.slot);
+            ar.status = SeqEngine::AdmitResult::Status::failed;
+            ar.error = "prefix admission protocol violation: " +
+                prefix_protocol_error;
+        } else if (prefix.capture != requested_plan.capture) {
+            // Rejected capture: no payload was touched, so preserve any
+            // incumbent selected by the cache's transactional eviction.
+            prepared_capture.cancel();
+        }
+
+
+        // Invalid restore cleanup deliberately precedes the status handling
+        // below. Every non-admitted outcome releases the untouched capture
+        // reservation so the next request can plan its own.
+        if (ar.status == SeqEngine::AdmitResult::Status::capacity_exceeded) {
+            prepared_capture.cancel();
+            if (job->report_admission) {
+                job->admission = RoutingAdmission::unfit;
+            } else {
+                const ResponseError error = ResponseError::invalid_request(
+                    "admission_failed", "admission failed: " + ar.error);
+                const json body = build_error_response(
+                    req.format, error, req.response_id);
+                send_response(job->fd, response_error_http_status(error),
+                              "application/json", body.dump() + "\n");
+            }
+            finish_job(job);
+            return AdmissionDisposition::Retired;
+        }
+        if (ar.status == SeqEngine::AdmitResult::Status::busy) {
+            prepared_capture.cancel();
+            if (job->report_admission) {
+                job->admission = RoutingAdmission::busy;
+                finish_job(job);
+                return AdmissionDisposition::Retired;
+            }
+            return AdmissionDisposition::Deferred;
+        }
+        if (ar.status != SeqEngine::AdmitResult::Status::admitted) {
+            prepared_capture.cancel();
+            std::fprintf(stderr, "[server] admit failed: %s\n",
+                         ar.error.c_str());
+            const ResponseError error = ResponseError::internal(
+                "admission_failed", "admission failed: " + ar.error);
+            const json body = build_error_response(
+                req.format, error, req.response_id);
+            send_response(job->fd, response_error_http_status(error),
+                          "application/json", body.dump() + "\n");
+            finish_job(job);
+            return AdmissionDisposition::Retired;
+        }
+        next_request_id++;
+        if (prefix.restored.valid() && restore_policy_slot >= 0) {
+            prefix_cache_.record_inline_hit(
+                restore_policy_slot, prefix.restored.tokens,
+                req.prompt_tokens.size());
+        }
+
+        // Commit response bytes only after admission. A busy routed request
+        // can still try another model; no tokenizer/model identity is on wire.
+        auto emitter = std::make_unique<SseEmitter>(
+            req.format, req.response_id, req.model,
+            (int)req.prompt_tokens.size(), req.tools, &tool_memory_,
+            req.stop_sequences, req.started_in_thinking);
+        if (req.stream) {
             bool ok = send_sse_headers(job);
             if (ok) {
-                for (const auto & c : job->emitter->emit_start()) {
+                for (const auto & c : emitter->emit_start()) {
                     if (!send_job_bytes(job, c.data(), c.size())) {
                         ok = false;
                         break;
@@ -440,36 +639,14 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 }
             }
             if (!ok) {
+                prepared_capture.cancel();
+                engine.retire(ar.slot);
                 finish_job(job);
                 return AdmissionDisposition::Retired;
             }
             start_job_stream(job);
         }
 
-        // Admission only claims the slot and queues the prompt. Prefill
-        // advances one chunk per engine step alongside live decode.
-        auto ar = engine.admit(next_request_id, req.prompt_tokens,
-                               req.sampler);
-        if (ar.status == SeqEngine::AdmitResult::Status::busy)
-            return AdmissionDisposition::Deferred;
-        if (ar.status != SeqEngine::AdmitResult::Status::admitted) {
-            std::fprintf(stderr, "[server] admit failed: %s\n",
-                         ar.error.c_str());
-            if (req.stream && job->sse_started) {
-                stop_job_stream(job);
-                // Headers are already on the wire: report in-stream, like
-                // the classic worker's fail_request after SSE start.
-                for (const std::string & chunk : sse_error_close_chunks(
-                         "admission failed: " + ar.error)) {
-                    send_job_bytes(job, chunk.data(), chunk.size());
-                }
-            } else {
-                send_error(job->fd, 500, "admission failed: " + ar.error);
-            }
-            finish_job(job);
-            return AdmissionDisposition::Retired;
-        }
-        next_request_id++;
 
         SchedSlot & s = slots[(size_t)ar.slot];
         s = SchedSlot{};
@@ -479,10 +656,12 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         s.admission_order = next_admission_order++;
         s.started_at = started_at;
         s.decode_started_at = started_at;  // sane on prefill failure
+        s.cached_prefix_tokens = prefix.restored.tokens;
+        s.cache_capture = std::move(prepared_capture);
         s.n_gen_cap = std::min(
             n_gen_cap,
             engine.max_context() - (int)req.prompt_tokens.size() + 1);
-        s.emitter = std::move(job->emitter);
+        s.emitter = std::move(emitter);
         s.send_buffer.mark_progress(std::chrono::steady_clock::now());
         if (budget_active && !config_.think_close_token_ids.empty() &&
             config_.hard_limit_reply_budget > 0) {
@@ -609,33 +788,148 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                     std::memory_order_acquire)) {
                 s.client_disconnected = true;
                 s.finished = true;
-                retire_slot(i, true);
+                retire_slot(i);
             }
         }
         if (live_slots == 0) continue;
 
-        // Phase 3 — Build one model-neutral batch plan: every decode row plus
-        // a FIFO, engine-bounded subset of pending prompt work. The engine
-        // lowers this plan into whatever graph/state representation it owns.
-        step_plan.decode.clear();
-        prefill_candidates.clear();
-        for (int i = 0; i < n_slots; i++) {
-            if (slots[(size_t)i].job && !slots[(size_t)i].prefilling) {
-                step_plan.decode.push_back(
-                    {i, slots[(size_t)i].pending_tok,
-                     slots[(size_t)i].hook.close_token_ids.empty()});
-            } else if (slots[(size_t)i].job) {
-                prefill_candidates.push_back(
-                    {i, slots[(size_t)i].admission_order});
+        if (offload_budget) {
+            int resident = 0, oldest = -1;
+            for (int i = 0; i < n_slots; ++i) {
+                if (!slots[(size_t)i].job) continue;
+                if (!parked(i)) { ++resident; continue; }
+                if (oldest < 0 || slots[(size_t)i].admission_order <
+                                  slots[(size_t)oldest].admission_order) oldest = i;
+            }
+            // Drain resident requests before restoring the oldest parked slot,
+            // unless the engine reports comfortable headroom — restoring then
+            // cannot re-trigger eviction on the next step, and a parked
+            // request behind one long resident would otherwise wait the whole
+            // generation. One resume per pass keeps the cadence bounded.
+            if (oldest >= 0 &&
+                (resident == 0 || engine.kv_restore_feasible(oldest))) {
+                const bool drained = resident == 0;
+                const auto oldest_state = engine.kv_offload_state(oldest);
+                std::string error;
+                if (engine.restore_kv(oldest, error)) {
+                    auto & s = slots[(size_t)oldest];
+                    if (oldest_state.recompute) {
+                        s.prefilling = true;
+                        s.pending_tok = -1;
+                        std::fprintf(stderr,
+                            "[parallel] slot %d resumed via re-prefill\n",
+                            oldest);
+                    } else {
+                        std::fprintf(stderr,
+                            "[parallel] slot %d resumed from RAM\n", oldest);
+                    }
+                    publish_live_count();
+                } else if (!error.empty() && !oldest_state.recompute &&
+                           engine.evict_kv(oldest,
+                               slots[(size_t)oldest].pending_tok, error)) {
+                    // A checkpoint copy that fails for a real reason does not
+                    // self-heal: drop the payload and park for recompute,
+                    // keeping the request alive through its retained history.
+                    std::fprintf(stderr,
+                        "[parallel] slot %d checkpoint lost; parked for recompute\n",
+                        oldest);
+                    publish_live_count();
+                } else if (drained || !error.empty()) {
+                    // Capacity failure (empty error) with an empty cohort
+                    // means the request cannot fit even alone; recompute
+                    // cannot help either, so this remains legitimately fatal.
+                    // A real restore error that evict_kv could not convert to
+                    // recompute leaves no recovery path — also fatal, rather
+                    // than retrying a broken checkpoint every pass.
+                    auto & s = slots[(size_t)oldest];
+                    s.error = to_response_error({GenerateErrorCode::DecodeFailed,
+                        error.empty()
+                            ? "parked request cannot fit its KV state and next token in the pool"
+                            : error});
+                    retire_slot(oldest);
+                }
+                // A feasibility hint is not a reservation. Even when restore
+                // cannot proceed, let residents advance and release capacity.
             }
         }
-        const StepPlanLimits step_limits =
-            engine.step_plan_limits((int)step_plan.decode.size());
-        step_plan.prefills = plan_prefill_slices(
-            prefill_candidates, step_limits, prefill_round_robin_start);
-        if (!prefill_candidates.empty()) {
-            ++prefill_round_robin_start;
+
+        // Phase 3 — Build the resident cohort. Parked requests retain their
+        // socket/emitter and pending token, but never enter a device graph.
+        auto build_plan = [&]() {
+            step_plan.decode.clear();
+            prefill_candidates.clear();
+            for (int i = 0; i < n_slots; ++i) {
+                const auto & s = slots[(size_t)i];
+                if (!s.job || parked(i)) continue;
+                if (!s.prefilling) {
+                    step_plan.decode.push_back(
+                        {i, s.pending_tok, s.hook.close_token_ids.empty()});
+                } else {
+                    prefill_candidates.push_back({i, s.admission_order});
+                }
+            }
+            step_plan.prefills = plan_prefill_slices(prefill_candidates,
+                engine.step_plan_limits((int)step_plan.decode.size()),
+                prefill_round_robin_start);
+        };
+        build_plan();
+        while (!engine.reserve_decode(step_plan)) {
+            // A speculative burst is optional. Try a one-token round before
+            // suspending a request to make room for a wider accepted chain.
+            for (auto & input : step_plan.decode) input.allow_speculation = false;
+            if (engine.reserve_decode(step_plan)) break;
+
+            std::vector<int> residents;
+            size_t used_bytes = 0;
+            for (int i = 0; i < n_slots; ++i) {
+                if (!slots[(size_t)i].job) continue;
+                const auto state = engine.kv_offload_state(i);
+                used_bytes += state.bytes;
+                if (!state.parked) residents.push_back(i);
+            }
+            std::sort(residents.begin(), residents.end(), [&](int a, int b) {
+                return slots[(size_t)a].admission_order > slots[(size_t)b].admission_order;
+            });
+            bool saved = false;
+            std::string error;
+            if (offload_budget && residents.size() > 1) {
+                const size_t available = offload_budget - std::min(offload_budget, used_bytes);
+                for (int victim : residents) {
+                    if (engine.offload_kv(victim, available, error)) {
+                        std::fprintf(stderr, "[parallel] slot %d suspended to RAM (%zu bytes)\n",
+                                     victim, engine.kv_offload_state(victim).bytes);
+                        saved = true;
+                        publish_live_count();
+                        break;
+                    }
+                }
+            }
+            if (!saved) {
+                // No checkpoint fit the RAM cap: park the newest decoder for
+                // recompute. With recovery disabled, fail only that request
+                // before compute, then retry the remaining cohort.
+                int victim = -1;
+                for (int candidate : residents) {
+                    if (!slots[(size_t)candidate].prefilling) { victim = candidate; break; }
+                }
+                if (victim < 0) break; // engines reserve prefills at admission
+                auto & s = slots[(size_t)victim];
+                if (offload_budget && engine.evict_kv(victim, s.pending_tok, error)) {
+                    std::fprintf(stderr,
+                        "[parallel] slot %d parked for KV recompute\n", victim);
+                    publish_live_count();
+                } else {
+                    s.error = to_response_error({GenerateErrorCode::DecodeFailed,
+                        error.empty()
+                            ? "paged KV pool cannot fit the request's next decode token"
+                            : "paged KV growth could not be preserved: " + error});
+                    retire_slot(victim);
+                }
+            }
+            build_plan();
         }
+        if (!prefill_candidates.empty()) ++prefill_round_robin_start;
+        if (step_plan.decode.empty() && step_plan.prefills.empty()) continue;
 
         SeqEngine::StepResult step_result = engine.step(step_plan);
         const std::string protocol_error =
@@ -654,9 +948,9 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 "failing all live requests\n", error.c_str());
             for (int i = 0; i < n_slots; i++) {
                 if (slots[(size_t)i].job) {
-                    slots[(size_t)i].failed = true;
-                    slots[(size_t)i].error = error;
-                    retire_slot(i, false);
+                    slots[(size_t)i].error = ResponseError::internal(
+                        "engine_step_failed", error);
+                    retire_slot(i);
                 }
             }
             continue;
@@ -666,8 +960,8 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             SchedSlot & s = slots[(size_t)out.slot];
             if (!s.job) continue;
             if (out.failed) {
-                s.failed = true;
-                s.error = out.error;
+                s.error = to_response_error(
+                    {GenerateErrorCode::DecodeFailed, out.error});
                 s.finished = true;
                 continue;
             }
@@ -682,9 +976,35 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
             if (out.slot < 0 || out.slot >= n_slots) continue;
             SchedSlot & s = slots[(size_t)out.slot];
             if (!s.job) continue;
+            if (out.prefix_store.attempted()) {
+                prefix_cache_.record_capture_attempt(
+                    out.prefix_store.elapsed_us,
+                    out.prefix_store.status ==
+                        PrefixStoreEvent::Status::saved);
+                using Resolution = PrefixCaptureTxn::Resolution;
+                const Resolution resolution = s.cache_capture.resolve(
+                    out.prefix_store, s.job->req.prompt_tokens);
+                if (resolution == Resolution::failed) {
+                    std::fprintf(stderr,
+                        "[parallel-pc] capture failed checkpoint=%llu: %s\n",
+                        (unsigned long long)
+                            out.prefix_store.ticket.checkpoint.id,
+                        out.prefix_store.error.c_str());
+                } else if (resolution == Resolution::mismatched ||
+                           resolution == Resolution::inactive) {
+                    // The transaction has already aborted only its own
+                    // destination. Never act on an event-supplied checkpoint.
+                    std::fprintf(stderr,
+                        "[parallel-pc] capture ticket mismatch id=%llu "
+                        "checkpoint=%llu\n",
+                        (unsigned long long)out.prefix_store.ticket.id,
+                        (unsigned long long)
+                            out.prefix_store.ticket.checkpoint.id);
+                }
+            }
             if (out.status == PrefillStatus::failed) {
-                s.failed = true;
-                s.error = out.error;
+                s.error = to_response_error(
+                    {GenerateErrorCode::PrefillFailed, out.error});
                 s.finished = true;
                 continue;
             }
@@ -694,9 +1014,14 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
                 // A prefill lane just became reusable, so the FIFO head may
                 // be admissible even though no KV blocks were retired.
                 deferred_retry_at = {};
-                s.decode_started_at = std::chrono::steady_clock::now();
-                s.prefill_s = std::chrono::duration<double>(
-                    s.decode_started_at - s.started_at).count();
+                // Recompute continues the same generation. Keep its original
+                // timing boundary so decode wall time includes parking and
+                // replay, matching the full response's completion-token count.
+                if (s.gen_tokens.empty()) {
+                    s.decode_started_at = std::chrono::steady_clock::now();
+                    s.prefill_s = std::chrono::duration<double>(
+                        s.decode_started_at - s.started_at).count();
+                }
                 advance_slot(s, out.token);
                 continue;
             }
@@ -733,7 +1058,7 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
         service_drains();
         for (int i = 0; i < n_slots; i++) {
             if (slots[(size_t)i].job && slots[(size_t)i].finished) {
-                retire_slot(i, true);
+                retire_slot(i);
             }
         }
     }
@@ -741,27 +1066,23 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // Shutdown: unblock every parked client thread.
     for (int i = 0; i < n_slots; i++) {
         if (slots[(size_t)i].job) {
-            slots[(size_t)i].failed = true;
-            retire_slot(i, false);
+            slots[(size_t)i].error = ResponseError::unavailable(
+                "server_shutting_down", "server shutting down");
+            retire_slot(i);
         }
     }
     service_drains();
     for (DrainJob & d : drains) finish_job(d.job);
     drains.clear();
     if (deferred) {
-        // admit_job() sends the SSE headers and opening event before asking
-        // the engine for a slot, so a pool-full deferred stream is already
-        // live on the wire. Close that protocol cleanly on shutdown instead
-        // of waking the client thread and letting it truncate the response.
+        // No response has been committed for a deferred admission.
         const ParsedRequest & req = deferred->req;
-        if (req.stream && deferred->sse_started) {
-            for (const std::string & chunk :
-                 sse_error_close_chunks("server shutting down")) {
-                send_all(deferred->fd, chunk.data(), chunk.size());
-            }
-        } else {
-            send_error(deferred->fd, 503, "server shutting down");
-        }
+        const ResponseError error = ResponseError::unavailable(
+            "server_shutting_down", "server shutting down");
+        const json body = build_error_response(
+            req.format, error, req.response_id);
+        send_response(deferred->fd, response_error_http_status(error),
+                      "application/json", body.dump() + "\n");
         finish_job(deferred);
     }
     // Jobs that never reached admission are still parked in their client
@@ -769,10 +1090,16 @@ void HttpServer::scheduler_loop(SeqEngine & engine) {
     // its client-shutdown timeout and the destructor never has to wake threads
     // after the server/backend teardown has already started.
     while (ServerJob * queued = try_dequeue()) {
-        send_error(queued->fd, 503, "server shutting down");
+        const ParsedRequest & req = queued->req;
+        const ResponseError error = ResponseError::unavailable(
+            "server_shutting_down", "server shutting down");
+        const json body = build_error_response(
+            req.format, error, req.response_id);
+        send_response(queued->fd, response_error_http_status(error),
+                      "application/json", body.dump() + "\n");
         finish_job(queued);
     }
 }
 
 
-}  // namespace dflash::common
+}  // namespace luce::common

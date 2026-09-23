@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct MoeHybridRoutingStats;
 
@@ -134,7 +134,7 @@ struct PipelinedDecodeState {
 
     // When true (default), non-local experts are computed through the expert
     // compute path instead of being dropped via cold-masking. Exact but slower.
-    // Set DFLASH_DROP_COLD=1 to disable (fast but lossy).
+    // Set LUCE_DROP_COLD=1 to disable (fast but lossy).
     bool expert_compute = true;
 
     // Shared MoE expert compute runtime (CPU or backend IPC).
@@ -252,4 +252,4 @@ bool pipelined_decode_one_token(
     bool capture_layers = false,
     MoeHybridRoutingStats * routing_stats = nullptr);
 
-}  // namespace dflash::common
+}  // namespace luce::common

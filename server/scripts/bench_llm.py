@@ -4,11 +4,11 @@
     python3 scripts/bench_llm.py
 
 Paths resolve from the repo root by default. Override with env vars:
-    DFLASH_TARGET    path to target Qwen3.6-27B-Q4_K_M.gguf (or 3.5)
-    DFLASH_DRAFT     path to DFlash draft GGUF or model.safetensors
-    DFLASH_BIN       path to build/test_dflash
-    DFLASH_BIN_AR    path to build/test_generate
-    DFLASH_TOKENIZER HF tokenizer repo (default Qwen/Qwen3.5-27B; matches run.py)
+    LUCE_TARGET    path to target Qwen3.6-27B-Q4_K_M.gguf (or 3.5)
+    LUCE_DRAFT     path to DFlash draft GGUF or model.safetensors
+    LUCE_BIN       path to build/test_dflash
+    LUCE_BIN_AR    path to build/test_generate
+    LUCE_TOKENIZER HF tokenizer repo (default Qwen/Qwen3.6-27B; matches run.py)
 """
 import argparse
 import json
@@ -27,26 +27,26 @@ from math_scoring import _extract_boxed, _math_equiv, _normalize_math
 ROOT = Path(__file__).resolve().parent.parent
 BIN_SUFFIX = ".exe" if os.name == "nt" else ""
 TARGET = os.environ.get(
-    "DFLASH_TARGET",
+    "LUCE_TARGET",
     str(ROOT / "models" / "Qwen3.6-27B-Q4_K_M.gguf"),
 )
 _LOCAL_DRAFT_FILE = ROOT / "models" / "draft" / "dflash-draft-3.6-q4_k_m.gguf"
 _LOCAL_DRAFT_ROOT = ROOT / "models" / "draft"
 DRAFT = None
-TEST_DFLASH = os.environ.get("DFLASH_BIN", str(ROOT / "build" / f"test_dflash{BIN_SUFFIX}"))
-TEST_GENERATE = os.environ.get("DFLASH_BIN_AR", str(ROOT / "build" / f"test_generate{BIN_SUFFIX}"))
-TOKENIZER = os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.6-27B")
+TEST_DFLASH = os.environ.get("LUCE_BIN", str(ROOT / "build" / f"test_dflash{BIN_SUFFIX}"))
+TEST_GENERATE = os.environ.get("LUCE_BIN_AR", str(ROOT / "build" / f"test_generate{BIN_SUFFIX}"))
+TOKENIZER = os.environ.get("LUCE_TOKENIZER", "Qwen/Qwen3.6-27B")
 TMPDIR = Path(tempfile.gettempdir()) / "dflash_bench"
 TMPDIR.mkdir(parents=True, exist_ok=True)
 
 N_GEN = 256
 BUDGET = 22  # default; overridden by --budget CLI arg
-N_SAMPLE = int(os.environ.get("DFLASH_N_SAMPLE", "10"))
+N_SAMPLE = int(os.environ.get("LUCE_N_SAMPLE", "10"))
 # Optional sampler tail for the DFlash run, "temp,top_p,top_k,rep_pen,seed[,freq,pres]".
 # When set, exercises the sample_logits chain (and its GPU port, on by default,
-# opt out with DFLASH_GPU_SAMPLE=0) instead of the default greedy path. AR
+# opt out with LUCE_GPU_SAMPLE=0) instead of the default greedy path. AR
 # (test_generate) is greedy-only and ignores this.
-SAMP = os.environ.get("DFLASH_SAMP", "").strip()
+SAMP = os.environ.get("LUCE_SAMP", "").strip()
 
 def _gsm_gold(x):
     """Extract numeric answer after #### from GSM8K answer field."""
@@ -77,12 +77,12 @@ def _find_draft_model(root: Path) -> str | None:
 
 
 def _resolve_draft() -> str:
-    env = os.environ.get("DFLASH_DRAFT")
+    env = os.environ.get("LUCE_DRAFT")
     if env:
         found = _find_draft_model(Path(env))
         if found:
             return found
-        raise FileNotFoundError(f"DFLASH_DRAFT does not point to a DFlash draft GGUF or model.safetensors: {env}")
+        raise FileNotFoundError(f"LUCE_DRAFT does not point to a DFlash draft GGUF or model.safetensors: {env}")
 
     for candidate in (_LOCAL_DRAFT_FILE, _LOCAL_DRAFT_ROOT):
         found = _find_draft_model(candidate)
@@ -92,7 +92,7 @@ def _resolve_draft() -> str:
     raise FileNotFoundError(
         "DFlash draft GGUF or model.safetensors not found. Expected one of:\n"
         f"  - {_LOCAL_DRAFT_FILE}\n"
-        "Download it as documented in the README, or set DFLASH_DRAFT to an explicit file or directory."
+        "Download it as documented in the README, or set LUCE_DRAFT to an explicit file or directory."
     )
 
 

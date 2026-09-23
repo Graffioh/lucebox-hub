@@ -9,7 +9,7 @@
 #include "common/sampler.h"
 #include "common/layer_split_runtime.h"
 #include "common/target_shard_ipc_daemon.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "placement/placement_backend.h"
 #include "qwen3/qwen3_kvflash_scorer.h"
 
@@ -24,9 +24,10 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -37,8 +38,8 @@ static bool tensor_ready(const ggml_tensor * t) {
 }  // namespace
 
 LagunaLayerSplitAdapter::LagunaLayerSplitAdapter(
-        const LagunaLayerSplitAdapterConfig & cfg)
-    : cfg_(cfg) {}
+        LagunaLayerSplitAdapterConfig cfg)
+    : cfg_(std::move(cfg)) {}
 
 LagunaLayerSplitAdapter::~LagunaLayerSplitAdapter() { shutdown(); }
 
@@ -48,7 +49,7 @@ bool LagunaLayerSplitAdapter::init() {
     }
 
     const LayerSplitRuntimeInit runtime_cfg{
-        cfg_.target_path,
+        cfg_.target_path.c_str(),
         &cfg_.device,
         "laguna-target-split",
     };
@@ -82,7 +83,7 @@ bool LagunaLayerSplitAdapter::init() {
                 cfg_.target_path, shard.backend, plan, shard.weights)) {
             std::fprintf(stderr,
                 "[laguna-target-split] load gpu=%d: %s\n",
-                shard.gpu, dflash27b_last_error());
+                shard.gpu, luce_last_error());
             return false;
         }
     }
@@ -97,7 +98,7 @@ bool LagunaLayerSplitAdapter::init() {
                 kvflash_tokens_)) {
             std::fprintf(stderr,
                 "[laguna-target-split] cache gpu=%d: %s\n",
-                shard.gpu, dflash27b_last_error());
+                shard.gpu, luce_last_error());
             return false;
         }
         std::fprintf(stderr, "[laguna-target-split] gpu=%d layers=[%d,%d)\n",
@@ -131,7 +132,7 @@ bool LagunaLayerSplitAdapter::init_mixed_target_split() {
         return false;
     }
 
-    const auto info = inspect_gguf_model_info(cfg_.target_path);
+    const auto info = inspect_gguf_model_info(cfg_.target_path.c_str());
     const int n_layer = info.n_layer;
     if (n_layer <= 0) {
         std::fprintf(stderr,
@@ -182,7 +183,7 @@ bool LagunaLayerSplitAdapter::init_mixed_target_split() {
                 cfg_.target_path, shard.backend, plan, shard.weights)) {
             std::fprintf(stderr,
                 "[laguna-target-split] mixed local load gpu=%d: %s\n",
-                shard.gpu, dflash27b_last_error());
+                shard.gpu, luce_last_error());
             return false;
         }
     }
@@ -195,7 +196,7 @@ bool LagunaLayerSplitAdapter::init_mixed_target_split() {
                 kvflash_tokens_)) {
             std::fprintf(stderr,
                 "[laguna-target-split] mixed local cache gpu=%d: %s\n",
-                shard.gpu, dflash27b_last_error());
+                shard.gpu, luce_last_error());
             return false;
         }
     }
@@ -214,7 +215,7 @@ bool LagunaLayerSplitAdapter::init_mixed_target_split() {
     TargetShardIpcLaunchConfig launch;
     launch.mode = BackendIpcMode::LagunaTargetShard;
     launch.bin = cfg_.remote_target_shard.ipc_bin;
-    launch.target_path = cfg_.target_path ? cfg_.target_path : "";
+    launch.target_path = cfg_.target_path;
     launch.gpus = remote_gpus;
     launch.layer_begins = remote_layer_begins;
     launch.layer_ends = remote_layer_ends;
@@ -257,8 +258,8 @@ KvFlashConfig LagunaLayerSplitAdapter::kvflash_config() const {
 }
 
 void LagunaLayerSplitAdapter::kvflash_read_config() {
-    if (!std::getenv("DFLASH_KVFLASH") || shards_.empty()) return;
-    kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path);
+    if (!std::getenv("LUCE_KVFLASH") || shards_.empty()) return;
+    kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path.c_str());
 
     int64_t min_free = std::numeric_limits<int64_t>::max();
     int64_t max_bytes_per_token = 0;
@@ -287,7 +288,7 @@ void LagunaLayerSplitAdapter::kvflash_read_config() {
         cfg_.device.max_ctx, kvflash_config(),
         !kvflash_drafter_path_.empty(), budget);
     if (kvflash_tokens_ > 0) {
-        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        const char * tau = std::getenv("LUCE_KVFLASH_TAU");
         kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
     }
 }
@@ -373,7 +374,7 @@ void LagunaLayerSplitAdapter::kvflash_maybe_reselect(int generated) {
                 std::fprintf(stderr,
                     "[laguna-target-split][kvflash] drafter load failed (%s); "
                     "staying on LRU residency\n",
-                    dflash27b_last_error());
+                    luce_last_error());
                 kvflash_drafter_failed_ = true;
                 return;
             }
@@ -436,7 +437,7 @@ bool LagunaLayerSplitAdapter::run_forward(
     const int hidden = ref.n_embd;
     const int n_tokens_total = (int)tokens.size();
     int ubatch = cfg_.chunk > 0 ? cfg_.chunk : 2048;
-    if (const char * e = std::getenv("DFLASH_LAGUNA_LAYER_SPLIT_UBATCH")) {
+    if (const char * e = std::getenv("LUCE_LAGUNA_LAYER_SPLIT_UBATCH")) {
         ubatch = std::max(1, std::atoi(e));
     }
 
@@ -640,7 +641,7 @@ bool LagunaLayerSplitAdapter::run_mixed_forward(
     const int hidden = ref.n_embd;
     const int n_tokens_total = (int)tokens.size();
     int ubatch = cfg_.chunk > 0 ? cfg_.chunk : 2048;
-    if (const char * e = std::getenv("DFLASH_LAGUNA_LAYER_SPLIT_UBATCH")) {
+    if (const char * e = std::getenv("LUCE_LAGUNA_LAYER_SPLIT_UBATCH")) {
         ubatch = std::max(1, std::atoi(e));
     }
     if (base_pos < 0 || base_pos + n_tokens_total > cfg_.device.max_ctx) {
@@ -1221,7 +1222,7 @@ int LagunaLayerSplitAdapter::current_last_token() const {
 void LagunaLayerSplitAdapter::shutdown() {
     kvflash_scorer_.reset();
     if (kvflash_drafter_loaded_) {
-        dflash::common::free_drafter(kvflash_drafter_);
+        luce::common::free_drafter(kvflash_drafter_);
         kvflash_drafter_loaded_ = false;
     }
     for (int i = 0; i < PREFIX_SLOTS; ++i) snapshot_free(i);
@@ -1310,7 +1311,7 @@ int run_laguna_target_shard_ipc_daemon(const char * target_path,
                 kvflash_pool_tokens)) {
             std::fprintf(stderr,
                 "[laguna-target-shard-daemon] load/cache failed gpu=%d: %s\n",
-                shard.gpu, dflash27b_last_error());
+                shard.gpu, luce_last_error());
             free_laguna_layer_split_shards(shards);
             return 1;
         }
@@ -1609,4 +1610,4 @@ int run_laguna_target_shard_ipc_daemon(const char * target_path,
 #endif
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

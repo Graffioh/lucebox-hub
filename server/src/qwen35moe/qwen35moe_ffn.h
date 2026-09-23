@@ -4,7 +4,7 @@
 
 #include "internal.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen35MoeRouterOutputs {
     ggml_tensor * selected = nullptr; // [n_used, n_tokens] i32
@@ -33,4 +33,4 @@ ggml_tensor * build_qwen35moe_ffn(
     const TargetLayer &   L,
     ggml_tensor **        selected_out = nullptr);
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -14,6 +14,7 @@
 #include "common/model_backend.h"
 #include "common/dflash_target.h"
 #include "common/dflash_draft_ipc.h"
+#include "common/specla_mode.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "step_graph.h"
@@ -25,6 +26,7 @@
 #include "common/concurrency/paged_kv_pool.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "internal.h"         // TargetWeights, TargetCache, DraftWeights, PrefixSnapshot
+#include "qwen35_vision.h"
 #include "qwen3/qwen3_drafter.h"  // DrafterContext, load_drafter, free_drafter, drafter_score_and_compress
 #include "kvflash_pager.h"         // bounded KV residency pool
 #include "kvflash_scorer.h"        // chunk-relevance policy interface
@@ -39,21 +41,27 @@
 #include <string>
 #include <cstddef>
 
-namespace dflash::common {
+namespace luce::common {
 
 class Qwen35TensorParallelContext;
+class Qwen35ImagePrompt;
+struct Qwen35ImageRows;
 
 // ── Configuration passed at construction ────────────────────────────────
 
 struct Qwen35Config {
-    const char * target_path = nullptr;
-    const char * draft_path  = nullptr;
+    std::string target_path;
+    std::optional<std::string> draft_path;
+    std::string  mmproj_path;              // vision projector; empty = text only
     DevicePlacement device;                // target GPU placement
     int          draft_gpu   = 0;
     RemoteDraftConfig remote_draft;
     int          stream_fd   = -1;
 
     // FA/KV
+    // Explicit per-model overrides; COUNT preserves environment/family defaults.
+    ggml_type    cache_type_k = GGML_TYPE_COUNT;
+    ggml_type    cache_type_v = GGML_TYPE_COUNT;
     int          fa_window       = 0;  // 0 = full attention. qwen3.6 full-attn layers must see the whole context; a finite window drops the system prompt/tools -> breaks tool calls.
     bool         paged_attention = false;
     int          kq_stride_pad   = 32;   // KQ_MASK_PAD or 256 for TBQ
@@ -82,6 +90,12 @@ struct Qwen35Config {
     // Speculative decode strategy
     bool         fast_rollback   = true;
     bool         seq_verify      = false;
+    // SpecLA state-resident verification (--specla). specla_top_k keeps the
+    // LUCE_SPECLA_TOPK env as its default for non-CLI harnesses
+    // (docs/SPECLA.md); the factory always overwrites both with the
+    // normalized BackendPlan values.
+    bool         specla_mode     = false;
+    int          specla_top_k    = specla_tree_topk();
     bool         ddtree_mode     = false;
     int          ddtree_budget   = 22;
     float        ddtree_temp     = 1.0f;
@@ -95,7 +109,7 @@ struct Qwen35Config {
 
 class Qwen35Backend : public ModelBackend {
 public:
-    explicit Qwen35Backend(const Qwen35Config & cfg);
+    explicit Qwen35Backend(Qwen35Config cfg);
     ~Qwen35Backend() override;
 
     // Non-copyable, non-movable (owns GPU resources).
@@ -104,7 +118,7 @@ public:
 
     // ── Initialization ───────────────────────────────────────────────
     // Load target + draft models, create KV caches.
-    // Returns false on failure (check dflash27b_last_error()).
+    // Returns false on failure (check luce_last_error()).
     virtual bool init();
 
     // ── ModelBackend interface ────────────────────────────────────────
@@ -143,6 +157,18 @@ public:
 
     bool supports_dflash_spec_decode() const override { return !cfg_.paged_attention; }
     DFlashTarget * dflash_target() override;
+
+    // Image input (--mmproj). Requests with images prefill through the normal
+    // chunk loop with the image rows written over the pad embeddings, and
+    // decode one token at a time.
+    bool supports_images() const override { return image_input_; }
+    std::string image_placeholder() const override;
+    bool prepare_images(std::vector<int32_t> & tokens,
+                        std::vector<EncodedImage> images,
+                        uint64_t context_capacity,
+                        uint64_t output_reserve,
+                        ImagePromptHandle & payload,
+                        std::string & error) const override;
     bool supports_remote_draft() const override { return true; }
 
     // ── Concurrent slot serving (paged AR decode over N sequences) ────
@@ -199,7 +225,7 @@ protected:
     Qwen35Config cfg_;
 
     // ── kvflash (bounded KV residency, FlashMemory-style) ────────────
-    // Active when kvflash_tokens_ > 0 (env DFLASH_KVFLASH / --kvflash):
+    // Active when kvflash_tokens_ > 0 (env LUCE_KVFLASH / --kvflash):
     // attention KV tensors are allocated at pool capacity, logical
     // positions map to pool slots via kvflash_pager_, cold chunks page to
     // host. Policy-agnostic: with no scorer the pager is LRU; when the
@@ -212,7 +238,7 @@ protected:
     std::vector<int32_t>           kvflash_history_;     // prompt + generated ids
     std::vector<float>             kvflash_scores_;      // latest chunk scores
     std::vector<uint16_t>          kvflash_mask_buf_;    // host mirror of slot mask
-    std::string                    kvflash_drafter_path_; // DFLASH_KVFLASH_DRAFTER
+    std::string                    kvflash_drafter_path_; // LUCE_KVFLASH_DRAFTER
     uint64_t                       kvflash_mask_epoch_ = (uint64_t)-1;
     int  kvflash_tokens_ = 0;                       // 0 = off
     int  kvflash_tau_    = 64;
@@ -269,7 +295,7 @@ private:
     // ── Draft feature mirror (cross-GPU feature transfer) ────────────
     DraftFeatureMirror feature_mirror_;
     // [TAG_DRAFT_KV] drafter context-KV ring cache (lazy-init; kill with
-    // DFLASH_DRAFT_KV=0). Shared module: common/dflash_draft_kv.h.
+    // LUCE_DRAFT_KV=0). Shared module: common/dflash_draft_kv.h.
     DraftKvState draft_kv_;
     DFlashDraftIpcClient remote_draft_;
 
@@ -280,6 +306,19 @@ private:
     // ── Park state ───────────────────────────────────────────────────
     bool target_parked_ = false;
     bool draft_parked_  = false;
+
+    // Vision projector, loaded next to the target weights when --mmproj is set.
+    bool load_vision();
+    bool encode_images(const Qwen35ImagePrompt & prompt, Qwen35ImageRows & rows,
+                       std::string & error);
+    std::unique_ptr<vision::Qwen35VisionTower> vision_;  // released while parked
+    // Fixed after init(); read by prepare_images() on request threads.
+    bool image_input_ = false;
+    vision::Qwen35VisionConfig vision_config_;
+    // Rotary position minus KV position for the sequence being decoded.
+    // Negative after an image prompt (an image spans fewer positions than
+    // tokens); zero for text.
+    int rope_delta_ = 0;
 
     // ── Pflash drafter (lazy-loaded) ─────────────────────────────────
     DrafterContext drafter_ctx_;
@@ -319,7 +358,7 @@ private:
     std::unique_ptr<Qwen35SeqEngine> seq_engine_;
     friend class Qwen35SeqEngine;
 
-    // DFLASH_MIN_TOKENS floor for the slot paths (mirrors do_ar_decode's
+    // LUCE_MIN_TOKENS floor for the slot paths (mirrors do_ar_decode's
     // EOS suppression); fetches the slot's logits row on demand.
     int32_t apply_min_tokens_floor(int32_t tok, int generated,
                                    size_t logits_row_offset);
@@ -331,10 +370,12 @@ private:
     // Prefill a prompt and return the number of tokens committed to KV.
     // kv_offset > 0 resumes from a restored snapshot: tokens are placed at
     // KV positions [kv_offset, kv_offset + tokens.size()) instead of [0, N).
+    // `images` carries the encoded rows of an image prompt (kv_offset 0 only).
     int do_prefill(const std::vector<int32_t> & tokens,
                    const DaemonIO & io,
                    int snap_pos = -1, int snap_slot = -1,
-                   int kv_offset = 0);
+                   int kv_offset = 0,
+                   const Qwen35ImageRows * images = nullptr);
 
     // Speculative decode loop: draft → verify → accept until EOS/max.
     // When budget_hook is non-null and (n_gen - generated) drops to the
@@ -396,4 +437,4 @@ private:
     int verify_tree(int committed, const DDTree & tree);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

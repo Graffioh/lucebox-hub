@@ -12,7 +12,7 @@
 #include <memory>
 #include <stdexcept>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Qwen3.5 tool preamble — matches the official Jinja template exactly.
 static const char QWEN3_TOOL_PREAMBLE[] =
@@ -495,8 +495,8 @@ std::string render_chat_template(
                       "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
                       "<｜DSML｜tool_calls>\n"
                       "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
-                      "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
-                      "...\n"
+                      "<｜DSML｜parameter name=\"$PARAM_STRING\" string=\"true\">string_value</｜DSML｜parameter>\n"
+                      "<｜DSML｜parameter name=\"$PARAM_JSON\" string=\"false\">[1, 2, 3]</｜DSML｜parameter>\n"
                       "</｜DSML｜invoke>\n"
                       "<｜DSML｜invoke name=\"$TOOL_NAME2\">\n"
                       "...\n"
@@ -649,4 +649,4 @@ std::string render_chat_template_jinja(
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

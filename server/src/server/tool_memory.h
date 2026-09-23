@@ -15,7 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Thread-safe: lookup() is called from HTTP client threads during request
 // parsing while the worker/scheduler thread calls remember() at stream
@@ -73,4 +73,4 @@ private:
     std::unordered_map<std::string, std::list<std::string>::iterator> lru_map_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

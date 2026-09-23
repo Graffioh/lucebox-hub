@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // A flat DFS-ordered tree built from the draft's top-K softmax distributions.
 // Slot 0 is the tree root (the bonus token from the previous spec round);
@@ -98,4 +98,4 @@ bool truncate_verified_path(std::vector<int> & accepted,
                             const int32_t * posterior,
                             int & out_next_token);
 
-}  // namespace dflash::common
+}  // namespace luce::common

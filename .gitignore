@@ -57,7 +57,7 @@ env/
 *.qdrep
 *.sqlite
 bench-out/
-dflash/bench/results/
+server/bench/results/
 profile-out/
 
 # Model weights and caches (pull fresh from HF)
@@ -88,7 +88,7 @@ models/.lucebox/
 .claude/
 
 # Local tuning snapshots (not committed)
-dflash/docs/tuning-snapshots/
+server/docs/tuning-snapshots/
 
 # Workdir editor backup suffixes
 *.git-head

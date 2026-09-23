@@ -31,7 +31,7 @@ LLAMA_MODEL_ID="${LLAMA_MODEL_ID:-llama-cpp}"
 API_KEY="${API_KEY:-sk-lucebox}"
 PROMPTS="${PROMPTS:-$SCRIPT_DIR/prompts/generation_smoke.jsonl}"
 
-DFLASH_SERVER_BIN="${DFLASH_SERVER_BIN:-$REPO_DIR/server/build/dflash_server}"
+LUCE_SERVER_BIN="${LUCE_SERVER_BIN:-$REPO_DIR/server/build/luce_server}"
 
 mkdir -p "$LOG_DIR"
 
@@ -112,11 +112,11 @@ extra_args=()
 if [[ -n "$EXTRA_SERVER_ARGS" ]]; then
   read -r -a extra_args <<< "$EXTRA_SERVER_ARGS"
 fi
-if [[ ! -x "$DFLASH_SERVER_BIN" ]]; then
-  echo "dflash_server not found or not executable: $DFLASH_SERVER_BIN" >&2
+if [[ ! -x "$LUCE_SERVER_BIN" ]]; then
+  echo "luce_server not found or not executable: $LUCE_SERVER_BIN" >&2
   echo "Build it first, for example:" >&2
-  echo "  cmake -S $REPO_DIR/dflash -B $REPO_DIR/server/build -DGGML_CUDA=ON" >&2
-  echo "  cmake --build $REPO_DIR/server/build --target dflash_server -j\$(nproc)" >&2
+  echo "  cmake -S $REPO_DIR/server -B $REPO_DIR/server/build -DGGML_CUDA=ON" >&2
+  echo "  cmake --build $REPO_DIR/server/build --target luce_server -j\$(nproc)" >&2
   exit 1
 fi
 local_ddtree_args=()
@@ -127,9 +127,9 @@ local_fa_args=()
 if [[ -n "$FA_WINDOW" ]] && [[ "$FA_WINDOW" != "0" ]]; then
   local_fa_args=(--fa-window "$FA_WINDOW")
 fi
-if [[ -n "$CACHE_TYPE_K" ]]; then export DFLASH27B_KV_K="$CACHE_TYPE_K"; fi
-if [[ -n "$CACHE_TYPE_V" ]]; then export DFLASH27B_KV_V="$CACHE_TYPE_V"; fi
-"$DFLASH_SERVER_BIN" "$TARGET" \
+if [[ -n "$CACHE_TYPE_K" ]]; then export LUCE_KV_K="$CACHE_TYPE_K"; fi
+if [[ -n "$CACHE_TYPE_V" ]]; then export LUCE_KV_V="$CACHE_TYPE_V"; fi
+"$LUCE_SERVER_BIN" "$TARGET" \
   --draft "$DRAFT" \
   --host "$HOST" \
   --port "$LUCEBOX_PORT" \

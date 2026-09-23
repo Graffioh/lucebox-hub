@@ -5,7 +5,7 @@
 #include <mutex>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 class MoeInputReady {
 public:
@@ -57,4 +57,4 @@ std::future<bool> launch_moe_input_ready_worker(MoeInputReady & input_ready, Wor
         });
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

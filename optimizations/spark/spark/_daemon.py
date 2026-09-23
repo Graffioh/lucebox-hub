@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Driver for the dflash daemon stdin/stdout protocol with real timeouts.
+"""Driver for the luce daemon stdin/stdout protocol with real timeouts.
 
 A blocking `proc.stdout.readline()` returns only on a new line or on EOF (daemon
 death). If the daemon goes silent (stalls during model load, deadlocks, disk

@@ -108,12 +108,12 @@ class RunnerTests(unittest.TestCase):
     def test_ragged_runner_records_prefill_first_policy(self) -> None:
         text = (HERE / "run_qwen36_concurrency.sh").read_text(encoding="utf-8")
         self.assertIn('PREFILL_FIRST_BURST_STEPS="${PREFILL_FIRST_BURST_STEPS:-0}"', text)
-        self.assertIn('DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"', text)
+        self.assertIn('LUCE_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"', text)
         self.assertIn('"prefill_first_burst_steps"', text)
         self.assertIn('(( 10#$PREFILL_FIRST_BURST_STEPS > 1024 ))', text)
         launch_start = text.index("launch_command=(env", text.index("else\n    launch_command="))
         burst_assignment = text.index(
-            'DFLASH_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"',
+            'LUCE_PREFILL_FIRST_BURST_STEPS="$PREFILL_FIRST_BURST_STEPS"',
             launch_start,
         )
         launch_end = text.index('"${command[@]}")', burst_assignment)
@@ -136,7 +136,7 @@ class RunnerTests(unittest.TestCase):
                 "IDLE_PREFILL_TOKENS must be an integer in range 1..16384", text
             )
             self.assertIn('"idle_prefill_tokens"', text)
-        assignment = 'DFLASH_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"'
+        assignment = 'LUCE_IDLE_PREFILL_TOKENS="$IDLE_PREFILL_TOKENS"'
         self.assertEqual(ragged.count(assignment), 1)
         self.assertEqual(canonical.count(assignment), 2)
         self.assertIn(

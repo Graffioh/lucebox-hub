@@ -5,7 +5,7 @@
 
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct DraftWeights; // fwd
 
@@ -98,4 +98,4 @@ std::vector<DraftGraphOutputs> build_draft_kv_steps(
     const DraftWeights &                   w,
     const std::vector<DraftKvLaneInputs> & lanes);
 
-} // namespace dflash::common
+} // namespace luce::common

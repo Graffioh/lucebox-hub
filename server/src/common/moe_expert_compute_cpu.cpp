@@ -15,7 +15,7 @@
 #include <omp.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 class CpuMoeExpertCompute : public MoeExpertCompute {
     int n_ff_max_;
@@ -33,8 +33,8 @@ public:
     explicit CpuMoeExpertCompute(int n_ff_max, int n_threads = 0) : n_ff_max_(n_ff_max) {
 #ifdef _OPENMP
         if (n_threads <= 0) {
-            const char * env = std::getenv("DFLASH_MOE_EXPERT_COMPUTE_THREADS");
-            if (!env) env = std::getenv("DFLASH_COLD_THREADS");
+            const char * env = std::getenv("LUCE_MOE_EXPERT_COMPUTE_THREADS");
+            if (!env) env = std::getenv("LUCE_COLD_THREADS");
             n_threads = env ? std::atoi(env) : 0;
         }
         n_threads_ = n_threads > 0 ? n_threads : std::min(omp_get_max_threads(), 8);
@@ -189,4 +189,4 @@ std::unique_ptr<MoeExpertCompute> make_cpu_moe_expert_compute(int n_ff_max) {
     return std::make_unique<CpuMoeExpertCompute>(n_ff_max);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

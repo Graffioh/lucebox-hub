@@ -9,7 +9,7 @@
 //
 // Usage: smoke_target_forward <qwen35.gguf>
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "internal.h"
 
 #include "ggml.h"
@@ -25,7 +25,7 @@
 #include <cstring>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
@@ -39,16 +39,16 @@ int main(int argc, char ** argv) {
     // Load target weights
     TargetWeights w;
     if (!load_target_gguf(argv[1], backend, w)) {
-        std::fprintf(stderr, "load_target_gguf: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load_target_gguf: %s\n", luce_last_error());
         return 1;
     }
-    std::printf("[target] %s\n", dflash27b_last_error());
+    std::printf("[target] %s\n", luce_last_error());
 
     // Create target state cache
     TargetCache cache;
     const int max_ctx = 64;
     if (!create_target_cache(w, max_ctx, /*max_verify_tokens=*/0, backend, cache)) {
-        std::fprintf(stderr, "create_target_cache: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "create_target_cache: %s\n", luce_last_error());
         return 1;
     }
     std::printf("[cache] attn_k=%zu attn_v=%zu ssm=%zu conv=%zu\n",

@@ -20,7 +20,7 @@
 #  include <sys/mman.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -302,4 +302,4 @@ int run_target_shard_ipc_daemon_loop(
 #endif
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

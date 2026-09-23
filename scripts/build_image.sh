@@ -24,7 +24,7 @@
 #
 # Env overrides:
 #   REGISTRY=ghcr.io/luce-org/   override image registry prefix
-#   DFLASH_CUDA_ARCHES=120       narrow arch list (skip the multi-arch compile)
+#   LUCE_CUDA_ARCHES=120       narrow arch list (skip the multi-arch compile)
 
 set -euo pipefail
 
@@ -59,7 +59,7 @@ if [ -n "$REGISTRY" ] && [ "${REGISTRY: -1}" != "/" ]; then
     REGISTRY="${REGISTRY}/"
 fi
 export REGISTRY
-export DFLASH_CUDA_ARCHES="${DFLASH_CUDA_ARCHES:-75;80;86;89;90;120}"
+export LUCE_CUDA_ARCHES="${LUCE_CUDA_ARCHES:-75;80;86;89;90;120}"
 
 # /props.build identity (baked into /opt/lucebox-hub/IMAGE_INFO and surfaced
 # at /props.build). All best-effort for local builds:

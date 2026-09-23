@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 
@@ -151,7 +151,7 @@ int main(int argc, char ** argv) {
     int layer_begin = -1;
     int layer_end = -1;
     int max_ctx = 8192;
-    int max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
+    int max_verify_tokens = LUCE_DRAFT_BLOCK_SIZE;
     int target_hidden = 0;
     int target_vocab = 0;
     int target_max_tokens = 0;
@@ -302,7 +302,7 @@ int main(int argc, char ** argv) {
     (void)target_max_tokens;
 
     if (ds4_fixed_slot_graphs) {
-        set_environment_variable("DFLASH_MOE_FIXED_SLOT_GRAPHS", "1", true);
+        set_environment_variable("LUCE_MOE_FIXED_SLOT_GRAPHS", "1", true);
     }
 
     switch (mode) {

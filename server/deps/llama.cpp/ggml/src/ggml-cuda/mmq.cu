@@ -562,7 +562,17 @@ void ggml_cuda_op_mul_mat_q(
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_padded_row_size);
 }
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+bool ggml_cuda_mixed_mmq_enabled(const ggml_tensor * op, bool default_enabled) {
+    const auto policy = ggml_mul_mat_get_mixed_mmq(op);
+    if (policy != GGML_MIXED_MMQ_DEFAULT) {
+        return policy == GGML_MIXED_MMQ_ENABLED;
+    }
+    const char * value = std::getenv("LUCE_DS4_MIX_MMQ_PREFILL");
+    return value ? std::strcmp(value, "0") != 0 : default_enabled;
+}
+
+bool ggml_cuda_should_use_mmq(const ggml_tensor * op, int cc, int64_t ne11, int64_t n_experts) {
+    const ggml_type type = op->src[0]->type;
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
@@ -571,7 +581,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     // The affine Q8_1 tile loader carries scale and -offset and uses the
     // activation sum correction. Keep it opt-in until model-level validation.
     if (type == GGML_TYPE_Q2_0_ROCMFP2 &&
-        std::getenv("DFLASH_CUDA_MMQ_FP2_AFFINE") == nullptr) {
+        std::getenv("LUCE_CUDA_MMQ_FP2_AFFINE") == nullptr) {
         return false;
     }
     // Batched expert MMQ is finite with the affine correction, but its
@@ -581,7 +591,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
     if (type == GGML_TYPE_Q2_0_ROCMFP2) {
         const char * runtime_disable = std::getenv(
-            "DFLASH_CUDA_MMQ_FP2_AFFINE_RUNTIME_DISABLE");
+            "LUCE_CUDA_MMQ_FP2_AFFINE_RUNTIME_DISABLE");
         if (runtime_disable && *runtime_disable &&
             std::strcmp(runtime_disable, "0") != 0) {
             return false;
@@ -592,7 +602,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         // accepted in decimal or 0x form (for example 0x1100 or 0x1151).
         static const int required_cc = [] {
             const char * raw = std::getenv(
-                "DFLASH_CUDA_MMQ_FP2_AFFINE_CC");
+                "LUCE_CUDA_MMQ_FP2_AFFINE_CC");
             if (!raw || !*raw) return 0;
             char * end = nullptr;
             const long parsed = std::strtol(raw, &end, 0);
@@ -608,7 +618,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     if (type == GGML_TYPE_Q2_0_ROCMFP2) {
         static const int min_ncols = [] {
             const char * raw = std::getenv(
-                "DFLASH_CUDA_MMQ_FP2_AFFINE_MIN_NCOLS");
+                "LUCE_CUDA_MMQ_FP2_AFFINE_MIN_NCOLS");
             if (!raw || !*raw) return 0;
             char * end = nullptr;
             const long parsed = std::strtol(raw, &end, 10);
@@ -663,21 +673,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             mmq_supported = GGML_CUDA_CC_IS_RDNA3_5(cc) ||
                             GGML_CUDA_CC_IS_RDNA4(cc);
             break;
-        case GGML_TYPE_Q2_1_ROCMFP2_MIX: {
-            static const bool mix_mmq_enabled = []() {
-                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
-            }();
-            mmq_supported = mix_mmq_enabled &&
-                (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
-            break;
-        }
+        case GGML_TYPE_Q2_1_ROCMFP2_MIX:
         case GGML_TYPE_Q3_1_ROCMFP3_MIX: {
-            static const bool mix_mmq_enabled = []() {
-                const char * value = getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
-                return value != nullptr && !(value[0] == '0' && value[1] == '\0');
-            }();
-            mmq_supported = mix_mmq_enabled &&
+            mmq_supported = ggml_cuda_mixed_mmq_enabled(op) &&
                 (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc));
             break;
         }

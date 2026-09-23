@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct TargetShardIpcLaunchConfig {
     BackendIpcMode mode = BackendIpcMode::Invalid;
@@ -100,4 +100,4 @@ bool copy_activation_to_host(const ggml_tensor * act,
                              int hidden,
                              std::vector<float> & out);
 
-}  // namespace dflash::common
+}  // namespace luce::common

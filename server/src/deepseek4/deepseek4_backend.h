@@ -15,6 +15,12 @@
 #include "../common/moe_hybrid_stream.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
+#include "deepseek4_vision.h"
+#include "deepseek4_image_prompt.h"
+#include "deepseek4_image_assembly.h"
+#include "deepseek4_image_admission.h"
+#include "qwen3/qwen3_drafter.h"
+#include "deepseek4_seq_engine.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -24,7 +30,9 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
+
+class DeepSeek4ImagePrompt;
 
 // Bounds the sparse heterogeneous prefill arena once accumulated attention
 // context dominates its memory footprint. Decode batching is unaffected.
@@ -41,9 +49,20 @@ int deepseek4_hybrid_prefill_step_tokens(
     int configured_chunk,
     int position,
     int remaining_tokens);
+
+// Mixed ROCmFP MMQ changes the reduction/quantization topology, so only the
+// already-approximate prefill modes may select it automatically. The policy is
+// kept separate from the qtype kernels so future model backends can reuse the
+// same generic MMQ path after device-level qualification.
+bool deepseek4_mix_mmq_prefill_default(
+    PrefillAttentionMode mode,
+    const char * gcn_arch);
+ggml_mixed_mmq_policy deepseek4_mix_mmq_prefill_policy(
+    PrefillAttentionMode mode, const char * gcn_arch, const char * explicit_value);
+
 class DeepSeek4Backend : public ModelBackend {
 public:
-    explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);
+    explicit DeepSeek4Backend(DeepSeek4BackendConfig cfg);
     ~DeepSeek4Backend() override;
 
     DeepSeek4Backend(const DeepSeek4Backend &) = delete;
@@ -53,6 +72,14 @@ public:
 
     // ModelBackend interface
     void print_ready_banner() const override;
+    bool supports_images() const override { return image_capable_ && vision_ != nullptr; }
+    std::string image_placeholder() const override { return vision::DS4V_IMAGE_PLACEHOLDER; }
+    bool prepare_images(std::vector<int32_t> & tokens,
+                        std::vector<EncodedImage> images,
+                        uint64_t context_capacity,
+                        uint64_t output_reserve,
+                        ImagePromptHandle & payload,
+                        std::string & error) const override;
 
     bool park(ParkTarget target) override;
     bool unpark(ParkTarget target) override;
@@ -65,16 +92,27 @@ public:
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
+    // Ondisk prefix cache: DeepSeek snapshots are CPU ggml contexts whose
+    // tensors carry stable names plus a meta/logits/feature sidecar, so they
+    // serialize and rebind like the Qwen snapshots do.
+    SnapshotRef snapshot_ref(int slot) const override;
+    bool snapshot_adopt(int slot, ggml_context * ctx,
+                        ggml_backend_buffer_t buf, int cur_pos,
+                        int32_t last_tok = -1) override;
 
     GenerateResult restore_and_generate_impl(int slot,
                                              const GenerateRequest & req,
                                              const DaemonIO & io) override;
 
+    CompressResult compress(const CompressRequest & req) override;
+    std::vector<CompressResult> compress_batch(
+        const std::vector<CompressRequest> & requests) override;
     bool handle_compress(const std::string & line,
                          const DaemonIO & io) override;
     void free_drafter() override;
 
     void shutdown() override;
+    SeqEngine * seq_engine() override { return seq_engine_.get(); }
 
     const MoeHybridRoutingStats * get_routing_stats() const override {
         return routing_stats_.get();
@@ -87,7 +125,14 @@ private:
     ggml_backend_t         expert_backend_ = nullptr;
     DeepSeek4Weights       w_;
     DeepSeek4Cache         cache_;
+    DeepSeek4PagedCache    paged_cache_;
+    std::unique_ptr<DeepSeek4SeqEngine> seq_engine_;
     bool                   parked_       = false;
+    bool                   image_capable_ = false;
+    bool                   cache_has_images_ = false;
+    std::unique_ptr<vision::VisionRuntime> vision_;
+    vision::ImageRequestGate image_request_gate_;
+    vision::ImageAdmissionReserves image_reserves_;
 
     // Sampler
     SamplerCfg             sampler_;
@@ -107,19 +152,24 @@ private:
     // safe only when this matches cache_.cur_pos.
     int                    last_logits_pos_ = -1;
 
-    // DSpark speculative decode (opt-in: DFLASH_DS4_SPEC=1 + DFLASH_DS4_DRAFT=<gguf>).
+    // DSpark speculative decode (opt-in: LUCE_DS4_SPEC=1 + LUCE_DS4_DRAFT=<gguf>).
     bool                           spec_enabled_ = false;
     bool                           spec_drafter_parked_ = false;
     std::string                    spec_draft_path_;
     ggml_backend_t                 spec_backend_ = nullptr;
     std::unique_ptr<DSparkDrafter> spec_drafter_;
     std::vector<float>             spec_feat_window_;
+    DrafterContext                 pflash_drafter_ctx_;
+    bool                           pflash_drafter_loaded_ = false;
+    std::string                    pflash_drafter_path_;
+    int                            pflash_drafter_gpu_ = -1;
     // Once a long prompt selects the fragmentation-safe prefill shape, retain
     // it for later requests so the HIP arenas never switch back under load.
     int                            hybrid_prefill_chunk_cap_ = 0;
 
     bool load_spec_drafter();
     void release_spec_drafter(bool mark_parked);
+    void release_pflash_drafter();
     void keep_spec_feature_tail(std::vector<float> & features,
                                 size_t max_rows) const;
     // True when a wide prefill path returns per-token DSpark features and the
@@ -141,7 +191,12 @@ private:
 
     // Prefill prompt tokens in chunks, return absolute committed position.
     int do_prefill(const std::vector<int32_t> & tokens, const DaemonIO & io,
-                   int kv_offset = 0, int snap_slot = -1, int snap_pos = -1);
+                   int kv_offset = 0, int snap_slot = -1, int snap_pos = -1,
+                   const DeepSeek4ImagePrompt * images = nullptr);
+    bool load_vision();
+    bool init_single_gpu_vision();
+    bool materialize_images(const DeepSeek4ImagePrompt & images,
+                            const DaemonIO & io, std::string & error);
 
     // Generate after either a fresh prefill or a restored prefix. kv_offset is
     // the number of prompt tokens already represented by cache_ and the
@@ -178,6 +233,7 @@ private:
     MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;
+    friend class DeepSeek4SeqEngine;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common
