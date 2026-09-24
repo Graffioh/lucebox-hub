@@ -62,12 +62,12 @@
 // Async DMA via a dedicated copy stream — enabled when a GPU runtime is
 // available.  gpu_runtime_compat.h maps cuda* → hip* on HIP builds and
 // pulls in <cuda_runtime.h> on CUDA builds.
-#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
 #include "gpu_runtime_compat.h"
 #define KVFLASH_HAS_ASYNC_DMA 1
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 struct KvFlashConfig {
     int chunk_tokens       = 64;  // logical tokens per page
@@ -601,7 +601,7 @@ struct KvFlashAutoBudget {
     // Decode cost grows with the FA span (= the pool), so cap the auto pool
     // where speed stays near the small-pool point. Measured on the 27B/3090:
     // 1K pool 39.6 tok/s, 4K 38.7; 16K extrapolates to ~31-33, still 1.7-2.4x
-    // the full cache at 128-256K. Override: DFLASH_KVFLASH_MAX_POOL.
+    // the full cache at 128-256K. Override: LUCE_KVFLASH_MAX_POOL.
     int     speed_cap_tokens = 16384;
 };
 
@@ -620,7 +620,7 @@ inline bool kvflash_fixed_pool_requested(const char * value) {
            std::strcmp(value, "auto") != 0;
 }
 
-// Pool size from DFLASH_KVFLASH for a backend with `cfg` protections:
+// Pool size from LUCE_KVFLASH for a backend with `cfg` protections:
 // 0 = off; otherwise rounded to a 256 multiple, floored at
 // min_pool_tokens(cfg) (eviction must keep a victim) and clamped to
 // `max_ctx` (a pool larger than the logical context is meaningless), with
@@ -636,12 +636,12 @@ inline bool kvflash_fixed_pool_requested(const char * value) {
 inline int kvflash_pool_from_env(int max_ctx, const KvFlashConfig & cfg = {},
                                  bool scorer_expected = false,
                                  const KvFlashAutoBudget & budget = {}) {
-    const char * env = std::getenv("DFLASH_KVFLASH");
+    const char * env = std::getenv("LUCE_KVFLASH");
     if (!env) return 0;
     int tokens;
     if (std::strcmp(env, "auto") == 0) {
         int speed_cap = budget.speed_cap_tokens;
-        if (const char * mp = std::getenv("DFLASH_KVFLASH_MAX_POOL")) {
+        if (const char * mp = std::getenv("LUCE_KVFLASH_MAX_POOL")) {
             speed_cap = std::max(256, std::atoi(mp));
         }
         if (budget.bytes_per_token > 0 && budget.free_bytes > 0) {
@@ -685,37 +685,37 @@ inline int kvflash_pool_from_env(int max_ctx, const KvFlashConfig & cfg = {},
     return tokens;
 }
 
-// Residency policy from DFLASH_KVFLASH_POLICY (--kvflash-policy): "lru"
+// Residency policy from LUCE_KVFLASH_POLICY (--kvflash-policy): "lru"
 // forces recency-only paging (no drafter probe, no scorer); anything else
 // (default "drafter") means scored residency when a drafter is available.
 inline bool kvflash_policy_is_lru() {
-    const char * env = std::getenv("DFLASH_KVFLASH_POLICY");
+    const char * env = std::getenv("LUCE_KVFLASH_POLICY");
     return env && std::strcmp(env, "lru") == 0;
 }
 
 // "qk": target-QK residency scoring (kvflash_qk.h) — pooled post-RoPE keys
 // vs the current decode query, no drafter involved.
 inline bool kvflash_policy_is_qk() {
-    const char * env = std::getenv("DFLASH_KVFLASH_POLICY");
+    const char * env = std::getenv("LUCE_KVFLASH_POLICY");
     return env && std::strcmp(env, "qk") == 0;
 }
 
-// Locate the Qwen3-0.6B residency drafter: the explicit override
-// (DFLASH_KVFLASH_DRAFTER, set from --prefill-drafter), then the
+// Locate the Qwen3.5-0.8B residency drafter: the explicit override
+// (LUCE_KVFLASH_DRAFTER, set from --prefill-drafter), then the
 // well-known locations next to the target model, then the appliance path.
 // Returns "" when nothing is readable (callers fall back to LRU, loudly).
 inline std::string kvflash_find_drafter(const char * target_path) {
     if (kvflash_policy_is_lru()) return "";
-    if (const char * dp = std::getenv("DFLASH_KVFLASH_DRAFTER")) return dp;
+    if (const char * dp = std::getenv("LUCE_KVFLASH_DRAFTER")) return dp;
     if (!target_path) return "";
     std::string dir(target_path);
     const size_t slash = dir.find_last_of('/');
     dir = (slash == std::string::npos) ? "." : dir.substr(0, slash);
     const std::string candidates[] = {
-        dir + "/Qwen3-0.6B-BF16.gguf",
-        dir + "/drafter/Qwen3-0.6B-BF16.gguf",
-        dir + "/draft/Qwen3-0.6B-BF16.gguf",
-        "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf",
+        dir + "/Qwen3.5-0.8B-BF16.gguf",
+        dir + "/drafter/Qwen3.5-0.8B-BF16.gguf",
+        dir + "/draft/Qwen3.5-0.8B-BF16.gguf",
+        "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf",
     };
     for (const std::string & c : candidates) {
         if (std::FILE * f = std::fopen(c.c_str(), "rb")) {
@@ -767,4 +767,4 @@ inline bool kvflash_fill_rows_and_masks(
     return true;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

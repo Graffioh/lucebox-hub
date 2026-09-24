@@ -55,11 +55,11 @@ pip install pytest
 
 ## Building the C++ daemon
 
-DFlash uses **CMake** with CUDA. The build produces `test_dflash`, the speculative-decoding
+Luce uses **CMake** with CUDA. The build produces `test_dflash`, the speculative-decoding
 daemon that the Python server drives via stdin/stdout.
 
 ```bash
-cd dflash
+cd server
 
 # Initialize the remaining submodule (Block-Sparse-Attention)
 git submodule update --init --recursive
@@ -78,9 +78,9 @@ The binary lands at `server/build/test_dflash`.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `CMAKE_CUDA_ARCHITECTURES` | `75;86` (auto-extended) | Target GPU architectures |
-| `DFLASH27B_FA_ALL_QUANTS` | `ON` | Build all FA KV-quant pairs (3× longer compile) |
-| `DFLASH27B_ENABLE_BSA` | `ON` | Block-Sparse Attention for spec-prefill (needs sm_80+) |
-| `DFLASH27B_TESTS` | `ON` | Build C++ numerics tests |
+| `LUCE_FA_ALL_QUANTS` | `ON` | Build all FA KV-quant pairs (3× longer compile) |
+| `LUCE_ENABLE_BSA` | `ON` | Block-Sparse Attention for spec-prefill (needs sm_80+) |
+| `LUCE_TESTS` | `ON` | Build C++ numerics tests |
 
 ---
 
@@ -105,15 +105,15 @@ server/models/
     └── dflash-draft-3.6-q4_k_m.gguf   # --draft  (GGUF)
 ```
 
-The target path can also be set via the `DFLASH_TARGET` environment variable.
+The target path can also be set via the `LUCE_TARGET` environment variable.
 
 ---
 
 ## Running the server
 
 ```bash
-cd dflash
-./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf --port 8080
+cd server
+./build/luce_server models/Qwen3.6-27B-Q4_K_M.gguf --port 8080
 ```
 
 ### Server CLI flags
@@ -224,10 +224,10 @@ Create `~/.codex/config.toml`:
 
 ```toml
 model = "luce-dflash"
-model_provider = "dflash"
+model_provider = "luce"
 
-[model_providers.dflash]
-name = "DFlash"
+[model_providers.luce]
+name = "Luce"
 base_url = "http://localhost:8080/v1"
 wire_api = "responses"
 supports_websockets = false
@@ -239,8 +239,8 @@ No `env_key` is needed for local use.
 
 ```bash
 # Start the server
-./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf --port 8080
+./build/luce_server models/Qwen3.6-27B-Q4_K_M.gguf --port 8080
 
 # In another terminal
-codex --provider dflash "Explain this codebase"
+codex --provider luce "Explain this codebase"
 ```

@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct GgufModelInfo {
     std::string arch;       // e.g. "qwen35", "laguna", "qwen3", "gemma4"
@@ -80,7 +80,7 @@ GgufMetadata read_gguf_metadata(const std::string & path,
 // the file size (upper bound on device weights); `runtime_bytes_per_token` and
 // `fixed_bytes` mirror the buffers the scorers allocate in
 // qwen35_drafter.cpp (hybrid) and qwen3_graph.cpp (dense). KV cache bytes honor
-// the same DFLASH27B_KV_* env resolution as the runtime cache, with TQ3
+// the same LUCE_KV_* env resolution as the runtime cache, with TQ3
 // suppressed like the drafter's ScopedKvTq3Off.
 //
 // Returns false when the file can't be opened or the architecture is unknown
@@ -89,4 +89,4 @@ GgufMetadata read_gguf_metadata(const std::string & path,
 bool inspect_drafter_footprint(const std::string & path,
                                SkipParkDrafterInfo & out);
 
-}  // namespace dflash::common
+}  // namespace luce::common

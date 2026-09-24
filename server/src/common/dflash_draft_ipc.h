@@ -11,7 +11,7 @@
 #pragma once
 
 #include "backend_ipc.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "io_utils.h"
 
 #include "ggml.h"
@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ── IPC Client (parent process) ─────────────────────────────────────
 
@@ -68,9 +68,9 @@ private:
     BackendIpcProcess process_;
     bool active_ = false;
     int ring_cap_ = 0;
-    int hidden_size_ = DFLASH27B_TARGET_HIDDEN;
-    int block_size_ = DFLASH27B_DRAFT_BLOCK_SIZE;
-    int n_target_layers_ = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+    int hidden_size_ = LUCE_TARGET_HIDDEN;
+    int block_size_ = LUCE_DRAFT_BLOCK_SIZE;
+    int n_target_layers_ = LUCE_DRAFT_N_TARGET_LAYERS;
 };
 
 // ── Remote draft feature copy helper ────────────────────────────────
@@ -108,4 +108,4 @@ int run_dflash_draft_ipc_daemon(const char * draft_path,
                                 int shared_payload_fd = -1,
                                 size_t shared_payload_bytes = 0);
 
-} // namespace dflash::common
+} // namespace luce::common

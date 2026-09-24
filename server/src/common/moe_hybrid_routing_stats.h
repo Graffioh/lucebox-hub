@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct MoeHybridRoutingStats {
     int n_layer       = 0;
@@ -51,4 +51,4 @@ private:
     size_t index_of(int layer_idx, int expert_idx) const;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

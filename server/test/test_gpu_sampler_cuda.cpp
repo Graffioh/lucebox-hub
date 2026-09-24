@@ -1,9 +1,9 @@
 // Correctness tests for geometric_sample_logits_cuda (src/common/geometric_sampler_cuda.cu)
 // vs the CPU sample_logits chain (src/common/sampler.h/.cpp). CUDA only — the GPU
-// sampler is compiled into dflash_common solely on the cuda backend (DFLASH_GPU_SAMPLER,
+// sampler is compiled into luce_common solely on the cuda backend (LUCE_GPU_SAMPLER,
 // default ON). All tests self-skip at runtime when no CUDA device is present.
 //
-// Build: registered in server/CMakeLists.txt under DFLASH27B_TESTS (CUDA only).
+// Build: registered in server/CMakeLists.txt under LUCE_TESTS (CUDA only).
 // Run:   ./test_gpu_sampler_cuda   (exit 0 = pass, non-zero = fail)
 
 #include "CppUnitTestFramework.hpp"
@@ -23,7 +23,7 @@
 #include <unordered_map>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 struct GpuSamplerCudaFixture {};
@@ -273,7 +273,7 @@ TEST_CASE(GpuSamplerCudaFixture, test_gpu_sampler_modal_token_matches_cpu) {
     TEST_ASSERT_MSG(modal(true) == modal(false), "GPU and CPU agree on the modal token");
 }
 
-// Per-call latency microbench (gated by env DFLASH_SAMPLER_BENCH=1). Isolates
+// Per-call latency microbench (gated by env LUCE_SAMPLER_BENCH=1). Isolates
 // the three regimes that explain the end-to-end numbers: the CPU chain, the GPU
 // path fed host logits (pays a full-vocab H2D every call), and the GPU path fed
 // a device pointer (the integrated path that skips the copy).
@@ -333,7 +333,7 @@ static void gpu_sampler_microbench() {
 }
 
 TEST_CASE(GpuSamplerCudaFixture, gpu_sampler_microbench_when_enabled) {
-    if (const char * b = std::getenv("DFLASH_SAMPLER_BENCH"); b && b[0] == '1') {
+    if (const char * b = std::getenv("LUCE_SAMPLER_BENCH"); b && b[0] == '1') {
         gpu_sampler_microbench();
     }
     CHECK(true);

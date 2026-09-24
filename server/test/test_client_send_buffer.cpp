@@ -14,7 +14,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-using namespace dflash::common;
+using namespace luce::common;
 using clock_t_ = std::chrono::steady_clock;
 using std::chrono::seconds;
 

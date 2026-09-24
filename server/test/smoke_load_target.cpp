@@ -3,7 +3,7 @@
 //
 // Usage: smoke_load_target <path/to/qwen35.gguf>
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "internal.h"
 #include "CppUnitTestFramework.hpp"
 #include "model_test_paths.h"
@@ -18,7 +18,7 @@
 #include <cstring>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 using namespace CppUnitTestFramework;
 
 struct SmokeLoadTarget : CommonFixture {
@@ -32,12 +32,12 @@ TEST_CASE(SmokeLoadTarget, LoadsConfiguredModel) {
     TargetWeights w;
     const bool loaded = load_target_gguf(path.c_str(), backend, w);
     if (!loaded) {
-        std::fprintf(stderr, "load_target_gguf failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load_target_gguf failed: %s\n", luce_last_error());
         ggml_backend_free(backend);
         REQUIRE(loaded);
     }
     // load_target_gguf stashes a summary string in last_error on success (hack)
-    std::printf("%s\n", dflash27b_last_error());
+    std::printf("%s\n", luce_last_error());
 
     // Count layer types
     int n_attn = 0, n_delta = 0;

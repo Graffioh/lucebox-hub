@@ -1,4 +1,4 @@
-// HTTP server infrastructure for dflash::common native server.
+// HTTP server infrastructure for luce::common native server.
 //
 // Ported from ds4_server.c's socket/threading/HTTP layer, converted to C++.
 // Architecture:
@@ -51,11 +51,11 @@
 #include <unordered_set>
 #include <vector>
 
-namespace dflash::engine {
+namespace luce::engine {
 class LuceEngine;
 }
 
-namespace dflash::common {
+namespace luce::common {
 
 using json = nlohmann::json;
 
@@ -100,7 +100,7 @@ struct ServerConfig {
     int         routing_queue_limit = 32; // waiting auto requests across the listener
     int         max_ctx     = 0;        // 0 = use backend's DevicePlacement default (8192)
     bool        enable_cors = true;
-    std::string model_name  = "dflash";
+    std::string model_name  = "luce";
     int         prefix_cache_cap = 32;  // prefix cache slots (0 disables)
     // Resident system-memory budget for copied paged checkpoints. The
     // scheduler enforces it only when concurrent paged prefix storage is
@@ -112,9 +112,9 @@ struct ServerConfig {
     bool        agent_turn_cache = false;
 
     // Pin-Friendly Prompt Processor (PPP): LCP pin_end + optional rearrange.
-    // See docs/PIN_FRIENDLY_PROMPT.md. Env: DFLASH_PPP=0|1,
-    // DFLASH_PPP_REARRANGE=0|1, DFLASH_PPP_LCP_WINDOW=N,
-    // DFLASH_PPP_MIN_PIN_TOKENS=N, DFLASH_PPP_MAX_EPHEMERAL=N.
+    // See docs/PIN_FRIENDLY_PROMPT.md. Env: LUCE_PPP=0|1,
+    // LUCE_PPP_REARRANGE=0|1, LUCE_PPP_LCP_WINDOW=N,
+    // LUCE_PPP_MIN_PIN_TOKENS=N, LUCE_PPP_MAX_EPHEMERAL=N.
     bool        ppp_enabled = true;
     bool        ppp_rearrange = false;
     int         ppp_lcp_window = 8;
@@ -194,12 +194,13 @@ struct ServerConfig {
     int         fa_window           = 0;
     int         ddtree_budget       = 0;
     bool        speculative_enabled = false;
+    bool        image_input_enabled = false;
     bool        target_sharding     = false;
     // Prefill chunk size (bargs.chunk). Exposed at /props.runtime.chunk so
     // bench/snapshot tooling can capture the full server config — needed
     // because pre-c35a8a4 snapshots had no /props capture and post-hoc
     // forensics on which chunk was used are otherwise impossible. See
-    // dflash/docs/specs/props-endpoint.md §4.5.
+    // docs/specs/props-endpoint.md §4.5.
     int         chunk               = 0;
     // Resolved device placement strings (e.g. "auto:0", "cuda:0"). Sourced
     // from placement_device_name(bargs.device / bargs.draft_device) in
@@ -210,14 +211,14 @@ struct ServerConfig {
     // never delays an already decoding request.
     int admission_coalesce_ms = 20;
     // Auto resolves after all models load, before workers start. Zero disables.
-    size_t decode_kv_offload_bytes = dflash::common::kAutoKvOffloadBytes;
+    size_t decode_kv_offload_bytes = luce::common::kAutoKvOffloadBytes;
 
     // PFlash (speculative prefill compression)
     enum class PflashMode { OFF, AUTO, ALWAYS };
     PflashMode  pflash_mode      = PflashMode::OFF;
     int         pflash_threshold = 32000;   // token count threshold for AUTO mode
     float       pflash_keep_ratio = 0.05f;  // fraction of tokens to keep
-    std::string pflash_drafter_path;        // path to drafter GGUF (Qwen3-0.6B)
+    std::string pflash_drafter_path;        // path to drafter GGUF (Qwen3.5-0.8B)
     int         pflash_drafter_gpu = 0;     // backend-local GPU for PFlash drafter
     bool        pflash_remote_drafter = false; // use IPC drafter for mixed backends
     RemoteDraftConfig pflash_remote;        // IPC binary/work-dir for remote PFlash drafter
@@ -316,6 +317,89 @@ PFlashTokenSpan pflash_changed_token_span(
 std::vector<PFlashTokenSpan> canonicalize_pflash_token_spans(
     std::vector<PFlashTokenSpan> spans);
 
+// Content length (drafter tokens) up to which a user turn or assistant
+// answer of a multi-turn chat is kept whole: PFLASH_CHAT_SKELETON_TOKENS,
+// default 256; 0 keeps only role headers.
+int pflash_chat_skeleton_tokens() noexcept;
+
+// Earlier user questions of a multi-turn chat that score alongside the
+// current one, most recent first at weights 1/2, 1/4, ...:
+// PFLASH_CHAT_HISTORY_QUERIES, default 3, at most 8; 0 scores the current
+// question alone.
+int pflash_chat_history_queries() noexcept;
+
+// Multi-turn follow-ups: PFLASH_CHAT_RECALL=0 turns recall off (a small
+// follow-up is then appended exactly as full prefill appends it, without
+// scoring); PFLASH_CHAT_COMPRESS_NEW_TOKENS (default 16384) is the size of
+// new material in one turn from which it is compressed instead of appended.
+bool pflash_chat_recall() noexcept;
+
+// The compressed text is rebuilt from the kept spans with a paragraph break
+// between pieces that were not adjacent in the prompt, unless one side
+// already ends or starts a paragraph (PFLASH_SELECT_PARAGRAPH_JOIN=0 turns
+// it off).
+bool pflash_paragraph_join() noexcept;
+std::string pflash_join_kept_spans(
+    const Tokenizer & tokenizer,
+    const std::vector<int32_t> & ids,
+    const std::vector<PFlashTokenSpan> & spans);
+int pflash_chat_compress_new_tokens() noexcept;
+
+// Recall takes the segments the new question clearly attends to: attention
+// lift (mass per token relative to uniform) of at least
+// PFLASH_CHAT_RECALL_MIN_LIFT (default 2), minus what the view holds.
+double pflash_chat_recall_min_lift() noexcept;
+std::vector<PFlashTokenSpan> pflash_recall_by_lift(
+    const std::vector<std::pair<PFlashTokenSpan, double>> & lifts,
+    const std::vector<PFlashTokenSpan> & in_view,
+    double min_lift);
+
+// The parts of ``spans`` that ``minus`` does not cover. Both canonical.
+std::vector<PFlashTokenSpan> pflash_subtract_token_spans(
+    const std::vector<PFlashTokenSpan> & spans,
+    const std::vector<PFlashTokenSpan> & minus);
+
+// Text of a recalled segment made safe to quote inside a user turn: chat
+// control markers are removed, with the role-name line that follows a
+// generic role marker ("<|im_start|>assistant\n"), and the result is trimmed.
+std::string pflash_recall_excerpt(
+    const std::string & text,
+    const std::vector<std::string> & role_markers,
+    const std::vector<std::string> & end_markers,
+    bool generic_role_lines);
+
+// A multi-turn PFlash view: what was served for one turn of a conversation,
+// kept so the next turn can append to it instead of recompressing. The next
+// request continues the view when its raw prompt starts with this one's up
+// to the generation prompt, in target and drafter tokens alike.
+struct PflashChatView {
+    std::vector<int32_t> raw_tokens;       // target tokens, raw prompt
+    int raw_gen_begin = -1;                 // its generation prompt
+    std::vector<int32_t> drafter_ids;      // drafter tokens, raw prompt
+    int drafter_gen_begin = -1;
+    std::vector<int32_t> view_tokens;      // target tokens served
+    int view_gen_begin = -1;
+    std::vector<PFlashTokenSpan> spans;    // raw drafter spans in the view
+    int turns = 0;
+};
+
+class PflashChatViewStore {
+public:
+    explicit PflashChatViewStore(size_t capacity = 8) : capacity_(capacity) {}
+    // The stored view the prompt continues (longest match), if any.
+    bool find(const std::vector<int32_t> & raw_tokens,
+              const std::vector<int32_t> & drafter_ids,
+              PflashChatView & out) const;
+    // Store a view, replacing the one it continues.
+    void remember(PflashChatView view);
+    size_t size() const;
+
+private:
+    mutable std::mutex mutex_;
+    size_t capacity_;
+    std::vector<PflashChatView> views_;   // most recent last
+};
+
 // Find the last sufficiently-specific suffix of the user query inside the
 // rendered drafter-tokenized prompt. Public for model-free regression tests.
 PflashQueryWindow find_pflash_query_window(
@@ -345,6 +429,56 @@ PFlashTokenSpan pflash_decoded_text_span(
     int end,
     const std::string & needle);
 
+// The chat turn the scorer query comes from, located by the model's own
+// chat control markers in the rendered prompt rather than message
+// bookkeeping: the latest user turn (tool output wrapped in a user turn does
+// not count), else the latest turn with content. An assistant turn left open
+// at the prompt end is the generation prompt -- whatever think or channel
+// prefix the template adds to it -- and never a candidate.
+// ``role_begin`` is the marker opening the turn (the header to pin);
+// ``content_begin`` skips the role-name line ("<|im_start|>user\n") when the
+// family uses generic role markers; ``content_end`` sits before the turn's
+// closing marker. Both trim the whitespace the template wraps content in.
+// ``turn_end`` sits past that closing marker; ``generation_begin`` is the
+// generation prompt's marker (the prompt end when there is none);
+// ``later_turns`` says assistant or tool turns sit between the two.
+// Offsets are token indices in ``prompt``'s own vocabulary. ``markers`` were
+// resolved on ``marker_tokenizer`` (the target model's); its marker strings
+// are searched in the decoded prompt text, so a drafter whose vocabulary
+// lacks the control tokens still maps correctly. Invalid when the prompt
+// carries no chat markers.
+struct PflashChatTurn {
+    int role_begin = -1;
+    int content_begin = -1;
+    int content_end = -1;
+    int turn_end = -1;
+    std::string role;       // "user", "assistant", "system", "tool", ...
+};
+
+struct PflashChatTurnSpan {
+    int role_begin = -1;
+    int content_begin = -1;
+    int content_end = -1;
+    int turn_end = -1;
+    int generation_begin = -1;
+    bool later_turns = false;
+    // Every turn before the generation prompt, in order; ``query_turn``
+    // indexes the one above. Tool output wrapped in a user turn has role
+    // "tool".
+    std::vector<PflashChatTurn> turns;
+    int query_turn = -1;
+
+    bool valid() const {
+        return content_begin >= 0 && content_end > content_begin;
+    }
+};
+
+PflashChatTurnSpan pflash_chat_query_turn(
+    const Tokenizer & marker_tokenizer,
+    const ChatMarkers & markers,
+    const Tokenizer & tokenizer,
+    const std::vector<int32_t> & prompt);
+
 // Return the original prompt offset immediately before the stable trailing
 // suffix shared with a version whose latest user message carries a sentinel.
 // Invalid when no such bounded suffix can establish the semantic boundary.
@@ -364,8 +498,21 @@ std::string pflash_token_fingerprint(
 
 bool pflash_full_cache_restore_allowed(
     bool selection_environment_present) noexcept;
-bool pflash_continuation_must_fail_closed(
-    bool selection_environment_present) noexcept;
+// Tokens the strict selector keeps whatever their score, counted the way it
+// charges them: every fixed chunk overlapping the query window or a kept span
+// and, with ``query_suffix_structural``, every chunk after the query. Probe
+// segments cut exactly at those edges, so this is an upper bound for them.
+int pflash_kept_tokens(
+    int input_tokens,
+    int chunk_size,
+    int query_begin,
+    int query_end,
+    const std::vector<PFlashTokenSpan> & kept_spans,
+    bool query_suffix_structural) noexcept;
+// The keep ratio that spends ``keep_ratio`` on the droppable tokens only:
+// (kept + keep_ratio * (input - kept) + 1) / input, capped at 1.
+double pflash_effective_keep_ratio(
+    int input_tokens, int kept_tokens, double keep_ratio) noexcept;
 int pflash_target_token_ceiling(
     int original_target_tokens, double keep_ratio) noexcept;
 
@@ -376,6 +523,7 @@ int pflash_target_token_ceiling(
 struct ParsedRequest {
     ApiFormat                  format;
     std::vector<int32_t>      prompt_tokens;  // tokenized prompt
+    ImagePromptHandle         images;
     std::string               rendered_prompt;
     int                       max_output   = 4096;
     bool                      stream       = true;
@@ -458,7 +606,7 @@ json build_props_body(const ServerConfig & config,
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {
 public:
-    HttpServer(dflash::engine::LuceEngine & engine,
+    HttpServer(luce::engine::LuceEngine & engine,
                Tokenizer & tokenizer,
                const ServerConfig & config);
     ~HttpServer();
@@ -511,11 +659,18 @@ private:
 
     struct PreparedPrompt {
         std::vector<int32_t> tokens;
+        ImagePromptHandle images;
         bool compressed = false;
         bool flowkv = false;
         int full_cache_served_tokens = -1;
         int full_cache_hit_slot = -1;
         int full_cache_hit_len = 0;
+        // Where to take this request's prefix-cache snapshot when nothing
+        // else asks for one: a multi-turn PFlash view sets the start of its
+        // generation prompt, where the next turn's prompt branches off.
+        int snapshot_cut = -1;
+        // PFlash details for usage.timings.pflash (see build_timings_json).
+        nlohmann::json pflash_stats;
         int error_status = 0;
         std::string error;
     };
@@ -527,6 +682,28 @@ private:
                                   PreparedPrompt & prepared);
     std::string apply_pflash_compression(const ParsedRequest & req,
                                          PreparedPrompt & prepared);
+    // Multi-turn: serve the conversation's previous view plus this turn's
+    // new material -- verbatim below PFLASH_CHAT_COMPRESS_NEW_TOKENS, else
+    // the parts the fresh selection keeps -- with the segments the fresh
+    // selection wants that the view lacks recalled at the new user turn.
+    // Without a fresh compression (``fresh`` null) it serves only what needs
+    // no scoring: a repeated prompt, or a small follow-up with recall off;
+    // it returns false for the caller to compress. With one it always
+    // serves: a continued view, or the fresh prompt as a new view.
+    bool serve_pflash_chat_view(
+        const ParsedRequest & req,
+        const std::vector<int32_t> & drafter_ids,
+        const http_detail::PflashChatTurnSpan & turn,
+        const std::vector<int32_t> * fresh,
+        const std::vector<PFlashTokenSpan> * kept_spans,
+        const std::vector<std::pair<PFlashTokenSpan, double>> * lifts,
+        std::vector<int32_t> & served,
+        int & snapshot_cut,
+        nlohmann::json & stats);
+    // PFLASH_VIEW_TRACE_PATH: one JSONL record per compressed request with
+    // the served prompt's text, for evidence checks in evaluations.
+    void trace_pflash_served(const ParsedRequest & req,
+                             const PreparedPrompt & prepared);
     bool forward_upstream(ServerJob * job, const ParsedRequest & req,
                           const PreparedPrompt & prepared);
 
@@ -661,7 +838,7 @@ private:
     bool has_pending_jobs();
 
     // Members.
-    dflash::engine::LuceEngine & engine_;
+    luce::engine::LuceEngine & engine_;
     ModelBackend &   backend_;
     Tokenizer &      tokenizer_;
     Tokenizer *      drafter_tokenizer_ = nullptr;  // pflash drafter (optional)
@@ -674,6 +851,9 @@ private:
 
     // Per-session adaptive keep_ratio bandit state.
     HttpServerSessions sessions_;
+
+    // Multi-turn PFlash views, matched by raw prompt prefix.
+    http_detail::PflashChatViewStore pflash_views_;
 
     // Live status tracker (read by /status/json, written by worker thread).
     ServerStatus status_;
@@ -833,4 +1013,4 @@ inline std::string parse_session_id_from_body(const json & body) {
     return {};
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

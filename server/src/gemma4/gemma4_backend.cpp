@@ -5,8 +5,8 @@
 // KV cache with layer sharing, snapshot/restore.
 
 #include "gemma4_backend.h"
-#include "dflash27b.h"
-#include "../qwen3/qwen3_kvflash_scorer.h"
+#include "luce.h"
+#include "pflash/kvflash_drafter_scorer.h"
 #include "common/sampler.h"
 #include "common/io_utils.h"
 #include "common/dflash_feature_ring.h"
@@ -23,7 +23,7 @@
 #include <cmath>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 // ── Ctor / dtor ────────────────────────────────────────────────────────
 
@@ -48,7 +48,7 @@ bool Gemma4Backend::init() {
 
     if (!load_gemma4_gguf(cfg_.model_path, backend_, w_)) {
         std::fprintf(stderr, "[gemma4] GGUF load failed: %s\n",
-                     dflash27b_last_error());
+                     luce_last_error());
         return false;
     }
 
@@ -156,7 +156,7 @@ bool Gemma4Backend::unpark(ParkTarget target) {
 // ── kvflash helpers ────────────────────────────────────────────────────
 
 void Gemma4Backend::kvflash_read_config() {
-    if (std::getenv("DFLASH_KVFLASH")) {
+    if (std::getenv("LUCE_KVFLASH")) {
         kvflash_drafter_path_ = kvflash_find_drafter(
             cfg_.model_path.c_str());
     }
@@ -184,13 +184,13 @@ void Gemma4Backend::kvflash_read_config() {
                                             !kvflash_drafter_path_.empty(),
                                             kvf_budget);
     if (kvflash_tokens_ > 0) {
-        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        const char * tau = std::getenv("LUCE_KVFLASH_TAU");
         kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
     }
 }
 
 // Drafter rescore + repage (FlashMemory tau loop) with the cross-tokenizer
-// scorer: gemma ids are detokenized and re-scored through the Qwen3-0.6B
+// scorer: gemma ids are detokenized and re-scored through the Qwen3.5-0.8B
 // drafter. Lazy: the drafter + tokenizers load on the first reselect that
 // needs them, never on a request's first tokens.
 void Gemma4Backend::kvflash_maybe_reselect(int generated) {
@@ -206,7 +206,7 @@ void Gemma4Backend::kvflash_maybe_reselect(int generated) {
             if (!load_drafter(kvflash_drafter_path_, /*gpu_layers=*/999,
                               cfg_.device.gpu, drafter_ctx_)) {
                 std::fprintf(stderr, "[kvflash] drafter load failed (%s); staying on "
-                                     "LRU residency\n", dflash27b_last_error());
+                                     "LRU residency\n", luce_last_error());
                 kvflash_drafter_failed_ = true;
                 return;
             }
@@ -257,7 +257,7 @@ bool Gemma4Backend::kvflash_attach() {
                 cache_.swa_size,
                 !kvflash_drafter_path_.empty()
                     ? "drafter/cross-tok (attaches on first reselect)"
-                    : "lru (recency-only: no Qwen3-0.6B drafter found)");
+                    : "lru (recency-only: no Qwen3.5-0.8B drafter found)");
     std::fflush(stdout);
     return true;
 }
@@ -362,7 +362,7 @@ bool Gemma4Backend::do_decode(int committed, int n_gen,
     std::vector<float> logits;
 
     // Budget force-close state — same shape as qwen35's maybe_force_close.
-    // See dflash/src/common/model_backend.h BudgetHook docs for the
+    // See server/src/common/model_backend.h BudgetHook docs for the
     // single- vs multi-token close-tag semantics.
     bool budget_close_started = false;
     int  close_inject_pos     = 0;
@@ -1203,7 +1203,7 @@ bool Gemma4Backend::handle_compress(const std::string & line,
 
     const char * dpath = (n >= 3 && drafter_path[0])
         ? drafter_path
-        : "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+        : "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf";
 
     // Park target to free VRAM for the drafter (unless skip_park).
     const bool was_parked = parked_;
@@ -1219,7 +1219,7 @@ bool Gemma4Backend::handle_compress(const std::string & line,
         std::fprintf(stderr, "[compress] loading drafter from %s ...\n", dpath);
         if (!load_drafter(dpath, /*gpu_layers=*/999, drafter_ctx_)) {
             std::fprintf(stderr, "[compress] drafter init failed: %s\n",
-                         dflash27b_last_error());
+                         luce_last_error());
             io.emit(-1);
             if (!skip_park && !was_parked) unpark(ParkTarget::TargetModel);
             return false;
@@ -1232,7 +1232,9 @@ bool Gemma4Backend::handle_compress(const std::string & line,
     bool ok = false;
     if (!tokens.empty()) {
         const float keep = (float)keep_x1000 / 1000.0f;
-        auto compressed = drafter_score_and_compress(drafter_ctx_, tokens, keep);
+        auto compressed = drafter_score_and_compress(drafter_ctx_, tokens, keep,
+            /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13,
+            (int)tokens.size());
         ok = !compressed.empty();
         if (ok) {
             std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
@@ -1252,7 +1254,7 @@ bool Gemma4Backend::handle_compress(const std::string & line,
 
 void Gemma4Backend::free_drafter() {
     if (drafter_loaded_) {
-        ::dflash::common::free_drafter(drafter_ctx_);
+        ::luce::common::free_drafter(drafter_ctx_);
         drafter_loaded_ = false;
     }
 }
@@ -1277,7 +1279,7 @@ bool Gemma4Backend::load_decode_draft() {
         return false;
     }
     if (!load_draft_gguf(*cfg_.draft_path, draft_backend_, dw_, nullptr)) {
-        std::fprintf(stderr, "[gemma4] draft load failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "[gemma4] draft load failed: %s\n", luce_last_error());
         ggml_backend_free(draft_backend_);
         draft_backend_ = nullptr;
         return false;
@@ -1380,4 +1382,4 @@ void Gemma4Backend::shutdown() {
     std::printf("[gemma4] shutdown\n"); std::fflush(stdout);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

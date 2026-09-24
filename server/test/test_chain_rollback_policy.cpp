@@ -11,26 +11,26 @@
 #include <cstring>
 #include <string>
 
-using dflash::common::resolve_chain_rollback_policy;
-using dflash::common::RollbackDiag;
-using dflash::common::set_environment_variable;
-using dflash::common::split_chain_fast_rollback_enabled;
-using dflash::common::unset_environment_variable;
+using luce::common::resolve_chain_rollback_policy;
+using luce::common::RollbackDiag;
+using luce::common::set_environment_variable;
+using luce::common::split_chain_fast_rollback_enabled;
+using luce::common::unset_environment_variable;
 
 namespace {
 struct ChainRollbackPolicyFixture {};
 }
 
 static void clear_policy_env() {
-    unset_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32");
-    unset_environment_variable("DFLASH_FAST_ROLLBACK_THRESHOLD");
-    unset_environment_variable("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG");
+    unset_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32");
+    unset_environment_variable("LUCE_FAST_ROLLBACK_THRESHOLD");
+    unset_environment_variable("LUCE_SINGLE_CHAIN_ROLLBACK_DIAG");
 }
 
 TEST_CASE(ChainRollbackPolicyFixture, policy_defaults_and_env_parsing) {
-    const luce_test::ScopedEnvVar checkpoint("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", nullptr);
-    const luce_test::ScopedEnvVar threshold("DFLASH_FAST_ROLLBACK_THRESHOLD", nullptr);
-    const luce_test::ScopedEnvVar diagnostics("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG", nullptr);
+    const luce_test::ScopedEnvVar checkpoint("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", nullptr);
+    const luce_test::ScopedEnvVar threshold("LUCE_FAST_ROLLBACK_THRESHOLD", nullptr);
+    const luce_test::ScopedEnvVar diagnostics("LUCE_SINGLE_CHAIN_ROLLBACK_DIAG", nullptr);
     clear_policy_env();
     // Exact F32 checkpoints and rollback from the first accepted token are the
     // default: the tuned decode path should not need an opt-in.
@@ -41,18 +41,18 @@ TEST_CASE(ChainRollbackPolicyFixture, policy_defaults_and_env_parsing) {
 
     // The threshold env is honoured on the default path, because the F32
     // checkpoints it depends on are now present without an opt-in.
-    set_environment_variable("DFLASH_FAST_ROLLBACK_THRESHOLD", "2", true);
+    set_environment_variable("LUCE_FAST_ROLLBACK_THRESHOLD", "2", true);
     policy = resolve_chain_rollback_policy();
     CHECK(policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 2);
 
     // Opting out restores the legacy F16 replay path and its threshold.
-    set_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "0", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", "0", true);
     policy = resolve_chain_rollback_policy();
     CHECK(!policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 5);
 
-    set_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "1", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", "1", true);
     policy = resolve_chain_rollback_policy();
     CHECK(policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 2);
@@ -62,7 +62,7 @@ TEST_CASE(ChainRollbackPolicyFixture, policy_defaults_and_env_parsing) {
     policy = resolve_chain_rollback_policy(true);
     CHECK(policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 1);
-    unset_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32");
+    unset_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32");
     policy = resolve_chain_rollback_policy(true);
     CHECK(policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 1);
@@ -71,67 +71,67 @@ TEST_CASE(ChainRollbackPolicyFixture, policy_defaults_and_env_parsing) {
     CHECK(policy.fast_rollback_threshold == 1);
     // Opted out, TP and exact device-side rollback still roll back from the
     // first accepted token: neither depends on host checkpoint precision.
-    set_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "0", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", "0", true);
     policy = resolve_chain_rollback_policy(true);
     CHECK(!policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 1);
     policy = resolve_chain_rollback_policy(false, true);
     CHECK(!policy.checkpoint_f32);
     CHECK(policy.fast_rollback_threshold == 1);
-    set_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "1", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", "1", true);
 
     // Boolean flags follow the project's non-empty, non-"0" convention.
-    set_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "true", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", "true", true);
     CHECK(resolve_chain_rollback_policy().checkpoint_f32);
-    set_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "yes", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", "yes", true);
     CHECK(resolve_chain_rollback_policy().checkpoint_f32);
-    set_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "on", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", "on", true);
     CHECK(resolve_chain_rollback_policy().checkpoint_f32);
-    set_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "0", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", "0", true);
     CHECK(!resolve_chain_rollback_policy().checkpoint_f32);
-    set_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "1", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", "1", true);
 
     // Out-of-range or unparseable values leave the default in place.
-    set_environment_variable("DFLASH_FAST_ROLLBACK_THRESHOLD", "0", true);
+    set_environment_variable("LUCE_FAST_ROLLBACK_THRESHOLD", "0", true);
     CHECK(resolve_chain_rollback_policy().fast_rollback_threshold == 1);
-    set_environment_variable("DFLASH_FAST_ROLLBACK_THRESHOLD", "6", true);
+    set_environment_variable("LUCE_FAST_ROLLBACK_THRESHOLD", "6", true);
     CHECK(resolve_chain_rollback_policy().fast_rollback_threshold == 1);
-    set_environment_variable("DFLASH_FAST_ROLLBACK_THRESHOLD", "garbage", true);
+    set_environment_variable("LUCE_FAST_ROLLBACK_THRESHOLD", "garbage", true);
     CHECK(resolve_chain_rollback_policy().fast_rollback_threshold == 1);
 
-    set_environment_variable("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG", "1", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_ROLLBACK_DIAG", "1", true);
     CHECK(resolve_chain_rollback_policy().diagnostics);
     clear_policy_env();
 }
 
 TEST_CASE(ChainRollbackPolicyFixture, split_fast_rollback_is_explicitly_opt_in) {
-    const luce_test::ScopedEnvVar split_fast("DFLASH_SPLIT_FAST_ROLLBACK", nullptr);
-    unset_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK");
+    const luce_test::ScopedEnvVar split_fast("LUCE_SPLIT_FAST_ROLLBACK", nullptr);
+    unset_environment_variable("LUCE_SPLIT_FAST_ROLLBACK");
     CHECK(!split_chain_fast_rollback_enabled());
 
-    set_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK", "1", true);
+    set_environment_variable("LUCE_SPLIT_FAST_ROLLBACK", "1", true);
     CHECK(split_chain_fast_rollback_enabled());
-    set_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK", "true", true);
+    set_environment_variable("LUCE_SPLIT_FAST_ROLLBACK", "true", true);
     CHECK(split_chain_fast_rollback_enabled());
-    set_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK", "0", true);
+    set_environment_variable("LUCE_SPLIT_FAST_ROLLBACK", "0", true);
     CHECK(!split_chain_fast_rollback_enabled());
-    set_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK", "", true);
+    set_environment_variable("LUCE_SPLIT_FAST_ROLLBACK", "", true);
     CHECK(!split_chain_fast_rollback_enabled());
-    unset_environment_variable("DFLASH_SPLIT_FAST_ROLLBACK");
+    unset_environment_variable("LUCE_SPLIT_FAST_ROLLBACK");
 }
 
 TEST_CASE(ChainRollbackPolicyFixture, split_checkpoint_dtype_is_gated_at_allocation) {
-    const luce_test::ScopedEnvVar kv_f16("DFLASH27B_KV_F16", nullptr);
-    const luce_test::ScopedEnvVar kv_q4("DFLASH27B_KV_Q4", nullptr);
-    const luce_test::ScopedEnvVar kv_tq3("DFLASH27B_KV_TQ3", nullptr);
-    const luce_test::ScopedEnvVar kv_k("DFLASH27B_KV_K", nullptr);
-    const luce_test::ScopedEnvVar kv_v("DFLASH27B_KV_V", nullptr);
+    const luce_test::ScopedEnvVar kv_f16("LUCE_KV_F16", nullptr);
+    const luce_test::ScopedEnvVar kv_q4("LUCE_KV_Q4", nullptr);
+    const luce_test::ScopedEnvVar kv_tq3("LUCE_KV_TQ3", nullptr);
+    const luce_test::ScopedEnvVar kv_k("LUCE_KV_K", nullptr);
+    const luce_test::ScopedEnvVar kv_v("LUCE_KV_V", nullptr);
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     CHECK(backend != nullptr);
     if (!backend) return;
 
-    dflash::common::TargetWeights weights;
+    luce::common::TargetWeights weights;
     weights.n_layer = 2;
     weights.full_attention_interval = 2;
     weights.n_embd_head_k = 32;
@@ -147,8 +147,8 @@ TEST_CASE(ChainRollbackPolicyFixture, split_checkpoint_dtype_is_gated_at_allocat
     weights.ssm_d_conv = 2;
 
     auto check_type = [&](bool f32_checkpoints, ggml_type expected) {
-        dflash::common::TargetCache cache;
-        const bool ok = dflash::common::create_target_cache_partial(
+        luce::common::TargetCache cache;
+        const bool ok = luce::common::create_target_cache_partial(
             weights, /*max_ctx=*/1, /*max_verify_tokens=*/2, backend, cache,
             /*prefill_only=*/false, /*layer_begin=*/0, /*layer_end=*/2,
             /*allocate_target_feat=*/false, /*ctx_alloc=*/0,
@@ -161,7 +161,7 @@ TEST_CASE(ChainRollbackPolicyFixture, split_checkpoint_dtype_is_gated_at_allocat
                 CHECK(cache.ssm_intermediate[0]->type == expected);
             }
         }
-        dflash::common::free_target_cache(cache);
+        luce::common::free_target_cache(cache);
     };
 
     check_type(false, GGML_TYPE_Q8_0);
@@ -170,17 +170,17 @@ TEST_CASE(ChainRollbackPolicyFixture, split_checkpoint_dtype_is_gated_at_allocat
 }
 
 TEST_CASE(ChainRollbackPolicyFixture, asymmetric_v_cache_is_ling_only) {
-    const luce_test::ScopedEnvVar kv_f16("DFLASH27B_KV_F16", "1");
-    const luce_test::ScopedEnvVar kv_q4("DFLASH27B_KV_Q4", nullptr);
-    const luce_test::ScopedEnvVar kv_tq3("DFLASH27B_KV_TQ3", nullptr);
-    const luce_test::ScopedEnvVar kv_k("DFLASH27B_KV_K", nullptr);
-    const luce_test::ScopedEnvVar kv_v("DFLASH27B_KV_V", nullptr);
+    const luce_test::ScopedEnvVar kv_f16("LUCE_KV_F16", "1");
+    const luce_test::ScopedEnvVar kv_q4("LUCE_KV_Q4", nullptr);
+    const luce_test::ScopedEnvVar kv_tq3("LUCE_KV_TQ3", nullptr);
+    const luce_test::ScopedEnvVar kv_k("LUCE_KV_K", nullptr);
+    const luce_test::ScopedEnvVar kv_v("LUCE_KV_V", nullptr);
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     CHECK(backend != nullptr);
     if (!backend) return;
 
-    dflash::common::TargetWeights weights;
+    luce::common::TargetWeights weights;
     weights.n_layer = 1;
     weights.full_attention_interval = 1;
     weights.n_embd_head_k = 32;
@@ -192,9 +192,9 @@ TEST_CASE(ChainRollbackPolicyFixture, asymmetric_v_cache_is_ling_only) {
 
     const auto check_width = [&](bool is_bailingmoe3, int expected) {
         weights.is_bailingmoe3 = is_bailingmoe3;
-        dflash::common::TargetCache cache;
+        luce::common::TargetCache cache;
         // This fixture has no recurrent layers, so no rollback cache is needed.
-        const bool ok = dflash::common::create_target_cache_partial(
+        const bool ok = luce::common::create_target_cache_partial(
             weights, /*max_ctx=*/1, /*max_verify_tokens=*/1, backend, cache,
             /*prefill_only=*/true, /*layer_begin=*/0, /*layer_end=*/1,
             /*allocate_target_feat=*/false, /*ctx_alloc=*/0,
@@ -205,7 +205,7 @@ TEST_CASE(ChainRollbackPolicyFixture, asymmetric_v_cache_is_ling_only) {
             CHECK(cache.attn_v[0] != nullptr);
             if (cache.attn_v[0]) CHECK(cache.attn_v[0]->ne[0] == expected);
         }
-        dflash::common::free_target_cache(cache);
+        luce::common::free_target_cache(cache);
     };
 
     check_width(/*is_bailingmoe3=*/false, /*expected=*/32);
@@ -214,11 +214,11 @@ TEST_CASE(ChainRollbackPolicyFixture, asymmetric_v_cache_is_ling_only) {
 }
 
 TEST_CASE(ChainRollbackPolicyFixture, diagnostics_accumulator_and_print_contract) {
-    const luce_test::ScopedEnvVar checkpoint("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", nullptr);
-    const luce_test::ScopedEnvVar threshold("DFLASH_FAST_ROLLBACK_THRESHOLD", nullptr);
-    const luce_test::ScopedEnvVar diagnostics("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG", nullptr);
+    const luce_test::ScopedEnvVar checkpoint("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", nullptr);
+    const luce_test::ScopedEnvVar threshold("LUCE_FAST_ROLLBACK_THRESHOLD", nullptr);
+    const luce_test::ScopedEnvVar diagnostics("LUCE_SINGLE_CHAIN_ROLLBACK_DIAG", nullptr);
     clear_policy_env();
-    set_environment_variable("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG", "1", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_ROLLBACK_DIAG", "1", true);
 
     RollbackDiag diag;
     diag.record_accept(1);
@@ -256,8 +256,8 @@ TEST_CASE(ChainRollbackPolicyFixture, diagnostics_accumulator_and_print_contract
         return text;
     };
 
-    set_environment_variable("DFLASH_SINGLE_CHAIN_CHECKPOINT_F32", "1", true);
-    set_environment_variable("DFLASH_FAST_ROLLBACK_THRESHOLD", "1", true);
+    set_environment_variable("LUCE_SINGLE_CHAIN_CHECKPOINT_F32", "1", true);
+    set_environment_variable("LUCE_FAST_ROLLBACK_THRESHOLD", "1", true);
     const std::string line = print_to_string(diag);
     CHECK(line ==
         "[chain-rollback-policy] checkpoint=F32 threshold=1 fast_low=1 fast_high=1 "
@@ -266,7 +266,7 @@ TEST_CASE(ChainRollbackPolicyFixture, diagnostics_accumulator_and_print_contract
 
     diag.print(resolve_chain_rollback_policy(), nullptr);
 
-    unset_environment_variable("DFLASH_SINGLE_CHAIN_ROLLBACK_DIAG");
+    unset_environment_variable("LUCE_SINGLE_CHAIN_ROLLBACK_DIAG");
     CHECK(print_to_string(diag).empty());
     clear_policy_env();
 }

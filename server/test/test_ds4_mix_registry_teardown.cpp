@@ -33,10 +33,10 @@
 
 using namespace CppUnitTestFramework;
 
-using dflash::common::DeepSeek4Layer;
-using dflash::common::DeepSeek4Weights;
-using dflash::common::MoeHybridStorage;
-using dflash::common::free_deepseek4_weights;
+using luce::common::DeepSeek4Layer;
+using luce::common::DeepSeek4Weights;
+using luce::common::MoeHybridStorage;
+using luce::common::free_deepseek4_weights;
 
 bool ggml_cuda_rocmfp3_mix_registered(const void * vx);
 bool ggml_cuda_rocmfp2_mix_registered(const void * vx);

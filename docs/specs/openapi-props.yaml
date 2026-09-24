@@ -1,9 +1,9 @@
 openapi: 3.1.0
 
 info:
-  title: dflash_server /props endpoint
+  title: luce_server /props endpoint
   version: "2"
-  summary: Capability and configuration introspection for dflash_server.
+  summary: Capability and configuration introspection for luce_server.
   description: |
     `GET /props` returns enough JSON for a dashboard, a deployment
     healthcheck, or a client SDK to know what this server can do
@@ -34,7 +34,7 @@ x-props-schema: 2
 
 servers:
   - url: http://localhost:8080
-    description: Default dflash_server bind.
+    description: Default luce_server bind.
 
 paths:
   /props:
@@ -106,7 +106,7 @@ paths:
                       arch: "qwen35"
                       draft_path: "/.../dflash-draft-3.6-q4_k_m.gguf"
                       tokenizer_id: null
-                    model_alias: "dflash"
+                    model_alias: "luce"
                     model_card:
                       name: "Qwen3.6 27B"
                       source: "https://huggingface.co/Qwen/Qwen3.6-27B"
@@ -238,9 +238,9 @@ components:
           type: string
           description: |
             The value clients should pass as the `model` field in
-            chat/responses requests. Defaults to `"dflash"`;
+            chat/responses requests. Defaults to `"luce"`;
             overridable with `--model-name`.
-          example: "dflash"
+          example: "luce"
         model_card:
           oneOf:
             - $ref: "#/components/schemas/ModelCard"
@@ -649,11 +649,11 @@ components:
         bsa_alpha:
           type: ["number", "null"]
           format: double
-          description: BSA alpha tunable (env `DFLASH_FP_ALPHA`).
+          description: BSA alpha tunable (env `LUCE_FP_ALPHA`).
           example: null
         bsa_enabled:
           type: ["boolean", "null"]
-          description: BSA toggle (env `DFLASH_FP_USE_BSA`).
+          description: BSA toggle (env `LUCE_FP_USE_BSA`).
           example: null
         drafter_gguf:
           type: ["string", "null"]
@@ -670,7 +670,7 @@ components:
           example: null
         lm_head_fix:
           type: ["boolean", "null"]
-          description: Backend-specific lm_head_fix tunable (env `DFLASH27B_LM_HEAD_FIX`).
+          description: Backend-specific lm_head_fix tunable (env `LUCE_LM_HEAD_FIX`).
           example: null
         mode:
           type: string
@@ -754,7 +754,7 @@ components:
           type: array
           description: |
             Effort tier values the server will recognize.
-            dflash_server lists all five; other servers may
+            luce_server lists all five; other servers may
             list a subset.
           items:
             type: string

@@ -11,7 +11,7 @@
 #include "gemma4_internal.h"
 #include "placement/placement_config.h"
 #include "placement/remote_target_shard_config.h"
-#include "qwen3/qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
 
 #include "ggml-backend.h"
 
@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Gemma4LayerSplitAdapterConfig {
     std::string target_path;
@@ -136,4 +136,4 @@ int run_gemma4_target_shard_ipc_daemon(const char * target_path,
                                        size_t shared_payload_bytes = 0,
                                        int kvflash_pool_tokens = 0);
 
-}  // namespace dflash::common
+}  // namespace luce::common

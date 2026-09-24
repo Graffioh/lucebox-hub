@@ -1,7 +1,7 @@
 #include "CppUnitTestFramework.hpp"
 
-#include "qwen3/pflash_selection.h"
-#include "qwen3/qwen3_drafter_model.h"
+#include "pflash/pflash_selection.h"
+#include "pflash/pflash_compress.h"
 #include "scoped_env.h"
 
 #include <cmath>
@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-using namespace dflash::qwen3;
+using namespace luce::pflash;
 
 namespace {
 
@@ -21,6 +21,7 @@ constexpr const char * kChunkEnv = "PFLASH_SELECT_CHUNK_SIZE";
 constexpr const char * kQueryEnv = "PFLASH_SELECT_QUERY_TOKENS";
 constexpr const char * kQueryParserEnv = "PFLASH_SELECT_QUERY_PARSER";
 constexpr const char * kTopPEnv = "PFLASH_SELECT_TOP_P";
+constexpr const char * kTopKEnv = "PFLASH_SELECT_TOPK";
 
 struct CleanPFlashEnv {
     luce_test::ScopedEnvVar mode{kModeEnv, nullptr};
@@ -28,6 +29,7 @@ struct CleanPFlashEnv {
     luce_test::ScopedEnvVar query{kQueryEnv, nullptr};
     luce_test::ScopedEnvVar query_parser{kQueryParserEnv, nullptr};
     luce_test::ScopedEnvVar top_p{kTopPEnv, nullptr};
+    luce_test::ScopedEnvVar top_k{kTopKEnv, nullptr};
 };
 
 void set_env(const char * name, const char * value) {
@@ -110,11 +112,28 @@ TEST_CASE(PFlashSelectionFixture, structural_suffix_only_chunk_is_mandatory_and_
     require_ordinals(result, {1, 2});
 }
 
+TEST_CASE(PFlashSelectionFixture, query_suffix_candidates_are_optional_unless_pinned) {
+    // Agent loop: turns after the query are scored context. Only the query
+    // window and pinned spans (the generation prompt) stay mandatory.
+    constexpr int input_tokens = 200;
+    constexpr int query_begin = 20;
+    constexpr int query_end = 30;
+    const std::vector<luce::common::PFlashTokenSpan> pinned{{190, 200}};
+    REQUIRE(pflash_chunk_is_structurally_required(
+        0, 32, query_begin, query_end, input_tokens, pinned, false));
+    REQUIRE(!pflash_chunk_is_structurally_required(
+        32, 64, query_begin, query_end, input_tokens, pinned, false));
+    REQUIRE(pflash_chunk_is_structurally_required(
+        32, 64, query_begin, query_end, input_tokens, pinned, true));
+    REQUIRE(pflash_chunk_is_structurally_required(
+        160, 200, query_begin, query_end, input_tokens, pinned, false));
+}
+
 TEST_CASE(PFlashSelectionFixture, instruction_overlap_is_mandatory_without_changing_optional_ranking) {
     constexpr int input_tokens = 120000;
     constexpr int query_begin = 119872;
     constexpr int query_end = 120000;
-    const std::vector<dflash::common::PFlashTokenSpan> instructions{
+    const std::vector<luce::common::PFlashTokenSpan> instructions{
         {0, 384},
         {4096, 4352},
     };
@@ -147,7 +166,7 @@ TEST_CASE(PFlashSelectionFixture, instruction_overlap_is_mandatory_without_chang
 
 TEST_CASE(PFlashSelectionFixture, invalid_instruction_spans_fail_closed) {
     constexpr int input_tokens = 32;
-    const std::vector<std::vector<dflash::common::PFlashTokenSpan>> invalid{
+    const std::vector<std::vector<luce::common::PFlashTokenSpan>> invalid{
         {{-1, 2}},
         {{4, 4}},
         {{4, 3}},
@@ -161,7 +180,7 @@ TEST_CASE(PFlashSelectionFixture, invalid_instruction_spans_fail_closed) {
             spans, input_tokens, error));
         REQUIRE(!error.empty());
     }
-    std::vector<dflash::common::PFlashTokenSpan> too_many(65, {0, 1});
+    std::vector<luce::common::PFlashTokenSpan> too_many(65, {0, 1});
     std::string error;
     REQUIRE(!validate_pflash_instruction_spans(
         too_many, input_tokens, error));
@@ -346,7 +365,7 @@ TEST_CASE(PFlashSelectionFixture, resolver_defaults_to_legacy_arguments) {
     REQUIRE(!config.configured);
     REQUIRE(!config.selection_active);
     REQUIRE(config.mode == PFlashSelectionMode::Legacy);
-    REQUIRE(config.query_parser == PFlashQueryParser::SemanticUser);
+    REQUIRE(config.query_parser == PFlashQueryParser::ArbitraryTail);
     REQUIRE(config.chunk_size == 32);
     REQUIRE(config.query_tokens == 8);
     REQUIRE(std::abs(config.top_p - 0.95) < 1e-12);
@@ -482,7 +501,7 @@ TEST_CASE(PFlashSelectionFixture, scoring_head_token_mass_averages_heads_and_que
         1.0f, 0.0f, 0.0f,   // head 1, query 1
     };
     std::vector<float> mass;
-    dflash::common::scoring_head_mean_token_mass(probs.data(), 3, 2, 2, mass);
+    luce::common::scoring_head_mean_token_mass(probs.data(), 3, 2, 2, mass);
     REQUIRE(mass.size() == 3u);
     CHECK(std::fabs(mass[0] - 0.45f) < 1e-6f);
     CHECK(std::fabs(mass[1] - 0.175f) < 1e-6f);
@@ -491,7 +510,7 @@ TEST_CASE(PFlashSelectionFixture, scoring_head_token_mass_averages_heads_and_que
     for (float value : mass) total += value;
     CHECK(std::fabs(total - 1.0) < 1e-6);
 
-    dflash::common::scoring_head_mean_token_mass(probs.data(), 0, 2, 2, mass);
+    luce::common::scoring_head_mean_token_mass(probs.data(), 0, 2, 2, mass);
     CHECK(mass.empty());
 }
 
@@ -672,4 +691,187 @@ TEST_CASE(PFlashSelectionFixture, scorer_and_split_environment_resolve_or_fail) 
     std::string error;
     REQUIRE(!resolve_pflash_selection(4096, 1024, invalid, error));
     REQUIRE(error.find("PFLASH_SELECT_SPLIT") != std::string::npos);
+}
+
+namespace {
+
+// Six equal-length optional candidates, scores descending with the ordinal.
+std::vector<PFlashSelectionCandidate> ranked_candidates() {
+    std::vector<PFlashSelectionCandidate> candidates;
+    for (size_t index = 0; index < 6; ++index) {
+        const int begin = (int) index * 100;
+        candidates.push_back(
+            candidate(index, begin, begin + 100, 6.0 - (double) index));
+    }
+    return candidates;
+}
+
+} // namespace
+
+TEST_CASE(PFlashSelectionFixture, top_k_keeps_the_k_highest_scoring_optional_candidates) {
+    const auto candidates = ranked_candidates();
+    // Budget far above the six candidates: K alone decides.
+    const auto result = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, 2},
+        PFlashSelectionMode::TopK);
+
+    REQUIRE(result.ok);
+    REQUIRE(result.stop == PFlashSelectionStop::TopKReached);
+    REQUIRE(result.retained_tokens == 200);
+    require_ordinals(result, {0, 1});
+}
+
+TEST_CASE(PFlashSelectionFixture, top_k_above_the_candidate_count_falls_back_to_budget_behaviour) {
+    const auto candidates = ranked_candidates();
+    // K larger than the candidate list: every candidate fits, so the run ends
+    // exactly where budget_only would.
+    const auto roomy = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, 50},
+        PFlashSelectionMode::TopK);
+    const auto budget_only = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false},
+        PFlashSelectionMode::BudgetOnly);
+
+    REQUIRE(roomy.ok);
+    REQUIRE(roomy.stop == PFlashSelectionStop::CandidatesExhausted);
+    REQUIRE(roomy.stop == budget_only.stop);
+    REQUIRE(roomy.retained_tokens == budget_only.retained_tokens);
+    require_ordinals(roomy, {0, 1, 2, 3, 4, 5});
+
+    // The same K against a budget that bites: the budget stops the fill.
+    const auto tight = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{250, 0.95, false, 50},
+        PFlashSelectionMode::TopK);
+    REQUIRE(tight.ok);
+    REQUIRE(tight.stop == PFlashSelectionStop::BudgetReached);
+    REQUIRE(tight.retained_tokens == 200);
+    require_ordinals(tight, {0, 1});
+}
+
+TEST_CASE(PFlashSelectionFixture, top_k_never_exceeds_the_token_budget) {
+    const auto candidates = ranked_candidates();
+    // K=5 wants 500 tokens; the budget caps the run at two candidates.
+    const auto result = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{250, 0.95, false, 5},
+        PFlashSelectionMode::TopK);
+
+    REQUIRE(result.ok);
+    REQUIRE(result.stop == PFlashSelectionStop::BudgetReached);
+    REQUIRE(result.retained_tokens <= 250);
+    REQUIRE(result.retained_tokens == 200);
+    require_ordinals(result, {0, 1});
+}
+
+TEST_CASE(PFlashSelectionFixture, top_k_skips_an_oversized_candidate_and_keeps_ranking) {
+    // Variable-length segments: the 300-token second-ranked candidate does not
+    // fit, so the fill continues below it instead of ending, exactly as
+    // budget_only does, and K counts only the candidates actually kept.
+    const std::vector<PFlashSelectionCandidate> candidates{
+        candidate(0, 0, 100, 10.0),
+        candidate(1, 100, 400, 9.0),
+        candidate(2, 400, 500, 8.0),
+        candidate(3, 500, 600, 7.0),
+    };
+    const auto result = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{250, 0.95, true, 3},
+        PFlashSelectionMode::TopK);
+
+    REQUIRE(result.ok);
+    REQUIRE(result.stop == PFlashSelectionStop::BudgetReached);
+    REQUIRE(result.retained_tokens == 200);
+    require_ordinals(result, {0, 2});
+}
+
+TEST_CASE(PFlashSelectionFixture, top_k_keeps_mandatory_candidates_outside_the_rank) {
+    // Ordinal 3 is mandatory and scores lowest: it is kept and charged, and K
+    // still buys one optional candidate on top of it.
+    std::vector<PFlashSelectionCandidate> candidates{
+        candidate(0, 0, 100, 5.0),
+        candidate(1, 100, 200, 4.0),
+        candidate(2, 200, 300, 3.0),
+        candidate(3, 300, 400, 0.0, true),
+    };
+    const auto result = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, 1},
+        PFlashSelectionMode::TopK);
+
+    REQUIRE(result.ok);
+    REQUIRE(result.stop == PFlashSelectionStop::TopKReached);
+    REQUIRE(result.retained_tokens == 200);
+    require_ordinals(result, {0, 3});
+
+    // A mandatory span that cannot fit still fails closed under top_k.
+    const auto overflow = select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{50, 0.95, false, 1},
+        PFlashSelectionMode::TopK);
+    REQUIRE(!overflow.ok);
+    REQUIRE(overflow.stop == PFlashSelectionStop::MandatoryQueryExceedsBudget);
+}
+
+TEST_CASE(PFlashSelectionFixture, top_k_requires_a_positive_k) {
+    const auto candidates = ranked_candidates();
+    REQUIRE(!select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, 0},
+        PFlashSelectionMode::TopK).ok);
+    REQUIRE(!select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, -1},
+        PFlashSelectionMode::TopK).ok);
+    // The other modes ignore the field.
+    REQUIRE(select_pflash_candidates(
+        candidates, PFlashSelectionPolicy{100000, 0.95, false, 0},
+        PFlashSelectionMode::BudgetOnly).ok);
+}
+
+TEST_CASE(PFlashSelectionFixture, top_k_environment_resolves_or_fails) {
+    CleanPFlashEnv clean;
+    set_env(kModeEnv, "top_k");
+
+    // Missing K in top_k mode is rejected by name.
+    PFlashSelectionConfig invalid;
+    std::string error;
+    REQUIRE(!resolve_pflash_selection(32768, 1024, invalid, error));
+    REQUIRE(error.find(kTopKEnv) != std::string::npos);
+
+    for (const char * bad : {"0", "-3", "abc", "20.5", ""}) {
+        set_env(kTopKEnv, bad);
+        REQUIRE(!resolve_pflash_selection(32768, 1024, invalid, error));
+        REQUIRE(error.find(kTopKEnv) != std::string::npos);
+    }
+
+    set_env(kTopKEnv, "20");
+    const auto config = resolve_or_fail(32768, 1024);
+    REQUIRE(config.configured);
+    REQUIRE(config.selection_active);
+    REQUIRE(config.mode == PFlashSelectionMode::TopK);
+    REQUIRE(config.top_k == 20);
+
+    // K alone, without the mode, parses but leaves the mode untouched.
+    set_env(kModeEnv, "budget_only");
+    const auto budget = resolve_or_fail(32768, 1024);
+    REQUIRE(budget.mode == PFlashSelectionMode::BudgetOnly);
+    REQUIRE(budget.top_k == 20);
+
+    // An unknown mode still names the legal set.
+    set_env(kModeEnv, "top_q");
+    REQUIRE(!resolve_pflash_selection(32768, 1024, invalid, error));
+    REQUIRE(error.find("top_k") != std::string::npos);
+
+    REQUIRE(std::string(pflash_selection_mode_name(PFlashSelectionMode::TopK)) == "top_k");
+    REQUIRE(std::string(pflash_selection_stop_name(PFlashSelectionStop::TopKReached)) ==
+            "top_k_reached");
+}
+
+TEST_CASE(PFlashSelectionFixture, split_selection_rejects_top_k) {
+    std::vector<PFlashSelectionCandidate> head;
+    std::vector<PFlashSelectionCandidate> other;
+    for (size_t i = 0; i < 4; ++i) {
+        const int begin = (int) i * 100;
+        head.push_back(candidate(i, begin, begin + 100, 4.0 - (double) i));
+        other.push_back(candidate(i, begin, begin + 100, (double) i));
+    }
+    const auto result = select_pflash_split(
+        head, other, PFlashSelectionPolicy{400, 0.95, false, 2}, 0.5,
+        PFlashSelectionMode::TopK);
+    REQUIRE(!result.ok);
+    REQUIRE(result.stop == PFlashSelectionStop::InvalidInput);
 }

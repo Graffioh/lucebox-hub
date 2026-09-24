@@ -26,10 +26,11 @@
 #include "ggml-backend.h"
 #include "generation_types.h"
 #include "sampler.h"
+#include "image_prompt.h"
 #include "concurrency/seq_engine.h"
 #include "placement/draft_residency.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 enum class ParkTarget {
     // NOTE: Empty preserves Qwen3's existing no-target park/unpark behavior.
@@ -134,6 +135,27 @@ struct DaemonIO {
 // ─── Backend interface ──────────────────────────────────────────────────
 struct ModelBackend {
     virtual ~ModelBackend() = default;
+
+    // Image input. A backend that supports it names the text its chat template
+    // turns into the image marker, and binds decoded images to a rendered prompt.
+    virtual bool supports_images() const { return false; }
+    virtual std::string image_placeholder() const { return {}; }
+    virtual bool prepare_images(std::vector<int32_t> & tokens,
+                                std::vector<EncodedImage> images,
+                                uint64_t context_capacity,
+                                uint64_t output_reserve,
+                                ImagePromptHandle & payload,
+                                std::string & error) const {
+        (void) tokens;
+        (void) context_capacity;
+        (void) output_reserve;
+        if (!images.empty()) {
+            error = "this backend does not support image input";
+            return false;
+        }
+        payload.reset();
+        return true;
+    }
 
     // Print the "[<arch>-daemon] ready ..." banner on stdout.
     virtual void print_ready_banner() const = 0;
@@ -264,13 +286,23 @@ struct ModelBackend {
         float                keep_ratio;      // fraction to keep (0.0–1.0)
         // Exclusive end and width of the user-query token window inside
         // input_ids. Negative end preserves the legacy trailing-token window.
-        // Keeping this separate from DFLASH_COMPRESS_QUERY_TOKENS matters:
+        // Keeping this separate from LUCE_COMPRESS_QUERY_TOKENS matters:
         // that knob controls lexical anchors, not neural scorer Q rows.
         int                  score_query_end = -1;
         int                  score_query_tokens = 8;
         // Role-derived instruction structure in drafter-token coordinates.
         // Empty is a valid instruction-free or legacy request.
         std::vector<PFlashTokenSpan> required_instruction_spans;
+        // Strict selection with the block-15 head: the tokens after the query
+        // window are scored candidates rather than a kept suffix. The caller
+        // pins what of that suffix must stay (the generation prompt).
+        bool                 query_suffix_candidates = false;
+        // Earlier user questions (their scorer windows), most recent first:
+        // they score the context alongside the query at halving weights.
+        std::vector<PFlashTokenSpan> history_query_spans;
+        // The latest user turn's tail, a second query window at full weight
+        // (prompt-end chat queries; {-1, -1} otherwise).
+        PFlashTokenSpan turn_query_span{-1, -1};
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs
@@ -280,6 +312,17 @@ struct ModelBackend {
     struct CompressResult {
         bool                 ok = false;
         std::vector<int32_t> compressed_ids;  // surviving token IDs
+        // Strict selection: the input spans behind compressed_ids, ascending.
+        // Empty when the backend does not report them (remote drafter).
+        std::vector<PFlashTokenSpan> kept_spans;
+        // Drafter session reuse: the token scoring resumed from and the
+        // tokens it ran (-1 when unknown), and its forward time.
+        // Strict selection with the head: every candidate's attention lift
+        // (mass per token relative to uniform); empty when unknown.
+        std::vector<std::pair<PFlashTokenSpan, double>> candidate_lifts;
+        int                  scorer_resume = -1;
+        int                  scorer_new_tokens = -1;
+        double               scorer_forward_s = 0.0;
 
         static CompressResult from_compressed_ids(
                 std::vector<int32_t> ids) {
@@ -382,4 +425,4 @@ struct ModelBackend {
     virtual void shutdown() = 0;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

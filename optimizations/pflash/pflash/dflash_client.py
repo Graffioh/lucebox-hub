@@ -65,7 +65,7 @@ class DflashClient:
         """Spawn the patched dflash daemon as a subprocess.
 
         Defaults for fa_window / kv_tq3 / lm_head_fix come from
-        ``config.DFLASH_REQUIRED_ENV`` and are the only flags pflash relies on.
+        ``config.LUCE_REQUIRED_ENV`` and are the only flags pflash relies on.
         Override per-call only when you know what you're doing.
         """
         self.bin_path = bin_path
@@ -75,11 +75,11 @@ class DflashClient:
         self._ready_event = threading.Event()
         self._stdout_tail: list[str] = []
         env_overrides = {
-            "DFLASH27B_FA_WINDOW": str(0 if fa_window is None else fa_window),
-            "DFLASH27B_KV_TQ3": "1" if (kv_tq3 if kv_tq3 is not None else True) else "0",
-            "DFLASH27B_LM_HEAD_FIX": "1" if lm_head_fix else "0",
+            "LUCE_FA_WINDOW": str(0 if fa_window is None else fa_window),
+            "LUCE_KV_TQ3": "1" if (kv_tq3 if kv_tq3 is not None else True) else "0",
+            "LUCE_LM_HEAD_FIX": "1" if lm_head_fix else "0",
         }
-        env = {**os.environ, **config.DFLASH_REQUIRED_ENV, **env_overrides}
+        env = {**os.environ, **config.LUCE_REQUIRED_ENV, **env_overrides}
         bin_dir = os.path.dirname(os.path.abspath(bin_path))
         if sys.platform == "win32":
             # Windows uses PATH for DLL search rather than LD_LIBRARY_PATH.
@@ -230,7 +230,7 @@ class DflashClient:
     def unpark_target(self): self._send("unpark target\n")
 
     def compress(self, prompt_ids: list[int], keep_ratio: float, drafter_gguf: str,
-                 drafter_arch: str = "qwen3-0.6b") -> list[int]:
+                 drafter_arch: str = "qwen35-0.8b") -> list[int]:
         """C++ drafter score+compress via daemon. Returns compressed token ids.
 
         Daemon command: compress <bin> <keep_x1000> <drafter_gguf> <drafter_arch>

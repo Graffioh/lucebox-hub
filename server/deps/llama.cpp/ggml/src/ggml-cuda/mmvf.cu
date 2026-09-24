@@ -807,7 +807,7 @@ void ggml_cuda_op_mul_mat_vec_f(
 
 static bool mmvf_narrow_f16_enabled() {
     static const bool enabled = []() {
-        const char * value = std::getenv("DFLASH_CUDA_MMVF_NARROW_F16");
+        const char * value = std::getenv("LUCE_CUDA_MMVF_NARROW_F16");
         return value == nullptr || value[0] == '\0' || std::atoi(value) != 0;
     }();
     return enabled;
@@ -898,7 +898,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 // hyper-connection mix projection [16384,24] x 4 measured
                 // 367 us there against 13 us on MMVF. MMVF instantiates up to
                 // eight columns and keeps the single-column accumulation
-                // order per column. DFLASH_CUDA_MMVF_NARROW_F16=0 restores
+                // order per column. LUCE_CUDA_MMVF_NARROW_F16=0 restores
                 // the BLAS route. DS4's [16384,24] hyper-connection
                 // projection at q4 and q5 is covered by this rule.
                 if (GGML_CUDA_CC_IS_RDNA3_5(cc) && src0_ne[1] <= 32 &&

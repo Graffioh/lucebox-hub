@@ -4,7 +4,7 @@ Sidecar JSON files carrying per-model defaults transcribed from the
 upstream model card (typically the HuggingFace README +
 `generation_config.json`).
 
-`dflash_server` reads these at startup to set sensible
+`luce_server` reads these at startup to set sensible
 `--default-max-tokens`, `--think-max-tokens`, sampler, and
 `reasoning.effort` tier values for the loaded model. The CLI
 flags still override anything here. See
@@ -71,7 +71,7 @@ npx --yes ajv-cli@5 validate \
 
 `additionalProperties: false` is set at the root, so typos in field
 names (e.g. `verified_on` instead of `verified_at`) surface as
-validation errors instead of being silently ignored by `dflash_server`.
+validation errors instead of being silently ignored by `luce_server`.
 The server itself does a runtime sanity check for the four required
 fields when loading a sidecar and warns (does not fail-start) when one
 is missing.

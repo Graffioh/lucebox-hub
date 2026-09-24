@@ -9,7 +9,7 @@
 #include <cmath>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 LayerSplitBackend::LayerSplitBackend(std::unique_ptr<LayerSplitAdapter> adapter)
     : adapter_(std::move(adapter)) {}
@@ -280,4 +280,4 @@ void LayerSplitBackend::shutdown() {
     if (adapter_) adapter_->shutdown();
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

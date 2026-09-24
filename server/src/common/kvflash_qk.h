@@ -25,7 +25,7 @@
 #include <cstring>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct KvFlashQkDims {
     int n_layers   = 0;   // full-attention layers pooled (16 on qwen35-27B)
@@ -86,7 +86,7 @@ inline void kvflash_qk_chunk_scores(
     }
 }
 
-} // namespace dflash::common
+} // namespace luce::common
 
 // ── Cache plumbing (needs ggml) ─────────────────────────────────────────
 #ifndef KVFLASH_QK_PURE_ONLY
@@ -94,7 +94,7 @@ inline void kvflash_qk_chunk_scores(
 #include "ggml.h"
 #include "ggml-backend.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 // Host-side store of pooled, L2-normalized post-RoPE keys per sealed chunk.
 // Pool at SEAL time (the chunk is tail-protected, hence resident); entries
@@ -196,6 +196,6 @@ private:
     std::vector<float> query_;
 };
 
-} // namespace dflash::common
+} // namespace luce::common
 
 #endif // KVFLASH_QK_PURE_ONLY

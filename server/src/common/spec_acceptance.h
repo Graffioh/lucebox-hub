@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Accepted/emitted verifier positions, including the always-committed seed.
 // Keep numerator and denominator together so tree/chain branches and early
@@ -40,4 +40,4 @@ private:
     int offered_ = 0;
 };
 
-} // namespace dflash::common
+} // namespace luce::common

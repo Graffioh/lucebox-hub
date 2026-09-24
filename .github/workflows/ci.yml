@@ -72,13 +72,13 @@ jobs:
           # uv reads .python-version (3.12, matching the previous CI) and downloads the matching
           # interpreter; no separate setup-python step needed.
 
-      - name: Build dflash (smoke + server)
+      - name: Build luce (smoke + server)
         run: |
           cd server
           cmake -B build \
             -DCMAKE_CUDA_ARCHITECTURES="86" \
-            -DDFLASH27B_ENABLE_BSA=OFF \
-            -DDFLASH27B_FA_ALL_QUANTS=OFF \
+            -DLUCE_ENABLE_BSA=OFF \
+            -DLUCE_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target \
             test_dflash test_generate test_flash_attn_sparse test_server_unit \
@@ -97,7 +97,7 @@ jobs:
             --no-tests=error
 
       - name: Populate venv with cu128 torch + setuptools
-        # First pass: install the workspace's default deps. dflash declares
+        # First pass: install the workspace's default deps. luce declares
         # torch (which uv pulls from the pytorch-cu128 index per
         # [tool.uv.sources]) and pflash drags in setuptools. Megakernel is
         # in the optional `megakernel` extra so its build does NOT run yet.
@@ -205,12 +205,12 @@ jobs:
           cmake -B build \
             -DCMAKE_CUDA_COMPILER="$CUDACXX" \
             -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
-            -DDFLASH27B_USER_CUDA_ARCHITECTURES="$CUDA_ARCH" \
-            -DDFLASH27B_ENABLE_BSA=OFF \
-            -DDFLASH27B_FA_ALL_QUANTS=OFF \
+            -DLUCE_USER_CUDA_ARCHITECTURES="$CUDA_ARCH" \
+            -DLUCE_ENABLE_BSA=OFF \
+            -DLUCE_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           if [[ "$CUDA_ARCH" == "121" ]]; then
-            grep -q '^DFLASH27B_EFFECTIVE_BLACKWELL_CONSUMER:INTERNAL=OFF$' build/CMakeCache.txt
+            grep -q '^LUCE_EFFECTIVE_BLACKWELL_CONSUMER:INTERNAL=OFF$' build/CMakeCache.txt
           fi
           targets=(
             test_server_unit
@@ -255,19 +255,19 @@ jobs:
             -R '^(test_model_smoke\.PagedAttention\.|batched_gdn$|gdn_replay_log_preflight$|test_kernel_qualification_core\.|kernel_qualification_gdn$|kernel_qualification_moe_ds4$|concat_transpose$)' --no-tests=error
 
       # Optional model-backed end-to-end smoke (real spec-decode on the 3090),
-      # disabled by default because it builds dflash_server and lazy-loads the
+      # disabled by default because it builds luce_server and lazy-loads the
       # ~16 GB Qwen3.6-27B target + draft (~1-2 min). The weights are already
       # staged at /opt/models on lucebox-rtx3090 (override with repo var
       # LUCEBOX_MODELS_DIR). Verified working on the runner. To enable, uncomment;
       # continue-on-error keeps a heavy/slow run from ever blocking a PR.
-      # - name: dflash end-to-end smoke (model-backed)
+      # - name: luce end-to-end smoke (model-backed)
       #   continue-on-error: true
       #   env:
       #     MODELS: ${{ vars.LUCEBOX_MODELS_DIR || '/opt/models' }}
       #   run: |
       #     cd server
-      #     cmake --build build --target dflash_server -j"$(nproc)"
-      #     ./build/dflash_server "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
+      #     cmake --build build --target luce_server -j"$(nproc)"
+      #     ./build/luce_server "$MODELS/Qwen3.6-27B-Q4_K_M.gguf" \
       #       --draft "$MODELS/draft/dflash-draft-3.6-q4_k_m.gguf" --port 8099 &
       #     SRV=$!; trap 'kill $SRV 2>/dev/null' EXIT
       #     for i in $(seq 1 90); do curl -sf localhost:8099/v1/models >/dev/null && break; sleep 2; done
@@ -361,13 +361,13 @@ jobs:
       - name: Build + test ROCm formats and inference core
         run: |
           cmake -S server -B "$RUNNER_TEMP/rocmfp-build" \
-            -DDFLASH27B_GPU_BACKEND=hip \
-            -DDFLASH27B_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
-            -DDFLASH27B_SERVER=OFF \
-            -DDFLASH27B_TESTS=ON \
+            -DLUCE_GPU_BACKEND=hip \
+            -DLUCE_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
+            -DLUCE_SERVER=OFF \
+            -DLUCE_TESTS=ON \
             -DGGML_HIP_GRAPHS=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
+            -DCMAKE_HIP_FLAGS=-DLUCE_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-build" \
             --target test_rocmfp4 test_rocmfpx test_rocmfp4_hip_tail test_rocmfpx_mmq \
               test_deepseek4_mmid_grouped_cuda test_deepseek4_unit \
@@ -404,14 +404,14 @@ jobs:
         # assert real MMVQ/MMQ dispatch rather than accepting a BLAS fallback.
         run: |
           cmake -S server -B "$RUNNER_TEMP/rocmfp-affine-build" \
-            -DDFLASH27B_GPU_BACKEND=hip \
-            -DDFLASH27B_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
-            -DDFLASH27B_SERVER=OFF \
-            -DDFLASH27B_TESTS=ON \
-            -DDFLASH27B_ROCMFP2_AFFINE=ON \
+            -DLUCE_GPU_BACKEND=hip \
+            -DLUCE_HIP_ARCHITECTURES="$EXPECTED_HIP_ARCH" \
+            -DLUCE_SERVER=OFF \
+            -DLUCE_TESTS=ON \
+            -DLUCE_ROCMFP2_AFFINE=ON \
             -DGGML_HIP_GRAPHS=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_HIP_FLAGS=-DDFLASH_WAVE_SIZE=32
+            -DCMAKE_HIP_FLAGS=-DLUCE_WAVE_SIZE=32
           cmake --build "$RUNNER_TEMP/rocmfp-affine-build" \
             --target test_rocmfpx test_rocmfpx_mmq \
               test_deepseek4_mmid_grouped_cuda \
@@ -451,14 +451,14 @@ jobs:
           cmake -B build -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_CUDA_ARCHITECTURES="75" ^
-            -DDFLASH27B_ENABLE_BSA=OFF ^
-            -DDFLASH27B_FA_ALL_QUANTS=OFF ^
+            -DLUCE_ENABLE_BSA=OFF ^
+            -DLUCE_FA_ALL_QUANTS=OFF ^
             -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe"
 
       - name: Build Windows targets
         working-directory: server
         shell: cmd
-        run: cmake --build build --target dflash_common dflash_server backend_ipc_daemon test_platform_compat -j 4
+        run: cmake --build build --target luce_common luce_server backend_ipc_daemon test_platform_compat -j 4
 
       - name: Run Windows platform smoke test
         working-directory: server
@@ -468,15 +468,15 @@ jobs:
       - name: Verify build outputs
         shell: pwsh
         run: |
-          $lib = Get-ChildItem server/build -Recurse -Filter "dflash_common.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $lib = Get-ChildItem server/build -Recurse -Filter "luce_common.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $lib) {
-            Write-Error "dflash_common.lib not found in build output"
+            Write-Error "luce_common.lib not found in build output"
             exit 1
           }
           Write-Host "Built: $($lib.FullName)"
           Write-Host "Size: $([math]::Round($lib.Length / 1MB, 2)) MB"
 
-          foreach ($binaryName in @("dflash_server.exe", "backend_ipc_daemon.exe")) {
+          foreach ($binaryName in @("luce_server.exe", "backend_ipc_daemon.exe")) {
             $binary = Get-ChildItem server/build -Recurse -Filter $binaryName -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $binary) {
               Write-Error "$binaryName not found in build output"

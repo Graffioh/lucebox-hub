@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Share identical immutable host inputs within one graph-cache lifetime.
 // Equality is byte-exact: floating-point signed zeros and NaN payloads must
@@ -38,4 +38,4 @@ private:
     std::vector<Values> entries_;
 };
 
-} // namespace dflash::common
+} // namespace luce::common

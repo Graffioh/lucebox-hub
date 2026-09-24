@@ -8,15 +8,15 @@
 //
 // Implementations:
 //   - (none)            pure LRU + recency, zero dependencies
-//   - KvFlashDrafterScorer   qwen3/qwen3_kvflash_scorer.h — pflash drafter tail
-//                       attention (shared with pflash compression)
+//   - KvFlashDrafterScorer   pflash/kvflash_drafter_scorer.h — pflash drafter
+//                       tail attention (shared with pflash compression)
 
 #pragma once
 
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct KvFlashScorer {
     virtual ~KvFlashScorer() = default;
@@ -30,4 +30,4 @@ struct KvFlashScorer {
                               std::vector<float> & out) = 0;
 };
 
-} // namespace dflash::common
+} // namespace luce::common

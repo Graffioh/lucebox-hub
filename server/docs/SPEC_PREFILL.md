@@ -21,7 +21,7 @@ single RTX 3090 (24 GB). No PyTorch at runtime.
 ```
 git submodule update --init --recursive
 mkdir build && cd build
-cmake -DCMAKE_CUDA_ARCHITECTURES=86 -DDFLASH27B_ENABLE_BSA=ON ..
+cmake -DCMAKE_CUDA_ARCHITECTURES=86 -DLUCE_ENABLE_BSA=ON ..
 cmake --build . --target test_dflash test_flashprefill_kernels -- -j8
 ```
 
@@ -33,20 +33,20 @@ Required:
   directly and keeps only the `ggml` subtree.
 
 CMake options:
-- `DFLASH27B_ENABLE_BSA=ON` (default) — build the Block-Sparse-Attention
+- `LUCE_ENABLE_BSA=ON` (default) — build the Block-Sparse-Attention
   kernel for sparse FA forward. Required for the long-context perf claim.
   Turn OFF only on sm<80.
-- `DFLASH27B_FA_ALL_QUANTS=ON` (default) — compile ggml-cuda fattn for
+- `LUCE_FA_ALL_QUANTS=ON` (default) — compile ggml-cuda fattn for
   all KV-quant pairs (needed for asymmetric Q4_0 K + Q8_0 V cache). Off
   cuts build time ~3x but breaks the 128K target gen path.
 
 ## Runtime tunables
 
 ```
-DFLASH_FP_USE_BSA=1    # dispatch sparse FA forward through BSA (sm_80+)
-DFLASH_FP_ALPHA=0.85   # block-selection threshold (default 0.12);
+LUCE_FP_USE_BSA=1    # dispatch sparse FA forward through BSA (sm_80+)
+LUCE_FP_ALPHA=0.85   # block-selection threshold (default 0.12);
                        # higher = stricter = fewer K-blocks per Q-row.
-DFLASH_FP_PROFILE=1    # log mean/score/select/forward stage timings
+LUCE_FP_PROFILE=1    # log mean/score/select/forward stage timings
 ```
 
 See `src/flashprefill.h` for the full list and defaults.
@@ -60,8 +60,8 @@ PFlash phase or DFlash draft-process boundary. See
 ## Performance
 
 NIAH single-needle end-to-end on RTX 3090 (Qwen3.6-27B Q4_K_M target,
-Qwen3-0.6B drafter, in-process daemon, `DFLASH_FP_USE_BSA=1`,
-`DFLASH_FP_ALPHA=0.85`, `keep_ratio=0.05`):
+Qwen3.5-0.8B drafter, in-process daemon, `LUCE_FP_USE_BSA=1`,
+`LUCE_FP_ALPHA=0.85`, `keep_ratio=0.05`):
 
 | Source S | dflash TTFT | llama.cpp baseline | Speedup | NIAH |
 |----------|------------:|-------------------:|--------:|:----:|
@@ -69,7 +69,7 @@ Qwen3-0.6B drafter, in-process daemon, `DFLASH_FP_USE_BSA=1`,
 | 128K     | **24.8 s**  | ~257 s (FA on, Q4_0 KV)  | **~10.4×** | ✅ |
 
 NIAH needle retrieved (accuracy 1/1) at every measured context. The
-runtime is C++/CUDA only — the headline number is the dflash binary on
+runtime is C++/CUDA only — the headline number is the luce binary on
 its own, no Python or Triton in the loop.
 
 ## Repo layout
@@ -81,10 +81,15 @@ src/
   flashprefill_select.cpp       Host fallback for block_select (rarely used)
   bsa_launcher.cu               BSA launcher: blockmask conversion + Flash_fwd_params
   bsa_fwd_inst.cu               Single-TU instantiation of BSA's hdim128 kernel
-  qwen3/                   Qwen3-0.6B drafter model code
+  pflash/                  PFlash drafter (Qwen3.5-0.8B scorer) code
+    qwen35_loader.cpp    GGUF → Qwen3.5-0.8B weights + scoring head + probe
+    qwen35_drafter.{h,cpp}    block-15 head scorer + legacy running-max scorer
+    pflash_drafter.{h,cpp}    drafter_score_and_compress() entry point
+    pflash_compress.{h,cpp}   scores → strict selection → compressed ids
+    pflash_selection.{h,cpp}  strict budget selection + segment probing
+  qwen3/                      Qwen3-0.6B standalone inference (not the drafter)
     qwen3_loader.cpp       GGUF → Qwen3-0.6B BF16 weight tensors
-    qwen3_graph.cpp        Custom Qwen3-0.6B forward (per-layer A/FP/B graphs)
-    qwen3_drafter.{h,cpp}       drafter_score_and_compress() entry point
+    qwen3_backend.{h,cpp}     step forward + ModelBackend
   qwen35/                       Qwen3.5/3.6 target + DFlash draft model code
     qwen35_target_graph.cpp     Qwen3.5/3.6 target graph (ggml)
     gguf_target_loader.cpp      Qwen3.5 target GGUF loader

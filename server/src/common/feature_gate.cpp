@@ -7,7 +7,7 @@
 
 #include <climits>
 
-namespace dflash::common {
+namespace luce::common {
 
 std::string check_feature_compatibility(
     const BackendArgs & args,
@@ -45,6 +45,19 @@ std::string check_feature_compatibility(
     if (!args.remote_target_shard.enabled() &&
         args.remote_target_shard.has_aux_options()) {
         return "--target-shard-ipc-work-dir requires --target-shard-ipc-bin";
+    }
+
+    // ── vision projector × architecture / placement
+    if (args.mmproj_path.has_value()) {
+        if ((arch != "deepseek4" && arch != "qwen35") || args.device.is_layer_split() ||
+            args.device.is_tensor_parallel() || args.remote_target_shard.enabled() ||
+            args.max_concurrency != 1) {
+            return "--mmproj requires a local single-request DeepSeek4 or Qwen3.5 backend "
+                   "that is not split across GPUs by layer or tensor";
+        }
+        if (arch == "deepseek4" && target_backend != PlacementBackend::Hip) {
+            return "--mmproj with DeepSeek4 requires a HIP backend";
+        }
     }
 
     // ── PFlash enablement × drafter model
@@ -413,8 +426,8 @@ std::vector<std::string> collect_feature_warnings(
                arch_supports_draft_swa(arch, false),
                split, arch, "--draft-swa", "draft sliding-window attention");
 
-    // MoE-only backend requests. These drive the DFLASH_QWEN35MOE_* /
-    // DFLASH_LAGUNA_* env vars, which a dense backend never reads.
+    // MoE-only backend requests. These drive the LUCE_QWEN35MOE_* /
+    // LUCE_LAGUNA_* env vars, which a dense backend never reads.
     if (args.routing_stats_requested && !arch_has_expert_offload(arch)) {
         out.push_back("--freq/--collect-routing ignored: architecture '" +
                       arch + "' has no expert routing to record");
@@ -427,4 +440,4 @@ std::vector<std::string> collect_feature_warnings(
     return out;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

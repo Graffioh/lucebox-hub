@@ -1,4 +1,4 @@
-// Unit tests for dflash::common::GgufMmap (RAII platform mmap wrapper).
+// Unit tests for luce::common::GgufMmap (RAII platform mmap wrapper).
 //
 // T1: open + read first few bytes of a known file → ok, size > 0
 // T2: open the same instance twice (idempotency) → no leak
@@ -64,7 +64,7 @@ static std::string make_temp_file() {
 
 static void t1_open_and_read() {
     std::string path = make_temp_file();
-    dflash::common::GgufMmap m;
+    luce::common::GgufMmap m;
     std::string err;
 
     assert(m.open(path, err));
@@ -87,7 +87,7 @@ static void t2_idempotent_open() {
     std::string path1 = make_temp_file();
     std::string path2 = make_temp_file();
 
-    dflash::common::GgufMmap m;
+    luce::common::GgufMmap m;
     std::string err;
 
     assert(m.open(path1, err));
@@ -108,7 +108,7 @@ static void t2_idempotent_open() {
 // ─── T3: missing file → returns false, object stays empty ───────────────────
 
 static void t3_missing_file() {
-    dflash::common::GgufMmap m;
+    luce::common::GgufMmap m;
     std::string err;
 
     bool ok = m.open("/tmp/gguf_mmap_does_not_exist_xyz987.bin", err);
@@ -125,7 +125,7 @@ static void t3_missing_file() {
 
 static void t4_explicit_release() {
     std::string path = make_temp_file();
-    dflash::common::GgufMmap m;
+    luce::common::GgufMmap m;
     std::string err;
 
     assert(m.open(path, err));
@@ -155,7 +155,7 @@ static void t4_explicit_release() {
 static void t5_raii_destructor() {
     std::string path = make_temp_file();
     {
-        dflash::common::GgufMmap m;
+        luce::common::GgufMmap m;
         std::string err;
         assert(m.open(path, err));
         assert(m.is_open());

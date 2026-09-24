@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 class DeepSeek4Backend;
 
@@ -52,4 +52,4 @@ private:
     std::vector<int> reserve_growth_;
 };
 
-} // namespace dflash::common
+} // namespace luce::common

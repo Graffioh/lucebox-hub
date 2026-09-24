@@ -14,7 +14,7 @@
 #include <cstdio>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 inline bool layer_split_kvflash_sync_identity(
         KvFlashPager & pager,
@@ -97,4 +97,4 @@ inline void layer_split_kvflash_save_history_snapshot(
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

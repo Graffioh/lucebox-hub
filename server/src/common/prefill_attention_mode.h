@@ -1,6 +1,6 @@
 #pragma once
 
-namespace dflash::common {
+namespace luce::common {
 
 // Numerics/performance policy for model-specific prefill attention. Exact is
 // the tokenwise reference. Dense changes the execution/reduction topology and
@@ -25,4 +25,4 @@ inline bool prefill_attention_mode_is_approximate(PrefillAttentionMode mode) {
     return mode != PrefillAttentionMode::Exact;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

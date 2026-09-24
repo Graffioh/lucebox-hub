@@ -8,9 +8,10 @@
 #include <utility>
 #include <vector>
 
+#include "image_prompt.h"
 #include "sampler.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 // Called once for each token committed by transitional whole-request
 // executors. Returning false requests cancellation.
@@ -26,6 +27,8 @@ struct BudgetHook {
 
 struct GenerateRequest {
     std::vector<int32_t> prompt;
+    // Backend-owned image payload bound to `prompt`; empty for text requests.
+    ImagePromptHandle images;
     int n_gen = 0;
     SamplerCfg sampler;
     bool do_sample = false;
@@ -133,4 +136,4 @@ struct GenerateResult {
     }
 };
 
-} // namespace dflash::common
+} // namespace luce::common

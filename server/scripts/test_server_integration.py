@@ -1,13 +1,13 @@
 """
-Integration tests for the C++ dflash_server HTTP API.
+Integration tests for the C++ luce_server HTTP API.
 
-Sends real HTTP requests to a running dflash_server instance and validates
+Sends real HTTP requests to a running luce_server instance and validates
 response structure, SSE streaming, multi-turn conversations, Responses API,
 reasoning/thinking, and error handling.
 
 Usage:
     # Start the server first:
-    #   ./dflash_server model.gguf [--port 8000] [...]
+    #   ./luce_server model.gguf [--port 8000] [...]
     #
     # Then run:
     #   pytest scripts/test_server_integration.py -v
@@ -31,7 +31,7 @@ import requests
 
 SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:8000")
 # Allow overriding model name (must match --model-name in server args)
-MODEL_NAME = os.environ.get("MODEL_NAME", "dflash")
+MODEL_NAME = os.environ.get("MODEL_NAME", "luce")
 # Timeout for generation requests (seconds)
 GEN_TIMEOUT = int(os.environ.get("GEN_TIMEOUT", "120"))
 

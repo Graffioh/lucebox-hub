@@ -4,7 +4,7 @@
 #include <functional>
 #include <stdexcept>
 
-namespace dflash::common {
+namespace luce::common {
 
 const char * paged_kv_status_string(PagedKvStatus status) {
     switch (status) {
@@ -313,4 +313,4 @@ void PagedKvPool::take_reserved_blocks(SequenceState & sequence,
     }
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -1,4 +1,4 @@
-// GGUF loader for Qwen3-0.6B drafter. Reads weights from a BF16 GGUF file
+// GGUF loader for the Qwen3-0.6B model. Reads weights from a BF16 GGUF file
 // produced by `convert_hf_to_gguf.py Qwen/Qwen3-0.6B`. Sets up ggml tensors
 // on the requested backend.
 //
@@ -20,9 +20,9 @@
 //   blk.<i>.ffn_down.weight           BF16 [ffn, hidden]
 //
 // We mmap the GGUF file and copy each tensor's bytes to the backend buffer
-// (mirrors the dflash gguf_target_loader pattern).
+// (mirrors the luce gguf_target_loader pattern).
 
-#include "qwen3_drafter_model.h"
+#include "qwen3_model.h"
 #include "common/backend_precision.h"
 #include "common/gguf_inspect.h"
 #include "common/gguf_mmap.h"
@@ -46,7 +46,7 @@
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -123,96 +123,11 @@ float get_f32(gguf_context * g, const char * key, float def) {
     return gguf_get_val_f32(g, k);
 }
 
-bool metadata_equals(gguf_context * g, const char * key, const char * expected) {
-    const int id = gguf_find_key(g, key);
-    return id >= 0 && std::string(gguf_get_val_str(g, id)) == expected;
-}
-
-bool load_scoring_head(
-        const std::string & path,
-        const std::string & drafter_sha256,
-        Qwen3DrafterWeights & out) {
-    ggml_context * tensor_ctx = nullptr;
-    gguf_init_params iparams{ /*no_alloc=*/ true, /*ctx=*/ &tensor_ctx };
-    gguf_context * gctx = gguf_init_from_file(path.c_str(), iparams);
-    if (!gctx) {
-        set_last_error("scoring head GGUF could not be opened: " + path);
-        return false;
-    }
-    auto fail = [&](const std::string & message) {
-        gguf_free(gctx);
-        if (tensor_ctx) ggml_free(tensor_ctx);
-        set_last_error(message);
-        return false;
-    };
-    // GGUF contract of a scoring-head file: architecture `pflash_scoring_head`,
-    // metadata and tensors under `scoringhead.*`.
-    const bool metadata_ok =
-        metadata_equals(gctx, "general.architecture", "pflash_scoring_head") &&
-        metadata_equals(gctx, "scoringhead.schema", "qwen3_0_6b_nope_qk_mass_v1") &&
-        metadata_equals(gctx, "scoringhead.base_model", "Qwen/Qwen3-0.6B") &&
-        metadata_equals(
-            gctx,
-            "scoringhead.runtime_gguf_sha256",
-            drafter_sha256.c_str()) &&
-        metadata_equals(
-            gctx,
-            "scoringhead.feature_tap",
-            "post_block12_residual_before_block13");
-    if (!metadata_ok) {
-        return fail("scoring head metadata does not match the loaded Qwen3-0.6B drafter");
-    }
-    struct TensorContract {
-        const char * name;
-        ggml_tensor * destination;
-    };
-    const TensorContract contracts[] = {
-        {"scoringhead.attn_q.weight", out.layers[13].wq},
-        {"scoringhead.attn_k.weight", out.layers[13].wk},
-    };
-    for (const auto & contract : contracts) {
-        const int64_t id = gguf_find_tensor(gctx, contract.name);
-        ggml_tensor * source = tensor_ctx
-            ? ggml_get_tensor(tensor_ctx, contract.name)
-            : nullptr;
-        if (id < 0 || gguf_get_tensor_type(gctx, id) != GGML_TYPE_F32 ||
-            !source || !ggml_are_same_shape(source, contract.destination) ||
-            gguf_get_tensor_size(gctx, id) !=
-                (size_t)ggml_nelements(contract.destination) * sizeof(float)) {
-            return fail(std::string("scoring head tensor contract mismatch: ") +
-                        contract.name);
-        }
-    }
-    const size_t data_offset = gguf_get_data_offset(gctx);
-    GgufMmap mmap;
-    std::string mmap_error;
-    if (!mmap.open(path, mmap_error)) {
-        return fail(mmap_error);
-    }
-    for (const auto & contract : contracts) {
-        const int64_t id = gguf_find_tensor(gctx, contract.name);
-        const size_t offset = gguf_get_tensor_offset(gctx, id);
-        const size_t size = gguf_get_tensor_size(gctx, id);
-        if (data_offset > mmap.size() || offset > mmap.size() - data_offset ||
-            size > mmap.size() - data_offset - offset ||
-            !copy_tensor_from_file(
-                gctx, contract.name, mmap.data(), data_offset, contract.destination)) {
-            return fail(std::string("scoring head tensor load failed: ") +
-                        contract.name);
-        }
-    }
-    gguf_free(gctx);
-    if (tensor_ctx) ggml_free(tensor_ctx);
-    out.scoring_head_loaded = true;
-    std::fprintf(stderr, "[qwen3-0.6b] loaded scoring head: %s\n", path.c_str());
-    return true;
-}
-
 } // namespace
 
-bool load_qwen3_drafter_model(const std::string & path,
-                              ggml_backend_t backend,
-                              Qwen3DrafterWeights & out) {
+bool load_qwen3_model(const std::string & path,
+                      ggml_backend_t backend,
+                      Qwen3Weights & out) {
     out.backend = backend;
     const BackendPrecisionPolicy precision = select_drafter_precision_policy(backend);
     out.weight_type = precision.weight_type;
@@ -294,7 +209,7 @@ bool load_qwen3_drafter_model(const std::string & path,
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) {
-        set_last_error("ggml_backend_alloc_ctx_tensors failed for Qwen3-0.6B drafter");
+        set_last_error("ggml_backend_alloc_ctx_tensors failed for Qwen3-0.6B");
         gguf_free(gctx);
         ggml_free(out.ctx);
         out.ctx = nullptr;
@@ -336,10 +251,10 @@ bool load_qwen3_drafter_model(const std::string & path,
         const size_t off = gguf_get_tensor_offset(gctx, i);  // relative to data_off
         const size_t sz  = gguf_get_tensor_size(gctx, i);
         if (data_off > file_size || off > data_avail || sz > data_avail - off) {
-            set_last_error(std::string("Qwen3-0.6B drafter GGUF is truncated or corrupt: tensor '")
+            set_last_error(std::string("Qwen3-0.6B GGUF is truncated or corrupt: tensor '")
                 + gguf_get_tensor_name(gctx, i) + "' data ends at " + std::to_string(data_off + off + sz)
                 + " but file is only " + std::to_string(file_size)
-                + " bytes. Re-download the drafter model (" + path + ").");
+                + " bytes. Re-download the model (" + path + ").");
             gguf_free(gctx);
             ggml_backend_buffer_free(out.buf);
             ggml_free(out.ctx);
@@ -387,33 +302,15 @@ bool load_qwen3_drafter_model(const std::string & path,
         out.ctx = nullptr;
         return false;
     }
-    if (const char * head_path = std::getenv("PFLASH_SCORING_HEAD_GGUF")) {
-        constexpr const char * expected_drafter_sha256 =
-            "f9c9f1d3c1e21755b82d4e165f88dbbbd4355646d632fb5d6cef7c66ed4ee04e";
-        const auto drafter_identity = read_gguf_metadata(path, true);
-        if (!*head_path || out.n_layer < 14 || !drafter_identity.ok ||
-            drafter_identity.sha256 != expected_drafter_sha256 ||
-            !load_scoring_head(head_path, drafter_identity.sha256, out)) {
-            if (drafter_identity.sha256 != expected_drafter_sha256) {
-                set_last_error("scoring head requires the pinned Qwen3-0.6B drafter GGUF");
-            }
-            ggml_backend_buffer_free(out.buf);
-            ggml_free(out.ctx);
-            out.buf = nullptr;
-            out.ctx = nullptr;
-            return false;
-        }
-    }
     return true;
 }
 
-void free_qwen3_drafter_model(Qwen3DrafterWeights & w) {
+void free_qwen3_model(Qwen3Weights & w) {
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx); w.ctx = nullptr; }
     w.layers.clear();
-    w.scoring_head_loaded = false;
     w.tok_embd = w.out_norm = w.output = nullptr;
     w.backend = nullptr;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

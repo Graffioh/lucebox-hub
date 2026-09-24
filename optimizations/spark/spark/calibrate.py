@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Step 2 of Spark calibration: corpus -> hot/cold placement profile.
 
-Feeds each corpus chunk through the dflash daemon in hybrid mode with
-`DFLASH_LAGUNA_NEXT_PLACEMENT_OUT` set, so per-(layer, expert) routing
+Feeds each corpus chunk through the luce daemon in hybrid mode with
+`LUCE_LAGUNA_NEXT_PLACEMENT_OUT` set, so per-(layer, expert) routing
 frequencies accumulate across the whole corpus. The resulting CSV is the
-placement profile: load it at serve time with `DFLASH_LAGUNA_HOTNESS=<csv>` and
+placement profile: load it at serve time with `LUCE_LAGUNA_HOTNESS=<csv>` and
 the greedy knapsack keeps the most-frequent experts resident.
 
 Routing is placement-independent, so calibrate at a high budget (fast, little
@@ -59,9 +59,9 @@ def main():
     print(f"[calib] {len(chunks)} chunks", flush=True)
 
     env = dict(os.environ)
-    env["DFLASH_IGNORE_EOS"] = "1"
-    env["DFLASH_EXPERT_BUDGET_PCT"] = str(args.budget_pct)
-    env["DFLASH_LAGUNA_NEXT_PLACEMENT_OUT"] = str(Path(args.out_profile))
+    env["LUCE_IGNORE_EOS"] = "1"
+    env["LUCE_EXPERT_BUDGET_PCT"] = str(args.budget_pct)
+    env["LUCE_LAGUNA_NEXT_PLACEMENT_OUT"] = str(Path(args.out_profile))
 
     daemon = Daemon([args.bin, args.gguf, "--max-ctx", str(args.max_ctx)], env)
     daemon.wait_ready(timeout=args.ready_timeout)

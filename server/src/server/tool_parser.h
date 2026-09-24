@@ -21,7 +21,7 @@
 #include <vector>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 using json = nlohmann::json;
 
@@ -51,4 +51,4 @@ size_t tool_syntax_holdback(const json & tools);
 ToolParseResult parse_tool_calls(const std::string & text,
                                  const json & tools = json());
 
-}  // namespace dflash::common
+}  // namespace luce::common

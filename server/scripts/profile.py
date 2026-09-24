@@ -613,9 +613,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True)
     ap.add_argument("--draft", required=True)
-    ap.add_argument("--df-bin", default=os.environ.get("DFLASH_BIN", "build/test_dflash"))
-    ap.add_argument("--ar-bin", default=os.environ.get("DFLASH_BIN_AR", "build/test_generate"))
-    ap.add_argument("--tokenizer", default=os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.6-27B"))
+    ap.add_argument("--df-bin", default=os.environ.get("LUCE_BIN", "build/test_dflash"))
+    ap.add_argument("--ar-bin", default=os.environ.get("LUCE_BIN_AR", "build/test_generate"))
+    ap.add_argument("--tokenizer", default=os.environ.get("LUCE_TOKENIZER", "Qwen/Qwen3.6-27B"))
     ap.add_argument("--n-gen", type=int, default=128,
                     help="requested generated tokens per benchmark prompt")
     ap.add_argument("--budget", type=int, default=22)

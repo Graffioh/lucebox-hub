@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 using json = nlohmann::json;
 
@@ -48,6 +48,9 @@ struct GenTimings {
     int    prefilled_tokens     = 0;
     int    effective_prompt_tokens = 0;
     bool   agent_turn_cache_hit = false;
+    // PFlash compression details (compress time, kept/served tokens, the
+    // multi-turn view and drafter-session outcome); null when not compressed.
+    nlohmann::json pflash;
 };
 
 // Build the `timings` sub-object emitted under `usage`.
@@ -223,4 +226,4 @@ private:
 
 std::string escape_for_logging(const std::string & s);
 
-}  // namespace dflash::common
+}  // namespace luce::common

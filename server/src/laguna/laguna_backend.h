@@ -13,7 +13,7 @@
 #include "common/dflash_draft_graph.h"
 #include "common/dflash_draft_kv.h"
 #include "placement/placement_config.h"
-#include "qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
 #include "kvflash_pager.h"
 #include "kvflash_scorer.h"
 #include "../common/moe_hybrid_ffn_eval.h"
@@ -32,7 +32,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct LagunaBackendArgs {
     std::string target_path;
@@ -111,7 +111,7 @@ private:
     std::string                                 default_draft_variant_ = "base";
     DraftFeatureMirror                          feature_mirror_{};
     // [TAG_DRAFT_KV] drafter context-KV ring cache (lazy-init on first spec
-    // decode; kill with DFLASH_DRAFT_KV=0). Replaces the per-step full-window
+    // decode; kill with LUCE_DRAFT_KV=0). Replaces the per-step full-window
     // K/V recompute once the feature window fills.
     DraftKvState                                draft_kv_{};
     LagunaDFlashTarget *                        dflash_target_ = nullptr;
@@ -141,7 +141,7 @@ private:
     bool ensure_slot(int slot);
 
     // ── kvflash (bounded KV residency; see common/kvflash_pager.h) ──
-    // Drafter-scored residency by default: the Qwen3-0.6B drafter scores
+    // Drafter-scored residency by default: the Qwen3.5-0.8B drafter scores
     // chunks through the cross-tokenizer bridge (KvFlashCrossTokScorer —
     // relevance is text-level, so the target's ids are detokenized and
     // re-tokenized for the drafter). LRU is the fallback when no drafter is
@@ -168,7 +168,7 @@ private:
     void kvflash_resolve_drafter();
     bool kvflash_scorer_expected() const { return !kvflash_drafter_path_.empty(); }
     KvFlashAutoBudget make_kvflash_budget(int64_t gpu_free) const;
-    // Read DFLASH_KVFLASH and round/clamp; call before cache creation.
+    // Read LUCE_KVFLASH and round/clamp; call before cache creation.
     void kvflash_read_config();
     // Attach the pager to the freshly created cache (init / unpark).
     bool kvflash_attach();
@@ -204,4 +204,4 @@ private:
                         const std::vector<int32_t> * sample_history_prefix = nullptr);
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

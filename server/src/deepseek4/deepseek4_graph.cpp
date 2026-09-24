@@ -9,6 +9,9 @@
 //   6. MoE FFN (hash routing + top-k + shared expert + clamped SwiGLU)
 
 #include "deepseek4_internal.h"
+#include "deepseek4_norm.h"
+#include "deepseek4_image_policy.h"
+#include "deepseek4_vision.h"
 #include "common/blocking_row_pool.h"
 #include "deepseek4_hc_cuda.h"
 #include "deepseek4_roctx.h"
@@ -49,7 +52,7 @@
 #include <immintrin.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 ggml_tensor * deepseek4_preserve_raw_rows(
         ggml_context * ctx, ggml_tensor * raw_kv, ggml_tensor * rows) {
@@ -107,7 +110,7 @@ static constexpr int DS4_FUSED_VERIFY_F16_F32_KV_MAX_ATTN = 512;
 
 static int ds4_effective_expert_count(const DeepSeek4Weights & w) {
     int requested = w.routed_expert_top_k;
-    if (const char * value = std::getenv("DFLASH_DS4_TOPK")) {
+    if (const char * value = std::getenv("LUCE_DS4_TOPK")) {
         const int env_requested = std::atoi(value);
         if (env_requested > 0) requested = env_requested;
     }
@@ -346,7 +349,8 @@ static ggml_tensor * build_moe_ffn(ggml_context * ctx,
                                     const DeepSeek4Weights & w,
                                     const DeepSeek4Layer & L,
                                     int layer_idx,
-                                    int n_tokens);
+                                    int n_tokens,
+                                    ggml_tensor * selection_bias = nullptr);
 
 // Every cached per-layer decode/prefill graph below owns a StepGraph whose
 // metadata arena holds the ggml nodes the CUDA/HIP backend keys its captured
@@ -498,7 +502,7 @@ struct DeepSeek4CachedDecodeAttnGraph {
 
 static bool ds4_moe_fused_combine_enabled() {
     static const bool enabled = []() {
-        const char * val = getenv("DFLASH_MOE_FUSED_COMBINE");
+        const char * val = getenv("LUCE_MOE_FUSED_COMBINE");
         if (!val) return true; // Default ON in production
         return atoi(val) != 0;
     }();
@@ -707,8 +711,7 @@ static bool build_cached_decode_output_graph(
 
 static ggml_tensor * build_rms_norm(ggml_context * ctx, ggml_tensor * x,
                                      ggml_tensor * weight, float eps) {
-    ggml_tensor * normed = ggml_rms_norm(ctx, x, eps);
-    return ggml_mul(ctx, normed, weight);
+    return detail::build_rms_norm(ctx, x, weight, eps);
 }
 
 // ─── Helper: Clamped SwiGLU ─────────────────────────────────────────────
@@ -1721,7 +1724,7 @@ static int ds4_comp_rows_used(const ggml_tensor * comp_cache, int n_cached, int 
 static int ds4_comp_pad_stride() {
     static const int stride = [] {
         constexpr int default_stride = 16;
-        const char * raw = std::getenv("DFLASH_DS4_COMP_PAD_STRIDE");
+        const char * raw = std::getenv("LUCE_DS4_COMP_PAD_STRIDE");
         if (!raw || !*raw) return default_stride;
         const int requested = std::atoi(raw);
         switch (requested) {
@@ -1732,7 +1735,7 @@ static int ds4_comp_pad_stride() {
                 return requested;
             default:
                 std::fprintf(stderr,
-                    "[deepseek4] invalid DFLASH_DS4_COMP_PAD_STRIDE=%s; "
+                    "[deepseek4] invalid LUCE_DS4_COMP_PAD_STRIDE=%s; "
                     "using %d\n",
                     raw, default_stride);
                 return default_stride;
@@ -1841,10 +1844,10 @@ static ggml_tensor * build_indexer_topk(
     // once avoids converting the same query again in every compressed-row
     // tile; decode and verify batches keep the F32 query, where the cast would
     // be pure overhead. Part of the gfx1151 sparse-prefill profile;
-    // DFLASH_DS4_INDEXER_F16_Q=0 is the kill switch.
+    // LUCE_DS4_INDEXER_F16_Q=0 is the kill switch.
     constexpr int indexer_f16_query_min_scored = 256;
     if (n_scored >= indexer_f16_query_min_scored &&
-        ds4_env_flag("DFLASH_DS4_INDEXER_F16_Q")) {
+        ds4_env_flag("LUCE_DS4_INDEXER_F16_Q")) {
         index_q = ggml_cast(ctx, index_q, GGML_TYPE_F16);
     }
 
@@ -2064,9 +2067,12 @@ static ggml_tensor * build_mla_output_projection(
         ctx, L.attn_output_a, group_dim, w.n_lora_o, w.n_out_group);
     ggml_tensor * attn_low = ds4_mul_mat_columns(ctx, out_a_3d, attn_out, projection_columns);
 
+    // The grouped source layout is read by MMQ's activation quantizer and by
+    // nothing else, so a projection stored unquantized (BF16 attention from a
+    // converter that leaves dense tensors alone) takes the plain path.
     const bool grouped_output_projection =
-        allow_grouped && n_tokens > 1 &&
-        !ds4_env_flag("DFLASH_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
+        allow_grouped && n_tokens > 1 && ggml_is_quantized(L.attn_output_b->type) &&
+        !ds4_env_flag("LUCE_DS4_DISABLE_GROUPED_OUTPUT_PROJECTION");
     if (grouped_output_projection) {
         return ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);
     }
@@ -2144,7 +2150,8 @@ static ggml_tensor * build_mla_attention_lane_core(
         DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit,
         const DeepSeek4PreparedProjectedLane * prepared = nullptr,
         ggml_tensor ** out_attn_context = nullptr,
-        DeepSeek4SpecBoundaryCheckpointLayer * boundary_checkpoint = nullptr) {
+        DeepSeek4SpecBoundaryCheckpointLayer * boundary_checkpoint = nullptr,
+        vision::ImageSpanView image_spans = {}) {
 
     const int n_embd    = w.n_embd;
     const int head_dim  = w.head_dim;
@@ -2206,10 +2213,10 @@ static ggml_tensor * build_mla_attention_lane_core(
     // j > i, must see the compressed-row count as of its own position, and —
     // once the ring has wrapped — must still see the OLD contents of ring
     // slots that later batch tokens overwrite. Default ON for multi-token
-    // steps on this path; DFLASH_DS4_NO_CAUSAL_VERIFY=1 restores the legacy
+    // steps on this path; LUCE_DS4_NO_CAUSAL_VERIFY=1 restores the legacy
     // (bidirectional) behavior for A/B comparison.
     const bool causal_batch = (n_tokens > 1) && !cached_inputs && f32_array_inputs &&
-                              !ds4_env_flag("DFLASH_DS4_NO_CAUSAL_VERIFY");
+                              (image_spans.size || !ds4_env_flag("LUCE_DS4_NO_CAUSAL_VERIFY"));
     const bool layer_major_batch =
         causal_batch && attention_impl != DeepSeek4AttentionImpl::Explicit;
     ggml_tensor * old_rows_scratch = nullptr;
@@ -2463,7 +2470,7 @@ static ggml_tensor * build_mla_attention_lane_core(
     constexpr int maskless_indexed_rows_cap = 512;  // fattn.cu top-k scan width
     const bool maskless_sparse_prefill =
         attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
-        layer_major_batch && !gathered_history &&
+        layer_major_batch && !gathered_history && !image_spans.size &&
         indexer_topk && n_tokens > w.n_swa &&
         indexer_topk->ne[0] <= maskless_indexed_rows_cap &&
         n_prior_rows == std::min(kv_start, w.n_swa) &&
@@ -2471,13 +2478,13 @@ static ggml_tensor * build_mla_attention_lane_core(
     // F16 K/V transport for long sparse prefill. F16 rounding of the prefill
     // rows changes the DSpark target features, so it is only used where it
     // was qualified: the gfx1151 sparse-prefill profile defaults it on and
-    // DFLASH_DS4_PREFILL_F16_KV_ALL=0 is the kill switch; everywhere else
+    // LUCE_DS4_PREFILL_F16_KV_ALL=0 is the kill switch; everywhere else
     // prefill keeps the F32 rows.
     const bool f16_sparse_prefill =
         attention_impl == DeepSeek4AttentionImpl::SparseFlash &&
         layer_major_batch && !gathered_history &&
         n_tokens > w.n_swa &&
-        ds4_env_flag("DFLASH_DS4_PREFILL_F16_KV_ALL");
+        ds4_env_flag("LUCE_DS4_PREFILL_F16_KV_ALL");
     // Stable path reads the full physical ring (masking not-yet-written slots)
     // and a padded compressed-row span; the plain path reads only valid rows.
     const int n_raw = gathered_history ? lane.n_raw_history + n_tokens
@@ -2660,18 +2667,19 @@ static ggml_tensor * build_mla_attention_lane_core(
     // [n_kv,n_query] F16; the explicit path broadcasts the same values over
     // heads in F32.
     ggml_tensor * score_mask = nullptr;
+    int raw_score_capacity = w.n_swa;
     // Ratio-4 sparse prefill already carries the authoritative compressed
     // row IDs. The CUDA/HIP kernel can derive the raw causal window and the
     // completed compressed-row frontier from kv_start and the query index.
     // Keep every other attention shape on the explicit mask contract.
-    const bool direct_indexer_topk = indexer_topk &&
+    const bool direct_indexer_topk = indexer_topk && !image_spans.size &&
         (maskless_sparse_prefill ||
-         ds4_env_flag("DFLASH_DS4_DIRECT_INDEXER_TOPK"));
+         ds4_env_flag("LUCE_DS4_DIRECT_INDEXER_TOPK"));
     // Layer-major, non-indexed layers can skip the quadratic causal mask:
     // their KV layout is [prior chronological window | current batch], so
     // the kernel derives the exact causal window from kv_start and the query
     // index (ggml_flash_attn_ext_set_ds4_causal_ratio). Part of the gfx1151
-    // sparse-prefill profile (DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL=0 is the
+    // sparse-prefill profile (LUCE_DS4_DIRECT_CONTIGUOUS_CAUSAL=0 is the
     // kill switch); measured +10% prefill at 8K with identical output.
     //
     // Admission repeats the kernel's own checks so the graph never emits an
@@ -2701,11 +2709,11 @@ static ggml_tensor * build_mla_attention_lane_core(
         ds4_env_flag("GGML_CUDA_MLA_DENSE_HIGH_RATIO") &&
         ds4_env_flag("GGML_CUDA_MLA_DENSE_WMMA");
     const bool direct_contiguous_causal = layer_major_batch &&
-        !gathered_history && !indexer_topk && n_tokens > w.n_swa &&
+        !gathered_history && !indexer_topk && !image_spans.size && n_tokens > w.n_swa &&
         (ratio == 0 || ratio > 1) &&
         (analytic_causal_shmem <= analytic_causal_lds_limit ||
          streaming_dense_high_ratio) &&
-        ds4_env_flag("DFLASH_DS4_DIRECT_CONTIGUOUS_CAUSAL");
+        ds4_env_flag("LUCE_DS4_DIRECT_CONTIGUOUS_CAUSAL");
     const bool exact_numerical_bands =
         attention_impl == DeepSeek4AttentionImpl::DenseFlash &&
         causal_batch &&
@@ -2728,15 +2736,29 @@ static ggml_tensor * build_mla_attention_lane_core(
                 const int pos_i = kv_start + i;
                 float * col = mvals.data() + (size_t) i * n_attn;
                 const int min_pos = pos_i - w.n_swa + 1;
+                const auto * image = vision::image_block_at(image_spans, uint64_t(pos_i));
+                const int64_t image_begin = image ? int64_t(image->visible_begin) : -1;
+                const int64_t image_end = image ? int64_t(image->visible_end) : -1;
                 for (int r = 0; r < n_prior_rows; ++r) {
                     const int prior_pos = kv_start - n_prior_rows + r;
-                    if (prior_pos < min_pos) col[r] = -1e30f;
+                    bool visible = prior_pos >= min_pos;
+                    if (image_spans.size && !vision::raw_key_visible(
+                            pos_i, prior_pos, w.n_swa, image_begin, image_end, visible)) return nullptr;
+                    if (!visible) col[r] = -1e30f;
                 }
                 for (int t = 0; t < n_tokens; ++t) {
                     const int current_pos = kv_start + t;
-                    if (t > i || current_pos < min_pos) {
-                        col[n_prior_rows + t] = -1e30f;
+                    bool visible = t <= i && current_pos >= min_pos;
+                    if (image_spans.size && !vision::raw_key_visible(
+                            pos_i, current_pos, w.n_swa, image_begin, image_end, visible)) return nullptr;
+                    if (!visible) col[n_prior_rows + t] = -1e30f;
+                }
+                if (image_spans.size) {
+                    int first = n_raw, last = -1;
+                    for (int r = 0; r < n_raw; ++r) {
+                        if (col[r] == 0.0f) { first = std::min(first, r); last = r; }
                     }
+                    raw_score_capacity = std::max(raw_score_capacity, last - first + 1);
                 }
                 if (n_comp_attn > 0) {
                     const int vis = gathered_history ? n_comp_attn
@@ -2978,7 +3000,7 @@ static ggml_tensor * build_mla_attention_lane_core(
             // dense attention unchanged while allowing the D=512 value pass to
             // skip the two masked envelopes without guessing DS4 cache layout.
             ggml_flash_attn_ext_set_ds4_sparse(
-                context, n_raw, w.n_swa,
+                context, n_raw, raw_score_capacity,
                 indexer_topk
                     ? -(int) indexer_topk->ne[0]
                     : attention_impl == DeepSeek4AttentionImpl::SparseFlash
@@ -3137,7 +3159,8 @@ static ggml_tensor * build_mla_attention(
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4F32ArrayBinding> * f32_array_inputs = nullptr,
         DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit,
-        DeepSeek4SpecBoundaryCheckpointLayer * boundary_checkpoint = nullptr) {
+        DeepSeek4SpecBoundaryCheckpointLayer * boundary_checkpoint = nullptr,
+        vision::ImageSpanView image_spans = {}) {
     const int ratio = w.compress_ratios[layer_idx];
     DeepSeek4MlaLaneBindings lane = deepseek4_contiguous_lane_bindings(
         lc, ratio, kv_start + n_tokens - 1);
@@ -3145,7 +3168,7 @@ static ggml_tensor * build_mla_attention(
         ctx, gf, cur, w, L, lane, layer_idx, kv_start, n_tokens,
         cached_inputs, i32_inputs, i32_array_inputs, i64_array_inputs,
         f32_array_inputs, attention_impl, /*prepared=*/nullptr,
-        /*out_attn_context=*/nullptr, boundary_checkpoint);
+        /*out_attn_context=*/nullptr, boundary_checkpoint, image_spans);
 }
 
 struct DeepSeek4CachedDecodeHcPreGraph {
@@ -3543,7 +3566,7 @@ static bool ds4_try_gpu_hc_pre(float * working,
                                int n_hc,
                                int sinkhorn_iters,
                                float hc_eps) {
-#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     if (!fn_tensor || !fn_tensor->data) {
         return false;
     }
@@ -3591,7 +3614,7 @@ static bool ds4_try_gpu_hc_pre_device(ggml_tensor * working,
                                       int n_hc,
                                       int sinkhorn_iters,
                                       float hc_eps) {
-#if defined(DFLASH27B_BACKEND_CUDA) || defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+#if defined(LUCE_BACKEND_CUDA) || defined(LUCE_BACKEND_HIP) || defined(GGML_USE_HIP)
     const void * fn_device = fn_device_override ? fn_device_override : (fn_tensor ? fn_tensor->data : nullptr);
     if (!working || !post || !comb || !hc_state || !fn_device || !scale_data || !base_data ||
         !working->data || !post->data || !comb->data || !hc_state->data) {
@@ -4005,12 +4028,16 @@ static bool eval_ds4_hybrid(
     return true;
 }
 
+// `selection_bias`, when given, is a per-token [n_expert, n_tokens] input that
+// replaces the layer's single selection bias. Image batches use it: image rows
+// select with the image router bias, text rows keep their usual selection.
 static Ds4MoeRouting build_moe_routing(
         ggml_context * ctx,
         ggml_tensor * cur,
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
-        int n_tokens) {
+        int n_tokens,
+        ggml_tensor * selection_bias = nullptr) {
     Ds4MoeRouting out;
     auto track = [&](ggml_tensor * tensor) {
         if (tensor) out.nodes.push_back(tensor);
@@ -4024,7 +4051,9 @@ static Ds4MoeRouting build_moe_routing(
     ggml_tensor * softplus = track(ggml_softplus(ctx, logits));
     ggml_tensor * probs = track(ggml_sqrt(ctx, softplus));
     ggml_tensor * selection = probs;
-    if (L.ffn_exp_probs_b) {
+    if (selection_bias) {
+        selection = track(ggml_add(ctx, selection, selection_bias));
+    } else if (L.ffn_exp_probs_b) {
         selection = track(ggml_add(ctx, selection, L.ffn_exp_probs_b));
     }
 
@@ -4049,7 +4078,8 @@ static ggml_tensor * build_moe_ffn(
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
         int layer_idx,
-        int n_tokens) {
+        int n_tokens,
+        ggml_tensor * selection_bias) {
 
     const int n_embd = w.n_embd;
     int n_used = w.n_expert_used;
@@ -4057,10 +4087,10 @@ static ggml_tensor * build_moe_ffn(
     ggml_tensor * shared_out = build_shared_ffn(ctx, cur, w, L);
     ggml_tensor * routed_out = nullptr;
 
-    if (layer_idx < w.n_hash_layer && L.ffn_gate_tid2eid) {
+    if (!selection_bias && layer_idx < w.n_hash_layer && L.ffn_gate_tid2eid) {
         routed_out = ggml_scale(ctx, cur, 0.0f);
     } else {
-        Ds4MoeRouting routing = build_moe_routing(ctx, cur, w, L, n_tokens);
+        Ds4MoeRouting routing = build_moe_routing(ctx, cur, w, L, n_tokens, selection_bias);
         n_used = (int) routing.selected->ne[0];
         ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
         ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, routing.selected);
@@ -4477,7 +4507,7 @@ static HcPreResult cpu_hc_pre(const float * hc_state, const uint16_t * fn_data,
 }
 
 static bool ds4_hc_cuda_enabled() {
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
     return true;
 #else
     return false;
@@ -4491,7 +4521,7 @@ static HcPreResult hc_pre_auto(const float * hc_state,
                                int n_hc,
                                int sinkhorn_iters,
                                float hc_eps) {
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
     if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data) {
         float mix[24];
         if (deepseek4_cuda_hc_pre_mix(hc_state, fn_tensor->data,
@@ -4523,7 +4553,7 @@ static void hc_pre_auto_into(float * working,
                              float * flat,
                              float * mix_scratch,
                              bool serial_fn) {
-#if defined(DFLASH27B_BACKEND_CUDA)
+#if defined(LUCE_BACKEND_CUDA)
     if (ds4_hc_cuda_enabled() && fn_tensor && fn_tensor->data) {
         float mix[24];
         if (deepseek4_cuda_hc_pre_mix(hc_state, fn_tensor->data,
@@ -5344,7 +5374,7 @@ static bool ds4_fused_decode_enabled(const DeepSeek4Weights & w) {
     // loaded weights. Keep the old environment spelling as a compatibility
     // fallback for existing launch scripts.
     static const bool legacy_env_enabled =
-        ds4_env_flag("DFLASH_DS4_FUSED_DECODE");
+        ds4_env_flag("LUCE_DS4_FUSED_DECODE");
     return w.fused_decode || legacy_env_enabled;
 }
 
@@ -5729,7 +5759,7 @@ struct DeepSeek4LayerRangeCache {
 // layout, and the out-of-memory retry in the attention path then discards
 // every warm graph on the device. Bound the cache by bytes instead: a quarter
 // of the target GPU's free memory when the first graph is cached
-// (DFLASH_DS4_DECODE_ATTN_CACHE_MB overrides), evicting the least recently
+// (LUCE_DS4_DECODE_ATTN_CACHE_MB overrides), evicting the least recently
 // used shape across all layers. A quarter, not half: the captured graph
 // executables, the verify slots and the prefill scratch share that headroom,
 // and half of it still left a 9.5k-token exact prefill at 370 MiB free.
@@ -5738,7 +5768,7 @@ static size_t ds4_decode_attn_cache_budget(DeepSeek4LayerRangeCache & rc) {
         return rc.decode_attn_cache_budget;
     }
     static const long override_mb = [] {
-        const char * raw = std::getenv("DFLASH_DS4_DECODE_ATTN_CACHE_MB");
+        const char * raw = std::getenv("LUCE_DS4_DECODE_ATTN_CACHE_MB");
         return raw && *raw ? std::strtol(raw, nullptr, 10) : 0L;
     }();
     if (override_mb > 0) {
@@ -6217,7 +6247,7 @@ static bool ds4_build_fused_decode_graph(
         std::vector<DeepSeek4I64ArrayBinding> i64ab;
         std::vector<DeepSeek4F32ArrayBinding> f32ab;
         const bool sparse_decode_flash =
-            ds4_env_flag("DFLASH_DS4_SPARSE_DECODE_FLASH");
+            ds4_env_flag("LUCE_DS4_SPARSE_DECODE_FLASH");
         const DeepSeek4AttentionImpl attention_impl = sparse_decode_flash
             ? DeepSeek4AttentionImpl::SparseFlash
             : DeepSeek4AttentionImpl::Explicit;
@@ -6515,8 +6545,9 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         MoeHybridRoutingStats * routing_stats,
         std::vector<float> & out,
         DeepSeek4StepTelemetry * telemetry,
-        const MoeHybridDeviceOutputs * device_outputs = nullptr) {
-    const bool trace_prefill = ds4_env_flag("DFLASH_DS4_PREFILL_TRACE");
+        const MoeHybridDeviceOutputs * device_outputs = nullptr,
+        int kv_start = 0, vision::ImageSpanView image_spans = {}) {
+    const bool trace_prefill = ds4_env_flag("LUCE_DS4_PREFILL_TRACE");
     if (trace_prefill) {
         std::fprintf(stderr,
                      "[deepseek4-prefill-trace] layer=%d ffn route begin tokens=%d\n",
@@ -6538,7 +6569,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     ggml_tensor * cold_stack_ref = layer_storage.gate_up_cold
         ? layer_storage.gate_up_cold : layer_storage.gate_cold;
     const char * device_input_env =
-        std::getenv("DFLASH_MOE_PREFILL_DEVICE_INPUT");
+        std::getenv("LUCE_MOE_PREFILL_DEVICE_INPUT");
     const bool device_input_enabled =
         !device_input_env || !*device_input_env ||
         std::strcmp(device_input_env, "0") != 0;
@@ -6550,7 +6581,7 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         hot_stack_ref && hot_stack_ref->ne[2] > 0 &&
         cold_stack_ref && cold_stack_ref->ne[2] > 0;
     const char * persistent_owner_env =
-        std::getenv("DFLASH_MOE_PREFILL_PERSISTENT_OWNER_ALLOC");
+        std::getenv("LUCE_MOE_PREFILL_PERSISTENT_OWNER_ALLOC");
     const bool persistent_owner_requested =
         !persistent_owner_env || !*persistent_owner_env ||
         std::strcmp(persistent_owner_env, "0") != 0;
@@ -6684,6 +6715,13 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         ggml_backend_tensor_get(L.ffn_exp_probs_b, bias.data(), 0,
                                 sizeof(float) * bias.size());
     }
+    std::vector<float> image_bias;
+    if (image_spans.size) {
+        if (!L.ffn_gate_bias_vl) return false;
+        image_bias.resize(size_t(w.n_expert));
+        ggml_backend_tensor_get(L.ffn_gate_bias_vl, image_bias.data(), 0,
+                                sizeof(float) * image_bias.size());
+    }
 
     const auto route_select_t0 = Ds4TimingClock::now();
     for (int t = 0; t < n_tokens; ++t) {
@@ -6693,6 +6731,21 @@ static bool eval_ds4_layer_range_hybrid_ffn(
             selected.data() + (size_t)t * (size_t)route_width;
         float * token_weights =
             weights.data() + (size_t)t * (size_t)route_width;
+
+        if (vision::image_block_at(image_spans, uint64_t(kv_start + t))) {
+            vision::ImageExpertSelection selection;
+            std::string error;
+            if (!vision::select_image_experts(token_probs, image_bias.data(),
+                    size_t(w.n_expert), size_t(route_width), selection, error,
+                    w.expert_weight_scale)) {
+                std::fprintf(stderr, "[deepseek4] image routing failed: %s\n", error.c_str());
+                return false;
+            }
+            std::copy_n(selection.indices.data(), route_width, token_ids_out);
+            std::copy_n(selection.weights.data(), route_width, token_weights);
+            observe_active_routing(routing_stats, layer, token_ids_out, token_weights, route_width);
+            continue;
+        }
 
         if (hash_routed) {
             const int32_t tok = token_ids[t];
@@ -7071,12 +7124,16 @@ static int ds4_try_layer_major_prefill(
         std::vector<float> * out_logits,
         const int32_t * token_ids,
         Ds4VerifyHooks * verify_hooks,
-        DeepSeek4StepTelemetry * telemetry) {
+        DeepSeek4StepTelemetry * telemetry,
+        vision::ImageSpanView image_spans = {}) {
     if (!backend || !embed || n_tokens <= 4 ||
         n_tokens > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS ||
         kv_start < 0 || w.moe_hybrid) {
         return 0;
     }
+    // Image batches carry their own attention mask and per-token expert
+    // selection, so their graphs are built fresh and never cached.
+    const bool image_batch = image_spans.size != 0;
     if (cache.prefill_mode == PrefillAttentionMode::Exact) return 0;
     // Layer-major prefill returns only the final-position logits. DSpark's
     // per-layer feature capture is supported below, but verifier requests for
@@ -7187,9 +7244,10 @@ static int ds4_try_layer_major_prefill(
     // growth costs several GiB without producing a cache hit. Keep the short
     // request win, then retire it before the first chunk beyond 32K.
     constexpr int layer_major_cache_context_limit = 32768;
-    const bool allow_graph_cache =
+    const bool cache_context_ok =
         token_ids && next_pos <= layer_major_cache_context_limit;
-    if (!allow_graph_cache) {
+    const bool allow_graph_cache = cache_context_ok && !image_batch;
+    if (!cache_context_ok) {
         for (auto & candidate : ds4_layer_major_graph_caches) {
             if (candidate.owner_ctx == w.ctx && candidate.backend == backend) {
                 candidate.destroy();
@@ -7456,7 +7514,8 @@ static int ds4_try_layer_major_prefill(
         ggml_tensor * attn_out = build_mla_attention(
             ctx, gf, attn_normed, w, L, lc, il, kv_start, n_tokens,
             nullptr, i32_inputs, i32_array_inputs, i64_array_inputs,
-            &f32_array_inputs, attention_impl);
+            &f32_array_inputs, attention_impl,
+            /*boundary_checkpoint=*/nullptr, image_spans);
         if (!attn_out) {
             if (!cached_layer) ggml_free(ctx);
             return fail("attention graph build failed", il);
@@ -7482,10 +7541,20 @@ static int ds4_try_layer_major_prefill(
         ggml_tensor * ffn_normed = build_rms_norm(ctx, ffn_in,
                                                   L.ffn_norm, w.rms_eps);
         ggml_tensor * hash_ids = nullptr;
+        ggml_tensor * selection_bias = nullptr;
         ggml_tensor * ffn_out = nullptr;
         const bool hash_routed = il < w.n_hash_layer && L.ffn_gate_tid2eid &&
                                  token_ids && hash_tables[(size_t) il].loaded;
-        if (hash_routed) {
+        if (image_batch) {
+            // One mechanism for every layer: top-k over probs + a per-token bias.
+            if (!L.ffn_gate_bias_vl) {
+                if (!cached_layer) ggml_free(ctx);
+                return fail("image batch without an image router bias", il);
+            }
+            selection_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_expert, n_tokens);
+            ggml_set_input(selection_bias);
+            ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, n_tokens, selection_bias);
+        } else if (hash_routed) {
             hash_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32,
                                           w.n_expert_used, n_tokens);
             ggml_set_input(hash_ids);
@@ -7581,6 +7650,33 @@ static int ds4_try_layer_major_prefill(
             }
             ggml_backend_tensor_set(hash_ids, hash_scratch.data(), 0,
                                     sizeof(int32_t) * hash_scratch.size());
+        }
+        if (selection_bias) {
+            // Image rows: the image router bias. Text rows: the layer's usual
+            // bias, or for a hash-routed layer a large bias on exactly the
+            // experts its table names, so top-k returns that set.
+            constexpr float HASH_PICK = 1.0e4f;
+            const size_t n_expert = (size_t) w.n_expert;
+            std::vector<float> image_bias(n_expert), text_bias(n_expert, 0.0f);
+            ggml_backend_tensor_get(L.ffn_gate_bias_vl, image_bias.data(), 0, sizeof(float) * n_expert);
+            if (!hash_routed && L.ffn_exp_probs_b) {
+                ggml_backend_tensor_get(L.ffn_exp_probs_b, text_bias.data(), 0, sizeof(float) * n_expert);
+            }
+            std::vector<float> bias(n_expert * (size_t) n_tokens);
+            for (int t = 0; t < n_tokens; ++t) {
+                float * row = bias.data() + (size_t) t * n_expert;
+                if (vision::image_block_at(image_spans, uint64_t(kv_start) + uint64_t(t))) {
+                    std::copy(image_bias.begin(), image_bias.end(), row);
+                    continue;
+                }
+                std::copy(text_bias.begin(), text_bias.end(), row);
+                if (hash_routed) {
+                    const int32_t * picks = hash_tables[(size_t) il].ids.data() +
+                        (size_t) token_ids[t] * (size_t) w.n_expert_used;
+                    for (int k = 0; k < w.n_expert_used; ++k) row[picks[k]] = HASH_PICK;
+                }
+            }
+            ggml_backend_tensor_set(selection_bias, bias.data(), 0, sizeof(float) * bias.size());
         }
         if (telemetry) {
             telemetry->full_graph_build_us += ds4_elapsed_us(
@@ -7732,6 +7828,68 @@ static bool initialize_layer_range_cache(
     runtime.layer_begin = layer_begin;
     runtime.layer_end = layer_end;
     runtime.owns_output = owns_output;
+    return true;
+}
+bool deepseek4_validate_image_batch(
+        const DeepSeek4Weights & w, const DeepSeek4Cache & cache,
+        const MoeHybridStorage * hybrid, const int32_t * tokens,
+        int count, int position, vision::ImageSpanView spans,
+        bool & has_images, std::string & error) {
+    has_images = false;
+    if (!spans.size) return true;
+    const auto fail = [&](const char * message) { error = message; return false; };
+    if (count <= 0 || position < 0 || int64_t(position) + count > cache.max_ctx ||
+        !vision::valid_image_spans(spans, uint64_t(std::max(0, cache.max_ctx))))
+        return fail("invalid image batch bounds");
+    const uint64_t end = uint64_t(position) + uint64_t(count);
+    for (size_t i = 0; i < spans.size; ++i) {
+        const auto & span = spans.data[i];
+        if (span.block_begin >= end || span.block_end <= uint64_t(position)) continue;
+        if (span.block_begin < uint64_t(position) || span.block_end > end)
+            return fail("prefill batch would split an image block");
+        has_images = true;
+    }
+    if (has_images && !tokens) return fail("image batch requires bound token IDs");
+    if (tokens) {
+        for (int i = 0; i < count; ++i) {
+            const bool image_row = vision::image_block_at(spans, uint64_t(position) + uint64_t(i));
+            const int32_t token = tokens[i];
+            if (image_row ? (token < w.n_vocab || int64_t(token) >= int64_t(w.n_vocab) + 5)
+                          : (token < 0 || token >= w.n_vocab))
+                return fail("token IDs do not match image block positions");
+        }
+    }
+    if (!has_images) return true;
+    // Images run through a batched sparse prefill: the single-GPU layer-major
+    // path, or the two-GPU path with both expert owners materialized on GPUs.
+    if (cache.prefill_mode != PrefillAttentionMode::Sparse || count <= 4 ||
+        count > DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS ||
+        w.layers.size() != size_t(w.n_layer) || cache.layers.size() != size_t(w.n_layer) ||
+        w.compress_ratios.size() != size_t(w.n_layer))
+        return fail("image batch requires batched sparse prefill");
+    if ((hybrid || w.moe_hybrid) &&
+        (!hybrid || !w.moe_hybrid || !hybrid->materialized_cold_experts ||
+         hybrid->cold_backend_kind != MoeHybridColdBackend::Gpu || !hybrid->cold_backend ||
+         hybrid->layers.size() != size_t(w.n_layer)))
+        return fail("image batch requires both expert owners on GPUs");
+    for (int il = 0; il < w.n_layer; ++il) {
+        const auto & layer = w.layers[size_t(il)];
+        const auto & state = cache.layers[size_t(il)];
+        const auto bias = layer.ffn_gate_bias_vl;
+        const int ratio = int(w.compress_ratios[size_t(il)]);
+        if (!bias || bias->type != GGML_TYPE_F32 || bias->ne[0] != w.n_expert ||
+            ggml_nelements(bias) != w.n_expert || !state.raw_kv)
+            return fail("image decoder is missing a validated router bias or attention state");
+        if (ratio && (!layer.attn_compressor_ape || !layer.attn_compressor_kv ||
+            !layer.attn_compressor_gate || !layer.attn_compressor_norm || !state.comp_kv ||
+            !state.attn_compressor.state_kv || !state.attn_compressor.state_score))
+            return fail("image decoder has incomplete attention compressor state");
+        if (ratio == 4 && (!layer.indexer_compressor_ape || !layer.indexer_compressor_kv ||
+            !layer.indexer_compressor_gate || !layer.indexer_compressor_norm ||
+            !state.index_comp_kv || !state.indexer_compressor.state_kv ||
+            !state.indexer_compressor.state_score))
+            return fail("image decoder has incomplete indexer compressor state");
+    }
     return true;
 }
 
@@ -8137,8 +8295,22 @@ bool deepseek4_step_layer_range(
         Ds4VerifyHooks * verify_hooks,
         MoeHybridStorage * moe_hybrid,
         MoeExpertComputeRuntime * expert_runtime,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats,
+        vision::ImageSpanView image_spans) {
     const auto step_t0 = Ds4TimingClock::now();
+
+    bool image_batch = false;
+    std::string image_error;
+    if (!deepseek4_validate_image_batch(w, cache, moe_hybrid, token_ids,
+            n_tokens, kv_start, image_spans, image_batch, image_error) ||
+        (image_batch && (!embed || layer_begin != 0 || layer_end != w.n_layer ||
+         verify_hooks || expert_runtime ||
+         !vision::detail::hip_bias_workspace(backend) ||
+         (moe_hybrid && moe_hybrid->cold_backend == backend)))) {
+        std::fprintf(stderr, "[deepseek4] image prefill rejected before evaluation: %s\n",
+                     image_error.empty() ? "unsupported execution path" : image_error.c_str());
+        return false;
+    }
 
     if (!deepseek4_cuda_hc_set_device(device)) {
         std::fprintf(stderr,
@@ -8159,7 +8331,7 @@ bool deepseek4_step_layer_range(
         moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
     const bool wide_verify_candidate =
         n_tokens == DS4_Q5_VERIFY_TOKENS &&
-        ds4_env_flag("DFLASH_DS4_Q5_VERIFY");
+        ds4_env_flag("LUCE_DS4_Q5_VERIFY");
     const bool fused_verify_candidate =
         (!moe_hybrid || fused_hybrid_ready) &&
         n_tokens >= 2 &&
@@ -8179,7 +8351,7 @@ bool deepseek4_step_layer_range(
         if (!warned) {
             warned = true;
             std::fprintf(stderr,
-                "[deepseek4] DFLASH_DS4_FUSED_VERIFY=1 but fused verify is "
+                "[deepseek4] LUCE_DS4_FUSED_VERIFY=1 but fused verify is "
                 "inactive: n_tokens=%d (cap %d) verify_hooks=%d out_logits=%d "
                 "backend_gpu=%d moe_hybrid=%d expert_runtime=%d "
                 "materialized_cold=%d cold_backend_kind_gpu=%d "
@@ -8230,7 +8402,7 @@ bool deepseek4_step_layer_range(
     // to this forward call; decode graph replay is restored on every return.
     ScopedCudaGraphOverrides heterogeneous_prefill_eager_scope(
         heterogeneous_sparse_prefill &&
-        ds4_env_flag("DFLASH_DS4_HYBRID_PREFILL_EAGER"));
+        (image_batch || ds4_env_flag("LUCE_DS4_HYBRID_PREFILL_EAGER")));
 
     // A dynamic batch may be supplied by callers other than the DSpark
     // verifier. Split it whenever it spans a learned-compressor boundary:
@@ -8294,7 +8466,7 @@ bool deepseek4_step_layer_range(
                     out_logits ? &chunk_out : nullptr,
                     token_ids ? token_ids + off : nullptr,
                     telemetry, allow_decode_graph_reuse, chunk_hooks_ptr,
-                    moe_hybrid, expert_runtime, routing_stats)) {
+                    moe_hybrid, expert_runtime, routing_stats, image_spans)) {
                 return false;
             }
             hc_all.insert(hc_all.end(), chunk_hc.begin(), chunk_hc.end());
@@ -8439,6 +8611,16 @@ bool deepseek4_step_layer_range(
                 moe_hybrid->prefill_cold_alloc = nullptr;
             }
         }
+        // Gallocr teardown does not return cached operator temporaries to
+        // the driver. Retire backend captures/memos and trim free pool blocks
+        // before allocating the new bulk-prefill scratch on either owner.
+        if (ds4_image_capable(w)) {
+            ggml_backend_cuda_trim_pool(backend);
+            if (moe_hybrid && moe_hybrid->cold_backend &&
+                moe_hybrid->cold_backend != backend) {
+                ggml_backend_cuda_trim_pool(moe_hybrid->cold_backend);
+            }
+        }
         std::fprintf(stderr,
                      "[deepseek4] released prior decode/tail arenas before "
                      "new layer-major prefill\n");
@@ -8450,7 +8632,7 @@ bool deepseek4_step_layer_range(
     scratch.ensure(w.ctx, n_tokens, n_embd, n_hc, n_expert_used);
     const bool trace_prefill =
         heterogeneous_sparse_prefill &&
-        ds4_env_flag("DFLASH_DS4_PREFILL_TRACE");
+        ds4_env_flag("LUCE_DS4_PREFILL_TRACE");
     if (trace_prefill) {
         std::fprintf(stderr,
                      "[deepseek4-prefill-trace] step begin pos=%d tokens=%d\n",
@@ -8465,7 +8647,7 @@ bool deepseek4_step_layer_range(
             hc_layer_weights_range, hc_output_weights_range,
             hash_routing_tables_range, scratch.hash_expert_ids, embed,
             n_tokens, kv_start, out_logits, token_ids, verify_hooks,
-            telemetry);
+            telemetry, image_batch ? image_spans : vision::ImageSpanView{});
         if (prc < 0) return false;
         if (prc > 0) {
             if (telemetry) {
@@ -8474,6 +8656,11 @@ bool deepseek4_step_layer_range(
             }
             return true;
         }
+    }
+    // Only the two batched prefill paths know about image rows.
+    if (image_batch && !heterogeneous_sparse_prefill) {
+        std::fprintf(stderr, "[deepseek4] image prefill has no batched path for this configuration\n");
+        return false;
     }
 
     // The batched verifier graph is also the only whole-model graph that can
@@ -8485,7 +8672,7 @@ bool deepseek4_step_layer_range(
     // native AR before the drafter has run at all.
     const bool fused_hybrid_decode =
         fused_hybrid_ready && n_tokens == 1 && allow_decode_graph_reuse &&
-        ds4_env_flag("DFLASH_DS4_FUSED_HYBRID_DECODE");
+        ds4_env_flag("LUCE_DS4_FUSED_HYBRID_DECODE");
     std::vector<int> fused_hybrid_decode_capture_ids;
     Ds4VerifyHooks fused_hybrid_decode_hooks;
     if (fused_hybrid_decode && !verify_hooks) {
@@ -8605,7 +8792,7 @@ bool deepseek4_step_layer_range(
         use_backend_decode_hc && !use_backend_decode_hc_direct;
     const bool use_backend_prefill_hc =
         heterogeneous_sparse_prefill &&
-        ds4_env_flag("DFLASH_DS4_HYBRID_PREFILL_GPU_HC");
+        ds4_env_flag("LUCE_DS4_HYBRID_PREFILL_GPU_HC");
     ggml_tensor * hc_state_backend = nullptr;
     if (use_backend_prefill_hc) {
         if (!ds4_fused_ensure_fn_mirrors(
@@ -8978,7 +9165,10 @@ bool deepseek4_step_layer_range(
                                                i32_inputs, i32_array_inputs,
                                                i64_array_inputs,
                                                &f32_array_inputs,
-                                               attention_impl);
+                                               attention_impl,
+                                               /*boundary_checkpoint=*/nullptr,
+                                               image_batch ? image_spans : vision::ImageSpanView{});
+                if (!attn_out) { ggml_free(ctx); return false; }
                 ggml_set_output(attn_out);
                 ggml_build_forward_expand(gf, attn_out);
 
@@ -9262,7 +9452,7 @@ bool deepseek4_step_layer_range(
         constexpr size_t k_long_context_attn_release_bytes =
             384u * 1024u * 1024u;
         if (!ds4_env_flag(
-                "DFLASH_DS4_DISABLE_LONG_CONTEXT_ARENA_HANDOFF") &&
+                "LUCE_DS4_DISABLE_LONG_CONTEXT_ARENA_HANDOFF") &&
             heterogeneous_sparse_prefill &&
             kv_start >= k_long_context_attn_release_pos &&
             shared_prefill_attn_alloc.alloc &&
@@ -9419,7 +9609,7 @@ bool deepseek4_step_layer_range(
                     ? layer_storage.gate_up_hot
                     : layer_storage.gate_hot;
                 const char * device_input_env =
-                    std::getenv("DFLASH_MOE_PREFILL_DEVICE_INPUT");
+                    std::getenv("LUCE_MOE_PREFILL_DEVICE_INPUT");
                 const bool device_input_enabled =
                     !device_input_env || !*device_input_env ||
                     std::strcmp(device_input_env, "0") != 0;
@@ -9460,7 +9650,8 @@ bool deepseek4_step_layer_range(
                         token_ids, hash_routing_tables_range[(size_t)il],
                         *moe_hybrid, expert_runtime, routing_stats,
                         ffn_out_host, telemetry,
-                        ffn_device_join ? &owner_outputs : nullptr)) {
+                        ffn_device_join ? &owner_outputs : nullptr,
+                        kv_start, image_batch ? image_spans : vision::ImageSpanView{})) {
                     std::fprintf(stderr,
                                  "[deepseek4-moe-tp] layer-range FFN failed layer %d\n",
                                  il);
@@ -9928,7 +10119,7 @@ void deepseek4_release_prefill_scratch(
     }
 
     static const bool report_release = [] {
-        const char * value = std::getenv("DFLASH_DS4_TIMING");
+        const char * value = std::getenv("LUCE_DS4_TIMING");
         return value != nullptr && value[0] != '\0' &&
                std::strcmp(value, "0") != 0;
     }();
@@ -9944,7 +10135,15 @@ void deepseek4_release_prefill_scratch(
     }
 }
 
-}  // namespace dflash::common
+void deepseek4_release_image_scratch(DeepSeek4Cache & c,
+                                     MoeHybridStorage * moe_hybrid) {
+    deepseek4_release_prefill_scratch(c, moe_hybrid);
+    delete c.layer_range_cache;
+    c.layer_range_cache = nullptr;
+    if (moe_hybrid) moe_hybrid->release_graph_caches();
+}
+
+}  // namespace luce::common
 
 // ══════════════════════════════════════════════════════════════════════
 //  DSpark drafter forward graph (appended to deepseek4_graph.cpp so it can
@@ -9969,7 +10168,7 @@ void deepseek4_release_prefill_scratch(
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -10352,9 +10551,9 @@ static bool deepseek4_dspark_draft_forward_impl(
     if (ctx_len < 0) ctx_len = 0;
     const int valid_ctx_len = ctx_len;
     const bool context_kv_cache =
-        ds4_env_flag("DFLASH_DS4_DRAFT_CONTEXT_KV_CACHE");
+        ds4_env_flag("LUCE_DS4_DRAFT_CONTEXT_KV_CACHE");
     const bool fixed_context = context_kv_cache ||
-        ds4_env_flag("DFLASH_DS4_DRAFT_FIXED_CONTEXT");
+        ds4_env_flag("LUCE_DS4_DRAFT_FIXED_CONTEXT");
     const int graph_ctx_len = fixed_context
         ? std::max(valid_ctx_len, w.n_swa)
         : valid_ctx_len;
@@ -10368,7 +10567,7 @@ static bool deepseek4_dspark_draft_forward_impl(
     }
 
     DsparkDraftCache & C = g_dspark_draft_cache;
-    const bool DS4_DBG = std::getenv("DFLASH_DS4_DSPARK_DEBUG") != nullptr;
+    const bool DS4_DBG = std::getenv("LUCE_DS4_DSPARK_DEBUG") != nullptr;
 
     // Context reuse is deliberately strict: never submit a graph with an
     // uninitialized or differently-shaped context tensor.  The normal warm
@@ -10588,7 +10787,7 @@ static bool deepseek4_dspark_draft_forward_impl(
             ggml_free(C.ctx); C.ctx = nullptr; C.gf = nullptr;
             return false;
         }
-        if (ds4_env_flag("DFLASH_DS4_DRAFT_GRAPH_STATS")) {
+        if (ds4_env_flag("LUCE_DS4_DRAFT_GRAPH_STATS")) {
             std::fprintf(stderr,
                 "[ds4-draft-graph] ctx=%d valid=%d nodes=%d scratch=%.2f MiB\n",
                 graph_ctx_len, valid_ctx_len, ggml_graph_n_nodes(gf),
@@ -10682,7 +10881,7 @@ static bool deepseek4_dspark_draft_forward_impl(
     // can take effect.  Keep this opt-in until exact output and replay stats
     // have both been qualified on the deployment GPUs.
     const bool force_graph_replay =
-        ds4_env_flag("DFLASH_DS4_DRAFT_FORCE_GRAPH_REPLAY");
+        ds4_env_flag("LUCE_DS4_DRAFT_FORCE_GRAPH_REPLAY");
     ScopedCudaGraphOverrides graph_replay_scope(
         /*disable_graphs=*/false,
         /*mmvq_max_ncols=*/0,
@@ -10788,4 +10987,4 @@ void deepseek4_dspark_draft_wait(ggml_backend_t backend) {
     ggml_backend_synchronize(backend);
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

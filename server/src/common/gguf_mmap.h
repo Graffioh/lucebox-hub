@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 class GgufMmap {
 public:
@@ -62,7 +62,7 @@ private:
 #endif
 };
 
-} // namespace dflash::common
+} // namespace luce::common
 
 // ── Implementation ────────────────────────────────────────────────────────
 // Header-only: the platform-conditional code lives here rather than in a .cpp
@@ -86,7 +86,7 @@ private:
 #include <unistd.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 inline GgufMmap::~GgufMmap() {
     if (!data_) return;
@@ -241,4 +241,4 @@ inline GgufMmap::OwnedRegion GgufMmap::release() {
     return r;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -2,7 +2,7 @@
 
 #include "reasoning.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 static const char THINK_OPEN[]  = "<think>";
 static const char THINK_CLOSE[] = "</think>";
@@ -85,4 +85,4 @@ ReasoningResult parse_reasoning(const std::string & text,
     return result;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

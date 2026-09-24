@@ -12,7 +12,7 @@ namespace {
 struct SkipParkGuardFixture {};
 }
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static constexpr size_t GiB = 1024ull * 1024 * 1024;
 

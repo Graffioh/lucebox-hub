@@ -14,8 +14,9 @@
 #include "qwen35/layer_split_forward.h"
 #include "qwen35/qwen35_layer_split_dflash_target.h"
 #include "qwen35/prefill_helpers.h"
-#include "qwen3/qwen3_drafter.h"
-#include "qwen3/qwen3_kvflash_scorer.h"
+#include "pflash/pflash_drafter.h"
+#include "pflash/pflash_compress.h"
+#include "pflash/kvflash_drafter_scorer.h"
 #include "kv_quant.h"
 
 #include "ggml-cuda.h"
@@ -29,7 +30,7 @@
 #include <string>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 Qwen35LayerSplitAdapter::Qwen35LayerSplitAdapter(
         Qwen35LayerSplitAdapterConfig cfg)
@@ -75,7 +76,7 @@ bool Qwen35LayerSplitAdapter::init() {
         if (!load_target_gguf_partial(cfg_.target_path, shard.backend, plan,
                                       shard.weights)) {
             std::fprintf(stderr, "[target-split] load gpu=%d: %s\n",
-                         shard.gpu, dflash27b_last_error());
+                         shard.gpu, luce_last_error());
             return false;
         }
     }
@@ -99,7 +100,7 @@ bool Qwen35LayerSplitAdapter::init() {
                                              cfg_.run_dflash &&
                                              split_chain_fast_rollback_enabled())) {
             std::fprintf(stderr, "[target-split] cache gpu=%d: %s\n",
-                         shard.gpu, dflash27b_last_error());
+                         shard.gpu, luce_last_error());
             return false;
         }
         std::fprintf(stderr, "[target-split] gpu=%d layers=[%d,%d)\n",
@@ -128,7 +129,7 @@ bool Qwen35LayerSplitAdapter::init() {
 }
 
 void Qwen35LayerSplitAdapter::kvflash_read_config() {
-    if (!std::getenv("DFLASH_KVFLASH") || shards_.empty()) return;
+    if (!std::getenv("LUCE_KVFLASH") || shards_.empty()) return;
     const bool target_shard_split =
         cfg_.device.is_layer_split() && cfg_.remote_target_shard.enabled();
     kvflash_drafter_path_ = target_shard_split
@@ -137,7 +138,7 @@ void Qwen35LayerSplitAdapter::kvflash_read_config() {
 
     ggml_type kv_k = GGML_TYPE_Q8_0;
     ggml_type kv_v = GGML_TYPE_Q8_0;
-    dflash::resolve_kv_types(kv_k, kv_v);
+    luce::resolve_kv_types(kv_k, kv_v);
 
     int64_t min_free = std::numeric_limits<int64_t>::max();
     int64_t max_bytes_per_token = 0;
@@ -170,7 +171,7 @@ void Qwen35LayerSplitAdapter::kvflash_read_config() {
         cfg_.device.max_ctx, KvFlashConfig{},
         !kvflash_drafter_path_.empty(), budget);
     if (kvflash_tokens_ > 0) {
-        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        const char * tau = std::getenv("LUCE_KVFLASH_TAU");
         kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
     }
 }
@@ -210,7 +211,7 @@ bool Qwen35LayerSplitAdapter::kvflash_attach() {
                 kvflash_tau_,
                 !kvflash_drafter_path_.empty()
                     ? "drafter (attaches on first reselect)"
-                    : "lru (recency-only: no Qwen3-0.6B drafter found)");
+                    : "lru (recency-only: no Qwen3.5-0.8B drafter found)");
     std::fflush(stdout);
     return true;
 }
@@ -254,7 +255,7 @@ void Qwen35LayerSplitAdapter::kvflash_maybe_reselect(int generated) {
                 std::fprintf(stderr,
                     "[target-split][kvflash] drafter load failed (%s); "
                     "staying on LRU residency\n",
-                    dflash27b_last_error());
+                    luce_last_error());
                 kvflash_drafter_failed_ = true;
                 return;
             }
@@ -335,7 +336,7 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
         if (!load_target_gguf_partial(cfg_.target_path, local.backend, local_plan,
                                       local.weights)) {
             std::fprintf(stderr, "[target-split] mixed local load gpu=%d: %s\n",
-                         local.gpu, dflash27b_last_error());
+                         local.gpu, luce_last_error());
             return false;
         }
     }
@@ -357,7 +358,7 @@ bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
                                          /*allocate_target_feat=*/false,
                                          kvflash_tokens_)) {
             std::fprintf(stderr, "[target-split] mixed local cache gpu=%d: %s\n",
-                         local.gpu, dflash27b_last_error());
+                         local.gpu, luce_last_error());
             return false;
         }
     }
@@ -441,9 +442,9 @@ bool Qwen35LayerSplitAdapter::load_draft() {
                 cfg_.draft_gpu);
             return false;
         }
-        draft_weights_.n_embd = DFLASH27B_TARGET_HIDDEN;
-        draft_weights_.block_size = DFLASH27B_DRAFT_BLOCK_SIZE;
-        draft_weights_.n_target_layers = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+        draft_weights_.n_embd = LUCE_TARGET_HIDDEN;
+        draft_weights_.block_size = LUCE_DRAFT_BLOCK_SIZE;
+        draft_weights_.n_target_layers = LUCE_DRAFT_N_TARGET_LAYERS;
         if (cfg_.draft_swa_window > 0) {
             draft_weights_.swa_window = cfg_.draft_swa_window;
         }
@@ -479,7 +480,7 @@ bool Qwen35LayerSplitAdapter::load_draft() {
                                  draft_weights_, &shards_.front().weights);
     if (!draft_ok) {
         std::fprintf(stderr, "[target-split] draft load gpu=%d: %s\n",
-                     cfg_.draft_gpu, dflash27b_last_error());
+                     cfg_.draft_gpu, luce_last_error());
         return false;
     }
     if (cfg_.draft_swa_window > 0) {
@@ -1360,7 +1361,7 @@ bool Qwen35LayerSplitAdapter::decode_dflash(
 }
 
 const char * Qwen35LayerSplitAdapter::default_compress_drafter_path() const {
-    return "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+    return "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf";
 }
 
 ModelBackend::CompressResult
@@ -1378,18 +1379,34 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
                           pflash_drafter_)) {
             std::fprintf(stderr,
                          "[target-split][compress] drafter init failed: %s\n",
-                         dflash27b_last_error());
+                         luce_last_error());
             return result;
         }
         pflash_drafter_loaded_ = true;
         std::fprintf(stderr, "[target-split][compress] drafter ready\n");
     }
 
+    // score_query_end < 0 is the legacy "tail window" request value; the
+    // qwen35 scorer requires an explicit end.
+    const int score_query_end = req.score_query_end >= 0
+        ? req.score_query_end : (int)req.input_ids.size();
     result.compressed_ids = drafter_score_and_compress(
         pflash_drafter_, req.input_ids, req.keep_ratio,
         /*chunk_size=*/32, req.score_query_tokens, /*pool_kernel=*/13,
-        req.score_query_end, req.required_instruction_spans);
+        score_query_end, req.required_instruction_spans,
+        req.query_suffix_candidates, req.history_query_spans,
+            req.turn_query_span);
     result.ok = !result.compressed_ids.empty();
+    if (result.ok) result.kept_spans = pflash_last_kept_spans();
+    if (result.ok) {
+        const auto & scoring = pflash_last_scoring_stats();
+        result.scorer_resume = scoring.resume;
+        result.scorer_new_tokens = scoring.new_tokens;
+        result.scorer_forward_s = scoring.forward_s;
+        for (const auto & candidate : pflash_last_candidate_lifts()) {
+            result.candidate_lifts.push_back({candidate.span, candidate.lift});
+        }
+    }
     if (result.ok) {
         std::fprintf(stderr, "[target-split][compress] %zu -> %zu tokens\n",
                      req.input_ids.size(), result.compressed_ids.size());
@@ -1400,12 +1417,12 @@ Qwen35LayerSplitAdapter::compress(const ModelBackend::CompressRequest & req) {
 void Qwen35LayerSplitAdapter::free_drafter() {
     remote_draft_.close();
     if (pflash_drafter_loaded_) {
-        dflash::common::free_drafter(pflash_drafter_);
+        luce::common::free_drafter(pflash_drafter_);
         pflash_drafter_loaded_ = false;
     }
     kvflash_scorer_.reset();
     if (kvflash_drafter_loaded_) {
-        dflash::common::free_drafter(kvflash_drafter_);
+        luce::common::free_drafter(kvflash_drafter_);
         kvflash_drafter_loaded_ = false;
     }
     step_graph_destroy(draft_sg_);
@@ -1453,4 +1470,4 @@ void Qwen35LayerSplitAdapter::shutdown() {
     shards_.clear();
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -15,7 +15,7 @@
 #include <utility>
 
 namespace {
-using namespace dflash::common;
+using namespace luce::common;
 struct DecodeKvOffloadGpuFixture {};
 #define GPU_OFFLOAD_CHECK(x) do { if (!(x)) throw std::runtime_error( \
     std::string("GPU KV offload line ") + std::to_string(__LINE__) + ": " #x); } while (false)

@@ -106,7 +106,7 @@ FA span traffic is bandwidth-realistic:
 ## Full LSA loop (drafter as Memory Indexer) — measured
 
 Test run F implements the paper's complete inference paradigm with the
-pflash drafter (Qwen3-0.6B, `/opt/lucebox/models/drafter/`) standing in
+pflash drafter (Qwen3.5-0.8B, `/opt/lucebox/models/drafter/`) standing in
 for the trained indexer: prompt (2048) larger than the pool (1024) so
 prefill itself evicts, then every τ=64 decoded tokens the drafter
 rescores the full sequence (tail attention = indexer query, chunk means
@@ -129,8 +129,8 @@ leaks footprint at scale (their §3.3.1); our fixed pool is a hard cap.
 ## Production integration (daemon)
 
 The pool is wired into the qwen35 backend behind `--kvflash <tokens>`
-(env `DFLASH_KVFLASH`; rounded to a 256 multiple) + `--kvflash-tau <N>`
-(env `DFLASH_KVFLASH_TAU`, default 64). Pieces:
+(env `LUCE_KVFLASH`; rounded to a 256 multiple) + `--kvflash-tau <N>`
+(env `LUCE_KVFLASH_TAU`, default 64). Pieces:
 
 - `create_target_cache(..., ctx_alloc)`: attention tensors allocated at
   pool capacity; `cache.max_ctx` stays the logical bound.
@@ -169,14 +169,14 @@ The pool is wired into the qwen35 backend behind `--kvflash <tokens>`
   (pooled snapshots need page-table serialization; prefill-time
   snapshots still work).
 
-## Production smokes (dflash_server on lucebox 3090, 2026-06-11)
+## Production smokes (luce_server on lucebox 3090, 2026-06-11)
 
-1. WITHOUT pflash (agnostic LRU): `dflash_server <27B> --kvflash 1024`.
+1. WITHOUT pflash (agnostic LRU): `luce_server <27B> --kvflash 1024`.
    41-token prompt + 1400 generated = 1441 logical through a 1024-slot
    pool (live LRU eviction mid-request). Coherent story end to end,
    36.9 tok/s, clean finish. Second request (per-request pager reset) ok.
 2. WITH pflash: `--kvflash 2048 --prefill-compression always
-   --prefill-threshold 256 --prefill-drafter <Qwen3-0.6B>`. Compression
+   --prefill-threshold 256 --prefill-drafter <Qwen3.5-0.8B>`. Compression
    1468 -> 60 tokens, then `[kvflash] drafter scorer attached (tau=64)`
    automatically; 400 coherent tokens answering from the compressed
    context. Same binary, zero pflash-specific configuration on the pool.
@@ -246,7 +246,7 @@ and masks through it. What differs per arch:
   3.09, identical text).
 
 Policy: drafter-scored residency is the default on all four archs. The
-server probes for the Qwen3-0.6B next to the model (or --prefill-drafter)
+server probes for the Qwen3.5-0.8B next to the model (or --prefill-drafter)
 and lazy-loads it at the first reselect; `--kvflash-policy lru` opts out.
 qwen35/qwen35moe feed the drafter target ids directly; laguna/gemma4 use
 KvFlashCrossTokScorer (detokenize -> re-tokenize -> score -> map back by

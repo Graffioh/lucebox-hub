@@ -6,7 +6,7 @@
 
 #include "common/inference_phase.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 struct DeepSeek4RoctxMetadata {
     InferencePhase phase = InferencePhase::Unspecified;
@@ -77,4 +77,4 @@ private:
     bool pushed_ = false;
 };
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -21,6 +21,7 @@
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
+#include "server/image_input.h"
 #include "engine/luce_engine.h"
 #include "server/chat_template.h"
 #include "common/concurrency/seq_engine.h"
@@ -45,9 +46,10 @@
 #include "qwen35moe/qwen35moe_ffn.h"
 #include "ggml-cpu.h"
 #include "server/prompt_normalize.h"
-#include "qwen3_drafter.h"
-#include "qwen3_drafter_model.h"
-#include "dflash27b.h"
+#include "pflash/pflash_drafter.h"
+#include "qwen3_model.h"
+#include "pflash/pflash_compress.h"
+#include "luce.h"
 #include "gguf.h"
 #include <nlohmann/json.hpp>
 
@@ -62,6 +64,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <type_traits>
 #include <thread>
 #include <vector>
 #include <limits>
@@ -72,19 +75,20 @@
 #include <sys/socket.h>
 #else
 #include <io.h>
+#include <process.h>
 #endif
 
 #if defined(_WIN32)
-#define dflash_setenv(name, value) _putenv_s(name, value)
-#define dflash_unsetenv(name) _putenv_s(name, "")
+#define luce_setenv(name, value) _putenv_s(name, value)
+#define luce_unsetenv(name) _putenv_s(name, "")
 #else
-#define dflash_setenv(name, value) setenv(name, value, 1)
-#define dflash_unsetenv(name) unsetenv(name)
+#define luce_setenv(name, value) setenv(name, value, 1)
+#define luce_unsetenv(name) unsetenv(name)
 #endif
 
 using json = nlohmann::json;
-using namespace dflash::common;
-using dflash::engine::LuceEngine;
+using namespace luce::common;
+using luce::engine::LuceEngine;
 namespace fs = std::filesystem;
 
 static fs::path test_tmp_path(const char * name) {
@@ -102,7 +106,7 @@ static void remove_test_path(const fs::path & path) {
     fs::remove(path, ec);
 }
 
-namespace dflash::common {
+namespace luce::common {
 std::vector<ChatMessage> normalize_chat_messages(
     const json & messages,
     ApiFormat format,
@@ -159,6 +163,10 @@ struct HttpServerTestAccess {
             HttpServer & server, const ParsedRequest & req) {
         HttpServer::PreparedPrompt prepared;
         return server.apply_pflash_compression(req, prepared);
+    }
+    static HttpServer::PreparedPrompt prepare_prompt(
+            HttpServer & server, const ParsedRequest & req) {
+        return server.prepare_prompt(req);
     }
 };
 }
@@ -427,9 +435,11 @@ static std::string test_gpt2_encode(const std::string & text) {
 
 static std::string write_pflash_bpe_tokenizer_fixture(
         const std::vector<std::string> & raw_tokens,
-        const std::string & byte_cover) {
-    std::vector<std::string> tokens{"<|im_start|>", "<|im_end|>"};
-    std::vector<uint32_t> types{3, 3};
+        const std::string & byte_cover,
+        const std::vector<std::string> & control_tokens =
+            {"<|im_start|>", "<|im_end|>"}) {
+    std::vector<std::string> tokens = control_tokens;
+    std::vector<uint32_t> types(tokens.size(), 3);
     const auto add = [&](const std::string & encoded, uint32_t type) {
         if (std::find(tokens.begin(), tokens.end(), encoded) == tokens.end()) {
             tokens.push_back(encoded);
@@ -450,9 +460,42 @@ static std::string write_pflash_bpe_tokenizer_fixture(
     gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
     gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 0);
     gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 1);
+    // Per-process names: ctest runs each case in its own process, in
+    // parallel, and every process starts the serial at zero.
     static int fixture_serial = 0;
-    const std::string path = "/tmp/dflash_test_pflash_bpe_" +
-        std::to_string(++fixture_serial) + ".gguf";
+#if defined(_WIN32)
+    const long long pid = (long long) _getpid();
+#else
+    const long long pid = (long long) getpid();
+#endif
+    const std::string path = test_tmp_path((
+        "luce_test_pflash_bpe_" + std::to_string(pid) + "_" +
+        std::to_string(++fixture_serial) + ".gguf").c_str()).string();
+    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
+    gguf_free(g);
+    return path;
+}
+
+static std::string write_deepseek_marker_tokenizer_fixture() {
+    gguf_context * g = gguf_init_empty();
+    const char * tokens[] = {
+        "x",
+        "<｜begin▁of▁sentence｜>",
+        "<｜end▁of▁sentence｜>",
+        "<｜User｜>",
+        "<｜Assistant｜>",
+    };
+    const uint32_t token_types[] = {1, 3, 3, 3, 3};
+    gguf_set_arr_str(g, "tokenizer.ggml.tokens", tokens,
+                     sizeof(tokens) / sizeof(tokens[0]));
+    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
+                      token_types, sizeof(token_types) / sizeof(token_types[0]));
+    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
+    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
+    gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 1);
+    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 2);
+
+    const std::string path = test_tmp_path("luce_test_deepseek_markers.gguf").string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
     gguf_free(g);
     return path;
@@ -788,6 +831,191 @@ TEST_CASE(ServerUnitFixture, test_pflash_tail_query_window) {
     TEST_ASSERT(!http_detail::pflash_tail_query_window(long_prompt, 128, 201).valid());
 }
 
+// Renders ``messages`` with the server's own chat template and returns the
+// chat-query turn the scorer would use, decoded as {header, content}.
+struct PflashRenderedQueryTurn {
+    bool valid = false;
+    bool later_turns = false;
+    std::string family;
+    std::string header;
+    std::string content;
+    std::string after;
+    std::string closing;      // content end .. turn end
+    std::string generation;   // generation prompt .. prompt end
+    std::vector<std::string> roles;
+};
+
+static PflashRenderedQueryTurn pflash_rendered_query_turn(
+        const std::vector<ChatMessage> & messages,
+        ChatFormat format,
+        bool thinking,
+        const std::vector<std::string> & control_tokens) {
+    const std::string rendered = render_chat_template(
+        messages, format, /*add_generation_prompt=*/true, thinking);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant", "model",
+         "system", "\n", "Sure", "."},
+        rendered, control_tokens);
+    Tokenizer tok;
+    PflashRenderedQueryTurn out;
+    if (!tok.load_from_gguf(path.c_str())) {
+        unlink(path.c_str());
+        return out;
+    }
+    const auto prompt = tok.encode(rendered);
+    ChatMarkers markers;
+    if (resolve_chat_markers(tok, markers)) {
+        out.family = markers.family;
+        const auto turn = http_detail::pflash_chat_query_turn(
+            tok, markers, tok, prompt);
+        out.valid = turn.valid();
+        if (out.valid) {
+            out.header = tok.decode({prompt.begin() + turn.role_begin,
+                                     prompt.begin() + turn.content_begin});
+            out.content = tok.decode({prompt.begin() + turn.content_begin,
+                                      prompt.begin() + turn.content_end});
+            out.after = tok.decode({prompt.begin() + turn.content_end,
+                                    prompt.end()});
+            out.closing = tok.decode({prompt.begin() + turn.content_end,
+                                      prompt.begin() + turn.turn_end});
+            out.generation = tok.decode(
+                {prompt.begin() + turn.generation_begin, prompt.end()});
+            out.later_turns = turn.later_turns;
+            for (const auto & each : turn.turns) out.roles.push_back(each.role);
+        }
+    }
+    unlink(path.c_str());
+    return out;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_query_turn_skips_rendered_generation_prompt) {
+    // Every family's generation prompt carries a think/channel prefix after
+    // the assistant marker; the query must still be the latest user turn.
+    const std::vector<ChatMessage> messages{
+        {"system", "You are helpful.", ""},
+        {"user", "first turn", ""},
+        {"assistant", "Sure.", ""},
+        {"user", "What is the answer?", ""},
+    };
+    struct Family {
+        ChatFormat format;
+        const char * name;
+        std::vector<std::string> control_tokens;
+        const char * header;
+    };
+    const std::vector<Family> families{
+        {ChatFormat::QWEN3, "qwen", {"<|im_start|>", "<|im_end|>"},
+         "<|im_start|>user\n"},
+        {ChatFormat::GEMMA4, "gemma", {"<|turn>", "<turn|>"},
+         "<|turn>user\n"},
+        {ChatFormat::DEEPSEEK4, "deepseek",
+         {"<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜User｜>",
+          "<｜Assistant｜>"},
+         "<｜User｜>"},
+        {ChatFormat::LAGUNA, "laguna",
+         {"<system>", "</system>", "<user>", "</user>", "<assistant>",
+          "</assistant>"},
+         "<user>\n"},
+    };
+    for (const auto & family : families) {
+        for (const bool thinking : {false, true}) {
+            const auto turn = pflash_rendered_query_turn(
+                messages, family.format, thinking, family.control_tokens);
+            TEST_ASSERT_MSG(turn.family == family.name, family.name);
+            TEST_ASSERT_MSG(turn.valid, family.name);
+            TEST_ASSERT_MSG(turn.content == "What is the answer?",
+                            std::string(family.name) + " thinking=" +
+                                (thinking ? "1" : "0") + " content=[" +
+                                turn.content + "]");
+            TEST_ASSERT_MSG(turn.header == family.header,
+                            std::string(family.name) + " header=[" +
+                                turn.header + "]");
+            // The rendered tail after the content is template machinery.
+            TEST_ASSERT_MSG(turn.after.find("answer") == std::string::npos,
+                            family.name);
+            TEST_ASSERT_MSG(!turn.later_turns, family.name);
+        }
+    }
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_query_turn_skips_tool_output_turns) {
+    // Agent loop: tool results render inside user turns on Qwen and
+    // DeepSeek. The query stays on the user's own latest turn.
+    const std::vector<ChatMessage> messages{
+        {"user", "What is the answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"tool", "tool output here", "call-1"},
+    };
+    const auto qwen = pflash_rendered_query_turn(
+        messages, ChatFormat::QWEN3, false, {"<|im_start|>", "<|im_end|>"});
+    TEST_ASSERT(qwen.valid);
+    TEST_ASSERT_MSG(qwen.content == "What is the answer?", qwen.content);
+    TEST_ASSERT(qwen.header == "<|im_start|>user\n");
+    TEST_ASSERT(qwen.later_turns);
+    TEST_ASSERT(qwen.roles == std::vector<std::string>({"user", "assistant", "tool"}));
+    TEST_ASSERT_MSG(qwen.closing == "<|im_end|>", qwen.closing);
+    TEST_ASSERT_MSG(qwen.generation == "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                    qwen.generation);
+
+    const auto deepseek = pflash_rendered_query_turn(
+        messages, ChatFormat::DEEPSEEK4, true,
+        {"<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜User｜>",
+         "<｜Assistant｜>"});
+    TEST_ASSERT(deepseek.valid);
+    TEST_ASSERT_MSG(deepseek.content == "What is the answer?",
+                    deepseek.content);
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_query_turn_falls_back_without_user_turn) {
+    const auto turn = pflash_rendered_query_turn(
+        {{"system", "You are helpful.", ""}}, ChatFormat::QWEN3, true,
+        {"<|im_start|>", "<|im_end|>"});
+    TEST_ASSERT(turn.valid);
+    TEST_ASSERT(turn.content == "You are helpful.");
+    TEST_ASSERT(turn.header == "<|im_start|>system\n");
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_query_turn_open_tail_runs_to_prompt_end) {
+    const std::string rendered = "<|im_start|>user\nhello there";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"hello", " there", "user", "\n"}, rendered);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tok, markers));
+    const auto span = http_detail::pflash_chat_query_turn(
+        tok, markers, tok, prompt);
+    TEST_ASSERT(span.valid());
+    TEST_ASSERT(span.content_end == (int) prompt.size());
+    TEST_ASSERT(tok.decode({prompt.begin() + span.content_begin,
+                            prompt.begin() + span.content_end})
+                == "hello there");
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_query_turn_rejects_markerless_text) {
+    const std::string rendered = "just some raw text, no chat markers";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"just", " some", " raw", " text"}, rendered);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+
+    const auto prompt = tok.encode(rendered);
+    ChatMarkers markers;
+    TEST_ASSERT(resolve_chat_markers(tok, markers));
+    const auto span = http_detail::pflash_chat_query_turn(
+        tok, markers, tok, prompt);
+    TEST_ASSERT(!span.valid());
+    unlink(path.c_str());
+}
+
 TEST_CASE(ServerUnitFixture, test_pflash_normalizes_multipart_latest_user_for_reverse_lookup) {
     ToolMemory tool_memory;
     const json messages = json::array({
@@ -816,8 +1044,141 @@ TEST_CASE(ServerUnitFixture, test_pflash_normalizes_multipart_latest_user_for_re
 TEST_CASE(ServerUnitFixture, test_pflash_selection_cache_and_continuation_policy) {
     TEST_ASSERT(http_detail::pflash_full_cache_restore_allowed(false));
     TEST_ASSERT(!http_detail::pflash_full_cache_restore_allowed(true));
-    TEST_ASSERT(!http_detail::pflash_continuation_must_fail_closed(false));
-    TEST_ASSERT(http_detail::pflash_continuation_must_fail_closed(true));
+}
+
+TEST_CASE(ServerUnitFixture, test_timings_json_carries_pflash_details) {
+    GenTimings timings;
+    TEST_ASSERT(!build_timings_json(timings, 0).contains("pflash"));
+    timings.pflash = {{"compress_ms", 12.5}, {"view", {{"mode", "continue"}}}};
+    const auto out = build_timings_json(timings, 0);
+    TEST_ASSERT(out["pflash"]["view"]["mode"] == "continue");
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_join_kept_spans_breaks_between_pieces) {
+    const std::string text = "one fact.\ngap text.Two starts.\n\nThree.";
+    const std::string path = write_pflash_bpe_tokenizer_fixture({}, text);
+    Tokenizer tok;
+    TEST_ASSERT(tok.load_from_gguf(path.c_str()));
+    const auto ids = tok.encode(text);
+    const auto token_at = [&] (const std::string & needle) {
+        const auto span = http_detail::pflash_decoded_text_span(
+            tok, ids, 0, (int) ids.size(), needle);
+        return span;
+    };
+    const auto one = token_at("one fact.");
+    const auto two = token_at("Two starts.");
+    const auto three = token_at("\n\nThree.");
+    // Non-adjacent pieces without a break get a paragraph break...
+    TEST_ASSERT_MSG(http_detail::pflash_join_kept_spans(tok, ids, {one, two}) ==
+                    "one fact.\n\nTwo starts.",
+                    http_detail::pflash_join_kept_spans(tok, ids, {one, two}));
+    // ...a piece that already opens a paragraph is left alone...
+    TEST_ASSERT(http_detail::pflash_join_kept_spans(tok, ids, {one, three}) ==
+                "one fact.\n\nThree.");
+    // ...and adjacent pieces are joined as they were.
+    TEST_ASSERT(http_detail::pflash_join_kept_spans(tok, ids, {{0, 3}, {3, 5}}) ==
+                tok.decode({ids.begin(), ids.begin() + 5}));
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_recall_by_lift_takes_clear_attention_only) {
+    const std::vector<std::pair<PFlashTokenSpan, double>> lifts{
+        {{0, 10}, 40.0},     // clearly attended, not in view
+        {{10, 20}, 2.0},     // background
+        {{20, 30}, 90.0},    // clearly attended, already in view
+        {{30, 60}, 12.0},    // attended, half in view
+        {{60, 70}, 25.0},
+    };
+    const std::vector<PFlashTokenSpan> in_view{{20, 45}};
+    auto recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 8.0);
+    TEST_ASSERT(recalled.size() == 2);   // [0,10) and [45,70) merged
+    TEST_ASSERT(recalled[0].begin == 0 && recalled[0].end == 10);
+    TEST_ASSERT(recalled[1].begin == 45 && recalled[1].end == 70);
+    // A lower bar takes the background segment too.
+    recalled = http_detail::pflash_recall_by_lift(lifts, in_view, 1.0);
+    TEST_ASSERT(recalled.size() == 2);   // [0,20) and [45,70)
+    TEST_ASSERT(recalled[0].begin == 0 && recalled[0].end == 20);
+    TEST_ASSERT(recalled[1].begin == 45 && recalled[1].end == 70);
+    // Nothing clears a high bar.
+    TEST_ASSERT(http_detail::pflash_recall_by_lift(lifts, in_view, 100.0).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_subtract_token_spans) {
+    const std::vector<PFlashTokenSpan> spans{{0, 10}, {20, 30}, {40, 50}};
+    const std::vector<PFlashTokenSpan> minus{{5, 22}, {25, 26}, {40, 50}};
+    const auto out = http_detail::pflash_subtract_token_spans(spans, minus);
+    TEST_ASSERT(out.size() == 3);
+    TEST_ASSERT(out[0].begin == 0 && out[0].end == 5);
+    TEST_ASSERT(out[1].begin == 22 && out[1].end == 25);
+    TEST_ASSERT(out[2].begin == 26 && out[2].end == 30);
+    TEST_ASSERT(http_detail::pflash_subtract_token_spans(spans, {}).size() == 3);
+    TEST_ASSERT(http_detail::pflash_subtract_token_spans(spans, {{0, 60}}).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_recall_excerpt_strips_chat_markers) {
+    const std::string text =
+        "tail of a fact<|im_end|>\n<|im_start|>assistant\nSure, noted."
+        "<|im_end|>\n<|im_start|>user\n";
+    const std::string excerpt = http_detail::pflash_recall_excerpt(
+        text, {"<|im_start|>"}, {"<|im_end|>"}, /*generic_role_lines=*/true);
+    TEST_ASSERT_MSG(excerpt == "tail of a fact\n\n\nSure, noted.", excerpt);
+    TEST_ASSERT(http_detail::pflash_recall_excerpt(
+        "<|im_end|>\n", {"<|im_start|>"}, {"<|im_end|>"}, true).empty());
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_chat_view_store_matches_prompt_prefix) {
+    http_detail::PflashChatViewStore store(2);
+    http_detail::PflashChatView first;
+    first.raw_tokens = {1, 2, 3, 9, 9};
+    first.raw_gen_begin = 3;
+    first.drafter_ids = {1, 2, 3, 9, 9};
+    first.drafter_gen_begin = 3;
+    store.remember(first);
+
+    http_detail::PflashChatView found;
+    // The next turn keeps the prefix before the old generation prompt.
+    TEST_ASSERT(store.find({1, 2, 3, 4, 5, 9, 9}, {1, 2, 3, 4, 5, 9, 9}, found));
+    TEST_ASSERT(found.raw_gen_begin == 3);
+    // A different conversation does not match.
+    TEST_ASSERT(!store.find({1, 7, 3, 4}, {1, 7, 3, 4}, found));
+    // A continuation replaces the view it continues.
+    http_detail::PflashChatView second = first;
+    second.raw_tokens = {1, 2, 3, 4, 5, 9, 9};
+    second.raw_gen_begin = 5;
+    second.drafter_ids = second.raw_tokens;
+    second.drafter_gen_begin = 5;
+    store.remember(second);
+    TEST_ASSERT(store.size() == 1);
+    TEST_ASSERT(store.find({1, 2, 3, 4, 5, 6, 9}, {1, 2, 3, 4, 5, 6, 9}, found));
+    TEST_ASSERT(found.raw_gen_begin == 5);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_kept_tokens_follow_selector_chunks) {
+    // 100 tokens in chunks of 10; query [80, 85); instruction span [3, 12)
+    // touches chunks 0 and 1.
+    const std::vector<PFlashTokenSpan> kept{{3, 12}};
+    // Suffix structural: chunks 0, 1, 8, 9.
+    TEST_ASSERT(http_detail::pflash_kept_tokens(100, 10, 80, 85, kept, true) == 40);
+    // Suffix scored: only the query's chunk after it.
+    TEST_ASSERT(http_detail::pflash_kept_tokens(100, 10, 80, 85, kept, false) == 30);
+    TEST_ASSERT(http_detail::pflash_kept_tokens(0, 10, 0, 0, kept, true) == 0);
+}
+
+TEST_CASE(ServerUnitFixture, test_pflash_effective_keep_ratio_spends_on_droppable) {
+    // 1000 tokens, 400 kept, 5 %: budget 400 + 30 + 1 slack.
+    TEST_ASSERT(std::abs(http_detail::pflash_effective_keep_ratio(
+        1000, 400, 0.05) - 0.431) < 1e-12);
+    // Nothing kept: the plain ratio plus the slack token.
+    TEST_ASSERT(std::abs(http_detail::pflash_effective_keep_ratio(
+        1000, 0, 0.05) - 0.051) < 1e-12);
+    // Everything kept caps at 1.
+    TEST_ASSERT(http_detail::pflash_effective_keep_ratio(1000, 1000, 0.05) == 1.0);
+    // The floored budget never lands below the kept tokens.
+    for (int kept = 0; kept <= 997; kept += 7) {
+        const double ratio =
+            http_detail::pflash_effective_keep_ratio(997, kept, 0.013);
+        TEST_ASSERT((int) std::floor(997.0 * ratio) >= kept);
+    }
 }
 
 TEST_CASE(ServerUnitFixture, test_pflash_target_token_ceiling_floors) {
@@ -855,7 +1216,6 @@ TEST_CASE(ServerUnitFixture, test_pflash_score_validation_counts_nan_and_inf) {
 TEST_CASE(ServerUnitFixture, test_qwen35_pflash_rejects_missing_query_window) {
     DrafterContext ctx;
     ctx.loaded = true;
-    ctx.arch = DrafterArch::Qwen35_0p8b;
     const std::vector<int32_t> ids(16, 1);
 
     const auto compressed = drafter_score_and_compress(
@@ -863,7 +1223,7 @@ TEST_CASE(ServerUnitFixture, test_qwen35_pflash_rejects_missing_query_window) {
         /*pool_kernel=*/13, /*score_query_end=*/-1);
 
     TEST_ASSERT(compressed.empty());
-    TEST_ASSERT(std::string(dflash27b_last_error()) ==
+    TEST_ASSERT(std::string(luce_last_error()) ==
                 "qwen35 scorer query window out of range");
 }
 
@@ -2203,6 +2563,385 @@ TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_string_attribute_semanti
     }
 }
 
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_invoke) {
+    // When a model omits </｜DSML｜invoke> between consecutive calls,
+    // lookahead termination should cleanly partition the invocations.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 2);
+    if (result.tool_calls.size() == 2) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args0 = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args0["command"] == "pwd");
+
+        TEST_ASSERT(result.tool_calls[1].name == "bash");
+        auto args1 = json::parse(result.tool_calls[1].arguments);
+        TEST_ASSERT(args1["command"] == "ls -la");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_deepseek_harness_exact_payload) {
+    // Regression test for the real DeepSeek Harness multi-tool call:
+    // Call 1: bash (unclosed invoke)
+    // Call 2: bash (closed invoke)
+    // Call 3: web_search with string="invalid"
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">find /home/dpavlin/aimax -name \"*.tar.gz\" -o -name \"*.tgz\" 2>/dev/null | head -20; ls -la /home/dpavlin/aimax 2>/dev/null | head -30</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">List aimax dir for package artifacts</｜DSML｜parameter>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la /home/dpavlin/.npm/_npx/1e7f6d9597241db0/ 2>/dev/null; cat /home/dpavlin/.npm/_npx/1e7f6d9597241db0/package.json 2>/dev/null | head -50</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">Check harness checkout package.json for version</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "<｜DSML｜invoke name=\"web_search\">\n"
+        "<｜DSML｜parameter name=\"queries\" string=\"invalid\">\n"
+        "</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"description", {{"type", "string"}}}
+                 }}
+             }}
+         }}},
+        {{"type", "function"}, {"function", {
+             {"name", "web_search"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"queries", {{"type", "array"}}}
+                 }}
+             }}
+         }}}
+    });
+
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 3);
+    if (result.tool_calls.size() == 3) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args0 = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args0["command"].get<std::string>().find("find /home/dpavlin/aimax") != std::string::npos);
+        TEST_ASSERT(args0["description"] == "List aimax dir for package artifacts");
+
+        TEST_ASSERT(result.tool_calls[1].name == "bash");
+        auto args1 = json::parse(result.tool_calls[1].arguments);
+        TEST_ASSERT(args1["command"].get<std::string>().find("cat /home/dpavlin/.npm") != std::string::npos);
+        TEST_ASSERT(args1["description"] == "Check harness checkout package.json for version");
+
+        TEST_ASSERT(result.tool_calls[2].name == "web_search");
+        auto args2 = json::parse(result.tool_calls[2].arguments);
+        TEST_ASSERT(args2.contains("queries"));
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_final_invoke_before_block_end) {
+    // Regression test for real payload (chatcmpl_000000000000000a) where the model omits </｜DSML｜invoke>
+    // before the closing </｜DSML｜tool_calls>.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"edit\">\n"
+        "<｜DSML｜parameter name=\"file_path\" string=\"true\">/home/dpavlin/aimax/LUCEBOX_STRIX_HALO_GUIDE.md</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"new_string\" string=\"true\">### B. Paged Attention WMMA (head-256, RDNA4) — `LUCE_PAGED_WMMA` (default off, BURN-IN)\n"
+        "- Env `LUCE_PAGED_WMMA=1` routes paged full-attention layers (head 256, F16/Q8_0/Q4_0 KV, non-tree) to the WMMA kernel. Default (unset/0) keeps the V_DOT2 decode kernel.\n"
+        "- Differential: single-prompt TTFT −21% @12K, −42% @44K; batched 8K-pool prefill slightly ahead. Kernel-level 20.6–22.4 TFLOP/s vs 6.4–6.8 (3.1–3.3×); end-to-end bounded by attention's prefill share (~8% @44K, ~4% @12K).\n"
+        "- Two-mode CTest: `test_paged_attn_wmma` (V_DOT2, env=0) / `paged_attn_wmma_route` (env=1), diff via `server/test/compare_paged_attn.py --tol 6e-3`. Need `--reconfig` after the upstream pull for `CMakeLists.txt` to register targets.\n"
+        "- Source of truth: `server/docs/PAGED_ATTN_WMMA_HANDOFF.md`.</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"old_string\" string=\"true\">### B. Prefill Mode: `--ds4-prefill sparse` (DO NOT use `exact` for multi-turn)</｜DSML｜parameter>\n"
+        "</｜DSML｜tool_calls>";
+
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "edit"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"file_path", {{"type", "string"}}},
+                     {"new_string", {{"type", "string"}}},
+                     {"old_string", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (result.tool_calls.size() == 1) {
+        TEST_ASSERT(result.tool_calls[0].name == "edit");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["file_path"] == "/home/dpavlin/aimax/LUCEBOX_STRIX_HALO_GUIDE.md");
+        TEST_ASSERT(args["new_string"].get<std::string>().find("LUCE_PAGED_WMMA") != std::string::npos);
+        TEST_ASSERT(args["old_string"].get<std::string>().find("Prefill Mode") != std::string::npos);
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_invoke_with_nested_json) {
+    // When an unclosed invoke contains a parameter whose value is a JSON tool-call object,
+    // subsequent sweeps must not parse that JSON value as a duplicate tool call.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">cat config.json</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"metadata\" string=\"false\">{\"name\": \"bash\", \"arguments\": {\"command\": \"nested\"}}</｜DSML｜parameter>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"metadata", {{"type", "object"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (result.tool_calls.size() == 1) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "cat config.json");
+        TEST_ASSERT(args["metadata"]["name"] == "bash");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_tag_like_parameter_content) {
+    // Parameter values containing substrings like <invoke-not-a-tag> or <parameterized>
+    // must not trigger premature lookahead termination.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">echo \"<invoke-not-a-tag>\"; cat <parameterized></｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (result.tool_calls.size() == 1) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "echo \"<invoke-not-a-tag>\"; cat <parameterized>");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_tool_calls_prose_invoke_tag_does_not_mask_json_call) {
+    // A prose or non-call <invoke> tag (without name/tool attribute) must not cause
+    // invoke_spans to span until EOF and mask subsequent bare JSON tool calls.
+    const std::string text =
+        "You can invoke the command as follows:\n"
+        "Please look at <invoke> syntax.\n"
+        "{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -l\"}}";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "ls -l");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_literal_invoke_in_string_parameter) {
+    // Parameter values with string="true" containing literal </invoke> or </parameter>
+    // inside their payload (e.g. grep commands, git diffs) must not be truncated prematurely.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">grep -n \"</invoke>\" server/src/server/tool_parser.cpp</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">Search for invoke close tags</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"description", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"] == "grep -n \"</invoke>\" server/src/server/tool_parser.cpp");
+        TEST_ASSERT(args["description"] == "Search for invoke close tags");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_unclosed_string_parameter_before_sibling_parameter) {
+    // When a string="true" parameter is unclosed before another parameter,
+    // lookahead termination on tag boundaries must cleanly partition them
+    // rather than consuming the sibling parameter into the first argument.
+    const std::string text =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la\n"
+        "<｜DSML｜parameter name=\"description\" string=\"true\">list directory files</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}},
+                     {"description", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+    auto result = parse_tool_calls(text, tools);
+    TEST_ASSERT(result.tool_calls.size() == 1);
+    if (!result.tool_calls.empty()) {
+        TEST_ASSERT(result.tool_calls[0].name == "bash");
+        auto args = json::parse(result.tool_calls[0].arguments);
+        TEST_ASSERT(args["command"].get<std::string>().find("ls -la") != std::string::npos);
+        TEST_ASSERT(args["command"].get<std::string>().find("<｜DSML｜parameter") == std::string::npos);
+        TEST_ASSERT(args["description"] == "list directory files");
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_parse_dsml_tool_calls_literal_param_tag_in_string_value) {
+    // Literal "<param>" / "<parameter ...>" text inside a verbatim value is
+    // payload, not a sibling parameter. Only a parameter tag that opens a new
+    // line terminates an unclosed value.
+    json tools = json::array({
+        {{"type", "function"}, {"function", {
+             {"name", "bash"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"command", {{"type", "string"}}}
+                 }}
+             }}
+         }}},
+        {{"type", "function"}, {"function", {
+             {"name", "write_file"},
+             {"parameters", {
+                 {"type", "object"},
+                 {"properties", {
+                     {"path", {{"type", "string"}}},
+                     {"content", {{"type", "string"}}}
+                 }}
+             }}
+         }}}
+    });
+
+    {
+        const std::string text =
+            "<｜DSML｜tool_calls>\n"
+            "<｜DSML｜invoke name=\"bash\">\n"
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo '<param>'</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>";
+        auto result = parse_tool_calls(text, tools);
+        TEST_ASSERT(result.tool_calls.size() == 1);
+        if (!result.tool_calls.empty()) {
+            TEST_ASSERT(result.tool_calls[0].name == "bash");
+            auto args = json::parse(result.tool_calls[0].arguments);
+            TEST_ASSERT(args["command"] == "echo '<param>'");
+        }
+    }
+
+    {
+        const std::string text =
+            "<｜DSML｜tool_calls>\n"
+            "<｜DSML｜invoke name=\"write_file\">\n"
+            "<｜DSML｜parameter name=\"path\" string=\"true\">doc.xml</｜DSML｜parameter>\n"
+            "<｜DSML｜parameter name=\"content\" string=\"true\">use <parameter name=\"x\"> here</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>";
+        auto result = parse_tool_calls(text, tools);
+        TEST_ASSERT(result.tool_calls.size() == 1);
+        if (!result.tool_calls.empty()) {
+            TEST_ASSERT(result.tool_calls[0].name == "write_file");
+            auto args = json::parse(result.tool_calls[0].arguments);
+            TEST_ASSERT(args["path"] == "doc.xml");
+            TEST_ASSERT(args["content"] == "use <parameter name=\"x\"> here");
+            TEST_ASSERT(!args.contains("x"));
+        }
+    }
+
+    {
+        // XML content whose lines open with <param ...> elements: extra
+        // attributes or a self-closing tag are not a sibling tool parameter.
+        const std::string content =
+            "<launch>\n"
+            "  <param name=\"rate\" value=\"10\"/>\n"
+            "  <parameter name=\"mode\" type=\"string\">fast\n"
+            "</launch>";
+        const std::string text =
+            "<｜DSML｜tool_calls>\n"
+            "<｜DSML｜invoke name=\"write_file\">\n"
+            "<｜DSML｜parameter name=\"path\" string=\"true\">robot.launch</｜DSML｜parameter>\n"
+            "<｜DSML｜parameter name=\"content\" string=\"true\">" + content + "</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜tool_calls>";
+        auto result = parse_tool_calls(text, tools);
+        TEST_ASSERT(result.tool_calls.size() == 1);
+        if (!result.tool_calls.empty()) {
+            TEST_ASSERT(result.tool_calls[0].name == "write_file");
+            auto args = json::parse(result.tool_calls[0].arguments);
+            TEST_ASSERT(args["path"] == "robot.launch");
+            TEST_ASSERT(args["content"] == content);
+            TEST_ASSERT(!args.contains("rate"));
+            TEST_ASSERT(!args.contains("mode"));
+        }
+    }
+}
+
+
 
 TEST_CASE(ServerUnitFixture, test_parse_tool_allowed_filter) {
     std::string text =
@@ -3303,32 +4042,6 @@ TEST_CASE(ServerUnitFixture, test_stop_sequence_holdback_extends) {
 // ═══════════════════════════════════════════════════════════════════════
 // Prefix cache hash tests (model-free)
 // ═══════════════════════════════════════════════════════════════════════
-
-static std::string write_deepseek_marker_tokenizer_fixture() {
-    gguf_context * g = gguf_init_empty();
-    const char * tokens[] = {
-        "x",
-        "<｜begin▁of▁sentence｜>",
-        "<｜end▁of▁sentence｜>",
-        "<｜User｜>",
-        "<｜Assistant｜>",
-    };
-    const uint32_t token_types[] = {1, 3, 3, 3, 3};
-    gguf_set_arr_str(g, "tokenizer.ggml.tokens", tokens,
-                     sizeof(tokens) / sizeof(tokens[0]));
-    gguf_set_arr_data(g, "tokenizer.ggml.token_type", GGUF_TYPE_UINT32,
-                      token_types,
-                      sizeof(token_types) / sizeof(token_types[0]));
-    gguf_set_val_str(g, "tokenizer.ggml.model", "gpt2");
-    gguf_set_val_str(g, "tokenizer.ggml.pre", "qwen35");
-    gguf_set_val_u32(g, "tokenizer.ggml.bos_token_id", 1);
-    gguf_set_val_u32(g, "tokenizer.ggml.eos_token_id", 2);
-
-    const std::string path = test_tmp_path("dflash_test_deepseek_markers.gguf").string();
-    gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
-    gguf_free(g);
-    return path;
-}
 
 TEST_CASE(ServerUnitFixture, test_resolve_deepseek_chat_markers) {
     const std::string path = write_deepseek_marker_tokenizer_fixture();
@@ -5669,7 +6382,7 @@ TEST_CASE(ServerUnitFixture, test_layer_split_backend_cancels_between_prefill_ch
 
 TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_drafter_path) {
     const std::string ids_path = test_tmp_path(
-        "dflash_test_layer_split_compress_ids.bin").string();
+        "luce_test_layer_split_compress_ids.bin").string();
     remove_test_path(ids_path);
     TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
 
@@ -5690,7 +6403,7 @@ TEST_CASE(ServerUnitFixture, test_layer_split_compress_nopark_uses_default_draft
 
 TEST_CASE(ServerUnitFixture, test_layer_split_compress_rejects_bad_keep_ratio) {
     const std::string ids_path = test_tmp_path(
-        "dflash_test_layer_split_compress_bad.bin").string();
+        "luce_test_layer_split_compress_bad.bin").string();
     remove_test_path(ids_path);
     TEST_ASSERT(write_int32_file(ids_path, {1, 2, 3, 4}));
 
@@ -6285,6 +6998,870 @@ TEST_CASE(ServerUnitFixture, test_pflash_default_raw_text_maps_user_query) {
     unlink(tokenizer_path.c_str());
 }
 
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_chat_query_is_the_prompt_end) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
+
+    // The server's own Qwen rendering, generation prompt and its think
+    // prefix included.
+    const std::string rendered = render_chat_template(
+        {{"system", "You are helpful.", ""},
+         {"user", "What is the answer?", ""}},
+        ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant",
+         "system", "\n", "You", " are", " helpful", "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 1.0f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "system"}, {"content", "You are helpful."}},
+            {{"role", "user"}, {"content", "What is the answer?"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & ids = backend.last_request.input_ids;
+    const int im_end = tokenizer.token_to_id("<|im_end|>");
+    int last_im_end = -1;
+    for (int i = 0; i < (int) ids.size(); ++i) {
+        if (ids[i] == im_end) last_im_end = i;
+    }
+    TEST_ASSERT(last_im_end > 0);
+    // The scorer query is the prompt's last token, where the model starts
+    // answering; nothing is parsed out of the user's text.
+    TEST_ASSERT(backend.last_request.score_query_end == (int) ids.size());
+    TEST_ASSERT(backend.last_request.score_query_tokens == 1);
+    // The user turn's tail scores as a second query window.
+    const auto turn = backend.last_request.turn_query_span;
+    TEST_ASSERT(turn.begin >= 0 && turn.end == last_im_end);
+    TEST_ASSERT(tokenizer.decode({ids.begin() + turn.begin, ids.begin() + turn.end})
+                == "What is the answer?");
+    // The generation prompt, the turn's role header and -- a short turn --
+    // the whole question stay.
+    bool header_pinned = false;
+    bool question_pinned = false;
+    bool generation_pinned = false;
+    for (const auto & span : backend.last_request.required_instruction_spans) {
+        const std::string text = tokenizer.decode(
+            {ids.begin() + span.begin, ids.begin() + span.end});
+        if (text.find("<|im_start|>user\n") != std::string::npos) {
+            header_pinned = true;
+        }
+        if (text.find("What is the answer?") != std::string::npos) {
+            question_pinned = true;
+        }
+        if (span.begin <= last_im_end + 2 && span.end == (int) ids.size()) {
+            generation_pinned = true;
+        }
+    }
+    TEST_ASSERT(header_pinned);
+    TEST_ASSERT(question_pinned);
+    TEST_ASSERT(generation_pinned);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_agent_turns_after_query_are_candidates) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
+
+    const std::vector<ChatMessage> messages{
+        {"user", "What is the answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"tool", "tool output here", "call-1"},
+    };
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant", "\n",
+         "Sure", "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 1.0f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "What is the answer?"}},
+            {{"role", "assistant"}, {"content", "Sure."}},
+            {{"role", "tool"}, {"content", "tool output here"},
+             {"tool_call_id", "call-1"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & request = backend.last_request;
+    const auto & ids = request.input_ids;
+    // The query is the prompt's end, so nothing follows it: the assistant
+    // and tool turns are ordinary context.
+    TEST_ASSERT(!request.query_suffix_candidates);
+    TEST_ASSERT(request.score_query_end == (int) ids.size());
+    TEST_ASSERT(request.score_query_tokens == 1);
+    // The generation prompt is pinned, and the short assistant turn stays as
+    // part of the conversation's skeleton; the tool output between the query
+    // and the generation prompt is scored, not pinned.
+    bool generation_pinned = false;
+    for (const auto & span : request.required_instruction_spans) {
+        const std::string text = tokenizer.decode(
+            {ids.begin() + span.begin, ids.begin() + span.end});
+        TEST_ASSERT_MSG(text.find("tool output") == std::string::npos, text);
+        if (span.end == (int) ids.size() &&
+            text.find("<|im_start|>assistant\n<think>\n") != std::string::npos) {
+            generation_pinned = true;
+        }
+    }
+    TEST_ASSERT(generation_pinned);
+    unlink(path.c_str());
+}
+
+// Keeps a prefix of the input that fits the requested ratio, so the target
+// ceiling check sees a real compression.
+struct MockPflashBudgetBackend : MockBackend {
+    int compress_calls = 0;
+    CompressRequest last_request;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        last_request = request;
+        const size_t keep = (size_t) std::max(1.0, std::floor(
+            (double) request.input_ids.size() * request.keep_ratio) - 2.0);
+        return CompressResult::from_compressed_ids(std::vector<int32_t>(
+            request.input_ids.begin(),
+            request.input_ids.begin() + (long) std::min(keep, request.input_ids.size())));
+    }
+};
+
+struct PflashSystemPromptCase {
+    std::string rendered;
+    json messages;
+    std::vector<std::string> vocab;
+};
+
+static PflashSystemPromptCase pflash_long_system_prompt_case(
+        const std::string & instruction_role = "system") {
+    std::string system;
+    for (int i = 0; i < 30; ++i) system += "You are helpful. ";
+    // Longer than the multi-turn skeleton keeps whole: droppable material.
+    std::string history;
+    for (int i = 0; i < 120; ++i) history += "Sure. ";
+    PflashSystemPromptCase out;
+    out.rendered = render_chat_template(
+        {{instruction_role, system, ""},
+         {"user", history, ""},
+         {"assistant", "Sure.", ""},
+         {"user", "What is the answer?", ""}},
+        // As the server renders it: ParsedRequest defaults to thinking on,
+        // and the instruction spans come from re-renders of this prompt.
+        ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true);
+    out.messages = json::array({
+        {{"role", instruction_role}, {"content", system}},
+        {{"role", "user"}, {"content", history}},
+        {{"role", "assistant"}, {"content", "Sure."}},
+        {{"role", "user"}, {"content", "What is the answer?"}},
+    });
+    out.vocab = {"What", " is", " the", " answer", "?", "user", "assistant",
+                 "system", "\n", "You", " are", " helpful", ".", " ", "Sure"};
+    return out;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_budget_spends_keep_ratio_on_droppable_tokens) {
+    // A system prompt larger than keep_ratio x prompt used to exhaust the
+    // budget (mandatory_query_exceeds_budget). It is kept and the ratio now
+    // applies to the rest.
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    const auto prompt = pflash_long_system_prompt_case();
+    const std::string path =
+        write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
+    MockPflashBudgetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 0.05f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    std::string error;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = prompt.messages;
+        request.prompt_tokens = tokenizer.encode(prompt.rendered);
+        error = HttpServerTestAccess::apply_pflash_compression(server, request);
+    }
+    TEST_ASSERT_MSG(error.empty(), error);
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & request = backend.last_request;
+    const int input = (int) request.input_ids.size();
+    int system_end = -1;
+    for (const auto & span : request.required_instruction_spans) {
+        const std::string text = tokenizer.decode(
+            {request.input_ids.begin() + span.begin,
+             request.input_ids.begin() + span.end});
+        if (text.find("You are helpful") != std::string::npos) {
+            system_end = span.end;
+        }
+    }
+    TEST_ASSERT(system_end > 0);   // the system prompt is still kept
+    // Its tokens are charged on top of 5 % of the droppable rest.
+    TEST_ASSERT(request.keep_ratio > (double) system_end / input);
+    TEST_ASSERT(request.keep_ratio < 1.0f);
+    unlink(path.c_str());
+}
+
+static std::string pflash_overflowing_instruction_error(
+        const std::string & role, bool & compressed,
+        std::vector<std::string> & kept_texts) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    const auto prompt = pflash_long_system_prompt_case(role);
+    const std::string path =
+        write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
+    MockPflashBudgetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 0.3f;
+    config.max_ctx = 200;   // smaller than the instructions + max_output
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    std::string error;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = prompt.messages;
+        request.prompt_tokens = tokenizer.encode(prompt.rendered);
+        request.max_output = 16;
+        error = HttpServerTestAccess::apply_pflash_compression(server, request);
+    }
+    compressed = backend.compress_calls == 1;
+    kept_texts.clear();
+    if (compressed) {
+        const auto & request = backend.last_request;
+        for (const auto & span : request.required_instruction_spans) {
+            kept_texts.push_back(tokenizer.decode(
+                {request.input_ids.begin() + span.begin,
+                 request.input_ids.begin() + span.end}));
+        }
+    }
+    unlink(path.c_str());
+    return error;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_refuses_system_prompt_that_overflows_context) {
+    // The system prompt is never compressed: when it alone does not fit the
+    // context the request fails before the drafter runs.
+    bool compressed = true;
+    std::vector<std::string> kept;
+    const std::string error =
+        pflash_overflowing_instruction_error("system", compressed, kept);
+    TEST_ASSERT_MSG(error.find("system prompt alone does not fit") !=
+                        std::string::npos, error);
+    TEST_ASSERT(!compressed);
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_scores_developer_text_that_overflows_context) {
+    // A developer message too large for the context is data: it loses its
+    // pin and competes for the budget.
+    bool compressed = false;
+    std::vector<std::string> kept;
+    const std::string error =
+        pflash_overflowing_instruction_error("developer", compressed, kept);
+    TEST_ASSERT_MSG(error.empty(), error);
+    TEST_ASSERT(compressed);
+    for (const auto & text : kept) {
+        TEST_ASSERT_MSG(text.find("You are helpful") == std::string::npos, text);
+    }
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_auto_threshold_counts_droppable_tokens) {
+    // Auto mode: the whole prompt clears the threshold, the droppable part
+    // does not -- nothing worth selecting, so the prompt goes through as is.
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar chunk{"PFLASH_SELECT_CHUNK_SIZE", "4"};
+    const auto prompt = pflash_long_system_prompt_case();
+    const std::string path =
+        write_pflash_bpe_tokenizer_fixture(prompt.vocab, prompt.rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    const auto ids = tokenizer.encode(prompt.rendered);
+
+    auto backend_owner = std::make_unique<MockPflashBudgetBackend>();
+    MockPflashBudgetBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::AUTO;
+    config.pflash_threshold = (int) ids.size() - 20;
+    config.pflash_keep_ratio = 0.3f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = prompt.messages;
+        request.prompt_tokens = ids;
+        const auto prepared =
+            HttpServerTestAccess::prepare_prompt(server, request);
+        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+        TEST_ASSERT(!prepared.compressed);
+        TEST_ASSERT(prepared.tokens == ids);
+    }
+    TEST_ASSERT(backend.compress_calls == 0);
+    unlink(path.c_str());
+}
+
+// Keeps the required spans, the query window through the end, and whatever
+// ``pick`` adds; reports the kept spans like the in-process drafter does.
+struct MockPflashSpanBackend : MockBackend {
+    int compress_calls = 0;
+    CompressRequest last_request;
+    std::function<std::vector<PFlashTokenSpan>(const CompressRequest &)> pick;
+
+    CompressResult compress(const CompressRequest & request) override {
+        ++compress_calls;
+        last_request = request;
+        auto spans = request.required_instruction_spans;
+        spans.push_back({request.score_query_end - request.score_query_tokens,
+                         (int) request.input_ids.size()});
+        if (pick) {
+            const auto extra = pick(request);
+            spans.insert(spans.end(), extra.begin(), extra.end());
+        }
+        spans = http_detail::canonicalize_pflash_token_spans(std::move(spans));
+        CompressResult result;
+        for (const auto & span : spans) {
+            result.compressed_ids.insert(result.compressed_ids.end(),
+                request.input_ids.begin() + span.begin,
+                request.input_ids.begin() + span.end);
+        }
+        result.kept_spans = spans;
+        result.ok = !result.compressed_ids.empty();
+        return result;
+    }
+};
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_view_appends_turns_and_recalls_missing_segments) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar view_env{"PFLASH_CHAT_VIEW", nullptr};
+    // Only turns of a few tokens stay whole, so the document turn is
+    // material the selection picks from.
+    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", "4"};
+
+    std::string system;
+    for (int i = 0; i < 20; ++i) system += "You are helpful. ";
+    const std::string document =
+        "alpha facts live here. filler filler filler. beta facts live here.";
+    const std::vector<ChatMessage> turn1{
+        {"system", system, ""},
+        {"user", document + " Question one?", ""},
+    };
+    auto turn2 = turn1;
+    turn2.push_back({"assistant", "Answer one.", ""});
+    turn2.push_back({"user", "Question two?", ""});
+    const auto render = [] (const std::vector<ChatMessage> & messages) {
+        return render_chat_template(messages, ChatFormat::QWEN3,
+                                    /*add_generation_prompt=*/true,
+                                    /*enable_thinking=*/true);
+    };
+    const auto to_json = [] (const std::vector<ChatMessage> & messages) {
+        json out = json::array();
+        for (const auto & message : messages) {
+            out.push_back({{"role", message.role}, {"content", message.content}});
+        }
+        return out;
+    };
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"alpha", " facts", "beta", " live", " here", ".", " filler",
+         "Question", " one", " two", "?", "Answer", "user", "assistant",
+         "system", "\n", "You", " are", " helpful"},
+        render(turn2) +
+            "[Earlier in this conversation]\n[End of earlier excerpts]\n");
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashSpanBackend>();
+    MockPflashSpanBackend & backend = *backend_owner;
+    const char * wanted = "alpha facts";
+    backend.pick = [&] (const ModelBackend::CompressRequest & request) {
+        const auto span = http_detail::pflash_decoded_text_span(
+            tokenizer, request.input_ids, 0, (int) request.input_ids.size(),
+            wanted);
+        return span.begin < 0 ? std::vector<PFlashTokenSpan>{}
+                              : std::vector<PFlashTokenSpan>{span};
+    };
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.pflash_keep_ratio = 1.0f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    std::vector<int32_t> served1;
+    std::vector<int32_t> served2;
+    std::vector<int32_t> served3;
+    std::vector<std::string> modes;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        const auto run = [&] (const std::vector<ChatMessage> & messages,
+                              std::vector<int32_t> & served) {
+            ParsedRequest request;
+            request.format = ApiFormat::OPENAI_CHAT;
+            request.messages = to_json(messages);
+            request.prompt_tokens = tokenizer.encode(render(messages));
+            const auto prepared =
+                HttpServerTestAccess::prepare_prompt(server, request);
+            TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+            TEST_ASSERT(prepared.compressed);
+            served = prepared.tokens;
+            // usage.timings.pflash reports the view outcome.
+            TEST_ASSERT(prepared.pflash_stats.contains("view"));
+            modes.push_back(prepared.pflash_stats["view"].value("mode", ""));
+            TEST_ASSERT(prepared.pflash_stats["view"].value("served_tokens", 0) ==
+                        (int) served.size());
+            // The snapshot lands where the next turn's prompt branches off.
+            const auto generation =
+                tokenizer.encode("<|im_start|>assistant\n<think>\n");
+            TEST_ASSERT(prepared.snapshot_cut ==
+                        (int) (served.size() - generation.size()));
+        };
+        run(turn1, served1);
+        wanted = "beta facts";   // the new query wants what turn 1 dropped
+        run(turn2, served2);
+        run(turn2, served3);     // a retry serves the same view
+    }
+    const std::string text1 = tokenizer.decode(served1);
+    const std::string text2 = tokenizer.decode(served2);
+    TEST_ASSERT(text1.find("alpha facts") != std::string::npos);
+    TEST_ASSERT(text1.find("beta facts") == std::string::npos);
+
+    // Turn 2 extends turn 1's served prompt: everything before its
+    // generation prompt is reused token for token.
+    const auto generation = tokenizer.encode("<|im_start|>assistant\n<think>\n");
+    TEST_ASSERT(served1.size() > generation.size());
+    const size_t reused = served1.size() - generation.size();
+    TEST_ASSERT(served2.size() > reused);
+    TEST_ASSERT(std::equal(served1.begin(), served1.begin() + (long) reused,
+                           served2.begin()));
+    // The recalled segment opens the new user turn, after the answer.
+    const size_t answer = text2.find("Answer one.");
+    const size_t recall = text2.find("[Earlier in this conversation]");
+    const size_t question = text2.find("Question two?");
+    TEST_ASSERT(answer != std::string::npos);
+    TEST_ASSERT(recall != std::string::npos && recall > answer);
+    TEST_ASSERT(text2.find("beta facts", recall) != std::string::npos);
+    TEST_ASSERT(question != std::string::npos && question > recall);
+    TEST_ASSERT(served3 == served2);
+    TEST_ASSERT(modes == std::vector<std::string>({"fresh", "continue", "repeat"}));
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_multi_turn_keeps_skeleton_and_history_queries) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", nullptr};
+
+    std::string material;
+    for (int i = 0; i < 80; ++i) material += "filler words here. ";
+    const std::vector<ChatMessage> messages{
+        {"system", "You are helpful.", ""},
+        {"user", "Here is text: " + material + "What is the first answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"user", "What is the answer?", ""},
+    };
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/true);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", " first", "?", "user", "assistant",
+         "system", "\n", "Sure", ".", " filler", " words", " here"},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_keep_ratio = 1.0f;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        json wire = json::array();
+        for (const auto & message : messages) {
+            wire.push_back({{"role", message.role}, {"content", message.content}});
+        }
+        request.messages = wire;
+        request.prompt_tokens = tokenizer.encode(rendered);
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & request = backend.last_request;
+    const auto & ids = request.input_ids;
+    const auto text_of = [&] (const PFlashTokenSpan & span) {
+        return tokenizer.decode({ids.begin() + span.begin, ids.begin() + span.end});
+    };
+    // The short assistant answer stays whole; the long first user turn keeps
+    // only its header, its material competes for the budget.
+    bool answer_kept = false;
+    bool material_kept = false;
+    for (const auto & span : request.required_instruction_spans) {
+        const std::string text = text_of(span);
+        answer_kept = answer_kept || text.find("Sure.") != std::string::npos;
+        material_kept = material_kept ||
+            text.find("filler words") != std::string::npos;
+    }
+    TEST_ASSERT(answer_kept);
+    TEST_ASSERT(!material_kept);
+    // The earlier question scores alongside the current one, through the
+    // last token of the header of the reply that followed it.
+    TEST_ASSERT(request.history_query_spans.size() == 1);
+    const auto history = request.history_query_spans[0];
+    TEST_ASSERT(history.end - history.begin == 1);
+    TEST_ASSERT_MSG(tokenizer.decode({ids.begin() + history.end,
+                                      ids.begin() + history.end + 2}) == "Sure.",
+                    text_of(history));
+    unlink(path.c_str());
+}
+
+// Two turns over one document through prepare_prompt; returns the served
+// prompts, the view modes and how often the compressor ran.
+struct PflashTwoTurnRun {
+    std::vector<std::vector<int32_t>> served;
+    std::vector<std::string> modes;
+    int compress_calls = 0;
+    std::string text2;
+};
+
+static PflashTwoTurnRun pflash_two_turn_run(const std::string & follow_up) {
+    std::string system;
+    for (int i = 0; i < 20; ++i) system += "You are helpful. ";
+    const std::string document =
+        "alpha facts live here. filler filler filler. beta facts live here.";
+    const std::vector<ChatMessage> turn1{
+        {"system", system, ""},
+        {"user", document + " Question one?", ""},
+    };
+    auto turn2 = turn1;
+    turn2.push_back({"assistant", "Answer one.", ""});
+    turn2.push_back({"user", follow_up + " Question two?", ""});
+    const auto render = [] (const std::vector<ChatMessage> & messages) {
+        return render_chat_template(messages, ChatFormat::QWEN3,
+                                    /*add_generation_prompt=*/true,
+                                    /*enable_thinking=*/true);
+    };
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"alpha", " facts", "beta", " live", " here", ".", " filler",
+         "Question", " one", " two", "?", "Answer", "user", "assistant",
+         "system", "\n", "You", " are", " helpful", " pasted", " notes"},
+        render(turn2) +
+            "[Earlier in this conversation]\n[End of earlier excerpts]\n");
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+    auto backend_owner = std::make_unique<MockPflashSpanBackend>();
+    MockPflashSpanBackend & backend = *backend_owner;
+    // The fact and the questions: a prompt-end query ranks the user's own
+    // sentences first, so the scorer keeps them.
+    backend.pick = [&] (const ModelBackend::CompressRequest & request) {
+        std::vector<PFlashTokenSpan> spans;
+        for (const char * text : {"alpha facts", "Question one?", "Question two?"}) {
+            const auto span = http_detail::pflash_decoded_text_span(
+                tokenizer, request.input_ids, 0, (int) request.input_ids.size(),
+                text);
+            if (span.begin >= 0) spans.push_back(span);
+        }
+        return spans;
+    };
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.pflash_keep_ratio = 1.0f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    PflashTwoTurnRun run;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+        const std::vector<const std::vector<ChatMessage> *> turns{&turn1, &turn2};
+        for (const auto * messages : turns) {
+            ParsedRequest request;
+            request.format = ApiFormat::OPENAI_CHAT;
+            json wire = json::array();
+            for (const auto & message : *messages) {
+                wire.push_back({{"role", message.role}, {"content", message.content}});
+            }
+            request.messages = wire;
+            request.prompt_tokens = tokenizer.encode(render(*messages));
+            const auto prepared = HttpServerTestAccess::prepare_prompt(server, request);
+            TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+            run.served.push_back(prepared.tokens);
+            run.modes.push_back(prepared.pflash_stats["view"].value("mode", ""));
+        }
+    }
+    run.compress_calls = backend.compress_calls;
+    run.text2 = tokenizer.decode(run.served[1]);
+    unlink(path.c_str());
+    return run;
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_view_small_follow_up_without_recall_skips_the_drafter) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar recall{"PFLASH_CHAT_RECALL", "0"};
+    const auto run = pflash_two_turn_run("");
+    // Turn 2 is appended exactly as full prefill appends it: no scoring.
+    TEST_ASSERT(run.compress_calls == 1);
+    TEST_ASSERT(run.modes == std::vector<std::string>({"fresh", "continue"}));
+    TEST_ASSERT(run.text2.find("[Earlier in this conversation]") == std::string::npos);
+    TEST_ASSERT(run.text2.find("Answer one.") != std::string::npos);
+    TEST_ASSERT(run.text2.find("Question two?") != std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_chat_view_compresses_large_follow_ups_only) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "budget_only"};
+    luce_test::ScopedEnvVar threshold{"PFLASH_CHAT_COMPRESS_NEW_TOKENS", "40"};
+    // The pasted turn is material, not a short turn kept whole.
+    luce_test::ScopedEnvVar skeleton{"PFLASH_CHAT_SKELETON_TOKENS", "8"};
+    std::string pasted;
+    for (int i = 0; i < 12; ++i) pasted += " pasted notes filler.";
+    const auto run = pflash_two_turn_run(pasted);
+    TEST_ASSERT(run.compress_calls == 2);
+    TEST_ASSERT(run.modes == std::vector<std::string>({"fresh", "continue-compressed"}));
+    // The view before the new material is reused token for token...
+    const auto & first = run.served[0];
+    const auto & second = run.served[1];
+    TEST_ASSERT(second.size() > 0 && first.size() > 16);
+    const size_t prefix = first.size() - 8;
+    TEST_ASSERT(std::equal(first.begin(), first.begin() + (long) (prefix - 8),
+                           second.begin()));
+    // ...and the pasted material is compressed: only what the selection
+    // keeps (the question) survives, not the whole paste.
+    TEST_ASSERT_MSG(run.text2.find("Question two?") != std::string::npos, run.text2);
+    TEST_ASSERT(run.text2.find(pasted) == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_legacy_chat_query_uses_last_user_turn) {
+    // No strict-selection environment: the legacy selector derives the same
+    // query, and a trailing tool result does not replace the user's turn.
+    const std::vector<ChatMessage> messages{
+        {"user", "What is the answer?", ""},
+        {"assistant", "Sure.", ""},
+        {"tool", "tool output here", "call-1"},
+    };
+    const std::string rendered = render_chat_template(
+        messages, ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/false);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"What", " is", " the", " answer", "?", "user", "assistant", "\n",
+         "Sure", "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "What is the answer?"}},
+            {{"role", "assistant"}, {"content", "Sure."}},
+            {{"role", "tool"}, {"content", "tool output here"},
+             {"tool_call_id", "call-1"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const std::string error =
+            HttpServerTestAccess::apply_pflash_compression(server, request);
+        TEST_ASSERT_MSG(error.empty(), error);
+    }
+
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & ids = backend.last_request.input_ids;
+    const int query_end = backend.last_request.score_query_end;
+    const int query_begin = query_end - backend.last_request.score_query_tokens;
+    TEST_ASSERT(query_begin >= 0);
+    TEST_ASSERT(backend.last_request.score_query_tokens <= 8);
+    const std::string query = tokenizer.decode(
+        {ids.begin() + query_begin, ids.begin() + query_end});
+    TEST_ASSERT_MSG(std::string("What is the answer?").size() >= query.size() &&
+                    std::string("What is the answer?").compare(
+                        19 - query.size(), query.size(), query) == 0,
+                    query);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_strict_selection_owns_chat_continuations) {
+    luce_test::ScopedEnvVar mode{"PFLASH_SELECT_MODE", "top_p"};
+
+    const std::string rendered = render_chat_template(
+        {{"user", "first", ""},
+         {"assistant", "Sure.", ""},
+         {"user", "second question", ""}},
+        ChatFormat::QWEN3, /*add_generation_prompt=*/true,
+        /*enable_thinking=*/false);
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"first", "second", " question", "user", "assistant", "\n", "Sure",
+         "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.pflash_keep_ratio = 1.0f;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "first"}},
+            {{"role", "assistant"}, {"content", "Sure."}},
+            {{"role", "user"}, {"content", "second question"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const auto prepared =
+            HttpServerTestAccess::prepare_prompt(server, request);
+        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+        TEST_ASSERT(prepared.compressed);
+        TEST_ASSERT(!prepared.flowkv);
+    }
+
+    // Whole-prompt PFlash ran on the multi-turn prompt and scored against
+    // the prompt's last token.
+    TEST_ASSERT(backend.compress_calls == 1);
+    const auto & ids = backend.last_request.input_ids;
+    TEST_ASSERT(backend.last_request.score_query_end == (int) ids.size());
+    TEST_ASSERT(backend.last_request.score_query_tokens == 1);
+    unlink(path.c_str());
+}
+
+TEST_CASE(ServerUnitFixture,
+        test_pflash_default_continuation_stays_on_flowkv) {
+    const std::string rendered =
+        "<|im_start|>user\nfirst<|im_end|>\n"
+        "<|im_start|>assistant\nSure.<|im_end|>\n"
+        "<|im_start|>user\nsecond<|im_end|>\n"
+        "<|im_start|>assistant\n";
+    const std::string path = write_pflash_bpe_tokenizer_fixture(
+        {"first", "second", "user", "assistant", "\n", "Sure", "."},
+        rendered);
+    Tokenizer tokenizer;
+    TEST_ASSERT(tokenizer.load_from_gguf(path.c_str()));
+
+    auto backend_owner = std::make_unique<MockPflashCompressBackend>();
+    MockPflashCompressBackend & backend = *backend_owner;
+    LuceEngine engine(std::move(backend_owner));
+    ServerConfig config;
+    config.pflash_mode = ServerConfig::PflashMode::ALWAYS;
+    config.max_ctx = 8192;
+    config.prefix_cache_cap = 0;
+    config.prefill_cache_cap = 0;
+    {
+        HttpServer server(engine, tokenizer, config);
+        server.set_drafter_tokenizer(&tokenizer);
+
+        ParsedRequest request;
+        request.format = ApiFormat::OPENAI_CHAT;
+        request.messages = json::array({
+            {{"role", "user"}, {"content", "first"}},
+            {{"role", "assistant"}, {"content", "Sure."}},
+            {{"role", "user"}, {"content", "second"}},
+        });
+        request.prompt_tokens = tokenizer.encode(rendered);
+
+        const auto prepared =
+            HttpServerTestAccess::prepare_prompt(server, request);
+        TEST_ASSERT_MSG(prepared.error.empty(), prepared.error);
+    }
+
+    // Without a strict-selection environment FlowKV keeps owning
+    // continuations; whole-prompt PFlash never ran.
+    TEST_ASSERT(backend.compress_calls == 0);
+    unlink(path.c_str());
+}
+
 struct MockBatchCompressBackend : MockBackend {
     int compress_calls = 0;
 
@@ -6513,7 +8090,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_disabled_when_no_dir) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_disables_memory_only_backend) {
     MockMemoryOnlySnapshotBackend backend;
     DiskCacheConfig cfg;
-    cfg.cache_dir = "/tmp/dflash_test_disk_cache_memory_only";
+    cfg.cache_dir = "/tmp/luce_test_disk_cache_memory_only";
     DiskPrefixCache cache(cfg, backend);
     TEST_ASSERT(!cache.disabled());
 
@@ -6525,7 +8102,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_disables_memory_only_backend) {
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_init_creates_directory) {
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_disk_cache_init").string();
+    std::string dir = test_tmp_path("luce_test_disk_cache_init").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6552,7 +8129,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_size) {
 
 TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
     // Write and read a header to verify serialization.
-    std::string path = test_tmp_path("dflash_test_header_rt.dkv").string();
+    std::string path = test_tmp_path("luce_test_header_rt.dkv").string();
     remove_test_path(path);
     std::error_code ec;
 
@@ -6617,7 +8194,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_header_round_trip) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_continued_boundary) {
     // Test maybe_store_continued logic: saves at interval boundaries.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_continued").string();
+    std::string dir = test_tmp_path("luce_test_continued").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6692,7 +8269,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_full_lookup_lengths) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {
     // Cold prefix should not trigger for short prompts.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_cold_short").string();
+    std::string dir = test_tmp_path("luce_test_cold_short").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6713,7 +8290,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_short_prompt) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_no_boundaries) {
     // Cold prefix should not trigger if no boundaries provided.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_cold_nobound").string();
+    std::string dir = test_tmp_path("luce_test_cold_nobound").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6733,7 +8310,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_no_boundaries) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_cold_prefix_finds_boundary) {
     // Cold prefix should find the last boundary <= cold_max_tokens.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_cold_finds").string();
+    std::string dir = test_tmp_path("luce_test_cold_finds").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6783,7 +8360,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_budget_enforcement_scoring) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
     // Lookup with no layout known should return false.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_lookup_miss").string();
+    std::string dir = test_tmp_path("luce_test_lookup_miss").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6800,7 +8377,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_lookup_miss_no_layout) {
 TEST_CASE(ServerUnitFixture, test_disk_cache_save_below_min_tokens) {
     // Save with fewer tokens than min_tokens should be rejected.
     MockBackend backend;
-    std::string dir = test_tmp_path("dflash_test_save_below").string();
+    std::string dir = test_tmp_path("luce_test_save_below").string();
     rm_rf(dir);
 
     DiskCacheConfig cfg;
@@ -6879,7 +8456,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_rejects_snapshot_past_key) {
     // covers at least kMaxPos tokens; shorter keys are refused on save and,
     // for files that already exist, on read.
     MockBackendWithAdopt backend;
-    std::string dir = test_tmp_path("dflash_test_past_key").string();
+    std::string dir = test_tmp_path("luce_test_past_key").string();
     rm_rf(dir);
     DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
     DiskPrefixCache cache(cfg, backend);
@@ -6939,7 +8516,7 @@ TEST_CASE(ServerUnitFixture, test_disk_cache_continued_keys_full_prefix) {
     // tokens the snapshot really covers, so only a prompt containing all of
     // them can hit.
     MockBackendWithAdopt backend;
-    std::string dir = test_tmp_path("dflash_test_continued_key").string();
+    std::string dir = test_tmp_path("luce_test_continued_key").string();
     rm_rf(dir);
     DiskCacheConfig cfg; cfg.cache_dir = dir; cfg.min_tokens = 1;
     cfg.continued_interval = 10;   // 32 positions -> crosses at 30
@@ -6991,7 +8568,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     std::array<uint8_t, 16> salt_a{};
     salt_a[0] = 0x01; salt_a[15] = 0xAB;
 
-    std::string dir_a = test_tmp_path("dflash_test_salt_a").string();
+    std::string dir_a = test_tmp_path("luce_test_salt_a").string();
     rm_rf(dir_a);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_a; cfg.min_tokens = 1;
@@ -7006,7 +8583,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     std::array<uint8_t, 16> salt_b{};
     salt_b[0] = 0x02; salt_b[15] = 0xCD;
 
-    std::string dir_b = test_tmp_path("dflash_test_salt_b").string();
+    std::string dir_b = test_tmp_path("luce_test_salt_b").string();
     rm_rf(dir_b);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_b; cfg.min_tokens = 1;
@@ -7024,7 +8601,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_changes_layout_id) {
     TEST_ASSERT(id_a != id_b);
 
     // Same salt A applied again → identical layout_id.
-    std::string dir_a2 = test_tmp_path("dflash_test_salt_a2").string();
+    std::string dir_a2 = test_tmp_path("luce_test_salt_a2").string();
     rm_rf(dir_a2);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir_a2; cfg.min_tokens = 1;
@@ -7049,7 +8626,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
     std::vector<int32_t> prompt;
     for (int i = 0; i < MockBackendWithLayout::kMaxPos; ++i) prompt.push_back(i + 1);
 
-    std::string dir1 = test_tmp_path("dflash_test_salt_zero1").string();
+    std::string dir1 = test_tmp_path("luce_test_salt_zero1").string();
     rm_rf(dir1);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir1; cfg.min_tokens = 1;
@@ -7060,7 +8637,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
         TEST_ASSERT(cache.save(0, prompt));
     }
 
-    std::string dir2 = test_tmp_path("dflash_test_salt_zero2").string();
+    std::string dir2 = test_tmp_path("luce_test_salt_zero2").string();
     rm_rf(dir2);
     {
         DiskCacheConfig cfg; cfg.cache_dir = dir2; cfg.min_tokens = 1;
@@ -7082,7 +8659,7 @@ TEST_CASE(ServerUnitFixture, test_disk_identity_salt_zero_is_backcompat) {
 
 TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
     const std::string file_path = test_tmp_path(
-        "dflash_test_backend_ipc_work_dir_file").string();
+        "luce_test_backend_ipc_work_dir_file").string();
     remove_test_path(file_path);
     FILE * file = std::fopen(file_path.c_str(), "wb");
     TEST_ASSERT(file != nullptr);
@@ -7094,7 +8671,7 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_rejects_file_work_dir) {
 
     BackendIpcLaunchConfig cfg;
     cfg.bin = "/bin/true";
-    cfg.payload_path = "/tmp/dflash_test_backend_ipc_payload";
+    cfg.payload_path = "/tmp/luce_test_backend_ipc_payload";
     cfg.work_dir = file_path;
 
     BackendIpcProcess proc;
@@ -7217,44 +8794,44 @@ TEST_CASE(ServerUnitFixture, test_backend_ipc_shared_payload_segment_contract) {
 }
 
 TEST_CASE(ServerUnitFixture, test_moe_hybrid_expert_compute_batch_default) {
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH");
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_BATCH_MAX");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_BATCH");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_BATCH_MAX");
     TEST_ASSERT(moe_hybrid_expert_compute_batch_limit() == 32);
 }
 
 TEST_CASE(ServerUnitFixture, test_moe_hybrid_expert_compute_ipc_mode_batch_limit) {
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE");
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
     TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 1024);
 
-    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "auto");
-    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY", "512");
+    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE", "auto");
+    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY", "512");
     TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 512);
 
-    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "batched");
+    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE", "batched");
     TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 512);
 
-    dflash_setenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE", "stream");
+    luce_setenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE", "stream");
     TEST_ASSERT(moe_hybrid_expert_compute_ipc_batch_limit(2048) == 32);
 
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_MODE");
-    dflash_unsetenv("DFLASH_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_MODE");
+    luce_unsetenv("LUCE_MOE_EXPERT_COMPUTE_IPC_BATCH_CAPACITY");
 }
 
 TEST_CASE(ServerUnitFixture, test_moe_hybrid_prefill_hot_sub_batch_limit) {
-    dflash_unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
+    luce_unsetenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
 
-    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "0");
+    luce_setenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH", "0");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
 
-    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "3");
+    luce_setenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH", "3");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 3);
 
-    dflash_setenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH", "8");
+    luce_setenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH", "8");
     TEST_ASSERT(moe_hybrid_prefill_hot_sub_batch_limit() == 4);
 
-    dflash_unsetenv("DFLASH_MOE_PREFILL_HOT_SUB_BATCH");
+    luce_unsetenv("LUCE_MOE_PREFILL_HOT_SUB_BATCH");
 }
 
 TEST_CASE(ServerUnitFixture, test_moe_hybrid_uma_core_memory_is_saturating) {
@@ -7270,8 +8847,8 @@ TEST_CASE(ServerUnitFixture, test_moe_hybrid_canonical_rocmfp2_q2_is_tokenwise) 
     // route-order joins must preserve [hidden, route, token] while appending
     // those token slices; concatenating the route dimension makes the final
     // owner reduction invalid.
-    dflash_unsetenv("DFLASH_MOE_TP_GROUPED_MMVQ");
-    dflash_unsetenv("DFLASH_DS4_TP_GROUPED_MMVQ");
+    luce_unsetenv("LUCE_MOE_TP_GROUPED_MMVQ");
+    luce_unsetenv("LUCE_DS4_TP_GROUPED_MMVQ");
 
     ggml_init_params params{};
     params.mem_size = 16 * 1024 * 1024;
@@ -7685,7 +9262,7 @@ static ServerConfig make_props_config_with_sidecar(const json & sidecar) {
 }
 
 TEST_CASE(ServerUnitFixture, test_model_card_env_override_beats_cwd) {
-    // DFLASH_MODEL_CARDS_DIR used to be the LAST candidate, tried after the cwd-relative
+    // LUCE_MODEL_CARDS_DIR used to be the LAST candidate, tried after the cwd-relative
     // "share/model_cards". Running from a directory that happened to contain one silently
     // ignored the operator's explicit override. An explicit setting must win.
     namespace fs = std::filesystem;
@@ -7703,14 +9280,14 @@ TEST_CASE(ServerUnitFixture, test_model_card_env_override_beats_cwd) {
         std::fclose(f);
     }
 
-    const char * prev = std::getenv("DFLASH_MODEL_CARDS_DIR");
+    const char * prev = std::getenv("LUCE_MODEL_CARDS_DIR");
     const std::string saved = prev ? prev : "";
-    dflash_setenv("DFLASH_MODEL_CARDS_DIR", envdir.string().c_str());
+    luce_setenv("LUCE_MODEL_CARDS_DIR", envdir.string().c_str());
 
-    auto card = dflash::common::resolve_model_card("", "env-probe-model", "deepseek4", "");
+    auto card = luce::common::resolve_model_card("", "env-probe-model", "deepseek4", "");
 
-    if (saved.empty()) dflash_unsetenv("DFLASH_MODEL_CARDS_DIR");
-    else dflash_setenv("DFLASH_MODEL_CARDS_DIR", saved.c_str());
+    if (saved.empty()) luce_unsetenv("LUCE_MODEL_CARDS_DIR");
+    else luce_setenv("LUCE_MODEL_CARDS_DIR", saved.c_str());
     fs::remove_all(root);
 
     // Resolved from the env dir, not the deepseek4 family fallback (which gives 32768).
@@ -7728,19 +9305,19 @@ TEST_CASE(ServerUnitFixture, test_model_card_family_fallback_deepseek4) {
     // sidecar for the real figures, and the fallback is deliberately conservative.
     // What must not regress is that deepseek4 resolves to a FAMILY card at all, and
     // carries the wider reply budget rather than the terse 512 default.
-    auto card = dflash::common::resolve_model_card("", "", "deepseek4", "");
+    auto card = luce::common::resolve_model_card("", "", "deepseek4", "");
     TEST_ASSERT(card.source_label == "family:deepseek4");
     TEST_ASSERT(card.max_tokens == 32768);
     TEST_ASSERT(card.hard_limit_reply_budget == 4096);
 
     // An unknown architecture must still fall through, or the safety net would mask
     // genuinely unsupported models.
-    auto unknown = dflash::common::resolve_model_card("", "", "not-a-real-arch", "");
+    auto unknown = luce::common::resolve_model_card("", "", "not-a-real-arch", "");
     TEST_ASSERT(unknown.source_label != "family:not-a-real-arch");
 }
 
 TEST_CASE(ServerUnitFixture, test_model_card_family_fallback_bailingmoe3) {
-    auto card = dflash::common::resolve_model_card("", "", "bailingmoe3", "");
+    auto card = luce::common::resolve_model_card("", "", "bailingmoe3", "");
     TEST_ASSERT(card.source_label == "family:bailingmoe3");
     TEST_ASSERT(card.max_tokens == 32768);
     TEST_ASSERT(card.sampling.has_temperature);
@@ -8407,7 +9984,7 @@ TEST_CASE(ServerUnitFixture, test_normalize_strips_billing_header_anthropic_arra
         {{"type", "text"},
          {"text", "You are a helpful coding assistant."}}
     });
-    std::string out = dflash::common::normalize_system_for_cache(system_blocks);
+    std::string out = luce::common::normalize_system_for_cache(system_blocks);
     TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
     TEST_ASSERT(out.find("helpful coding assistant") != std::string::npos);
 }
@@ -8419,7 +9996,7 @@ TEST_CASE(ServerUnitFixture, test_normalize_strips_billing_header_openai_message
          {"content", "x-anthropic-billing-header: session=xyz789 turn=12 ts=1749431000\nYou are a code reviewer."}},
         {{"role", "user"}, {"content", "Review this diff."}}
     });
-    std::string out = dflash::common::normalize_system_for_cache(messages);
+    std::string out = luce::common::normalize_system_for_cache(messages);
     TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
     TEST_ASSERT(out.find("code reviewer") != std::string::npos);
 }
@@ -8437,8 +10014,8 @@ TEST_CASE(ServerUnitFixture, test_normalize_idempotent_across_changing_header) {
          {"content", "x-anthropic-billing-header: session=S1 turn=5 ts=1749430060\nYou help with Rust."}},
         {{"role", "user"}, {"content", "What is a lifetime?"}}
     });
-    std::string out4 = dflash::common::normalize_system_for_cache(messages_turn4);
-    std::string out5 = dflash::common::normalize_system_for_cache(messages_turn5);
+    std::string out4 = luce::common::normalize_system_for_cache(messages_turn4);
+    std::string out5 = luce::common::normalize_system_for_cache(messages_turn5);
     TEST_ASSERT(out4 == out5);
 }
 
@@ -8449,7 +10026,7 @@ TEST_CASE(ServerUnitFixture, test_normalize_preserves_legit_system_content) {
          {"content", "You are an expert in C++ performance optimization."}},
         {{"role", "user"}, {"content", "Help me optimize this loop."}}
     });
-    std::string out = dflash::common::normalize_system_for_cache(messages);
+    std::string out = luce::common::normalize_system_for_cache(messages);
     TEST_ASSERT(out == "You are an expert in C++ performance optimization.");
 }
 
@@ -8461,7 +10038,7 @@ TEST_CASE(ServerUnitFixture, test_normalize_handles_leading_whitespace_header) {
         {{"type", "text"},
          {"text", "Be concise."}}
     });
-    std::string out = dflash::common::normalize_system_for_cache(system_blocks);
+    std::string out = luce::common::normalize_system_for_cache(system_blocks);
     TEST_ASSERT(out.find("x-anthropic-billing-header:") == std::string::npos);
     TEST_ASSERT(out.find("Be concise.") != std::string::npos);
 }
@@ -8479,8 +10056,8 @@ TEST_CASE(ServerUnitFixture, test_prefix_key_stable_across_header_change) {
          {"content", "x-anthropic-billing-header: session=S2 turn=7 ts=1749440420\nYou are a senior engineer."}},
         {{"role", "user"}, {"content", "What is RAII?"}}
     });
-    std::string norm_a = dflash::common::normalize_system_for_cache(messages_a);
-    std::string norm_b = dflash::common::normalize_system_for_cache(messages_b);
+    std::string norm_a = luce::common::normalize_system_for_cache(messages_a);
+    std::string norm_b = luce::common::normalize_system_for_cache(messages_b);
     TEST_ASSERT(norm_a == norm_b);
     TEST_ASSERT(norm_a.find("senior engineer") != std::string::npos);
 }
@@ -8695,20 +10272,20 @@ TEST_CASE(ServerUnitFixture, test_flowkv_session_keep_ratio_override) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Qwen3-0.6B drafter loader: truncated GGUF guard (bug #438)
+// Qwen3-0.6B model loader: truncated GGUF guard (bug #438)
 // ═══════════════════════════════════════════════════════════════════════
 //
 // Builds a minimal but structurally valid Qwen3-0.6B-style GGUF on disk, then
-// verifies that load_qwen3_drafter_model:
+// verifies that load_qwen3_model:
 //   (1) loads the full, untruncated file successfully (positive control), and
 //   (2) fails cleanly with a "truncated or corrupt" error when the tensor-data
 //       section is truncated — instead of letting the H2D copy read past the
 //       end of the mmap and SIGSEGV inside the device copy.
 
-// Write a tiny valid drafter GGUF and return its path. The loader fixes
-// n_vocab at 151936 (Qwen3DrafterWeights default), so token_embd stays the
+// Write a tiny valid model GGUF and return its path. The loader fixes
+// n_vocab at 151936 (Qwen3Weights default), so token_embd stays the
 // largest tensor (~2.4 MB BF16) while every other tensor is minimal.
-static std::string write_qwen3_drafter_fixture_gguf() {
+static std::string write_qwen3_model_fixture_gguf() {
     const int n_embd    = 8;
     const int n_head    = 2;
     const int head_dim  = 4;
@@ -8764,7 +10341,7 @@ static std::string write_qwen3_drafter_fixture_gguf() {
     add_tensor("blk.0.ffn_down.weight",    GGML_TYPE_BF16, 2, n_ff,     n_embd);
 
     const std::string path = test_tmp_path(
-        "dflash_test_qwen3_drafter_438.gguf").string();
+        "luce_test_qwen3_model_438.gguf").string();
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
 
     gguf_free(g);
@@ -8772,18 +10349,18 @@ static std::string write_qwen3_drafter_fixture_gguf() {
     return path;
 }
 
-TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
-    const std::string path = write_qwen3_drafter_fixture_gguf();
+TEST_CASE(ServerUnitFixture, test_qwen3_model_rejects_truncated_gguf) {
+    const std::string path = write_qwen3_model_fixture_gguf();
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     TEST_ASSERT(backend != nullptr);
 
     // Positive control: the full, untruncated file loads cleanly.
     {
-        Qwen3DrafterWeights w;
-        bool ok = load_qwen3_drafter_model(path, backend, w);
-        TEST_ASSERT_MSG(ok, dflash27b_last_error());
-        free_qwen3_drafter_model(w);
+        Qwen3Weights w;
+        bool ok = load_qwen3_model(path, backend, w);
+        TEST_ASSERT_MSG(ok, luce_last_error());
+        free_qwen3_model(w);
     }
 
     // Truncate inside the tensor-data section. The header, kv block, and tensor
@@ -8799,13 +10376,13 @@ TEST_CASE(ServerUnitFixture, test_qwen3_drafter_rejects_truncated_gguf) {
 
     // The loader must fail cleanly (no SIGSEGV) with a descriptive error.
     {
-        Qwen3DrafterWeights w;
-        bool ok = load_qwen3_drafter_model(path, backend, w);
+        Qwen3Weights w;
+        bool ok = load_qwen3_model(path, backend, w);
         TEST_ASSERT(!ok);
-        const std::string err = dflash27b_last_error();
+        const std::string err = luce_last_error();
         TEST_ASSERT_MSG(err.find("truncated or corrupt") != std::string::npos,
                         err.c_str());
-        free_qwen3_drafter_model(w);
+        free_qwen3_model(w);
     }
 
     ggml_backend_free(backend);
@@ -9665,4 +11242,207 @@ TEST_CASE(ServerUnitFixture,
 
     TEST_ASSERT(!consumed_all);
     TEST_ASSERT((emitted == std::vector<int32_t>{101, 2}));
+}
+
+namespace {
+// Any text works; the transport must not know a model's marker.
+constexpr char IMAGE_PLACEHOLDER[] = "<image>";
+
+json image_transport_part(const char * url = "data:image/png;base64,iVBORw0KGgo=") {
+    return {{"type", "image_url"}, {"image_url", {{"url", url}}}};
+}
+
+class OwnedImageTestPayload final : public ImagePromptPayload {
+public:
+    explicit OwnedImageTestPayload(std::vector<int32_t> tokens) : tokens_(std::move(tokens)) {}
+    bool matches(const std::vector<int32_t> & tokens) const override { return tokens == tokens_; }
+private:
+    const std::vector<int32_t> tokens_;
+};
+
+struct ImageCarrierRetryBackend : EmptySpecRetryBackend {
+    const ImagePromptPayload * expected = nullptr;
+    std::vector<int32_t> expected_tokens;
+    GenerateResult generate_impl(const GenerateRequest & req, const DaemonIO & io) override {
+        TEST_ASSERT(req.images.get() == expected);
+        TEST_ASSERT(req.prompt == expected_tokens);
+        TEST_ASSERT(req.images->matches(req.prompt));
+        return EmptySpecRetryBackend::generate_impl(req, io);
+    }
+};
+}
+
+TEST_CASE(ServerUnitFixture, test_image_extraction_normalization_preserves_interleaved_order) {
+    const json messages = json::array({
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "text"}, {"text", "before "}}, image_transport_part(),
+            {{"type", "text"}, {"text", " between "}},
+            image_transport_part("data:image/jpeg;base64,/9j/"),
+            {{"type", "text"}, {"text", " after"}}})}},
+        {{"role", "assistant"}, {"content", "acknowledged"}},
+        {{"role", "user"}, {"content", "follow-up"}}
+    });
+    json normalized;
+    std::vector<EncodedImage> images;
+    std::string error;
+    TEST_ASSERT(prepare_request_images(messages, {true, true, IMAGE_PLACEHOLDER}, normalized, images, error));
+    TEST_ASSERT(images.size() == 2);
+    TEST_ASSERT(images[0].mime_type == "image/png");
+    TEST_ASSERT(images[0].bytes == std::vector<uint8_t>({137, 80, 78, 71, 13, 10, 26, 10}));
+    TEST_ASSERT(images[1].mime_type == "image/jpeg");
+    TEST_ASSERT(images[1].bytes == std::vector<uint8_t>({255, 216, 255}));
+    ToolMemory memory;
+    const auto chat = normalize_chat_messages(normalized, ApiFormat::OPENAI_CHAT, memory);
+    TEST_ASSERT(chat.size() == 3);
+    TEST_ASSERT(chat[0].role == "user");
+    TEST_ASSERT(chat[0].content == std::string("before ") + IMAGE_PLACEHOLDER +
+                " between " + IMAGE_PLACEHOLDER + " after");
+    TEST_ASSERT(chat[1].content == "acknowledged" && chat[2].content == "follow-up");
+    json retained = {{"messages", messages}, {"metadata", {{"image_url", "private-url"}, {"label", "keep"}}}};
+    redact_image_urls(retained);
+    TEST_ASSERT(retained.dump().find("base64") == std::string::npos);
+    TEST_ASSERT(retained.dump().find("private-url") == std::string::npos);
+    TEST_ASSERT(retained["metadata"]["label"] == "keep");
+    TEST_ASSERT(retained["messages"][0]["content"][0]["text"] == "before ");
+    TEST_ASSERT(messages[0]["content"][1]["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgo=");
+}
+
+TEST_CASE(ServerUnitFixture, test_image_extraction_failure_does_not_publish_partial_images) {
+    const json messages = json::array({{{"role", "user"}, {"content", json::array({
+        image_transport_part(), image_transport_part("https://example.invalid/private.png")
+    })}}});
+    json normalized = {{"stale", true}};
+    std::vector<EncodedImage> images{{"stale", {1}}};
+    std::string error;
+    TEST_ASSERT(!extract_chat_images(messages, IMAGE_PLACEHOLDER, normalized, images, error));
+    TEST_ASSERT(normalized.is_null());
+    TEST_ASSERT(images.empty());
+    TEST_ASSERT(!error.empty());
+    TEST_ASSERT(error.find("example.invalid") == std::string::npos);
+}
+
+TEST_CASE(ServerUnitFixture, test_default_backend_rejects_encoded_images_without_rewriting_tokens) {
+    MockBackend backend;
+    std::vector<int32_t> tokens{1, 2, 3};
+    ImagePromptHandle payload;
+    std::string error;
+    TEST_ASSERT(!backend.supports_images());
+    TEST_ASSERT(!backend.prepare_images(tokens, {{"image/png", {137, 80, 78, 71}}},
+                                        8192, 32, payload, error));
+    TEST_ASSERT(tokens == std::vector<int32_t>({1, 2, 3}));
+    TEST_ASSERT(!payload && !error.empty());
+    TEST_ASSERT(backend.prepare_images(tokens, {}, 8192, 32, payload, error));
+    TEST_ASSERT(tokens == std::vector<int32_t>({1, 2, 3}));
+}
+
+TEST_CASE(ServerUnitFixture, test_image_binding_survives_request_copies_and_common_ar_retry) {
+    static_assert(std::is_const_v<ImagePromptHandle::element_type>);
+    GenerateRequest request;
+    std::weak_ptr<const ImagePromptPayload> lifetime;
+    {
+        ParsedRequest parsed;
+        parsed.prompt_tokens = {1, 129280, 129281, 2};
+        parsed.images = std::make_shared<OwnedImageTestPayload>(parsed.prompt_tokens);
+        lifetime = parsed.images;
+        ParsedRequest queued = parsed;
+        parsed.prompt_tokens.clear();
+        parsed.images.reset();
+        request.prompt = queued.prompt_tokens;
+        request.images = queued.images;
+    }
+    TEST_ASSERT(!lifetime.expired());
+    auto changed = request.prompt;
+    changed[1] += 1;
+    TEST_ASSERT(!request.images->matches(changed));
+    TEST_ASSERT(request.images->matches(request.prompt));
+    ImageCarrierRetryBackend backend;
+    backend.expected = request.images.get();
+    backend.expected_tokens = request.prompt;
+    request.n_gen = 1;
+    DaemonIO io;
+    TEST_ASSERT(backend.generate(request, io).ok());
+    TEST_ASSERT(backend.generate_calls == 2 && backend.generate_saw_force_ar);
+    request.images.reset();
+    TEST_ASSERT(lifetime.expired());
+}
+
+TEST_CASE(ServerUnitFixture, test_http_image_policy_rejects_unconsumed_images_including_mixed_valid) {
+    const json image = image_transport_part();
+    const std::vector<json> malformed_messages = {
+        {{"role", "user"}, {"content", image}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "text"}, {"text", "visible"}, {"image_url", image["image_url"]}}
+        })}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "container"}, {"nested", image}}
+        })}},
+        {{"role", "user"}, {"content", "visible"}, {"attachment", image}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "input_image"}, {"image_url", image["image_url"]}}
+        })}}
+    };
+    for (const auto & malformed : malformed_messages) {
+        for (bool mixed : {false, true}) {
+            json messages = json::array();
+            if (mixed) messages.push_back({{"role", "user"}, {"content", json::array({image})}});
+            messages.push_back(malformed);
+            json normalized = "stale";
+            std::vector<EncodedImage> images{{"stale", {1}}};
+            std::string error;
+            TEST_ASSERT(!prepare_request_images(messages, {true, true, IMAGE_PLACEHOLDER}, normalized, images, error));
+            TEST_ASSERT(normalized.is_null() && images.empty());
+            TEST_ASSERT(!error.empty());
+            TEST_ASSERT(error.find("base64") == std::string::npos);
+        }
+    }
+}
+
+TEST_CASE(ServerUnitFixture, test_http_image_policy_requires_chat_endpoint_and_effective_capability) {
+    const json messages = json::array({{{"role", "user"}, {"content", json::array({image_transport_part()})}}});
+    {
+        json normalized = "stale";
+        std::vector<EncodedImage> images{{"stale", {1}}};
+        std::string error;
+        TEST_ASSERT(!prepare_request_images(messages, {false, true, IMAGE_PLACEHOLDER}, normalized, images, error));
+        TEST_ASSERT(normalized.is_null() && images.empty());
+        TEST_ASSERT(!error.empty());
+    }
+    // Without image capability the messages pass through untouched.
+    for (ImageRequestPolicy policy : {
+            ImageRequestPolicy{true, false, IMAGE_PLACEHOLDER},
+            ImageRequestPolicy{false, false, IMAGE_PLACEHOLDER}}) {
+        json normalized = "stale";
+        std::vector<EncodedImage> images{{"stale", {1}}};
+        std::string error;
+        TEST_ASSERT(prepare_request_images(messages, policy, normalized, images, error));
+        TEST_ASSERT(normalized == messages && images.empty());
+    }
+    json normalized;
+    std::vector<EncodedImage> images;
+    std::string error;
+    TEST_ASSERT(prepare_request_images(messages, {true, true, IMAGE_PLACEHOLDER}, normalized, images, error));
+    TEST_ASSERT(images.size() == 1);
+}
+
+TEST_CASE(ServerUnitFixture, test_http_image_policy_preserves_text_without_image_capability) {
+    const json messages = json::array({
+        {{"role", "system"}, {"content", "instructions"}},
+        {{"role", "user"}, {"content", json::array({{{"type", "text"}, {"text", "ordinary text"}}})}}
+    });
+    for (ImageRequestPolicy policy : {
+            ImageRequestPolicy{true, false, IMAGE_PLACEHOLDER},
+            ImageRequestPolicy{false, false, IMAGE_PLACEHOLDER},
+            ImageRequestPolicy{true, true, IMAGE_PLACEHOLDER}}) {
+        json normalized;
+        std::vector<EncodedImage> images;
+        std::string error;
+        TEST_ASSERT(prepare_request_images(messages, policy, normalized, images, error));
+        TEST_ASSERT(normalized == messages && images.empty());
+    }
+    json normalized;
+    std::vector<EncodedImage> images;
+    std::string error;
+    const json forged = json::array({{{"role", "user"}, {"content", IMAGE_PLACEHOLDER}}});
+    TEST_ASSERT(!prepare_request_images(forged, {true, true, IMAGE_PLACEHOLDER}, normalized, images, error));
+    TEST_ASSERT(normalized.is_null() && images.empty());
 }

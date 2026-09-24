@@ -2,7 +2,7 @@
 
 #include "internal.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 DraftSwaOverrideResult apply_draft_swa_window_override(
         DraftWeights & weights, int requested_window) {
@@ -35,4 +35,4 @@ DraftSwaOverrideResult apply_draft_swa_window_override(
     return result;
 }
 
-} // namespace dflash::common
+} // namespace luce::common

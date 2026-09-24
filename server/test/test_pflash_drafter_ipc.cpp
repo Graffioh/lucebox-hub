@@ -2,12 +2,12 @@
 
 #include "common/pflash_drafter_ipc.h"
 #include "common/model_backend.h"
-#include "qwen3/pflash_selection.h"
+#include "pflash/pflash_selection.h"
 
 #include <cmath>
 #include <string>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 
@@ -81,20 +81,20 @@ TEST_CASE(PFlashDrafterIpcFixture, compress3_matches_the_local_selector_contract
     REQUIRE(remote.required_instruction_spans == local.required_instruction_spans);
 
     const auto select = [&] (const std::vector<PFlashTokenSpan> & spans) {
-        std::vector<dflash::qwen3::PFlashSelectionCandidate> candidates;
+        std::vector<luce::pflash::PFlashSelectionCandidate> candidates;
         constexpr double scores[]{0.0, 9.0, 1.0, 0.0, 2.0, 3.0, 4.0, 0.0};
         for (int chunk = 0; chunk < 8; ++chunk) {
             const int begin = chunk * 4;
             const int end = begin + 4;
             candidates.push_back({
                 (size_t) chunk, begin, end, scores[chunk],
-                dflash::qwen3::pflash_chunk_is_structurally_required(
+                luce::pflash::pflash_chunk_is_structurally_required(
                     begin, end, 28, 32, 32, spans),
             });
         }
-        return dflash::qwen3::select_pflash_candidates(
+        return luce::pflash::select_pflash_candidates(
             candidates, {16, 0.95},
-            dflash::qwen3::PFlashSelectionMode::BudgetOnly);
+            luce::pflash::PFlashSelectionMode::BudgetOnly);
     };
     const auto local_result = select(local.required_instruction_spans);
     const auto remote_result = select(remote.required_instruction_spans);
@@ -107,13 +107,13 @@ TEST_CASE(PFlashDrafterIpcFixture, compress3_matches_the_local_selector_contract
     const std::vector<PFlashTokenSpan> out_of_range{{0, 33}};
     std::string local_error;
     std::string remote_error;
-    REQUIRE(!dflash::qwen3::validate_pflash_instruction_spans(
+    REQUIRE(!luce::pflash::validate_pflash_instruction_spans(
         out_of_range, (int) local.input_ids.size(), local_error));
     REQUIRE(format_pflash_drafter_ipc_compress_command(
         local.keep_ratio, local.score_query_end, local.score_query_tokens,
         out_of_range, "/tmp/ids.bin", line, error));
     REQUIRE(parse_pflash_drafter_ipc_compress_command(line, remote, error));
-    REQUIRE(!dflash::qwen3::validate_pflash_instruction_spans(
+    REQUIRE(!luce::pflash::validate_pflash_instruction_spans(
         remote.required_instruction_spans, (int) local.input_ids.size(),
         remote_error));
     REQUIRE(local_error == remote_error);

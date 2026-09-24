@@ -15,7 +15,7 @@
 #include <windows.h>
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 
 size_t auto_kv_offload_budget(size_t pool_bytes, size_t available_bytes,
                               size_t explicit_bytes, size_t auto_models) {
@@ -234,4 +234,4 @@ void PagedKvOffload::discard(int slot) {
     }
 }
 
-} // namespace dflash::common
+} // namespace luce::common

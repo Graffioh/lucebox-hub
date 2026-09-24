@@ -21,14 +21,14 @@
 //                 [--prompt=N] [--gen=N] [--skip-profile] [--no-mask]
 //   modes: (default) verification suite A-F | --niah | --niah256 | --longab
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "internal.h"
 #include "kvflash_pager.h"
 #include "kvflash_qk.h"
 #include "attn_masks.h"
 #include "prefill_helpers.h"
-#include "qwen3_drafter.h"
-#include "qwen3_kvflash_scorer.h"
+#include "pflash/pflash_drafter.h"
+#include "pflash/kvflash_drafter_scorer.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -43,7 +43,7 @@
 #include <string>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 
@@ -212,7 +212,7 @@ struct Stepper {
 std::vector<int32_t> make_prompt(int n, int vocab) {
     std::vector<int32_t> p(n);
     uint64_t s = 0x9E3779B97F4A7C15ull;
-    // Cap below the drafter vocab too (Qwen3-0.6B ~151K) so the same ids
+    // Cap below the drafter vocab too (Qwen3.5-0.8B) so the same ids
     // are scoreable by the indexer in run F.
     const int cap = std::min(vocab, 100000);
     for (int i = 0; i < n; i++) {
@@ -470,7 +470,7 @@ int main(int argc, char ** argv) {
 
     TargetWeights w;
     if (!load_target_gguf(argv[1], backend, w)) {
-        std::fprintf(stderr, "load: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load: %s\n", luce_last_error());
         return 1;
     }
     std::printf("[load] weights ok, vram_used=%.1f MiB\n",
@@ -502,7 +502,7 @@ int main(int argc, char ** argv) {
         KvFlashDrafterScorer dscorer(&dctx);
         if (is_drafter) {
             const char * dpath = arg_str(argc, argv, "--qk-drafter",
-                "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf");
+                "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf");
             if (!load_drafter(dpath, 0, dctx)) {
                 std::fprintf(stderr, "drafter load failed\n");
                 return 1;
@@ -720,7 +720,7 @@ int main(int argc, char ** argv) {
             for (int mode = 0; mode < 2; mode++) {           // 0=baseline 1=pool
                 if (only_mode >= 0 && mode != only_mode) continue;
                 if (mode == 1 && !dctx.loaded &&
-                    !load_drafter("/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf", 0, dctx)) {
+                    !load_drafter("/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf", 0, dctx)) {
                     std::fprintf(stderr, "drafter load failed\n");
                     return 1;
                 }
@@ -808,7 +808,7 @@ int main(int argc, char ** argv) {
     // inside the recency window is the induction control (distance-free).
     if (arg_flag(argc, argv, "--niah256")) {
         DrafterContext dctx;
-        if (!load_drafter("/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf", 0, dctx)) {
+        if (!load_drafter("/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf", 0, dctx)) {
             std::fprintf(stderr, "drafter load failed\n");
             return 1;
         }
@@ -895,7 +895,7 @@ int main(int argc, char ** argv) {
     if (arg_flag(argc, argv, "--niah")) {
         DrafterContext dctx;
         const bool have_drafter =
-            load_drafter("/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf", 0, dctx);
+            load_drafter("/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf", 0, dctx);
         if (!have_drafter) std::printf("[niah] drafter unavailable, skipping drafter policy\n");
         KvFlashDrafterScorer scorer(&dctx);
         if (have_drafter) {
@@ -1005,7 +1005,7 @@ int main(int argc, char ** argv) {
         const size_t v_before = vram_used_now();
         TargetCache cache;
         if (!create_target_cache(w, logical_ctx, 0, backend, cache, /*prefill_only=*/true)) {
-            std::fprintf(stderr, "cache A: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "cache A: %s\n", luce_last_error());
             return 1;
         }
         mem_a_kv = kv_cache_bytes(cache);
@@ -1043,7 +1043,7 @@ int main(int argc, char ** argv) {
     {
         TargetCache cache;
         if (!create_target_cache(w, pool_b, 0, backend, cache, /*prefill_only=*/true)) {
-            std::fprintf(stderr, "cache B: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "cache B: %s\n", luce_last_error());
             return 1;
         }
         KvFlashPager pager;
@@ -1096,7 +1096,7 @@ int main(int argc, char ** argv) {
         const size_t v_before = vram_used_now();
         TargetCache cache;
         if (!create_target_cache(w, pool_c, 0, backend, cache, /*prefill_only=*/true)) {
-            std::fprintf(stderr, "cache C: %s\n", dflash27b_last_error());
+            std::fprintf(stderr, "cache C: %s\n", luce_last_error());
             return 1;
         }
         mem_c_kv = kv_cache_bytes(cache);
@@ -1198,10 +1198,10 @@ int main(int argc, char ** argv) {
     // reselect() repages the pool. PASS requires at least one genuine
     // drafter-driven recall of a chunk evicted earlier.
     {
-        const char * drafter_path = "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+        const char * drafter_path = "/opt/lucebox/models/drafter/Qwen3.5-0.8B-BF16.gguf";
         DrafterContext dctx;
         if (!load_drafter(drafter_path, 0, dctx)) {
-            std::printf("FAIL indexer run: drafter load failed (%s)\n", dflash27b_last_error());
+            std::printf("FAIL indexer run: drafter load failed (%s)\n", luce_last_error());
             hard_failures++;
         } else {
             const int n_prompt_f = 2048, n_gen_f = 768, pool_f = 1024, tau = 64;
@@ -1279,7 +1279,7 @@ int main(int argc, char ** argv) {
                            KvFlashPager * pager, int pos_base) {
             TargetCache cache;
             if (!create_target_cache(w, alloc_ctx, 0, backend, cache, true)) {
-                std::fprintf(stderr, "cache E(%s): %s\n", tag, dflash27b_last_error());
+                std::fprintf(stderr, "cache E(%s): %s\n", tag, luce_last_error());
                 std::exit(1);
             }
             KvFlashPager local;

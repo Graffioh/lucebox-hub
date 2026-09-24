@@ -10,13 +10,13 @@ if(TEST_CASE STREQUAL "parent_benchmark")
         endif()
         execute_process(
             COMMAND "${CMAKE_COMMAND}" -E env
-                DFLASH_MMID_BENCH_ITERS=1 DFLASH_MMID_BENCH_ROWS=64
-                DFLASH_MMID_BENCH_TOP_K=4 --unset=DFLASH_MMID_TEST_WIDTH
+                LUCE_MMID_BENCH_ITERS=1 LUCE_MMID_BENCH_ROWS=64
+                LUCE_MMID_BENCH_TOP_K=4 --unset=LUCE_MMID_TEST_WIDTH
                 "${TEST_EXECUTABLE}" ${args}
             RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr
             TIMEOUT 60)
         if(NOT status STREQUAL "2" OR
-           NOT stderr MATCHES "DFLASH_MMID_BENCH_ITERS is supported only with --child")
+           NOT stderr MATCHES "LUCE_MMID_BENCH_ITERS is supported only with --child")
             message(FATAL_ERROR "${mode} did not reject benchmark mode (${status}):\n${stdout}\n${stderr}")
         endif()
     endforeach()

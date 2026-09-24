@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Choose the quarter-route main-owner quota that minimizes the slower owner's
 // estimated completion time. Returns zero for invalid inputs.
@@ -397,4 +397,4 @@ bool build_cached_hot_batched_graph(
     const MoeHybridConfig & cfg,
     int n_tokens);
 
-}  // namespace dflash::common
+}  // namespace luce::common

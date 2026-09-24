@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 using SplitState = ggml_backend_meta_split_state;
@@ -212,7 +212,7 @@ Qwen35TensorParallelContext::Qwen35TensorParallelContext(
 std::unique_ptr<Qwen35TensorParallelContext>
 Qwen35TensorParallelContext::create(const DevicePlacement & placement,
                                     TargetWeights & weights) {
-#if !defined(DFLASH27B_BACKEND_CUDA)
+#if !defined(LUCE_BACKEND_CUDA)
     (void) placement;
     (void) weights;
     std::fprintf(stderr, "[tp] tensor parallelism requires a CUDA build\n");
@@ -273,4 +273,4 @@ ggml_backend_meta_split_state Qwen35TensorParallelContext::split_state(
         tensor, *context->weights_, context->devices_.size());
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

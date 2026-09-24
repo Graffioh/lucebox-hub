@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 static const char THINK_OPEN[]  = "<think>";
 static const char THINK_CLOSE[] = "</think>";
@@ -76,7 +76,7 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
     const double decode_ms  = round1(t.decode_s  * 1000.0);
     const double tps = t.decode_s > 0.0
         ? round1((double)completion_tokens / t.decode_s) : 0.0;
-    return json{
+    json out{
         {"prefill_ms",            prefill_ms},
         {"decode_ms",             decode_ms},
         {"decode_tokens_per_sec", tps},
@@ -86,6 +86,8 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
         {"effective_prompt_tokens", t.effective_prompt_tokens},
         {"agent_turn_cache_hit",  t.agent_turn_cache_hit}
     };
+    if (!t.pflash.is_null()) out["pflash"] = t.pflash;
+    return out;
 }
 
 // ─── Constructor ────────────────────────────────────────────────────────
@@ -768,7 +770,7 @@ std::vector<std::string> SseEmitter::emit_finish(int completion_tokens,
 
         if (!tool_calls_.empty()) {
             static const bool log_tools = []() {
-                const char * e = std::getenv("DFLASH_LOG_TOOL_CALLS");
+                const char * e = std::getenv("LUCE_LOG_TOOL_CALLS");
                 if (!e || !*e) return false;
                 std::string v(e);
                 std::transform(v.begin(), v.end(), v.begin(),
@@ -1114,4 +1116,4 @@ std::string SseEmitter::finish_reason() const {
     return finish_reason_;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

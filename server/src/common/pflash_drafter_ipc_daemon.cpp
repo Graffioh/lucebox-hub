@@ -2,16 +2,16 @@
 
 #include "pflash_drafter_ipc.h"
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "dflash_draft_ipc.h"
-#include "qwen3/qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <iostream>
 #include <sstream>
 
-namespace dflash::common {
+namespace luce::common {
 
 int run_pflash_drafter_ipc_daemon(const char * drafter_path,
                                   int drafter_gpu,
@@ -31,7 +31,7 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
     DrafterContext ctx;
     if (!load_drafter(drafter_path, /*gpu_layers=*/999, std::max(0, drafter_gpu), ctx)) {
         std::fprintf(stderr, "[pflash-ipc-daemon] drafter load failed: %s\n",
-                     dflash27b_last_error());
+                     luce_last_error());
         stream_status(stream_fd, -1);
         return 1;
     }
@@ -61,10 +61,14 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
                 stream_status(stream_fd, -1);
                 continue;
             }
+            // The IPC protocol uses score_query_end < 0 for "tail"; the
+            // qwen35 scorer requires an explicit end, so translate here.
+            const int score_query_end = request.score_query_end >= 0
+                ? request.score_query_end : (int)input_ids.size();
             auto compressed = drafter_score_and_compress(
                 ctx, input_ids, request.keep_ratio, /*chunk_size=*/32,
                 request.score_query_tokens, /*pool_kernel=*/13,
-                request.score_query_end,
+                score_query_end,
                 request.required_instruction_spans);
             if (compressed.empty()) {
                 std::fprintf(stderr, "[pflash-ipc-daemon] compress returned empty\n");
@@ -91,4 +95,4 @@ int run_pflash_drafter_ipc_daemon(const char * drafter_path,
 #endif
 }
 
-} // namespace dflash::common
+} // namespace luce::common

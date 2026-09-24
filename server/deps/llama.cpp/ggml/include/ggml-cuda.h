@@ -25,6 +25,14 @@ extern "C" {
 #define GGML_CUDA_DS4_MIX_MMV_MAX_TOKENS 5
 #define GGML_CUDA_DS4_MIX_MMV_PAGED_MAX_TOKENS 16
 
+// HIP registry-only opt-in DS4V BF16 linear capability (not NVIDIA/CUDA).
+// Lookup "ggml_backend_hip_vision_bias_bf16_workspace" as size_t (*)(ggml_backend_t):
+// nonzero means the explicit op is available, and returns its retained external
+// workspace reservation (76 MiB). Unsupported op shapes must fail, not fallback.
+// "ggml_backend_hip_vision_bias_bf16_launches" has the same signature and returns
+// actual successful Lt submissions, with or without bias. Registry names retain
+// their original spelling; both modes require a matching GGML/HIP library set.
+
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
@@ -95,7 +103,7 @@ GGML_BACKEND_API size_t ggml_backend_cuda_get_fattn_mma256_launch_count(void);
 GGML_BACKEND_API size_t ggml_backend_cuda_get_fattn_wmma256_launch_count(void);
 
 // Calling-thread launch counter for the head-size-256 WMMA paged-attention
-// kernel (stage-1; gated by DFLASH27B_PAGED_WMMA).
+// kernel (stage-1; gated by LUCE_PAGED_WMMA).
 GGML_BACKEND_API size_t ggml_backend_cuda_get_paged_attn_wmma256_launch_count(void);
 
 // device buffer

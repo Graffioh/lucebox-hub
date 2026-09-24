@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cstring>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 namespace {
 struct ImmutableGraphInputPoolFixture {};

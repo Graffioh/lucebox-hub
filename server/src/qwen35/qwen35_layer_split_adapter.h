@@ -12,7 +12,7 @@
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "placement/remote_target_shard_config.h"
-#include "qwen3/qwen3_drafter.h"
+#include "pflash/pflash_drafter.h"
 #include "qwen35_target_shard_ipc.h"
 #include "step_graph.h"
 #include "internal.h"
@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct Qwen35LayerSplitAdapterConfig {
     std::string target_path;
@@ -39,7 +39,7 @@ struct Qwen35LayerSplitAdapterConfig {
     int kq_stride_pad = 32;
     int draft_ctx_max = 4096;
     int chunk = 512;
-    int max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
+    int max_verify_tokens = LUCE_DRAFT_BLOCK_SIZE;
     bool run_dflash = false;
     int draft_swa_window = 0;
 };
@@ -165,4 +165,4 @@ private:
     std::vector<float> prefill_last_logits_;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

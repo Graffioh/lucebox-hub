@@ -2,13 +2,13 @@
 
 #include "gemma4_dflash_target.h"
 #include "../common/kvflash_pager.h"
-#include "dflash27b.h"
+#include "luce.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 
-namespace dflash::common {
+namespace luce::common {
 
 Gemma4DFlashTarget::Gemma4DFlashTarget(
         Gemma4Weights & w,
@@ -20,7 +20,7 @@ Gemma4DFlashTarget::Gemma4DFlashTarget(
         capture_ids_ = cache.capture_layer_ids;
     } else {
         // Fallback: evenly-spaced (legacy path)
-        const int N = DFLASH27B_DRAFT_N_TARGET_LAYERS;
+        const int N = LUCE_DRAFT_N_TARGET_LAYERS;
         capture_ids_.resize(N);
         const int step = std::max(1, (w.n_layer - 2) / (N - 1));
         for (int k = 0; k < N; k++) {
@@ -156,4 +156,4 @@ const std::vector<int> & Gemma4DFlashTarget::capture_layer_ids() const {
     return capture_ids_;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

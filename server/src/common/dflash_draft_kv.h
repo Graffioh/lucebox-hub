@@ -29,7 +29,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 struct DraftKvState {
     DraftKvState() = default;
@@ -136,4 +136,4 @@ bool draft_kv_batch_compute(
     const std::vector<DraftKvState *> & lane_states,
     std::vector<std::vector<float>> & hidden_by_lane);
 
-}  // namespace dflash::common
+}  // namespace luce::common

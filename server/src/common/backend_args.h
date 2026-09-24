@@ -17,7 +17,7 @@
 #include "placement/remote_target_shard_config.h"
 #include "prefill_attention_mode.h"
 
-namespace dflash::common {
+namespace luce::common {
 
 enum class KvFlashRequest {
     Off,
@@ -53,6 +53,9 @@ struct BackendArgs {
 
     // Optional: speculative decode draft model (qwen35 only)
     std::optional<std::string> draft_path;
+
+    // Optional: vision projector .gguf (deepseek4 only)
+    std::optional<std::string> mmproj_path;
 
     // Device placement
     DevicePlacement device;
@@ -112,4 +115,4 @@ struct BackendArgs {
     bool            adaptive_experts_requested = false;
 };
 
-}  // namespace dflash::common
+}  // namespace luce::common

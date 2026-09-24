@@ -78,7 +78,7 @@ class PublicationClientTests(unittest.TestCase):
             return_value=response,
         ):
             result = ds4_publication_decode_client.stream_request(
-                "http://127.0.0.1:1", "dflash", "prompt", max_tokens=2
+                "http://127.0.0.1:1", "luce", "prompt", max_tokens=2
             )
 
         self.assertFalse(result["ok"])
@@ -92,7 +92,7 @@ class PublicationClientTests(unittest.TestCase):
             side_effect=http.client.IncompleteRead(b"partial"),
         ):
             result = ds4_publication_decode_client.stream_request(
-                "http://127.0.0.1:1", "dflash", "prompt", max_tokens=2
+                "http://127.0.0.1:1", "luce", "prompt", max_tokens=2
             )
 
         self.assertFalse(result["ok"])
@@ -112,7 +112,7 @@ class PublicationClientTests(unittest.TestCase):
             side_effect=error,
         ):
             result = ds4_publication_decode_client.stream_request(
-                "http://127.0.0.1:1", "dflash", "prompt", max_tokens=2
+                "http://127.0.0.1:1", "luce", "prompt", max_tokens=2
             )
 
         self.assertFalse(result["ok"])

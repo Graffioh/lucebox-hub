@@ -1,6 +1,6 @@
 # `/props` endpoint
 
-A design spec for `dflash_server`'s `/props` capability-advertising
+A design spec for `luce_server`'s `/props` capability-advertising
 endpoint. `/props` is the operator-facing introspection surface: a
 single GET that returns enough JSON for a dashboard, a deployment
 healthcheck, or a client SDK to know what this server can do and
@@ -14,7 +14,7 @@ semantics, schema versioning, and backward-compatibility rules.
 There is no industry-standard "what can this LLM server do?"
 endpoint. OpenAI exposes `/v1/models` for the model list; Anthropic
 exposes nothing equivalent; llama.cpp has `/props` historically as
-a server-state snapshot. dflash_server's `/props` extends that
+a server-state snapshot. luce_server's `/props` extends that
 tradition with structured capability advertising for:
 
 - The set of HTTP endpoints exposed
@@ -268,7 +268,7 @@ best-effort tokenizer family hint from GGUF metadata.
 ### 4.9 `model_alias` and `model_path`
 
 `model_alias` is the value clients should pass as the `model` field
-in chat/responses requests (defaults to `"dflash"`; override with
+in chat/responses requests (defaults to `"luce"`; override with
 `--model-name`).
 
 `model_path` is the absolute filesystem path of the loaded target
@@ -417,7 +417,7 @@ Reasoning capability:
   fields are silently ignored (and the rest of this section can be
   ignored).
 - `supported_efforts` — the full set of effort tier values the
-  server will recognize. dflash_server always lists all five
+  server will recognize. luce_server always lists all five
   (`low`, `medium`, `high`, `x-high`, `max`); other servers may
   list a subset.
 - `default` — when set, the effort tier the server will apply if
@@ -600,7 +600,7 @@ version increments.
     "draft_path":   "/.../dflash-draft-3.6-q4_k_m.gguf",
     "tokenizer_id": "qwen3"
   },
-  "model_alias": "dflash",
+  "model_alias": "luce",
   "model_card": {
     "name":                       "Qwen3.6 27B",
     "source":                     "https://huggingface.co/Qwen/Qwen3.6-27B",

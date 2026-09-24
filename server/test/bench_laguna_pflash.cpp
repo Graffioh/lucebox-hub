@@ -1,7 +1,7 @@
 // End-to-end PFlash + Laguna TTFT bench. Mirrors the qwen3.6-27B PFlash flow:
 //
 //   1. Tokenize input (synthetic in DRAFTER vocab for the bench)
-//   2. Drafter (Qwen3-0.6B BF16) score_and_compress  -> surviving Qwen3 IDs
+//   2. Drafter (Qwen3.5-0.8B BF16) score_and_compress -> surviving Qwen3.5 IDs
 //   3. Cross-tokenizer mapping Qwen3 IDs -> Laguna IDs (NOT plumbed yet; we
 //      use a fake target token for compute-time-only measurement)
 //   4. Laguna build_laguna_graph dense prefill on the COMPRESSED sequence
@@ -13,8 +13,9 @@
 
 #include "laguna_internal.h"
 #include "internal.h"
-#include "qwen3_drafter.h"
-#include "dflash27b.h"
+#include "pflash/pflash_drafter.h"
+#include "pflash/qwen35_drafter.h"
+#include "luce.h"
 
 #include <chrono>
 #include <cmath>
@@ -27,7 +28,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
-using namespace dflash::common;
+using namespace luce::common;
 
 // Chunked prefill loop on top of the shared laguna_step() helper. Reports
 // total prefill time and the argmax / logit at the LAST chunk.
@@ -86,7 +87,7 @@ int main(int argc, char ** argv) {
     const int chunk_arg   = (argc >= 6) ? std::atoi(argv[5]) : 2048;
     const int32_t fake_q  = 1972;  // any non-special drafter id
     const int32_t fake_l  = 1972;  // dummy laguna id (cross-tokenizer skipped)
-    const bool no_mask    = (std::getenv("DFLASH_NO_MASK") != nullptr);
+    const bool no_mask    = (std::getenv("LUCE_NO_MASK") != nullptr);
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
@@ -97,20 +98,21 @@ int main(int argc, char ** argv) {
     DrafterContext drafter;
     auto td0 = std::chrono::steady_clock::now();
     if (!load_drafter(drafter_path, /*gpu_layers=*/-1, drafter)) {
-        std::fprintf(stderr, "load_drafter failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load_drafter failed: %s\n", luce_last_error());
         return 1;
     }
     auto td1 = std::chrono::steady_clock::now();
     std::printf("[pflash] drafter loaded in %.2fs vocab=%d\n",
-                std::chrono::duration<double>(td1 - td0).count(), drafter.weights.n_vocab);
+                std::chrono::duration<double>(td1 - td0).count(), drafter.state->weights.n_vocab);
 
     std::vector<int32_t> input(N, fake_q);
     auto tc0 = std::chrono::steady_clock::now();
     std::vector<int32_t> compressed = drafter_score_and_compress(
-        drafter, input, keep_r, /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13);
+        drafter, input, keep_r, /*chunk_size=*/32, /*n_lookahead=*/8, /*pool_kernel=*/13,
+        /*score_query_end=*/(int)input.size());
     auto tc1 = std::chrono::steady_clock::now();
     if (compressed.empty()) {
-        std::fprintf(stderr, "drafter compress failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "drafter compress failed: %s\n", luce_last_error());
         free_drafter(drafter); return 1;
     }
     const int M = (int)compressed.size();
@@ -125,12 +127,12 @@ int main(int argc, char ** argv) {
     // ---- Phase 2: load Laguna target now that drafter VRAM is free ----
     LagunaTargetWeights w;
     if (!load_target_gguf_laguna(laguna_path, backend, w)) {
-        std::fprintf(stderr, "load_laguna failed: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load_laguna failed: %s\n", luce_last_error());
         return 1;
     }
 
     LagunaTargetCache cache;
-    if (const char * kv_t = std::getenv("DFLASH_KV_TYPE")) {
+    if (const char * kv_t = std::getenv("LUCE_KV_TYPE")) {
         const std::string s = kv_t;
         if      (s == "q4_0") { cache.kv_k_type = GGML_TYPE_Q4_0; cache.kv_v_type = GGML_TYPE_Q4_0; }
         else if (s == "q5_0") { cache.kv_k_type = GGML_TYPE_Q5_0; cache.kv_v_type = GGML_TYPE_Q5_0; }
@@ -139,7 +141,7 @@ int main(int argc, char ** argv) {
     }
     // Cache sized for COMPRESSED length M (much smaller than raw N).
     if (!create_laguna_target_cache(w, M, backend, cache)) {
-        std::fprintf(stderr, "create_laguna_target_cache: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "create_laguna_target_cache: %s\n", luce_last_error());
         free_laguna_target_weights(w); return 1;
     }
     std::printf("[pflash] laguna cache max_ctx=%d KV=%s/%s\n", M,

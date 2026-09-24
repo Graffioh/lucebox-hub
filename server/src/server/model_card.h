@@ -16,7 +16,7 @@
 
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Phase-1 reasoning budgets per `reasoning.effort` tier.
 // See spec §3.3, §4.2.
@@ -81,7 +81,7 @@ struct ModelCard {
     //     hint is the bare `<channel|>\n\n` transition cue (the trailing
     //     newlines mirror Qwen3's no-think template suffix, giving gemma
     //     the same trained transition cue — see
-    //     dflash/docs/experiments/gemma4-26b-thinking-control-2026-05-25.md).
+    //     docs/experiments/gemma4-26b-thinking-control-2026-05-25.md).
     std::string       thinking_marker;
     std::string       thinking_terminator_hint;
 
@@ -110,10 +110,10 @@ std::string normalize_model_card_stem(const std::string & general_name);
 //
 // `repo_root_hint` is an optional explicit directory to search for
 // share/model_cards/; pass empty to use auto-discovery (binary's parent,
-// then cwd, then $DFLASH_MODEL_CARDS_DIR).
+// then cwd, then $LUCE_MODEL_CARDS_DIR).
 ModelCard resolve_model_card(const std::string & gguf_path,
                              const std::string & general_name,
                              const std::string & general_architecture,
                              const std::string & repo_root_hint = "");
 
-}  // namespace dflash::common
+}  // namespace luce::common

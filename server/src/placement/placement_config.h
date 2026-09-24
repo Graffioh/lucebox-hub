@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 enum class TargetSplitMode {
     Layer,
@@ -158,4 +158,4 @@ std::string validate_device_placement(
     const DevicePlacement & dp,
     int device_count);
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -653,8 +653,8 @@ static void launch_gated_delta_net(
     const bool ampere_nvidia = GGML_CUDA_CC_IS_NVIDIA(cc)
                             && cc >= GGML_CUDA_CC_AMPERE
                             && cc <  GGML_CUDA_CC_ADA_LOVELACE;
-    const bool force_grouped_cols = getenv("DFLASH_GDN_FORCE_GROUPED_COLS") != nullptr;
-    const bool disable_grouped_cols = getenv("DFLASH_GDN_NO_GROUPED_COLS") != nullptr;
+    const bool force_grouped_cols = getenv("LUCE_GDN_FORCE_GROUPED_COLS") != nullptr;
+    const bool disable_grouped_cols = getenv("LUCE_GDN_NO_GROUPED_COLS") != nullptr;
     const bool use_grouped_cols = force_grouped_cols ||
         (!disable_grouped_cols && !ampere_nvidia);
     const bool take_grouped_cols = S_v == 128 && !KDA && use_grouped_cols &&

@@ -3,6 +3,10 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/vision-bias.cuh"
+#include "ggml-cuda/vision-rotary.cuh"
+#include "ggml-cuda/vision-softmax.cuh"
+#include "ggml-cuda/vision-av.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -180,8 +184,8 @@ int ggml_cuda_get_device() {
 // this APU, so small models that fit stay on the faster hipMalloc path (verified:
 // 16GB model loads 3s / decodes 11.8 tok/s on hipMalloc vs 15s / 10.9 on managed).
 // The cached ggml_cuda_info().devices[].integrated is hard-forced false (#15034
-// dodge), so probe a FRESH cudaDeviceProp. Opt out: DFLASH_HIP_NO_AUTO_UMA=1.
-// Force-all: GGML_CUDA_ENABLE_UNIFIED_MEMORY. Tune gate: DFLASH_HIP_UMA_MIN_FRAC.
+// dodge), so probe a FRESH cudaDeviceProp. Opt out: LUCE_HIP_NO_AUTO_UMA=1.
+// Force-all: GGML_CUDA_ENABLE_UNIFIED_MEMORY. Tune gate: LUCE_HIP_UMA_MIN_FRAC.
 static size_t ggml_cuda_total_ram_bytes() {
     static const size_t cached = []() -> size_t {
         size_t bytes = 0;
@@ -203,7 +207,7 @@ static bool ggml_cuda_device_use_uma(int device, size_t size) {
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         return true;
     }
-    if (getenv("DFLASH_HIP_NO_AUTO_UMA") != nullptr) {
+    if (getenv("LUCE_HIP_NO_AUTO_UMA") != nullptr) {
         return false;
     }
     static const std::array<bool, GGML_CUDA_MAX_DEVICES> integrated = []() {
@@ -224,7 +228,7 @@ static bool ggml_cuda_device_use_uma(int device, size_t size) {
         return false; // unknown RAM: stay conservative on the legacy path
     }
     double frac = 0.45;
-    const char * fenv = getenv("DFLASH_HIP_UMA_MIN_FRAC");
+    const char * fenv = getenv("LUCE_HIP_UMA_MIN_FRAC");
     if (fenv != nullptr) {
         double v = atof(fenv);
         if (v > 0.0 && v < 1.0) { frac = v; }
@@ -233,7 +237,7 @@ static bool ggml_cuda_device_use_uma(int device, size_t size) {
     if (use) {
         GGML_LOG_INFO("ggml_cuda: device %d integrated, alloc %.1f GiB (> %.0f%% of %.1f GiB RAM) "
                       "-> unified (managed) memory; small models stay on hipMalloc "
-                      "(DFLASH_HIP_NO_AUTO_UMA=1 to disable)\n",
+                      "(LUCE_HIP_NO_AUTO_UMA=1 to disable)\n",
                       device, (double) size / 1073741824.0, frac * 100.0,
                       (double) total_ram / 1073741824.0);
     }
@@ -729,6 +733,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         luce_q8_memo.pop_back();
     }
 
+#if defined(GGML_HIP_DS4V_VISION)
+    if (vision_bias_workspace) {
+        ggml_cuda_set_device(device);
+        // The latest event follows every use of the shared workspace.
+        if (vision_bias_launches || vision_av_launches) CUDA_CHECK(cudaEventSynchronize(vision_bias_event));
+        CUDA_CHECK(cudaFree(vision_bias_workspace));
+        CUDA_CHECK(cudaEventDestroy(vision_bias_event));
+    }
+    if (vision_bias_handle) CUBLAS_CHECK(hipblasLtDestroy(vision_bias_handle));
+#endif
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
         copy_event = nullptr;
@@ -2595,7 +2609,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     // The affine MMVQ dot includes the offset correction in vecdotq.cuh.
     // Keep the conservative dequantize fallback unless explicitly enabled.
     if (src0->type == GGML_TYPE_Q2_0_ROCMFP2 &&
-        std::getenv("DFLASH_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
+        std::getenv("LUCE_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
         use_mul_mat_vec_q = false;
     }
 #endif // ROCMFP2_AFFINE
@@ -2865,11 +2879,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // throughput. The phase-scoped master switch still enables the qualified
     // paired gate/up fusion independently.
     if (src0->type == GGML_TYPE_Q2_0_ROCMFP2) {
-        if (std::getenv("DFLASH_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
+        if (std::getenv("LUCE_CUDA_MMVQ_FP2_AFFINE") == nullptr) {
             use_mul_mat_vec_q = false;
         }
-        if (std::getenv("DFLASH_CUDA_MMQ_FP2_AFFINE") == nullptr ||
-            std::getenv("DFLASH_CUDA_MMQ_FP2_AFFINE_GENERAL") == nullptr) {
+        if (std::getenv("LUCE_CUDA_MMQ_FP2_AFFINE") == nullptr ||
+            std::getenv("LUCE_CUDA_MMQ_FP2_AFFINE_GENERAL") == nullptr) {
             use_mul_mat_q = false;
         }
     }
@@ -2921,10 +2935,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // catches the mul_mat_id per-expert slices (which re-enter here with a 105
     // src0 slice + f32 sorted tokens). Larger batches (prefill) fall through to
     // the dequant fallback. Returns false (=> fall through) if unregistered.
-    // DFLASH_MIX_FUSED=0 forces the dequant->cuBLAS fallback (A/B against the
+    // LUCE_MIX_FUSED=0 forces the dequant->cuBLAS fallback (A/B against the
     // fused path on the same binary). Default on.
     static const bool mix_fused_on = []() {
-        const char * e = getenv("DFLASH_MIX_FUSED");
+        const char * e = getenv("LUCE_MIX_FUSED");
         return e ? atoi(e) != 0 : true;
     }();
     if (mix_fused_on && is_rocmfp3_mix && !split
@@ -3038,7 +3052,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     static const bool mmid_telemetry = []() {
-        const char * value = std::getenv("DFLASH_MMID_TELEMETRY");
+        const char * value = std::getenv("LUCE_MMID_TELEMETRY");
         return value != nullptr && std::strcmp(value, "0") != 0;
     }();
     const int mmvq_mmid_max = ggml_is_quantized(src0->type)
@@ -3597,6 +3611,34 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FLASH_ATTN_SPARSE:
             ggml_cuda_flash_attn_sparse(ctx, dst);
             break;
+        case GGML_OP_MUL_MAT_BIAS_BF16:
+#if defined(GGML_HIP_DS4V_VISION)
+            ggml_hip_vision_bias(ctx, dst);
+            break;
+#else
+            return false;
+#endif
+        case GGML_OP_RMS_NORM_VISION_F32:
+#if defined(GGML_HIP_DS4V_VISION)
+            ggml_hip_vision_norm(ctx, dst);
+            break;
+#else
+            return false;
+#endif
+        case GGML_OP_SOFT_MAX_VISION_F32:
+#if defined(GGML_HIP_DS4V_VISION)
+            ggml_cuda_op_soft_max_vision_f32(ctx, dst);
+            break;
+#else
+            return false;
+#endif
+        case GGML_OP_MUL_MAT_VISION_AV_F32:
+#if defined(GGML_HIP_DS4V_VISION)
+            ggml_hip_vision_av_f32(ctx, dst);
+            break;
+#else
+            return false;
+#endif
         case GGML_OP_PAGED_ATTN:
             ggml_cuda_paged_attn(ctx, dst);
             break;
@@ -3878,13 +3920,17 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
     static const bool mmid_telemetry = []() {
-        const char * value = std::getenv("DFLASH_MMID_TELEMETRY");
+        const char * value = std::getenv("LUCE_MMID_TELEMETRY");
         return value != nullptr && std::strcmp(value, "0") != 0;
     }();
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        // These explicit vision operations are qualified through direct
+        // execution only; the linear also retains a workspace and event.
+        if (node->op == GGML_OP_MUL_MAT_BIAS_BF16 || node->op == GGML_OP_RMS_NORM_VISION_F32 ||
+            node->op == GGML_OP_SOFT_MAX_VISION_F32 || node->op == GGML_OP_MUL_MAT_VISION_AV_F32) return false;
 
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
@@ -6523,6 +6569,30 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_FLASH_ATTN_SPARSE:
             return true;  // Always supported on CUDA
+        case GGML_OP_MUL_MAT_BIAS_BF16:
+#if defined(GGML_HIP_DS4V_VISION)
+            return ggml_hip_vision_bias_supported(op);
+#else
+            return false;
+#endif
+        case GGML_OP_RMS_NORM_VISION_F32:
+#if defined(GGML_HIP_DS4V_VISION)
+            return ggml_hip_vision_norm_supported(dev_ctx->device, op);
+#else
+            return false;
+#endif
+        case GGML_OP_SOFT_MAX_VISION_F32:
+#if defined(GGML_HIP_DS4V_VISION)
+            return ggml_hip_vision_softmax_f32_supported(dev_ctx->device, op);
+#else
+            return false;
+#endif
+        case GGML_OP_MUL_MAT_VISION_AV_F32:
+#if defined(GGML_HIP_DS4V_VISION)
+            return ggml_hip_vision_av_f32_supported(dev_ctx->device, op);
+#else
+            return false;
+#endif
         case GGML_OP_PAGED_ATTN:
             return ggml_cuda_paged_attn_supported(op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
@@ -6700,7 +6770,66 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#if defined(GGML_HIP_DS4V_VISION)
+static size_t ggml_backend_hip_vision_bias_bf16_workspace(ggml_backend_t backend) {
+    return backend && ggml_backend_is_cuda(backend) ? 76ULL*1024*1024 : 0;
+}
+static size_t ggml_backend_hip_vision_bias_bf16_launches(ggml_backend_t backend) {
+    return backend && ggml_backend_is_cuda(backend) ?
+        static_cast<ggml_backend_cuda_context *>(backend->context)->vision_bias_launches : 0;
+}
+static bool ggml_backend_hip_vision_norm_f32_capable(ggml_backend_t backend) {
+    return backend && ggml_backend_is_cuda(backend) &&
+        ggml_hip_vision_norm_capable(static_cast<ggml_backend_cuda_context *>(backend->context)->device);
+}
+static size_t ggml_backend_hip_vision_norm_f32_launches(ggml_backend_t backend) {
+    return backend && ggml_backend_is_cuda(backend) ?
+        static_cast<ggml_backend_cuda_context *>(backend->context)->vision_norm_launches : 0;
+}
+static bool ggml_backend_hip_vision_softmax_f32_capable(ggml_backend_t backend) {
+    return ggml_backend_hip_vision_norm_f32_capable(backend);
+}
+static size_t ggml_backend_hip_vision_softmax_f32_launches(ggml_backend_t backend) {
+    return backend && ggml_backend_is_cuda(backend) ?
+        static_cast<ggml_backend_cuda_context *>(backend->context)->vision_softmax_launches : 0;
+}
+static bool ggml_backend_hip_vision_av_f32_capable(ggml_backend_t backend) {
+    return ggml_backend_hip_vision_norm_f32_capable(backend);
+}
+static size_t ggml_backend_hip_vision_av_f32_launches(ggml_backend_t backend) {
+    return backend && ggml_backend_is_cuda(backend) ?
+        static_cast<ggml_backend_cuda_context *>(backend->context)->vision_av_launches : 0;
+}
+static bool ggml_backend_hip_vision_rotary_f32_capable(ggml_backend_t backend) {
+    return ggml_backend_hip_vision_norm_f32_capable(backend);
+}
+static bool ggml_backend_hip_vision_rotary_f32(ggml_backend_t backend, int64_t height, int64_t width,
+                                            float * cosine, float * sine) {
+    return ggml_backend_hip_vision_rotary_f32_capable(backend) &&
+        ggml_hip_vision_rotary(*static_cast<ggml_backend_cuda_context *>(backend->context),
+                              height, width, cosine, sine);
+}
+static size_t ggml_backend_hip_vision_rotary_f32_launches(ggml_backend_t backend) {
+    return backend && ggml_backend_is_cuda(backend) ?
+        static_cast<ggml_backend_cuda_context *>(backend->context)->vision_rotary_launches : 0;
+}
+
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+#if defined(GGML_HIP_DS4V_VISION)
+    if (strcmp(name,"ggml_backend_hip_vision_bias_bf16_workspace")==0) return (void *)ggml_backend_hip_vision_bias_bf16_workspace;
+    if (strcmp(name,"ggml_backend_hip_vision_bias_bf16_launches")==0) return (void *)ggml_backend_hip_vision_bias_bf16_launches;
+    if (strcmp(name,"ggml_backend_hip_vision_norm_f32_capable")==0) return (void *)ggml_backend_hip_vision_norm_f32_capable;
+    if (strcmp(name,"ggml_backend_hip_vision_norm_f32_launches")==0) return (void *)ggml_backend_hip_vision_norm_f32_launches;
+    if (strcmp(name,"ggml_backend_hip_vision_softmax_f32_capable")==0) return (void *)ggml_backend_hip_vision_softmax_f32_capable;
+    if (strcmp(name,"ggml_backend_hip_vision_softmax_f32_launches")==0) return (void *)ggml_backend_hip_vision_softmax_f32_launches;
+    if (strcmp(name,"ggml_backend_hip_vision_av_f32_capable")==0) return (void *)ggml_backend_hip_vision_av_f32_capable;
+    if (strcmp(name,"ggml_backend_hip_vision_av_f32_launches")==0) return (void *)ggml_backend_hip_vision_av_f32_launches;
+    if (strcmp(name,"ggml_backend_hip_vision_rotary_f32_capable")==0) return (void *)ggml_backend_hip_vision_rotary_f32_capable;
+    if (strcmp(name,"ggml_backend_hip_vision_rotary_f32")==0) return (void *)ggml_backend_hip_vision_rotary_f32;
+    if (strcmp(name,"ggml_backend_hip_vision_rotary_f32_launches")==0) return (void *)ggml_backend_hip_vision_rotary_f32_launches;
+#endif
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

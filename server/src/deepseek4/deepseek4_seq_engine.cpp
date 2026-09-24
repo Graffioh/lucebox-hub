@@ -10,7 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 std::vector<PagedKvTensor> ds4_paged_kv_planes(const DeepSeek4PagedCache & cache) {
@@ -102,7 +102,7 @@ void DeepSeek4SeqEngine::fail_prefill(
 SeqEngine::StepResult DeepSeek4SeqEngine::step(const StepPlan & plan) {
     using Clock = std::chrono::steady_clock;
     const auto phase_t0 = Clock::now();
-    const char * timing_env = std::getenv("DFLASH_DS4_TIMING");
+    const char * timing_env = std::getenv("LUCE_DS4_TIMING");
     const bool timing = timing_env && *timing_env && std::strcmp(timing_env, "0") != 0;
     DeepSeek4StepTelemetry telemetry;
     StepResult result;
@@ -376,4 +376,4 @@ void DeepSeek4SeqEngine::retire(int slot) {
     std::fill_n(host_tables_.data() + (size_t)slot * stride_, stride_, -1);
 }
 
-} // namespace dflash::common
+} // namespace luce::common

@@ -2,7 +2,7 @@
 
 All numbers: single RTX 3090 (24 GB), Qwen3.6-27B Q4_K_M target, Q8_0 KV,
 Qwen3-0.6B pflash drafter as the scorer. June 2026, `test_kvflash` +
-`dflash_server` + `harness/benchmarks`.
+`luce_server` + `harness/benchmarks`.
 
 ## End-to-end long-prompt A/B (`--longab`; needle depth 0.25, 240-token timed free run)
 

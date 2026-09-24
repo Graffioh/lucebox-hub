@@ -8,9 +8,9 @@
 #include "common/layer_split_utils.h"
 #include "common/layer_split_runtime.h"
 #include "common/target_shard_ipc_daemon.h"
-#include "dflash27b.h"
+#include "luce.h"
 #include "placement/placement_backend.h"
-#include "qwen3/qwen3_kvflash_scorer.h"
+#include "pflash/kvflash_drafter_scorer.h"
 
 #include "ggml-cuda.h"
 
@@ -21,7 +21,7 @@
 #include <limits>
 #include <utility>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -145,7 +145,7 @@ bool Gemma4LayerSplitAdapter::init() {
                                       plan, shard.weights)) {
             std::fprintf(stderr,
                 "[gemma4-target-split] load gpu=%d: %s\n",
-                shard.gpu, dflash27b_last_error());
+                shard.gpu, luce_last_error());
             return false;
         }
     }
@@ -165,7 +165,7 @@ bool Gemma4LayerSplitAdapter::init() {
                                          shard.cache, kvflash_tokens_)) {
             std::fprintf(stderr,
                 "[gemma4-target-split] cache gpu=%d: %s\n",
-                shard.gpu, dflash27b_last_error());
+                shard.gpu, luce_last_error());
             return false;
         }
         shard.cache.fa_window = cfg_.fa_window;
@@ -259,7 +259,7 @@ bool Gemma4LayerSplitAdapter::init_mixed_target_split() {
                                       plan, shard.weights)) {
             std::fprintf(stderr,
                 "[gemma4-target-split] mixed local load gpu=%d: %s\n",
-                shard.gpu, dflash27b_last_error());
+                shard.gpu, luce_last_error());
             return false;
         }
     }
@@ -279,7 +279,7 @@ bool Gemma4LayerSplitAdapter::init_mixed_target_split() {
                                          shard.cache, kvflash_tokens_)) {
             std::fprintf(stderr,
                 "[gemma4-target-split] mixed local cache gpu=%d: %s\n",
-                shard.gpu, dflash27b_last_error());
+                shard.gpu, luce_last_error());
             return false;
         }
         shard.cache.fa_window = cfg_.fa_window;
@@ -332,7 +332,7 @@ bool Gemma4LayerSplitAdapter::init_mixed_target_split() {
 }
 
 void Gemma4LayerSplitAdapter::kvflash_read_config() {
-    if (!std::getenv("DFLASH_KVFLASH") || shards_.empty()) return;
+    if (!std::getenv("LUCE_KVFLASH") || shards_.empty()) return;
     kvflash_drafter_path_ = kvflash_find_drafter(cfg_.target_path.c_str());
 
     int64_t min_free = std::numeric_limits<int64_t>::max();
@@ -367,7 +367,7 @@ void Gemma4LayerSplitAdapter::kvflash_read_config() {
         cfg_.device.max_ctx, KvFlashConfig{},
         !kvflash_drafter_path_.empty(), budget);
     if (kvflash_tokens_ > 0) {
-        const char * tau = std::getenv("DFLASH_KVFLASH_TAU");
+        const char * tau = std::getenv("LUCE_KVFLASH_TAU");
         kvflash_tau_ = std::max(1, tau ? std::atoi(tau) : 64);
     }
 }
@@ -410,7 +410,7 @@ bool Gemma4LayerSplitAdapter::kvflash_attach() {
                 kvflash_tau_,
                 !kvflash_drafter_path_.empty()
                     ? "drafter/cross-tok (attaches on first reselect)"
-                    : "lru (recency-only: no Qwen3-0.6B drafter found)");
+                    : "lru (recency-only: no Qwen3.5-0.8B drafter found)");
     std::fflush(stdout);
     return true;
 }
@@ -454,7 +454,7 @@ void Gemma4LayerSplitAdapter::kvflash_maybe_reselect(int generated) {
                 std::fprintf(stderr,
                     "[gemma4-target-split][kvflash] drafter load failed (%s); "
                     "staying on LRU residency\n",
-                    dflash27b_last_error());
+                    luce_last_error());
                 kvflash_drafter_failed_ = true;
                 return;
             }
@@ -518,7 +518,7 @@ bool Gemma4LayerSplitAdapter::run_forward(
     const int hidden = ref.n_embd;
     const int n_tokens_total = (int)tokens.size();
     int ubatch = cfg_.chunk > 0 ? cfg_.chunk : 512;
-    if (const char * e = std::getenv("DFLASH_GEMMA4_LAYER_SPLIT_UBATCH")) {
+    if (const char * e = std::getenv("LUCE_GEMMA4_LAYER_SPLIT_UBATCH")) {
         ubatch = std::max(1, std::atoi(e));
     }
 
@@ -769,7 +769,7 @@ bool Gemma4LayerSplitAdapter::run_mixed_forward(
     const int hidden = ref.n_embd;
     const int n_tokens_total = (int)tokens.size();
     int ubatch = cfg_.chunk > 0 ? cfg_.chunk : 512;
-    if (const char * e = std::getenv("DFLASH_GEMMA4_LAYER_SPLIT_UBATCH")) {
+    if (const char * e = std::getenv("LUCE_GEMMA4_LAYER_SPLIT_UBATCH")) {
         ubatch = std::max(1, std::atoi(e));
     }
     if (base_pos < 0 || base_pos + n_tokens_total > cfg_.device.max_ctx) {
@@ -1240,7 +1240,7 @@ int Gemma4LayerSplitAdapter::current_last_token() const {
 void Gemma4LayerSplitAdapter::shutdown() {
     kvflash_scorer_.reset();
     if (kvflash_drafter_loaded_) {
-        dflash::common::free_drafter(kvflash_drafter_);
+        luce::common::free_drafter(kvflash_drafter_);
         kvflash_drafter_loaded_ = false;
     }
     for (int i = 0; i < PREFIX_SLOTS; ++i) snapshot_free(i);
@@ -1331,7 +1331,7 @@ int run_gemma4_target_shard_ipc_daemon(const char * target_path,
                                          kvflash_pool_tokens)) {
             std::fprintf(stderr,
                 "[gemma4-target-shard-daemon] load/cache failed gpu=%d: %s\n",
-                shard.gpu, dflash27b_last_error());
+                shard.gpu, luce_last_error());
             free_gemma4_layer_split_shards(shards);
             return 1;
         }
@@ -1765,4 +1765,4 @@ int run_gemma4_target_shard_ipc_daemon(const char * target_path,
 #endif
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

@@ -1,6 +1,6 @@
 # paged_attn_wmma — handoff
 
-Status: LANDED, env-gated (`DFLASH27B_PAGED_WMMA`, default off), RDNA4-only.
+Status: LANDED, env-gated (`LUCE_PAGED_WMMA`, default off), RDNA4-only.
 Stage-1 kernel: `paged_attn_wmma` in `paged-attn.cu`, a paged port of the
 contiguous `fattn-mma-f16.cuh` machinery. This file keeps the non-obvious
 invariants, the bug classes already hit, and the qualification state. Read the
@@ -88,7 +88,7 @@ Build with the ROCm CI flags, then run both routes and the comparator:
 
 ```
 ctest -R '^test_paged_attn_wmma$'                     # V_DOT2
-ctest -R '^paged_attn_wmma_route$'                    # DFLASH27B_PAGED_WMMA=1
+ctest -R '^paged_attn_wmma_route$'                    # LUCE_PAGED_WMMA=1
 python3 server/test/compare_paged_attn.py \
     paged_attn_out_vdot2.bin paged_attn_out_wmma.bin
 ```

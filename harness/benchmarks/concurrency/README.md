@@ -22,7 +22,7 @@ harness/benchmarks/concurrency/run_qwen36_canonical_concurrency.sh
 It runs paged concurrent AR by default. Set `VARIANTS=blog-ddtree` and provide
 `DRAFT_MODEL` to opt into the Strix Halo decode recipe from the AMD post:
 the Q8_0 Qwen3.6 drafter,
-`DFLASH27B_DRAFT_SWA=2048`, `--ddtree-budget 22`, `--fast-rollback`, and 128
+`LUCE_DRAFT_SWA=2048`, `--ddtree-budget 22`, `--fast-rollback`, and 128
 forced output tokens. Adaptive fallback is disabled so every eligible decode
 step measures the speculative path. It intentionally keeps paged attention on,
 including at C=1, because the goal is to compare the concurrent implementation
@@ -133,7 +133,7 @@ Run a quick screening repeat:
 MODEL=/path/to/Qwen3.6-27B-Q4_K_M.gguf \
 GPU_DEVICE=1 \
 EXPECTED_GPU_ARCH=gfx1151 \
-LUCE_SERVER_BIN=server/build-hip/dflash_server \
+LUCE_SERVER_BIN=server/build-hip/luce_server \
 LLAMA_SERVER_BIN=/path/to/llama-server \
 harness/benchmarks/concurrency/run_qwen36_concurrency.sh
 ```
@@ -144,7 +144,7 @@ Run a decode-heavy comparison with the same harness:
 MODEL=/path/to/Qwen3.6-27B-Q4_K_M.gguf \
 GPU_DEVICE=1 \
 EXPECTED_GPU_ARCH=gfx1151 \
-LUCE_SERVER_BIN=server/build-hip/dflash_server \
+LUCE_SERVER_BIN=server/build-hip/luce_server \
 LLAMA_SERVER_BIN=/path/to/llama-server \
 WORKLOADS=short MAX_TOKENS=256 VARIANTS=luce-k8,llama REPEATS=3 \
 harness/benchmarks/concurrency/run_qwen36_concurrency.sh
@@ -173,7 +173,7 @@ The upper bound is the largest currently effective K8 pure-prefill batch:
 eight packed lanes times the 2048-token per-sequence cap. Both runners inject
 the resolved value into Luce AR/DDTree launches and record it in metadata;
 synthetic llama metadata records `null`, and llama never receives the
-`DFLASH_IDLE_PREFILL_TOKENS` environment variable.
+`LUCE_IDLE_PREFILL_TOKENS` environment variable.
 
 Values above 4096 pair with a positive `PREFILL_FIRST_BURST_STEPS`: the burst
 creates prefill-only traversal opportunities while the larger idle budget

@@ -1,6 +1,8 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "../deps/llama.cpp/ggml/src/ggml-backend-impl.h"
+#include "deepseek4/deepseek4_image_admission.h"
 #include "ggml-cpu.h"
 #include "../deps/llama.cpp/ggml/src/ggml-cuda/ds4-causal.h"
 #if defined(GGML_USE_HIP)
@@ -47,7 +49,7 @@
 #include "deepseek4/deepseek4_layer_split_adapter.h"
 #undef private
 
-using namespace dflash::common;
+using namespace luce::common;
 
 static int g_failures = 0;
 
@@ -234,6 +236,15 @@ struct DeepSeek4FixtureOptions {
     gguf_type compress_ratios_type = GGUF_TYPE_UINT32;
     int32_t eos_id = -1;
     int32_t eot_id = -1;
+    uint32_t block_count = 43;
+    bool image_biases = false;
+    int missing_image_bias = -1;
+    int malformed_image_bias = -1;
+    ggml_type image_bias_type = GGML_TYPE_F32;
+    int image_bias_width = 256;
+    int image_bias_rows = 1;
+    bool add_mtp_image_bias = false;
+    bool llama_cpp_image_bias_names = false;  // "blk.N.exp_probs_b_vl.bias"
 };
 
 static std::string make_temp_gguf_path(const char * prefix) {
@@ -249,7 +260,7 @@ static std::string make_temp_gguf_path(const char * prefix) {
 static std::string write_deepseek4_loader_fixture(const DeepSeek4FixtureOptions & opts) {
     gguf_context * g = gguf_init_empty();
     gguf_set_val_str(g, "general.architecture", "deepseek4");
-    gguf_set_val_u32(g, "deepseek4.block_count", 43);
+    gguf_set_val_u32(g, "deepseek4.block_count", opts.block_count);
     gguf_set_val_u32(g, "deepseek4.embedding_length", 4096);
     if (opts.include_vocab_size) {
         gguf_set_val_u32(g, "deepseek4.vocab_size", opts.vocab_size);
@@ -304,9 +315,31 @@ static std::string write_deepseek4_loader_fixture(const DeepSeek4FixtureOptions 
         gguf_set_val_u32(g, "tokenizer.ggml.eot_token_id", (uint32_t)opts.eot_id);
     }
 
+    ggml_context * tensor_ctx = nullptr;
+    if (opts.image_biases) {
+        tensor_ctx = ggml_init({1u << 20, nullptr, false});
+        for (int layer = 0; layer < (opts.add_mtp_image_bias ? 44 : 43); ++layer) {
+            if (layer == opts.missing_image_bias) continue;
+            const bool malformed = layer == opts.malformed_image_bias;
+            ggml_tensor * bias = ggml_new_tensor_2d(tensor_ctx,
+                malformed ? opts.image_bias_type : GGML_TYPE_F32,
+                malformed ? opts.image_bias_width : 256,
+                malformed ? opts.image_bias_rows : 1);
+            const std::string name = opts.llama_cpp_image_bias_names
+                ? "blk." + std::to_string(layer) + ".exp_probs_b_vl.bias"
+                : "layers." + std::to_string(layer) + ".ffn.gate.bias_vl";
+            ggml_set_name(bias, name.c_str());
+            std::memset(bias->data, 0, ggml_nbytes(bias));
+            if (bias->type == GGML_TYPE_F32) {
+                std::fill_n(static_cast<float *>(bias->data), ggml_nelements(bias), float(layer + 1));
+            }
+            gguf_add_tensor(g, bias);
+        }
+    }
     const std::string path = make_temp_gguf_path("fixture");
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
     gguf_free(g);
+    if (tensor_ctx) ggml_free(tensor_ctx);
     return path;
 }
 
@@ -1531,6 +1564,323 @@ struct ScopedEnvVar {
     std::string old_value;
 };
 
+// Metadata-only device: every allocation/graph callback is a test failure.
+struct ImageAdmissionFakeOwner {
+    ggml_backend_buffer_type buft{};
+    ggml_backend_device device{};
+    ggml_backend backend{};
+    size_t alignment = 128;
+    size_t padding = 64;
+    size_t maximum = SIZE_MAX;
+    size_t forced_allocation = 0;
+    size_t free_bytes = 8ULL * 1024 * 1024 * 1024;
+    size_t total_bytes = 8ULL * 1024 * 1024 * 1024;
+    size_t queries = 0;
+    size_t allocation_calls = 0;
+    size_t graph_calls = 0;
+
+    ImageAdmissionFakeOwner() {
+        buft.context = this;
+        buft.device = &device;
+        buft.iface.get_name = [](ggml_backend_buffer_type_t) { return "image-admission-fake"; };
+        buft.iface.get_alignment = [](ggml_backend_buffer_type_t b) {
+            return static_cast<ImageAdmissionFakeOwner *>(b->context)->alignment;
+        };
+        buft.iface.get_max_size = [](ggml_backend_buffer_type_t b) {
+            return static_cast<ImageAdmissionFakeOwner *>(b->context)->maximum;
+        };
+        buft.iface.get_alloc_size = [](ggml_backend_buffer_type_t b, const ggml_tensor * t) {
+            auto & owner = *static_cast<ImageAdmissionFakeOwner *>(b->context);
+            ++owner.queries;
+            return owner.forced_allocation ? owner.forced_allocation : ggml_nbytes(t) + owner.padding;
+        };
+        buft.iface.alloc_buffer = [](ggml_backend_buffer_type_t b, size_t) -> ggml_backend_buffer_t {
+            ++static_cast<ImageAdmissionFakeOwner *>(b->context)->allocation_calls;
+            TEST_ASSERT_MSG(false, "admission must not allocate a device buffer");
+            return nullptr;
+        };
+        device.context = this;
+        device.iface.get_type = [](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; };
+        device.iface.get_buffer_type = [](ggml_backend_dev_t d) {
+            return &static_cast<ImageAdmissionFakeOwner *>(d->context)->buft;
+        };
+        device.iface.get_memory = [](ggml_backend_dev_t d, size_t * free, size_t * total) {
+            const auto & owner = *static_cast<ImageAdmissionFakeOwner *>(d->context);
+            *free = owner.free_bytes;
+            *total = owner.total_bytes;
+        };
+        backend.device = &device;
+        backend.context = this;
+        backend.iface.graph_compute = [](ggml_backend_t b, ggml_cgraph *) {
+            ++static_cast<ImageAdmissionFakeOwner *>(b->context)->graph_calls;
+            TEST_ASSERT_MSG(false, "admission must not execute a graph");
+            return GGML_STATUS_FAILED;
+        };
+    }
+};
+
+static void test_image_storage_admission_metadata() {
+    std::fprintf(stderr, "test_image_storage_admission_metadata...");
+    using namespace luce::vision;
+    ScopedEnvVar duplicate_env("LUCE_MOE_DUPLICATE_HOT_ON_COLD");
+    ScopedEnvVar decode_env("LUCE_DS4_DECODE_ALL_COLD");
+    unsetenv("LUCE_MOE_DUPLICATE_HOT_ON_COLD");
+    unsetenv("LUCE_DS4_DECODE_ALL_COLD");
+    ggml_init_params params{};
+    params.mem_size = 1024 * 1024;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    TEST_ASSERT(ctx != nullptr);
+    if (!ctx) return;
+    DeepSeek4Weights weights;
+    weights.n_layer = 1;
+    weights.n_expert = 4;
+    weights.n_expert_used = 2;
+    weights.n_embd = 128;
+    weights.n_ff_exp = 128;
+    weights.layers.resize(1);
+    auto & layer = weights.layers[0];
+    layer.ffn_gate_exps = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_1_ROCMFP2_MIX, 128, 128, 4);
+    layer.ffn_up_exps = ggml_new_tensor_3d(ctx, GGML_TYPE_Q2_1_ROCMFP2_MIX, 128, 128, 4);
+    layer.ffn_down_exps = ggml_new_tensor_3d(ctx, GGML_TYPE_Q3_1_ROCMFP3_MIX, 128, 128, 4);
+    MoeHybridConfig config;
+    config.n_layer = 1;
+    config.n_expert = 4;
+    config.n_expert_used = 2;
+    config.n_embd = 128;
+    config.n_ff_exp = 128;
+    config.cold_expert_backend = MoeHybridColdBackend::Gpu;
+    MoeHybridPlacement placement;
+    placement.n_layer = 1;
+    placement.n_expert = 4;
+    placement.n_expert_used = 2;
+    placement.total_hot = 1;
+    placement.hot_counts = {1};
+    placement.hot_expert_ids = {{2}};
+    ImageAdmissionFakeOwner hot, cold;
+    cold.alignment = 256;
+    cold.padding = 257;
+    std::string error;
+    ImageStorageEstimate initial;
+    TEST_ASSERT(estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, initial, error));
+    // Pinned qtype-106 and105 formats occupy10 and14 bytes per32 weights.
+    // Three128x128 surfaces occupy5120+5120+7168 bytes per expert.
+    TEST_ASSERT(initial.hot_payload_bytes == 17408);
+    TEST_ASSERT(initial.cold_payload_bytes == 3 * 17408);
+    TEST_ASSERT(initial.hot_allocation_bytes == 17408 + 3 * 128);
+    TEST_ASSERT(initial.cold_allocation_bytes == 3 * 17408 + 3 * 512);
+    TEST_ASSERT(initial.hot_mix_table_bytes == 17 + 17 + 33);
+    TEST_ASSERT(initial.cold_mix_table_bytes == 3 * (17 + 17 + 33));
+    TEST_ASSERT(initial.mix_device_allocation_count == 12);
+    TEST_ASSERT(initial.largest_copy_bytes == 3 * 7168);
+    TEST_ASSERT(initial.host_copy_peak_bytes == 3 * initial.largest_copy_bytes);
+    TEST_ASSERT(initial.host_mix_payload_peak_bytes == 34 * 4 + 33 * 3 + 4);
+    TEST_ASSERT(initial.hot_buffer_count == 1 && initial.cold_buffer_count == 1);
+    TEST_ASSERT(hot.queries == 3 && cold.queries == 3);
+
+    // Changing the actual allocator's maximum splits buffers without losing
+    // padding charges or pretending the whole layer must fit one allocation.
+    hot.maximum = 10000;
+    cold.maximum = 23000;
+    ImageStorageEstimate split;
+    TEST_ASSERT(estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, split, error));
+    TEST_ASSERT(split.hot_buffer_count == 3 && split.cold_buffer_count == 3);
+    TEST_ASSERT(split.hot_allocation_bytes == initial.hot_allocation_bytes);
+    TEST_ASSERT(split.cold_allocation_bytes == initial.cold_allocation_bytes);
+    cold.maximum = 22015; // one byte below the padded down-expert allocation
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, split, error));
+    hot.maximum = cold.maximum = SIZE_MAX;
+    cold.forced_allocation = SIZE_MAX;
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, split, error));
+    TEST_ASSERT(error.find("allocation size") != std::string::npos);
+    cold.forced_allocation = 0;
+
+    setenv("LUCE_MOE_DUPLICATE_HOT_ON_COLD", "1", 1);
+    ImageStorageEstimate duplicated;
+    TEST_ASSERT(estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, true, duplicated, error));
+    TEST_ASSERT(duplicated.hot_payload_bytes == initial.hot_payload_bytes);
+    TEST_ASSERT(duplicated.cold_payload_bytes == initial.hot_payload_bytes + initial.cold_payload_bytes);
+    TEST_ASSERT(duplicated.cold_mix_table_bytes == 4 * (17 + 17 + 33));
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, duplicated, error));
+    unsetenv("LUCE_MOE_DUPLICATE_HOT_ON_COLD");
+    setenv("LUCE_DS4_DECODE_ALL_COLD", "1", 1);
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, split, error));
+    unsetenv("LUCE_DS4_DECODE_ALL_COLD");
+
+    placement.total_hot = 0;
+    placement.hot_counts = {0};
+    placement.hot_expert_ids = {{}};
+    TEST_ASSERT(estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, split, error));
+    TEST_ASSERT(split.hot_payload_bytes == 0 && split.hot_mix_table_bytes == 0);
+    TEST_ASSERT(split.cold_payload_bytes == initial.hot_payload_bytes + initial.cold_payload_bytes);
+    TEST_ASSERT(split.cold_mix_table_bytes == 4 * 67);
+    placement.total_hot = 1;
+    placement.hot_counts = {1};
+    placement.hot_expert_ids = {{2}};
+    const int64_t original_experts = layer.ffn_gate_exps->ne[2];
+    layer.ffn_gate_exps->ne[2] = 3;
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, split, error));
+    layer.ffn_gate_exps->ne[2] = original_experts;
+    const size_t original_stride = layer.ffn_gate_exps->nb[2];
+    ++layer.ffn_gate_exps->nb[2];
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, split, error));
+    layer.ffn_gate_exps->nb[2] = original_stride;
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &hot.backend, false, split, error));
+    config.materialize_cold_experts = false;
+    TEST_ASSERT(!estimate_deepseek4_image_storage(weights, placement, config,
+        &hot.backend, &cold.backend, false, split, error));
+    config.materialize_cold_experts = true;
+
+    // Actual wrapper sees the fake device's exhausted snapshot. It cannot pass
+    // regardless of the machine's memory; no positive case reads /proc. The
+    // fake is dedicated memory: a host-shared device is also credited with the
+    // GPU driver's page pool, which depends on the machine running the test.
+    ImageAdmissionReserves reserves;
+    reserves.primary_domain = ImageMemoryDomain::Dedicated;
+    reserves.cold_domain = ImageMemoryDomain::Dedicated;
+    reserves.cold_runtime_reservation_bytes = 2ULL * 1024 * 1024 * 1024;
+    reserves.host_request_bytes = 1024 * 1024;
+    reserves.host_loader_overhead_bytes = 1024 * 1024;
+    cold.free_bytes = 0;
+    ImageAdmissionReport report;
+    TEST_ASSERT(!check_deepseek4_image_admission(weights, placement, config,
+        &hot.backend, &cold.backend, reserves, report, error));
+    TEST_ASSERT(report.storage_estimated && !report.known_charges_fit);
+    TEST_ASSERT(report.cold_free_bytes == 0);
+    TEST_ASSERT(!check_deepseek4_image_runtime_admission(config,
+        &hot.backend, &cold.backend, reserves, report, error));
+    TEST_ASSERT(report.storage.hot_allocation_bytes == 0 && report.storage.cold_allocation_bytes == 0);
+    TEST_ASSERT(report.cold_required_bytes == reserves.cold_runtime_reservation_bytes);
+    TEST_ASSERT(!check_deepseek4_image_host_preparation(0, error));
+    TEST_ASSERT(!check_deepseek4_image_host_preparation(std::numeric_limits<uint64_t>::max(), error));
+    TEST_ASSERT(hot.allocation_calls == 0 && cold.allocation_calls == 0);
+    TEST_ASSERT(hot.graph_calls == 0 && cold.graph_calls == 0);
+    ggml_free(ctx);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_image_admission_resource_snapshots() {
+    std::fprintf(stderr, "test_image_admission_resource_snapshots...");
+    using namespace luce::vision;
+    ImageStorageEstimate storage;
+    storage.hot_allocation_bytes = 100;
+    storage.cold_allocation_bytes = 300;
+    storage.hot_mix_table_bytes = 10;
+    storage.cold_mix_table_bytes = 30;
+    storage.host_copy_peak_bytes = 50;
+    storage.host_mix_payload_peak_bytes = 5;
+    ImageAdmissionReserves reserves;
+    reserves.primary_domain = ImageMemoryDomain::Dedicated;
+    reserves.cold_domain = ImageMemoryDomain::HostShared;
+    reserves.primary_future_bytes = 20;
+    reserves.cold_future_bytes = 40;
+    reserves.cold_runtime_reservation_bytes = 200;
+    reserves.host_loader_overhead_bytes = 15;
+    reserves.host_request_bytes = 100;
+    reserves.host_runtime_bytes = 7;
+    ImageMemorySnapshot snapshot{130, 570, 677};
+    ImageAdmissionReport report;
+    std::string error;
+    const auto assess = [&]() {
+        return assess_deepseek4_image_admission(storage, 150, reserves, snapshot, report, error);
+    };
+    TEST_ASSERT(assess());
+    TEST_ASSERT(report.primary_required_bytes == 130 && report.cold_required_bytes == 570);
+    TEST_ASSERT(report.host_required_bytes == 677); // max(load70,request100)+runtime7+UMA570
+    --snapshot.host_available_bytes;
+    TEST_ASSERT(!assess()); // independent device checks would both pass
+    TEST_ASSERT(!report.known_charges_fit);
+    snapshot.host_available_bytes = 677;
+    --snapshot.cold_free_bytes;
+    TEST_ASSERT(!assess());
+    snapshot.cold_free_bytes = 570;
+    --snapshot.primary_free_bytes;
+    TEST_ASSERT(!assess());
+    snapshot.primary_free_bytes = 130;
+    reserves.cold_domain = ImageMemoryDomain::Dedicated;
+    snapshot.host_available_bytes = 107;
+    TEST_ASSERT(assess()); // dedicated VRAM must not also consume host admission
+    reserves.primary_domain = ImageMemoryDomain::HostShared;
+    reserves.cold_domain = ImageMemoryDomain::HostShared;
+    snapshot.host_available_bytes = 807;
+    TEST_ASSERT(assess());
+    TEST_ASSERT(report.host_required_bytes == 807);
+    --snapshot.host_available_bytes;
+    TEST_ASSERT(!assess());
+    reserves.primary_domain = ImageMemoryDomain::Unknown;
+    TEST_ASSERT(!assess());
+    reserves.primary_domain = ImageMemoryDomain::Dedicated;
+    snapshot.host_available_bytes = 677;
+    reserves.host_request_bytes = 60;
+    TEST_ASSERT(assess());
+    TEST_ASSERT(report.host_required_bytes == 647); // load70 exceeds request60
+    reserves.host_request_bytes = 100;
+    reserves.cold_runtime_reservation_bytes = 149;
+    TEST_ASSERT(!assess());
+    TEST_ASSERT(report.known_charges_fit); // rejection is missing runtime headroom, not physical exhaustion
+    reserves.cold_runtime_reservation_bytes = 200;
+    reserves.host_request_bytes = 0;
+    TEST_ASSERT(!assess());
+    reserves.host_request_bytes = 100;
+    reserves.host_loader_overhead_bytes = 0;
+    TEST_ASSERT(!assess());
+    reserves.host_loader_overhead_bytes = 15;
+
+    // After startup materializes the experts/tables, their bytes disappear
+    // from free memory and from new allocations together. Retained KV/draft
+    // snapshots added later only shrink the next free-memory snapshot.
+    const ImageStorageEstimate resident_storage{};
+    ImageAdmissionReserves runtime_reserves = reserves;
+    runtime_reserves.host_loader_overhead_bytes = 0;
+    ImageMemorySnapshot runtime_snapshot{20, 240, 347};
+    const auto runtime_assess = [&]() {
+        return assess_deepseek4_image_admission(resident_storage, 150,
+            runtime_reserves, runtime_snapshot, report, error);
+    };
+    TEST_ASSERT(runtime_assess());
+    TEST_ASSERT(report.primary_required_bytes == 20 && report.cold_required_bytes == 240);
+    TEST_ASSERT(report.host_required_bytes == 347);
+    --runtime_snapshot.primary_free_bytes;
+    TEST_ASSERT(!runtime_assess());
+    runtime_snapshot.primary_free_bytes = 20;
+    --runtime_snapshot.cold_free_bytes;
+    TEST_ASSERT(!runtime_assess());
+    runtime_snapshot.cold_free_bytes = 240;
+    --runtime_snapshot.host_available_bytes;
+    TEST_ASSERT(!runtime_assess());
+
+    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
+    snapshot = {max, max, max};
+    storage.hot_allocation_bytes = max;
+    TEST_ASSERT(!assess());
+    TEST_ASSERT(error.find("overflow") != std::string::npos);
+    storage.hot_allocation_bytes = 100;
+    storage.host_copy_peak_bytes = max;
+    TEST_ASSERT(!assess());
+    TEST_ASSERT(error.find("overflow") != std::string::npos);
+    storage.host_copy_peak_bytes = 50;
+    reserves.host_request_bytes = max - 100;
+    TEST_ASSERT(!assess()); // UMA sum overflows even though separate device budgets fit
+    TEST_ASSERT(error.find("overflow") != std::string::npos);
+    reserves.host_request_bytes = 100;
+    TEST_ASSERT(assess());
+    TEST_ASSERT(assess_deepseek4_image_admission(report.storage, 150, reserves,
+        snapshot, report, error)); // report may safely be reused without losing its estimate
+    TEST_ASSERT(report.primary_required_bytes == 130);
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
 static void test_verify_raw_mask_spans() {
     std::fprintf(stderr, "  test_verify_raw_mask_spans ...");
     int cases = 0;
@@ -1571,26 +1921,26 @@ static void test_verify_raw_mask_spans() {
 static void test_failed_init_preserves_sparse_opt_in() {
     std::fprintf(stderr, "  test_failed_init_preserves_sparse_opt_in ...\n");
     if (ggml_backend_cuda_get_device_count() == 0) return;
-    ScopedEnvVar spec("DFLASH_DS4_SPEC");
-    ScopedEnvVar draft("DFLASH_DS4_DRAFT");
-    ScopedEnvVar sparse("DFLASH_DS4_SPARSE_DECODE_FLASH");
+    ScopedEnvVar spec("LUCE_DS4_SPEC");
+    ScopedEnvVar draft("LUCE_DS4_DRAFT");
+    ScopedEnvVar sparse("LUCE_DS4_SPARSE_DECODE_FLASH");
     ScopedEnvVar mmvq("LUCE_MMVQ_MAX_NCOLS");
-    setenv("DFLASH_DS4_SPEC", "1", 1);
-    unsetenv("DFLASH_DS4_DRAFT");
+    setenv("LUCE_DS4_SPEC", "1", 1);
+    unsetenv("LUCE_DS4_DRAFT");
     // The removed gfx1151 auto-enable ran in init() BEFORE load_model().
     // Deliberately fail at model loading: even a failed init with no drafter
     // must not change process-wide sparse-verifier policy for the next model.
     // This tests early-init side effects, not successful verifier construction.
     const std::string missing_model = make_temp_gguf_path("missing");
     for (const char * value : {static_cast<const char *>(nullptr), "0", "1"}) {
-        if (value) setenv("DFLASH_DS4_SPARSE_DECODE_FLASH", value, 1);
-        else unsetenv("DFLASH_DS4_SPARSE_DECODE_FLASH");
+        if (value) setenv("LUCE_DS4_SPARSE_DECODE_FLASH", value, 1);
+        else unsetenv("LUCE_DS4_SPARSE_DECODE_FLASH");
         DeepSeek4BackendConfig cfg;
         cfg.model_path = missing_model.c_str();
         cfg.device.gpu = 0;
         DeepSeek4Backend backend(cfg);
         TEST_ASSERT(!backend.init());
-        const char * actual = std::getenv("DFLASH_DS4_SPARSE_DECODE_FLASH");
+        const char * actual = std::getenv("LUCE_DS4_SPARSE_DECODE_FLASH");
         TEST_ASSERT(value ? actual && std::strcmp(actual, value) == 0 : !actual);
     }
 }
@@ -1598,11 +1948,11 @@ static void test_failed_init_preserves_sparse_opt_in() {
 static void test_failed_init_preserves_mix_mmq_policy() {
     std::fprintf(stderr, "  test_failed_init_preserves_mix_mmq_policy ...\n");
     if (ggml_backend_cuda_get_device_count() == 0) return;
-    ScopedEnvVar saved("DFLASH_DS4_MIX_MMQ_PREFILL");
+    ScopedEnvVar saved("LUCE_DS4_MIX_MMQ_PREFILL");
     const std::string missing_model = make_temp_gguf_path("missing-mix-policy");
     for (const char * value : {static_cast<const char *>(nullptr), "0", "1"}) {
-        if (value) setenv("DFLASH_DS4_MIX_MMQ_PREFILL", value, 1);
-        else unsetenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+        if (value) setenv("LUCE_DS4_MIX_MMQ_PREFILL", value, 1);
+        else unsetenv("LUCE_DS4_MIX_MMQ_PREFILL");
         for (auto mode : {PrefillAttentionMode::Sparse, PrefillAttentionMode::Exact}) {
             DeepSeek4BackendConfig cfg;
             cfg.model_path = missing_model.c_str();
@@ -1610,7 +1960,7 @@ static void test_failed_init_preserves_mix_mmq_policy() {
             cfg.prefill_mode = mode;
             DeepSeek4Backend backend(cfg);
             TEST_ASSERT(!backend.init());
-            const char * actual = std::getenv("DFLASH_DS4_MIX_MMQ_PREFILL");
+            const char * actual = std::getenv("LUCE_DS4_MIX_MMQ_PREFILL");
             TEST_ASSERT(value ? actual && std::strcmp(actual, value) == 0 : !actual);
         }
     }
@@ -1671,13 +2021,13 @@ static bool init_snapshot_test_shard(DeepSeek4LayerSplitAdapter & adapter) {
 static void test_auto_split_computation() {
     std::fprintf(stderr, "  test_auto_split_computation ...");
 
-    ScopedEnvVar env_guard("DFLASH_DS4_CUDA_LAYERS");
+    ScopedEnvVar env_guard("LUCE_DS4_CUDA_LAYERS");
     auto adapter = make_test_adapter();
 
-    setenv("DFLASH_DS4_CUDA_LAYERS", "17", 1);
+    setenv("LUCE_DS4_CUDA_LAYERS", "17", 1);
     TEST_ASSERT(adapter.compute_auto_split_layers() == 17);
 
-    unsetenv("DFLASH_DS4_CUDA_LAYERS");
+    unsetenv("LUCE_DS4_CUDA_LAYERS");
     const int estimated =
         DeepSeek4LayerSplitAdapter::estimate_cuda_layers_from_free_bytes(
             20ULL * 1024 * 1024 * 1024);
@@ -1918,9 +2268,10 @@ static void test_loader_rejects_missing_required_metadata(ggml_backend_t backend
     DeepSeek4Weights weights;
     const bool ok = load_deepseek4_gguf(path, backend, weights);
     TEST_ASSERT(!ok);
-    TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
-                        "missing required key: deepseek4.vocab_size") != std::string::npos,
-                    dflash27b_last_error());
+    // The fixture has no tokenizer token list either, so no size can be derived.
+    TEST_ASSERT_MSG(std::string(luce_last_error()).find(
+                        "no vocabulary size") != std::string::npos,
+                    luce_last_error());
     free_deepseek4_weights(weights);
     unlink(path.c_str());
 
@@ -1937,9 +2288,9 @@ static void test_loader_rejects_invalid_compress_ratio_type(ggml_backend_t backe
     DeepSeek4Weights weights;
     const bool ok = load_deepseek4_gguf(path, backend, weights);
     TEST_ASSERT(!ok);
-    TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
+    TEST_ASSERT_MSG(std::string(luce_last_error()).find(
                         "deepseek4.attention.compress_ratios array element type must be i32 or u32") != std::string::npos,
-                    dflash27b_last_error());
+                    luce_last_error());
     free_deepseek4_weights(weights);
     unlink(path.c_str());
 
@@ -1955,9 +2306,9 @@ static void test_loader_rejects_zero_vocab_size(ggml_backend_t backend) {
     DeepSeek4Weights weights;
     const bool ok = load_deepseek4_gguf(path, backend, weights);
     TEST_ASSERT(!ok);
-    TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
-                        "deepseek4.vocab_size must be > 0") != std::string::npos,
-                    dflash27b_last_error());
+    TEST_ASSERT_MSG(std::string(luce_last_error()).find(
+                        "no vocabulary size") != std::string::npos,
+                    luce_last_error());
     free_deepseek4_weights(weights);
     unlink(path.c_str());
 
@@ -1973,7 +2324,7 @@ static void test_loader_reads_tokenizer_special_ids(ggml_backend_t backend) {
     const std::string path = write_deepseek4_loader_fixture(opts);
     DeepSeek4Weights weights;
     const bool ok = load_deepseek4_gguf(path, backend, weights);
-    TEST_ASSERT_MSG(ok, dflash27b_last_error());
+    TEST_ASSERT_MSG(ok, luce_last_error());
     if (ok) {
         TEST_ASSERT(weights.eos_id == 151645);
         TEST_ASSERT(weights.eos_chat_id == 151643);
@@ -1994,7 +2345,7 @@ static void test_loader_rejects_truncated_tensor_data(ggml_backend_t backend) {
     {
         DeepSeek4Weights weights;
         const bool ok = load_deepseek4_gguf(path, backend, weights);
-        TEST_ASSERT_MSG(ok, dflash27b_last_error());
+        TEST_ASSERT_MSG(ok, luce_last_error());
         free_deepseek4_weights(weights);
     }
 
@@ -2008,13 +2359,228 @@ static void test_loader_rejects_truncated_tensor_data(ggml_backend_t backend) {
         DeepSeek4Weights weights;
         const bool ok = load_deepseek4_gguf(path, backend, weights);
         TEST_ASSERT(!ok);
-        TEST_ASSERT_MSG(std::string(dflash27b_last_error()).find(
+        TEST_ASSERT_MSG(std::string(luce_last_error()).find(
                             "truncated or corrupt") != std::string::npos,
-                        dflash27b_last_error());
+                        luce_last_error());
         free_deepseek4_weights(weights);
     }
     unlink(path.c_str());
 
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+
+static void test_image_bias_loader_opt_in_contract(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_image_bias_loader_opt_in_contract ...");
+    DeepSeek4FixtureOptions valid;
+    valid.vocab_size = 129280;
+    valid.image_biases = true;
+    valid.add_mtp_image_bias = true;
+    // Both spellings load: the source checkpoint's and llama.cpp's.
+    for (bool llama_cpp_names : {false, true}) {
+    valid.llama_cpp_image_bias_names = llama_cpp_names;
+    const std::string path = write_deepseek4_loader_fixture(valid);
+    for (bool enabled : {false, true}) {
+        TargetLoadPlan plan;
+        plan.load_ds4_image_bias = enabled;
+        DeepSeek4Weights weights;
+        const bool ok = load_deepseek4_gguf_partial(path, backend, plan, weights);
+        TEST_ASSERT_MSG(ok, luce_last_error());
+        if (ok) {
+            TEST_ASSERT(weights.layers.size() == 43);
+            for (size_t i = 0; i < weights.layers.size(); ++i) {
+                const auto bias = weights.layers[i].ffn_gate_bias_vl;
+                TEST_ASSERT(bool(bias) == enabled);
+                if (bias) {
+                    TEST_ASSERT(bias->type == GGML_TYPE_F32 && ggml_nelements(bias) == 256);
+                    std::vector<float> values(256);
+                    ggml_backend_tensor_get(bias, values.data(), 0, values.size() * sizeof(float));
+                    TEST_ASSERT(std::all_of(values.begin(), values.end(),
+                        [i](float value) { return value == float(i + 1); }));
+                }
+            }
+            if (weights.ctx) {
+                const auto mtp = ggml_get_tensor(weights.ctx, llama_cpp_names
+                    ? "blk.43.exp_probs_b_vl.bias" : "layers.43.ffn.gate.bias_vl");
+                TEST_ASSERT(mtp == nullptr || (mtp->buffer == nullptr && mtp->data == nullptr));
+            }
+        }
+        free_deepseek4_weights(weights);
+    }
+    unlink(path.c_str());
+    }
+    valid.llama_cpp_image_bias_names = false;
+    const std::string path = write_deepseek4_loader_fixture(valid);
+    for (int boundary : {0, 1}) {
+        TargetLoadPlan plan;
+        plan.load_ds4_image_bias = true;
+        if (boundary == 0) plan.layer_begin = 1;
+        else plan.layer_end = 42;
+        DeepSeek4Weights weights;
+        TEST_ASSERT(!load_deepseek4_gguf_partial(path, backend, plan, weights));
+        TEST_ASSERT_MSG(std::string(luce_last_error()).find("one F32[n_expert] image router bias per layer") != std::string::npos,
+                        luce_last_error());
+        TEST_ASSERT(weights.ctx == nullptr && weights.buf == nullptr);
+        free_deepseek4_weights(weights);
+    }
+    unlink(path.c_str());
+
+    std::vector<DeepSeek4FixtureOptions> invalid;
+    auto missing_all = valid;
+    missing_all.image_biases = false;
+    invalid.push_back(missing_all);
+    for (int layer : {0, 21, 42}) {
+        auto missing = valid;
+        missing.missing_image_bias = layer;
+        invalid.push_back(missing);
+    }
+    auto wrong_type = valid;
+    wrong_type.malformed_image_bias = 21;
+    wrong_type.image_bias_type = GGML_TYPE_F16;
+    invalid.push_back(wrong_type);
+    auto wrong_width = valid;
+    wrong_width.malformed_image_bias = 42;
+    wrong_width.image_bias_width = 255;
+    invalid.push_back(wrong_width);
+    auto matrix = valid;
+    matrix.malformed_image_bias = 0;
+    matrix.image_bias_width = 128;
+    matrix.image_bias_rows = 2;
+    invalid.push_back(matrix);
+    // Decoder width and vocabulary are checked against the projector's own
+    // metadata when it loads, not here.
+    for (const auto & options : invalid) {
+        const std::string bad_path = write_deepseek4_loader_fixture(options);
+        TargetLoadPlan plan;
+        plan.load_ds4_image_bias = true;
+        DeepSeek4Weights weights;
+        TEST_ASSERT(!load_deepseek4_gguf_partial(bad_path, backend, plan, weights));
+        TEST_ASSERT_MSG(std::string(luce_last_error()).find("one F32[n_expert] image router bias per layer") != std::string::npos,
+                        luce_last_error());
+        TEST_ASSERT(weights.ctx == nullptr && weights.buf == nullptr && weights.dense_split_buf == nullptr);
+        free_deepseek4_weights(weights);
+        plan.load_ds4_image_bias = false;
+        TEST_ASSERT_MSG(load_deepseek4_gguf_partial(bad_path, backend, plan, weights), luce_last_error());
+        for (const auto & layer : weights.layers) TEST_ASSERT(layer.ffn_gate_bias_vl == nullptr);
+        free_deepseek4_weights(weights);
+        unlink(bad_path.c_str());
+    }
+    std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
+}
+
+static void test_image_batch_admission_before_execution(ggml_backend_t backend) {
+    std::fprintf(stderr, "  test_image_batch_admission_before_execution ...");
+    ggml_context * ctx = ggml_init({1u << 20, nullptr, false});
+    ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
+    ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    static_cast<float *>(state->data)[0] = 123.0f;
+    DeepSeek4Weights weights;
+    weights.n_vocab = 129280;
+    weights.n_layer = 43;
+    weights.moe_hybrid = true;
+    weights.layers.resize(43);
+    weights.compress_ratios.resize(43);
+    DeepSeek4Cache cache;
+    cache.max_ctx = 32;
+    cache.cur_pos = 17;
+    cache.prefill_mode = PrefillAttentionMode::Sparse;
+    cache.layers.resize(43);
+    MoeHybridStorage hybrid;
+    hybrid.layers.resize(43);
+    hybrid.cold_backend_kind = MoeHybridColdBackend::Gpu;
+    hybrid.cold_backend = backend;
+    for (int i = 0; i < 43; ++i) {
+        weights.compress_ratios[size_t(i)] = i < 2 ? 0 : i % 2 == 0 ? 4 : 128;
+        auto & layer = weights.layers[size_t(i)];
+        auto & layer_cache = cache.layers[size_t(i)];
+        layer.ffn_gate_bias_vl = bias;
+        layer.attn_compressor_ape = layer.attn_compressor_kv = layer.attn_compressor_gate = layer.attn_compressor_norm = state;
+        layer.indexer_compressor_ape = layer.indexer_compressor_kv = layer.indexer_compressor_gate = layer.indexer_compressor_norm = state;
+        layer_cache.raw_kv = layer_cache.comp_kv = layer_cache.index_comp_kv = state;
+        layer_cache.attn_compressor.state_kv = layer_cache.attn_compressor.state_score = state;
+        layer_cache.indexer_compressor.state_kv = layer_cache.indexer_compressor.state_score = state;
+    }
+    const luce::vision::TokenSpan span{1, 2, 5, 6};
+    const luce::vision::ImageSpanView spans{&span, 1};
+    std::vector<int32_t> tokens{7, 129280, 129281, 129282, 129283, 129284, 8};
+    bool has_images = false;
+    std::string error;
+    auto validate = [&]() {
+        error.clear();
+        return deepseek4_validate_image_batch(weights, cache, &hybrid, tokens.data(),
+            int(tokens.size()), 0, spans, has_images, error);
+    };
+    TEST_ASSERT(validate() && has_images);
+    for (size_t position : {size_t(0), size_t(1), size_t(5), size_t(6)}) {
+        const int32_t original = tokens[position];
+        tokens[position] = position == 0 || position == 6 ? 129280 : 7;
+        TEST_ASSERT(!validate());
+        TEST_ASSERT(error.find("token IDs") != std::string::npos);
+        tokens[position] = original;
+    }
+    tokens[2] = 129285;
+    TEST_ASSERT(!validate());
+    tokens[2] = 129281;
+    TEST_ASSERT(!deepseek4_validate_image_batch(weights, cache, &hybrid, tokens.data(),
+        5, 0, spans, has_images, error));
+    TEST_ASSERT(!deepseek4_validate_image_batch(weights, cache, &hybrid, tokens.data() + 2,
+        5, 2, spans, has_images, error));
+    TEST_ASSERT(!deepseek4_validate_image_batch(weights, cache, &hybrid, nullptr,
+        7, 0, spans, has_images, error));
+    const auto check_missing_tensor = [&](ggml_tensor * & tensor) {
+        ggml_tensor * saved = tensor;
+        tensor = nullptr;
+        TEST_ASSERT(!validate());
+        tensor = saved;
+        TEST_ASSERT(validate());
+    };
+    for (int i : {0, 2, 3, 42}) {
+        auto & layer = weights.layers[size_t(i)];
+        auto & layer_cache = cache.layers[size_t(i)];
+        check_missing_tensor(layer.ffn_gate_bias_vl);
+        check_missing_tensor(layer_cache.raw_kv);
+        if (i >= 2) {
+            check_missing_tensor(layer.attn_compressor_gate);
+            check_missing_tensor(layer_cache.attn_compressor.state_score);
+        }
+        if (i >= 2 && i % 2 == 0) {
+            check_missing_tensor(layer.indexer_compressor_kv);
+            check_missing_tensor(layer_cache.indexer_compressor.state_kv);
+        }
+    }
+    weights.layers[42].ffn_gate_bias_vl = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 256);
+    TEST_ASSERT(!validate());
+    weights.layers[42].ffn_gate_bias_vl = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 2);
+    TEST_ASSERT(!validate());
+    weights.layers[42].ffn_gate_bias_vl = bias;
+    TEST_ASSERT(validate());
+    hybrid.materialized_cold_experts = false;
+    TEST_ASSERT(!validate());
+    hybrid.materialized_cold_experts = true;
+    cache.layers.pop_back();
+    TEST_ASSERT(!validate());
+    TEST_ASSERT(cache.cur_pos == 17 && static_cast<float *>(state->data)[0] == 123.0f);
+    const luce::vision::TokenSpan invalid_span{1, 2, 7, 6};
+    TEST_ASSERT(!deepseek4_validate_image_batch(weights, cache, &hybrid, tokens.data(),
+        7, 0, {&invalid_span, 1}, has_images, error));
+    const int32_t text[] = {1, 2};
+    TEST_ASSERT(deepseek4_validate_image_batch(weights, cache, nullptr, text, 2, 6,
+        spans, has_images, error) && !has_images);
+    // One GPU holding the whole model has no second expert owner to check.
+    // (Dense weights here are unset, so the per-layer tensor checks still apply.)
+    weights.moe_hybrid = false;
+    cache.layers.resize(43);
+    for (auto & layer_cache : cache.layers) {
+        layer_cache.raw_kv = layer_cache.comp_kv = layer_cache.index_comp_kv = state;
+        layer_cache.attn_compressor.state_kv = layer_cache.attn_compressor.state_score = state;
+        layer_cache.indexer_compressor.state_kv = layer_cache.indexer_compressor.state_score = state;
+    }
+    TEST_ASSERT(deepseek4_validate_image_batch(weights, cache, nullptr, tokens.data(),
+        int(tokens.size()), 0, spans, has_images, error) && has_images);
+    cache.prefill_mode = PrefillAttentionMode::Exact;
+    TEST_ASSERT(!deepseek4_validate_image_batch(weights, cache, nullptr, tokens.data(),
+        int(tokens.size()), 0, spans, has_images, error));
+    ggml_free(ctx);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -2216,7 +2782,7 @@ static void test_pflash_failed_load_releases_backend() {
     TEST_ASSERT(backend.pflash_drafter_ctx_.backend == nullptr);
     TEST_ASSERT(backend.pflash_drafter_ctx_.gpu == -1);
     // Also keep a failing baseline run leak-free.
-    dflash::common::free_drafter(backend.pflash_drafter_ctx_);
+    luce::common::free_drafter(backend.pflash_drafter_ctx_);
     std::fprintf(stderr, g_failures ? " done\n" : " ok\n");
 }
 
@@ -2549,7 +3115,7 @@ static void test_dspark_chain_graph_cache_generation(ggml_backend_t backend) {
         return tokens;
     };
     const char * kill_switch =
-        std::getenv("DFLASH_DSPARK_NO_CHAIN_GRAPH_CACHE");
+        std::getenv("LUCE_DSPARK_NO_CHAIN_GRAPH_CACHE");
     const bool cache_enabled = !kill_switch || !*kill_switch ||
                                std::strcmp(kill_switch, "0") == 0;
 
@@ -2838,7 +3404,7 @@ static bool all_snapshot_tensors_named(ggml_context * ctx, size_t * count_out) {
 }
 
 static std::string make_test_disk_cache_dir(const char * tag) {
-    return "/tmp/dflash_test_ds4_disk_" + std::string(tag) + "_" +
+    return "/tmp/luce_test_ds4_disk_" + std::string(tag) + "_" +
            std::to_string((long) getpid());
 }
 
@@ -7273,6 +7839,10 @@ int main(int argc, char ** argv) {
     test_loader_rejects_zero_vocab_size(backend);
     test_loader_reads_tokenizer_special_ids(backend);
     test_loader_rejects_truncated_tensor_data(backend);
+    test_image_bias_loader_opt_in_contract(backend);
+    test_image_batch_admission_before_execution(backend);
+    test_image_storage_admission_metadata();
+    test_image_admission_resource_snapshots();
     test_dspark_loader_contract_and_bounds(backend);
     test_dspark_confidence_uses_separate_hidden(backend);
     test_safe_compressor_batch_tokens();

@@ -26,12 +26,12 @@ struct MixedMmqPolicy : CppUnitTestFramework::CommonFixture {
 };
 
 struct SavedMixEnvironment {
-    static constexpr const char * name = "DFLASH_DS4_MIX_MMQ_PREFILL";
+    static constexpr const char * name = "LUCE_DS4_MIX_MMQ_PREFILL";
     const bool present = std::getenv(name) != nullptr;
     const std::string value = present ? std::getenv(name) : "";
     ~SavedMixEnvironment() {
-        if (present) dflash::common::set_environment_variable(name, value.c_str(), true);
-        else dflash::common::unset_environment_variable(name);
+        if (present) luce::common::set_environment_variable(name, value.c_str(), true);
+        else luce::common::unset_environment_variable(name);
     }
 };
 }
@@ -166,14 +166,14 @@ void MixedMmqPolicy::check_mix_graph_isolation(ggml_type type) {
 
     // DEFAULT keeps the explicit legacy override, without latching the
     // first model's value in a function-static dispatch decision.
-    REQUIRE(dflash::common::set_environment_variable(
+    REQUIRE(luce::common::set_environment_variable(
         SavedMixEnvironment::name, "1", true) == 0);
     compute(false, true);
-    REQUIRE(dflash::common::set_environment_variable(
+    REQUIRE(luce::common::set_environment_variable(
         SavedMixEnvironment::name, "0", true) == 0);
     CHECK(compute(false, false) == reference);
     compute(true, true); // model-local selection is already resolved
-    REQUIRE(dflash::common::unset_environment_variable(SavedMixEnvironment::name) == 0);
+    REQUIRE(luce::common::unset_environment_variable(SavedMixEnvironment::name) == 0);
 
     // Capture/replay must also honor graph-local policy and detect changes.
     ggml_backend_cuda_set_graphs_disabled_override(false);
@@ -199,7 +199,7 @@ TEST_CASE(MixedMmqPolicy, interleaved_backends_and_replay_preserve_policy) {
         SKIP("requires gfx1151/gfx12 mixed MMQ");
     }
     SavedMixEnvironment saved;
-    CHECK(dflash::common::unset_environment_variable(saved.name) == 0);
+    CHECK(luce::common::unset_environment_variable(saved.name) == 0);
     for (auto type : {GGML_TYPE_Q2_1_ROCMFP2_MIX, GGML_TYPE_Q3_1_ROCMFP3_MIX}) {
         check_mix_graph_isolation(type);
     }

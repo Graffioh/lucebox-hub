@@ -6,7 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
 #  if defined(_WIN32)
 #    define WIN32_LEAN_AND_MEAN
 #    include <windows.h>
@@ -15,7 +15,7 @@
 #  endif
 #endif
 
-namespace dflash::common {
+namespace luce::common {
 namespace {
 
 thread_local InferencePhase current_phase = InferencePhase::Unspecified;
@@ -33,7 +33,7 @@ bool equals_ignore_case(const char * lhs, const char * rhs) {
     return *lhs == '\0' && *rhs == '\0';
 }
 
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
 #  if defined(_WIN32)
 void * platform_open() {
     return reinterpret_cast<void *>(LoadLibraryA("roctx64.dll"));
@@ -77,7 +77,7 @@ void platform_diagnose(const char * message) {
 #endif
 
 DeepSeek4RoctxCallbacks runtime_callbacks() {
-#if defined(DFLASH27B_BACKEND_HIP)
+#if defined(LUCE_BACKEND_HIP)
     static const DeepSeek4RoctxCallbacks callbacks =
         deepseek4_roctx_load_callbacks(
             true, {platform_open, platform_find_push, platform_find_pop,
@@ -92,7 +92,7 @@ DeepSeek4RoctxCallbacks configured_callbacks() {
     // Serving configuration is process-scoped. Cache the disabled path too so
     // hot layer-range calls do not repeatedly query the environment.
     static const DeepSeek4RoctxCallbacks callbacks = [] {
-        if (!deepseek4_roctx_env_enabled(std::getenv("DFLASH_DS4_ROCTX"))) {
+        if (!deepseek4_roctx_env_enabled(std::getenv("LUCE_DS4_ROCTX"))) {
             return DeepSeek4RoctxCallbacks{};
         }
         return runtime_callbacks();
@@ -134,7 +134,7 @@ DeepSeek4RoctxCallbacks deepseek4_roctx_load_callbacks(
     if (!handle) {
         if (loader.diagnose) {
             loader.diagnose(
-                "DFLASH_DS4_ROCTX is enabled, but the ROCTX library could not "
+                "LUCE_DS4_ROCTX is enabled, but the ROCTX library could not "
                 "be loaded; markers are disabled");
         }
         return {};
@@ -146,7 +146,7 @@ DeepSeek4RoctxCallbacks deepseek4_roctx_load_callbacks(
         loader.close(handle);
         if (loader.diagnose) {
             loader.diagnose(
-                "DFLASH_DS4_ROCTX is enabled, but required ROCTX range symbols "
+                "LUCE_DS4_ROCTX is enabled, but required ROCTX range symbols "
                 "are missing; markers are disabled");
         }
         return {};
@@ -232,4 +232,4 @@ DeepSeek4RoctxRange::~DeepSeek4RoctxRange() {
     if (pushed_ && pop_) pop_();
 }
 
-} // namespace dflash::common
+} // namespace luce::common

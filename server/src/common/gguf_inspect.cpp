@@ -13,7 +13,7 @@
 #include <sys/stat.h>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 bool derive_effective_target_layer_count(const std::string & arch,
                                          uint32_t block_count,
@@ -457,22 +457,22 @@ constexpr int64_t kDenseFixedBytes  = 96ll * 1024 * 1024;
 // a drafter KV type, so suppress it while resolving the same env overrides.
 struct ScopedKvTq3Suppress {
     ScopedKvTq3Suppress() {
-        const char * raw = std::getenv("DFLASH27B_KV_TQ3");
+        const char * raw = std::getenv("LUCE_KV_TQ3");
         had_ = raw != nullptr;
         old_ = had_ ? raw : "";
 #if defined(_WIN32)
-        _putenv_s("DFLASH27B_KV_TQ3", "0");
+        _putenv_s("LUCE_KV_TQ3", "0");
 #else
-        setenv("DFLASH27B_KV_TQ3", "0", 1);
+        setenv("LUCE_KV_TQ3", "0", 1);
 #endif
     }
     ~ScopedKvTq3Suppress() {
 #if defined(_WIN32)
-        if (had_) _putenv_s("DFLASH27B_KV_TQ3", old_.c_str());
-        else      _putenv_s("DFLASH27B_KV_TQ3", "");
+        if (had_) _putenv_s("LUCE_KV_TQ3", old_.c_str());
+        else      _putenv_s("LUCE_KV_TQ3", "");
 #else
-        if (had_) setenv("DFLASH27B_KV_TQ3", old_.c_str(), 1);
-        else      unsetenv("DFLASH27B_KV_TQ3");
+        if (had_) setenv("LUCE_KV_TQ3", old_.c_str(), 1);
+        else      unsetenv("LUCE_KV_TQ3");
 #endif
     }
     bool        had_ = false;
@@ -561,7 +561,7 @@ bool inspect_drafter_footprint(const std::string & path,
     ggml_type kv_k = GGML_TYPE_Q4_0, kv_v = GGML_TYPE_Q4_0;
     {
         ScopedKvTq3Suppress tq3_off;
-        dflash::resolve_kv_types(kv_k, kv_v);
+        luce::resolve_kv_types(kv_k, kv_v);
     }
 
     int64_t per_token;
@@ -592,4 +592,4 @@ bool inspect_drafter_footprint(const std::string & path,
     return true;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

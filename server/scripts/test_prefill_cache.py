@@ -1,6 +1,6 @@
 """End-to-end proof for exact prefill/full-prompt cache.
 
-Starts dflash_server with inline prefix cache disabled and prefill cache
+Starts luce_server with inline prefix cache disabled and prefill cache
 enabled, sends the same long chat prompt three times, and asserts:
 
   - /props.full_cache reports enabled capacity.
@@ -9,9 +9,9 @@ enabled, sends the same long chat prompt three times, and asserts:
   - warm prefill time is at least 5x faster than cold prefill.
 
 Environment overrides:
-  DFLASH_SERVER_BIN
-  DFLASH_TARGET
-  DFLASH_DRAFT
+  LUCE_SERVER_BIN
+  LUCE_TARGET
+  LUCE_DRAFT
 """
 
 import atexit
@@ -27,11 +27,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SERVER_BIN = Path(os.environ.get("DFLASH_SERVER_BIN", ROOT / "build/dflash_server"))
-TARGET = Path(os.environ.get("DFLASH_TARGET", Path.home() / "models/Qwen3.6-27B-Q4_K_M.gguf"))
-DRAFT = Path(os.environ.get("DFLASH_DRAFT", Path.home() / "models/draft/dflash-draft-3.6-q4_k_m.gguf"))
-PORT = int(os.environ.get("DFLASH_PREFILL_CACHE_TEST_PORT", "18185"))
-LOG_PATH = Path(os.environ.get("DFLASH_PREFILL_CACHE_TEST_LOG", "/tmp/test_prefill_cache_server.log"))
+SERVER_BIN = Path(os.environ.get("LUCE_SERVER_BIN", ROOT / "build/luce_server"))
+TARGET = Path(os.environ.get("LUCE_TARGET", Path.home() / "models/Qwen3.6-27B-Q4_K_M.gguf"))
+DRAFT = Path(os.environ.get("LUCE_DRAFT", Path.home() / "models/draft/dflash-draft-3.6-q4_k_m.gguf"))
+PORT = int(os.environ.get("LUCE_PREFILL_CACHE_TEST_PORT", "18185"))
+LOG_PATH = Path(os.environ.get("LUCE_PREFILL_CACHE_TEST_LOG", "/tmp/test_prefill_cache_server.log"))
 
 
 def require_path(path: Path, label: str, *, executable: bool = False) -> None:
@@ -87,7 +87,7 @@ def wait_server(proc: subprocess.Popen, deadline_s: int = 240) -> None:
 
 
 def main() -> int:
-    require_path(SERVER_BIN, "dflash_server", executable=True)
+    require_path(SERVER_BIN, "luce_server", executable=True)
     require_path(TARGET, "target GGUF")
     require_path(DRAFT, "draft GGUF")
 
@@ -133,7 +133,7 @@ def main() -> int:
     )
     prompt = (filler * 240) + "\n\nQuestion: Reply with exactly the word cached."
     payload = {
-        "model": "dflash",
+        "model": "luce",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 8,
         "temperature": 0.0,

@@ -476,11 +476,11 @@ std::string child_command(
         const std::string & output_path,
         const std::string & count_path) {
 #if defined(_WIN32)
-    return "set \"DFLASH_MMID_GROUPED_TYPES=15\" && set \"DFLASH_MMID_GROUPED=" +
+    return "set \"LUCE_MMID_GROUPED_TYPES=15\" && set \"LUCE_MMID_GROUPED=" +
         std::string(grouped ? "1" : "0") + "\" && " + shell_quote(executable) +
         " --child " + shell_quote(output_path) + " " + shell_quote(count_path);
 #else
-    return "DFLASH_MMID_GROUPED_TYPES=15 DFLASH_MMID_GROUPED=" +
+    return "LUCE_MMID_GROUPED_TYPES=15 LUCE_MMID_GROUPED=" +
         std::string(grouped ? "1" : "0") + " " + shell_quote(executable) +
         " --child " + shell_quote(output_path) + " " + shell_quote(count_path);
 #endif

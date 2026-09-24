@@ -115,9 +115,9 @@ jobs:
           cmake -B build \
             -DCMAKE_CUDA_COMPILER="$CUDACXX" \
             -DCMAKE_CUDA_ARCHITECTURES="86" \
-            -DDFLASH27B_USER_CUDA_ARCHITECTURES="86" \
-            -DDFLASH27B_ENABLE_BSA=OFF \
-            -DDFLASH27B_FA_ALL_QUANTS=OFF \
+            -DLUCE_USER_CUDA_ARCHITECTURES="86" \
+            -DLUCE_ENABLE_BSA=OFF \
+            -DLUCE_FA_ALL_QUANTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target test_dflash test_generate -j"$(nproc)"
 

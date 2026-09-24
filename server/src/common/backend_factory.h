@@ -16,7 +16,7 @@
 #include <variant>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace detail {
 class BackendPlanBuilder;
@@ -36,6 +36,7 @@ class BackendPlan final {
 public:
     struct Model {
         std::string path;
+        std::optional<std::string> mmproj_path;
         GgufModelInfo metadata;
     };
 
@@ -134,4 +135,4 @@ BackendPreparation prepare_backend(
     BackendArgs args,
     BackendAdmissionContext admission = {});
 
-}  // namespace dflash::common
+}  // namespace luce::common

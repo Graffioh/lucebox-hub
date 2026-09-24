@@ -283,7 +283,7 @@ static bool test_case(
         reference_mul_mat(quant, shape, weights_quantized, input_f32);
     std::vector<float> actual;
     double median_ms = 0.0;
-    const bool benchmark = std::getenv("DFLASH_TEST_BENCH") != nullptr;
+    const bool benchmark = std::getenv("LUCE_TEST_BENCH") != nullptr;
     if (!run_backend(
             hip_backend, quant.type, shape, weights_quantized, input_f32, actual,
             expected_path, mmvq_ceiling, benchmark ? &median_ms : nullptr)) {
@@ -305,10 +305,10 @@ static bool test_case(
 }
 
 int main() {
-    dflash::common::set_environment_variable("LUCE_MMVQ_MAX_NCOLS", "1", true);
-    dflash::common::set_environment_variable("DFLASH_CUDA_MMVQ_FP2_AFFINE", "1", true);
-    dflash::common::set_environment_variable("DFLASH_CUDA_MMQ_FP2_AFFINE", "1", true);
-    dflash::common::set_environment_variable("DFLASH_CUDA_MMQ_FP2_AFFINE_GENERAL", "1", true);
+    luce::common::set_environment_variable("LUCE_MMVQ_MAX_NCOLS", "1", true);
+    luce::common::set_environment_variable("LUCE_CUDA_MMVQ_FP2_AFFINE", "1", true);
+    luce::common::set_environment_variable("LUCE_CUDA_MMQ_FP2_AFFINE", "1", true);
+    luce::common::set_environment_variable("LUCE_CUDA_MMQ_FP2_AFFINE_GENERAL", "1", true);
     hipDeviceProp_t properties{};
     if (hipGetDeviceProperties(&properties, 0) != hipSuccess) {
         std::fprintf(stderr, "failed to query HIP device 0\n");
@@ -356,8 +356,8 @@ int main() {
         {8192, 4096, 4, "actual_dense_o_b_n4"},
         {12288, 4096, 4, "actual_dense_main_proj_n4"},
     };
-    const char * shape_filter = std::getenv("DFLASH_TEST_SHAPE");
-    const char * quant_filter = std::getenv("DFLASH_TEST_QUANT");
+    const char * shape_filter = std::getenv("LUCE_TEST_SHAPE");
+    const char * quant_filter = std::getenv("LUCE_TEST_QUANT");
     bool matched_shape = false;
     bool matched_quant = false;
 
@@ -397,12 +397,12 @@ int main() {
         }
     }
     if (shape_filter && !matched_shape) {
-        std::fprintf(stderr, "DFLASH_TEST_SHAPE matched no shape: %s\n",
+        std::fprintf(stderr, "LUCE_TEST_SHAPE matched no shape: %s\n",
                      shape_filter);
         ok = false;
     }
     if (quant_filter && !matched_quant) {
-        std::fprintf(stderr, "DFLASH_TEST_QUANT matched no quant: %s\n",
+        std::fprintf(stderr, "LUCE_TEST_QUANT matched no quant: %s\n",
                      quant_filter);
         ok = false;
     }

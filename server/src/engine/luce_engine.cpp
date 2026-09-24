@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace dflash::engine {
+namespace luce::engine {
 
 LuceEngine::LuceEngine(std::unique_ptr<common::ModelBackend> backend)
     : backend_(std::move(backend)) {
@@ -71,4 +71,4 @@ bool LuceEngine::is_serving() const {
     return worker_.joinable();
 }
 
-} // namespace dflash::engine
+} // namespace luce::engine

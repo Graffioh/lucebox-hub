@@ -10,10 +10,10 @@
 #include <cstdlib>
 #include <vector>
 
-namespace dflash::common {
+namespace luce::common {
 
 inline int qwen35_prefill_ubatch(int fallback) {
-    const char * value = std::getenv("DFLASH27B_PREFILL_UBATCH");
+    const char * value = std::getenv("LUCE_PREFILL_UBATCH");
     return value ? std::max(1, std::atoi(value)) : fallback;
 }
 
@@ -68,4 +68,4 @@ inline void upload_qwen35_causal_mask(ggml_tensor * mask, int kv_start,
                             sizeof(uint16_t) * data.size());
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

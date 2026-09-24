@@ -42,7 +42,7 @@
 #include <cstdlib>
 #include <unordered_map>
 
-namespace dflash::common {
+namespace luce::common {
 
 namespace {
 
@@ -210,7 +210,7 @@ extern __shared__ unsigned char geometric_smem[];
 // (penalties are applied in place as pass 0, in-kernel — see
 // apply_penalties_inplace). Behaviour selected by `mode` (see above); ties in
 // the greedy argmax go to the lowest token id, matching the CPU manual-argmax
-// and DFLASH_GPU_ARGMAX behaviour.
+// and LUCE_GPU_ARGMAX behaviour.
 __global__ void geometric_sample_kernel(float * __restrict__ work, int vocab,
                               float inv_t, int mode,
                               double r_uniform,
@@ -467,7 +467,7 @@ bool stage_and_penalize(int dev, const float * logits, int vocab, const SamplerC
 
 bool gpu_sampler_enabled() {
     static const bool on = []() {
-        const char * v = std::getenv("DFLASH_GPU_SAMPLE");
+        const char * v = std::getenv("LUCE_GPU_SAMPLE");
         if (v == nullptr || v[0] == '\0') return true;  // on by default
         return v[0] != '0';                             // "0" (or "0...") opts out
     }();
@@ -571,4 +571,4 @@ bool geometric_compute_probs_cuda(const float * logits,
     return ok;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common

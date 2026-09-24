@@ -7,7 +7,7 @@
 // oracle_dir must contain: noise.bin, target.bin, expected.bin, meta.txt
 // Exit 0 on success (cos_sim >= 0.9999 and max_abs_diff < 1e-2 in bf16 regime).
 
-#include "dflash27b.h"
+#include "luce.h"
 #include "internal.h"
 #include "draft_graph.h"
 
@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-using namespace dflash::common;
+using namespace luce::common;
 
 struct OracleMeta {
     int ctx_len = 0;
@@ -102,7 +102,7 @@ int main(int argc, char ** argv) {
     if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
     DraftWeights w;
     if (!load_draft_safetensors(draft_path, backend, w)) {
-        std::fprintf(stderr, "load: %s\n", dflash27b_last_error());
+        std::fprintf(stderr, "load: %s\n", luce_last_error());
         return 1;
     }
 

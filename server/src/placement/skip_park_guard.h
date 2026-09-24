@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <string>
 
-namespace dflash::common {
+namespace luce::common {
 
 // Requested policy for --prefill-skip-park. Bare `--prefill-skip-park` (no
 // value) keeps the historical boolean meaning = On. Auto is the default:
@@ -127,4 +127,4 @@ inline SkipParkDecision resolve_skip_park(
     return d;
 }
 
-}  // namespace dflash::common
+}  // namespace luce::common
