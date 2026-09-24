@@ -80,6 +80,8 @@ inline void scoring_head_mean_token_mass(
     for (int j = 0; j < n_keys; ++j) out[(size_t) j] = (float) (sum[(size_t) j] / denominator);
 }
 
+struct PFlashDrafterProfile;
+
 struct PFlashTraceFields {
     const std::vector<int32_t> * input_ids = nullptr;
     int query_begin = -1;
@@ -114,6 +116,8 @@ struct PFlashTraceFields {
     int header_tokens = -1;
     int cut_markers = -1;
     const std::vector<size_t> * assembly_dropped = nullptr;
+    // PFLASH_DRAFTER_PROFILE=1 only.
+    const PFlashDrafterProfile * drafter_profile = nullptr;
 };
 
 void write_compression_trace(
@@ -147,6 +151,29 @@ struct PFlashScoringStats {
 };
 const PFlashScoringStats & pflash_last_scoring_stats();
 void pflash_set_scoring_stats(const PFlashScoringStats & stats);
+
+// PFLASH_DRAFTER_PROFILE=1: wall time of the last Qwen3.5 scoring forward on
+// this thread, per phase, the backend synchronized at every mark. mask: the
+// causal masks built and uploaded; graph: layer graphs built and allocated;
+// attn / deltanet: compute of the full-attention and DeltaNet blocks among
+// 0..14 (one graph per block and ubatch); score: keys, probe and head scoring
+// and segmentation after block 14; total: the whole call up to selection.
+// ``valid`` only when the switch was on; cleared with the kept spans.
+struct PFlashDrafterProfile {
+    bool valid = false;
+    int input_tokens = 0;
+    int resume = 0;
+    int new_tokens = 0;
+    int ubatches = 0;
+    double mask_ms = 0.0;
+    double graph_ms = 0.0;
+    double attn_ms = 0.0;
+    double deltanet_ms = 0.0;
+    double score_ms = 0.0;
+    double total_ms = 0.0;
+};
+const PFlashDrafterProfile & pflash_last_drafter_profile();
+void pflash_set_drafter_profile(const PFlashDrafterProfile & profile);
 
 // Every candidate of the last strict selection on this thread with its
 // attention lift: mean per-token mass relative to uniform attention over

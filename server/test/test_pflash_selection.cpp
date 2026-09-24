@@ -1232,3 +1232,44 @@ TEST_CASE(PFlashSelectionFixture, select_chunks_assembles_headers_and_markers_in
     REQUIRE(only.find("\"cut_markers\":2") != std::string::npos);
     std::remove(trace.c_str());
 }
+
+TEST_CASE(PFlashSelectionFixture, drafter_profile_reaches_the_trace_only_when_recorded) {
+    AssemblyFixture f;
+    const std::string trace = temp_trace_path("profile");
+    std::remove(trace.c_str());
+    luce_test::ScopedEnvVar trace_env{kTraceEnv, trace.c_str()};
+    luce::common::pflash_clear_kept_spans();
+    const auto plain = f.run(f.config());
+    const std::string plain_line = read_last_line(trace);
+    REQUIRE(plain_line.find("drafter_profile") == std::string::npos);
+
+    luce::common::PFlashDrafterProfile prof;
+    prof.valid = true;
+    prof.input_tokens = 40;
+    prof.new_tokens = 40;
+    prof.ubatches = 1;
+    prof.mask_ms = 0.5;
+    prof.graph_ms = 1.25;
+    prof.attn_ms = 3;
+    prof.deltanet_ms = 7;
+    prof.score_ms = 2;
+    prof.total_ms = 14;
+    luce::common::pflash_set_drafter_profile(prof);
+    // Selection and ids are untouched; only the trace gains the object.
+    REQUIRE(f.run(f.config()) == plain);
+    const std::string line = read_last_line(trace);
+    REQUIRE(line.find("\"drafter_profile\":{\"S\":40,\"resume\":0,\"new_tokens\":40,"
+                      "\"ubatches\":1,\"mask_ms\":0.5,\"graph_ms\":1.25,\"attn_ms\":3,"
+                      "\"deltanet_ms\":7,\"score_ms\":2,\"total_ms\":14}") != std::string::npos);
+    std::string stripped = line;
+    const size_t at = stripped.find(",\"drafter_profile\"");
+    stripped.erase(at, stripped.find('}', at) + 1 - at);
+    REQUIRE(stripped == plain_line);
+
+    // Cleared with the kept spans at the next drafter call.
+    luce::common::pflash_clear_kept_spans();
+    REQUIRE(!luce::common::pflash_last_drafter_profile().valid);
+    f.run(f.config());
+    REQUIRE(read_last_line(trace) == plain_line);
+    std::remove(trace.c_str());
+}
