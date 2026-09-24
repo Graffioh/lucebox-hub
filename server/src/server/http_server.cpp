@@ -4102,7 +4102,9 @@ void HttpServer::prepare_generation_inputs(
 
     inputs.request.prompt = prepared.tokens;
     inputs.request.images = prepared.images;
-    inputs.request.force_ar_decode = bool(prepared.images);
+    // Image requests may speculate; each backend decides (Qwen3.5 verifies at
+    // image-shifted rotary positions, DeepSeek4 drafts from the text after
+    // the last image).
     inputs.request.n_gen = inputs.generation_cap;
     inputs.request.sampler = req.sampler;
     inputs.request.do_sample = req.sampler.needs_logit_processing();

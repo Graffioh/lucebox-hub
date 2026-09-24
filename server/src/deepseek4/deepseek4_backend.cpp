@@ -2643,8 +2643,9 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                                   int snap_slot,
                                   int snap_pos,
                                   const DeepSeek4ImagePrompt * images) {
-    const bool capture_spec = !images && spec_enabled_ && spec_drafter_;
-    if (images) spec_feat_window_.clear();
+    // Image prompts capture DSpark features from their text chunks only: the
+    // image graph takes no capture hooks (see the chunking below).
+    const bool capture_spec = spec_enabled_ && spec_drafter_;
     const InferencePhase phase = deepseek4_roctx_prefill_phase(
         prefill_attention_mode_name(cfg_.prefill_mode));
     const DeepSeek4RoctxPhaseScope roctx_phase(phase);
@@ -2825,10 +2826,23 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
                 spec_snap_from, spec_snap_to);
         }
 
+        bool chunk_has_image = false;
         if (images) {
             n_tok = vision::atomic_image_chunk(images->spans(), uint64_t(pos), n_tok,
                                                uint64_t(n_total - i), image_capacity);
             if (!n_tok) return -1;
+            // An image batch cannot capture DSpark features, so end it at its
+            // last image: the text after the image then prefills (and
+            // captures) as ordinary chunks.
+            const uint64_t last_image_end =
+                vision::last_image_end_in(images->spans(), uint64_t(pos), uint64_t(pos + n_tok));
+            chunk_has_image = last_image_end != 0;
+            if (chunk_has_image && capture_spec && last_image_end < uint64_t(pos + n_tok)) {
+                n_tok = int(last_image_end - uint64_t(pos));
+            }
+            // The drafter reads the newest rows as one contiguous window, so
+            // rows from before an image cannot sit next to rows after it.
+            if (chunk_has_image) spec_feat_window_.clear();
         }
 
         // Bulk prompt graphs and the final DSpark feature-capture graph have
@@ -2875,7 +2889,7 @@ int DeepSeek4Backend::do_prefill(const std::vector<int32_t> & tokens,
         const bool capture_snapshot =
             !snapshot_saved && i < spec_snap_to &&
             i + n_tok > spec_snap_from;
-        if (capture_spec &&
+        if (capture_spec && !chunk_has_image &&
             (capture_final || capture_snapshot)) {
             spec_hooks.capture_layer_ids = &spec_drafter_->capture_layer_ids;
             spec_hooks.capture_out = &spec_cap;
@@ -3280,8 +3294,11 @@ GenerateResult DeepSeek4Backend::generate_from_state(
                 sampler_.rep_pen, sampler_.freq_pen, sampler_.pres_pen);
         }
     }
-    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
-        !req.images && !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
+    // An image prompt whose last image leaves no captured text rows gives the
+    // drafter no context to start from; decode that request plainly.
+    const bool image_without_draft_context = req.images && spec_feat_window_.empty();
+    if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 && !image_without_draft_context &&
+        !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
         if (last_logits_.empty()) {
             result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");
             return result;
