@@ -44,6 +44,7 @@ struct Qwen35ScoringSession {
     bool                  keys_trained = false;
     std::vector<float>    probe_raw;        // per token, unit logit
     std::vector<float>    subunit_raw;      // per token, when the probe has one
+    std::vector<float>    container_raw;    // per token, with container headers on
     // Block-14 output of recent query windows (the query and earlier
     // questions), reused while they sit in the shared prefix: an agent step
     // appends tool output after the same user turn, and a new turn's history
@@ -88,6 +89,20 @@ struct Qwen35DrafterState {
     int                   probe_max_segment = 2048;
     int                   probe_width = 0;
     bool                  probe_loaded = false;
+    // Container head (loaded only with PFLASH_SELECT_CONTAINER_HEADERS=1 and
+    // when the probe ships it): container_fc2 on the shared trunk, its own
+    // smoothing conv, sigmoid, starts above ``probe_container_threshold``.
+    ggml_tensor *         probe_container_fc2_w = nullptr;
+    ggml_tensor *         probe_container_fc2_b = nullptr;
+    std::vector<float>    probe_container_conv_w;
+    float                 probe_container_conv_b = 0.0f;
+    float                 probe_container_threshold = 0.5f;
+    bool                  probe_container_loaded = false;
+    // Assembly vocabulary from the drafter tokenizer, loaded only when an
+    // assembly switch is on: which token ids carry a newline, and the cut
+    // marker's ids.
+    std::vector<uint8_t>  newline_vocab;
+    std::vector<int32_t>  cut_marker_ids;
     // Strict scorer sessions, least recently used evicted
     // (PFLASH_DRAFTER_SESSIONS, default 2; 0 scores every prompt from scratch).
     std::vector<std::unique_ptr<Qwen35ScoringSession>> sessions;
@@ -96,6 +111,14 @@ struct Qwen35DrafterState {
 
 // Defined in qwen35_loader.cpp.
 bool qwen35_head_block_available(const TargetWeights & w, std::string & error);
+// Segment probe onto ``st.weights.backend`` (needs ``st.weights.n_embd`` and
+// ``st.gguf_sha256``); fails closed on a contract mismatch. The container
+// head loads only when PFLASH_SELECT_CONTAINER_HEADERS=1; a probe without it
+// then logs a warning and container headers stay off.
+bool load_qwen35_segment_probe(const std::string & path, Qwen35DrafterState & st);
+void free_qwen35_segment_probe(Qwen35DrafterState & st);
+// Newline vocabulary and cut marker ids from the drafter tokenizer.
+bool load_qwen35_assembly_vocab(const std::string & gguf_path, Qwen35DrafterState & st);
 bool load_qwen35_drafter(const std::string & gguf_path, DrafterContext & out);
 void free_qwen35_drafter_state(DrafterContext & ctx);
 

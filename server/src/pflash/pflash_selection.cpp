@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -25,6 +26,17 @@ constexpr const char * kSegmentsEnv = "PFLASH_SELECT_SEGMENTS";
 constexpr const char * kSelectEnv = "PFLASH_SELECT_SCORE";
 constexpr const char * kScorerEnv = "PFLASH_SELECT_SCORER";
 constexpr const char * kSplitEnv = "PFLASH_SELECT_SPLIT";
+constexpr const char * kContainerHeadersEnv = "PFLASH_SELECT_CONTAINER_HEADERS";
+constexpr const char * kContainerHeaderMaxEnv = "PFLASH_SELECT_CONTAINER_HEADER_MAX";
+constexpr const char * kCutMarkerEnv = "PFLASH_ASSEMBLY_CUT_MARKER";
+
+// "1" on, unset or "0" off, anything else invalid.
+enum class Switch { Off, On, Invalid };
+Switch parse_switch(const char * raw) {
+    if (!raw || std::strcmp(raw, "0") == 0) return Switch::Off;
+    if (std::strcmp(raw, "1") == 0) return Switch::On;
+    return Switch::Invalid;
+}
 
 PFlashSelectionResult invalid_result(std::string error) {
     PFlashSelectionResult result;
@@ -65,6 +77,14 @@ int scheduled_chunk_size(int input_tokens) {
 }
 
 } // namespace
+
+bool pflash_container_headers_requested() noexcept {
+    return parse_switch(std::getenv(kContainerHeadersEnv)) == Switch::On;
+}
+
+bool pflash_cut_markers_requested() noexcept {
+    return parse_switch(std::getenv(kCutMarkerEnv)) == Switch::On;
+}
 
 bool has_pflash_selection_environment() noexcept {
     return std::getenv(kModeEnv) != nullptr ||
@@ -430,6 +450,30 @@ bool resolve_pflash_selection(
         return false;
     }
 
+    // Assembly switches: parsed whatever the mode, applied only by strict
+    // selection. They do not mark the selection as configured.
+    const Switch headers = parse_switch(std::getenv(kContainerHeadersEnv));
+    const Switch markers = parse_switch(std::getenv(kCutMarkerEnv));
+    if (headers == Switch::Invalid) {
+        error = std::string(kContainerHeadersEnv) + " must be 0 or 1";
+        return false;
+    }
+    if (markers == Switch::Invalid) {
+        error = std::string(kCutMarkerEnv) + " must be 0 or 1";
+        return false;
+    }
+    config.container_headers = headers == Switch::On;
+    config.cut_markers = markers == Switch::On;
+    if (const char * raw = std::getenv(kContainerHeaderMaxEnv)) {
+        if (!parse_int(raw, config.container_header_max) ||
+            config.container_header_max < 1 ||
+            config.container_header_max > 4096) {
+            error = std::string(kContainerHeaderMaxEnv) +
+                " must be an integer in [1, 4096]";
+            return false;
+        }
+    }
+
     out = config;
     return true;
 }
@@ -581,6 +625,230 @@ const char * pflash_candidate_score_name(PFlashCandidateScore score) noexcept {
         case PFlashCandidateScore::Density: return "density";
     }
     return "unknown";
+}
+
+namespace {
+
+using luce::common::PFlashTokenSpan;
+
+bool inside_any(int token, const std::vector<PFlashTokenSpan> & spans) {
+    for (const auto & span : spans) {
+        if (token >= span.begin && token < span.end) return true;
+    }
+    return false;
+}
+
+// Sorted, merged copy of ``spans`` (touching spans merge).
+std::vector<PFlashTokenSpan> merge_spans(std::vector<PFlashTokenSpan> spans) {
+    std::sort(spans.begin(), spans.end(),
+        [](const PFlashTokenSpan & a, const PFlashTokenSpan & b) {
+            return a.begin != b.begin ? a.begin < b.begin : a.end < b.end;
+        });
+    std::vector<PFlashTokenSpan> merged;
+    for (const auto & span : spans) {
+        if (span.end <= span.begin) continue;
+        if (!merged.empty() && span.begin <= merged.back().end) {
+            merged.back().end = std::max(merged.back().end, span.end);
+        } else {
+            merged.push_back(span);
+        }
+    }
+    return merged;
+}
+
+int span_tokens(const std::vector<PFlashTokenSpan> & spans) {
+    int total = 0;
+    for (const auto & span : spans) total += span.end - span.begin;
+    return total;
+}
+
+} // namespace
+
+std::vector<int> pflash_container_starts(
+        const std::vector<float> & container_probs,
+        int input_tokens,
+        float threshold,
+        int min_spacing,
+        const std::vector<PFlashTokenSpan> & excluded) {
+    std::vector<int> starts;
+    if (input_tokens <= 0 || (int) container_probs.size() < input_tokens) {
+        return starts;
+    }
+    min_spacing = std::max(1, min_spacing);
+    for (int token = 0; token < input_tokens; ++token) {
+        const float p = container_probs[(size_t) token];
+        if (!std::isfinite(p) || !(p > threshold)) continue;
+        if (inside_any(token, excluded)) continue;
+        if (!starts.empty() && token - starts.back() < min_spacing) continue;
+        starts.push_back(token);
+    }
+    return starts;
+}
+
+PFlashContainers pflash_container_headers(
+        const std::vector<int32_t> & ids,
+        const std::vector<int> & starts,
+        const std::vector<PFlashTokenSpan> & excluded,
+        const std::vector<uint8_t> & newline_vocab,
+        int header_max) {
+    PFlashContainers out;
+    const int input_tokens = (int) ids.size();
+    header_max = std::max(1, header_max);
+    for (size_t index = 0; index < starts.size(); ++index) {
+        const int start = starts[index];
+        if (start < 0 || start >= input_tokens) continue;
+        if (!out.starts.empty() && start <= out.starts.back()) continue;
+        int end = index + 1 < starts.size()
+            ? std::min(starts[index + 1], input_tokens) : input_tokens;
+        for (const auto & span : excluded) {
+            if (span.begin > start && span.begin < end) end = span.begin;
+        }
+        if (end <= start) continue;
+        const int cap = std::min(end, start + header_max);
+        int header_end = cap;
+        for (int token = start + 1; token < cap; ++token) {
+            const int32_t id = ids[(size_t) token];
+            if (id >= 0 && (size_t) id < newline_vocab.size() &&
+                newline_vocab[(size_t) id]) {
+                header_end = token + 1;
+                break;
+            }
+        }
+        out.starts.push_back(start);
+        out.extents.push_back({start, end});
+        out.headers.push_back({start, header_end});
+    }
+    return out;
+}
+
+PFlashAssemblyResult pflash_assemble_selection(
+        const std::vector<PFlashSelectionCandidate> & candidates,
+        const std::vector<size_t> & selected_ordinals,
+        const PFlashAssemblyPolicy & policy) {
+    PFlashAssemblyResult result;
+    if (policy.token_budget <= 0 || policy.marker_tokens < 0) {
+        result.error = "PFlash assembly budget must be positive";
+        return result;
+    }
+    const PFlashContainers * containers = policy.containers;
+    if (containers && (containers->extents.size() != containers->headers.size())) {
+        result.error = "PFlash container extents and headers differ in length";
+        return result;
+    }
+    std::unordered_map<size_t, size_t> index_of;
+    for (size_t i = 0; i < candidates.size(); ++i) index_of[candidates[i].ordinal] = i;
+    // Selected candidates in source order.
+    std::vector<const PFlashSelectionCandidate *> selected;
+    for (size_t ordinal : selected_ordinals) {
+        const auto found = index_of.find(ordinal);
+        if (found == index_of.end()) {
+            result.error = "PFlash assembly got an unknown ordinal";
+            return result;
+        }
+        selected.push_back(&candidates[found->second]);
+    }
+    std::sort(selected.begin(), selected.end(),
+        [](const auto * a, const auto * b) { return a->begin < b->begin; });
+    // Drop order: the reverse of the selection order (lowest clamped score
+    // first, the higher ordinal first among equals).
+    std::vector<const PFlashSelectionCandidate *> droppable;
+    for (const auto * candidate : selected) {
+        if (!candidate->mandatory) droppable.push_back(candidate);
+    }
+    std::sort(droppable.begin(), droppable.end(),
+        [](const auto * a, const auto * b) {
+            const double sa = std::max(0.0, a->score);
+            const double sb = std::max(0.0, b->score);
+            if (sa != sb) return sa < sb;
+            return a->ordinal > b->ordinal;
+        });
+    std::vector<uint8_t> dropped_flag(candidates.size(), 0);
+    size_t next_drop = 0;
+
+    for (;;) {
+        ++result.passes;
+        std::vector<PFlashTokenSpan> segment_spans;
+        for (const auto * candidate : selected) {
+            if (dropped_flag[index_of[candidate->ordinal]]) continue;
+            segment_spans.push_back({candidate->begin, candidate->end});
+        }
+        const std::vector<PFlashTokenSpan> segments_merged = merge_spans(segment_spans);
+        std::vector<PFlashTokenSpan> all = segment_spans;
+        std::vector<PFlashTokenSpan> headers;
+        if (containers && !containers->extents.empty()) {
+            // Containers holding a selected non-mandatory candidate.
+            std::vector<uint8_t> has_content(containers->extents.size(), 0);
+            const auto & extents = containers->extents;
+            for (const auto * candidate : selected) {
+                if (candidate->mandatory || dropped_flag[index_of[candidate->ordinal]]) continue;
+                // First container ending after the candidate begins.
+                auto it = std::upper_bound(extents.begin(), extents.end(), candidate->begin,
+                    [](int value, const PFlashTokenSpan & span) { return value < span.end; });
+                for (; it != extents.end() && it->begin < candidate->end; ++it) {
+                    has_content[(size_t) (it - extents.begin())] = 1;
+                }
+            }
+            for (size_t c = 0; c < extents.size(); ++c) {
+                if (has_content[c]) headers.push_back(containers->headers[c]);
+            }
+            all.insert(all.end(), headers.begin(), headers.end());
+        }
+        const std::vector<PFlashTokenSpan> kept = merge_spans(all);
+        const int kept_tokens = span_tokens(kept);
+        const int markers = policy.marker_tokens > 0 && !kept.empty()
+            ? (int) kept.size() - 1 : 0;
+        const int total = kept_tokens + markers * policy.marker_tokens;
+        if (total <= policy.token_budget || next_drop >= droppable.size()) {
+            result.ok = true;
+            result.kept = kept;
+            result.header_tokens = kept_tokens - span_tokens(segments_merged);
+            result.cut_markers = markers;
+            result.retained_tokens = total;
+            for (const auto & header : headers) {
+                // Added when some header token was not already a segment's.
+                bool covered = false;
+                for (const auto & span : segments_merged) {
+                    if (span.begin <= header.begin && span.end >= header.end) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (!covered) result.headers_added.push_back(header);
+            }
+            for (const auto * candidate : selected) {
+                if (!dropped_flag[index_of[candidate->ordinal]]) {
+                    result.ordinals.push_back(candidate->ordinal);
+                }
+            }
+            std::sort(result.ordinals.begin(), result.ordinals.end());
+            return result;
+        }
+        // Drop the lowest-ranked candidate and recompute: dropping it may
+        // also free its container's header or a marker, so one at a time
+        // drops no more than the overflow needs.
+        const auto * candidate = droppable[next_drop++];
+        dropped_flag[index_of[candidate->ordinal]] = 1;
+        result.dropped.push_back(candidate->ordinal);
+    }
+}
+
+std::vector<int32_t> pflash_assemble_ids(
+        const std::vector<int32_t> & ids,
+        const std::vector<PFlashTokenSpan> & kept,
+        const std::vector<int32_t> & marker_ids) {
+    std::vector<int32_t> out;
+    int previous_end = -1;
+    for (const auto & span : kept) {
+        const int begin = std::max(0, span.begin);
+        const int end = std::min((int) ids.size(), span.end);
+        if (end <= begin) continue;
+        if (previous_end >= 0 && begin > previous_end) {
+            out.insert(out.end(), marker_ids.begin(), marker_ids.end());
+        }
+        out.insert(out.end(), ids.begin() + begin, ids.begin() + end);
+        previous_end = end;
+    }
+    return out;
 }
 
 } // namespace luce::pflash

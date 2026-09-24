@@ -532,6 +532,7 @@ void free_qwen35_scoring_session(Qwen35ScoringSession & session) {
     session.checkpoint = 0;
     session.probe_raw.clear();
     session.subunit_raw.clear();
+    session.container_raw.clear();
     session.query_windows.clear();
 }
 
@@ -603,6 +604,7 @@ Qwen35ScoringSession * acquire_scoring_session(
         int query_end,
         bool need_probe,
         bool need_subunit,
+        bool need_container,
         int & resume,
         int & shared_prefix,
         std::unique_ptr<Qwen35ScoringSession> & scratch) {
@@ -649,7 +651,8 @@ Qwen35ScoringSession * acquire_scoring_session(
             }
         }
         if ((need_probe && (int) session->probe_raw.size() < r) ||
-            (need_subunit && (int) session->subunit_raw.size() < r)) {
+            (need_subunit && (int) session->subunit_raw.size() < r) ||
+            (need_container && (int) session->container_raw.size() < r)) {
             r = 0;
         }
         if (r > resume) {
@@ -697,6 +700,7 @@ Qwen35ScoringSession * acquire_scoring_session(
     target->checkpoint = 0;
     target->probe_raw.clear();
     target->subunit_raw.clear();
+    target->container_raw.clear();
     target->query_windows.clear();
     return target;
 }
@@ -743,6 +747,11 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     const TargetLayer & L = w.layers[(size_t)kQwen35HeadBlock];
     const bool use_probe = st.probe_loaded &&
         experiment.segmentation != luce::pflash::PFlashSegmentation::Fixed;
+    // Container headers: the container head runs on the probe trunk only
+    // when the switch is on and the probe ships it (and never for the
+    // two-scorer pass, which does not assemble here).
+    const bool use_container = use_probe && experiment.container_headers &&
+        st.probe_container_loaded && token_mass_out == nullptr;
 
     auto t0 = std::chrono::steady_clock::now();
     int resume = 0;
@@ -750,8 +759,8 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     std::unique_ptr<Qwen35ScoringSession> scratch;
     Qwen35ScoringSession * session = acquire_scoring_session(
         st, ids, query_start, query_end, use_probe,
-        use_probe && st.probe_sub_fc2_w != nullptr, resume, shared_prefix,
-        scratch);
+        use_probe && st.probe_sub_fc2_w != nullptr, use_container, resume,
+        shared_prefix, scratch);
     if (!session) return {};
     // A session is released (freed or kept) on every exit below.
     struct SessionExit {
@@ -965,6 +974,11 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
     session->probe_raw.resize(use_probe ? (size_t) resume : 0);
     session->subunit_raw.resize(
         use_probe && st.probe_sub_fc2_w ? (size_t) resume : 0);
+    if (use_container) {
+        session->container_raw.resize((size_t) resume);
+    } else {
+        session->container_raw.clear();
+    }
 
     // Keys (and probe logits) of the new tokens, into the session. Keys are
     // projected in chunks so no intermediate tensor puts the sequence length
@@ -978,6 +992,8 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         ggml_tensor * probe_new = use_probe ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
         ggml_tensor * subunit_new = use_probe && st.probe_sub_fc2_w
             ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
+        ggml_tensor * container_new = use_container
+            ? ggml_new_tensor_1d(nctx, GGML_TYPE_F32, n_new) : nullptr;
         ggml_backend_buffer_t nbuf = use_probe
             ? ggml_backend_alloc_ctx_tensors(nctx, w.backend) : nullptr;
         if (use_probe && !nbuf) {
@@ -986,7 +1002,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         }
         const int n_key_chunks = (n_new + key_chunk - 1) / key_chunk;
         ggml_init_params kip{};
-        kip.mem_size = ggml_tensor_overhead() * (size_t)(64 + 24 * n_key_chunks) +
+        // The container head adds five tensors per key chunk.
+        kip.mem_size = ggml_tensor_overhead() *
+                           (size_t)(64 + (use_container ? 32 : 24) * n_key_chunks) +
                        ggml_graph_overhead_custom(4096, false) + 64 * 1024;
         kip.no_alloc = true;
         ggml_context * kctx = ggml_init(kip);
@@ -1022,6 +1040,15 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                     ggml_build_forward_expand(kgf,
                         ggml_cpy(kctx, ggml_reshape_1d(kctx, sub, n), s_dst));
                 }
+                if (container_new) {
+                    ggml_tensor * cont = ggml_add(kctx,
+                        ggml_mul_mat(kctx, st.probe_container_fc2_w, p),
+                        st.probe_container_fc2_b);
+                    ggml_tensor * c_dst = ggml_view_1d(kctx, container_new, n,
+                        (size_t)b * ggml_element_size(container_new));
+                    ggml_build_forward_expand(kgf,
+                        ggml_cpy(kctx, ggml_reshape_1d(kctx, cont, n), c_dst));
+                }
             }
         }
         ggml_gallocr_t kalloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w.backend));
@@ -1036,6 +1063,11 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             if (subunit_new) {
                 session->subunit_raw.resize((size_t) S);
                 ggml_backend_tensor_get(subunit_new, session->subunit_raw.data() + resume, 0,
+                                        (size_t) n_new * sizeof(float));
+            }
+            if (container_new) {
+                session->container_raw.resize((size_t) S);
+                ggml_backend_tensor_get(container_new, session->container_raw.data() + resume, 0,
                                         (size_t) n_new * sizeof(float));
             }
         }
@@ -1215,6 +1247,7 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
 
     std::vector<PFlashTokenSpan> segments;
     bool density = experiment.candidate_score == luce::pflash::PFlashCandidateScore::Density;
+    luce::pflash::PFlashContainers containers;
     if (use_probe) {
         // Tap-count smoothing over the raw logits (torch Conv1d, symmetric
         // padding) plus the residual logit, then sigmoid: the boundary score
@@ -1279,6 +1312,31 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
                 st.probe_min_segment, st.probe_max_segment,
                 density ? "density" : "sum");
         }
+        if (use_container) {
+            // Container starts, decoded like unit boundaries, in the context
+            // only: never inside the query window, an instruction span or the
+            // kept suffix.
+            std::vector<float> container_probs;
+            smooth(session->container_raw, st.probe_container_conv_w,
+                   st.probe_container_conv_b, container_probs);
+            std::vector<PFlashTokenSpan> excluded{{query_begin, query_end}};
+            if (!experiment.query_suffix_candidates && query_end < S) {
+                excluded.push_back({query_end, S});
+            }
+            excluded.insert(excluded.end(), required_instruction_spans.begin(),
+                            required_instruction_spans.end());
+            const auto starts = luce::pflash::pflash_container_starts(
+                container_probs, S, st.probe_container_threshold,
+                st.probe_min_segment, excluded);
+            containers = luce::pflash::pflash_container_headers(
+                ids, starts, excluded, st.newline_vocab,
+                experiment.container_header_max);
+            std::fprintf(stderr,
+                "[qwen35-segment-probe] %zu container starts in the context "
+                "(threshold %.2f, header cap %d tokens)\n",
+                containers.starts.size(), st.probe_container_threshold,
+                experiment.container_header_max);
+        }
         std::fflush(stderr);
     }
 
@@ -1295,7 +1353,9 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
         ids, token_mass, keep_ratio, n_lookahead, score_query_end,
         /*pool_kernel=*/1, experiment, required_instruction_spans,
         /*direct_mass=*/true, /*write_trace=*/true,
-        segments.empty() ? nullptr : &segments, density);
+        segments.empty() ? nullptr : &segments, density,
+        /*other_token_scores=*/nullptr, /*split_fraction=*/0.0,
+        use_container ? &containers : nullptr);
 }
 
 std::vector<int32_t> qwen35_drafter_score_and_compress(
@@ -1306,13 +1366,24 @@ std::vector<int32_t> qwen35_drafter_score_and_compress(
     int n_lookahead,
     int pool_kernel,
     int score_query_end,
-    const luce::pflash::PFlashSelectionConfig & experiment,
+    const luce::pflash::PFlashSelectionConfig & experiment_in,
     const std::vector<PFlashTokenSpan> & required_instruction_spans) {
     if (!ctx.state) {
         set_last_error("qwen35 drafter state missing");
         return {};
     }
     auto * st = static_cast<Qwen35DrafterState *>(ctx.state);
+    // Cut markers: the drafter tokenizer's ids for the marker text, loaded
+    // with the drafter when the switch is on.
+    const bool fill_markers =
+        experiment_in.cut_markers && experiment_in.cut_marker_ids.empty();
+    luce::pflash::PFlashSelectionConfig with_markers;
+    if (fill_markers) {
+        with_markers = experiment_in;
+        with_markers.cut_marker_ids = st->cut_marker_ids;
+    }
+    const luce::pflash::PFlashSelectionConfig & experiment =
+        fill_markers ? with_markers : experiment_in;
     // Strict budget selection scores with the block-15 head; the
     // legacy all-layer running-max scorer stays available for legacy
     // selection or when PFLASH_QWEN35_LEGACY_SCORER=1 forces it.

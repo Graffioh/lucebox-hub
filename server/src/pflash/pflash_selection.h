@@ -3,6 +3,7 @@
 #include "common/pflash_types.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -127,7 +128,101 @@ struct PFlashSelectionConfig {
     // strings (an identifier, a function description) the last token does
     // not carry.
     luce::common::PFlashTokenSpan turn_query{-1, -1};
+    // Assembly experiments, both off by default. Container headers
+    // (PFLASH_SELECT_CONTAINER_HEADERS=1) keep the header line of every
+    // container (document, record, file) the selection keeps content from;
+    // cut markers (PFLASH_ASSEMBLY_CUT_MARKER=1) put kPFlashCutMarkerText
+    // between kept ranges that were not adjacent in the prompt. Both are
+    // paid for inside the token budget.
+    bool container_headers = false;
+    int container_header_max = 48;
+    bool cut_markers = false;
+    // Per process, filled by the drafter: the cut marker's token ids.
+    std::vector<int32_t> cut_marker_ids;
 };
+
+// Text of the cut marker; the drafter tokenizes it once, the server's
+// paragraph join inserts it verbatim.
+inline constexpr const char * kPFlashCutMarkerText = "\n[...]\n";
+
+// The assembly switches straight from the environment ("1" on; unset or "0"
+// off; anything else is off here and a resolution error in
+// resolve_pflash_selection).
+bool pflash_container_headers_requested() noexcept;
+bool pflash_cut_markers_requested() noexcept;
+
+// Container starts from per-token container probabilities, decoded like unit
+// boundaries: a token whose probability is above ``threshold`` (strict, the
+// offline threshold-selection rule) starts a container unless it lies within
+// ``min_spacing`` tokens of the previous accepted start. Tokens inside any
+// ``excluded`` span (the query window, instruction spans, the kept suffix)
+// never start one. Ascending.
+std::vector<int> pflash_container_starts(
+    const std::vector<float> & container_probs,
+    int input_tokens,
+    float threshold,
+    int min_spacing,
+    const std::vector<luce::common::PFlashTokenSpan> & excluded);
+
+// Container extents and header spans. Container i runs from its start to the
+// next start, the next excluded span or the input end, whichever comes
+// first. Its header runs from the start through the first newline-bearing
+// token after the start (``newline_vocab[id] != 0``), capped at
+// ``header_max`` tokens and at the container end.
+struct PFlashContainers {
+    std::vector<int> starts;
+    std::vector<luce::common::PFlashTokenSpan> extents;
+    std::vector<luce::common::PFlashTokenSpan> headers;
+};
+PFlashContainers pflash_container_headers(
+    const std::vector<int32_t> & ids,
+    const std::vector<int> & starts,
+    const std::vector<luce::common::PFlashTokenSpan> & excluded,
+    const std::vector<uint8_t> & newline_vocab,
+    int header_max);
+
+struct PFlashAssemblyPolicy {
+    int token_budget = 0;
+    // Containers (extents and header spans, parallel, ascending, disjoint);
+    // empty when container headers are off.
+    const PFlashContainers * containers = nullptr;
+    // Cut marker length in tokens; 0 when cut markers are off.
+    int marker_tokens = 0;
+};
+
+struct PFlashAssemblyResult {
+    bool ok = false;
+    std::vector<size_t> ordinals;          // final selection, source order
+    std::vector<size_t> dropped;           // ordinals dropped to pay, in drop order
+    std::vector<luce::common::PFlashTokenSpan> kept;   // merged kept ranges
+    std::vector<luce::common::PFlashTokenSpan> headers_added;
+    int header_tokens = 0;                 // header tokens not already kept
+    int cut_markers = 0;
+    int retained_tokens = 0;               // kept tokens plus marker tokens
+    int passes = 0;
+    std::string error;
+};
+
+// After a normal selection: add the header span of every container that
+// holds a selected non-mandatory candidate, count a cut marker between every
+// two kept ranges that are not adjacent, and pay for both inside the budget
+// by dropping the lowest-ranked selected non-mandatory candidates (the
+// reverse of the selection order), one per pass. A dropped candidate can
+// leave a container without content, whose header then goes too, or remove
+// a marker: every pass recomputes both, until the result fits.
+// Mandatory candidates are never dropped; when only they remain the result
+// may exceed the budget by the markers between them.
+PFlashAssemblyResult pflash_assemble_selection(
+    const std::vector<PFlashSelectionCandidate> & candidates,
+    const std::vector<size_t> & selected_ordinals,
+    const PFlashAssemblyPolicy & policy);
+
+// The kept ranges' ids in order, ``marker_ids`` between two ranges that are
+// not adjacent (never before the first or after the last).
+std::vector<int32_t> pflash_assemble_ids(
+    const std::vector<int32_t> & ids,
+    const std::vector<luce::common::PFlashTokenSpan> & kept,
+    const std::vector<int32_t> & marker_ids);
 
 // Segment probe: cut the context before every token whose boundary score is
 // above ``threshold``; ``forced_cuts`` (query start, instruction span edges)

@@ -6,6 +6,10 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -874,4 +878,357 @@ TEST_CASE(PFlashSelectionFixture, split_selection_rejects_top_k) {
         PFlashSelectionMode::TopK);
     REQUIRE(!result.ok);
     REQUIRE(result.stop == PFlashSelectionStop::InvalidInput);
+}
+
+// ---------------------------------------------------------------------------
+// Assembly experiments: container headers and cut markers.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char * kContainerHeadersEnv = "PFLASH_SELECT_CONTAINER_HEADERS";
+constexpr const char * kContainerHeaderMaxEnv = "PFLASH_SELECT_CONTAINER_HEADER_MAX";
+constexpr const char * kCutMarkerEnv = "PFLASH_ASSEMBLY_CUT_MARKER";
+constexpr const char * kTraceEnv = "PFLASH_TRACE_PATH";
+
+using luce::common::PFlashTokenSpan;
+
+// 40 tokens (ids 100..139), fixed 4-token chunks, query window [36, 40).
+// Budget 20 at keep ratio 0.5: the query chunk (mandatory) plus the four
+// best optional chunks 1, 3, 4, 7.
+struct AssemblyFixture {
+    std::vector<int32_t> ids;
+    std::vector<float> token_scores;
+    std::vector<uint8_t> newline_vocab;
+    AssemblyFixture() {
+        for (int i = 0; i < 40; ++i) ids.push_back(100 + i);
+        const double chunk_score[10] = {0.1, 0.9, 0.1, 0.8, 0.7, 0.1, 0.1, 0.6, 0.5, 0.0};
+        for (int i = 0; i < 40; ++i) token_scores.push_back((float) chunk_score[i / 4] / 4.0f);
+        newline_vocab.assign(200, 0);
+        newline_vocab[111] = 1;   // token 11 ends container 10's header line
+    }
+    PFlashSelectionConfig config() const {
+        PFlashSelectionConfig c;
+        c.mode = PFlashSelectionMode::BudgetOnly;
+        c.selection_active = true;
+        c.configured = true;
+        c.chunk_size = 4;
+        return c;
+    }
+    std::vector<int32_t> run(const PFlashSelectionConfig & c,
+                             const PFlashContainers * containers = nullptr) const {
+        return luce::common::select_pflash_chunks(
+            ids, token_scores, 0.5f, /*n_lookahead=*/4, /*score_query_end=*/40,
+            /*pool_kernel=*/1, c, {}, /*direct_mass=*/true, /*write_trace=*/true,
+            nullptr, false, nullptr, 0.0, containers);
+    }
+    std::vector<int32_t> slice(int begin, int end) const {
+        return {ids.begin() + begin, ids.begin() + end};
+    }
+    PFlashContainers containers(int header_max = 3) const {
+        // Containers start at 10 and 26; the query window is excluded.
+        return pflash_container_headers(ids, {10, 26}, {{36, 40}}, newline_vocab, header_max);
+    }
+};
+
+std::vector<int32_t> concat(std::initializer_list<std::vector<int32_t>> parts) {
+    std::vector<int32_t> out;
+    for (const auto & part : parts) out.insert(out.end(), part.begin(), part.end());
+    return out;
+}
+
+std::string temp_trace_path(const char * tag) {
+    return (std::filesystem::temp_directory_path() /
+            ("luce_pflash_assembly_" + std::string(tag) + "_" +
+             std::to_string((long long) getpid()) + ".jsonl")).string();
+}
+
+std::string read_last_line(const std::string & path) {
+    std::ifstream in(path);
+    std::string line, last;
+    while (std::getline(in, line)) if (!line.empty()) last = line;
+    return last;
+}
+
+std::vector<PFlashSelectionCandidate> four_chunk_candidates() {
+    // Chunks of 4 over 40 tokens, scores as in AssemblyFixture; chunk 9 is
+    // the query (mandatory).
+    const double chunk_score[10] = {0.1, 0.9, 0.1, 0.8, 0.7, 0.1, 0.1, 0.6, 0.5, 0.0};
+    std::vector<PFlashSelectionCandidate> out;
+    for (int c = 0; c < 10; ++c) {
+        out.push_back(candidate((size_t) c, c * 4, c * 4 + 4, chunk_score[c], c == 9));
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE(PFlashSelectionFixture, assembly_switches_default_off_and_resolve_or_fail) {
+    CleanPFlashEnv clean;
+    luce_test::ScopedEnvVar headers{kContainerHeadersEnv, nullptr};
+    luce_test::ScopedEnvVar header_max{kContainerHeaderMaxEnv, nullptr};
+    luce_test::ScopedEnvVar markers{kCutMarkerEnv, nullptr};
+    set_env(kModeEnv, "budget_only");
+    auto config = resolve_or_fail(32768, 1024);
+    REQUIRE(!config.container_headers);
+    REQUIRE(!config.cut_markers);
+    REQUIRE(config.container_header_max == 48);
+    REQUIRE(!pflash_container_headers_requested());
+    REQUIRE(!pflash_cut_markers_requested());
+
+    set_env(kContainerHeadersEnv, "0");
+    set_env(kCutMarkerEnv, "0");
+    config = resolve_or_fail(32768, 1024);
+    REQUIRE(!config.container_headers);
+    REQUIRE(!config.cut_markers);
+
+    set_env(kContainerHeadersEnv, "1");
+    set_env(kCutMarkerEnv, "1");
+    set_env(kContainerHeaderMaxEnv, "64");
+    config = resolve_or_fail(32768, 1024);
+    REQUIRE(config.container_headers);
+    REQUIRE(config.cut_markers);
+    REQUIRE(config.container_header_max == 64);
+    REQUIRE(pflash_container_headers_requested());
+    REQUIRE(pflash_cut_markers_requested());
+    // The assembly switches alone never configure selection.
+    set_env(kModeEnv, nullptr);
+    REQUIRE(!resolve_or_fail(32768, 1024).configured);
+    REQUIRE(!has_pflash_selection_environment());
+
+    PFlashSelectionConfig invalid;
+    std::string error;
+    for (const char * bad : {"2", "yes", ""}) {
+        set_env(kContainerHeadersEnv, bad);
+        REQUIRE(!resolve_pflash_selection(32768, 1024, invalid, error));
+        REQUIRE(error.find(kContainerHeadersEnv) != std::string::npos);
+    }
+    set_env(kContainerHeadersEnv, "1");
+    set_env(kCutMarkerEnv, "true");
+    REQUIRE(!resolve_pflash_selection(32768, 1024, invalid, error));
+    REQUIRE(error.find(kCutMarkerEnv) != std::string::npos);
+    set_env(kCutMarkerEnv, "1");
+    for (const char * bad : {"0", "-1", "4097", "abc"}) {
+        set_env(kContainerHeaderMaxEnv, bad);
+        REQUIRE(!resolve_pflash_selection(32768, 1024, invalid, error));
+        REQUIRE(error.find(kContainerHeaderMaxEnv) != std::string::npos);
+    }
+}
+
+TEST_CASE(PFlashSelectionFixture, container_starts_decode_like_unit_boundaries) {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    //                              0     1     2     3    4     5     6     7    8     9    10    11
+    const std::vector<float> probs{0.9f, 0.1f, 0.6f, 0.7f, 0.5f, 0.2f, 0.8f, nan, 0.9f, 0.9f, 0.1f, 0.95f};
+    // Strict threshold: 0.5 exactly is not a start; spacing 3 drops 2 (after
+    // 0) and 8 (after 6); NaN never starts one; 11 is inside an excluded span.
+    auto starts = pflash_container_starts(probs, 12, 0.5f, 3, {{10, 12}});
+    REQUIRE((starts == std::vector<int>{0, 3, 6, 9}));
+    // Spacing 1 keeps every token above the threshold outside the exclusions.
+    starts = pflash_container_starts(probs, 12, 0.5f, 1, {{10, 12}});
+    REQUIRE((starts == std::vector<int>{0, 2, 3, 6, 8, 9}));
+    // An excluded start does not reset the spacing.
+    starts = pflash_container_starts(probs, 12, 0.5f, 1, {{0, 1}, {8, 12}});
+    REQUIRE((starts == std::vector<int>{2, 3, 6}));
+    // Too few probabilities: nothing.
+    REQUIRE(pflash_container_starts(probs, 13, 0.5f, 1, {}).empty());
+}
+
+TEST_CASE(PFlashSelectionFixture, container_headers_end_at_first_newline_and_cap) {
+    AssemblyFixture f;
+    const auto c = f.containers(/*header_max=*/3);
+    REQUIRE((c.starts == std::vector<int>{10, 26}));
+    // Container 10 runs to the next start; container 26 ends at the query.
+    REQUIRE((c.extents == std::vector<PFlashTokenSpan>{{10, 26}, {26, 36}}));
+    // Header 10: through the newline token at 11. Header 26: no newline, cap 3.
+    REQUIRE((c.headers == std::vector<PFlashTokenSpan>{{10, 12}, {26, 29}}));
+    // The cap never runs past the container end.
+    const auto tight = pflash_container_headers(f.ids, {10, 12}, {}, f.newline_vocab, 48);
+    REQUIRE((tight.headers == std::vector<PFlashTokenSpan>{{10, 12}, {12, 40}}));
+    const auto capped = pflash_container_headers(f.ids, {12, 14}, {}, f.newline_vocab, 48);
+    REQUIRE((capped.headers[0] == PFlashTokenSpan{12, 14}));
+    // A newline token as the start itself does not end its own header.
+    std::vector<uint8_t> newline_start(200, 0);
+    newline_start[110] = 1;
+    newline_start[113] = 1;
+    const auto own = pflash_container_headers(f.ids, {10}, {}, newline_start, 48);
+    REQUIRE((own.headers[0] == PFlashTokenSpan{10, 14}));
+}
+
+TEST_CASE(PFlashSelectionFixture, assembly_switches_off_leave_selection_and_trace_unchanged) {
+    AssemblyFixture f;
+    const std::string trace = temp_trace_path("off");
+    std::remove(trace.c_str());
+    luce_test::ScopedEnvVar trace_env{kTraceEnv, trace.c_str()};
+    const auto config = f.config();
+    const auto expected = concat({f.slice(4, 8), f.slice(12, 20), f.slice(28, 32), f.slice(36, 40)});
+
+    const auto plain = f.run(config);
+    REQUIRE(plain == expected);
+    const auto plain_spans = luce::common::pflash_last_kept_spans();
+    REQUIRE((plain_spans == std::vector<PFlashTokenSpan>{{4, 8}, {12, 20}, {28, 32}, {36, 40}}));
+    const std::string plain_trace = read_last_line(trace);
+
+    // Containers handed in, marker ids present, switches off: identical.
+    auto with_inputs = config;
+    with_inputs.cut_marker_ids = {900, 901};
+    const auto containers = f.containers();
+    REQUIRE(f.run(with_inputs, &containers) == expected);
+    REQUIRE(luce::common::pflash_last_kept_spans() == plain_spans);
+    REQUIRE(read_last_line(trace) == plain_trace);
+    for (const char * key : {"container_starts", "headers_added", "header_tokens",
+                             "cut_markers", "assembly_dropped"}) {
+        REQUIRE(plain_trace.find(key) == std::string::npos);
+    }
+    REQUIRE(plain_trace.find("\"retained_tokens\":20") != std::string::npos);
+    std::remove(trace.c_str());
+}
+
+TEST_CASE(PFlashSelectionFixture, assembly_adds_headers_within_budget) {
+    AssemblyFixture f;
+    const auto candidates = four_chunk_candidates();
+    const auto selected = select_pflash_candidates(
+        candidates, {20, 0.95}, PFlashSelectionMode::BudgetOnly);
+    REQUIRE(selected.ok);
+    require_ordinals(selected, {1, 3, 4, 7, 9});
+    const auto containers = f.containers();
+    PFlashAssemblyPolicy policy;
+    policy.token_budget = 30;
+    policy.containers = &containers;
+    const auto result = pflash_assemble_selection(candidates, selected.ordinals, policy);
+    REQUIRE(result.ok);
+    REQUIRE(result.dropped.empty());
+    REQUIRE((result.ordinals == std::vector<size_t>{1, 3, 4, 7, 9}));
+    // Header [10,12) is new; header [26,29) adds 26 and 27 (28 is chunk 7's).
+    REQUIRE((result.headers_added == std::vector<PFlashTokenSpan>{{10, 12}, {26, 29}}));
+    REQUIRE(result.header_tokens == 4);
+    REQUIRE(result.retained_tokens == 24);
+    REQUIRE((result.kept == std::vector<PFlashTokenSpan>{{4, 8}, {10, 20}, {26, 32}, {36, 40}}));
+    // Chunk 1 sits before any container: no header for it.
+    REQUIRE(result.cut_markers == 0);
+    // A header already inside a kept segment is not "added".
+    PFlashContainers covered = pflash_container_headers(f.ids, {12}, {{36, 40}}, f.newline_vocab, 2);
+    const auto inside = pflash_assemble_selection(candidates, selected.ordinals,
+        PFlashAssemblyPolicy{30, &covered, 0});
+    REQUIRE(inside.headers_added.empty());
+    REQUIRE(inside.header_tokens == 0);
+    REQUIRE(inside.retained_tokens == 20);
+}
+
+TEST_CASE(PFlashSelectionFixture, assembly_drops_lowest_to_a_fixed_point) {
+    AssemblyFixture f;
+    const auto candidates = four_chunk_candidates();
+    const auto containers = f.containers();
+    // Headers cost 4 over a budget of 20: chunk 7 (lowest selected) goes, and
+    // with it container 26's content, so its header goes too. 18 fits.
+    const auto result = pflash_assemble_selection(
+        candidates, {1, 3, 4, 7, 9}, PFlashAssemblyPolicy{20, &containers, 0});
+    REQUIRE(result.ok);
+    REQUIRE((result.dropped == std::vector<size_t>{7}));
+    REQUIRE((result.ordinals == std::vector<size_t>{1, 3, 4, 9}));
+    REQUIRE((result.headers_added == std::vector<PFlashTokenSpan>{{10, 12}}));
+    REQUIRE(result.header_tokens == 2);
+    REQUIRE(result.retained_tokens == 18);
+    REQUIRE(result.retained_tokens <= 20);
+    REQUIRE(result.passes == 2);
+    REQUIRE((result.kept == std::vector<PFlashTokenSpan>{{4, 8}, {10, 20}, {36, 40}}));
+}
+
+TEST_CASE(PFlashSelectionFixture, assembly_markers_only_between_non_contiguous_ranges) {
+    const auto candidates = four_chunk_candidates();
+    // Contiguous selection: one range, no marker.
+    auto result = pflash_assemble_selection(candidates, {7, 8, 9}, PFlashAssemblyPolicy{20, nullptr, 2});
+    REQUIRE(result.ok);
+    REQUIRE(result.cut_markers == 0);
+    REQUIRE(result.retained_tokens == 12);
+    // Four ranges, three markers of 2 tokens: 26 > 20. Dropping chunk 7
+    // removes a range and its marker: 16 + 4 = 20 fits, nothing else goes.
+    result = pflash_assemble_selection(candidates, {1, 3, 4, 7, 9}, PFlashAssemblyPolicy{20, nullptr, 2});
+    REQUIRE(result.ok);
+    REQUIRE((result.dropped == std::vector<size_t>{7}));
+    REQUIRE(result.cut_markers == 2);
+    REQUIRE(result.retained_tokens == 20);
+
+    AssemblyFixture f;
+    const std::vector<int32_t> marker{900, 901};
+    const auto ids = pflash_assemble_ids(f.ids, result.kept, marker);
+    REQUIRE(ids == concat({f.slice(4, 8), marker, f.slice(12, 20), marker, f.slice(36, 40)}));
+    // Never before the first or after the last range, even when the first
+    // range does not start the prompt or the last does not end it.
+    const auto inner = pflash_assemble_ids(f.ids, {{4, 8}, {8, 12}, {20, 24}}, marker);
+    REQUIRE(inner == concat({f.slice(4, 12), marker, f.slice(20, 24)}));
+    REQUIRE(pflash_assemble_ids(f.ids, {{4, 8}}, marker) == f.slice(4, 8));
+}
+
+TEST_CASE(PFlashSelectionFixture, assembly_keeps_forced_spans_whole_and_never_drops_them) {
+    // An instruction span [20, 24) is mandatory in the middle of the prompt.
+    auto candidates = four_chunk_candidates();
+    candidates[5].mandatory = true;
+    const auto selected = select_pflash_candidates(
+        candidates, {16, 0.95}, PFlashSelectionMode::BudgetOnly);
+    REQUIRE(selected.ok);
+    require_ordinals(selected, {1, 3, 5, 9});
+    // Budget 16 with 2-token markers: 16 kept + 6 marker tokens. The lowest
+    // optional chunk (3) goes; the mandatory chunk 5 stays whole although
+    // it scores lowest, and a marker sits on each side of it.
+    const auto result = pflash_assemble_selection(
+        candidates, selected.ordinals, PFlashAssemblyPolicy{16, nullptr, 2});
+    REQUIRE(result.ok);
+    REQUIRE((result.dropped == std::vector<size_t>{3}));
+    REQUIRE((result.ordinals == std::vector<size_t>{1, 5, 9}));
+    REQUIRE(result.cut_markers == 2);
+    REQUIRE(result.retained_tokens == 16);
+    // With a budget the mandatory spans and their marker exceed, the result
+    // keeps them all and reports the overflow rather than cutting them.
+    const auto over = pflash_assemble_selection(
+        candidates, {5, 9}, PFlashAssemblyPolicy{9, nullptr, 2});
+    REQUIRE(over.ok);
+    REQUIRE((over.ordinals == std::vector<size_t>{5, 9}));
+    REQUIRE(over.retained_tokens == 10);
+
+    AssemblyFixture f;
+    const std::vector<int32_t> marker{900, 901};
+    const auto ids = pflash_assemble_ids(f.ids, result.kept, marker);
+    REQUIRE(ids == concat({f.slice(4, 8), marker, f.slice(20, 24), marker, f.slice(36, 40)}));
+}
+
+TEST_CASE(PFlashSelectionFixture, select_chunks_assembles_headers_and_markers_into_ids_and_trace) {
+    AssemblyFixture f;
+    const std::string trace = temp_trace_path("on");
+    std::remove(trace.c_str());
+    luce_test::ScopedEnvVar trace_env{kTraceEnv, trace.c_str()};
+    auto config = f.config();
+    config.container_headers = true;
+    config.cut_markers = true;
+    config.cut_marker_ids = {900, 901};
+    const auto containers = f.containers();
+    // Selection 1,3,4,7 + query = 20. Headers +4 and three markers +6: 30.
+    // Drop 7 (its header goes): 18 + 4 = 22. Drop 4: 14 + 4 = 18 fits;
+    // chunk 3 still holds container 10's content, so its header stays.
+    const auto out = f.run(config, &containers);
+    const std::vector<int32_t> marker{900, 901};
+    REQUIRE(out == concat({f.slice(4, 8), marker, f.slice(10, 16), marker, f.slice(36, 40)}));
+    REQUIRE((luce::common::pflash_last_kept_spans() ==
+             std::vector<PFlashTokenSpan>{{4, 8}, {10, 16}, {36, 40}}));
+    const std::string line = read_last_line(trace);
+    REQUIRE(line.find("\"container_starts\":[10,26]") != std::string::npos);
+    REQUIRE(line.find("\"headers_added\":[[10,12]]") != std::string::npos);
+    REQUIRE(line.find("\"header_tokens\":2") != std::string::npos);
+    REQUIRE(line.find("\"cut_markers\":2") != std::string::npos);
+    REQUIRE(line.find("\"assembly_dropped\":[7,4]") != std::string::npos);
+    REQUIRE(line.find("\"retained_tokens\":18") != std::string::npos);
+    REQUIRE(line.find("\"selected_chunks\":[1,3,9]") != std::string::npos);
+
+    // Headers alone: no marker field; markers alone: no container fields.
+    config.cut_markers = false;
+    f.run(config, &containers);
+    std::string only = read_last_line(trace);
+    REQUIRE(only.find("\"header_tokens\":2") != std::string::npos);
+    REQUIRE(only.find("cut_markers") == std::string::npos);
+    config.cut_markers = true;
+    config.container_headers = false;
+    f.run(config, &containers);
+    only = read_last_line(trace);
+    REQUIRE(only.find("container_starts") == std::string::npos);
+    REQUIRE(only.find("\"cut_markers\":2") != std::string::npos);
+    std::remove(trace.c_str());
 }

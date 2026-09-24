@@ -639,13 +639,21 @@ std::string pflash_join_kept_spans(
         const std::vector<PFlashTokenSpan> & spans) {
     std::string out;
     int previous_end = -1;
+    // Cut markers (PFLASH_ASSEMBLY_CUT_MARKER=1): the drafter put the marker
+    // between every two kept ranges that were not adjacent; the join does
+    // the same, verbatim, in place of the paragraph break.
+    const bool cut_markers = luce::pflash::pflash_cut_markers_requested();
     for (const auto & span : spans) {
         if (span.begin < 0 || span.end > (int) ids.size() || span.end <= span.begin) {
             continue;
         }
         std::string piece = tokenizer.decode(std::vector<int32_t>(
             ids.begin() + span.begin, ids.begin() + span.end));
-        if (previous_end >= 0 && span.begin > previous_end && !out.empty() &&
+        if (cut_markers) {
+            if (previous_end >= 0 && span.begin > previous_end) {
+                out += luce::pflash::kPFlashCutMarkerText;
+            }
+        } else if (previous_end >= 0 && span.begin > previous_end && !out.empty() &&
             !piece.empty()) {
             const bool left_break = out.back() == '\n';
             const bool right_break = piece.front() == '\n';

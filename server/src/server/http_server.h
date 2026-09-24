@@ -325,7 +325,8 @@ bool pflash_chat_recall() noexcept;
 // The compressed text is rebuilt from the kept spans with a paragraph break
 // between pieces that were not adjacent in the prompt, unless one side
 // already ends or starts a paragraph (PFLASH_SELECT_PARAGRAPH_JOIN=0 turns
-// it off).
+// it off). With PFLASH_ASSEMBLY_CUT_MARKER=1 the break is the cut marker
+// text instead, always, as the drafter's compressed ids carry it.
 bool pflash_paragraph_join() noexcept;
 std::string pflash_join_kept_spans(
     const Tokenizer & tokenizer,

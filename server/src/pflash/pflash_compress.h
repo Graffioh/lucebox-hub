@@ -105,6 +105,15 @@ struct PFlashTraceFields {
     const std::vector<double> * other_chunk_scores = nullptr;
     // Rank-mode ceiling: the K that applied, 0 outside top_k mode.
     int top_k = 0;
+    // Assembly experiments; each field is written only when its switch is
+    // on. Container headers: decoded starts, header spans added ([begin,
+    // end)), header tokens added. Cut markers: markers inserted. Either:
+    // the ordinals dropped to pay for them.
+    const std::vector<int> * container_starts = nullptr;
+    const std::vector<PFlashTokenSpan> * headers_added = nullptr;
+    int header_tokens = -1;
+    int cut_markers = -1;
+    const std::vector<size_t> * assembly_dropped = nullptr;
 };
 
 void write_compression_trace(
@@ -163,6 +172,7 @@ std::vector<int32_t> select_pflash_chunks(
         const std::vector<PFlashTokenSpan> * segments = nullptr,
         bool density = false,
         const std::vector<float> * other_token_scores = nullptr,
-        double split_fraction = 0.0);
+        double split_fraction = 0.0,
+        const luce::pflash::PFlashContainers * containers = nullptr);
 
 } // namespace luce::common

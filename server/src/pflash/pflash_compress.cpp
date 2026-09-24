@@ -138,6 +138,36 @@ void write_compression_trace(
             }
             std::fputc(']', file);
         }
+        if (trace_fields->container_starts) {
+            std::fputs(",\"container_starts\":[", file);
+            for (size_t index = 0; index < trace_fields->container_starts->size(); ++index) {
+                std::fprintf(file, "%s%d", index ? "," : "",
+                             (*trace_fields->container_starts)[index]);
+            }
+            std::fputc(']', file);
+        }
+        if (trace_fields->headers_added) {
+            std::fputs(",\"headers_added\":[", file);
+            for (size_t index = 0; index < trace_fields->headers_added->size(); ++index) {
+                const auto & span = (*trace_fields->headers_added)[index];
+                std::fprintf(file, "%s[%d,%d]", index ? "," : "", span.begin, span.end);
+            }
+            std::fputc(']', file);
+        }
+        if (trace_fields->header_tokens >= 0) {
+            std::fprintf(file, ",\"header_tokens\":%d", trace_fields->header_tokens);
+        }
+        if (trace_fields->cut_markers >= 0) {
+            std::fprintf(file, ",\"cut_markers\":%d", trace_fields->cut_markers);
+        }
+        if (trace_fields->assembly_dropped) {
+            std::fputs(",\"assembly_dropped\":[", file);
+            for (size_t index = 0; index < trace_fields->assembly_dropped->size(); ++index) {
+                std::fprintf(file, "%s%zu", index ? "," : "",
+                             (*trace_fields->assembly_dropped)[index]);
+            }
+            std::fputc(']', file);
+        }
     }
     std::fprintf(file,
         ",\"chunk_size\":%d,\"n_lookahead\":%d,\"pool_kernel\":%d,"
@@ -221,7 +251,8 @@ std::vector<int32_t> select_pflash_chunks(
         const std::vector<PFlashTokenSpan> * segments,
         bool density,
         const std::vector<float> * other_token_scores,
-        double split_fraction) {
+        double split_fraction,
+        const luce::pflash::PFlashContainers * containers) {
     const int input_tokens = (int) ids.size();
     const int query_end = score_query_end < 0 ? input_tokens : score_query_end;
     const int query_tokens = std::min(n_lookahead, query_end);
@@ -294,12 +325,37 @@ std::vector<int32_t> select_pflash_chunks(
         return {};
     }
 
+    // Assembly experiments (container headers, cut markers): off by
+    // default, and then nothing below changes.
+    const bool with_headers = config.container_headers && containers != nullptr;
+    const bool with_markers = config.cut_markers && !config.cut_marker_ids.empty();
+    luce::pflash::PFlashAssemblyResult assembly;
+    if (with_headers || with_markers) {
+        luce::pflash::PFlashAssemblyPolicy assembly_policy;
+        assembly_policy.token_budget = selector_budget;
+        assembly_policy.containers = with_headers ? containers : nullptr;
+        assembly_policy.marker_tokens =
+            with_markers ? (int) config.cut_marker_ids.size() : 0;
+        assembly = luce::pflash::pflash_assemble_selection(
+            candidates, selected.ordinals, assembly_policy);
+        if (!assembly.ok) {
+            set_last_error("PFlash assembly failed: " + assembly.error);
+            std::fprintf(stderr, "[pflash-select] ERROR assembly: %s\n",
+                         assembly.error.c_str());
+            std::fflush(stderr);
+            return {};
+        }
+    }
+    const bool assembled = with_headers || with_markers;
+    const std::vector<size_t> & final_ordinals =
+        assembled ? assembly.ordinals : selected.ordinals;
+
     std::vector<uint8_t> selected_mask((size_t) n_chunks, 0);
     std::vector<uint8_t> mandatory_mask((size_t) n_chunks, 0);
     for (const auto & candidate : candidates) {
         if (candidate.mandatory) mandatory_mask[candidate.ordinal] = 1;
     }
-    for (size_t ordinal : selected.ordinals) {
+    for (size_t ordinal : final_ordinals) {
         if (ordinal >= selected_mask.size()) {
             set_last_error("PFlash selector returned an invalid ordinal");
             return {};
@@ -325,16 +381,25 @@ std::vector<int32_t> select_pflash_chunks(
                  mass / (double) length * (double) input_tokens});
         }
     }
-    for (const auto & candidate : candidates) {
-        if (!selected_mask[candidate.ordinal]) continue;
-        output.insert(output.end(),
-                      ids.begin() + candidate.begin,
-                      ids.begin() + candidate.end);
-        if (!g_last_kept_spans.empty() &&
-            g_last_kept_spans.back().end == candidate.begin) {
-            g_last_kept_spans.back().end = candidate.end;
-        } else {
-            g_last_kept_spans.push_back({candidate.begin, candidate.end});
+    if (assembled) {
+        // Kept ranges are arbitrary token ranges now (header spans are
+        // sub-segment); markers go between ranges that are not adjacent.
+        static const std::vector<int32_t> no_markers;
+        output = luce::pflash::pflash_assemble_ids(
+            ids, assembly.kept, with_markers ? config.cut_marker_ids : no_markers);
+        g_last_kept_spans = assembly.kept;
+    } else {
+        for (const auto & candidate : candidates) {
+            if (!selected_mask[candidate.ordinal]) continue;
+            output.insert(output.end(),
+                          ids.begin() + candidate.begin,
+                          ids.begin() + candidate.end);
+            if (!g_last_kept_spans.empty() &&
+                g_last_kept_spans.back().end == candidate.begin) {
+                g_last_kept_spans.back().end = candidate.end;
+            } else {
+                g_last_kept_spans.push_back({candidate.begin, candidate.end});
+            }
         }
     }
 
@@ -345,20 +410,34 @@ std::vector<int32_t> select_pflash_chunks(
         split ? "split" : "single",
         segments ? "probe" : "fixed", density ? "density" : "sum",
         segments ? 0 : config.chunk_size, query_tokens, selector_budget, output.size(),
-        selected.ordinals.size(), n_chunks,
+        final_ordinals.size(), n_chunks,
         luce::pflash::pflash_selection_stop_name(selected.stop),
         selected.retained_mass);
+    if (assembled) {
+        std::fprintf(stderr,
+            "[pflash-assembly] containers=%zu headers_added=%zu header_tokens=%d "
+            "cut_markers=%d marker_tokens=%d dropped=%zu passes=%d "
+            "retained=%d budget=%d\n",
+            with_headers ? containers->starts.size() : (size_t) 0,
+            assembly.headers_added.size(), assembly.header_tokens,
+            assembly.cut_markers,
+            with_markers ? (int) config.cut_marker_ids.size() : 0,
+            assembly.dropped.size(), assembly.passes,
+            assembly.retained_tokens, selector_budget);
+    }
     std::fflush(stderr);
 
     if (write_trace) {
         const int trace_chunk = segments ? 0 : config.chunk_size;
         const int n_keep_approx = segments
-            ? (int) selected.ordinals.size()
+            ? (int) final_ordinals.size()
             : std::max(1, (selector_budget + config.chunk_size - 1) / config.chunk_size);
         PFlashTraceFields strict_fields{
             &ids, query_begin, query_end, config.mode, config.query_parser,
             selector_budget,
-            selected.stop, selected.retained_tokens, selected.retained_mass,
+            selected.stop,
+            assembled ? assembly.retained_tokens : selected.retained_tokens,
+            selected.retained_mass,
             &exact_chunk_scores, &required_instruction_spans};
         strict_fields.segments = segments;
         strict_fields.segmentation = segments ? "probe" : "fixed";
@@ -368,6 +447,13 @@ std::vector<int32_t> select_pflash_chunks(
         strict_fields.other_chunk_scores = split ? &other_scores : nullptr;
         strict_fields.top_k =
             config.mode == luce::pflash::PFlashSelectionMode::TopK ? config.top_k : 0;
+        if (with_headers) {
+            strict_fields.container_starts = &containers->starts;
+            strict_fields.headers_added = &assembly.headers_added;
+            strict_fields.header_tokens = assembly.header_tokens;
+        }
+        if (with_markers) strict_fields.cut_markers = assembly.cut_markers;
+        if (assembled) strict_fields.assembly_dropped = &assembly.dropped;
         write_compression_trace(
             input_tokens, keep_ratio, trace_chunk, query_tokens,
             pool_kernel, n_keep_approx, chunk_means, selected_mask,

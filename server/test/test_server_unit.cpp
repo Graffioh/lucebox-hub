@@ -1078,6 +1078,19 @@ TEST_CASE(ServerUnitFixture, test_pflash_join_kept_spans_breaks_between_pieces) 
     // ...and adjacent pieces are joined as they were.
     TEST_ASSERT(http_detail::pflash_join_kept_spans(tok, ids, {{0, 3}, {3, 5}}) ==
                 tok.decode({ids.begin(), ids.begin() + 5}));
+    {
+        // Cut markers: the marker text replaces the paragraph break between
+        // every two pieces that were not adjacent, whatever their edges, and
+        // adjacent pieces still join as they were.
+        luce_test::ScopedEnvVar markers{"PFLASH_ASSEMBLY_CUT_MARKER", "1"};
+        TEST_ASSERT_MSG(http_detail::pflash_join_kept_spans(tok, ids, {one, two}) ==
+                        "one fact.\n[...]\nTwo starts.",
+                        http_detail::pflash_join_kept_spans(tok, ids, {one, two}));
+        TEST_ASSERT(http_detail::pflash_join_kept_spans(tok, ids, {one, three}) ==
+                    "one fact.\n[...]\n\n\nThree.");
+        TEST_ASSERT(http_detail::pflash_join_kept_spans(tok, ids, {{0, 3}, {3, 5}}) ==
+                    tok.decode({ids.begin(), ids.begin() + 5}));
+    }
     unlink(path.c_str());
 }
 
