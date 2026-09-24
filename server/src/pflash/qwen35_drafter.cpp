@@ -937,6 +937,15 @@ std::vector<int32_t> qwen35_strict_score_and_compress(
             return fail("qwen35 scorer query rows unavailable");
         }
         windows.push_back(std::move(query));
+        const auto & turn = experiment.turn_query;
+        if (turn.begin >= 0 && turn.end <= query_start && turn.end > turn.begin) {
+            ScoredWindow tail;
+            tail.begin = turn.begin;
+            tail.end = turn.end;
+            if (rows_for(turn.begin, turn.end, tail.rows)) {
+                windows.push_back(std::move(tail));
+            }
+        }
         double weight = 1.0;
         for (const auto & span : experiment.history_queries) {
             weight *= 0.5;

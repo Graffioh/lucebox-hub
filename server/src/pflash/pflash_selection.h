@@ -121,6 +121,12 @@ struct PFlashSelectionConfig {
     // first. The head scores the context against each and mixes the masses
     // with the query's at weights 1/2, 1/4, ... (multi-turn chats).
     std::vector<luce::common::PFlashTokenSpan> history_queries;
+    // Per request: the tail of the latest user turn, scored as a second
+    // query window at full weight next to the prompt-end query. The last
+    // token reads the whole request; the user's own tokens match literal
+    // strings (an identifier, a function description) the last token does
+    // not carry.
+    luce::common::PFlashTokenSpan turn_query{-1, -1};
 };
 
 // Segment probe: cut the context before every token whose boundary score is

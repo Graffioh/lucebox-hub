@@ -393,7 +393,11 @@ generation prompt, where the model starts answering, having read the whole
 request. Nothing is parsed out of the user's text, so the question can sit
 anywhere in the message -- before a pasted document, in the middle of it, or
 among the user's own sentences -- and the user's own words score far above
-the material they paste. Strict selection keeps the generation prompt and
+the material they paste. The tail (`PFLASH_SELECT_QUERY_TOKENS`) of the
+latest user turn scores alongside it as a second query window at the same
+weight: the last token reads the whole request, the user's own tokens match
+literal strings -- an identifier, a described function -- that it does not
+carry. Strict selection keeps the generation prompt and
 the latest user turn's role header, and it runs on every turn of a
 multi-turn chat. In an agent loop the assistant and tool turns after the
 user's turn are scored like the rest of the conversation. A prompt without

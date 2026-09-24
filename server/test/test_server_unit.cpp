@@ -7029,6 +7029,11 @@ TEST_CASE(ServerUnitFixture,
     // answering; nothing is parsed out of the user's text.
     TEST_ASSERT(backend.last_request.score_query_end == (int) ids.size());
     TEST_ASSERT(backend.last_request.score_query_tokens == 1);
+    // The user turn's tail scores as a second query window.
+    const auto turn = backend.last_request.turn_query_span;
+    TEST_ASSERT(turn.begin >= 0 && turn.end == last_im_end);
+    TEST_ASSERT(tokenizer.decode({ids.begin() + turn.begin, ids.begin() + turn.end})
+                == "What is the answer?");
     // The generation prompt, the turn's role header and -- a short turn --
     // the whole question stay.
     bool header_pinned = false;

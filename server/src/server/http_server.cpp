@@ -3866,6 +3866,10 @@ std::string HttpServer::apply_pflash_compression(
     // Earlier user questions of a multi-turn chat, most recent first: they
     // score the context alongside the current query at halving weights.
     std::vector<PFlashTokenSpan> history_query_spans;
+    // The latest user turn's tail (PFLASH_SELECT_QUERY_TOKENS), a second
+    // query window next to the prompt-end query: literal strings in the
+    // question (an identifier, a described function) match their passage.
+    PFlashTokenSpan turn_query_span{-1, -1};
     // Header ("<|im_start|>user\n") opening the query's turn, when the chat
     // markers resolved it — pinned mandatory so a compressed prompt keeps
     // the current turn's role envelope.
@@ -4045,6 +4049,12 @@ std::string HttpServer::apply_pflash_compression(
                     chat_turn.generation_begin < prompt_end) {
                     query_span = {prompt_end - 1, prompt_end};
                     query_span_rule = "prompt_end";
+                    const auto tail = http_detail::pflash_tail_query_window(
+                        drafter_ids, experiment.query_tokens,
+                        chat_turn.content_end, chat_turn.content_begin);
+                    if (tail.valid()) {
+                        turn_query_span = {tail.end - tail.tokens, tail.end};
+                    }
                 } else {
                     const auto window = http_detail::pflash_tail_query_window(
                         drafter_ids, experiment.query_tokens,
@@ -4425,6 +4435,7 @@ std::string HttpServer::apply_pflash_compression(
         std::move(required_instruction_spans);
     compress_request.query_suffix_candidates = query_suffix_candidates;
     compress_request.history_query_spans = history_query_spans;
+    compress_request.turn_query_span = turn_query_span;
     compress_request.keep_ratio = http_detail::resolve_pflash_keep_ratio(
         pflash_keep_ratio(config_, prompt_tokens), req.session_id, sessions_);
     if (experiment.selection_active && query_window.valid()) {
@@ -4468,6 +4479,8 @@ std::string HttpServer::apply_pflash_compression(
                 {"query_span_end", query_span.end},
                 {"query_suffix_candidates", query_suffix_candidates},
                 {"history_queries", history_query_spans.size()},
+                {"turn_query_begin", turn_query_span.begin},
+                {"turn_query_end", turn_query_span.end},
                 {"requested_query_tokens", experiment.query_tokens},
                 {"required_text_count", req.pflash_required.size()},
                 {"expected_query_ids", expected_query_ids},

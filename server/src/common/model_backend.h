@@ -300,6 +300,9 @@ struct ModelBackend {
         // Earlier user questions (their scorer windows), most recent first:
         // they score the context alongside the query at halving weights.
         std::vector<PFlashTokenSpan> history_query_spans;
+        // The latest user turn's tail, a second query window at full weight
+        // (prompt-end chat queries; {-1, -1} otherwise).
+        PFlashTokenSpan turn_query_span{-1, -1};
         std::string          drafter_path;    // GGUF path (for lazy-load)
         int                  drafter_gpu = 0;  // backend-local GPU for PFlash drafter
         bool                 skip_park = false; // true on >=32GB GPUs
