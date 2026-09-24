@@ -1,4 +1,59 @@
 cmake_minimum_required(VERSION 3.21)  # 3.21 adds first-class HIP language support (project(LANGUAGES ... HIP))
+# The options were called DFLASH27B_* (DFLASH_GPU_SAMPLER) before the luce
+# rename. A build directory configured under the old names (or an old -D
+# command line) would otherwise fall back to the defaults without a word: CUDA
+# instead of HIP, gfx1151 instead of the configured GPU. Adopt each old value
+# once, when the new option is unset, empty, or still at its declared default
+# below, then drop the old entry. Keep these defaults in sync with the
+# declarations.
+foreach(_luce_entry
+        "DFLASH27B_GPU_BACKEND=cuda" "DFLASH27B_ENABLE_MIXED_CUDA_HIP=OFF"
+        "DFLASH27B_CUDA_ARCHITECTURES=86" "DFLASH27B_HIP_ARCHITECTURES="
+        "DFLASH27B_COVERAGE=OFF" "DFLASH27B_FA_ALL_QUANTS=ON"
+        "DFLASH27B_ROCMFP2_AFFINE=OFF" "DFLASH27B_HIP_SM80_EQUIV=OFF"
+        "DFLASH27B_USE_BLACKWELL_CONSUMER_FIX=OFF" "DFLASH_GPU_SAMPLER=ON"
+        "DFLASH27B_TESTS=ON" "DFLASH27B_SERVER=ON")
+    string(REGEX MATCH "^(DFLASH27B_|DFLASH_)([^=]+)=(.*)$" _luce_match
+        "${_luce_entry}")
+    set(_luce_old "${CMAKE_MATCH_1}${CMAKE_MATCH_2}")
+    set(_luce_new "LUCE_${CMAKE_MATCH_2}")
+    set(_luce_default "${CMAKE_MATCH_3}")
+    if(DEFINED CACHE{${_luce_old}})
+        if(NOT DEFINED CACHE{${_luce_new}}
+           OR "$CACHE{${_luce_new}}" STREQUAL ""
+           OR "$CACHE{${_luce_new}}" STREQUAL "${_luce_default}")
+            if(NOT "$CACHE{${_luce_old}}" STREQUAL "$CACHE{${_luce_new}}")
+                if(DEFINED CACHE{${_luce_new}})
+                    get_property(_luce_type CACHE ${_luce_new} PROPERTY TYPE)
+                else()
+                    get_property(_luce_type CACHE ${_luce_old} PROPERTY TYPE)
+                endif()
+                if(_luce_type STREQUAL "UNINITIALIZED")
+                    if(_luce_default MATCHES "^(ON|OFF)$")
+                        set(_luce_type BOOL)
+                    else()
+                        set(_luce_type STRING)
+                    endif()
+                endif()
+                set(${_luce_new} "$CACHE{${_luce_old}}" CACHE ${_luce_type} "" FORCE)
+                message(WARNING
+                    "${_luce_old} is renamed ${_luce_new}; using "
+                    "${_luce_new}=$CACHE{${_luce_old}}")
+            endif()
+        elseif(NOT "$CACHE{${_luce_old}}" STREQUAL "$CACHE{${_luce_new}}")
+            message(WARNING
+                "${_luce_old}=$CACHE{${_luce_old}} is ignored: "
+                "${_luce_new}=$CACHE{${_luce_new}} is already set")
+        endif()
+        unset(${_luce_old} CACHE)
+    endif()
+endforeach()
+unset(_luce_entry)
+unset(_luce_match)
+unset(_luce_old)
+unset(_luce_new)
+unset(_luce_default)
+unset(_luce_type)
 set(LUCE_GPU_BACKEND "cuda" CACHE STRING "GPU backend to build: cuda or hip")
 set_property(CACHE LUCE_GPU_BACKEND PROPERTY STRINGS cuda hip)
 option(LUCE_ENABLE_MIXED_CUDA_HIP
