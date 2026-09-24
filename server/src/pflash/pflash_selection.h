@@ -151,7 +151,8 @@ inline constexpr const char * kPFlashCutMarkerText = "\n[...]\n";
 bool pflash_container_headers_requested() noexcept;
 bool pflash_cut_markers_requested() noexcept;
 
-// Container starts from per-token container probabilities, decoded like unit
+// Container starts from per-token start probabilities (the probe's
+// record-start head: document, file, email, session), decoded like unit
 // boundaries: a token whose probability is above ``threshold`` (strict, the
 // offline threshold-selection rule) starts a container unless it lies within
 // ``min_spacing`` tokens of the previous accepted start. Tokens inside any

@@ -108,10 +108,10 @@ struct PFlashTraceFields {
     // Rank-mode ceiling: the K that applied, 0 outside top_k mode.
     int top_k = 0;
     // Assembly experiments; each field is written only when its switch is
-    // on. Container headers: decoded starts, header spans added ([begin,
+    // on. Container headers: decoded record starts, header spans added ([begin,
     // end)), header tokens added. Cut markers: markers inserted. Either:
     // the ordinals dropped to pay for them.
-    const std::vector<int> * container_starts = nullptr;
+    const std::vector<int> * record_starts = nullptr;
     const std::vector<PFlashTokenSpan> * headers_added = nullptr;
     int header_tokens = -1;
     int cut_markers = -1;

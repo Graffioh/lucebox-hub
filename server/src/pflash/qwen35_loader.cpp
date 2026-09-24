@@ -61,10 +61,12 @@ void free_qwen35_segment_probe(Qwen35DrafterState & st) {
         st.probe_sub_fc2_w = st.probe_sub_fc2_b = nullptr;
     st.probe_conv_w.clear();
     st.probe_sub_conv_w.clear();
-    st.probe_container_fc2_w = st.probe_container_fc2_b = nullptr;
-    st.probe_container_conv_w.clear();
-    st.probe_container_threshold = 0.5f;
-    st.probe_container_loaded = false;
+    st.probe_record_fc1_w = st.probe_record_fc1_b =
+        st.probe_record_fc2_w = st.probe_record_fc2_b = nullptr;
+    st.probe_record_conv_w.clear();
+    st.probe_record_threshold = 0.5f;
+    st.probe_record_hidden = 0;
+    st.probe_record_loaded = false;
     st.probe_loaded = false;
 }
 
@@ -238,7 +240,7 @@ bool load_qwen35_segment_probe(const std::string & path,
         {"segmentprobe.fc2.bias", 1, 1, 1, &st.probe_fc2_b},
     };
     ggml_init_params probe_params{};
-    probe_params.mem_size = 10 * ggml_tensor_overhead();
+    probe_params.mem_size = 12 * ggml_tensor_overhead();
     probe_params.no_alloc = true;
     st.probe_ctx = ggml_init(probe_params);
     if (!st.probe_ctx) return fail("segment probe context allocation failed");
@@ -291,54 +293,69 @@ bool load_qwen35_segment_probe(const std::string & path,
                                    (const float *) sub_cw_src->data + sub_cw_src->ne[0]);
         st.probe_sub_conv_b = ((const float *) sub_cb_src->data)[0];
     }
-    // Optional container head: read only when container headers are
-    // requested, so a probe loads exactly as before with the switch off.
-    // All four tensors ship together or none; the threshold defaults to 0.5.
-    ggml_tensor * container_src = nullptr;
-    ggml_tensor * container_b_src = nullptr;
-    const bool container_requested = luce::pflash::pflash_container_headers_requested();
-    if (container_requested) {
-        container_src = ggml_get_tensor(data_ctx, "segmentprobe.container.fc2.weight");
-        container_b_src = ggml_get_tensor(data_ctx, "segmentprobe.container.fc2.bias");
-        ggml_tensor * container_cw_src = ggml_get_tensor(data_ctx, "segmentprobe.container.conv.weight");
-        ggml_tensor * container_cb_src = ggml_get_tensor(data_ctx, "segmentprobe.container.conv.bias");
-        const bool any = container_src || container_b_src || container_cw_src || container_cb_src;
+    // Optional record-start head (documents, files, emails, sessions): read
+    // only when container headers are requested, so a probe loads exactly as
+    // before with the switch off. On the shared trunk: fc1 (width -> hidden),
+    // GELU, fc2 (hidden -> 1), its own smoothing conv (residual, like the
+    // other heads), sigmoid. All six tensors ship together or none; the
+    // threshold (segmentprobe.record_threshold) defaults to 0.5.
+    ggml_tensor * record_fc1_src = nullptr;
+    ggml_tensor * record_fc1_b_src = nullptr;
+    ggml_tensor * record_fc2_src = nullptr;
+    ggml_tensor * record_fc2_b_src = nullptr;
+    if (luce::pflash::pflash_container_headers_requested()) {
+        const auto get = [&](const char * name) { return ggml_get_tensor(data_ctx, name); };
+        record_fc1_src = get("segmentprobe.record.fc1.weight");
+        record_fc1_b_src = get("segmentprobe.record.fc1.bias");
+        record_fc2_src = get("segmentprobe.record.fc2.weight");
+        record_fc2_b_src = get("segmentprobe.record.fc2.bias");
+        ggml_tensor * record_cw_src = get("segmentprobe.record.conv.weight");
+        ggml_tensor * record_cb_src = get("segmentprobe.record.conv.bias");
+        const auto f32 = [](const ggml_tensor * t) { return t && t->type == GGML_TYPE_F32; };
+        const bool any = record_fc1_src || record_fc1_b_src || record_fc2_src ||
+            record_fc2_b_src || record_cw_src || record_cb_src;
         if (any) {
-            if (!container_src || container_src->type != GGML_TYPE_F32 ||
-                ggml_n_dims(container_src) != 1 ||
-                container_src->ne[0] != (int64_t) st.probe_width ||
-                !container_b_src || container_b_src->type != GGML_TYPE_F32 ||
-                ggml_n_dims(container_b_src) != 1 || container_b_src->ne[0] != 1 ||
-                !container_cw_src || container_cw_src->type != GGML_TYPE_F32 ||
-                ggml_n_dims(container_cw_src) != 1 ||
-                container_cw_src->ne[0] != conv_w->ne[0] ||
-                !container_cb_src || container_cb_src->type != GGML_TYPE_F32 ||
-                ggml_n_dims(container_cb_src) != 1 || container_cb_src->ne[0] != 1) {
-                return fail("segment probe tensor contract mismatch: segmentprobe.container");
+            // fc1 is [width, hidden]; fc2 is the [hidden, 1] row, which ggml
+            // reports 1-D; the conv weight is the flat odd tap vector.
+            const int64_t hidden = f32(record_fc1_src) ? record_fc1_src->ne[1] : 0;
+            if (!f32(record_fc1_src) || ggml_n_dims(record_fc1_src) != 2 ||
+                record_fc1_src->ne[0] != (int64_t) st.probe_width || hidden < 1 ||
+                !f32(record_fc1_b_src) || ggml_n_dims(record_fc1_b_src) != 1 ||
+                record_fc1_b_src->ne[0] != hidden ||
+                !f32(record_fc2_src) || ggml_n_dims(record_fc2_src) != 1 ||
+                record_fc2_src->ne[0] != hidden ||
+                !f32(record_fc2_b_src) || ggml_nelements(record_fc2_b_src) != 1 ||
+                !f32(record_cw_src) || ggml_n_dims(record_cw_src) != 1 ||
+                record_cw_src->ne[0] < 1 || record_cw_src->ne[0] % 2 != 1 ||
+                !f32(record_cb_src) || ggml_nelements(record_cb_src) != 1) {
+                return fail("segment probe tensor contract mismatch: segmentprobe.record");
             }
-            const int threshold_id = gguf_find_key(g, "segmentprobe.container_threshold");
-            if (threshold_id >= 0 &&
-                !qwen35_metadata_f32(g, "segmentprobe.container_threshold",
-                                     st.probe_container_threshold)) {
-                return fail("segment probe container_threshold is not a float32");
+            if (gguf_find_key(g, "segmentprobe.record_threshold") >= 0 &&
+                !qwen35_metadata_f32(g, "segmentprobe.record_threshold",
+                                     st.probe_record_threshold)) {
+                return fail("segment probe record_threshold is not a float32");
             }
-            if (!(st.probe_container_threshold > 0.0f &&
-                  st.probe_container_threshold < 1.0f)) {
-                return fail("segment probe container_threshold is out of range");
+            if (!(st.probe_record_threshold > 0.0f && st.probe_record_threshold < 1.0f)) {
+                return fail("segment probe record_threshold is out of range");
             }
-            st.probe_container_fc2_w =
-                ggml_new_tensor_1d(st.probe_ctx, GGML_TYPE_F32, st.probe_width);
-            ggml_set_name(st.probe_container_fc2_w, "segmentprobe.container.fc2.weight");
-            st.probe_container_fc2_b = ggml_new_tensor_1d(st.probe_ctx, GGML_TYPE_F32, 1);
-            ggml_set_name(st.probe_container_fc2_b, "segmentprobe.container.fc2.bias");
-            st.probe_container_conv_w.assign(
-                (const float *) container_cw_src->data,
-                (const float *) container_cw_src->data + container_cw_src->ne[0]);
-            st.probe_container_conv_b = ((const float *) container_cb_src->data)[0];
+            st.probe_record_hidden = (int) hidden;
+            st.probe_record_fc1_w = ggml_new_tensor_2d(st.probe_ctx, GGML_TYPE_F32,
+                                                       st.probe_width, hidden);
+            ggml_set_name(st.probe_record_fc1_w, "segmentprobe.record.fc1.weight");
+            st.probe_record_fc1_b = ggml_new_tensor_1d(st.probe_ctx, GGML_TYPE_F32, hidden);
+            ggml_set_name(st.probe_record_fc1_b, "segmentprobe.record.fc1.bias");
+            st.probe_record_fc2_w = ggml_new_tensor_1d(st.probe_ctx, GGML_TYPE_F32, hidden);
+            ggml_set_name(st.probe_record_fc2_w, "segmentprobe.record.fc2.weight");
+            st.probe_record_fc2_b = ggml_new_tensor_1d(st.probe_ctx, GGML_TYPE_F32, 1);
+            ggml_set_name(st.probe_record_fc2_b, "segmentprobe.record.fc2.bias");
+            st.probe_record_conv_w.assign(
+                (const float *) record_cw_src->data,
+                (const float *) record_cw_src->data + record_cw_src->ne[0]);
+            st.probe_record_conv_b = ((const float *) record_cb_src->data)[0];
         } else {
             std::fprintf(stderr,
                 "[qwen35-drafter] WARNING: PFLASH_SELECT_CONTAINER_HEADERS=1 but the "
-                "segment probe has no container head (segmentprobe.container.*); "
+                "segment probe has no record-start head (segmentprobe.record.*); "
                 "container headers stay off\n");
             std::fflush(stderr);
         }
@@ -353,12 +370,16 @@ bool load_qwen35_segment_probe(const std::string & path,
         ggml_backend_tensor_set(st.probe_sub_fc2_w, sub_src->data, 0, ggml_nbytes(sub_src));
         ggml_backend_tensor_set(st.probe_sub_fc2_b, sub_b_src->data, 0, ggml_nbytes(sub_b_src));
     }
-    if (st.probe_container_fc2_w) {
-        ggml_backend_tensor_set(st.probe_container_fc2_w, container_src->data, 0,
-                                ggml_nbytes(container_src));
-        ggml_backend_tensor_set(st.probe_container_fc2_b, container_b_src->data, 0,
-                                ggml_nbytes(container_b_src));
-        st.probe_container_loaded = true;
+    if (st.probe_record_fc1_w) {
+        ggml_backend_tensor_set(st.probe_record_fc1_w, record_fc1_src->data, 0,
+                                ggml_nbytes(record_fc1_src));
+        ggml_backend_tensor_set(st.probe_record_fc1_b, record_fc1_b_src->data, 0,
+                                ggml_nbytes(record_fc1_b_src));
+        ggml_backend_tensor_set(st.probe_record_fc2_w, record_fc2_src->data, 0,
+                                ggml_nbytes(record_fc2_src));
+        ggml_backend_tensor_set(st.probe_record_fc2_b, record_fc2_b_src->data, 0,
+                                ggml_nbytes(record_fc2_b_src));
+        st.probe_record_loaded = true;
     }
     gguf_free(g);
     ggml_free(data_ctx);
@@ -369,11 +390,13 @@ bool load_qwen35_segment_probe(const std::string & path,
         path.c_str(), st.probe_width, st.probe_threshold,
         st.probe_min_segment, st.probe_max_segment, st.probe_conv_w.size(),
         st.probe_sub_fc2_w ? ", sub-unit head" : "");
-    if (st.probe_container_loaded) {
+    if (st.probe_record_loaded) {
         std::fprintf(stderr,
-            "[qwen35-drafter] container headers on: container threshold %.3f, "
-            "header cap from PFLASH_SELECT_CONTAINER_HEADER_MAX\n",
-            st.probe_container_threshold);
+            "[qwen35-drafter] container headers on: record-start head (hidden %d, "
+            "%zu conv taps), record threshold %.3f, header cap from "
+            "PFLASH_SELECT_CONTAINER_HEADER_MAX\n",
+            st.probe_record_hidden, st.probe_record_conv_w.size(),
+            st.probe_record_threshold);
     }
     std::fflush(stderr);
     return true;
@@ -437,7 +460,7 @@ bool load_qwen35_drafter(const std::string & gguf_path,
             return false;
         }
     }
-    if (luce::pflash::pflash_container_headers_requested() && !st->probe_container_loaded) {
+    if (luce::pflash::pflash_container_headers_requested() && !st->probe_record_loaded) {
         if (!probe_path) {
             std::fprintf(stderr,
                 "[qwen35-drafter] WARNING: PFLASH_SELECT_CONTAINER_HEADERS=1 without "
@@ -445,7 +468,7 @@ bool load_qwen35_drafter(const std::string & gguf_path,
             std::fflush(stderr);
         }
     }
-    if (st->probe_container_loaded || luce::pflash::pflash_cut_markers_requested()) {
+    if (st->probe_record_loaded || luce::pflash::pflash_cut_markers_requested()) {
         if (!load_qwen35_assembly_vocab(gguf_path, *st)) {
             // Fail closed: an assembly switch the runtime cannot honour would
             // silently turn an experiment arm into the baseline.

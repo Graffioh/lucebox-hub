@@ -1,7 +1,8 @@
-// Segment probe loader: the optional container head, on a CPU backend.
+// Segment probe loader: the optional record-start head, on a CPU backend.
 //
-// Synthetic probe GGUFs (hidden 8, width 4, 5 conv taps) with and without the
-// container tensors, loaded under PFLASH_SELECT_CONTAINER_HEADERS on and off;
+// Synthetic probe GGUFs (hidden 8, width 4, record hidden 3, 5 unit and 7
+// record conv taps) with and without the record tensors, loaded under
+// PFLASH_SELECT_CONTAINER_HEADERS on and off;
 // and the assembly vocabulary (newline tokens, cut marker ids) read from a
 // tokenizer GGUF.
 
@@ -17,7 +18,9 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -31,10 +34,12 @@ namespace {
 constexpr int kHidden = 8;
 constexpr int kWidth = 4;
 constexpr int kTaps = 5;
+constexpr int kRecordHidden = 3;
+constexpr int kRecordTaps = 7;
 constexpr const char * kSha = "sha-of-the-test-drafter";
 constexpr const char * kContainerHeadersEnv = "PFLASH_SELECT_CONTAINER_HEADERS";
 
-enum class Container { None, Full, NoThreshold, Partial };
+enum class Record { None, Full, NoThreshold, Partial, EvenTaps };
 
 std::string temp_path(const std::string & tag) {
     static int serial = 0;
@@ -43,7 +48,7 @@ std::string temp_path(const std::string & tag) {
              "_" + std::to_string(++serial) + ".gguf")).string();
 }
 
-std::string write_probe(Container container) {
+std::string write_probe(Record record, bool with_container = true) {
     ggml_init_params ip{};
     ip.mem_size = 32 * ggml_tensor_overhead() + 64 * 1024;
     ip.no_alloc = false;
@@ -77,16 +82,27 @@ std::string write_probe(Container container) {
     add("segmentprobe.fc2.bias", 1);
     add("segmentprobe.conv.weight", kTaps);
     add("segmentprobe.conv.bias", 1);
-    if (container != Container::None) {
+    if (record != Record::None) {
+        add("segmentprobe.record.fc1.weight", kWidth, kRecordHidden);
+        add("segmentprobe.record.fc1.bias", kRecordHidden);
+        add("segmentprobe.record.fc2.weight", kRecordHidden);
+        if (record != Record::Partial) {
+            add("segmentprobe.record.fc2.bias", 1);
+            add("segmentprobe.record.conv.weight",
+                record == Record::EvenTaps ? kRecordTaps - 1 : kRecordTaps);
+            add("segmentprobe.record.conv.bias", 1);
+        }
+        if (record == Record::Full) {
+            gguf_set_val_f32(g, "segmentprobe.record_threshold", 0.3f);
+        }
+    }
+    if (with_container) {
+        // The mixed-level container head: never read by the runtime.
         add("segmentprobe.container.fc2.weight", kWidth);
-        if (container != Container::Partial) {
-            add("segmentprobe.container.fc2.bias", 1);
-            add("segmentprobe.container.conv.weight", kTaps);
-            add("segmentprobe.container.conv.bias", 1);
-        }
-        if (container == Container::Full) {
-            gguf_set_val_f32(g, "segmentprobe.container_threshold", 0.3f);
-        }
+        add("segmentprobe.container.fc2.bias", 1);
+        add("segmentprobe.container.conv.weight", kTaps);
+        add("segmentprobe.container.conv.bias", 1);
+        gguf_set_val_f32(g, "segmentprobe.container_threshold", 0.4f);
     }
     const std::string path = temp_path("probe");
     gguf_write_to_file(g, path.c_str(), /*only_meta=*/false);
@@ -115,76 +131,84 @@ struct ProbeLoaderFixture : CppUnitTestFramework::CommonFixture {
 
 } // namespace
 
-TEST_CASE(ProbeLoaderFixture, probe_with_container_head_loads_it_only_when_requested) {
-    const std::string path = write_probe(Container::Full);
+TEST_CASE(ProbeLoaderFixture, probe_with_record_head_loads_it_only_when_requested) {
+    const std::string path = write_probe(Record::Full);
     {
         luce_test::ScopedEnvVar headers{kContainerHeadersEnv, "1"};
         CpuProbeState state;
         REQUIRE(luce::common::load_qwen35_segment_probe(path, state.st));
         REQUIRE(state.st.probe_loaded);
-        REQUIRE(state.st.probe_container_loaded);
-        REQUIRE(state.st.probe_container_threshold == 0.3f);
-        REQUIRE(state.st.probe_container_conv_w.size() == (size_t) kTaps);
-        REQUIRE(state.st.probe_container_fc2_w != nullptr);
-        // The container row landed on the backend as written: it follows the
-        // unit tensors in the fill sequence.
-        std::vector<float> row(kWidth);
-        ggml_backend_tensor_get(state.st.probe_container_fc2_w, row.data(), 0,
+        REQUIRE(state.st.probe_record_loaded);
+        REQUIRE(state.st.probe_record_threshold == 0.3f);
+        REQUIRE(state.st.probe_record_hidden == kRecordHidden);
+        REQUIRE(state.st.probe_record_conv_w.size() == (size_t) kRecordTaps);
+        REQUIRE(state.st.probe_record_fc1_w->ne[0] == kWidth);
+        REQUIRE(state.st.probe_record_fc1_w->ne[1] == kRecordHidden);
+        // The record rows landed on the backend as written: fc2 follows the
+        // unit tensors, fc1 and its bias in the fill sequence.
+        std::vector<float> row(kRecordHidden);
+        ggml_backend_tensor_get(state.st.probe_record_fc2_w, row.data(), 0,
                                 row.size() * sizeof(float));
-        const int before = 2 * kHidden + kHidden * kWidth + kWidth + kWidth + 1 + kTaps + 1;
-        for (int i = 0; i < kWidth; ++i) {
+        const int before = 2 * kHidden + kHidden * kWidth + kWidth + kWidth + 1 + kTaps + 1 +
+            kWidth * kRecordHidden + kRecordHidden;
+        for (int i = 0; i < kRecordHidden; ++i) {
             const float expected = 0.01f * (float) (before + i + 1);
             REQUIRE(std::abs(row[(size_t) i] - expected) < 1e-4f);
         }
     }
     {
-        // Switch off: the container tensors are not even read.
+        // Switch off: the record tensors are not even read.
         luce_test::ScopedEnvVar headers{kContainerHeadersEnv, nullptr};
         CpuProbeState state;
         REQUIRE(luce::common::load_qwen35_segment_probe(path, state.st));
         REQUIRE(state.st.probe_loaded);
-        REQUIRE(!state.st.probe_container_loaded);
-        REQUIRE(state.st.probe_container_fc2_w == nullptr);
+        REQUIRE(!state.st.probe_record_loaded);
+        REQUIRE(state.st.probe_record_fc1_w == nullptr);
     }
     std::remove(path.c_str());
 }
 
-TEST_CASE(ProbeLoaderFixture, probe_without_container_head_leaves_headers_off) {
-    const std::string path = write_probe(Container::None);
-    luce_test::ScopedEnvVar headers{kContainerHeadersEnv, "1"};
-    CpuProbeState state;
-    // Loads (the unit probe is intact), warns, and container headers stay off.
-    REQUIRE(luce::common::load_qwen35_segment_probe(path, state.st));
-    REQUIRE(state.st.probe_loaded);
-    REQUIRE(!state.st.probe_container_loaded);
-    std::remove(path.c_str());
-}
-
-TEST_CASE(ProbeLoaderFixture, container_threshold_defaults_to_one_half) {
-    const std::string path = write_probe(Container::NoThreshold);
-    luce_test::ScopedEnvVar headers{kContainerHeadersEnv, "1"};
-    CpuProbeState state;
-    REQUIRE(luce::common::load_qwen35_segment_probe(path, state.st));
-    REQUIRE(state.st.probe_container_loaded);
-    REQUIRE(state.st.probe_container_threshold == 0.5f);
-    std::remove(path.c_str());
-}
-
-TEST_CASE(ProbeLoaderFixture, partial_container_head_fails_closed_only_when_requested) {
-    const std::string path = write_probe(Container::Partial);
-    {
+TEST_CASE(ProbeLoaderFixture, probe_without_record_head_leaves_headers_off) {
+    // A container head alone is not used in its place.
+    for (const bool with_container : {true, false}) {
+        const std::string path = write_probe(Record::None, with_container);
         luce_test::ScopedEnvVar headers{kContainerHeadersEnv, "1"};
         CpuProbeState state;
-        REQUIRE(!luce::common::load_qwen35_segment_probe(path, state.st));
-        REQUIRE(!state.st.probe_loaded);
-    }
-    {
-        luce_test::ScopedEnvVar headers{kContainerHeadersEnv, "0"};
-        CpuProbeState state;
+        // Loads (the unit probe is intact), warns, and headers stay off.
         REQUIRE(luce::common::load_qwen35_segment_probe(path, state.st));
-        REQUIRE(!state.st.probe_container_loaded);
+        REQUIRE(state.st.probe_loaded);
+        REQUIRE(!state.st.probe_record_loaded);
+        std::remove(path.c_str());
     }
+}
+
+TEST_CASE(ProbeLoaderFixture, record_threshold_defaults_to_one_half) {
+    const std::string path = write_probe(Record::NoThreshold);
+    luce_test::ScopedEnvVar headers{kContainerHeadersEnv, "1"};
+    CpuProbeState state;
+    REQUIRE(luce::common::load_qwen35_segment_probe(path, state.st));
+    REQUIRE(state.st.probe_record_loaded);
+    REQUIRE(state.st.probe_record_threshold == 0.5f);
     std::remove(path.c_str());
+}
+
+TEST_CASE(ProbeLoaderFixture, malformed_record_head_fails_closed_only_when_requested) {
+    for (const Record record : {Record::Partial, Record::EvenTaps}) {
+        const std::string path = write_probe(record);
+        {
+            luce_test::ScopedEnvVar headers{kContainerHeadersEnv, "1"};
+            CpuProbeState state;
+            REQUIRE(!luce::common::load_qwen35_segment_probe(path, state.st));
+            REQUIRE(!state.st.probe_loaded);
+        }
+        {
+            luce_test::ScopedEnvVar headers{kContainerHeadersEnv, "0"};
+            CpuProbeState state;
+            REQUIRE(luce::common::load_qwen35_segment_probe(path, state.st));
+            REQUIRE(!state.st.probe_record_loaded);
+        }
+        std::remove(path.c_str());
+    }
 }
 
 TEST_CASE(ProbeLoaderFixture, assembly_vocab_marks_newline_tokens_and_tokenizes_the_marker) {
@@ -215,5 +239,53 @@ TEST_CASE(ProbeLoaderFixture, assembly_vocab_marks_newline_tokens_and_tokenizes_
     REQUIRE(tok.decode(st.cut_marker_ids) == luce::pflash::kPFlashCutMarkerText);
     REQUIRE(st.cut_marker_ids.front() == 2);
     REQUIRE(st.cut_marker_ids.back() == 2);
+    std::remove(path.c_str());
+}
+
+TEST_CASE(ProbeLoaderFixture, record_logits_are_fc1_gelu_erf_fc2_on_the_trunk) {
+    const std::string path = write_probe(Record::Full);
+    luce_test::ScopedEnvVar headers{kContainerHeadersEnv, "1"};
+    CpuProbeState state;
+    REQUIRE(luce::common::load_qwen35_segment_probe(path, state.st));
+    const auto & st = state.st;
+    const auto read = [](ggml_tensor * t) {
+        std::vector<float> v((size_t) ggml_nelements(t));
+        ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+        return v;
+    };
+    const auto w1 = read(st.probe_record_fc1_w);   // [width, hidden], width fastest
+    const auto b1 = read(st.probe_record_fc1_b);
+    const auto w2 = read(st.probe_record_fc2_w);
+    const auto b2 = read(st.probe_record_fc2_b);
+
+    constexpr int n = 3;
+    std::vector<float> trunk((size_t) kWidth * n);
+    for (size_t i = 0; i < trunk.size(); ++i) trunk[i] = std::sin(0.7f * (float) i) * 2.0f;
+
+    ggml_init_params ip{};
+    ip.mem_size = 64 * ggml_tensor_overhead() + ggml_graph_overhead() + 1024 * 1024;
+    ip.no_alloc = false;
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kWidth, n);
+    std::memcpy(x->data, trunk.data(), trunk.size() * sizeof(float));
+    // Weights live on the CPU backend buffer: the graph reads them in place.
+    ggml_tensor * out = luce::common::qwen35_probe_record_logits(ctx, st, x);
+    REQUIRE(ggml_nelements(out) == n);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    REQUIRE(ggml_graph_compute_with_ctx(ctx, gf, 1) == GGML_STATUS_SUCCESS);
+    for (int t = 0; t < n; ++t) {
+        double logit = b2[0];
+        for (int h = 0; h < kRecordHidden; ++h) {
+            double z = b1[(size_t) h];
+            for (int c = 0; c < kWidth; ++c) {
+                z += (double) w1[(size_t) h * kWidth + c] * trunk[(size_t) t * kWidth + c];
+            }
+            const double gelu = 0.5 * z * (1.0 + std::erf(z / std::sqrt(2.0)));
+            logit += (double) w2[(size_t) h] * gelu;
+        }
+        REQUIRE(std::abs(((const float *) out->data)[t] - (float) logit) < 1e-4f);
+    }
+    ggml_free(ctx);
     std::remove(path.c_str());
 }

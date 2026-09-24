@@ -138,11 +138,11 @@ void write_compression_trace(
             }
             std::fputc(']', file);
         }
-        if (trace_fields->container_starts) {
-            std::fputs(",\"container_starts\":[", file);
-            for (size_t index = 0; index < trace_fields->container_starts->size(); ++index) {
+        if (trace_fields->record_starts) {
+            std::fputs(",\"record_starts\":[", file);
+            for (size_t index = 0; index < trace_fields->record_starts->size(); ++index) {
                 std::fprintf(file, "%s%d", index ? "," : "",
-                             (*trace_fields->container_starts)[index]);
+                             (*trace_fields->record_starts)[index]);
             }
             std::fputc(']', file);
         }
@@ -469,7 +469,7 @@ std::vector<int32_t> select_pflash_chunks(
         strict_fields.top_k =
             config.mode == luce::pflash::PFlashSelectionMode::TopK ? config.top_k : 0;
         if (with_headers) {
-            strict_fields.container_starts = &containers->starts;
+            strict_fields.record_starts = &containers->starts;
             strict_fields.headers_added = &assembly.headers_added;
             strict_fields.header_tokens = assembly.header_tokens;
         }

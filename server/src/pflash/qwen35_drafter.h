@@ -44,7 +44,7 @@ struct Qwen35ScoringSession {
     bool                  keys_trained = false;
     std::vector<float>    probe_raw;        // per token, unit logit
     std::vector<float>    subunit_raw;      // per token, when the probe has one
-    std::vector<float>    container_raw;    // per token, with container headers on
+    std::vector<float>    record_raw;       // per token, with container headers on
     // Block-14 output of recent query windows (the query and earlier
     // questions), reused while they sit in the shared prefix: an agent step
     // appends tool output after the same user turn, and a new turn's history
@@ -89,15 +89,18 @@ struct Qwen35DrafterState {
     int                   probe_max_segment = 2048;
     int                   probe_width = 0;
     bool                  probe_loaded = false;
-    // Container head (loaded only with PFLASH_SELECT_CONTAINER_HEADERS=1 and
-    // when the probe ships it): container_fc2 on the shared trunk, its own
-    // smoothing conv, sigmoid, starts above ``probe_container_threshold``.
-    ggml_tensor *         probe_container_fc2_w = nullptr;
-    ggml_tensor *         probe_container_fc2_b = nullptr;
-    std::vector<float>    probe_container_conv_w;
-    float                 probe_container_conv_b = 0.0f;
-    float                 probe_container_threshold = 0.5f;
-    bool                  probe_container_loaded = false;
+    // Record-start head (loaded only with PFLASH_SELECT_CONTAINER_HEADERS=1
+    // and when the probe ships it): fc1 -> GELU -> fc2 on the shared trunk,
+    // its own smoothing conv, sigmoid, starts above ``probe_record_threshold``.
+    ggml_tensor *         probe_record_fc1_w = nullptr;  // [width, hidden]
+    ggml_tensor *         probe_record_fc1_b = nullptr;  // [hidden]
+    ggml_tensor *         probe_record_fc2_w = nullptr;  // [hidden]
+    ggml_tensor *         probe_record_fc2_b = nullptr;  // [1]
+    std::vector<float>    probe_record_conv_w;
+    float                 probe_record_conv_b = 0.0f;
+    float                 probe_record_threshold = 0.5f;
+    int                   probe_record_hidden = 0;
+    bool                  probe_record_loaded = false;
     // Assembly vocabulary from the drafter tokenizer, loaded only when an
     // assembly switch is on: which token ids carry a newline, and the cut
     // marker's ids.
@@ -112,7 +115,7 @@ struct Qwen35DrafterState {
 // Defined in qwen35_loader.cpp.
 bool qwen35_head_block_available(const TargetWeights & w, std::string & error);
 // Segment probe onto ``st.weights.backend`` (needs ``st.weights.n_embd`` and
-// ``st.gguf_sha256``); fails closed on a contract mismatch. The container
+// ``st.gguf_sha256``); fails closed on a contract mismatch. The record-start
 // head loads only when PFLASH_SELECT_CONTAINER_HEADERS=1; a probe without it
 // then logs a warning and container headers stay off.
 bool load_qwen35_segment_probe(const std::string & path, Qwen35DrafterState & st);
@@ -123,6 +126,12 @@ bool load_qwen35_drafter(const std::string & gguf_path, DrafterContext & out);
 void free_qwen35_drafter_state(DrafterContext & ctx);
 
 // Defined in qwen35_drafter.cpp.
+//
+// Raw record-start logits [1, n] from the probe trunk [width, n] (after the
+// trunk GELU); the smoothing conv and sigmoid follow on the CPU.
+ggml_tensor * qwen35_probe_record_logits(ggml_context * ctx,
+                                         const Qwen35DrafterState & st,
+                                         ggml_tensor * trunk);
 //
 // The legacy all-layer running-max scorer, on the Qwen3.5 architecture.
 std::vector<int32_t> qwen35_score_and_compress(

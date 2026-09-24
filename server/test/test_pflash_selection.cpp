@@ -1015,7 +1015,7 @@ TEST_CASE(PFlashSelectionFixture, assembly_switches_default_off_and_resolve_or_f
     }
 }
 
-TEST_CASE(PFlashSelectionFixture, container_starts_decode_like_unit_boundaries) {
+TEST_CASE(PFlashSelectionFixture, record_starts_decode_like_unit_boundaries) {
     const float nan = std::numeric_limits<float>::quiet_NaN();
     //                              0     1     2     3    4     5     6     7    8     9    10    11
     const std::vector<float> probs{0.9f, 0.1f, 0.6f, 0.7f, 0.5f, 0.2f, 0.8f, nan, 0.9f, 0.9f, 0.1f, 0.95f};
@@ -1075,7 +1075,7 @@ TEST_CASE(PFlashSelectionFixture, assembly_switches_off_leave_selection_and_trac
     REQUIRE(f.run(with_inputs, &containers) == expected);
     REQUIRE(luce::common::pflash_last_kept_spans() == plain_spans);
     REQUIRE(read_last_line(trace) == plain_trace);
-    for (const char * key : {"container_starts", "headers_added", "header_tokens",
+    for (const char * key : {"record_starts", "headers_added", "header_tokens",
                              "cut_markers", "assembly_dropped"}) {
         REQUIRE(plain_trace.find(key) == std::string::npos);
     }
@@ -1210,7 +1210,7 @@ TEST_CASE(PFlashSelectionFixture, select_chunks_assembles_headers_and_markers_in
     REQUIRE((luce::common::pflash_last_kept_spans() ==
              std::vector<PFlashTokenSpan>{{4, 8}, {10, 16}, {36, 40}}));
     const std::string line = read_last_line(trace);
-    REQUIRE(line.find("\"container_starts\":[10,26]") != std::string::npos);
+    REQUIRE(line.find("\"record_starts\":[10,26]") != std::string::npos);
     REQUIRE(line.find("\"headers_added\":[[10,12]]") != std::string::npos);
     REQUIRE(line.find("\"header_tokens\":2") != std::string::npos);
     REQUIRE(line.find("\"cut_markers\":2") != std::string::npos);
@@ -1228,7 +1228,7 @@ TEST_CASE(PFlashSelectionFixture, select_chunks_assembles_headers_and_markers_in
     config.container_headers = false;
     f.run(config, &containers);
     only = read_last_line(trace);
-    REQUIRE(only.find("container_starts") == std::string::npos);
+    REQUIRE(only.find("record_starts") == std::string::npos);
     REQUIRE(only.find("\"cut_markers\":2") != std::string::npos);
     std::remove(trace.c_str());
 }
